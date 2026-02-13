@@ -241,6 +241,10 @@ class Hyperedge:
     pattern_completion_strength: float = 0.3
     child_hyperedges: Set[str] = field(default_factory=set)
     level: int = 0
+    # Phase 2.5: Dynamic pattern completion — EMA of recent activation rate
+    recent_activation_ema: float = 0.0
+    # Phase 2.5: Cross-level consistency — archived flag
+    is_archived: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +268,57 @@ class StepResult:
     fired_hyperedge_ids: List[str] = field(default_factory=list)
     synapses_pruned: int = 0
     synapses_sprouted: int = 0
+    predictions_confirmed: int = 0
+    predictions_surprised: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Prediction State (Phase 2.5 §1)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PredictionState:
+    """Tracks a pending prediction made by a hyperedge firing.
+
+    When a hyperedge fires, it predicts that its output_targets will fire
+    within ``prediction_window`` steps.  The Graph checks each step whether
+    the predicted targets actually fired (confirmed) or the window expired
+    without firing (surprise).
+
+    Attributes:
+        hyperedge_id: Which hyperedge made the prediction.
+        predicted_targets: Node IDs expected to fire.
+        prediction_strength: Confidence based on hyperedge activation level.
+        prediction_timestamp: Timestep when the prediction was created.
+        prediction_window: How many steps to wait before declaring surprise.
+        confirmed_targets: Targets that have already fired within the window.
+    """
+
+    hyperedge_id: str = ""
+    predicted_targets: Set[str] = field(default_factory=set)
+    prediction_strength: float = 0.0
+    prediction_timestamp: int = 0
+    prediction_window: int = 5
+    confirmed_targets: Set[str] = field(default_factory=set)
+
+
+@dataclass
+class SurpriseEvent:
+    """Emitted when a prediction fails — an expected node did not fire.
+
+    Attributes:
+        hyperedge_id: Which hyperedge made the failed prediction.
+        expected_node: The node that was predicted to fire but didn't.
+        prediction_strength: How confident the prediction was.
+        actual_nodes: Nodes that did fire during the prediction window.
+        timestamp: When the surprise was detected (window expiry step).
+    """
+
+    hyperedge_id: str = ""
+    expected_node: str = ""
+    prediction_strength: float = 0.0
+    actual_nodes: Set[str] = field(default_factory=set)
+    timestamp: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +792,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_member_evolution_window": 50,
     "he_member_evolution_min_co_fires": 10,
     "he_member_evolution_initial_weight": 0.3,
+    # Phase 2.5: Prediction infrastructure
+    "prediction_window": 5,
+    "prediction_ema_alpha": 0.01,
+    "he_experience_threshold": 100,
 }
 
 
@@ -781,6 +840,18 @@ class Graph:
         # tuple(sorted node_ids) → fire_count
         self._he_discovery_counts: Dict[Tuple[str, ...], int] = {}
         self._he_discovery_last_reset: int = 0
+
+        # --- Phase 2.5: Prediction tracking ---
+        # prediction_id → PredictionState
+        self._active_predictions: Dict[str, PredictionState] = {}
+        self._prediction_counter: int = 0
+        self._total_predictions: int = 0
+        self._total_confirmed: int = 0
+        self._total_surprised: int = 0
+        # Nodes that fired during each prediction's window (rolling)
+        self._prediction_window_fired: Dict[str, Set[str]] = {}
+        # Archived hyperedges (for cross-level pruning)
+        self._archived_hyperedges: Dict[str, Hyperedge] = {}
 
         # --- Plasticity rules ---
         self._plasticity_rules: List[PlasticityRule] = [
@@ -859,6 +930,21 @@ class Graph:
                         "(PRD §3.2).",
                         "Hyperedges enforce a refractory period (default 2 steps) to "
                         "prevent cascading feedback loops from output-to-member cycles.",
+                    ],
+                },
+                {
+                    "version": "0.2.5",
+                    "description": "Phase 2.5 Predictive Infrastructure",
+                    "notes": [
+                        "Prediction error events: hyperedge firings create predictions "
+                        "for output targets. Confirmed if target fires within window, "
+                        "SurpriseEvent emitted if window expires without firing.",
+                        "Dynamic pattern completion: completion strength scales with "
+                        "hyperedge experience (activation_count / threshold). New "
+                        "hyperedges complete at 10% strength; experienced ones at 100%.",
+                        "Cross-level consistency pruning: subsumption detection archives "
+                        "redundant lower-level hyperedges when a higher-level one covers "
+                        "identical members. Archived hyperedges preserved in metadata.",
                     ],
                 },
             ],
@@ -1140,17 +1226,27 @@ class Graph:
                 )
                 syn.inactive_steps = 0  # Reset inactivity
 
-        # 6. Evaluate hyperedges (PRD §4.2) — with pattern completion
+        # 6. Evaluate hyperedges (PRD §4.2) — with dynamic pattern completion
         fired_set = set(fired_ids)
         fired_he_this_step: List[str] = []
+        experience_threshold = self.config["he_experience_threshold"]
+        ema_alpha = self.config["prediction_ema_alpha"]
         # Process by level so child hyperedges fire before parents
         max_level = max((he.level for he in self.hyperedges.values()), default=0)
         for level in range(max_level + 1):
             for hid, he in self.hyperedges.items():
                 if he.level != level:
                     continue
+                if he.is_archived:
+                    continue  # Archived hyperedges don't participate
                 activation = self._compute_hyperedge_activation(he, fired_set)
                 he.current_activation = activation
+                # Update activation EMA (Phase 2.5)
+                fired_flag = 1.0 if (activation >= he.activation_threshold and he.refractory_remaining == 0) else 0.0
+                he.recent_activation_ema = (
+                    (1.0 - ema_alpha) * he.recent_activation_ema
+                    + ema_alpha * fired_flag
+                )
                 if he.refractory_remaining > 0:
                     continue  # Still in refractory — cannot fire
                 if activation >= he.activation_threshold:
@@ -1168,17 +1264,39 @@ class Graph:
                         if target is not None:
                             target.voltage += effective_weight * target.intrinsic_excitability
 
-                    # Pattern completion (PRD §4.2): pre-charge inactive members
+                    # Dynamic pattern completion (Phase 2.5):
+                    # Scale by experience: new HEs complete weakly, experienced ones fully.
+                    # completion_strength = base × min(1.0, activation_count / threshold)
                     if he.pattern_completion_strength > 0:
-                        for nid in he.member_nodes:
-                            if nid not in fired_set:
-                                node = self.nodes.get(nid)
-                                if node is not None and node.refractory_remaining == 0:
-                                    node.voltage += (
-                                        he.pattern_completion_strength
-                                        * he.member_weights.get(nid, 1.0)
-                                        * node.intrinsic_excitability
-                                    )
+                        learning_factor = min(1.0, he.activation_count / max(experience_threshold, 1))
+                        effective_completion = he.pattern_completion_strength * learning_factor
+                        if effective_completion > 0:
+                            for nid in he.member_nodes:
+                                if nid not in fired_set:
+                                    node = self.nodes.get(nid)
+                                    if node is not None and node.refractory_remaining == 0:
+                                        node.voltage += (
+                                            effective_completion
+                                            * he.member_weights.get(nid, 1.0)
+                                            * node.intrinsic_excitability
+                                        )
+
+                    # Prediction creation (Phase 2.5): predict output targets will fire
+                    if he.output_targets:
+                        pred_id = f"pred_{self._prediction_counter}"
+                        self._prediction_counter += 1
+                        pred = PredictionState(
+                            hyperedge_id=hid,
+                            predicted_targets=set(he.output_targets),
+                            prediction_strength=activation,
+                            prediction_timestamp=self.timestep,
+                            prediction_window=self.config["prediction_window"],
+                        )
+                        self._active_predictions[pred_id] = pred
+                        self._prediction_window_fired[pred_id] = set()
+                        self._total_predictions += 1
+                        self._emit("prediction_created", prediction_id=pred_id,
+                                   hyperedge_id=hid, targets=list(he.output_targets))
 
                     self._emit("hyperedge_fired", hid=hid, activation=activation)
 
@@ -1888,8 +2006,22 @@ class Graph:
             if hid in self.hyperedges
         ]
 
+    def get_active_predictions(self) -> Dict[str, "PredictionState"]:
+        """Return currently active (pending) predictions (Phase 2.5)."""
+        return dict(self._active_predictions)
+
+    def get_archived_hyperedges(self) -> Dict[str, Hyperedge]:
+        """Return archived (subsumed) hyperedges preserved for debugging (Phase 2.5)."""
+        return dict(self._archived_hyperedges)
+
     def get_telemetry(self) -> Telemetry:
-        """Network statistics snapshot (PRD §8 get_telemetry)."""
+        """Network statistics snapshot (PRD §8 get_telemetry).
+
+        Phase 2.5 additions:
+            prediction_accuracy: confirmed / total predictions (0 if none).
+            surprise_rate: surprises / total predictions (0 if none).
+            hyperedge_experience_distribution: bucket histogram of activation_counts.
+        """
         weights = [s.weight for s in self.synapses.values()]
         rates = [n.firing_rate_ema for n in self.nodes.values()]
         he_counts = [he.activation_count for he in self.hyperedges.values()]
@@ -2135,16 +2267,24 @@ class Graph:
     # -----------------------------------------------------------------------
 
     def consolidate_hyperedges(self) -> int:
-        """Merge highly overlapping hyperedges (PRD §4.3).
+        """Merge highly overlapping hyperedges and archive subsumed ones (PRD §4.3).
 
-        Two hyperedges with >80% member overlap (Jaccard) get merged into
-        one, keeping the union of members and the lower threshold.
+        Phase 2 behavior: Two hyperedges at same level with >80% member overlap
+        (Jaccard) get merged into one, keeping the union of members and the lower
+        threshold.
+
+        Phase 2.5 addition — cross-level consistency pruning: after same-level
+        merges, detect subsumption where a lower-level hyperedge has identical
+        members to (or is a hierarchical child of) a higher-level one.  The
+        lower-level edge is archived (``is_archived=True``, preserved in
+        ``_archived_hyperedges`` for debugging) rather than deleted.
 
         Returns:
-            Number of hyperedges removed by consolidation.
+            Number of hyperedges removed or archived by consolidation.
         """
         overlap_threshold = self.config["he_consolidation_overlap"]
-        he_list = [(hid, he) for hid, he in self.hyperedges.items() if he.level == 0]
+        he_list = [(hid, he) for hid, he in self.hyperedges.items()
+                   if he.level == 0 and not he.is_archived]
         to_remove: Set[str] = set()
         merged_count = 0
 
@@ -2181,11 +2321,74 @@ class Graph:
         for hid in to_remove:
             self._remove_hyperedge_internal(hid)
 
+        # --- Phase 2.5: Cross-level consistency pruning (subsumption) ---
+        archived_count = self._prune_subsumed_hyperedges()
+        merged_count += archived_count
+
         self._total_he_consolidated += merged_count
         if merged_count > 0:
             self._emit("hyperedges_consolidated", count=merged_count)
 
         return merged_count
+
+    def _prune_subsumed_hyperedges(self) -> int:
+        """Archive lower-level hyperedges subsumed by higher-level ones.
+
+        Subsumption criteria:
+            - Jaccard similarity = 1.0 (exact member match), OR
+            - The lower-level hyperedge is a child of the higher-level one
+              AND they share identical members.
+            - Keep the higher-level abstraction, archive the lower.
+
+        Returns:
+            Number of hyperedges archived.
+        """
+        archived_count = 0
+        # Build lookup: level → list of (hid, he)
+        by_level: Dict[int, List[Tuple[str, Hyperedge]]] = {}
+        for hid, he in self.hyperedges.items():
+            if he.is_archived:
+                continue
+            by_level.setdefault(he.level, []).append((hid, he))
+
+        levels = sorted(by_level.keys())
+        if len(levels) < 2:
+            return 0
+
+        for lower_level in levels:
+            for higher_level in levels:
+                if higher_level <= lower_level:
+                    continue
+                for hid_lo, he_lo in by_level.get(lower_level, []):
+                    if he_lo.is_archived:
+                        continue
+                    for hid_hi, he_hi in by_level.get(higher_level, []):
+                        if he_hi.is_archived:
+                            continue
+                        # Check exact member match (Jaccard = 1.0)
+                        if he_lo.member_nodes == he_hi.member_nodes:
+                            # Archive the lower-level one
+                            he_lo.is_archived = True
+                            self._archived_hyperedges[hid_lo] = he_lo
+                            archived_count += 1
+                            self._emit("hyperedge_archived",
+                                       archived_id=hid_lo,
+                                       subsumed_by=hid_hi,
+                                       reason="exact_member_match")
+                            break
+                        # Check if lower is a child of higher with identical members
+                        if hid_lo in he_hi.child_hyperedges:
+                            if he_lo.member_nodes == he_hi.member_nodes:
+                                he_lo.is_archived = True
+                                self._archived_hyperedges[hid_lo] = he_lo
+                                archived_count += 1
+                                self._emit("hyperedge_archived",
+                                           archived_id=hid_lo,
+                                           subsumed_by=hid_hi,
+                                           reason="child_subsumption")
+                                break
+
+        return archived_count
 
     # -----------------------------------------------------------------------
     # Event System (PRD §8 register_event_handler)
@@ -2299,16 +2502,23 @@ class Graph:
             "pattern_completion_strength": he.pattern_completion_strength,
             "child_hyperedges": list(he.child_hyperedges),
             "level": he.level,
+            # Phase 2.5 fields
+            "recent_activation_ema": he.recent_activation_ema,
+            "is_archived": he.is_archived,
         }
 
     def _serialize_full(self) -> Dict[str, Any]:
         return {
-            "version": "0.1.0",
+            "version": "0.2.5",
             "timestep": self.timestep,
             "config": self.config,
             "nodes": {nid: self._serialize_node(n) for nid, n in self.nodes.items()},
             "synapses": {sid: self._serialize_synapse(s) for sid, s in self.synapses.items()},
             "hyperedges": {hid: self._serialize_hyperedge(h) for hid, h in self.hyperedges.items()},
+            "archived_hyperedges": {
+                hid: self._serialize_hyperedge(h)
+                for hid, h in self._archived_hyperedges.items()
+            },
             "telemetry": {
                 "total_pruned": self._total_pruned,
                 "total_sprouted": self._total_sprouted,
@@ -2358,6 +2568,9 @@ class Graph:
         self._node_hyperedges.clear()
         self._recent_spikes.clear()
         self._delay_buffer.clear()
+        self._active_predictions.clear()
+        self._prediction_window_fired.clear()
+        self._archived_hyperedges.clear()
 
         # Restore nodes
         for nid, nd in data.get("nodes", {}).items():
@@ -2426,11 +2639,38 @@ class Graph:
                 pattern_completion_strength=hd.get("pattern_completion_strength", 0.3),
                 child_hyperedges=set(hd.get("child_hyperedges", [])),
                 level=hd.get("level", 0),
+                recent_activation_ema=hd.get("recent_activation_ema", 0.0),
+                is_archived=hd.get("is_archived", False),
             )
             self.hyperedges[hid] = he
             for nid in he.member_nodes:
                 self._node_hyperedges.setdefault(nid, set()).add(hid)
             self._he_co_fire_counts[hid] = {}
+
+        # Restore archived hyperedges (Phase 2.5)
+        self._archived_hyperedges.clear()
+        for hid, hd in data.get("archived_hyperedges", {}).items():
+            he = Hyperedge(
+                hyperedge_id=hid,
+                member_nodes=set(hd["member_nodes"]),
+                member_weights=hd.get("member_weights", {}),
+                activation_threshold=hd.get("activation_threshold", 0.6),
+                activation_mode=ActivationMode[hd.get("activation_mode", "WEIGHTED_THRESHOLD")],
+                current_activation=hd.get("current_activation", 0.0),
+                output_targets=hd.get("output_targets", []),
+                output_weight=hd.get("output_weight", 1.0),
+                metadata=hd.get("metadata", {}),
+                is_learnable=hd.get("is_learnable", True),
+                refractory_period=hd.get("refractory_period", 2),
+                refractory_remaining=hd.get("refractory_remaining", 0),
+                activation_count=hd.get("activation_count", 0),
+                pattern_completion_strength=hd.get("pattern_completion_strength", 0.3),
+                child_hyperedges=set(hd.get("child_hyperedges", [])),
+                level=hd.get("level", 0),
+                recent_activation_ema=hd.get("recent_activation_ema", 0.0),
+                is_archived=hd.get("is_archived", True),
+            )
+            self._archived_hyperedges[hid] = he
 
         # Restore telemetry
         tel = data.get("telemetry", {})
