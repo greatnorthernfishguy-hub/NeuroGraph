@@ -824,6 +824,41 @@ class Graph:
                     ],
                 },
                 {
+                    "version": "0.1.5",
+                    "description": "Phase 1.5 Stability Enhancements",
+                    "notes": [
+                        "Added changelog metadata to Graph.__init__ (this structure) "
+                        "for auditability of design decisions across phases.",
+                        "Added refractory_period and refractory_remaining to Hyperedge "
+                        "class. Uses same skip-on-fire-step pattern as nodes: counter "
+                        "set on fire, skip decrement on firing step, decrement on "
+                        "subsequent steps. Default refractory_period=2.",
+                    ],
+                },
+                {
+                    "version": "0.2.0",
+                    "description": "Phase 2 Hypergraph Engine",
+                    "notes": [
+                        "Enhanced activation dynamics: all 4 modes (WEIGHTED_THRESHOLD, "
+                        "K_OF_N, ALL_OR_NONE, GRADED) with GRADED output scaling "
+                        "(effective_weight = output_weight × activation_level).",
+                        "Pattern completion: when hyperedge fires from partial activation, "
+                        "inactive members get pre-charged proportional to member weight "
+                        "and intrinsic excitability (PRD §4.2).",
+                        "HyperedgePlasticityRule: member weight adaptation (active +lr, "
+                        "inactive -lr×0.5), threshold learning via inject_reward, and "
+                        "member evolution from co-activation tracking.",
+                        "Hierarchical hyperedges: create_hierarchical_hyperedge() composes "
+                        "child HEs. Members = union, level = max(child levels) + 1. "
+                        "Step processes level 0 first, then 1, etc.",
+                        "Hyperedge discovery: discover_hyperedges() auto-creates HEs from "
+                        "repeated co-activation patterns (≥ min_co_fires in window).",
+                        "Consolidation: consolidate_hyperedges() merges same-level HEs "
+                        "with Jaccard similarity ≥ 0.8. Keeps union members, lower "
+                        "threshold, summed activation counts.",
+                    ],
+                },
+                {
                     "version": "0.2.5",
                     "description": "Phase 2.5 Predictive Infrastructure",
                     "notes": [
