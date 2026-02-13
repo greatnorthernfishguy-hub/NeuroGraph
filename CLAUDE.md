@@ -213,7 +213,7 @@ msgpack>=1.0.0  # For efficient serialization
 - [x] Phase 1.5: Stability Enhancements
 - [x] Phase 2: Hypergraph Engine
 - [x] Phase 2.5: Predictive Infrastructure Enhancements
-- [ ] Phase 3: Predictive Coding
+- [x] Phase 3: Predictive Coding
 - [ ] Phase 4: Vector DB Integration
 
 ## Changelog
@@ -347,3 +347,73 @@ msgpack>=1.0.0  # For efficient serialization
 
 **Files created:**
 - `tests/test_phase25.py`
+
+---
+
+### Phase 3: Predictive Coding Engine (v0.3.0)
+**Commit:** Implement Phase 3: Predictive Coding Engine (PRD Section 5)
+
+**What was built:**
+1. **Synapse-level prediction generation (PRD §5.1):**
+   - `Prediction` dataclass: source_node_id, target_node_id, strength, confidence, created_at, expires_at, chain_depth, pre_charge_applied
+   - `PredictionOutcome` dataclass: records confirmed/error results with actual firing nodes
+   - When node fires with strong causal link (weight > `prediction_threshold`), prediction registered in `Graph.active_predictions` and target pre-charged by `strength × 0.3`
+   - `get_predictions()` public API returns active predictions
+
+2. **Prediction chains:**
+   - `_generate_predictions_from_node()` recursively cascades predictions through learned sequences (A→B→C)
+   - Strength decays ×0.7 per hop (`prediction_chain_decay`), max depth 3 (`prediction_max_chain_depth`)
+   - Cycle-safe via `visited` set passed through recursion
+   - `_predicted_this_step` set prevents double-predicting the same target from both synapse and hyperedge sources
+
+3. **Prediction confirmation and error (PRD §5.1):**
+   - `_evaluate_predictions()`: each step checks if predicted targets fired → `_on_prediction_confirmed()`
+   - `_cleanup_predictions()`: expired predictions → `_on_prediction_error()`
+   - Confirmation: weight += `prediction_confirm_bonus` × confidence (default 0.01)
+   - Error: weight -= `prediction_error_penalty` × confidence (default 0.02)
+   - Events emitted: `prediction_generated`, `prediction_confirmed`, `prediction_error`
+
+4. **Surprise-driven exploration (PRD §5.2):**
+   - `_surprise_exploration()`: when A→B prediction fails, examines what fired instead
+   - If node C fired when B was expected: creates speculative synapse A→C (weight 0.1) tagged `{"creation_mode": "surprise_driven"}` in `Synapse.metadata`
+   - `_has_learned_pattern()`: novelty detection — if alternative firing nodes have no strong connections from source, emits `novel_sequence` event
+   - Novel sequences logged in `_novel_sequence_log` (bounded to 1000)
+
+5. **Three-factor learning (PRD §5.2):**
+   - `STDPRule._apply_dw()`: when `three_factor_enabled=True`, weight changes accumulate in `Synapse.eligibility_trace` instead of being applied directly
+   - Eligibility traces decay each step: `trace *= exp(-1/τ)` with τ=100 (`eligibility_trace_tau`), only when three-factor is enabled
+   - `inject_reward(strength, scope)`: commits traces as `Δw = trace × reward × learning_rate`. Optional `scope` (set of node IDs) limits which synapses are affected
+   - Reward history tracked in `_reward_history` (bounded to 1000)
+
+6. **Telemetry extensions:**
+   - `Telemetry` dataclass: `prediction_accuracy`, `surprise_rate`, `active_predictions_count`, `total_predictions_made`, `total_predictions_confirmed`, `total_predictions_errors`, `total_novel_sequences`, `total_rewards_injected`
+   - `get_telemetry()` computes accuracy as confirmed / (confirmed + errors)
+
+7. **Synapse.metadata field:**
+   - New `Dict[str, Any]` field on `Synapse` for application-specific data
+   - Used by surprise exploration to tag creation mode
+   - Serialized/deserialized with full state
+
+**Key design decisions:**
+- Prediction confidence = 60% weight factor + 40% confirmation history rate — balances link strength with empirical accuracy
+- Pre-charge factor of 0.3 chosen to nudge targets toward threshold without guaranteeing firing — predictions are suggestions, not commands
+- Chain predictions use a `visited` set rather than depth-only limiting — handles cyclic topologies safely without infinite recursion
+- Three-factor mode modifies `STDPRule._apply_dw()` with a single branch rather than a separate rule class — preserves all existing STDP logic (weight-dependent scaling, temporal aliasing) without duplication
+- Eligibility trace decay skipped entirely when `three_factor_enabled=False` — zero overhead for non-three-factor usage
+- Prediction state bounded at 1000 active + 1000 outcomes — prevents memory leaks in long-running simulations without losing recent history
+
+**New config keys:**
+- `prediction_threshold` (3.0), `prediction_pre_charge_factor` (0.3), `prediction_window` (10), `prediction_chain_decay` (0.7), `prediction_max_chain_depth` (3)
+- `prediction_confirm_bonus` (0.01), `prediction_error_penalty` (0.02), `prediction_max_active` (1000)
+- `surprise_sprouting_weight` (0.1), `eligibility_trace_tau` (100), `three_factor_enabled` (False)
+
+**Serialization updates:**
+- `_serialize_synapse` includes `metadata` field
+- `_serialize_full` telemetry includes prediction counters (`total_predictions_made`, `total_predictions_confirmed`, `total_predictions_errors`, `total_novel_sequences`, `total_rewards_injected`)
+- `_deserialize` restores prediction counters and synapse metadata; clears transient prediction state
+
+**Tests added (38):**
+- `test_prediction.py`: prediction generation (5), chain predictions (5), confirmation (3), errors (3), surprise exploration (2), novelty detection (2), three-factor learning (4), reward scoping (2), state management (3), telemetry (2), sequence learning (2), get_predictions API (3), serialization (2)
+
+**Files created:**
+- `tests/test_prediction.py`, `examples/predictive_demo.py`

@@ -365,6 +365,8 @@ class Telemetry:
     total_predictions_errors: int = 0
     total_novel_sequences: int = 0
     total_rewards_injected: int = 0
+    # Phase 2.5: Experience distribution
+    hyperedge_experience_distribution: Dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +949,34 @@ class Graph:
                         "identical members. Archived hyperedges preserved in metadata.",
                     ],
                 },
+                {
+                    "version": "0.3.0",
+                    "description": "Phase 3 Predictive Coding Engine",
+                    "notes": [
+                        "Synapse-level predictions: when a fired node has a strong "
+                        "causal link (weight > prediction_threshold) to downstream "
+                        "targets, a Prediction is registered and the target is "
+                        "pre-charged by strength × 0.3 (PRD §5.1).",
+                        "Prediction chains cascade through learned sequences (A→B→C) "
+                        "with strength decaying ×0.7 per hop, up to max depth 3. "
+                        "Cycle-safe via visited set passed through recursion.",
+                        "Confirmed predictions strengthen the causal link (bonus × "
+                        "confidence); expired predictions weaken it (penalty × "
+                        "confidence) and trigger surprise-driven exploration that "
+                        "sprouts speculative synapses to alternative firing nodes.",
+                        "Three-factor learning: STDPRule._apply_dw routes weight "
+                        "changes to eligibility_trace when three_factor_enabled=True. "
+                        "Traces decay with τ=100 steps. Weight commits only on "
+                        "inject_reward(strength, scope). Δw = trace × reward × lr.",
+                        "Prediction confidence computed from synapse weight relative "
+                        "to max_weight (60%) and historical confirmation rate (40%). "
+                        "Higher confidence → stronger pre-charge and larger error "
+                        "penalty.",
+                        "Active predictions capped at 1000 with per-step cleanup of "
+                        "expired entries. Outcomes stored in bounded deque (max 1000) "
+                        "for accuracy tracking in Telemetry.",
+                    ],
+                },
             ],
         }
 
@@ -1306,14 +1336,67 @@ class Graph:
             if he.refractory_remaining > 0 and hid not in fired_he_set:
                 he.refractory_remaining -= 1
 
-        # 6b. Evaluate predictions: confirm or error (PRD §5.1)
+        # 6b. Evaluate Phase 2.5 hyperedge-level predictions
+        he_confirmed_this_step = 0
+        he_surprised_this_step = 0
+        he_preds_to_remove: List[str] = []
+        for pid, pred_state in self._active_predictions.items():
+            # Track nodes that fired during this prediction's window
+            window_fired = self._prediction_window_fired.get(pid, set())
+            window_fired.update(fired_set)
+            self._prediction_window_fired[pid] = window_fired
+
+            # Check for newly confirmed targets
+            for target in pred_state.predicted_targets - pred_state.confirmed_targets:
+                if target in fired_set:
+                    pred_state.confirmed_targets.add(target)
+
+            # Check if all targets confirmed
+            if pred_state.confirmed_targets >= pred_state.predicted_targets:
+                he_confirmed_this_step += 1
+                self._total_confirmed += 1
+                he_preds_to_remove.append(pid)
+                target_list = list(pred_state.predicted_targets)
+                self._emit(
+                    "prediction_confirmed",
+                    prediction_id=pid,
+                    hyperedge_id=pred_state.hyperedge_id,
+                    targets=target_list,
+                    target_node=target_list[0] if target_list else None,
+                    timestep=self.timestep,
+                )
+            # Check if window expired
+            elif self.timestep - pred_state.prediction_timestamp >= pred_state.prediction_window:
+                he_surprised_this_step += 1
+                self._total_surprised += 1
+                he_preds_to_remove.append(pid)
+                for expected in pred_state.predicted_targets - pred_state.confirmed_targets:
+                    surprise = SurpriseEvent(
+                        hyperedge_id=pred_state.hyperedge_id,
+                        expected_node=expected,
+                        prediction_strength=pred_state.prediction_strength,
+                        actual_nodes=window_fired,
+                        timestamp=self.timestep,
+                    )
+                    self._emit(
+                        "surprise",
+                        surprise=surprise,
+                        timestep=self.timestep,
+                    )
+        for pid in he_preds_to_remove:
+            self._active_predictions.pop(pid, None)
+            self._prediction_window_fired.pop(pid, None)
+        result.predictions_confirmed = he_confirmed_this_step
+        result.predictions_surprised = he_surprised_this_step
+
+        # 6c. Evaluate Phase 3 synapse-level predictions (PRD §5.1)
         self._predicted_this_step.clear()
         self._evaluate_predictions(fired_set)
 
-        # 6c. Generate new predictions from fired nodes (PRD §5.1)
+        # 6d. Generate new predictions from fired nodes (PRD §5.1)
         self._generate_predictions(fired_ids)
 
-        # 6d. Decay eligibility traces (PRD §5.2)
+        # 6e. Decay eligibility traces (PRD §5.2)
         # Only process synapses with non-zero traces for performance
         if self.config.get("three_factor_enabled", False):
             trace_tau = self.config["eligibility_trace_tau"]
@@ -1322,7 +1405,7 @@ class Graph:
                 if abs(syn.eligibility_trace) > 1e-12:
                     syn.eligibility_trace *= trace_decay
 
-        # 6e. Clean up expired predictions
+        # 6f. Clean up expired Phase 3 predictions
         self._cleanup_predictions()
 
         # 7. Apply plasticity rules
@@ -2026,15 +2109,30 @@ class Graph:
         rates = [n.firing_rate_ema for n in self.nodes.values()]
         he_counts = [he.activation_count for he in self.hyperedges.values()]
 
-        # Prediction accuracy
-        total_resolved = self._total_predictions_confirmed + self._total_predictions_errors
+        # Phase 2.5: Experience distribution buckets
+        exp_dist: Dict[str, int] = {"0": 0, "1-9": 0, "10-99": 0, "100+": 0}
+        for count in he_counts:
+            if count == 0:
+                exp_dist["0"] += 1
+            elif count < 10:
+                exp_dist["1-9"] += 1
+            elif count < 100:
+                exp_dist["10-99"] += 1
+            else:
+                exp_dist["100+"] += 1
+
+        # Prediction accuracy — combine Phase 2.5 (HE-level) and Phase 3 (synapse-level)
+        combined_confirmed = self._total_predictions_confirmed + self._total_confirmed
+        combined_errors = self._total_predictions_errors + self._total_surprised
+        total_resolved = combined_confirmed + combined_errors
         accuracy = (
-            self._total_predictions_confirmed / total_resolved
+            combined_confirmed / total_resolved
             if total_resolved > 0
             else 0.0
         )
+        combined_made = self._total_predictions_made + self._total_predictions
         surprise_rate = (
-            self._total_predictions_errors / max(self._total_predictions_made, 1)
+            combined_errors / max(combined_made, 1)
         )
 
         return Telemetry(
@@ -2059,6 +2157,7 @@ class Graph:
             total_predictions_errors=self._total_predictions_errors,
             total_novel_sequences=self._total_novel_sequences,
             total_rewards_injected=self._total_rewards_injected,
+            hyperedge_experience_distribution=exp_dist,
         )
 
     # -----------------------------------------------------------------------
@@ -2529,6 +2628,10 @@ class Graph:
                 "total_predictions_errors": self._total_predictions_errors,
                 "total_novel_sequences": self._total_novel_sequences,
                 "total_rewards_injected": self._total_rewards_injected,
+                # Phase 2.5 counters
+                "he_total_predictions": self._total_predictions,
+                "he_total_confirmed": self._total_confirmed,
+                "he_total_surprised": self._total_surprised,
             },
         }
 
@@ -2683,6 +2786,10 @@ class Graph:
         self._total_predictions_errors = tel.get("total_predictions_errors", 0)
         self._total_novel_sequences = tel.get("total_novel_sequences", 0)
         self._total_rewards_injected = tel.get("total_rewards_injected", 0)
+        # Phase 2.5 counters
+        self._total_predictions = tel.get("he_total_predictions", 0)
+        self._total_confirmed = tel.get("he_total_confirmed", 0)
+        self._total_surprised = tel.get("he_total_surprised", 0)
 
         # Clear prediction state on restore
         self.active_predictions.clear()
