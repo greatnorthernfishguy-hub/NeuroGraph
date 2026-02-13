@@ -125,8 +125,8 @@ class TestPredictionConfirmation:
         r2 = g.step()
         assert out.node_id in r2.fired_node_ids
 
-        # Run until prediction window expires
-        total_confirmed = 0
+        # Confirmation may happen on the step 'out' fires or later steps
+        total_confirmed = r2.predictions_confirmed
         for _ in range(10):
             r = g.step()
             total_confirmed += r.predictions_confirmed
