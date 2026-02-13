@@ -997,6 +997,24 @@ class Graph:
                         "empty prediction state. Checkpoint version bumped to 0.3.5.",
                     ],
                 },
+                {
+                    "version": "0.4.0",
+                    "description": "Phase 4 Universal Ingestor System",
+                    "notes": [
+                        "Five-stage ingestion pipeline: Extract → Chunk → Embed → "
+                        "Register → Associate.  Converts raw data (text, markdown, "
+                        "code, URLs, PDFs) into fully integrated NeuroGraph knowledge.",
+                        "SimpleVectorDB: in-memory cosine-similarity search over "
+                        "L2-normalized embeddings with content/metadata storage.",
+                        "Novelty dampening: new ingested nodes start at reduced "
+                        "intrinsic_excitability and boosted threshold, fading over "
+                        "a probation period (linear/exponential/logarithmic curves) "
+                        "to prevent destabilizing learned STDP pathways.",
+                        "Three project configs: OpenClaw (code-aware, fast 0.3 "
+                        "dampening), DSM (hierarchical, conservative 0.05), "
+                        "Consciousness (semantic, exploratory 0.01).",
+                    ],
+                },
             ],
         }
 
