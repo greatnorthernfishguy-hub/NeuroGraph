@@ -43,9 +43,15 @@ Build the base `neuro_foundation.py` implementing:
 - Cross-level consistency pruning — subsumption archival
 - Telemetry — prediction_accuracy, surprise_rate, experience distribution
 
-### Phase 3: Predictive Coding
+### Phase 3: Predictive Coding -- COMPLETE
 - Prediction tracking and error events (Section 5)
 - Surprise-driven exploration
+
+### Phase 3.5: Predictive State Persistence & Validation -- COMPLETE
+- Active prediction persistence — both Phase 3 and Phase 2.5 predictions survive checkpoint/restore
+- Prediction validation on restore — expired, stale-node, stale-HE predictions dropped
+- Support state persistence — outcomes, confirmation history, novel sequence log, reward history
+- Backward-compatible restore — old v0.2.5 checkpoints load cleanly
 
 ### Phase 4: Vector DB Integration
 - Adapter interface (Section 7)
@@ -54,7 +60,7 @@ Build the base `neuro_foundation.py` implementing:
 ## File Structure
 ```
 NeuroGraph/
-├── neuro_foundation.py              # Core implementation (Phase 1 + 1.5 + 2 + 2.5)
+├── neuro_foundation.py              # Core implementation (Phase 1 + 1.5 + 2 + 2.5 + 3 + 3.5)
 ├── tests/
 │   ├── __init__.py
 │   ├── test_snn.py                  # SNN dynamics tests (12)
@@ -62,6 +68,8 @@ NeuroGraph/
 │   ├── test_hypergraph.py           # Phase 1 + 1.5 hyperedge tests (18)
 │   ├── test_hypergraph_phase2.py    # Phase 2 hypergraph engine tests (26)
 │   ├── test_phase25.py              # Phase 2.5 predictive infrastructure tests (26)
+│   ├── test_prediction.py           # Phase 3 predictive coding tests (38)
+│   ├── test_phase35.py              # Phase 3.5 prediction persistence tests (20)
 │   └── test_integration.py          # End-to-end tests (18)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
@@ -214,6 +222,7 @@ msgpack>=1.0.0  # For efficient serialization
 - [x] Phase 2: Hypergraph Engine
 - [x] Phase 2.5: Predictive Infrastructure Enhancements
 - [x] Phase 3: Predictive Coding
+- [x] Phase 3.5: Predictive State Persistence & Validation
 - [ ] Phase 4: Vector DB Integration
 
 ## Changelog
@@ -417,3 +426,51 @@ msgpack>=1.0.0  # For efficient serialization
 
 **Files created:**
 - `tests/test_prediction.py`, `examples/predictive_demo.py`
+
+---
+
+### Phase 3.5: Predictive State Persistence & Validation (v0.3.5)
+**Commit:** Implement Phase 3.5: Predictive State Persistence & Validation
+
+**What was built:**
+1. **Active prediction serialization (CRITICAL FIX):**
+   - `_serialize_prediction()`: serializes Phase 3 `Prediction` objects (all 10 fields)
+   - `_serialize_prediction_state()`: serializes Phase 2.5 `PredictionState` objects (all 6 fields)
+   - `_serialize_full()` now includes: `active_predictions`, `he_active_predictions`, `he_prediction_window_fired`, `he_prediction_counter`
+   - Previously, active predictions were lost on checkpoint/restore — the system "forgot" what it was expecting
+
+2. **Prediction support state serialization:**
+   - `prediction_outcomes`: resolved prediction history (Prediction + confirmed/error + actual nodes)
+   - `synapse_confirmation_history`: per-synapse boolean deques tracking confirmation rates (used for confidence calculations)
+   - `novel_sequence_log`: bounded list of novel sequence events
+   - `reward_history`: bounded list of reward injection events
+
+3. **Validation on restore:**
+   - Phase 3 predictions: dropped if `expires_at <= timestep` (expired) or source/target node missing
+   - Phase 2.5 HE predictions: dropped if hyperedge removed, all target nodes removed, or window expired
+   - Synapse confirmation history: entries for deleted synapses are dropped
+   - Phase 2.5 window-fired tracking: only restored for predictions that survived validation
+   - Ensures no dangling references after topology changes between checkpoint and restore
+
+4. **Backward compatibility:**
+   - Restoring a v0.2.5 checkpoint (no prediction fields) works cleanly — all prediction state defaults to empty
+   - Version bumped to `0.3.5`
+
+**Key design decisions:**
+- Validation filters predictions at restore time rather than lazily during step — fail-fast prevents stale predictions from corrupting confidence calculations or emitting spurious events
+- `_prediction_counter` is serialized to prevent HE prediction ID collisions after restore (Phase 3 uses UUIDs so no collision risk there)
+- `PredictionOutcome.prediction` is serialized inline (not by reference) because the parent prediction may have been cleaned up from active_predictions by the time the outcome was recorded
+- Confirmation history uses `deque(hist, maxlen=100)` on restore to maintain the bounded size invariant
+
+**Serialization version:** `0.3.5` (up from `0.2.5`)
+
+**Tests added (20):**
+- `test_phase35.py`:
+  - Phase 3 persistence: active predictions restored (1), field preservation (1), confirmable after restore (1), error after restore (1)
+  - Phase 2.5 persistence: HE predictions restored (1), confirmable after restore (1), counter preserved (1), window-fired preserved (1)
+  - Support state: outcomes (1), confirmation history (1), novel sequence log (1), reward history (1)
+  - Validation: expired P3 dropped (1), deleted-node P3 dropped (1), expired HE dropped (1), deleted-HE dropped (1), stale confirmation history dropped (1)
+  - Integration: version bump (1), full mid-flight roundtrip (1), backward-compatible restore (1)
+
+**Files created:**
+- `tests/test_phase35.py`
