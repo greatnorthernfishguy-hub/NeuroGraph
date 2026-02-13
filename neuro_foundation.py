@@ -204,6 +204,10 @@ class Hyperedge:
         output_weight: Signal strength sent to output targets on activation.
         metadata: Application data (label, domain, creation_mode).
         is_learnable: Whether plasticity can modify weights/threshold.
+        refractory_period: Minimum timesteps between firings (default 2).
+            Prevents cascading feedback loops where a hyperedge's output
+            re-activates its own members on the very next step.
+        refractory_remaining: Timesteps left in current refractory window.
     """
 
     hyperedge_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -216,6 +220,8 @@ class Hyperedge:
     output_weight: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
     is_learnable: bool = True
+    refractory_period: int = 2
+    refractory_remaining: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +600,29 @@ class Graph:
         self._dirty_synapses: Set[str] = set()
         self._dirty_hyperedges: Set[str] = set()
 
+        # --- Graph metadata with design changelog ---
+        self.metadata: Dict[str, Any] = {
+            "changelog": [
+                {
+                    "version": "0.1.0",
+                    "description": "Phase 1 Core Foundation",
+                    "notes": [
+                        "STDP uses weight-dependent soft-saturation: LTP scaled by "
+                        "(max_weight - w) / max_weight to prevent runaway potentiation "
+                        "(PRD §3.1.2).",
+                        "Spike history stored in fixed-capacity RingBuffer (default 100) "
+                        "to bound memory per node while enabling firing-rate and burst "
+                        "detection (PRD §2.2.1).",
+                        "Homeostatic scaling is multiplicative (w * ratio^factor), NOT "
+                        "divisive normalization, to preserve learned weight distributions "
+                        "(PRD §3.2).",
+                        "Hyperedges enforce a refractory period (default 2 steps) to "
+                        "prevent cascading feedback loops from output-to-member cycles.",
+                    ],
+                },
+            ],
+        }
+
     # -----------------------------------------------------------------------
     # Topology Management (PRD §2.2.4)
     # -----------------------------------------------------------------------
@@ -867,17 +896,28 @@ class Graph:
 
         # 6. Evaluate hyperedges (PRD §4.2)
         fired_set = set(fired_ids)
+        fired_he_this_step: List[str] = []
         for hid, he in self.hyperedges.items():
             activation = self._compute_hyperedge_activation(he, fired_set)
             he.current_activation = activation
+            if he.refractory_remaining > 0:
+                continue  # Still in refractory — cannot fire
             if activation >= he.activation_threshold:
                 result.fired_hyperedge_ids.append(hid)
+                fired_he_this_step.append(hid)
+                he.refractory_remaining = he.refractory_period
                 # Inject current into output targets
                 for target_id in he.output_targets:
                     target = self.nodes.get(target_id)
                     if target is not None:
                         target.voltage += he.output_weight * target.intrinsic_excitability
                 self._emit("hyperedge_fired", hid=hid, activation=activation)
+
+        # Decrement hyperedge refractory counters (skip those that just fired)
+        fired_he_set = set(fired_he_this_step)
+        for hid, he in self.hyperedges.items():
+            if he.refractory_remaining > 0 and hid not in fired_he_set:
+                he.refractory_remaining -= 1
 
         # 7. Apply plasticity rules
         if fired_ids:
@@ -1266,6 +1306,8 @@ class Graph:
             "output_weight": he.output_weight,
             "metadata": he.metadata,
             "is_learnable": he.is_learnable,
+            "refractory_period": he.refractory_period,
+            "refractory_remaining": he.refractory_remaining,
         }
 
     def _serialize_full(self) -> Dict[str, Any]:
@@ -1379,6 +1421,8 @@ class Graph:
                 output_weight=hd.get("output_weight", 1.0),
                 metadata=hd.get("metadata", {}),
                 is_learnable=hd.get("is_learnable", True),
+                refractory_period=hd.get("refractory_period", 2),
+                refractory_remaining=hd.get("refractory_remaining", 0),
             )
             self.hyperedges[hid] = he
             for nid in he.member_nodes:
