@@ -861,6 +861,56 @@ class Graph:
                         "prevent cascading feedback loops from output-to-member cycles.",
                     ],
                 },
+                {
+                    "version": "0.2.0",
+                    "description": "Phase 2 Hypergraph Engine (PRD §4)",
+                    "notes": [
+                        "Hyperedge activation dynamics with four modes: "
+                        "WEIGHTED_THRESHOLD, K_OF_N, ALL_OR_NONE, GRADED (PRD §4.2).",
+                        "Pattern completion pre-charges inactive members when a "
+                        "hyperedge fires, enabling recall from partial cues (PRD §4.2).",
+                        "Adaptive plasticity: member weight adaptation, threshold "
+                        "learning via reward, and member evolution through co-firing "
+                        "promotion (PRD §4.3).",
+                        "Hierarchical hyperedges: child hyperedges compose into "
+                        "parents, levels processed bottom-up each step (PRD §4.4).",
+                        "Automatic hyperedge discovery from repeated co-activation "
+                        "patterns, with consolidation merging overlapping groups.",
+                    ],
+                },
+                {
+                    "version": "0.3.0",
+                    "description": "Phase 3 Predictive Coding Engine (PRD §5)",
+                    "notes": [
+                        "Predictions generated when fired node has strong causal link "
+                        "(weight > prediction_threshold) to downstream targets. "
+                        "Pre-charges target voltage by strength × 0.3 (PRD §5.1).",
+                        "Prediction chains cascade through learned sequences (e.g. "
+                        "A→B→C) with strength decaying ×0.7 per hop, up to "
+                        "configurable max depth (default 3). Cycle-safe via visited set.",
+                        "Confirmed predictions strengthen causal links (bonus × "
+                        "confidence); prediction errors weaken links (penalty × "
+                        "confidence) and trigger surprise-driven exploration (PRD §5.1).",
+                        "Surprise exploration: when predicted target doesn't fire but "
+                        "an alternative does, speculative synapses are sprouted to the "
+                        "alternative (weight 0.1, tagged 'surprise_driven'). Novel "
+                        "sequences with no learned patterns emit NovelSequence events.",
+                        "Three-factor learning (PRD §5.2): STDP creates eligibility "
+                        "traces instead of direct weight changes when "
+                        "three_factor_enabled=True. Traces decay with τ=100 steps. "
+                        "Weight changes only commit when inject_reward() is called. "
+                        "Δw = eligibility_trace × reward_strength × learning_rate.",
+                        "inject_reward() accepts optional scope (set of node IDs) to "
+                        "limit reward to specific subnetworks, enabling targeted "
+                        "reinforcement for modular architectures.",
+                        "Prediction confidence computed from synapse weight relative "
+                        "to max_weight (60%) and historical confirmation rate (40%). "
+                        "Higher confidence → stronger pre-charge, larger error penalty.",
+                        "Active predictions capped at 1000 to prevent memory leaks. "
+                        "Expired predictions cleaned up each step. Prediction outcomes "
+                        "stored in bounded deque (max 1000) for accuracy tracking.",
+                    ],
+                },
             ],
         }
 
