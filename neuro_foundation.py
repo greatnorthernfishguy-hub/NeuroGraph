@@ -1,18 +1,16 @@
 """
-NeuroGraph Foundation - Core Cognitive Architecture (Phase 1 + 2 + 2.5)
+NeuroGraph Foundation - Core Cognitive Architecture (Phase 1 + 2 + 3)
 
 Implements the Temporal Dynamics Layer: a sparse Spiking Neural Network (SNN)
-with STDP plasticity, homeostatic regulation, structural plasticity, and
+with STDP plasticity, homeostatic regulation, structural plasticity,
 a full hypergraph engine with pattern completion, adaptive plasticity,
-hierarchical composition, automatic discovery, and consolidation.
+hierarchical composition, automatic discovery, and consolidation,
+and a predictive coding engine with prediction tracking, error events,
+surprise-driven exploration, and three-factor learning.
 
-Phase 2.5 adds predictive infrastructure: prediction error events (surprise
-detection), dynamic pattern completion (experience-scaled), and cross-level
-consistency pruning (subsumption archival).
-
-Reference: NeuroGraph Foundation PRD v1.0, Sections 2-6, 9 (Phase 1)
-           and Section 4 (Phase 2 — Hypergraph Engine).
-           Phase 2.5: Predictive Infrastructure Enhancements.
+Reference: NeuroGraph Foundation PRD v1.0, Sections 2-6, 9 (Phase 1),
+           Section 4 (Phase 2 — Hypergraph Engine),
+           and Section 5 (Phase 3 — Predictive Coding Engine).
 
 Design principles (PRD §2.1):
     - Sparse by default: dict/set topology, no dense matrices
@@ -192,6 +190,9 @@ class Synapse:
     low_weight_steps: int = 0
     # Steps since last pre or post spike traversal
     inactive_steps: int = 0
+    # Application-specific metadata (Phase 3: tracks creation_mode for
+    # surprise-driven synapses)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -355,10 +356,70 @@ class Telemetry:
     total_he_discovered: int = 0
     total_he_consolidated: int = 0
     mean_he_activation_count: float = 0.0
-    # Phase 2.5: Prediction metrics
+    # Phase 3: Predictive Coding telemetry
     prediction_accuracy: float = 0.0
     surprise_rate: float = 0.0
-    hyperedge_experience_distribution: Dict[str, int] = field(default_factory=dict)
+    active_predictions_count: int = 0
+    total_predictions_made: int = 0
+    total_predictions_confirmed: int = 0
+    total_predictions_errors: int = 0
+    total_novel_sequences: int = 0
+    total_rewards_injected: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Prediction Data Structures (PRD §5)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Prediction:
+    """An active prediction that node B will fire after node A fired.
+
+    Generated when a node fires with a strong causal link (weight > threshold)
+    to downstream nodes.  The prediction pre-charges the target's voltage and
+    is tracked until confirmed or expired (PRD §5.1).
+
+    Attributes:
+        prediction_id: Unique identifier.
+        source_node_id: Node that fired and generated this prediction.
+        target_node_id: Node predicted to fire.
+        strength: Prediction strength based on synapse weight.
+        confidence: Confidence score [0,1] based on weight, firing stability,
+            and historical confirmation rate.
+        created_at: Timestep when prediction was generated.
+        expires_at: Timestep when prediction expires (prediction window).
+        chain_depth: How many hops from the original stimulus (0 = direct).
+        via_hyperedge: If prediction came from a hyperedge, its ID.
+        pre_charge_applied: Voltage pre-charge applied to target.
+    """
+
+    prediction_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    source_node_id: str = ""
+    target_node_id: str = ""
+    strength: float = 0.0
+    confidence: float = 0.0
+    created_at: int = 0
+    expires_at: int = 0
+    chain_depth: int = 0
+    via_hyperedge: Optional[str] = None
+    pre_charge_applied: float = 0.0
+
+
+@dataclass
+class PredictionOutcome:
+    """Record of a resolved prediction (confirmed or error).
+
+    Attributes:
+        prediction: The original prediction.
+        confirmed: Whether the target fired within the window.
+        resolved_at: Timestep when the prediction was resolved.
+        actual_firing_nodes: Nodes that actually fired (for error analysis).
+    """
+
+    prediction: Prediction = field(default_factory=Prediction)
+    confirmed: bool = False
+    resolved_at: int = 0
+    actual_firing_nodes: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -412,13 +473,35 @@ class STDPRule(PlasticityRule):
         self.A_minus = A_minus
         self.learning_rate = learning_rate
 
+    def _apply_dw(self, syn: Synapse, dw: float, timestep: int,
+                  three_factor: bool) -> None:
+        """Apply weight change directly or via eligibility trace.
+
+        In three-factor mode (PRD §5.2), STDP creates the eligibility trace
+        but weight change only commits when reward arrives via inject_reward.
+        """
+        if three_factor:
+            syn.eligibility_trace += dw
+        else:
+            syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
+            if syn.weight > syn.peak_weight:
+                syn.peak_weight = syn.weight
+        syn.last_update_time = float(timestep)
+
     def apply(
         self,
         graph: "Graph",
         fired_node_ids: List[str],
         timestep: int,
     ) -> None:
-        """Apply STDP to all synapses incident on fired nodes."""
+        """Apply STDP to all synapses incident on fired nodes.
+
+        When three_factor_enabled is set in graph config, weight changes
+        accumulate in eligibility_trace instead of being applied directly
+        (PRD §5.2 Three-Factor Learning).
+        """
+        three_factor = graph.config.get("three_factor_enabled", False)
+
         for post_id in fired_node_ids:
             post_node = graph.nodes[post_id]
             t_post = float(timestep)
@@ -455,10 +538,7 @@ class STDPRule(PlasticityRule):
                     scale = (syn.max_weight - syn.weight) / syn.max_weight
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
 
-                syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
-                syn.last_update_time = float(timestep)
-                if syn.weight > syn.peak_weight:
-                    syn.peak_weight = syn.weight
+                self._apply_dw(syn, dw, timestep, three_factor)
 
             # Also handle outgoing synapses (post-before-pre → LTD from
             # perspective of those synapses where this node is pre)
@@ -492,10 +572,7 @@ class STDPRule(PlasticityRule):
                 else:
                     continue  # already handled in incoming pass
 
-                syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
-                syn.last_update_time = float(timestep)
-                if syn.weight > syn.peak_weight:
-                    syn.peak_weight = syn.weight
+                self._apply_dw(syn, dw, timestep, three_factor)
 
 
 class HomeostaticRule(PlasticityRule):
@@ -692,6 +769,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
+    # Phase 3: Predictive Coding config
+    "prediction_threshold": 3.0,         # Min synapse weight to generate prediction
+    "prediction_pre_charge_factor": 0.3,  # Fraction of prediction strength for pre-charge
+    "prediction_window": 10,             # Steps before prediction expires
+    "prediction_chain_decay": 0.7,       # Strength decay per chain hop
+    "prediction_max_chain_depth": 3,     # Max depth for prediction chains
+    "prediction_confirm_bonus": 0.01,    # Weight bonus on confirmation (×confidence)
+    "prediction_error_penalty": 0.02,    # Weight penalty on error (×confidence)
+    "prediction_max_active": 1000,       # Max active predictions (memory limit)
+    "surprise_sprouting_weight": 0.1,    # Initial weight for surprise-driven synapses
+    "eligibility_trace_tau": 100,        # Decay time constant for eligibility traces
+    "three_factor_enabled": False,       # Whether to use three-factor learning
     # Phase 2: Hypergraph Engine config
     "he_pattern_completion_strength": 0.3,
     "he_member_weight_lr": 0.05,
@@ -785,6 +874,26 @@ class Graph:
                 evolution_initial_weight=self.config["he_member_evolution_initial_weight"],
             ),
         ]
+
+        # --- Phase 3: Predictive Coding state ---
+        # Active predictions awaiting confirmation or expiry
+        self.active_predictions: Dict[str, Prediction] = {}
+        # Recent prediction outcomes for accuracy tracking
+        self._prediction_outcomes: Deque[PredictionOutcome] = deque(maxlen=1000)
+        # Per-synapse confirmation history: synapse_id → deque of bool
+        self._synapse_confirmation_history: Dict[str, Deque[bool]] = {}
+        # Nodes predicted this step (to avoid double-prediction)
+        self._predicted_this_step: Set[str] = set()
+        # Novel sequence log
+        self._novel_sequence_log: List[Dict[str, Any]] = []
+        # Reward history
+        self._reward_history: List[Dict[str, Any]] = []
+        # Prediction telemetry counters
+        self._total_predictions_made = 0
+        self._total_predictions_confirmed = 0
+        self._total_predictions_errors = 0
+        self._total_novel_sequences = 0
+        self._total_rewards_injected = 0
 
         # --- Event handlers ---
         self._event_handlers: Dict[str, List[Callable]] = {}
@@ -1052,6 +1161,9 @@ class Graph:
             4. Reset fired node voltages; set refractory
             5. Propagate spikes through outgoing synapses (with delays)
             6. Evaluate hyperedges
+            6b. Evaluate predictions (confirm/error) (PRD §5.1)
+            6c. Generate new predictions from fired nodes (PRD §5.1)
+            6d. Decay eligibility traces (PRD §5.2)
             7. Apply plasticity rules
             8. Structural plasticity (prune / sprout)
             9. Decrement refractory counters
@@ -1194,48 +1306,24 @@ class Graph:
             if he.refractory_remaining > 0 and hid not in fired_he_set:
                 he.refractory_remaining -= 1
 
-        # 6b. Check active predictions (Phase 2.5)
-        confirmed_this_step = 0
-        surprised_this_step = 0
-        expired_preds: List[str] = []
-        for pred_id, pred in self._active_predictions.items():
-            # Track which predicted targets fired this step
-            for nid in pred.predicted_targets:
-                if nid in fired_set and nid not in pred.confirmed_targets:
-                    pred.confirmed_targets.add(nid)
-            self._prediction_window_fired[pred_id].update(fired_set)
+        # 6b. Evaluate predictions: confirm or error (PRD §5.1)
+        self._predicted_this_step.clear()
+        self._evaluate_predictions(fired_set)
 
-            # Check if prediction window expired
-            elapsed = self.timestep - pred.prediction_timestamp
-            if elapsed >= pred.prediction_window:
-                expired_preds.append(pred_id)
-                # Evaluate: which targets were confirmed, which are surprises
-                for target_nid in pred.predicted_targets:
-                    if target_nid in pred.confirmed_targets:
-                        confirmed_this_step += 1
-                        self._total_confirmed += 1
-                        self._emit("prediction_confirmed",
-                                   hyperedge_id=pred.hyperedge_id,
-                                   target_node=target_nid,
-                                   prediction_strength=pred.prediction_strength)
-                    else:
-                        surprised_this_step += 1
-                        self._total_surprised += 1
-                        surprise = SurpriseEvent(
-                            hyperedge_id=pred.hyperedge_id,
-                            expected_node=target_nid,
-                            prediction_strength=pred.prediction_strength,
-                            actual_nodes=self._prediction_window_fired.get(pred_id, set()).copy(),
-                            timestamp=self.timestep,
-                        )
-                        self._emit("surprise", surprise=surprise)
+        # 6c. Generate new predictions from fired nodes (PRD §5.1)
+        self._generate_predictions(fired_ids)
 
-        for pred_id in expired_preds:
-            del self._active_predictions[pred_id]
-            self._prediction_window_fired.pop(pred_id, None)
+        # 6d. Decay eligibility traces (PRD §5.2)
+        # Only process synapses with non-zero traces for performance
+        if self.config.get("three_factor_enabled", False):
+            trace_tau = self.config["eligibility_trace_tau"]
+            trace_decay = math.exp(-1.0 / trace_tau) if trace_tau > 0 else 0.0
+            for syn in self.synapses.values():
+                if abs(syn.eligibility_trace) > 1e-12:
+                    syn.eligibility_trace *= trace_decay
 
-        result.predictions_confirmed = confirmed_this_step
-        result.predictions_surprised = surprised_this_step
+        # 6e. Clean up expired predictions
+        self._cleanup_predictions()
 
         # 7. Apply plasticity rules
         if fired_ids:
@@ -1314,6 +1402,440 @@ class Graph:
             return active / len(he.member_nodes)
 
         return 0.0
+
+    # -----------------------------------------------------------------------
+    # Phase 3: Predictive Coding Engine (PRD §5)
+    # -----------------------------------------------------------------------
+
+    def _compute_prediction_confidence(
+        self, synapse: Synapse
+    ) -> float:
+        """Compute prediction confidence for a synapse (PRD §5.1).
+
+        Confidence is based on:
+            1. Synapse weight relative to max_weight (strength of causal link)
+            2. Confirmation history (how often predictions were correct)
+
+        Returns:
+            Confidence in [0.0, 1.0].
+        """
+        # Factor 1: weight strength
+        weight_factor = synapse.weight / synapse.max_weight
+
+        # Factor 2: confirmation history
+        history = self._synapse_confirmation_history.get(synapse.synapse_id)
+        if history and len(history) > 0:
+            confirmation_rate = sum(1 for x in history if x) / len(history)
+        else:
+            confirmation_rate = 0.5  # Neutral prior
+
+        return min(1.0, weight_factor * 0.6 + confirmation_rate * 0.4)
+
+    def _generate_predictions(self, fired_ids: List[str]) -> None:
+        """Generate predictions from fired nodes (PRD §5.1).
+
+        When node A fires with a strong causal link to B (weight > threshold):
+            - Pre-charge B's voltage (prediction strength × factor)
+            - Register prediction in active_predictions
+            - Cascade through learned chains with decaying strength
+
+        Avoids double-predicting the same target from both synapse and
+        hyperedge sources.
+        """
+        if not fired_ids:
+            return
+
+        threshold = self.config["prediction_threshold"]
+        pre_charge_factor = self.config["prediction_pre_charge_factor"]
+        window = self.config["prediction_window"]
+        chain_decay = self.config["prediction_chain_decay"]
+        max_depth = self.config["prediction_max_chain_depth"]
+        max_active = self.config["prediction_max_active"]
+
+        # Generate predictions for each fired node
+        for nid in fired_ids:
+            if len(self.active_predictions) >= max_active:
+                break
+            self._generate_predictions_from_node(
+                source_id=nid,
+                origin_id=nid,
+                strength=1.0,
+                chain_depth=0,
+                threshold=threshold,
+                pre_charge_factor=pre_charge_factor,
+                window=window,
+                chain_decay=chain_decay,
+                max_depth=max_depth,
+                max_active=max_active,
+                visited=set(),
+            )
+
+    def _generate_predictions_from_node(
+        self,
+        source_id: str,
+        origin_id: str,
+        strength: float,
+        chain_depth: int,
+        threshold: float,
+        pre_charge_factor: float,
+        window: int,
+        chain_decay: float,
+        max_depth: int,
+        max_active: int,
+        visited: Set[str],
+    ) -> None:
+        """Recursively generate predictions through causal chains.
+
+        Args:
+            source_id: Node whose outgoing synapses we're examining.
+            origin_id: Original node that started the prediction chain.
+            strength: Current prediction strength (decays with depth).
+            chain_depth: Current depth in the prediction chain.
+            threshold: Min weight to trigger prediction.
+            pre_charge_factor: Voltage pre-charge fraction.
+            window: Prediction expiry window in timesteps.
+            chain_decay: Strength multiplier per chain hop.
+            max_depth: Maximum chain depth.
+            max_active: Maximum active predictions allowed.
+            visited: Nodes already visited in this chain (cycle prevention).
+        """
+        if chain_depth > max_depth:
+            return
+        if source_id in visited:
+            return
+        visited.add(source_id)
+
+        for syn_id in self._outgoing.get(source_id, set()):
+            if len(self.active_predictions) >= max_active:
+                return
+
+            syn = self.synapses.get(syn_id)
+            if syn is None:
+                continue
+
+            # Only predict for strong causal links
+            effective_weight = syn.weight
+            if chain_depth == 0 and effective_weight < threshold:
+                continue
+
+            target_id = syn.post_node_id
+            target = self.nodes.get(target_id)
+            if target is None:
+                continue
+
+            # Skip if already predicted this step (avoid double-prediction)
+            if target_id in self._predicted_this_step:
+                continue
+
+            # Calculate prediction strength for this hop
+            pred_strength = strength * (effective_weight / syn.max_weight)
+            if chain_depth > 0:
+                pred_strength *= chain_decay
+
+            # Skip very weak predictions
+            if pred_strength < 0.01:
+                continue
+
+            confidence = self._compute_prediction_confidence(syn)
+
+            # Pre-charge target voltage
+            pre_charge = pred_strength * pre_charge_factor
+            if target.refractory_remaining == 0:
+                target.voltage += pre_charge * target.intrinsic_excitability
+
+            # Register prediction
+            pred = Prediction(
+                source_node_id=origin_id,
+                target_node_id=target_id,
+                strength=pred_strength,
+                confidence=confidence,
+                created_at=self.timestep,
+                expires_at=self.timestep + window,
+                chain_depth=chain_depth,
+                pre_charge_applied=pre_charge,
+            )
+            self.active_predictions[pred.prediction_id] = pred
+            self._predicted_this_step.add(target_id)
+            self._total_predictions_made += 1
+
+            self._emit(
+                "prediction_generated",
+                source=origin_id,
+                target=target_id,
+                strength=pred_strength,
+                confidence=confidence,
+                chain_depth=chain_depth,
+                timestep=self.timestep,
+            )
+
+            # Cascade predictions through chains
+            if chain_depth < max_depth and effective_weight >= threshold:
+                self._generate_predictions_from_node(
+                    source_id=target_id,
+                    origin_id=origin_id,
+                    strength=pred_strength,
+                    chain_depth=chain_depth + 1,
+                    threshold=threshold,
+                    pre_charge_factor=pre_charge_factor,
+                    window=window,
+                    chain_decay=chain_decay,
+                    max_depth=max_depth,
+                    max_active=max_active,
+                    visited=visited,
+                )
+
+    def _evaluate_predictions(self, fired_set: Set[str]) -> None:
+        """Check active predictions against fired nodes (PRD §5.1).
+
+        Confirmed predictions strengthen the causal link.
+        Failed predictions (expired) weaken the link and trigger surprise.
+        """
+        confirm_bonus = self.config["prediction_confirm_bonus"]
+        error_penalty = self.config["prediction_error_penalty"]
+
+        to_remove: List[str] = []
+
+        for pid, pred in list(self.active_predictions.items()):
+            if pred.target_node_id in fired_set:
+                # Prediction confirmed
+                self._on_prediction_confirmed(pred, confirm_bonus)
+                to_remove.append(pid)
+
+        for pid in to_remove:
+            self.active_predictions.pop(pid, None)
+
+    def _on_prediction_confirmed(
+        self, pred: Prediction, confirm_bonus: float
+    ) -> None:
+        """Handle a confirmed prediction (PRD §5.1).
+
+        Effects:
+            - Strengthen the causal link (weight += bonus × confidence)
+            - Record confirmation in synapse history
+            - Emit PredictionConfirmed event
+        """
+        # Find the synapse from source to target
+        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
+        if syn is not None:
+            bonus = confirm_bonus * pred.confidence
+            if not self.config["three_factor_enabled"]:
+                syn.weight = min(syn.weight + bonus, syn.max_weight)
+            else:
+                # In three-factor mode, add to eligibility trace
+                syn.eligibility_trace += bonus
+            syn.last_update_time = float(self.timestep)
+            if syn.weight > syn.peak_weight:
+                syn.peak_weight = syn.weight
+
+            # Update confirmation history
+            history = self._synapse_confirmation_history.setdefault(
+                syn.synapse_id, deque(maxlen=100)
+            )
+            history.append(True)
+
+        self._total_predictions_confirmed += 1
+
+        outcome = PredictionOutcome(
+            prediction=pred,
+            confirmed=True,
+            resolved_at=self.timestep,
+            actual_firing_nodes=[pred.target_node_id],
+        )
+        self._prediction_outcomes.append(outcome)
+
+        self._emit(
+            "prediction_confirmed",
+            source=pred.source_node_id,
+            target=pred.target_node_id,
+            strength=pred.strength,
+            confidence=pred.confidence,
+            delay=self.timestep - pred.created_at,
+            timestep=self.timestep,
+        )
+
+    def _on_prediction_error(
+        self, pred: Prediction, error_penalty: float, recent_fired: Set[str]
+    ) -> None:
+        """Handle a prediction error / surprise (PRD §5.1, §5.2).
+
+        Effects:
+            - Weaken the causal link (weight -= penalty × confidence)
+            - Emit SurpriseEvent
+            - Trigger surprise-driven exploration
+        """
+        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
+        if syn is not None:
+            penalty = error_penalty * pred.confidence
+            if not self.config["three_factor_enabled"]:
+                syn.weight = max(0.0, syn.weight - penalty)
+            else:
+                syn.eligibility_trace -= penalty
+            syn.last_update_time = float(self.timestep)
+
+            # Update confirmation history
+            history = self._synapse_confirmation_history.setdefault(
+                syn.synapse_id, deque(maxlen=100)
+            )
+            history.append(False)
+
+        self._total_predictions_errors += 1
+
+        outcome = PredictionOutcome(
+            prediction=pred,
+            confirmed=False,
+            resolved_at=self.timestep,
+            actual_firing_nodes=list(recent_fired),
+        )
+        self._prediction_outcomes.append(outcome)
+
+        self._emit(
+            "prediction_error",
+            source=pred.source_node_id,
+            expected_target=pred.target_node_id,
+            strength=pred.strength,
+            confidence=pred.confidence,
+            actual_fired=list(recent_fired),
+            timestep=self.timestep,
+        )
+
+        # Surprise-driven exploration (PRD §5.2)
+        self._surprise_exploration(pred, recent_fired)
+
+    def _surprise_exploration(
+        self, pred: Prediction, recent_fired: Set[str]
+    ) -> None:
+        """Explore alternative pathways after prediction error (PRD §5.2).
+
+        When A→B prediction fails, examine what DID fire instead.
+        If node C fired when B was expected:
+            - Create speculative synapse A→C (weight 0.1)
+            - Tag as "surprise-driven" in metadata
+
+        Also check for novel sequences (no learned patterns).
+        """
+        source_id = pred.source_node_id
+        expected_id = pred.target_node_id
+        sprout_weight = self.config["surprise_sprouting_weight"]
+
+        # Find what fired instead of the expected target
+        alternative_nodes = recent_fired - {expected_id}
+
+        sprouted_count = 0
+        for alt_id in alternative_nodes:
+            if alt_id == source_id:
+                continue
+            if alt_id not in self.nodes:
+                continue
+
+            # Check if synapse already exists
+            existing = self._find_synapse(source_id, alt_id)
+            if existing is not None:
+                continue
+
+            # Create speculative synapse
+            try:
+                syn = self.create_synapse(
+                    source_id, alt_id, weight=sprout_weight
+                )
+                syn.metadata = {"creation_mode": "surprise_driven",
+                                "expected_target": expected_id,
+                                "timestep": self.timestep}
+                sprouted_count += 1
+                self._total_sprouted += 1
+            except (KeyError, ValueError):
+                continue
+
+        if sprouted_count > 0:
+            self._emit(
+                "surprise_sprouted",
+                source=source_id,
+                expected=expected_id,
+                alternatives=list(alternative_nodes),
+                count=sprouted_count,
+                timestep=self.timestep,
+            )
+
+        # Novelty detection: check if any fired sequence has NO learned patterns
+        if alternative_nodes and not self._has_learned_pattern(source_id, alternative_nodes):
+            self._total_novel_sequences += 1
+            novel_event = {
+                "source": source_id,
+                "firing_nodes": list(alternative_nodes),
+                "timestep": self.timestep,
+            }
+            self._novel_sequence_log.append(novel_event)
+            # Cap log size
+            if len(self._novel_sequence_log) > 1000:
+                self._novel_sequence_log = self._novel_sequence_log[-500:]
+
+            self._emit(
+                "novel_sequence",
+                source=source_id,
+                firing_nodes=list(alternative_nodes),
+                timestep=self.timestep,
+            )
+
+    def _has_learned_pattern(
+        self, source_id: str, targets: Set[str]
+    ) -> bool:
+        """Check if any of the targets have a learned connection from source.
+
+        A "learned pattern" means there exists a synapse with weight above
+        the prediction threshold.
+        """
+        threshold = self.config["prediction_threshold"]
+        for syn_id in self._outgoing.get(source_id, set()):
+            syn = self.synapses.get(syn_id)
+            if syn and syn.post_node_id in targets and syn.weight >= threshold:
+                return True
+        return False
+
+    def _cleanup_predictions(self) -> None:
+        """Remove expired predictions and trigger error handling (PRD §5.1).
+
+        Called each step to clean up predictions that have exceeded their
+        window without confirmation.
+        """
+        error_penalty = self.config["prediction_error_penalty"]
+
+        # Collect recently fired nodes for surprise analysis
+        recent_window = self.config["prediction_window"]
+        recent_fired: Set[str] = set()
+        for nid, spikes in self._recent_spikes.items():
+            for t in spikes:
+                if self.timestep - t <= recent_window:
+                    recent_fired.add(nid)
+                    break
+
+        expired: List[str] = []
+        for pid, pred in self.active_predictions.items():
+            if self.timestep > pred.expires_at:
+                expired.append(pid)
+
+        for pid in expired:
+            pred = self.active_predictions.pop(pid)
+            self._on_prediction_error(pred, error_penalty, recent_fired)
+
+    def _find_synapse(
+        self, pre_id: str, post_id: str
+    ) -> Optional[Synapse]:
+        """Find a synapse connecting pre_id → post_id, if one exists."""
+        for syn_id in self._outgoing.get(pre_id, set()):
+            syn = self.synapses.get(syn_id)
+            if syn and syn.post_node_id == post_id:
+                return syn
+        return None
+
+    # -----------------------------------------------------------------------
+    # Phase 3: Public Prediction API (PRD §8)
+    # -----------------------------------------------------------------------
+
+    def get_predictions(self) -> List[Prediction]:
+        """Current active predictions (PRD §8 get_predictions).
+
+        Returns pre-charged unfired nodes that the system expects to fire.
+        """
+        return list(self.active_predictions.values())
 
     # -----------------------------------------------------------------------
     # Structural Plasticity (PRD §3.3)
@@ -1504,22 +2026,16 @@ class Graph:
         rates = [n.firing_rate_ema for n in self.nodes.values()]
         he_counts = [he.activation_count for he in self.hyperedges.values()]
 
-        # Prediction accuracy and surprise rate (Phase 2.5)
-        total_outcomes = self._total_confirmed + self._total_surprised
-        pred_accuracy = self._total_confirmed / total_outcomes if total_outcomes > 0 else 0.0
-        surprise_rt = self._total_surprised / total_outcomes if total_outcomes > 0 else 0.0
-
-        # Experience distribution: bucket hyperedges by activation count ranges
-        experience_dist: Dict[str, int] = {"0": 0, "1-9": 0, "10-99": 0, "100+": 0}
-        for cnt in he_counts:
-            if cnt == 0:
-                experience_dist["0"] += 1
-            elif cnt < 10:
-                experience_dist["1-9"] += 1
-            elif cnt < 100:
-                experience_dist["10-99"] += 1
-            else:
-                experience_dist["100+"] += 1
+        # Prediction accuracy
+        total_resolved = self._total_predictions_confirmed + self._total_predictions_errors
+        accuracy = (
+            self._total_predictions_confirmed / total_resolved
+            if total_resolved > 0
+            else 0.0
+        )
+        surprise_rate = (
+            self._total_predictions_errors / max(self._total_predictions_made, 1)
+        )
 
         return Telemetry(
             timestep=self.timestep,
@@ -1534,9 +2050,15 @@ class Graph:
             total_he_discovered=self._total_he_discovered,
             total_he_consolidated=self._total_he_consolidated,
             mean_he_activation_count=float(np.mean(he_counts)) if he_counts else 0.0,
-            prediction_accuracy=pred_accuracy,
-            surprise_rate=surprise_rt,
-            hyperedge_experience_distribution=experience_dist,
+            # Phase 3 telemetry
+            prediction_accuracy=accuracy,
+            surprise_rate=surprise_rate,
+            active_predictions_count=len(self.active_predictions),
+            total_predictions_made=self._total_predictions_made,
+            total_predictions_confirmed=self._total_predictions_confirmed,
+            total_predictions_errors=self._total_predictions_errors,
+            total_novel_sequences=self._total_novel_sequences,
+            total_rewards_injected=self._total_rewards_injected,
         )
 
     # -----------------------------------------------------------------------
@@ -1547,31 +2069,72 @@ class Graph:
         """Configure active plasticity rules (PRD §8 set_plasticity_rules)."""
         self._plasticity_rules = list(rules)
 
-    def inject_reward(self, strength: float) -> None:
-        """Broadcast reward for three-factor learning (PRD §8 inject_reward).
+    def inject_reward(
+        self,
+        strength: float,
+        scope: Optional[Set[str]] = None,
+    ) -> None:
+        """Broadcast reward for three-factor learning (PRD §5.2, §8 inject_reward).
 
-        Commits eligibility traces proportional to strength.
-        Also applies threshold learning to recently-fired hyperedges (PRD §4.3):
-            reward → lower threshold (more sensitive)
-            punishment → raise threshold (more strict)
+        Three-factor rule (PRD §5.2):
+            Factor 1: Pre-spike (STDP creates eligibility trace)
+            Factor 2: Post-spike (updates trace)
+            Factor 3: Reward signal (confirms or rejects)
+            Final: Δw = eligibility_trace × reward_strength
+
+        Args:
+            strength: Reward signal in [-1.0, 1.0].
+                Positive = reinforce, negative = weaken.
+            scope: Optional set of node IDs to limit reward scope.
+                If None, reward applies globally to all synapses with traces.
         """
         lr = self.config["he_threshold_lr"]
+        self._total_rewards_injected += 1
+        self._reward_history.append({
+            "strength": strength,
+            "timestep": self.timestep,
+            "scope_size": len(scope) if scope else None,
+        })
+        # Cap reward history
+        if len(self._reward_history) > 1000:
+            self._reward_history = self._reward_history[-500:]
+
         for syn in self.synapses.values():
-            if abs(syn.eligibility_trace) > 1e-9:
-                dw = syn.eligibility_trace * strength * self.config["learning_rate"]
-                syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
-                syn.eligibility_trace *= 0.9  # Decay trace
+            if abs(syn.eligibility_trace) < 1e-9:
+                continue
+
+            # Apply scope filter
+            if scope is not None:
+                if syn.pre_node_id not in scope and syn.post_node_id not in scope:
+                    continue
+
+            dw = syn.eligibility_trace * strength * self.config["learning_rate"]
+            syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
+            syn.eligibility_trace *= 0.9  # Decay trace after use
+            if syn.weight > syn.peak_weight:
+                syn.peak_weight = syn.weight
 
         # Hyperedge threshold learning (PRD §4.3)
         for he in self.hyperedges.values():
             if not he.is_learnable:
                 continue
+            # Scope check for hyperedges
+            if scope is not None:
+                if not he.member_nodes.intersection(scope):
+                    continue
             # Threshold adapts for recently-fired hyperedges
             if he.refractory_remaining > 0:
                 if strength > 0:
                     he.activation_threshold = max(0.1, he.activation_threshold - lr * strength)
                 else:
                     he.activation_threshold = min(1.0, he.activation_threshold - lr * strength)
+
+        self._emit(
+            "reward_injected",
+            strength=strength,
+            scope_size=len(scope) if scope else None,
+            timestep=self.timestep,
+        )
 
     # -----------------------------------------------------------------------
     # Phase 2: Hierarchical Hyperedges (PRD §4.4)
@@ -1918,6 +2481,7 @@ class Graph:
             "peak_weight": syn.peak_weight,
             "low_weight_steps": syn.low_weight_steps,
             "inactive_steps": syn.inactive_steps,
+            "metadata": syn.metadata,
         }
 
     def _serialize_hyperedge(self, he: Hyperedge) -> Dict[str, Any]:
@@ -1960,9 +2524,11 @@ class Graph:
                 "total_sprouted": self._total_sprouted,
                 "total_he_discovered": self._total_he_discovered,
                 "total_he_consolidated": self._total_he_consolidated,
-                "total_predictions": self._total_predictions,
-                "total_confirmed": self._total_confirmed,
-                "total_surprised": self._total_surprised,
+                "total_predictions_made": self._total_predictions_made,
+                "total_predictions_confirmed": self._total_predictions_confirmed,
+                "total_predictions_errors": self._total_predictions_errors,
+                "total_novel_sequences": self._total_novel_sequences,
+                "total_rewards_injected": self._total_rewards_injected,
             },
         }
 
@@ -2048,6 +2614,7 @@ class Graph:
                 peak_weight=sd.get("peak_weight", sd["weight"]),
                 low_weight_steps=sd.get("low_weight_steps", 0),
                 inactive_steps=sd.get("inactive_steps", 0),
+                metadata=sd.get("metadata", {}),
             )
             self.synapses[sid] = syn
             self._outgoing.setdefault(syn.pre_node_id, set()).add(sid)
@@ -2111,9 +2678,19 @@ class Graph:
         self._total_sprouted = tel.get("total_sprouted", 0)
         self._total_he_discovered = tel.get("total_he_discovered", 0)
         self._total_he_consolidated = tel.get("total_he_consolidated", 0)
-        self._total_predictions = tel.get("total_predictions", 0)
-        self._total_confirmed = tel.get("total_confirmed", 0)
-        self._total_surprised = tel.get("total_surprised", 0)
+        self._total_predictions_made = tel.get("total_predictions_made", 0)
+        self._total_predictions_confirmed = tel.get("total_predictions_confirmed", 0)
+        self._total_predictions_errors = tel.get("total_predictions_errors", 0)
+        self._total_novel_sequences = tel.get("total_novel_sequences", 0)
+        self._total_rewards_injected = tel.get("total_rewards_injected", 0)
+
+        # Clear prediction state on restore
+        self.active_predictions.clear()
+        self._prediction_outcomes.clear()
+        self._synapse_confirmation_history.clear()
+        self._predicted_this_step.clear()
+        self._novel_sequence_log.clear()
+        self._reward_history.clear()
 
         # Re-init plasticity rules from config
         self._plasticity_rules = [
