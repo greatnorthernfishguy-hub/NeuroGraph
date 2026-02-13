@@ -94,6 +94,8 @@ class TestPatternCompletion:
         )
         # Very strong pattern completion
         he.pattern_completion_strength = 2.0
+        # Phase 2.5: dynamic completion scales by experience — set high count
+        he.activation_count = 200
 
         # Pre-charge the inactive node close to threshold
         g.nodes[ids[2]].voltage = 0.5
