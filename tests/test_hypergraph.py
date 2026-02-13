@@ -195,6 +195,63 @@ class TestGradedActivation:
         assert he.hyperedge_id in result.fired_hyperedge_ids
 
 
+class TestHyperedgeRefractory:
+    """Hyperedge refractory period prevents cascading feedback loops."""
+
+    def test_cannot_refire_during_refractory(self):
+        g = Graph({"default_threshold": 1.0, "decay_rate": 1.0})
+        ids = [g.create_node(f"n{i}").node_id for i in range(3)]
+        he = g.create_hyperedge(
+            set(ids),
+            activation_threshold=0.5,
+        )
+        assert he.refractory_period == 2
+
+        # Fire all members → hyperedge fires
+        for nid in ids:
+            g.stimulate(nid, 2.0)
+        r1 = g.step()
+        assert he.hyperedge_id in r1.fired_hyperedge_ids
+
+        # Immediately re-stimulate all members — should NOT fire (refractory)
+        for nid in ids:
+            g.stimulate(nid, 2.0)
+        r2 = g.step()
+        assert he.hyperedge_id not in r2.fired_hyperedge_ids
+
+        # Still refractory on 2nd step after firing
+        for nid in ids:
+            g.stimulate(nid, 2.0)
+        r3 = g.step()
+        assert he.hyperedge_id not in r3.fired_hyperedge_ids
+
+        # Now refractory has expired — should fire again
+        for nid in ids:
+            g.stimulate(nid, 2.0)
+        r4 = g.step()
+        assert he.hyperedge_id in r4.fired_hyperedge_ids
+
+    def test_custom_refractory_period(self):
+        """With refractory_period=0, hyperedge can re-fire on consecutive steps
+        (provided its member nodes also fire)."""
+        g = Graph({"default_threshold": 1.0, "decay_rate": 1.0, "refractory_period": 0})
+        ids = [g.create_node(f"n{i}").node_id for i in range(3)]
+        he = g.create_hyperedge(set(ids), activation_threshold=0.5)
+        he.refractory_period = 0  # No hyperedge refractory
+
+        # Fire all members
+        for nid in ids:
+            g.stimulate(nid, 2.0)
+        r1 = g.step()
+        assert he.hyperedge_id in r1.fired_hyperedge_ids
+
+        # Immediately re-fire (node refractory also 0, so they can fire again)
+        for nid in ids:
+            g.stimulate(nid, 2.0)
+        r2 = g.step()
+        assert he.hyperedge_id in r2.fired_hyperedge_ids
+
+
 class TestNodeRemovalCascade:
     """Removing a node should update hyperedges."""
 
