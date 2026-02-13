@@ -977,6 +977,44 @@ class Graph:
                         "for accuracy tracking in Telemetry.",
                     ],
                 },
+                {
+                    "version": "0.3.5",
+                    "description": "Phase 3.5 Predictive State Persistence & Validation",
+                    "notes": [
+                        "Active predictions now survive checkpoint/restore. Both Phase 3 "
+                        "synapse-level Predictions and Phase 2.5 HE-level PredictionStates "
+                        "are serialized with all fields, preventing the system from "
+                        "'forgetting' what it was expecting after reload.",
+                        "Prediction support state persisted: PredictionOutcome history, "
+                        "per-synapse confirmation history (deques), novel_sequence_log, "
+                        "reward_history. These are needed for confidence calculations and "
+                        "telemetry accuracy after restore.",
+                        "Validation on restore: expired predictions dropped, predictions "
+                        "referencing deleted nodes/hyperedges dropped, stale synapse "
+                        "confirmation history entries dropped. Fail-fast prevents stale "
+                        "predictions from corrupting confidence or emitting spurious events.",
+                        "Backward compatible: v0.2.5 checkpoints restore cleanly with "
+                        "empty prediction state. Checkpoint version bumped to 0.3.5.",
+                    ],
+                },
+                {
+                    "version": "0.4.0",
+                    "description": "Phase 4 Universal Ingestor System",
+                    "notes": [
+                        "Five-stage ingestion pipeline: Extract → Chunk → Embed → "
+                        "Register → Associate.  Converts raw data (text, markdown, "
+                        "code, URLs, PDFs) into fully integrated NeuroGraph knowledge.",
+                        "SimpleVectorDB: in-memory cosine-similarity search over "
+                        "L2-normalized embeddings with content/metadata storage.",
+                        "Novelty dampening: new ingested nodes start at reduced "
+                        "intrinsic_excitability and boosted threshold, fading over "
+                        "a probation period (linear/exponential/logarithmic curves) "
+                        "to prevent destabilizing learned STDP pathways.",
+                        "Three project configs: OpenClaw (code-aware, fast 0.3 "
+                        "dampening), DSM (hierarchical, conservative 0.05), "
+                        "Consciousness (semantic, exploratory 0.01).",
+                    ],
+                },
             ],
         }
 
@@ -2606,9 +2644,35 @@ class Graph:
             "is_archived": he.is_archived,
         }
 
+    def _serialize_prediction(self, pred: Prediction) -> Dict[str, Any]:
+        """Serialize a Phase 3 synapse-level Prediction."""
+        return {
+            "prediction_id": pred.prediction_id,
+            "source_node_id": pred.source_node_id,
+            "target_node_id": pred.target_node_id,
+            "strength": pred.strength,
+            "confidence": pred.confidence,
+            "created_at": pred.created_at,
+            "expires_at": pred.expires_at,
+            "chain_depth": pred.chain_depth,
+            "via_hyperedge": pred.via_hyperedge,
+            "pre_charge_applied": pred.pre_charge_applied,
+        }
+
+    def _serialize_prediction_state(self, ps: PredictionState) -> Dict[str, Any]:
+        """Serialize a Phase 2.5 hyperedge-level PredictionState."""
+        return {
+            "hyperedge_id": ps.hyperedge_id,
+            "predicted_targets": list(ps.predicted_targets),
+            "prediction_strength": ps.prediction_strength,
+            "prediction_timestamp": ps.prediction_timestamp,
+            "prediction_window": ps.prediction_window,
+            "confirmed_targets": list(ps.confirmed_targets),
+        }
+
     def _serialize_full(self) -> Dict[str, Any]:
         return {
-            "version": "0.2.5",
+            "version": "0.3.5",
             "timestep": self.timestep,
             "config": self.config,
             "nodes": {nid: self._serialize_node(n) for nid, n in self.nodes.items()},
@@ -2618,6 +2682,41 @@ class Graph:
                 hid: self._serialize_hyperedge(h)
                 for hid, h in self._archived_hyperedges.items()
             },
+            # Phase 3: Active synapse-level predictions
+            "active_predictions": {
+                pid: self._serialize_prediction(pred)
+                for pid, pred in self.active_predictions.items()
+            },
+            # Phase 3: Recent prediction outcomes
+            "prediction_outcomes": [
+                {
+                    "prediction": self._serialize_prediction(po.prediction),
+                    "confirmed": po.confirmed,
+                    "resolved_at": po.resolved_at,
+                    "actual_firing_nodes": po.actual_firing_nodes,
+                }
+                for po in self._prediction_outcomes
+            ],
+            # Phase 3: Per-synapse confirmation history
+            "synapse_confirmation_history": {
+                syn_id: list(history)
+                for syn_id, history in self._synapse_confirmation_history.items()
+            },
+            # Phase 3: Logs
+            "novel_sequence_log": list(self._novel_sequence_log),
+            "reward_history": list(self._reward_history),
+            # Phase 2.5: Active HE-level predictions
+            "he_active_predictions": {
+                pid: self._serialize_prediction_state(ps)
+                for pid, ps in self._active_predictions.items()
+            },
+            # Phase 2.5: Window-fired tracking
+            "he_prediction_window_fired": {
+                pid: list(nodes)
+                for pid, nodes in self._prediction_window_fired.items()
+            },
+            # Phase 2.5: Counter for unique HE prediction IDs
+            "he_prediction_counter": self._prediction_counter,
             "telemetry": {
                 "total_pruned": self._total_pruned,
                 "total_sprouted": self._total_sprouted,
@@ -2791,13 +2890,105 @@ class Graph:
         self._total_confirmed = tel.get("he_total_confirmed", 0)
         self._total_surprised = tel.get("he_total_surprised", 0)
 
-        # Clear prediction state on restore
+        # Restore Phase 3 active predictions with validation
         self.active_predictions.clear()
+        node_ids = set(self.nodes.keys())
+        for pid, pd in data.get("active_predictions", {}).items():
+            src = pd.get("source_node_id", "")
+            tgt = pd.get("target_node_id", "")
+            # Validate: both source and target nodes must exist
+            if src not in node_ids or tgt not in node_ids:
+                continue
+            # Validate: prediction must not already be expired
+            if pd.get("expires_at", 0) <= self.timestep:
+                continue
+            pred = Prediction(
+                prediction_id=pd.get("prediction_id", pid),
+                source_node_id=src,
+                target_node_id=tgt,
+                strength=pd.get("strength", 0.0),
+                confidence=pd.get("confidence", 0.0),
+                created_at=pd.get("created_at", 0),
+                expires_at=pd.get("expires_at", 0),
+                chain_depth=pd.get("chain_depth", 0),
+                via_hyperedge=pd.get("via_hyperedge"),
+                pre_charge_applied=pd.get("pre_charge_applied", 0.0),
+            )
+            self.active_predictions[pid] = pred
+
+        # Restore Phase 3 prediction outcomes
         self._prediction_outcomes.clear()
+        for pod in data.get("prediction_outcomes", []):
+            ppd = pod.get("prediction", {})
+            inner_pred = Prediction(
+                prediction_id=ppd.get("prediction_id", ""),
+                source_node_id=ppd.get("source_node_id", ""),
+                target_node_id=ppd.get("target_node_id", ""),
+                strength=ppd.get("strength", 0.0),
+                confidence=ppd.get("confidence", 0.0),
+                created_at=ppd.get("created_at", 0),
+                expires_at=ppd.get("expires_at", 0),
+                chain_depth=ppd.get("chain_depth", 0),
+                via_hyperedge=ppd.get("via_hyperedge"),
+                pre_charge_applied=ppd.get("pre_charge_applied", 0.0),
+            )
+            outcome = PredictionOutcome(
+                prediction=inner_pred,
+                confirmed=pod.get("confirmed", False),
+                resolved_at=pod.get("resolved_at", 0),
+                actual_firing_nodes=pod.get("actual_firing_nodes", []),
+            )
+            self._prediction_outcomes.append(outcome)
+
+        # Restore per-synapse confirmation history
         self._synapse_confirmation_history.clear()
+        synapse_ids = set(self.synapses.keys())
+        for syn_id, hist in data.get("synapse_confirmation_history", {}).items():
+            if syn_id not in synapse_ids:
+                continue  # Skip stale entries for deleted synapses
+            d: Deque[bool] = deque(hist, maxlen=100)
+            self._synapse_confirmation_history[syn_id] = d
+
+        # Restore logs
+        self._novel_sequence_log = list(data.get("novel_sequence_log", []))
+        self._reward_history = list(data.get("reward_history", []))
+
+        # Restore Phase 2.5 HE-level predictions with validation
+        self._active_predictions.clear()
+        self._prediction_window_fired.clear()
+        he_ids = set(self.hyperedges.keys())
+        for pid, psd in data.get("he_active_predictions", {}).items():
+            he_id = psd.get("hyperedge_id", "")
+            if he_id not in he_ids:
+                continue  # HE was removed
+            predicted = set(psd.get("predicted_targets", []))
+            # Validate: at least some targets must still exist
+            valid_targets = predicted & node_ids
+            if not valid_targets:
+                continue
+            ps = PredictionState(
+                hyperedge_id=he_id,
+                predicted_targets=valid_targets,
+                prediction_strength=psd.get("prediction_strength", 0.0),
+                prediction_timestamp=psd.get("prediction_timestamp", 0),
+                prediction_window=psd.get("prediction_window", 5),
+                confirmed_targets=set(psd.get("confirmed_targets", [])) & node_ids,
+            )
+            # Validate: window must not already be expired
+            if self.timestep - ps.prediction_timestamp >= ps.prediction_window:
+                continue
+            self._active_predictions[pid] = ps
+
+        # Restore Phase 2.5 window-fired tracking
+        for pid, fired_list in data.get("he_prediction_window_fired", {}).items():
+            if pid in self._active_predictions:
+                self._prediction_window_fired[pid] = set(fired_list)
+
+        # Restore Phase 2.5 prediction counter
+        self._prediction_counter = data.get("he_prediction_counter", 0)
+
+        # Transient per-step state — always start fresh
         self._predicted_this_step.clear()
-        self._novel_sequence_log.clear()
-        self._reward_history.clear()
 
         # Re-init plasticity rules from config
         self._plasticity_rules = [

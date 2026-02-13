@@ -43,18 +43,31 @@ Build the base `neuro_foundation.py` implementing:
 - Cross-level consistency pruning — subsumption archival
 - Telemetry — prediction_accuracy, surprise_rate, experience distribution
 
-### Phase 3: Predictive Coding
+### Phase 3: Predictive Coding -- COMPLETE
 - Prediction tracking and error events (Section 5)
 - Surprise-driven exploration
 
-### Phase 4: Vector DB Integration
-- Adapter interface (Section 7)
-- Bidirectional flow
+### Phase 3.5: Predictive State Persistence & Validation -- COMPLETE
+- Active prediction persistence — both Phase 3 and Phase 2.5 predictions survive checkpoint/restore
+- Prediction validation on restore — expired, stale-node, stale-HE predictions dropped
+- Support state persistence — outcomes, confirmation history, novel sequence log, reward history
+- Backward-compatible restore — old v0.2.5 checkpoints load cleanly
+
+### Phase 4: Universal Ingestor System -- COMPLETE
+- Five-stage pipeline: Extract → Chunk → Embed → Register → Associate (Addendum §2)
+- SimpleVectorDB — in-memory cosine similarity search (Section 7)
+- Extractors: Text, Markdown, Code (AST-based), URL/HTML, PDF
+- Adaptive chunking: Semantic, Code-aware, Hierarchical, Fixed-size
+- Embedding engine with sentence-transformers + hash fallback + caching
+- Novelty dampening with probation and 3 fade curves (Addendum §4.2-4.3)
+- Project configs: OpenClaw, DSM, Consciousness (Addendum §3)
+- HypergraphAssociator: similarity synapses, structural links, cluster hyperedges
 
 ## File Structure
 ```
 NeuroGraph/
-├── neuro_foundation.py              # Core implementation (Phase 1 + 1.5 + 2 + 2.5)
+├── neuro_foundation.py              # Core implementation (Phase 1 + 1.5 + 2 + 2.5 + 3 + 3.5)
+├── universal_ingestor.py            # Phase 4: Universal Ingestor System
 ├── tests/
 │   ├── __init__.py
 │   ├── test_snn.py                  # SNN dynamics tests (12)
@@ -62,11 +75,17 @@ NeuroGraph/
 │   ├── test_hypergraph.py           # Phase 1 + 1.5 hyperedge tests (18)
 │   ├── test_hypergraph_phase2.py    # Phase 2 hypergraph engine tests (26)
 │   ├── test_phase25.py              # Phase 2.5 predictive infrastructure tests (26)
+│   ├── test_prediction.py           # Phase 3 predictive coding tests (38)
+│   ├── test_phase35.py              # Phase 3.5 prediction persistence tests (20)
+│   ├── test_ingestor.py             # Phase 4 universal ingestor tests (88)
 │   └── test_integration.py          # End-to-end tests (18)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
 │   ├── project_configs.py           # OpenClaw, DSM, Consciousness configs
-│   └── hypergraph_demo.py           # Phase 2 hypergraph features demo
+│   ├── hypergraph_demo.py           # Phase 2 hypergraph features demo
+│   ├── ingest_code.py               # Phase 4: Ingest Python code example
+│   ├── ingest_document.py           # Phase 4: Ingest markdown document example
+│   └── ingest_multi_source.py       # Phase 4: Multi-source integration example
 ├── docs/                            # PRD documentation
 ├── requirements.txt
 ├── .gitignore
@@ -194,8 +213,11 @@ DEFAULT_CONFIG = {
 ## Dependencies
 ```
 numpy>=1.24.0
-scipy>=1.10.0  # For sparse matrices if needed
-msgpack>=1.0.0  # For efficient serialization
+scipy>=1.10.0           # For sparse matrices if needed
+msgpack>=1.0.0          # For efficient serialization
+sentence-transformers>=2.2.0  # For embedding generation (Phase 4)
+beautifulsoup4>=4.12.0  # For URL/HTML extraction (Phase 4)
+PyPDF2>=3.0.0           # For PDF extraction (Phase 4)
 ```
 
 ## Notes for Claude Code
@@ -214,7 +236,8 @@ msgpack>=1.0.0  # For efficient serialization
 - [x] Phase 2: Hypergraph Engine
 - [x] Phase 2.5: Predictive Infrastructure Enhancements
 - [x] Phase 3: Predictive Coding
-- [ ] Phase 4: Vector DB Integration
+- [x] Phase 3.5: Predictive State Persistence & Validation
+- [x] Phase 4: Universal Ingestor System
 
 ## Changelog
 
@@ -417,3 +440,137 @@ msgpack>=1.0.0  # For efficient serialization
 
 **Files created:**
 - `tests/test_prediction.py`, `examples/predictive_demo.py`
+
+---
+
+### Phase 3.5: Predictive State Persistence & Validation (v0.3.5)
+**Commit:** Implement Phase 3.5: Predictive State Persistence & Validation
+
+**What was built:**
+1. **Active prediction serialization (CRITICAL FIX):**
+   - `_serialize_prediction()`: serializes Phase 3 `Prediction` objects (all 10 fields)
+   - `_serialize_prediction_state()`: serializes Phase 2.5 `PredictionState` objects (all 6 fields)
+   - `_serialize_full()` now includes: `active_predictions`, `he_active_predictions`, `he_prediction_window_fired`, `he_prediction_counter`
+   - Previously, active predictions were lost on checkpoint/restore — the system "forgot" what it was expecting
+
+2. **Prediction support state serialization:**
+   - `prediction_outcomes`: resolved prediction history (Prediction + confirmed/error + actual nodes)
+   - `synapse_confirmation_history`: per-synapse boolean deques tracking confirmation rates (used for confidence calculations)
+   - `novel_sequence_log`: bounded list of novel sequence events
+   - `reward_history`: bounded list of reward injection events
+
+3. **Validation on restore:**
+   - Phase 3 predictions: dropped if `expires_at <= timestep` (expired) or source/target node missing
+   - Phase 2.5 HE predictions: dropped if hyperedge removed, all target nodes removed, or window expired
+   - Synapse confirmation history: entries for deleted synapses are dropped
+   - Phase 2.5 window-fired tracking: only restored for predictions that survived validation
+   - Ensures no dangling references after topology changes between checkpoint and restore
+
+4. **Backward compatibility:**
+   - Restoring a v0.2.5 checkpoint (no prediction fields) works cleanly — all prediction state defaults to empty
+   - Version bumped to `0.3.5`
+
+**Key design decisions:**
+- Validation filters predictions at restore time rather than lazily during step — fail-fast prevents stale predictions from corrupting confidence calculations or emitting spurious events
+- `_prediction_counter` is serialized to prevent HE prediction ID collisions after restore (Phase 3 uses UUIDs so no collision risk there)
+- `PredictionOutcome.prediction` is serialized inline (not by reference) because the parent prediction may have been cleaned up from active_predictions by the time the outcome was recorded
+- Confirmation history uses `deque(hist, maxlen=100)` on restore to maintain the bounded size invariant
+
+**Serialization version:** `0.3.5` (up from `0.2.5`)
+
+**Tests added (20):**
+- `test_phase35.py`:
+  - Phase 3 persistence: active predictions restored (1), field preservation (1), confirmable after restore (1), error after restore (1)
+  - Phase 2.5 persistence: HE predictions restored (1), confirmable after restore (1), counter preserved (1), window-fired preserved (1)
+  - Support state: outcomes (1), confirmation history (1), novel sequence log (1), reward history (1)
+  - Validation: expired P3 dropped (1), deleted-node P3 dropped (1), expired HE dropped (1), deleted-HE dropped (1), stale confirmation history dropped (1)
+  - Integration: version bump (1), full mid-flight roundtrip (1), backward-compatible restore (1)
+
+**Files created:**
+- `tests/test_phase35.py`
+
+---
+
+### Phase 4: Universal Ingestor System (v0.4.0)
+**Commit:** Implement Phase 4: Universal Ingestor System (PRD Addendum §1-4)
+
+**What was built:**
+1. **SimpleVectorDB (PRD §7):**
+   - In-memory vector database using numpy
+   - L2-normalized storage for cosine similarity via dot product
+   - `insert()`, `search()`, `get()`, `delete()`, `count()`, `all_ids()` API
+   - Top-k search with configurable similarity threshold
+
+2. **Five-Stage Ingestion Pipeline (PRD Addendum §2):**
+   - **Stage 1 — Extract:** `ExtractorRouter` with auto-detection + 5 extractors:
+     - `TextExtractor`: plain text passthrough
+     - `MarkdownExtractor`: preserves heading hierarchy as structure entries
+     - `CodeExtractor`: regex-based AST detection for Python/JS (functions, classes, async)
+     - `URLExtractor`: HTML→text via BeautifulSoup (regex fallback)
+     - `PDFExtractor`: page-aware text extraction via PyPDF2
+   - **Stage 2 — Chunk:** `AdaptiveChunker` with 4 strategies:
+     - SEMANTIC: paragraph/sentence boundary splitting (200-500 tokens)
+     - CODE_AWARE: split by function/class definition boundaries
+     - HIERARCHICAL: follows heading structure with parent-child relationships
+     - FIXED_SIZE: sliding window (512 tokens, 64 overlap) fallback
+   - **Stage 3 — Embed:** `EmbeddingEngine` with sentence-transformers/all-mpnet-base-v2:
+     - Batch processing, LRU cache (10K entries), auto-normalization
+     - Deterministic SHA-256 hash fallback for testing without model
+   - **Stage 4 — Register:** `NodeRegistrar` with novelty dampening (PRD Addendum §4.2-4.3):
+     - New nodes start at reduced `intrinsic_excitability` (dampening factor)
+     - Higher initial `threshold` (configurable boost)
+     - Probation period with 3 fade curves: LINEAR, EXPONENTIAL, LOGARITHMIC
+     - `update_probation()` called per step graduates nodes to full weight
+   - **Stage 5 — Associate:** `HypergraphAssociator` with 3 strategies:
+     - Similarity-based: bidirectional synapses for chunks above similarity threshold
+     - Structural: sequential links, parent→child links, code definition→usage links
+     - Hypergraph clustering: greedy groups of similar nodes → hyperedges
+
+3. **UniversalIngestor coordinator (PRD Addendum §4.1):**
+   - `ingest(source, source_type)`: main entry point, executes all 5 stages
+   - `ingest_batch()`: sequential multi-source ingestion
+   - `update_probation()`: advance novelty dampening for all ingested nodes
+   - `query_similar()`: vector similarity search over ingested content
+   - `ingestion_log`: history of all ingestion results
+
+4. **Project configurations (PRD Addendum §3):**
+   - `OPENCLAW_INGESTOR_CONFIG`: code-aware chunking, novelty_dampening=0.3, similarity=0.7
+   - `DSM_INGESTOR_CONFIG`: hierarchical chunking, novelty_dampening=0.05, similarity=0.8
+   - `CONSCIOUSNESS_INGESTOR_CONFIG`: semantic chunking, novelty_dampening=0.01, similarity=0.65
+   - `get_ingestor_config(project)` accessor
+
+**Key design decisions:**
+- Embedding engine falls back to deterministic SHA-256 hash-based vectors when sentence-transformers is unavailable — enables full test coverage without heavy model dependencies
+- Novelty dampening modifies `intrinsic_excitability` (which scales incoming current in the SNN step loop) rather than adding a separate dampening pathway — leverages existing SNN infrastructure
+- Similarity synapses are bidirectional (A→B and B→A) because semantic similarity is symmetric — causal directionality emerges later through STDP
+- Code definition→usage links use text search rather than full AST analysis — pragmatic choice balancing accuracy with language-independence
+- LRU cache on embeddings (10K entries) bounds memory while avoiding recomputation for repeated content during batch or multi-source ingestion
+- Probation graduation restores both excitability and threshold in a single step — no partial graduation states
+
+**New data structures:**
+- `ExtractedContent`, `Chunk`, `EmbeddedChunk`, `IngestionResult`
+- `SourceType`, `ChunkStrategy`, `DampeningCurve` enumerations
+- `SimpleVectorDB`, `IngestorConfig`
+
+**New dependencies:**
+- `sentence-transformers>=2.2.0` (optional — hash fallback available)
+- `beautifulsoup4>=4.12.0` (optional — regex fallback available)
+- `PyPDF2>=3.0.0` (required only for PDF extraction)
+
+**Tests added (88):**
+- `test_ingestor.py`:
+  - SimpleVectorDB: insert/get (1), normalization (1), search cosine (1), threshold (1), top-k (1), empty (1), delete (1), count (1), all_ids (1)
+  - Extractors: text (2), markdown (3), code Python (2), code JS (1), URL/HTML (2), router (6)
+  - Chunking: semantic (2), code-aware (1), hierarchical (2), fixed-size (1), empty (1), token estimation (1), fallback (1)
+  - Embedding: vectors (1), deterministic (1), caching (1), single text (1), different texts (1), model name (1)
+  - Novelty dampening: reduced excitability (1), boosted threshold (1), metadata (1), decrement (1), graduation (1), fade (1), vector DB (1), exponential curve (1)
+  - Association: similarity (2), sequential (1), parent-child (1), code links (1), clustering (1)
+  - End-to-end: text (1), markdown (1), code (1), empty (1), graph nodes (1), vector DB (1), log (1), query (1), probation (1), batch (1), sequential in pipeline (1)
+  - Project configs: OpenClaw (4), DSM (4), Consciousness (3), get_config (2)
+  - IngestorConfig: access (1), missing (1), get (1)
+  - Edge cases: single word (1), whitespace (1), long input (1), unicode (1), accumulate (1), zero vector (1)
+
+**Files created:**
+- `universal_ingestor.py`
+- `tests/test_ingestor.py`
+- `examples/ingest_code.py`, `examples/ingest_document.py`, `examples/ingest_multi_source.py`
