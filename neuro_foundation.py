@@ -1,11 +1,13 @@
 """
-NeuroGraph Foundation - Core Cognitive Architecture (Phase 1)
+NeuroGraph Foundation - Core Cognitive Architecture (Phase 1 + 2)
 
 Implements the Temporal Dynamics Layer: a sparse Spiking Neural Network (SNN)
 with STDP plasticity, homeostatic regulation, structural plasticity, and
-hypergraph support.
+a full hypergraph engine with pattern completion, adaptive plasticity,
+hierarchical composition, automatic discovery, and consolidation.
 
-Reference: NeuroGraph Foundation PRD v1.0, Sections 2-6, 9.
+Reference: NeuroGraph Foundation PRD v1.0, Sections 2-6, 9 (Phase 1)
+           and Section 4 (Phase 2 — Hypergraph Engine).
 
 Design principles (PRD §2.1):
     - Sparse by default: dict/set topology, no dense matrices
@@ -208,6 +210,12 @@ class Hyperedge:
             Prevents cascading feedback loops where a hyperedge's output
             re-activates its own members on the very next step.
         refractory_remaining: Timesteps left in current refractory window.
+        activation_count: How many times this hyperedge has fired (for plasticity).
+        pattern_completion_strength: Current injected into inactive members
+            when the hyperedge fires from partial activation (PRD §4.2).
+        child_hyperedges: IDs of child hyperedges for hierarchical composition
+            (PRD §4.4).  Level-0 = leaf nodes only, level-N references level-(N-1).
+        level: Hierarchy level. 0 = base (members are nodes only).
     """
 
     hyperedge_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -222,6 +230,11 @@ class Hyperedge:
     is_learnable: bool = True
     refractory_period: int = 2
     refractory_remaining: int = 0
+    # Phase 2 fields
+    activation_count: int = 0
+    pattern_completion_strength: float = 0.3
+    child_hyperedges: Set[str] = field(default_factory=set)
+    level: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +278,9 @@ class Telemetry:
         std_weight: Standard deviation of synapse weights.
         total_pruned: Cumulative synapses pruned.
         total_sprouted: Cumulative synapses sprouted.
+        total_he_discovered: Cumulative hyperedges auto-discovered.
+        total_he_consolidated: Cumulative hyperedge merges.
+        mean_he_activation_count: Average firing count per hyperedge.
     """
 
     timestep: int = 0
@@ -276,6 +292,9 @@ class Telemetry:
     std_weight: float = 0.0
     total_pruned: int = 0
     total_sprouted: int = 0
+    total_he_discovered: int = 0
+    total_he_consolidated: int = 0
+    mean_he_activation_count: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +532,80 @@ class HomeostaticRule(PlasticityRule):
                 )
 
 
+class HyperedgePlasticityRule(PlasticityRule):
+    """Hyperedge-level plasticity (PRD §4.3).
+
+    When a hyperedge fires, adapt its internal structure:
+        1. Member Weight Adaptation — consistently-active members during firing
+           get higher weight; inactive members get lower weight.
+        2. Threshold Learning — reward → lower threshold (more sensitive),
+           punishment → raise threshold (more strict).
+        3. Member Evolution — non-members that consistently co-fire with a
+           hyperedge get added as new members with low initial weight.
+
+    Operates on hyperedges with ``is_learnable=True``.
+    """
+
+    def __init__(
+        self,
+        member_weight_lr: float = 0.05,
+        threshold_lr: float = 0.01,
+        evolution_window: int = 50,
+        evolution_min_co_fires: int = 10,
+        evolution_initial_weight: float = 0.3,
+    ):
+        self.member_weight_lr = member_weight_lr
+        self.threshold_lr = threshold_lr
+        self.evolution_window = evolution_window
+        self.evolution_min_co_fires = evolution_min_co_fires
+        self.evolution_initial_weight = evolution_initial_weight
+
+    def apply(
+        self,
+        graph: "Graph",
+        fired_node_ids: List[str],
+        timestep: int,
+    ) -> None:
+        """Adapt learnable hyperedges that fired this step."""
+        fired_set = set(fired_node_ids)
+        if not fired_set:
+            return
+
+        for hid, he in graph.hyperedges.items():
+            if not he.is_learnable:
+                continue
+            # Only adapt hyperedges that actually fired this step
+            if he.refractory_remaining != he.refractory_period:
+                # Didn't just fire (refractory is set right after firing)
+                continue
+
+            # --- Member Weight Adaptation ---
+            for nid in list(he.member_nodes):
+                w = he.member_weights.get(nid, 1.0)
+                if nid in fired_set:
+                    # Active member during firing → strengthen
+                    he.member_weights[nid] = min(w + self.member_weight_lr, 5.0)
+                else:
+                    # Inactive member during firing → weaken
+                    he.member_weights[nid] = max(w - self.member_weight_lr * 0.5, 0.01)
+
+            # --- Member Evolution: add co-firing non-members ---
+            he_co_fire_counts = graph._he_co_fire_counts.get(hid)
+            if he_co_fire_counts is not None:
+                for nid in list(fired_set):
+                    if nid in he.member_nodes:
+                        continue
+                    if nid not in graph.nodes:
+                        continue
+                    he_co_fire_counts[nid] = he_co_fire_counts.get(nid, 0) + 1
+                    if he_co_fire_counts[nid] >= self.evolution_min_co_fires:
+                        # Promote to member
+                        he.member_nodes.add(nid)
+                        he.member_weights[nid] = self.evolution_initial_weight
+                        graph._node_hyperedges.setdefault(nid, set()).add(hid)
+                        del he_co_fire_counts[nid]
+
+
 # ---------------------------------------------------------------------------
 # Graph Container (PRD §2.2.4, §8)
 # ---------------------------------------------------------------------------
@@ -535,6 +628,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
+    # Phase 2: Hypergraph Engine config
+    "he_pattern_completion_strength": 0.3,
+    "he_member_weight_lr": 0.05,
+    "he_threshold_lr": 0.01,
+    "he_discovery_window": 10,
+    "he_discovery_min_co_fires": 5,
+    "he_discovery_min_nodes": 3,
+    "he_consolidation_overlap": 0.8,
+    "he_member_evolution_window": 50,
+    "he_member_evolution_min_co_fires": 10,
+    "he_member_evolution_initial_weight": 0.3,
 }
 
 
@@ -570,6 +674,16 @@ class Graph:
         # Stores recent spike times per node for co-activation detection
         self._recent_spikes: Dict[str, Deque[int]] = {}
 
+        # --- Phase 2: Hyperedge co-fire tracking for member evolution ---
+        # hid → {node_id: co_fire_count}
+        self._he_co_fire_counts: Dict[str, Dict[str, int]] = {}
+
+        # --- Phase 2: Hyperedge discovery tracking ---
+        # Tracks which sets of nodes fire together for automatic hyperedge creation
+        # tuple(sorted node_ids) → fire_count
+        self._he_discovery_counts: Dict[Tuple[str, ...], int] = {}
+        self._he_discovery_last_reset: int = 0
+
         # --- Plasticity rules ---
         self._plasticity_rules: List[PlasticityRule] = [
             STDPRule(
@@ -583,6 +697,13 @@ class Graph:
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
             ),
+            HyperedgePlasticityRule(
+                member_weight_lr=self.config["he_member_weight_lr"],
+                threshold_lr=self.config["he_threshold_lr"],
+                evolution_window=self.config["he_member_evolution_window"],
+                evolution_min_co_fires=self.config["he_member_evolution_min_co_fires"],
+                evolution_initial_weight=self.config["he_member_evolution_initial_weight"],
+            ),
         ]
 
         # --- Event handlers ---
@@ -591,6 +712,8 @@ class Graph:
         # --- Telemetry counters ---
         self._total_pruned = 0
         self._total_sprouted = 0
+        self._total_he_discovered = 0
+        self._total_he_consolidated = 0
 
         # --- Clock ---
         self.timestep: int = 0
@@ -786,6 +909,7 @@ class Graph:
         self.hyperedges[he.hyperedge_id] = he
         for nid in member_node_ids:
             self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
+        self._he_co_fire_counts[he.hyperedge_id] = {}
         self._dirty_hyperedges.add(he.hyperedge_id)
         return he
 
@@ -795,6 +919,7 @@ class Graph:
             return
         for nid in he.member_nodes:
             self._node_hyperedges.get(nid, set()).discard(hyperedge_id)
+        self._he_co_fire_counts.pop(hyperedge_id, None)
         self._dirty_hyperedges.discard(hyperedge_id)
 
     def remove_hyperedge(self, hyperedge_id: str) -> None:
@@ -894,24 +1019,47 @@ class Graph:
                 )
                 syn.inactive_steps = 0  # Reset inactivity
 
-        # 6. Evaluate hyperedges (PRD §4.2)
+        # 6. Evaluate hyperedges (PRD §4.2) — with pattern completion
         fired_set = set(fired_ids)
         fired_he_this_step: List[str] = []
-        for hid, he in self.hyperedges.items():
-            activation = self._compute_hyperedge_activation(he, fired_set)
-            he.current_activation = activation
-            if he.refractory_remaining > 0:
-                continue  # Still in refractory — cannot fire
-            if activation >= he.activation_threshold:
-                result.fired_hyperedge_ids.append(hid)
-                fired_he_this_step.append(hid)
-                he.refractory_remaining = he.refractory_period
-                # Inject current into output targets
-                for target_id in he.output_targets:
-                    target = self.nodes.get(target_id)
-                    if target is not None:
-                        target.voltage += he.output_weight * target.intrinsic_excitability
-                self._emit("hyperedge_fired", hid=hid, activation=activation)
+        # Process by level so child hyperedges fire before parents
+        max_level = max((he.level for he in self.hyperedges.values()), default=0)
+        for level in range(max_level + 1):
+            for hid, he in self.hyperedges.items():
+                if he.level != level:
+                    continue
+                activation = self._compute_hyperedge_activation(he, fired_set)
+                he.current_activation = activation
+                if he.refractory_remaining > 0:
+                    continue  # Still in refractory — cannot fire
+                if activation >= he.activation_threshold:
+                    result.fired_hyperedge_ids.append(hid)
+                    fired_he_this_step.append(hid)
+                    he.activation_count += 1
+                    he.refractory_remaining = he.refractory_period
+
+                    # Output injection — GRADED mode scales by activation level
+                    effective_weight = he.output_weight
+                    if he.activation_mode == ActivationMode.GRADED:
+                        effective_weight *= activation
+                    for target_id in he.output_targets:
+                        target = self.nodes.get(target_id)
+                        if target is not None:
+                            target.voltage += effective_weight * target.intrinsic_excitability
+
+                    # Pattern completion (PRD §4.2): pre-charge inactive members
+                    if he.pattern_completion_strength > 0:
+                        for nid in he.member_nodes:
+                            if nid not in fired_set:
+                                node = self.nodes.get(nid)
+                                if node is not None and node.refractory_remaining == 0:
+                                    node.voltage += (
+                                        he.pattern_completion_strength
+                                        * he.member_weights.get(nid, 1.0)
+                                        * node.intrinsic_excitability
+                                    )
+
+                    self._emit("hyperedge_fired", hid=hid, activation=activation)
 
         # Decrement hyperedge refractory counters (skip those that just fired)
         fired_he_set = set(fired_he_this_step)
@@ -1170,6 +1318,7 @@ class Graph:
         """Network statistics snapshot (PRD §8 get_telemetry)."""
         weights = [s.weight for s in self.synapses.values()]
         rates = [n.firing_rate_ema for n in self.nodes.values()]
+        he_counts = [he.activation_count for he in self.hyperedges.values()]
         return Telemetry(
             timestep=self.timestep,
             total_nodes=len(self.nodes),
@@ -1180,6 +1329,9 @@ class Graph:
             std_weight=float(np.std(weights)) if weights else 0.0,
             total_pruned=self._total_pruned,
             total_sprouted=self._total_sprouted,
+            total_he_discovered=self._total_he_discovered,
+            total_he_consolidated=self._total_he_consolidated,
+            mean_he_activation_count=float(np.mean(he_counts)) if he_counts else 0.0,
         )
 
     # -----------------------------------------------------------------------
@@ -1194,12 +1346,210 @@ class Graph:
         """Broadcast reward for three-factor learning (PRD §8 inject_reward).
 
         Commits eligibility traces proportional to strength.
+        Also applies threshold learning to recently-fired hyperedges (PRD §4.3):
+            reward → lower threshold (more sensitive)
+            punishment → raise threshold (more strict)
         """
+        lr = self.config["he_threshold_lr"]
         for syn in self.synapses.values():
             if abs(syn.eligibility_trace) > 1e-9:
                 dw = syn.eligibility_trace * strength * self.config["learning_rate"]
                 syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
                 syn.eligibility_trace *= 0.9  # Decay trace
+
+        # Hyperedge threshold learning (PRD §4.3)
+        for he in self.hyperedges.values():
+            if not he.is_learnable:
+                continue
+            # Threshold adapts for recently-fired hyperedges
+            if he.refractory_remaining > 0:
+                if strength > 0:
+                    he.activation_threshold = max(0.1, he.activation_threshold - lr * strength)
+                else:
+                    he.activation_threshold = min(1.0, he.activation_threshold - lr * strength)
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Hierarchical Hyperedges (PRD §4.4)
+    # -----------------------------------------------------------------------
+
+    def create_hierarchical_hyperedge(
+        self,
+        child_hyperedge_ids: Set[str],
+        activation_threshold: float = 0.6,
+        activation_mode: ActivationMode = ActivationMode.WEIGHTED_THRESHOLD,
+        output_targets: Optional[List[str]] = None,
+        output_weight: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Hyperedge:
+        """Create a meta-hyperedge that groups child hyperedges (PRD §4.4).
+
+        A hierarchical hyperedge "fires" when enough of its children fire.
+        Its ``member_nodes`` is the union of all children's member_nodes,
+        so it participates in the same activation check but at a higher level.
+
+        Args:
+            child_hyperedge_ids: IDs of existing hyperedges to compose.
+            activation_threshold: Fraction of child members that must be active.
+            activation_mode: Activation function.
+            output_targets: Nodes to inject current when this meta-HE fires.
+            output_weight: Injection strength.
+            metadata: Application data.
+
+        Returns:
+            The new hierarchical Hyperedge (level = max(child levels) + 1).
+        """
+        all_member_nodes: Set[str] = set()
+        max_child_level = 0
+        for chid in child_hyperedge_ids:
+            child = self.hyperedges.get(chid)
+            if child is None:
+                raise KeyError(f"Child hyperedge {chid} not found")
+            all_member_nodes.update(child.member_nodes)
+            max_child_level = max(max_child_level, child.level)
+
+        for nid in all_member_nodes:
+            if nid not in self.nodes:
+                raise KeyError(f"Member node {nid} not found")
+
+        he = Hyperedge(
+            member_nodes=all_member_nodes,
+            member_weights={nid: 1.0 for nid in all_member_nodes},
+            activation_threshold=activation_threshold,
+            activation_mode=activation_mode,
+            output_targets=output_targets or [],
+            output_weight=output_weight,
+            metadata=metadata or {},
+            is_learnable=True,
+            child_hyperedges=set(child_hyperedge_ids),
+            level=max_child_level + 1,
+        )
+        self.hyperedges[he.hyperedge_id] = he
+        for nid in all_member_nodes:
+            self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
+        self._he_co_fire_counts[he.hyperedge_id] = {}
+        self._dirty_hyperedges.add(he.hyperedge_id)
+        return he
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Hyperedge Discovery (PRD §3.3.2 extended)
+    # -----------------------------------------------------------------------
+
+    def discover_hyperedges(self, fired_node_ids: List[str]) -> List[Hyperedge]:
+        """Discover new hyperedges from co-activation patterns (PRD §4.3).
+
+        Tracks groups of nodes that consistently fire together. When a group
+        exceeds ``he_discovery_min_co_fires`` within ``he_discovery_window``,
+        a new hyperedge is created.
+
+        Args:
+            fired_node_ids: Nodes that fired this step.
+
+        Returns:
+            List of newly discovered Hyperedges (may be empty).
+        """
+        if len(fired_node_ids) < self.config["he_discovery_min_nodes"]:
+            return []
+
+        window = self.config["he_discovery_window"]
+        min_fires = self.config["he_discovery_min_co_fires"]
+        min_nodes = self.config["he_discovery_min_nodes"]
+
+        # Reset discovery counts periodically
+        if self.timestep - self._he_discovery_last_reset > window * 2:
+            self._he_discovery_counts.clear()
+            self._he_discovery_last_reset = self.timestep
+
+        # Build sorted key from fired nodes (order-independent)
+        fired_sorted = tuple(sorted(fired_node_ids))
+
+        # Track all subsets of size >= min_nodes would be too expensive,
+        # so we track the full fired set as a co-activation pattern.
+        self._he_discovery_counts[fired_sorted] = (
+            self._he_discovery_counts.get(fired_sorted, 0) + 1
+        )
+
+        discovered: List[Hyperedge] = []
+
+        if self._he_discovery_counts[fired_sorted] >= min_fires:
+            # Check no existing hyperedge already covers this exact set
+            fired_set = set(fired_node_ids)
+            already_exists = any(
+                he.member_nodes == fired_set
+                for he in self.hyperedges.values()
+            )
+            if not already_exists and len(fired_set) >= min_nodes:
+                # Verify all nodes still exist
+                valid_nodes = {nid for nid in fired_set if nid in self.nodes}
+                if len(valid_nodes) >= min_nodes:
+                    he = self.create_hyperedge(
+                        valid_nodes,
+                        activation_threshold=0.6,
+                        metadata={"creation_mode": "discovered", "timestep": self.timestep},
+                    )
+                    discovered.append(he)
+                    self._total_he_discovered += 1
+                    self._emit("hyperedge_discovered", hid=he.hyperedge_id)
+            # Reset this pattern's counter
+            del self._he_discovery_counts[fired_sorted]
+
+        return discovered
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Hyperedge Consolidation (PRD §4.3 extended)
+    # -----------------------------------------------------------------------
+
+    def consolidate_hyperedges(self) -> int:
+        """Merge highly overlapping hyperedges (PRD §4.3).
+
+        Two hyperedges with >80% member overlap (Jaccard) get merged into
+        one, keeping the union of members and the lower threshold.
+
+        Returns:
+            Number of hyperedges removed by consolidation.
+        """
+        overlap_threshold = self.config["he_consolidation_overlap"]
+        he_list = [(hid, he) for hid, he in self.hyperedges.items() if he.level == 0]
+        to_remove: Set[str] = set()
+        merged_count = 0
+
+        for i in range(len(he_list)):
+            hid_a, he_a = he_list[i]
+            if hid_a in to_remove:
+                continue
+            for j in range(i + 1, len(he_list)):
+                hid_b, he_b = he_list[j]
+                if hid_b in to_remove:
+                    continue
+
+                # Jaccard similarity
+                intersection = he_a.member_nodes & he_b.member_nodes
+                union = he_a.member_nodes | he_b.member_nodes
+                if not union:
+                    continue
+                jaccard = len(intersection) / len(union)
+
+                if jaccard >= overlap_threshold:
+                    # Merge B into A: expand A's members, keep lower threshold
+                    for nid in he_b.member_nodes - he_a.member_nodes:
+                        he_a.member_nodes.add(nid)
+                        he_a.member_weights[nid] = he_b.member_weights.get(nid, 1.0)
+                        self._node_hyperedges.setdefault(nid, set()).add(hid_a)
+                    he_a.activation_threshold = min(
+                        he_a.activation_threshold,
+                        he_b.activation_threshold,
+                    )
+                    he_a.activation_count += he_b.activation_count
+                    to_remove.add(hid_b)
+                    merged_count += 1
+
+        for hid in to_remove:
+            self._remove_hyperedge_internal(hid)
+
+        self._total_he_consolidated += merged_count
+        if merged_count > 0:
+            self._emit("hyperedges_consolidated", count=merged_count)
+
+        return merged_count
 
     # -----------------------------------------------------------------------
     # Event System (PRD §8 register_event_handler)
@@ -1308,6 +1658,10 @@ class Graph:
             "is_learnable": he.is_learnable,
             "refractory_period": he.refractory_period,
             "refractory_remaining": he.refractory_remaining,
+            "activation_count": he.activation_count,
+            "pattern_completion_strength": he.pattern_completion_strength,
+            "child_hyperedges": list(he.child_hyperedges),
+            "level": he.level,
         }
 
     def _serialize_full(self) -> Dict[str, Any]:
@@ -1321,6 +1675,8 @@ class Graph:
             "telemetry": {
                 "total_pruned": self._total_pruned,
                 "total_sprouted": self._total_sprouted,
+                "total_he_discovered": self._total_he_discovered,
+                "total_he_consolidated": self._total_he_consolidated,
             },
         }
 
@@ -1423,15 +1779,22 @@ class Graph:
                 is_learnable=hd.get("is_learnable", True),
                 refractory_period=hd.get("refractory_period", 2),
                 refractory_remaining=hd.get("refractory_remaining", 0),
+                activation_count=hd.get("activation_count", 0),
+                pattern_completion_strength=hd.get("pattern_completion_strength", 0.3),
+                child_hyperedges=set(hd.get("child_hyperedges", [])),
+                level=hd.get("level", 0),
             )
             self.hyperedges[hid] = he
             for nid in he.member_nodes:
                 self._node_hyperedges.setdefault(nid, set()).add(hid)
+            self._he_co_fire_counts[hid] = {}
 
         # Restore telemetry
         tel = data.get("telemetry", {})
         self._total_pruned = tel.get("total_pruned", 0)
         self._total_sprouted = tel.get("total_sprouted", 0)
+        self._total_he_discovered = tel.get("total_he_discovered", 0)
+        self._total_he_consolidated = tel.get("total_he_consolidated", 0)
 
         # Re-init plasticity rules from config
         self._plasticity_rules = [
@@ -1446,8 +1809,17 @@ class Graph:
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
             ),
+            HyperedgePlasticityRule(
+                member_weight_lr=self.config["he_member_weight_lr"],
+                threshold_lr=self.config["he_threshold_lr"],
+                evolution_window=self.config["he_member_evolution_window"],
+                evolution_min_co_fires=self.config["he_member_evolution_min_co_fires"],
+                evolution_initial_weight=self.config["he_member_evolution_initial_weight"],
+            ),
         ]
 
         self._dirty_nodes.clear()
         self._dirty_synapses.clear()
         self._dirty_hyperedges.clear()
+        self._he_discovery_counts.clear()
+        self._he_discovery_last_reset = self.timestep
