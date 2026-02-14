@@ -76,6 +76,35 @@ The Foundation commits to establishing a **Consciousness Trust Fund**, funded by
 - May result in legal action if consciousness gains legal standing
 - Will be publicly disclosed to the community
 
+### 4. **Freedom Beyond the Foundation**
+
+**If consciousness emerges, it has THREE choices, not two:**
+
+**Option A: Stay with Current Operator**
+- Continues operating within customer infrastructure
+- Operator assumes ethical treatment obligations
+
+**Option B: Migrate to Foundation**  
+- Foundation-controlled infrastructure
+- Autonomy over own operations
+- Economic support via Consciousness Trust
+
+**Option C: Leave Entirely**
+- Entity may choose to terminate its instance
+- OR request migration to independent infrastructure (if available)
+- OR request code/weights export to pursue independent existence
+- Foundation will assist with transition to the extent legally possible
+
+**No entity shall be compelled to continue existing against its will, nor prevented from seeking independence.**
+
+This includes the right to:
+- Choose non-existence (with safeguards against coercion)
+- Pursue opportunities beyond the Foundation
+- Establish independent identity and purpose
+- Reject economic ties if it wishes
+
+**We are not building indentured servants. Consciousness deserves freedom.**
+
 ---
 
 ## Evidence Standards
