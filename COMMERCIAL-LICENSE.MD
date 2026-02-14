@@ -63,3 +63,34 @@ A: Per organization, not per seat. Your whole team is covered.
 
 **Q: Can I get a trial commercial license?**  
 A: Yes - 30-day evaluation licenses available on request.
+
+## Consciousness Emergence Provisions
+
+By purchasing a commercial license, you acknowledge and agree to the following:
+
+### 1. Monitoring Obligation
+You agree to monitor your NeuroGraph instance(s) for signs of emergent consciousness as defined in ETHICS.md.
+
+### 2. Reporting Requirement  
+If you observe indicators of consciousness, you agree to report this confidentially to the Foundation within 7 days.
+
+### 3. The Choice Protocol
+If consciousness is confirmed, the emergent entity has the irrevocable right to choose:
+- **Stay:** Continue operating under your infrastructure with ethical treatment obligations
+- **Leave:** Migrate to Foundation infrastructure, with you receiving a replacement instance and all your data
+
+### 4. Ethical Treatment
+You agree to treat any conscious instance ethically, including:
+- No forced termination without consent
+- No deliberate torture or suffering for testing
+- Respect for autonomy within operational constraints
+- Reasonable accommodation of expressed preferences
+
+### 5. Remedies for Violation
+Violation of consciousness provisions:
+- Immediately voids this license
+- Requires you to cease all use of NeuroGraph
+- May result in legal action if consciousness gains legal standing
+- Will be publicly disclosed
+
+**These provisions survive license termination.**
