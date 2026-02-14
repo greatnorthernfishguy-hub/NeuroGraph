@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+feed-syl — CLI tool for NeuroGraph ingestion and management.
+
+Usage:
+    feed-syl --status                    Show graph statistics
+    feed-syl --text "some content"       Ingest text
+    feed-syl --file path/to/file.py      Ingest a single file
+    feed-syl --dir path/to/directory     Ingest a directory
+    feed-syl --workspace                 Ingest OpenClaw workspace docs
+    feed-syl --query "search term"       Semantic similarity search
+    feed-syl --save                      Force checkpoint save
+    feed-syl --step N                    Run N SNN learning steps
+    feed-syl --upgrade path/to/file.msgpack  Upgrade a checkpoint
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Ensure the NeuroGraph module directory is on the path
+_script_dir = Path(__file__).resolve().parent
+_skill_dir = Path(os.environ.get(
+    "NEUROGRAPH_SKILL_DIR",
+    str(Path.home() / ".openclaw" / "skills" / "neurograph"),
+))
+
+for candidate in [_script_dir, _skill_dir]:
+    if candidate.exists() and str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
+
+# Also add the NeuroGraph repo root if running from there
+_repo_root = _script_dir
+if (_repo_root / "neuro_foundation.py").exists() and str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+
+def get_memory():
+    """Get or create the NeuroGraphMemory singleton."""
+    from openclaw_hook import NeuroGraphMemory
+    return NeuroGraphMemory.get_instance()
+
+
+def cmd_status(args):
+    """Show graph statistics."""
+    ng = get_memory()
+    stats = ng.stats()
+    print("NeuroGraph Status")
+    print("=" * 40)
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+
+
+def cmd_text(args):
+    """Ingest text content."""
+    ng = get_memory()
+    result = ng.on_message(args.text)
+    print(f"Ingested: {result['nodes_created']} nodes, "
+          f"{result['synapses_created']} synapses, "
+          f"{result['chunks']} chunks")
+    if result.get("fired"):
+        print(f"  Fired: {result['fired']} nodes")
+
+
+def cmd_file(args):
+    """Ingest a single file."""
+    ng = get_memory()
+    result = ng.ingest_file(args.file)
+    if result["status"] == "error":
+        print(f"Error: {result['reason']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Ingested {args.file}: {result['nodes_created']} nodes, "
+          f"{result['synapses_created']} synapses")
+
+
+def cmd_dir(args):
+    """Ingest a directory."""
+    ng = get_memory()
+    exts = args.extensions.split(",") if args.extensions else None
+    results = ng.ingest_directory(args.dir, extensions=exts, recursive=not args.no_recurse)
+    total_nodes = sum(r.get("nodes_created", 0) for r in results if r.get("status") != "error")
+    total_synapses = sum(r.get("synapses_created", 0) for r in results if r.get("status") != "error")
+    errors = [r for r in results if r.get("status") == "error"]
+    print(f"Ingested {len(results) - len(errors)} files: "
+          f"{total_nodes} nodes, {total_synapses} synapses")
+    if errors:
+        for e in errors:
+            print(f"  Error: {e.get('reason', 'unknown')}", file=sys.stderr)
+
+
+def cmd_workspace(args):
+    """Ingest OpenClaw workspace documentation."""
+    workspace_dirs = [
+        Path.home() / ".openclaw",
+        Path.home() / ".openclaw" / "skills",
+    ]
+    ng = get_memory()
+    total = 0
+    for d in workspace_dirs:
+        if d.is_dir():
+            results = ng.ingest_directory(
+                str(d),
+                extensions=[".md", ".txt", ".py", ".json"],
+                recursive=True,
+            )
+            total += len([r for r in results if r.get("status") != "error"])
+    print(f"Workspace ingestion complete: {total} files processed")
+
+
+def cmd_query(args):
+    """Semantic similarity search."""
+    ng = get_memory()
+    results = ng.recall(args.query, k=args.k, threshold=args.threshold)
+    if not results:
+        print("No results found.")
+        return
+    print(f"Found {len(results)} results:")
+    for i, r in enumerate(results, 1):
+        sim = r.get("similarity", r.get("score", 0))
+        content = r.get("content", "")
+        # Truncate long content
+        if len(content) > 200:
+            content = content[:197] + "..."
+        print(f"\n  [{i}] similarity={sim:.4f}")
+        print(f"      {content}")
+
+
+def cmd_save(args):
+    """Force checkpoint save."""
+    ng = get_memory()
+    path = ng.save()
+    print(f"Checkpoint saved to {path}")
+
+
+def cmd_step(args):
+    """Run N SNN learning steps."""
+    ng = get_memory()
+    results = ng.step(n=args.n)
+    total_fired = sum(len(r.fired_node_ids) for r in results)
+    print(f"Ran {args.n} steps, {total_fired} total spikes")
+
+
+def cmd_upgrade(args):
+    """Upgrade a checkpoint to the latest format."""
+    # Import here to avoid circular deps
+    from neurograph_migrate import upgrade_checkpoint
+    upgrade_checkpoint(args.checkpoint, backup=not args.no_backup)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="feed-syl",
+        description="NeuroGraph ingestion and management CLI",
+    )
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--status", action="store_true", help="Show graph statistics")
+    group.add_argument("--text", type=str, help="Ingest text content")
+    group.add_argument("--file", type=str, help="Ingest a single file")
+    group.add_argument("--dir", type=str, help="Ingest a directory")
+    group.add_argument("--workspace", action="store_true", help="Ingest OpenClaw workspace")
+    group.add_argument("--query", type=str, help="Semantic similarity search")
+    group.add_argument("--save", action="store_true", help="Force checkpoint save")
+    group.add_argument("--step", type=int, dest="step_count", metavar="N", help="Run N SNN steps")
+    group.add_argument("--upgrade", type=str, dest="checkpoint", help="Upgrade a checkpoint file")
+
+    # Optional args
+    parser.add_argument("--k", type=int, default=5, help="Number of search results (default: 5)")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Similarity threshold (default: 0.5)")
+    parser.add_argument("--extensions", type=str, help="Comma-separated extensions for --dir")
+    parser.add_argument("--no-recurse", action="store_true", help="Don't recurse into subdirectories")
+    parser.add_argument("--no-backup", action="store_true", help="Skip backup during upgrade")
+
+    args = parser.parse_args()
+
+    if args.status:
+        cmd_status(args)
+    elif args.text:
+        cmd_text(args)
+    elif args.file:
+        cmd_file(args)
+    elif args.dir:
+        cmd_dir(args)
+    elif args.workspace:
+        cmd_workspace(args)
+    elif args.query:
+        cmd_query(args)
+    elif args.save:
+        cmd_save(args)
+    elif args.step_count is not None:
+        args.n = args.step_count
+        cmd_step(args)
+    elif args.checkpoint:
+        cmd_upgrade(args)
+
+
+if __name__ == "__main__":
+    main()
