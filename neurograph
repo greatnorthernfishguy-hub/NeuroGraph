@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+neurograph — NeuroGraph management CLI
+
+Usage:
+    neurograph setup                          Interactive setup wizard
+    neurograph status                         Show graph statistics
+    neurograph upgrade --checkpoint FILE      Upgrade a checkpoint
+    neurograph upgrade --checkpoint FILE --dry-run   Preview migration
+    neurograph rollback --checkpoint FILE     Rollback to latest backup
+    neurograph info --checkpoint FILE         Show checkpoint details
+    neurograph backups --checkpoint FILE      List backup files
+    neurograph verify                         Verify installation
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Add script directory to path
+_script_dir = Path(__file__).resolve().parent
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
+
+
+def cmd_setup(args):
+    """Interactive setup wizard."""
+    print("=" * 50)
+    print("  NeuroGraph Setup Wizard")
+    print("=" * 50)
+    print()
+
+    # Step 1: Workspace directory
+    default_workspace = Path.home() / ".openclaw" / "neurograph"
+    workspace = input(f"Workspace directory [{default_workspace}]: ").strip()
+    if not workspace:
+        workspace = str(default_workspace)
+    workspace = str(Path(workspace).expanduser())
+
+    # Step 2: Check dependencies
+    print("\nChecking dependencies...")
+    deps = _check_deps()
+    for name, status in deps.items():
+        marker = "OK" if status["available"] else "MISSING"
+        extra = f" ({status.get('version', '')})" if status.get("version") else ""
+        if status.get("fallback"):
+            extra += f" [fallback: {status['fallback']}]"
+        print(f"  {name}: {marker}{extra}")
+
+    # Step 3: Embedding backend
+    print("\nEmbedding backend:")
+    if deps["sentence-transformers"]["available"]:
+        print("  Using: sentence-transformers (real embeddings)")
+        print("  Model: all-MiniLM-L6-v2 (384 dimensions)")
+    else:
+        print("  Using: hash fallback (deterministic, no ML model)")
+        print("  To enable real embeddings, run:")
+        print("    pip3 install --no-deps sentence-transformers")
+        print("    pip3 install transformers torch")
+
+    # Step 4: Create directories
+    print(f"\nCreating workspace at {workspace}...")
+    Path(workspace).mkdir(parents=True, exist_ok=True)
+    (Path(workspace) / "checkpoints").mkdir(parents=True, exist_ok=True)
+    print("  Done")
+
+    # Step 5: Test graph creation
+    print("\nTesting graph creation...")
+    try:
+        from neuro_foundation import Graph
+        g = Graph()
+        n1 = g.create_node(node_id="test_a")
+        n2 = g.create_node(node_id="test_b")
+        g.create_synapse("test_a", "test_b", weight=0.5)
+        g.step()
+        g.remove_node("test_a")
+        g.remove_node("test_b")
+        print("  Graph engine: OK")
+    except Exception as e:
+        print(f"  Graph engine: FAILED ({e})")
+        return
+
+    # Step 6: Test ingestor
+    print("Testing ingestor...")
+    try:
+        from universal_ingestor import UniversalIngestor, SimpleVectorDB
+        vdb = SimpleVectorDB()
+        g2 = Graph()
+        ingestor = UniversalIngestor(g2, vdb)
+        result = ingestor.ingest("Hello world test")
+        print(f"  Ingestor: OK ({result.chunks_created} chunks, {len(result.node_ids)} nodes)")
+    except Exception as e:
+        print(f"  Ingestor: FAILED ({e})")
+
+    # Step 7: Set environment variable
+    print(f"\nConfiguration:")
+    print(f"  NEUROGRAPH_WORKSPACE_DIR={workspace}")
+
+    # Write env to bashrc if not already there
+    bashrc = Path.home() / ".bashrc"
+    env_line = f'export NEUROGRAPH_WORKSPACE_DIR="{workspace}"'
+    if bashrc.exists():
+        content = bashrc.read_text()
+        if "NEUROGRAPH_WORKSPACE_DIR" not in content:
+            resp = input("\nAdd to ~/.bashrc? [Y/n]: ").strip().lower()
+            if resp in ("", "y", "yes"):
+                with open(bashrc, "a") as f:
+                    f.write(f"\n# NeuroGraph workspace\n{env_line}\n")
+                print("  Added to ~/.bashrc")
+
+    print("\n" + "=" * 50)
+    print("  Setup complete!")
+    print("=" * 50)
+    print()
+    print("Quick start:")
+    print("  feed-syl --status              # Check status")
+    print("  feed-syl --text 'Hello world'  # Ingest text")
+    print("  neurograph status              # Graph stats")
+    print()
+
+
+def cmd_status(args):
+    """Show graph statistics."""
+    try:
+        from openclaw_hook import NeuroGraphMemory
+        ng = NeuroGraphMemory.get_instance()
+        stats = ng.stats()
+        print("NeuroGraph Status")
+        print("=" * 40)
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print("Run 'neurograph setup' first.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_upgrade(args):
+    """Upgrade a checkpoint to latest schema version."""
+    from neurograph_migrate import upgrade_checkpoint, get_checkpoint_info
+
+    # Show current state
+    info = get_checkpoint_info(args.checkpoint)
+    print(f"Checkpoint: {info['path']}")
+    print(f"  Version:    {info['version']}")
+    print(f"  Timestep:   {info['timestep']}")
+    print(f"  Nodes:      {info['nodes']}")
+    print(f"  Synapses:   {info['synapses']}")
+    print(f"  Hyperedges: {info['hyperedges']}")
+    print(f"  Size:       {info['file_size_bytes']:,} bytes")
+    print()
+
+    # Run migration
+    result = upgrade_checkpoint(
+        args.checkpoint,
+        target_version=args.target,
+        backup=not args.no_backup,
+        dry_run=args.dry_run,
+    )
+
+    if args.dry_run:
+        print("DRY RUN — no changes written")
+        print()
+
+    print(f"  {result['message']}")
+    if result["steps_applied"]:
+        print(f"  Steps: {', '.join(result['steps_applied'])}")
+    if result.get("backup_path"):
+        print(f"  Backup: {result['backup_path']}")
+
+
+def cmd_rollback(args):
+    """Rollback a checkpoint to its backup."""
+    from neurograph_migrate import rollback_checkpoint, get_checkpoint_info
+
+    try:
+        backup_used = rollback_checkpoint(args.checkpoint, backup_path=args.backup)
+        info = get_checkpoint_info(args.checkpoint)
+        print(f"Rolled back to: {backup_used}")
+        print(f"  Version: {info['version']}")
+        print(f"  Nodes:   {info['nodes']}")
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_info(args):
+    """Show checkpoint details."""
+    from neurograph_migrate import get_checkpoint_info
+
+    info = get_checkpoint_info(args.checkpoint)
+    print("Checkpoint Information")
+    print("=" * 40)
+    for key, value in info.items():
+        if key == "file_size_bytes":
+            print(f"  file_size: {value:,} bytes")
+        else:
+            print(f"  {key}: {value}")
+
+
+def cmd_backups(args):
+    """List backup files."""
+    from neurograph_migrate import list_backups
+
+    backups = list_backups(args.checkpoint)
+    if not backups:
+        print("No backups found.")
+        return
+
+    print(f"Backups for {args.checkpoint}:")
+    for b in backups:
+        import time
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(b["modified"]))
+        print(f"  {b['path']}")
+        print(f"    Version: {b['version']}  Size: {b['size_bytes']:,}  Modified: {ts}")
+
+
+def cmd_verify(args):
+    """Verify installation health."""
+    print("NeuroGraph Installation Verification")
+    print("=" * 40)
+
+    deps = _check_deps()
+    all_ok = True
+    for name, status in deps.items():
+        marker = "OK" if status["available"] else "MISSING"
+        print(f"  {name}: {marker}")
+        if not status["available"] and not status.get("optional"):
+            all_ok = False
+
+    # Check files
+    print()
+    print("  Core files:")
+    for mod in ["neuro_foundation", "universal_ingestor", "openclaw_hook", "neurograph_migrate"]:
+        try:
+            __import__(mod)
+            print(f"    {mod}: OK")
+        except ImportError as e:
+            print(f"    {mod}: FAILED ({e})")
+            all_ok = False
+
+    # Check embedding
+    print()
+    try:
+        from universal_ingestor import EmbeddingEngine
+        eng = EmbeddingEngine()
+        vec = eng.embed_text("test")
+        dim = len(vec)
+        backend = "sentence-transformers" if eng._model_available else "hash-fallback"
+        print(f"  Embedding: {backend} (dim={dim})")
+    except Exception as e:
+        print(f"  Embedding: FAILED ({e})")
+
+    print()
+    if all_ok:
+        print("  All checks passed")
+    else:
+        print("  Some checks failed — run 'neurograph setup' or './deploy.sh'")
+
+
+def _check_deps():
+    """Check dependency availability."""
+    deps = {}
+
+    # numpy
+    try:
+        import numpy
+        deps["numpy"] = {"available": True, "version": numpy.__version__}
+    except ImportError:
+        deps["numpy"] = {"available": False}
+
+    # scipy
+    try:
+        import scipy
+        deps["scipy"] = {"available": True, "version": scipy.__version__}
+    except ImportError:
+        deps["scipy"] = {"available": False}
+
+    # msgpack
+    try:
+        import msgpack
+        deps["msgpack"] = {"available": True, "version": msgpack.version[0:3]}
+    except ImportError:
+        deps["msgpack"] = {"available": False}
+
+    # sentence-transformers
+    try:
+        import sentence_transformers
+        deps["sentence-transformers"] = {
+            "available": True,
+            "version": getattr(sentence_transformers, "__version__", "unknown"),
+        }
+    except ImportError:
+        deps["sentence-transformers"] = {
+            "available": False,
+            "optional": True,
+            "fallback": "hash-based embeddings",
+        }
+
+    # torch
+    try:
+        import torch
+        deps["torch"] = {"available": True, "version": torch.__version__}
+    except ImportError:
+        deps["torch"] = {
+            "available": False,
+            "optional": True,
+            "fallback": "hash-based embeddings",
+        }
+
+    # beautifulsoup4
+    try:
+        import bs4
+        deps["beautifulsoup4"] = {"available": True, "version": bs4.__version__}
+    except ImportError:
+        deps["beautifulsoup4"] = {
+            "available": False,
+            "optional": True,
+            "fallback": "regex HTML parsing",
+        }
+
+    # PyPDF2
+    try:
+        import PyPDF2
+        deps["PyPDF2"] = {"available": True, "version": PyPDF2.__version__}
+    except ImportError:
+        deps["PyPDF2"] = {
+            "available": False,
+            "optional": True,
+            "fallback": "PDF extraction unavailable",
+        }
+
+    return deps
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="neurograph",
+        description="NeuroGraph management CLI",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # setup
+    subparsers.add_parser("setup", help="Interactive setup wizard")
+
+    # status
+    subparsers.add_parser("status", help="Show graph statistics")
+
+    # upgrade
+    upgrade_p = subparsers.add_parser("upgrade", help="Upgrade a checkpoint")
+    upgrade_p.add_argument("--checkpoint", required=True, help="Path to checkpoint file")
+    upgrade_p.add_argument("--target", help="Target version (default: latest)")
+    upgrade_p.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    upgrade_p.add_argument("--no-backup", action="store_true", help="Skip backup")
+
+    # rollback
+    rollback_p = subparsers.add_parser("rollback", help="Rollback to backup")
+    rollback_p.add_argument("--checkpoint", required=True, help="Path to checkpoint file")
+    rollback_p.add_argument("--backup", help="Specific backup path (default: latest)")
+
+    # info
+    info_p = subparsers.add_parser("info", help="Show checkpoint details")
+    info_p.add_argument("--checkpoint", required=True, help="Path to checkpoint file")
+
+    # backups
+    backups_p = subparsers.add_parser("backups", help="List backup files")
+    backups_p.add_argument("--checkpoint", required=True, help="Path to checkpoint file")
+
+    # verify
+    subparsers.add_parser("verify", help="Verify installation")
+
+    args = parser.parse_args()
+
+    if args.command == "setup":
+        cmd_setup(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "upgrade":
+        cmd_upgrade(args)
+    elif args.command == "rollback":
+        cmd_rollback(args)
+    elif args.command == "info":
+        cmd_info(args)
+    elif args.command == "backups":
+        cmd_backups(args)
+    elif args.command == "verify":
+        cmd_verify(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

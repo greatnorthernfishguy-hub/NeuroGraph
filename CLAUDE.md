@@ -63,11 +63,27 @@ Build the base `neuro_foundation.py` implementing:
 - Project configs: OpenClaw, DSM, Consciousness (Addendum §3)
 - HypergraphAssociator: similarity synapses, structural links, cluster hyperedges
 
+### Phase 5: Deployment & Modular Setup -- COMPLETE
+- OpenClaw integration hook with singleton NeuroGraphMemory
+- SKILL.md with autoload configuration
+- feed-syl CLI tool for ingestion, status, and search
+- neurograph management CLI (setup wizard, upgrade, rollback, verify)
+- deploy.sh one-command deployment script
+- Checkpoint migration framework with versioned schema upgrades
+- Backup/rollback capability for checkpoint upgrades
+- Migration path: 0.1.0 → 0.2.0 → 0.2.5 → 0.3.0 → 0.3.5 → 0.4.0
+
 ## File Structure
 ```
 NeuroGraph/
 ├── neuro_foundation.py              # Core implementation (Phase 1 + 1.5 + 2 + 2.5 + 3 + 3.5)
 ├── universal_ingestor.py            # Phase 4: Universal Ingestor System
+├── openclaw_hook.py                 # Phase 5: OpenClaw integration singleton
+├── neurograph_migrate.py            # Phase 5: Checkpoint migration framework
+├── neurograph                       # Phase 5: neurograph management CLI
+├── feed-syl                         # Phase 5: Ingestion/status CLI tool
+├── deploy.sh                        # Phase 5: One-command deployment script
+├── SKILL.md                         # Phase 5: OpenClaw skill definition
 ├── tests/
 │   ├── __init__.py
 │   ├── test_snn.py                  # SNN dynamics tests (12)
@@ -78,7 +94,9 @@ NeuroGraph/
 │   ├── test_prediction.py           # Phase 3 predictive coding tests (38)
 │   ├── test_phase35.py              # Phase 3.5 prediction persistence tests (20)
 │   ├── test_ingestor.py             # Phase 4 universal ingestor tests (88)
-│   └── test_integration.py          # End-to-end tests (18)
+│   ├── test_integration.py          # End-to-end tests (18)
+│   ├── test_migration.py            # Phase 5: Migration framework tests (32)
+│   └── test_openclaw_hook.py        # Phase 5: OpenClaw hook tests (18)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
 │   ├── project_configs.py           # OpenClaw, DSM, Consciousness configs
@@ -238,6 +256,7 @@ PyPDF2>=3.0.0           # For PDF extraction (Phase 4)
 - [x] Phase 3: Predictive Coding
 - [x] Phase 3.5: Predictive State Persistence & Validation
 - [x] Phase 4: Universal Ingestor System
+- [x] Phase 5: Deployment & Modular Setup
 
 ## Changelog
 
@@ -574,3 +593,72 @@ PyPDF2>=3.0.0           # For PDF extraction (Phase 4)
 - `universal_ingestor.py`
 - `tests/test_ingestor.py`
 - `examples/ingest_code.py`, `examples/ingest_document.py`, `examples/ingest_multi_source.py`
+
+---
+
+### Phase 5: Deployment & Modular Setup (v0.5.0)
+**Commit:** Implement Phase 5: Deployment, OpenClaw integration, and migration framework
+
+**What was built:**
+1. **OpenClaw Integration Hook (`openclaw_hook.py`):**
+   - `NeuroGraphMemory` singleton class wrapping Graph + UniversalIngestor + SimpleVectorDB
+   - `get_instance()` / `reset_instance()` class methods for singleton lifecycle
+   - `on_message(text)`: ingest content, run STDP step, update probation, auto-save every N messages
+   - `recall(query, k, threshold)`: semantic similarity search over ingested knowledge
+   - `save()`: force checkpoint to disk
+   - `stats()`: telemetry dict with nodes, synapses, predictions, accuracy, etc.
+   - `ingest_file(path)`: auto-detect source type from extension, ingest file content
+   - `ingest_directory(directory, extensions, recursive)`: batch ingest matching files
+   - `step(n)`: run N SNN learning steps without ingestion
+   - OpenClaw-tuned SNN config: `learning_rate=0.02`, `tau=15.0`, fast novelty dampening
+
+2. **Checkpoint Migration Framework (`neurograph_migrate.py`):**
+   - Schema version registry: 0.1.0 → 0.2.0 → 0.2.5 → 0.3.0 → 0.3.5 → 0.4.0
+   - `get_checkpoint_version(path)`: detect schema version of any checkpoint file
+   - `get_checkpoint_info(path)`: detailed checkpoint metadata (version, counts, size)
+   - `plan_migration(from_version, target_version)`: compute migration path
+   - `migrate_data(data, target)`: in-memory migration with deep copy (original unchanged)
+   - `upgrade_checkpoint(path, target, backup, dry_run)`: file-based upgrade with backup
+   - `rollback_checkpoint(path, backup_path)`: restore from backup
+   - `list_backups(path)`: enumerate all backup files for a checkpoint
+   - 5 migration functions covering all schema transitions:
+     - 0.1.0→0.2.0: adds hyperedge engine fields (activation_count, pattern_completion, etc.)
+     - 0.2.0→0.2.5: adds predictive infrastructure (recent_activation_ema, archived HEs, etc.)
+     - 0.2.5→0.3.0: adds predictive coding (eligibility_trace, synapse metadata, etc.)
+     - 0.3.0→0.3.5: adds prediction persistence (active_predictions, outcomes, etc.)
+     - 0.3.5→0.4.0: version bump only (no schema changes for Universal Ingestor)
+
+3. **CLI Tools:**
+   - `feed-syl`: ingestion/status CLI (`--status`, `--text`, `--file`, `--dir`, `--workspace`, `--query`, `--save`, `--step`, `--upgrade`)
+   - `neurograph`: management CLI with subcommands (`setup`, `status`, `upgrade`, `rollback`, `info`, `backups`, `verify`)
+   - `neurograph setup`: interactive wizard — checks deps, tests graph/ingestor, configures workspace
+   - `neurograph verify`: installation health check with dependency status
+
+4. **Deployment Script (`deploy.sh`):**
+   - One-command installation: `./deploy.sh`
+   - Installs dependencies (sentence-transformers from source, CPU PyTorch, etc.)
+   - Deploys files to `~/.openclaw/skills/neurograph/`
+   - Installs `feed-syl` to `~/.local/bin/`
+   - Configures OpenClaw JSON (`openclaw.json` neurograph skill entry)
+   - Verification step: checks file presence, Python imports, embedding backend
+   - Flags: `--deps-only`, `--files-only`, `--uninstall`, `--verify`
+
+5. **Skill Definition (`SKILL.md`):**
+   - `autoload: true` for automatic OpenClaw integration
+   - Documents environment variables, capabilities, CLI usage
+
+**Key design decisions:**
+- Singleton pattern ensures one NeuroGraphMemory per process — prevents checkpoint contention
+- Migration uses deep copy to preserve original data, enabling safe rollback without file backup
+- Backup files use timestamp suffixes (`.backup-{unix_time}`) for deterministic ordering
+- `deploy.sh` uses `--break-system-packages` with fallback to standard pip — handles both bare-metal and virtualenv environments
+- `feed-syl` adds both script directory and skill directory to `sys.path` — works whether run from repo or installed location
+- Auto-save interval defaults to 10 messages — balances persistence safety with I/O overhead
+
+**Tests added (50):**
+- `test_migration.py` (32): version detection (4), migration planning (4), individual steps (5), full migration (4), file upgrade (5), backup/rollback (5), checkpoint info (2), Graph integration (3)
+- `test_openclaw_hook.py` (18): singleton (2), message ingestion (5), recall (2), auto-save (2), stats (2), persistence (1), file ingestion (3), step (1)
+
+**Files created:**
+- `openclaw_hook.py`, `neurograph_migrate.py`, `neurograph`, `feed-syl`, `deploy.sh`, `SKILL.md`
+- `tests/test_migration.py`, `tests/test_openclaw_hook.py`
