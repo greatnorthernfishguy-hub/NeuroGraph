@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -337,6 +338,36 @@ def _check_deps():
     return deps
 
 
+def cmd_patch(args):
+    """Patch deployed code files from repo."""
+    # Import the patch module from the same directory
+    patch_script = _script_dir / "neurograph-patch"
+    if not patch_script.exists():
+        print(f"Error: neurograph-patch not found at {patch_script}", file=sys.stderr)
+        sys.exit(1)
+
+    # Build the command
+    cmd = [sys.executable, str(patch_script)]
+    if args.rollback:
+        cmd.append("--rollback")
+    elif args.list_changes:
+        cmd.append("--list")
+        if args.files:
+            cmd.extend(["--files"] + args.files)
+    else:
+        if args.dry_run:
+            cmd.append("--dry-run")
+        if args.no_backup:
+            cmd.append("--no-backup")
+        if args.check_schema:
+            cmd.append("--check-schema")
+        if args.files:
+            cmd.extend(["--files"] + args.files)
+
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="neurograph",
@@ -373,6 +404,21 @@ def main():
     # verify
     subparsers.add_parser("verify", help="Verify installation")
 
+    # patch
+    patch_p = subparsers.add_parser("patch", help="Patch deployed code files")
+    patch_p.add_argument("--list", action="store_true", dest="list_changes",
+                         help="Show which files differ (read-only)")
+    patch_p.add_argument("--dry-run", action="store_true",
+                         help="Preview without writing")
+    patch_p.add_argument("--files", nargs="+", metavar="FILE",
+                         help="Patch only specific files")
+    patch_p.add_argument("--no-backup", action="store_true",
+                         help="Skip per-file backups")
+    patch_p.add_argument("--rollback", action="store_true",
+                         help="Undo the most recent patch")
+    patch_p.add_argument("--check-schema", action="store_true",
+                         help="Check if checkpoint needs schema upgrade")
+
     args = parser.parse_args()
 
     if args.command == "setup":
@@ -389,6 +435,8 @@ def main():
         cmd_backups(args)
     elif args.command == "verify":
         cmd_verify(args)
+    elif args.command == "patch":
+        cmd_patch(args)
     else:
         parser.print_help()
 
