@@ -186,3 +186,73 @@ class TestStep:
         ng.on_message("Create some nodes first")
         results = ng.step(n=5)
         assert len(results) == 5
+
+
+class TestMemoryLogging:
+    def test_memory_dir_created(self, workspace):
+        """Memory directory is created on initialization."""
+        ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        memory_dir = Path(workspace) / "memory"
+        assert memory_dir.is_dir()
+
+    def test_embedding_status_event_on_init(self, workspace):
+        """Embedding status event is written on initialization."""
+        ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        events_path = Path(workspace) / "memory" / "events.jsonl"
+        assert events_path.exists()
+        import json
+        lines = events_path.read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines]
+        # First event should be embedding_status
+        assert events[0]["event"] == "embedding_status"
+        assert "model_available" in events[0]["data"]
+
+    def test_ingestion_event_on_message(self, workspace):
+        """Ingestion events are written to memory/ on on_message."""
+        ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        ng.on_message("Memory logging test message with enough content")
+        events_path = Path(workspace) / "memory" / "events.jsonl"
+        import json
+        lines = events_path.read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines]
+        ingestion_events = [e for e in events if e["event"] == "ingestion"]
+        assert len(ingestion_events) >= 1
+        assert ingestion_events[0]["data"]["status"] == "ingested"
+
+    def test_stats_includes_memory_dir(self, workspace):
+        """Stats include memory_dir path."""
+        ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        stats = ng.stats()
+        assert "memory_dir" in stats
+        assert "memory" in stats["memory_dir"]
+
+    def test_stats_includes_embedding_status(self, workspace):
+        """Stats include embedding backend status."""
+        ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        stats = ng.stats()
+        assert "embedding" in stats
+        assert "model_available" in stats["embedding"]
+        assert "device_requested" in stats["embedding"]
+
+
+class TestEmbeddingDeviceConfig:
+    def test_default_device_is_auto(self, workspace):
+        """Default embedding device is 'auto'."""
+        ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        status = ng.ingestor.embedder.status
+        assert status["device_requested"] == "auto"
+
+    def test_explicit_cpu_device_via_config(self, workspace):
+        """Embedding device can be set via config."""
+        ng = NeuroGraphMemory.get_instance(
+            workspace_dir=workspace, config={"embedding_device": "cpu"}
+        )
+        status = ng.ingestor.embedder.status
+        assert status["device_requested"] == "cpu"
+
+    def test_env_var_device_override(self, workspace, monkeypatch):
+        """NEUROGRAPH_EMBEDDING_DEVICE env var overrides default."""
+        monkeypatch.setenv("NEUROGRAPH_EMBEDDING_DEVICE", "cpu")
+        ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        status = ng.ingestor.embedder.status
+        assert status["device_requested"] == "cpu"

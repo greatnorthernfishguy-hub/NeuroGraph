@@ -493,6 +493,74 @@ class TestEmbeddingEngine(unittest.TestCase):
         self.assertEqual(embedded[0].model_name, "hash_fallback")
 
 
+class TestEmbeddingDeviceControl(unittest.TestCase):
+    """Tests for device control and graceful degradation."""
+
+    def test_default_device_is_auto(self):
+        """Default device is 'auto'."""
+        engine = EmbeddingEngine({"use_model": False})
+        self.assertEqual(engine.device, "auto")
+
+    def test_explicit_cpu_device(self):
+        """Explicit CPU device is accepted."""
+        engine = EmbeddingEngine({"use_model": False, "device": "cpu"})
+        self.assertEqual(engine.device, "cpu")
+
+    def test_explicit_cuda_device_falls_back(self):
+        """CUDA device gracefully falls back when CUDA unavailable."""
+        # In test environment, CUDA is typically not available
+        engine = EmbeddingEngine({"use_model": False, "device": "cuda"})
+        self.assertEqual(engine.device, "cuda")
+        # Engine should still work (hash fallback since use_model=False)
+        vec = engine.embed_text("test")
+        self.assertEqual(vec.shape[0], 768)
+
+    def test_status_property(self):
+        """Status property returns diagnostic info."""
+        engine = EmbeddingEngine({"use_model": False, "dimension": 64})
+        status = engine.status
+        self.assertFalse(status["model_available"])
+        self.assertEqual(status["model_name"], "hash_fallback")
+        self.assertEqual(status["device_requested"], "auto")
+        self.assertIsNone(status["device_active"])
+        self.assertEqual(status["dimension"], 64)
+        self.assertEqual(status["cache_entries"], 0)
+
+    def test_status_after_embedding(self):
+        """Status reflects cache entries after embedding."""
+        engine = EmbeddingEngine({"use_model": False, "dimension": 64})
+        engine.embed_text("test")
+        self.assertEqual(engine.status["cache_entries"], 1)
+
+    def test_fallback_reason_when_model_disabled(self):
+        """No fallback reason when model intentionally disabled."""
+        engine = EmbeddingEngine({"use_model": False})
+        self.assertIsNone(engine.status["fallback_reason"])
+
+    def test_fallback_reason_when_import_fails(self):
+        """Fallback reason set when sentence-transformers unavailable."""
+        # use_model=True but sentence-transformers is not installed in test env
+        engine = EmbeddingEngine({"use_model": True})
+        if not engine._model_available:
+            self.assertIsNotNone(engine.status["fallback_reason"])
+
+    def test_encode_batch_runtime_fallback(self):
+        """If model encode raises at runtime, falls back to hash."""
+        engine = EmbeddingEngine({"use_model": False, "dimension": 64})
+        # Simulate a loaded model that fails at encode time
+        engine._model_available = True
+
+        class FaultyModel:
+            def encode(self, texts, **kwargs):
+                raise RuntimeError("CUDA out of memory")
+
+        engine._model = FaultyModel()
+        # Should not raise — falls back to hash embeddings
+        vecs = engine._encode_batch(["hello", "world"])
+        self.assertEqual(len(vecs), 2)
+        self.assertEqual(vecs[0].shape[0], 64)
+
+
 # ---------------------------------------------------------------------------
 # Novelty Dampening Tests
 # ---------------------------------------------------------------------------

@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""
+neurograph-patch — Selective code patching for deployed NeuroGraph
+
+Surgically updates only changed files in a deployed NeuroGraph installation,
+with per-file backups, post-patch validation, and automatic rollback on failure.
+
+Never touches checkpoints or memory data.
+
+Usage:
+    neurograph-patch                          Patch all changed files
+    neurograph-patch --list                   Show what differs (read-only)
+    neurograph-patch --dry-run                Preview without writing
+    neurograph-patch --files FILE [FILE...]   Patch only specific files
+    neurograph-patch --no-backup              Skip per-file backups
+    neurograph-patch --rollback               Undo last patch from manifest
+    neurograph-patch --check-schema           Check if checkpoint needs upgrade
+
+Environment:
+    NEUROGRAPH_SKILL_DIR      Override skill directory (default: ~/.openclaw/skills/neurograph)
+    NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/.openclaw/neurograph)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Deployment manifest — mirrors deploy.sh lines 87-105
+# ---------------------------------------------------------------------------
+
+# (source_basename, list_of_relative_deploy_targets, is_executable)
+# Targets are relative to SKILL_DIR unless prefixed with special keys.
+MANIFEST = [
+    ("neuro_foundation.py",   ["skill:neuro_foundation.py"], False),
+    ("universal_ingestor.py",  ["skill:universal_ingestor.py"], False),
+    ("openclaw_hook.py",       ["skill:openclaw_hook.py", "skill:scripts/openclaw_hook.py"], False),
+    ("neurograph_migrate.py",  ["skill:neurograph_migrate.py"], False),
+    ("SKILL.md",               ["skill:SKILL.md"], False),
+    ("feed-syl",               ["bin:feed-syl", "home:feed-syl"], True),
+]
+
+
+def resolve_paths() -> Dict[str, Path]:
+    """Resolve all deployment paths from environment or defaults."""
+    repo_dir = Path(__file__).resolve().parent
+    skill_dir = Path(
+        os.environ.get("NEUROGRAPH_SKILL_DIR", "~/.openclaw/skills/neurograph")
+    ).expanduser()
+    workspace_dir = Path(
+        os.environ.get("NEUROGRAPH_WORKSPACE_DIR", "~/.openclaw/neurograph")
+    ).expanduser()
+    bin_dir = Path.home() / ".local" / "bin"
+    home_dir = Path.home()
+
+    return {
+        "repo": repo_dir,
+        "skill": skill_dir,
+        "workspace": workspace_dir,
+        "bin": bin_dir,
+        "home": home_dir,
+    }
+
+
+def expand_target(target: str, paths: Dict[str, Path]) -> Path:
+    """Expand a manifest target like 'skill:foo.py' to a full path."""
+    prefix, relpath = target.split(":", 1)
+    return paths[prefix] / relpath
+
+
+def file_hash(path: Path) -> Optional[str]:
+    """SHA-256 hash of file contents, or None if file doesn't exist."""
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Diff detection
+# ---------------------------------------------------------------------------
+
+def detect_changes(
+    paths: Dict[str, Path],
+    filter_files: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Compare repo files against deployed files.
+
+    Returns a list of dicts with keys:
+        name, source, targets, status (CHANGED/IDENTICAL/MISSING),
+        source_hash, target_hash, executable
+    """
+    results = []
+    for name, targets, executable in MANIFEST:
+        if filter_files and name not in filter_files:
+            continue
+
+        source = paths["repo"] / name
+        if not source.exists():
+            continue  # skip files not in repo (shouldn't happen)
+
+        src_hash = file_hash(source)
+        expanded = [expand_target(t, paths) for t in targets]
+
+        # Use the first target for status determination
+        tgt_hash = file_hash(expanded[0])
+        if tgt_hash is None:
+            status = "MISSING"
+        elif tgt_hash == src_hash:
+            status = "IDENTICAL"
+        else:
+            status = "CHANGED"
+
+        results.append({
+            "name": name,
+            "source": source,
+            "targets": expanded,
+            "status": status,
+            "source_hash": src_hash,
+            "target_hash": tgt_hash,
+            "executable": executable,
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+
+def backup_file(path: Path, timestamp: int) -> Optional[str]:
+    """Create a timestamped backup. Returns backup path or None."""
+    if not path.exists():
+        return None
+    backup_path = str(path) + f".backup-{timestamp}"
+    shutil.copy2(str(path), backup_path)
+    return backup_path
+
+
+# ---------------------------------------------------------------------------
+# Patch manifest (for rollback)
+# ---------------------------------------------------------------------------
+
+def write_manifest(
+    workspace: Path,
+    results: List[Dict[str, Any]],
+    timestamp: int,
+    repo_commit: Optional[str] = None,
+) -> str:
+    """Write a patch manifest to workspace/patch_history/."""
+    history_dir = workspace / "patch_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = history_dir / f"patch-{timestamp}.json"
+
+    manifest = {
+        "timestamp": timestamp,
+        "repo_commit": repo_commit,
+        "files_patched": results,
+    }
+
+    # Convert Path objects to strings for JSON
+    def serialize(obj: Any) -> Any:
+        if isinstance(obj, Path):
+            return str(obj)
+        raise TypeError(f"Not serializable: {type(obj)}")
+
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, default=serialize)
+
+    return str(manifest_path)
+
+
+def load_latest_manifest(workspace: Path) -> Optional[Dict[str, Any]]:
+    """Load the most recent patch manifest."""
+    history_dir = workspace / "patch_history"
+    if not history_dir.exists():
+        return None
+    manifests = sorted(history_dir.glob("patch-*.json"))
+    if not manifests:
+        return None
+    with open(manifests[-1]) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_patch(skill_dir: Path) -> Tuple[bool, str]:
+    """Run import and instantiation tests against patched files.
+
+    Returns (success, message).
+    """
+    test_code = f"""
+import sys
+sys.path.insert(0, {str(skill_dir)!r})
+try:
+    from neuro_foundation import Graph
+    from universal_ingestor import UniversalIngestor, SimpleVectorDB, EmbeddingEngine
+    from openclaw_hook import NeuroGraphMemory
+    g = Graph()
+    g.step()
+    eng = EmbeddingEngine({{"use_model": False}})
+    eng.embed_text("validation test")
+    print("VALID")
+except Exception as e:
+    print(f"FAIL: {{e}}")
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", test_code],
+            capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout.strip()
+        if "VALID" in output:
+            return True, "Imports and instantiation OK"
+        else:
+            msg = output or result.stderr.strip()
+            return False, msg
+    except subprocess.TimeoutExpired:
+        return False, "Validation timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# Schema check
+# ---------------------------------------------------------------------------
+
+def check_schema(workspace: Path, skill_dir: Path) -> Optional[str]:
+    """Check if checkpoint needs a schema upgrade. Returns message or None."""
+    checkpoint = workspace / "checkpoints" / "main.msgpack"
+    if not checkpoint.exists():
+        return None
+
+    try:
+        sys.path.insert(0, str(skill_dir))
+        from neurograph_migrate import get_checkpoint_version, CURRENT_VERSION
+        version = get_checkpoint_version(str(checkpoint))
+        if version == CURRENT_VERSION:
+            return f"Checkpoint schema OK (v{version})"
+        else:
+            return (
+                f"Checkpoint at v{version}, code expects v{CURRENT_VERSION}. "
+                f"Run: neurograph upgrade --checkpoint {checkpoint}"
+            )
+    except Exception as e:
+        return f"Schema check failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+def get_repo_commit(repo_dir: Path) -> Optional[str]:
+    """Get current git commit hash, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=str(repo_dir), timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Core operations
+# ---------------------------------------------------------------------------
+
+def run_list(paths: Dict[str, Path], filter_files: Optional[List[str]] = None) -> int:
+    """List changed files. Returns exit code."""
+    changes = detect_changes(paths, filter_files)
+    if not changes:
+        print("No files in manifest to check.")
+        return 0
+
+    changed = [c for c in changes if c["status"] == "CHANGED"]
+    missing = [c for c in changes if c["status"] == "MISSING"]
+    identical = [c for c in changes if c["status"] == "IDENTICAL"]
+
+    print("NeuroGraph Patch Status")
+    print("=" * 50)
+    for c in changes:
+        marker = {"CHANGED": "*", "MISSING": "+", "IDENTICAL": " "}[c["status"]]
+        ntargets = len(c["targets"])
+        suffix = f" ({ntargets} targets)" if ntargets > 1 else ""
+        print(f"  [{marker}] {c['name']}{suffix}  [{c['status']}]")
+
+    print()
+    print(f"  {len(changed)} changed, {len(missing)} missing, {len(identical)} identical")
+    if changed or missing:
+        print(f"\n  Run 'neurograph-patch' to apply changes.")
+    else:
+        print(f"\n  Nothing to patch.")
+    return 0
+
+
+def run_patch(
+    paths: Dict[str, Path],
+    filter_files: Optional[List[str]] = None,
+    dry_run: bool = False,
+    no_backup: bool = False,
+    do_check_schema: bool = False,
+) -> int:
+    """Execute the patch. Returns exit code."""
+    changes = detect_changes(paths, filter_files)
+    to_patch = [c for c in changes if c["status"] in ("CHANGED", "MISSING")]
+
+    if not to_patch:
+        print("Nothing to patch — all files are identical.")
+        return 0
+
+    timestamp = int(time.time())
+    repo_commit = get_repo_commit(paths["repo"])
+
+    print("NeuroGraph Patch")
+    print("=" * 50)
+    if dry_run:
+        print("  *** DRY RUN — no files will be modified ***")
+        print()
+
+    # Phase 1: Backup
+    backup_map: Dict[str, List[str]] = {}  # name -> list of backup paths
+    if not no_backup and not dry_run:
+        for entry in to_patch:
+            backups = []
+            for target in entry["targets"]:
+                bp = backup_file(target, timestamp)
+                if bp:
+                    backups.append(bp)
+            backup_map[entry["name"]] = backups
+
+    # Phase 2: Copy
+    patched_results = []
+    for entry in to_patch:
+        if not dry_run:
+            for target in entry["targets"]:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(entry["source"]), str(target))
+                if entry["executable"]:
+                    target.chmod(target.stat().st_mode | 0o111)
+
+        ntargets = len(entry["targets"])
+        suffix = f" -> {ntargets} targets" if ntargets > 1 else ""
+        action = "WOULD PATCH" if dry_run else "PATCHED"
+        print(f"  [{action}] {entry['name']}{suffix}")
+
+        patched_results.append({
+            "name": entry["name"],
+            "source_hash": entry["source_hash"],
+            "previous_hash": entry["target_hash"],
+            "targets": entry["targets"],
+            "backups": backup_map.get(entry["name"], []),
+        })
+
+    # Phase 3: Validate (not for dry run)
+    if not dry_run:
+        print()
+        valid, msg = validate_patch(paths["skill"])
+        if valid:
+            print(f"  Validation: PASSED ({msg})")
+        else:
+            print(f"  Validation: FAILED — {msg}")
+            print("  Rolling back...")
+            for entry in patched_results:
+                for bp in entry["backups"]:
+                    # Restore from backup
+                    original = bp.rsplit(".backup-", 1)[0]
+                    shutil.copy2(bp, original)
+                    print(f"    Restored {Path(original).name}")
+            print("  Patch rolled back due to validation failure.")
+            return 1
+
+        # Phase 4: Write manifest
+        manifest_path = write_manifest(
+            paths["workspace"], patched_results, timestamp, repo_commit
+        )
+
+        # Phase 5: Schema check
+        schema_msg = None
+        if do_check_schema:
+            schema_msg = check_schema(paths["workspace"], paths["skill"])
+
+        # Summary
+        identical = [c for c in changes if c["status"] == "IDENTICAL"]
+        print()
+        print(f"  Files patched:   {len(to_patch)}")
+        print(f"  Files unchanged: {len(identical)}")
+        if not no_backup:
+            print(f"  Backups:         *.backup-{timestamp}")
+        print(f"  Manifest:        {manifest_path}")
+        if schema_msg:
+            print(f"  Schema:          {schema_msg}")
+        if repo_commit:
+            print(f"  Repo commit:     {repo_commit}")
+    else:
+        print(f"\n  {len(to_patch)} file(s) would be patched.")
+
+    return 0
+
+
+def run_rollback(paths: Dict[str, Path]) -> int:
+    """Rollback the most recent patch using its manifest."""
+    manifest = load_latest_manifest(paths["workspace"])
+    if not manifest:
+        print("No patch manifest found. Nothing to roll back.")
+        return 1
+
+    ts = manifest["timestamp"]
+    print(f"Rolling back patch from {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}")
+
+    restored = 0
+    for entry in manifest.get("files_patched", []):
+        for bp in entry.get("backups", []):
+            bp_path = Path(bp)
+            if bp_path.exists():
+                original = bp.rsplit(".backup-", 1)[0]
+                shutil.copy2(bp, original)
+                print(f"  Restored {Path(original).name} from backup")
+                restored += 1
+            else:
+                print(f"  Backup not found: {bp}")
+
+    if restored > 0:
+        # Validate after rollback
+        valid, msg = validate_patch(paths["skill"])
+        status = "PASSED" if valid else f"FAILED ({msg})"
+        print(f"\n  Restored {restored} file(s). Validation: {status}")
+    else:
+        print("\n  No backup files found to restore.")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="neurograph-patch",
+        description="Selective code patching for deployed NeuroGraph",
+    )
+    parser.add_argument(
+        "--list", action="store_true", dest="list_changes",
+        help="Show which files differ (read-only)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview patch without writing any files",
+    )
+    parser.add_argument(
+        "--files", nargs="+", metavar="FILE",
+        help="Patch only these specific files (basenames)",
+    )
+    parser.add_argument(
+        "--no-backup", action="store_true",
+        help="Skip creating per-file backups",
+    )
+    parser.add_argument(
+        "--rollback", action="store_true",
+        help="Undo the most recent patch",
+    )
+    parser.add_argument(
+        "--check-schema", action="store_true",
+        help="After patching, check if checkpoint needs schema upgrade",
+    )
+
+    args = parser.parse_args()
+    paths = resolve_paths()
+
+    # Verify deployment exists (except for --list which can show MISSING)
+    if not args.list_changes and not args.rollback:
+        if not paths["skill"].exists():
+            print(
+                f"NeuroGraph not deployed at {paths['skill']}.\n"
+                f"Run './deploy.sh' first, then use neurograph-patch for updates."
+            )
+            return 1
+
+    if args.rollback:
+        return run_rollback(paths)
+    elif args.list_changes:
+        return run_list(paths, args.files)
+    else:
+        return run_patch(
+            paths,
+            filter_files=args.files,
+            dry_run=args.dry_run,
+            no_backup=args.no_backup,
+            do_check_schema=args.check_schema,
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
