@@ -311,6 +311,10 @@ class NeuroGraphMemory:
 
         return self.on_message(content, source_type=source_type)
 
+    def ingest_url(self, url: str) -> Dict[str, Any]:
+        """Fetch and ingest content from a URL."""
+        return self.on_message(url, source_type=SourceType.URL)
+
     def ingest_directory(
         self,
         directory: str,
