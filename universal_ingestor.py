@@ -17,6 +17,7 @@ Reference: NeuroGraph Foundation PRD Addendum v1.1-1.2 (Universal Ingestor).
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -849,6 +850,11 @@ class EmbeddingEngine:
     Falls back to a deterministic hash-based embedding for environments
     without the model installed (testing, lightweight deployments).
 
+    Supports explicit device control via the ``device`` config key:
+    - ``"auto"`` (default): let sentence-transformers pick the best device
+    - ``"cpu"``: force CPU inference (safe for CUDA-less environments)
+    - ``"cuda"``: request GPU; falls back to CPU if CUDA is unavailable
+
     Caching avoids recomputation of identical text.
 
     Args:
@@ -857,7 +863,10 @@ class EmbeddingEngine:
             - dimension: Embedding dimension (default 768)
             - cache_size: Max cache entries (default 10000)
             - use_model: Force model loading (default True, falls back if unavailable)
+            - device: Device selection — "auto", "cpu", or "cuda" (default "auto")
     """
+
+    _logger = logging.getLogger("neurograph.embedding")
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
@@ -865,23 +874,80 @@ class EmbeddingEngine:
         self.dimension = self.config.get("dimension", 768)
         self.cache_size = self.config.get("cache_size", 10000)
         self.use_model = self.config.get("use_model", True)
+        self.device = self.config.get("device", "auto")
         self._model = None
         self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._model_available = False
+        self._active_device: Optional[str] = None  # actual device after resolution
+        self._fallback_reason: Optional[str] = None
 
         if self.use_model:
             self._try_load_model()
 
+    def _resolve_device(self) -> str:
+        """Resolve the requested device to an actual device string.
+
+        Handles graceful degradation: if 'cuda' is requested but unavailable,
+        falls back to 'cpu' with a warning rather than hard-failing.
+
+        Returns:
+            Device string suitable for SentenceTransformer (or None for auto).
+        """
+        if self.device == "auto":
+            return None  # let sentence-transformers auto-detect
+        if self.device == "cuda":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return "cuda"
+                else:
+                    self._logger.warning(
+                        "CUDA requested but not available (torch.cuda.is_available()=False). "
+                        "Falling back to CPU."
+                    )
+                    return "cpu"
+            except ImportError:
+                self._logger.warning(
+                    "CUDA requested but PyTorch not installed. Falling back to CPU."
+                )
+                return "cpu"
+        return self.device  # "cpu" or any explicit device string
+
     def _try_load_model(self) -> None:
-        """Attempt to load the sentence-transformers model."""
+        """Attempt to load the sentence-transformers model.
+
+        Logs the outcome so silent failures are visible to operators.
+        """
         try:
             from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self.model_name)
+            resolved_device = self._resolve_device()
+            if resolved_device is not None:
+                self._model = SentenceTransformer(self.model_name, device=resolved_device)
+            else:
+                self._model = SentenceTransformer(self.model_name)
             self._model_available = True
+            self._active_device = str(self._model.device)
             # Update dimension from loaded model
             self.dimension = self._model.get_sentence_embedding_dimension()
-        except (ImportError, Exception):
+            self._logger.info(
+                "Loaded embedding model '%s' on device '%s'",
+                self.model_name, self._active_device,
+            )
+        except ImportError:
             self._model_available = False
+            self._fallback_reason = "sentence-transformers not installed"
+            self._logger.warning(
+                "sentence-transformers not installed. "
+                "Using deterministic hash-based fallback embeddings."
+            )
+        except Exception as exc:
+            self._model_available = False
+            self._fallback_reason = str(exc)
+            self._logger.warning(
+                "Failed to load embedding model '%s': %s. "
+                "Using deterministic hash-based fallback embeddings.",
+                self.model_name, exc,
+            )
 
     def embed(self, chunks: List[Chunk]) -> List[EmbeddedChunk]:
         """Embed a list of chunks, using cache where possible.
@@ -941,10 +1007,23 @@ class EmbeddingEngine:
         return vec
 
     def _encode_batch(self, texts: List[str]) -> List[np.ndarray]:
-        """Encode a batch of texts into vectors."""
+        """Encode a batch of texts into vectors.
+
+        If the model is loaded but encoding fails at runtime (e.g. CUDA
+        out-of-memory, driver error), falls back to hash embeddings for this
+        batch rather than crashing the entire pipeline.
+        """
         if self._model_available and self._model is not None:
-            embeddings = self._model.encode(texts, normalize_embeddings=True)
-            return [np.array(e) for e in embeddings]
+            try:
+                embeddings = self._model.encode(texts, normalize_embeddings=True)
+                return [np.array(e) for e in embeddings]
+            except Exception as exc:
+                self._logger.warning(
+                    "Model encode failed (%s). Falling back to hash embeddings "
+                    "for this batch of %d texts.",
+                    exc, len(texts),
+                )
+                return [self._hash_embed(t) for t in texts]
         else:
             return [self._hash_embed(t) for t in texts]
 
@@ -977,6 +1056,23 @@ class EmbeddingEngine:
     def cache_hits(self) -> int:
         """Number of entries currently in cache."""
         return len(self._cache)
+
+    @property
+    def status(self) -> Dict[str, Any]:
+        """Return embedding engine status for diagnostics.
+
+        Useful for OpenClaw and CLI tools to verify the embedding backend
+        without running a full ingestion cycle.
+        """
+        return {
+            "model_available": self._model_available,
+            "model_name": self.model_name if self._model_available else "hash_fallback",
+            "device_requested": self.device,
+            "device_active": self._active_device,
+            "dimension": self.dimension,
+            "cache_entries": len(self._cache),
+            "fallback_reason": self._fallback_reason,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1435,6 +1531,7 @@ OPENCLAW_INGESTOR_CONFIG = {
     "embedding": {
         "model_name": "all-mpnet-base-v2",
         "use_model": True,
+        "device": "auto",
     },
     "registration": {
         "novelty_dampening": 0.3,

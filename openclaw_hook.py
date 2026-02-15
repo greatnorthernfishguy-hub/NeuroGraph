@@ -5,6 +5,10 @@ Singleton NeuroGraphMemory class that integrates NeuroGraph's cognitive
 architecture into the OpenClaw AI assistant framework. Provides automatic
 ingestion, STDP learning, semantic recall, and cross-session persistence.
 
+Writes structured operational logs to ``{workspace}/memory/`` so that
+OpenClaw's memory system can parse ingestion events, learning progress,
+and recall results without relying on stdout.
+
 Usage:
     from openclaw_hook import NeuroGraphMemory
 
@@ -16,6 +20,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -99,6 +104,9 @@ class NeuroGraphMemory:
         self._checkpoint_dir = self._workspace_dir / "checkpoints"
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        self._memory_dir = self._workspace_dir / "memory"
+        self._memory_dir.mkdir(parents=True, exist_ok=True)
+
         self._checkpoint_path = self._checkpoint_dir / "main.msgpack"
 
         # Merge user config over OpenClaw defaults
@@ -121,11 +129,23 @@ class NeuroGraphMemory:
         # Vector DB for semantic search
         self.vector_db = SimpleVectorDB()
 
-        # Ingestor with OpenClaw project config
+        # Ingestor with OpenClaw project config, respecting embedding_device
         ingestor_config = get_ingestor_config("openclaw")
+
+        # Allow callers / env to override the embedding device mode
+        embedding_device = (
+            (config or {}).get("embedding_device")
+            or os.environ.get("NEUROGRAPH_EMBEDDING_DEVICE")
+            or "auto"
+        )
+        ingestor_config["embedding"]["device"] = embedding_device
+
         self.ingestor = UniversalIngestor(
             self.graph, self.vector_db, config=ingestor_config
         )
+
+        # Log embedding backend status to memory/ for OpenClaw to parse
+        self._write_memory_event("embedding_status", self.ingestor.embedder.status)
 
         self._message_count = 0
         self.auto_save_interval = 10
@@ -145,6 +165,29 @@ class NeuroGraphMemory:
     def reset_instance(cls) -> None:
         """Reset the singleton (useful for testing)."""
         cls._instance = None
+
+    # ------------------------------------------------------------------
+    # Memory logging (structured output for OpenClaw)
+    # ------------------------------------------------------------------
+
+    def _write_memory_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Write a structured event to the memory/ directory.
+
+        Each event is a JSON line appended to ``memory/events.jsonl``.
+        OpenClaw's memory system can tail this file for ingestion/learning
+        events instead of parsing stdout.
+        """
+        event = {
+            "timestamp": time.time(),
+            "event": event_type,
+            "data": data,
+        }
+        try:
+            events_path = self._memory_dir / "events.jsonl"
+            with open(events_path, "a") as f:
+                f.write(json.dumps(event, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to write memory event: %s", exc)
 
     # ------------------------------------------------------------------
     # Core API
@@ -178,7 +221,7 @@ class NeuroGraphMemory:
         if self._message_count % self.auto_save_interval == 0:
             self.save()
 
-        return {
+        event_data = {
             "status": "ingested",
             "nodes_created": len(result.nodes_created),
             "synapses_created": len(result.synapses_created),
@@ -188,6 +231,11 @@ class NeuroGraphMemory:
             "graduated": len(graduated),
             "message_count": self._message_count,
         }
+
+        # Write to memory/ for OpenClaw consumption
+        self._write_memory_event("ingestion", event_data)
+
+        return event_data
 
     def recall(self, query: str, k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
         """Semantic similarity search over ingested knowledge.
@@ -234,6 +282,8 @@ class NeuroGraphMemory:
             "sprouted": tel.total_sprouted,
             "vector_db_count": self.vector_db.count(),
             "checkpoint": str(self._checkpoint_path),
+            "memory_dir": str(self._memory_dir),
+            "embedding": self.ingestor.embedder.status,
             "message_count": self._message_count,
         }
 
