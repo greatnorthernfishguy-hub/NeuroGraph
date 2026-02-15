@@ -69,6 +69,11 @@ install_deps() {
         "beautifulsoup4>=4.12.0" "PyPDF2>=3.0.0" || \
     warn "Optional deps (beautifulsoup4, PyPDF2) failed — URL/PDF extraction unavailable"
 
+    # watchdog for GUI file watcher
+    pip3 install --break-system-packages --no-cache-dir "watchdog>=3.0.0" 2>/dev/null || \
+    pip3 install --no-cache-dir "watchdog>=3.0.0" || \
+    warn "watchdog install failed — GUI file watcher will use polling fallback"
+
     info "Dependencies installed"
 }
 
@@ -95,6 +100,37 @@ deploy_files() {
 
     # Migration framework
     cp "$SCRIPT_DIR/neurograph_migrate.py" "$SKILL_DIR/"
+
+    # Management GUI
+    if [ -f "$SCRIPT_DIR/neurograph_gui.py" ]; then
+        cp "$SCRIPT_DIR/neurograph_gui.py" "$SKILL_DIR/"
+        info "GUI deployed to $SKILL_DIR/neurograph_gui.py"
+
+        # Desktop entry (Linux application launcher)
+        DESKTOP_DIR="$HOME/.local/share/applications"
+        mkdir -p "$DESKTOP_DIR"
+        cat > "$DESKTOP_DIR/neurograph.desktop" << DESKTOPEOF
+[Desktop Entry]
+Type=Application
+Name=NeuroGraph Manager
+GenericName=Cognitive Architecture Manager
+Comment=Manage NeuroGraph updates, ingestion, and monitoring
+Exec=python3 $SKILL_DIR/neurograph_gui.py
+Icon=preferences-system
+Categories=Utility;Development;Science;
+Terminal=false
+StartupWMClass=neurograph
+Keywords=neurograph;ai;memory;ingestion;snn;
+DESKTOPEOF
+        chmod +x "$DESKTOP_DIR/neurograph.desktop"
+        info "Desktop entry installed at $DESKTOP_DIR/neurograph.desktop"
+
+        # GUI data directories
+        mkdir -p "$HOME/.neurograph/inbox"
+        mkdir -p "$HOME/.neurograph/ingested"
+        mkdir -p "$HOME/.neurograph/logs"
+        info "GUI directories created at ~/.neurograph/"
+    fi
 
     # CLI tool
     cp "$SCRIPT_DIR/feed-syl" "$BIN_DIR/feed-syl"
@@ -197,6 +233,13 @@ print('imports_ok')
         ok=false
     fi
 
+    # Check GUI
+    if [ -f "$SKILL_DIR/neurograph_gui.py" ]; then
+        info "GUI: installed"
+    else
+        warn "GUI: not found (optional)"
+    fi
+
     # Check embedding backend
     if python3 -c "
 from sentence_transformers import SentenceTransformer
@@ -225,7 +268,9 @@ uninstall() {
     rm -f "$BIN_DIR/feed-syl"
     rm -f "$HOME/feed-syl"
     rm -rf "$SKILL_DIR"
+    rm -f "$HOME/.local/share/applications/neurograph.desktop"
     info "Files removed (checkpoints preserved in $CHECKPOINT_DIR)"
+    info "Note: ~/.neurograph/ (inbox/ingested data) preserved"
 }
 
 # ------------------------------------------------------------------

@@ -73,6 +73,16 @@ Build the base `neuro_foundation.py` implementing:
 - Backup/rollback capability for checkpoint upgrades
 - Migration path: 0.1.0 → 0.2.0 → 0.2.5 → 0.3.0 → 0.3.5 → 0.4.0
 
+### Phase 5.5: Management GUI -- COMPLETE
+- tkinter-based desktop GUI (`neurograph_gui.py`) with four tabs
+- **Status tab**: live telemetry dashboard from NeuroGraphMemory.stats()
+- **Ingestion tab**: watchdog file watcher + manual ingest, auto-moves to ingested/
+- **Updates tab**: git-based update mechanism with neurograph-patch integration
+- **Logs tab**: viewer for events.jsonl and gui.log
+- Linux `.desktop` file for application launcher
+- `~/.neurograph/` directory: inbox, ingested, repo clone, logs, config
+- Non-destructive updates: never touches checkpoints or learned knowledge
+
 ## File Structure
 ```
 NeuroGraph/
@@ -84,6 +94,8 @@ NeuroGraph/
 ├── feed-syl                         # Phase 5: Ingestion/status CLI tool
 ├── deploy.sh                        # Phase 5: One-command deployment script
 ├── SKILL.md                         # Phase 5: OpenClaw skill definition
+├── neurograph_gui.py                # Phase 5.5: tkinter management GUI
+├── neurograph.desktop               # Phase 5.5: Linux desktop entry
 ├── tests/
 │   ├── __init__.py
 │   ├── test_snn.py                  # SNN dynamics tests (12)
@@ -96,7 +108,8 @@ NeuroGraph/
 │   ├── test_ingestor.py             # Phase 4 universal ingestor tests (88)
 │   ├── test_integration.py          # End-to-end tests (18)
 │   ├── test_migration.py            # Phase 5: Migration framework tests (32)
-│   └── test_openclaw_hook.py        # Phase 5: OpenClaw hook tests (18)
+│   ├── test_openclaw_hook.py        # Phase 5: OpenClaw hook tests (18)
+│   └── test_gui.py                  # Phase 5.5: GUI non-GUI logic tests (25)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
 │   ├── project_configs.py           # OpenClaw, DSM, Consciousness configs
@@ -236,6 +249,7 @@ msgpack>=1.0.0          # For efficient serialization
 sentence-transformers>=2.2.0  # For embedding generation (Phase 4)
 beautifulsoup4>=4.12.0  # For URL/HTML extraction (Phase 4)
 PyPDF2>=3.0.0           # For PDF extraction (Phase 4)
+watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 ```
 
 ## Notes for Claude Code
@@ -257,6 +271,7 @@ PyPDF2>=3.0.0           # For PDF extraction (Phase 4)
 - [x] Phase 3.5: Predictive State Persistence & Validation
 - [x] Phase 4: Universal Ingestor System
 - [x] Phase 5: Deployment & Modular Setup
+- [x] Phase 5.5: Management GUI
 
 ## Changelog
 
@@ -662,3 +677,69 @@ PyPDF2>=3.0.0           # For PDF extraction (Phase 4)
 **Files created:**
 - `openclaw_hook.py`, `neurograph_migrate.py`, `neurograph`, `feed-syl`, `deploy.sh`, `SKILL.md`
 - `tests/test_migration.py`, `tests/test_openclaw_hook.py`
+
+---
+
+### Phase 5.5: Management GUI (v0.5.5)
+**Commit:** Implement Phase 5.5: NeuroGraph Management GUI
+
+**What was built:**
+1. **tkinter Management GUI (`neurograph_gui.py`):**
+   - `GUIConfig`: manages `~/.neurograph/config.json` with defaults, directory creation
+   - `FileWatcher`: watchdog-based inbox monitor with stability checking (waits for file write completion), polling fallback when watchdog unavailable, ignore patterns for hidden/temp/unsupported files
+   - `GitUpdater`: git clone/fetch/pull with neurograph-patch integration for deployment, all operations on daemon threads, auto-rollback on validation failure
+   - `IngestionManager`: wraps NeuroGraphMemory.ingest_file() with post-ingestion file movement to `ingested/YYYY-MM-DD/`, name collision handling, lazy NeuroGraphMemory initialization
+   - `GUIMessageQueue`: thread-safe bridge (queue.Queue + root.after polling) for background thread → tkinter main loop communication
+   - `NeuroGraphGUI`: main window with ttk.Notebook, four tabs:
+     - **Status tab**: live telemetry grid (nodes, synapses, predictions, accuracy, etc.), auto-refresh every 5s, Save Checkpoint button
+     - **Ingestion tab**: inbox path display, watcher ON/OFF toggle, inbox file Listbox, Ingest All/Selected/Add Files buttons, ingestion history Listbox
+     - **Updates tab**: version and install info, Check for Updates button, Update Now button, scrolling update log
+     - **Logs tab**: source selector (events.jsonl / gui.log), formatted event display, Refresh/Clear buttons
+   - Settings dialog for editing all config values
+   - Menu bar with File (Settings, Quit) and Help (About)
+
+2. **Linux Desktop Entry (`neurograph.desktop`):**
+   - Standard freedesktop.org `.desktop` file
+   - Installed to `~/.local/share/applications/` for application launcher visibility
+   - Exec path resolved at deploy time to point to installed `neurograph_gui.py`
+
+3. **Directory structure (`~/.neurograph/`):**
+   - `inbox/` — drop files here for auto-ingestion by watchdog
+   - `ingested/YYYY-MM-DD/` — successfully ingested files moved here
+   - `repo/` — shallow git clone for update mechanism
+   - `logs/gui.log` — GUI activity log
+   - `config.json` — persistent GUI settings
+   - Intentionally separate from `~/.openclaw/neurograph/` to prevent GUI data from mixing with learned knowledge
+
+**Key design decisions:**
+- Non-GUI classes (`GUIConfig`, `FileWatcher`, `GitUpdater`, `IngestionManager`) defined before tkinter imports — testable in headless environments without a display server
+- watchdog import guarded with try/except; polling fallback (2s interval) when unavailable — GUI works without the dependency, just less responsive
+- Lazy `NeuroGraphMemory` initialization — avoids loading embeddings/checkpoint at startup if user only wants to check for updates
+- GitUpdater imports neurograph-patch from the pulled repo (not installed copy) using `importlib.machinery.SourceFileLoader` — ensures latest MANIFEST and migration logic are always used for deployment
+- All background operations (git, ingestion, file watching) run on daemon threads — GUI never blocks
+- File stability checking: records file size, re-checks after 0.5s; only fires ingestion callback when size unchanged — handles partial writes, downloads-in-progress
+- Post-ingestion files moved to dated subdirectories with automatic name collision resolution (append `_1`, `_2`, etc.)
+- `~/.neurograph/` never deleted on uninstall — user's inbox and ingested files are preserved
+
+**Deployment integration:**
+- `deploy.sh` updated: installs `neurograph_gui.py` to skill dir, generates `.desktop` file with resolved Exec path, creates `~/.neurograph/` directories, installs watchdog dependency
+- `neurograph-patch` MANIFEST updated: includes `neurograph_gui.py` and `neurograph.desktop` — future patches automatically deploy GUI updates
+- `requirements.txt` updated: added `watchdog>=3.0.0`
+
+**Tests added (25):**
+- `test_gui.py`:
+  - GUIConfig: defaults (1), custom default (1), set/get (1), save creates file (1), load existing (1), corrupt JSON fallback (1), ensure directories (1), save then reload (1)
+  - FileWatcher: hidden files (1), temp files (1), unsupported extensions (1), supported extensions (1), no extension (1), start/stop lifecycle (1), stable file detection (1), hidden file ignored (1)
+  - GitUpdater: clone when missing (1), skip if exists (1), get local commit (1), check no updates (1), check has updates (1), check error (1)
+  - IngestionManager: move creates date dir (1), name collision (1), multiple collisions (1), success worker (1), error worker (1), batch ingest (1)
+  - Integration: file drop pipeline (1)
+
+**Files created:**
+- `neurograph_gui.py`, `neurograph.desktop`
+- `tests/test_gui.py`
+
+**Files modified:**
+- `neurograph-patch` (MANIFEST entries for GUI files)
+- `deploy.sh` (GUI deployment, watchdog dep, .desktop installation)
+- `requirements.txt` (watchdog>=3.0.0)
+- `CLAUDE.md` (Phase 5.5 documentation)
