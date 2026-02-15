@@ -289,9 +289,9 @@ class NeuroGraphMemory:
 
     def ingest_file(self, path: str, source_type: Optional[SourceType] = None) -> Dict[str, Any]:
         """Ingest a file from disk."""
-        p = Path(path).expanduser()
+        p = Path(path).expanduser().resolve()
         if not p.exists():
-            return {"status": "error", "reason": f"File not found: {path}"}
+            return {"status": "error", "reason": f"File not found: {p}"}
 
         content = p.read_text(errors="replace")
 
@@ -310,6 +310,10 @@ class NeuroGraphMemory:
             source_type = type_map.get(ext, SourceType.TEXT)
 
         return self.on_message(content, source_type=source_type)
+
+    def ingest_url(self, url: str) -> Dict[str, Any]:
+        """Fetch and ingest content from a URL."""
+        return self.on_message(url, source_type=SourceType.URL)
 
     def ingest_directory(
         self,

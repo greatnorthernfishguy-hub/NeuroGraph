@@ -77,6 +77,18 @@ def cmd_file(args):
           f"{result['synapses_created']} synapses")
 
 
+def cmd_url(args):
+    """Ingest content from a URL."""
+    ng = get_memory()
+    result = ng.ingest_url(args.url)
+    if result.get("status") == "error":
+        print(f"Error: {result['reason']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Ingested {args.url}: {result['nodes_created']} nodes, "
+          f"{result['synapses_created']} synapses, "
+          f"{result['chunks']} chunks")
+
+
 def cmd_dir(args):
     """Ingest a directory."""
     ng = get_memory()
@@ -160,6 +172,7 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--status", action="store_true", help="Show graph statistics")
     group.add_argument("--text", type=str, help="Ingest text content")
+    group.add_argument("--url", type=str, help="Fetch and ingest a URL")
     group.add_argument("--file", type=str, help="Ingest a single file")
     group.add_argument("--dir", type=str, help="Ingest a directory")
     group.add_argument("--workspace", action="store_true", help="Ingest OpenClaw workspace")
@@ -181,6 +194,8 @@ def main():
         cmd_status(args)
     elif args.text:
         cmd_text(args)
+    elif args.url:
+        cmd_url(args)
     elif args.file:
         cmd_file(args)
     elif args.dir:
