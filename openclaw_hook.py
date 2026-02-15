@@ -289,9 +289,9 @@ class NeuroGraphMemory:
 
     def ingest_file(self, path: str, source_type: Optional[SourceType] = None) -> Dict[str, Any]:
         """Ingest a file from disk."""
-        p = Path(path).expanduser()
+        p = Path(path).expanduser().resolve()
         if not p.exists():
-            return {"status": "error", "reason": f"File not found: {path}"}
+            return {"status": "error", "reason": f"File not found: {p}"}
 
         content = p.read_text(errors="replace")
 
