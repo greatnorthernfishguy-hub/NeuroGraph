@@ -129,13 +129,41 @@ class GUIConfig:
     def set(self, key: str, value: Any) -> None:
         self._data[key] = value
 
-    def ensure_directories(self) -> None:
-        """Create inbox, ingested, repo, and logs dirs if missing."""
+    def ensure_directories(self) -> List[str]:
+        """Create inbox, ingested, repo, and logs dirs if missing.
+
+        Returns a list of directories that were newly created.
+        Prints to stderr on failure so the user sees feedback even
+        before the GUI logger is initialised.
+        """
+        created: List[str] = []
         for key in ("inbox_path", "ingested_path", "repo_path"):
-            Path(self.get(key)).mkdir(parents=True, exist_ok=True)
+            dir_path = Path(self.get(key))
+            try:
+                if not dir_path.exists():
+                    dir_path.mkdir(parents=True, exist_ok=True)
+                    created.append(str(dir_path))
+                    print(f"[neurograph] Created directory: {dir_path}",
+                          file=sys.stderr)
+                elif not dir_path.is_dir():
+                    print(f"[neurograph] WARNING: {dir_path} exists but is "
+                          f"not a directory", file=sys.stderr)
+            except OSError as exc:
+                print(f"[neurograph] ERROR creating {dir_path}: {exc}",
+                      file=sys.stderr)
         log_path = self.get("log_path")
         if log_path:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            log_dir = Path(log_path).parent
+            try:
+                if not log_dir.exists():
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    created.append(str(log_dir))
+                    print(f"[neurograph] Created directory: {log_dir}",
+                          file=sys.stderr)
+            except OSError as exc:
+                print(f"[neurograph] ERROR creating {log_dir}: {exc}",
+                      file=sys.stderr)
+        return created
 
 
 # ---------------------------------------------------------------------------
@@ -704,12 +732,23 @@ class NeuroGraphGUI:
         self.root.minsize(750, 520)
 
         self.config = GUIConfig()
-        self.config.ensure_directories()
+        created = self.config.ensure_directories()
 
         self.msg_queue = GUIMessageQueue(root)
 
         # Set up file-based logging
         self._setup_logging()
+
+        # Log directory creation results
+        if created:
+            _logger.info("Created directories at startup: %s", created)
+        # Verify critical directories exist
+        for key, label in (("inbox_path", "Inbox"), ("ingested_path", "Ingested")):
+            d = Path(self.config.get(key))
+            if not d.is_dir():
+                _logger.error("%s directory missing: %s", label, d)
+                print(f"[neurograph] ERROR: {label} directory not found: {d}",
+                      file=sys.stderr)
 
         # Core managers
         self.ingestion_mgr = IngestionManager(
@@ -1442,7 +1481,15 @@ def main() -> None:
         sys.exit(1)
 
     root = _make_root()
-    NeuroGraphGUI(root)
+    try:
+        NeuroGraphGUI(root)
+    except Exception as exc:
+        print(f"[neurograph] Fatal startup error: {exc}", file=sys.stderr)
+        try:
+            messagebox.showerror("NeuroGraph Startup Error", str(exc))
+        except Exception:
+            pass
+        sys.exit(1)
     root.mainloop()
 
 
