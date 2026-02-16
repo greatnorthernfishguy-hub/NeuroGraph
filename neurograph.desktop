@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NeuroGraph Manager
+GenericName=Cognitive Architecture Manager
+Comment=Manage NeuroGraph updates, ingestion, and monitoring
+Exec=python3 ~/.openclaw/skills/neurograph/neurograph_gui.py
+Icon=preferences-system
+Categories=Utility;Development;Science;
+Terminal=false
+StartupWMClass=neurograph
+Keywords=neurograph;ai;memory;ingestion;snn;

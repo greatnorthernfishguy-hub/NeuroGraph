@@ -47,6 +47,12 @@ MANIFEST = [
     ("neurograph_migrate.py",  ["skill:neurograph_migrate.py"], False),
     ("SKILL.md",               ["skill:SKILL.md"], False),
     ("feed-syl",               ["bin:feed-syl", "home:feed-syl"], True),
+    # Phase 5.5: Management GUI
+    ("neurograph_gui.py",      ["skill:neurograph_gui.py"], False),
+    ("neurograph.desktop",     ["home:.local/share/applications/neurograph.desktop"], False),
+    # NG-Lite: Lightweight learning substrate + bridge
+    ("ng_lite.py",             ["skill:ng_lite.py"], False),
+    ("ng_bridge.py",           ["skill:ng_bridge.py"], False),
 ]
 
 
