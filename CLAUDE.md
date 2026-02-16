@@ -83,6 +83,18 @@ Build the base `neuro_foundation.py` implementing:
 - `~/.neurograph/` directory: inbox, ingested, repo clone, logs, config
 - Non-destructive updates: never touches checkpoints or learned knowledge
 
+### Phase 6: NG-Lite Canonical Source & Bridge -- COMPLETE
+- `ng_lite.py` — canonical lightweight learning substrate for E-T Systems modules
+- Single-file vendorable design: numpy + stdlib only, no heavy dependencies
+- Hebbian learning with soft saturation, bounded [0.0, 1.0] weights
+- Pattern recognition via embedding hashing + cosine similarity
+- Novelty detection, LRU pruning, JSON persistence
+- `NGBridge` abstract interface for tier upgrades (Tier 1→2→3)
+- `ng_bridge.py` — `NGSaaSBridge` Tier 3 implementation connecting NG-Lite to full NeuroGraph
+- Weight normalization: NG-Lite [0,1] ↔ NeuroGraph [0,max_weight]
+- Node ID translation: incremental ("n_1") ↔ UUID
+- Format bridge: JSON (ng_lite) ↔ msgpack (neuro_foundation)
+
 ## File Structure
 ```
 NeuroGraph/
@@ -96,6 +108,8 @@ NeuroGraph/
 ├── SKILL.md                         # Phase 5: OpenClaw skill definition
 ├── neurograph_gui.py                # Phase 5.5: tkinter management GUI
 ├── neurograph.desktop               # Phase 5.5: Linux desktop entry
+├── ng_lite.py                       # Phase 6: Lightweight learning substrate (vendorable)
+├── ng_bridge.py                     # Phase 6: NGSaaSBridge (Tier 3 bridge to full NeuroGraph)
 ├── tests/
 │   ├── __init__.py
 │   ├── test_snn.py                  # SNN dynamics tests (12)
@@ -109,7 +123,8 @@ NeuroGraph/
 │   ├── test_integration.py          # End-to-end tests (18)
 │   ├── test_migration.py            # Phase 5: Migration framework tests (32)
 │   ├── test_openclaw_hook.py        # Phase 5: OpenClaw hook tests (18)
-│   └── test_gui.py                  # Phase 5.5: GUI non-GUI logic tests (25)
+│   ├── test_gui.py                  # Phase 5.5: GUI non-GUI logic tests (25)
+│   └── test_ng_lite.py              # Phase 6: NG-Lite + NGSaaSBridge tests (52)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
 │   ├── project_configs.py           # OpenClaw, DSM, Consciousness configs
@@ -272,6 +287,7 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 - [x] Phase 4: Universal Ingestor System
 - [x] Phase 5: Deployment & Modular Setup
 - [x] Phase 5.5: Management GUI
+- [x] Phase 6: NG-Lite Canonical Source & Bridge
 
 ## Changelog
 
@@ -743,3 +759,67 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 - `deploy.sh` (GUI deployment, watchdog dep, .desktop installation)
 - `requirements.txt` (watchdog>=3.0.0)
 - `CLAUDE.md` (Phase 5.5 documentation)
+
+---
+
+### Phase 6: NG-Lite Canonical Source & Bridge (v0.6.0)
+**Commit:** Add canonical NG-Lite learning substrate and NGSaaSBridge
+
+**What was built:**
+1. **NG-Lite (`ng_lite.py`) — Canonical lightweight learning substrate:**
+   - Single-file vendorable design: numpy + stdlib only
+   - `NGLiteNode`: pattern nodes with embedding hash, activation tracking, LRU metadata
+   - `NGLiteSynapse`: weighted connections with Hebbian learning, success/failure counts
+   - `NGLite` core class with full API:
+     - `find_or_create_node(embedding)`: hash-first lookup, cosine similarity fallback, LRU pruning
+     - `record_outcome(embedding, target_id, success)`: Hebbian weight update with soft saturation
+     - `get_recommendations(embedding, top_k)`: ranked target retrieval by weight
+     - `detect_novelty(embedding)`: cosine distance from known patterns
+     - `save(filepath)` / `load(filepath)`: JSON persistence
+   - `NGBridge` abstract interface for tier upgrades (Tier 1→2→3)
+   - Bridge-first API: all methods check bridge before falling back to local
+   - Bounded memory: configurable max_nodes (1000), max_synapses (5000) with LRU/weight pruning
+   - Embedding hashing: SHA-256 of first 128 dims for O(1) exact-match lookup
+
+2. **NGSaaSBridge (`ng_bridge.py`) — Tier 3 bridge implementation:**
+   - Connects NG-Lite to full NeuroGraph Foundation via NeuroGraphMemory
+   - `record_outcome()`: forwards outcomes as structured messages for SNN ingestion
+   - `get_recommendations()`: semantic recall from full graph, extracts target IDs from content
+   - `detect_novelty()`: cross-module novelty via full graph's vector DB
+   - `sync_state()`: periodic state sync — ingests high-weight (>0.7) synapses into full SNN
+   - Weight normalization: `[0,1] * max_weight ↔ [0,max_weight] / max_weight`
+   - Disconnect/reconnect with automatic fallback to local learning
+
+**Key design decisions:**
+- **JSON for ng_lite, msgpack for neuro_foundation** — deliberate. NG-Lite state is small (≤1000 nodes), human-readable JSON aids debugging, and json is stdlib (no dependency). Full NeuroGraph has 20+ fields per node with spike histories and numpy arrays where msgpack's binary handling is 3-5x faster
+- **Weight range [0,1] for ng_lite, [0,5] for full** — ng_lite's normalized range is simpler for Hebbian learning with soft saturation. Bridge handles translation. The ranges are equivalent under linear mapping
+- **Incremental node IDs ("n_1") for ng_lite, UUIDs for full** — compactness vs global uniqueness. Bridge maintains mapping tables
+- **Synapse keys as tuples, serialized as "src|tgt"** — JSON doesn't support tuple keys, pipe delimiter chosen for unambiguous splitting since node IDs never contain pipes
+- **Bridge-first API pattern** — every method (recommendations, novelty, outcome) tries the bridge first, falls back to local on failure or disconnection. This makes tier transitions transparent to the consuming module
+
+**Compatibility with The-Inference-Difference:**
+- This is the canonical source for ng_lite.py (as declared in its docstring)
+- Byte-for-byte compatible with the vendored copy in The-Inference-Difference
+- router.py consumption pattern: `_classification_to_embedding()` → `record_outcome()` / `get_recommendations()` — works unchanged
+- NGSaaSBridge is the upgrade path from Tier 1 (standalone) to Tier 3 (full SNN)
+
+**Tests added (52):**
+- `test_ng_lite.py`:
+  - Node management: create (1), find existing (1), similar reuse (1), novel creates new (1), capacity pruning (1), incremental IDs (1)
+  - Learning: success strengthens (1), failure weakens (1), approaches 1.0 (1), approaches 0.0 (1), bounded [0,1] (1), independent targets (1), success/failure counts (1), synapse pruning (1)
+  - Recommendations: empty (1), sorted by weight (1), top_k limit (1)
+  - Novelty: empty graph (1), known pattern (1), different pattern (1), similar pattern (1)
+  - Persistence: save/load roundtrip (1), weight preservation (1), valid JSON (1), synapse key format (1), forward compatible (1), counters preserved (1)
+  - Bridge interface: record outcome (1), recommendations (1), novelty (1), sync (1), disconnected fallback (1), connect/disconnect (1), failure fallback (1)
+  - Stats: initial (1), after learning (1), memory estimate (1)
+  - NGSaaSBridge: connected (1), disconnect/reconnect (1), record outcome (1), disconnected (1), recommendations (1), no results (1), novelty (1), empty graph novelty (1), sync state (1), sync disconnected (1), weight normalization (1), extract target (1)
+  - Integration: full pipeline (1), bridge disconnect fallback (1)
+  - Edge cases: zero vector (1), single dim (1), concurrent targets (1), empty module ID (1), version string (1)
+
+**Files created:**
+- `ng_lite.py`, `ng_bridge.py`
+- `tests/test_ng_lite.py`
+
+**Files modified:**
+- `neurograph-patch` (MANIFEST entries for ng_lite.py and ng_bridge.py)
+- `CLAUDE.md` (Phase 6 documentation)
