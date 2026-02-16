@@ -21,8 +21,10 @@ import logging
 import math
 import os
 import re
+import tempfile
 import textwrap
 import uuid
+import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -50,6 +52,7 @@ class SourceType(Enum):
     CODE = auto()
     MARKDOWN = auto()
     TEXT = auto()
+    ZIP = auto()
 
 
 class ChunkStrategy(Enum):
@@ -467,6 +470,115 @@ class PDFExtractor(BaseExtractor):
             raise ValueError(f"Failed to extract PDF '{path}': {e}")
 
 
+class ZipExtractor(BaseExtractor):
+    """ZIP archive extractor that recursively processes contained files.
+
+    Extracts a ZIP archive to a temporary directory, then routes each
+    supported file inside through the appropriate extractor.  Unsupported
+    files (binaries, images, etc.) are silently skipped.
+
+    The combined output is a single ``ExtractedContent`` whose ``raw_text``
+    is the concatenation of all extracted file texts, separated by markers.
+    ``structure`` entries record each file's path, type, and offset within
+    the combined text.
+
+    Uses only stdlib ``zipfile`` — no extra dependencies.
+    """
+
+    # Extensions we know how to handle (mirrors SUPPORTED_EXTENSIONS + code types)
+    _SUPPORTED_EXTS = {
+        ".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp", ".rb", ".php",
+        ".md", ".markdown", ".txt", ".html", ".htm", ".pdf",
+    }
+
+    def extract(self, source: str, **kwargs: Any) -> ExtractedContent:
+        """Extract contents of a ZIP file.
+
+        Args:
+            source: Path to a ``.zip`` file on disk.
+
+        Returns:
+            ExtractedContent with combined text from all supported files.
+        """
+        if not zipfile.is_zipfile(source):
+            raise ValueError(f"Not a valid ZIP archive: {source}")
+
+        combined_texts: List[str] = []
+        structure: List[Dict[str, Any]] = []
+        file_count = 0
+        skipped_count = 0
+
+        with tempfile.TemporaryDirectory(prefix="neurograph_zip_") as tmp_dir:
+            with zipfile.ZipFile(source, "r") as zf:
+                # Security: skip entries with absolute paths or parent traversal
+                safe_members = [
+                    m for m in zf.namelist()
+                    if not os.path.isabs(m) and ".." not in m.split("/")
+                ]
+                zf.extractall(tmp_dir, members=safe_members)
+
+            # Walk the extracted tree and process each supported file
+            for root, _dirs, files in os.walk(tmp_dir):
+                for fname in sorted(files):
+                    fpath = os.path.join(root, fname)
+                    ext = os.path.splitext(fname)[1].lower()
+                    rel_path = os.path.relpath(fpath, tmp_dir)
+
+                    if ext not in self._SUPPORTED_EXTS:
+                        skipped_count += 1
+                        continue
+
+                    try:
+                        file_text = self._extract_single(fpath, ext)
+                    except Exception:
+                        skipped_count += 1
+                        continue
+
+                    if not file_text.strip():
+                        continue
+
+                    marker = f"--- {rel_path} ---"
+                    structure.append({
+                        "type": "zip_member",
+                        "path": rel_path,
+                        "extension": ext,
+                        "offset": sum(len(t) for t in combined_texts),
+                        "length": len(file_text),
+                    })
+                    combined_texts.append(f"{marker}\n{file_text}")
+                    file_count += 1
+
+        raw_text = "\n\n".join(combined_texts)
+
+        return ExtractedContent(
+            raw_text=raw_text,
+            metadata={
+                "source_type": "zip",
+                "path": source,
+                "files_extracted": file_count,
+                "files_skipped": skipped_count,
+                "length": len(raw_text),
+            },
+            structure=structure,
+            source_type=SourceType.ZIP,
+        )
+
+    def _extract_single(self, fpath: str, ext: str) -> str:
+        """Extract text from a single file within the archive."""
+        if ext == ".pdf":
+            try:
+                from PyPDF2 import PdfReader
+                reader = PdfReader(fpath)
+                return "\n\n".join(
+                    page.extract_text() or "" for page in reader.pages
+                )
+            except Exception:
+                return ""
+        # All other supported types: read as text
+        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+
 class ExtractorRouter:
     """Routes source input to the appropriate extractor (PRD Addendum §2).
 
@@ -482,6 +594,7 @@ class ExtractorRouter:
             SourceType.CODE: CodeExtractor(),
             SourceType.URL: URLExtractor(),
             SourceType.PDF: PDFExtractor(),
+            SourceType.ZIP: ZipExtractor(),
         }
 
     def detect_source_type(self, source: str) -> SourceType:
@@ -493,6 +606,8 @@ class ExtractorRouter:
         # File path detection
         if os.path.isfile(source):
             ext = os.path.splitext(source)[1].lower()
+            if ext == ".zip":
+                return SourceType.ZIP
             if ext == ".pdf":
                 return SourceType.PDF
             if ext in (".py", ".js", ".ts", ".java", ".go", ".rs", ".c",
@@ -523,9 +638,9 @@ class ExtractorRouter:
 
         extractor = self._extractors.get(source_type, self._extractors[SourceType.TEXT])
 
-        # For file paths, read the file first (except PDF which handles its own reading)
+        # For file paths, read the file first (except PDF/ZIP which handle their own reading)
         if (os.path.isfile(source)
-                and source_type not in (SourceType.PDF, SourceType.URL)):
+                and source_type not in (SourceType.PDF, SourceType.URL, SourceType.ZIP)):
             with open(source, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             result = extractor.extract(content, **kwargs)

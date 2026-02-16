@@ -293,8 +293,6 @@ class NeuroGraphMemory:
         if not p.exists():
             return {"status": "error", "reason": f"File not found: {p}"}
 
-        content = p.read_text(errors="replace")
-
         # Auto-detect source type from extension
         if source_type is None:
             ext = p.suffix.lower()
@@ -306,9 +304,15 @@ class NeuroGraphMemory:
                 ".html": SourceType.URL,
                 ".htm": SourceType.URL,
                 ".pdf": SourceType.PDF,
+                ".zip": SourceType.ZIP,
             }
             source_type = type_map.get(ext, SourceType.TEXT)
 
+        # Binary formats (PDF, ZIP) must be passed as file paths, not text content
+        if source_type in (SourceType.PDF, SourceType.ZIP):
+            return self.on_message(str(p), source_type=source_type)
+
+        content = p.read_text(errors="replace")
         return self.on_message(content, source_type=source_type)
 
     def ingest_url(self, url: str) -> Dict[str, Any]:
