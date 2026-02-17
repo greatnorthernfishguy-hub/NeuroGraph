@@ -98,6 +98,17 @@ deploy_files() {
     cp "$SCRIPT_DIR/openclaw_hook.py" "$SKILL_DIR/scripts/"
     cp "$SCRIPT_DIR/SKILL.md" "$SKILL_DIR/"
 
+    # NG-Lite ecosystem files
+    cp "$SCRIPT_DIR/ng_lite.py" "$SKILL_DIR/"
+    cp "$SCRIPT_DIR/ng_bridge.py" "$SKILL_DIR/"
+    cp "$SCRIPT_DIR/ng_peer_bridge.py" "$SKILL_DIR/"
+
+    # ET Module Manager
+    mkdir -p "$SKILL_DIR/et_modules"
+    cp "$SCRIPT_DIR/et_modules/__init__.py" "$SKILL_DIR/et_modules/"
+    cp "$SCRIPT_DIR/et_modules/manager.py" "$SKILL_DIR/et_modules/"
+    cp "$SCRIPT_DIR/et_module.json" "$SKILL_DIR/"
+
     # Migration framework
     cp "$SCRIPT_DIR/neurograph_migrate.py" "$SKILL_DIR/"
 
@@ -193,6 +204,43 @@ JSONEOF
         info "Created OpenClaw configuration"
     fi
 
+    # --- ET Module Manager registration ---
+    ET_MODULES_DIR="${ET_MODULES_DIR:-$HOME/.et_modules}"
+    mkdir -p "$ET_MODULES_DIR/shared_learning"
+
+    python3 -c "
+import json, time
+
+registry_path = '$ET_MODULES_DIR/registry.json'
+try:
+    with open(registry_path, 'r') as f:
+        registry = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    registry = {'modules': {}}
+
+registry['modules']['neurograph'] = {
+    'module_id': 'neurograph',
+    'display_name': 'NeuroGraph Foundation',
+    'version': '0.6.0',
+    'install_path': '$SKILL_DIR',
+    'git_remote': 'https://github.com/greatnorthernfishguy-hub/NeuroGraph.git',
+    'git_branch': 'main',
+    'entry_point': 'openclaw_hook.py',
+    'ng_lite_version': '1.0.0',
+    'dependencies': [],
+    'service_name': '',
+    'api_port': 0,
+    'registered_at': time.time(),
+}
+registry['last_updated'] = time.time()
+
+with open(registry_path, 'w') as f:
+    json.dump(registry, f, indent=2)
+
+print('registered')
+" 2>/dev/null && info "Registered with ET Module Manager at $ET_MODULES_DIR" || \
+    warn "ET Module Manager registration skipped (non-critical)"
+
     info "Files deployed to $SKILL_DIR"
     info "CLI tool installed at $BIN_DIR/feed-syl"
 }
@@ -271,6 +319,7 @@ uninstall() {
     rm -f "$HOME/.local/share/applications/neurograph.desktop"
     info "Files removed (checkpoints preserved in $CHECKPOINT_DIR)"
     info "Note: ~/.neurograph/ (inbox/ingested data) preserved"
+    info "Note: ~/.et_modules/ (shared learning data) preserved"
 }
 
 # ------------------------------------------------------------------
