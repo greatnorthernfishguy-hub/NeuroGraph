@@ -494,8 +494,23 @@ class GitUpdater:
         core_files = [
             "neuro_foundation.py", "universal_ingestor.py",
             "openclaw_hook.py", "neurograph_migrate.py", "neurograph_gui.py",
+            "ng_lite.py", "ng_bridge.py", "ng_peer_bridge.py",
+            "et_module.json",
+        ]
+        # Subdirectory files (source -> relative target)
+        subdir_files = [
+            ("et_modules/__init__.py", "et_modules/__init__.py"),
+            ("et_modules/manager.py", "et_modules/manager.py"),
         ]
         patched = 0
+        for src_rel, dst_rel in subdir_files:
+            src = self._repo_path / src_rel
+            dst = self._skill_dir / dst_rel
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+                patched += 1
+                self._on_status(f"  Copied {src_rel}")
         for name in core_files:
             src = self._repo_path / name
             dst = self._skill_dir / name

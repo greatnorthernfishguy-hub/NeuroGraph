@@ -50,9 +50,14 @@ MANIFEST = [
     # Phase 5.5: Management GUI
     ("neurograph_gui.py",      ["skill:neurograph_gui.py"], False),
     ("neurograph.desktop",     ["home:.local/share/applications/neurograph.desktop"], False),
-    # NG-Lite: Lightweight learning substrate + bridge
+    # Phase 6: NG-Lite canonical source + Tier 3 bridge
     ("ng_lite.py",             ["skill:ng_lite.py"], False),
     ("ng_bridge.py",           ["skill:ng_bridge.py"], False),
+    # Phase 7: ET Module Manager + Tier 2 peer bridge
+    ("ng_peer_bridge.py",      ["skill:ng_peer_bridge.py"], False),
+    ("et_module.json",         ["skill:et_module.json"], False),
+    ("et_modules/__init__.py", ["skill:et_modules/__init__.py"], False),
+    ("et_modules/manager.py",  ["skill:et_modules/manager.py"], False),
 ]
 
 
