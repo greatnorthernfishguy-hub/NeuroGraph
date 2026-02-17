@@ -5,6 +5,16 @@ Singleton NeuroGraphMemory class that integrates NeuroGraph's cognitive
 architecture into the OpenClaw AI assistant framework. Provides automatic
 ingestion, STDP learning, semantic recall, and cross-session persistence.
 
+NeuroGraph acts as the Tier 3 SNN backend for the E-T Systems ecosystem.
+When peer modules (TrollGuard, The-Inference-Difference, Cricket) are
+co-located on the same host, NeuroGraphMemory:
+  - Writes learning events to the shared learning directory so peers
+    can absorb patterns via NGPeerBridge (Tier 2)
+  - Provides the full SNN substrate that peers upgrade to via
+    NGSaaSBridge (Tier 3)
+  - Participates in the ET Module Manager for unified discovery,
+    status reporting, and coordinated updates
+
 Writes structured operational logs to ``{workspace}/memory/`` so that
 OpenClaw's memory system can parse ingestion events, learning progress,
 and recall results without relying on stdout.
@@ -16,6 +26,23 @@ Usage:
     ng.on_message("User said something interesting about recursion")
     context = ng.recall("recursion")
     print(ng.stats())
+
+# ---- Changelog ----
+# [2026-02-17] Claude (Opus 4.6) — ET Module Manager integration.
+#   What: Added NGPeerBridge connection, shared learning event writing,
+#         ET Module Manager registration, peer module discovery, and
+#         Tier 3 upgrade offering via get_peer_modules().
+#   Why:  NeuroGraph is the Tier 3 SNN backend for all E-T Systems
+#         modules.  This integration enables automatic cross-module
+#         learning: when NeuroGraph ingests or learns, it writes events
+#         to the shared directory so sibling modules benefit.
+#   Settings: peer_bridge_enabled defaults to True, sync_interval=50
+#         (more frequent than default 100 because NeuroGraph processes
+#         more events), shared_dir=~/.et_modules/shared_learning/.
+#   How:  NGPeerBridge initialized in __init__ (guarded by try/except
+#         for graceful degradation).  on_message() writes learning
+#         events after ingestion.  stats() includes peer bridge status.
+# -------------------
 """
 
 from __future__ import annotations
@@ -150,6 +177,29 @@ class NeuroGraphMemory:
         self._message_count = 0
         self.auto_save_interval = 10
 
+        # --- ET Module Manager: Peer bridge for cross-module learning ---
+        # NeuroGraph is the Tier 3 backend.  We also participate as a
+        # Tier 2 peer so sibling modules can absorb our learning events
+        # from the shared directory even without a direct SaaS connection.
+        self._peer_bridge = None
+        peer_config = (config or {}).get("peer_bridge", {})
+        if peer_config.get("enabled", True):
+            try:
+                from ng_peer_bridge import NGPeerBridge
+                self._peer_bridge = NGPeerBridge(
+                    module_id="neurograph",
+                    shared_dir=peer_config.get("shared_dir"),
+                    sync_interval=peer_config.get("sync_interval", 50),
+                    relevance_threshold=peer_config.get(
+                        "relevance_threshold", 0.3
+                    ),
+                )
+                logger.info("NGPeerBridge connected for cross-module learning")
+            except Exception as exc:
+                logger.info(
+                    "NGPeerBridge not available (standalone mode): %s", exc
+                )
+
     @classmethod
     def get_instance(
         cls,
@@ -235,7 +285,75 @@ class NeuroGraphMemory:
         # Write to memory/ for OpenClaw consumption
         self._write_memory_event("ingestion", event_data)
 
+        # Write learning event to shared directory for peer modules.
+        # This is how sibling modules (TrollGuard, TID, etc.) absorb
+        # NeuroGraph's learning without a direct SaaS connection.
+        self._write_peer_learning_event(text, result, step_result)
+
         return event_data
+
+    def _write_peer_learning_event(
+        self, text: str, result: Any, step_result: Any
+    ) -> None:
+        """Write a learning event to the shared peer directory.
+
+        Called after each ingestion so sibling modules can absorb
+        NeuroGraph's patterns via NGPeerBridge.  Uses the ingestor's
+        embedding engine to generate the event embedding.
+        """
+        if self._peer_bridge is None:
+            return
+
+        try:
+            import numpy as np
+
+            # Embed the ingested text for cross-module similarity matching
+            embedding = self.ingestor.embedder.embed_text(text)
+
+            # Record as a peer learning event
+            self._peer_bridge.record_outcome(
+                embedding=embedding,
+                target_id=f"ingestion_{self._message_count}",
+                success=True,
+                module_id="neurograph",
+                metadata={
+                    "nodes_created": len(result.nodes_created),
+                    "fired": len(step_result.fired_node_ids),
+                    "text_preview": text[:200],
+                },
+            )
+        except Exception as exc:
+            logger.debug("Peer learning event write failed: %s", exc)
+
+    def get_peer_modules(self) -> List[Dict[str, Any]]:
+        """Discover peer E-T Systems modules on this host.
+
+        NeuroGraph is the Tier 3 SNN backend.  This method finds
+        co-located modules that could benefit from a full SNN upgrade.
+
+        Returns:
+            List of dicts with module_id, display_name, version, tier.
+        """
+        try:
+            from et_modules.manager import ETModuleManager
+            manager = ETModuleManager()
+            statuses = manager.status()
+            peers = []
+            for mid, status in statuses.items():
+                if mid == "neurograph":
+                    continue
+                peers.append({
+                    "module_id": mid,
+                    "display_name": status.manifest.display_name,
+                    "version": status.manifest.version,
+                    "health": status.health,
+                    "tier": status.tier,
+                    "ng_lite_connected": status.ng_lite_connected,
+                })
+            return peers
+        except Exception as exc:
+            logger.debug("Peer module discovery failed: %s", exc)
+            return []
 
     def recall(self, query: str, k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
         """Semantic similarity search over ingested knowledge.
@@ -266,8 +384,8 @@ class NeuroGraphMemory:
     def stats(self) -> Dict[str, Any]:
         """Return current graph statistics and telemetry."""
         tel = self.graph.get_telemetry()
-        return {
-            "version": "0.4.0",
+        result = {
+            "version": "0.6.0",
             "timestep": tel.timestep,
             "nodes": tel.total_nodes,
             "synapses": tel.total_synapses,
@@ -286,6 +404,14 @@ class NeuroGraphMemory:
             "embedding": self.ingestor.embedder.status,
             "message_count": self._message_count,
         }
+
+        # Peer bridge status
+        if self._peer_bridge is not None:
+            result["peer_bridge"] = self._peer_bridge.get_stats()
+        else:
+            result["peer_bridge"] = {"connected": False}
+
+        return result
 
     def ingest_file(self, path: str, source_type: Optional[SourceType] = None) -> Dict[str, Any]:
         """Ingest a file from disk."""
