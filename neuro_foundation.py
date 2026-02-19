@@ -425,6 +425,46 @@ class PredictionOutcome:
 
 
 # ---------------------------------------------------------------------------
+# Auto-Knowledge: Spreading Activation Harvest Data Structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FiredEntry:
+    """A node that fired during spreading activation propagation.
+
+    Attributes:
+        node_id: ID of the node that fired.
+        firing_step: Which propagation step it fired on (0-indexed from
+            the first propagation step).  Lower = stronger association.
+        voltage_at_fire: Voltage at the moment of firing.
+        was_predicted: Whether this node was a prediction target.
+        source_distance: Hop count from nearest primed node (approximate,
+            tracked via breadth-first through synapses).
+    """
+
+    node_id: str = ""
+    firing_step: int = 0
+    voltage_at_fire: float = 0.0
+    was_predicted: bool = False
+    source_distance: int = 0
+
+
+@dataclass
+class PropagationResult:
+    """Result of a prime-and-propagate spreading activation harvest.
+
+    Attributes:
+        fired_entries: All nodes that fired during propagation, with metadata.
+        steps_run: How many SNN steps were executed.
+        nodes_primed: How many nodes received the initial priming current.
+    """
+
+    fired_entries: List[FiredEntry] = field(default_factory=list)
+    steps_run: int = 0
+    nodes_primed: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Plasticity Rules (PRD §3 – pluggable strategy objects)
 # ---------------------------------------------------------------------------
 
@@ -1482,6 +1522,198 @@ class Graph:
         for _ in range(n):
             results.append(self.step())
         return results
+
+    # -----------------------------------------------------------------------
+    # Auto-Knowledge: Spreading Activation Harvest
+    # -----------------------------------------------------------------------
+
+    def prime_and_propagate(
+        self,
+        node_ids: List[str],
+        currents: List[float],
+        steps: int = 3,
+    ) -> PropagationResult:
+        """Prime nodes and propagate activation through the network.
+
+        This is the SNN-level primitive for associative recall.  It runs a
+        *read-mostly* simulation: activation dynamics (voltage decay, spike
+        propagation, hyperedge evaluation, pattern completion, prediction
+        pre-charging) are active, but plasticity rules and structural changes
+        are NOT applied.  This prevents recall-driven activation from
+        altering learned weights.
+
+        Args:
+            node_ids: Nodes to inject current into (semantic priming).
+            currents: Current to inject into each node (parallel to node_ids).
+            steps: Number of SNN steps to propagate.
+
+        Returns:
+            PropagationResult with all nodes that fired, ranked by latency.
+        """
+        if not node_ids:
+            return PropagationResult(steps_run=steps, nodes_primed=0)
+
+        # Save and restore state so propagation is non-destructive
+        saved_voltages: Dict[str, float] = {}
+        saved_refractory: Dict[str, int] = {}
+        for nid, node in self.nodes.items():
+            saved_voltages[nid] = node.voltage
+            saved_refractory[nid] = node.refractory_remaining
+
+        saved_he_refractory: Dict[str, int] = {}
+        for hid, he in self.hyperedges.items():
+            saved_he_refractory[hid] = he.refractory_remaining
+
+        # Compute approximate distances from primed nodes
+        primed_set = set(node_ids)
+        distances: Dict[str, int] = {nid: 0 for nid in node_ids}
+        # BFS to compute distances
+        frontier = set(node_ids)
+        for dist in range(1, steps + 1):
+            next_frontier: Set[str] = set()
+            for nid in frontier:
+                for syn_id in self._outgoing.get(nid, set()):
+                    syn = self.synapses.get(syn_id)
+                    if syn and syn.post_node_id not in distances:
+                        distances[syn.post_node_id] = dist
+                        next_frontier.add(syn.post_node_id)
+            frontier = next_frontier
+
+        # Collect current prediction targets for was_predicted tagging
+        predicted_targets: Set[str] = set()
+        for pred in self.active_predictions.values():
+            predicted_targets.add(pred.target_node_id)
+        for pred_state in self._active_predictions.values():
+            predicted_targets.update(pred_state.predicted_targets)
+
+        # --- PRIME: inject current into specified nodes ---
+        for nid, current in zip(node_ids, currents):
+            node = self.nodes.get(nid)
+            if node is not None:
+                node.voltage += current * node.intrinsic_excitability
+
+        # --- PROPAGATE: run N read-only SNN steps ---
+        result = PropagationResult(
+            steps_run=steps,
+            nodes_primed=len(node_ids),
+        )
+        # Local delay buffer separate from the graph's real one
+        prop_delay_buffer: Dict[int, List[Tuple[str, float]]] = {}
+        prop_timestep = self.timestep
+
+        decay = self.config["decay_rate"]
+        experience_threshold = self.config["he_experience_threshold"]
+
+        for step_idx in range(steps):
+            prop_timestep += 1
+
+            # 1. Voltage decay
+            for node in self.nodes.values():
+                node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
+
+            # 2. Deliver delayed spikes from propagation buffer
+            arrivals = prop_delay_buffer.pop(prop_timestep, [])
+            for target_id, current in arrivals:
+                target = self.nodes.get(target_id)
+                if target is not None:
+                    target.voltage += current * target.intrinsic_excitability
+
+            # 3. Detect firing nodes
+            fired_ids: List[str] = []
+            for nid, node in self.nodes.items():
+                if node.refractory_remaining > 0:
+                    continue
+                if node.voltage >= node.threshold:
+                    fired_ids.append(nid)
+
+            # 4. Reset fired nodes and set refractory
+            for nid in fired_ids:
+                node = self.nodes[nid]
+                voltage_at_fire = node.voltage
+                node.voltage = node.resting_potential
+                node.refractory_remaining = node.refractory_period
+
+                entry = FiredEntry(
+                    node_id=nid,
+                    firing_step=step_idx,
+                    voltage_at_fire=voltage_at_fire,
+                    was_predicted=nid in predicted_targets,
+                    source_distance=distances.get(nid, steps + 1),
+                )
+                result.fired_entries.append(entry)
+
+            # 5. Propagate spikes through outgoing synapses
+            fired_set = set(fired_ids)
+            for nid in fired_ids:
+                node = self.nodes[nid]
+                sign = -1.0 if node.is_inhibitory else 1.0
+                for syn_id in self._outgoing.get(nid, set()):
+                    syn = self.synapses.get(syn_id)
+                    if syn is None:
+                        continue
+                    effective_type_sign = sign
+                    if syn.synapse_type == SynapseType.INHIBITORY:
+                        effective_type_sign = -1.0
+                    current = syn.weight * effective_type_sign
+                    arrival = prop_timestep + syn.delay
+                    prop_delay_buffer.setdefault(arrival, []).append(
+                        (syn.post_node_id, current)
+                    )
+
+            # 6. Evaluate hyperedges (pattern completion, output injection)
+            max_level = max((he.level for he in self.hyperedges.values()), default=0)
+            for level in range(max_level + 1):
+                for hid, he in self.hyperedges.items():
+                    if he.level != level or he.is_archived:
+                        continue
+                    activation = self._compute_hyperedge_activation(he, fired_set)
+                    if he.refractory_remaining > 0:
+                        continue
+                    if activation >= he.activation_threshold:
+                        he.refractory_remaining = he.refractory_period
+
+                        # Output injection
+                        effective_weight = he.output_weight
+                        if he.activation_mode == ActivationMode.GRADED:
+                            effective_weight *= activation
+                        for target_id in he.output_targets:
+                            target = self.nodes.get(target_id)
+                            if target is not None:
+                                target.voltage += effective_weight * target.intrinsic_excitability
+
+                        # Pattern completion (pre-charge inactive members)
+                        if he.pattern_completion_strength > 0:
+                            learning_factor = min(
+                                1.0, he.activation_count / max(experience_threshold, 1)
+                            )
+                            eff_completion = he.pattern_completion_strength * learning_factor
+                            if eff_completion > 0:
+                                for mnid in he.member_nodes:
+                                    if mnid not in fired_set:
+                                        mnode = self.nodes.get(mnid)
+                                        if mnode and mnode.refractory_remaining == 0:
+                                            mnode.voltage += (
+                                                eff_completion
+                                                * he.member_weights.get(mnid, 1.0)
+                                                * mnode.intrinsic_excitability
+                                            )
+
+            # Decrement refractory counters (skip those that just fired)
+            for nid, node in self.nodes.items():
+                if node.refractory_remaining > 0 and nid not in fired_set:
+                    node.refractory_remaining -= 1
+            for hid, he in self.hyperedges.items():
+                if he.refractory_remaining > 0 and hid not in set(fired_ids):
+                    he.refractory_remaining -= 1
+
+        # --- RESTORE: put all voltages and refractory counters back ---
+        for nid, node in self.nodes.items():
+            node.voltage = saved_voltages.get(nid, node.resting_potential)
+            node.refractory_remaining = saved_refractory.get(nid, 0)
+        for hid, he in self.hyperedges.items():
+            he.refractory_remaining = saved_he_refractory.get(hid, 0)
+
+        return result
 
     # -----------------------------------------------------------------------
     # Hyperedge Activation (PRD §4.2)

@@ -492,8 +492,14 @@ class GitUpdater:
     def _deploy_copy_fallback(self) -> Dict[str, Any]:
         """Simple file-copy fallback when neurograph-patch is not in repo."""
         core_files = [
+            # Core engine
             "neuro_foundation.py", "universal_ingestor.py",
             "openclaw_hook.py", "neurograph_migrate.py", "neurograph_gui.py",
+            # Phase 6: NG-Lite + bridge
+            "ng_lite.py", "ng_bridge.py",
+            # Phase 7: Peer bridge + ET Module Manager
+            "ng_peer_bridge.py", "et_module.json",
+            "et_modules/__init__.py", "et_modules/manager.py",
         ]
         patched = 0
         for name in core_files:
