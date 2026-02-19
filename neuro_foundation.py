@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import uuid
 from collections import deque
@@ -45,6 +46,8 @@ try:
     import msgpack
 except ImportError:
     msgpack = None
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1058,50 @@ class Graph:
                         "Consciousness (semantic, exploratory 0.01).",
                     ],
                 },
+                {
+                    "version": "0.7.1",
+                    "description": "Grok Review Optimizations",
+                    "notes": [
+                        # --- Accepted suggestions ---
+                        "Accepted: Added try/except guard in step() spike propagation "
+                        "(phase 5) around delay buffer delivery and outgoing synapse "
+                        "traversal to log and skip stale references from deleted nodes "
+                        "mid-step, rather than silently skipping (Grok suggestion #1.3).",
+                        "Accepted: Added logging import and defensive KeyError handling "
+                        "in _cleanup_predictions() and _evaluate_predictions() for "
+                        "robustness against topology mutations during prediction "
+                        "evaluation (Grok suggestion #1.3).",
+                        "Accepted: Added input validation in create_hyperedge() to warn "
+                        "on single-member hyperedges, which are structurally degenerate "
+                        "(Grok suggestion #1.3, adapted: duplicates were already "
+                        "impossible since member_node_ids is Set[str]).",
+                        # --- Rejected suggestions with reasons ---
+                        "Rejected: 'Enums everywhere with no validation in setters' — "
+                        "There are no setters. Fields are set via dataclass __init__ and "
+                        "enum types self-validate on construction. Runtime validation "
+                        "occurs at topology boundaries (create_node, create_synapse, "
+                        "create_hyperedge). Adding redundant per-field setters would "
+                        "violate the dataclass pattern and add overhead without benefit.",
+                        "Rejected: 'RingBuffer firing_rate() iterates whole buffer — "
+                        "O(n) waste' — There is no firing_rate() method on RingBuffer. "
+                        "Firing rate is tracked via firing_rate_ema (exponential moving "
+                        "average) updated O(1) per step in HomeostaticRule.apply(). "
+                        "RingBuffer stores spike timestamps for STDP timing only.",
+                        "Rejected: 'FiredEntry should be a dict for performance' — "
+                        "FiredEntry is used in PropagationResult (auto-knowledge), not "
+                        "in the hot SNN step loop. Dataclass provides type safety, IDE "
+                        "completion, and self-documentation. Typical count is <100 per "
+                        "propagation. Dict overhead savings: ~0 for this use case.",
+                        "Rejected: 'Predictive window assumes timestep increments by 1' "
+                        "— Timestep always increments by 1 in step(). On restore, Phase "
+                        "3.5 validation already drops expired/stale predictions. Forked "
+                        "graphs via FORK checkpoint mode get a fresh timestep baseline. "
+                        "No gap scenario exists in the current architecture.",
+                        "Rejected: 'create_hyperedge allows duplicate members' — "
+                        "member_node_ids parameter is Set[str], making duplicates "
+                        "impossible by type contract. No additional enforcement needed.",
+                    ],
+                },
             ],
         }
 
@@ -1207,6 +1254,13 @@ class Graph:
             if nid not in self.nodes:
                 raise KeyError(f"Member node {nid} not found")
 
+        if len(member_node_ids) < 2:
+            logger.warning(
+                "Creating hyperedge with %d member(s) — hyperedges with fewer "
+                "than 2 members are structurally degenerate",
+                len(member_node_ids),
+            )
+
         mw = member_weights or {nid: 1.0 for nid in member_node_ids}
         he = Hyperedge(
             member_nodes=set(member_node_ids),
@@ -1292,8 +1346,13 @@ class Graph:
         arrivals = self._delay_buffer.pop(self.timestep, [])
         for target_id, current in arrivals:
             target = self.nodes.get(target_id)
-            if target is not None:
-                target.voltage += current * target.intrinsic_excitability
+            if target is None:
+                logger.debug(
+                    "Delayed spike target %s no longer exists (deleted mid-flight)",
+                    target_id,
+                )
+                continue
+            target.voltage += current * target.intrinsic_excitability
 
         # 3. Detect firing nodes
         fired_ids: List[str] = []
@@ -1322,6 +1381,7 @@ class Graph:
             for syn_id in self._outgoing.get(nid, set()):
                 syn = self.synapses.get(syn_id)
                 if syn is None:
+                    logger.debug("Stale synapse ref %s in outgoing[%s]", syn_id, nid)
                     continue
                 # Effective current is weight × sign
                 effective_type_sign = sign

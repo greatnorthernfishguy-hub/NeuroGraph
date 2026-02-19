@@ -27,6 +27,22 @@ Schema Version History:
              prediction_outcomes, confirmation_history serialized)
     0.4.0  — Phase 4: Universal Ingestor (no checkpoint schema changes,
              version bump for tracking)
+
+Grok Review Changelog (v0.7.1):
+    No code changes.  Grok's suggestions for neurograph_migrate.py evaluated:
+    Rejected: 'Incomplete migrations — _migrate_0_3_0_to_0_3_5 adds fields
+        but doesnt backfill' — The fields added (active_predictions,
+        prediction_outcomes, confirmation_history, etc.) were transient
+        before Phase 3.5: they existed only in memory and were NOT persisted
+        to checkpoints.  There is no data to backfill from.  Initializing
+        them as empty collections is the correct migration: the system
+        starts with a clean prediction slate after upgrade, which is the
+        same state it would have been in had the graph been saved under
+        the old schema.
+    Rejected: 'No validation after migration' — Graph._deserialize() already
+        performs extensive validation on restore (expired predictions dropped,
+        stale node references pruned, etc.).  Adding duplicate validation in
+        the migration layer would create a maintenance burden without benefit.
 """
 
 from __future__ import annotations

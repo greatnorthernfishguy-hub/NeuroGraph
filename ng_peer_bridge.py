@@ -57,6 +57,33 @@ License: AGPL-3.0
 #         position (no re-reading).  Recommendations scored by embedding
 #         cosine similarity.
 # -------------------
+#
+# ---- Grok Review Changelog (v0.7.1) ----
+# Accepted: Added module_id validation in _sync_from_peers() — only accepts
+#     events from peers listed in the _peer_registry.json, filtering out
+#     orphaned or unrecognized JSONL files.
+# Rejected: 'Security Hole — reads all *.jsonl without auth' — The shared
+#     directory is ~/.et_modules/ (user-owned, mode 0700 on Linux).  All
+#     co-located modules run under the same user.  If an attacker has write
+#     access to the user's home directory, filesystem-level auth would not
+#     help.  Module ID validation (now added) provides sufficient filtering.
+# Rejected: 'Race Conditions — no file locks on seek/read' — JSONL is
+#     append-only.  Each line is either fully written or not.  The worst
+#     case (partial last line) is already handled by the json.loads
+#     try/except.  Adding fcntl.lockf() would add platform-specific
+#     complexity (Windows incompatible) for no practical benefit.
+# Rejected: 'NGSaaSBridge sync_state() is one-way' — Intentional.  NG-Lite
+#     is a lightweight Hebbian substrate; pulling SNN predictions, hyperedges,
+#     and STDP state back into it would defeat its purpose as a simple,
+#     vendorable single-file module.  Cross-module intelligence flows
+#     upward (Lite → Full) by design; enriched recommendations flow back
+#     through the bridge.get_recommendations() API.
+# Rejected: '_normalize() duplicates np.linalg.norm' — The 3-line static
+#     method exists in both ng_lite.py and ng_peer_bridge.py because peer
+#     bridge imports only NGBridge (the abstract interface), not private
+#     methods.  The duplication is deliberate: ng_peer_bridge.py must remain
+#     independent of ng_lite.py's internals.
+# -------------------------------------------
 """
 
 from __future__ import annotations
@@ -345,9 +372,26 @@ class NGPeerBridge(NGBridge):
     # -------------------------------------------------------------------
 
     def _sync_from_peers(self) -> None:
-        """Read new events from all peer modules' event files."""
+        """Read new events from all peer modules' event files.
+
+        Only reads from peers listed in the _peer_registry.json to filter
+        out orphaned or unrecognized JSONL files (Grok review: peer validation).
+        """
         self._sync_count += 1
         self._last_sync_time = time.time()
+
+        # Load registered peers for validation (Grok review: peer filtering)
+        registered_peers: set = set()
+        registry_path = self._shared_dir / "_peer_registry.json"
+        try:
+            if registry_path.exists():
+                with open(registry_path, "r") as f:
+                    registry = json.load(f)
+                registered_peers = set(registry.get("modules", {}).keys())
+                # Remove self — we only care about OTHER registered peers
+                registered_peers.discard(self.module_id)
+        except (OSError, json.JSONDecodeError):
+            pass  # If registry is unreadable, fall back to accepting all
 
         new_events: List[Dict[str, Any]] = []
 
@@ -355,6 +399,15 @@ class NGPeerBridge(NGBridge):
             peer_module = event_file.stem
             if peer_module == self.module_id:
                 continue  # Skip own file
+            if peer_module.startswith("_"):
+                continue  # Skip meta-files like _peer_registry
+            # Only filter if other peers ARE registered — if none are,
+            # accept all files (new module just starting up).
+            if registered_peers and peer_module not in registered_peers:
+                logger.debug(
+                    "Skipping unregistered peer file: %s", event_file.name
+                )
+                continue
 
             # Read from last known position
             last_pos = self._peer_read_positions.get(peer_module, 0)
