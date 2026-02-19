@@ -16,6 +16,20 @@ Environment:
     NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/.openclaw/neurograph)
     NEUROGRAPH_SKILL_DIR      Override skill dir (default: ~/.openclaw/skills/neurograph)
     NEUROGRAPH_GUI_DIR        Override GUI data dir (default: ~/.neurograph)
+
+Grok Review Changelog (v0.7.1):
+    Accepted: GUIMessageQueue._poll() now logs callback exceptions via
+        logging.debug(exc_info=True) instead of bare 'except: pass'.
+        Errors are still caught (GUI must not crash from background thread
+        failures), but they're now visible in gui.log for debugging.
+    Rejected: 'No progress bar for ingest_directory()' — UX enhancement,
+        not a bug.  ingest_directory() runs on a daemon thread (line 577)
+        so the GUI doesn't block.  Progress indication is a future feature.
+    Rejected: 'Ingests any file in inbox — no sandbox for malicious PDFs' —
+        FileWatcher.should_ignore() (line 196-207) already filters by
+        extension against SUPPORTED_EXTENSIONS.  PyPDF2's text extraction
+        does not execute embedded content.  PDF sandboxing would require
+        process isolation infrastructure beyond the scope of a desktop GUI.
 """
 
 from __future__ import annotations
@@ -654,7 +668,11 @@ class GUIMessageQueue:
                 cb, args, kwargs = self._queue.get_nowait()
                 cb(*args, **kwargs)
             except Exception:
-                pass
+                # Log callback errors instead of silently swallowing
+                # (Grok review: GUI queue exception handling)
+                logging.getLogger("neurograph.gui").debug(
+                    "GUI queue callback error", exc_info=True,
+                )
         self._root.after(self._poll_ms, self._poll)
 
 

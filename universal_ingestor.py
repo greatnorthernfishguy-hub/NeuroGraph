@@ -12,6 +12,30 @@ Pipeline stages (PRD Addendum §2):
     5. Associate — Create synapses/hyperedges via similarity and structure
 
 Reference: NeuroGraph Foundation PRD Addendum v1.1-1.2 (Universal Ingestor).
+
+Grok Review Changelog (v0.7.1):
+    Accepted: Added outer try/except in embed() as defense-in-depth around
+        _encode_batch() — if something unexpected bypasses the inner catch,
+        the batch falls back to per-chunk hash embeddings rather than
+        propagating up to the caller.
+    Rejected: 'PDF extraction loses images/tables' — PyPDF2 is a text
+        extraction library by design. Image/table extraction would require
+        pdfplumber or similar, which is a feature request (not a bug).
+        Will consider for a future phase if demand warrants.
+    Rejected: 'No graceful degrade if model load fails' — _try_load_model()
+        already catches ImportError AND broad Exception, sets _model_available
+        = False, and falls back to hash. _encode_batch() additionally wraps
+        runtime model errors. Both paths were implemented since Phase 4.
+    Rejected: 'Cache uses SHA256 on vectors — why?' — Cache key is SHA256 of
+        the TEXT, not the vector (_cache_key hashes text.encode("utf-8")).
+        Text is the correct key: same text always maps to the same embedding
+        within a model session. Using text directly as key would consume more
+        memory for large chunks.
+    Rejected: 'Chunker OOM for >10k tokens' — Semantic chunker already splits
+        oversized paragraphs by sentence boundaries (lines 619-634).
+        Hierarchical chunker calls _split_large_section() for oversized
+        headings. Fixed-size chunker uses a sliding window. All paths are
+        bounded by max_chunk_tokens.
 """
 
 from __future__ import annotations
@@ -1003,6 +1027,8 @@ class EmbeddingEngine:
         """Embed a list of chunks, using cache where possible.
 
         Returns list of EmbeddedChunk with normalized vectors.
+        Individual chunk failures fall back to hash embedding rather than
+        failing the entire batch (Grok review: batch resilience).
         """
         results: List[EmbeddedChunk] = []
         uncached: List[Tuple[int, Chunk]] = []
@@ -1025,7 +1051,13 @@ class EmbeddingEngine:
 
         if uncached:
             texts = [c.text for _, c in uncached]
-            vectors = self._encode_batch(texts)
+            try:
+                vectors = self._encode_batch(texts)
+            except Exception as exc:
+                self._logger.warning(
+                    "Batch embed failed (%s), falling back to per-chunk hash", exc,
+                )
+                vectors = [self._hash_embed(t) for t in texts]
             for (idx, chunk), vec in zip(uncached, vectors):
                 # Normalize
                 norm = np.linalg.norm(vec)

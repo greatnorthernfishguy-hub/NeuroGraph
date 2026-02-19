@@ -43,6 +43,27 @@ Usage:
 #         for graceful degradation).  on_message() writes learning
 #         events after ingestion.  stats() includes peer bridge status.
 # -------------------
+#
+# ---- Grok Review Changelog (v0.7.1) ----
+# Accepted: Added file size guard in ingest_file() — warns and skips files
+#     above 50MB to prevent excessive memory use when ingesting large binaries
+#     that were accidentally placed in the ingest path.
+# Rejected: 'No locks around graph access — concurrent on_message() could
+#     race' — NeuroGraphMemory is a singleton within a single Python process.
+#     OpenClaw calls on_message() sequentially per session.  Adding a
+#     threading.Lock would add overhead with zero benefit.  If multi-threaded
+#     access is ever needed, the lock should be added at the caller level
+#     (e.g., an async wrapper), not inside the singleton.
+# Rejected: '_load_checkpoint() assumes msgpack always succeeds' — Lines
+#     150-161 already wrap graph.restore() in try/except Exception, log the
+#     error, and continue with a fresh graph.  This was implemented in the
+#     original Phase 5 code.
+# Rejected: 'Config Overload: no merge with user overrides' — Line 147
+#     does exactly this: {**OPENCLAW_SNN_CONFIG, **(config or {})} merges
+#     user config over defaults, with user keys taking precedence.
+# Rejected: 'Auto-knowledge ranking lacks dedup' — _harvest_associations()
+#     lines 374-377 explicitly deduplicate via a `seen` set before ranking.
+# -------------------------------------------
 """
 
 from __future__ import annotations
@@ -550,10 +571,30 @@ class NeuroGraphMemory:
         return result
 
     def ingest_file(self, path: str, source_type: Optional[SourceType] = None) -> Dict[str, Any]:
-        """Ingest a file from disk."""
+        """Ingest a file from disk.
+
+        Files above 50 MB are skipped to prevent excessive memory use
+        (Grok review: large file guard).
+        """
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return {"status": "error", "reason": f"File not found: {p}"}
+
+        # Guard against very large files (Grok review optimization)
+        max_file_bytes = 50 * 1024 * 1024  # 50 MB
+        try:
+            file_size = p.stat().st_size
+            if file_size > max_file_bytes:
+                logger.warning(
+                    "Skipping %s — file size %d bytes exceeds 50 MB limit",
+                    p, file_size,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"File too large ({file_size} bytes, limit {max_file_bytes})",
+                }
+        except OSError:
+            pass  # stat failed, proceed anyway
 
         content = p.read_text(errors="replace")
 

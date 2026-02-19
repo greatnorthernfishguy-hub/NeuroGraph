@@ -26,6 +26,19 @@ Node ID translation:
 
 Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
+
+Grok Review Changelog (v0.7.1):
+    No code changes.  Grok's suggestions for ng_bridge.py were evaluated:
+    Rejected: 'sync_state() is one-way (Lite → Full)' — By design.  NG-Lite
+        is a lightweight Hebbian substrate; pulling SNN state back would
+        require implementing STDP traces, hyperedges, and prediction chains
+        that NG-Lite deliberately omits.  Enriched cross-module intelligence
+        flows back through get_recommendations() and detect_novelty() calls,
+        which query the full graph in real time.
+    Rejected: '_normalize() duplicates np.linalg.norm' — Same rationale as
+        ng_peer_bridge.py: the bridge imports only the abstract NGBridge
+        interface.  Each file owns its own 3-line normalize() to avoid
+        coupling to ng_lite internal methods.
 """
 
 from __future__ import annotations
