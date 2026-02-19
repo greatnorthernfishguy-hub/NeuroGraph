@@ -310,7 +310,7 @@ class GitUpdater:
 
     * First use:  ``git clone --depth 1`` into ``repo_path``.
     * Check:      ``git fetch origin main`` then compare HEADs.
-    * Update:     ``git pull origin main`` then deploy via neurograph-patch.
+    * Update:     ``git pull --rebase origin main`` then deploy via neurograph-patch.
 
     All git and deploy operations run on daemon threads so the GUI
     stays responsive.  Results are delivered via callbacks.
@@ -345,11 +345,25 @@ class GitUpdater:
     def ensure_repo(self) -> bool:
         """Clone if not present.  Returns True when repo is ready."""
         if (self._repo_path / ".git").is_dir():
+            # Ensure pull strategy is set so updates never fail with
+            # "divergent branches" — safe for a deployed read-only clone.
+            try:
+                self._run_git(
+                    "config", "pull.rebase", "true",
+                    cwd=str(self._repo_path),
+                )
+            except Exception:
+                pass  # non-fatal; --rebase flag on pull is the backup
             return True
         self._repo_path.mkdir(parents=True, exist_ok=True)
         try:
             self._run_git(
                 "clone", "--depth", "1", self._repo_url, str(self._repo_path)
+            )
+            # Set pull strategy immediately after clone
+            self._run_git(
+                "config", "pull.rebase", "true",
+                cwd=str(self._repo_path),
             )
             return True
         except Exception as exc:
@@ -413,7 +427,7 @@ class GitUpdater:
             if not self.ensure_repo():
                 return
             self._on_status("Pulling latest changes...")
-            self._run_git("pull", "origin", "main", cwd=str(self._repo_path))
+            self._run_git("pull", "--rebase", "origin", "main", cwd=str(self._repo_path))
             commit = self.get_local_commit() or "unknown"
             self._on_status(f"Pulled to {commit}. Deploying files...")
 

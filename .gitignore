@@ -1,7 +1,42 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-.pytest_cache/
 *.egg-info/
 dist/
 build/
+*.egg
+.eggs/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets — NEVER commit these
+.env
+.env.local
+*.pem
+*.key
+
+# Runtime data
+*.checkpoint
+*.checkpoint.bak
+checkpoints/
+memory_state.json
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
