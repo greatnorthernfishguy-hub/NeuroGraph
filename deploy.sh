@@ -150,9 +150,11 @@ DESKTOPEOF
         info "GUI directories created at ~/.neurograph/"
     fi
 
-    # CLI tool
+    # CLI tools
     cp "$SCRIPT_DIR/feed-syl" "$BIN_DIR/feed-syl"
     chmod +x "$BIN_DIR/feed-syl"
+    cp "$SCRIPT_DIR/neurograph" "$BIN_DIR/neurograph"
+    chmod +x "$BIN_DIR/neurograph"
 
     # Also copy feed-syl to home for convenience
     cp "$SCRIPT_DIR/feed-syl" "$HOME/feed-syl"
@@ -268,7 +270,7 @@ print('registered')
     warn "ET Module Manager registration skipped (non-critical)"
 
     info "Files deployed to $SKILL_DIR"
-    info "CLI tool installed at $BIN_DIR/feed-syl"
+    info "CLI tools installed at $BIN_DIR/feed-syl and $BIN_DIR/neurograph"
 }
 
 # ------------------------------------------------------------------
@@ -286,11 +288,13 @@ verify() {
         fi
     done
 
-    # Check CLI
-    if [ ! -x "$BIN_DIR/feed-syl" ]; then
-        error "Missing or not executable: $BIN_DIR/feed-syl"
-        ok=false
-    fi
+    # Check CLIs
+    for cli in feed-syl neurograph; do
+        if [ ! -x "$BIN_DIR/$cli" ]; then
+            error "Missing or not executable: $BIN_DIR/$cli"
+            ok=false
+        fi
+    done
 
     # Check Python imports
     if python3 -c "
@@ -340,6 +344,7 @@ print(f'embeddings_ok dim={e.shape[1]}')
 uninstall() {
     warn "Removing deployed NeuroGraph files..."
     rm -f "$BIN_DIR/feed-syl"
+    rm -f "$BIN_DIR/neurograph"
     rm -f "$HOME/feed-syl"
     rm -rf "$SKILL_DIR"
     rm -f "$HOME/.local/share/applications/neurograph.desktop"
@@ -379,6 +384,8 @@ case "${1:-}" in
         info "Deployment complete!"
         echo ""
         echo "Quick start:"
+        echo "  neurograph status              # System health check"
+        echo "  neurograph verify              # Verify installation"
         echo "  feed-syl --status              # Check status"
         echo "  feed-syl --text 'Hello world'  # Ingest text"
         echo "  feed-syl --workspace           # Ingest OpenClaw docs"

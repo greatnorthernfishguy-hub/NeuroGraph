@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from neuro_foundation import Graph, CheckpointMode
+from neuro_foundation import Graph, CheckpointMode, PropagationResult
 from universal_ingestor import (
     UniversalIngestor,
     SimpleVectorDB,
@@ -103,6 +103,13 @@ OPENCLAW_SNN_CONFIG = {
     "he_discovery_min_nodes": 3,
     "he_consolidation_overlap": 0.8,
     "he_experience_threshold": 100,
+    # Auto-knowledge / Associative recall
+    "auto_knowledge_enabled": True,
+    "prime_k": 10,
+    "prime_threshold": 0.4,
+    "prime_strength": 0.8,
+    "propagation_steps": 3,
+    "max_surfaced": 10,
 }
 
 
@@ -246,20 +253,36 @@ class NeuroGraphMemory:
     def on_message(self, text: str, source_type: Optional[SourceType] = None) -> Dict[str, Any]:
         """Ingest a message, run one STDP learning step, and auto-save.
 
+        When ``auto_knowledge_enabled`` is True (the default), this method
+        also performs **spreading activation harvest**: it primes similar
+        existing nodes, propagates activation through the SNN's learned
+        synaptic structure, and returns any knowledge that "lights up" as
+        a ``surfaced`` list.  This is the cortex-like recall — you don't
+        search for it, the network *just knows*.
+
         Args:
             text: Raw message content to ingest.
             source_type: Override auto-detection (TEXT, MARKDOWN, CODE, etc.).
 
         Returns:
-            Dict with ingestion stats and learning results.
+            Dict with ingestion stats, learning results, and surfaced
+            knowledge (if auto_knowledge_enabled).
         """
         if not text or not text.strip():
             return {"status": "skipped", "reason": "empty_input"}
 
         # Stage 1-5: Extract → Chunk → Embed → Register → Associate
         result = self.ingestor.ingest(text, source_type=source_type)
+        new_node_ids = set(result.nodes_created)
 
-        # Run SNN learning step
+        # --- AUTO-KNOWLEDGE: Spreading Activation Harvest ---
+        surfaced: List[Dict[str, Any]] = []
+        snn_config = self.graph.config
+        if snn_config.get("auto_knowledge_enabled", True) and self.vector_db.count() > 0:
+            surfaced = self._harvest_associations(text, new_node_ids)
+
+        # Run SNN learning step (separate from propagation — this one
+        # applies STDP, structural plasticity, predictions, etc.)
         step_result = self.graph.step()
 
         # Update novelty probation for ingested nodes
@@ -280,6 +303,7 @@ class NeuroGraphMemory:
             "fired": len(step_result.fired_node_ids),
             "graduated": len(graduated),
             "message_count": self._message_count,
+            "surfaced": surfaced,
         }
 
         # Write to memory/ for OpenClaw consumption
@@ -291,6 +315,85 @@ class NeuroGraphMemory:
         self._write_peer_learning_event(text, result, step_result)
 
         return event_data
+
+    def _harvest_associations(
+        self,
+        text: str,
+        exclude_node_ids: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantic priming + spreading activation harvest.
+
+        Embeds the input text, finds similar existing nodes via the vector DB,
+        injects current into those nodes, runs N SNN steps, and harvests
+        everything that fires.  The result is knowledge the network
+        *associatively connects* with the input — no explicit search needed.
+
+        Returns:
+            List of surfaced knowledge dicts sorted by association strength.
+        """
+        if exclude_node_ids is None:
+            exclude_node_ids = set()
+
+        snn_config = self.graph.config
+        prime_k = snn_config.get("prime_k", 10)
+        prime_threshold = snn_config.get("prime_threshold", 0.4)
+        prime_strength = snn_config.get("prime_strength", 0.8)
+        propagation_steps = snn_config.get("propagation_steps", 3)
+        max_surfaced = snn_config.get("max_surfaced", 10)
+
+        try:
+            # Embed the input and find similar existing nodes
+            query_vec = self.ingestor.embedder.embed_text(text)
+            similar = self.vector_db.search(
+                query_vec, k=prime_k, threshold=prime_threshold
+            )
+
+            # Filter out newly created nodes (they ARE the input)
+            prime_ids = []
+            prime_currents = []
+            for entry_id, sim_score in similar:
+                if entry_id not in exclude_node_ids:
+                    prime_ids.append(entry_id)
+                    prime_currents.append(sim_score * prime_strength)
+
+            if not prime_ids:
+                return []
+
+            # Spreading activation through learned synaptic connections
+            propagation = self.graph.prime_and_propagate(
+                node_ids=prime_ids,
+                currents=prime_currents,
+                steps=propagation_steps,
+            )
+
+            # Harvest content from fired nodes
+            surfaced = []
+            seen = set()
+            for entry in propagation.fired_entries:
+                if entry.node_id in exclude_node_ids:
+                    continue  # Skip input nodes
+                if entry.node_id in seen:
+                    continue  # Deduplicate
+                seen.add(entry.node_id)
+
+                db_entry = self.vector_db.get(entry.node_id)
+                if db_entry is not None:
+                    surfaced.append({
+                        "node_id": entry.node_id,
+                        "content": db_entry.get("content", ""),
+                        "metadata": db_entry.get("metadata", {}),
+                        "latency": entry.firing_step,
+                        "strength": entry.voltage_at_fire,
+                        "was_predicted": entry.was_predicted,
+                    })
+
+            # Sort: lower latency first, then higher strength
+            surfaced.sort(key=lambda x: (x["latency"], -x["strength"]))
+            return surfaced[:max_surfaced]
+
+        except Exception as exc:
+            logger.debug("Auto-knowledge harvest failed: %s", exc)
+            return []
 
     def _write_peer_learning_event(
         self, text: str, result: Any, step_result: Any
@@ -368,6 +471,38 @@ class NeuroGraphMemory:
         """
         return self.ingestor.query_similar(query, k=k, threshold=threshold)
 
+    def associate(self, text: str, k: int = 10, steps: int = 3) -> List[Dict[str, Any]]:
+        """Associative recall: surface knowledge the network connects to this input.
+
+        Unlike ``recall()`` which does pure vector similarity (cosine search),
+        this routes through the SNN's learned synaptic structure — surfacing
+        knowledge based on causal connections, pattern completion, and
+        prediction chains.  This is the difference between searching a
+        database and *remembering*.
+
+        Args:
+            text: Input text to associate from.
+            k: Maximum results to return.
+            steps: SNN propagation steps (more = deeper associations).
+
+        Returns:
+            List of dicts with 'content', 'metadata', 'latency', 'strength',
+            'was_predicted', 'node_id'.
+        """
+        if not text or not text.strip():
+            return []
+
+        # Temporarily override config for this call
+        old_max = self.graph.config.get("max_surfaced", 10)
+        old_steps = self.graph.config.get("propagation_steps", 3)
+        self.graph.config["max_surfaced"] = k
+        self.graph.config["propagation_steps"] = steps
+        try:
+            return self._harvest_associations(text)
+        finally:
+            self.graph.config["max_surfaced"] = old_max
+            self.graph.config["propagation_steps"] = old_steps
+
     def step(self, n: int = 1) -> List[Any]:
         """Run N SNN learning steps without ingestion."""
         results = []
@@ -403,6 +538,7 @@ class NeuroGraphMemory:
             "memory_dir": str(self._memory_dir),
             "embedding": self.ingestor.embedder.status,
             "message_count": self._message_count,
+            "auto_knowledge": self.graph.config.get("auto_knowledge_enabled", True),
         }
 
         # Peer bridge status
