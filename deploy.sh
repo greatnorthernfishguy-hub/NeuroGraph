@@ -178,11 +178,13 @@ DESKTOPEOF
         if ! grep -q 'TRANSFORMERS_VERBOSITY' "$HOME/.bashrc"; then
             cat >> "$HOME/.bashrc" << 'ENVEOF'
 
-# NeuroGraph: suppress HuggingFace inference provider warnings (local embeddings only)
+# NeuroGraph: suppress HuggingFace inference provider warnings
+# (local torch embeddings only — TID controls all external API calls)
 export TRANSFORMERS_VERBOSITY=error
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 export HF_HUB_DISABLE_TELEMETRY=1
 export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
+export HF_HUB_DISABLE_EXPERIMENTAL_WARNING=1
 export TOKENIZERS_PARALLELISM=false
 ENVEOF
             info "Added HuggingFace warning suppression to ~/.bashrc"
@@ -318,14 +320,26 @@ print('imports_ok')
         warn "GUI: not found (optional)"
     fi
 
-    # Check embedding backend
+    # Check embedding backend — suppress provider warnings (NeuroGraph uses
+    # local torch only; TID controls all external API calls)
     if python3 -c "
+import os, warnings
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['HF_HUB_DISABLE_IMPLICIT_TOKEN'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['HF_HUB_DISABLE_EXPERIMENTAL_WARNING'] = '1'
+warnings.filterwarnings('ignore')
 from sentence_transformers import SentenceTransformer
-model = SentenceTransformer('all-MiniLM-L6-v2')
+try:
+    model = SentenceTransformer('all-MiniLM-L6-v2', backend='torch')
+except TypeError:
+    model = SentenceTransformer('all-MiniLM-L6-v2')
 e = model.encode(['test'])
-print(f'embeddings_ok dim={e.shape[1]}')
+print(f'embeddings_ok dim={e.shape[1]} backend=torch')
 " 2>/dev/null; then
-        info "Real embeddings available"
+        info "Real embeddings available (local torch — no external API keys needed)"
     else
         warn "sentence-transformers unavailable — using hash fallback"
     fi

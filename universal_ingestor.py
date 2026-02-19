@@ -944,8 +944,14 @@ class EmbeddingEngine:
         sentence-transformers v5+ and transformers v5+ added inference provider
         backends (OpenAI, Google, Voyage, etc.) that emit noisy warnings when
         their API keys aren't set — even when we only use local torch models.
+        NeuroGraph uses ONLY local torch-based embeddings; TID controls all
+        external API calls.  No provider API keys are needed or used.
+
         This sets environment variables and warning filters BEFORE import to
         prevent those warnings from reaching the user.
+
+        Grok review v0.7.1: Broadened filters to catch all warning categories
+        (not just UserWarning) and plural "KEYS" patterns that were escaping.
         """
         import os
         import warnings
@@ -956,17 +962,26 @@ class EmbeddingEngine:
         # Disable HuggingFace Hub telemetry and inference provider checks
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+        os.environ.setdefault("HF_HUB_DISABLE_EXPERIMENTAL_WARNING", "1")
         # Prevent tokenizers parallelism warning
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         # Filter out API key warnings that slip through from provider packages
-        # (openai, google-generativeai, voyageai) if they happen to be installed
-        warnings.filterwarnings("ignore", message=r".*api.?key.*", category=UserWarning)
-        warnings.filterwarnings("ignore", message=r".*API.?KEY.*", category=UserWarning)
-        warnings.filterwarnings("ignore", message=r".*OPENAI.*", category=UserWarning)
-        warnings.filterwarnings("ignore", message=r".*GOOGLE.*", category=UserWarning)
-        warnings.filterwarnings("ignore", message=r".*VOYAGE.*", category=UserWarning)
-        warnings.filterwarnings("ignore", message=r".*inference.?provider.*", category=UserWarning)
+        # (openai, google-generativeai, voyageai) if they happen to be installed.
+        # Use no category restriction to catch UserWarning, FutureWarning,
+        # DeprecationWarning, RuntimeWarning — providers use various types.
+        # Use re.IGNORECASE-equivalent patterns for case-insensitive matching.
+        for pattern in [
+            r"(?i).*api.?keys?.*",
+            r"(?i).*set up your.*api.*",
+            r"(?i).*openai.*",
+            r"(?i).*google.*api.*",
+            r"(?i).*voyage.*",
+            r"(?i).*inference.?provider.*",
+            r"(?i).*provider.*backend.*",
+            r"(?i).*api.?key.*not.?set.*",
+        ]:
+            warnings.filterwarnings("ignore", message=pattern)
 
     def _try_load_model(self) -> None:
         """Attempt to load the sentence-transformers model.
