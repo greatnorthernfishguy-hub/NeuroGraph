@@ -913,24 +913,74 @@ class EmbeddingEngine:
                 return "cpu"
         return self.device  # "cpu" or any explicit device string
 
+    @staticmethod
+    def _suppress_provider_warnings() -> None:
+        """Suppress API key warnings from HuggingFace inference providers.
+
+        sentence-transformers v5+ and transformers v5+ added inference provider
+        backends (OpenAI, Google, Voyage, etc.) that emit noisy warnings when
+        their API keys aren't set — even when we only use local torch models.
+        This sets environment variables and warning filters BEFORE import to
+        prevent those warnings from reaching the user.
+        """
+        import os
+        import warnings
+
+        # Tell transformers to only log errors, not provider-related warnings
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+        # Disable HuggingFace Hub telemetry and inference provider checks
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+        # Prevent tokenizers parallelism warning
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+        # Filter out API key warnings that slip through from provider packages
+        # (openai, google-generativeai, voyageai) if they happen to be installed
+        warnings.filterwarnings("ignore", message=r".*api.?key.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*API.?KEY.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*OPENAI.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*GOOGLE.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*VOYAGE.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*inference.?provider.*", category=UserWarning)
+
     def _try_load_model(self) -> None:
         """Attempt to load the sentence-transformers model.
 
+        Suppresses API key warnings from inference providers (OpenAI, Google,
+        Voyage) that were added in sentence-transformers v5+ / transformers v5+.
+        NeuroGraph uses local torch-based embeddings only — no external API
+        keys are needed.
+
         Logs the outcome so silent failures are visible to operators.
         """
+        # Suppress provider warnings BEFORE any HuggingFace imports
+        self._suppress_provider_warnings()
+
         try:
             from sentence_transformers import SentenceTransformer
+
             resolved_device = self._resolve_device()
+            # Build kwargs — use backend="torch" if the version supports it
+            # (v5+) to explicitly avoid API provider backends
+            kwargs: Dict[str, Any] = {}
             if resolved_device is not None:
-                self._model = SentenceTransformer(self.model_name, device=resolved_device)
-            else:
-                self._model = SentenceTransformer(self.model_name)
+                kwargs["device"] = resolved_device
+            try:
+                # sentence-transformers v5+ accepts backend parameter
+                self._model = SentenceTransformer(
+                    self.model_name, backend="torch", **kwargs
+                )
+            except TypeError:
+                # Older versions don't have the backend parameter
+                self._model = SentenceTransformer(self.model_name, **kwargs)
+
             self._model_available = True
             self._active_device = str(self._model.device)
             # Update dimension from loaded model
             self.dimension = self._model.get_sentence_embedding_dimension()
             self._logger.info(
-                "Loaded embedding model '%s' on device '%s'",
+                "Loaded embedding model '%s' on device '%s' (local torch backend)",
                 self.model_name, self._active_device,
             )
         except ImportError:

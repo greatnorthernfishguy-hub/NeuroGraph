@@ -42,25 +42,32 @@ install_deps() {
     pip3 install --no-cache-dir \
         "numpy>=1.24.0" "scipy>=1.10.0" "msgpack>=1.0.0"
 
-    # sentence-transformers from source (bleeding edge, no broken deps)
-    info "Installing sentence-transformers from source..."
-    pip3 install --break-system-packages --no-deps --no-cache-dir \
-        "sentence-transformers @ git+https://github.com/huggingface/sentence-transformers.git" 2>/dev/null || \
-    pip3 install --no-deps --no-cache-dir \
-        "sentence-transformers @ git+https://github.com/huggingface/sentence-transformers.git" || \
-    warn "sentence-transformers install failed — hash fallback will be used"
-
-    # transformers (gets modern huggingface_hub)
-    pip3 install --break-system-packages --no-cache-dir transformers tqdm 2>/dev/null || \
-    pip3 install --no-cache-dir transformers tqdm || \
-    warn "transformers install failed — hash fallback will be used"
-
-    # CPU-only PyTorch
+    # CPU-only PyTorch (install BEFORE sentence-transformers so it picks up
+    # the local torch backend instead of trying inference providers)
     pip3 install --break-system-packages --no-cache-dir torch \
         --index-url https://download.pytorch.org/whl/cpu 2>/dev/null || \
     pip3 install --no-cache-dir torch \
         --index-url https://download.pytorch.org/whl/cpu || \
     warn "PyTorch install failed — hash fallback will be used"
+
+    # sentence-transformers from PyPI (pinned stable release).
+    # NOTE: Previous versions installed from git HEAD which pulled v5.x+
+    # that added inference provider backends (OpenAI, Google, Voyage) and
+    # emitted API key warnings even when only using local torch embeddings.
+    # Pinning to stable PyPI release avoids this issue.
+    info "Installing sentence-transformers (stable release)..."
+    pip3 install --break-system-packages --no-cache-dir \
+        "sentence-transformers>=3.0.0,<6.0.0" 2>/dev/null || \
+    pip3 install --no-cache-dir \
+        "sentence-transformers>=3.0.0,<6.0.0" || \
+    warn "sentence-transformers install failed — hash fallback will be used"
+
+    # transformers + tqdm (pinned to avoid v5 inference provider issues)
+    pip3 install --break-system-packages --no-cache-dir \
+        "transformers>=4.41.0" tqdm 2>/dev/null || \
+    pip3 install --no-cache-dir \
+        "transformers>=4.41.0" tqdm || \
+    warn "transformers install failed — hash fallback will be used"
 
     # Optional: beautifulsoup4, PyPDF2
     pip3 install --break-system-packages --no-cache-dir \
@@ -158,6 +165,25 @@ DESKTOPEOF
                 echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
                 info "Added $BIN_DIR to PATH in ~/.bashrc"
             fi
+        fi
+    fi
+
+    # Suppress HuggingFace inference provider API key warnings.
+    # NeuroGraph uses LOCAL torch-based embeddings only — no OpenAI, Google,
+    # or Voyage API keys are needed.  These env vars prevent noisy warnings
+    # from sentence-transformers v5+ / transformers v5+ inference providers.
+    if [ -f "$HOME/.bashrc" ]; then
+        if ! grep -q 'TRANSFORMERS_VERBOSITY' "$HOME/.bashrc"; then
+            cat >> "$HOME/.bashrc" << 'ENVEOF'
+
+# NeuroGraph: suppress HuggingFace inference provider warnings (local embeddings only)
+export TRANSFORMERS_VERBOSITY=error
+export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
+export TOKENIZERS_PARALLELISM=false
+ENVEOF
+            info "Added HuggingFace warning suppression to ~/.bashrc"
         fi
     fi
 
