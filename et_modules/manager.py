@@ -141,12 +141,16 @@ class ETModuleManager:
         peers = manager.get_peer_modules()
     """
 
-    # Known install locations to scan for modules
+    # Canonical install locations — one per module, all under ~.
+    # These are the ONLY real locations.  No legacy paths, no
+    # /opt/ duplicates, no ~/.openclaw/skills/ copies.  Every module
+    # lives in ~/ModuleName as a git checkout.  deploy.sh may still
+    # symlink or copy to a runtime dir, but discovery starts HERE.
     KNOWN_LOCATIONS = [
-        "~/.openclaw/skills/neurograph",      # NeuroGraph
-        "/opt/inference-difference",           # The-Inference-Difference
-        "/opt/trollguard",                     # TrollGuard
-        "~/.et_modules/modules",              # Generic module install dir
+        "~/NeuroGraph",                       # NeuroGraph
+        "~/The-Inference-Difference",         # The-Inference-Difference
+        "~/TrollGuard",                       # TrollGuard
+        "~/.et_modules/modules",              # Generic / future modules
     ]
 
     def __init__(self, root_dir: Optional[str] = None):

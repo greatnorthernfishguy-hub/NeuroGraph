@@ -249,7 +249,7 @@ except (FileNotFoundError, json.JSONDecodeError):
 registry['modules']['neurograph'] = {
     'module_id': 'neurograph',
     'display_name': 'NeuroGraph Foundation',
-    'version': '0.6.0',
+    'version': '0.7.0',
     'install_path': '$SKILL_DIR',
     'git_remote': 'https://github.com/greatnorthernfishguy-hub/NeuroGraph.git',
     'git_branch': 'main',

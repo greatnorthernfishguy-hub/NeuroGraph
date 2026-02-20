@@ -152,15 +152,18 @@ The ET Module Manager scans these locations by default:
 
 ```python
 KNOWN_LOCATIONS = [
-    "~/NeuroGraph",                       # NeuroGraph (primary)
-    "~/.openclaw/skills/neurograph",      # NeuroGraph (legacy)
-    "~/The-Inference-Difference",         # The-Inference-Difference (primary)
-    "/opt/inference-difference",           # The-Inference-Difference (legacy)
-    "~/TrollGuard",                       # TrollGuard (primary)
-    "/opt/trollguard",                     # TrollGuard (legacy)
-    "~/.et_modules/modules",              # Generic module install dir
+    "~/NeuroGraph",                       # NeuroGraph
+    "~/The-Inference-Difference",         # The-Inference-Difference
+    "~/TrollGuard",                       # TrollGuard
+    "~/.et_modules/modules",              # Generic / future modules
 ]
 ```
+
+**IMPORTANT:** Every module lives in `~/ModuleName` as a git checkout.
+There are NO legacy paths (`/opt/`, `~/.openclaw/skills/`).  `deploy.sh`
+may copy files to a runtime directory, but discovery always starts at the
+canonical home-directory location.  Do NOT add duplicate scan paths — that
+is how ghost file systems happen.
 
 If your module installs somewhere else, make sure you register via the
 registry mechanism (step B above) so the manager can find it.

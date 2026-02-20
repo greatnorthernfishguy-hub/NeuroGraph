@@ -541,7 +541,7 @@ class NeuroGraphMemory:
         """Return current graph statistics and telemetry."""
         tel = self.graph.get_telemetry()
         result = {
-            "version": "0.6.0",
+            "version": "0.7.0",
             "timestep": tel.timestep,
             "nodes": tel.total_nodes,
             "synapses": tel.total_synapses,
