@@ -943,9 +943,9 @@ class EmbeddingEngine:
 
         sentence-transformers v5+ and transformers v5+ added inference provider
         backends (OpenAI, Google, Voyage, etc.) that emit noisy warnings when
-        their API keys aren't set — even when we only use local torch models.
-        NeuroGraph uses ONLY local torch-based embeddings; TID controls all
-        external API calls.  No provider API keys are needed or used.
+        their API keys aren't set — even though NeuroGraph's embedding engine
+        uses the torch backend, not those provider APIs.  TID handles all
+        external API routing via OpenRouter.
 
         This sets environment variables and warning filters BEFORE import to
         prevent those warnings from reaching the user.
@@ -986,10 +986,11 @@ class EmbeddingEngine:
     def _try_load_model(self) -> None:
         """Attempt to load the sentence-transformers model.
 
-        Suppresses API key warnings from inference providers (OpenAI, Google,
-        Voyage) that were added in sentence-transformers v5+ / transformers v5+.
-        NeuroGraph uses local torch-based embeddings only — no external API
-        keys are needed.
+        Suppresses API key warnings from HuggingFace inference providers
+        (OpenAI, Google, Voyage) added in sentence-transformers v5+ /
+        transformers v5+.  NeuroGraph's embedding engine uses the torch
+        backend for vector computation — those provider API keys are not
+        used.  TID handles all external API routing via OpenRouter.
 
         Logs the outcome so silent failures are visible to operators.
         """
@@ -1019,7 +1020,7 @@ class EmbeddingEngine:
             # Update dimension from loaded model
             self.dimension = self._model.get_sentence_embedding_dimension()
             self._logger.info(
-                "Loaded embedding model '%s' on device '%s' (local torch backend)",
+                "Loaded embedding model '%s' on device '%s' (torch backend)",
                 self.model_name, self._active_device,
             )
         except ImportError:

@@ -24,8 +24,10 @@ import warnings
 from pathlib import Path
 
 # Suppress HuggingFace inference provider API key warnings BEFORE any imports.
-# NeuroGraph uses only local torch-based embeddings; TID controls all external
-# API calls.  No OpenAI, Google, or Voyage API keys are needed.
+# NeuroGraph's embedding engine uses the torch backend for vector computation.
+# The OpenAI, Google, and Voyage provider keys warned about here are for HF's
+# inference provider backends, which NeuroGraph does not use.  TID handles all
+# external API routing via OpenRouter.
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")

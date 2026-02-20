@@ -43,7 +43,7 @@ install_deps() {
         "numpy>=1.24.0" "scipy>=1.10.0" "msgpack>=1.0.0"
 
     # CPU-only PyTorch (install BEFORE sentence-transformers so it picks up
-    # the local torch backend instead of trying inference providers)
+    # the torch backend for embeddings instead of HF inference providers)
     pip3 install --break-system-packages --no-cache-dir torch \
         --index-url https://download.pytorch.org/whl/cpu 2>/dev/null || \
     pip3 install --no-cache-dir torch \
@@ -53,7 +53,7 @@ install_deps() {
     # sentence-transformers from PyPI (pinned stable release).
     # NOTE: Previous versions installed from git HEAD which pulled v5.x+
     # that added inference provider backends (OpenAI, Google, Voyage) and
-    # emitted API key warnings even when only using local torch embeddings.
+    # emitted API key warnings even though NeuroGraph uses the torch backend.
     # Pinning to stable PyPI release avoids this issue.
     info "Installing sentence-transformers (stable release)..."
     pip3 install --break-system-packages --no-cache-dir \
@@ -171,15 +171,16 @@ DESKTOPEOF
     fi
 
     # Suppress HuggingFace inference provider API key warnings.
-    # NeuroGraph uses LOCAL torch-based embeddings only — no OpenAI, Google,
-    # or Voyage API keys are needed.  These env vars prevent noisy warnings
-    # from sentence-transformers v5+ / transformers v5+ inference providers.
+    # NeuroGraph's embedding engine uses the torch backend for vector
+    # computation — the OpenAI, Google, and Voyage API keys warned about
+    # are for HF inference providers that NeuroGraph does not use.
+    # TID handles all external API routing via OpenRouter.
     if [ -f "$HOME/.bashrc" ]; then
         if ! grep -q 'TRANSFORMERS_VERBOSITY' "$HOME/.bashrc"; then
             cat >> "$HOME/.bashrc" << 'ENVEOF'
 
 # NeuroGraph: suppress HuggingFace inference provider warnings
-# (local torch embeddings only — TID controls all external API calls)
+# (torch backend for embeddings — TID handles external API routing)
 export TRANSFORMERS_VERBOSITY=error
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 export HF_HUB_DISABLE_TELEMETRY=1
@@ -320,8 +321,8 @@ print('imports_ok')
         warn "GUI: not found (optional)"
     fi
 
-    # Check embedding backend — suppress provider warnings (NeuroGraph uses
-    # local torch only; TID controls all external API calls)
+    # Check embedding backend — suppress HF inference provider warnings
+    # (NeuroGraph uses the torch backend; TID handles external API routing)
     if python3 -c "
 import os, warnings
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
@@ -339,7 +340,7 @@ except TypeError:
 e = model.encode(['test'])
 print(f'embeddings_ok dim={e.shape[1]} backend=torch')
 " 2>/dev/null; then
-        info "Real embeddings available (local torch — no external API keys needed)"
+        info "Real embeddings available (torch backend — HF provider keys not needed)"
     else
         warn "sentence-transformers unavailable — using hash fallback"
     fi
