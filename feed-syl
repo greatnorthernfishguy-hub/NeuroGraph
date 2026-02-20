@@ -20,7 +20,24 @@ import argparse
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress HuggingFace inference provider API key warnings BEFORE any imports.
+# NeuroGraph uses only local torch-based embeddings; TID controls all external
+# API calls.  No OpenAI, Google, or Voyage API keys are needed.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("HF_HUB_DISABLE_EXPERIMENTAL_WARNING", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+warnings.filterwarnings("ignore", message=r"(?i).*api.?keys?.*")
+warnings.filterwarnings("ignore", message=r"(?i).*set up your.*api.*")
+warnings.filterwarnings("ignore", message=r"(?i).*openai.*")
+warnings.filterwarnings("ignore", message=r"(?i).*google.*api.*")
+warnings.filterwarnings("ignore", message=r"(?i).*voyage.*")
+warnings.filterwarnings("ignore", message=r"(?i).*inference.?provider.*")
 
 # Ensure the NeuroGraph module directory is on the path
 _script_dir = Path(__file__).resolve().parent
