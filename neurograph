@@ -29,13 +29,15 @@ if str(_script_dir) not in sys.path:
 
 def cmd_setup(args):
     """Interactive setup wizard."""
+    from neurograph_paths import get_neurograph_home, write_conf
+
     print("=" * 50)
     print("  NeuroGraph Setup Wizard")
     print("=" * 50)
     print()
 
-    # Step 1: Workspace directory
-    default_workspace = Path.home() / ".openclaw" / "neurograph"
+    # Step 1: Workspace directory — use unified resolver for the default
+    default_workspace = get_neurograph_home()
     workspace = input(f"Workspace directory [{default_workspace}]: ").strip()
     if not workspace:
         workspace = str(default_workspace)
@@ -96,21 +98,11 @@ def cmd_setup(args):
     except Exception as e:
         print(f"  Ingestor: FAILED ({e})")
 
-    # Step 7: Set environment variable
-    print(f"\nConfiguration:")
-    print(f"  NEUROGRAPH_WORKSPACE_DIR={workspace}")
-
-    # Write env to bashrc if not already there
-    bashrc = Path.home() / ".bashrc"
-    env_line = f'export NEUROGRAPH_WORKSPACE_DIR="{workspace}"'
-    if bashrc.exists():
-        content = bashrc.read_text()
-        if "NEUROGRAPH_WORKSPACE_DIR" not in content:
-            resp = input("\nAdd to ~/.bashrc? [Y/n]: ").strip().lower()
-            if resp in ("", "y", "yes"):
-                with open(bashrc, "a") as f:
-                    f.write(f"\n# NeuroGraph workspace\n{env_line}\n")
-                print("  Added to ~/.bashrc")
+    # Step 7: Write unified config file
+    conf_file = write_conf(workspace)
+    print(f"\nConfiguration saved to {conf_file}:")
+    print(f"  neurograph_home={workspace}")
+    print("  All NeuroGraph components will use this path.")
 
     print("\n" + "=" * 50)
     print("  Setup complete!")

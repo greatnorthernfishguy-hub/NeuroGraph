@@ -9,15 +9,49 @@
 #   ./deploy.sh --uninstall  # Remove deployed files
 #
 # Environment:
-#   NEUROGRAPH_WORKSPACE_DIR  — Override workspace (default: ~/.openclaw/neurograph)
-#   NEUROGRAPH_SKILL_DIR      — Override skill dir (default: ~/.openclaw/skills/neurograph)
+#   NEUROGRAPH_HOME           — Override data directory (default: ~/.neurograph)
+#   NEUROGRAPH_SKILL_DIR      — Override module install dir (default: $NEUROGRAPH_HOME/modules)
+#
+# Config file: ~/.neurograph.conf  (written on first deploy, read by all components)
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_DIR="${NEUROGRAPH_SKILL_DIR:-$HOME/.openclaw/skills/neurograph}"
-WORKSPACE_DIR="${NEUROGRAPH_WORKSPACE_DIR:-$HOME/.openclaw/neurograph}"
+
+# Unified path resolution — same order as neurograph_paths.py:
+#   1. NEUROGRAPH_HOME env var
+#   2. ~/.neurograph.conf JSON file
+#   3. NEUROGRAPH_WORKSPACE_DIR env var (legacy)
+#   4. Default: ~/.neurograph
+_resolve_home() {
+    # 1. Explicit env var
+    if [ -n "${NEUROGRAPH_HOME:-}" ]; then
+        echo "$NEUROGRAPH_HOME"
+        return
+    fi
+    # 2. Config file
+    local conf="$HOME/.neurograph.conf"
+    if [ -f "$conf" ]; then
+        local from_conf
+        from_conf="$(python3 -c "import json; print(json.load(open('$conf')).get('neurograph_home',''))" 2>/dev/null || true)"
+        if [ -n "$from_conf" ]; then
+            echo "$from_conf"
+            return
+        fi
+    fi
+    # 3. Legacy env var
+    if [ -n "${NEUROGRAPH_WORKSPACE_DIR:-}" ]; then
+        echo "$NEUROGRAPH_WORKSPACE_DIR"
+        return
+    fi
+    # 4. Default
+    echo "$HOME/.neurograph"
+}
+
+NEUROGRAPH_HOME="$(_resolve_home)"
+SKILL_DIR="${NEUROGRAPH_SKILL_DIR:-$NEUROGRAPH_HOME/modules}"
+WORKSPACE_DIR="$NEUROGRAPH_HOME"
 CHECKPOINT_DIR="$WORKSPACE_DIR/checkpoints"
 BIN_DIR="$HOME/.local/bin"
 
@@ -78,6 +112,15 @@ install_deps() {
 deploy_files() {
     info "Deploying NeuroGraph files..."
 
+    # Write unified config so all components agree on the data path
+    local conf="$HOME/.neurograph.conf"
+    if [ ! -f "$conf" ]; then
+        echo "{\"neurograph_home\": \"$NEUROGRAPH_HOME\"}" > "$conf"
+        info "Created $conf -> $NEUROGRAPH_HOME"
+    else
+        info "Config exists: $conf (using configured path)"
+    fi
+
     # Create directories
     mkdir -p "$SKILL_DIR"
     mkdir -p "$SKILL_DIR/scripts"
@@ -126,7 +169,7 @@ skills = cfg.get('skills', {}).get('entries', {})
 if 'neurograph' not in skills:
     skills['neurograph'] = {
         'enabled': True,
-        'env': {'NEUROGRAPH_WORKSPACE_DIR': '$WORKSPACE_DIR'}
+        'env': {'NEUROGRAPH_HOME': '$NEUROGRAPH_HOME'}
     }
     cfg.setdefault('skills', {})['entries'] = skills
     with open('$OPENCLAW_CONFIG', 'w') as f:
@@ -147,7 +190,7 @@ else:
       "neurograph": {
         "enabled": true,
         "env": {
-          "NEUROGRAPH_WORKSPACE_DIR": "~/.openclaw/neurograph"
+          "NEUROGRAPH_HOME": "~/.neurograph"
         }
       }
     }
