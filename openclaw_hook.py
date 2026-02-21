@@ -91,6 +91,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from neuro_foundation import Graph, CheckpointMode, PropagationResult
+from neurograph_paths import get_neurograph_home
 from universal_ingestor import (
     UniversalIngestor,
     SimpleVectorDB,
@@ -168,8 +169,7 @@ class NeuroGraphMemory:
         config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._workspace_dir = Path(
-            workspace_dir
-            or os.environ.get("NEUROGRAPH_WORKSPACE_DIR", "~/.openclaw/neurograph")
+            workspace_dir or str(get_neurograph_home())
         ).expanduser()
 
         self._checkpoint_dir = self._workspace_dir / "checkpoints"

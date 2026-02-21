@@ -47,19 +47,17 @@ warnings.filterwarnings("ignore", message=r"(?i).*inference.?provider.*")
 
 # Ensure the NeuroGraph module directory is on the path
 _script_dir = Path(__file__).resolve().parent
-_skill_dir = Path(os.environ.get(
-    "NEUROGRAPH_SKILL_DIR",
-    str(Path.home() / ".openclaw" / "skills" / "neurograph"),
-))
 
-for candidate in [_script_dir, _skill_dir]:
-    if candidate.exists() and str(candidate) not in sys.path:
-        sys.path.insert(0, str(candidate))
+# Always add the script's own directory (covers running from repo or install)
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
 
-# Also add the NeuroGraph repo root if running from there
-_repo_root = _script_dir
-if (_repo_root / "neuro_foundation.py").exists() and str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
+# Legacy env var support — if someone set NEUROGRAPH_SKILL_DIR, honor it
+_legacy_skill_dir = os.environ.get("NEUROGRAPH_SKILL_DIR")
+if _legacy_skill_dir:
+    _legacy_path = Path(_legacy_skill_dir)
+    if _legacy_path.exists() and str(_legacy_path) not in sys.path:
+        sys.path.insert(0, str(_legacy_path))
 
 
 class _InitTimeout(Exception):

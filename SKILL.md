@@ -13,7 +13,15 @@ It combines three memory layers:
 - **Temporal Memory** (Spiking Neural Network) — causal learning via STDP
 
 ## Environment Variables
-- `NEUROGRAPH_WORKSPACE_DIR` — Working directory for checkpoints and data (default: `~/.openclaw/neurograph`)
+- `NEUROGRAPH_HOME` — Data directory for checkpoints and state (default: `~/.neurograph`)
+- `NEUROGRAPH_WORKSPACE_DIR` — Legacy alias for `NEUROGRAPH_HOME` (still honored)
+
+## Configuration
+All components read `~/.neurograph.conf` for the canonical data path:
+```json
+{"neurograph_home": "/your/chosen/path"}
+```
+Run `neurograph setup` to configure, or set `NEUROGRAPH_HOME` to override.
 
 ## Capabilities
 - Automatic content ingestion (text, code, markdown, URLs, PDFs)
