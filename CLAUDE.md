@@ -104,6 +104,16 @@ Build the base `neuro_foundation.py` implementing:
 - Three-tier architecture: Tier 1 (standalone NG-Lite) → Tier 2 (NGPeerBridge) → Tier 3 (NGSaaSBridge)
 - Graceful degradation: peer bridge failure never blocks core SNN operation
 
+### Phase 9: Cognitive Enhancement Suite (CES) -- COMPLETE
+- `ces_config.py` — Centralized CES configuration (streaming, surfacing, persistence, monitoring)
+- `stream_parser.py` — Real-time stream parser: background thread, Ollama embeddings, node nudging, pattern completion
+- `activation_persistence.py` — JSON sidecar for cross-session voltage state with temporal decay
+- `surfacing.py` — Priority queue of relevant concepts for prompt injection
+- `ces_monitoring.py` — Health context strings, rotating logger, HTTP dashboard (port 8847)
+- `openclaw_hook.py` modified to wire in all CES modules with try/except guards (CES is optional)
+- Ollama primary embedding with sentence-transformers/hash fallback
+- All CES imports guarded: core NeuroGraph works without CES files present
+
 ## File Structure
 ```
 NeuroGraph/
@@ -124,6 +134,11 @@ NeuroGraph/
 ├── et_modules/
 │   ├── __init__.py
 │   └── manager.py                   # Phase 7: ET Module Manager
+├── ces_config.py                    # Phase 9: CES centralized configuration
+├── stream_parser.py                 # Phase 9: Real-time stream parser (Ollama + fallback)
+├── activation_persistence.py        # Phase 9: Cross-session activation state sidecar
+├── surfacing.py                     # Phase 9: Surfacing monitor for prompt injection
+├── ces_monitoring.py                # Phase 9: Health context, logger, HTTP dashboard
 ├── tests/
 │   ├── __init__.py
 │   ├── test_snn.py                  # SNN dynamics tests (12)
@@ -139,7 +154,8 @@ NeuroGraph/
 │   ├── test_openclaw_hook.py        # Phase 5: OpenClaw hook tests (18)
 │   ├── test_gui.py                  # Phase 5.5: GUI non-GUI logic tests (25)
 │   ├── test_ng_lite.py              # Phase 6: NG-Lite + NGSaaSBridge tests (52)
-│   └── test_et_modules.py           # Phase 7: ET Module Manager + NGPeerBridge tests (45)
+│   ├── test_et_modules.py           # Phase 7: ET Module Manager + NGPeerBridge tests (45)
+│   └── test_ces.py                  # Phase 9: CES test suite (64)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
 │   ├── project_configs.py           # OpenClaw, DSM, Consciousness configs
@@ -304,6 +320,7 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 - [x] Phase 5.5: Management GUI
 - [x] Phase 6: NG-Lite Canonical Source & Bridge
 - [x] Phase 7: ET Module Manager Integration
+- [x] Phase 9: Cognitive Enhancement Suite (CES)
 
 ## Changelog
 
@@ -915,3 +932,75 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 - `openclaw_hook.py` (peer bridge integration, shared learning events, version bump)
 - `deploy.sh` (NG-Lite ecosystem files, ET Module Manager registration, shared learning dir)
 - `CLAUDE.md` (Phase 7 documentation)
+
+---
+
+### Phase 9: Cognitive Enhancement Suite (v0.9.0)
+**Commit:** Implement Phase 9: Cognitive Enhancement Suite (CES)
+
+**What was built:**
+1. **CES Config (`ces_config.py`):**
+   - `CESConfig` dataclass with four section dataclasses: `StreamingConfig`, `SurfacingConfig`, `PersistenceConfig`, `MonitoringConfig`
+   - `load_ces_config(overrides, config_path)` factory with JSON file + dict override layering
+   - All CES defaults centralised: Ollama model, chunk sizes, thresholds, HTTP port, etc.
+
+2. **Stream Parser (`stream_parser.py`):**
+   - `StreamParser` class with background daemon thread consuming from `queue.Queue`
+   - Pipeline: `feed(text)` → `_chunk_text()` (overlapping word-level chunks) → `_embed_chunk()` (Ollama HTTP API) → `_find_similar()` (vector DB search) → `_nudge_nodes()` (voltage injection) → `_trigger_completions()` (hyperedge pattern completion)
+   - Ollama availability detection with cached periodic re-check (60s interval)
+   - Fallback chain: Ollama → sentence-transformers → hash embedder
+   - Lifecycle: `pause()`, `resume()`, `stop()`, `is_running`, `get_stats()`
+
+3. **Activation Persistence (`activation_persistence.py`):**
+   - `ActivationPersistence` class writing JSON sidecar alongside msgpack checkpoint
+   - `capture(graph)` → dict of node voltages, excitability, timestamps
+   - `save(graph, checkpoint_path)` / `restore(graph, checkpoint_path)` with temporal decay
+   - Exponential decay: `voltage *= (1 - decay_per_hour) ^ elapsed_hours`
+   - Sub-threshold pruning, max_entries bounding, auto-save timer thread
+
+4. **Surfacing Monitor (`surfacing.py`):**
+   - `SurfacingMonitor` class with bounded priority queue (max 50 entries)
+   - `after_step(step_result)` — scans fired nodes, filters by voltage threshold + min confidence
+   - Composite scoring: 50% voltage, 30% excitability, 20% hyperedge membership
+   - Per-step decay: `score *= decay_rate` with automatic cleanup of sub-threshold items
+   - `format_context()` — renders surfaced items as `[NeuroGraph Surfaced Knowledge]` block
+
+5. **CES Monitoring (`ces_monitoring.py`):**
+   - `health_context(ng_memory)` — natural language status string for prompt injection
+   - `CESLogger` — rotating file handler to `~/.neurograph/logs/ces.log` (size-based rotation)
+   - `MonitoringDashboard` — HTTP server on port 8847 with `/health`, `/stats`, `/surfaced` endpoints (stdlib `http.server`, daemon thread)
+   - `CESMonitor` coordinator: starts/stops dashboard + periodic health check logging
+
+6. **OpenClaw integration (`openclaw_hook.py` modifications):**
+   - CES modules initialized in `__init__` after peer bridge, all imports guarded by try/except
+   - `on_message()`: feeds stream parser, calls surfacing monitor after step, includes `ces_surfaced` in return
+   - `save()`: writes activation sidecar alongside checkpoint
+   - `stats()`: includes CES subsystem status (stream_parser, surfacing, persistence, monitor)
+   - `config={"ces": {"enabled": False}}` disables CES entirely
+
+**Key design decisions:**
+- **All CES imports guarded** — `try/except ImportError` around all CES module imports in `openclaw_hook.py`. Core NeuroGraph works unchanged if CES files are absent. This makes CES truly optional
+- **Ollama primary, fallback secondary** — stream parser tries Ollama first for embeddings (fast, local, no GPU needed for nomic-embed-text), falls back to the ingestor's `embed_text()` method (sentence-transformers or hash). Ollama availability cached with 60s re-check
+- **Direct voltage injection, not current** — `_nudge_nodes()` adds to `node.voltage` directly rather than going through the synapse/current pathway. This is intentional: stream parsing is a continuous attention signal, not a synaptic event. It warms nodes without triggering STDP
+- **Sidecar file, not checkpoint modification** — activation persistence writes a separate `.activations.json` file rather than modifying the msgpack checkpoint. This avoids version/schema conflicts and makes activation state independently inspectable
+- **Temporal decay on restore, not save** — decay is applied at restore time based on elapsed wall-clock hours. This means the sidecar always stores raw activation state, and the decay amount depends on how long the system was offline
+- **Queue-based surfacing with decay** — surfacing queue decays every step (`score *= 0.95`), so stale concepts naturally fade. This prevents old activations from permanently occupying the surfacing window
+- **HTTP dashboard in daemon thread** — the monitoring server runs in a daemon thread so it dies automatically when the process exits. No cleanup needed, no port leaks
+
+**Tests added (64):**
+- `test_ces.py`:
+  - CESConfig: defaults (4), overrides (4), JSON file (3)
+  - StreamParser: chunking (4), nudging (3), lifecycle (4), embedding (3), completions (1)
+  - ActivationPersistence: capture (3), save/restore (4), decay (3), stats (2), auto-save (1)
+  - SurfacingMonitor: after_step (3), scoring (3), queue (3), formatting (2), stats (1)
+  - CESMonitoring: health_context (2), logger (1), coordinator (3), dashboard (2)
+  - Integration: CES initialized (1), CES disabled (1), on_message (1), save sidecar (1), stats (1)
+
+**Files created:**
+- `ces_config.py`, `stream_parser.py`, `activation_persistence.py`, `surfacing.py`, `ces_monitoring.py`
+- `tests/test_ces.py`
+
+**Files modified:**
+- `openclaw_hook.py` (CES integration: init, on_message, save, stats)
+- `deploy.sh` (CES file deployment)
+- `CLAUDE.md` (Phase 9 documentation)

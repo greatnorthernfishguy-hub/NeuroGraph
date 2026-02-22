@@ -28,6 +28,21 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-02-22] Claude (Opus 4.6) — CES integration (Phase 9).
+#   What: Added Cognitive Enhancement Suite — StreamParser (real-time
+#         Ollama embedding + node nudging), ActivationPersistence (JSON
+#         sidecar for cross-session voltage state), SurfacingMonitor
+#         (priority queue of relevant concepts for prompt injection),
+#         CESMonitor (health context + HTTP dashboard + rotating logger).
+#   Why:  CES adds real-time cognitive capabilities: continuous attention
+#         streaming, activation warmth across sessions, and automatic
+#         surfacing of relevant knowledge without explicit search.
+#   Settings: ces.enabled defaults to True, all CES imports guarded by
+#         try/except so core NeuroGraph works without CES files present.
+#   How:  CES modules initialized in __init__ after peer bridge.
+#         on_message() feeds stream parser + calls surfacing monitor.
+#         save() writes activation sidecar.  stats() includes CES status.
+#
 # [2026-02-17] Claude (Opus 4.6) — ET Module Manager integration.
 #   What: Added NGPeerBridge connection, shared learning event writing,
 #         ET Module Manager registration, peer module discovery, and
@@ -228,6 +243,53 @@ class NeuroGraphMemory:
                     "NGPeerBridge not available (standalone mode): %s", exc
                 )
 
+        # --- CES: Cognitive Enhancement Suite ---
+        # Optional real-time cognitive modules: stream parser (Ollama
+        # embedding + node nudging), activation persistence (cross-session
+        # voltage state), surfacing monitor (priority queue of relevant
+        # concepts), and CES monitoring (health + HTTP dashboard + logs).
+        self._ces_config = None
+        self._stream_parser = None
+        self._activation_persistence = None
+        self._surfacing_monitor = None
+        self._ces_monitor = None
+
+        ces_conf = (config or {}).get("ces", {})
+        if ces_conf.get("enabled", True):
+            try:
+                from ces_config import load_ces_config
+                from stream_parser import StreamParser
+                from activation_persistence import ActivationPersistence
+                from surfacing import SurfacingMonitor
+                from ces_monitoring import CESMonitor
+
+                self._ces_config = load_ces_config(ces_conf)
+                self._stream_parser = StreamParser(
+                    self.graph,
+                    self.vector_db,
+                    self._ces_config,
+                    fallback_embedder=self.ingestor.embedder.embed_text,
+                )
+                self._activation_persistence = ActivationPersistence(
+                    self._ces_config
+                )
+                self._surfacing_monitor = SurfacingMonitor(
+                    self.graph, self.vector_db, self._ces_config
+                )
+                self._ces_monitor = CESMonitor(self, self._ces_config)
+                self._ces_monitor._surfacing_monitor = self._surfacing_monitor
+
+                # Restore activation state if checkpoint exists
+                if self._checkpoint_path.exists():
+                    self._activation_persistence.restore(
+                        self.graph, str(self._checkpoint_path)
+                    )
+
+                self._ces_monitor.start()
+                logger.info("CES modules initialized")
+            except Exception as exc:
+                logger.info("CES not available: %s", exc)
+
     @classmethod
     def get_instance(
         cls,
@@ -306,6 +368,16 @@ class NeuroGraphMemory:
         # applies STDP, structural plasticity, predictions, etc.)
         step_result = self.graph.step()
 
+        # CES: Feed stream parser (async background processing)
+        if self._stream_parser is not None:
+            self._stream_parser.feed(text)
+
+        # CES: Surfacing monitor — scan fired nodes for relevant concepts
+        ces_surfaced: List[Dict[str, Any]] = []
+        if self._surfacing_monitor is not None:
+            self._surfacing_monitor.after_step(step_result)
+            ces_surfaced = self._surfacing_monitor.get_surfaced()
+
         # Update novelty probation for ingested nodes
         graduated = self.ingestor.update_probation()
 
@@ -325,6 +397,7 @@ class NeuroGraphMemory:
             "graduated": len(graduated),
             "message_count": self._message_count,
             "surfaced": surfaced,
+            "ces_surfaced": ces_surfaced,
         }
 
         # Write to memory/ for OpenClaw consumption
@@ -534,6 +607,11 @@ class NeuroGraphMemory:
     def save(self) -> str:
         """Save graph state to checkpoint. Returns the checkpoint path."""
         self.graph.checkpoint(str(self._checkpoint_path), mode=CheckpointMode.FULL)
+        # CES: Save activation sidecar alongside checkpoint
+        if self._activation_persistence is not None:
+            self._activation_persistence.save(
+                self.graph, str(self._checkpoint_path)
+            )
         logger.info("Checkpoint saved to %s", self._checkpoint_path)
         return str(self._checkpoint_path)
 
@@ -567,6 +645,31 @@ class NeuroGraphMemory:
             result["peer_bridge"] = self._peer_bridge.get_stats()
         else:
             result["peer_bridge"] = {"connected": False}
+
+        # CES subsystem status
+        if self._ces_config is not None:
+            result["ces"] = {
+                "stream_parser": (
+                    self._stream_parser.get_stats()
+                    if self._stream_parser
+                    else None
+                ),
+                "surfacing": (
+                    self._surfacing_monitor.get_stats()
+                    if self._surfacing_monitor
+                    else None
+                ),
+                "persistence": (
+                    self._activation_persistence.get_stats()
+                    if self._activation_persistence
+                    else None
+                ),
+                "monitor": (
+                    self._ces_monitor.get_health()
+                    if self._ces_monitor
+                    else None
+                ),
+            }
 
         return result
 
