@@ -119,6 +119,13 @@ deploy_files() {
     # Migration framework
     cp "$SCRIPT_DIR/neurograph_migrate.py" "$SKILL_DIR/"
 
+    # CES (Cognitive Enhancement Suite) files
+    for cesfile in ces_config.py stream_parser.py activation_persistence.py surfacing.py ces_monitoring.py; do
+        if [ -f "$SCRIPT_DIR/$cesfile" ]; then
+            cp "$SCRIPT_DIR/$cesfile" "$SKILL_DIR/"
+        fi
+    done
+
     # Management GUI
     if [ -f "$SCRIPT_DIR/neurograph_gui.py" ]; then
         cp "$SCRIPT_DIR/neurograph_gui.py" "$SKILL_DIR/"
