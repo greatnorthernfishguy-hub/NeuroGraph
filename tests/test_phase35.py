@@ -516,11 +516,11 @@ class TestVersionAndIntegration:
     """Checkpoint version and end-to-end roundtrip tests."""
 
     def test_version_bump(self):
-        """Checkpoint version should be 0.3.5."""
+        """Checkpoint version should be 0.4.1."""
         g = build_predictive_graph()
         g.create_node(node_id="A")
         data = g._serialize_full()
-        assert data["version"] == "0.3.5"
+        assert data["version"] == "0.4.1"
 
     def test_full_roundtrip_with_active_state(self):
         """Full scenario: generate predictions, save mid-flight, restore, continue."""

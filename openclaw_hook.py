@@ -673,6 +673,40 @@ class NeuroGraphMemory:
 
         return result
 
+    def ces_stats(self) -> Dict[str, Any]:
+        """Return dedicated CES (Cognitive Enhancement Suite) statistics.
+
+        Returns a dict with status of each CES subsystem: stream_parser,
+        surfacing, persistence, monitor.  Returns {"enabled": False} when
+        CES is not initialized.
+        """
+        if self._ces_config is None:
+            return {"enabled": False}
+
+        return {
+            "enabled": True,
+            "stream_parser": (
+                self._stream_parser.get_stats()
+                if self._stream_parser
+                else None
+            ),
+            "surfacing": (
+                self._surfacing_monitor.get_stats()
+                if self._surfacing_monitor
+                else None
+            ),
+            "persistence": (
+                self._activation_persistence.get_stats()
+                if self._activation_persistence
+                else None
+            ),
+            "monitor": (
+                self._ces_monitor.get_health()
+                if self._ces_monitor
+                else None
+            ),
+        }
+
     def ingest_file(self, path: str, source_type: Optional[SourceType] = None) -> Dict[str, Any]:
         """Ingest a file from disk.
 
