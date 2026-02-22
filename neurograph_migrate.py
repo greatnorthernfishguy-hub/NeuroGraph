@@ -27,6 +27,8 @@ Schema Version History:
              prediction_outcomes, confirmation_history serialized)
     0.4.0  — Phase 4: Universal Ingestor (no checkpoint schema changes,
              version bump for tracking)
+    0.4.1  — Phase 4.1: Consolidation Lifecycle (ConsolidationState enum,
+             synapse salience, hyperedge creation_time, consolidation config)
 
 Grok Review Changelog (v0.7.1):
     No code changes.  Grok's suggestions for neurograph_migrate.py evaluated:
@@ -62,10 +64,10 @@ except ImportError:
 
 
 # Ordered list of all schema versions
-SCHEMA_VERSIONS = ["0.1.0", "0.2.0", "0.2.5", "0.3.0", "0.3.5", "0.4.0"]
+SCHEMA_VERSIONS = ["0.1.0", "0.2.0", "0.2.5", "0.3.0", "0.3.5", "0.4.0", "0.4.1"]
 
 # Current target version
-CURRENT_VERSION = "0.4.0"
+CURRENT_VERSION = "0.4.1"
 
 
 def _version_tuple(v: str) -> Tuple[int, ...]:
@@ -204,6 +206,42 @@ def _migrate_0_3_5_to_0_4_0(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _migrate_0_4_0_to_0_4_1(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Phase 4 → Phase 4.1: Consolidation Lifecycle.
+
+    Adds ConsolidationState fields to hyperedges, salience to synapses,
+    and consolidation config keys + telemetry fields.
+    """
+    # Synapse: add salience field (Amygdala Protocol armor)
+    for sid, sd in data.get("synapses", {}).items():
+        sd.setdefault("salience", 1.0)
+
+    # Hyperedge: add consolidation_state and creation_time
+    for hid, hd in data.get("hyperedges", {}).items():
+        hd.setdefault("consolidation_state", "SPECULATIVE")
+        hd.setdefault("creation_time", 0)
+
+    # Archived hyperedges too
+    for hid, hd in data.get("archived_hyperedges", {}).items():
+        hd.setdefault("consolidation_state", "SPECULATIVE")
+        hd.setdefault("creation_time", 0)
+
+    # Config: add consolidation lifecycle keys
+    config = data.get("config", {})
+    config.setdefault("he_speculative_to_candidate_min_count", 10)
+    config.setdefault("he_speculative_to_candidate_min_ema", 0.2)
+    config.setdefault("he_candidate_to_consolidated_min_count", 100)
+    config.setdefault("he_candidate_to_consolidated_min_age", 5000)
+    config.setdefault("he_consolidation_eval_interval", 100)
+    config.setdefault("he_cull_penalty_factor", 0.25)
+    config.setdefault("he_consolidation_adapt_rate", 0.005)
+    config.setdefault("he_salience_max", 5.0)
+    config.setdefault("he_salience_decay_rate", 0.0002)
+
+    data["version"] = "0.4.1"
+    return data
+
+
 # Migration registry: (from_version, to_version) → migration function
 MIGRATIONS: List[Tuple[str, str, Callable]] = [
     ("0.1.0", "0.2.0", _migrate_0_1_0_to_0_2_0),
@@ -211,6 +249,7 @@ MIGRATIONS: List[Tuple[str, str, Callable]] = [
     ("0.2.5", "0.3.0", _migrate_0_2_5_to_0_3_0),
     ("0.3.0", "0.3.5", _migrate_0_3_0_to_0_3_5),
     ("0.3.5", "0.4.0", _migrate_0_3_5_to_0_4_0),
+    ("0.4.0", "0.4.1", _migrate_0_4_0_to_0_4_1),
 ]
 
 
