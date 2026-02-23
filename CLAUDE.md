@@ -104,6 +104,17 @@ Build the base `neuro_foundation.py` implementing:
 - Three-tier architecture: Tier 1 (standalone NG-Lite) → Tier 2 (NGPeerBridge) → Tier 3 (NGSaaSBridge)
 - Graceful degradation: peer bridge failure never blocks core SNN operation
 
+### Phase 8: Module Integration Spec v2 -- COMPLETE
+- `ng_ecosystem.py` — Canonical vendorable Tier 1→2→3 orchestration file
+- `openclaw_adapter.py` — Standardized OpenClaw hook ABC for all E-T Systems modules
+- `et_module_template.json` — v2 schema template for new modules
+- `et_module.json` updated to v2 schema with `ecosystem` block
+- `Integration-Specs/` — Spec documents (primer, templates, examples)
+- Automatic tier progression: standalone → peer-pooled → full SNN
+- Background polling thread for NeuroGraph auto-detection (Tier 3 upgrade)
+- Thread-safe singleton pattern with per-module instances
+- NeuroGraph configured as Tier 3 provider (`tier3_upgrade: false`, `provides: ["*"]`)
+
 ### Phase 9: Cognitive Enhancement Suite (CES) -- COMPLETE
 - `ces_config.py` — Centralized CES configuration (streaming, surfacing, persistence, monitoring)
 - `stream_parser.py` — Real-time stream parser: background thread, Ollama embeddings, node nudging, pattern completion
@@ -130,7 +141,11 @@ NeuroGraph/
 ├── ng_lite.py                       # Phase 6: Lightweight learning substrate (vendorable)
 ├── ng_bridge.py                     # Phase 6: NGSaaSBridge (Tier 3 bridge to full NeuroGraph)
 ├── ng_peer_bridge.py                # Phase 7: NGPeerBridge (Tier 2 cross-module learning)
-├── et_module.json                   # Phase 7: Module manifest for ET ecosystem
+├── ng_ecosystem.py                  # Phase 8: Canonical Tier 1→2→3 orchestration (vendorable)
+├── openclaw_adapter.py              # Phase 8: OpenClaw hook ABC for E-T Systems modules
+├── et_module.json                   # Phase 7+8: Module manifest (v2 schema)
+├── et_module_template.json          # Phase 8: v2 manifest template for new modules
+├── Integration-Specs/               # Phase 8: Spec documents (primer, templates, examples)
 ├── et_modules/
 │   ├── __init__.py
 │   └── manager.py                   # Phase 7: ET Module Manager
@@ -155,6 +170,8 @@ NeuroGraph/
 │   ├── test_gui.py                  # Phase 5.5: GUI non-GUI logic tests (25)
 │   ├── test_ng_lite.py              # Phase 6: NG-Lite + NGSaaSBridge tests (52)
 │   ├── test_et_modules.py           # Phase 7: ET Module Manager + NGPeerBridge tests (45)
+│   ├── test_ng_ecosystem.py         # Phase 8: NGEcosystem + tier orchestration tests
+│   ├── test_openclaw_adapter.py     # Phase 8: OpenClawAdapter tests
 │   └── test_ces.py                  # Phase 9: CES test suite (64)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
@@ -320,6 +337,7 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 - [x] Phase 5.5: Management GUI
 - [x] Phase 6: NG-Lite Canonical Source & Bridge
 - [x] Phase 7: ET Module Manager Integration
+- [x] Phase 8: Module Integration Spec v2
 - [x] Phase 9: Cognitive Enhancement Suite (CES)
 
 ## Changelog
@@ -932,6 +950,100 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 - `openclaw_hook.py` (peer bridge integration, shared learning events, version bump)
 - `deploy.sh` (NG-Lite ecosystem files, ET Module Manager registration, shared learning dir)
 - `CLAUDE.md` (Phase 7 documentation)
+
+---
+
+### Phase 8: Module Integration Spec v2 (v0.8.0)
+**Commit:** Implement Module Integration Spec v2 — ng_ecosystem.py, openclaw_adapter.py, et_module v2 schema
+
+**What was built:**
+1. **`ng_ecosystem.py` — Canonical Tier 1→2→3 orchestration (vendorable):**
+   - `NGEcosystem` singleton class managing the full tier lifecycle automatically
+   - `get_instance(module_id, state_path, config)` thread-safe factory
+   - Boot sequence: `_init_ng_lite()` (Tier 1) → `_init_peer_bridge()` (Tier 2) → `_init_tier3_upgrade()` (Tier 3)
+   - Background daemon thread polls for NeuroGraph every 5 minutes (configurable)
+   - Three-probe Tier 3 detection: in-process singleton → ETModuleManager registry → known filesystem paths
+   - Public API: `record_outcome()`, `get_recommendations()`, `detect_novelty()`, `get_context()`, `save()`, `stats()`, `shutdown()`
+   - `tier` / `tier_name` properties for runtime inspection
+   - All public methods protected by `_ops_lock` for thread safety
+   - `NGEcosystemAdapter` ABC for framework-specific adapters (OpenClaw, etc.)
+   - Module-level `init()` convenience function for one-line integration
+   - `_deep_merge()` utility for nested config override
+
+2. **`openclaw_adapter.py` — Standardized OpenClaw hook ABC:**
+   - `OpenClawAdapter` abstract base class for all E-T Systems OpenClaw skills
+   - Standard interface: `on_message(text)` → `recall(query)` → `stats()`
+   - Subclasses override: `MODULE_ID`, `SKILL_NAME`, `WORKSPACE_ENV`, `DEFAULT_WORKSPACE`
+   - Three hook methods: `_embed(text)` (required), `_module_on_message(text, emb)` (optional), `_module_stats()` (optional)
+   - `_hash_embed(text, dims)` zero-dependency embedding fallback (SHA-256 seeded RNG)
+   - Memory event logging to `{workspace}/memory/events.jsonl`
+   - Auto-save at configurable interval (default 10 messages)
+   - Initializes NGEcosystem via `ng_ecosystem.init()` — all tier wiring is automatic
+
+3. **`et_module_template.json` — v2 schema template:**
+   - Complete annotated template with `_comment` fields for every field
+   - New `ecosystem` block: `ng_lite`, `peer_bridge`, `tier3_upgrade`, `ng_ecosystem_version`, `openclaw_adapter`, `openclaw_skill_name`, `shared_learning_writes`, `capabilities`
+   - `provides` field for backend-capable modules (NeuroGraph uses `["*"]`)
+
+4. **`et_module.json` updated to v2 schema:**
+   - Added `_schema: "et_module/2.0"` identifier
+   - Added full `ecosystem` block with `tier3_upgrade: false` (NeuroGraph IS Tier 3)
+   - Added `provides: ["*"]` (NeuroGraph upgrades any co-located module)
+   - Added `capabilities` list: snn-backend, memory, hypergraph, stdp, predictive-coding, ces
+   - Version bumped to 0.9.0
+
+5. **`Integration-Specs/` directory populated:**
+   - `ET MODULE INTEGRATION PRIMER v2.pdf` — Complete integration standard
+   - `et module neurograph.pdf` — NeuroGraph-specific v2 manifest
+   - `et module template.pdf` — Annotated template for new modules
+   - `ng ecosystem.pdf` — Full ng_ecosystem.py source specification
+   - `openclaw adapter.pdf` — Full openclaw_adapter.py source specification
+   - `trollguard hook example.pdf` — Reference implementation using OpenClawAdapter
+
+6. **`deploy.sh` updated:**
+   - Deploys `ng_ecosystem.py`, `openclaw_adapter.py`, `et_module_template.json` to skill directory
+   - ET Module Manager registration uses v2 schema with `ecosystem` block
+   - Verification checks for new canonical files
+
+**Key design decisions:**
+- **NeuroGraph IS Tier 3, not a consumer** — `tier3_upgrade.enabled: false` in config. NeuroGraph does not auto-upgrade itself to itself. It participates as a Tier 2 peer (writes to shared_learning/) AND provides the Tier 3 backend for other modules via NGSaaSBridge. `provides: ["*"]` signals this to the ETModuleManager
+- **Existing `openclaw_hook.py` preserved as-is** — The primer explicitly states: "migrating it to the adapter pattern is a future nice-to-have, not required." NeuroGraph's hook pre-dates OpenClawAdapter and is significantly more complex (CES, auto-knowledge, vector DB, etc.) than a typical adapter subclass. The adapter pattern is for consumer modules
+- **Singleton per module_id, not global** — `NGEcosystem._instances` is a dict keyed by module_id. This supports the case where multiple E-T modules run in the same Python process (e.g., OpenClaw loading TrollGuard + TID skills simultaneously)
+- **Background upgrade thread is daemon** — If the main process exits, the upgrade thread dies automatically. No cleanup needed, no port leaks. `_shutdown_event` provides cooperative cancellation for graceful shutdown
+- **Config uses deep merge, not shallow** — `_deep_merge()` allows overriding `peer_bridge.sync_interval` without wiping `peer_bridge.enabled`. This makes partial config overrides safe
+- **Three-probe Tier 3 detection** — Probe 1 (in-process) handles the common case where NeuroGraph's OpenClaw hook is loaded in the same process. Probe 2 (registry) handles installed-but-not-imported. Probe 3 (filesystem) handles fresh installs before registry exists. Each probe is independently try/excepted
+
+**Tests added:**
+- `test_ng_ecosystem.py`:
+  - Deep merge: flat (1), nested (1), override nested (1), empty (1)
+  - Constants: tier values (1), tier names (1), version (1)
+  - Singleton: create (1), same instance (1), different module_ids (1), reset (1)
+  - Tier 1: starts at tier 1 (1), ng_lite initialized (1), state path created (1)
+  - Tier 2: upgrades when available (1), stays tier 1 when disabled (1)
+  - Public API: record_outcome (2), recommendations (2), novelty (2), context (2), null safety (2)
+  - Persistence: save creates file (1), roundtrip (1), valid JSON (1)
+  - Stats: returns dict (1), required keys (1), module_id (1), tier (1), version (1), peer bridge none (1), ng_memory none (1)
+  - Convenience init (2), adapter ABC (3), shutdown (1), config overrides (3), default path (1)
+  - Tier 3 detection: registry probe (2), graceful degradation (1), thread safety (1)
+- `test_openclaw_adapter.py`:
+  - ABC enforcement: no module_id (1), no embed (1)
+  - on_message: returns dict (1), count (1), tier (1), module results (1), hook called (1), novelty (1), recommendations (1)
+  - Skip empty: empty (1), none (1), whitespace (1)
+  - recall: context dict (1), logs event (1)
+  - Stats: returns dict (1), keys (1), skill name (1), module_id (1), module stats (1), message count (1), ecosystem (1)
+  - Event logging: dir created (1), logged (1), fields (1), multiple (1)
+  - Hash embedding: ndarray (1), dims (1), normalized (1), deterministic (1), different (1)
+  - Auto-save (1), workspace env var (1), integration lifecycle (1), ecosystem tier (1)
+
+**Files created:**
+- `ng_ecosystem.py`, `openclaw_adapter.py`, `et_module_template.json`
+- `tests/test_ng_ecosystem.py`, `tests/test_openclaw_adapter.py`
+- `Integration-Specs/*.pdf` (6 spec documents)
+
+**Files modified:**
+- `et_module.json` (v2 schema with ecosystem block)
+- `deploy.sh` (new file deployment + v2 registry)
+- `CLAUDE.md` (Phase 8 documentation)
 
 ---
 

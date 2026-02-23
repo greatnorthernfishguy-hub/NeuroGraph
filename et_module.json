@@ -1,14 +1,32 @@
 {
+  "_schema": "et_module/2.0",
   "module_id": "neurograph",
-  "display_name": "NeuroGraph Foundation",
-  "version": "0.6.0",
-  "description": "Reusable cognitive architecture — dynamic learning, causal reasoning, and self-optimizing knowledge management via SNN + Hypergraph + Vector DB",
-  "install_path": "",
+  "display_name": "NeuroGraph Cognitive Foundation",
+  "version": "0.9.0",
+  "description": "Dynamic Spiking Neuro-Hypergraph foundation — the Tier 3 SNN backend for the E-T Systems ecosystem.",
+
   "git_remote": "https://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
   "git_branch": "main",
   "entry_point": "openclaw_hook.py",
-  "ng_lite_version": "1.0.0",
-  "dependencies": [],
+
+  "install_path": "",
   "service_name": "",
-  "api_port": 0
+  "api_port": 0,
+
+  "ecosystem": {
+    "ng_lite": true,
+    "ng_lite_version": "1.0.0",
+    "peer_bridge": true,
+    "tier3_upgrade": false,
+    "_tier3_note": "NeuroGraph IS Tier 3.  It does not upgrade to itself.  It offers upgrades TO others.",
+    "ng_ecosystem_version": "1.0.0",
+    "openclaw_adapter": "openclaw_hook.py",
+    "openclaw_skill_name": "NeuroGraph Cognitive Memory",
+    "shared_learning_writes": true,
+    "capabilities": ["snn-backend", "memory", "hypergraph", "stdp", "predictive-coding", "ces"]
+  },
+
+  "dependencies": [],
+  "provides": ["*"],
+  "_provides_comment": "NeuroGraph can upgrade any co-located peer module from Tier 2 to Tier 3."
 }

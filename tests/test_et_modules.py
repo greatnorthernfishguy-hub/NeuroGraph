@@ -622,7 +622,7 @@ class TestETModuleManifestNeurograph(unittest.TestCase):
         m = ModuleManifest.from_file(manifest_path)
         self.assertIsNotNone(m)
         self.assertEqual(m.module_id, "neurograph")
-        self.assertEqual(m.display_name, "NeuroGraph Foundation")
+        self.assertEqual(m.display_name, "NeuroGraph Cognitive Foundation")
         self.assertEqual(m.ng_lite_version, "1.0.0")
         self.assertEqual(m.git_branch, "main")
         self.assertIn("github.com", m.git_remote)

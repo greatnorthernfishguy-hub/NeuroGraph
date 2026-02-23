@@ -74,10 +74,19 @@ class ModuleManifest:
 
     @classmethod
     def from_file(cls, path: str) -> Optional[ModuleManifest]:
-        """Load a manifest from an et_module.json file."""
+        """Load a manifest from an et_module.json file.
+
+        Supports both v1 (flat) and v2 (nested ecosystem block) schemas.
+        In v2, ng_lite_version lives inside the ecosystem block.
+        """
         try:
             with open(path, "r") as f:
                 data = json.load(f)
+            # v2 schema: extract ng_lite_version from ecosystem block
+            if "ecosystem" in data and isinstance(data["ecosystem"], dict):
+                eco = data["ecosystem"]
+                if "ng_lite_version" in eco and "ng_lite_version" not in data:
+                    data["ng_lite_version"] = eco["ng_lite_version"]
             return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         except (OSError, json.JSONDecodeError, TypeError) as e:
             logger.warning("Failed to load manifest from %s: %s", path, e)

@@ -110,6 +110,11 @@ deploy_files() {
     cp "$SCRIPT_DIR/ng_bridge.py" "$SKILL_DIR/"
     cp "$SCRIPT_DIR/ng_peer_bridge.py" "$SKILL_DIR/"
 
+    # Module Integration Spec v2 files (canonical source)
+    cp "$SCRIPT_DIR/ng_ecosystem.py" "$SKILL_DIR/"
+    cp "$SCRIPT_DIR/openclaw_adapter.py" "$SKILL_DIR/"
+    cp "$SCRIPT_DIR/et_module_template.json" "$SKILL_DIR/"
+
     # ET Module Manager
     mkdir -p "$SKILL_DIR/et_modules"
     cp "$SCRIPT_DIR/et_modules/__init__.py" "$SKILL_DIR/et_modules/"
@@ -256,15 +261,27 @@ except (FileNotFoundError, json.JSONDecodeError):
     registry = {'modules': {}}
 
 registry['modules']['neurograph'] = {
+    '_schema': 'et_module/2.0',
     'module_id': 'neurograph',
-    'display_name': 'NeuroGraph Foundation',
-    'version': '0.6.0',
+    'display_name': 'NeuroGraph Cognitive Foundation',
+    'version': '0.9.0',
     'install_path': '$SKILL_DIR',
     'git_remote': 'https://github.com/greatnorthernfishguy-hub/NeuroGraph.git',
     'git_branch': 'main',
     'entry_point': 'openclaw_hook.py',
-    'ng_lite_version': '1.0.0',
+    'ecosystem': {
+        'ng_lite': True,
+        'ng_lite_version': '1.0.0',
+        'peer_bridge': True,
+        'tier3_upgrade': False,
+        'ng_ecosystem_version': '1.0.0',
+        'openclaw_adapter': 'openclaw_hook.py',
+        'openclaw_skill_name': 'NeuroGraph Cognitive Memory',
+        'shared_learning_writes': True,
+        'capabilities': ['snn-backend', 'memory', 'hypergraph', 'stdp', 'predictive-coding', 'ces'],
+    },
     'dependencies': [],
+    'provides': ['*'],
     'service_name': '',
     'api_port': 0,
     'registered_at': time.time(),
@@ -290,7 +307,7 @@ verify() {
     local ok=true
 
     # Check core files
-    for f in neuro_foundation.py universal_ingestor.py openclaw_hook.py SKILL.md; do
+    for f in neuro_foundation.py universal_ingestor.py openclaw_hook.py SKILL.md ng_ecosystem.py openclaw_adapter.py; do
         if [ ! -f "$SKILL_DIR/$f" ]; then
             error "Missing: $SKILL_DIR/$f"
             ok=false

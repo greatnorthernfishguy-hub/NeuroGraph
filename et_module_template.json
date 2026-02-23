@@ -1,0 +1,59 @@
+{
+  "_schema": "et_module/2.0",
+  "_comment": "E-T Systems Module Manifest v2.  Copy this file to your project root as et_module.json and fill in your values.  Remove all _comment and _schema fields before shipping.",
+
+  "module_id": "your_module_id",
+  "display_name": "Your Module Name",
+  "version": "0.1.0",
+  "description": "What your module does in one sentence.",
+
+  "git_remote": "https://github.com/greatnorthernfishguy-hub/YourRepo.git",
+  "git_branch": "main",
+  "entry_point": "main.py",
+
+  "install_path": "",
+  "_install_path_comment": "Populated at install time by install.sh/deploy.sh.  Leave blank here.",
+
+  "service_name": "",
+  "_service_name_comment": "systemd service name if module runs as a daemon.  Empty if not a service.",
+
+  "api_port": 0,
+  "_api_port_comment": "HTTP port if module exposes an API.  0 if none.",
+
+  "ecosystem": {
+    "_comment": "Declares this module's participation in the E-T Systems ecosystem.",
+
+    "ng_lite": true,
+    "_ng_lite_comment": "true if this module vendors ng_lite.py.  Required for Tier 1.",
+
+    "ng_lite_version": "1.0.0",
+    "_ng_lite_version_comment": "Version of ng_lite.py vendored.  Must match canonical source in NeuroGraph repo.",
+
+    "peer_bridge": true,
+    "_peer_bridge_comment": "true if this module vendors ng_peer_bridge.py and connects NGPeerBridge on startup.  Required for Tier 2.",
+
+    "tier3_upgrade": true,
+    "_tier3_upgrade_comment": "true if this module uses ng_ecosystem.py and will auto-upgrade to NGSaaSBridge when NeuroGraph is detected.  Required for Tier 3.",
+
+    "ng_ecosystem_version": "1.0.0",
+    "_ng_ecosystem_version_comment": "Version of ng_ecosystem.py vendored.  Must match canonical source in NeuroGraph repo.",
+
+    "openclaw_adapter": "",
+    "_openclaw_adapter_comment": "Filename of the OpenClaw hook if this module exposes one (e.g. 'trollguard_hook.py').  Empty if not an OpenClaw skill.",
+
+    "openclaw_skill_name": "",
+    "_openclaw_skill_name_comment": "Display name used in OpenClaw skill telemetry.  Empty if not an OpenClaw skill.",
+
+    "shared_learning_writes": true,
+    "_shared_learning_writes_comment": "true if this module writes to ~/.et_modules/shared_learning/.  Should match peer_bridge.",
+
+    "capabilities": [],
+    "_capabilities_comment": "Free-form list of module capability tags.  Used by ETModuleManager for feature discovery.  Examples: 'security', 'routing', 'memory', 'snn-backend'."
+  },
+
+  "dependencies": [],
+  "_dependencies_comment": "List of other module_ids this module requires to be installed.  Empty for most modules.",
+
+  "provides": [],
+  "_provides_comment": "List of module_ids this module can serve as a backend for.  NeuroGraph uses ['*'] meaning it can upgrade any peer module to Tier 3."
+}
