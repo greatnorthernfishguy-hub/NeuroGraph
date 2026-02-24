@@ -72,11 +72,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "NEUROGRAPH_SKILL_DIR",
         str(Path.home() / ".openclaw" / "skills" / "neurograph"),
     ),
+    "watch_paths": [],  # Additional watch directories (e.g. ~/Downloads)
     "watcher_enabled": True,
     "watcher_stability_seconds": 1.0,
     "status_refresh_seconds": 5,
 }
 
+SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf", ".zip"}
 SUPPORTED_EXTENSIONS = {
     ".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf",
     ".json", ".csv",
@@ -99,6 +101,15 @@ try:
     _HAS_WATCHDOG = True
 except ImportError:
     _HAS_WATCHDOG = False
+
+# ---------------------------------------------------------------------------
+# Optional tkinterdnd2 import (drag-and-drop from file manager)
+# ---------------------------------------------------------------------------
+try:
+    import tkinterdnd2
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
 
 # ---------------------------------------------------------------------------
 # 1. GUIConfig
@@ -142,13 +153,41 @@ class GUIConfig:
     def set(self, key: str, value: Any) -> None:
         self._data[key] = value
 
-    def ensure_directories(self) -> None:
-        """Create inbox, ingested, repo, and logs dirs if missing."""
+    def ensure_directories(self) -> List[str]:
+        """Create inbox, ingested, repo, and logs dirs if missing.
+
+        Returns a list of directories that were newly created.
+        Prints to stderr on failure so the user sees feedback even
+        before the GUI logger is initialised.
+        """
+        created: List[str] = []
         for key in ("inbox_path", "ingested_path", "repo_path"):
-            Path(self.get(key)).mkdir(parents=True, exist_ok=True)
+            dir_path = Path(self.get(key))
+            try:
+                if not dir_path.exists():
+                    dir_path.mkdir(parents=True, exist_ok=True)
+                    created.append(str(dir_path))
+                    print(f"[neurograph] Created directory: {dir_path}",
+                          file=sys.stderr)
+                elif not dir_path.is_dir():
+                    print(f"[neurograph] WARNING: {dir_path} exists but is "
+                          f"not a directory", file=sys.stderr)
+            except OSError as exc:
+                print(f"[neurograph] ERROR creating {dir_path}: {exc}",
+                      file=sys.stderr)
         log_path = self.get("log_path")
         if log_path:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            log_dir = Path(log_path).parent
+            try:
+                if not log_dir.exists():
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    created.append(str(log_dir))
+                    print(f"[neurograph] Created directory: {log_dir}",
+                          file=sys.stderr)
+            except OSError as exc:
+                print(f"[neurograph] ERROR creating {log_dir}: {exc}",
+                      file=sys.stderr)
+        return created
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +646,11 @@ class IngestionManager:
             target=self._ingest_batch_worker, args=(paths,), daemon=True
         ).start()
 
+    def ingest_url(self, url: str) -> None:
+        """Ingest content from a URL on a background thread."""
+        threading.Thread(
+            target=self._ingest_url_worker, args=(url,), daemon=True
+        ).start()
     @property
     def is_initialized(self) -> bool:
         """True if NeuroGraphMemory has been loaded (non-blocking check)."""
@@ -673,6 +717,18 @@ class IngestionManager:
         for p in paths:
             self._ingest_file_worker(p)
 
+    def _ingest_url_worker(self, url: str) -> None:
+        try:
+            ng = self.get_memory()
+            result = ng.ingest_url(url)
+            if result.get("status") == "error":
+                self._on_error(f"URL failed: {url}: {result.get('reason')}")
+                return
+            result["original_path"] = url
+            self._on_result(result)
+        except Exception as exc:
+            self._on_error(f"URL ingestion error for {url}: {exc}")
+
     def _move_to_ingested(self, original_path: str) -> str:
         date_dir = self._ingested_path / datetime.now().strftime("%Y-%m-%d")
         date_dir.mkdir(parents=True, exist_ok=True)
@@ -698,6 +754,13 @@ try:
     _HAS_TK = True
 except ImportError:
     _HAS_TK = False
+
+# Re-export DnD root factory for main()
+def _make_root() -> Any:
+    """Create the root Tk window, using tkinterdnd2 when available for DnD."""
+    if _HAS_DND:
+        return tkinterdnd2.Tk()
+    return tk.Tk()
 
 
 class GUIMessageQueue:
@@ -744,12 +807,23 @@ class NeuroGraphGUI:
         self.root.minsize(750, 520)
 
         self.config = GUIConfig()
-        self.config.ensure_directories()
+        created = self.config.ensure_directories()
 
         self.msg_queue = GUIMessageQueue(root)
 
         # Set up file-based logging
         self._setup_logging()
+
+        # Log directory creation results
+        if created:
+            _logger.info("Created directories at startup: %s", created)
+        # Verify critical directories exist
+        for key, label in (("inbox_path", "Inbox"), ("ingested_path", "Ingested")):
+            d = Path(self.config.get(key))
+            if not d.is_dir():
+                _logger.error("%s directory missing: %s", label, d)
+                print(f"[neurograph] ERROR: {label} directory not found: {d}",
+                      file=sys.stderr)
 
         # Core managers
         self.ingestion_mgr = IngestionManager(
@@ -922,12 +996,26 @@ class NeuroGraphGUI:
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text=" Ingestion ")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-        frame.rowconfigure(5, weight=1)
+        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(7, weight=1)
+
+        # -- URL ingestion bar --
+        url_frame = ttk.LabelFrame(frame, text="URL Ingestion", padding=5)
+        url_frame.grid(row=0, column=0, columnspan=2, sticky=tk.EW, pady=(0, 5))
+        url_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(url_frame, text="URL:").grid(row=0, column=0, sticky=tk.E, padx=(0, 5))
+        self._url_var = tk.StringVar()
+        url_entry = ttk.Entry(url_frame, textvariable=self._url_var)
+        url_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 5))
+        url_entry.bind("<Return>", lambda e: self._ingest_url())
+        ttk.Button(url_frame, text="Ingest URL", command=self._ingest_url).grid(
+            row=0, column=2,
+        )
 
         # -- Inbox path and watcher controls --
         top = ttk.LabelFrame(frame, text="Inbox", padding=5)
-        top.grid(row=0, column=0, sticky=tk.EW, pady=(0, 5))
+        top.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 5))
         top.columnconfigure(1, weight=1)
 
         ttk.Label(top, text="Path:").grid(row=0, column=0, sticky=tk.E, padx=(0, 5))
@@ -945,19 +1033,32 @@ class NeuroGraphGUI:
         if self.file_watcher and self.file_watcher.is_running:
             self._watcher_var.set("Watcher: ON")
 
+        # Show additional watch paths if configured
+        watch_paths = self.config.get("watch_paths", [])
+        if watch_paths:
+            paths_str = ", ".join(watch_paths)
+            ttk.Label(top, text="Also watching:").grid(
+                row=1, column=0, sticky=tk.E, padx=(0, 5),
+            )
+            ttk.Label(top, text=paths_str).grid(row=1, column=1, sticky=tk.W)
+
         # -- Inbox file list --
         ttk.Label(frame, text="Files in Inbox:").grid(
-            row=1, column=0, sticky=tk.W, pady=(5, 0),
+            row=2, column=0, sticky=tk.W, pady=(5, 0),
         )
         self._inbox_listbox = tk.Listbox(frame, selectmode=tk.EXTENDED, height=6)
-        self._inbox_listbox.grid(row=2, column=0, sticky=tk.NSEW)
+        self._inbox_listbox.grid(row=3, column=0, sticky=tk.NSEW)
         inbox_scroll = ttk.Scrollbar(frame, command=self._inbox_listbox.yview)
-        inbox_scroll.grid(row=2, column=1, sticky=tk.NS)
+        inbox_scroll.grid(row=3, column=1, sticky=tk.NS)
         self._inbox_listbox.config(yscrollcommand=inbox_scroll.set)
+
+        # -- Drag-and-drop zone --
+        if _HAS_DND:
+            self._setup_dnd(self._inbox_listbox)
 
         # -- Action buttons --
         btn_bar = ttk.Frame(frame)
-        btn_bar.grid(row=3, column=0, pady=5, sticky=tk.W)
+        btn_bar.grid(row=4, column=0, pady=5, sticky=tk.W)
         ttk.Button(btn_bar, text="Ingest All", command=self._ingest_all).pack(
             side=tk.LEFT, padx=(0, 5),
         )
@@ -970,15 +1071,20 @@ class NeuroGraphGUI:
         ttk.Button(btn_bar, text="Refresh Inbox", command=self._refresh_inbox).pack(
             side=tk.LEFT,
         )
+        dnd_label = " (Drag & Drop enabled)" if _HAS_DND else ""
+        if dnd_label:
+            ttk.Label(btn_bar, text=dnd_label, foreground="gray").pack(
+                side=tk.LEFT, padx=(10, 0),
+            )
 
         # -- Ingestion history --
         ttk.Label(frame, text="Ingestion History:").grid(
-            row=4, column=0, sticky=tk.W, pady=(5, 0),
+            row=5, column=0, sticky=tk.W, pady=(5, 0),
         )
         self._history_listbox = tk.Listbox(frame, height=6)
-        self._history_listbox.grid(row=5, column=0, sticky=tk.NSEW)
+        self._history_listbox.grid(row=7, column=0, sticky=tk.NSEW)
         hist_scroll = ttk.Scrollbar(frame, command=self._history_listbox.yview)
-        hist_scroll.grid(row=5, column=1, sticky=tk.NS)
+        hist_scroll.grid(row=7, column=1, sticky=tk.NS)
         self._history_listbox.config(yscrollcommand=hist_scroll.set)
 
         # Initial refresh
@@ -1048,6 +1154,75 @@ class NeuroGraphGUI:
                 shutil.copy2(p, str(dest))
         self._refresh_inbox()
         self._status_var.set(f"Added {len(paths)} file(s) to inbox")
+
+    def _ingest_url(self) -> None:
+        """Ingest content from the URL entry bar."""
+        url = self._url_var.get().strip()
+        if not url:
+            self._status_var.set("No URL entered")
+            return
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        self._status_var.set(f"Ingesting URL: {url}...")
+        self.ingestion_mgr.ingest_url(url)
+        self._url_var.set("")
+
+    def _setup_dnd(self, target_widget: Any) -> None:
+        """Enable drag-and-drop on a widget via tkinterdnd2."""
+        try:
+            target_widget.drop_target_register("DND_Files")
+            target_widget.dnd_bind("<<Drop>>", self._on_dnd_drop)
+        except Exception as exc:
+            _logger.warning("Failed to set up drag-and-drop: %s", exc)
+
+    def _on_dnd_drop(self, event: Any) -> None:
+        """Handle files dropped via drag-and-drop."""
+        # tkinterdnd2 provides paths as a space-separated string;
+        # paths with spaces are wrapped in curly braces: {/path/with spaces/file.txt}
+        raw = event.data
+        paths: List[str] = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == "{":
+                end = raw.index("}", i)
+                paths.append(raw[i + 1:end])
+                i = end + 2  # skip } and space
+            elif raw[i] == " ":
+                i += 1
+            else:
+                end = raw.find(" ", i)
+                if end == -1:
+                    end = len(raw)
+                paths.append(raw[i:end])
+                i = end + 1
+
+        if not paths:
+            return
+
+        # Copy files to inbox, then trigger ingestion
+        inbox = Path(self.config.get("inbox_path"))
+        inbox.mkdir(parents=True, exist_ok=True)
+        added = 0
+        for p in paths:
+            p = p.strip()
+            if not p or not os.path.isfile(p):
+                continue
+            if FileWatcher.should_ignore(p):
+                continue
+            dest = inbox / Path(p).name
+            counter = 1
+            while dest.exists():
+                stem = Path(p).stem
+                suffix = Path(p).suffix
+                dest = inbox / f"{stem}_{counter}{suffix}"
+                counter += 1
+            shutil.copy2(p, str(dest))
+            added += 1
+
+        self._refresh_inbox()
+        if added:
+            self._status_var.set(f"Dropped {added} file(s) into inbox")
+            _logger.info("DnD: added %d files to inbox", added)
 
     def _on_ingest_result(self, result: Dict[str, Any]) -> None:
         name = Path(result.get("original_path", "?")).name
@@ -1277,6 +1452,7 @@ class NeuroGraphGUI:
         fields = [
             ("Inbox Path", "inbox_path"),
             ("Ingested Path", "ingested_path"),
+            ("Watch Paths", "watch_paths"),
             ("Repo URL", "repo_url"),
             ("Repo Clone Path", "repo_path"),
             ("Workspace Dir", "workspace_dir"),
@@ -1284,7 +1460,13 @@ class NeuroGraphGUI:
         ]
         for i, (label, key) in enumerate(fields):
             ttk.Label(dlg, text=f"{label}:").grid(row=i, column=0, sticky=tk.E, **pad)
-            var = tk.StringVar(value=self.config.get(key, ""))
+            raw_val = self.config.get(key, "")
+            # Display list values as comma-separated
+            if isinstance(raw_val, list):
+                display_val = ", ".join(raw_val)
+            else:
+                display_val = str(raw_val) if raw_val else ""
+            var = tk.StringVar(value=display_val)
             ttk.Entry(dlg, textvariable=var, width=50).grid(
                 row=i, column=1, sticky=tk.EW, **pad,
             )
@@ -1298,7 +1480,11 @@ class NeuroGraphGUI:
 
         def on_save() -> None:
             for key, var in entries.items():
-                self.config.set(key, var.get())
+                val = var.get()
+                if key == "watch_paths":
+                    # Parse comma-separated paths into a list
+                    val = [p.strip() for p in val.split(",") if p.strip()]
+                self.config.set(key, val)
             self.config.set("watcher_enabled", watcher_var.get())
             self.config.save()
             self.config.ensure_directories()
@@ -1340,11 +1526,33 @@ class NeuroGraphGUI:
         self._watcher_var.set("Watcher: ON")
         _logger.info("File watcher started on %s", inbox)
 
+        # Start additional watchers for configured watch paths
+        self._extra_watchers: List[FileWatcher] = []
+        for wp in self.config.get("watch_paths", []):
+            if wp and os.path.isdir(wp):
+                extra = FileWatcher(
+                    inbox_path=wp,
+                    on_file_ready=lambda p: self.msg_queue.put(self._on_file_detected, p),
+                    on_error=lambda e: self.msg_queue.put(self._on_ingest_error, e),
+                    stability_seconds=float(
+                        self.config.get("watcher_stability_seconds", 1.0)
+                    ),
+                )
+                extra.start()
+                self._extra_watchers.append(extra)
+                _logger.info("Extra watcher started on %s", wp)
+
     def _stop_watcher(self) -> None:
         if self.file_watcher and self.file_watcher.is_running:
             self.file_watcher.stop()
             self.file_watcher = None
             _logger.info("File watcher stopped")
+        for w in getattr(self, "_extra_watchers", []):
+            try:
+                w.stop()
+            except Exception:
+                pass
+        self._extra_watchers = []
 
     # ---- Lifecycle ----
 
@@ -1378,8 +1586,16 @@ def main() -> None:
         )
         sys.exit(1)
 
-    root = tk.Tk()
-    NeuroGraphGUI(root)
+    root = _make_root()
+    try:
+        NeuroGraphGUI(root)
+    except Exception as exc:
+        print(f"[neurograph] Fatal startup error: {exc}", file=sys.stderr)
+        try:
+            messagebox.showerror("NeuroGraph Startup Error", str(exc))
+        except Exception:
+            pass
+        sys.exit(1)
     root.mainloop()
 
 

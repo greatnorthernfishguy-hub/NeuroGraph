@@ -753,6 +753,7 @@ class NeuroGraphMemory:
                 ".html": SourceType.HTML,
                 ".htm": SourceType.HTML,
                 ".pdf": SourceType.PDF,
+                ".zip": SourceType.ZIP,
                 ".json": SourceType.JSON,
                 ".csv": SourceType.CSV,
             }
@@ -785,6 +786,10 @@ class NeuroGraphMemory:
                 "chunks": result.chunks_created,
                 "fired": len(step_result.fired_node_ids),
             }
+
+        # Binary formats (PDF, ZIP) must be passed as file paths, not text content
+        if source_type in (SourceType.PDF, SourceType.ZIP):
+            return self.on_message(str(p), source_type=source_type)
 
         content = p.read_text(errors="replace")
         return self.on_message(content, source_type=source_type)
