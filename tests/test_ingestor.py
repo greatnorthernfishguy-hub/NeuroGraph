@@ -287,7 +287,7 @@ class TestExtractorRouter(unittest.TestCase):
         """Auto-detects HTML content."""
         router = ExtractorRouter()
         stype = router.detect_source_type("<html><body>hi</body></html>")
-        self.assertEqual(stype, SourceType.URL)
+        self.assertEqual(stype, SourceType.HTML)
 
     def test_detect_text_fallback(self):
         """Falls back to TEXT for unrecognized content."""
