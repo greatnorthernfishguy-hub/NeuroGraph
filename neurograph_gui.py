@@ -34,6 +34,7 @@ Grok Review Changelog (v0.7.1):
 
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -390,6 +391,57 @@ class GitUpdater:
 
     # -- background workers --
 
+    @staticmethod
+    def _file_sha256(path: Path) -> Optional[str]:
+        """Return hex SHA-256 of *path*, or None if the file doesn't exist."""
+        if not path.is_file():
+            return None
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _count_stale_deployed_files(self) -> int:
+        """Compare repo files to deployed files using the neurograph-patch MANIFEST.
+
+        Returns the number of deployed files that differ from (or are missing
+        relative to) the repo copy.  This catches the case where a previous
+        update pulled successfully but deployment was rolled back after a
+        validation failure, leaving the repo up-to-date while the skill
+        directory still has stale files.
+        """
+        patch_script = self._repo_path / "neurograph-patch"
+        if patch_script.exists():
+            try:
+                loader = importlib.machinery.SourceFileLoader(
+                    "_ng_patch_check", str(patch_script)
+                )
+                spec = importlib.util.spec_from_loader("_ng_patch_check", loader)
+                mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                loader.exec_module(mod)
+                paths = {
+                    "repo": self._repo_path,
+                    "skill": self._skill_dir,
+                    "workspace": self._workspace_dir,
+                    "bin": Path.home() / ".local" / "bin",
+                    "home": Path.home(),
+                }
+                changes = mod.detect_changes(paths)
+                return sum(1 for c in changes if c["status"] in ("CHANGED", "MISSING"))
+            except Exception:
+                pass  # fall through to hash comparison
+
+        # Fallback: compare a few key files by hash
+        stale = 0
+        for name in ("neuro_foundation.py", "universal_ingestor.py",
+                     "openclaw_hook.py", "neurograph_gui.py"):
+            src = self._repo_path / name
+            dst = self._skill_dir / name
+            if self._file_sha256(src) != self._file_sha256(dst):
+                stale += 1
+        return stale
+
     def _check_worker(self) -> None:
         try:
             self._on_status("Ensuring local repo exists...")
@@ -420,13 +472,27 @@ class GitUpdater:
                     cwd=str(self._repo_path),
                 )
                 log_text = log_result.stdout.strip()
+
+            # Even when commits are in sync, deployed files may be stale
+            # (e.g. after a previous rollback).  Detect and report.
+            stale_files = 0
+            needs_deploy = False
+            if behind == 0:
+                self._on_status("Verifying deployed files...")
+                stale_files = self._count_stale_deployed_files()
+                needs_deploy = stale_files > 0
+                if needs_deploy:
+                    log_text = (f"{stale_files} deployed file(s) differ from "
+                                f"repo — re-deploy needed")
+
             self._on_complete({
                 "action": "check",
-                "has_updates": behind > 0,
+                "has_updates": behind > 0 or needs_deploy,
                 "local_commit": local,
                 "remote_commit": remote,
                 "commits_behind": behind,
                 "commit_log": log_text,
+                "stale_files": stale_files,
             })
         except Exception as exc:
             self._on_error(f"Update check failed: {exc}")
@@ -1153,13 +1219,22 @@ class NeuroGraphGUI:
         action = result.get("action", "")
         if action == "check":
             behind = result.get("commits_behind", 0)
+            stale = result.get("stale_files", 0)
             local = result.get("local_commit", "?")
             remote = result.get("remote_commit", "?")
             if result.get("has_updates"):
-                self._update_status_var.set(
-                    f"{behind} commit(s) behind  (local: {local}, remote: {remote})"
-                )
-                self._append_update_log(f"Updates available: {behind} commit(s) behind")
+                if stale > 0 and behind == 0:
+                    self._update_status_var.set(
+                        f"{stale} file(s) need re-deploy (commit: {local})"
+                    )
+                    self._append_update_log(
+                        f"Re-deploy needed: {stale} deployed file(s) differ from repo"
+                    )
+                else:
+                    self._update_status_var.set(
+                        f"{behind} commit(s) behind  (local: {local}, remote: {remote})"
+                    )
+                    self._append_update_log(f"Updates available: {behind} commit(s) behind")
                 log_text = result.get("commit_log", "")
                 if log_text:
                     self._append_update_log(log_text)
