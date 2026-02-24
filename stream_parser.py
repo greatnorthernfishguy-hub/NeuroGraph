@@ -305,11 +305,18 @@ class StreamParser:
             return []
 
     def _nudge_nodes(self, similar_nodes: List[Tuple[str, float]]) -> None:
-        """Inject current into similar graph nodes (voltage nudge)."""
+        """Inject current into similar graph nodes (voltage nudge).
+
+        Nudges are capped so voltage never exceeds 2x the node's threshold.
+        This prevents unbounded voltage spikes from high similarity scores
+        or repeated nudges that could destabilise the SNN.
+        """
         for node_id, similarity in similar_nodes:
             node = self._graph.nodes.get(node_id)
             if node is not None and node.refractory_remaining == 0:
-                node.voltage += similarity * self._cfg.nudge_strength
+                nudge = similarity * self._cfg.nudge_strength
+                max_voltage = node.threshold * 2.0
+                node.voltage = min(node.voltage + nudge, max_voltage)
                 self._nudges_applied += 1
 
     def _trigger_completions(self) -> None:
