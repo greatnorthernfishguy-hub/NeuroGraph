@@ -273,12 +273,41 @@ class TestGitUpdater:
                 r.stdout = ""
             return r
 
-        with mock.patch.object(updater, "_run_git", side_effect=fake_git):
+        with mock.patch.object(updater, "_run_git", side_effect=fake_git), \
+             mock.patch.object(updater, "_count_stale_deployed_files", return_value=0):
             updater._check_worker()
 
         assert len(results) == 1
         assert results[0]["has_updates"] is False
         assert results[0]["commits_behind"] == 0
+
+    def test_check_worker_stale_files_after_rollback(self, tmp_path):
+        """When commits are in sync but deployed files differ, report updates needed."""
+        results = []
+        updater = self._make_updater(
+            tmp_path, on_complete=lambda r: results.append(r),
+        )
+        repo_dir = tmp_path / "repo" / ".git"
+        repo_dir.mkdir(parents=True)
+
+        def fake_git(*args, **kwargs):
+            r = mock.Mock()
+            if "rev-parse" in args:
+                r.stdout = "abc1234\n"
+            elif "rev-list" in args:
+                r.stdout = "0\n"
+            else:
+                r.stdout = ""
+            return r
+
+        with mock.patch.object(updater, "_run_git", side_effect=fake_git), \
+             mock.patch.object(updater, "_count_stale_deployed_files", return_value=3):
+            updater._check_worker()
+
+        assert len(results) == 1
+        assert results[0]["has_updates"] is True
+        assert results[0]["commits_behind"] == 0
+        assert results[0]["stale_files"] == 3
 
     def test_check_worker_has_updates(self, tmp_path):
         results = []
@@ -325,6 +354,27 @@ class TestGitUpdater:
 
         assert len(errors) == 1
         assert "network down" in errors[0]
+
+    def test_count_stale_files_hash_fallback(self, tmp_path):
+        """Fallback hash comparison detects when deployed files differ."""
+        updater = self._make_updater(tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir(parents=True)
+        skill = tmp_path / "skill"
+        skill.mkdir(parents=True)
+
+        # No neurograph-patch script → triggers fallback
+        # Create matching file
+        (repo / "neuro_foundation.py").write_text("same content")
+        (skill / "neuro_foundation.py").write_text("same content")
+        # Create differing file
+        (repo / "universal_ingestor.py").write_text("new version")
+        (skill / "universal_ingestor.py").write_text("old version")
+        # Create missing files (in repo but not in skill)
+        (repo / "openclaw_hook.py").write_text("hook code")
+        (repo / "neurograph_gui.py").write_text("gui code")
+
+        assert updater._count_stale_deployed_files() == 3  # ingestor + hook + gui
 
 
 # ===================================================================
