@@ -1070,14 +1070,11 @@ class ExtractorRouter:
 
         extractor = self._extractors.get(source_type, self._extractors[SourceType.TEXT])
 
-        # For file paths, read the file first (except PDF/ZIP which handle their own reading)
-        if (os.path.isfile(source)
-                and source_type not in (SourceType.PDF, SourceType.URL, SourceType.ZIP)):
         # For file paths, read the file first.
         # Exceptions: PDF (handles its own reading), URL (fetches from network),
-        # MEDIA (handles its own file/URL detection).
+        # ZIP (handles its own archive reading), MEDIA (handles its own file/URL detection).
         if (os.path.isfile(source)
-                and source_type not in (SourceType.PDF, SourceType.URL, SourceType.MEDIA)):
+                and source_type not in (SourceType.PDF, SourceType.URL, SourceType.ZIP, SourceType.MEDIA)):
             with open(source, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             result = extractor.extract(content, **kwargs)
