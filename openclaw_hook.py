@@ -96,6 +96,7 @@ from universal_ingestor import (
     SimpleVectorDB,
     SourceType,
     get_ingestor_config,
+    MEDIA_EXTENSIONS,
 )
 
 logger = logging.getLogger("neurograph")
@@ -733,8 +734,6 @@ class NeuroGraphMemory:
         except OSError:
             pass  # stat failed, proceed anyway
 
-        content = p.read_text(errors="replace")
-
         # Auto-detect source type from extension
         if source_type is None:
             ext = p.suffix.lower()
@@ -742,13 +741,52 @@ class NeuroGraphMemory:
                 ".py": SourceType.CODE,
                 ".js": SourceType.CODE,
                 ".ts": SourceType.CODE,
+                ".java": SourceType.CODE,
+                ".go": SourceType.CODE,
+                ".rs": SourceType.CODE,
+                ".c": SourceType.CODE,
+                ".cpp": SourceType.CODE,
+                ".rb": SourceType.CODE,
+                ".php": SourceType.CODE,
                 ".md": SourceType.MARKDOWN,
-                ".html": SourceType.URL,
-                ".htm": SourceType.URL,
+                ".markdown": SourceType.MARKDOWN,
+                ".html": SourceType.HTML,
+                ".htm": SourceType.HTML,
                 ".pdf": SourceType.PDF,
+                ".json": SourceType.JSON,
+                ".csv": SourceType.CSV,
             }
-            source_type = type_map.get(ext, SourceType.TEXT)
+            source_type = type_map.get(ext)
+            if source_type is None and ext in MEDIA_EXTENSIONS:
+                source_type = SourceType.MEDIA
+            if source_type is None:
+                source_type = SourceType.TEXT
 
+        # Media files are handled by the extractor directly (it reads
+        # metadata from the file path, not the file content).
+        if source_type == SourceType.MEDIA:
+            result = self.ingestor.ingest(str(p), source_type=SourceType.MEDIA)
+            return {
+                "status": "ingested",
+                "nodes_created": len(result.nodes_created),
+                "synapses_created": len(result.synapses_created),
+                "chunks": result.chunks_created,
+                "media_type": result.metadata.get("extraction_metadata", {}).get("media_type", "unknown"),
+            }
+
+        # PDF files are handled by the extractor directly (reads the file).
+        if source_type == SourceType.PDF:
+            result = self.ingestor.ingest(str(p), source_type=SourceType.PDF)
+            step_result = self.graph.step()
+            return {
+                "status": "ingested",
+                "nodes_created": len(result.nodes_created),
+                "synapses_created": len(result.synapses_created),
+                "chunks": result.chunks_created,
+                "fired": len(step_result.fired_node_ids),
+            }
+
+        content = p.read_text(errors="replace")
         return self.on_message(content, source_type=source_type)
 
     def ingest_url(self, url: str) -> Dict[str, Any]:

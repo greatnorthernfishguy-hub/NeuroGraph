@@ -41,12 +41,14 @@ Grok Review Changelog (v0.7.1):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
 import re
 import textwrap
 import uuid
+from pathlib import Path
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -74,6 +76,10 @@ class SourceType(Enum):
     CODE = auto()
     MARKDOWN = auto()
     TEXT = auto()
+    JSON = auto()
+    CSV = auto()
+    HTML = auto()
+    MEDIA = auto()
 
 
 class ChunkStrategy(Enum):
@@ -491,6 +497,385 @@ class PDFExtractor(BaseExtractor):
             raise ValueError(f"Failed to extract PDF '{path}': {e}")
 
 
+class JSONExtractor(BaseExtractor):
+    """JSON file extractor that preserves structure as navigation hints.
+
+    Extracts all text content from JSON data (string values, keys) and
+    reports the top-level structure (keys, nesting depth) so that the
+    chunker can produce meaningful segments.
+    """
+
+    def extract(self, source: str, **kwargs: Any) -> ExtractedContent:
+        try:
+            data = json.loads(source)
+        except (json.JSONDecodeError, ValueError):
+            # Not valid JSON — fall back to plain text
+            return TextExtractor().extract(source, **kwargs)
+
+        text_parts: List[str] = []
+        structure: List[Dict[str, Any]] = []
+        self._walk(data, text_parts, structure, depth=0, path="$")
+
+        raw_text = "\n".join(text_parts) if text_parts else source
+
+        return ExtractedContent(
+            raw_text=raw_text,
+            metadata={
+                "source_type": "json",
+                "length": len(source),
+                "top_level_type": type(data).__name__,
+                "top_level_keys": (
+                    list(data.keys())[:50] if isinstance(data, dict) else None
+                ),
+                "structure_entries": len(structure),
+            },
+            structure=structure,
+            source_type=SourceType.JSON,
+        )
+
+    def _walk(
+        self,
+        obj: Any,
+        text_parts: List[str],
+        structure: List[Dict[str, Any]],
+        depth: int,
+        path: str,
+    ) -> None:
+        if isinstance(obj, dict):
+            structure.append({
+                "type": "object",
+                "path": path,
+                "depth": depth,
+                "keys": list(obj.keys())[:50],
+            })
+            for key, value in obj.items():
+                text_parts.append(f"{key}: {self._value_repr(value)}")
+                if isinstance(value, (dict, list)):
+                    self._walk(value, text_parts, structure, depth + 1, f"{path}.{key}")
+        elif isinstance(obj, list):
+            structure.append({
+                "type": "array",
+                "path": path,
+                "depth": depth,
+                "length": len(obj),
+            })
+            for i, item in enumerate(obj[:200]):  # cap iteration
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, (dict, list)):
+                    self._walk(item, text_parts, structure, depth + 1, f"{path}[{i}]")
+                else:
+                    text_parts.append(str(item))
+        elif isinstance(obj, str):
+            text_parts.append(obj)
+        else:
+            text_parts.append(str(obj))
+
+    @staticmethod
+    def _value_repr(value: Any) -> str:
+        if isinstance(value, str):
+            return value[:500] if len(value) > 500 else value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            return f"[...{len(value)} items]"
+        if isinstance(value, dict):
+            return f"{{...{len(value)} keys}}"
+        if value is None:
+            return "null"
+        return str(value)[:200]
+
+
+class CSVExtractor(BaseExtractor):
+    """CSV file extractor that preserves column structure.
+
+    Reads the CSV using the ``csv`` stdlib module and produces text
+    that represents each row as key-value pairs (using header column
+    names when available).  Structure entries record column names and
+    row count.
+    """
+
+    def extract(self, source: str, **kwargs: Any) -> ExtractedContent:
+        import csv
+        import io
+
+        reader = csv.reader(io.StringIO(source))
+        rows = list(reader)
+
+        if not rows:
+            return ExtractedContent(
+                raw_text=source,
+                metadata={"source_type": "csv", "length": len(source), "rows": 0},
+                structure=[],
+                source_type=SourceType.CSV,
+            )
+
+        # Heuristic: first row is a header if it doesn't look numeric
+        header = rows[0]
+        has_header = not all(self._looks_numeric(cell) for cell in header if cell.strip())
+
+        if has_header:
+            data_rows = rows[1:]
+            columns = header
+        else:
+            data_rows = rows
+            columns = [f"col_{i}" for i in range(len(header))]
+
+        text_parts: List[str] = []
+        # Emit column names as a header line
+        text_parts.append("Columns: " + ", ".join(columns))
+
+        for row_idx, row in enumerate(data_rows[:5000]):  # cap to prevent OOM
+            pairs = []
+            for col_idx, cell in enumerate(row):
+                col_name = columns[col_idx] if col_idx < len(columns) else f"col_{col_idx}"
+                if cell.strip():
+                    pairs.append(f"{col_name}={cell.strip()}")
+            if pairs:
+                text_parts.append(f"Row {row_idx + 1}: " + "; ".join(pairs))
+
+        structure = [{
+            "type": "table",
+            "columns": columns,
+            "row_count": len(data_rows),
+            "has_header": has_header,
+        }]
+
+        return ExtractedContent(
+            raw_text="\n".join(text_parts),
+            metadata={
+                "source_type": "csv",
+                "length": len(source),
+                "columns": columns,
+                "rows": len(data_rows),
+                "has_header": has_header,
+            },
+            structure=structure,
+            source_type=SourceType.CSV,
+        )
+
+    @staticmethod
+    def _looks_numeric(value: str) -> bool:
+        try:
+            float(value.strip())
+            return True
+        except (ValueError, AttributeError):
+            return False
+
+
+class HTMLExtractor(BaseExtractor):
+    """Local HTML file extractor.
+
+    Unlike ``URLExtractor`` which fetches from a URL first, this extractor
+    operates directly on HTML content (typically read from a local file).
+    Uses BeautifulSoup when available, falls back to regex tag stripping.
+    """
+
+    def extract(self, source: str, **kwargs: Any) -> ExtractedContent:
+        text = self._html_to_text(source)
+        title = self._extract_title(source)
+        headings = self._extract_headings(source)
+
+        return ExtractedContent(
+            raw_text=text,
+            metadata={
+                "source_type": "html",
+                "title": title,
+                "length": len(text),
+                "heading_count": len(headings),
+            },
+            structure=headings,
+            source_type=SourceType.HTML,
+        )
+
+    def _html_to_text(self, html: str) -> str:
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            return soup.get_text(separator="\n", strip=True)
+        except ImportError:
+            text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+            text = re.sub(r'<[^>]+>', ' ', text)
+            text = re.sub(r'\s+', ' ', text)
+            return text.strip()
+
+    def _extract_title(self, html: str) -> str:
+        match = re.search(r'<title[^>]*>(.*?)</title>', html, re.DOTALL | re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    def _extract_headings(self, html: str) -> List[Dict[str, Any]]:
+        headings: List[Dict[str, Any]] = []
+        for match in re.finditer(r'<(h[1-6])[^>]*>(.*?)</\1>', html, re.DOTALL | re.IGNORECASE):
+            level = int(match.group(1)[1])
+            title = re.sub(r'<[^>]+>', '', match.group(2)).strip()
+            if title:
+                headings.append({
+                    "type": "heading",
+                    "level": level,
+                    "title": title,
+                })
+        return headings
+
+
+# Media format registry
+MEDIA_EXTENSIONS: Dict[str, str] = {
+    # Video
+    ".mp4": "video", ".avi": "video", ".mkv": "video", ".mov": "video",
+    ".webm": "video", ".wmv": "video", ".flv": "video", ".m4v": "video",
+    ".mpg": "video", ".mpeg": "video", ".3gp": "video", ".ogv": "video",
+    # Audio
+    ".mp3": "audio", ".wav": "audio", ".flac": "audio", ".ogg": "audio",
+    ".m4a": "audio", ".aac": "audio", ".wma": "audio", ".opus": "audio",
+    ".aiff": "audio", ".alac": "audio",
+}
+
+
+class MediaReferenceExtractor(BaseExtractor):
+    """Creates reference nodes for audio/video media files.
+
+    Does NOT transcode or transcribe content.  Instead, creates a
+    metadata-rich reference node that can be linked to other knowledge
+    in the graph through synaptic associations.
+
+    Supports both local file paths and URLs.
+    """
+
+    def extract(self, source: str, **kwargs: Any) -> ExtractedContent:
+        is_url = bool(re.match(r'^https?://', source, re.IGNORECASE))
+        is_file = os.path.isfile(source)
+
+        if is_file:
+            return self._extract_file(source)
+        elif is_url:
+            return self._extract_url(source)
+        else:
+            # Treat as a path reference even if file doesn't exist yet
+            return self._extract_reference(source)
+
+    def _extract_file(self, path: str) -> ExtractedContent:
+        p = Path(path)
+        ext = p.suffix.lower()
+        media_type = MEDIA_EXTENSIONS.get(ext, "unknown")
+
+        try:
+            stat = p.stat()
+            size_bytes = stat.st_size
+            size_human = self._human_size(size_bytes)
+        except OSError:
+            size_bytes = 0
+            size_human = "unknown"
+
+        # Build a textual description for the node
+        description = (
+            f"[Media Reference: {p.name}]\n"
+            f"Type: {media_type}/{ext.lstrip('.')}\n"
+            f"Filename: {p.name}\n"
+            f"Size: {size_human}\n"
+            f"Path: {path}\n"
+        )
+
+        return ExtractedContent(
+            raw_text=description,
+            metadata={
+                "source_type": "media",
+                "media_type": media_type,
+                "format": ext.lstrip("."),
+                "filename": p.name,
+                "file_path": str(p.resolve()),
+                "size_bytes": size_bytes,
+                "size_human": size_human,
+                "length": len(description),
+                "is_reference": True,
+            },
+            structure=[{
+                "type": "media_reference",
+                "media_type": media_type,
+                "format": ext.lstrip("."),
+                "filename": p.name,
+            }],
+            source_type=SourceType.MEDIA,
+        )
+
+    def _extract_url(self, url: str) -> ExtractedContent:
+        # Parse the URL to extract filename and extension
+        from urllib.parse import urlparse, unquote
+        parsed = urlparse(url)
+        path_part = unquote(parsed.path)
+        filename = Path(path_part).name if path_part else url
+        ext = Path(path_part).suffix.lower() if path_part else ""
+        media_type = MEDIA_EXTENSIONS.get(ext, "media")
+
+        description = (
+            f"[Media Reference: {filename}]\n"
+            f"Type: {media_type}/{ext.lstrip('.') if ext else 'unknown'}\n"
+            f"Filename: {filename}\n"
+            f"URL: {url}\n"
+        )
+
+        return ExtractedContent(
+            raw_text=description,
+            metadata={
+                "source_type": "media",
+                "media_type": media_type,
+                "format": ext.lstrip(".") if ext else "unknown",
+                "filename": filename,
+                "url": url,
+                "length": len(description),
+                "is_reference": True,
+            },
+            structure=[{
+                "type": "media_reference",
+                "media_type": media_type,
+                "format": ext.lstrip(".") if ext else "unknown",
+                "url": url,
+            }],
+            source_type=SourceType.MEDIA,
+        )
+
+    def _extract_reference(self, source: str) -> ExtractedContent:
+        """Handle a path that doesn't exist on disk (future/external reference)."""
+        p = Path(source)
+        ext = p.suffix.lower()
+        media_type = MEDIA_EXTENSIONS.get(ext, "unknown")
+
+        description = (
+            f"[Media Reference: {p.name}]\n"
+            f"Type: {media_type}/{ext.lstrip('.') if ext else 'unknown'}\n"
+            f"Filename: {p.name}\n"
+            f"Reference: {source}\n"
+        )
+
+        return ExtractedContent(
+            raw_text=description,
+            metadata={
+                "source_type": "media",
+                "media_type": media_type,
+                "format": ext.lstrip(".") if ext else "unknown",
+                "filename": p.name,
+                "reference": source,
+                "length": len(description),
+                "is_reference": True,
+            },
+            structure=[{
+                "type": "media_reference",
+                "media_type": media_type,
+                "format": ext.lstrip(".") if ext else "unknown",
+            }],
+            source_type=SourceType.MEDIA,
+        )
+
+    @staticmethod
+    def _human_size(size_bytes: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(size_bytes) < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0  # type: ignore[assignment]
+        return f"{size_bytes:.1f} PB"
+
+
 class ExtractorRouter:
     """Routes source input to the appropriate extractor (PRD Addendum §2).
 
@@ -506,12 +891,21 @@ class ExtractorRouter:
             SourceType.CODE: CodeExtractor(),
             SourceType.URL: URLExtractor(),
             SourceType.PDF: PDFExtractor(),
+            SourceType.JSON: JSONExtractor(),
+            SourceType.CSV: CSVExtractor(),
+            SourceType.HTML: HTMLExtractor(),
+            SourceType.MEDIA: MediaReferenceExtractor(),
         }
 
     def detect_source_type(self, source: str) -> SourceType:
         """Auto-detect source type from content analysis."""
-        # URL detection
+        # URL detection — check for media URLs first
         if re.match(r'^https?://', source, re.IGNORECASE):
+            from urllib.parse import urlparse, unquote
+            parsed = urlparse(source)
+            url_ext = Path(unquote(parsed.path)).suffix.lower()
+            if url_ext in MEDIA_EXTENSIONS:
+                return SourceType.MEDIA
             return SourceType.URL
 
         # File path detection
@@ -524,6 +918,14 @@ class ExtractorRouter:
                 return SourceType.CODE
             if ext in (".md", ".markdown"):
                 return SourceType.MARKDOWN
+            if ext == ".json":
+                return SourceType.JSON
+            if ext == ".csv":
+                return SourceType.CSV
+            if ext in (".html", ".htm"):
+                return SourceType.HTML
+            if ext in MEDIA_EXTENSIONS:
+                return SourceType.MEDIA
 
         # Content-based detection
         if source.strip().startswith(("# ", "## ", "### ")):
@@ -531,7 +933,15 @@ class ExtractorRouter:
         if re.search(r'^(def |class |import |from |function )', source, re.MULTILINE):
             return SourceType.CODE
         if source.strip().startswith(("<html", "<!DOCTYPE", "<head")):
-            return SourceType.URL
+            return SourceType.HTML
+        # JSON detection: starts with { or [
+        stripped = source.strip()
+        if stripped and stripped[0] in ('{', '['):
+            try:
+                json.loads(stripped[:1000] if len(stripped) > 1000 else stripped)
+                return SourceType.JSON
+            except (json.JSONDecodeError, ValueError):
+                pass
 
         return SourceType.TEXT
 
@@ -547,9 +957,11 @@ class ExtractorRouter:
 
         extractor = self._extractors.get(source_type, self._extractors[SourceType.TEXT])
 
-        # For file paths, read the file first (except PDF which handles its own reading)
+        # For file paths, read the file first.
+        # Exceptions: PDF (handles its own reading), URL (fetches from network),
+        # MEDIA (handles its own file/URL detection).
         if (os.path.isfile(source)
-                and source_type not in (SourceType.PDF, SourceType.URL)):
+                and source_type not in (SourceType.PDF, SourceType.URL, SourceType.MEDIA)):
             with open(source, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             result = extractor.extract(content, **kwargs)
