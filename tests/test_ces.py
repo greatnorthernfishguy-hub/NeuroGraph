@@ -663,13 +663,16 @@ class TestSurfacingAfterStep:
         assert len(surfaced) > 0
         assert surfaced[0]["node_id"] == "node_3"
 
-    def test_fired_node_below_threshold_not_surfaced(self, graph, vector_db, ces_config):
+    def test_fired_node_below_min_confidence_not_surfaced(self, graph, vector_db, ces_config):
         from surfacing import SurfacingMonitor
 
-        ces_config.surfacing.voltage_threshold = 5.0
+        # A default node with no HE membership scores 0.8:
+        #   0.5 * voltage_norm(1.0) + 0.3 * excitability(1.0) + 0.2 * he(0.0)
+        # Setting min_confidence above 0.8 should filter it out.
+        ces_config.surfacing.min_confidence = 0.9
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
-        graph.nodes["node_1"].voltage = 0.5
+        graph.nodes["node_1"].voltage = 0.0  # Post-reset (as in real SNN step)
         step_result = MockStepResult(fired_node_ids=["node_1"])
         monitor.after_step(step_result)
 
