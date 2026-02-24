@@ -238,6 +238,7 @@ class MonitoringDashboard:
         """Shut down the HTTP server."""
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()  # Release the socket
             self._server = None
         if self._thread is not None:
             self._thread.join(timeout=5.0)
@@ -326,6 +327,11 @@ class CESMonitor:
 
     def _health_check_tick(self) -> None:
         """Periodic health check callback."""
+        # Guard against orphan timer chains after stop() sets _health_timer
+        # to None — without this, a pending callback can reschedule itself
+        # indefinitely.
+        if self._health_timer is None:
+            return
         try:
             health = self.get_health()
             self._ces_logger.log_event("health_check", health)

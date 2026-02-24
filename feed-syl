@@ -132,19 +132,45 @@ def get_memory(timeout=120, disable_ces=True):
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
     else:
-        # Fallback for non-Unix: use a threading timer
-        timer = threading.Timer(timeout, lambda: None)
-        timer.daemon = True
-        timer.start()
-        try:
-            from openclaw_hook import NeuroGraphMemory
-            result = NeuroGraphMemory.get_instance(config=config)
-            print(" done.", flush=True)
-        except Exception as exc:
+        # Fallback for non-Unix: run init in a worker thread with a timeout
+        # join.  The main thread waits up to `timeout` seconds; if the worker
+        # hasn't finished, we report the timeout and exit.
+        init_done = threading.Event()
+        init_result_box: list = []  # [NeuroGraphMemory] or [Exception]
+
+        def _init_worker():
+            try:
+                from openclaw_hook import NeuroGraphMemory
+                inst = NeuroGraphMemory.get_instance(config=config)
+                init_result_box.append(inst)
+            except Exception as exc:
+                init_result_box.append(exc)
+            finally:
+                init_done.set()
+
+        worker = threading.Thread(target=_init_worker, daemon=True)
+        worker.start()
+        finished = init_done.wait(timeout=timeout)
+
+        if not finished:
+            print(" TIMEOUT.", flush=True)
+            print(
+                f"\nInitialization did not complete within {timeout}s.\n"
+                "This usually means the embedding model is being downloaded\n"
+                "for the first time, or the system is resource-constrained.\n"
+                "\nTry: feed-syl --timeout 300 --status",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        elif init_result_box and isinstance(init_result_box[0], Exception):
             print(" FAILED.", flush=True)
-            init_error = exc
-        finally:
-            timer.cancel()
+            init_error = init_result_box[0]
+        elif init_result_box:
+            result = init_result_box[0]
+            print(" done.", flush=True)
+        else:
+            print(" FAILED.", flush=True)
+            init_error = RuntimeError("Initialization returned no result")
 
     if init_error is not None:
         print(f"Error: {init_error}", file=sys.stderr)

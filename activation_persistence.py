@@ -73,7 +73,7 @@ class ActivationPersistence:
         entries: Dict[str, Dict[str, Any]] = {}
 
         for node_id, node in graph.nodes.items():
-            if node.voltage == 0.0 and node.voltage == node.resting_potential:
+            if node.voltage == 0.0 or node.voltage == node.resting_potential:
                 continue
             entries[node_id] = {
                 "voltage": node.voltage,
@@ -257,9 +257,12 @@ class ActivationPersistence:
 
     def _auto_save_tick(self) -> None:
         """Auto-save callback."""
-        if self._auto_save_graph is not None and self._auto_save_checkpoint_path is not None:
-            try:
-                self.save(self._auto_save_graph, self._auto_save_checkpoint_path)
-            except Exception as exc:
-                logger.warning("Auto-save failed: %s", exc)
+        # Check if we've been stopped before doing anything — prevents orphan
+        # timer chains that keep rescheduling after stop_auto_save().
+        if self._auto_save_graph is None or self._auto_save_checkpoint_path is None:
+            return
+        try:
+            self.save(self._auto_save_graph, self._auto_save_checkpoint_path)
+        except Exception as exc:
+            logger.warning("Auto-save failed: %s", exc)
         self._schedule_auto_save()
