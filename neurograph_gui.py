@@ -435,6 +435,16 @@ class GitUpdater:
         try:
             if not self.ensure_repo():
                 return
+            # Reset the update-only clone to a clean state before pulling.
+            # This clone is never the user's working copy — it exists solely
+            # to fetch upstream changes for deployment.  Unstaged changes
+            # (e.g. from a previous partial deploy or rebase config) would
+            # block ``git pull``, so we discard them here.
+            self._on_status("Cleaning local repo state...")
+            self._run_git(
+                "checkout", "--", ".",
+                cwd=str(self._repo_path),
+            )
             self._on_status("Pulling latest changes...")
             self._run_git("pull", "origin", "main", cwd=str(self._repo_path))
             commit = self.get_local_commit() or "unknown"
