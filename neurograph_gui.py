@@ -16,6 +16,20 @@ Environment:
     NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/.openclaw/neurograph)
     NEUROGRAPH_SKILL_DIR      Override skill dir (default: ~/.openclaw/skills/neurograph)
     NEUROGRAPH_GUI_DIR        Override GUI data dir (default: ~/.neurograph)
+
+Grok Review Changelog (v0.7.1):
+    Accepted: GUIMessageQueue._poll() now logs callback exceptions via
+        logging.debug(exc_info=True) instead of bare 'except: pass'.
+        Errors are still caught (GUI must not crash from background thread
+        failures), but they're now visible in gui.log for debugging.
+    Rejected: 'No progress bar for ingest_directory()' — UX enhancement,
+        not a bug.  ingest_directory() runs on a daemon thread (line 577)
+        so the GUI doesn't block.  Progress indication is a future feature.
+    Rejected: 'Ingests any file in inbox — no sandbox for malicious PDFs' —
+        FileWatcher.should_ignore() (line 196-207) already filters by
+        extension against SUPPORTED_EXTENSIONS.  PyPDF2's text extraction
+        does not execute embedded content.  PDF sandboxing would require
+        process isolation infrastructure beyond the scope of a desktop GUI.
 """
 
 from __future__ import annotations
@@ -65,6 +79,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf", ".zip"}
+SUPPORTED_EXTENSIONS = {
+    ".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf",
+    ".json", ".csv",
+    # Media (video)
+    ".mp4", ".avi", ".mkv", ".mov", ".webm", ".wmv", ".flv", ".m4v",
+    ".mpg", ".mpeg", ".3gp", ".ogv",
+    # Media (audio)
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus",
+    ".aiff", ".alac",
+}
 
 _logger = logging.getLogger("neurograph_gui")
 
@@ -530,8 +554,14 @@ class GitUpdater:
     def _deploy_copy_fallback(self) -> Dict[str, Any]:
         """Simple file-copy fallback when neurograph-patch is not in repo."""
         core_files = [
+            # Core engine
             "neuro_foundation.py", "universal_ingestor.py",
             "openclaw_hook.py", "neurograph_migrate.py", "neurograph_gui.py",
+            # Phase 6: NG-Lite + bridge
+            "ng_lite.py", "ng_bridge.py",
+            # Phase 7: Peer bridge + ET Module Manager
+            "ng_peer_bridge.py", "et_module.json",
+            "et_modules/__init__.py", "et_modules/manager.py",
         ]
         patched = 0
         for name in core_files:
@@ -621,12 +651,53 @@ class IngestionManager:
         threading.Thread(
             target=self._ingest_url_worker, args=(url,), daemon=True
         ).start()
+    @property
+    def is_initialized(self) -> bool:
+        """True if NeuroGraphMemory has been loaded (non-blocking check)."""
+        return self._ng is not None
 
     def get_stats(self) -> Dict[str, Any]:
         return self.get_memory().stats()
 
+    def get_stats_async(
+        self,
+        on_result: Callable[[Dict[str, Any]], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        """Fetch stats in a background thread (non-blocking)."""
+        threading.Thread(
+            target=self._stats_worker,
+            args=(on_result, on_error),
+            daemon=True,
+        ).start()
+
+    def save_checkpoint_async(
+        self,
+        on_result: Callable[[str], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        """Save checkpoint in a background thread (non-blocking)."""
+        def worker():
+            try:
+                path = self.get_memory().save()
+                on_result(path)
+            except Exception as exc:
+                on_error(str(exc))
+        threading.Thread(target=worker, daemon=True).start()
+
     def save_checkpoint(self) -> str:
         return self.get_memory().save()
+
+    def _stats_worker(
+        self,
+        on_result: Callable[[Dict[str, Any]], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        try:
+            stats = self.get_stats()
+            on_result(stats)
+        except Exception as exc:
+            on_error(str(exc))
 
     def _ingest_file_worker(self, path: str) -> None:
         try:
@@ -711,7 +782,11 @@ class GUIMessageQueue:
                 cb, args, kwargs = self._queue.get_nowait()
                 cb(*args, **kwargs)
             except Exception:
-                pass
+                # Log callback errors instead of silently swallowing
+                # (Grok review: GUI queue exception handling)
+                logging.getLogger("neurograph.gui").debug(
+                    "GUI queue callback error", exc_info=True,
+                )
         self._root.after(self._poll_ms, self._poll)
 
 
@@ -858,37 +933,62 @@ class NeuroGraphGUI:
         )
 
     def _refresh_status(self) -> None:
-        """Auto-refresh driven by root.after()."""
+        """Auto-refresh driven by root.after().
+
+        Uses a background thread for stats retrieval so the GUI main loop
+        never blocks on NeuroGraphMemory initialization or model loading.
+        """
         self._refresh_status_now()
         interval = int(self.config.get("status_refresh_seconds", 5)) * 1000
         self.root.after(interval, self._refresh_status)
 
     def _refresh_status_now(self) -> None:
-        try:
-            stats = self.ingestion_mgr.get_stats()
-            for key, var in self._stat_labels.items():
-                if key == "pruned_sprouted":
-                    var.set(f"{stats.get('pruned', 0)} / {stats.get('sprouted', 0)}")
-                elif key == "embedding_backend":
-                    emb = stats.get("embedding", {})
-                    if isinstance(emb, dict):
-                        backend = emb.get("backend", "unknown")
-                        dim = emb.get("dimension", "?")
-                        var.set(f"{backend} ({dim}d)")
-                    else:
-                        var.set(str(emb))
-                else:
-                    var.set(str(stats.get(key, "--")))
-        except Exception:
+        """Kick off an async stats fetch.  Results arrive via msg_queue."""
+        if not self.ingestion_mgr.is_initialized:
+            # Show "initializing" state instead of blocking
             for var in self._stat_labels.values():
-                var.set("--")
+                var.set("loading...")
+            self._status_var.set("Initializing NeuroGraph (loading model)...")
+
+        self.ingestion_mgr.get_stats_async(
+            on_result=lambda stats: self.msg_queue.put(self._apply_stats, stats),
+            on_error=lambda err: self.msg_queue.put(self._apply_stats_error, err),
+        )
+
+    def _apply_stats(self, stats: Dict[str, Any]) -> None:
+        """Apply fetched stats to the status tab labels (runs on main thread)."""
+        for key, var in self._stat_labels.items():
+            if key == "pruned_sprouted":
+                var.set(f"{stats.get('pruned', 0)} / {stats.get('sprouted', 0)}")
+            elif key == "embedding_backend":
+                emb = stats.get("embedding", {})
+                if isinstance(emb, dict):
+                    backend = emb.get("backend", "unknown")
+                    dim = emb.get("dimension", "?")
+                    var.set(f"{backend} ({dim}d)")
+                else:
+                    var.set(str(emb))
+            else:
+                var.set(str(stats.get(key, "--")))
+        self._status_var.set("Ready")
+
+    def _apply_stats_error(self, error: str) -> None:
+        """Handle stats fetch failure (runs on main thread)."""
+        for var in self._stat_labels.values():
+            var.set("--")
+        self._status_var.set(f"Stats error: {error}")
 
     def _save_checkpoint(self) -> None:
-        try:
-            path = self.ingestion_mgr.save_checkpoint()
-            self._status_var.set(f"Checkpoint saved to {path}")
-        except Exception as exc:
-            messagebox.showerror("Checkpoint Error", str(exc))
+        """Save checkpoint asynchronously so the GUI doesn't freeze."""
+        self._status_var.set("Saving checkpoint...")
+        self.ingestion_mgr.save_checkpoint_async(
+            on_result=lambda path: self.msg_queue.put(
+                self._status_var.set, f"Checkpoint saved to {path}"
+            ),
+            on_error=lambda err: self.msg_queue.put(
+                self._status_var.set, f"Save failed: {err}"
+            ),
+        )
 
     # ---- Ingestion Tab ----
 
@@ -1034,9 +1134,15 @@ class NeuroGraphGUI:
         paths = filedialog.askopenfilenames(
             title="Select files to ingest",
             filetypes=[
-                ("All supported", "*.py *.js *.ts *.md *.txt *.html *.htm *.pdf"),
-                ("Python", "*.py"), ("Markdown", "*.md"), ("Text", "*.txt"),
-                ("PDF", "*.pdf"), ("All files", "*.*"),
+                ("All supported",
+                 "*.py *.js *.ts *.md *.txt *.html *.htm *.pdf "
+                 "*.json *.csv "
+                 "*.mp4 *.avi *.mkv *.mov *.webm *.mp3 *.wav *.flac *.ogg *.m4a"),
+                ("Code", "*.py *.js *.ts"),
+                ("Documents", "*.md *.txt *.pdf *.html *.htm"),
+                ("Data", "*.json *.csv"),
+                ("Media", "*.mp4 *.avi *.mkv *.mov *.webm *.mp3 *.wav *.flac *.ogg *.m4a"),
+                ("All files", "*.*"),
             ],
         )
         if not paths:

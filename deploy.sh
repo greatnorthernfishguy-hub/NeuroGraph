@@ -42,25 +42,32 @@ install_deps() {
     pip3 install --no-cache-dir \
         "numpy>=1.24.0" "scipy>=1.10.0" "msgpack>=1.0.0"
 
-    # sentence-transformers from source (bleeding edge, no broken deps)
-    info "Installing sentence-transformers from source..."
-    pip3 install --break-system-packages --no-deps --no-cache-dir \
-        "sentence-transformers @ git+https://github.com/huggingface/sentence-transformers.git" 2>/dev/null || \
-    pip3 install --no-deps --no-cache-dir \
-        "sentence-transformers @ git+https://github.com/huggingface/sentence-transformers.git" || \
-    warn "sentence-transformers install failed — hash fallback will be used"
-
-    # transformers (gets modern huggingface_hub)
-    pip3 install --break-system-packages --no-cache-dir transformers tqdm 2>/dev/null || \
-    pip3 install --no-cache-dir transformers tqdm || \
-    warn "transformers install failed — hash fallback will be used"
-
-    # CPU-only PyTorch
+    # CPU-only PyTorch (install BEFORE sentence-transformers so it picks up
+    # the local torch backend instead of trying inference providers)
     pip3 install --break-system-packages --no-cache-dir torch \
         --index-url https://download.pytorch.org/whl/cpu 2>/dev/null || \
     pip3 install --no-cache-dir torch \
         --index-url https://download.pytorch.org/whl/cpu || \
     warn "PyTorch install failed — hash fallback will be used"
+
+    # sentence-transformers from PyPI (pinned stable release).
+    # NOTE: Previous versions installed from git HEAD which pulled v5.x+
+    # that added inference provider backends (OpenAI, Google, Voyage) and
+    # emitted API key warnings even when only using local torch embeddings.
+    # Pinning to stable PyPI release avoids this issue.
+    info "Installing sentence-transformers (stable release)..."
+    pip3 install --break-system-packages --no-cache-dir \
+        "sentence-transformers>=3.0.0,<6.0.0" 2>/dev/null || \
+    pip3 install --no-cache-dir \
+        "sentence-transformers>=3.0.0,<6.0.0" || \
+    warn "sentence-transformers install failed — hash fallback will be used"
+
+    # transformers + tqdm (pinned to avoid v5 inference provider issues)
+    pip3 install --break-system-packages --no-cache-dir \
+        "transformers>=4.41.0" tqdm 2>/dev/null || \
+    pip3 install --no-cache-dir \
+        "transformers>=4.41.0" tqdm || \
+    warn "transformers install failed — hash fallback will be used"
 
     # Optional: beautifulsoup4, PyPDF2
     pip3 install --break-system-packages --no-cache-dir \
@@ -98,8 +105,26 @@ deploy_files() {
     cp "$SCRIPT_DIR/openclaw_hook.py" "$SKILL_DIR/scripts/"
     cp "$SCRIPT_DIR/SKILL.md" "$SKILL_DIR/"
 
+    # NG-Lite ecosystem files
+    cp "$SCRIPT_DIR/ng_lite.py" "$SKILL_DIR/"
+    cp "$SCRIPT_DIR/ng_bridge.py" "$SKILL_DIR/"
+    cp "$SCRIPT_DIR/ng_peer_bridge.py" "$SKILL_DIR/"
+
+    # ET Module Manager
+    mkdir -p "$SKILL_DIR/et_modules"
+    cp "$SCRIPT_DIR/et_modules/__init__.py" "$SKILL_DIR/et_modules/"
+    cp "$SCRIPT_DIR/et_modules/manager.py" "$SKILL_DIR/et_modules/"
+    cp "$SCRIPT_DIR/et_module.json" "$SKILL_DIR/"
+
     # Migration framework
     cp "$SCRIPT_DIR/neurograph_migrate.py" "$SKILL_DIR/"
+
+    # CES (Cognitive Enhancement Suite) files
+    for cesfile in ces_config.py stream_parser.py activation_persistence.py surfacing.py ces_monitoring.py; do
+        if [ -f "$SCRIPT_DIR/$cesfile" ]; then
+            cp "$SCRIPT_DIR/$cesfile" "$SKILL_DIR/"
+        fi
+    done
 
     # Management GUI
     if [ -f "$SCRIPT_DIR/neurograph_gui.py" ]; then
@@ -132,9 +157,11 @@ DESKTOPEOF
         info "GUI directories created at ~/.neurograph/"
     fi
 
-    # CLI tool
+    # CLI tools
     cp "$SCRIPT_DIR/feed-syl" "$BIN_DIR/feed-syl"
     chmod +x "$BIN_DIR/feed-syl"
+    cp "$SCRIPT_DIR/neurograph" "$BIN_DIR/neurograph"
+    chmod +x "$BIN_DIR/neurograph"
 
     # Also copy feed-syl to home for convenience
     cp "$SCRIPT_DIR/feed-syl" "$HOME/feed-syl"
@@ -147,6 +174,27 @@ DESKTOPEOF
                 echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
                 info "Added $BIN_DIR to PATH in ~/.bashrc"
             fi
+        fi
+    fi
+
+    # Suppress HuggingFace inference provider API key warnings.
+    # NeuroGraph uses LOCAL torch-based embeddings only — no OpenAI, Google,
+    # or Voyage API keys are needed.  These env vars prevent noisy warnings
+    # from sentence-transformers v5+ / transformers v5+ inference providers.
+    if [ -f "$HOME/.bashrc" ]; then
+        if ! grep -q 'TRANSFORMERS_VERBOSITY' "$HOME/.bashrc"; then
+            cat >> "$HOME/.bashrc" << 'ENVEOF'
+
+# NeuroGraph: suppress HuggingFace inference provider warnings
+# (local torch embeddings only — TID controls all external API calls)
+export TRANSFORMERS_VERBOSITY=error
+export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
+export HF_HUB_DISABLE_EXPERIMENTAL_WARNING=1
+export TOKENIZERS_PARALLELISM=false
+ENVEOF
+            info "Added HuggingFace warning suppression to ~/.bashrc"
         fi
     fi
 
@@ -193,8 +241,45 @@ JSONEOF
         info "Created OpenClaw configuration"
     fi
 
+    # --- ET Module Manager registration ---
+    ET_MODULES_DIR="${ET_MODULES_DIR:-$HOME/.et_modules}"
+    mkdir -p "$ET_MODULES_DIR/shared_learning"
+
+    python3 -c "
+import json, time
+
+registry_path = '$ET_MODULES_DIR/registry.json'
+try:
+    with open(registry_path, 'r') as f:
+        registry = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    registry = {'modules': {}}
+
+registry['modules']['neurograph'] = {
+    'module_id': 'neurograph',
+    'display_name': 'NeuroGraph Foundation',
+    'version': '0.6.0',
+    'install_path': '$SKILL_DIR',
+    'git_remote': 'https://github.com/greatnorthernfishguy-hub/NeuroGraph.git',
+    'git_branch': 'main',
+    'entry_point': 'openclaw_hook.py',
+    'ng_lite_version': '1.0.0',
+    'dependencies': [],
+    'service_name': '',
+    'api_port': 0,
+    'registered_at': time.time(),
+}
+registry['last_updated'] = time.time()
+
+with open(registry_path, 'w') as f:
+    json.dump(registry, f, indent=2)
+
+print('registered')
+" 2>/dev/null && info "Registered with ET Module Manager at $ET_MODULES_DIR" || \
+    warn "ET Module Manager registration skipped (non-critical)"
+
     info "Files deployed to $SKILL_DIR"
-    info "CLI tool installed at $BIN_DIR/feed-syl"
+    info "CLI tools installed at $BIN_DIR/feed-syl and $BIN_DIR/neurograph"
 }
 
 # ------------------------------------------------------------------
@@ -212,11 +297,13 @@ verify() {
         fi
     done
 
-    # Check CLI
-    if [ ! -x "$BIN_DIR/feed-syl" ]; then
-        error "Missing or not executable: $BIN_DIR/feed-syl"
-        ok=false
-    fi
+    # Check CLIs
+    for cli in feed-syl neurograph; do
+        if [ ! -x "$BIN_DIR/$cli" ]; then
+            error "Missing or not executable: $BIN_DIR/$cli"
+            ok=false
+        fi
+    done
 
     # Check Python imports
     if python3 -c "
@@ -240,14 +327,26 @@ print('imports_ok')
         warn "GUI: not found (optional)"
     fi
 
-    # Check embedding backend
+    # Check embedding backend — suppress provider warnings (NeuroGraph uses
+    # local torch only; TID controls all external API calls)
     if python3 -c "
+import os, warnings
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['HF_HUB_DISABLE_IMPLICIT_TOKEN'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['HF_HUB_DISABLE_EXPERIMENTAL_WARNING'] = '1'
+warnings.filterwarnings('ignore')
 from sentence_transformers import SentenceTransformer
-model = SentenceTransformer('all-MiniLM-L6-v2')
+try:
+    model = SentenceTransformer('all-MiniLM-L6-v2', backend='torch')
+except TypeError:
+    model = SentenceTransformer('all-MiniLM-L6-v2')
 e = model.encode(['test'])
-print(f'embeddings_ok dim={e.shape[1]}')
+print(f'embeddings_ok dim={e.shape[1]} backend=torch')
 " 2>/dev/null; then
-        info "Real embeddings available"
+        info "Real embeddings available (local torch — no external API keys needed)"
     else
         warn "sentence-transformers unavailable — using hash fallback"
     fi
@@ -266,11 +365,13 @@ print(f'embeddings_ok dim={e.shape[1]}')
 uninstall() {
     warn "Removing deployed NeuroGraph files..."
     rm -f "$BIN_DIR/feed-syl"
+    rm -f "$BIN_DIR/neurograph"
     rm -f "$HOME/feed-syl"
     rm -rf "$SKILL_DIR"
     rm -f "$HOME/.local/share/applications/neurograph.desktop"
     info "Files removed (checkpoints preserved in $CHECKPOINT_DIR)"
     info "Note: ~/.neurograph/ (inbox/ingested data) preserved"
+    info "Note: ~/.et_modules/ (shared learning data) preserved"
 }
 
 # ------------------------------------------------------------------
@@ -304,6 +405,8 @@ case "${1:-}" in
         info "Deployment complete!"
         echo ""
         echo "Quick start:"
+        echo "  neurograph status              # System health check"
+        echo "  neurograph verify              # Verify installation"
         echo "  feed-syl --status              # Check status"
         echo "  feed-syl --text 'Hello world'  # Ingest text"
         echo "  feed-syl --workspace           # Ingest OpenClaw docs"

@@ -134,6 +134,8 @@ class TestFileWatcherIgnore:
     def test_unsupported_extensions_ignored(self):
         assert FileWatcher.should_ignore("/inbox/photo.jpg") is True
         assert FileWatcher.should_ignore("/inbox/data.csv") is True
+        assert FileWatcher.should_ignore("/inbox/archive.zip") is True
+        assert FileWatcher.should_ignore("/inbox/data.exe") is True
 
     def test_zip_extension_supported(self):
         """ZIP files should NOT be ignored since ZipExtractor handles them."""

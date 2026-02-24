@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import uuid
 from collections import deque
@@ -46,6 +47,8 @@ try:
 except ImportError:
     msgpack = None
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Enumerations (PRD §2.2.2, §2.2.3)
@@ -64,6 +67,24 @@ class ActivationMode(Enum):
     K_OF_N = auto()
     ALL_OR_NONE = auto()
     GRADED = auto()
+
+
+class ConsolidationState(Enum):
+    """Maturity lifecycle for hyperedges (Phase 4).
+
+    Mirrors the biological hippocampus-to-cortex consolidation pipeline.
+
+    SPECULATIVE  → Just discovered. Volatile. Has not yet proven recurring value.
+    CANDIDATE    → Survived initial pruning pressure. Building evidence.
+    CONSOLIDATED → Trusted abstraction. Triggers soft substrate cull.
+                   Underlying redundant synapses weakened (not deleted).
+    PERMANENT    → Cortical fact / reflex. is_learnable set False.
+                   Treated as structural, not plastic.
+    """
+    SPECULATIVE  = "SPECULATIVE"
+    CANDIDATE    = "CANDIDATE"
+    CONSOLIDATED = "CONSOLIDATED"
+    PERMANENT    = "PERMANENT"
 
 
 class CheckpointMode(Enum):
@@ -193,6 +214,11 @@ class Synapse:
     # Application-specific metadata (Phase 3: tracks creation_mode for
     # surprise-driven synapses)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Salience armor (Phase 4 — Amygdala Protocol).
+    # Multiplies effective inactivity_threshold during pruning.
+    # Surprise events boost this; it decays slowly over time.
+    # Default 1.0 = no armor. Range: [1.0, he_salience_max].
+    salience: float = 1.0
 
 
 @dataclass
@@ -245,6 +271,10 @@ class Hyperedge:
     recent_activation_ema: float = 0.0
     # Phase 2.5: Cross-level consistency — archived flag
     is_archived: bool = False
+    # Phase 4: Consolidation lifecycle.
+    consolidation_state: ConsolidationState = ConsolidationState.SPECULATIVE
+    # Timestep when this hyperedge was first created (for age-based promotion).
+    creation_time: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +397,12 @@ class Telemetry:
     total_rewards_injected: int = 0
     # Phase 2.5: Experience distribution
     hyperedge_experience_distribution: Dict[str, int] = field(default_factory=dict)
+    # Phase 4 consolidation metrics.
+    he_survival_ema: float = 0.0
+    total_he_state_transitions: int = 0
+    total_he_substrate_culled: int = 0
+    he_adapt_candidate_count: float = 0.0
+    he_by_state: Dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +458,46 @@ class PredictionOutcome:
     confirmed: bool = False
     resolved_at: int = 0
     actual_firing_nodes: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Auto-Knowledge: Spreading Activation Harvest Data Structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FiredEntry:
+    """A node that fired during spreading activation propagation.
+
+    Attributes:
+        node_id: ID of the node that fired.
+        firing_step: Which propagation step it fired on (0-indexed from
+            the first propagation step).  Lower = stronger association.
+        voltage_at_fire: Voltage at the moment of firing.
+        was_predicted: Whether this node was a prediction target.
+        source_distance: Hop count from nearest primed node (approximate,
+            tracked via breadth-first through synapses).
+    """
+
+    node_id: str = ""
+    firing_step: int = 0
+    voltage_at_fire: float = 0.0
+    was_predicted: bool = False
+    source_distance: int = 0
+
+
+@dataclass
+class PropagationResult:
+    """Result of a prime-and-propagate spreading activation harvest.
+
+    Attributes:
+        fired_entries: All nodes that fired during propagation, with metadata.
+        steps_run: How many SNN steps were executed.
+        nodes_primed: How many nodes received the initial priming current.
+    """
+
+    fired_entries: List[FiredEntry] = field(default_factory=list)
+    steps_run: int = 0
+    nodes_primed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +874,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "prediction_window": 5,
     "prediction_ema_alpha": 0.01,
     "he_experience_threshold": 100,
+    # --- Phase 4: Consolidation Lifecycle ---
+    # Initial (adaptive) thresholds for SPECULATIVE → CANDIDATE promotion.
+    # The system adjusts these based on observed survival rates.
+    "he_speculative_to_candidate_min_count": 10,
+    "he_speculative_to_candidate_min_ema": 0.2,
+    # Initial (adaptive) thresholds for CANDIDATE → CONSOLIDATED promotion.
+    "he_candidate_to_consolidated_min_count": 100,
+    "he_candidate_to_consolidated_min_age": 5000,
+    # How often (steps) to run _evaluate_consolidation_states().
+    "he_consolidation_eval_interval": 100,
+    # Soft cull: internal mesh synapses multiplied by this on CONSOLIDATED.
+    "he_cull_penalty_factor": 0.25,
+    # How fast adaptive thresholds respond to observed survival rates.
+    "he_consolidation_adapt_rate": 0.005,
+    # Salience ceiling — caps Amygdala Protocol multiplier.
+    "he_salience_max": 5.0,
+    # Per-step salience decay (applied every step to all synapses with salience > 1.0).
+    # At 0.0002/step, a salience of 5.0 returns to 1.0 in ~20,000 steps.
+    "he_salience_decay_rate": 0.0002,
 }
 
 
@@ -906,6 +1001,28 @@ class Graph:
         self._total_he_discovered = 0
         self._total_he_consolidated = 0
 
+        # --- Phase 4: Adaptive Consolidation State ---
+        # Adaptive promotion thresholds — initialized from config, drift at runtime.
+        self._he_adapt_candidate_count: float = float(
+            self.config["he_speculative_to_candidate_min_count"]
+        )
+        self._he_adapt_candidate_ema: float = self.config[
+            "he_speculative_to_candidate_min_ema"
+        ]
+        self._he_adapt_consolidated_count: float = float(
+            self.config["he_candidate_to_consolidated_min_count"]
+        )
+        self._he_adapt_consolidated_age: float = float(
+            self.config["he_candidate_to_consolidated_min_age"]
+        )
+        # EMA of hyperedge survival rate (SPECULATIVE that graduate / total created).
+        # Starts at 0.5 (neutral). Drives adaptive threshold adjustment.
+        self._he_survival_ema: float = 0.5
+        self._he_consolidation_eval_steps: int = 0
+        # Telemetry counters.
+        self._total_he_state_transitions: int = 0
+        self._total_he_substrate_culled: int = 0
+
         # --- Clock ---
         self.timestep: int = 0
 
@@ -1013,6 +1130,50 @@ class Graph:
                         "Three project configs: OpenClaw (code-aware, fast 0.3 "
                         "dampening), DSM (hierarchical, conservative 0.05), "
                         "Consciousness (semantic, exploratory 0.01).",
+                    ],
+                },
+                {
+                    "version": "0.7.1",
+                    "description": "Grok Review Optimizations",
+                    "notes": [
+                        # --- Accepted suggestions ---
+                        "Accepted: Added try/except guard in step() spike propagation "
+                        "(phase 5) around delay buffer delivery and outgoing synapse "
+                        "traversal to log and skip stale references from deleted nodes "
+                        "mid-step, rather than silently skipping (Grok suggestion #1.3).",
+                        "Accepted: Added logging import and defensive KeyError handling "
+                        "in _cleanup_predictions() and _evaluate_predictions() for "
+                        "robustness against topology mutations during prediction "
+                        "evaluation (Grok suggestion #1.3).",
+                        "Accepted: Added input validation in create_hyperedge() to warn "
+                        "on single-member hyperedges, which are structurally degenerate "
+                        "(Grok suggestion #1.3, adapted: duplicates were already "
+                        "impossible since member_node_ids is Set[str]).",
+                        # --- Rejected suggestions with reasons ---
+                        "Rejected: 'Enums everywhere with no validation in setters' — "
+                        "There are no setters. Fields are set via dataclass __init__ and "
+                        "enum types self-validate on construction. Runtime validation "
+                        "occurs at topology boundaries (create_node, create_synapse, "
+                        "create_hyperedge). Adding redundant per-field setters would "
+                        "violate the dataclass pattern and add overhead without benefit.",
+                        "Rejected: 'RingBuffer firing_rate() iterates whole buffer — "
+                        "O(n) waste' — There is no firing_rate() method on RingBuffer. "
+                        "Firing rate is tracked via firing_rate_ema (exponential moving "
+                        "average) updated O(1) per step in HomeostaticRule.apply(). "
+                        "RingBuffer stores spike timestamps for STDP timing only.",
+                        "Rejected: 'FiredEntry should be a dict for performance' — "
+                        "FiredEntry is used in PropagationResult (auto-knowledge), not "
+                        "in the hot SNN step loop. Dataclass provides type safety, IDE "
+                        "completion, and self-documentation. Typical count is <100 per "
+                        "propagation. Dict overhead savings: ~0 for this use case.",
+                        "Rejected: 'Predictive window assumes timestep increments by 1' "
+                        "— Timestep always increments by 1 in step(). On restore, Phase "
+                        "3.5 validation already drops expired/stale predictions. Forked "
+                        "graphs via FORK checkpoint mode get a fresh timestep baseline. "
+                        "No gap scenario exists in the current architecture.",
+                        "Rejected: 'create_hyperedge allows duplicate members' — "
+                        "member_node_ids parameter is Set[str], making duplicates "
+                        "impossible by type contract. No additional enforcement needed.",
                     ],
                 },
             ],
@@ -1167,6 +1328,13 @@ class Graph:
             if nid not in self.nodes:
                 raise KeyError(f"Member node {nid} not found")
 
+        if len(member_node_ids) < 2:
+            logger.warning(
+                "Creating hyperedge with %d member(s) — hyperedges with fewer "
+                "than 2 members are structurally degenerate",
+                len(member_node_ids),
+            )
+
         mw = member_weights or {nid: 1.0 for nid in member_node_ids}
         he = Hyperedge(
             member_nodes=set(member_node_ids),
@@ -1179,6 +1347,8 @@ class Graph:
             is_learnable=is_learnable,
         )
         self.hyperedges[he.hyperedge_id] = he
+        # Phase 4: stamp creation time.
+        he.creation_time = self.timestep
         for nid in member_node_ids:
             self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
         self._he_co_fire_counts[he.hyperedge_id] = {}
@@ -1252,8 +1422,13 @@ class Graph:
         arrivals = self._delay_buffer.pop(self.timestep, [])
         for target_id, current in arrivals:
             target = self.nodes.get(target_id)
-            if target is not None:
-                target.voltage += current * target.intrinsic_excitability
+            if target is None:
+                logger.debug(
+                    "Delayed spike target %s no longer exists (deleted mid-flight)",
+                    target_id,
+                )
+                continue
+            target.voltage += current * target.intrinsic_excitability
 
         # 3. Detect firing nodes
         fired_ids: List[str] = []
@@ -1282,6 +1457,7 @@ class Graph:
             for syn_id in self._outgoing.get(nid, set()):
                 syn = self.synapses.get(syn_id)
                 if syn is None:
+                    logger.debug("Stale synapse ref %s in outgoing[%s]", syn_id, nid)
                     continue
                 # Effective current is weight × sign
                 effective_type_sign = sign
@@ -1458,6 +1634,12 @@ class Graph:
         self._total_pruned += pruned
         self._total_sprouted += sprouted
 
+        # 8b. Consolidation lifecycle evaluation (Phase 4 — runs on interval).
+        self._he_consolidation_eval_steps += 1
+        if self._he_consolidation_eval_steps >= self.config["he_consolidation_eval_interval"]:
+            self._he_consolidation_eval_steps = 0
+            self._evaluate_consolidation_states()
+
         # 9. Decrement refractory counters
         #    Skip nodes that just fired this step — their full refractory
         #    period starts on the NEXT step (PRD §3.2.1: mandatory N-step rest).
@@ -1466,9 +1648,13 @@ class Graph:
             if node.refractory_remaining > 0 and nid not in fired_this_step:
                 node.refractory_remaining -= 1
 
-        # 10. Track synapse inactivity
+        # 10. Track synapse inactivity + decay salience armor (Phase 4).
+        salience_decay = self.config["he_salience_decay_rate"]
         for syn in self.synapses.values():
             syn.inactive_steps += 1
+            # Salience decays toward 1.0; never drops below it.
+            if syn.salience > 1.0:
+                syn.salience = max(1.0, syn.salience - salience_decay)
 
         # Emit spike events
         if fired_ids:
@@ -1482,6 +1668,198 @@ class Graph:
         for _ in range(n):
             results.append(self.step())
         return results
+
+    # -----------------------------------------------------------------------
+    # Auto-Knowledge: Spreading Activation Harvest
+    # -----------------------------------------------------------------------
+
+    def prime_and_propagate(
+        self,
+        node_ids: List[str],
+        currents: List[float],
+        steps: int = 3,
+    ) -> PropagationResult:
+        """Prime nodes and propagate activation through the network.
+
+        This is the SNN-level primitive for associative recall.  It runs a
+        *read-mostly* simulation: activation dynamics (voltage decay, spike
+        propagation, hyperedge evaluation, pattern completion, prediction
+        pre-charging) are active, but plasticity rules and structural changes
+        are NOT applied.  This prevents recall-driven activation from
+        altering learned weights.
+
+        Args:
+            node_ids: Nodes to inject current into (semantic priming).
+            currents: Current to inject into each node (parallel to node_ids).
+            steps: Number of SNN steps to propagate.
+
+        Returns:
+            PropagationResult with all nodes that fired, ranked by latency.
+        """
+        if not node_ids:
+            return PropagationResult(steps_run=steps, nodes_primed=0)
+
+        # Save and restore state so propagation is non-destructive
+        saved_voltages: Dict[str, float] = {}
+        saved_refractory: Dict[str, int] = {}
+        for nid, node in self.nodes.items():
+            saved_voltages[nid] = node.voltage
+            saved_refractory[nid] = node.refractory_remaining
+
+        saved_he_refractory: Dict[str, int] = {}
+        for hid, he in self.hyperedges.items():
+            saved_he_refractory[hid] = he.refractory_remaining
+
+        # Compute approximate distances from primed nodes
+        primed_set = set(node_ids)
+        distances: Dict[str, int] = {nid: 0 for nid in node_ids}
+        # BFS to compute distances
+        frontier = set(node_ids)
+        for dist in range(1, steps + 1):
+            next_frontier: Set[str] = set()
+            for nid in frontier:
+                for syn_id in self._outgoing.get(nid, set()):
+                    syn = self.synapses.get(syn_id)
+                    if syn and syn.post_node_id not in distances:
+                        distances[syn.post_node_id] = dist
+                        next_frontier.add(syn.post_node_id)
+            frontier = next_frontier
+
+        # Collect current prediction targets for was_predicted tagging
+        predicted_targets: Set[str] = set()
+        for pred in self.active_predictions.values():
+            predicted_targets.add(pred.target_node_id)
+        for pred_state in self._active_predictions.values():
+            predicted_targets.update(pred_state.predicted_targets)
+
+        # --- PRIME: inject current into specified nodes ---
+        for nid, current in zip(node_ids, currents):
+            node = self.nodes.get(nid)
+            if node is not None:
+                node.voltage += current * node.intrinsic_excitability
+
+        # --- PROPAGATE: run N read-only SNN steps ---
+        result = PropagationResult(
+            steps_run=steps,
+            nodes_primed=len(node_ids),
+        )
+        # Local delay buffer separate from the graph's real one
+        prop_delay_buffer: Dict[int, List[Tuple[str, float]]] = {}
+        prop_timestep = self.timestep
+
+        decay = self.config["decay_rate"]
+        experience_threshold = self.config["he_experience_threshold"]
+
+        for step_idx in range(steps):
+            prop_timestep += 1
+
+            # 1. Voltage decay
+            for node in self.nodes.values():
+                node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
+
+            # 2. Deliver delayed spikes from propagation buffer
+            arrivals = prop_delay_buffer.pop(prop_timestep, [])
+            for target_id, current in arrivals:
+                target = self.nodes.get(target_id)
+                if target is not None:
+                    target.voltage += current * target.intrinsic_excitability
+
+            # 3. Detect firing nodes
+            fired_ids: List[str] = []
+            for nid, node in self.nodes.items():
+                if node.refractory_remaining > 0:
+                    continue
+                if node.voltage >= node.threshold:
+                    fired_ids.append(nid)
+
+            # 4. Reset fired nodes and set refractory
+            for nid in fired_ids:
+                node = self.nodes[nid]
+                voltage_at_fire = node.voltage
+                node.voltage = node.resting_potential
+                node.refractory_remaining = node.refractory_period
+
+                entry = FiredEntry(
+                    node_id=nid,
+                    firing_step=step_idx,
+                    voltage_at_fire=voltage_at_fire,
+                    was_predicted=nid in predicted_targets,
+                    source_distance=distances.get(nid, steps + 1),
+                )
+                result.fired_entries.append(entry)
+
+            # 5. Propagate spikes through outgoing synapses
+            fired_set = set(fired_ids)
+            for nid in fired_ids:
+                node = self.nodes[nid]
+                sign = -1.0 if node.is_inhibitory else 1.0
+                for syn_id in self._outgoing.get(nid, set()):
+                    syn = self.synapses.get(syn_id)
+                    if syn is None:
+                        continue
+                    effective_type_sign = sign
+                    if syn.synapse_type == SynapseType.INHIBITORY:
+                        effective_type_sign = -1.0
+                    current = syn.weight * effective_type_sign
+                    arrival = prop_timestep + syn.delay
+                    prop_delay_buffer.setdefault(arrival, []).append(
+                        (syn.post_node_id, current)
+                    )
+
+            # 6. Evaluate hyperedges (pattern completion, output injection)
+            max_level = max((he.level for he in self.hyperedges.values()), default=0)
+            for level in range(max_level + 1):
+                for hid, he in self.hyperedges.items():
+                    if he.level != level or he.is_archived:
+                        continue
+                    activation = self._compute_hyperedge_activation(he, fired_set)
+                    if he.refractory_remaining > 0:
+                        continue
+                    if activation >= he.activation_threshold:
+                        he.refractory_remaining = he.refractory_period
+
+                        # Output injection
+                        effective_weight = he.output_weight
+                        if he.activation_mode == ActivationMode.GRADED:
+                            effective_weight *= activation
+                        for target_id in he.output_targets:
+                            target = self.nodes.get(target_id)
+                            if target is not None:
+                                target.voltage += effective_weight * target.intrinsic_excitability
+
+                        # Pattern completion (pre-charge inactive members)
+                        if he.pattern_completion_strength > 0:
+                            learning_factor = min(
+                                1.0, he.activation_count / max(experience_threshold, 1)
+                            )
+                            eff_completion = he.pattern_completion_strength * learning_factor
+                            if eff_completion > 0:
+                                for mnid in he.member_nodes:
+                                    if mnid not in fired_set:
+                                        mnode = self.nodes.get(mnid)
+                                        if mnode and mnode.refractory_remaining == 0:
+                                            mnode.voltage += (
+                                                eff_completion
+                                                * he.member_weights.get(mnid, 1.0)
+                                                * mnode.intrinsic_excitability
+                                            )
+
+            # Decrement refractory counters (skip those that just fired)
+            for nid, node in self.nodes.items():
+                if node.refractory_remaining > 0 and nid not in fired_set:
+                    node.refractory_remaining -= 1
+            for hid, he in self.hyperedges.items():
+                if he.refractory_remaining > 0 and hid not in set(fired_ids):
+                    he.refractory_remaining -= 1
+
+        # --- RESTORE: put all voltages and refractory counters back ---
+        for nid, node in self.nodes.items():
+            node.voltage = saved_voltages.get(nid, node.resting_potential)
+            node.refractory_remaining = saved_refractory.get(nid, 0)
+        for hid, he in self.hyperedges.items():
+            he.refractory_remaining = saved_he_refractory.get(hid, 0)
+
+        return result
 
     # -----------------------------------------------------------------------
     # Hyperedge Activation (PRD §4.2)
@@ -1853,7 +2231,7 @@ class Graph:
             if existing is not None:
                 continue
 
-            # Create speculative synapse
+            # Create speculative synapse with Amygdala Protocol salience (Phase 4).
             try:
                 syn = self.create_synapse(
                     source_id, alt_id, weight=sprout_weight
@@ -1861,6 +2239,14 @@ class Graph:
                 syn.metadata = {"creation_mode": "surprise_driven",
                                 "expected_target": expected_id,
                                 "timestep": self.timestep}
+                # Salience armor: surprise magnitude = prediction strength × confidence.
+                # High-surprise births earn proportional inactivity protection.
+                surprise_magnitude = pred.strength * pred.confidence
+                salience_boost = 1.0 + (surprise_magnitude * 4.0)  # range ~[1.0, 5.0]
+                syn.salience = min(
+                    salience_boost,
+                    self.config["he_salience_max"]
+                )
                 sprouted_count += 1
                 self._total_sprouted += 1
             except (KeyError, ValueError):
@@ -1875,6 +2261,18 @@ class Graph:
                 count=sprouted_count,
                 timestep=self.timestep,
             )
+
+        # Amygdala Protocol: boost salience on existing synapses that were active
+        # during this surprise. The context-of-surprise is as important as the
+        # new alternative path (Phase 4).
+        salience_max = self.config["he_salience_max"]
+        surprise_magnitude = pred.strength * pred.confidence
+        context_boost = 1.0 + (surprise_magnitude * 2.0)  # softer than new synapse boost
+        for syn_id in self._outgoing.get(source_id, set()):
+            syn = self.synapses.get(syn_id)
+            if syn and syn.inactive_steps < self.config["co_activation_window"] * 2:
+                # Recently active from source — this was part of the context.
+                syn.salience = min(salience_max, max(syn.salience, context_boost))
 
         # Novelty detection: check if any fired sequence has NO learned patterns
         if alternative_nodes and not self._has_learned_pattern(source_id, alternative_nodes):
@@ -1998,8 +2396,10 @@ class Graph:
             else:
                 syn.low_weight_steps = 0
 
-            # Activity-based pruning
-            if syn.inactive_steps > inactivity:
+            # Activity-based pruning — salience armor multiplies effective threshold.
+            # Surprise-tagged synapses can sit dormant longer before being culled.
+            effective_inactivity = inactivity * syn.salience
+            if syn.inactive_steps > effective_inactivity:
                 to_prune.append(sid)
                 continue
 
@@ -2196,6 +2596,18 @@ class Graph:
             total_novel_sequences=self._total_novel_sequences,
             total_rewards_injected=self._total_rewards_injected,
             hyperedge_experience_distribution=exp_dist,
+            # Phase 4 consolidation telemetry
+            he_survival_ema=self._he_survival_ema,
+            total_he_state_transitions=self._total_he_state_transitions,
+            total_he_substrate_culled=self._total_he_substrate_culled,
+            he_adapt_candidate_count=self._he_adapt_candidate_count,
+            he_by_state={
+                state.value: sum(
+                    1 for he in self.hyperedges.values()
+                    if not he.is_archived and he.consolidation_state == state
+                )
+                for state in ConsolidationState
+            },
         )
 
     # -----------------------------------------------------------------------
@@ -2391,6 +2803,8 @@ class Graph:
                         activation_threshold=0.6,
                         metadata={"creation_mode": "discovered", "timestep": self.timestep},
                     )
+                    # Phase 4: stamp creation_time for age-based promotion.
+                    he.creation_time = self.timestep
                     discovered.append(he)
                     self._total_he_discovered += 1
                     self._emit("hyperedge_discovered", hid=he.hyperedge_id)
@@ -2456,6 +2870,13 @@ class Graph:
                     merged_count += 1
 
         for hid in to_remove:
+            he = self.hyperedges.get(hid)
+            # Phase 4: penalize survival EMA for hyperedges pruned before graduating.
+            if he and he.consolidation_state == ConsolidationState.SPECULATIVE:
+                adapt_rate = self.config["he_consolidation_adapt_rate"]
+                self._he_survival_ema = (
+                    (1.0 - adapt_rate) * self._he_survival_ema + adapt_rate * 0.0
+                )
             self._remove_hyperedge_internal(hid)
 
         # --- Phase 2.5: Cross-level consistency pruning (subsumption) ---
@@ -2508,6 +2929,14 @@ class Graph:
                             he_lo.is_archived = True
                             self._archived_hyperedges[hid_lo] = he_lo
                             archived_count += 1
+                            # Phase 4: if this hyperedge never graduated from SPECULATIVE,
+                            # record it as a failed survival → drives threshold upward.
+                            if he_lo.consolidation_state == ConsolidationState.SPECULATIVE:
+                                adapt_rate = self.config["he_consolidation_adapt_rate"]
+                                self._he_survival_ema = (
+                                    (1.0 - adapt_rate) * self._he_survival_ema
+                                    + adapt_rate * 0.0  # negative signal
+                                )
                             self._emit("hyperedge_archived",
                                        archived_id=hid_lo,
                                        subsumed_by=hid_hi,
@@ -2519,6 +2948,13 @@ class Graph:
                                 he_lo.is_archived = True
                                 self._archived_hyperedges[hid_lo] = he_lo
                                 archived_count += 1
+                                # Phase 4: negative survival signal for ungraduated HE.
+                                if he_lo.consolidation_state == ConsolidationState.SPECULATIVE:
+                                    adapt_rate = self.config["he_consolidation_adapt_rate"]
+                                    self._he_survival_ema = (
+                                        (1.0 - adapt_rate) * self._he_survival_ema
+                                        + adapt_rate * 0.0
+                                    )
                                 self._emit("hyperedge_archived",
                                            archived_id=hid_lo,
                                            subsumed_by=hid_hi,
@@ -2526,6 +2962,170 @@ class Graph:
                                 break
 
         return archived_count
+
+    # -----------------------------------------------------------------------
+    # Phase 4: Consolidation Lifecycle
+    # -----------------------------------------------------------------------
+
+    def _evaluate_consolidation_states(self) -> int:
+        """Promote hyperedges through ConsolidationState lifecycle (Phase 4).
+
+        Runs every ``he_consolidation_eval_interval`` steps (wired in step()).
+
+        Promotion criteria use adaptive thresholds that drift based on observed
+        hyperedge survival rates — the same homeostatic principle used for node
+        firing rates. High survival → thresholds can relax (patterns are reliable).
+        Low survival → thresholds tighten (require stronger evidence before promoting).
+
+        Returns:
+            Number of state transitions made this evaluation.
+        """
+        adapt_rate = self.config["he_consolidation_adapt_rate"]
+        transitions = 0
+
+        for hid, he in list(self.hyperedges.items()):
+            if he.is_archived:
+                continue
+
+            age = self.timestep - he.creation_time
+
+            if he.consolidation_state == ConsolidationState.SPECULATIVE:
+                if (he.activation_count >= self._he_adapt_candidate_count and
+                        he.recent_activation_ema >= self._he_adapt_candidate_ema):
+                    he.consolidation_state = ConsolidationState.CANDIDATE
+                    transitions += 1
+                    self._total_he_state_transitions += 1
+                    # Positive survival signal → loosen thresholds slightly over time.
+                    self._he_survival_ema = (
+                        (1.0 - adapt_rate) * self._he_survival_ema + adapt_rate * 1.0
+                    )
+                    self._emit(
+                        "he_state_transition",
+                        hyperedge_id=hid,
+                        from_state="SPECULATIVE",
+                        to_state="CANDIDATE",
+                        activation_count=he.activation_count,
+                        timestep=self.timestep,
+                    )
+
+            elif he.consolidation_state == ConsolidationState.CANDIDATE:
+                if (he.activation_count >= self._he_adapt_consolidated_count and
+                        age >= self._he_adapt_consolidated_age):
+                    he.consolidation_state = ConsolidationState.CONSOLIDATED
+                    transitions += 1
+                    self._total_he_state_transitions += 1
+                    culled = self._cull_substrate(he)
+                    self._total_he_substrate_culled += culled
+                    self._emit(
+                        "he_state_transition",
+                        hyperedge_id=hid,
+                        from_state="CANDIDATE",
+                        to_state="CONSOLIDATED",
+                        substrate_synapses_penalized=culled,
+                        timestep=self.timestep,
+                    )
+
+            elif he.consolidation_state == ConsolidationState.CONSOLIDATED:
+                # CONSOLIDATED → PERMANENT: near-perfect sustained activation.
+                # Require double the age of the CONSOLIDATED promotion threshold
+                # to ensure this isn't a temporary burst.
+                if (he.recent_activation_ema > 0.9 and
+                        age >= self._he_adapt_consolidated_age * 2 and
+                        he.activation_count > self._he_adapt_consolidated_count * 2):
+                    he.consolidation_state = ConsolidationState.PERMANENT
+                    he.is_learnable = False
+                    transitions += 1
+                    self._total_he_state_transitions += 1
+                    self._emit(
+                        "he_state_transition",
+                        hyperedge_id=hid,
+                        from_state="CONSOLIDATED",
+                        to_state="PERMANENT",
+                        activation_count=he.activation_count,
+                        timestep=self.timestep,
+                    )
+
+        # Adapt promotion thresholds based on survival EMA.
+        # High survival (> 0.7): patterns are reliable → relax candidate threshold.
+        # Low survival  (< 0.3): noise level is high  → tighten candidate threshold.
+        if self._he_survival_ema > 0.7:
+            self._he_adapt_candidate_count = max(
+                5.0,
+                self._he_adapt_candidate_count * (1.0 - adapt_rate)
+            )
+            self._he_adapt_candidate_ema = max(
+                0.05,
+                self._he_adapt_candidate_ema * (1.0 - adapt_rate)
+            )
+        elif self._he_survival_ema < 0.3:
+            self._he_adapt_candidate_count = min(
+                50.0,
+                self._he_adapt_candidate_count * (1.0 + adapt_rate)
+            )
+            self._he_adapt_candidate_ema = min(
+                0.5,
+                self._he_adapt_candidate_ema * (1.0 + adapt_rate)
+            )
+
+        if transitions > 0:
+            self._emit(
+                "consolidation_evaluated",
+                transitions=transitions,
+                survival_ema=self._he_survival_ema,
+                adapt_candidate_count=self._he_adapt_candidate_count,
+                timestep=self.timestep,
+            )
+
+        return transitions
+
+    def _cull_substrate(self, he: Hyperedge) -> int:
+        """Soft-cull redundant Tier-1 synapses when a hyperedge consolidates (Phase 4).
+
+        When a hyperedge graduates to CONSOLIDATED, the dense mesh of pairwise
+        synapses between its members becomes partially redundant — the hyperedge
+        itself now handles that pattern completion.
+
+        Rather than deleting, we apply a one-time ``he_cull_penalty_factor``
+        weight reduction. Synapses that are ONLY serving this hyperedge will
+        fall below the weight threshold and be naturally pruned by
+        ``_prune_synapses``. Synapses doing double duty (also part of another
+        causal chain) will be re-strengthened by STDP during those other tasks
+        and survive.
+
+        Resets ``peak_weight`` so age-based pruning can also reach them if
+        they never recover.
+
+        Args:
+            he: The hyperedge that just reached CONSOLIDATED state.
+
+        Returns:
+            Number of synapses penalized.
+        """
+        penalty = self.config["he_cull_penalty_factor"]
+        penalized = 0
+        member_list = list(he.member_nodes)
+
+        for src_id in member_list:
+            for tgt_id in member_list:
+                if src_id == tgt_id:
+                    continue
+                syn = self._find_synapse(src_id, tgt_id)
+                if syn is None:
+                    continue
+                syn.weight = max(0.0, syn.weight * penalty)
+                # Reset peak so age-based pruning can catch it if it never recovers.
+                syn.peak_weight = syn.weight
+                penalized += 1
+
+        if penalized > 0:
+            self._emit(
+                "substrate_culled",
+                hyperedge_id=he.hyperedge_id,
+                synapses_penalized=penalized,
+                timestep=self.timestep,
+            )
+
+        return penalized
 
     # -----------------------------------------------------------------------
     # Event System (PRD §8 register_event_handler)
@@ -2619,6 +3219,7 @@ class Graph:
             "low_weight_steps": syn.low_weight_steps,
             "inactive_steps": syn.inactive_steps,
             "metadata": syn.metadata,
+            "salience": syn.salience,
         }
 
     def _serialize_hyperedge(self, he: Hyperedge) -> Dict[str, Any]:
@@ -2642,6 +3243,9 @@ class Graph:
             # Phase 2.5 fields
             "recent_activation_ema": he.recent_activation_ema,
             "is_archived": he.is_archived,
+            # Phase 4 fields
+            "consolidation_state": he.consolidation_state.value,
+            "creation_time": he.creation_time,
         }
 
     def _serialize_prediction(self, pred: Prediction) -> Dict[str, Any]:
@@ -2672,7 +3276,7 @@ class Graph:
 
     def _serialize_full(self) -> Dict[str, Any]:
         return {
-            "version": "0.3.5",
+            "version": "0.4.1",
             "timestep": self.timestep,
             "config": self.config,
             "nodes": {nid: self._serialize_node(n) for nid, n in self.nodes.items()},
@@ -2732,6 +3336,14 @@ class Graph:
                 "he_total_confirmed": self._total_confirmed,
                 "he_total_surprised": self._total_surprised,
             },
+            # Phase 4 adaptive consolidation state.
+            "he_adapt_candidate_count":    self._he_adapt_candidate_count,
+            "he_adapt_candidate_ema":      self._he_adapt_candidate_ema,
+            "he_adapt_consolidated_count": self._he_adapt_consolidated_count,
+            "he_adapt_consolidated_age":   self._he_adapt_consolidated_age,
+            "he_survival_ema":             self._he_survival_ema,
+            "total_he_state_transitions":  self._total_he_state_transitions,
+            "total_he_substrate_culled":   self._total_he_substrate_culled,
         }
 
     def _serialize_incremental(self) -> Dict[str, Any]:
@@ -2817,6 +3429,7 @@ class Graph:
                 low_weight_steps=sd.get("low_weight_steps", 0),
                 inactive_steps=sd.get("inactive_steps", 0),
                 metadata=sd.get("metadata", {}),
+                salience=sd.get("salience", 1.0),          # Phase 4
             )
             self.synapses[sid] = syn
             self._outgoing.setdefault(syn.pre_node_id, set()).add(sid)
@@ -2843,6 +3456,10 @@ class Graph:
                 level=hd.get("level", 0),
                 recent_activation_ema=hd.get("recent_activation_ema", 0.0),
                 is_archived=hd.get("is_archived", False),
+                consolidation_state=ConsolidationState(              # Phase 4
+                    hd.get("consolidation_state", "SPECULATIVE")
+                ),
+                creation_time=hd.get("creation_time", 0),           # Phase 4
             )
             self.hyperedges[hid] = he
             for nid in he.member_nodes:
@@ -2871,6 +3488,10 @@ class Graph:
                 level=hd.get("level", 0),
                 recent_activation_ema=hd.get("recent_activation_ema", 0.0),
                 is_archived=hd.get("is_archived", True),
+                consolidation_state=ConsolidationState(              # Phase 4
+                    hd.get("consolidation_state", "SPECULATIVE")
+                ),
+                creation_time=hd.get("creation_time", 0),           # Phase 4
             )
             self._archived_hyperedges[hid] = he
 
@@ -2889,6 +3510,27 @@ class Graph:
         self._total_predictions = tel.get("he_total_predictions", 0)
         self._total_confirmed = tel.get("he_total_confirmed", 0)
         self._total_surprised = tel.get("he_total_surprised", 0)
+
+        # Restore Phase 4 adaptive consolidation state.
+        self._he_adapt_candidate_count = data.get(
+            "he_adapt_candidate_count",
+            float(self.config["he_speculative_to_candidate_min_count"])
+        )
+        self._he_adapt_candidate_ema = data.get(
+            "he_adapt_candidate_ema",
+            self.config["he_speculative_to_candidate_min_ema"]
+        )
+        self._he_adapt_consolidated_count = data.get(
+            "he_adapt_consolidated_count",
+            float(self.config["he_candidate_to_consolidated_min_count"])
+        )
+        self._he_adapt_consolidated_age = data.get(
+            "he_adapt_consolidated_age",
+            float(self.config["he_candidate_to_consolidated_min_age"])
+        )
+        self._he_survival_ema = data.get("he_survival_ema", 0.5)
+        self._total_he_state_transitions = data.get("total_he_state_transitions", 0)
+        self._total_he_substrate_culled  = data.get("total_he_substrate_culled", 0)
 
         # Restore Phase 3 active predictions with validation
         self.active_predictions.clear()
