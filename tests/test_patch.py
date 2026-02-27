@@ -59,13 +59,22 @@ def mock_deploy(tmp_path):
               workspace / "memory", bin_dir, home]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # Create source files in repo
+    # Create source files in repo (must cover all MANIFEST entries)
     (repo / "neuro_foundation.py").write_text("# neuro v2\nprint('updated')\n")
     (repo / "universal_ingestor.py").write_text("# ingestor v2\nclass EmbeddingEngine: pass\n")
     (repo / "openclaw_hook.py").write_text("# hook v2\nclass NeuroGraphMemory: pass\n")
     (repo / "neurograph_migrate.py").write_text("# migrate v2\n")
     (repo / "SKILL.md").write_text("# SKILL v2\n")
     (repo / "feed-syl").write_text("#!/usr/bin/env python3\n# feed-syl v2\n")
+    (repo / "neurograph_gui.py").write_text("# gui v2\n")
+    (repo / "neurograph.desktop").write_text("[Desktop Entry]\nName=NeuroGraph\n")
+    (repo / "ng_lite.py").write_text("# ng_lite v2\n")
+    (repo / "ng_bridge.py").write_text("# ng_bridge v2\n")
+    (repo / "ng_peer_bridge.py").write_text("# ng_peer_bridge v2\n")
+    (repo / "et_modules").mkdir(parents=True, exist_ok=True)
+    (repo / "et_modules" / "__init__.py").write_text("# et_modules init\n")
+    (repo / "et_modules" / "manager.py").write_text("# et_modules manager v2\n")
+    (repo / "et_module.json").write_text('{"module_id": "neurograph"}\n')
 
     # Create deployed files (some identical, some different)
     (skill / "neuro_foundation.py").write_text("# neuro v1\nprint('old')\n")

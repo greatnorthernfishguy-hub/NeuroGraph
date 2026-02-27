@@ -12,6 +12,10 @@ Usage:
     feed-syl --save                      Force checkpoint save
     feed-syl --step N                    Run N SNN learning steps
     feed-syl --upgrade path/to/file.msgpack  Upgrade a checkpoint
+
+Options:
+    --timeout SECONDS   Initialization timeout (default: 120)
+    --no-ces            Disable CES modules for faster startup
 """
 
 from __future__ import annotations
@@ -19,8 +23,27 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import threading
+import warnings
 from pathlib import Path
+
+# Suppress HuggingFace inference provider API key warnings BEFORE any imports.
+# NeuroGraph uses only local torch-based embeddings; TID controls all external
+# API calls.  No OpenAI, Google, or Voyage API keys are needed.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("HF_HUB_DISABLE_EXPERIMENTAL_WARNING", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+warnings.filterwarnings("ignore", message=r"(?i).*api.?keys?.*")
+warnings.filterwarnings("ignore", message=r"(?i).*set up your.*api.*")
+warnings.filterwarnings("ignore", message=r"(?i).*openai.*")
+warnings.filterwarnings("ignore", message=r"(?i).*google.*api.*")
+warnings.filterwarnings("ignore", message=r"(?i).*voyage.*")
+warnings.filterwarnings("ignore", message=r"(?i).*inference.?provider.*")
 
 # Ensure the NeuroGraph module directory is on the path
 _script_dir = Path(__file__).resolve().parent
@@ -39,25 +62,142 @@ if (_repo_root / "neuro_foundation.py").exists() and str(_repo_root) not in sys.
     sys.path.insert(0, str(_repo_root))
 
 
-def get_memory():
-    """Get or create the NeuroGraphMemory singleton."""
-    from openclaw_hook import NeuroGraphMemory
-    return NeuroGraphMemory.get_instance()
+class _InitTimeout(Exception):
+    """Raised when NeuroGraphMemory initialization exceeds the timeout."""
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise _InitTimeout(
+        "NeuroGraph initialization timed out. The embedding model may be "
+        "downloading or the system is under heavy load. Try again or use "
+        "--timeout to increase the limit."
+    )
+
+
+_memory_instance = None
+
+
+def get_memory(timeout=120, disable_ces=True):
+    """Get or create the NeuroGraphMemory singleton.
+
+    Args:
+        timeout: Maximum seconds to wait for initialization.
+        disable_ces: If True, skip CES modules for faster CLI startup.
+            CES (stream parser, HTTP dashboard, etc.) is designed for
+            persistent daemon use, not short-lived CLI invocations.
+    """
+    global _memory_instance
+    if _memory_instance is not None:
+        return _memory_instance
+
+    # Build config: disable CES for CLI mode (it starts background threads,
+    # HTTP servers, and Ollama connections that are unnecessary for CLI usage
+    # and can cause hangs if ports are already bound by the GUI).
+    config = {}
+    if disable_ces:
+        config["ces"] = {"enabled": False}
+
+    print("Initializing NeuroGraph...", end="", flush=True)
+
+    # Use SIGALRM on Unix for reliable timeout
+    use_signal = hasattr(signal, "SIGALRM")
+
+    if use_signal:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout)
+
+    init_error = None
+    result = None
+
+    if use_signal:
+        try:
+            from openclaw_hook import NeuroGraphMemory
+            result = NeuroGraphMemory.get_instance(config=config)
+            print(" done.", flush=True)
+        except _InitTimeout:
+            print(" TIMEOUT.", flush=True)
+            print(
+                f"\nInitialization did not complete within {timeout}s.\n"
+                "This usually means the embedding model is being downloaded\n"
+                "for the first time, or the system is resource-constrained.\n"
+                "\nTry: feed-syl --timeout 300 --status",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except Exception as exc:
+            print(" FAILED.", flush=True)
+            init_error = exc
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    else:
+        # Fallback for non-Unix: run init in a worker thread with a timeout
+        # join.  The main thread waits up to `timeout` seconds; if the worker
+        # hasn't finished, we report the timeout and exit.
+        init_done = threading.Event()
+        init_result_box: list = []  # [NeuroGraphMemory] or [Exception]
+
+        def _init_worker():
+            try:
+                from openclaw_hook import NeuroGraphMemory
+                inst = NeuroGraphMemory.get_instance(config=config)
+                init_result_box.append(inst)
+            except Exception as exc:
+                init_result_box.append(exc)
+            finally:
+                init_done.set()
+
+        worker = threading.Thread(target=_init_worker, daemon=True)
+        worker.start()
+        finished = init_done.wait(timeout=timeout)
+
+        if not finished:
+            print(" TIMEOUT.", flush=True)
+            print(
+                f"\nInitialization did not complete within {timeout}s.\n"
+                "This usually means the embedding model is being downloaded\n"
+                "for the first time, or the system is resource-constrained.\n"
+                "\nTry: feed-syl --timeout 300 --status",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        elif init_result_box and isinstance(init_result_box[0], Exception):
+            print(" FAILED.", flush=True)
+            init_error = init_result_box[0]
+        elif init_result_box:
+            result = init_result_box[0]
+            print(" done.", flush=True)
+        else:
+            print(" FAILED.", flush=True)
+            init_error = RuntimeError("Initialization returned no result")
+
+    if init_error is not None:
+        print(f"Error: {init_error}", file=sys.stderr)
+        sys.exit(1)
+
+    _memory_instance = result
+    return result
 
 
 def cmd_status(args):
     """Show graph statistics."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     stats = ng.stats()
     print("NeuroGraph Status")
     print("=" * 40)
     for key, value in stats.items():
-        print(f"  {key}: {value}")
+        if isinstance(value, dict):
+            print(f"  {key}:")
+            for k2, v2 in value.items():
+                print(f"    {k2}: {v2}")
+        else:
+            print(f"  {key}: {value}")
 
 
 def cmd_text(args):
     """Ingest text content."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     result = ng.on_message(args.text)
     print(f"Ingested: {result['nodes_created']} nodes, "
           f"{result['synapses_created']} synapses, "
@@ -68,18 +208,18 @@ def cmd_text(args):
 
 def cmd_file(args):
     """Ingest a single file."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     result = ng.ingest_file(args.file)
-    if result["status"] == "error":
+    if result.get("status") == "error":
         print(f"Error: {result['reason']}", file=sys.stderr)
         sys.exit(1)
-    print(f"Ingested {args.file}: {result['nodes_created']} nodes, "
-          f"{result['synapses_created']} synapses")
+    print(f"Ingested {args.file}: {result.get('nodes_created', 0)} nodes, "
+          f"{result.get('synapses_created', 0)} synapses")
 
 
 def cmd_url(args):
     """Ingest content from a URL."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     result = ng.ingest_url(args.url)
     if result.get("status") == "error":
         print(f"Error: {result['reason']}", file=sys.stderr)
@@ -91,7 +231,7 @@ def cmd_url(args):
 
 def cmd_dir(args):
     """Ingest a directory."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     exts = args.extensions.split(",") if args.extensions else None
     results = ng.ingest_directory(args.dir, extensions=exts, recursive=not args.no_recurse)
     total_nodes = sum(r.get("nodes_created", 0) for r in results if r.get("status") != "error")
@@ -110,7 +250,7 @@ def cmd_workspace(args):
         Path.home() / ".openclaw",
         Path.home() / ".openclaw" / "skills",
     ]
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     total = 0
     for d in workspace_dirs:
         if d.is_dir():
@@ -125,7 +265,7 @@ def cmd_workspace(args):
 
 def cmd_query(args):
     """Semantic similarity search."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     results = ng.recall(args.query, k=args.k, threshold=args.threshold)
     if not results:
         print("No results found.")
@@ -143,14 +283,14 @@ def cmd_query(args):
 
 def cmd_save(args):
     """Force checkpoint save."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     path = ng.save()
     print(f"Checkpoint saved to {path}")
 
 
 def cmd_step(args):
     """Run N SNN learning steps."""
-    ng = get_memory()
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     results = ng.step(n=args.n)
     total_fired = sum(len(r.fired_node_ids) for r in results)
     print(f"Ran {args.n} steps, {total_fired} total spikes")
@@ -187,6 +327,18 @@ def main():
     parser.add_argument("--extensions", type=str, help="Comma-separated extensions for --dir")
     parser.add_argument("--no-recurse", action="store_true", help="Don't recurse into subdirectories")
     parser.add_argument("--no-backup", action="store_true", help="Skip backup during upgrade")
+    parser.add_argument(
+        "--timeout", type=int, default=120,
+        help="Initialization timeout in seconds (default: 120)",
+    )
+    parser.add_argument(
+        "--no-ces", action="store_true", default=True,
+        help="Disable CES modules for faster startup (default: True for CLI)",
+    )
+    parser.add_argument(
+        "--with-ces", action="store_false", dest="no_ces",
+        help="Enable CES modules (overrides --no-ces default)",
+    )
 
     args = parser.parse_args()
 

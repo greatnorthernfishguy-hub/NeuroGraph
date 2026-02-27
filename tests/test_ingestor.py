@@ -17,7 +17,9 @@ Tests cover:
 import math
 import os
 import sys
+import tempfile
 import unittest
+import zipfile
 
 import numpy as np
 
@@ -41,6 +43,7 @@ from universal_ingestor import (
     CodeExtractor,
     URLExtractor,
     PDFExtractor,
+    ZipExtractor,
     ExtractorRouter,
     # Chunker
     AdaptiveChunker,
@@ -287,7 +290,7 @@ class TestExtractorRouter(unittest.TestCase):
         """Auto-detects HTML content."""
         router = ExtractorRouter()
         stype = router.detect_source_type("<html><body>hi</body></html>")
-        self.assertEqual(stype, SourceType.URL)
+        self.assertEqual(stype, SourceType.HTML)
 
     def test_detect_text_fallback(self):
         """Falls back to TEXT for unrecognized content."""
@@ -1184,6 +1187,179 @@ class TestEdgeCases(unittest.TestCase):
         results = db.search(np.zeros(3), k=5, threshold=0.0)
         # Result is implementation-defined but should not crash
         self.assertIsInstance(results, list)
+
+
+# ---------------------------------------------------------------------------
+# ZipExtractor Tests
+# ---------------------------------------------------------------------------
+
+class TestZipExtractor(unittest.TestCase):
+    """Tests for ZIP archive extraction."""
+
+    def _make_zip(self, files: dict) -> str:
+        """Create a temporary zip with given {name: content} entries."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        with zipfile.ZipFile(tmp.name, "w") as zf:
+            for name, content in files.items():
+                zf.writestr(name, content)
+        return tmp.name
+
+    def test_extract_basic_zip(self):
+        """ZIP with one text file extracts successfully."""
+        path = self._make_zip({"hello.txt": "Hello World"})
+        try:
+            ext = ZipExtractor()
+            result = ext.extract(path)
+            self.assertEqual(result.source_type, SourceType.ZIP)
+            self.assertIn("Hello World", result.raw_text)
+            self.assertEqual(result.metadata["files_extracted"], 1)
+        finally:
+            os.unlink(path)
+
+    def test_extract_multiple_files(self):
+        """ZIP with multiple supported files extracts all."""
+        path = self._make_zip({
+            "readme.md": "# Hello\nContent here.",
+            "main.py": "def foo():\n    pass",
+            "notes.txt": "Some notes.",
+        })
+        try:
+            ext = ZipExtractor()
+            result = ext.extract(path)
+            self.assertEqual(result.metadata["files_extracted"], 3)
+            self.assertIn("Hello", result.raw_text)
+            self.assertIn("def foo", result.raw_text)
+            self.assertIn("Some notes", result.raw_text)
+            # Structure should have 3 entries
+            self.assertEqual(len(result.structure), 3)
+        finally:
+            os.unlink(path)
+
+    def test_skips_unsupported_files(self):
+        """ZIP with unsupported files (images, binaries) skips them."""
+        path = self._make_zip({
+            "photo.jpg": "fake image data",
+            "data.csv": "a,b,c",
+            "readme.md": "# Supported",
+        })
+        try:
+            ext = ZipExtractor()
+            result = ext.extract(path)
+            self.assertEqual(result.metadata["files_extracted"], 1)
+            self.assertEqual(result.metadata["files_skipped"], 2)
+            self.assertIn("Supported", result.raw_text)
+        finally:
+            os.unlink(path)
+
+    def test_nested_directories(self):
+        """ZIP with nested directory structure works."""
+        path = self._make_zip({
+            "src/main.py": "print('hello')",
+            "src/utils/helper.py": "def help(): pass",
+            "docs/readme.md": "# Docs",
+        })
+        try:
+            ext = ZipExtractor()
+            result = ext.extract(path)
+            self.assertEqual(result.metadata["files_extracted"], 3)
+            # Structure entries should have relative paths
+            paths = [s["path"] for s in result.structure]
+            self.assertTrue(any("src/main.py" in p for p in paths))
+            self.assertTrue(any("helper.py" in p for p in paths))
+        finally:
+            os.unlink(path)
+
+    def test_empty_zip(self):
+        """ZIP with no supported files produces empty text."""
+        path = self._make_zip({"image.png": "fake"})
+        try:
+            ext = ZipExtractor()
+            result = ext.extract(path)
+            self.assertEqual(result.metadata["files_extracted"], 0)
+            self.assertEqual(result.raw_text.strip(), "")
+        finally:
+            os.unlink(path)
+
+    def test_invalid_zip_raises(self):
+        """Non-ZIP file raises ValueError."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tmp.write(b"not a zip file")
+        tmp.close()
+        try:
+            ext = ZipExtractor()
+            with self.assertRaises(ValueError):
+                ext.extract(tmp.name)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_structure_entries_have_correct_fields(self):
+        """Structure entries contain path, extension, offset, length."""
+        path = self._make_zip({"code.py": "x = 1"})
+        try:
+            ext = ZipExtractor()
+            result = ext.extract(path)
+            self.assertEqual(len(result.structure), 1)
+            entry = result.structure[0]
+            self.assertEqual(entry["type"], "zip_member")
+            self.assertIn("code.py", entry["path"])
+            self.assertEqual(entry["extension"], ".py")
+            self.assertIn("offset", entry)
+            self.assertIn("length", entry)
+        finally:
+            os.unlink(path)
+
+    def test_router_detects_zip(self):
+        """ExtractorRouter auto-detects .zip files."""
+        path = self._make_zip({"test.txt": "hello"})
+        try:
+            router = ExtractorRouter()
+            detected = router.detect_source_type(path)
+            self.assertEqual(detected, SourceType.ZIP)
+        finally:
+            os.unlink(path)
+
+    def test_router_extracts_zip(self):
+        """ExtractorRouter can extract .zip files end-to-end."""
+        path = self._make_zip({"doc.md": "# Title\nBody"})
+        try:
+            router = ExtractorRouter()
+            result = router.extract(path)
+            self.assertEqual(result.source_type, SourceType.ZIP)
+            self.assertIn("Title", result.raw_text)
+        finally:
+            os.unlink(path)
+
+    def test_end_to_end_zip_ingestion(self):
+        """Full pipeline ingests a ZIP file."""
+        path = self._make_zip({
+            "readme.md": "# Project\n\nThis is a project readme with enough content to form chunks. " * 20,
+            "main.py": "def main():\n    print('hello world')\n" * 10,
+        })
+        try:
+            graph = Graph()
+            db = SimpleVectorDB()
+            ingestor = UniversalIngestor(graph, db, {"embedding": {"use_model": False}})
+            result = ingestor.ingest(path, source_type=SourceType.ZIP)
+            self.assertGreater(result.chunks_created, 0)
+            self.assertGreater(len(result.nodes_created), 0)
+        finally:
+            os.unlink(path)
+
+    def test_path_traversal_blocked(self):
+        """ZIP entries with .. in path are skipped (security)."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        with zipfile.ZipFile(tmp.name, "w") as zf:
+            zf.writestr("safe.txt", "safe content")
+            zf.writestr("../escape.txt", "escape attempt")
+        try:
+            ext = ZipExtractor()
+            result = ext.extract(tmp.name)
+            # Only safe.txt should be extracted
+            self.assertEqual(result.metadata["files_extracted"], 1)
+            self.assertIn("safe content", result.raw_text)
+            self.assertNotIn("escape attempt", result.raw_text)
+        finally:
+            os.unlink(tmp.name)
 
 
 if __name__ == "__main__":

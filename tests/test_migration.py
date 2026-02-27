@@ -4,7 +4,7 @@ Tests for the NeuroGraph checkpoint migration framework.
 Covers:
 - Version detection
 - Migration path planning
-- Individual migration steps (0.1.0 → 0.2.0 → 0.2.5 → 0.3.0 → 0.3.5 → 0.4.0)
+- Individual migration steps (0.1.0 → 0.2.0 → 0.2.5 → 0.3.0 → 0.3.5 → 0.4.0 → 0.4.1)
 - Full migration from oldest to latest
 - Backup and rollback
 - Checkpoint info
@@ -184,13 +184,13 @@ class TestVersionDetection:
 class TestMigrationPlanning:
     def test_plan_v010_to_current(self):
         steps = plan_migration("0.1.0", CURRENT_VERSION)
-        assert len(steps) == 5
+        assert len(steps) == 6
         assert steps[0] == ("0.1.0", "0.2.0")
-        assert steps[-1] == ("0.3.5", "0.4.0")
+        assert steps[-1] == ("0.4.0", "0.4.1")
 
     def test_plan_v025_to_current(self):
         steps = plan_migration("0.2.5", CURRENT_VERSION)
-        assert len(steps) == 3
+        assert len(steps) == 4
         assert steps[0] == ("0.2.5", "0.3.0")
 
     def test_plan_already_current(self):
@@ -275,7 +275,7 @@ class TestFullMigration:
         data = _make_v010_checkpoint()
         migrated, applied = migrate_data(data)
         assert migrated["version"] == CURRENT_VERSION
-        assert len(applied) == 5
+        assert len(applied) == 6
         # All Phase 2+ fields present
         he = migrated["hyperedges"]["he1"]
         assert "activation_count" in he
@@ -327,7 +327,7 @@ class TestFileUpgrade:
         result = upgrade_checkpoint(path)
         assert result["version_before"] == "0.1.0"
         assert result["version_after"] == CURRENT_VERSION
-        assert len(result["steps_applied"]) == 5
+        assert len(result["steps_applied"]) == 6
         assert result["backup_path"] is not None
 
         # Verify file was updated
@@ -359,7 +359,7 @@ class TestFileUpgrade:
 
         result = upgrade_checkpoint(path, dry_run=True)
         assert result["dry_run"] is True
-        assert len(result["steps_applied"]) == 5
+        assert len(result["steps_applied"]) == 6
 
         # File should NOT be modified
         data = load_checkpoint(path)
@@ -519,9 +519,9 @@ class TestGraphIntegration:
 
         # The saved checkpoint should already be at current version
         info = get_checkpoint_info(path)
-        assert info["version"] == "0.3.5"  # serialization version
+        assert info["version"] == "0.4.1"  # serialization version
 
-        # Upgrade (should handle 0.3.5 → 0.4.0)
+        # Upgrade (should be a no-op — already at current version)
         result = upgrade_checkpoint(path)
 
         # Restore into new graph

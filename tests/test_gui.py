@@ -41,6 +41,7 @@ GitUpdater = _mod.GitUpdater
 IngestionManager = _mod.IngestionManager
 SUPPORTED_EXTENSIONS = _mod.SUPPORTED_EXTENSIONS
 DEFAULT_CONFIG = _mod.DEFAULT_CONFIG
+_HAS_DND = _mod._HAS_DND
 
 
 # ===================================================================
@@ -132,8 +133,13 @@ class TestFileWatcherIgnore:
 
     def test_unsupported_extensions_ignored(self):
         assert FileWatcher.should_ignore("/inbox/photo.jpg") is True
-        assert FileWatcher.should_ignore("/inbox/archive.zip") is True
         assert FileWatcher.should_ignore("/inbox/data.csv") is True
+        assert FileWatcher.should_ignore("/inbox/archive.zip") is True
+        assert FileWatcher.should_ignore("/inbox/data.exe") is True
+
+    def test_zip_extension_supported(self):
+        """ZIP files should NOT be ignored since ZipExtractor handles them."""
+        assert FileWatcher.should_ignore("/inbox/archive.zip") is False
 
     def test_supported_extensions_not_ignored(self):
         for ext in SUPPORTED_EXTENSIONS:
@@ -267,12 +273,41 @@ class TestGitUpdater:
                 r.stdout = ""
             return r
 
-        with mock.patch.object(updater, "_run_git", side_effect=fake_git):
+        with mock.patch.object(updater, "_run_git", side_effect=fake_git), \
+             mock.patch.object(updater, "_count_stale_deployed_files", return_value=0):
             updater._check_worker()
 
         assert len(results) == 1
         assert results[0]["has_updates"] is False
         assert results[0]["commits_behind"] == 0
+
+    def test_check_worker_stale_files_after_rollback(self, tmp_path):
+        """When commits are in sync but deployed files differ, report updates needed."""
+        results = []
+        updater = self._make_updater(
+            tmp_path, on_complete=lambda r: results.append(r),
+        )
+        repo_dir = tmp_path / "repo" / ".git"
+        repo_dir.mkdir(parents=True)
+
+        def fake_git(*args, **kwargs):
+            r = mock.Mock()
+            if "rev-parse" in args:
+                r.stdout = "abc1234\n"
+            elif "rev-list" in args:
+                r.stdout = "0\n"
+            else:
+                r.stdout = ""
+            return r
+
+        with mock.patch.object(updater, "_run_git", side_effect=fake_git), \
+             mock.patch.object(updater, "_count_stale_deployed_files", return_value=3):
+            updater._check_worker()
+
+        assert len(results) == 1
+        assert results[0]["has_updates"] is True
+        assert results[0]["commits_behind"] == 0
+        assert results[0]["stale_files"] == 3
 
     def test_check_worker_has_updates(self, tmp_path):
         results = []
@@ -319,6 +354,27 @@ class TestGitUpdater:
 
         assert len(errors) == 1
         assert "network down" in errors[0]
+
+    def test_count_stale_files_hash_fallback(self, tmp_path):
+        """Fallback hash comparison detects when deployed files differ."""
+        updater = self._make_updater(tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir(parents=True)
+        skill = tmp_path / "skill"
+        skill.mkdir(parents=True)
+
+        # No neurograph-patch script → triggers fallback
+        # Create matching file
+        (repo / "neuro_foundation.py").write_text("same content")
+        (skill / "neuro_foundation.py").write_text("same content")
+        # Create differing file
+        (repo / "universal_ingestor.py").write_text("new version")
+        (skill / "universal_ingestor.py").write_text("old version")
+        # Create missing files (in repo but not in skill)
+        (repo / "openclaw_hook.py").write_text("hook code")
+        (repo / "neurograph_gui.py").write_text("gui code")
+
+        assert updater._count_stale_deployed_files() == 3  # ingestor + hook + gui
 
 
 # ===================================================================
@@ -511,3 +567,143 @@ class TestPipelineIntegration:
         # Check file was moved to ingested/
         ingested_files = list(ingested.rglob("notes.md"))
         assert len(ingested_files) == 1
+
+
+# ===================================================================
+# URL Ingestion
+# ===================================================================
+
+class TestURLIngestion:
+    """Tests for IngestionManager URL ingestion."""
+
+    def _make_manager(self, tmp_path, on_result=None, on_error=None):
+        return IngestionManager(
+            workspace_dir=str(tmp_path / "workspace"),
+            ingested_path=str(tmp_path / "ingested"),
+            on_result=on_result or (lambda r: None),
+            on_error=on_error or (lambda e: None),
+        )
+
+    def test_ingest_url_calls_ng(self, tmp_path):
+        """URL ingestion calls NeuroGraphMemory.ingest_url()."""
+        results = []
+        mgr = self._make_manager(tmp_path, on_result=lambda r: results.append(r))
+
+        mock_ng = mock.Mock()
+        mock_ng.ingest_url.return_value = {
+            "status": "ingested",
+            "nodes_created": 5,
+            "synapses_created": 3,
+        }
+        mgr._ng = mock_ng
+
+        mgr._ingest_url_worker("https://example.com")
+
+        mock_ng.ingest_url.assert_called_once_with("https://example.com")
+        assert len(results) == 1
+        assert results[0]["nodes_created"] == 5
+        assert results[0]["original_path"] == "https://example.com"
+
+    def test_ingest_url_error(self, tmp_path):
+        """URL ingestion error is reported correctly."""
+        errors = []
+        mgr = self._make_manager(tmp_path, on_error=lambda e: errors.append(e))
+
+        mock_ng = mock.Mock()
+        mock_ng.ingest_url.return_value = {
+            "status": "error",
+            "reason": "fetch failed",
+        }
+        mgr._ng = mock_ng
+
+        mgr._ingest_url_worker("https://bad-url.example")
+
+        assert len(errors) == 1
+        assert "bad-url" in errors[0]
+
+    def test_ingest_url_exception(self, tmp_path):
+        """URL ingestion exception is caught and reported."""
+        errors = []
+        mgr = self._make_manager(tmp_path, on_error=lambda e: errors.append(e))
+
+        mock_ng = mock.Mock()
+        mock_ng.ingest_url.side_effect = ConnectionError("network down")
+        mgr._ng = mock_ng
+
+        mgr._ingest_url_worker("https://example.com")
+
+        assert len(errors) == 1
+        assert "network down" in errors[0]
+
+
+# ===================================================================
+# Watch Paths Configuration
+# ===================================================================
+
+class TestWatchPaths:
+    """Tests for configurable watch paths."""
+
+    def test_default_watch_paths_empty(self, tmp_path):
+        cfg = GUIConfig(config_path=str(tmp_path / "config.json"))
+        assert cfg.get("watch_paths") == []
+
+    def test_set_watch_paths(self, tmp_path):
+        cfg = GUIConfig(config_path=str(tmp_path / "config.json"))
+        cfg.set("watch_paths", ["/home/user/Downloads", "/tmp/inbox"])
+        assert cfg.get("watch_paths") == ["/home/user/Downloads", "/tmp/inbox"]
+
+    def test_watch_paths_persist(self, tmp_path):
+        path = tmp_path / "config.json"
+        cfg1 = GUIConfig(config_path=str(path))
+        cfg1.set("watch_paths", ["/home/josh/Downloads"])
+        cfg1.save()
+
+        cfg2 = GUIConfig(config_path=str(path))
+        assert cfg2.get("watch_paths") == ["/home/josh/Downloads"]
+
+
+# ===================================================================
+# Drag-and-Drop (DnD) Logic
+# ===================================================================
+
+class TestDnDAvailability:
+    """Tests for DnD availability flag."""
+
+    def test_dnd_flag_is_boolean(self):
+        """_HAS_DND should be a boolean indicating tkinterdnd2 availability."""
+        assert isinstance(_HAS_DND, bool)
+
+
+# ===================================================================
+# ZIP Support in FileWatcher
+# ===================================================================
+
+class TestZipFileWatcherSupport:
+    """Tests for .zip file acceptance in the file watcher."""
+
+    def test_zip_not_ignored(self):
+        assert ".zip" in SUPPORTED_EXTENSIONS
+        assert FileWatcher.should_ignore("/inbox/archive.zip") is False
+
+    def test_detects_stable_zip(self, tmp_path):
+        """Watcher detects a stable .zip file in inbox."""
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+        results = []
+        watcher = FileWatcher(
+            inbox_path=str(inbox),
+            on_file_ready=lambda p: results.append(p),
+            on_error=lambda e: None,
+            stability_seconds=0.1,
+        )
+        watcher.start()
+        try:
+            import zipfile as zf
+            test_zip = inbox / "test.zip"
+            with zf.ZipFile(str(test_zip), "w") as z:
+                z.writestr("hello.txt", "world")
+            time.sleep(1.5)
+            assert len(results) >= 1
+            assert "test.zip" in results[0]
+        finally:
+            watcher.stop()

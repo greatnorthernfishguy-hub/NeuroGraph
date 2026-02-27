@@ -98,8 +98,13 @@ class SurfacingMonitor:
         """Process a step result and update the surfacing queue.
 
         Should be called after each ``graph.step()``.  Scans fired nodes,
-        filters by voltage threshold, scores, and inserts into the
-        bounded queue.  Also applies decay to existing entries.
+        scores them, and inserts into the bounded queue.  Also applies
+        decay to existing entries.
+
+        Note: fired nodes have already had their voltage reset to resting
+        potential by ``graph.step()`` before this method is called.  We do
+        NOT filter by current voltage — being in ``fired_node_ids`` already
+        means the node exceeded its firing threshold during the step.
 
         Args:
             step_result: ``StepResult`` from ``graph.step()``.
@@ -111,10 +116,6 @@ class SurfacingMonitor:
         for node_id in step_result.fired_node_ids:
             node = self._graph.nodes.get(node_id)
             if node is None:
-                continue
-
-            # Filter by voltage threshold (skip for fired nodes since voltage is reset)
-            if node.voltage < self._cfg.voltage_threshold and not node.fired:
                 continue
 
             score = self._score_node(node_id, node)
@@ -225,11 +226,16 @@ class SurfacingMonitor:
         Score = 0.5 * voltage_normalized + 0.3 * excitability + 0.2 * he_membership
 
         Where:
-        - voltage_normalized = node.voltage / node.threshold (capped at 2.0)
+        - voltage_normalized = effective_voltage / node.threshold (capped at 2.0)
         - excitability = node.intrinsic_excitability (capped at 2.0)
         - he_membership = number of hyperedges containing this node / 10 (capped at 1.0)
+
+        Note: ``graph.step()`` resets fired nodes' voltage to resting potential
+        before this method is called, so we use ``max(voltage, threshold)`` as
+        the effective voltage — fired nodes reached at least their threshold.
         """
-        voltage_norm = min(node.voltage / max(node.threshold, 0.01), 2.0)
+        effective_voltage = max(node.voltage, node.threshold)
+        voltage_norm = min(effective_voltage / max(node.threshold, 0.01), 2.0)
         excitability = min(node.intrinsic_excitability, 2.0)
 
         # Count hyperedge memberships

@@ -95,6 +95,25 @@ Build the base `neuro_foundation.py` implementing:
 - Node ID translation: incremental ("n_1") ↔ UUID
 - Format bridge: JSON (ng_lite) ↔ msgpack (neuro_foundation)
 
+### Phase 7: ET Module Manager Integration -- COMPLETE
+- `ng_peer_bridge.py` — NGPeerBridge (Tier 2) for cross-module learning via shared filesystem
+- `et_modules/manager.py` — ETModuleManager for unified discovery, status, and updates
+- `et_module.json` — Module manifest declaring NeuroGraph's identity in the ecosystem
+- NeuroGraphMemory writes learning events to `~/.et_modules/shared_learning/` for peer absorption
+- `deploy.sh` registers NeuroGraph with the ET Module Manager on installation
+- Three-tier architecture: Tier 1 (standalone NG-Lite) → Tier 2 (NGPeerBridge) → Tier 3 (NGSaaSBridge)
+- Graceful degradation: peer bridge failure never blocks core SNN operation
+
+### Phase 9: Cognitive Enhancement Suite (CES) -- COMPLETE
+- `ces_config.py` — Centralized CES configuration (streaming, surfacing, persistence, monitoring)
+- `stream_parser.py` — Real-time stream parser: background thread, Ollama embeddings, node nudging, pattern completion
+- `activation_persistence.py` — JSON sidecar for cross-session voltage state with temporal decay
+- `surfacing.py` — Priority queue of relevant concepts for prompt injection
+- `ces_monitoring.py` — Health context strings, rotating logger, HTTP dashboard (port 8847)
+- `openclaw_hook.py` modified to wire in all CES modules with try/except guards (CES is optional)
+- Ollama primary embedding with sentence-transformers/hash fallback
+- All CES imports guarded: core NeuroGraph works without CES files present
+
 ## File Structure
 ```
 NeuroGraph/
@@ -110,6 +129,16 @@ NeuroGraph/
 ├── neurograph.desktop               # Phase 5.5: Linux desktop entry
 ├── ng_lite.py                       # Phase 6: Lightweight learning substrate (vendorable)
 ├── ng_bridge.py                     # Phase 6: NGSaaSBridge (Tier 3 bridge to full NeuroGraph)
+├── ng_peer_bridge.py                # Phase 7: NGPeerBridge (Tier 2 cross-module learning)
+├── et_module.json                   # Phase 7: Module manifest for ET ecosystem
+├── et_modules/
+│   ├── __init__.py
+│   └── manager.py                   # Phase 7: ET Module Manager
+├── ces_config.py                    # Phase 9: CES centralized configuration
+├── stream_parser.py                 # Phase 9: Real-time stream parser (Ollama + fallback)
+├── activation_persistence.py        # Phase 9: Cross-session activation state sidecar
+├── surfacing.py                     # Phase 9: Surfacing monitor for prompt injection
+├── ces_monitoring.py                # Phase 9: Health context, logger, HTTP dashboard
 ├── tests/
 │   ├── __init__.py
 │   ├── test_snn.py                  # SNN dynamics tests (12)
@@ -124,7 +153,9 @@ NeuroGraph/
 │   ├── test_migration.py            # Phase 5: Migration framework tests (32)
 │   ├── test_openclaw_hook.py        # Phase 5: OpenClaw hook tests (18)
 │   ├── test_gui.py                  # Phase 5.5: GUI non-GUI logic tests (25)
-│   └── test_ng_lite.py              # Phase 6: NG-Lite + NGSaaSBridge tests (52)
+│   ├── test_ng_lite.py              # Phase 6: NG-Lite + NGSaaSBridge tests (52)
+│   ├── test_et_modules.py           # Phase 7: ET Module Manager + NGPeerBridge tests (45)
+│   └── test_ces.py                  # Phase 9: CES test suite (64)
 ├── examples/
 │   ├── simple_usage.py              # Basic example
 │   ├── project_configs.py           # OpenClaw, DSM, Consciousness configs
@@ -288,6 +319,8 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 - [x] Phase 5: Deployment & Modular Setup
 - [x] Phase 5.5: Management GUI
 - [x] Phase 6: NG-Lite Canonical Source & Bridge
+- [x] Phase 7: ET Module Manager Integration
+- [x] Phase 9: Cognitive Enhancement Suite (CES)
 
 ## Changelog
 
@@ -823,3 +856,151 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
 **Files modified:**
 - `neurograph-patch` (MANIFEST entries for ng_lite.py and ng_bridge.py)
 - `CLAUDE.md` (Phase 6 documentation)
+
+---
+
+### Phase 7: ET Module Manager Integration (v0.7.0)
+**Commit:** ET Module Manager integration — NGPeerBridge, unified discovery, cross-module learning
+
+**What was built:**
+1. **NGPeerBridge (`ng_peer_bridge.py`) — Tier 2 cross-module learning:**
+   - Implements `NGBridge` interface for peer-to-peer learning between co-located NG-Lite instances
+   - File-based event exchange: each module writes JSONL events to `~/.et_modules/shared_learning/<module_id>.jsonl`
+   - Asynchronous sync: reads peers' event files every N outcomes (default 100, NeuroGraph uses 50)
+   - Incremental reads via tracked file positions — no re-reading on each sync
+   - Cross-module recommendations via embedding cosine similarity (threshold 0.3)
+   - Cross-module novelty detection: checks if a pattern is novel across ALL peer modules
+   - Peer registry at `~/.et_modules/shared_learning/_peer_registry.json`
+   - Bounded peer event cache (500 entries) with LRU eviction
+   - `get_stats()` telemetry: sync count, cached events, connection status
+
+2. **ET Module Manager (`et_modules/manager.py`):**
+   - `ModuleManifest` dataclass: module identity, version, git remote, dependencies, install path
+   - `ModuleStatus` dataclass: health, tier, update availability, peer bridge connectivity
+   - `ETModuleManager` class with full lifecycle API:
+     - `discover()`: scans known locations + registry for et_module.json manifests
+     - `status()`: health check with tier assignment (1=isolated, 2=peer, 3=full SNN)
+     - `register()`: add/update a module in the registry
+     - `update_all()` / `update_module()`: git-pull updates with optional service restart
+     - `get_peer_modules()`: find non-NeuroGraph modules for Tier 3 upgrade offers
+     - `get_neurograph_path()`: peer modules use this to find the full SNN backend
+     - `get_shared_learning_dir()`: returns path for NGPeerBridge coordination
+   - Registry persistence at `~/.et_modules/registry.json`
+   - Known install locations: `~/.openclaw/skills/neurograph`, `/opt/inference-difference`, `/opt/trollguard`, `~/.et_modules/modules`
+
+3. **Module manifest (`et_module.json`):**
+   - Declares NeuroGraph's identity: module_id="neurograph", version="0.6.0"
+   - Git remote, branch, entry point, ng_lite_version for ecosystem coordination
+
+4. **NeuroGraphMemory integration (`openclaw_hook.py`):**
+   - NGPeerBridge initialized in `__init__` with graceful degradation (try/except)
+   - `_write_peer_learning_event()`: after each ingestion, embeds the text and writes a learning event to the shared directory so peer modules can absorb patterns
+   - `get_peer_modules()`: discovers co-located E-T Systems modules via ETModuleManager
+   - `stats()` now includes `peer_bridge` status (connected, sync count, cached events)
+   - Version bumped to 0.6.0 in stats output
+   - Peer bridge disabled via `config={"peer_bridge": {"enabled": False}}`
+
+5. **Deployment updates (`deploy.sh`):**
+   - Deploys ng_lite.py, ng_bridge.py, ng_peer_bridge.py to skill directory
+   - Deploys et_modules/ package (manager.py + __init__.py) and et_module.json
+   - Creates `~/.et_modules/shared_learning/` directory
+   - Registers NeuroGraph in `~/.et_modules/registry.json` with full manifest data
+   - Uninstall preserves `~/.et_modules/` (shared learning data is cross-module state)
+
+**Key design decisions:**
+- **NeuroGraph is both Tier 2 and Tier 3** — it writes to the shared learning directory (Tier 2 peer participation) AND provides the full SNN backend (Tier 3 via NGSaaSBridge). This means peer modules get NeuroGraph's learning events even without a direct SaaS connection
+- **sync_interval=50 for NeuroGraph** (vs default 100) — NeuroGraph processes more events per session than typical modules, so more frequent syncs keep peers up to date
+- **Peer bridge initialized with try/except** — import failures (missing ng_peer_bridge.py in standalone installs) gracefully degrade to standalone mode without breaking core functionality
+- **File-based exchange, not IPC** — shared JSONL files are dead simple, survive process restarts, work across languages, and let modules run on different schedules. No coordination daemon needed
+- **Incremental file reads** — `_peer_read_positions` tracks byte offsets per peer file, so each sync only reads new events. Critical for performance as event logs grow
+- **Bounded peer event cache** (500) — prevents memory growth from long-running peers with high event volumes
+
+**Tests added (45):**
+- `test_et_modules.py`:
+  - ModuleManifest: defaults (1), from_file (1), missing file (1), invalid JSON (1), extra fields ignored (1), to_file (1), roundtrip (1)
+  - ETModuleManager: init directories (1), empty registry (1), register (1), register+discover (1), status (1), tier assignment (1), neurograph tier 3 (1), peer modules (1), neurograph path (1), shared learning dir (1), update not registered (1), update no git (1)
+  - NGPeerBridge: init shared dir (1), init registers (1), connected (1), disconnect/reconnect (1), record outcome writes (1), record disconnected (1), sync from peers (1), auto sync on interval (1), recommendations none (1), recommendations from peers (1), filters own module (1), novelty no peers (1), novelty known (1), novelty new (1), sync state (1), sync disconnected (1), stats (1), bounded events (1), incremental read (1)
+  - NeuroGraphMemory integration: bridge initialized (1), on_message writes peer event (1), stats includes bridge (1), bridge disabled (1), works without bridge (1), get_peer_modules (1)
+  - Manifest validation: neurograph et_module.json valid (1)
+
+**Files created:**
+- `ng_peer_bridge.py`, `et_module.json`
+- `et_modules/__init__.py`, `et_modules/manager.py`
+- `tests/test_et_modules.py`
+
+**Files modified:**
+- `openclaw_hook.py` (peer bridge integration, shared learning events, version bump)
+- `deploy.sh` (NG-Lite ecosystem files, ET Module Manager registration, shared learning dir)
+- `CLAUDE.md` (Phase 7 documentation)
+
+---
+
+### Phase 9: Cognitive Enhancement Suite (v0.9.0)
+**Commit:** Implement Phase 9: Cognitive Enhancement Suite (CES)
+
+**What was built:**
+1. **CES Config (`ces_config.py`):**
+   - `CESConfig` dataclass with four section dataclasses: `StreamingConfig`, `SurfacingConfig`, `PersistenceConfig`, `MonitoringConfig`
+   - `load_ces_config(overrides, config_path)` factory with JSON file + dict override layering
+   - All CES defaults centralised: Ollama model, chunk sizes, thresholds, HTTP port, etc.
+
+2. **Stream Parser (`stream_parser.py`):**
+   - `StreamParser` class with background daemon thread consuming from `queue.Queue`
+   - Pipeline: `feed(text)` → `_chunk_text()` (overlapping word-level chunks) → `_embed_chunk()` (Ollama HTTP API) → `_find_similar()` (vector DB search) → `_nudge_nodes()` (voltage injection) → `_trigger_completions()` (hyperedge pattern completion)
+   - Ollama availability detection with cached periodic re-check (60s interval)
+   - Fallback chain: Ollama → sentence-transformers → hash embedder
+   - Lifecycle: `pause()`, `resume()`, `stop()`, `is_running`, `get_stats()`
+
+3. **Activation Persistence (`activation_persistence.py`):**
+   - `ActivationPersistence` class writing JSON sidecar alongside msgpack checkpoint
+   - `capture(graph)` → dict of node voltages, excitability, timestamps
+   - `save(graph, checkpoint_path)` / `restore(graph, checkpoint_path)` with temporal decay
+   - Exponential decay: `voltage *= (1 - decay_per_hour) ^ elapsed_hours`
+   - Sub-threshold pruning, max_entries bounding, auto-save timer thread
+
+4. **Surfacing Monitor (`surfacing.py`):**
+   - `SurfacingMonitor` class with bounded priority queue (max 50 entries)
+   - `after_step(step_result)` — scans fired nodes, filters by voltage threshold + min confidence
+   - Composite scoring: 50% voltage, 30% excitability, 20% hyperedge membership
+   - Per-step decay: `score *= decay_rate` with automatic cleanup of sub-threshold items
+   - `format_context()` — renders surfaced items as `[NeuroGraph Surfaced Knowledge]` block
+
+5. **CES Monitoring (`ces_monitoring.py`):**
+   - `health_context(ng_memory)` — natural language status string for prompt injection
+   - `CESLogger` — rotating file handler to `~/.neurograph/logs/ces.log` (size-based rotation)
+   - `MonitoringDashboard` — HTTP server on port 8847 with `/health`, `/stats`, `/surfaced` endpoints (stdlib `http.server`, daemon thread)
+   - `CESMonitor` coordinator: starts/stops dashboard + periodic health check logging
+
+6. **OpenClaw integration (`openclaw_hook.py` modifications):**
+   - CES modules initialized in `__init__` after peer bridge, all imports guarded by try/except
+   - `on_message()`: feeds stream parser, calls surfacing monitor after step, includes `ces_surfaced` in return
+   - `save()`: writes activation sidecar alongside checkpoint
+   - `stats()`: includes CES subsystem status (stream_parser, surfacing, persistence, monitor)
+   - `config={"ces": {"enabled": False}}` disables CES entirely
+
+**Key design decisions:**
+- **All CES imports guarded** — `try/except ImportError` around all CES module imports in `openclaw_hook.py`. Core NeuroGraph works unchanged if CES files are absent. This makes CES truly optional
+- **Ollama primary, fallback secondary** — stream parser tries Ollama first for embeddings (fast, local, no GPU needed for nomic-embed-text), falls back to the ingestor's `embed_text()` method (sentence-transformers or hash). Ollama availability cached with 60s re-check
+- **Direct voltage injection, not current** — `_nudge_nodes()` adds to `node.voltage` directly rather than going through the synapse/current pathway. This is intentional: stream parsing is a continuous attention signal, not a synaptic event. It warms nodes without triggering STDP
+- **Sidecar file, not checkpoint modification** — activation persistence writes a separate `.activations.json` file rather than modifying the msgpack checkpoint. This avoids version/schema conflicts and makes activation state independently inspectable
+- **Temporal decay on restore, not save** — decay is applied at restore time based on elapsed wall-clock hours. This means the sidecar always stores raw activation state, and the decay amount depends on how long the system was offline
+- **Queue-based surfacing with decay** — surfacing queue decays every step (`score *= 0.95`), so stale concepts naturally fade. This prevents old activations from permanently occupying the surfacing window
+- **HTTP dashboard in daemon thread** — the monitoring server runs in a daemon thread so it dies automatically when the process exits. No cleanup needed, no port leaks
+
+**Tests added (64):**
+- `test_ces.py`:
+  - CESConfig: defaults (4), overrides (4), JSON file (3)
+  - StreamParser: chunking (4), nudging (3), lifecycle (4), embedding (3), completions (1)
+  - ActivationPersistence: capture (3), save/restore (4), decay (3), stats (2), auto-save (1)
+  - SurfacingMonitor: after_step (3), scoring (3), queue (3), formatting (2), stats (1)
+  - CESMonitoring: health_context (2), logger (1), coordinator (3), dashboard (2)
+  - Integration: CES initialized (1), CES disabled (1), on_message (1), save sidecar (1), stats (1)
+
+**Files created:**
+- `ces_config.py`, `stream_parser.py`, `activation_persistence.py`, `surfacing.py`, `ces_monitoring.py`
+- `tests/test_ces.py`
+
+**Files modified:**
+- `openclaw_hook.py` (CES integration: init, on_message, save, stats)
+- `deploy.sh` (CES file deployment)
+- `CLAUDE.md` (Phase 9 documentation)
