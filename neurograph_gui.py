@@ -16,10 +16,25 @@ Environment:
     NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/.openclaw/neurograph)
     NEUROGRAPH_SKILL_DIR      Override skill dir (default: ~/.openclaw/skills/neurograph)
     NEUROGRAPH_GUI_DIR        Override GUI data dir (default: ~/.neurograph)
+
+Grok Review Changelog (v0.7.1):
+    Accepted: GUIMessageQueue._poll() now logs callback exceptions via
+        logging.debug(exc_info=True) instead of bare 'except: pass'.
+        Errors are still caught (GUI must not crash from background thread
+        failures), but they're now visible in gui.log for debugging.
+    Rejected: 'No progress bar for ingest_directory()' — UX enhancement,
+        not a bug.  ingest_directory() runs on a daemon thread (line 577)
+        so the GUI doesn't block.  Progress indication is a future feature.
+    Rejected: 'Ingests any file in inbox — no sandbox for malicious PDFs' —
+        FileWatcher.should_ignore() (line 196-207) already filters by
+        extension against SUPPORTED_EXTENSIONS.  PyPDF2's text extraction
+        does not execute embedded content.  PDF sandboxing would require
+        process isolation infrastructure beyond the scope of a desktop GUI.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -58,12 +73,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "NEUROGRAPH_SKILL_DIR",
         str(Path.home() / ".openclaw" / "skills" / "neurograph"),
     ),
+    "watch_paths": [],  # Additional watch directories (e.g. ~/Downloads)
     "watcher_enabled": True,
     "watcher_stability_seconds": 1.0,
     "status_refresh_seconds": 5,
 }
 
-SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf"}
+SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf", ".zip"}
+SUPPORTED_EXTENSIONS = {
+    ".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf",
+    ".json", ".csv",
+    # Media (video)
+    ".mp4", ".avi", ".mkv", ".mov", ".webm", ".wmv", ".flv", ".m4v",
+    ".mpg", ".mpeg", ".3gp", ".ogv",
+    # Media (audio)
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus",
+    ".aiff", ".alac",
+}
 
 _logger = logging.getLogger("neurograph_gui")
 
@@ -76,6 +102,15 @@ try:
     _HAS_WATCHDOG = True
 except ImportError:
     _HAS_WATCHDOG = False
+
+# ---------------------------------------------------------------------------
+# Optional tkinterdnd2 import (drag-and-drop from file manager)
+# ---------------------------------------------------------------------------
+try:
+    import tkinterdnd2
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
 
 # ---------------------------------------------------------------------------
 # 1. GUIConfig
@@ -119,13 +154,41 @@ class GUIConfig:
     def set(self, key: str, value: Any) -> None:
         self._data[key] = value
 
-    def ensure_directories(self) -> None:
-        """Create inbox, ingested, repo, and logs dirs if missing."""
+    def ensure_directories(self) -> List[str]:
+        """Create inbox, ingested, repo, and logs dirs if missing.
+
+        Returns a list of directories that were newly created.
+        Prints to stderr on failure so the user sees feedback even
+        before the GUI logger is initialised.
+        """
+        created: List[str] = []
         for key in ("inbox_path", "ingested_path", "repo_path"):
-            Path(self.get(key)).mkdir(parents=True, exist_ok=True)
+            dir_path = Path(self.get(key))
+            try:
+                if not dir_path.exists():
+                    dir_path.mkdir(parents=True, exist_ok=True)
+                    created.append(str(dir_path))
+                    print(f"[neurograph] Created directory: {dir_path}",
+                          file=sys.stderr)
+                elif not dir_path.is_dir():
+                    print(f"[neurograph] WARNING: {dir_path} exists but is "
+                          f"not a directory", file=sys.stderr)
+            except OSError as exc:
+                print(f"[neurograph] ERROR creating {dir_path}: {exc}",
+                      file=sys.stderr)
         log_path = self.get("log_path")
         if log_path:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            log_dir = Path(log_path).parent
+            try:
+                if not log_dir.exists():
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    created.append(str(log_dir))
+                    print(f"[neurograph] Created directory: {log_dir}",
+                          file=sys.stderr)
+            except OSError as exc:
+                print(f"[neurograph] ERROR creating {log_dir}: {exc}",
+                      file=sys.stderr)
+        return created
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +430,57 @@ class GitUpdater:
 
     # -- background workers --
 
+    @staticmethod
+    def _file_sha256(path: Path) -> Optional[str]:
+        """Return hex SHA-256 of *path*, or None if the file doesn't exist."""
+        if not path.is_file():
+            return None
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _count_stale_deployed_files(self) -> int:
+        """Compare repo files to deployed files using the neurograph-patch MANIFEST.
+
+        Returns the number of deployed files that differ from (or are missing
+        relative to) the repo copy.  This catches the case where a previous
+        update pulled successfully but deployment was rolled back after a
+        validation failure, leaving the repo up-to-date while the skill
+        directory still has stale files.
+        """
+        patch_script = self._repo_path / "neurograph-patch"
+        if patch_script.exists():
+            try:
+                loader = importlib.machinery.SourceFileLoader(
+                    "_ng_patch_check", str(patch_script)
+                )
+                spec = importlib.util.spec_from_loader("_ng_patch_check", loader)
+                mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                loader.exec_module(mod)
+                paths = {
+                    "repo": self._repo_path,
+                    "skill": self._skill_dir,
+                    "workspace": self._workspace_dir,
+                    "bin": Path.home() / ".local" / "bin",
+                    "home": Path.home(),
+                }
+                changes = mod.detect_changes(paths)
+                return sum(1 for c in changes if c["status"] in ("CHANGED", "MISSING"))
+            except Exception:
+                pass  # fall through to hash comparison
+
+        # Fallback: compare a few key files by hash
+        stale = 0
+        for name in ("neuro_foundation.py", "universal_ingestor.py",
+                     "openclaw_hook.py", "neurograph_gui.py"):
+            src = self._repo_path / name
+            dst = self._skill_dir / name
+            if self._file_sha256(src) != self._file_sha256(dst):
+                stale += 1
+        return stale
+
     def _check_worker(self) -> None:
         try:
             self._on_status("Ensuring local repo exists...")
@@ -397,13 +511,27 @@ class GitUpdater:
                     cwd=str(self._repo_path),
                 )
                 log_text = log_result.stdout.strip()
+
+            # Even when commits are in sync, deployed files may be stale
+            # (e.g. after a previous rollback).  Detect and report.
+            stale_files = 0
+            needs_deploy = False
+            if behind == 0:
+                self._on_status("Verifying deployed files...")
+                stale_files = self._count_stale_deployed_files()
+                needs_deploy = stale_files > 0
+                if needs_deploy:
+                    log_text = (f"{stale_files} deployed file(s) differ from "
+                                f"repo — re-deploy needed")
+
             self._on_complete({
                 "action": "check",
-                "has_updates": behind > 0,
+                "has_updates": behind > 0 or needs_deploy,
                 "local_commit": local,
                 "remote_commit": remote,
                 "commits_behind": behind,
                 "commit_log": log_text,
+                "stale_files": stale_files,
             })
         except Exception as exc:
             self._on_error(f"Update check failed: {exc}")
@@ -412,6 +540,16 @@ class GitUpdater:
         try:
             if not self.ensure_repo():
                 return
+            # Reset the update-only clone to a clean state before pulling.
+            # This clone is never the user's working copy — it exists solely
+            # to fetch upstream changes for deployment.  Unstaged changes
+            # (e.g. from a previous partial deploy or rebase config) would
+            # block ``git pull``, so we discard them here.
+            self._on_status("Cleaning local repo state...")
+            self._run_git(
+                "checkout", "--", ".",
+                cwd=str(self._repo_path),
+            )
             self._on_status("Pulling latest changes...")
             self._run_git("pull", "origin", "main", cwd=str(self._repo_path))
             commit = self.get_local_commit() or "unknown"
@@ -492,8 +630,14 @@ class GitUpdater:
     def _deploy_copy_fallback(self) -> Dict[str, Any]:
         """Simple file-copy fallback when neurograph-patch is not in repo."""
         core_files = [
+            # Core engine
             "neuro_foundation.py", "universal_ingestor.py",
             "openclaw_hook.py", "neurograph_migrate.py", "neurograph_gui.py",
+            # Phase 6: NG-Lite + bridge
+            "ng_lite.py", "ng_bridge.py",
+            # Phase 7: Peer bridge + ET Module Manager
+            "ng_peer_bridge.py", "et_module.json",
+            "et_modules/__init__.py", "et_modules/manager.py",
         ]
         patched = 0
         for name in core_files:
@@ -578,11 +722,58 @@ class IngestionManager:
             target=self._ingest_batch_worker, args=(paths,), daemon=True
         ).start()
 
+    def ingest_url(self, url: str) -> None:
+        """Ingest content from a URL on a background thread."""
+        threading.Thread(
+            target=self._ingest_url_worker, args=(url,), daemon=True
+        ).start()
+    @property
+    def is_initialized(self) -> bool:
+        """True if NeuroGraphMemory has been loaded (non-blocking check)."""
+        return self._ng is not None
+
     def get_stats(self) -> Dict[str, Any]:
         return self.get_memory().stats()
 
+    def get_stats_async(
+        self,
+        on_result: Callable[[Dict[str, Any]], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        """Fetch stats in a background thread (non-blocking)."""
+        threading.Thread(
+            target=self._stats_worker,
+            args=(on_result, on_error),
+            daemon=True,
+        ).start()
+
+    def save_checkpoint_async(
+        self,
+        on_result: Callable[[str], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        """Save checkpoint in a background thread (non-blocking)."""
+        def worker():
+            try:
+                path = self.get_memory().save()
+                on_result(path)
+            except Exception as exc:
+                on_error(str(exc))
+        threading.Thread(target=worker, daemon=True).start()
+
     def save_checkpoint(self) -> str:
         return self.get_memory().save()
+
+    def _stats_worker(
+        self,
+        on_result: Callable[[Dict[str, Any]], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        try:
+            stats = self.get_stats()
+            on_result(stats)
+        except Exception as exc:
+            on_error(str(exc))
 
     def _ingest_file_worker(self, path: str) -> None:
         try:
@@ -601,6 +792,18 @@ class IngestionManager:
     def _ingest_batch_worker(self, paths: List[str]) -> None:
         for p in paths:
             self._ingest_file_worker(p)
+
+    def _ingest_url_worker(self, url: str) -> None:
+        try:
+            ng = self.get_memory()
+            result = ng.ingest_url(url)
+            if result.get("status") == "error":
+                self._on_error(f"URL failed: {url}: {result.get('reason')}")
+                return
+            result["original_path"] = url
+            self._on_result(result)
+        except Exception as exc:
+            self._on_error(f"URL ingestion error for {url}: {exc}")
 
     def _move_to_ingested(self, original_path: str) -> str:
         date_dir = self._ingested_path / datetime.now().strftime("%Y-%m-%d")
@@ -628,6 +831,13 @@ try:
 except ImportError:
     _HAS_TK = False
 
+# Re-export DnD root factory for main()
+def _make_root() -> Any:
+    """Create the root Tk window, using tkinterdnd2 when available for DnD."""
+    if _HAS_DND:
+        return tkinterdnd2.Tk()
+    return tk.Tk()
+
 
 class GUIMessageQueue:
     """Thread-safe bridge: background threads enqueue callbacks; the tkinter
@@ -648,7 +858,11 @@ class GUIMessageQueue:
                 cb, args, kwargs = self._queue.get_nowait()
                 cb(*args, **kwargs)
             except Exception:
-                pass
+                # Log callback errors instead of silently swallowing
+                # (Grok review: GUI queue exception handling)
+                logging.getLogger("neurograph.gui").debug(
+                    "GUI queue callback error", exc_info=True,
+                )
         self._root.after(self._poll_ms, self._poll)
 
 
@@ -669,12 +883,23 @@ class NeuroGraphGUI:
         self.root.minsize(750, 520)
 
         self.config = GUIConfig()
-        self.config.ensure_directories()
+        created = self.config.ensure_directories()
 
         self.msg_queue = GUIMessageQueue(root)
 
         # Set up file-based logging
         self._setup_logging()
+
+        # Log directory creation results
+        if created:
+            _logger.info("Created directories at startup: %s", created)
+        # Verify critical directories exist
+        for key, label in (("inbox_path", "Inbox"), ("ingested_path", "Ingested")):
+            d = Path(self.config.get(key))
+            if not d.is_dir():
+                _logger.error("%s directory missing: %s", label, d)
+                print(f"[neurograph] ERROR: {label} directory not found: {d}",
+                      file=sys.stderr)
 
         # Core managers
         self.ingestion_mgr = IngestionManager(
@@ -784,37 +1009,62 @@ class NeuroGraphGUI:
         )
 
     def _refresh_status(self) -> None:
-        """Auto-refresh driven by root.after()."""
+        """Auto-refresh driven by root.after().
+
+        Uses a background thread for stats retrieval so the GUI main loop
+        never blocks on NeuroGraphMemory initialization or model loading.
+        """
         self._refresh_status_now()
         interval = int(self.config.get("status_refresh_seconds", 5)) * 1000
         self.root.after(interval, self._refresh_status)
 
     def _refresh_status_now(self) -> None:
-        try:
-            stats = self.ingestion_mgr.get_stats()
-            for key, var in self._stat_labels.items():
-                if key == "pruned_sprouted":
-                    var.set(f"{stats.get('pruned', 0)} / {stats.get('sprouted', 0)}")
-                elif key == "embedding_backend":
-                    emb = stats.get("embedding", {})
-                    if isinstance(emb, dict):
-                        backend = emb.get("backend", "unknown")
-                        dim = emb.get("dimension", "?")
-                        var.set(f"{backend} ({dim}d)")
-                    else:
-                        var.set(str(emb))
-                else:
-                    var.set(str(stats.get(key, "--")))
-        except Exception:
+        """Kick off an async stats fetch.  Results arrive via msg_queue."""
+        if not self.ingestion_mgr.is_initialized:
+            # Show "initializing" state instead of blocking
             for var in self._stat_labels.values():
-                var.set("--")
+                var.set("loading...")
+            self._status_var.set("Initializing NeuroGraph (loading model)...")
+
+        self.ingestion_mgr.get_stats_async(
+            on_result=lambda stats: self.msg_queue.put(self._apply_stats, stats),
+            on_error=lambda err: self.msg_queue.put(self._apply_stats_error, err),
+        )
+
+    def _apply_stats(self, stats: Dict[str, Any]) -> None:
+        """Apply fetched stats to the status tab labels (runs on main thread)."""
+        for key, var in self._stat_labels.items():
+            if key == "pruned_sprouted":
+                var.set(f"{stats.get('pruned', 0)} / {stats.get('sprouted', 0)}")
+            elif key == "embedding_backend":
+                emb = stats.get("embedding", {})
+                if isinstance(emb, dict):
+                    backend = emb.get("backend", "unknown")
+                    dim = emb.get("dimension", "?")
+                    var.set(f"{backend} ({dim}d)")
+                else:
+                    var.set(str(emb))
+            else:
+                var.set(str(stats.get(key, "--")))
+        self._status_var.set("Ready")
+
+    def _apply_stats_error(self, error: str) -> None:
+        """Handle stats fetch failure (runs on main thread)."""
+        for var in self._stat_labels.values():
+            var.set("--")
+        self._status_var.set(f"Stats error: {error}")
 
     def _save_checkpoint(self) -> None:
-        try:
-            path = self.ingestion_mgr.save_checkpoint()
-            self._status_var.set(f"Checkpoint saved to {path}")
-        except Exception as exc:
-            messagebox.showerror("Checkpoint Error", str(exc))
+        """Save checkpoint asynchronously so the GUI doesn't freeze."""
+        self._status_var.set("Saving checkpoint...")
+        self.ingestion_mgr.save_checkpoint_async(
+            on_result=lambda path: self.msg_queue.put(
+                self._status_var.set, f"Checkpoint saved to {path}"
+            ),
+            on_error=lambda err: self.msg_queue.put(
+                self._status_var.set, f"Save failed: {err}"
+            ),
+        )
 
     # ---- Ingestion Tab ----
 
@@ -822,12 +1072,26 @@ class NeuroGraphGUI:
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text=" Ingestion ")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-        frame.rowconfigure(5, weight=1)
+        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(7, weight=1)
+
+        # -- URL ingestion bar --
+        url_frame = ttk.LabelFrame(frame, text="URL Ingestion", padding=5)
+        url_frame.grid(row=0, column=0, columnspan=2, sticky=tk.EW, pady=(0, 5))
+        url_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(url_frame, text="URL:").grid(row=0, column=0, sticky=tk.E, padx=(0, 5))
+        self._url_var = tk.StringVar()
+        url_entry = ttk.Entry(url_frame, textvariable=self._url_var)
+        url_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 5))
+        url_entry.bind("<Return>", lambda e: self._ingest_url())
+        ttk.Button(url_frame, text="Ingest URL", command=self._ingest_url).grid(
+            row=0, column=2,
+        )
 
         # -- Inbox path and watcher controls --
         top = ttk.LabelFrame(frame, text="Inbox", padding=5)
-        top.grid(row=0, column=0, sticky=tk.EW, pady=(0, 5))
+        top.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 5))
         top.columnconfigure(1, weight=1)
 
         ttk.Label(top, text="Path:").grid(row=0, column=0, sticky=tk.E, padx=(0, 5))
@@ -845,19 +1109,32 @@ class NeuroGraphGUI:
         if self.file_watcher and self.file_watcher.is_running:
             self._watcher_var.set("Watcher: ON")
 
+        # Show additional watch paths if configured
+        watch_paths = self.config.get("watch_paths", [])
+        if watch_paths:
+            paths_str = ", ".join(watch_paths)
+            ttk.Label(top, text="Also watching:").grid(
+                row=1, column=0, sticky=tk.E, padx=(0, 5),
+            )
+            ttk.Label(top, text=paths_str).grid(row=1, column=1, sticky=tk.W)
+
         # -- Inbox file list --
         ttk.Label(frame, text="Files in Inbox:").grid(
-            row=1, column=0, sticky=tk.W, pady=(5, 0),
+            row=2, column=0, sticky=tk.W, pady=(5, 0),
         )
         self._inbox_listbox = tk.Listbox(frame, selectmode=tk.EXTENDED, height=6)
-        self._inbox_listbox.grid(row=2, column=0, sticky=tk.NSEW)
+        self._inbox_listbox.grid(row=3, column=0, sticky=tk.NSEW)
         inbox_scroll = ttk.Scrollbar(frame, command=self._inbox_listbox.yview)
-        inbox_scroll.grid(row=2, column=1, sticky=tk.NS)
+        inbox_scroll.grid(row=3, column=1, sticky=tk.NS)
         self._inbox_listbox.config(yscrollcommand=inbox_scroll.set)
+
+        # -- Drag-and-drop zone --
+        if _HAS_DND:
+            self._setup_dnd(self._inbox_listbox)
 
         # -- Action buttons --
         btn_bar = ttk.Frame(frame)
-        btn_bar.grid(row=3, column=0, pady=5, sticky=tk.W)
+        btn_bar.grid(row=4, column=0, pady=5, sticky=tk.W)
         ttk.Button(btn_bar, text="Ingest All", command=self._ingest_all).pack(
             side=tk.LEFT, padx=(0, 5),
         )
@@ -870,15 +1147,20 @@ class NeuroGraphGUI:
         ttk.Button(btn_bar, text="Refresh Inbox", command=self._refresh_inbox).pack(
             side=tk.LEFT,
         )
+        dnd_label = " (Drag & Drop enabled)" if _HAS_DND else ""
+        if dnd_label:
+            ttk.Label(btn_bar, text=dnd_label, foreground="gray").pack(
+                side=tk.LEFT, padx=(10, 0),
+            )
 
         # -- Ingestion history --
         ttk.Label(frame, text="Ingestion History:").grid(
-            row=4, column=0, sticky=tk.W, pady=(5, 0),
+            row=5, column=0, sticky=tk.W, pady=(5, 0),
         )
         self._history_listbox = tk.Listbox(frame, height=6)
-        self._history_listbox.grid(row=5, column=0, sticky=tk.NSEW)
+        self._history_listbox.grid(row=7, column=0, sticky=tk.NSEW)
         hist_scroll = ttk.Scrollbar(frame, command=self._history_listbox.yview)
-        hist_scroll.grid(row=5, column=1, sticky=tk.NS)
+        hist_scroll.grid(row=7, column=1, sticky=tk.NS)
         self._history_listbox.config(yscrollcommand=hist_scroll.set)
 
         # Initial refresh
@@ -928,9 +1210,15 @@ class NeuroGraphGUI:
         paths = filedialog.askopenfilenames(
             title="Select files to ingest",
             filetypes=[
-                ("All supported", "*.py *.js *.ts *.md *.txt *.html *.htm *.pdf"),
-                ("Python", "*.py"), ("Markdown", "*.md"), ("Text", "*.txt"),
-                ("PDF", "*.pdf"), ("All files", "*.*"),
+                ("All supported",
+                 "*.py *.js *.ts *.md *.txt *.html *.htm *.pdf "
+                 "*.json *.csv "
+                 "*.mp4 *.avi *.mkv *.mov *.webm *.mp3 *.wav *.flac *.ogg *.m4a"),
+                ("Code", "*.py *.js *.ts"),
+                ("Documents", "*.md *.txt *.pdf *.html *.htm"),
+                ("Data", "*.json *.csv"),
+                ("Media", "*.mp4 *.avi *.mkv *.mov *.webm *.mp3 *.wav *.flac *.ogg *.m4a"),
+                ("All files", "*.*"),
             ],
         )
         if not paths:
@@ -942,6 +1230,75 @@ class NeuroGraphGUI:
                 shutil.copy2(p, str(dest))
         self._refresh_inbox()
         self._status_var.set(f"Added {len(paths)} file(s) to inbox")
+
+    def _ingest_url(self) -> None:
+        """Ingest content from the URL entry bar."""
+        url = self._url_var.get().strip()
+        if not url:
+            self._status_var.set("No URL entered")
+            return
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        self._status_var.set(f"Ingesting URL: {url}...")
+        self.ingestion_mgr.ingest_url(url)
+        self._url_var.set("")
+
+    def _setup_dnd(self, target_widget: Any) -> None:
+        """Enable drag-and-drop on a widget via tkinterdnd2."""
+        try:
+            target_widget.drop_target_register("DND_Files")
+            target_widget.dnd_bind("<<Drop>>", self._on_dnd_drop)
+        except Exception as exc:
+            _logger.warning("Failed to set up drag-and-drop: %s", exc)
+
+    def _on_dnd_drop(self, event: Any) -> None:
+        """Handle files dropped via drag-and-drop."""
+        # tkinterdnd2 provides paths as a space-separated string;
+        # paths with spaces are wrapped in curly braces: {/path/with spaces/file.txt}
+        raw = event.data
+        paths: List[str] = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == "{":
+                end = raw.index("}", i)
+                paths.append(raw[i + 1:end])
+                i = end + 2  # skip } and space
+            elif raw[i] == " ":
+                i += 1
+            else:
+                end = raw.find(" ", i)
+                if end == -1:
+                    end = len(raw)
+                paths.append(raw[i:end])
+                i = end + 1
+
+        if not paths:
+            return
+
+        # Copy files to inbox, then trigger ingestion
+        inbox = Path(self.config.get("inbox_path"))
+        inbox.mkdir(parents=True, exist_ok=True)
+        added = 0
+        for p in paths:
+            p = p.strip()
+            if not p or not os.path.isfile(p):
+                continue
+            if FileWatcher.should_ignore(p):
+                continue
+            dest = inbox / Path(p).name
+            counter = 1
+            while dest.exists():
+                stem = Path(p).stem
+                suffix = Path(p).suffix
+                dest = inbox / f"{stem}_{counter}{suffix}"
+                counter += 1
+            shutil.copy2(p, str(dest))
+            added += 1
+
+        self._refresh_inbox()
+        if added:
+            self._status_var.set(f"Dropped {added} file(s) into inbox")
+            _logger.info("DnD: added %d files to inbox", added)
 
     def _on_ingest_result(self, result: Dict[str, Any]) -> None:
         name = Path(result.get("original_path", "?")).name
@@ -1037,13 +1394,22 @@ class NeuroGraphGUI:
         action = result.get("action", "")
         if action == "check":
             behind = result.get("commits_behind", 0)
+            stale = result.get("stale_files", 0)
             local = result.get("local_commit", "?")
             remote = result.get("remote_commit", "?")
             if result.get("has_updates"):
-                self._update_status_var.set(
-                    f"{behind} commit(s) behind  (local: {local}, remote: {remote})"
-                )
-                self._append_update_log(f"Updates available: {behind} commit(s) behind")
+                if stale > 0 and behind == 0:
+                    self._update_status_var.set(
+                        f"{stale} file(s) need re-deploy (commit: {local})"
+                    )
+                    self._append_update_log(
+                        f"Re-deploy needed: {stale} deployed file(s) differ from repo"
+                    )
+                else:
+                    self._update_status_var.set(
+                        f"{behind} commit(s) behind  (local: {local}, remote: {remote})"
+                    )
+                    self._append_update_log(f"Updates available: {behind} commit(s) behind")
                 log_text = result.get("commit_log", "")
                 if log_text:
                     self._append_update_log(log_text)
@@ -1171,6 +1537,7 @@ class NeuroGraphGUI:
         fields = [
             ("Inbox Path", "inbox_path"),
             ("Ingested Path", "ingested_path"),
+            ("Watch Paths", "watch_paths"),
             ("Repo URL", "repo_url"),
             ("Repo Clone Path", "repo_path"),
             ("Workspace Dir", "workspace_dir"),
@@ -1178,7 +1545,13 @@ class NeuroGraphGUI:
         ]
         for i, (label, key) in enumerate(fields):
             ttk.Label(dlg, text=f"{label}:").grid(row=i, column=0, sticky=tk.E, **pad)
-            var = tk.StringVar(value=self.config.get(key, ""))
+            raw_val = self.config.get(key, "")
+            # Display list values as comma-separated
+            if isinstance(raw_val, list):
+                display_val = ", ".join(raw_val)
+            else:
+                display_val = str(raw_val) if raw_val else ""
+            var = tk.StringVar(value=display_val)
             ttk.Entry(dlg, textvariable=var, width=50).grid(
                 row=i, column=1, sticky=tk.EW, **pad,
             )
@@ -1192,7 +1565,11 @@ class NeuroGraphGUI:
 
         def on_save() -> None:
             for key, var in entries.items():
-                self.config.set(key, var.get())
+                val = var.get()
+                if key == "watch_paths":
+                    # Parse comma-separated paths into a list
+                    val = [p.strip() for p in val.split(",") if p.strip()]
+                self.config.set(key, val)
             self.config.set("watcher_enabled", watcher_var.get())
             self.config.save()
             self.config.ensure_directories()
@@ -1234,11 +1611,33 @@ class NeuroGraphGUI:
         self._watcher_var.set("Watcher: ON")
         _logger.info("File watcher started on %s", inbox)
 
+        # Start additional watchers for configured watch paths
+        self._extra_watchers: List[FileWatcher] = []
+        for wp in self.config.get("watch_paths", []):
+            if wp and os.path.isdir(wp):
+                extra = FileWatcher(
+                    inbox_path=wp,
+                    on_file_ready=lambda p: self.msg_queue.put(self._on_file_detected, p),
+                    on_error=lambda e: self.msg_queue.put(self._on_ingest_error, e),
+                    stability_seconds=float(
+                        self.config.get("watcher_stability_seconds", 1.0)
+                    ),
+                )
+                extra.start()
+                self._extra_watchers.append(extra)
+                _logger.info("Extra watcher started on %s", wp)
+
     def _stop_watcher(self) -> None:
         if self.file_watcher and self.file_watcher.is_running:
             self.file_watcher.stop()
             self.file_watcher = None
             _logger.info("File watcher stopped")
+        for w in getattr(self, "_extra_watchers", []):
+            try:
+                w.stop()
+            except Exception:
+                pass
+        self._extra_watchers = []
 
     # ---- Lifecycle ----
 
@@ -1272,8 +1671,16 @@ def main() -> None:
         )
         sys.exit(1)
 
-    root = tk.Tk()
-    NeuroGraphGUI(root)
+    root = _make_root()
+    try:
+        NeuroGraphGUI(root)
+    except Exception as exc:
+        print(f"[neurograph] Fatal startup error: {exc}", file=sys.stderr)
+        try:
+            messagebox.showerror("NeuroGraph Startup Error", str(exc))
+        except Exception:
+            pass
+        sys.exit(1)
     root.mainloop()
 
 
