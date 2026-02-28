@@ -10,13 +10,13 @@
 #
 # Environment:
 #   NEUROGRAPH_WORKSPACE_DIR  — Override workspace (default: ~/.openclaw/neurograph)
-#   NEUROGRAPH_SKILL_DIR      — Override skill dir (default: ~/.openclaw/skills/neurograph)
+#   NEUROGRAPH_SKILL_DIR      — Override skill dir (default: ~/.openclaw/workspace/skills/neurograph)
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_DIR="${NEUROGRAPH_SKILL_DIR:-$HOME/.openclaw/skills/neurograph}"
+SKILL_DIR="${NEUROGRAPH_SKILL_DIR:-$HOME/.openclaw/workspace/skills/neurograph}"
 WORKSPACE_DIR="${NEUROGRAPH_WORKSPACE_DIR:-$HOME/.openclaw/neurograph}"
 CHECKPOINT_DIR="$WORKSPACE_DIR/checkpoints"
 BIN_DIR="$HOME/.local/bin"
@@ -160,8 +160,12 @@ DESKTOPEOF
     # CLI tools
     cp "$SCRIPT_DIR/feed-syl" "$BIN_DIR/feed-syl"
     chmod +x "$BIN_DIR/feed-syl"
-    cp "$SCRIPT_DIR/neurograph" "$BIN_DIR/neurograph"
-    chmod +x "$BIN_DIR/neurograph"
+    if [ -f "$SCRIPT_DIR/neurograph" ]; then
+        cp "$SCRIPT_DIR/neurograph" "$BIN_DIR/neurograph"
+        chmod +x "$BIN_DIR/neurograph"
+    else
+        warn "neurograph CLI not found in source — skipping (use feed-syl instead)"
+    fi
 
     # Also copy feed-syl to home for convenience
     cp "$SCRIPT_DIR/feed-syl" "$HOME/feed-syl"
@@ -298,12 +302,13 @@ verify() {
     done
 
     # Check CLIs
-    for cli in feed-syl neurograph; do
-        if [ ! -x "$BIN_DIR/$cli" ]; then
-            error "Missing or not executable: $BIN_DIR/$cli"
-            ok=false
-        fi
-    done
+    if [ ! -x "$BIN_DIR/feed-syl" ]; then
+        error "Missing or not executable: $BIN_DIR/feed-syl"
+        ok=false
+    fi
+    if [ ! -x "$BIN_DIR/neurograph" ]; then
+        warn "neurograph CLI not installed (optional — use feed-syl)"
+    fi
 
     # Check Python imports
     if python3 -c "
