@@ -152,13 +152,11 @@ The ET Module Manager scans these locations by default:
 
 ```python
 KNOWN_LOCATIONS = [
-    "~/NeuroGraph",                       # NeuroGraph (primary)
-    "~/.openclaw/skills/neurograph",      # NeuroGraph (legacy)
-    "~/The-Inference-Difference",         # The-Inference-Difference (primary)
-    "/opt/inference-difference",           # The-Inference-Difference (legacy)
-    "~/TrollGuard",                       # TrollGuard (primary)
-    "/opt/trollguard",                     # TrollGuard (legacy)
-    "~/.et_modules/modules",              # Generic module install dir
+    "~/NeuroGraph",                       # NeuroGraph (source)
+    "~/.openclaw/skills/neurograph",      # NeuroGraph (deployed skill)
+    "~/The-Inference-Difference",         # The-Inference-Difference
+    "~/TrollGuard",                       # TrollGuard
+    "~/.et_modules/modules",             # Generic module install dir
 ]
 ```
 

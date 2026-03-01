@@ -143,10 +143,11 @@ class ETModuleManager:
 
     # Known install locations to scan for modules
     KNOWN_LOCATIONS = [
-        "~/.openclaw/skills/neurograph",      # NeuroGraph
-        "/opt/inference-difference",           # The-Inference-Difference
-        "/opt/trollguard",                     # TrollGuard
-        "~/.et_modules/modules",              # Generic module install dir
+        "~/NeuroGraph",                       # NeuroGraph (source)
+        "~/.openclaw/skills/neurograph",      # NeuroGraph (deployed skill)
+        "~/The-Inference-Difference",         # The-Inference-Difference
+        "~/TrollGuard",                       # TrollGuard
+        "~/.et_modules/modules",             # Generic module install dir
     ]
 
     def __init__(self, root_dir: Optional[str] = None):

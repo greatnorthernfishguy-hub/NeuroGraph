@@ -627,7 +627,6 @@ class NGEcosystem:
 _NEUROGRAPH_KNOWN_PATHS: List[str] = [
     "~/NeuroGraph",
     "~/.openclaw/skills/neurograph",
-    "/opt/neurograph",
     "~/.et_modules/modules/neurograph",
 ]
 

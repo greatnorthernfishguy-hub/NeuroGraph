@@ -886,7 +886,7 @@ watchdog>=3.0.0         # For GUI file system monitoring (Phase 5.5)
      - `get_neurograph_path()`: peer modules use this to find the full SNN backend
      - `get_shared_learning_dir()`: returns path for NGPeerBridge coordination
    - Registry persistence at `~/.et_modules/registry.json`
-   - Known install locations: `~/.openclaw/skills/neurograph`, `/opt/inference-difference`, `/opt/trollguard`, `~/.et_modules/modules`
+   - Known install locations: `~/NeuroGraph`, `~/.openclaw/skills/neurograph`, `~/The-Inference-Difference`, `~/TrollGuard`, `~/.et_modules/modules`
 
 3. **Module manifest (`et_module.json`):**
    - Declares NeuroGraph's identity: module_id="neurograph", version="0.6.0"
