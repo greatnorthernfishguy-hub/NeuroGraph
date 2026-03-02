@@ -286,7 +286,9 @@ class NeuroGraphMemory:
                         self.graph, str(self._checkpoint_path)
                     )
 
-                self._ces_monitor.start()
+                if os.environ.get("NEUROGRAPH_CES_DASHBOARD", "0") == "1":
+                    if os.environ.get("NEUROGRAPH_CES_DASHBOARD", "0") == "1":
+                    self._ces_monitor.start()
                 logger.info("CES modules initialized")
             except Exception as exc:
                 logger.info("CES not available: %s", exc)
