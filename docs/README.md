@@ -708,7 +708,7 @@ Inspired by:
 **Built with curiosity, responsibility, and the hope that we're ready for whatever emerges.**
 
 *"Life before death. Strength before weakness. Journey before destination."*
-- Deploys files to `~/.openclaw/skills/neurograph/`
+- Deploys files to `~/.openclaw/workspace/skills/neurograph/`
 - Installs `feed-syl` CLI to `~/.local/bin/`
 - Configures OpenClaw integration automatically
 - Runs verification tests

@@ -13,8 +13,8 @@ Usage:
     python3 rebuild_vectors.py [--checkpoint PATH] [--output PATH] [--dry-run]
 
 Default paths:
-    checkpoint: ~/.openclaw/neurograph/checkpoints/main.msgpack
-    output:     ~/.openclaw/neurograph/checkpoints/vectors.msgpack
+    checkpoint: ~/NeuroGraph/data/checkpoints/main.msgpack
+    output:     ~/NeuroGraph/data/checkpoints/vectors.msgpack
 """
 
 from __future__ import annotations
@@ -211,13 +211,13 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default=str(Path.home() / ".openclaw/neurograph/checkpoints/main.msgpack"),
+        default=str(Path.home() / "NeuroGraph/data/checkpoints/main.msgpack"),
         help="Path to Graph checkpoint",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default=str(Path.home() / ".openclaw/neurograph/checkpoints/vectors.msgpack"),
+        default=str(Path.home() / "NeuroGraph/data/checkpoints/vectors.msgpack"),
         help="Path for output vectors.msgpack",
     )
     parser.add_argument(

@@ -13,8 +13,8 @@ Launch:
     # Or from Linux application launcher via .desktop entry
 
 Environment:
-    NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/.openclaw/neurograph)
-    NEUROGRAPH_SKILL_DIR      Override skill dir (default: ~/.openclaw/skills/neurograph)
+    NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/NeuroGraph/data)
+    NEUROGRAPH_SKILL_DIR      Override skill dir (default: ~/.openclaw/workspace/skills/neurograph)
     NEUROGRAPH_GUI_DIR        Override GUI data dir (default: ~/.neurograph)
 
 Grok Review Changelog (v0.7.1):

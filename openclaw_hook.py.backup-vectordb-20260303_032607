@@ -169,7 +169,7 @@ class NeuroGraphMemory:
     ) -> None:
         self._workspace_dir = Path(
             workspace_dir
-            or os.environ.get("NEUROGRAPH_WORKSPACE_DIR", "~/NeuroGraph/data")
+            or os.environ.get("NEUROGRAPH_WORKSPACE_DIR", "~/.openclaw/neurograph")
         ).expanduser()
 
         self._checkpoint_dir = self._workspace_dir / "checkpoints"
@@ -199,20 +199,6 @@ class NeuroGraphMemory:
 
         # Vector DB for semantic search
         self.vector_db = SimpleVectorDB()
-
-        # Restore vector DB from persistent storage if available
-        self._vector_db_path = self._checkpoint_dir / "vectors.msgpack"
-        if self._vector_db_path.exists():
-            try:
-                count = self.vector_db.load(str(self._vector_db_path))
-                logger.info(
-                    "Restored vector DB from %s (%d entries)",
-                    self._vector_db_path,
-                    count,
-                )
-            except Exception as exc:
-                logger.warning("Failed to restore vector DB: %s", exc)
-
 
         # Ingestor with OpenClaw project config, respecting embedding_device
         ingestor_config = get_ingestor_config("openclaw")
@@ -629,14 +615,6 @@ class NeuroGraphMemory:
                 self.graph, str(self._checkpoint_path)
             )
         logger.info("Checkpoint saved to %s", self._checkpoint_path)
-
-        # Save vector DB alongside graph checkpoint
-        try:
-            vdb_count = self.vector_db.save(str(self._vector_db_path))
-            logger.info("Vector DB saved to %s (%d entries)", self._vector_db_path, vdb_count)
-        except Exception as exc:
-            logger.warning("Failed to save vector DB: %s", exc)
-
         return str(self._checkpoint_path)
 
     def stats(self) -> Dict[str, Any]:

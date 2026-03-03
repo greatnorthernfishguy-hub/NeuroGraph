@@ -143,7 +143,7 @@ class ETModuleManager:
 
     # Known install locations to scan for modules
     KNOWN_LOCATIONS = [
-        "~/.openclaw/skills/neurograph",      # NeuroGraph
+        "~/.openclaw/workspace/skills/neurograph",      # NeuroGraph
         "/opt/inference-difference",           # The-Inference-Difference
         "/opt/trollguard",                     # TrollGuard
         "~/.et_modules/modules",              # Generic module install dir
