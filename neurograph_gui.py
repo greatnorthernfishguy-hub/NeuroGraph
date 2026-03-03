@@ -14,7 +14,7 @@ Launch:
 
 Environment:
     NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/NeuroGraph/data)
-    NEUROGRAPH_SKILL_DIR      Override skill dir (default: ~/.openclaw/workspace/skills/neurograph)
+    NEUROGRAPH_SKILL_DIR      Override skill dir (default: ~/NeuroGraph)
     NEUROGRAPH_GUI_DIR        Override GUI data dir (default: ~/.neurograph)
 
 Grok Review Changelog (v0.7.1):
@@ -63,15 +63,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "inbox_path": str(Path.home() / ".neurograph" / "inbox"),
     "ingested_path": str(Path.home() / ".neurograph" / "ingested"),
     "repo_url": "https://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
-    "repo_path": str(Path.home() / ".neurograph" / "repo"),
+    "repo_path": str(Path.home() / "NeuroGraph"),
     "log_path": str(Path.home() / ".neurograph" / "logs" / "gui.log"),
     "workspace_dir": os.environ.get(
         "NEUROGRAPH_WORKSPACE_DIR",
-        str(Path.home() / ".openclaw" / "neurograph"),
+        str(Path.home() / "NeuroGraph" / "data"),
     ),
     "skill_dir": os.environ.get(
         "NEUROGRAPH_SKILL_DIR",
-        str(Path.home() / ".openclaw" / "skills" / "neurograph"),
+        str(Path.home() / "NeuroGraph"),
     ),
     "watch_paths": [],  # Additional watch directories (e.g. ~/Downloads)
     "watcher_enabled": True,
