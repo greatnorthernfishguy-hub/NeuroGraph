@@ -125,8 +125,6 @@ deploy_files() {
 
     # Management GUI
     if [ -f "$SCRIPT_DIR/neurograph_gui.py" ]; then
-        cp "$SCRIPT_DIR/neurograph_gui.py" "$SKILL_DIR/"
-        info "GUI deployed to $SKILL_DIR/neurograph_gui.py"
 
         # Desktop entry (Linux application launcher)
         DESKTOP_DIR="$HOME/.local/share/applications"
@@ -225,7 +223,7 @@ else:
     else
         # Create minimal OpenClaw config
         mkdir -p "$HOME/.openclaw"
-        cat > "$OPENCLAW_CONFIG" << 'JSONEOF'
+        cat > "$OPENCLAW_CONFIG" << JSONEOF
 {
   "skills": {
     "entries": {
@@ -369,7 +367,14 @@ uninstall() {
     rm -f "$BIN_DIR/feed-syl"
     rm -f "$BIN_DIR/neurograph"
     rm -f "$HOME/feed-syl"
-    rm -rf "$SKILL_DIR"
+    # Only remove the symlink, not the repo itself
+    if [ -L "$SKILL_DIR" ]; then
+        rm "$SKILL_DIR"
+        info "Removed skill symlink"
+    elif [ -d "$SKILL_DIR" ]; then
+        rm -rf "$SKILL_DIR"
+        info "Removed skill directory"
+    fi
     rm -f "$HOME/.local/share/applications/neurograph.desktop"
     info "Files removed (checkpoints preserved in $CHECKPOINT_DIR)"
     info "Note: ~/.neurograph/ (inbox/ingested data) preserved"

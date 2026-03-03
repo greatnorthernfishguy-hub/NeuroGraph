@@ -17,8 +17,8 @@ Usage:
     neurograph-patch --check-schema           Check if checkpoint needs upgrade
 
 Environment:
-    NEUROGRAPH_SKILL_DIR      Override skill directory (default: ~/.openclaw/skills/neurograph)
-    NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/.openclaw/neurograph)
+    NEUROGRAPH_SKILL_DIR      Override skill directory (default: ~/.openclaw/workspace/skills/neurograph)
+    NEUROGRAPH_WORKSPACE_DIR  Override workspace (default: ~/NeuroGraph/data)
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 MANIFEST = [
     ("neuro_foundation.py",   ["skill:neuro_foundation.py"], False),
     ("universal_ingestor.py",  ["skill:universal_ingestor.py"], False),
-    ("openclaw_hook.py",       ["skill:openclaw_hook.py", "skill:scripts/openclaw_hook.py"], False),
+    ("openclaw_hook.py",       ["skill:openclaw_hook.py"], False),
     ("neurograph_migrate.py",  ["skill:neurograph_migrate.py"], False),
     ("SKILL.md",               ["skill:SKILL.md"], False),
     ("feed-syl",               ["bin:feed-syl", "home:feed-syl"], True),
@@ -65,10 +65,10 @@ def resolve_paths() -> Dict[str, Path]:
     """Resolve all deployment paths from environment or defaults."""
     repo_dir = Path(__file__).resolve().parent
     skill_dir = Path(
-        os.environ.get("NEUROGRAPH_SKILL_DIR", "~/.openclaw/skills/neurograph")
+        os.environ.get("NEUROGRAPH_SKILL_DIR", "~/.openclaw/workspace/skills/neurograph")
     ).expanduser()
     workspace_dir = Path(
-        os.environ.get("NEUROGRAPH_WORKSPACE_DIR", "~/.openclaw/neurograph")
+        os.environ.get("NEUROGRAPH_WORKSPACE_DIR", "~/NeuroGraph/data")
     ).expanduser()
     bin_dir = Path.home() / ".local" / "bin"
     home_dir = Path.home()
@@ -325,6 +325,15 @@ def run_patch(
     do_check_schema: bool = False,
 ) -> int:
     """Execute the patch. Returns exit code."""
+    # If skill_dir is a symlink to the repo, skip skill: targets — they're the same files
+    skill_is_repo = False
+    try:
+        if paths["skill"].resolve() == paths["repo"].resolve():
+            skill_is_repo = True
+            print("Skill directory is symlinked to repo — skipping skill: targets")
+    except OSError:
+        pass
+
     changes = detect_changes(paths, filter_files)
     to_patch = [c for c in changes if c["status"] in ("CHANGED", "MISSING")]
 
@@ -355,14 +364,22 @@ def run_patch(
     # Phase 2: Copy
     patched_results = []
     for entry in to_patch:
+        # Skip skill: targets when skill dir IS the repo
+        if skill_is_repo:
+            targets = [t for t in entry["targets"] if not str(t).startswith(str(paths["skill"]))]
+            if not targets:
+                continue
+        else:
+            targets = entry["targets"]
+
         if not dry_run:
-            for target in entry["targets"]:
+            for target in targets:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(entry["source"]), str(target))
                 if entry["executable"]:
                     target.chmod(target.stat().st_mode | 0o111)
 
-        ntargets = len(entry["targets"])
+        ntargets = len(targets)
         suffix = f" -> {ntargets} targets" if ntargets > 1 else ""
         action = "WOULD PATCH" if dry_run else "PATCHED"
         print(f"  [{action}] {entry['name']}{suffix}")
@@ -371,7 +388,7 @@ def run_patch(
             "name": entry["name"],
             "source_hash": entry["source_hash"],
             "previous_hash": entry["target_hash"],
-            "targets": entry["targets"],
+            "targets": targets,
             "backups": backup_map.get(entry["name"], []),
         })
 
