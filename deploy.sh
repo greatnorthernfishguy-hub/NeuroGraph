@@ -9,7 +9,7 @@
 #   ./deploy.sh --uninstall  # Remove deployed files
 #
 # Environment:
-#   NEUROGRAPH_WORKSPACE_DIR  — Override workspace (default: ~/.openclaw/neurograph)
+#   NEUROGRAPH_WORKSPACE_DIR  — Override workspace (default: ~/NeuroGraph/data)
 #   NEUROGRAPH_SKILL_DIR      — Override skill dir (default: ~/.openclaw/workspace/skills/neurograph)
 #
 
@@ -17,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="${NEUROGRAPH_SKILL_DIR:-$HOME/.openclaw/workspace/skills/neurograph}"
-WORKSPACE_DIR="${NEUROGRAPH_WORKSPACE_DIR:-$HOME/.openclaw/neurograph}"
+WORKSPACE_DIR="${NEUROGRAPH_WORKSPACE_DIR:-$HOME/NeuroGraph/data}"
 CHECKPOINT_DIR="$WORKSPACE_DIR/checkpoints"
 BIN_DIR="$HOME/.local/bin"
 
@@ -90,41 +90,38 @@ install_deps() {
 deploy_files() {
     info "Deploying NeuroGraph files..."
 
-    # Create directories
-    mkdir -p "$SKILL_DIR"
-    mkdir -p "$SKILL_DIR/scripts"
+    # Create data directories
     mkdir -p "$CHECKPOINT_DIR"
+    mkdir -p "$WORKSPACE_DIR/memory"
     mkdir -p "$BIN_DIR"
 
-    # Core engine files
-    cp "$SCRIPT_DIR/neuro_foundation.py" "$SKILL_DIR/"
-    cp "$SCRIPT_DIR/universal_ingestor.py" "$SKILL_DIR/"
-
-    # Integration files
-    cp "$SCRIPT_DIR/openclaw_hook.py" "$SKILL_DIR/"
-    cp "$SCRIPT_DIR/openclaw_hook.py" "$SKILL_DIR/scripts/"
-    cp "$SCRIPT_DIR/SKILL.md" "$SKILL_DIR/"
-
-    # NG-Lite ecosystem files
-    cp "$SCRIPT_DIR/ng_lite.py" "$SKILL_DIR/"
-    cp "$SCRIPT_DIR/ng_bridge.py" "$SKILL_DIR/"
-    cp "$SCRIPT_DIR/ng_peer_bridge.py" "$SKILL_DIR/"
-
-    # ET Module Manager
-    mkdir -p "$SKILL_DIR/et_modules"
-    cp "$SCRIPT_DIR/et_modules/__init__.py" "$SKILL_DIR/et_modules/"
-    cp "$SCRIPT_DIR/et_modules/manager.py" "$SKILL_DIR/et_modules/"
-    cp "$SCRIPT_DIR/et_module.json" "$SKILL_DIR/"
-
-    # Migration framework
-    cp "$SCRIPT_DIR/neurograph_migrate.py" "$SKILL_DIR/"
-
-    # CES (Cognitive Enhancement Suite) files
-    for cesfile in ces_config.py stream_parser.py activation_persistence.py surfacing.py ces_monitoring.py; do
-        if [ -f "$SCRIPT_DIR/$cesfile" ]; then
-            cp "$SCRIPT_DIR/$cesfile" "$SKILL_DIR/"
+    # --- Skill directory deployment ---
+    # If the skill dir is already a symlink to the repo, no file copies needed.
+    # The repo IS the skill — one source of truth, zero drift.
+    if [ -L "$SKILL_DIR" ]; then
+        local target
+        target="$(readlink -f "$SKILL_DIR")"
+        if [ "$target" = "$(realpath "$SCRIPT_DIR")" ]; then
+            info "Skill directory already symlinked to repo — no file copies needed"
+        else
+            warn "Skill dir symlink points to $target, expected $SCRIPT_DIR"
+            warn "Re-linking..."
+            rm "$SKILL_DIR"
+            ln -s "$SCRIPT_DIR" "$SKILL_DIR"
+            info "Symlink updated: $SKILL_DIR -> $SCRIPT_DIR"
         fi
-    done
+    elif [ "$(realpath "$SCRIPT_DIR" 2>/dev/null)" = "$(realpath "$SKILL_DIR" 2>/dev/null)" ]; then
+        info "Skill directory is the repo — no file copies needed"
+    else
+        # Fresh install or old copy-based install: replace with symlink
+        if [ -d "$SKILL_DIR" ]; then
+            warn "Removing old skill directory (replacing with symlink to repo)"
+            rm -rf "$SKILL_DIR"
+        fi
+        mkdir -p "$(dirname "$SKILL_DIR")"
+        ln -s "$SCRIPT_DIR" "$SKILL_DIR"
+        info "Created symlink: $SKILL_DIR -> $SCRIPT_DIR"
+    fi
 
     # Management GUI
     if [ -f "$SCRIPT_DIR/neurograph_gui.py" ]; then
@@ -140,7 +137,7 @@ Type=Application
 Name=NeuroGraph Manager
 GenericName=Cognitive Architecture Manager
 Comment=Manage NeuroGraph updates, ingestion, and monitoring
-Exec=python3 $SKILL_DIR/neurograph_gui.py
+Exec=python3 $SCRIPT_DIR/neurograph_gui.py
 Icon=preferences-system
 Categories=Utility;Development;Science;
 Terminal=false
@@ -235,7 +232,7 @@ else:
       "neurograph": {
         "enabled": true,
         "env": {
-          "NEUROGRAPH_WORKSPACE_DIR": "~/.openclaw/neurograph"
+          "NEUROGRAPH_WORKSPACE_DIR": "$WORKSPACE_DIR"
         }
       }
     }
@@ -263,7 +260,7 @@ registry['modules']['neurograph'] = {
     'module_id': 'neurograph',
     'display_name': 'NeuroGraph Foundation',
     'version': '0.6.0',
-    'install_path': '$SKILL_DIR',
+    'install_path': '$SCRIPT_DIR',
     'git_remote': 'https://github.com/greatnorthernfishguy-hub/NeuroGraph.git',
     'git_branch': 'main',
     'entry_point': 'openclaw_hook.py',
@@ -282,7 +279,7 @@ print('registered')
 " 2>/dev/null && info "Registered with ET Module Manager at $ET_MODULES_DIR" || \
     warn "ET Module Manager registration skipped (non-critical)"
 
-    info "Files deployed to $SKILL_DIR"
+    info "Skill directory ready at $SKILL_DIR"
     info "CLI tools installed at $BIN_DIR/feed-syl and $BIN_DIR/neurograph"
 }
 
