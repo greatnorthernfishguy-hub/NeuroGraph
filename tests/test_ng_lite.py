@@ -429,7 +429,7 @@ class TestBridge:
         bridge = MockBridge()
         ng = NGLite(module_id="test", bridge=bridge)
         recs = ng.get_recommendations(embedding, top_k=3)
-        assert recs[0] == ("bridge_model", 0.95)
+        assert recs[0] == ("bridge_model", 0.95, "cross-module recommendation")
 
     def test_bridge_novelty(self, embedding):
         bridge = MockBridge()

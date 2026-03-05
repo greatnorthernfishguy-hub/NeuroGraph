@@ -480,39 +480,39 @@ class NGEcosystem:
         embedding: np.ndarray,
         target_id: str,
         success: bool,
+        strength: float = 1.0,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """Record a learning outcome.
 
         The embedding is the semantic representation of the input.
         The target_id is an opaque string representing what was decided
         (e.g., "model:llama3", "threat:prompt_injection", "action:search").
 
-        Returns enriched response from the active bridge (Tier 2/3) or
-        None if only Tier 1 is active.
+        Returns the learning result dict from the substrate.
         """
         if self._ng is None:
-            return None
+            return {}
         with self._ops_lock:
             return self._ng.record_outcome(
-                embedding, target_id, success, metadata=metadata
+                embedding, target_id, success, strength=strength, metadata=metadata
             )
 
     def get_recommendations(
         self,
         embedding: np.ndarray,
         top_k: int = 3,
-    ) -> Optional[List[Tuple[str, float, str]]]:
+    ) -> List[Tuple[str, float, str]]:
         """Get recommendations from the active learning substrate.
 
-        Returns list of (target_id, confidence, reasoning) or None.
+        Returns list of (target_id, confidence, reasoning).
 
         At Tier 1, returns local recommendations only.
         At Tier 2, includes cross-module peer patterns.
         At Tier 3, includes full SNN recommendations + hyperedge context.
         """
         if self._ng is None:
-            return None
+            return []
         with self._ops_lock:
             return self._ng.get_recommendations(embedding, top_k=top_k)
 
@@ -542,7 +542,7 @@ class NGEcosystem:
           novelty:         float — novelty score [0.0, 1.0]
           ng_context:      str|None — Tier 3 SNN surfaced context if available
         """
-        recs = self.get_recommendations(embedding, top_k=top_k) or []
+        recs = self.get_recommendations(embedding, top_k=top_k)
         novelty = self.detect_novelty(embedding)
         ng_context = None
 

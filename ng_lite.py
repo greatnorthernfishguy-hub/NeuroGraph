@@ -398,6 +398,7 @@ class NGLite:
         embedding: np.ndarray,
         target_id: str,
         success: bool,
+        strength: float = 1.0,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Record an outcome and update learning weights.
@@ -405,20 +406,31 @@ class NGLite:
         This is the core learning method. Call it after every
         decision to teach NG-Lite what works and what doesn't.
 
-        Hebbian rule:
-            - Success: weight += success_boost * (1.0 - weight)
-              (diminishing returns as weight approaches 1.0)
-            - Failure: weight -= failure_penalty * weight
-              (proportional to current confidence)
+        Hebbian rule (strength-modulated):
+            - Success: weight += success_boost * (1 - weight) * strength
+            - Failure: weight -= failure_penalty * weight * strength
 
-        If a bridge to NeuroGraph SaaS is connected, the outcome
-        is also forwarded there for cross-module learning.
+        The strength parameter lets callers indicate how significant
+        this outcome was in their domain.  High-severity TrollGuard
+        detections or divergent TID quality scores teach harder than
+        routine confirmations.  Default 1.0 preserves backward compat.
+
+        Strength experience accumulates on the synapse as metadata,
+        giving the topology a record of how intensely each connection
+        was forged.  At Tier 3, NeuroGraph proper reads these
+        signatures to distinguish battle-tested synapses from routine.
+
+        If a bridge is connected, the outcome is forwarded for
+        cross-module learning with strength included in metadata.
 
         Args:
             embedding: The input pattern embedding (1-D numpy array).
             target_id: What was chosen (model name, action, etc.).
             success: Whether the outcome was successful.
-            metadata: Optional context about this outcome.
+            strength: Learning intensity [0.0, 1.0].  How significant
+                this outcome was in the caller's domain.  Default 1.0.
+            metadata: Optional caller context.  Stored on the synapse
+                as last_context for extraction-boundary use.
 
         Returns:
             Dict with learning results (node_id, weight_after, etc.).
@@ -438,19 +450,29 @@ class NGLite:
 
         synapse.activation_count += 1
 
+        # Clamp strength to valid range
+        strength = float(np.clip(strength, 0.0, 1.0))
+
         if success:
             synapse.success_count += 1
-            # Hebbian strengthening with soft saturation
-            delta = self.config["success_boost"] * (1.0 - synapse.weight)
+            # Hebbian strengthening, modulated by caller-reported significance
+            delta = self.config["success_boost"] * (1.0 - synapse.weight) * strength
             synapse.weight += delta
         else:
             synapse.failure_count += 1
-            # Anti-Hebbian weakening proportional to current weight
-            delta = self.config["failure_penalty"] * synapse.weight
+            # Anti-Hebbian weakening, modulated by caller-reported significance
+            delta = self.config["failure_penalty"] * synapse.weight * strength
             synapse.weight -= delta
 
         synapse.weight = float(np.clip(synapse.weight, 0.0, 1.0))
         synapse.last_updated = time.time()
+
+        # Accumulate strength experience on synapse —
+        # the topology remembers how intensely it was taught
+        synapse.metadata["strength_sum"] = synapse.metadata.get("strength_sum", 0.0) + strength
+        synapse.metadata["strength_count"] = synapse.metadata.get("strength_count", 0) + 1
+        if metadata:
+            synapse.metadata["last_context"] = metadata
 
         self._total_outcomes += 1
         if success:
@@ -467,15 +489,17 @@ class NGLite:
         # Record in history
         self._record_history(result)
 
-        # Forward to bridge if connected
+        # Forward to bridge if connected (include strength for Tier 2/3)
         if self._bridge and self._bridge.is_connected():
             try:
+                bridge_meta = dict(metadata or {})
+                bridge_meta["strength"] = strength
                 enriched = self._bridge.record_outcome(
                     embedding=embedding,
                     target_id=target_id,
                     success=success,
                     module_id=self.module_id,
-                    metadata=metadata,
+                    metadata=bridge_meta,
                 )
                 if enriched:
                     result["bridge_response"] = enriched
@@ -488,7 +512,7 @@ class NGLite:
         self,
         embedding: np.ndarray,
         top_k: int = 3,
-    ) -> List[Tuple[str, float]]:
+    ) -> List[Tuple[str, float, str]]:
         """Get target recommendations for an input pattern.
 
         Finds the closest known pattern node and returns its strongest
@@ -503,7 +527,10 @@ class NGLite:
             top_k: Maximum number of recommendations to return.
 
         Returns:
-            List of (target_id, confidence) tuples, highest first.
+            List of (target_id, confidence, reasoning) tuples, highest
+            first.  The reasoning string captures the experience behind
+            each recommendation — learning mechanism, success ratio,
+            weight, activation volume, and strength signature.
             Empty list if no learned routes exist for this pattern.
         """
         # Try bridge first
@@ -515,26 +542,55 @@ class NGLite:
                     top_k=top_k,
                 )
                 if bridge_recs:
-                    # Bridge returns (target, confidence, reasoning)
-                    # We return (target, confidence) for API consistency
-                    return [(t, c) for t, c, _ in bridge_recs]
+                    return bridge_recs
             except Exception as e:
                 logger.warning("Bridge get_recommendations failed: %s", e)
 
         # Local learning
         node = self.find_or_create_node(embedding)
 
-        relevant = [
-            (syn.target_id, syn.weight)
-            for key, syn in self.synapses.items()
-            if key[0] == node.node_id and syn.weight > self.config["pruning_threshold"]
-        ]
+        relevant = []
+        for key, syn in self.synapses.items():
+            if key[0] == node.node_id and syn.weight > self.config["pruning_threshold"]:
+                reasoning = self._build_local_reasoning(syn)
+                relevant.append((syn.target_id, syn.weight, reasoning))
 
         if not relevant:
             return []
 
         relevant.sort(key=lambda x: x[1], reverse=True)
         return relevant[:top_k]
+
+    def _build_local_reasoning(self, synapse: NGLiteSynapse) -> str:
+        """Generate reasoning string from local Hebbian experience.
+
+        Single point of evolution for how NG-Lite articulates its local
+        learning.  V1 renders synapse stats and strength signatures.
+        As NG-Lite gains meta-learning capability (punch list #21),
+        this method becomes the place where reasoning generation
+        itself improves.
+
+        This is an extraction boundary — topology becomes human-legible
+        here.  The substrate doesn't need these labels; consumers and
+        dashboards do.
+
+        Args:
+            synapse: The synapse whose experience to articulate.
+
+        Returns:
+            Human-readable reasoning grounded in actual experience data.
+        """
+        total = synapse.success_count + synapse.failure_count
+        if total > 0:
+            detail = f"w={synapse.weight:.2f}, {synapse.activation_count} activations"
+            strength_count = synapse.metadata.get("strength_count", 0)
+            if strength_count > 0:
+                avg = synapse.metadata["strength_sum"] / strength_count
+                detail += f", avg_strength={avg:.2f}"
+            return (
+                f"Hebbian: {synapse.success_count}/{total} success ({detail})"
+            )
+        return f"Hebbian: no outcomes yet (w={synapse.weight:.2f})"
 
     def detect_novelty(self, embedding: np.ndarray) -> float:
         """How novel is this input pattern?
