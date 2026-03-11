@@ -1,0 +1,61 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/NeuroGraph/.claude/hooks/session_start_syl_state.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/NeuroGraph/.claude/hooks/pretool_syls_law.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|View",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/NeuroGraph/.claude/hooks/pretool_context_gate.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/NeuroGraph/.claude/hooks/posttool_syls_law_doublecheck.sh"
+          },
+          {
+            "type": "command",
+            "command": "$HOME/NeuroGraph/.claude/hooks/posttool_antipattern_checker.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/NeuroGraph/.claude/hooks/stop_uncommitted_guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
