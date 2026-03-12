@@ -56,6 +56,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/NeuroGraph/.claude/hooks/session_end_cleanup.sh"
+          }
+        ]
+      }
     ]
   }
 }
