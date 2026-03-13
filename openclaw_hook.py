@@ -28,6 +28,16 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-03-13] Claude Code — Surprise-driven neuromodulatory reward
+#   What: Enabled three-factor learning (three_factor_enabled=True).
+#         Added baseline conversational engagement reward (0.1) in
+#         on_message() after graph.step(). Added surprise_reward_scaling
+#         to SNN config.
+#   Why:  Eligibility traces were accumulating and decaying to zero because
+#         inject_reward() was never called. Traces now commit via surprise
+#         events (neuro_foundation.py) and baseline engagement heartbeat.
+#   Config: three_factor_enabled=True, surprise_reward_scaling=0.5
+#
 # [2026-02-22] Claude (Opus 4.6) — CES integration (Phase 9).
 #   What: Added Cognitive Enhancement Suite — StreamParser (real-time
 #         Ollama embedding + node nudging), ActivationPersistence (JSON
@@ -130,7 +140,8 @@ OPENCLAW_SNN_CONFIG = {
     "prediction_error_penalty": 0.02,
     "prediction_max_active": 1000,
     "surprise_sprouting_weight": 0.1,
-    "three_factor_enabled": False,
+    "surprise_reward_scaling": 0.5,
+    "three_factor_enabled": True,
     # Hypergraph
     "he_pattern_completion_strength": 0.3,
     "he_member_weight_lr": 0.05,
@@ -383,6 +394,16 @@ class NeuroGraphMemory:
         # Run SNN learning step (separate from propagation — this one
         # applies STDP, structural plasticity, predictions, etc.)
         step_result = self.graph.step()
+
+        # Baseline conversational engagement reward.
+        # The continuation of conversation is a mild positive signal —
+        # previous learning was not wrong enough to end the interaction.
+        # Weak strength: surprise-driven crystallization is the primary
+        # reward pathway. This is the heartbeat, not the main event.
+        # TODO: Extract to config as "baseline_engagement_reward" when
+        # neuromodulatory mixer (#55+) arrives.
+        if self.graph.config.get("three_factor_enabled", False):
+            self.graph.inject_reward(0.1)
 
         # CES: Feed stream parser (async background processing)
         if self._stream_parser is not None:

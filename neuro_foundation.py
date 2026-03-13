@@ -17,6 +17,19 @@ Design principles (PRD §2.1):
     - Dynamic topology: nodes/edges created and destroyed at runtime
     - Pluggable plasticity: learning rules are swappable strategy objects
     - Persistence-native: all state is serializable
+
+# ---- Changelog ----
+# [2026-03-13] Claude Code — Surprise-driven neuromodulatory reward
+# What: Wired prediction errors to inject_reward() for surprise-driven
+#   trace crystallization. Added surprise_reward_scaling config.
+# Why: Eligibility traces were accumulating and decaying to zero because
+#   inject_reward() was never called. Surprise events now broadcast
+#   reward to all active traces — high-confidence prediction failures
+#   produce stronger crystallization (norepinephrine analog).
+# How: Added inject_reward() call at end of _on_prediction_error(),
+#   gated on three_factor_enabled. Strength = pred.confidence *
+#   surprise_reward_scaling. No scope (broadcast to all warm traces).
+# -------------------
 """
 
 from __future__ import annotations
@@ -857,6 +870,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "prediction_error_penalty": 0.02,    # Weight penalty on error (×confidence)
     "prediction_max_active": 1000,       # Max active predictions (memory limit)
     "surprise_sprouting_weight": 0.1,    # Initial weight for surprise-driven synapses
+    "surprise_reward_scaling": 0.5,      # Modulates surprise -> reward strength. Elmer-tunable.
     "eligibility_trace_tau": 100,        # Decay time constant for eligibility traces
     "three_factor_enabled": False,       # Whether to use three-factor learning
     # Phase 2: Hypergraph Engine config
@@ -2199,6 +2213,21 @@ class Graph:
 
         # Surprise-driven exploration (PRD §5.2)
         self._surprise_exploration(pred, recent_fired)
+
+        # Surprise-driven neuromodulatory crystallization
+        # Failed predictions broadcast reward to ALL active eligibility traces.
+        # Strength scales with prediction confidence — high-confidence failures
+        # produce stronger crystallization than low-confidence failures.
+        # No scope: this is a broadcast signal, not a targeted one.
+        # Note: the direct prediction penalty (line ~2171 above) reduces this
+        # synapse's trace BEFORE the broadcast commits it. This is correct —
+        # the failing synapse gets reduced crystallization. The broadcast
+        # benefits other active traces that weren't involved in the failed
+        # prediction.
+        if self.config.get("three_factor_enabled", False):
+            surprise_strength = pred.confidence * self.config.get("surprise_reward_scaling", 0.5)
+            if surprise_strength > 0.01:  # Don't bother with negligible surprise
+                self.inject_reward(surprise_strength)
 
     def _surprise_exploration(
         self, pred: Prediction, recent_fired: Set[str]
