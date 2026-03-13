@@ -36,6 +36,19 @@ Grok Review Changelog (v0.7.1):
         Hierarchical chunker calls _split_large_section() for oversized
         headings. Fixed-size chunker uses a sliding window. All paths are
         bounded by max_chunk_tokens.
+
+# ---- Changelog ----
+# [2026-03-10] Claude (Opus) — Harden _resolve_device() for "auto" mode
+# What: _resolve_device() now explicitly checks torch.cuda.is_available()
+#        for "auto" device instead of returning None for ST auto-detect.
+# Why: CUDA-built torch (e.g. 2.10.0+cu128) on systems without a GPU
+#       causes sentence-transformers auto-detect to hit meta-tensor errors
+#       ("Cannot copy out of meta tensor; no data!"), silently falling back
+#       to hash-based embeddings and degrading Syl's semantic quality.
+# How: Moved the torch.cuda.is_available() check above both "auto" and
+#       "cuda" branches. "auto" now resolves to "cuda" or "cpu" explicitly.
+#       Return type is always a concrete device string, never None.
+# -------------------
 """
 
 from __future__ import annotations
@@ -1552,27 +1565,32 @@ class EmbeddingEngine:
         Handles graceful degradation: if 'cuda' is requested but unavailable,
         falls back to 'cpu' with a warning rather than hard-failing.
 
+        When device is 'auto', performs explicit CUDA availability detection
+        rather than delegating to sentence-transformers' auto-detect, which
+        can hit meta-tensor errors on CUDA-built torch without a GPU.
+
         Returns:
-            Device string suitable for SentenceTransformer (or None for auto).
+            Device string for SentenceTransformer — always explicit, never None.
         """
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+        except ImportError:
+            cuda_available = False
+
         if self.device == "auto":
-            return None  # let sentence-transformers auto-detect
+            if cuda_available:
+                self._logger.info("Auto-detected CUDA device.")
+                return "cuda"
+            return "cpu"
         if self.device == "cuda":
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    return "cuda"
-                else:
-                    self._logger.warning(
-                        "CUDA requested but not available (torch.cuda.is_available()=False). "
-                        "Falling back to CPU."
-                    )
-                    return "cpu"
-            except ImportError:
-                self._logger.warning(
-                    "CUDA requested but PyTorch not installed. Falling back to CPU."
-                )
-                return "cpu"
+            if cuda_available:
+                return "cuda"
+            self._logger.warning(
+                "CUDA requested but not available (torch.cuda.is_available()=False). "
+                "Falling back to CPU."
+            )
+            return "cpu"
         return self.device  # "cpu" or any explicit device string
 
     @staticmethod
