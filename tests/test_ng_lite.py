@@ -383,6 +383,144 @@ class TestPersistence:
         finally:
             os.unlink(filepath)
 
+    def test_embedding_persists_across_load(self, ng, embedding):
+        """Embeddings survive save/load and rebuild the cache."""
+        ng.record_outcome(embedding, "model_a", success=True)
+        assert len(ng._embedding_cache) == 1
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            ng2 = NGLite()
+            ng2.load(filepath)
+
+            # Cache should be rebuilt from persisted embeddings
+            assert len(ng2._embedding_cache) == 1
+
+            # Node should have its embedding
+            node = list(ng2.nodes.values())[0]
+            assert node.embedding is not None
+            assert node.embedding.shape == (384,)
+        finally:
+            os.unlink(filepath)
+
+    def test_similarity_works_after_load(self, ng, embedding):
+        """After save/load, similar embeddings snap to existing nodes."""
+        ng.record_outcome(embedding, "model_a", success=True)
+        assert len(ng.nodes) == 1
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            ng2 = NGLite()
+            ng2.load(filepath)
+
+            # Slightly noisy version of same embedding
+            rng = np.random.RandomState(123)
+            noisy = embedding + rng.randn(384) * 0.01
+            noisy = noisy / np.linalg.norm(noisy)
+
+            # Should snap to existing node, not create new
+            node = ng2.find_or_create_node(noisy)
+            assert len(ng2.nodes) == 1
+            assert node.activation_count == 2  # original + this one
+        finally:
+            os.unlink(filepath)
+
+    def test_no_sprawl_after_load(self, ng, embedding):
+        """Recording same outcomes after load doesn't create duplicate nodes."""
+        ng.record_outcome(embedding, "model_a", success=True)
+        ng.record_outcome(embedding, "model_b", success=True)
+        node_count_before = len(ng.nodes)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            ng2 = NGLite()
+            ng2.load(filepath)
+
+            # Re-record same outcomes
+            ng2.record_outcome(embedding, "model_a", success=True)
+            ng2.record_outcome(embedding, "model_b", success=True)
+
+            assert len(ng2.nodes) == node_count_before
+        finally:
+            os.unlink(filepath)
+
+    def test_legacy_state_loads_without_embeddings(self, ng):
+        """State files from before embedding persistence load cleanly."""
+        # Simulate old-format state with no embedding field on nodes
+        state = {
+            "version": "1.0.0",
+            "module_id": "legacy_module",
+            "config": DEFAULT_CONFIG,
+            "nodes": {
+                "abc123": {
+                    "node_id": "n_1",
+                    "embedding_hash": "abc123",
+                    "activation_count": 5,
+                    "last_activation": 1000.0,
+                    "metadata": {},
+                }
+            },
+            "synapses": {},
+            "counters": {"node_id_counter": 1},
+        }
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", delete=False, mode="w"
+        ) as f:
+            json.dump(state, f)
+            filepath = f.name
+
+        try:
+            ng.load(filepath)
+            assert len(ng.nodes) == 1
+            node = ng.nodes["abc123"]
+            assert node.embedding is None
+            # Cache should be empty — no embeddings to rebuild from
+            assert len(ng._embedding_cache) == 0
+        finally:
+            os.unlink(filepath)
+
+    def test_similarity_backfill_on_legacy_node(self, ng, embedding):
+        """Legacy nodes (no embedding) get backfilled on similarity match."""
+        # Create a node and save
+        ng.record_outcome(embedding, "model_a", success=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+
+            # Manually strip embeddings to simulate legacy state
+            with open(filepath) as f:
+                state = json.load(f)
+            for node_data in state["nodes"].values():
+                node_data.pop("embedding", None)
+            with open(filepath, "w") as f:
+                json.dump(state, f)
+
+            # Load legacy state
+            ng2 = NGLite()
+            ng2.load(filepath)
+            node = list(ng2.nodes.values())[0]
+            assert node.embedding is None
+
+            # Feed exact same embedding — hash match backfills
+            node_found = ng2.find_or_create_node(embedding)
+            assert node_found.node_id == node.node_id
+            assert node_found.embedding is not None
+        finally:
+            os.unlink(filepath)
+
 
 # ---------------------------------------------------------------------------
 # Bridge Tests

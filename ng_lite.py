@@ -65,6 +65,19 @@ License: AGPL-3.0 (see NeuroGraph LICENSE)
 Author: Josh + Claude
 Date: February 2026
 
+# ---- Changelog ----
+# [2026-03-13] Claude Code — Persist node embeddings across restarts
+# What: Store embedding vector on NGLiteNode, serialize/deserialize with
+#   state, rebuild _embedding_cache from persisted nodes on load().
+# Why: _embedding_cache cleared on load(), causing _find_similar_node()
+#   to fail after every restart. Primary source of node sprawl — semantically
+#   identical inputs created duplicate nodes when cache was cold.
+# How: Added Optional[np.ndarray] embedding field to NGLiteNode. Backfill
+#   on exact hash match (always) and similarity match (only if None).
+#   New nodes born with embedding. _export_state()/_import_state() handle
+#   numpy<->list conversion. Old state files load cleanly (embedding=None).
+# -------------------
+
 Grok Review Changelog (v0.7.1):
     Accepted: Replaced per-node loop in _find_similar_node() with vectorized
         np.stack + matrix-vector dot product.  For 1000 nodes this reduces
@@ -156,6 +169,7 @@ class NGLiteNode:
     activation_count: int = 0
     last_activation: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    embedding: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -368,6 +382,7 @@ class NGLite:
             node = self.nodes[emb_hash]
             node.activation_count += 1
             node.last_activation = time.time()
+            node.embedding = emb
             self._embedding_cache[emb_hash] = emb
             return node
 
@@ -376,6 +391,9 @@ class NGLite:
         if similar is not None:
             similar.activation_count += 1
             similar.last_activation = time.time()
+            if similar.embedding is None:
+                similar.embedding = emb
+                self._embedding_cache[similar.embedding_hash] = emb
             return similar
 
         # Novel pattern — create new node
@@ -388,6 +406,7 @@ class NGLite:
             embedding_hash=emb_hash,
             activation_count=1,
             last_activation=time.time(),
+            embedding=emb,
         )
         self.nodes[emb_hash] = node
         self._embedding_cache[emb_hash] = emb
@@ -731,7 +750,7 @@ class NGLite:
             "module_id": self.module_id,
             "timestamp": time.time(),
             "config": self.config,
-            "nodes": {k: asdict(v) for k, v in self.nodes.items()},
+            "nodes": {k: self._serialize_node(v) for k, v in self.nodes.items()},
             "synapses": synapses_serialized,
             "counters": {
                 "node_id_counter": self._node_id_counter,
@@ -748,10 +767,19 @@ class NGLite:
         saved_config = state.get("config", {})
         self.config = {**DEFAULT_CONFIG, **saved_config}
 
-        # Restore nodes
+        # Clear caches before rebuild
+        self._embedding_cache.clear()
+        self._history.clear()
+
+        # Restore nodes (rebuild embedding cache from persisted embeddings)
         self.nodes = {}
         for key, node_data in state.get("nodes", {}).items():
-            self.nodes[key] = NGLiteNode(**node_data)
+            emb_list = node_data.pop("embedding", None)
+            node = NGLiteNode(**node_data)
+            if emb_list is not None:
+                node.embedding = self._normalize(np.array(emb_list, dtype=np.float32))
+                self._embedding_cache[key] = node.embedding
+            self.nodes[key] = node
 
         # Restore synapses
         self.synapses = {}
@@ -766,10 +794,6 @@ class NGLite:
         self._node_id_counter = counters.get("node_id_counter", 0)
         self._total_outcomes = counters.get("total_outcomes", 0)
         self._total_successes = counters.get("total_successes", 0)
-
-        # Clear caches (will rebuild on use)
-        self._embedding_cache.clear()
-        self._history.clear()
 
     # -------------------------------------------------------------------
     # Stats & Telemetry
@@ -811,6 +835,20 @@ class NGLite:
     # -------------------------------------------------------------------
     # Internal Methods
     # -------------------------------------------------------------------
+
+    def _serialize_node(self, node: NGLiteNode) -> Dict[str, Any]:
+        """Serialize a node to a JSON-compatible dict.
+
+        Converts embedding from np.ndarray to list for JSON.
+        Omits embedding key when None (backward-compatible with
+        state files created before embedding persistence).
+        """
+        d = asdict(node)
+        if node.embedding is not None:
+            d["embedding"] = node.embedding.tolist()
+        else:
+            d.pop("embedding", None)
+        return d
 
     @staticmethod
     def _normalize(embedding: np.ndarray) -> np.ndarray:
