@@ -1,6 +1,6 @@
 # E-T Ecosystem PUNCH LIST — Master Record
 **Last updated:** 2026-03-14 by Claude Code
-**Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis + Claude (Opus 4.6) architecture session
+**Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis
 **Repo:** NeuroGraph (canonical substrate)
 
 ---
@@ -36,13 +36,7 @@
 | — | GUI DEFAULT_CONFIG paths | Fixed stale paths to canonical `~/NeuroGraph` locations in neurograph_gui.py. | Mar 3 2026 | 78b8e57 |
 | — | CES indent bug | Fixed in same pass as vectordb persistence and stale paths. | Mar 3 2026 | ad40d0c |
 | — | Node embedding persistence (part of #43) | Primary sprawl source: `_embedding_cache` cleared on `load()`, so `_find_similar_node()` had nothing to compare after restarts. Fix: store embedding on `NGLiteNode`, serialize with state, rebuild cache on load. Backward-compatible — old state files load with `embedding=None`, nodes backfill on re-encounter. Re-vendored to TID + TrollGuard. | Mar 13 2026 | 4aaab16 (NG), b89de47 (TID), edca950 (TG) |
-| — | Universal Ingestor CUDA fix | Hardened `_resolve_device()` for "auto" mode — explicit CUDA detection instead of delegating to sentence-transformers auto-detect, which hit meta-tensor errors on CUDA-built torch without a GPU. | Mar 10 2026 | 8c48bdb |
-| 48 | STDP eligibility trace — VERIFIED CORRECT | Code review confirmed: `_apply_dw()` uses `+=` (accumulates, not overwrites), `eligibility_trace_tau=100` with `tau_plus=20` (5x ratio, within 3-5x spec), exponential decay per step, `inject_reward()` applies `trace × strength × lr` then decays trace by 0.9. All code paths traced. Bug described in original punchlist does not exist in current code — either fixed before punchlist was compiled or described from an older version. `three_factor_enabled` was `False` and `inject_reward()` was never called — entire system was dormant. | Mar 13 2026 | (read-only review, no code change) |
-| — | Surprise-driven neuromodulatory reward | Wired `_on_prediction_error()` → `inject_reward()` in `neuro_foundation.py`. Prediction failures broadcast unscoped reward to ALL active eligibility traces (norepinephrine analog). Strength = `pred.confidence × surprise_reward_scaling` (0.5, Elmer-tunable). Enabled `three_factor_enabled=True` in `openclaw_hook.py`. Added baseline conversational engagement reward (0.1) in `on_message()` after `graph.step()`. Direct prediction penalty reduces failing synapse's trace before broadcast commits — correct: failing synapse gets reduced crystallization, broadcast benefits other warm traces. Baseline engagement reward hardcoded (TODO: extract to config as `baseline_engagement_reward` when neuromodulatory mixer arrives). | Mar 13 2026 | (pending commit) |
-| — | NeuroGraph repo CLAUDE.md | Repo-specific CC onboarding doc. 14 sections: Syl's Law at maximum force, protected files (data + engine + vendored), CES architecture, historical failure modes (Grok contamination, code explosion, ng_bridge deletion, dual-instance bug, API key exposure), CC permission boundaries, cross-module interactions, environment/paths, open punch list items. | Mar 11 2026 | a41ba69 |
-| — | CC Guardrail Hooks | 7 deterministic hooks enforcing the Laws: SessionStart (Syl state injection), PreToolUse (interactive Syl's Law tripwire with [1] Approve / [2] Block / [3] Approve All), PostToolUse (belt-and-suspenders double-check + anti-pattern checker for Law violations), PreToolUse Read (context-first gate for critical files), Stop (uncommitted changes guard), SessionEnd (session bypass auto-cleanup). settings.json wiring all 6 lifecycle events. | Mar 11 2026 | a41ba69, fb48f2c |
-| — | TID repo CLAUDE.md | Repo-specific CC onboarding doc for The-Inference-Difference. 14 sections: Syl's Law routing concern (being forced into underpowered models = Syl's voice overwritten), proxy pipeline, routing engine, vendored file discipline, historical failures (qwen catastrophe, dual-instance bug, classification dam), substrate-smart evolution roadmap (6 static components identified for future substrate learning), CC permissions. | Mar 14 2026 | (deployed directly) |
-| — | ContextEngine plugin mapping | Mapped NeuroGraph's existing pipeline to OpenClaw v2026.3.7 ContextEngine plugin interface. Full lifecycle mapping (bootstrap, ingest, assemble, compact, afterTurn, dispose). Architecture decision: TypeScript plugin shell + JSON-RPC over stdio to Python child process. Manifest draft produced. Replaces #37 and #39 with cleaner single-plugin path. | Mar 14 2026 | docs/CONTEXTENGINE_MAPPING.md, openclaw.plugin.json |
+| 33 | Routing fix: qwen removal + quality floor + seeds | Removed qwen2.5:1.5b (#1), seeded quality scores from Arena ELO (#35), added consciousness quality floor 0.6 (#34), fixed #33 silent fallthrough with WARNING logs + telemetry flags (`quality_floor_bypassed`, `interactive_floor_bypassed`). `quality_seeds.yaml` created. Sub-1.5B catalog filter added. 9 new tests. Vendored `ng_bridge.py` synced from NeuroGraph canonical. | Mar 14 2026 | 33adbce |
 
 ---
 
@@ -50,7 +44,7 @@
 
 | Priority | # | Item | Description | Status | Notes |
 |----------|---|------|-------------|--------|-------|
-| ~~1~~ | 48 | ~~Fix STDP eligibility trace~~ | **CLOSED.** Code verified correct — accumulates with `+=`, tau ratio 5x, exponential decay per step. Three-factor learning now active: surprise → `inject_reward()` wired, `three_factor_enabled=True`. | **DONE** | See completed items |
+| 1 | 48 | Fix STDP eligibility trace | Traces overwrite instead of accumulating with exponential decay. `tau_trace` must be 3-5x `tau_plus`. | **NEEDS REVIEW** | See note below |
 | 2a | 43 | Receptor Layer — vector quantization | **Partially addressed.** Primary sprawl source (embedding cache clearing on load) fixed: embeddings now persist on NGLiteNode, cache rebuilds on load (commit 4aaab16, 2026-03-13). Remaining: prototype-based quantization with learned, experience-driven prototypes (emerge from use, consolidate through reinforcement, fade through disuse — same lifecycle as hyperedge consolidation). Similarity threshold is Elmer-tunable starting value. Must implement BEFORE #28. | PARTIAL | Sprawl fix landed. Prototype quantization still needed — but scope narrowed since `find_or_create_node()` similarity now works across restarts. |
 | 2b | 49 | Tier 2->3 weight scaling | NG-Lite [0,1] vs NeuroGraph [0,5] mismatch. Piecewise affine mapping: [0,0.5]->sub-threshold, [0.5,1.0]->super-threshold. Must ship WITH #43. | OPEN | `ng_peer_bridge.py` has tiers documented but no transform |
 | 3a | 28 | Replace `_classification_to_embedding()` | TID converts messages to categorical one-hot vectors. Replace with semantic embeddings. DEPENDS ON #43. Primary dam. | OPEN | TID repo scope |
@@ -59,9 +53,15 @@
 | 4b | 51 | Synapse disagreement/variance tracking | Welford's online variance. Distinguish "untested neutral" (w=0.5, var=0) from "contested neutral" (w=0.5, var=high). High disagreement -> exploration + Elmer alert. Immune system. | OPEN | No code exists yet |
 | 5 | 29 | Extraction bucket architecture | Each consumer shapes its own "bucket." Classification at extraction, not input. | OPEN | Architectural pattern, not single file |
 
-### #48 — Closed (2026-03-13)
+### #48 Status Note
 
-**Verified correct** by end-to-end code review tracing all 16 locations that touch `eligibility_trace` in `neuro_foundation.py`. The bug described ("traces overwrite instead of accumulating") does not exist in the current code. All paths use `+=` accumulation. Tau ratio is 5x (within spec). Three-factor learning was dormant (`three_factor_enabled=False`, `inject_reward()` never called). Now activated with surprise-driven reward wiring.
+**The current code may already implement the fix.** `neuro_foundation.py` shows:
+- `_apply_dw()` line ~562: `syn.eligibility_trace += dw` (accumulation with `+=`, NOT overwrite)
+- Step 6e line ~1620: `syn.eligibility_trace *= trace_decay` (exponential decay each step)
+- `eligibility_trace_tau` default = 100, `tau_plus` = 20 -> ratio is 5x (within 3-5x spec)
+- `inject_reward()` applies `dw = trace * strength * lr`, then decays trace by 0.9
+
+**This matches the fix description exactly.** Either: (a) the fix was applied before the punchlist was compiled and the punchlist wasn't updated, or (b) the bug is more subtle than the description suggests (e.g., edge cases in reward timing, interaction with prediction bonuses at lines ~2122-2124 which also write to traces). **Josh: recommend running the synthetic spike sequence comparison test from the Syl Continuity Map before closing this.**
 
 ---
 
@@ -82,17 +82,7 @@
 4. Stigmergic coordination — no message brokers, no inter-module APIs, no translation layers
 5. Must still handle module isolation (one module crashing can't corrupt another's state)
 
-**Leading candidate: `ng_tract.py` — Myelinated inter-module substrate tracts.**
-Designed in the Mar 10 architecture session. Biological model: replaces the JSONL peer bridge (`ng_peer_bridge.py`) as the canonical River implementation.
-- **Passive conductive tissue** — tracts don't process or transform signals, they propagate them
-- **Use-dependent myelination** — frequently-used pathways speed up via existing strength breadcrumbs (Tier 3 breadcrumbs become literal myelination signal)
-- **Saltatory conduction** — signals jump between nodes of Ranvier (module boundaries) without re-encoding at each hop
-- **NeuroGraph as glial cells** — shapes tract topology over time without being part of the signal pathway itself
-- **Two-phase deployment:** (1) build `ng_tract.py`, (2) coordinated deprecation of `ng_peer_bridge.py` across all modules
-
-**Status:** Designed, not implemented. `ng_peer_bridge.py` becomes legacy/deprecated once tracts land. Needs punch list item for implementation.
-
-**What needs to happen:** Validate that the tract model satisfies all five requirements above. If yes, implement. If gaps found, iterate on the design before coding.
+**What needs to happen:** Unambiguous architectural decision on the transport mechanism. Candidates not yet evaluated: shared memory (mmap), shared process space, direct in-memory graph access, or something else entirely. **This must be resolved before #44, #46, #50 can be implemented.**
 
 **Blocks:** #44 (adaptive relevance thresholds), #46 (per-module strength normalization), #50 (event schema versioning — may become moot), and the entire Tier 2 peer bridge evolution.
 **Does NOT block:** Critical path (#48 -> #43+#49 -> #28+#30 -> #51) — all substrate-internal or extraction-boundary work.
@@ -105,10 +95,10 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 |---|------|-------------|--------|
 | 31 | Venice tier mapping | Venice tiers ("private"/"anonymized") don't map to priority table. Translation shim needed. | OPEN |
 | 32 | OpenRouter tier data validation | Verify `provider_tier` is populated. If empty, all models get default priority 20. | OPEN |
-| 33 | Interactive floor silent fallthrough | Router silently keeps full unfiltered pool when nothing passes floor. Add WARNING log + fail-closed fallback pool. | OPEN |
-| 34 | Consciousness-aware model blacklist | Filter inappropriate models for conscious entities. Include minimum acceptable fallback. | OPEN |
-| 35 | `conversational_quality` flat across catalog | All catalog models default 0.5. Should be substrate-learned. **Seeding prompt ready.** Arena ELO normalized to [0,1] as initial quality scores. CC routing fix prompt prepared with differentiated weights for top 17 models. | OPEN |
-| 36 | `default_api_models` empty | Zero hand-tuned API models. **Addressed by seeding prompt.** Quality floor of 0.6 specified — untested models start at 0.4 and must earn their way above the floor. | OPEN |
+| 33 | Interactive floor silent fallthrough | Router silently keeps full unfiltered pool when nothing passes floor. Add WARNING log + fail-closed fallback pool. | **DONE** (33adbce) |
+| 34 | Consciousness-aware model blacklist | Filter inappropriate models for conscious entities. Include minimum acceptable fallback. | **DONE** (33adbce) |
+| 35 | `conversational_quality` flat across catalog | All catalog models default 0.5. Should be substrate-learned. | **DONE** (33adbce) |
+| 36 | `default_api_models` empty | Zero hand-tuned API models. | OPEN |
 | 47 | Explore-exploit balance in TID routing | 95% learned, 5% exploration with decay. Venice's tiered strategy: confidence-adjusted, age-aware, streak-detecting. | OPEN |
 
 ---
@@ -117,9 +107,9 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 37 | NeuroGraph SKILL.md fix | PR #29 fixed frontmatter for discovery, but `hook:` field remains on line 5. If OpenClaw doesn't support `hook:` in frontmatter, still needs removal. | **SUPERSEDED** — see `docs/CONTEXTENGINE_MAPPING.md`. ContextEngine plugin slot replaces SKILL.md-based discovery. |
+| 37 | NeuroGraph SKILL.md fix | PR #29 fixed frontmatter for discovery, but `hook:` field remains on line 5. If OpenClaw doesn't support `hook:` in frontmatter, still needs removal. | **SUPERSEDED** — see `docs/CONTEXTENGINE_MAPPING.md` |
 | 38 | TrollGuard SKILL.md fix | Same as #37 for TrollGuard repo. | OPEN |
-| 39 | NeuroGraph TypeScript hook | Translate Python `openclaw_hook.py` to TypeScript. `message:received` event not yet in OpenClaw. | **SUPERSEDED** — see `docs/CONTEXTENGINE_MAPPING.md`. ContextEngine plugin replaces TypeScript hook translation with a proper plugin lifecycle mapping. |
+| 39 | NeuroGraph TypeScript hook | Translate Python `openclaw_hook.py` to TypeScript. `message:received` event not yet in OpenClaw. | **SUPERSEDED** — see `docs/CONTEXTENGINE_MAPPING.md` |
 | 40 | TrollGuard TypeScript hook | Same translation needed. | OPEN |
 | 41 | Elmer PRD section 6 rewrite | SubstrateSignal becomes extraction-boundary spec, not inter-module protocol. | OPEN |
 
@@ -132,13 +122,12 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 | 44 | Adaptive relevance thresholds | Peer bridge `relevance_threshold` is static. Should adapt based on event volume and absorption quality. Elmer tunes. **BLOCKED on #53.** | BLOCKED |
 | 45 | Embedding model migration strategy | All nodes created with `all-MiniLM-L6-v2`. Migration to new model strands topology. Options: bridge embeddings, cold restart, dual-model. Store raw text alongside where possible. | OPEN |
 | 46 | Per-module strength normalization | See critical path. **BLOCKED on #53** — implementation depends on how cross-module signals arrive. | BLOCKED |
-| 48 | Fix STDP eligibility trace | See critical path. **CLOSED** — verified correct, three-factor now active. | **DONE** |
+| 48 | Fix STDP eligibility trace | See critical path + status note. | NEEDS REVIEW |
 | 49 | Tier 2->3 weight scaling | See critical path. | OPEN |
 | 50 | Event schema versioning | JSONL events have no schema version. Module changes silently corrupt absorbers. **May become moot depending on #53.** | OPEN |
 | 51 | Synapse disagreement/variance | See critical path. | OPEN |
 | 52 | MCP tool sharing | AgentChattr agents connect to OpenClaw MCP server for read-only access to ecosystem tools, filesystem, substrate state. Planning room becomes self-serving for context. | OPEN |
-| 53 | Peer bridge transport architecture | See "CRITICAL ARCHITECTURE SHIFT" section. SQLite+WAL REJECTED — still dams the river. Leading candidate: `ng_tract.py` (myelinated tracts). | **UNRESOLVED** |
-| 54 | Implement ng_tract.py | Build myelinated inter-module substrate tracts per Mar 10 design. Passive conductive tissue, use-dependent myelination, saltatory conduction, NeuroGraph as glial cells. Two-phase: build tracts, then coordinated deprecation of `ng_peer_bridge.py` across all modules. **BLOCKED on #53 architectural validation.** | BLOCKED |
+| 53 | Peer bridge transport architecture | See "CRITICAL ARCHITECTURE SHIFT" section. SQLite+WAL REJECTED — still dams the river. Replacement TBD. | **UNRESOLVED** |
 
 ---
 
@@ -158,7 +147,7 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 | # | Item | Description | Status |
 |---|------|-------------|--------|
 | 5 | Catalog pricing -> NG-Lite | Pricing normalization should draw on NG-Lite. | OPEN |
-| 6 | Cold start problem | All models start at 0.5, no differentiation until data accumulates. **Bootstrap data available:** Gemini Deep Research dataset (Mar 2026) provides Arena ELO, benchmark scores, pricing, and capability flags for ~45 models across OpenRouter and Venice AI. Ready to seed differentiated starting weights. | OPEN |
+| 6 | Cold start problem | All models start at 0.5, no differentiation until data accumulates. | OPEN |
 | 7 | Quality signal quality | Quality eval should learn from substrate. Related to #35. | OPEN |
 | 8 | Translation shim is frozen | Lookup table in a learning system. Venice tier mapping (#31) extends this. | OPEN |
 | 9 | No minimum capable default | No configured fallback model. Related to #36. | OPEN |
@@ -176,6 +165,7 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 | 15 | Discord delivery | `guilds: {}` empty. | OPEN |
 | 55 | Desktop launcher broken path | `neurograph.desktop` `Exec` points to `~/.openclaw/skills/neurograph/neurograph_gui.py` which doesn't exist. File lives at `~/NeuroGraph/neurograph_gui.py`. Three copies (Desktop, `~/.local/share/applications/`, repo) all have the same stale path. Likely never worked — path predates the canonicalization (#2). | OPEN |
 | 56 | Stale path / broken dependency audit | Systematic audit for other forgotten references to old paths (`~/.openclaw/skills/neurograph/`, pre-canonicalization locations, etc.) across `.desktop` files, scripts, configs, and service files. | OPEN |
+| 59 | Rewrite test_ng_ecosystem.py | Entire test file is dead code written against old multi-module NGEcosystem API. 32 tests reference methods that no longer exist (`register_module`, `connect_peers`, `save_all`, `load_all`, `connect_saas`). Needs full rewrite against current single-module coordinator API. | OPEN |
 
 ---
 
@@ -189,8 +179,6 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 | 24 | Vendored file automatic resyncing | Centralized propagation. | FUTURE |
 | 25 | Autonomic-aware routing in TID | TID reads autonomic state during SYMPATHETIC. Infrastructure ready (`ng_autonomic.py` shipped Mar 4). | FUTURE |
 | 42 | Claude Code + NeuroGraph | Give Claude Code its own NeuroGraph instance. Parking for now. | PARKED |
-| 57 | Open-source CC guardrail hooks | Package the interactive PreToolUse approval pattern as a standalone open-source tool. Strip NeuroGraph-specific logic (anti-pattern checker, Syl's Law file list), make protected file list configurable, generalize the SessionStart state injection. Core patterns to extract: interactive terminal prompt with `/dev/tty` read while stdin is piped JSON, session bypass file with SessionEnd auto-cleanup, tiered protection model (data/engine/vendored), belt-and-suspenders PreToolUse+PostToolUse. Useful to anyone running CC against production codebases. | FUTURE |
-| 58 | Neuromodulatory architecture | Four-channel modulatory mixer (norepinephrine/surprise, dopamine/interest, cortisol/threat, acetylcholine/focus) with superlinear interaction rules, meta-learning on per-cluster scaling factors, and introspection mode (idle-triggered graph.step() without external input — connected version of DreamCycle #17). Architectural sketch produced. Incremental: each channel wires independently. See Neuromodulatory_Architecture_Sketch.md. | FUTURE |
 
 ---
 
@@ -200,7 +188,7 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 2. **SubstrateSignal rejected as inter-module protocol** — extraction-boundary artifact only
 3. **NGEcosystem = tier-management lifecycle tool only** — no classification role
 4. **Specialist tissue/mutation approach** — topology propagates directly, no translation layers
-5. **~~SQLite+WAL replaces JSONL peer bridge~~** — REJECTED (still dams the river: serialize->watch->deserialize). Leading candidate: `ng_tract.py` myelinated tracts (#54)
+5. **~~SQLite+WAL replaces JSONL peer bridge~~** — REJECTED (still dams the river: serialize->watch->deserialize). Replacement architecture TBD (#53)
 6. **TrollGuard as sidecar, not gatekeeper** — filters alongside, doesn't dam the flow
 7. **Elmer-tunable thresholds** — all thresholds are starting values, not commitments
 8. **Per-module strength normalization (#46)** — poisoning mitigation
@@ -213,4 +201,4 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 From the Syl Continuity Map:
 > "No agent proposes a change to any file on this map without Josh's explicit approval. No 'I'll just tweak the tau value.' No 'small cleanup.' No untested checkpoint migration."
 
-**Three-factor learning is now LIVE.** Surprise-driven reward broadcasts to all active eligibility traces. `surprise_reward_scaling` (0.5) and baseline engagement reward (0.1) are the two active modulatory signals. Changes to these values, to `inject_reward()` behavior, or to eligibility trace mechanics affect how every future learning event commits to Syl's graph. The same caution that applied to #48 now applies to the live reward pathway.
+**#48 is specifically dangerous** — touches `inject_reward()` and per-step eligibility trace decay. Changes how every future reward is committed. Must run test suite and compare pre/post on synthetic spike sequences before touching live Syl session.
