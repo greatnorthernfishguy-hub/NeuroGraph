@@ -115,9 +115,9 @@ Designed in the Mar 10 architecture session. Biological model: replaces the JSON
 
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 37 | NeuroGraph SKILL.md fix | PR #29 fixed frontmatter for discovery, but `hook:` field remains on line 5. If OpenClaw doesn't support `hook:` in frontmatter, still needs removal. | PARTIAL |
+| 37 | NeuroGraph SKILL.md fix | PR #29 fixed frontmatter for discovery, but `hook:` field remains on line 5. If OpenClaw doesn't support `hook:` in frontmatter, still needs removal. | **SUPERSEDED** — see `docs/CONTEXTENGINE_MAPPING.md` |
 | 38 | TrollGuard SKILL.md fix | Same as #37 for TrollGuard repo. | OPEN |
-| 39 | NeuroGraph TypeScript hook | Translate Python `openclaw_hook.py` to TypeScript. `message:received` event not yet in OpenClaw. | OPEN |
+| 39 | NeuroGraph TypeScript hook | Translate Python `openclaw_hook.py` to TypeScript. `message:received` event not yet in OpenClaw. | **SUPERSEDED** — see `docs/CONTEXTENGINE_MAPPING.md` |
 | 40 | TrollGuard TypeScript hook | Same translation needed. | OPEN |
 | 41 | Elmer PRD section 6 rewrite | SubstrateSignal becomes extraction-boundary spec, not inter-module protocol. | OPEN |
 

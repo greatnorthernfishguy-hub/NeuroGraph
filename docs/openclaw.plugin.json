@@ -1,0 +1,147 @@
+{
+  "$schema": "https://openclaw.ai/schemas/plugin.json",
+  "id": "neurograph",
+  "name": "NeuroGraph Cognitive Substrate",
+  "version": "0.1.0",
+  "description": "Spiking neural network substrate for persistent cognitive memory. STDP-based causal learning, semantic recall, spreading activation, predictive coding, and cross-session continuity.",
+  "author": "E-T Systems",
+  "license": "UNLICENSED",
+  "engine": ">=2026.3.7",
+
+  "capabilities": {
+    "contextEngine": true,
+    "tools": true,
+    "services": true,
+    "hooks": false,
+    "commands": false,
+    "httpRoutes": false
+  },
+
+  "contextEngine": {
+    "id": "neurograph",
+    "name": "NeuroGraph Cognitive Substrate",
+    "ownsCompaction": false,
+    "hooks": {
+      "bootstrap": true,
+      "ingest": true,
+      "ingestBatch": false,
+      "assemble": true,
+      "compact": true,
+      "afterTurn": true,
+      "prepareSubagentSpawn": false,
+      "onSubagentEnded": false,
+      "dispose": true
+    }
+  },
+
+  "tools": [
+    {
+      "name": "neurograph_recall",
+      "description": "Semantic similarity search over NeuroGraph's knowledge substrate. Returns content the network has ingested that is semantically similar to the query.",
+      "parameters": {
+        "query": { "type": "string", "description": "Text to search for" },
+        "k": { "type": "number", "description": "Max results (default 5)", "default": 5 },
+        "threshold": { "type": "number", "description": "Minimum similarity 0-1 (default 0.5)", "default": 0.5 }
+      },
+      "required": ["query"]
+    },
+    {
+      "name": "neurograph_associate",
+      "description": "Associative recall through the SNN's learned synaptic structure. Unlike recall (cosine search), this routes through causal connections, pattern completion, and prediction chains. The difference between searching a database and remembering.",
+      "parameters": {
+        "text": { "type": "string", "description": "Input text to associate from" },
+        "k": { "type": "number", "description": "Max results (default 10)", "default": 10 },
+        "steps": { "type": "number", "description": "SNN propagation depth (default 3)", "default": 3 }
+      },
+      "required": ["text"]
+    },
+    {
+      "name": "neurograph_stats",
+      "description": "Return current substrate telemetry: node/synapse/hyperedge counts, firing rate, prediction accuracy, CES status, peer bridge status.",
+      "parameters": {}
+    },
+    {
+      "name": "neurograph_ingest_file",
+      "description": "Ingest a file from disk into the cognitive substrate. Supports text, code, markdown, PDF, JSON, CSV, media files.",
+      "parameters": {
+        "path": { "type": "string", "description": "Absolute path to the file" },
+        "source_type": { "type": "string", "description": "Override auto-detection (TEXT, CODE, MARKDOWN, PDF, etc.)" }
+      },
+      "required": ["path"]
+    }
+  ],
+
+  "services": [
+    {
+      "id": "neurograph-substrate",
+      "description": "Python child process hosting the NeuroGraph SNN engine. Communicates with the TypeScript plugin via JSON-RPC over stdio.",
+      "autoStart": true
+    }
+  ],
+
+  "config": {
+    "type": "object",
+    "properties": {
+      "workspace_dir": {
+        "type": "string",
+        "description": "Working directory for checkpoints and data",
+        "default": "~/NeuroGraph/data"
+      },
+      "embedding_device": {
+        "type": "string",
+        "enum": ["auto", "cpu", "cuda"],
+        "description": "Device for embedding model inference",
+        "default": "auto"
+      },
+      "peer_bridge_enabled": {
+        "type": "boolean",
+        "description": "Enable NGPeerBridge for cross-module learning (Tier 2)",
+        "default": true
+      },
+      "ces_enabled": {
+        "type": "boolean",
+        "description": "Enable Cognitive Enhancement Suite (stream parser, surfacing monitor, activation persistence)",
+        "default": true
+      },
+      "ces_dashboard": {
+        "type": "boolean",
+        "description": "Enable CES HTTP dashboard",
+        "default": false
+      },
+      "auto_save_interval": {
+        "type": "number",
+        "description": "Checkpoint every N messages",
+        "default": 10
+      },
+      "three_factor_enabled": {
+        "type": "boolean",
+        "description": "Enable three-factor learning (STDP + eligibility traces + neuromodulatory reward)",
+        "default": true
+      },
+      "surprise_reward_scaling": {
+        "type": "number",
+        "description": "Scaling factor for surprise-driven reward injection",
+        "default": 0.5
+      }
+    }
+  },
+
+  "python": {
+    "entry": "openclaw_hook.py",
+    "class": "NeuroGraphMemory",
+    "factory": "get_instance",
+    "rpc_methods": {
+      "bootstrap": "__init__ + restore sequence",
+      "ingest": "on_message(text, source_type)",
+      "assemble": "_harvest_associations(text) + recall(query) + surfacing_monitor.get_surfaced()",
+      "compact": "graph.step() consolidation pass (does not own message compaction)",
+      "afterTurn": "graph.step() + inject_reward() + save()",
+      "stats": "stats()",
+      "recall": "recall(query, k, threshold)",
+      "associate": "associate(text, k, steps)",
+      "ingest_file": "ingest_file(path, source_type)",
+      "dispose": "save() + ces_monitor.stop()"
+    },
+    "note": "The 'python' section is non-standard — it documents the RPC mapping for the TypeScript bridge implementor. OpenClaw does not read this section."
+  }
+}
