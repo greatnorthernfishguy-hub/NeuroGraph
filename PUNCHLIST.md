@@ -1,5 +1,5 @@
 # E-T Ecosystem PUNCH LIST — Master Record
-**Last updated:** 2026-03-14 by Claude Code
+**Last updated:** 2026-03-15 by Claude Code
 **Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis
 **Repo:** NeuroGraph (canonical substrate)
 
@@ -166,6 +166,8 @@
 | 55 | Desktop launcher broken path | `neurograph.desktop` `Exec` points to `~/.openclaw/skills/neurograph/neurograph_gui.py` which doesn't exist. File lives at `~/NeuroGraph/neurograph_gui.py`. Three copies (Desktop, `~/.local/share/applications/`, repo) all have the same stale path. Likely never worked — path predates the canonicalization (#2). | OPEN |
 | 56 | Stale path / broken dependency audit | Systematic audit for other forgotten references to old paths (`~/.openclaw/skills/neurograph/`, pre-canonicalization locations, etc.) across `.desktop` files, scripts, configs, and service files. | OPEN |
 | 59 | Rewrite test_ng_ecosystem.py | Entire test file is dead code written against old multi-module NGEcosystem API. 32 tests reference methods that no longer exist (`register_module`, `connect_peers`, `save_all`, `load_all`, `connect_saas`). Needs full rewrite against current single-module coordinator API. | OPEN |
+| 60 | Remove OpenClaw CLI token wrapper after upgrade | `~/.local/bin/openclaw` wrapper removed. Fresh OpenClaw install (2026-03-15) resolved device auth. Root cause: stale `OPENCLAW_GATEWAY_TOKEN="lobster-secret-123"` in `.bashrc` overriding real token. Fixed. `gateway install` still doesn't write `OPENCLAW_GATEWAY_TOKEN` to systemd service (v2026.3.13 bug) — added manually. | **DONE** (2026-03-15) |
+| 61 | ContextEngine migration Phase 1 | TS plugin shell + JSON-RPC bridge to Python `NeuroGraphMemory` singleton. Wire bootstrap/ingest/assemble/afterTurn/dispose. assemble = relevance-threshold-gated (Elmer-tunable, not token-capped). ingest = real-time single-message (batching as SYMPATHETIC fallback). afterTurn = simultaneous with response via ng_tract. Session ID passthrough for multi-channel attribution. **BLOCKED on #53 (ng_tract).** Full proposal: `~/Desktop/contextengine_migration_proposal.md`. | BLOCKED |
 
 ---
 
