@@ -763,13 +763,21 @@ class NeuroGraphMemory:
             return {"status": "error", "reason": f"File not found: {p}"}
 
         # Guard against very large files (Grok review optimization)
-        max_file_bytes = 50 * 1024 * 1024  # 50 MB
+        # ZIP/media archives can be large but extract to smaller individual
+        # files, so apply a higher limit for archives.
+        ext = p.suffix.lower()
+        archive_exts = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".7z", ".rar"}
+        max_file_bytes = (
+            500 * 1024 * 1024 if ext in archive_exts  # 500 MB for archives
+            else 50 * 1024 * 1024                       # 50 MB for single files
+        )
         try:
             file_size = p.stat().st_size
             if file_size > max_file_bytes:
+                limit_mb = max_file_bytes // (1024 * 1024)
                 logger.warning(
-                    "Skipping %s — file size %d bytes exceeds 50 MB limit",
-                    p, file_size,
+                    "Skipping %s — file size %d bytes exceeds %d MB limit",
+                    p, file_size, limit_mb,
                 )
                 return {
                     "status": "skipped",

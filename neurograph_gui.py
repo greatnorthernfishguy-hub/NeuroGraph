@@ -79,10 +79,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "status_refresh_seconds": 5,
 }
 
-SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf", ".zip"}
 SUPPORTED_EXTENSIONS = {
-    ".py", ".js", ".ts", ".md", ".txt", ".html", ".htm", ".pdf",
+    # Code / text
+    ".py", ".js", ".ts", ".md", ".txt", ".html", ".htm",
     ".json", ".csv",
+    # Documents / archives
+    ".pdf", ".zip", ".docx",
+    # Images
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg",
+    ".tiff", ".tif", ".heic", ".heif", ".ico",
     # Media (video)
     ".mp4", ".avi", ".mkv", ".mov", ".webm", ".wmv", ".flv", ".m4v",
     ".mpg", ".mpeg", ".3gp", ".ogv",

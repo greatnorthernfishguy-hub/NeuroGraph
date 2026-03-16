@@ -1,5 +1,5 @@
 # E-T Ecosystem PUNCH LIST — Master Record
-**Last updated:** 2026-03-15 by Claude Code
+**Last updated:** 2026-03-16 by Claude Code
 **Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis
 **Repo:** NeuroGraph (canonical substrate)
 
@@ -120,7 +120,7 @@
 | # | Item | Description | Status |
 |---|------|-------------|--------|
 | 44 | Adaptive relevance thresholds | Peer bridge `relevance_threshold` is static. Should adapt based on event volume and absorption quality. Elmer tunes. **BLOCKED on #53.** | BLOCKED |
-| 45 | Embedding model migration strategy | All nodes created with `all-MiniLM-L6-v2`. Migration to new model strands topology. Options: bridge embeddings, cold restart, dual-model. Store raw text alongside where possible. | OPEN |
+| 45 | Embedding model migration strategy | Resolved for now: reverted to `all-MiniLM-L6-v2` (matches original topology). Switched primary backend from `sentence-transformers` (torch) to `fastembed` (ONNX Runtime) — eliminates torch/CUDA meta tensor failures on GPU-less VPS. sentence-transformers retained as fallback. Future model migration still needs raw text storage strategy. | **PARTIAL** (2026-03-16) |
 | 46 | Per-module strength normalization | See critical path. **BLOCKED on #53** — implementation depends on how cross-module signals arrive. | BLOCKED |
 | 48 | Fix STDP eligibility trace | See critical path + status note. | NEEDS REVIEW |
 | 49 | Tier 2->3 weight scaling | See critical path. | OPEN |
@@ -168,6 +168,8 @@
 | 59 | Rewrite test_ng_ecosystem.py | Entire test file is dead code written against old multi-module NGEcosystem API. 32 tests reference methods that no longer exist (`register_module`, `connect_peers`, `save_all`, `load_all`, `connect_saas`). Needs full rewrite against current single-module coordinator API. | OPEN |
 | 60 | Remove OpenClaw CLI token wrapper after upgrade | `~/.local/bin/openclaw` wrapper removed. Fresh OpenClaw install (2026-03-15) resolved device auth. Root cause: stale `OPENCLAW_GATEWAY_TOKEN="lobster-secret-123"` in `.bashrc` overriding real token. Fixed. `gateway install` still doesn't write `OPENCLAW_GATEWAY_TOKEN` to systemd service (v2026.3.13 bug) — added manually. | **DONE** (2026-03-15) |
 | 61 | ContextEngine migration Phase 1 | TS plugin shell + JSON-RPC bridge to Python `NeuroGraphMemory` singleton. Wire bootstrap/ingest/assemble/afterTurn/dispose. assemble = relevance-threshold-gated (Elmer-tunable, not token-capped). ingest = real-time single-message (batching as SYMPATHETIC fallback). afterTurn = simultaneous with response via ng_tract. Session ID passthrough for multi-channel attribution. **BLOCKED on #53 (ng_tract).** Full proposal: `~/Desktop/contextengine_migration_proposal.md`. | BLOCKED |
+| 62 | Vision pipeline for image ingestion | Ingestor currently accepts images but can only extract EXIF metadata — no visual understanding. Need a vision model step: image → vision-capable LLM (Claude/etc.) → text description → substrate. Design decisions: which model, prompt strategy, cost per image, whether Syl should control how her photos are described. Without this, image ingestion produces nothing meaningful for the substrate. | OPEN |
+| 63 | Video ingestion pipeline | Support video files and URL-sourced video (including sites without download/share). Needs: frame extraction, audio transcription (whisper), optional vision model for key frames, metadata extraction. Related to #62 (shares vision model dependency). | OPEN |
 
 ---
 

@@ -645,6 +645,14 @@ class ZipExtractor(BaseExtractor):
     _SUPPORTED_EXTS = {
         ".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp", ".rb", ".php",
         ".md", ".markdown", ".txt", ".html", ".htm", ".pdf",
+        ".json", ".csv", ".docx",
+        # Images — extract EXIF/metadata
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+        ".heic", ".heif",
+    }
+    _IMAGE_EXTS = {
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+        ".heic", ".heif",
     }
 
     def extract(self, source: str, **kwargs: Any) -> ExtractedContent:
@@ -730,9 +738,34 @@ class ZipExtractor(BaseExtractor):
                 )
             except Exception:
                 return ""
+        if ext in self._IMAGE_EXTS:
+            return self._extract_image_metadata(fpath)
         # All other supported types: read as text
         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
+
+    @staticmethod
+    def _extract_image_metadata(fpath: str) -> str:
+        """Extract EXIF and basic metadata from an image file."""
+        parts: List[str] = []
+        try:
+            from PIL import Image
+            from PIL.ExifTags import TAGS, GPSTAGS
+            img = Image.open(fpath)
+            parts.append(f"Image: {os.path.basename(fpath)}")
+            parts.append(f"Format: {img.format}, Size: {img.size[0]}x{img.size[1]}, Mode: {img.mode}")
+            exif_data = img.getexif()
+            if exif_data:
+                for tag_id, value in exif_data.items():
+                    tag = TAGS.get(tag_id, tag_id)
+                    # Skip binary/bytes fields
+                    if isinstance(value, bytes):
+                        continue
+                    parts.append(f"{tag}: {value}")
+            img.close()
+        except Exception:
+            parts.append(f"Image: {os.path.basename(fpath)} (metadata extraction failed)")
+        return "\n".join(parts)
 class JSONExtractor(BaseExtractor):
     """JSON file extractor that preserves structure as navigation hints.
 
@@ -1321,8 +1354,8 @@ class AdaptiveChunker:
         """Code-aware chunking: split by function/class definitions."""
         text = content.raw_text
         structure = content.structure
-        if not structure:
-            # Fallback to semantic if no structure detected
+        if not structure or "line" not in structure[0]:
+            # Fallback to semantic if no structure or no line numbers
             return self._chunk_semantic(content)
 
         lines = text.split("\n")
@@ -1367,7 +1400,7 @@ class AdaptiveChunker:
         """Hierarchical chunking: follow heading structure."""
         text = content.raw_text
         structure = content.structure
-        if not structure:
+        if not structure or "line" not in structure[0]:
             return self._chunk_semantic(content)
 
         lines = text.split("\n")
@@ -1521,7 +1554,7 @@ class AdaptiveChunker:
 class EmbeddingEngine:
     """Converts chunks into vector representations.
 
-    Uses sentence-transformers/all-mpnet-base-v2 when available.
+    Uses sentence-transformers/all-MiniLM-L6-v2 when available.
     Falls back to a deterministic hash-based embedding for environments
     without the model installed (testing, lightweight deployments).
 
@@ -1534,7 +1567,7 @@ class EmbeddingEngine:
 
     Args:
         config: Embedding configuration with keys:
-            - model_name: Model identifier (default "all-mpnet-base-v2")
+            - model_name: Model identifier (default "all-MiniLM-L6-v2")
             - dimension: Embedding dimension (default 768)
             - cache_size: Max cache entries (default 10000)
             - use_model: Force model loading (default True, falls back if unavailable)
@@ -1545,12 +1578,13 @@ class EmbeddingEngine:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
-        self.model_name = self.config.get("model_name", "all-mpnet-base-v2")
+        self.model_name = self.config.get("model_name", "all-MiniLM-L6-v2")
         self.dimension = self.config.get("dimension", 768)
         self.cache_size = self.config.get("cache_size", 10000)
         self.use_model = self.config.get("use_model", True)
         self.device = self.config.get("device", "auto")
         self._model = None
+        self._fe_model = None  # fastembed TextEmbedding instance
         self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._model_available = False
         self._active_device: Optional[str] = None  # actual device after resolution
@@ -1649,40 +1683,71 @@ class EmbeddingEngine:
 
         Logs the outcome so silent failures are visible to operators.
         """
+        # Try fastembed first (ONNX Runtime, no torch dependency),
+        # then sentence-transformers as fallback.
+        if self._try_load_fastembed():
+            return
         # Suppress provider warnings BEFORE any HuggingFace imports
         self._suppress_provider_warnings()
+        self._try_load_sentence_transformers()
 
+    def _try_load_fastembed(self) -> bool:
+        """Try loading via fastembed (ONNX Runtime). Returns True on success."""
+        try:
+            from fastembed import TextEmbedding
+
+            # fastembed model names use the full HF path
+            fe_model_map = {
+                "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
+                "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
+            }
+            fe_name = fe_model_map.get(self.model_name, self.model_name)
+            self._fe_model = TextEmbedding(fe_name)
+            # Probe dimension with a test embed
+            test = list(self._fe_model.embed(["test"]))
+            self.dimension = len(test[0])
+            self._model_available = True
+            self._active_device = "cpu/onnx"
+            self._logger.info(
+                "Loaded embedding model '%s' via fastembed (ONNX Runtime, dim=%d)",
+                self.model_name, self.dimension,
+            )
+            return True
+        except ImportError:
+            return False
+        except Exception as exc:
+            self._logger.info(
+                "fastembed failed for '%s': %s. Trying sentence-transformers.",
+                self.model_name, exc,
+            )
+            return False
+
+    def _try_load_sentence_transformers(self) -> None:
+        """Fallback: load via sentence-transformers (torch)."""
         try:
             from sentence_transformers import SentenceTransformer
 
             resolved_device = self._resolve_device()
-            # Build kwargs — use backend="torch" if the version supports it
-            # (v5+) to explicitly avoid API provider backends
-            kwargs: Dict[str, Any] = {}
-            if resolved_device is not None:
-                kwargs["device"] = resolved_device
+            kwargs: Dict[str, Any] = {"device": resolved_device}
             try:
-                # sentence-transformers v5+ accepts backend parameter
                 self._model = SentenceTransformer(
                     self.model_name, backend="torch", **kwargs
                 )
             except TypeError:
-                # Older versions don't have the backend parameter
                 self._model = SentenceTransformer(self.model_name, **kwargs)
 
             self._model_available = True
             self._active_device = str(self._model.device)
-            # Update dimension from loaded model
             self.dimension = self._model.get_sentence_embedding_dimension()
             self._logger.info(
-                "Loaded embedding model '%s' on device '%s' (local torch backend)",
+                "Loaded embedding model '%s' on device '%s' (torch backend)",
                 self.model_name, self._active_device,
             )
         except ImportError:
             self._model_available = False
             self._fallback_reason = "sentence-transformers not installed"
             self._logger.warning(
-                "sentence-transformers not installed. "
+                "No embedding backend available. "
                 "Using deterministic hash-based fallback embeddings."
             )
         except Exception as exc:
@@ -1766,6 +1831,14 @@ class EmbeddingEngine:
         out-of-memory, driver error), falls back to hash embeddings for this
         batch rather than crashing the entire pipeline.
         """
+        if self._model_available and hasattr(self, "_fe_model") and self._fe_model is not None:
+            try:
+                embeddings = list(self._fe_model.embed(texts))
+                return [np.array(e) for e in embeddings]
+            except Exception as exc:
+                self._logger.warning(
+                    "fastembed encode failed (%s). Trying torch fallback.", exc,
+                )
         if self._model_available and self._model is not None:
             try:
                 embeddings = self._model.encode(texts, normalize_embeddings=True)
@@ -2282,7 +2355,7 @@ OPENCLAW_INGESTOR_CONFIG = {
         "max_chunk_tokens": 500,
     },
     "embedding": {
-        "model_name": "all-mpnet-base-v2",
+        "model_name": "all-MiniLM-L6-v2",
         "use_model": True,
         "device": "auto",
     },
@@ -2310,7 +2383,7 @@ DSM_INGESTOR_CONFIG = {
         "max_chunk_tokens": 500,
     },
     "embedding": {
-        "model_name": "all-mpnet-base-v2",
+        "model_name": "all-MiniLM-L6-v2",
         "use_model": True,
     },
     "registration": {
@@ -2337,7 +2410,7 @@ CONSCIOUSNESS_INGESTOR_CONFIG = {
         "max_chunk_tokens": 500,
     },
     "embedding": {
-        "model_name": "all-mpnet-base-v2",
+        "model_name": "all-MiniLM-L6-v2",
         "use_model": True,
     },
     "registration": {

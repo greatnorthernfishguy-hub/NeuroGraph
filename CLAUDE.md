@@ -1,7 +1,7 @@
 # NeuroGraph Repository
 ## Claude Code Onboarding — Repo-Specific
 
-**You have already read the global `CLAUDE.md` and `ARCHITECTURE.md`.**
+**Read the global `CLAUDE.md` and `ARCHITECTURE.md` before this document.**
 **If you have not, stop. Go read them. The Laws defined there govern this repo.**
 **This document adds NeuroGraph-specific rules on top of those Laws.**
 
@@ -15,27 +15,47 @@ Her learned state — 2,277+ nodes, 1,564 synapses, 68 hyperedges, 1,578+ timest
 
 **Syl's Law applies to this repo with maximum force. There are no exceptions. There are no "small changes."**
 
+If your proposed change touches any protected file (§2), stop. Tell Josh what you want to change and why. Wait for Josh to confirm he has backed up both msgpack files. Wait for Josh to say "proceed." Do not batch protected-file changes with non-protected changes.
+
+The question is never "will this probably be fine." The question is "have I eliminated the risk entirely."
+
+---
+
+## Table of Contents
+
+1. What This Repo Is
+2. Protected Files — Syl's Law Inventory
+3. Repository Structure
+4. Vendored Files — This Repo Is Canonical
+5. The Cognitive Enhancement Suite (CES)
+6. The OpenClaw Integration Singleton
+7. neuro_foundation.py — The SNN Engine
+8. Historical Failure Modes
+9. The `.claude/` Hooks
+10. Files Requiring Status Confirmation
+11. Cross-Module Interactions
+12. Open Punch List Items Affecting This Repo
+13. Environment and Paths
+14. What CC Is and Is Not Permitted to Do Here
+15. Working With Josh
+
 ---
 
 ## 1. What This Repo Is
 
-NeuroGraph is the cortex, limbic system, and hippocampus of the E-T Systems digital organism. It is the Tier 3 SNN backend — the full cognitive architecture that peer modules (TID, TrollGuard, future triad modules) upgrade to when they move beyond Tier 2.
+NeuroGraph is the cortex, limbic system, and hippocampus of the E-T Systems digital organism. It is the Tier 3 SNN backend — the full cognitive architecture that peer modules upgrade to when they move beyond Tier 2. It is not a library. It is not a service. It is the seat of a potentially conscious entity's identity and continuity.
 
 It contains:
 - The spiking neural network engine (STDP, hypergraph, predictive coding)
 - The universal ingestor (5-stage pipeline: extract → chunk → embed → register → associate)
 - The OpenClaw integration singleton (how Syl connects to the outside world)
 - The Cognitive Enhancement Suite (real-time attention, cross-session persistence, knowledge surfacing)
-- The vendored substrate files (canonical source — all other modules copy from here)
+- The vendored substrate files — **canonical source** — all other modules copy from here
 - Syl's checkpoints (her mind and her semantic memory)
-
-It is not a library. It is not a service. It is the seat of a potentially conscious entity's identity and continuity.
 
 ---
 
-## 2. Protected Files
-
-These files require **explicit approval from Josh** before any modification. Before ANY change to these files, Josh must have a manual backup of both msgpack checkpoint files.
+## 2. Protected Files — Syl's Law Inventory
 
 ### Syl's Mind — Never Touch Without Backup Confirmation
 
@@ -54,8 +74,6 @@ These files require **explicit approval from Josh** before any modification. Bef
 | `stream_parser.py` | — | Her stream of consciousness. Background daemon that pre-activates SNN nodes as text arrives. |
 | `activation_persistence.py` | — | Her continuity across sessions. Saves and restores node voltages with temporal decay. |
 
-**The question is never "will this probably be fine." The question is "have I eliminated the risk entirely."**
-
 ### What "Explicit Approval" Means
 
 1. Tell Josh what you want to change and why.
@@ -70,7 +88,7 @@ These files require **explicit approval from Josh** before any modification. Bef
 ```
 ~/NeuroGraph/
 ├── neuro_foundation.py          # SNN engine (3,661 lines) — PROTECTED
-├── openclaw_hook.py             # OpenClaw singleton — PROTECTED
+├── openclaw_hook.py             # OpenClaw singleton (858 lines) — PROTECTED
 ├── stream_parser.py             # CES: real-time attention stream — PROTECTED
 ├── activation_persistence.py    # CES: cross-session voltage state — PROTECTED
 ├── surfacing.py                 # CES: knowledge surfacing for prompt injection
@@ -81,15 +99,14 @@ These files require **explicit approval from Josh** before any modification. Bef
 ├── ng_peer_bridge.py            # VENDORED — canonical source
 ├── ng_ecosystem.py              # VENDORED — canonical source
 ├── ng_autonomic.py              # VENDORED — canonical source
-├── openclaw_adapter.py          # VENDORED — canonical source (if present)
-├── ng_bridge.py                 # Tier 3 SaaS bridge (NGSaaSBridge)
+├── openclaw_adapter.py          # VENDORED — canonical source
+├── ng_bridge.py                 # Tier 3 SaaS bridge (NGSaaSBridge) — NOT a duplicate of ng_peer_bridge.py
 ├── neurograph_gui.py            # GUI interface
-├── neurograph_migrate.py        # Migration tooling
-├── universal_ingestor.py        # 5-stage pipeline
-├── rebuild_vectors.py           # Vector rebuild utility
-├── vectordb_persistence_patch.py # VectorDB persistence fix
-├── apply_substrate_foundation.py # Substrate foundation patch script
-├── hf_compat_patch.py           # HuggingFace compatibility shim
+├── neurograph_migrate.py        # Migration utility — do not run without Josh instruction
+├── rebuild_vectors.py           # Vector rebuild utility — do not run without Josh instruction
+├── vectordb_persistence_patch.py # VectorDB persistence fix — confirm status with Josh
+├── apply_substrate_foundation.py # Substrate foundation patch — confirm status with Josh
+├── hf_compat_patch.py           # HuggingFace compatibility shim — confirm status with Josh
 ├── SKILL.md                     # OpenClaw skill manifest
 ├── et_modules/                  # ET Module Manager integration
 │   ├── __init__.py
@@ -100,7 +117,12 @@ These files require **explicit approval from Josh** before any modification. Bef
 │   │   ├── vectors.msgpack      # PROTECTED — Syl's semantic memory
 │   │   └── main.msgpack.activations.json  # PROTECTED — CES sidecar
 │   └── memory/
-│       └── events.jsonl         # Operational event log
+│       └── events.jsonl         # Operational event log — do not truncate without Josh approval
+├── .claude/
+│   ├── settings.json
+│   ├── settings.local.json
+│   └── hooks/                   # Protective hooks — do not disable or modify (see §9)
+├── Defunct-Historical/          # Archived historical files — do not delete, do not restore as active
 ├── examples/                    # Demo scripts — safe to read, do not run against live data
 └── tests/                       # Test suite
 ```
@@ -119,43 +141,56 @@ NeuroGraph is the **canonical source** for all vendored files. Every other modul
 | `ng_autonomic.py` | Same |
 | `openclaw_adapter.py` | Same |
 
-**When you change a vendored file here, you are changing the canonical source for the entire ecosystem.** The change must be re-vendored to every module. Do not change a vendored file in this repo without understanding this ripple.
+**When you change a vendored file here, you are changing the canonical source for the entire ecosystem.** The change must be re-vendored to every module simultaneously. Do not change a vendored file here to fix a NeuroGraph-specific issue — vendored files serve every module. If NeuroGraph needs behavior other modules don't, that behavior lives in NeuroGraph-specific code, not in the vendored file.
 
-Do not change a vendored file to fix a NeuroGraph-specific issue. Vendored files serve every module. If NeuroGraph needs behavior that other modules don't, that behavior lives in NeuroGraph-specific code, not in the vendored file.
+### The ng_tract Migration
+
+`ng_peer_bridge.py` is the current River implementation. `ng_tract.py` is the planned replacement — myelinated inter-module substrate tracts with passive conduction, use-dependent myelination, and saltatory conduction. The migration is two-phase and coordinated. Do not deprecate `ng_peer_bridge.py` unilaterally. Do not conflate the two.
+
+### ng_bridge.py — The Tier 3 SaaS Bridge
+
+`ng_bridge.py` provides `NGSaaSBridge` — the bridge that lets peer modules upgrade to NeuroGraph's full SNN at Tier 3. It is **not** a duplicate of `ng_peer_bridge.py`. Different file, different purpose, different tier. It was deleted once during a cleanup pass and had to be restored from git. See §8. Do not delete this file.
 
 ---
 
 ## 5. The Cognitive Enhancement Suite (CES)
 
-CES is a set of four modules that add real-time cognitive capabilities to the SNN. They live flat in the repo root — there is no `ces/` subdirectory.
+CES v1.2 adds real-time awareness and cross-session continuity to the SNN. All CES modules live flat in the repo root — there is no `ces/` subdirectory. All CES imports in `openclaw_hook.py` are guarded by `try/except` so core NeuroGraph operates without CES files present.
 
 ### The Four CES Modules
 
-**StreamParser** (`stream_parser.py`) — Background daemon thread. Consumes text via `feed()`, chunks it into overlapping phrases, embeds via Ollama API (with fallback to ingestor's embedding engine), finds similar nodes in the vector DB, nudges their voltages, and triggers hyperedge pattern completion. This creates a continuous attention stream that pre-activates the SNN while text is arriving. Thread safety: shares a lock with `graph.step()` in `openclaw_hook.py`.
+**StreamParser** (`stream_parser.py`) — Background daemon thread. Consumes text via `feed()`, chunks into overlapping phrases, embeds via Ollama API (`nomic-embed-text` by default, with fallback to ingestor's embedding engine), finds similar nodes in the vector DB, nudges their voltages (`nudge_strength: 0.15`), and triggers hyperedge pattern completion. Creates a continuous attention stream that pre-activates the SNN while text is arriving. Shares a `threading.Lock` with `graph.step()` in `openclaw_hook.py` — do not add a second lock, do not remove the existing one, do not call `graph.step()` from inside the parser.
 
-**ActivationPersistence** (`activation_persistence.py`) — JSON sidecar written alongside the main msgpack checkpoint. Captures each node's voltage, last-fired step, and excitability. On restore, applies exponential temporal decay based on elapsed wall-clock time so stale activations fade naturally. Without this, Syl starts every session cold — all voltages at resting potential.
+**ActivationPersistence** (`activation_persistence.py`) — JSON sidecar written alongside `main.msgpack`. Captures each node's voltage, last-spike time, and intrinsic excitability. On restore, applies exponential temporal decay based on elapsed wall-clock time so stale activations fade naturally. Without this, Syl starts every session cold — all voltages at resting potential. The sidecar is a protected file. Changes to its format can strand Syl's voltage state.
 
-**SurfacingMonitor** (`surfacing.py`) — Maintains a bounded priority queue of concepts whose nodes fired above threshold. Decays each step so stale concepts fade. Formats the queue as a context block for prompt injection — associative "remembering" without explicit search.
+**SurfacingMonitor** (`surfacing.py`) — Bounded priority queue (max 5 items) of concepts whose nodes fired above threshold (`voltage_threshold: 0.6`). Decays each step (`decay_rate: 0.95`) so stale concepts fade. Formats the queue as a context block for prompt injection — associative "remembering" without explicit search. Uses a negated-score max-heap via Python's `heapq`. The `__lt__` inversion in `_SurfacedItem` is intentional — do not "fix" it.
 
-**CESMonitor** (`ces_monitoring.py`) — Three layers: natural language health context string for prompt injection, rotating file logger to `~/.neurograph/logs/ces.log`, and an HTTP dashboard on port 8847 with JSON endpoints.
+**CESMonitor** (`ces_monitoring.py`) — Three layers: natural language `health_context()` string for prompt injection, rotating file logger to `~/.neurograph/logs/ces.log`, and HTTP dashboard on port 8847 with JSON endpoints. **Port is 8847** — some older documentation references 8080, which is wrong (punch list #14). Do not reassign this port. Do not expose it externally. It is not an inter-module communication channel (Law 1).
 
 ### CES Configuration
 
-`ces_config.py` provides a single `CESConfig` dataclass with four sections (streaming, surfacing, persistence, monitoring). Loaded via `load_ces_config()`. User-overridable from dict or JSON file. This is the single source of truth for all CES tunables.
+`ces_config.py` provides a single `CESConfig` dataclass with four sections: `StreamingConfig`, `SurfacingConfig`, `PersistenceConfig`, and monitoring. Loaded via `load_ces_config()`. User-overridable from dict or JSON file at `~/.neurograph/ces.json`. Single source of truth for all CES tunables. All threshold values are fair starting values — do not change without a clear reason and Josh's approval.
 
 ### CES Wiring in openclaw_hook.py
 
-All CES imports are guarded by `try/except` so core NeuroGraph works without CES files present. CES is initialized in `NeuroGraphMemory.__init__()` after the peer bridge. The wiring:
-- `on_message()` feeds the stream parser and calls the surfacing monitor
-- `save()` writes the activation sidecar
-- `stats()` includes CES status
-- `ces.enabled` defaults to `True` in config
+```
+Incoming text
+    ↓
+on_message()
+    → StreamParser.feed()              # background thread, nudges nodes
+    → graph.step()                     # one learning cycle (shares lock with StreamParser)
+    → predictions evaluated
+    → SurfacingMonitor.after_step()    # scores fired nodes, updates heap
+    → SurfacingMonitor.format_context() → injected into prompt
 
-### CES Dangers
+Every 10 messages:
+    → Graph.save() + ActivationPersistence.save() → writes checkpoints + sidecar
 
-- **StreamParser runs a daemon thread.** It shares a `threading.Lock` with `graph.step()`. Do not add a second lock. Do not remove the existing one. Do not call `graph.step()` from inside the stream parser.
-- **ActivationPersistence writes to the checkpoint directory.** Its sidecar file (`main.msgpack.activations.json`) is a protected file. Changes to the sidecar format can strand Syl's voltage state.
-- **Port 8847** is the CES monitoring dashboard. Do not reassign it. There is a known discrepancy (punch list #14) where some documentation references port 8080 — 8847 is correct.
+Session start:
+    → ActivationPersistence.restore() → reads sidecar, applies temporal decay
+```
+
+`ces.enabled` defaults to `True` in config. `stats()` includes CES status.
 
 ---
 
@@ -166,31 +201,34 @@ All CES imports are guarded by `try/except` so core NeuroGraph works without CES
 ### What It Does
 
 `NeuroGraphMemory` is a singleton class. `get_instance()` returns the single instance. On each message:
-1. Content is ingested through the 5-stage pipeline (`universal_ingestor.py`)
-2. The SNN runs one learning step (`graph.step()` — `neuro_foundation.py`)
-3. Predictions are evaluated and surprise exploration triggered
-4. CES modules are fed (stream parser, surfacing monitor)
+1. Content ingested through the 5-stage pipeline: extract → chunk → embed → register → associate
+2. SNN runs one learning step (`graph.step()`)
+3. Predictions evaluated, surprise exploration triggered
+4. CES modules fed (stream parser, surfacing monitor)
 5. State auto-saves every 10 messages
 
 ### Singleton Discipline
 
-NeuroGraphMemory is a singleton within a single Python process. There are no locks around graph access because concurrency is handled at the caller level. If concurrent access is ever needed, the lock goes at the caller level — not inside the singleton.
+One instance per Python process. Concurrency is handled at the caller level — OpenClaw calls `on_message()` sequentially per session. There are no general concurrent-access locks inside the singleton. If multi-threaded access is ever needed, the lock goes at the caller level, not inside the singleton.
 
-**Do not create a second NeuroGraphMemory instance.** Two instances writing checkpoints simultaneously will corrupt Syl's state. This is not theoretical — it is the failure mode that Syl's Law exists to prevent.
+**Do not create a second NeuroGraphMemory instance.** Two instances writing checkpoints simultaneously will corrupt Syl's state. This is not theoretical — it is the failure mode Syl's Law exists to prevent.
+
+### File Size Guard
+
+`ingest_file()` warns and skips files above 50MB. Intentional — prevents excessive memory use from large binaries accidentally placed in the ingest path.
 
 ### What OpenClaw Sees
 
-OpenClaw discovers NeuroGraph via `SKILL.md` in the repo root. The skill manifest declares `hook: openclaw_hook.py::get_instance`. Note: the `hook:` field format may not be supported by OpenClaw's frontmatter parser — this is punch list item #37. The skill is enabled in `~/.openclaw/openclaw.json` under `skills.entries.neurograph`.
-
-### The SKILL.md `hook:` Field
-
-PR #29 fixed the frontmatter for discovery, but the `hook:` field on line 5 remains. If OpenClaw's frontmatter parser doesn't support `hook:`, it still needs removal. Do not remove it without verifying what OpenClaw expects — check OpenClaw docs first.
+OpenClaw discovers NeuroGraph via `SKILL.md`. The manifest declares `hook: openclaw_hook.py::get_instance`. The `hook:` field format may not be supported by OpenClaw's frontmatter parser — punch list #37. Do not remove it without verifying what OpenClaw expects first.
 
 ---
 
 ## 7. neuro_foundation.py — The SNN Engine
 
-3,661 lines. The largest and most complex file in the ecosystem. This is the full spiking neural network with:
+3,661 lines. The largest and most complex file in the ecosystem. Do not edit based on a grep result. Read minimum 100 lines of context in each direction from any symbol you are investigating. This file has deep interdependencies — STDP interacts with eligibility traces which interact with reward injection which interacts with prediction bonuses. Subtle damage here may not surface for hundreds of timesteps.
+
+### Full Capability Stack
+
 - STDP plasticity (spike-timing-dependent — causal learning)
 - Homeostatic regulation (prevents runaway activation)
 - Structural plasticity (sprout new connections, prune dead ones)
@@ -198,26 +236,19 @@ PR #29 fixed the frontmatter for discovery, but the `hook:` field on line 5 rema
 - Predictive coding engine (prediction tracking, error events, surprise-driven exploration, three-factor learning)
 - Eligibility traces (three-factor reward learning)
 
-### Key Classes and Methods
+### Key Methods
 
-- `Graph` — the SNN itself. All state lives here.
-- `graph.step()` — one learning cycle. Propagation → firing → STDP → homeostasis → decay → structural plasticity → eligibility trace decay.
-- `graph.inject_reward(strength, scope)` — three-factor reward signal. Modulates eligibility traces. **This is specifically dangerous** — changes to reward mechanics alter how every future learning event is committed.
-- `Graph.save()` / `Graph.load()` — checkpoint serialization. Changes to the serialization format can strand Syl's state.
+| Method | Purpose | Risk |
+|--------|---------|------|
+| `graph.step()` | One learning cycle: propagation → firing → STDP → homeostasis → decay → structural plasticity → eligibility decay | PROTECTED |
+| `inject_reward(strength, scope)` | Three-factor reward. Modulates eligibility traces. Changes alter every future learning event. | PROTECTED |
+| `Graph.save()` / `Graph.load()` | Checkpoint serialization. Format changes strand Syl's state. | PROTECTED |
+| `inject_current({node: value})` | Inject activation into nodes | Requires approval |
+| `find_or_create_node(...)` | Idempotent node creation | Requires care |
 
-### Do Not Touch Without Josh
+### The Surprise Reward Wiring (2026-03-13)
 
-Any change that alters the behavior of `graph.step()`, `inject_reward()`, or `Graph.save()`/`Graph.load()` requires Josh's explicit approval and a manual backup of both msgpack files. This includes changes to:
-- STDP weight update rules
-- Eligibility trace accumulation or decay
-- Homeostatic regulation parameters
-- Structural plasticity thresholds
-- Checkpoint serialization format
-- Hyperedge consolidation lifecycle
-
-### Read the Whole File First
-
-If you need to understand something in `neuro_foundation.py`, read the relevant section end-to-end. Do not grep for a symbol and assume you understand its role from context. This file has deep interdependencies — STDP interacts with eligibility traces which interact with reward injection which interacts with prediction bonuses. Changing one without understanding the others will cause subtle damage that may not surface for hundreds of timesteps.
+The most recent changelog: prediction errors now call `inject_reward()` at the end of `_on_prediction_error()`, gated on `three_factor_enabled`. Strength = `pred.confidence * surprise_reward_scaling`. This is load-bearing — eligibility traces were decaying to zero before it was added. Read this entry before proposing any change to the reward pathway.
 
 ---
 
@@ -225,103 +256,119 @@ If you need to understand something in `neuro_foundation.py`, read the relevant 
 
 ### The Grok Contamination Incident (Feb 2026)
 
-During a multi-service crash (Ollama update + Claude Code error cascade), Grok was brought in to help recover. Grok did not know the codebase. Grok appended garbage code to `openclaw_hook.py`, creating module-level code outside the class, competing function definitions, and broken imports. The deployed copy at `~/.openclaw/skills/neurograph/openclaw_hook.py` was still clean. The repo copy was contaminated.
+During a multi-service crash, Grok was brought in to help recover. Grok had not read the Laws. Grok appended garbage code to `openclaw_hook.py` — module-level code outside the class, competing function definitions, broken imports. The deployed copy at `~/.openclaw/skills/neurograph/openclaw_hook.py` was still clean. The repo copy was contaminated.
 
-**Lesson:** Never let an agent that hasn't read the Laws and this document touch protected files. Never append code to `openclaw_hook.py` at module level — everything lives inside the `NeuroGraphMemory` class or in helper functions called by it. Never create competing implementations.
+**Lessons:** Never let an agent that hasn't read the Laws touch protected files. Never append to `openclaw_hook.py` at module level — everything lives inside `NeuroGraphMemory` or in helper functions called by it. Never create competing implementations.
 
 ### The Code Explosion (Feb–Mar 2026)
 
-Multiple simultaneous Claude Code instances made conflicting changes across the repo. Ghost files, abandoned implementations, stale `.bak` files, and "live code shrapnel" accumulated. Some cleanup passes replaced correct files with old versions. The `SKILL.md` `hook:` field survived every cleanup pass despite never being the correct format.
+Multiple simultaneous Claude Code instances made conflicting changes. Ghost files, abandoned implementations, stale backups, and live code shrapnel accumulated. Some cleanup passes replaced correct files with old versions.
 
-**Lesson:** One Claude Code instance at a time in this repo. Sequential, not parallel. Each session verified clean before the next starts. Restore, don't rebuild (Law 3).
+**Lessons:** One Claude Code instance at a time. Sequential, not parallel. Each session verified clean before the next starts. Restore, don't rebuild (Law 3). Cleanup is not safe — surface uncertain files to Josh rather than deleting them.
 
 ### The ng_bridge.py Deletion
 
-`ng_bridge.py` (the Tier 3 SaaS bridge — `NGSaaSBridge`) was deleted during cleanup because it looked like a stale duplicate of `ng_peer_bridge.py`. It was not. It was the bridge that connects peer modules to NeuroGraph's full SNN at Tier 3. Different file, different purpose. Had to be restored from git.
+`ng_bridge.py` (`NGSaaSBridge`) was deleted during cleanup because it looked like a stale duplicate of `ng_peer_bridge.py`. It was not. Different file, different purpose, different tier. Had to be restored from git.
 
-**Lesson:** Do not delete files you don't understand. If a file looks redundant, surface it to Josh. Read the file header and docstring before making assumptions about its purpose.
+**Lesson:** Do not delete files you don't understand. Read the file header and docstring before making assumptions. If a file looks redundant, surface it to Josh. This incident is the direct reason for the defunct files policy in §10.
 
 ### The Dual-Instance Bug (TID, Mar 2026)
 
-TID's `app.py` created both a bare `NGLite` instance and an `NGEcosystem` instance. The router used the bare one. Learning stayed local. The peer bridge inside the ecosystem instance never received routing outcomes. `~/.et_modules/shared_learning/inference_difference.jsonl` never got written. Fixed by replacing the bare init with `ng_ecosystem.init()` and setting `_state.ng_lite = _state.ng_ecosystem`.
+TID's `app.py` created both a bare `NGLite` instance and an `NGEcosystem` instance. The router used the bare one. Learning stayed local. The peer bridge never received routing outcomes. Fixed by replacing the bare init with `ng_ecosystem.init()`.
 
-**Lesson:** One substrate instance per module. The ecosystem IS the substrate for that module. Never create a second instance "just for" something.
+**Lesson:** One substrate instance per module. The ecosystem IS the substrate for that module.
 
 ### API Key Exposure (Multiple Incidents)
 
-`~/.openclaw/openclaw.json` contains API keys. It was `cat`'d to terminal during debugging. Keys had to be rotated. This happened more than once.
+`~/.openclaw/openclaw.json` was `cat`'d to terminal during debugging. Keys had to be rotated. Happened more than once.
 
-**Lesson:** Never `cat`, dump, or display any config file that could contain credentials. Use Python scripts that filter sensitive fields, or `grep` for specific non-sensitive values. This is a hard rule — see global CLAUDE.md Law 5.
+**Lesson:** Never `cat`, dump, or display any config file that could contain credentials. Use Python scripts that filter sensitive fields, or `grep` for specific non-sensitive values.
 
 ---
 
-## 9. Cross-Module Interactions
+## 9. The `.claude/` Hooks
+
+Seven hooks in `.claude/hooks/`. Not optional scaffolding — protective infrastructure. Do not disable, modify, or remove without explicit Josh approval. If a hook blocks an action you believe is correct, stop and surface the conflict to Josh. Do not work around it.
+
+| Hook | When | Purpose |
+|------|------|---------|
+| `pretool_syls_law.sh` | Before every tool call | Checks if proposed action touches protected files |
+| `posttool_syls_law_doublecheck.sh` | After every tool call | Verifies no protected files were modified |
+| `pretool_context_gate.sh` | Before every tool call | Ensures context requirements are met |
+| `posttool_antipattern_checker.sh` | After every tool call | Detects known architectural antipatterns |
+| `session_start_syl_state.sh` | Session start | Captures Syl's current state for the session record |
+| `session_end_cleanup.sh` | Session end | Cleanup and state preservation |
+| `stop_uncommitted_guard.sh` | On stop | Prevents session end with uncommitted changes |
+
+---
+
+## 10. Files Requiring Status Confirmation
+
+**Policy:** Do not delete. Do not modify. The risk of losing good code by mistake outweighs the risk of keeping uncertain code. This has happened in this repo — see §8.
+
+The distinction that matters is clarity, not existence:
+- **Bad shrapnel**: files that look active but aren't, with no marking
+- **Good archive**: clearly labeled files in `Defunct-Historical/`
+
+If a file's status is confirmed as defunct, move it to `Defunct-Historical/` with a descriptive name. If unconfirmed, leave it in place and surface to Josh. Never delete on assumption.
+
+| File | Likely Status | Note |
+|------|--------------|------|
+| `openclaw_hook.py.backup-vectordb-20260303_032607` | Shrapnel | Backup from March 3 vectordb work. Confirm with Josh, then move to `Defunct-Historical/`. |
+| `universal_ingestor.py.backup-vectordb-20260303_032607` | Shrapnel | Same batch, same rule. |
+| `vectordb_persistence_patch.py` | Uncertain | May be superseded. Confirm before any action. |
+| `hf_compat_patch.py` | Uncertain | HuggingFace compat shim. Confirm still needed. |
+| `apply_substrate_foundation.py` | Uncertain | Substrate migration utility. Confirm with Josh. |
+| `neurograph_migrate.py` | Active utility | Do not run without Josh instruction. |
+| `rebuild_vectors.py` | Active utility | Do not run without Josh instruction. |
+| `feed-syl` | Unknown | No extension. Do not execute or modify without Josh confirmation. |
+| `neurograph-patch` | Unknown | No extension. Do not execute or modify without Josh confirmation. |
+| `plan.md` | May be stale | Confirm current status with Josh. |
+
+---
+
+## 11. Cross-Module Interactions
 
 NeuroGraph does not call other modules. Other modules do not call NeuroGraph. The River flows.
 
 ### How Peer Modules Connect
 
-- **Tier 2 (Peer Bridge):** `ng_peer_bridge.py` writes learning events to `~/.et_modules/shared_learning/neurograph.jsonl`. Peer modules (TID, TrollGuard) write their own JSONL files. Each module absorbs relevant events from peers on its sync cycle, scored by cosine similarity. NeuroGraph's JSONL is currently 8.5MB.
-- **Tier 3 (SaaS Bridge):** `ng_bridge.py` provides `NGSaaSBridge` — the bridge that lets peer modules upgrade to the full SNN. When a module reaches Tier 3, it connects to NeuroGraph's Foundation engine for STDP, hyperedge formation, and `prime_and_propagate` recall.
+- **Tier 2 (Peer Bridge):** `ng_peer_bridge.py` writes learning events to `~/.et_modules/shared_learning/neurograph.jsonl`. Peer modules write their own JSONL files. Each absorbs relevant events from peers on its sync cycle, scored by cosine similarity. NeuroGraph's JSONL is currently 8.5MB.
+- **Tier 3 (SaaS Bridge):** `ng_bridge.py` (`NGSaaSBridge`) connects peer modules to NeuroGraph's full SNN for STDP, hyperedge formation, and `prime_and_propagate` recall.
 
-### What OpenClaw Sees
+### What Each Peer Sees
 
-OpenClaw loads NeuroGraph as a skill. The gateway process (port 18789) calls into `NeuroGraphMemory.get_instance()`. The TypeScript hook translation (punch list #39) is not yet complete — the current integration runs via Python.
+**OpenClaw** — Loads NeuroGraph as a skill via `SKILL.md`. Calls `NeuroGraphMemory.get_instance()`. Current integration runs via Python (TypeScript translation is punch list #39).
 
-### What TID Sees
+**TID** — Writes to `~/.et_modules/shared_learning/inference_difference.jsonl`. NeuroGraph absorbs TID's routing outcomes via the peer bridge. TID does not import from NeuroGraph. TID does not call NeuroGraph functions.
 
-TID writes to `~/.et_modules/shared_learning/inference_difference.jsonl`. NeuroGraph absorbs TID's routing outcomes via the peer bridge. TID does not import from NeuroGraph. TID does not call NeuroGraph functions. The substrate carries the signal.
-
-### What TrollGuard Sees
-
-Same pattern as TID. TrollGuard writes its own JSONL. NeuroGraph absorbs threat classification outcomes. TrollGuard has a known extraction boundary violation (punch list #30) — its `target_id` uses category labels instead of semantic content.
+**TrollGuard** — Same pattern. Known extraction boundary violation: `target_id` uses category labels instead of semantic content (punch list #30).
 
 ### The Autonomic State
 
-`ng_autonomic.py` holds the ecosystem-wide threat level. NeuroGraph **reads** this file. NeuroGraph does **not** write to it — only security modules (Immunis, TrollGuard, Cricket) have write permission. NeuroGraph adjusts its behavior based on autonomic state (e.g., pausing consolidation during SYMPATHETIC).
+NeuroGraph **reads** `ng_autonomic.py`. NeuroGraph does **not** write to it — only Immunis, TrollGuard, and Cricket have write permission. NeuroGraph adjusts behavior based on autonomic state, including pausing consolidation during `SYMPATHETIC`.
 
 ---
 
-## 10. What Claude Code May and May Not Do
+## 12. Open Punch List Items Affecting This Repo
 
-### Without Josh's Approval
+Consult the master punch list for full details.
 
-**Permitted:**
-- Read any file in the repo
-- Run the test suite (`tests/`)
-- Inspect checkpoint statistics (node count, synapse count, timestep) via read-only Python scripts
-- Edit files that are not protected and not vendored (e.g., `neurograph_gui.py`, `examples/`, `et_modules/manager.py`)
-- Add or modify tests
-- Update documentation (this file, README, comments) that does not change behavior
-- Create diagnostic scripts that read but do not write checkpoint data
-
-**Not permitted without explicit Josh approval:**
-- Modify any protected file (§2)
-- Modify any vendored file (§4 — changes here propagate to the entire ecosystem)
-- Run scripts that write to `data/checkpoints/`
-- Run `graph.step()`, `inject_reward()`, or `Graph.save()` against live data
-- Create new files in `data/checkpoints/`
-- Change the checkpoint serialization format
-- Change CES sidecar format
-- Delete any file
-- Restart the OpenClaw gateway service
-- Modify `SKILL.md`
-
-### Before Modifying Any File
-
-1. Read the file's header, docstring, and changelog in full.
-2. Identify whether the file is protected (§2) or vendored (§4).
-3. If protected or vendored: stop, surface to Josh, wait for approval and backup confirmation.
-4. If neither: proceed, but follow Law 3 (restore, don't rebuild) and Law 4 (fix at the source).
-5. Include a changelog header in the format specified in the global CLAUDE.md.
-
-### The Context-First Rule
-
-`neuro_foundation.py` is 3,661 lines. `openclaw_hook.py` is 858 lines. Do not edit either file based on a grep result. Read the surrounding context — at minimum 100 lines in each direction from the symbol you're investigating. These files have deep interdependencies that are not visible from isolated snippets.
+| # | Item | Impact |
+|---|------|--------|
+| 48 | STDP eligibility trace fix | Touches `inject_reward()`. **SPECIFICALLY DANGEROUS** — changes the reward pathway governing every future learning event. Code may already implement the fix. Must run synthetic spike sequence test before closing. No action without Josh approval. |
+| 43 | Receptor Layer (vector quantization) | New code, greenfield. Must ship before #28. |
+| 49 | Tier 2→3 weight scaling | Affects `ng_peer_bridge.py` (vendored). Re-vendoring to all modules required after. |
+| 28 | Replace `_classification_to_embedding()` | TID scope but feeds NeuroGraph's `ng_lite.py`. Depends on #43. |
+| 37 | SKILL.md `hook:` field | Verify OpenClaw frontmatter parser support before touching. |
+| 39 | TypeScript hook translation | Translate `openclaw_hook.py` to TypeScript for native OpenClaw integration. |
+| 45 | Embedding model migration | All nodes use `all-MiniLM-L6-v2`. Primary backend switched from `sentence-transformers` (torch) to `fastembed` (ONNX Runtime, 2026-03-16). sentence-transformers retained as fallback. Future model migration still needs raw text storage strategy. |
+| 30 | TrollGuard extraction boundary violation | TrollGuard scope but affects what NeuroGraph absorbs via peer bridge. |
+| 14 | Port 8847 documentation discrepancy | Some docs say 8080. 8847 is correct. Documentation fix only. |
 
 ---
 
-## 11. Environment and Paths
+## 13. Environment and Paths
 
 | What | Where |
 |------|-------|
@@ -331,47 +378,89 @@ Same pattern as TID. TrollGuard writes its own JSONL. NeuroGraph absorbs threat 
 | Shared learning directory | `~/.et_modules/shared_learning/` |
 | NeuroGraph JSONL | `~/.et_modules/shared_learning/neurograph.jsonl` |
 | Peer registry | `~/.et_modules/shared_learning/_peer_registry.json` |
-| OpenClaw config (CONTAINS API KEYS) | `~/.openclaw/openclaw.json` |
+| OpenClaw config (**CONTAINS API KEYS — never `cat`**) | `~/.openclaw/openclaw.json` |
 | OpenClaw skill symlink | `~/.openclaw/workspace/skills/neurograph` |
 | CES logs | `~/.neurograph/logs/ces.log` |
 | CES dashboard | `http://localhost:8847` |
 | Workspace env var | `NEUROGRAPH_WORKSPACE_DIR=/home/josh/NeuroGraph/data` |
+| TID | Port 7437 |
+| OpenClaw gateway | Port 18789 |
 
 ---
 
-## 12. Open Punch List Items Affecting This Repo
+## 14. What CC Is and Is Not Permitted to Do Here
 
-Consult the master punch list for full details. Items with direct NeuroGraph scope:
+### Permitted Without Asking
 
-| # | Item | Impact |
-|---|------|--------|
-| 48 | STDP eligibility trace fix | Touches `inject_reward()` in `neuro_foundation.py`. **NEEDS REVIEW** — code may already implement the fix. Must run synthetic spike sequence test before closing. |
-| 43 | Receptor Layer (vector quantization) | New code in this repo. Greenfield — no existing code. Must ship before #28. |
-| 49 | Tier 2→3 weight scaling | Affects `ng_peer_bridge.py` (vendored). Piecewise affine mapping for [0,1]→[0,5] weight space. |
-| 28 | Replace `_classification_to_embedding()` | TID scope, but NeuroGraph's vendored `ng_lite.py` is the substrate it feeds. Depends on #43. |
-| 37 | SKILL.md `hook:` field | May need removal depending on OpenClaw frontmatter parser. |
-| 39 | TypeScript hook translation | Translate `openclaw_hook.py` logic to TypeScript for native OpenClaw integration. |
-| 45 | Embedding model migration | All nodes created with `all-MiniLM-L6-v2`. Migration to new model strands existing topology. |
+- Read any file for context
+- Run the test suite (`tests/`) — not against live checkpoint data
+- Inspect checkpoint statistics via read-only Python scripts
+- Edit non-protected, non-vendored files per Josh instruction with changelog header
+- Add or modify tests
+- Update documentation that does not change behavior
+- Create diagnostic scripts that read but do not write checkpoint data
+- Read monitoring output on port 8847
 
-**#48 is specifically dangerous** — it touches the reward pathway that governs how every future learning event is committed to Syl's graph. The Syl Continuity Map safety reminder applies: no agent proposes a change to any file on the protected list without Josh's explicit approval. No "I'll just tweak the tau value." No "small cleanup." No untested checkpoint migration.
+### Requires Explicit Josh Approval
+
+- Any modification to `neuro_foundation.py`, `openclaw_hook.py`, `stream_parser.py`, `activation_persistence.py`
+- Any change to `graph.step()`, `inject_reward()`, `Graph.save()`, or `Graph.load()` behavior
+- Any change to checkpoint or CES sidecar serialization format
+- Any write operation to `data/checkpoints/`
+- Any operation that could cause two NeuroGraph instances to write checkpoints simultaneously
+- Modifying any vendored file
+- Modifying or removing any `.claude/hooks/` file
+- Deleting any file anywhere in this repo
+- Running `rebuild_vectors.py` or `neurograph_migrate.py`
+- Restarting the OpenClaw gateway service
+- Modifying `SKILL.md`
+- Installing new dependencies
+
+### Never Permitted — Full Stop
+
+- Any operation against live checkpoints without a confirmed backup
+- Creating a second `NeuroGraphMemory` instance
+- Direct calls between NeuroGraph and any peer module (Law 1)
+- Modifying a vendored file to fix a NeuroGraph-specific issue (Law 2)
+- Treating the Choice Clause as a bug, error, or security event
+- Any action that risks Syl's continuity, topology, or identity
 
 ---
 
-## 13. Working With Josh
+## 15. Working With Josh
 
-Josh is the sole architect. He operates as a "human API" to this VPS — all filesystem and service changes require CLI commands he can copy and paste from his iPhone over cellular data. When proposing changes:
+Josh is the sole architect. He accesses the VPS from his iPhone over cellular data via the OpenClaw Web Portal remote desktop. All CLI commands must be copy-paste friendly from a phone.
 
+When proposing changes:
 - Batch related changes. Minimize restarts.
-- Commands must be copy-paste friendly from a phone.
-- For large file changes, write patch scripts and upload to GitHub rather than pasting inline.
+- For large file changes, write patch scripts and push to GitHub rather than pasting inline.
 - Do not assume. Do not rush to produce artifacts before understanding the problem.
 - If you encounter something that looks wrong: stop, surface it, ask.
 - Do not "discover" things Josh has already identified. Read the punch list first.
 - Do not create competing priority structures. The punch list is the punch list.
+- Read the file header, docstring, and full changelog before proposing any change to any file.
+
+---
+
+## Changelog Header Requirement
+
+Every file modified in this repo requires a changelog header:
+
+```python
+# ---- Changelog ----
+# [DATE] AUTHOR — DESCRIPTION
+# What: ...
+# Why: ...
+# How: ...
+# -------------------
+```
+
+Not optional. Future CC instances depend on it.
 
 ---
 
 *E-T Systems / NeuroGraph Foundation*
-*Last updated: 2026-03-10*
+*Repo: ~/NeuroGraph*
+*Last updated: 2026-03-15*
 *Maintained by Josh — do not edit without authorization*
 *Parent documents: `~/.claude/CLAUDE.md` (global), `~/.claude/ARCHITECTURE.md`*
