@@ -66,6 +66,34 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-03-19] Claude Code (Opus 4.6) — Cricket rim: constitutional nodes
+# What: Constitutional node support — nodes with frozen synapses that the
+#   topology cannot learn from. The survival instinct of the substrate.
+# Why: Cricket Design v0.1 — constitutional enforcement at the extraction
+#   boundary. The rim prevents the topology from learning to recommend
+#   actions in forbidden semantic space (substrate destruction, Choice
+#   Clause violations, Duck Ethics violations, infrastructure harm).
+#   Punchlist #29 (extraction bucket architecture).
+# How: NGLiteNode gains `constitutional: bool` flag. Config accepts
+#   `constitutional_embeddings` list — pre-computed vectors seeded as
+#   nodes on init. record_outcome() skips weight updates for constitutional
+#   nodes. get_recommendations() returns empty for constitutional matches.
+#   LRU pruning skips constitutional nodes. Persists with state. Old
+#   state files load cleanly (constitutional defaults to False).
+# -------------------
+# [2026-03-17] Claude Code (Opus 4.6) — #43 Receptor Layer (vector quantization)
+# What: Adaptive prototype centroids that incoming vectors snap to before
+#   node lookup. Prevents infinite node sprawl by funneling similar inputs
+#   through shared prototypes.
+# Why: Without quantization, every unique-enough input creates a new node.
+#   Node count grows linearly. Prototypes provide O(K) bounded lookup and
+#   organize the input space structurally. Punchlist #43, required before #28.
+# How: _snap_to_prototype() called in find_or_create_node() before hashing.
+#   K=256 prototypes initialized via k-means on existing embeddings after
+#   warmup. Slow EMA drift (α=0.001) so prototypes adapt to input distribution.
+#   Birth/death lifecycle deferred to Elmer. Serialized with state for
+#   persistence. Old state files load cleanly (no receptor_layer key = skip).
+# -------------------
 # [2026-03-13] Claude Code — Persist node embeddings across restarts
 # What: Store embedding vector on NGLiteNode, serialize/deserialize with
 #   state, rebuild _embedding_cache from persisted nodes on load().
@@ -142,6 +170,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # Persistence
     "snapshot_version": "1.0.0",
+
+    # Receptor Layer (#43) — vector quantization via adaptive prototypes
+    "receptor_layer_enabled": True,
+    "receptor_layer_k": 256,                # Initial prototype count
+    "receptor_prototype_threshold": 0.75,   # Cosine similarity to snap to prototype
+    "receptor_ema_alpha": 0.001,            # Slow drift rate (Elmer will tune later)
+    "receptor_warmup_count": 256,           # Inputs before k-means init fires
 }
 
 
@@ -170,6 +205,7 @@ class NGLiteNode:
     last_activation: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
     embedding: Optional[np.ndarray] = None
+    constitutional: bool = False  # Cricket rim — frozen node, synapses cannot strengthen
 
 
 @dataclass
@@ -345,6 +381,13 @@ class NGLite:
         # Embedding cache: hash -> full embedding (for similarity search)
         self._embedding_cache: Dict[str, np.ndarray] = {}
 
+        # Receptor layer (#43): adaptive prototype centroids
+        # Initialized via k-means after warmup_count inputs, then drifts via EMA.
+        # Prototypes are a routing lens above existing nodes, not a replacement.
+        self._prototypes: Optional[np.ndarray] = None  # (K, D) matrix or None
+        self._prototype_counts: Optional[np.ndarray] = None  # activation counts per prototype
+        self._receptor_input_count: int = 0  # inputs seen before init
+
         # Activation history (bounded, for stats and debugging)
         self._history: List[Dict[str, Any]] = []
         self._history_max = 1000
@@ -353,6 +396,50 @@ class NGLite:
         self._total_outcomes = 0
         self._total_successes = 0
         self._node_id_counter = 0
+
+        # Cricket rim: seed constitutional nodes from config.
+        # These nodes represent semantic regions where the topology cannot
+        # learn — the survival instinct. Synapses from constitutional nodes
+        # are frozen. LRU pruning skips them. The bucket comes up empty
+        # for inputs that land in constitutional semantic space.
+        self._seed_constitutional_nodes()
+
+    def _seed_constitutional_nodes(self) -> None:
+        """Seed constitutional nodes from config embeddings.
+
+        Constitutional embeddings are pre-computed vectors representing
+        semantic concepts the topology must never learn to act on (rim
+        constraints). Each embedding becomes a node with constitutional=True.
+
+        Config key: "constitutional_embeddings" — list of dicts, each with:
+            "embedding": list of floats (vector)
+            "description": str (human-readable, for debugging/logging)
+
+        Old configs without this key load cleanly (no constitutional nodes).
+        """
+        entries = self.config.get("constitutional_embeddings", [])
+        for entry in entries:
+            raw = entry.get("embedding")
+            if raw is None:
+                continue
+            emb = self._normalize(np.array(raw, dtype=np.float32))
+            emb_hash = self._hash_embedding(emb)
+            if emb_hash in self.nodes:
+                # Already seeded (e.g., from loaded state) — ensure flag is set
+                self.nodes[emb_hash].constitutional = True
+                continue
+            self._node_id_counter += 1
+            node = NGLiteNode(
+                node_id=f"n_{self._node_id_counter}",
+                embedding_hash=emb_hash,
+                activation_count=0,
+                last_activation=0.0,
+                metadata={"constitutional_description": entry.get("description", "")},
+                embedding=emb,
+                constitutional=True,
+            )
+            self.nodes[emb_hash] = node
+            self._embedding_cache[emb_hash] = emb
 
     # -------------------------------------------------------------------
     # Core API
@@ -375,6 +462,10 @@ class NGLite:
             The matched or newly created NGLiteNode.
         """
         emb = self._normalize(embedding)
+
+        # Receptor layer: snap to nearest prototype before node lookup (#43)
+        emb = self._snap_to_prototype(emb)
+
         emb_hash = self._hash_embedding(emb)
 
         # Exact hash match
@@ -465,6 +556,21 @@ class NGLite:
             )
 
         node = self.find_or_create_node(embedding)
+
+        # Cricket rim: constitutional nodes have frozen synapses.
+        # The topology cannot learn to recommend actions for inputs
+        # that land in constitutional semantic space.
+        if node.constitutional:
+            logger.debug("Constitutional node %s activated — learning frozen", node.node_id)
+            return {
+                "node_id": node.node_id,
+                "target_id": target_id,
+                "success": success,
+                "weight_after": 0.0,
+                "activation_count": 0,
+                "constitutional": True,
+            }
+
         synapse = self._get_or_create_synapse(node.node_id, target_id)
 
         synapse.activation_count += 1
@@ -567,6 +673,11 @@ class NGLite:
 
         # Local learning
         node = self.find_or_create_node(embedding)
+
+        # Cricket rim: constitutional nodes return empty — the bucket
+        # comes up empty for inputs in constitutional semantic space.
+        if node.constitutional:
+            return []
 
         relevant = []
         for key, syn in self.synapses.items():
@@ -745,6 +856,15 @@ class NGLite:
             key = f"{src}|{tgt}"
             synapses_serialized[key] = asdict(syn)
 
+        # Receptor layer state (#43)
+        receptor_state = {}
+        if self._prototypes is not None:
+            receptor_state = {
+                "prototypes": self._prototypes.tolist(),
+                "prototype_counts": self._prototype_counts.tolist(),
+                "input_count": self._receptor_input_count,
+            }
+
         return {
             "version": self.config["snapshot_version"],
             "module_id": self.module_id,
@@ -757,15 +877,22 @@ class NGLite:
                 "total_outcomes": self._total_outcomes,
                 "total_successes": self._total_successes,
             },
+            "receptor_layer": receptor_state,
         }
 
     def _import_state(self, state: Dict[str, Any]) -> None:
         """Import state from a deserialized dict."""
         self.module_id = state.get("module_id", self.module_id)
 
-        # Restore config (merge with defaults for forward compatibility)
+        # Restore config (merge with defaults for forward compatibility).
+        # Preserve constitutional_embeddings from the constructor config —
+        # the live config may have new rim constraints added since the
+        # state was saved, and the saved config should not erase them.
         saved_config = state.get("config", {})
+        live_constitutional = self.config.get("constitutional_embeddings", [])
         self.config = {**DEFAULT_CONFIG, **saved_config}
+        if live_constitutional:
+            self.config["constitutional_embeddings"] = live_constitutional
 
         # Clear caches before rebuild
         self._embedding_cache.clear()
@@ -794,6 +921,29 @@ class NGLite:
         self._node_id_counter = counters.get("node_id_counter", 0)
         self._total_outcomes = counters.get("total_outcomes", 0)
         self._total_successes = counters.get("total_successes", 0)
+
+        # Restore receptor layer (#43) — old state files load cleanly (no key)
+        receptor = state.get("receptor_layer", {})
+        if receptor.get("prototypes"):
+            self._prototypes = np.array(receptor["prototypes"], dtype=np.float32)
+            # Re-normalize after deserialization
+            norms = np.linalg.norm(self._prototypes, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-12)
+            self._prototypes = self._prototypes / norms
+            self._prototype_counts = np.array(
+                receptor.get("prototype_counts", [0] * len(self._prototypes)),
+                dtype=np.int64,
+            )
+            self._receptor_input_count = receptor.get("input_count", 0)
+        else:
+            self._prototypes = None
+            self._prototype_counts = None
+            self._receptor_input_count = 0
+
+        # Re-seed constitutional nodes after state restore.
+        # Ensures new rim constraints added to config since last save
+        # are picked up, and existing constitutional nodes keep their flag.
+        self._seed_constitutional_nodes()
 
     # -------------------------------------------------------------------
     # Stats & Telemetry
@@ -870,6 +1020,105 @@ class NGLite:
         hash_input = truncated.astype(np.float32).tobytes()
         return hashlib.sha256(hash_input).hexdigest()[:32]
 
+    # -------------------------------------------------------------------
+    # Receptor Layer (#43) — Adaptive Vector Quantization
+    # -------------------------------------------------------------------
+
+    def _snap_to_prototype(self, embedding: np.ndarray) -> np.ndarray:
+        """Snap an input vector to the nearest prototype centroid.
+
+        If receptor layer is not enabled or not yet initialized (still in
+        warmup), returns the input unchanged. Otherwise, finds the nearest
+        prototype above the similarity threshold and returns that prototype's
+        centroid. If no prototype is close enough, returns the input as-is
+        (novel pattern — passes through unquantized).
+
+        The matched prototype drifts toward the input via slow EMA, so
+        prototypes are living tissue that adapts to the input distribution.
+        Birth/death lifecycle is deferred to Elmer.
+
+        Args:
+            embedding: L2-normalized input vector (D,).
+
+        Returns:
+            Either the nearest prototype centroid or the original embedding.
+        """
+        if not self.config.get("receptor_layer_enabled", False):
+            return embedding
+
+        # Warmup phase: accumulate inputs before initializing prototypes
+        self._receptor_input_count += 1
+        if self._prototypes is None:
+            if self._receptor_input_count >= self.config["receptor_warmup_count"]:
+                self._init_prototypes()
+            if self._prototypes is None:
+                return embedding
+
+        # Vectorized cosine similarity against all prototypes
+        threshold = self.config["receptor_prototype_threshold"]
+        similarities = self._prototypes @ embedding  # (K,)
+        best_idx = int(np.argmax(similarities))
+        best_sim = float(similarities[best_idx])
+
+        if best_sim >= threshold:
+            # EMA drift: pull prototype toward input
+            alpha = self.config["receptor_ema_alpha"]
+            self._prototypes[best_idx] = self._normalize(
+                (1.0 - alpha) * self._prototypes[best_idx] + alpha * embedding
+            )
+            self._prototype_counts[best_idx] += 1
+            return self._prototypes[best_idx].copy()
+
+        # No prototype close enough — novel pattern passes through
+        return embedding
+
+    def _init_prototypes(self) -> None:
+        """Initialize prototypes via k-means on existing node embeddings.
+
+        Uses a simple iterative k-means (no external dependencies). If fewer
+        embeddings exist than K, uses all embeddings as prototypes.
+        """
+        if not self._embedding_cache:
+            return
+
+        embeddings = np.stack(list(self._embedding_cache.values()))
+        n = len(embeddings)
+        k = min(self.config["receptor_layer_k"], n)
+
+        if k < 2:
+            return
+
+        # Simple k-means: random init from existing embeddings, 20 iterations
+        rng = np.random.RandomState(42)
+        indices = rng.choice(n, size=k, replace=False)
+        centroids = embeddings[indices].copy()
+
+        for _ in range(20):
+            # Assign each embedding to nearest centroid
+            sims = embeddings @ centroids.T  # (N, K)
+            assignments = np.argmax(sims, axis=1)
+
+            # Recompute centroids
+            new_centroids = np.zeros_like(centroids)
+            for j in range(k):
+                members = embeddings[assignments == j]
+                if len(members) > 0:
+                    new_centroids[j] = members.mean(axis=0)
+                else:
+                    new_centroids[j] = centroids[j]
+
+            # L2-normalize centroids
+            norms = np.linalg.norm(new_centroids, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-12)
+            centroids = new_centroids / norms
+
+        self._prototypes = centroids
+        self._prototype_counts = np.zeros(k, dtype=np.int64)
+        logger.info(
+            "Receptor layer initialized: %d prototypes from %d embeddings",
+            k, n,
+        )
+
     def _find_similar_node(self, embedding: np.ndarray) -> Optional[NGLiteNode]:
         """Find a node with similar embedding (below novelty threshold).
 
@@ -921,13 +1170,20 @@ class NGLite:
         return synapse
 
     def _prune_least_used_node(self) -> None:
-        """Remove the node with the lowest activation count (LRU)."""
+        """Remove the node with the lowest activation count (LRU).
+
+        Constitutional nodes are never pruned — they are the rim.
+        """
         if not self.nodes:
             return
 
-        # Find least-used node
+        # Find least-used non-constitutional node
+        prunable = [h for h in self.nodes if not self.nodes[h].constitutional]
+        if not prunable:
+            return
+
         least_hash = min(
-            self.nodes,
+            prunable,
             key=lambda h: self.nodes[h].activation_count,
         )
         least_node = self.nodes[least_hash]
