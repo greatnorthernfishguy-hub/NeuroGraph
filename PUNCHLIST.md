@@ -1,5 +1,5 @@
 # E-T Ecosystem PUNCH LIST — Master Record
-**Last updated:** 2026-03-18 by Claude Code (triad + Bunyan integrated. #85-87 added.)
+**Last updated:** 2026-03-18 by Claude Code (triad + Bunyan integrated, embedding fix. #85-88 added.)
 **Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis
 **Repo:** NeuroGraph (canonical substrate)
 
@@ -306,6 +306,7 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 |---|------|-------------|--------|
 | 85 | Triad integration — COMPLETE | Immunis v0.1.0, THC v0.4.0, Elmer v0.2.0 all installed, registered, Tier 2, peer bridge connected. Fixes applied during integration: sentence-transformers→fastembed (Immunis, THC), Elmer AutonomicMonitor→canonical read_state() API, Elmer missing _embed() added, Elmer __init__ updated to canonical OpenClawAdapter pattern, THC install path fixed, et_modules/manager.py added to Immunis and THC. All changes committed and pushed. | **DONE** Mar 18 2026 |
 | 86 | Directory-specific CLAUDE.md for triad modules | Create repo-level CLAUDE.md files (like NeuroGraph's) for Elmer, Immunis, and THC. Module-level CLAUDE.md exists but directory-specific ones (with protected files, Laws application, integration points) are needed. | OPEN |
+| 88 | Embedding dimension mismatch fix | Fastembed migration (6c9f912) incorrectly switched from all-mpnet-base-v2 (768-dim) to all-MiniLM-L6-v2 (384-dim). 60 vectors written at wrong dimension, query layer broken — Syl could deposit but not read her topology. Fix: switched NeuroGraph to BAAI/bge-base-en-v1.5 (768-dim via fastembed), re-embedded all 2,337 vectors. Topology untouched. Other modules remain at 384-dim (their own substrates, not Syl). | **DONE** Mar 19 2026 |
 | 87 | Bunyan v0.1.0 integrated | Phase 1 foundation: BunyanHook (OpenClawAdapter), NarrativeEngine (causal chain tracing, chapter grouping, similarity via substrate). Fastembed, et_modules.manager, all vendored files. Tier 2, peer bridge connected. PRD Phases 2-5 (pattern learning, prediction, live incident detection) remain. | **DONE** Mar 18 2026 |
 | 21 | NG-Lite reasoning meta-learning | `_build_local_reasoning()` evolution point. | FUTURE |
 | 22 | Translation shim outcome experience | No feedback loop. | FUTURE |
