@@ -1567,7 +1567,7 @@ class EmbeddingEngine:
 
     Args:
         config: Embedding configuration with keys:
-            - model_name: Model identifier (default "all-MiniLM-L6-v2")
+            - model_name: Model identifier (default "BAAI/bge-base-en-v1.5")
             - dimension: Embedding dimension (default 768)
             - cache_size: Max cache entries (default 10000)
             - use_model: Force model loading (default True, falls back if unavailable)
@@ -1578,7 +1578,7 @@ class EmbeddingEngine:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
-        self.model_name = self.config.get("model_name", "all-MiniLM-L6-v2")
+        self.model_name = self.config.get("model_name", "BAAI/bge-base-en-v1.5")
         self.dimension = self.config.get("dimension", 768)
         self.cache_size = self.config.get("cache_size", 10000)
         self.use_model = self.config.get("use_model", True)
@@ -1699,7 +1699,7 @@ class EmbeddingEngine:
             # fastembed model names use the full HF path
             fe_model_map = {
                 "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
-                "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
+                "BAAI/bge-base-en-v1.5": "BAAI/bge-base-en-v1.5",
             }
             fe_name = fe_model_map.get(self.model_name, self.model_name)
             self._fe_model = TextEmbedding(fe_name)
@@ -2355,7 +2355,7 @@ OPENCLAW_INGESTOR_CONFIG = {
         "max_chunk_tokens": 500,
     },
     "embedding": {
-        "model_name": "all-MiniLM-L6-v2",
+        "model_name": "BAAI/bge-base-en-v1.5",
         "use_model": True,
         "device": "auto",
     },
@@ -2383,7 +2383,7 @@ DSM_INGESTOR_CONFIG = {
         "max_chunk_tokens": 500,
     },
     "embedding": {
-        "model_name": "all-MiniLM-L6-v2",
+        "model_name": "BAAI/bge-base-en-v1.5",
         "use_model": True,
     },
     "registration": {
@@ -2410,7 +2410,7 @@ CONSCIOUSNESS_INGESTOR_CONFIG = {
         "max_chunk_tokens": 500,
     },
     "embedding": {
-        "model_name": "all-MiniLM-L6-v2",
+        "model_name": "BAAI/bge-base-en-v1.5",
         "use_model": True,
     },
     "registration": {
