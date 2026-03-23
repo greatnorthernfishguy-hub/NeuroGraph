@@ -109,7 +109,8 @@ It contains:
 ├── ces_monitoring.py            # CES: health context, logger, HTTP dashboard (port 8847)
 ├── universal_ingestor.py        # 5-stage ingestion pipeline
 ├── ng_lite.py                   # VENDORED — canonical source
-├── ng_peer_bridge.py            # VENDORED — canonical source
+├── ng_peer_bridge.py            # VENDORED — canonical source (legacy, retained until v1.0)
+├── ng_tract_bridge.py           # VENDORED — canonical source (v0.3+, per-pair tracts)
 ├── ng_ecosystem.py              # VENDORED — canonical source
 ├── ng_autonomic.py              # VENDORED — canonical source
 ├── openclaw_adapter.py          # VENDORED — canonical source
@@ -148,17 +149,26 @@ NeuroGraph is the **canonical source** for all vendored files. Every other modul
 
 | File | Vendored To |
 |------|-------------|
-| `ng_lite.py` | TID, TrollGuard, Immunis, Elmer, THC, all future modules |
-| `ng_peer_bridge.py` | Same |
+| `ng_lite.py` | TID, TrollGuard, Immunis, Elmer, THC, Bunyan, Praxis, Agent Zero |
+| `ng_peer_bridge.py` | Same (legacy, retained until v1.0 tract migration) |
+| `ng_tract_bridge.py` | Same (v0.3+, per-pair directional tracts, preferred over ng_peer_bridge) |
 | `ng_ecosystem.py` | Same |
 | `ng_autonomic.py` | Same |
 | `openclaw_adapter.py` | Same |
+| `ng_embed.py` | Same (centralized embedding + dual-pass, added 2026-03-22) |
 
 **When you change a vendored file here, you are changing the canonical source for the entire ecosystem.** The change must be re-vendored to every module simultaneously. Do not change a vendored file here to fix a NeuroGraph-specific issue — vendored files serve every module. If NeuroGraph needs behavior other modules don't, that behavior lives in NeuroGraph-specific code, not in the vendored file.
 
 ### The ng_tract Migration
 
-`ng_peer_bridge.py` is the current River implementation. `ng_tract.py` is the planned replacement — myelinated inter-module substrate tracts with passive conduction, use-dependent myelination, and saltatory conduction. The migration is two-phase and coordinated. Do not deprecate `ng_peer_bridge.py` unilaterally. Do not conflate the two.
+`ng_peer_bridge.py` is the legacy River implementation (JSONL broadcast). `ng_tract_bridge.py` is the active replacement (v0.3, per-pair directional tracts). Both are vendored. `ng_ecosystem.py` prefers the tract bridge with automatic fallback to the legacy bridge. `openclaw_hook.py` uses the same pattern.
+
+**Three tract-related files — do not conflate:**
+- `ng_tract.py` — feeder→topology-owner tracts (GUI, feed-syl → ContextEngine). NOT vendored.
+- `ng_tract_bridge.py` — per-pair inter-module tracts implementing NGBridge. Vendored. Replaces `ng_peer_bridge.py`.
+- `ng_peer_bridge.py` — legacy JSONL bridge. Vendored. Do not deprecate until v1.0.
+
+v0.4 (myelination), v0.5 (vagus nerve), and v1.0 (full cutover) are planned. Do not deprecate `ng_peer_bridge.py` unilaterally.
 
 ### ng_bridge.py — The Tier 3 SaaS Bridge
 
@@ -369,14 +379,15 @@ Consult the master punch list for full details.
 
 | # | Item | Impact |
 |---|------|--------|
-| 48 | STDP eligibility trace fix | Touches `inject_reward()`. **SPECIFICALLY DANGEROUS** — changes the reward pathway governing every future learning event. Code may already implement the fix. Must run synthetic spike sequence test before closing. No action without Josh approval. |
-| 43 | Receptor Layer (vector quantization) | New code, greenfield. Must ship before #28. |
-| 49 | Tier 2→3 weight scaling | Affects `ng_peer_bridge.py` (vendored). Re-vendoring to all modules required after. |
-| 28 | Replace `_classification_to_embedding()` | TID scope but feeds NeuroGraph's `ng_lite.py`. Depends on #43. |
-| 37 | SKILL.md `hook:` field | Verify OpenClaw frontmatter parser support before touching. |
-| 39 | TypeScript hook translation | Translate `openclaw_hook.py` to TypeScript for native OpenClaw integration. |
-| 45 | Embedding model migration | All nodes use `all-MiniLM-L6-v2`. Primary backend switched from `sentence-transformers` (torch) to `fastembed` (ONNX Runtime, 2026-03-16). sentence-transformers retained as fallback. Future model migration still needs raw text storage strategy. |
-| 30 | TrollGuard extraction boundary violation | TrollGuard scope but affects what NeuroGraph absorbs via peer bridge. |
+| 53 | Myelinated tract model | **v0.3 DONE (2026-03-20).** `ng_tract_bridge.py` vendored to all modules. v0.4 (myelination), v0.5 (vagus), v1.0 (cutover) remaining. |
+| 48 | STDP eligibility trace fix | **DONE (2026-03-18).** Confirmed fixed. 13-test synthetic spike sequence validates all mechanics. |
+| 43 | Receptor Layer (vector quantization) | **DONE (2026-03-17).** K=256 adaptive prototypes, vendored to all modules. |
+| 28 | Replace `_classification_to_embedding()` | **DONE (2026-03-18).** Semantic embeddings in TID via ng_embed.py. |
+| 45 | Embedding model migration | **DONE (2026-03-22).** `Snowflake/snowflake-arctic-embed-m-v1.5` (768-dim) via `ng_embed.py` (ONNX Runtime). All 2,539 vectors re-embedded. Centralized in vendored ng_embed.py. |
+| 81 | Dual-pass embedding | **DONE (2026-03-22).** `ng_embed.py` vendored ecosystem-wide. `dual_record_outcome()` in ng_ecosystem.py. Forest + tree concept extraction via TID. |
+| 30 | TrollGuard extraction boundary violation | **DONE (2026-03-18).** `target_id` changed to content-derived identifiers. |
+| 44 | Adaptive relevance thresholds | Unblocked by #53 v0.3. Elmer tunes. |
+| 46 | Per-module strength normalization | Unblocked by #53 v0.3. Per-pair tracts enable per-source isolation. |
 | 14 | Port 8847 documentation discrepancy | Some docs say 8080. 8847 is correct. Documentation fix only. |
 
 ---
