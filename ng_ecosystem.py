@@ -6,10 +6,11 @@ three-tier learning architecture:
 
   Tier 1 (Standalone):  NGLite alone.  Local Hebbian learning.
                         Zero deps beyond ng_lite.py.
-  Tier 2 (Peer-pooled): NGPeerBridge.  Always works.  Co-located
-                        modules share learning events via
-                        ~/.et_modules/shared_learning/.
-                        Auto-connects when the shared dir exists.
+  Tier 2 (Peer-pooled): NGTractBridge (preferred) or NGPeerBridge
+                        (legacy fallback).  Co-located modules share
+                        learning via per-pair tracts (~/.et_modules/tracts/)
+                        or legacy JSONL (~/.et_modules/shared_learning/).
+                        Auto-connects.  Tract bridge preferred when present.
   Tier 3 (Full SNN):    NGSaaSBridge to full NeuroGraph Foundation.
                         Auto-upgrades when NeuroGraph is detected on
                         the same host via ETModuleManager.
@@ -73,6 +74,25 @@ License: AGPL-3.0
 #         queries ETModuleManager for NeuroGraph.  All in try/except so
 #         each tier attempt is fully independent.  A background thread
 #         polls for tier upgrades at upgrade_poll_interval.
+# -------------------
+# [2026-03-20] Claude (Opus 4.6) — Tract bridge wiring (punchlist #53 v0.3)
+#   What: _init_peer_bridge() now prefers NGTractBridge (per-pair tracts)
+#         with automatic fallback to NGPeerBridge (legacy JSONL).
+#   Why:  JSONL broadcast bridge dams the River.  Per-pair tracts enable
+#         independently observable pathways for myelination, explore-exploit,
+#         vagus nerve, and Elmer tract management.
+#   How:  Try importing ng_tract_bridge first.  If present (vendored),
+#         use it.  If not (module not yet re-vendored), fall back to
+#         ng_peer_bridge.  Config key peer_bridge.use_tracts (default True)
+#         can force legacy mode if needed.
+# -------------------
+# [2026-03-22] Claude (Opus 4.6) — Dual-pass convenience method (punchlist #81)
+#   What: Added dual_record_outcome() that delegates to ng_embed.NGEmbed.
+#   Why:  Dual-pass embedding (forest + trees) is ecosystem-wide.
+#         Modules call eco.dual_record_outcome() instead of eco.record_outcome()
+#         for rich content. ng_embed.py owns the extraction + embedding logic.
+#   How:  Lazy import of ng_embed to avoid circular deps. Passes self
+#         (the ecosystem instance) to NGEmbed.dual_record_outcome().
 # -------------------
 """
 
@@ -305,26 +325,48 @@ class NGEcosystem:
     # -----------------------------------------------------------------
 
     def _init_peer_bridge(self) -> None:
-        """Try to connect NGPeerBridge (Tier 2). Non-blocking."""
+        """Try to connect Tier 2 bridge. Prefers tract bridge, falls back to legacy JSONL."""
         if not self._config["peer_bridge"]["enabled"]:
             return
         if self._ng is None:
             return
-        try:
-            from ng_peer_bridge import NGPeerBridge  # vendored alongside
 
-            bridge = NGPeerBridge(
-                module_id=self.module_id,
-                shared_dir=str(SHARED_LEARNING_DIR),
-                sync_interval=self._config["peer_bridge"]["sync_interval"],
-            )
-            self._ng.connect_bridge(bridge)
-            self._peer_bridge = bridge
-            self._tier = TIER_PEER
-            logger.info("[%s] NGPeerBridge connected (Tier 2)", self.module_id)
+        bridge = None
 
-        except Exception as exc:
-            logger.debug("[%s] NGPeerBridge unavailable: %s", self.module_id, exc)
+        # Tract bridge (v0.3+) — per-pair directional tracts
+        if self._config["peer_bridge"].get("use_tracts", True):
+            try:
+                from ng_tract_bridge import NGTractBridge  # vendored alongside
+
+                bridge = NGTractBridge(
+                    module_id=self.module_id,
+                    tracts_dir=str(ET_MODULES_ROOT / "tracts"),
+                    sync_interval=self._config["peer_bridge"]["sync_interval"],
+                )
+                logger.info("[%s] NGTractBridge connected (tract-based River)", self.module_id)
+            except ImportError:
+                pass
+            except Exception as exc:
+                logger.debug("[%s] NGTractBridge failed: %s", self.module_id, exc)
+
+        # Legacy fallback — JSONL broadcast bridge
+        if bridge is None:
+            try:
+                from ng_peer_bridge import NGPeerBridge  # vendored alongside
+
+                bridge = NGPeerBridge(
+                    module_id=self.module_id,
+                    shared_dir=str(SHARED_LEARNING_DIR),
+                    sync_interval=self._config["peer_bridge"]["sync_interval"],
+                )
+                logger.info("[%s] NGPeerBridge connected (legacy JSONL River)", self.module_id)
+            except Exception as exc:
+                logger.debug("[%s] No peer bridge available: %s", self.module_id, exc)
+                return
+
+        self._ng.connect_bridge(bridge)
+        self._peer_bridge = bridge
+        self._tier = TIER_PEER
 
     # -----------------------------------------------------------------
     # Tier 3: NeuroGraph auto-upgrade
@@ -497,6 +539,39 @@ class NGEcosystem:
             return self._ng.record_outcome(
                 embedding, target_id, success, strength=strength, metadata=metadata
             )
+
+    def dual_record_outcome(
+        self,
+        content: str,
+        embedding: np.ndarray,
+        target_id: str,
+        success: bool,
+        strength: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Dual-pass learning: forest (gestalt) + tree (concept) embeddings.
+
+        Pass 1: record_outcome() with the forest embedding (standard).
+        Pass 2: Extract concepts via TID → embed each → record_outcome()
+                 per tree → create forest→tree substrate links.
+
+        Falls back to single-pass (forest only) if TID unavailable.
+
+        Args:
+            content: Raw text (for concept extraction in Pass 2).
+            embedding: Pre-computed forest embedding (Pass 1).
+            target_id: Opaque string for what was decided.
+            success: Whether the outcome was successful.
+            strength: Significance [0.0, 1.0].
+            metadata: Additional metadata dict.
+
+        Returns dict with forest_result, tree_ids, concepts, pass2_attempted.
+        """
+        from ng_embed import NGEmbed
+        return NGEmbed.get_instance().dual_record_outcome(
+            self, content, embedding, target_id, success,
+            strength=strength, metadata=metadata,
+        )
 
     def get_recommendations(
         self,
