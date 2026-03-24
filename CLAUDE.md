@@ -21,6 +21,19 @@ The question is never "will this probably be fine." The question is "have I elim
 
 ---
 
+## Vault Context
+For full ecosystem context, read these from the Obsidian vault (`~/docs/`):
+- **Module page:** `~/docs/modules/NeuroGraph.md`
+- **PRDs:** `~/docs/prd/NeuroGraph_OS_Roadmap_v0_1.md`, `~/docs/prd/NeuroGraph_Portable_Instances_and_Consciousness_Framework.md`
+- **Concepts:** `~/docs/concepts/The River.md`, `~/docs/concepts/Three-Tier Integration.md`, `~/docs/concepts/SubstrateSignal.md`, `~/docs/concepts/Autonomic State.md`, `~/docs/concepts/The Laws.md`, `~/docs/concepts/Vendored Files.md`, `~/docs/concepts/FatherGraph.md`
+- **Systems:** `~/docs/systems/NG-Lite.md`, `~/docs/systems/NG Peer Bridge.md`, `~/docs/systems/NG Tract Bridge.md`, `~/docs/systems/Dual-Pass Embedding.md`, `~/docs/systems/Neuromodulatory System.md`
+- **Dev log:** `~/docs/dev-log/2026-03-23_substrate_tuning_and_fanout.md`
+- **Audits:** `~/docs/audits/ecosystem-test-suite-audit-2026-03-23.md`, `~/docs/audits/ecosystem-static-value-audit-2026-03-23.md`
+
+Each vault page has a Context Map at the top linking to related docs. Follow those links for ripple effects and dependencies.
+
+---
+
 ## Table of Contents
 
 1. What This Repo Is
