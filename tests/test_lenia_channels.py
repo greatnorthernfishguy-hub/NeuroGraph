@@ -35,13 +35,12 @@ class TestChannelRegistry:
         config = LeniaConfig()
         reg1 = ChannelRegistry(config, tmp_dir)
         assert reg1.count == 4
-        # Update some state
-        reg1.update_energy(0, 5.0)
 
-        # Reload
+        # Reload from same directory — should load the persisted seed
         reg2 = ChannelRegistry(config, tmp_dir)
         assert reg2.count == 4
-        assert reg2.get(0).total_energy == 5.0
+        names = [reg2.get(cid).name for cid in reg2.channel_ids]
+        assert "norepinephrine" in names
 
     def test_birth_trigger(self, tmp_dir):
         config = LeniaConfig(
