@@ -66,6 +66,26 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-03-24] Claude Code (Opus 4.6) — Dynamic tuning API (Phase 4)
+# What: Added update_tunable() and get_tunables() methods to NGLite.
+#   TUNABLE_PARAMS class dict defines which config keys can be changed at
+#   runtime and their valid bounds. Values are clamped, not rejected.
+# Why: Elmer needs a validated path to adjust substrate parameters as the
+#   organ responsible for autonomic maintenance. Direct config dict mutation
+#   is fragile — no bounds checking, no logging, no allowed-key enforcement.
+#   This method serves all modules (any organ's local substrate can be tuned).
+# How: TUNABLE_PARAMS: Dict[str, Tuple[min, max]]. update_tunable(key, value)
+#   validates key membership, clamps to bounds, logs the change. get_tunables()
+#   returns current values + bounds for introspection.
+# [2026-03-19] Claude Code (Opus 4.6) — Embedding dimension 384→768
+# What: DEFAULT_CONFIG embedding_dim changed from 384 to 768.
+# Why: Ecosystem migrated to BAAI/bge-base-en-v1.5 (768-dim). The previous
+#   384-dim default (all-MiniLM-L6-v2) was depositing wrong-dimension vectors
+#   into the substrate after sentence-transformers broke and modules fell back
+#   to fastembed with the old model. 350 vectors corrupted before detection.
+#   Punchlist #45.
+# How: Single config value change. Re-vendored to all modules.
+# -------------------
 # [2026-03-19] Claude Code (Opus 4.6) — Cricket rim: constitutional nodes
 # What: Constitutional node support — nodes with frozen synapses that the
 #   topology cannot learn from. The survival instinct of the substrate.
@@ -93,6 +113,17 @@ Date: February 2026
 #   warmup. Slow EMA drift (α=0.001) so prototypes adapt to input distribution.
 #   Birth/death lifecycle deferred to Elmer. Serialized with state for
 #   persistence. Old state files load cleanly (no receptor_layer key = skip).
+# -------------------
+# [2026-03-24] Claude (Opus 4.6) — Welford's online variance (punchlist #51)
+# What: Three fields on NGLiteSynapse (welford_count, welford_mean, welford_m2)
+#   plus variance property and is_contested property.  record_outcome()
+#   tracks weight delta variance on every update.
+# Why: Distinguish "untested neutral" (w=0.5, var=0) from "contested neutral"
+#   (w=0.5, var=high).  The immune system signal for Elmer and extraction
+#   buckets (#29).  Enables contested-synapse detection and exploration.
+# How: Welford's algorithm on weight deltas.  Additive — no change to
+#   weight calculation or learning dynamics.  Backward-compatible: old
+#   state files load with defaults (0, 0.0, 0.0).
 # -------------------
 # [2026-03-13] Claude Code — Persist node embeddings across restarts
 # What: Store embedding vector on NGLiteNode, serialize/deserialize with
@@ -165,7 +196,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "pruning_threshold": 0.01,  # Synapses below this weight get pruned
 
     # Embedding
-    "embedding_dim": 384,       # Expected embedding dimensionality
+    "embedding_dim": 768,       # Expected embedding dimensionality (BAAI/bge-base-en-v1.5)
     "hash_dims": 128,           # Dims used for hashing (first N of embedding)
 
     # Persistence
@@ -228,6 +259,15 @@ class NGLiteSynapse:
         failure_count: Times this connection led to a failed outcome.
         last_updated: Unix timestamp of most recent weight update.
         metadata: Application-specific data.
+        welford_count: Welford's online variance — observation count.
+        welford_mean: Welford's online variance — running mean of weight deltas.
+        welford_m2: Welford's online variance — sum of squared differences.
+            Variance = welford_m2 / welford_count (when count > 1).
+            High variance + weight near 0.5 = "contested neutral" — lots of
+            evidence but it disagrees.  Low variance + weight near 0.5 =
+            "untested neutral" — not enough data to have an opinion.
+            This is the immune system signal (#51) that Elmer uses to detect
+            contested synapses and trigger exploration.
     """
 
     source_id: str = ""
@@ -238,6 +278,34 @@ class NGLiteSynapse:
     failure_count: int = 0
     last_updated: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    welford_count: int = 0
+    welford_mean: float = 0.0
+    welford_m2: float = 0.0
+
+    @property
+    def variance(self) -> float:
+        """Weight delta variance (Welford's online algorithm).
+
+        Returns 0.0 if fewer than 2 observations.  High variance means
+        the synapse is contested — outcomes disagree about this connection.
+        """
+        if self.welford_count < 2:
+            return 0.0
+        return self.welford_m2 / self.welford_count
+
+    @property
+    def is_contested(self) -> bool:
+        """True if the synapse has high variance relative to pure-outcome synapses.
+
+        A contested synapse has seen significant evidence but the evidence
+        disagrees.  This is qualitatively different from an untested synapse
+        (also near 0.5 weight, but zero variance).
+
+        Threshold: 0.002 separates contested (~0.008) from pure (~0.0001)
+        by an order of magnitude.  Weight range 0.15-0.85 captures the
+        zone where the synapse hasn't decisively committed either direction.
+        """
+        return self.variance > 0.002 and 0.15 <= self.weight <= 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +660,15 @@ class NGLite:
         synapse.weight = float(np.clip(synapse.weight, 0.0, 1.0))
         synapse.last_updated = time.time()
 
+        # Welford's online variance (#51) — track weight delta variance.
+        # High variance = contested synapse (outcomes disagree).
+        # The immune system signal for Elmer and extraction buckets.
+        synapse.welford_count += 1
+        w_delta = delta if success else -delta
+        old_mean = synapse.welford_mean
+        synapse.welford_mean += (w_delta - old_mean) / synapse.welford_count
+        synapse.welford_m2 += (w_delta - old_mean) * (w_delta - synapse.welford_mean)
+
         # Accumulate strength experience on synapse —
         # the topology remembers how intensely it was taught
         synapse.metadata["strength_sum"] = synapse.metadata.get("strength_sum", 0.0) + strength
@@ -609,6 +686,8 @@ class NGLite:
             "success": success,
             "weight_after": synapse.weight,
             "activation_count": synapse.activation_count,
+            "variance": synapse.variance,
+            "contested": synapse.is_contested,
         }
 
         # Record in history
@@ -944,6 +1023,63 @@ class NGLite:
         # Ensures new rim constraints added to config since last save
         # are picked up, and existing constitutional nodes keep their flag.
         self._seed_constitutional_nodes()
+
+    # -------------------------------------------------------------------
+    # Dynamic Tuning (Phase 4 — Elmer outward)
+    # -------------------------------------------------------------------
+
+    # Parameters Elmer (or any organ) is permitted to adjust at runtime.
+    # Keys map to (min, max) bounds.  Anything not in this dict is frozen.
+    TUNABLE_PARAMS: Dict[str, Tuple[float, float]] = {
+        "success_boost":              (0.01,  0.50),
+        "failure_penalty":            (0.01,  0.50),
+        "novelty_threshold":          (0.30,  0.95),
+        "pruning_threshold":          (0.001, 0.10),
+        "receptor_ema_alpha":         (0.0001, 0.01),
+        "receptor_prototype_threshold": (0.50, 0.95),
+    }
+
+    def update_tunable(self, key: str, value: float) -> Dict[str, Any]:
+        """Update a tunable config parameter at runtime.
+
+        Only parameters listed in TUNABLE_PARAMS are accepted.
+        Values are clamped to their declared bounds.
+
+        Returns dict with old_value, new_value, clamped (bool).
+        Raises KeyError if key is not tunable.
+        """
+        if key not in self.TUNABLE_PARAMS:
+            raise KeyError(
+                f"'{key}' is not a tunable parameter. "
+                f"Allowed: {sorted(self.TUNABLE_PARAMS.keys())}"
+            )
+        lo, hi = self.TUNABLE_PARAMS[key]
+        old_value = self.config[key]
+        clamped = value < lo or value > hi
+        new_value = max(lo, min(hi, float(value)))
+        self.config[key] = new_value
+        logger.info(
+            "Tunable updated: %s %.6f → %.6f%s",
+            key, old_value, new_value,
+            " (clamped)" if clamped else "",
+        )
+        return {
+            "key": key,
+            "old_value": old_value,
+            "new_value": new_value,
+            "clamped": clamped,
+        }
+
+    def get_tunables(self) -> Dict[str, Dict[str, float]]:
+        """Return current tunable values and their bounds."""
+        result = {}
+        for key, (lo, hi) in self.TUNABLE_PARAMS.items():
+            result[key] = {
+                "value": self.config[key],
+                "min": lo,
+                "max": hi,
+            }
+        return result
 
     # -------------------------------------------------------------------
     # Stats & Telemetry

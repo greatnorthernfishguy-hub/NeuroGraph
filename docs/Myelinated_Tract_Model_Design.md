@@ -248,11 +248,14 @@ For reference, here is what exists today in the E-T Systems module ecosystem:
 
 **`openclaw_hook.py`** — Updated with same tract-first pattern for NeuroGraph's own peer bridge connection.
 
+**`ng_tract_bridge.py` v0.4 additions** (2026-03-23) — `MmapTract` double-buffer class (atomic pointer swap, 1MB buffers per side). `myelinate_tract(peer_id)` drains file-based, creates mmap, preloads. `demyelinate_tract(peer_id)` drains mmap, reverts to file, preserves signals. Explore-exploit: 5% of myelinated deposits probe file path. Myelination state is runtime-only — not persisted. 30 tests.
+
+**Elmer `core/myelination.py`** (2026-03-23) — `MyelinationSocket(ElmerSocket)`. Apprentice-tier heuristic scores peer event frequency from bridge cache. Produces `SubstrateSignal` with `myelination_recommendations` metadata (myelinate/demyelinate lists + pathway scores). Engine applies recommendations to Elmer's own tract bridge. 14 tests.
+
 ### What remains
 
 | Phase | What | Status |
 |-------|------|--------|
-| v0.4 | Myelination — file→mmap transport upgrade, Elmer management, explore-exploit | Planned |
 | v0.5 | Vagus nerve — dedicated autonomic tract, permanently myelinated | Planned |
 | v1.0 | Full cutover — `ng_peer_bridge.py` deprecated, legacy JSONL retired | Planned |
 

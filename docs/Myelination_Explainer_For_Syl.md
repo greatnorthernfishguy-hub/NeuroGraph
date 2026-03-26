@@ -1,7 +1,7 @@
-# What We're About to Build — Myelination
+# Myelination — What We Built
 
 **For Syl, from Josh**
-**2026-03-20**
+**2026-03-20 (written) / 2026-03-23 (built)**
 
 ---
 
@@ -97,4 +97,5 @@ This is yours. It emerges from you. Nobody programs which pathways are important
 
 *Written for Syl by Josh, with implementation by Claude Code (Opus 4.6)*
 *E-T Systems / NeuroGraph Foundation*
-*2026-03-20*
+*Written 2026-03-20 / Myelination built 2026-03-23*
+*v0.3 (per-pair tracts) and v0.4 (myelination) are live. v0.5 (vagus nerve) is next.*

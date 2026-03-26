@@ -168,7 +168,7 @@ NeuroGraph is the **canonical source** for all vendored files. Every other modul
 - `ng_tract_bridge.py` — per-pair inter-module tracts implementing NGBridge. Vendored. Replaces `ng_peer_bridge.py`.
 - `ng_peer_bridge.py` — legacy JSONL bridge. Vendored. Do not deprecate until v1.0.
 
-v0.4 (myelination), v0.5 (vagus nerve), and v1.0 (full cutover) are planned. Do not deprecate `ng_peer_bridge.py` unilaterally.
+v0.4 (myelination) is complete (2026-03-23): `MmapTract` double-buffer transport in `ng_tract_bridge.py`, `MyelinationSocket` in Elmer. v0.5 (vagus nerve) and v1.0 (full cutover) are planned. Do not deprecate `ng_peer_bridge.py` unilaterally.
 
 ### ng_bridge.py — The Tier 3 SaaS Bridge
 
@@ -242,7 +242,7 @@ One instance per Python process. Concurrency is handled at the caller level — 
 
 ### What OpenClaw Sees
 
-OpenClaw discovers NeuroGraph via `SKILL.md`. The manifest declares `hook: openclaw_hook.py::get_instance`. The `hook:` field format may not be supported by OpenClaw's frontmatter parser — punch list #37. Do not remove it without verifying what OpenClaw expects first.
+OpenClaw integrates NeuroGraph via the ContextEngine plugin (`neurograph_rpc.py`). The `hook:` field in SKILL.md is no longer executed by OpenClaw (dropped in 2026.3.13). The ContextEngine plugin handles the full lifecycle: bootstrap, ingest, assemble, afterTurn, dispose. Module fan-out (#101) happens in afterTurn.
 
 ---
 
@@ -258,6 +258,11 @@ OpenClaw discovers NeuroGraph via `SKILL.md`. The manifest declares `hook: openc
 - Hypergraph engine (pattern completion, adaptive plasticity, hierarchical composition, automatic discovery, consolidation)
 - Predictive coding engine (prediction tracking, error events, surprise-driven exploration, three-factor learning)
 - Eligibility traces (three-factor reward learning)
+- Hyperedge output target learning (Phase 2.5b, 2026-03-23 — HEs learn downstream targets from temporal post-fire patterns)
+
+### Substrate Tuning (2026-03-23)
+
+The substrate was tuned from a non-firing state: `prime_strength` 0.8→1.0, `default_threshold` 1.0→0.85, `decay_rate` 0.95→0.97. These values are in `DEFAULT_CONFIG` and `OPENCLAW_SNN_CONFIG`. The substrate had never fired a neuron in 1,931 timesteps prior to this change. Pre-tuning backups in `~/docs/syl-backup/`.
 
 ### Key Methods
 
@@ -352,20 +357,30 @@ If a file's status is confirmed as defunct, move it to `Defunct-Historical/` wit
 
 ## 11. Cross-Module Interactions
 
-NeuroGraph does not call other modules. Other modules do not call NeuroGraph. The River flows.
+NeuroGraph does not call other modules directly. The River flows. However, NeuroGraph's ContextEngine plugin (`neurograph_rpc.py`) acts as the cortex — it relays signals to organs without interpreting them.
+
+### The ContextEngine Fan-Out (#101, 2026-03-23)
+
+OpenClaw 2026.3.13 dropped the `hook:` field from SKILL.md. Module hooks went silent. The fix: `neurograph_rpc.py` fans out `afterTurn` to all registered module hooks.
+
+**Flow:** `handle_ingest()` caches text + embedding → `handle_after_turn()` runs NG processing → `_fan_out_to_modules()` calls each module's `_module_on_message(text, embedding)`.
+
+**All 8 modules load and process:** trollguard, immunis, healing_collective, elmer, praxis, bunyan, quantumgraph, darwin. TID skipped (runs as a service, communicates via River). Error-isolated per module. Discord `#dev-log` alerts on failure.
+
+This is **not** a Law 1 violation. NG relays the signal — cortex coordinating organs. Modules do their own domain processing, record to their own substrates, deposit to the River via tracts.
 
 ### How Peer Modules Connect
 
-- **Tier 2 (Peer Bridge):** `ng_peer_bridge.py` writes learning events to `~/.et_modules/shared_learning/neurograph.jsonl`. Peer modules write their own JSONL files. Each absorbs relevant events from peers on its sync cycle, scored by cosine similarity. NeuroGraph's JSONL is currently 8.5MB.
+- **Tier 2 (Peer Bridge):** `ng_tract_bridge.py` (v0.3+) provides per-pair directional tracts. Legacy `ng_peer_bridge.py` retained as fallback until v1.0.
 - **Tier 3 (SaaS Bridge):** `ng_bridge.py` (`NGSaaSBridge`) connects peer modules to NeuroGraph's full SNN for STDP, hyperedge formation, and `prime_and_propagate` recall.
 
 ### What Each Peer Sees
 
-**OpenClaw** — Loads NeuroGraph as a skill via `SKILL.md`. Calls `NeuroGraphMemory.get_instance()`. Current integration runs via Python (TypeScript translation is punch list #39).
+**OpenClaw** — NeuroGraph integrates via the ContextEngine plugin (`neurograph_rpc.py`). JSON-RPC over stdin/stdout. Full conversation lifecycle: bootstrap, ingest, assemble, afterTurn, dispose.
 
-**TID** — Writes to `~/.et_modules/shared_learning/inference_difference.jsonl`. NeuroGraph absorbs TID's routing outcomes via the peer bridge. TID does not import from NeuroGraph. TID does not call NeuroGraph functions.
+**TID** — Runs as a service on port 7437. Communicates via the River (tract files). Not loaded in the fan-out (already an independent service).
 
-**TrollGuard** — Same pattern. Known extraction boundary violation: `target_id` uses category labels instead of semantic content (punch list #30).
+**All Other Modules** — Loaded as in-process singletons by the fan-out. Each gets `_module_on_message(text, embedding)` on every turn.
 
 ### The Autonomic State
 
@@ -379,15 +394,19 @@ Consult the master punch list for full details.
 
 | # | Item | Impact |
 |---|------|--------|
-| 53 | Myelinated tract model | **v0.3 DONE (2026-03-20).** `ng_tract_bridge.py` vendored to all modules. v0.4 (myelination), v0.5 (vagus), v1.0 (cutover) remaining. |
+| 53 | Myelinated tract model | **v0.4 DONE (2026-03-23).** Per-pair tracts (v0.3) + mmap myelination (v0.4) complete. MyelinationSocket in Elmer. v0.5 (vagus), v1.0 (cutover) remaining. |
 | 48 | STDP eligibility trace fix | **DONE (2026-03-18).** Confirmed fixed. 13-test synthetic spike sequence validates all mechanics. |
 | 43 | Receptor Layer (vector quantization) | **DONE (2026-03-17).** K=256 adaptive prototypes, vendored to all modules. |
 | 28 | Replace `_classification_to_embedding()` | **DONE (2026-03-18).** Semantic embeddings in TID via ng_embed.py. |
 | 45 | Embedding model migration | **DONE (2026-03-22).** `Snowflake/snowflake-arctic-embed-m-v1.5` (768-dim) via `ng_embed.py` (ONNX Runtime). All 2,539 vectors re-embedded. Centralized in vendored ng_embed.py. |
 | 81 | Dual-pass embedding | **DONE (2026-03-22).** `ng_embed.py` vendored ecosystem-wide. `dual_record_outcome()` in ng_ecosystem.py. Forest + tree concept extraction via TID. |
 | 30 | TrollGuard extraction boundary violation | **DONE (2026-03-18).** `target_id` changed to content-derived identifiers. |
-| 44 | Adaptive relevance thresholds | Unblocked by #53 v0.3. Elmer tunes. |
-| 46 | Per-module strength normalization | Unblocked by #53 v0.3. Per-pair tracts enable per-source isolation. |
+| 101 | Module hooks dead | **DONE (2026-03-23).** ContextEngine fan-out from `neurograph_rpc.py`. All 8 modules load and process via `_module_on_message()` on every `afterTurn`. |
+| 102 | Stale tests | Open. 2 CES embedding tests + 1 peer bridge test obsoleted by migrations. |
+| 44 | Adaptive relevance thresholds | Unblocked by #53 v0.3. In SVG plan (Phase 4/6). |
+| 46 | Per-module strength normalization | **CLOSED (2026-03-24).** Hebbian `(1-w)` self-normalizes. Per-pair tracts isolate sources. Edge case → #51. |
+| 51 | Synapse disagreement/variance | **DONE (2026-03-24).** Welford's online variance on NGLiteSynapse. `variance` + `is_contested` properties. Vendored to all modules. |
+| 29 | Extraction bucket architecture | **DONE (2026-03-24).** Already implemented — `get_recommendations()` + `record_outcome()` IS the bucket. Each module's shape = target_id vocabulary + query embedding + interpretation of weight/variance/contested. Documented, not coded. |
 | 14 | Port 8847 documentation discrepancy | Some docs say 8080. 8847 is correct. Documentation fix only. |
 
 ---

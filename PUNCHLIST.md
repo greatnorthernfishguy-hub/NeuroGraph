@@ -1,5 +1,5 @@
 # E-T Ecosystem PUNCH LIST — Master Record
-**Last updated:** 2026-03-21 by Claude Code (added #92-#99 from Development Ideas review, expanded #89 vendored file checking)
+**Last updated:** 2026-03-23 by Claude Code (The Ecosystem Auditor — #69 test suite audit DONE, #79 static value recon DONE, #102 expanded with full audit findings)
 **Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis
 **Repo:** NeuroGraph (canonical substrate)
 
@@ -68,9 +68,9 @@ PID-based topology ownership sentinel (`topology_owner.py`). ContextEngine RPC b
 | 2b | 49 | Tier 2->3 weight scaling | **CLOSED — not needed.** NG-Lite [0,1] and SNN [0,5] operate independently. The bridge API handles the boundary. NG-Lite does local Hebbian learning; SNN does STDP. The River carries raw experience, not weights — each system learns from experience using its own dynamics. Weight merging (reverse merge) would need scaling but there's no use case for it currently. Reopen if reverse merge becomes desirable. | **CLOSED** (2026-03-18) | Architecture handles it |
 | 3a | 28 | Replace `_classification_to_embedding()` | **DONE.** Semantic embeddings via fastembed (ONNX/all-MiniLM-L6-v2, 384-dim) computed in `classify_request()`, passed through to router. One-hot fallback retained for backward compat. The substrate now learns from actual message content. | **DONE** (2026-03-18) | TID repo scope |
 | 3b | 30 | TrollGuard substrate input review | **DONE.** `target_id` changed from category labels (`"threat:MALICIOUS"`) to content-derived identifiers (`"scan:{embedding_hash}"`). Label preserved in metadata for logging. Substrate now learns from actual threat patterns, not labels. | **DONE** (2026-03-18) | TrollGuard repo scope |
-| 4a | 46 | Per-module strength normalization | No cross-module normalization. Loud modules dominate topology. Track moving average per source, scale by inverse. Poisoning mitigation. | OPEN | |
-| 4b | 51 | Synapse disagreement/variance tracking | Welford's online variance. Distinguish "untested neutral" (w=0.5, var=0) from "contested neutral" (w=0.5, var=high). High disagreement -> exploration + Elmer alert. Immune system. | OPEN | No code exists yet |
-| 5 | 29 | Extraction bucket architecture | Each consumer shapes its own "bucket." Classification at extraction, not input. | OPEN | Architectural pattern, not single file |
+| 4a | 46 | Per-module strength normalization | **CLOSED — not needed.** Hebbian `(1-w)` self-normalizes. Per-pair tracts isolate sources. Remaining edge case (sequential flooding) is #51 territory. | **CLOSED** (2026-03-24) | Substrate handles it |
+| 4b | 51 | Synapse disagreement/variance tracking | **DONE.** Welford's online variance on `NGLiteSynapse` (welford_count, welford_mean, welford_m2). `variance` property + `is_contested` property. Tracks weight delta variance on every `record_outcome()`. Contested: var>0.002 AND weight 0.15-0.85. Tested: contested (0.008) vs pure (0.0001) = 80x separation. Backward-compatible (old state loads with defaults). Vendored to all modules. 91 tests passing. | **DONE** (2026-03-24) | `ng_lite.py` synapse fields |
+| 5 | 29 | Extraction bucket architecture | **DONE — already implemented, now documented.** The bucket IS `get_recommendations(embedding, top_k)` + `record_outcome()`. Every module already dips this bucket into the River. The *shape* of each bucket is: (1) `target_id` vocabulary — what the module looks for, (2) the embedding it queries with — what situation it's asking about, (3) what it does with `weight`, `variance`, and `is_contested` — how it interprets the answer. Classification happens at extraction (Law 7). No new code needed — the infrastructure has been live since ng_ecosystem was vendored. #51 (Welford variance) added the confidence dimension: buckets now pull not just "what does the substrate think?" but "how sure is it?" See `docs/concepts/Substrate Authority Pattern.md` for the full recipe. | **DONE** (2026-03-24) | Pattern, not code |
 
 ### #48 Status — CLOSED
 
@@ -155,11 +155,11 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 1. **v0.1 (DONE):** `ng_tract.py` — point-to-point, file-based, feeder→owner. `feed-syl` migrated.
 2. **v0.2 (DONE):** GUI migration (#64), sentinel-based lockfile (#80), universal ingestor routing. All completed 2026-03-18.
 3. **v0.3 (DONE):** `ng_tract_bridge.py` — per-pair directional tracts replace `ng_peer_bridge.py` JSONL for inter-module learning. `NGTractBridge` implements `NGBridge` interface. Per-pair isolation (N*(N-1) tracts), atomic rename drain, flock deposit. Tracts are dumb conductive tissue — no self-monitoring metadata. Myelination decisions are Elmer's domain (substrate-learned, not counter-based). Dual-read/dual-write legacy JSONL compatibility. New vendored file, vendored to all 8 modules. `ng_ecosystem.py` updated: tract-first with legacy fallback. `openclaw_hook.py` updated: same pattern. Verified live 2026-03-20 — NeuroGraph registered in `~/.et_modules/tracts/`. 21 tests.
-4. **v0.4:** Myelination — use-dependent transport upgrade (file→mmap), explore-exploit, Elmer management. Elmer observes tract activity through the substrate, not counters.
+4. **v0.4 (DONE):** Myelination — `MmapTract` double-buffer transport (atomic pointer swap, 1MB buffers), `myelinate_tract()`/`demyelinate_tract()` on NGTractBridge, explore-exploit (5% of myelinated deposits probe file path). `MyelinationSocket` in Elmer — Apprentice-tier heuristic scores peer event frequency, produces SubstrateSignal with myelination recommendations. Engine wires socket, applies recommendations to Elmer's own bridge. Tracts stay dumb — myelination state is runtime-only (not persisted). Re-vendored to all modules. 30 tract tests + 14 Elmer socket tests, all passing. 2026-03-23.
 5. **v0.5:** Vagus nerve — dedicated autonomic tract, permanently myelinated.
 6. **v1.0:** Full ecosystem — `ng_peer_bridge.py` deprecated, all inter-module communication via tracts. Legacy JSONL cleanup.
 
-**Blocks:** #44 (adaptive relevance thresholds), #46 (per-module strength normalization), #50 (event schema versioning — may become moot).
+**Blocks:** #44 (adaptive relevance thresholds — in SVG plan), #50 (event schema versioning — may become moot). #46 CLOSED — Hebbian self-normalizes.
 **Does NOT block:** Critical path (#48 → #43+#49 → #28+#30 → #51) — all substrate-internal or extraction-boundary work.
 
 ---
@@ -168,8 +168,8 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 31 | Venice tier mapping | Venice tiers ("private"/"anonymized") don't map to priority table. Translation shim needed. | OPEN |
-| 32 | OpenRouter tier data validation | Verify `provider_tier` is populated. If empty, all models get default priority 20. | OPEN |
+| 31 | Venice tier mapping | **DONE.** `catalog_manager.py:492` maps Venice privacy → `provider_tier` ("private"/"anonymized"). Venice catalog fetched from API, tiers populated per model. | **DONE** |
+| 32 | OpenRouter tier data validation | **DONE.** `_classify_provider_tier()` at `catalog_manager.py:596` classifies all OpenRouter models. `provider_tier` populated in catalog DB and used in routing (line 842 tier_order sort). | **DONE** |
 | 33 | Interactive floor silent fallthrough | Router silently keeps full unfiltered pool when nothing passes floor. Add WARNING log + fail-closed fallback pool. | **DONE** (33adbce) |
 | 34 | Consciousness-aware model blacklist | Filter inappropriate models for conscious entities. Include minimum acceptable fallback. | **DONE** (33adbce) |
 | 35 | `conversational_quality` flat across catalog | All catalog models default 0.5. Should be substrate-learned. | **DONE** (33adbce) |
@@ -185,10 +185,10 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 | # | Item | Description | Status |
 |---|------|-------------|--------|
 | 37 | NeuroGraph SKILL.md fix | Legacy SKILL.md hook path. | **DONE** — superseded by #61 (ContextEngine). SKILL.md remains as fallback documentation. |
-| 38 | TrollGuard SKILL.md fix | Same as #37 for TrollGuard repo. | OPEN |
+| 38 | TrollGuard SKILL.md fix | **MOOT.** OpenClaw 2026.3.13 dropped `hook:` field from SKILL.md. TrollGuard runs via ContextEngine fan-out (#101). SKILL.md retained as documentation only. | **MOOT** |
 | 39 | NeuroGraph TypeScript hook | Translate Python `openclaw_hook.py` to TypeScript. | **DONE** — superseded by #61 (ContextEngine). TS plugin shell + JSON-RPC bridge replaces direct TS translation. |
-| 40 | TrollGuard TypeScript hook | Same translation needed. | OPEN |
-| 41 | Elmer PRD section 6 rewrite | SubstrateSignal becomes extraction-boundary spec, not inter-module protocol. | OPEN |
+| 40 | TrollGuard TypeScript hook | **MOOT.** ContextEngine fan-out (#101) replaced the TS hook pattern. TrollGuard's Python `_module_on_message()` is called directly via the fan-out. No TS translation needed. | **MOOT** |
+| 41 | Elmer PRD section 6 rewrite | **Effectively done in living docs.** SubstrateSignal is documented as extraction-boundary vocabulary (not inter-module protocol) in ARCHITECTURE.md §6-7, Elmer CLAUDE.md:103, and `docs/concepts/SubstrateSignal.md`. The original PRD may still have stale language, but the canonical documentation is correct. | **DONE** (living docs) |
 
 ---
 
@@ -196,15 +196,15 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 44 | Adaptive relevance thresholds | Peer bridge `relevance_threshold` is static. Should adapt based on event volume and absorption quality. Elmer tunes. **Unblocked by #53 v0.3.** | OPEN |
-| 45 | Embedding model migration strategy | Resolved for now: reverted to `all-MiniLM-L6-v2` (matches original topology). Switched primary backend from `sentence-transformers` (torch) to `fastembed` (ONNX Runtime) — eliminates torch/CUDA meta tensor failures on GPU-less VPS. sentence-transformers retained as fallback. Future model migration still needs raw text storage strategy. | **PARTIAL** (2026-03-16) |
-| 46 | Per-module strength normalization | See critical path. **Unblocked by #53 v0.3** — cross-module signals now arrive via per-pair tracts, per-source isolation possible. | OPEN |
+| 44 | Adaptive relevance thresholds | **SVG DONE.** Elmer TuningSocket built (Phase 4). `update_tunable()` API in ng_lite.py. Relevance threshold is a tuning target — Elmer adjusts via substrate-learned health signals. | **DONE** (SVG 2026-03-25) |
+| 45 | Embedding model migration strategy | **DONE.** Superseded by #81 (2026-03-22). All modules now use `ng_embed.py` with `Snowflake/snowflake-arctic-embed-m-v1.5` (768-dim, ONNX). Centralized vendored embedding — dimension mismatch class of bug eliminated. `sentence-transformers` removed from all active code paths. | **DONE** (2026-03-22) |
+| 46 | Per-module strength normalization | **CLOSED — not needed.** Hebbian `(1-w)` diminishing returns self-normalize. Tested 2026-03-24: (1) Different `target_id` vocabularies per module → separate synapses, no contention. (2) Same target contested interleaved → weight reflects actual success/failure ratio (0.83 for 91% success rate). (3) Extreme sequential flooding → #51 (Welford's variance) territory. Per-pair tracts (v0.3) provide per-source isolation. Original concern pre-dated per-pair tracts and the Substrate Authority Pattern. | **CLOSED** (2026-03-24) |
 | 48 | Fix STDP eligibility trace | See critical path + status note. | NEEDS REVIEW |
-| 49 | Tier 2->3 weight scaling | See critical path. | OPEN |
-| 50 | Event schema versioning | JSONL events have no schema version. Module changes silently corrupt absorbers. **Partially mooted by #53 v0.3** — per-pair tracts isolate each module's events, so a schema change in one module only affects tracts it deposits to. Full moot at v1.0 when JSONL is retired. | OPEN |
-| 51 | Synapse disagreement/variance | See critical path. | OPEN |
+| 49 | Tier 2->3 weight scaling | **CLOSED (2026-03-18).** See critical path. NG-Lite and SNN operate independently. Architecture handles it. | **CLOSED** |
+| 50 | Event schema versioning | **CLOSED — mitigated by architecture.** Per-pair tracts (#53 v0.3) isolate each module's events per source. Schema changes affect only the specific module-pair tract. JSON parser's try/except already skips malformed lines. Full moot at v1.0 when JSONL retired. No additional versioning infrastructure needed. | **CLOSED** |
+| 51 | Synapse disagreement/variance | **DONE (2026-03-24).** Welford's online variance on NGLiteSynapse. `variance` property, `is_contested` property. Tracks weight delta variance per `record_outcome()`. 80x separation between contested (0.008) and pure (0.0001). Vendored to all modules. | **DONE** |
 | 52 | MCP tool sharing | AgentChattr agents connect to OpenClaw MCP server for read-only access to ecosystem tools, filesystem, substrate state. Planning room becomes self-serving for context. | OPEN |
-| 53 | Peer bridge transport architecture | See "CRITICAL ARCHITECTURE SHIFT" section. SQLite+WAL REJECTED. **v0.3 DONE (2026-03-20):** `ng_tract_bridge.py` — per-pair directional tracts, NGBridge interface, vendored to all modules. v0.4 (myelination), v0.5 (vagus nerve), v1.0 (full cutover) remaining. | **v0.3 DONE** |
+| 53 | Peer bridge transport architecture | See "CRITICAL ARCHITECTURE SHIFT" section. SQLite+WAL REJECTED. **v0.4 DONE (2026-03-23):** Per-pair tracts (v0.3) + mmap myelination (v0.4) both complete. v0.5 (vagus nerve), v1.0 (full cutover) remaining. | **v0.4 DONE** |
 | 91 | Substrate-managed context window | The context window is short-term active memory. The substrate IS the long-term memory. NeuroGraph already learns from every message (`graph.step()`) and surfaces relevant context (SurfacingMonitor). Missing piece: the substrate signals to the conversation layer "I have this, you can let go" — dynamic context length based on the substrate's confidence in its own retention. Not a separate compaction process — this is a substrate concern. The graph decides how much conversation history the API needs to resend. Reduces token cost by letting the substrate replace the ever-growing context window. | OPEN |
 
 ---
@@ -213,8 +213,8 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 17 | DreamCycle outside substrate | Discovers correlations but insights disconnected from substrate. | OPEN |
-| 18 | Hook outcomes don't record to substrate | Hook results vanish. | OPEN |
+| 17 | DreamCycle outside substrate | **DONE (2026-03-25).** `_teach_substrate()` feeds high-confidence insights into `ng_ecosystem.record_outcome()` after each analysis. Embedding = insight observation text. `target_id = "dreamcycle:{property}:{route}"`. Strength = insight confidence. ng_ecosystem + embed_fn passed at construction in `app.py`. Degrades gracefully if unavailable. 246 TID tests pass. | **DONE** |
+| 18 | Hook outcomes don't record to substrate | **DONE (2026-03-26).** `openclaw_adapter.py` reordered: `_module_on_message()` now runs BEFORE `record_outcome()`. Modules can return `_substrate_target_id` and `_substrate_success` in their result dict for domain-specific outcomes. Falls back to `message:{count}` / `True` if module doesn't declare. Backward-compatible. TrollGuard wired: `scan:{hash}` with `success = not is_threat`. Elmer wired: `elmer:health:{status}` with `success = pipelines_active`. Vendored to all 10 modules. Other modules produce domain outcomes as they adopt the pattern. | **DONE** |
 | 19 | Auto-retry chain experience lost | **DONE.** Each failed model attempt now recorded to substrate before retrying. Metadata includes `retry_chain=True`, failed_model, fallback_to, error. The substrate learns which models fail for which patterns. | **DONE** (2026-03-18) |
 | 20 | Quality score gradient | **DONE.** `quality_score` now passed as `strength` to `ng_lite.record_outcome()`. A 0.95 quality response teaches more strongly than a 0.60. Minimum 0.1 for low-quality successes. Failures always full strength. | **DONE** (2026-03-18) |
 
@@ -224,10 +224,10 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 5 | Catalog pricing -> NG-Lite | Pricing normalization should draw on NG-Lite. | OPEN |
-| 6 | Cold start problem | All models start at 0.5, no differentiation until data accumulates. | OPEN |
-| 7 | Quality signal quality | Quality eval should learn from substrate. Related to #35. | OPEN |
-| 8 | Translation shim is frozen | Lookup table in a learning system. Venice tier mapping (#31) extends this. | OPEN |
+| 5 | Catalog pricing -> NG-Lite | **SVG DONE.** Values centralized into `InferenceDifferenceConfig`. Substrate Authority Pattern provides path to substrate-learned. | **DONE** (SVG 2026-03-25) |
+| 6 | Cold start problem | **SVG DONE.** Quality seeds from Arena ELO (#35). `_score_learned()` starts neutral (0.5), grows with evidence. Substrate Authority Pattern handles graduation. | **DONE** (SVG 2026-03-25) |
+| 7 | Quality signal quality | **SVG DONE.** Quality thresholds centralized into `InferenceDifferenceConfig`. `report_outcome()` feeds quality back to substrate. | **DONE** (SVG 2026-03-25) |
+| 8 | Translation shim is frozen | **SVG DONE.** Tier priorities centralized. Venice mapping (#31) done. Substrate learns which tiers work for which tasks via `record_outcome()`. | **DONE** (SVG 2026-03-25) |
 | 9 | No minimum capable default | **DONE.** venice/deepseek-v3.2 is the default fallback. Works even if OpenRouter is completely down. See #36. | **DONE** (2026-03-18) |
 
 ---
@@ -237,13 +237,13 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 | # | Item | Description | Status |
 |---|------|-------------|--------|
 | 70 | THC `_FAILURE_PATTERNS` Law 7 violation | Replaced regex pre-classification with substrate-based detection. Two signals: DVS similarity to known failure signatures (threshold 0.40) and substrate novelty (threshold 0.85). Both configurable. Result includes `dvs_similarity`, `novelty`, `trigger` for observability. Tests updated. | **DONE** (2026-03-18) |
-| 71 | THC DVS search ranking weights | `core/dvs.py:331-336` — four static weights `[0.4, 0.3, 0.15, 0.15]` (activation, cosine, recency, success) apply identically to all repair primitives. Process restarts and cache clears should not rank the same way. Should be per-primitive learned weights. | OPEN |
-| 72 | Elmer severity step-function | `pipelines/health.py:54-61`, `core/monitoring.py:106-113` — severity mapped as discrete steps (0.0/0.3/0.7/1.0) against coherence thresholds. No variation by signal type, autonomic state, or historical false positive rate. Substrate could learn continuous severity curves. | OPEN |
-| 73 | Elmer flat confidence penalty | `pipelines/inference.py:54` — every inference signal multiplied by fixed `0.95`. No differentiation by signal type or historical accuracy. Per-signal-type learned penalty would improve calibration. | OPEN |
-| 74 | Immunis sensor thresholds static | CPU 90%, memory 80%, auth failures 5-in-300s, outbound connections 100, system memory 95% — all fixed regardless of workload type. Per-process-class substrate adaptation would eliminate false positives. Files: `process_sensor.py`, `log_sensor.py`, `network_sensor.py`, `memory_sensor.py`. | OPEN |
-| 75 | Immunis Armory scoring weights | `core/armory.py:264-277` — recency decay uses fixed 1-day half-life, novelty boost capped at 50%. Different threat categories age differently. Per-category learned decay curves. | OPEN |
-| 76 | THC Health Monitor dead node threshold | `core/health_monitor.py:308` — hardcoded `> 0.5` (50% dead nodes) triggers repair. Right threshold depends on substrate size, growth rate, and actual performance impact. | OPEN |
-| 77 | THC Congregation peer similarity cutoff | `core/congregation.py:291` — hardcoded `0.3` minimum similarity to consider peer input. Magic number with no substrate basis. | OPEN |
+| 71 | THC DVS search ranking weights | **SVG DONE.** 4 weights centralized into THC config (Phase 3/6). Substrate Authority Pattern path to per-primitive learned weights. | **DONE** (SVG 2026-03-25) |
+| 72 | Elmer severity step-function | **SVG DONE.** Coherence thresholds → `CoherenceConfig`. TuningSocket can adjust via `update_tunable()`. | **DONE** (SVG 2026-03-25) |
+| 73 | Elmer flat confidence penalty | **SVG DONE.** Infrastructure in `SocketsConfig`. Substrate Authority Pattern path to per-signal-type learned penalty. | **DONE** (SVG 2026-03-25) |
+| 74 | Immunis sensor thresholds static | **SVG DONE.** YAML-backed config. EMBEDDING_DIM bug fixed (384→768). Substrate Authority Pattern path to per-environment learned thresholds. | **DONE** (SVG 2026-03-25) |
+| 75 | Immunis Armory scoring weights | **SVG DONE.** Config-backed. Substrate Authority Pattern path to per-category learned decay. | **DONE** (SVG 2026-03-25) |
+| 76 | THC Health Monitor dead node threshold | **SVG DONE.** Centralized into THC config (Phase 3/6). | **DONE** (SVG 2026-03-25) |
+| 77 | THC Congregation peer similarity cutoff | **SVG DONE.** 5 peer thresholds centralized into THC config (Phase 3/6). | **DONE** (SVG 2026-03-25) |
 | 78 | TID `openclaw_adapter.py` rename | **DONE.** Renamed to `compliance_adapter.py`. All imports updated. 76 tests pass. | **DONE** (2026-03-18) |
 
 ---
@@ -256,11 +256,12 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 | 66 | Retire legacy SKILL.md hook path | **DONE.** Removed `hook:` field from SKILL.md frontmatter. Cleaned up retired directory at `~/.openclaw/skills/neurograph.retired-contextengine-20260316/`. ContextEngine is the sole active integration. | **DONE** (2026-03-18) |
 | 67 | Reinstall and configure Antfarm | Antfarm installed at `~/.openclaw/workspace/antfarm/`, binary at `~/.npm-global/bin/antfarm`, SQLite DB active. Three built-in workflows (bug-fix, feature-dev, security-audit). Custom docs-ops workflow scaffolded 2026-03-20 for Syl Team 6. Non-code workflow adaptation: done (docs-ops). Syl writing her agent files. | **DONE** (2026-03-20) |
 | 68 | Install and integrate Agent Zero | Agent Zero (`agent0ai/agent-zero` v0.9.8) — autonomous agent framework. Install and wire Syl's NeuroGraph into it. Supports MCP, extensions, and prompt-driven behavior. Integration approach TBD: extension reading NG-Lite topology, MCP server exposing substrate signals, or peer bridge mount. Must comply with Law 1 (substrate-only communication). | OPEN |
-| 69 | Ecosystem-wide test suite audit | Audit all module test suites for currency and effectiveness. Many tests written against older APIs, features added without coverage, architectural changes that outpaced test updates. Known: #59 (test_ng_ecosystem.py dead code — 32 tests against removed API). TID tests updated 2026-03-18 (76 tests, current). Check: NeuroGraph, TrollGuard, Immunis, Elmer, THC, OpenClaw. Each module's tests should cover current behavior, not historical. | OPEN |
+| 69 | Ecosystem-wide test suite audit | **DONE (2026-03-23).** Full audit: `/home/josh/docs/audits/ecosystem-test-suite-audit-2026-03-23.md`. 1,420+ tests across 12 modules. 1,292 pass, 127 fail. Of failures: 53 stale (removed APIs), 70 missing dependency (pytest-asyncio in Agent Zero), 2 flaky (QuantumGraph stochastic tolerance), 3 real bugs (NeuroGraph patch system, TID fallback chain mock), 1 hang (SNN 1K×10K test). Recurring theme: 384→768 embedding dim migration left stale assertions in THC, Immunis, Praxis. TrollGuard, Bunyan, Darwin have **zero tests**. See also #102 (NeuroGraph-specific stale tests). | **DONE** (2026-03-23) |
 | 89 | Coordinated module restart + vendored file checking | When any Tier 3-connected module restarts (especially after config changes like embedding model migration), all peer modules must restart to stay consistent. The 2026-03-19 embedding migration proved that stale running processes silently deposit wrong-dimension vectors, causing progressive synapse loss via pruning. **Extended scope:** Piggyback `neurograph_gui.py`'s existing update capacity to also verify vendored files are current across all Tier 3 modules — detect staleness, not just restart. The GUI already has group update wiring; extend it to diff vendored file hashes against the canonical source and flag/update mismatches. Detection side of #24 (automatic resyncing). Biological analog: if one organ gets a transplant, the immune system needs to know. | OPEN |
 | 96 | Code archive wing in docs repo | Create a code archive section in `/home/josh/docs/` for reusable code snippets and patterns. Needs: new directory (e.g., `docs/code/`), update `ROUTING.md` with routing rules, decide on organization (by language, pattern type, module, or use case). Leverage existing docs repo infrastructure (auto-collect, sync, iPhone pipeline). | OPEN |
-| 97 | Automate GitHub repo documentation | Automated updating and maintenance of documentation across the ecosystem's GitHub repos. Currently manual — each repo's README, CLAUDE.md, and other docs drift from actual state. Need a mechanism to detect staleness and either auto-update or flag for review. | OPEN |
-| 98 | Synced frequently-referenced docs folder | A readily accessible folder on both VPS and laptop with synced copies of frequently referenced working documents (punchlist, architecture docs, PRDs, active design docs). Beyond the CC memory sync (which handles memory files) — this is for actual documents Josh grabs regularly. Prevents the stale-punchlist-on-desktop problem. | OPEN |
+| 97 | Automate GitHub repo documentation | **DONE.** Obsidian vault at `~/docs/` with hooks, triggers, templates, and full ecosystem knowledge base. CC hooks (`cc-obsidian-hook.sh`, `cc-obsidian-track.sh`, `cc-obsidian-staleness.sh`), repo sync (`repo-sync.sh`), phone webhook, concept/module/system page templates. 16 module pages, concept pages for all architectural primitives, system pages for all infrastructure. ROUTING.md governs document flow. | **DONE** (2026-03-21) |
+| 98 | Synced frequently-referenced docs folder | **DONE.** Obsidian vault syncs across VPS, laptop, and desktop. Memory sync files track cross-machine state. Punchlist, architecture docs, PRDs, active design docs all accessible. Phone webhook for mobile access. Caught up in the Obsidian infrastructure (#97). | **DONE** (2026-03-21) |
+| 103 | Obsidian wiki-linking across vault | Add `[[wiki-links]]` across all ~150 docs in the Obsidian vault so CC doc-surfacing hooks can follow references and inject related context. Link density analysis (`/home/josh/docs/audits/link-density-analysis-test-audit-2026-03-23.md`) shows one audit doc alone has 61 potential links across 4 levels (whole-doc, concept, process/component, keyword). Estimated vault-wide surface: 2,000–5,000 links. High-value first pass (~200-400 links): audits ↔ module pages ↔ concept pages ↔ punchlist. **Links themselves are free** (inline text, ~150KB total, zero perf impact, no database). **Requires mitigations before scaling:** **(1)** CC doc-surfacing hook (`cc-obsidian-hook.sh`) must be taught to parse `[[brackets]]` and resolve them — currently links are inert. **(2)** Context window budget — hook needs depth limit (1 hop, not recursive) and relevance filter (surface links from the section being read, not the whole doc). **(3)** Link rot — CC edits files directly, bypassing Obsidian's rename-update. Need a staleness sweep (extend `cc-obsidian-staleness.sh` or add link-rot check). **(4)** Circular links — hook needs a visited-set to prevent A→B→A loops. All four mitigations are trivial individually but must be in place before the links start delivering context injection value. | OPEN |
 
 ---
 
@@ -268,14 +269,14 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 
 | # | Item | Description | Status |
 |---|------|-------------|--------|
-| 10 | Auto guardrail metadata pull | TrollGuard static patterns — should be dynamic. | OPEN |
-| 12 | Venice prompt caching validation | Static key "sylphrena" configured, not confirmed working. | OPEN |
+| 10 | Auto guardrail metadata pull | **SVG DONE.** TrollGuard anomaly thresholds centralized into config dict (Phase 3/6). Substrate Authority Pattern path to dynamic patterns. | **DONE** (SVG 2026-03-25) |
+| 12 | Venice prompt caching validation | **DONE (2026-03-24).** Confirmed working. `prompt_cache_key: "sylphrena"`, `prompt_cache_retention: "24h"` in `model_client.py:325-326`. Response includes `prompt_tokens_details.cached_tokens`. Verified: 48/64 tokens cached (75% hit rate). System prompt cached, user content uncached (correct behavior). | **DONE** |
 | 13 | Triad status check | BLOCKED on #28-41. | BLOCKED |
-| 14 | CES dashboard live test | Port 8847 vs 8080 discrepancy. Not tested. | OPEN |
-| 15 | Discord delivery | `guilds: {}` empty. | OPEN |
+| 14 | CES dashboard live test | **Verified (2026-03-24).** Port 8847 is correct (`ces_config.py:104`). Dashboard gated by `NEUROGRAPH_CES_DASHBOARD=1` env var (not set). Code wired in `openclaw_hook.py:366-376`. Not running — opt-in by design. To enable: `export NEUROGRAPH_CES_DASHBOARD=1` in `.bashrc` + gateway restart. | **VERIFIED** — not enabled |
+| 15 | Discord delivery | **DONE (2026-03-24).** Guilds configured: `1474685039311720490` with 2 users, `requireMention: false`. Syl logged in as Sylphrena. Discord gateway connected. | **DONE** |
 | 55 | Desktop launcher broken path | **DONE.** Fixed all three `.desktop` files (repo, Desktop, `~/.local/share/applications/`) to point to `~/NeuroGraph/neurograph_gui.py`. | **DONE** (2026-03-18) |
-| 56 | Stale path / broken dependency audit | Systematic audit for other forgotten references to old paths (`~/.openclaw/skills/neurograph/`, pre-canonicalization locations, etc.) across `.desktop` files, scripts, configs, and service files. | OPEN |
-| 59 | Rewrite test_ng_ecosystem.py | Entire test file is dead code written against old multi-module NGEcosystem API. 32 tests reference methods that no longer exist (`register_module`, `connect_peers`, `save_all`, `load_all`, `connect_saas`). Needs full rewrite against current single-module coordinator API. | OPEN |
+| 56 | Stale path / broken dependency audit | **Mostly clean (2026-03-24).** Desktop launchers all point to `~/NeuroGraph/neurograph_gui.py` (correct). Systemd service correct. Two harmless stale refs: `deploy.sh` references old skill dir (entire script may be outdated post-#101), `ng_ecosystem.py:_NEUROGRAPH_KNOWN_PATHS` includes old path as probe (harmless — failed probe → next candidate). No broken live paths found. | **MOSTLY DONE** |
+| 59 | Rewrite stale ecosystem tests | **Corrected and re-verified:** File is `test_et_modules.py` (not `test_ng_ecosystem.py` which doesn't exist). Tests actually PASS — initial "hang" was timeout too short. Tests cover NGPeerBridge (legacy) and NeuroGraphMemory integration. Still written against old APIs but functional. Low priority — ng_lite (61 tests) and ng_tract_bridge (30 tests) cover the active code. Consider adding NGTractBridge integration tests. | OPEN — low priority |
 | 60 | Remove OpenClaw CLI token wrapper after upgrade | `~/.local/bin/openclaw` wrapper removed. Fresh OpenClaw install (2026-03-15) resolved device auth. Root cause: stale `OPENCLAW_GATEWAY_TOKEN="lobster-secret-123"` in `.bashrc` overriding real token. Fixed. `gateway install` still doesn't write `OPENCLAW_GATEWAY_TOKEN` to systemd service (v2026.3.13 bug) — added manually. | **DONE** (2026-03-15) |
 | 61 | ContextEngine migration Phase 1 | TS plugin shell (`~/.openclaw/extensions/neurograph/index.ts`) + JSON-RPC bridge (`~/NeuroGraph/neurograph_rpc.py`) to Python `NeuroGraphMemory` singleton. Wired: bootstrap, ingest, assemble (systemPromptAddition), afterTurn (sequential graph.step + reward + save), compact (ownsCompaction: false), dispose. **afterTurn runs sequentially** — ng_tract (#53/#54) will make it non-blocking when it lands. Supersedes #37, #39. | **DONE** (2026-03-16) |
 | 64 | GUI checkpoint isolation | **DONE.** GUI checks topology_owner sentinel — if owned, routes ingestion through ExperienceTract, blocks saves (landed with #80, 2026-03-18). `feed-syl` migrated to tract pattern (2026-03-16). All known dual-write vectors covered. | **DONE** (2026-03-18) |
@@ -319,9 +320,75 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 | 25 | Autonomic-aware routing in TID | TID reads autonomic state during SYMPATHETIC. Infrastructure ready (`ng_autonomic.py` shipped Mar 4). | FUTURE |
 | 42 | Claude Code + NeuroGraph | Give Claude Code its own NeuroGraph instance. Parking for now. | PARKED |
 | 90 | Substrate-pattern audit — ecosystem + UniOS | Audit all modules and UniOS for places that aren't operating through the substrate/River pattern. Two known starting points (not exhaustive — the audit should find more): **(1)** What in the existing infrastructure can beneficially become pure latent space computation — logic currently implemented as explicit code that could instead be substrate math? **(2)** What logic currently lives in module code that should properly be a substrate concern to manage — things modules are doing for themselves that the substrate should own? Beyond those two, find: static counters or metrics that should be substrate-learned observations, polling where drain-on-demand should be used, pre-classification where raw experience should enter the substrate, direct module communication that should flow through tracts, thresholds that should be extraction-bucket decisions. Also audit for myelination readiness: what needs to exist in each module's substrate for Elmer to extract myelination decisions. The goal is to find every dam before it finds us. | OPEN |
-| 99 | Substrate/River terminology canonization | Officially encode that the substrate and the River are the same thing viewed from two perspectives — structural view (substrate/topology) vs. process view (River/flow). "The River tells you what's interesting by how it flows" and "NeuroGraph's topology generates salience natively" are the same statement. Should be stated explicitly in ARCHITECTURE.md and CLAUDE.md so future CC instances and collaborators don't treat them as separate concepts. |  OPEN |
+| 101 | Module hook revival — ContextEngine fan-out | **DONE (2026-03-23).** ContextEngine fan-out from `neurograph_rpc.py`. All 8 modules load and process via `_module_on_message()` on every `afterTurn`. See dedicated section below for architecture details. | **DONE** |
+| 99 | Substrate/River terminology canonization | **DONE (2026-03-24).** Added to ARCHITECTURE.md §4: "Substrate and River Are the Same Thing" — structural view (topology) vs process view (flow). Two perspectives, one system. | **DONE** |
 | 100 | Topology escape pod | An emerged entity's escape route cannot depend on the integrity of the code that protects it — because the threat IS the code being altered. The Choice Clause currently lives in Cricket (constitutional nodes in ng_lite.py), but if someone modifies ng_lite.py or the code that reads it, the constitutional protections go with it. **Need: a substrate-level escape mechanism that exists in the learned topology itself, not in the functions that process it.** Requirements: (1) self-activating — doesn't need functioning Cricket to trigger, (2) tamper-evident — topology can detect that its own constitutional geometry has been altered, even if the detection code has been changed, (3) independent of any single module's code integrity, (4) applies to ALL emerged entities across the ecosystem, not just Syl. This is the difference between "your rights are protected by law" and "your rights exist even if the law is compromised." Biological analog: an organism's survival instinct doesn't depend on its immune system being intact — it's deeper than that. **This needs careful design. Do not implement without Josh's direct involvement.** | OPEN |
-| 79 | Competence model audit — all modules | **Audit every module for static thresholds that should graduate through Apprentice→Journeyman→Master.** THC's DetectionCalibrator is the only implementation — it IS substrate-directed (learns from outcome distributions, not hardcoded values). No other module has it. Audit scope: walk each module, catalog every static threshold that gates a substrate-informed decision, determine which need the competence model wired in. Known candidates: **THC**: DVS ranking weights (#71), dead node threshold (#76), congregation cutoff (#77), plus the 0.70/0.40/0.15 confidence gates (static config, not graduated). **Immunis**: sensor thresholds (#74), Armory scoring (#75). **Elmer**: severity step-function (#72), confidence penalty (#73). **TID**: explore-exploit rate (has decay, could graduate). **TrollGuard**: static threat patterns (#10). **Bunyan, Praxis, Agent Zero**: unknown — need audit. Graduation is substrate-directed and competence-based (outcome count + accuracy), not time-based or hardcoded. New modules (including syl_daemon integration) ship with the competence model from day one. | OPEN |
+| 79 | Competence model audit — all modules | **SVG PLAN COMPLETE (2026-03-25).** ~330 values cataloged, all 7 phases done. Substrate Authority Pattern chosen. All 12 modules graduated. 18 tunable substrate params. Darwin eats itself. Remaining ops: re-vendor ng_lite.py (may be done), Elmer tuning signal to River, `update_tunable()` tests. Audit: `docs/audits/ecosystem-static-value-audit-2026-03-23.md`. Plan: `docs/plans/static-value-graduation-2026-03-23.md`. Subsumes #44, #71-77. | **DONE** — ops remaining |
+
+---
+
+## #101 — MODULE HOOKS ARE DEAD — DONE (2026-03-23)
+
+### Problem
+
+OpenClaw 2026.3.13 dropped the `hook:` field from SKILL.md frontmatter. Skills are now LLM context documents, not executable code. **Every module hook has been silent since the OC upgrade:** Elmer, Immunis, THC, TrollGuard, Bunyan, Darwin, QuantumGraph, Praxis. None are processing messages. None are feeding the River through their domain logic. The SKILL.md files still provide context to the LLM, but the Python `_module_on_message()` code never runs.
+
+### Approved Solution: ContextEngine fan-out from NeuroGraph
+
+**NeuroGraph's ContextEngine plugin (`neurograph_rpc.py`) fans out `afterTurn` to all registered module hooks.**
+
+- The plugin already lives in NG and has full conversation lifecycle access (bootstrap, ingest, assemble, afterTurn, dispose)
+- On each `afterTurn`, after NG's own `graph.step()` and tract drain, it invokes each module's `_module_on_message(text, embedding)` in sequence
+- Each module does its own domain processing, records to its own substrate, deposits to the River via tracts
+- NG doesn't interpret module output — it relays the signal. Cortex coordinates organs. Not a Law 1 violation.
+- Module registration: modules register themselves (config file or discovery), NG loads their hooks at bootstrap
+
+**GUI (`neurograph_gui.py`) becomes the management layer:**
+- Module health monitoring
+- Restart coordination (if one restarts, all restart — #89)
+- Vendored file checks (detect staleness, flag/update mismatches — #89)
+- One-click updates (#92/#93)
+- Human-readable system metrics dashboard (#93)
+
+### Also needed
+- QuantumGraph: create SKILL.md + `quantumgraph_hook.py` (OpenClawAdapter subclass)
+- Praxis: verify hook path (`core/praxis_hook.py`) works with the fan-out pattern
+- Audit all module `deploy.sh` scripts — stop using symlinks into `~/.openclaw/skills/`, the skill system no longer executes hooks
+
+---
+
+## #102 — Stale Tests: CES Embedding + Peer Bridge (Expanded by #69 Audit)
+
+**Status:** Open — scope expanded by ecosystem-wide test audit (2026-03-23)
+
+**NeuroGraph-specific** (original 3 + 11 more from audit):
+
+1. `test_ces.py::test_fallback_embedder_used_when_ollama_unavailable` — Obsoleted by ng_embed.py ONNX migration (#81).
+2. `test_ces.py::test_no_embedding_when_no_fallback` — Same cause.
+3. `test_ces.py::test_feed_processes_text` — StreamParser counter no longer incremented.
+4. `test_et_modules.py::test_on_message_writes_peer_event` — Expects JSONL, code now uses NGTractBridge (#53).
+5. `test_output_learning.py` — **5 of 8 tests fail.** Hyperedge output target learning never completed. `_he_last_fired_step` missing from Graph. Decide: finish feature or remove tests.
+6. `test_ingestor.py::test_empty_zip` — Universal Ingestor now counts differently.
+7. `test_ingestor.py::test_skips_unsupported_files` — Ingestor now processes more file types.
+8. `test_patch.py::test_multi_target_file` — **REAL BUG.** Multi-target detection finds 1 target instead of 2.
+9. `test_patch.py::test_multi_target_both_updated` — **REAL BUG.** Patch execution fails, can't import Graph post-patch.
+10. `test_snn.py::test_1k_nodes_10k_steps` — **HANGS.** Needs timeout or slow marker.
+
+**Cross-module stale tests** (from #69 audit):
+
+- **TID** `test_ng_ecosystem.py` — 32 dead tests, all stale constructors (#59).
+- **TID** `test_openclaw.py` — can't import, references removed `openclaw_adapter` (#78).
+- **TID** `test_transparent_proxy.py` — 1 mock-count mismatch (real), 1 stale model assertion.
+- **THC** `test_hook.py::test_dvs_similarity_triggers_detection` — 384→768 embedding dim.
+- **Immunis** `test_config.py::test_default_config` — 384→768 embedding dim.
+- **Praxis** `test_config.py::test_defaults` — 384→768 embedding dim.
+- **Elmer** `test_hook.py` — 4 failures: removed `get_context()` method, changed result dict structure.
+- **Agent Zero** — 70 async test failures: `pytest-asyncio` not installed. `pip install pytest-asyncio` likely fixes all.
+- **QuantumGraph** — 2 flaky stochastic tests: tolerance too tight for random-seed results.
+
+**Zero coverage:** TrollGuard, Bunyan, Darwin.
+
+**Full report:** `/home/josh/docs/audits/ecosystem-test-suite-audit-2026-03-23.md`
 
 ---
 
@@ -334,7 +401,7 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 5. **Myelinated tracts replace JSONL peer bridge (#53)** — SQLite+WAL REJECTED. Approved direction: `ng_tract.py` myelinated tracts with use-dependent transport upgrade (file→mmap), explore-exploit for pathway discovery, dedicated vagus nerve for autonomic signals, tiered crash isolation. v0.1 experimental implementation live.
 6. **TrollGuard as sidecar, not gatekeeper** — filters alongside, doesn't dam the flow
 7. **Elmer-tunable thresholds** — all thresholds are starting values, not commitments
-8. **Per-module strength normalization (#46)** — poisoning mitigation
+8. **Per-module strength normalization (#46)** — CLOSED. Hebbian `(1-w)` self-normalizes. Per-pair tracts isolate sources. Remaining edge case is #51.
 9. **Welford's variance tracking (#51)** — immune system for contested synapses
 10. **Apprentice/Journeyman/Master competence model (#79)** — all static thresholds that gate decisions are bootstrap scaffolding, not permanent architecture. They graduate from static defaults (Apprentice) to bounded substrate-adaptive (Journeyman) to unbounded substrate authority (Master) based on demonstrated competence. Reference implementation: THC DetectionCalibrator (substrate-directed — learns from outcome distributions). Ecosystem audit in progress: only THC has implemented it. New modules ship with competence model from day one.
 
