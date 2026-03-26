@@ -81,6 +81,17 @@ Design principles (PRD §2.1):
 # How: Added inject_reward() call at end of _on_prediction_error(),
 #   gated on three_factor_enabled. Strength = pred.confidence *
 #   surprise_reward_scaling. No scope (broadcast to all warm traces).
+# [2026-03-25] Claude Code (Opus 4.6) — Lenia FlowGraph hook points
+# What: Added pre_fire event for threshold modulation, enriched spikes
+#   event with per-node eligibility trace state.
+# Why: Lenia FlowGraph substrate integration (PRD: Lenia_FlowGraph_Design_v0.1.md).
+#   Pre-fire lets the continuous field modulate SNN firing thresholds.
+#   Trace info lets the spike-field bridge compute channel distribution
+#   from structural state (Law 7 compliant — no semantic content examined).
+# How: Step 3 firing detection calls pre_fire handlers and sums threshold
+#   adjustments. Spikes emit includes trace_info dict mapping fired node
+#   IDs to their outgoing synapse eligibility trace values. Both are no-ops
+#   when no handlers are registered (single dict lookup cost).
 # -------------------
 """
 
@@ -1596,11 +1607,16 @@ class Graph:
             target.voltage += current * target.intrinsic_excitability
 
         # 3. Detect firing nodes
+        #    Lenia FlowGraph: pre_fire handlers can adjust thresholds.
         fired_ids: List[str] = []
         for nid, node in self.nodes.items():
             if node.refractory_remaining > 0:
                 continue
-            if node.voltage >= node.threshold:
+            effective_threshold = node.threshold
+            if self._event_handlers.get("pre_fire"):
+                for cb in self._event_handlers["pre_fire"]:
+                    effective_threshold += cb(node_id=nid)
+            if node.voltage >= effective_threshold:
                 fired_ids.append(nid)
 
         # 3b. Zero-firing circuit breaker tracking
@@ -1875,9 +1891,21 @@ class Graph:
             if syn.salience > 1.0:
                 syn.salience = 1.0 + (syn.salience - 1.0) * (1.0 - salience_decay)
 
-        # Emit spike events
+        # Emit spike events (enriched with trace state for Lenia bridge)
         if fired_ids:
-            self._emit("spikes", node_ids=fired_ids, timestep=self.timestep)
+            # Collect eligibility trace magnitudes per fired node (Law 7:
+            # trace STATE is structural, not semantic content analysis).
+            trace_info = {}
+            if self._event_handlers.get("spikes"):
+                for nid in fired_ids:
+                    traces = []
+                    for syn_id in self._outgoing.get(nid, set()):
+                        syn = self.synapses.get(syn_id)
+                        if syn is not None and abs(syn.eligibility_trace) > 1e-12:
+                            traces.append(syn.eligibility_trace)
+                    trace_info[nid] = traces
+            self._emit("spikes", node_ids=fired_ids, timestep=self.timestep,
+                        trace_info=trace_info)
 
         # 11. Zero-firing circuit breaker
         breaker_steps = self.config.get("zero_fire_breaker_steps", 200)

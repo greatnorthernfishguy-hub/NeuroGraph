@@ -12,6 +12,13 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-03-25] Claude Code (Opus 4.6) — Lenia FlowGraph integration
+# What: Initialize Lenia stack on bootstrap, competence/watchdog on afterTurn,
+#   clean shutdown on dispose. Dormant by default (kill switch off).
+# Why: Lenia FlowGraph PRD — continuous field dynamics for the substrate.
+# How: Import lenia/ package in bootstrap, create full stack, check kill switch.
+#   Post-step: update competence meter, check energy watchdog. Dispose: stop engine.
+#   All wrapped in try/except — Lenia failure never affects core NG operation.
 # [2026-03-24] Claude Code (Opus 4.6) — The Tonic: latent thread in context assembly
 #   What: handle_assemble() runs ouroboros_cycle() and injects latent thread
 #     into systemPromptAddition. _format_substrate_context() takes optional
@@ -92,6 +99,12 @@ _module_hooks: Dict[str, Any] = {}
 _module_install_paths: Dict[str, str] = {}  # module_id -> install_path
 _module_errors: Dict[str, str] = {}
 _module_error_times: Dict[str, float] = {}
+
+# Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)
+_lenia_kill_switch: Optional[Any] = None
+_lenia_engine: Optional[Any] = None
+_lenia_bridge: Optional[Any] = None
+_lenia_competence: Optional[Any] = None
 
 # Embedding cache — text + embedding from ingest, consumed in afterTurn
 _cached_text: Optional[str] = None
@@ -391,6 +404,56 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     global _module_hooks
     _module_hooks = _load_module_hooks()
 
+    # Lenia FlowGraph — continuous field dynamics (dormant by default)
+    global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
+    try:
+        from lenia.config import default_config as lenia_default_config
+        from lenia.field import FieldStore as LeniaFieldStore
+        from lenia.channels import ChannelRegistry
+        from lenia.kernel import DistanceCache, KernelComputer
+        from lenia.engine import UpdateEngine
+        from lenia.bridge import SpikeFieldBridge
+        from lenia.myelination import MyelinationObserver
+        from lenia.competence import CompetenceMeter
+        from lenia.kill_switch import KillSwitch
+        from lenia.graph_substrate import NeuroGraphSubstrate
+
+        lenia_cfg = lenia_default_config()
+        n_entities = len(_memory.graph.nodes)
+        n_channels = len(lenia_cfg.initial_channels)
+
+        lenia_substrate = NeuroGraphSubstrate(_memory.graph)
+        lenia_field = LeniaFieldStore(lenia_cfg.field_dir, n_entities, n_channels)
+        lenia_registry = ChannelRegistry(lenia_cfg, lenia_cfg.field_dir)
+        lenia_cache = DistanceCache(n_entities)
+        lenia_kernel = KernelComputer(lenia_cache, lenia_registry)
+        lenia_myelin = MyelinationObserver(lenia_cfg)
+        _lenia_competence = CompetenceMeter(lenia_cfg, lenia_myelin)
+        _lenia_engine = UpdateEngine(lenia_cfg, lenia_field, lenia_kernel, lenia_registry)
+        _lenia_bridge = SpikeFieldBridge(lenia_cfg, lenia_field, lenia_substrate)
+        _lenia_kill_switch = KillSwitch(lenia_cfg, lenia_cfg.field_dir)
+        _lenia_kill_switch.set_components(_lenia_engine, _lenia_bridge)
+
+        _lenia_engine.register_post_tick(lenia_myelin.update)
+
+        if _lenia_kill_switch.enabled:
+            _lenia_kill_switch.enable(graph=_memory.graph)
+            logger.info("Lenia FlowGraph ACTIVE — field dynamics running")
+        else:
+            logger.info("Lenia FlowGraph loaded (dormant — kill switch off)")
+    except ImportError:
+        logger.info("Lenia FlowGraph not available (lenia/ package not found)")
+        _lenia_kill_switch = None
+        _lenia_engine = None
+        _lenia_bridge = None
+        _lenia_competence = None
+    except Exception:
+        logger.exception("Lenia FlowGraph failed to initialize — continuing without")
+        _lenia_kill_switch = None
+        _lenia_engine = None
+        _lenia_bridge = None
+        _lenia_competence = None
+
     stats = _memory.stats()
     tract_stats = _tract.stats()
     logger.info(
@@ -539,6 +602,19 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     if _memory._message_count > 0 and _memory._message_count % _memory.auto_save_interval == 0:
         _memory.save()
         logger.info("Auto-save at message %d", _memory._message_count)
+
+    # Lenia FlowGraph — post-step competence update and energy watchdog
+    if _lenia_kill_switch is not None and _lenia_kill_switch.enabled:
+        try:
+            if _lenia_competence is not None and _lenia_engine is not None:
+                _lenia_competence.update(_lenia_engine._field.read_buffer())
+            _lenia_kill_switch.check_energy(
+                _lenia_engine._field.total_energy(),
+                _lenia_engine._field._ledger[:, 0].sum(),
+            )
+            _lenia_engine._field.reset_ledger()
+        except Exception:
+            logger.exception("Lenia post-step update failed")
 
     # Fan-out to module hooks — cortex coordinating organs (#101)
     _fan_out_to_modules()
@@ -814,6 +890,13 @@ def handle_dispose(params: Dict[str, Any]) -> None:
             _memory._tonic_thread.conversation_ended()
         except Exception:
             pass
+
+    # Lenia FlowGraph — stop engine, preserve field state in mmap
+    if _lenia_kill_switch is not None and _lenia_kill_switch.enabled:
+        try:
+            _lenia_kill_switch.disable(reason="dispose")
+        except Exception:
+            logger.exception("Lenia shutdown failed")
 
     _memory.save()
     logger.info("Final save on dispose")
