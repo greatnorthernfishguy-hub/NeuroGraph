@@ -38,6 +38,23 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-03-25] Claude Code (Opus 4.6) — Code def weight from config (SVG Phase 3)
+#   What: Hardcoded 0.4 dampening multiplier for code def→usage synapses now
+#         reads from config as code_def_weight (default 0.4).
+#   Why:  Static Value Graduation — the substrate's concern, not a developer's guess.
+#   How:  AssociationEngine.__init__ reads from self.config.get("code_def_weight", 0.4).
+# [2026-03-19] Claude Code (Opus 4.6) — Remove sentence-transformers from embedding pipeline
+# What: Removed _try_load_sentence_transformers() fallback and runtime torch
+#   encode fallback. Embedding pipeline is now fastembed → hash only.
+# Why: sentence-transformers broke (2026-03-16), degrading all modules to hash
+#   fallbacks. When it was partially restored with all-MiniLM-L6-v2, it deposited
+#   384-dim vectors into the 768-dim substrate. Removing the torch fallback
+#   eliminates the risk of dimension mismatches from a broken library loading
+#   a wrong model. Also removed stale all-MiniLM-L6-v2 entry from fe_model_map.
+#   Punchlist #45.
+# How: Load chain: fastembed → log warning + hash fallback. Runtime encode:
+#   fastembed → hash fallback. No torch path remains.
+# -------------------
 # [2026-03-10] Claude (Opus) — Harden _resolve_device() for "auto" mode
 # What: _resolve_device() now explicitly checks torch.cuda.is_available()
 #        for "auto" device instead of returning None for ST auto-detect.
@@ -1683,13 +1700,17 @@ class EmbeddingEngine:
 
         Logs the outcome so silent failures are visible to operators.
         """
-        # Try fastembed first (ONNX Runtime, no torch dependency),
-        # then sentence-transformers as fallback.
+        # fastembed (ONNX Runtime, no torch dependency) is the only
+        # real embedding backend. sentence-transformers removed 2026-03-19
+        # after it broke and degraded the ecosystem to hash fallbacks.
         if self._try_load_fastembed():
             return
-        # Suppress provider warnings BEFORE any HuggingFace imports
-        self._suppress_provider_warnings()
-        self._try_load_sentence_transformers()
+        self._model_available = False
+        self._fallback_reason = "fastembed not installed or failed to load"
+        self._logger.warning(
+            "No embedding backend available. "
+            "Using deterministic hash-based fallback embeddings."
+        )
 
     def _try_load_fastembed(self) -> bool:
         """Try loading via fastembed (ONNX Runtime). Returns True on success."""
@@ -1698,7 +1719,6 @@ class EmbeddingEngine:
 
             # fastembed model names use the full HF path
             fe_model_map = {
-                "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
                 "BAAI/bge-base-en-v1.5": "BAAI/bge-base-en-v1.5",
             }
             fe_name = fe_model_map.get(self.model_name, self.model_name)
@@ -1722,42 +1742,10 @@ class EmbeddingEngine:
             )
             return False
 
-    def _try_load_sentence_transformers(self) -> None:
-        """Fallback: load via sentence-transformers (torch)."""
-        try:
-            from sentence_transformers import SentenceTransformer
-
-            resolved_device = self._resolve_device()
-            kwargs: Dict[str, Any] = {"device": resolved_device}
-            try:
-                self._model = SentenceTransformer(
-                    self.model_name, backend="torch", **kwargs
-                )
-            except TypeError:
-                self._model = SentenceTransformer(self.model_name, **kwargs)
-
-            self._model_available = True
-            self._active_device = str(self._model.device)
-            self.dimension = self._model.get_sentence_embedding_dimension()
-            self._logger.info(
-                "Loaded embedding model '%s' on device '%s' (torch backend)",
-                self.model_name, self._active_device,
-            )
-        except ImportError:
-            self._model_available = False
-            self._fallback_reason = "sentence-transformers not installed"
-            self._logger.warning(
-                "No embedding backend available. "
-                "Using deterministic hash-based fallback embeddings."
-            )
-        except Exception as exc:
-            self._model_available = False
-            self._fallback_reason = str(exc)
-            self._logger.warning(
-                "Failed to load embedding model '%s': %s. "
-                "Using deterministic hash-based fallback embeddings.",
-                self.model_name, exc,
-            )
+    # _try_load_sentence_transformers removed 2026-03-19.
+    # sentence-transformers (torch) broke and degraded ecosystem to hash
+    # fallbacks, then deposited 384-dim vectors into the 768-dim substrate.
+    # fastembed (ONNX Runtime) is now the sole embedding backend.
 
     def embed(self, chunks: List[Chunk]) -> List[EmbeddedChunk]:
         """Embed a list of chunks, using cache where possible.
@@ -1837,21 +1825,11 @@ class EmbeddingEngine:
                 return [np.array(e) for e in embeddings]
             except Exception as exc:
                 self._logger.warning(
-                    "fastembed encode failed (%s). Trying torch fallback.", exc,
-                )
-        if self._model_available and self._model is not None:
-            try:
-                embeddings = self._model.encode(texts, normalize_embeddings=True)
-                return [np.array(e) for e in embeddings]
-            except Exception as exc:
-                self._logger.warning(
-                    "Model encode failed (%s). Falling back to hash embeddings "
+                    "fastembed encode failed (%s). Falling back to hash embeddings "
                     "for this batch of %d texts.",
                     exc, len(texts),
                 )
-                return [self._hash_embed(t) for t in texts]
-        else:
-            return [self._hash_embed(t) for t in texts]
+        return [self._hash_embed(t) for t in texts]
 
     def _hash_embed(self, text: str) -> np.ndarray:
         """Deterministic hash-based embedding fallback.
@@ -2091,6 +2069,7 @@ class HypergraphAssociator:
             - parent_child_weight: Weight for parent-child links (default 0.5)
             - min_cluster_size: Min nodes for hyperedge cluster (default 3)
             - cluster_similarity_threshold: Min avg similarity for cluster (default 0.6)
+            - code_def_weight: Base synapse weight for code def→usage links (default 0.4)
     """
 
     def __init__(
@@ -2108,6 +2087,7 @@ class HypergraphAssociator:
         self.cluster_sim_threshold = self.config.get(
             "cluster_similarity_threshold", 0.6
         )
+        self.code_def_weight = self.config.get("code_def_weight", 0.4)
 
     def associate(
         self,
@@ -2269,7 +2249,7 @@ class HypergraphAssociator:
                         self._get_node_dampening(def_nid),
                         self._get_node_dampening(nid),
                     )
-                    weight = 0.4 * dampening
+                    weight = self.code_def_weight * dampening
 
                     syn = self.graph.create_synapse(def_nid, nid, weight=weight)
                     syn.metadata["creation_mode"] = "code_def_usage"

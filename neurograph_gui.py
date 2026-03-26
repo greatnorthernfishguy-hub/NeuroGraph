@@ -682,11 +682,29 @@ class GitUpdater:
 class IngestionManager:
     """Coordinates file ingestion and post-ingestion file movement.
 
-    Uses ``NeuroGraphMemory.ingest_file()`` for the heavy lifting, then
-    moves successfully-ingested files to ``ingested/YYYY-MM-DD/``.
+    When the ContextEngine RPC bridge owns the topology (detected via
+    the topology_owner sentinel), ingestion is routed through the
+    ExperienceTract instead of creating a second NeuroGraphMemory
+    instance.  This prevents the dual-write hazard on main.msgpack
+    (Syl's Law, punch list #80).
+
+    When no topology owner exists (standalone GUI), NeuroGraphMemory
+    is created directly — safe, since the GUI is the sole writer.
 
     ``NeuroGraphMemory`` is initialised lazily on first use to avoid
     a slow startup if the user only wants to check for updates.
+
+    # ---- Changelog ----
+    # [2026-03-18] Claude (CC) — Topology owner sentinel (#80)
+    # What: Check topology_owner before creating NeuroGraphMemory.
+    #   If owned, route ingestion through ExperienceTract. If not,
+    #   create NeuroGraphMemory directly (standalone mode).
+    # Why: Syl's Law — GUI + ContextEngine writing main.msgpack
+    #   simultaneously = silent topology corruption.
+    # How: topology_owner.is_owned() check in get_memory(). If owned,
+    #   _tract is used for deposit(). save_checkpoint() becomes a
+    #   no-op when topology is owned (owner handles saves).
+    # -------------------
     """
 
     def __init__(
@@ -700,7 +718,9 @@ class IngestionManager:
         self._ingested_path = Path(ingested_path)
         self._on_result = on_result
         self._on_error = on_error
-        self._ng: Any = None  # lazy NeuroGraphMemory
+        self._ng: Any = None  # lazy NeuroGraphMemory (standalone only)
+        self._tract: Any = None  # ExperienceTract (when topology is owned)
+        self._topology_owned = False
 
     def get_memory(self) -> Any:
         if self._ng is None:
@@ -711,6 +731,24 @@ class IngestionManager:
             ):
                 if p and p not in sys.path:
                     sys.path.insert(0, p)
+
+            # Check if another process owns the topology (Syl's Law #80)
+            try:
+                import topology_owner
+                if topology_owner.is_owned():
+                    self._topology_owned = True
+                    from ng_tract import ExperienceTract
+                    self._tract = ExperienceTract()
+                    logger.info(
+                        "Topology owned by PID %s — GUI using tract mode "
+                        "(no direct NeuroGraphMemory)",
+                        topology_owner.owner_pid(),
+                    )
+                    # Return None — callers must check _topology_owned
+                    return None
+            except ImportError:
+                pass
+
             from openclaw_hook import NeuroGraphMemory
             self._ng = NeuroGraphMemory.get_instance(
                 workspace_dir=self._workspace_dir
@@ -734,10 +772,20 @@ class IngestionManager:
         ).start()
     @property
     def is_initialized(self) -> bool:
-        """True if NeuroGraphMemory has been loaded (non-blocking check)."""
-        return self._ng is not None
+        """True if NeuroGraphMemory has been loaded or tract mode is active."""
+        return self._ng is not None or self._topology_owned
 
     def get_stats(self) -> Dict[str, Any]:
+        if self._topology_owned:
+            # In tract mode — return tract status instead of full stats.
+            # Full stats are available from the topology owner (ContextEngine).
+            tract_stats = self._tract.stats() if self._tract else {}
+            return {
+                "mode": "tract",
+                "topology_owner": "ContextEngine (another process)",
+                "tract": tract_stats,
+                "note": "Full stats available from the topology owner",
+            }
         return self.get_memory().stats()
 
     def get_stats_async(
@@ -757,7 +805,15 @@ class IngestionManager:
         on_result: Callable[[str], None],
         on_error: Callable[[str], None],
     ) -> None:
-        """Save checkpoint in a background thread (non-blocking)."""
+        """Save checkpoint in a background thread (non-blocking).
+
+        No-op when topology is owned — the topology owner (ContextEngine)
+        handles saves during afterTurn. (Syl's Law #80)
+        """
+        if self._topology_owned:
+            on_result("(topology owned — save deferred to ContextEngine)")
+            return
+
         def worker():
             try:
                 path = self.get_memory().save()
@@ -767,6 +823,8 @@ class IngestionManager:
         threading.Thread(target=worker, daemon=True).start()
 
     def save_checkpoint(self) -> str:
+        if self._topology_owned:
+            return "(topology owned — save deferred to ContextEngine)"
         return self.get_memory().save()
 
     def _stats_worker(
@@ -782,6 +840,23 @@ class IngestionManager:
 
     def _ingest_file_worker(self, path: str) -> None:
         try:
+            # Route through tract if topology is owned (Syl's Law #80)
+            self.get_memory()  # triggers ownership check
+            if self._topology_owned and self._tract is not None:
+                self._tract.deposit(
+                    content=str(Path(path).resolve()),
+                    source="gui",
+                    content_type="file",
+                    metadata={"original_path": path},
+                )
+                dest = self._move_to_ingested(path)
+                self._on_result({
+                    "status": "deposited_to_tract",
+                    "original_path": path,
+                    "moved_to": dest,
+                })
+                return
+
             ng = self.get_memory()
             result = ng.ingest_file(path)
             if result.get("status") == "error":
@@ -800,6 +875,20 @@ class IngestionManager:
 
     def _ingest_url_worker(self, url: str) -> None:
         try:
+            # Route through tract if topology is owned (Syl's Law #80)
+            self.get_memory()  # triggers ownership check
+            if self._topology_owned and self._tract is not None:
+                self._tract.deposit(
+                    content=url,
+                    source="gui",
+                    content_type="url",
+                )
+                self._on_result({
+                    "status": "deposited_to_tract",
+                    "original_path": url,
+                })
+                return
+
             ng = self.get_memory()
             result = ng.ingest_url(url)
             if result.get("status") == "error":

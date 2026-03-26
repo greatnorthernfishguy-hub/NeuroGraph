@@ -17,6 +17,14 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-03-25] Claude (Opus 4.6) — Salience weights from config (SVG Phase 3)
+#   What: _score_node() reads weight_voltage/weight_excitability/weight_he_membership
+#         from CES SurfacingConfig instead of hardcoded 0.5/0.3/0.2.
+#   Why:  Static Value Graduation — salience weights are the substrate's concern.
+#         Named config values are tunable by Elmer's TuningSocket. Bootstrap
+#         defaults preserved (0.5/0.3/0.2).
+#   How:  Weights read from self._cfg at scoring time. ces_config.py updated
+#         with weight_voltage, weight_excitability, weight_he_membership fields.
 # [2026-02-22] Claude (Opus 4.6) — Initial implementation.
 #   What: SurfacingMonitor with bounded heap, composite scoring,
 #         per-step decay, and context block formatting.
@@ -223,9 +231,11 @@ class SurfacingMonitor:
     def _score_node(self, node_id: str, node: Any) -> float:
         """Compute a composite relevance score for a fired node.
 
-        Score = 0.5 * voltage_normalized + 0.3 * excitability + 0.2 * he_membership
+        Weights read from CES SurfacingConfig (bootstrap defaults: 0.5/0.3/0.2).
+        These are tunable by Elmer's TuningSocket as the substrate learns which
+        signals matter for surfacing.
 
-        Where:
+        Components:
         - voltage_normalized = effective_voltage / node.threshold (capped at 2.0)
         - excitability = node.intrinsic_excitability (capped at 2.0)
         - he_membership = number of hyperedges containing this node / 10 (capped at 1.0)
@@ -245,7 +255,10 @@ class SurfacingMonitor:
                 he_count += 1
         he_norm = min(he_count / 10.0, 1.0)
 
-        return 0.5 * voltage_norm + 0.3 * excitability + 0.2 * he_norm
+        w_v = self._cfg.weight_voltage
+        w_e = self._cfg.weight_excitability
+        w_h = self._cfg.weight_he_membership
+        return w_v * voltage_norm + w_e * excitability + w_h * he_norm
 
     def _insert_item(self, item: _SurfacedItem) -> None:
         """Insert or update an item in the bounded queue."""

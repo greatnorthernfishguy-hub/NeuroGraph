@@ -19,6 +19,58 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-03-25] Claude Code (Opus 4.6) — Dynamic tuning API (SVG Phase 5)
+#   What: Added TUNABLE_PARAMS, update_tunable(), get_tunables() to Graph class.
+#     12 SNN parameters tunable at runtime with validated bounds: learning_rate,
+#     decay_rate, default_threshold, target_firing_rate, surprise_reward_scaling,
+#     he_member_weight_lr, he_threshold_lr, he_pattern_completion_strength,
+#     prediction_confirm_bonus, prediction_error_penalty, he_salience_decay_rate,
+#     he_consolidation_adapt_rate. Updates propagate to cached plasticity rule objects.
+#   Why:  SVG Phase 5 — the substrate's own parameters are the substrate's concern.
+#     Elmer's TuningSocket can now adjust the SNN engine itself, not just ng_lite.
+#   How:  TUNABLE_PARAMS dict with (min, max) bounds. update_tunable() validates,
+#     clamps, updates config dict AND propagates to STDPRule/HomeostaticRule/
+#     HyperedgePlasticityRule objects. Matches ng_lite.py pattern.
+# [2026-03-24] Claude Code (Opus 4.6) — Homeostasis audit: 6 remaining fixes
+# What: (1) Threshold ceiling at 5.0 prevents unbounded growth. (2) prediction_window
+#   dataclass default aligned to 10 (was 5, conflicting with Phase 3 config).
+#   (3) three_factor_enabled default True (was False — traces decayed to zero).
+#   (4) scaling_interval reduced 100→25 for 4x responsiveness. (5) Salience decay
+#   switched from linear to proportional at 0.002 rate (was 0.0002 linear — armor
+#   persisted across 18+ sessions). (6) Zero-firing circuit breaker: warning at
+#   50 silent steps, emergency excitability boost at 200 silent steps.
+# Why: Homeostasis audit found these 6 gaps. The substrate sat dead for 1,931
+#   steps with no detection (issue 6), thresholds could grow unbounded (issue 1),
+#   reward-gated learning was off by default (issue 3), scaling lagged threshold
+#   adaptation by 100x (issue 4), and salience armor was effectively permanent (issue 5).
+# How: Config changes + HomeostaticRule threshold ceiling + proportional salience
+#   decay formula + _steps_since_last_fire tracking + _emergency_excitability_boost()
+#   method + zero_fire_warning/zero_fire_breaker_tripped events.
+# [2026-03-24] Claude Code (Opus 4.6) — Phase 2.5b output_target learning + DEFAULT_CONFIG alignment
+# What: Implemented HE output_target learning in step(). When an HE fires, nodes
+#   that consistently fire within a configurable window (he_output_learning_window=5,
+#   he_output_min_co_fires=3) are promoted to output_targets. Members excluded.
+#   Max targets capped (he_output_max_targets=5). Tracking dicts serialized.
+#   Also aligned DEFAULT_CONFIG: decay_rate 0.95→0.97, default_threshold 1.0→0.85
+#   to match post-tuning values and prevent standalone NG from reverting to dead state.
+# Why: All 68 HEs had empty output_targets — substrate learned causal structure
+#   but couldn't project forward. Tests existed (test_output_learning.py) but the
+#   learning loop was never committed. DEFAULT_CONFIG still had pre-tuning values
+#   that produced zero firing in 1,931 timesteps.
+# How: Learning loop after HE firing in step() §6a. Tracking dicts (_he_last_fired_step,
+#   _he_output_candidates) in __init__, cleanup in _remove_hyperedge_internal(),
+#   serialization in _serialize_full()/_deserialize(). Event: he_output_learned.
+# [2026-03-24] Claude Code (Opus 4.6) — Write-mode for prime_and_propagate()
+# What: Added write_mode parameter to prime_and_propagate(). When True:
+#   voltages not saved/restored, last_spike_time recorded on fired nodes,
+#   STDP plasticity rules applied after each propagation step.
+# Why: The Tonic (Syl's latent space awareness) requires exploration that
+#   shapes topology. Read-only recall prevents learning from attention.
+#   Write mode enables "thinking leaves traces" — the ouroboros loop.
+# How: write_mode=False (default) preserves existing read-only behavior.
+#   write_mode=True skips save/restore, records spike times, calls
+#   STDPRule.apply() on fired nodes each step. No other plasticity rules
+#   (homeostatic, structural) are applied — only STDP.
 # [2026-03-13] Claude Code — Surprise-driven neuromodulatory reward
 # What: Wired prediction errors to inject_reward() for surprise-driven
 #   trace crystallization. Added surprise_reward_scaling config.
@@ -341,7 +393,7 @@ class PredictionState:
     predicted_targets: Set[str] = field(default_factory=set)
     prediction_strength: float = 0.0
     prediction_timestamp: int = 0
-    prediction_window: int = 5
+    prediction_window: int = 10
     confirmed_targets: Set[str] = field(default_factory=set)
 
 
@@ -713,10 +765,11 @@ class HomeostaticRule(PlasticityRule):
             )
 
         # Threshold adaptation: continuous, 0.001/step (PRD §3.2.1)
+        threshold_ceiling = graph.config.get("threshold_ceiling", 5.0)
         for nid, node in graph.nodes.items():
             rate = node.firing_rate_ema
             if rate > self.target_firing_rate * 1.2:
-                node.threshold += self.threshold_rate
+                node.threshold = min(node.threshold + self.threshold_rate, threshold_ceiling)
             elif rate < self.target_firing_rate * 0.8:
                 node.threshold = max(0.01, node.threshold - self.threshold_rate)
 
@@ -844,8 +897,8 @@ class HyperedgePlasticityRule(PlasticityRule):
 
 # Default configuration (PRD §9)
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "decay_rate": 0.95,
-    "default_threshold": 1.0,
+    "decay_rate": 0.97,
+    "default_threshold": 0.85,
     "refractory_period": 2,
     "tau_plus": 20.0,
     "tau_minus": 20.0,
@@ -854,7 +907,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "learning_rate": 0.01,
     "max_weight": 5.0,
     "target_firing_rate": 0.05,
-    "scaling_interval": 100,
+    "threshold_ceiling": 5.0,
+    "scaling_interval": 25,
     "weight_threshold": 0.01,
     "grace_period": 500,
     "inactivity_threshold": 1000,
@@ -872,7 +926,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "surprise_sprouting_weight": 0.1,    # Initial weight for surprise-driven synapses
     "surprise_reward_scaling": 0.5,      # Modulates surprise -> reward strength. Elmer-tunable.
     "eligibility_trace_tau": 100,        # Decay time constant for eligibility traces
-    "three_factor_enabled": False,       # Whether to use three-factor learning
+    "three_factor_enabled": True,        # Reward-gated STDP via eligibility traces
     # Phase 2: Hypergraph Engine config
     "he_pattern_completion_strength": 0.3,
     "he_member_weight_lr": 0.05,
@@ -885,9 +939,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_member_evolution_min_co_fires": 10,
     "he_member_evolution_initial_weight": 0.3,
     # Phase 2.5: Prediction infrastructure
-    "prediction_window": 5,
+    # NOTE: prediction_window intentionally NOT here — superseded by Phase 3 value (10) above.
+    # Phase 2.5 originally set 5; Phase 3 upgraded to 10 (longer window for chain predictions).
+    # The duplicate key was removed 2026-03-24 to fix Python last-key-wins shadowing bug.
     "prediction_ema_alpha": 0.01,
     "he_experience_threshold": 100,
+    # Phase 2.5b: Output target learning — HEs learn downstream targets
+    "he_output_learning_window": 5,    # Steps after HE fire to watch for co-firing
+    "he_output_min_co_fires": 3,       # Min fires within window to learn target
+    "he_output_max_targets": 5,        # Max output targets per HE
     # --- Phase 4: Consolidation Lifecycle ---
     # Initial (adaptive) thresholds for SPECULATIVE → CANDIDATE promotion.
     # The system adjusts these based on observed survival rates.
@@ -904,9 +964,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_consolidation_adapt_rate": 0.005,
     # Salience ceiling — caps Amygdala Protocol multiplier.
     "he_salience_max": 5.0,
-    # Per-step salience decay (applied every step to all synapses with salience > 1.0).
-    # At 0.0002/step, a salience of 5.0 returns to 1.0 in ~20,000 steps.
-    "he_salience_decay_rate": 0.0002,
+    # Per-step proportional salience decay (applied every step to synapses with salience > 1.0).
+    # Proportional: high salience decays faster than low. At 0.002/step,
+    # salience 5.0 → ~1.0 in ~2,000 steps (~1.5 sessions).
+    "he_salience_decay_rate": 0.002,
+    # Zero-firing circuit breaker — detects prolonged substrate silence
+    "zero_fire_alert_steps": 50,      # Steps of zero firing before warning event
+    "zero_fire_breaker_steps": 200,   # Steps of zero firing before emergency intervention
 }
 
 
@@ -1008,6 +1072,15 @@ class Graph:
 
         # --- Event handlers ---
         self._event_handlers: Dict[str, List[Callable]] = {}
+
+        # --- Zero-firing circuit breaker ---
+        self._steps_since_last_fire: int = 0
+
+        # --- Phase 2.5b: Hyperedge output target learning ---
+        # he_id → timestep when HE last fired
+        self._he_last_fired_step: Dict[str, int] = {}
+        # he_id → {candidate_node_id: fire_count_within_window}
+        self._he_output_candidates: Dict[str, Dict[str, int]] = {}
 
         # --- Telemetry counters ---
         self._total_pruned = 0
@@ -1197,6 +1270,82 @@ class Graph:
     # Topology Management (PRD §2.2.4)
     # -----------------------------------------------------------------------
 
+    # --- SVG Phase 5: Dynamic Tuning API ---
+    # Parameters Elmer (or any organ) is permitted to adjust at runtime.
+    # Keys map to (min, max) bounds. Anything not in this dict is frozen.
+    # Matches the ng_lite.py TUNABLE_PARAMS pattern.
+    TUNABLE_PARAMS: Dict[str, Tuple[float, float]] = {
+        # STDP / learning
+        "learning_rate":                (0.001, 0.1),
+        "decay_rate":                   (0.90,  0.99),
+        "default_threshold":            (0.5,   2.0),
+        "target_firing_rate":           (0.01,  0.2),
+        "surprise_reward_scaling":      (0.1,   2.0),
+        # Hyperedge plasticity
+        "he_member_weight_lr":          (0.005, 0.2),
+        "he_threshold_lr":              (0.001, 0.05),
+        "he_pattern_completion_strength": (0.1, 1.0),
+        # Predictive coding
+        "prediction_confirm_bonus":     (0.001, 0.1),
+        "prediction_error_penalty":     (0.001, 0.1),
+        # Salience
+        "he_salience_decay_rate":       (0.0001, 0.01),
+        # Consolidation
+        "he_consolidation_adapt_rate":  (0.001, 0.05),
+    }
+
+    def update_tunable(self, key: str, value: float) -> Dict[str, Any]:
+        """Update a tunable config parameter at runtime.
+
+        Only parameters listed in TUNABLE_PARAMS are accepted.
+        Values are clamped to their declared bounds.
+
+        When learning/plasticity parameters change, the corresponding
+        plasticity rule objects are updated to stay in sync.
+
+        Returns dict with old_value, new_value, clamped (bool).
+        Raises KeyError if key is not tunable.
+        """
+        if key not in self.TUNABLE_PARAMS:
+            raise KeyError(
+                f"'{key}' is not a tunable parameter. "
+                f"Allowed: {sorted(self.TUNABLE_PARAMS.keys())}"
+            )
+        lo, hi = self.TUNABLE_PARAMS[key]
+        old_value = self.config[key]
+        clamped = value < lo or value > hi
+        new_value = max(lo, min(hi, float(value)))
+        self.config[key] = new_value
+
+        # Propagate to plasticity rule objects that cache these values
+        for rule in self._plasticity_rules:
+            if isinstance(rule, STDPRule) and key == "learning_rate":
+                rule.learning_rate = new_value
+            elif isinstance(rule, HomeostaticRule) and key == "target_firing_rate":
+                rule.target_firing_rate = new_value
+            elif isinstance(rule, HyperedgePlasticityRule):
+                if key == "he_member_weight_lr":
+                    rule.member_weight_lr = new_value
+                elif key == "he_threshold_lr":
+                    rule.threshold_lr = new_value
+
+        logger.info(
+            "Tunable update: %s = %.6f → %.6f%s",
+            key, old_value, new_value, " (clamped)" if clamped else "",
+        )
+        return {"old_value": old_value, "new_value": new_value, "clamped": clamped}
+
+    def get_tunables(self) -> Dict[str, Dict[str, float]]:
+        """Return current tunable values and their bounds."""
+        result = {}
+        for key, (lo, hi) in self.TUNABLE_PARAMS.items():
+            result[key] = {
+                "value": self.config[key],
+                "min": lo,
+                "max": hi,
+            }
+        return result
+
     def create_node(
         self,
         node_id: Optional[str] = None,
@@ -1376,6 +1525,8 @@ class Graph:
         for nid in he.member_nodes:
             self._node_hyperedges.get(nid, set()).discard(hyperedge_id)
         self._he_co_fire_counts.pop(hyperedge_id, None)
+        self._he_last_fired_step.pop(hyperedge_id, None)
+        self._he_output_candidates.pop(hyperedge_id, None)
         self._dirty_hyperedges.discard(hyperedge_id)
 
     def remove_hyperedge(self, hyperedge_id: str) -> None:
@@ -1451,6 +1602,12 @@ class Graph:
                 continue
             if node.voltage >= node.threshold:
                 fired_ids.append(nid)
+
+        # 3b. Zero-firing circuit breaker tracking
+        if fired_ids:
+            self._steps_since_last_fire = 0
+        else:
+            self._steps_since_last_fire += 1
 
         # 4. Reset fired nodes and set refractory
         for nid in fired_ids:
@@ -1557,6 +1714,53 @@ class Graph:
                                    hyperedge_id=hid, targets=list(he.output_targets))
 
                     self._emit("hyperedge_fired", hid=hid, activation=activation)
+
+        # 6a. Phase 2.5b: Output target learning
+        # When an HE fires, we start watching. On subsequent steps, any
+        # non-member node that fires within the window gets counted. If it
+        # fires enough times (min_co_fires), it becomes an output_target.
+        ol_window = self.config["he_output_learning_window"]
+        ol_min = self.config["he_output_min_co_fires"]
+        ol_max = self.config["he_output_max_targets"]
+
+        # Record which HEs fired THIS step
+        for hid in fired_he_this_step:
+            self._he_last_fired_step[hid] = self.timestep
+            self._he_output_candidates[hid] = {}
+
+        # For all HEs with active learning windows, count fired non-members
+        expired_windows: List[str] = []
+        for hid, fire_step in self._he_last_fired_step.items():
+            if hid in fired_he_this_step:
+                continue  # Just started tracking — skip this step
+            if self.timestep - fire_step > ol_window:
+                expired_windows.append(hid)
+                continue
+            he = self.hyperedges.get(hid)
+            if he is None:
+                expired_windows.append(hid)
+                continue
+            candidates = self._he_output_candidates.get(hid, {})
+            for nid in fired_ids:
+                if nid in he.member_nodes:
+                    continue  # Members excluded
+                if nid in he.output_targets:
+                    continue  # Already learned
+                candidates[nid] = candidates.get(nid, 0) + 1
+                if candidates[nid] >= ol_min and len(he.output_targets) < ol_max:
+                    he.output_targets.append(nid)
+                    self._emit("he_output_learned", hid=hid, target=nid)
+                    logger.info(
+                        "Phase 2.5b: HE %s learned output target %s "
+                        "(co-fires=%d within window=%d)",
+                        hid, nid, candidates[nid], ol_window,
+                    )
+            self._he_output_candidates[hid] = candidates
+
+        # Clean up expired windows
+        for hid in expired_windows:
+            self._he_last_fired_step.pop(hid, None)
+            self._he_output_candidates.pop(hid, None)
 
         # Decrement hyperedge refractory counters (skip those that just fired)
         fired_he_set = set(fired_he_this_step)
@@ -1666,13 +1870,41 @@ class Graph:
         salience_decay = self.config["he_salience_decay_rate"]
         for syn in self.synapses.values():
             syn.inactive_steps += 1
-            # Salience decays toward 1.0; never drops below it.
+            # Salience decays proportionally toward 1.0 — high salience fades
+            # faster than low.  Never drops below 1.0.
             if syn.salience > 1.0:
-                syn.salience = max(1.0, syn.salience - salience_decay)
+                syn.salience = 1.0 + (syn.salience - 1.0) * (1.0 - salience_decay)
 
         # Emit spike events
         if fired_ids:
             self._emit("spikes", node_ids=fired_ids, timestep=self.timestep)
+
+        # 11. Zero-firing circuit breaker
+        breaker_steps = self.config.get("zero_fire_breaker_steps", 200)
+        alert_steps = self.config.get("zero_fire_alert_steps", 50)
+        if self._steps_since_last_fire >= breaker_steps:
+            self._emergency_excitability_boost()
+            self._emit(
+                "zero_fire_breaker_tripped",
+                steps_silent=self._steps_since_last_fire,
+                timestep=self.timestep,
+            )
+            logger.warning(
+                "Zero-fire breaker tripped at step %d (%d steps silent). "
+                "Emergency excitability boost applied.",
+                self.timestep, self._steps_since_last_fire,
+            )
+            self._steps_since_last_fire = 0
+        elif self._steps_since_last_fire == alert_steps:
+            self._emit(
+                "zero_fire_warning",
+                steps_silent=self._steps_since_last_fire,
+                timestep=self.timestep,
+            )
+            logger.warning(
+                "Zero-fire warning at step %d (%d steps without any neuron firing).",
+                self.timestep, self._steps_since_last_fire,
+            )
 
         return result
 
@@ -1692,6 +1924,7 @@ class Graph:
         node_ids: List[str],
         currents: List[float],
         steps: int = 3,
+        write_mode: bool = False,
     ) -> PropagationResult:
         """Prime nodes and propagate activation through the network.
 
@@ -1702,10 +1935,17 @@ class Graph:
         are NOT applied.  This prevents recall-driven activation from
         altering learned weights.
 
+        When write_mode=True (The Tonic — latent space exploration):
+        voltages are NOT saved/restored, last_spike_time is recorded on
+        fired nodes, and STDP plasticity rules ARE applied. Exploration
+        shapes topology. Thinking leaves traces.
+
         Args:
             node_ids: Nodes to inject current into (semantic priming).
             currents: Current to inject into each node (parallel to node_ids).
             steps: Number of SNN steps to propagate.
+            write_mode: If True, enable plasticity and persist voltage
+                changes. Used by The Tonic for latent space exploration.
 
         Returns:
             PropagationResult with all nodes that fired, ranked by latency.
@@ -1713,16 +1953,19 @@ class Graph:
         if not node_ids:
             return PropagationResult(steps_run=steps, nodes_primed=0)
 
-        # Save and restore state so propagation is non-destructive
+        # In read mode: save state for non-destructive propagation
+        # In write mode: skip save — voltages and spikes persist
         saved_voltages: Dict[str, float] = {}
         saved_refractory: Dict[str, int] = {}
-        for nid, node in self.nodes.items():
-            saved_voltages[nid] = node.voltage
-            saved_refractory[nid] = node.refractory_remaining
-
         saved_he_refractory: Dict[str, int] = {}
-        for hid, he in self.hyperedges.items():
-            saved_he_refractory[hid] = he.refractory_remaining
+
+        if not write_mode:
+            for nid, node in self.nodes.items():
+                saved_voltages[nid] = node.voltage
+                saved_refractory[nid] = node.refractory_remaining
+
+            for hid, he in self.hyperedges.items():
+                saved_he_refractory[hid] = he.refractory_remaining
 
         # Compute approximate distances from primed nodes
         primed_set = set(node_ids)
@@ -1792,6 +2035,10 @@ class Graph:
                 voltage_at_fire = node.voltage
                 node.voltage = node.resting_potential
                 node.refractory_remaining = node.refractory_period
+
+                # Write mode: record spike time so STDP can see it
+                if write_mode:
+                    node.last_spike_time = float(prop_timestep)
 
                 entry = FiredEntry(
                     node_id=nid,
@@ -1866,12 +2113,21 @@ class Graph:
                 if he.refractory_remaining > 0 and hid not in set(fired_ids):
                     he.refractory_remaining -= 1
 
-        # --- RESTORE: put all voltages and refractory counters back ---
-        for nid, node in self.nodes.items():
-            node.voltage = saved_voltages.get(nid, node.resting_potential)
-            node.refractory_remaining = saved_refractory.get(nid, 0)
-        for hid, he in self.hyperedges.items():
-            he.refractory_remaining = saved_he_refractory.get(hid, 0)
+            # Write mode: apply STDP plasticity on fired nodes
+            if write_mode and fired_ids:
+                for rule in self._plasticity_rules:
+                    if isinstance(rule, STDPRule):
+                        rule.apply(self, fired_ids, prop_timestep)
+
+        # --- RESTORE (read mode only) ---
+        # In write mode: voltages, spike times, and weight changes persist.
+        # The exploration shaped the topology. That's the point.
+        if not write_mode:
+            for nid, node in self.nodes.items():
+                node.voltage = saved_voltages.get(nid, node.resting_potential)
+                node.refractory_remaining = saved_refractory.get(nid, 0)
+            for hid, he in self.hyperedges.items():
+                he.refractory_remaining = saved_he_refractory.get(hid, 0)
 
         return result
 
@@ -3169,6 +3425,32 @@ class Graph:
             cb(**kwargs)
 
     # -----------------------------------------------------------------------
+    # Zero-Firing Circuit Breaker
+    # -----------------------------------------------------------------------
+
+    def _emergency_excitability_boost(self) -> None:
+        """Gentle emergency intervention when the substrate goes completely silent.
+
+        Boosts intrinsic_excitability by 20% for all nodes (capped at 5.0)
+        and reduces thresholds by 10% (floored at 0.01, ceilinged by
+        threshold_ceiling).  This is a nudge, not a reset — the homeostatic
+        mechanisms should find a new equilibrium from the boosted state.
+        """
+        threshold_ceiling = self.config.get("threshold_ceiling", 5.0)
+        boosted = 0
+        for node in self.nodes.values():
+            node.intrinsic_excitability = min(
+                node.intrinsic_excitability * 1.2, 5.0,
+            )
+            node.threshold = max(
+                0.01, min(node.threshold * 0.9, threshold_ceiling),
+            )
+            boosted += 1
+        logger.info(
+            "Emergency excitability boost applied to %d nodes", boosted,
+        )
+
+    # -----------------------------------------------------------------------
     # Persistence (PRD §6)
     # -----------------------------------------------------------------------
 
@@ -3373,6 +3655,9 @@ class Graph:
             "he_survival_ema":             self._he_survival_ema,
             "total_he_state_transitions":  self._total_he_state_transitions,
             "total_he_substrate_culled":   self._total_he_substrate_culled,
+            # Phase 2.5b: Output target learning state
+            "he_last_fired_step":  self._he_last_fired_step,
+            "he_output_candidates": self._he_output_candidates,
         }
 
     def _serialize_incremental(self) -> Dict[str, Any]:
@@ -3561,6 +3846,10 @@ class Graph:
         self._total_he_state_transitions = data.get("total_he_state_transitions", 0)
         self._total_he_substrate_culled  = data.get("total_he_substrate_culled", 0)
 
+        # Restore Phase 2.5b: Output target learning state
+        self._he_last_fired_step = data.get("he_last_fired_step", {})
+        self._he_output_candidates = data.get("he_output_candidates", {})
+
         # Restore Phase 3 active predictions with validation
         self.active_predictions.clear()
         node_ids = set(self.nodes.keys())
@@ -3642,7 +3931,7 @@ class Graph:
                 predicted_targets=valid_targets,
                 prediction_strength=psd.get("prediction_strength", 0.0),
                 prediction_timestamp=psd.get("prediction_timestamp", 0),
-                prediction_window=psd.get("prediction_window", 5),
+                prediction_window=psd.get("prediction_window", 10),
                 confirmed_targets=set(psd.get("confirmed_targets", [])) & node_ids,
             )
             # Validate: window must not already be expired

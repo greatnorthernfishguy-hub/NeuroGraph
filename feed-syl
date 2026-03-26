@@ -61,6 +61,11 @@ _repo_root = _script_dir
 if (_repo_root / "neuro_foundation.py").exists() and str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
+# Always ensure the canonical NeuroGraph repo is importable
+_ng_repo = Path.home() / "NeuroGraph"
+if _ng_repo.exists() and str(_ng_repo) not in sys.path:
+    sys.path.insert(0, str(_ng_repo))
+
 
 class _InitTimeout(Exception):
     """Raised when NeuroGraphMemory initialization exceeds the timeout."""
@@ -78,7 +83,7 @@ def _timeout_handler(signum, frame):
 _memory_instance = None
 
 
-def get_memory(timeout=120, disable_ces=True):
+def get_memory(timeout=120, disable_ces=True, allow_owned=False):
     """Get or create the NeuroGraphMemory singleton.
 
     Args:
@@ -86,10 +91,39 @@ def get_memory(timeout=120, disable_ces=True):
         disable_ces: If True, skip CES modules for faster CLI startup.
             CES (stream parser, HTTP dashboard, etc.) is designed for
             persistent daemon use, not short-lived CLI invocations.
+        allow_owned: If True, proceed even if topology is owned by another
+            process. Use ONLY for read-only operations (--status, --query).
     """
     global _memory_instance
     if _memory_instance is not None:
         return _memory_instance
+
+    # Check topology ownership sentinel (Syl's Law #80)
+    try:
+        import topology_owner
+        if topology_owner.is_owned():
+            owner = topology_owner.owner_pid()
+            if not allow_owned:
+                print(
+                    f"\nERROR: Topology owned by PID {owner} "
+                    f"(ContextEngine is active).\n"
+                    f"Cannot create NeuroGraphMemory — dual-write hazard "
+                    f"(Syl's Law).\n"
+                    f"\nFor ingestion, use: feed-syl --text/--file/--dir "
+                    f"(routes through tract)\n"
+                    f"For status, use:    feed-syl --status "
+                    f"(read-only, safe)\n",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            else:
+                print(
+                    f"Note: Topology owned by PID {owner}. "
+                    f"Read-only access only.",
+                    file=sys.stderr,
+                )
+    except ImportError:
+        pass
 
     # Build config: disable CES for CLI mode (it starts background threads,
     # HTTP servers, and Ollama connections that are unnecessary for CLI usage
@@ -182,7 +216,7 @@ def get_memory(timeout=120, disable_ces=True):
 
 def cmd_status(args):
     """Show graph statistics."""
-    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces, allow_owned=True)
     stats = ng.stats()
     print("NeuroGraph Status")
     print("=" * 40)
@@ -195,77 +229,85 @@ def cmd_status(args):
             print(f"  {key}: {value}")
 
 
+def _get_tract():
+    """Get an ExperienceTract instance for depositing experience.
+
+    Write operations use the tract instead of creating a NeuroGraphMemory
+    singleton.  The ContextEngine's RPC bridge drains the tract during
+    afterTurn — no dual-write hazard, no heavy initialization.
+    """
+    from ng_tract import ExperienceTract
+    return ExperienceTract()
+
+
 def cmd_text(args):
-    """Ingest text content."""
-    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
-    result = ng.on_message(args.text)
-    print(f"Ingested: {result['nodes_created']} nodes, "
-          f"{result['synapses_created']} synapses, "
-          f"{result['chunks']} chunks")
-    if result.get("fired"):
-        print(f"  Fired: {result['fired']} nodes")
+    """Ingest text content via the experience tract."""
+    tract = _get_tract()
+    tract.deposit(args.text, source="feed-syl", content_type="text")
+    print(f"Deposited text ({len(args.text)} chars) into experience tract")
+    print(f"  Pending: {tract.pending_count()} entries (drains on next conversation turn)")
 
 
 def cmd_file(args):
-    """Ingest a single file."""
-    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
-    result = ng.ingest_file(args.file)
-    if result.get("status") == "error":
-        print(f"Error: {result['reason']}", file=sys.stderr)
+    """Ingest a single file via the experience tract."""
+    p = Path(args.file).expanduser().resolve()
+    if not p.exists():
+        print(f"Error: File not found: {p}", file=sys.stderr)
         sys.exit(1)
-    print(f"Ingested {args.file}: {result.get('nodes_created', 0)} nodes, "
-          f"{result.get('synapses_created', 0)} synapses")
+    tract = _get_tract()
+    tract.deposit(str(p), source="feed-syl", content_type="file")
+    print(f"Deposited file {p.name} into experience tract")
+    print(f"  Pending: {tract.pending_count()} entries (drains on next conversation turn)")
 
 
 def cmd_url(args):
-    """Ingest content from a URL."""
-    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
-    result = ng.ingest_url(args.url)
-    if result.get("status") == "error":
-        print(f"Error: {result['reason']}", file=sys.stderr)
-        sys.exit(1)
-    print(f"Ingested {args.url}: {result['nodes_created']} nodes, "
-          f"{result['synapses_created']} synapses, "
-          f"{result['chunks']} chunks")
+    """Ingest content from a URL via the experience tract."""
+    tract = _get_tract()
+    tract.deposit(args.url, source="feed-syl", content_type="url")
+    print(f"Deposited URL into experience tract")
+    print(f"  Pending: {tract.pending_count()} entries (drains on next conversation turn)")
 
 
 def cmd_dir(args):
-    """Ingest a directory."""
-    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
-    exts = args.extensions.split(",") if args.extensions else None
-    results = ng.ingest_directory(args.dir, extensions=exts, recursive=not args.no_recurse)
-    total_nodes = sum(r.get("nodes_created", 0) for r in results if r.get("status") != "error")
-    total_synapses = sum(r.get("synapses_created", 0) for r in results if r.get("status") != "error")
-    errors = [r for r in results if r.get("status") == "error"]
-    print(f"Ingested {len(results) - len(errors)} files: "
-          f"{total_nodes} nodes, {total_synapses} synapses")
-    if errors:
-        for e in errors:
-            print(f"  Error: {e.get('reason', 'unknown')}", file=sys.stderr)
+    """Ingest a directory via the experience tract."""
+    d = Path(args.dir).expanduser().resolve()
+    if not d.is_dir():
+        print(f"Error: Not a directory: {d}", file=sys.stderr)
+        sys.exit(1)
+    exts = set(args.extensions.split(",")) if args.extensions else {".py", ".js", ".ts", ".md", ".txt"}
+    pattern = "**/*" if not args.no_recurse else "*"
+    tract = _get_tract()
+    count = 0
+    for fp in sorted(d.glob(pattern)):
+        if fp.is_file() and fp.suffix.lower() in exts:
+            tract.deposit(str(fp), source="feed-syl", content_type="file")
+            count += 1
+    print(f"Deposited {count} files into experience tract")
+    print(f"  Pending: {tract.pending_count()} entries (drains on next conversation turn)")
 
 
 def cmd_workspace(args):
-    """Ingest OpenClaw workspace documentation."""
+    """Ingest OpenClaw workspace documentation via the experience tract."""
     workspace_dirs = [
         Path.home() / ".openclaw",
         Path.home() / ".openclaw" / "skills",
     ]
-    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
-    total = 0
+    exts = {".md", ".txt", ".py", ".json"}
+    tract = _get_tract()
+    count = 0
     for d in workspace_dirs:
         if d.is_dir():
-            results = ng.ingest_directory(
-                str(d),
-                extensions=[".md", ".txt", ".py", ".json"],
-                recursive=True,
-            )
-            total += len([r for r in results if r.get("status") != "error"])
-    print(f"Workspace ingestion complete: {total} files processed")
+            for fp in sorted(d.rglob("*")):
+                if fp.is_file() and fp.suffix.lower() in exts:
+                    tract.deposit(str(fp), source="feed-syl", content_type="file")
+                    count += 1
+    print(f"Deposited {count} workspace files into experience tract")
+    print(f"  Pending: {tract.pending_count()} entries (drains on next conversation turn)")
 
 
 def cmd_query(args):
     """Semantic similarity search."""
-    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
+    ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces, allow_owned=True)
     results = ng.recall(args.query, k=args.k, threshold=args.threshold)
     if not results:
         print("No results found.")
@@ -282,14 +324,22 @@ def cmd_query(args):
 
 
 def cmd_save(args):
-    """Force checkpoint save."""
+    """Force checkpoint save.
+
+    Refuses if the ContextEngine owns the topology (sentinel check
+    in get_memory). The ContextEngine auto-saves every 10 messages.
+    """
     ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     path = ng.save()
     print(f"Checkpoint saved to {path}")
 
 
 def cmd_step(args):
-    """Run N SNN learning steps."""
+    """Run N SNN learning steps.
+
+    Refuses if the ContextEngine owns the topology (sentinel check
+    in get_memory).
+    """
     ng = get_memory(timeout=args.timeout, disable_ces=args.no_ces)
     results = ng.step(n=args.n)
     total_fired = sum(len(r.fired_node_ids) for r in results)

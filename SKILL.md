@@ -2,7 +2,6 @@
 name: neurograph
 description: "NeuroGraph is a cognitive memory system that remembers context across conversations using a spiking neural network substrate. Invoke when the user asks about memory, remember, context, what was learned, what the system knows, Syl, graph associations, knowledge, or wants to ingest or feed content into the knowledge base."
 metadata: { "openclaw": { "emoji": "🧠", "requires": {} } }
-hook: openclaw_hook.py::get_instance
 ---
 
 # NeuroGraph Cognitive Memory

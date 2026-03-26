@@ -1,5 +1,22 @@
 # Phase 7: Auto-Knowledge — Spreading Activation Harvest
 
+## Status — 2026-03-22
+
+**~60% implemented via CES. Key primitive still open.**
+
+| Component | Described In This Doc | Current State |
+|-----------|----------------------|---------------|
+| Semantic priming (pre-activate similar nodes) | Stage: PRIME | **Done** — StreamParser (`stream_parser.py`) does continuous priming as text arrives |
+| Spreading activation harvest | Stage: PROPAGATE + HARVEST | **Partially done** — SurfacingMonitor (`surfacing.py`) harvests fired nodes after `graph.step()`, but ranks by voltage only, not by hop distance from stimulus |
+| Cross-session activation warmth | (implicit requirement) | **Done** — ActivationPersistence (`activation_persistence.py`) |
+| `prime_and_propagate()` read-only method | §Architecture.1 | **Not built** — Currently surfacing happens as a side effect of the learning step, not as a separate read-only propagation |
+| `associate()` standalone method | §Architecture.3 | **Not built** — No way to query associations without ingesting |
+| Latency-ranked multi-hop surfacing | §Ranking | **Not built** — SurfacingMonitor ranks by voltage, not by causal distance from stimulus |
+
+**What's still valuable:** The `prime_and_propagate()` primitive (read-only propagation that doesn't modify weights) and latency ranking (direct association vs epiphany-distance connections). These two features enable each other and synergize with dual-pass embedding (#81) — tree-level concept embeddings give keyword-precision entry points for priming, SNN propagation surfaces forest-level connections through learned causal structure.
+
+---
+
 ## Problem
 NeuroGraph has two disconnected retrieval systems:
 1. **Vector DB** — explicit `recall(query)` → cosine similarity search

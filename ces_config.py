@@ -20,6 +20,12 @@ Usage::
     cfg = load_ces_config(config_path="~/.neurograph/ces.json")
 
 # ---- Changelog ----
+# [2026-03-25] Claude (Opus 4.6) — Salience weights in SurfacingConfig (SVG Phase 3)
+#   What: Added weight_voltage, weight_excitability, weight_he_membership to
+#         SurfacingConfig. Bootstrap defaults match original hardcoded 0.5/0.3/0.2.
+#   Why:  Static Value Graduation — surfacing weights are the substrate's concern.
+#         Named values are tunable by Elmer's TuningSocket.
+#   How:  Three new float fields on SurfacingConfig dataclass.
 # [2026-02-22] Claude (Opus 4.6) — Initial implementation.
 #   What: CESConfig dataclass with four sections (streaming, surfacing,
 #         persistence, monitoring) and load_ces_config() factory.
@@ -68,6 +74,13 @@ class SurfacingConfig:
     format: str = "context_block"
     include_metadata: bool = True
     queue_capacity: int = 50
+
+    # Salience scoring weights — determines what Syl notices.
+    # Bootstrap scaffolding: Elmer tunes these via TuningSocket as the
+    # substrate accumulates evidence about which signals matter.
+    weight_voltage: float = 0.5       # Firing strength contribution
+    weight_excitability: float = 0.3  # Intrinsic excitability contribution
+    weight_he_membership: float = 0.2 # Hyperedge membership contribution
 
 
 @dataclass

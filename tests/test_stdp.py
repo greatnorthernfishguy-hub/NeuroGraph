@@ -3,6 +3,9 @@
 Covers PRD §3.1 and §9 acceptance criteria:
 - STDP correctly strengthens causal sequences (A→B strengthens when A fires before B)
 - STDP correctly weakens acausal pairs (A→B weakens when A fires after B)
+
+Note: All tests use three_factor_enabled=False to test raw STDP mechanics.
+Three-factor (eligibility trace) behavior is covered in test_eligibility_traces.py.
 """
 
 import math
@@ -25,6 +28,7 @@ class TestLTP:
             "decay_rate": 1.0,
             "max_weight": 5.0,
             "learning_rate": 0.01,
+            "three_factor_enabled": False,  # Test raw STDP, not trace accumulation
             "co_activation_window": 0,  # Disable sprouting for this test
             "grace_period": 100000,
             "inactivity_threshold": 100000,
@@ -56,6 +60,7 @@ class TestLTP:
             "tau_plus": 20.0,
             "tau_minus": 20.0,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -90,6 +95,7 @@ class TestLTD:
             "max_weight": 5.0,
             "learning_rate": 0.01,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -120,6 +126,7 @@ class TestLTD:
             "tau_plus": 20.0,
             "tau_minus": 20.0,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -155,6 +162,7 @@ class TestWeightDependentSTDP:
             "max_weight": 5.0,
             "learning_rate": 0.01,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -192,6 +200,7 @@ class TestWeightDependentSTDP:
             "max_weight": 5.0,
             "learning_rate": 0.05,  # Fast learning
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -221,6 +230,7 @@ class TestWeightDependentSTDP:
             "max_weight": 5.0,
             "learning_rate": 0.05,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -252,6 +262,7 @@ class TestTemporalAliasing:
             "max_weight": 5.0,
             "learning_rate": 0.01,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -298,6 +309,7 @@ class TestAsymmetry:
             "A_plus": 1.0,
             "A_minus": 1.2,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
@@ -320,6 +332,7 @@ class TestAsymmetry:
             "A_plus": 1.0,
             "A_minus": 1.2,
             "co_activation_window": 0,
+            "three_factor_enabled": False,
             "grace_period": 100000,
             "inactivity_threshold": 100000,
         })
