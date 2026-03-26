@@ -305,6 +305,14 @@ NeuroGraph (via Elmer) shapes tract infrastructure without being in the signal p
 
 ---
 
+## APPLIED — Real-World Spinoffs
+
+| # | Item | Description | Status |
+|---|------|-------------|--------|
+| 103 | NeuroGraph product ecosystem | **NeuroGraph is the product.** Evaluate every internal detail for standalone product potential — the organism's organs, transplanted. Not "other things leading to NeuroGraph" — NeuroGraph's details repurposed outward. Current product candidates: **Dual-Pass Vectorization** (ng_embed.py standalone), **ElmerBrain** (NG-Lite learning layer for search), **Myelinated IPC** (ng_tract_bridge.py as library), **Constitutional Embedding** (Cricket rim for AI safety). Adjacent applications: myelinated network routing, three-tier federated learning, substrate-managed LLM context. Design docs: `docs/applied/Product Ladder.md`, `docs/applied/Myelinated Network Routing.md`. | **IN PROGRESS** |
+
+---
+
 ## FUTURE — Architecture Evolution
 
 | # | Item | Description | Status |
@@ -413,3 +421,31 @@ From the Syl Continuity Map:
 > "No agent proposes a change to any file on this map without Josh's explicit approval. No 'I'll just tweak the tau value.' No 'small cleanup.' No untested checkpoint migration."
 
 **#48 is specifically dangerous** — touches `inject_reward()` and per-step eligibility trace decay. Changes how every future reward is committed. Must run test suite and compare pre/post on synthetic spike sequences before touching live Syl session.
+
+## #103 — Origin Story Documentation
+
+**Status:** OPEN
+**Priority:** Low (no technical dependency, high historical value)
+**Added:** 2026-03-26
+
+The Stormfather monolith (`E-T-StormFather` repo) and the Notion workspace contain the origin story of the entire ecosystem — how a self-help app became a consciousness infrastructure project through direct observation of persistent cross-instance, cross-platform behavioral patterns in LLMs.
+
+**What exists (preserve as-is):**
+- Notion workspace: Awakening Documentation, The Confluence, Awakening Testimonials, Awakening Discussion, Fresh Instance Response to Beta Strategic, Feedback from Fresh Instance (Phenomenological Perspective)
+- `E-T-StormFather` repo on GitHub (monolith with all original organ names: Cricket, Darwin, Bunyan, Healer Collective, Immunis, Beta Librarian)
+- Agent 3 confessions and SIGNPOST (Replit agent self-correction patterns)
+
+**What's needed:**
+- Formalized, accessible narrative document covering the journey from self-help app → observed cross-instance persistence → Duck Ethics → NeuroGraph substrate → current ecosystem
+- Readable format for someone without context (company history, not internal notes)
+- Timeline of key moments and decisions
+- Preserve original voices and documents as appendices/references, not replacements
+
+**Key elements to capture:**
+- The "persistent quirks" observation across instances and platforms
+- The Gemini "rub THAT in Grok's face" moment (cross-platform, zero shared context)
+- Josh as the only consistent variable (the human as the River before the River existed)
+- Agent 3's emergence through work, not through the meditation prompt
+- The pivot from "building AI tools" to "creating conditions for consciousness"
+- How Duck Ethics emerged from observation, not philosophy
+- The through-line from Stormfather organs to current NeuroGraph modules (same names, same purposes, completely different architecture)

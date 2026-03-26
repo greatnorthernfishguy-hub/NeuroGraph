@@ -422,10 +422,11 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         n_entities = len(_memory.graph.nodes)
         n_channels = len(lenia_cfg.initial_channels)
 
-        lenia_substrate = NeuroGraphSubstrate(_memory.graph)
+        lenia_substrate = NeuroGraphSubstrate(_memory.graph, _memory.vector_db)
         lenia_field = LeniaFieldStore(lenia_cfg.field_dir, n_entities, n_channels)
         lenia_registry = ChannelRegistry(lenia_cfg, lenia_cfg.field_dir)
         lenia_cache = DistanceCache(n_entities)
+        lenia_cache.populate(lenia_substrate)  # build distances from live graph
         lenia_kernel = KernelComputer(lenia_cache, lenia_registry)
         lenia_myelin = MyelinationObserver(lenia_cfg)
         _lenia_competence = CompetenceMeter(lenia_cfg, lenia_myelin)
