@@ -4,13 +4,26 @@
 # Why: Maps Lenia's abstract entity/distance interface to NG's nodes/synapses
 # How: Wraps graph.nodes, graph.synapses, computes 5-metric distance vectors
 # PRD: ~/docs/prd/Lenia_FlowGraph_Design_v0.1.md §4
+# [2026-03-26] Claude Code (Opus 4.6) — Dual-pass embeddings + vector DB access
+# What: Distance vector now 6 components (forest + tree embedding similarity).
+#   Reads embeddings from SimpleVectorDB, distinguishes forest/tree nodes via
+#   metadata._tree_concept flag. Cached embedding matrix for fast cosine sim.
+# Why: Dual-pass gives kernel two semantic scales. Forest = broad concept,
+#   tree = specific detail. Channels can weight each differently.
+# How: vector_db reference passed at init. Embedding matrix built on populate().
+#   Forest nodes get forest similarity in component 4, tree nodes get tree
+#   similarity in component 5. Mixed pairs get the relevant component.
 # -------------------
 
 """NeuroGraph-specific implementation of the LeniaSubstrate interface.
 
 entity = graph node
 distance = [topology_hops, synaptic_weight, cofire_frequency,
-            hyperedge_membership, embedding_similarity]
+            hyperedge_membership, embedding_forest, embedding_tree]
+
+Dual-pass: forest embeddings capture broad concept similarity,
+tree embeddings capture specific detail similarity. Both come from
+ng_embed.py's dual_record_outcome — already in the vector DB.
 """
 
 import logging
@@ -25,20 +38,28 @@ logger = logging.getLogger(__name__)
 
 
 class NeuroGraphSubstrate(LeniaSubstrate):
-    """Wraps a neuro_foundation.py Graph as a LeniaSubstrate.
+    """Wraps a neuro_foundation.py Graph + SimpleVectorDB as a LeniaSubstrate.
 
-    The Graph is not owned — this is a view over the existing graph.
+    The Graph and VectorDB are not owned — this is a view.
     Changes to the graph (node additions, STDP, etc.) are reflected
     here because we read from the graph directly.
     """
 
-    def __init__(self, graph: Any):
+    def __init__(self, graph: Any, vector_db: Any = None):
         """
         Args:
             graph: neuro_foundation.py Graph instance.
+            vector_db: SimpleVectorDB instance (for embeddings).
         """
         self._graph = graph
+        self._vector_db = vector_db
         self._rebuild_index()
+
+        # Embedding caches — built on first access or populate()
+        self._embedding_matrix: Optional[np.ndarray] = None
+        self._embedding_norms: Optional[np.ndarray] = None
+        self._is_tree_node: Optional[np.ndarray] = None  # bool array
+        self._embeddings_cached = False
 
     def _rebuild_index(self):
         """Build entity_id ↔ index mapping from current graph state."""
@@ -48,9 +69,74 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         }
         # Cache for BFS distances
         self._topo_cache: Dict[Tuple[str, str], int] = {}
+        # Adjacency list cache
+        self._adj: Optional[Dict[str, List[str]]] = None
         # Co-fire tracking
         self._cofire_counts: Dict[Tuple[str, str], int] = defaultdict(int)
         self._cofire_window: int = 0
+        # Invalidate embedding cache
+        self._embeddings_cached = False
+
+    def _build_adjacency(self):
+        """Build adjacency list from synapses (cached)."""
+        self._adj = defaultdict(list)
+        for syn in self._graph.synapses.values():
+            self._adj[syn.pre_id].append(syn.post_id)
+            self._adj[syn.post_id].append(syn.pre_id)
+
+    def _cache_embeddings(self):
+        """Build embedding matrix from vector DB for fast cosine similarity.
+
+        Identifies forest vs tree nodes from VDB metadata._tree_concept.
+        """
+        n = len(self._entity_list)
+        if n == 0 or self._vector_db is None:
+            self._embeddings_cached = True
+            return
+
+        # Determine embedding dimension from first available entry
+        dim = None
+        for eid in self._entity_list:
+            emb = self._vector_db.embeddings.get(eid)
+            if emb is not None:
+                dim = len(emb)
+                break
+
+        if dim is None:
+            logger.warning("No embeddings found in vector DB")
+            self._embeddings_cached = True
+            return
+
+        self._embedding_matrix = np.zeros((n, dim), dtype=np.float64)
+        self._is_tree_node = np.zeros(n, dtype=bool)
+
+        found = 0
+        for i, eid in enumerate(self._entity_list):
+            emb = self._vector_db.embeddings.get(eid)
+            if emb is not None:
+                self._embedding_matrix[i] = emb
+                found += 1
+
+            # Check metadata for tree/forest distinction
+            meta = self._vector_db.metadata.get(eid, {})
+            if meta.get("_tree_concept", False):
+                self._is_tree_node[i] = True
+
+        # Precompute norms for fast cosine sim
+        self._embedding_norms = np.linalg.norm(
+            self._embedding_matrix, axis=1, keepdims=True
+        )
+        # Avoid division by zero
+        self._embedding_norms = np.where(
+            self._embedding_norms < 1e-10, 1.0, self._embedding_norms
+        )
+
+        self._embeddings_cached = True
+        tree_count = int(self._is_tree_node.sum())
+        logger.info(
+            "Cached %d/%d embeddings (%d forest, %d tree, dim=%d)",
+            found, n, found - tree_count, tree_count, dim,
+        )
 
     def entities(self) -> List[str]:
         return self._entity_list
@@ -59,7 +145,6 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         return len(self._entity_list)
 
     def channel_count(self) -> int:
-        # Delegated to channel registry, not stored here
         raise NotImplementedError("Use ChannelRegistry.count instead")
 
     def entity_index(self, entity_id: str) -> int:
@@ -69,35 +154,32 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         return self._entity_list[index]
 
     def distance_vector(self, source_id: str, target_id: str) -> np.ndarray:
-        """Compute 5-component distance vector between two nodes.
+        """Compute 6-component distance vector between two nodes.
 
         Components:
             0: topology (hop count, BFS)
-            1: synaptic weight (direct connection weight, 0 if no direct synapse)
+            1: synaptic weight (direct connection weight, 0 if none)
             2: co-fire frequency (normalized)
-            3: hyperedge membership (Jaccard similarity of shared HEs)
-            4: embedding similarity (cosine similarity, 0 if no embeddings)
+            3: hyperedge membership (Jaccard similarity)
+            4: embedding similarity — forest (broad concept)
+            5: embedding similarity — tree (specific detail)
         """
-        vec = np.zeros(5, dtype=np.float64)
+        vec = np.zeros(6, dtype=np.float64)
 
-        # 0: Topological distance (BFS hop count)
         vec[0] = self._topology_distance(source_id, target_id)
-
-        # 1: Synaptic weight (direct connection)
         vec[1] = self._synaptic_distance(source_id, target_id)
 
-        # 2: Co-fire frequency
         pair = (min(source_id, target_id), max(source_id, target_id))
         if self._cofire_window > 0:
             vec[2] = self._cofire_counts[pair] / self._cofire_window
-        else:
-            vec[2] = 0.0
 
-        # 3: Hyperedge membership (Jaccard)
         vec[3] = self._hyperedge_similarity(source_id, target_id)
 
-        # 4: Embedding similarity
-        vec[4] = self._embedding_similarity(source_id, target_id)
+        forest_sim, tree_sim = self._dual_embedding_similarity(
+            source_id, target_id
+        )
+        vec[4] = forest_sim
+        vec[5] = tree_sim
 
         return vec
 
@@ -127,11 +209,12 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         """Called when nodes/synapses are added or removed."""
         self._rebuild_index()
         self._topo_cache.clear()
+        self._adj = None
 
     # -- Private distance computation --
 
     def _topology_distance(self, a: str, b: str) -> float:
-        """BFS hop count between two nodes. Returns inf if unreachable."""
+        """BFS hop count between two nodes."""
         if a == b:
             return 0.0
 
@@ -139,13 +222,9 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         if pair in self._topo_cache:
             return self._topo_cache[pair]
 
-        # Build adjacency from synapses
-        adj: Dict[str, List[str]] = defaultdict(list)
-        for syn in self._graph.synapses.values():
-            adj[syn.pre_id].append(syn.post_id)
-            adj[syn.post_id].append(syn.pre_id)
+        if self._adj is None:
+            self._build_adjacency()
 
-        # BFS
         visited = {a}
         frontier = [a]
         depth = 0
@@ -153,7 +232,7 @@ class NeuroGraphSubstrate(LeniaSubstrate):
             depth += 1
             next_frontier = []
             for node in frontier:
-                for neighbor in adj.get(node, []):
+                for neighbor in self._adj.get(node, []):
                     if neighbor == b:
                         self._topo_cache[pair] = float(depth)
                         return float(depth)
@@ -162,13 +241,19 @@ class NeuroGraphSubstrate(LeniaSubstrate):
                         next_frontier.append(neighbor)
             frontier = next_frontier
 
-        # Unreachable — use a large but finite value
         result = float(len(self._entity_list))
         self._topo_cache[pair] = result
         return result
 
     def _synaptic_distance(self, a: str, b: str) -> float:
         """Direct synapse weight. Returns 0 if no direct connection."""
+        if self._adj is None:
+            self._build_adjacency()
+
+        # Fast check: are they even neighbors?
+        if b not in self._adj.get(a, []):
+            return 0.0
+
         for syn in self._graph.synapses.values():
             if (syn.pre_id == a and syn.post_id == b) or (
                 syn.pre_id == b and syn.post_id == a
@@ -181,7 +266,10 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         hes_a = set()
         hes_b = set()
         for he in self._graph.hyperedges.values():
-            members = set(he.node_ids) if hasattr(he, "node_ids") else set()
+            members = set(
+                he.node_ids if hasattr(he, "node_ids") else
+                (he.member_nodes if hasattr(he, "member_nodes") else [])
+            )
             if a in members:
                 hes_a.add(he.hyperedge_id)
             if b in members:
@@ -193,24 +281,53 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         union = hes_a | hes_b
         return len(intersection) / len(union) if union else 0.0
 
-    def _embedding_similarity(self, a: str, b: str) -> float:
-        """Cosine similarity of node embeddings."""
-        node_a = self._graph.nodes.get(a)
-        node_b = self._graph.nodes.get(b)
-        if node_a is None or node_b is None:
-            return 0.0
+    def _dual_embedding_similarity(
+        self, a: str, b: str
+    ) -> Tuple[float, float]:
+        """Compute forest and tree embedding similarity separately.
 
-        emb_a = getattr(node_a, "embedding", None)
-        emb_b = getattr(node_b, "embedding", None)
-        if emb_a is None or emb_b is None:
-            return 0.0
+        Returns (forest_similarity, tree_similarity).
 
-        emb_a = np.asarray(emb_a, dtype=np.float64)
-        emb_b = np.asarray(emb_b, dtype=np.float64)
+        Logic:
+        - Both forest nodes: similarity goes into forest component
+        - Both tree nodes: similarity goes into tree component
+        - One forest, one tree: similarity goes into tree component
+          (the tree is a detail of a broader concept — the detail
+          scale is more informative for mixed pairs)
+        - No embeddings: both 0.0
+        """
+        if not self._embeddings_cached:
+            self._cache_embeddings()
 
-        norm_a = np.linalg.norm(emb_a)
-        norm_b = np.linalg.norm(emb_b)
+        if self._embedding_matrix is None:
+            return 0.0, 0.0
+
+        try:
+            i = self._id_to_idx[a]
+            j = self._id_to_idx[b]
+        except KeyError:
+            return 0.0, 0.0
+
+        # Fast cosine similarity from cached matrix
+        emb_a = self._embedding_matrix[i]
+        emb_b = self._embedding_matrix[j]
+        norm_a = self._embedding_norms[i, 0]
+        norm_b = self._embedding_norms[j, 0]
+
         if norm_a < 1e-10 or norm_b < 1e-10:
-            return 0.0
+            return 0.0, 0.0
 
-        return float(np.dot(emb_a, emb_b) / (norm_a * norm_b))
+        sim = float(np.dot(emb_a, emb_b) / (norm_a * norm_b))
+
+        is_tree_a = self._is_tree_node[i]
+        is_tree_b = self._is_tree_node[j]
+
+        if not is_tree_a and not is_tree_b:
+            # Both forest: broad concept similarity
+            return sim, 0.0
+        elif is_tree_a and is_tree_b:
+            # Both tree: specific detail similarity
+            return 0.0, sim
+        else:
+            # Mixed: goes into tree (detail scale)
+            return 0.0, sim
