@@ -1087,6 +1087,9 @@ class Graph:
         # --- Zero-firing circuit breaker ---
         self._steps_since_last_fire: int = 0
 
+        # --- Last step result (for downstream substrate readers) ---
+        self._last_step_result: Optional[StepResult] = None
+
         # --- Phase 2.5b: Hyperedge output target learning ---
         # he_id → timestep when HE last fired
         self._he_last_fired_step: Dict[str, int] = {}
@@ -1934,6 +1937,7 @@ class Graph:
                 self.timestep, self._steps_since_last_fire,
             )
 
+        self._last_step_result = result
         return result
 
     def step_n(self, n: int) -> List[StepResult]:
