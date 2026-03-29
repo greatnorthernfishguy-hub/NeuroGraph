@@ -145,6 +145,11 @@ class TonicThread:
         # Latent engine reference — set by openclaw_hook when engine is ready
         self._latent_engine = None
 
+        # Post-cycle callback — set by neurograph_rpc to deposit topology
+        # deltas to module tracts after each ouroboros cycle. The Tonic
+        # doesn't know about bridges or deltas — it just fires the hook.
+        self._post_cycle_hook = None
+
         logger.info("TonicThread initialized — the latent thread is live")
 
     # -----------------------------------------------------------------
@@ -194,6 +199,13 @@ class TonicThread:
         fired_count = len(result.fired_entries)
         self._total_firings += fired_count
         self._cycle_count += 1
+
+        # DEPOSIT: notify downstream modules of topology changes
+        if self._post_cycle_hook and fired_count > 0:
+            try:
+                self._post_cycle_hook(result)
+            except Exception as exc:
+                logger.debug("Post-cycle hook error: %s", exc)
 
         # UPDATE THREAD: refresh with current graph state
         self._update_thread(active_nodes, result)

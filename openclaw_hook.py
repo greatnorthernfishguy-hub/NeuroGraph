@@ -133,6 +133,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+import importlib
+import importlib.util
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -201,6 +204,120 @@ OPENCLAW_SNN_CONFIG = {
     "max_surfaced": 10,
 }
 
+
+
+# ── Module Fan-Out (#101) ────────────────────────────────────────────
+# [2026-03-26] Claude Code (Opus 4.6) — Direct fan-out from on_message
+# What: Fire _module_on_message on all registered module hooks after
+#       each message is processed.
+# Why:  OpenClaw 2026.3.13 never calls afterTurn on the ContextEngine
+#       plugin. The fan-out in neurograph_rpc.py was dead. This puts
+#       it where it belongs — in the message processing path itself.
+# How:  Lazy-loads hooks from ~/.et_modules/registry.json on first call.
+#       Caches instances. Error-isolated per module.
+
+_fanout_hooks: Optional[Dict[str, Any]] = None
+_fanout_install_paths: Dict[str, str] = {}
+_FANOUT_SKIP = {"neurograph", "inference_difference"}
+_FANOUT_GENERIC_PREFIXES = ("core", "pipelines", "runtime", "utils", "config")
+
+
+def _load_fanout_hooks() -> Dict[str, Any]:
+    """Load module hooks from the ET module registry. Cached after first call."""
+    global _fanout_hooks, _fanout_install_paths
+    if _fanout_hooks is not None:
+        return _fanout_hooks
+
+    registry_path = os.path.expanduser("~/.et_modules/registry.json")
+    if not os.path.exists(registry_path):
+        _fanout_hooks = {}
+        return _fanout_hooks
+
+    try:
+        with open(registry_path) as f:
+            registry = json.load(f)
+    except Exception:
+        _fanout_hooks = {}
+        return _fanout_hooks
+
+    hooks: Dict[str, Any] = {}
+    for reg_key, manifest in registry.get("modules", {}).items():
+        module_id = manifest.get("module_id") or reg_key
+        install_path = manifest.get("install_path", "")
+        entry_point = manifest.get("entry_point", "")
+
+        if not install_path or not entry_point or module_id in _FANOUT_SKIP:
+            continue
+
+        if module_id == "praxis":
+            hook_file = os.path.join(install_path, "core", "praxis_hook.py")
+        else:
+            hook_file = os.path.join(install_path, entry_point)
+
+        if not os.path.exists(hook_file):
+            continue
+
+        try:
+            spec_name = f"_fanout_{module_id}"
+            spec = importlib.util.spec_from_file_location(spec_name, hook_file)
+            if not spec or not spec.loader:
+                continue
+
+            module_dir = os.path.dirname(hook_file)
+            parent_dir = os.path.dirname(module_dir)
+            for p in (module_dir, parent_dir, install_path):
+                if p and p not in sys.path:
+                    sys.path.insert(0, p)
+
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec_name] = mod
+            spec.loader.exec_module(mod)
+
+            get_inst = getattr(mod, "get_instance", None)
+            if not get_inst:
+                continue
+
+            instance = get_inst()
+            if hasattr(instance, "_module_on_message"):
+                hooks[module_id] = instance
+                _fanout_install_paths[module_id] = install_path
+                logger.info("Fan-out hook loaded: %s", module_id)
+        except Exception as exc:
+            logger.warning("Fan-out hook failed for %s: %s", module_id, exc)
+
+    _fanout_hooks = hooks
+    logger.info("Fan-out: %d modules loaded: %s", len(hooks), list(hooks.keys()))
+    return _fanout_hooks
+
+
+def _fire_fanout(text: str, embedding) -> None:
+    """Call _module_on_message on each loaded module hook. Error-isolated."""
+    hooks = _load_fanout_hooks()
+    if not hooks:
+        return
+
+    for module_id, hook in hooks.items():
+        ip = _fanout_install_paths.get(module_id, "")
+        if ip and ip not in sys.path:
+            sys.path.insert(0, ip)
+
+        # Clear generic module names so lazy imports resolve per-module
+        for mod_name in list(sys.modules.keys()):
+            for prefix in _FANOUT_GENERIC_PREFIXES:
+                if mod_name == prefix or mod_name.startswith(prefix + "."):
+                    sys.modules.pop(mod_name, None)
+                    break
+
+        try:
+            hook._module_on_message(text, embedding)
+        except Exception as exc:
+            logger.warning("Fan-out %s error: %s", module_id, exc)
+        finally:
+            if ip:
+                try:
+                    sys.path.remove(ip)
+                except ValueError:
+                    pass
 
 class NeuroGraphMemory:
     """Singleton cognitive memory layer for OpenClaw integration.
@@ -397,6 +514,38 @@ class NeuroGraphMemory:
                 )
                 logger.info("The Tonic initialized — latent thread live")
 
+                # Wire topology delta deposit after each ouroboros cycle.
+                # The Tonic's write-mode exploration changes the substrate.
+                # Downstream modules should see those changes via the River.
+                _graph_ref = self.graph
+                _vdb_ref = self.vector_db
+                _self_ref = self  # for peer_bridge access
+                def _tonic_post_cycle(propagation_result):
+                    bridge = getattr(_self_ref, '_peer_bridge', None)
+                    if bridge is None:
+                        return
+                    from neuro_foundation import StepResult
+                    # Build a StepResult from the PropagationResult
+                    step_result = StepResult(
+                        timestep=_graph_ref.timestep,
+                        fired_node_ids=[
+                            e.node_id for e in propagation_result.fired_entries
+                        ],
+                        fired_hyperedge_ids=[],  # propagation doesn't track HE firing
+                        synapses_pruned=0,
+                        synapses_sprouted=0,
+                        predictions_confirmed=0,
+                        predictions_surprised=0,
+                    )
+                    from ng_topology_delta import extract_and_deposit_delta
+                    extract_and_deposit_delta(
+                        graph=_graph_ref,
+                        vector_db=_vdb_ref,
+                        step_result=step_result,
+                        peer_bridge=bridge,
+                    )
+                self._tonic_thread._post_cycle_hook = _tonic_post_cycle
+
                 # Latent engine (surgical model) — provides the push
                 # between conversations via actual inference, not a timer
                 try:
@@ -573,6 +722,11 @@ class NeuroGraphMemory:
         # NeuroGraph's learning without a direct SaaS connection.
         self._write_peer_learning_event(text, result, step_result)
 
+
+        # [2026-03-27] Fan-out disabled here — now handled by neurograph_rpc.py's
+        # _fan_out_to_modules() which has proper namespace isolation (stash/restore).
+        # This old path lacked isolation and caused 4/8 modules to fail with
+        # core.config collisions. See neurograph_rpc.py line 290+.
         return event_data
 
     def _harvest_associations(
