@@ -145,6 +145,11 @@ class TonicThread:
         # Latent engine reference — set by openclaw_hook when engine is ready
         self._latent_engine = None
 
+        # Post-cycle callback for topology delta deposit.
+        # Set by openclaw_hook. Fires after write-mode propagation
+        # when nodes fired. Same thread — no concurrency risk.
+        self._post_cycle_hook = None
+
 
 
         logger.info("TonicThread initialized — the latent thread is live")
@@ -196,6 +201,13 @@ class TonicThread:
         fired_count = len(result.fired_entries)
         self._total_firings += fired_count
         self._cycle_count += 1
+
+        # Deposit topology changes to the River
+        if self._post_cycle_hook and fired_count > 0:
+            try:
+                self._post_cycle_hook(result)
+            except Exception as exc:
+                logger.debug("Post-cycle deposit error: %s", exc)
 
         # UPDATE THREAD: refresh with current graph state
         self._update_thread(active_nodes, result)
