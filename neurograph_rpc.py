@@ -1232,6 +1232,22 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
                 k = int(qs.get('k', [5])[0])
                 result = hook.find_similar_events(q, k=k)
                 self._json_response(200, {'events': result})
+            elif parsed.path == '/bunyan/recall':
+                k = int(qs.get('k', [5])[0])
+                threshold = float(qs.get('threshold', [0.5])[0])
+                if _memory is None:
+                    self._json_response(503, {'error': 'NeuroGraph not bootstrapped'})
+                    return
+                result = _memory.recall(q, k=k, threshold=threshold)
+                self._json_response(200, {'results': result})
+            elif parsed.path == '/bunyan/associate':
+                k = int(qs.get('k', [10])[0])
+                steps = int(qs.get('steps', [3])[0])
+                if _memory is None:
+                    self._json_response(503, {'error': 'NeuroGraph not bootstrapped'})
+                    return
+                result = _memory.associate(q, k=k, steps=steps)
+                self._json_response(200, {'associations': result})
             else:
                 self._json_response(404, {'error': 'Unknown bunyan endpoint'})
         except Exception as exc:
