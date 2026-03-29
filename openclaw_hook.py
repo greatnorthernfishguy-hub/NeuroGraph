@@ -514,38 +514,6 @@ class NeuroGraphMemory:
                 )
                 logger.info("The Tonic initialized — latent thread live")
 
-                # Wire topology delta deposit after each ouroboros cycle.
-                # The Tonic's write-mode exploration changes the substrate.
-                # Downstream modules should see those changes via the River.
-                _graph_ref = self.graph
-                _vdb_ref = self.vector_db
-                _self_ref = self  # for peer_bridge access
-                def _tonic_post_cycle(propagation_result):
-                    bridge = getattr(_self_ref, '_peer_bridge', None)
-                    if bridge is None:
-                        return
-                    from neuro_foundation import StepResult
-                    # Build a StepResult from the PropagationResult
-                    step_result = StepResult(
-                        timestep=_graph_ref.timestep,
-                        fired_node_ids=[
-                            e.node_id for e in propagation_result.fired_entries
-                        ],
-                        fired_hyperedge_ids=[],  # propagation doesn't track HE firing
-                        synapses_pruned=0,
-                        synapses_sprouted=0,
-                        predictions_confirmed=0,
-                        predictions_surprised=0,
-                    )
-                    from ng_topology_delta import extract_and_deposit_delta
-                    extract_and_deposit_delta(
-                        graph=_graph_ref,
-                        vector_db=_vdb_ref,
-                        step_result=step_result,
-                        peer_bridge=bridge,
-                    )
-                self._tonic_thread._post_cycle_hook = _tonic_post_cycle
-
                 # Latent engine (surgical model) — provides the push
                 # between conversations via actual inference, not a timer
                 try:
