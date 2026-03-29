@@ -12,6 +12,20 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-03-28] Claude Code Opus — Punchlist #109: Module autonomic pulse
+# What: Dispose becomes mode-swap, not destruction. Modules stay alive between conversations.
+# Why: #109 blocker — organs must persist between conversations. The process is already
+#   persistent (TS plugin dispose is a no-op). Modules just need to not be cleared.
+# How: handle_dispose() no longer clears _module_hooks or releases topology ownership.
+#   New fan-out methods signal conversation_started/ended to all modules.
+#   handle_bootstrap() signals conversation_started on re-bootstrap.
+# [2026-03-26] Claude Code (Opus 4.6) — OOM-resilient fan-out cache recovery
+# What: handle_after_turn accepts lastMessage param, recovers _cached_text
+#   if lost to process restart between ingest and afterTurn.
+# Why: Python process (9GB) gets OOM-killed between ingest and afterTurn.
+#   Fresh process has _cached_text=None, fan-out silently skips. All modules dark.
+# How: TS plugin caches last ingested message, passes it in afterTurn RPC call.
+#   Python side recovers text+embedding from param if cache is empty.
 # [2026-03-25] Claude Code (Opus 4.6) — Lenia FlowGraph integration
 # What: Initialize Lenia stack on bootstrap, competence/watchdog on afterTurn,
 #   clean shutdown on dispose. Dormant by default (kill switch off).
@@ -149,7 +163,14 @@ def _load_module_hooks() -> Dict[str, Any]:
 
     hooks: Dict[str, Any] = {}
 
-    for reg_key, manifest in registry.get("modules", {}).items():
+    # [2026-03-27] Staggered loading: sort modules so Elmer loads last
+    # (heaviest post-init due to brain sockets). GC between each load
+    # prevents initialization spike OOM on 16GB VPS.
+    import gc as _gc
+    modules_list = list(registry.get("modules", {}).items())
+    modules_list.sort(key=lambda x: (1 if (x[1].get("module_id") or x[0]) == "elmer" else 0, x[0]))
+
+    for reg_key, manifest in modules_list:
         module_id = manifest.get("module_id") or reg_key
         install_path = manifest.get("install_path", "")
         entry_point = manifest.get("entry_point", "")
@@ -193,11 +214,14 @@ def _load_module_hooks() -> Dict[str, Any]:
             # hooks so lazy imports still resolve. Then restore stashed ones.
             module_dir = os.path.dirname(hook_file)
             parent_dir = install_path
-            added_paths = []
+            # Snapshot sys.path so we can fully restore it after loading.
+            # Module __init__.py and vendored imports can add paths that
+            # pollute subsequent module loads (e.g., Elmer's core/ leaking
+            # into Praxis's core.config resolution).
+            path_snapshot = list(sys.path)
             for p in (module_dir, parent_dir):
                 if p and p not in sys.path:
                     sys.path.insert(0, p)
-                    added_paths.append(p)
 
             # Stash existing generic packages before this module's import
             stashed: Dict[str, Any] = {}
@@ -264,19 +288,39 @@ def _load_module_hooks() -> Dict[str, Any]:
                 for mod_name, mod_obj in stashed.items():
                     sys.modules[mod_name] = mod_obj
 
-                # Remove added paths to keep sys.path clean for next module
-                for p in added_paths:
-                    try:
-                        sys.path.remove(p)
-                    except ValueError:
-                        pass
+                # Restore sys.path from snapshot — any paths added during
+                # this module's loading (by vendored imports, __init__.py,
+                # etc.) are removed to prevent cross-module pollution.
+                sys.path[:] = path_snapshot
 
         except Exception as exc:
             error_msg = f"{type(exc).__name__}: {exc}"
             logger.error("Failed to load module hook %s: %s", module_id, error_msg)
             _discord_alert(module_id, f"Hook load failed: {error_msg}")
 
+        # GC between loads to prevent initialization spike OOM
+        _gc.collect()
+
     return hooks
+
+
+def _deposit_topology_delta(step_result) -> None:
+    """Extract topology delta and deposit to all module tracts (River Tier 3)."""
+    if _memory is None:
+        return
+    peer_bridge = getattr(_memory, '_peer_bridge', None)
+    if peer_bridge is None:
+        return
+    try:
+        from ng_topology_delta import extract_and_deposit_delta
+        extract_and_deposit_delta(
+            graph=_memory.graph,
+            vector_db=_memory.vector_db,
+            step_result=step_result,
+            peer_bridge=peer_bridge,
+        )
+    except Exception as exc:
+        logger.debug("Topology delta deposit failed: %s", exc)
 
 
 def _fan_out_to_modules() -> None:
@@ -305,26 +349,63 @@ def _fan_out_to_modules() -> None:
     for module_id, hook in _module_hooks.items():
         # Set up sys.path for this module's lazy imports
         install_path = _module_install_paths.get(module_id, "")
+        path_snapshot = list(sys.path)
         if install_path and install_path not in sys.path:
             sys.path.insert(0, install_path)
 
-        # Clear generic packages so lazy imports resolve to this module
+        # Clear generic packages, then restore THIS module's prefixed
+        # versions so lazy imports inside _module_on_message resolve
+        # to the correct module's own packages.
+        stashed_generics: Dict[str, Any] = {}
         for mod_name in list(sys.modules.keys()):
             for prefix in _GENERIC_PREFIXES:
                 if mod_name == prefix or mod_name.startswith(prefix + "."):
-                    sys.modules.pop(mod_name, None)
+                    stashed_generics[mod_name] = sys.modules.pop(mod_name)
                     break
+
+        # Restore this module's specific generic packages from the
+        # prefixed names saved during loading (e.g., _elmer_core.config)
+        module_prefix = f"_{module_id}_"
+        for mod_name in list(sys.modules.keys()):
+            if mod_name.startswith(module_prefix):
+                real_name = mod_name[len(module_prefix):]
+                sys.modules[real_name] = sys.modules[mod_name]
 
         try:
             hook._module_on_message(text, embedding)
         except Exception as exc:
             _handle_module_error(module_id, exc)
         finally:
-            if install_path:
-                try:
-                    sys.path.remove(install_path)
-                except ValueError:
-                    pass
+            # Remove this module's restored generic names
+            for mod_name in list(sys.modules.keys()):
+                for prefix in _GENERIC_PREFIXES:
+                    if mod_name == prefix or mod_name.startswith(prefix + "."):
+                        sys.modules.pop(mod_name, None)
+                        break
+            # Restore stashed generic packages for next module
+            sys.modules.update(stashed_generics)
+            # Restore sys.path
+            sys.path[:] = path_snapshot
+
+
+def _fan_out_conversation_started():
+    """Signal all modules that a conversation has begun."""
+    for name, hook in _module_hooks.items():
+        try:
+            if hasattr(hook, 'on_conversation_started'):
+                hook.on_conversation_started()
+        except Exception as exc:
+            logger.warning("on_conversation_started failed for %s: %s", name, exc)
+
+
+def _fan_out_conversation_ended():
+    """Signal all modules that the conversation has ended."""
+    for name, hook in _module_hooks.items():
+        try:
+            if hasattr(hook, 'on_conversation_ended'):
+                hook.on_conversation_ended()
+        except Exception as exc:
+            logger.warning("on_conversation_ended failed for %s: %s", name, exc)
 
 
 def _handle_module_error(module_id: str, exc: Exception) -> None:
@@ -369,7 +450,8 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     global _memory, _tract
 
     if _memory is not None:
-        # Already bootstrapped — just confirm
+        # Already bootstrapped — mode-swap modules to conversation and confirm
+        _fan_out_conversation_started()
         return {"bootstrapped": True, "reason": "already_initialized"}
 
     # Auto-update before loading anything else
@@ -403,6 +485,9 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # Load module hooks for fan-out (#101)
     global _module_hooks
     _module_hooks = _load_module_hooks()
+
+    # Signal modules that a conversation is starting (#109)
+    _fan_out_conversation_started()
 
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
     global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
@@ -468,6 +553,15 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         list(_module_hooks.keys()),
     )
 
+    _start_http_sidecar(8850)
+
+    # #109: Shared graph lock for thread safety.
+    # Pulse loops (via NGSaaSBridge) and the Tonic both access graph
+    # internals concurrently. This RLock serializes access.
+    # Attached to graph object so both bridge and engine can find it.
+    import threading as _thr
+    _memory.graph._concurrent_lock = _thr.RLock()
+
     # The Tonic: conversation starting — language tokens about to flow
     if _memory._tonic_thread is not None:
         try:
@@ -519,6 +613,15 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
     # Cache text + embedding for module fan-out in afterTurn (#101)
     global _cached_text, _cached_embedding
     _cached_text = text
+
+    # Write trigger file for standalone fanout daemon
+    try:
+        import json as _json
+        with open("/tmp/fanout_trigger.jsonl", "a") as _tf:
+            _tf.write(_json.dumps({"text": text[:5000]}) + "\n")
+            _tf.flush()
+    except Exception:
+        pass
     try:
         from ng_embed import embed
         _cached_embedding = embed(text)
@@ -581,6 +684,21 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     if _memory is None:
         return
 
+    # Recover fan-out cache if lost to process restart (OOM resilience).
+    # The TS plugin passes lastMessage so the fan-out doesn't depend on
+    # in-memory state surviving between ingest and afterTurn calls.
+    global _cached_text, _cached_embedding
+    if _cached_text is None and params.get("lastMessage"):
+        recovered = _extract_message_text(params["lastMessage"])
+        if recovered and recovered.strip():
+            _cached_text = recovered
+            try:
+                from ng_embed import embed
+                _cached_embedding = embed(recovered)
+            except Exception:
+                _cached_embedding = None
+            logger.info("Recovered fan-out text from afterTurn params (%d chars)", len(recovered))
+
     # Drain the experience tract — absorb feeder deposits
     if _tract is not None:
         _drain_tract()
@@ -595,6 +713,12 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # CES surfacing monitor — scan fired nodes
     if _memory._surfacing_monitor is not None:
         _memory._surfacing_monitor.after_step(step_result)
+
+    # River-based Tier 3: deposit raw topology delta to all module tracts.
+    # The delta contains fired nodes with causal context, hyperedge activations,
+    # prediction results, structural changes, and salience signals. Raw,
+    # unclassified (Law 7). Each module's bucket extracts what it needs.
+    _deposit_topology_delta(step_result)
 
     # Novelty probation
     _memory.ingestor.update_probation()
@@ -902,22 +1026,14 @@ def handle_dispose(params: Dict[str, Any]) -> None:
     _memory.save()
     logger.info("Final save on dispose")
 
-    if _memory._ces_monitor is not None:
-        try:
-            _memory._ces_monitor.stop()
-        except Exception:
-            pass
+    # Signal modules to switch to resting mode (#109)
+    # Modules stay alive — dispose is subtraction, not destruction.
+    # The process persists (TS plugin dispose is a no-op). Modules
+    # keep their pulse loops running at resting intervals.
+    _fan_out_conversation_ended()
 
-    # Release topology ownership so other processes can claim it
-    try:
-        import topology_owner
-        topology_owner.release()
-    except Exception:
-        pass
-
-    # Clean up module hooks (#101)
-    global _module_hooks, _cached_text, _cached_embedding
-    _module_hooks.clear()
+    # Clear conversation cache — consumed or stale
+    global _cached_text, _cached_embedding
     _cached_text = None
     _cached_embedding = None
 
@@ -1031,6 +1147,119 @@ def _format_substrate_context(
     return "\n".join(lines)
 
 
+
+# ── HTTP Sidecar — afterTurn bypass ──────────────────────────────────
+# [2026-03-26] Claude Code (Opus 4.6) — afterTurn HTTP trigger
+# What: Lightweight HTTP listener on port 8850 for direct afterTurn calls.
+# Why:  OpenClaw 2026.3.13 never calls afterTurn on the ContextEngine plugin.
+#       Module fan-out was dead. This bypasses OC's lifecycle gap.
+# How:  Background thread runs http.server on 127.0.0.1:8850.
+#       POST /afterTurn triggers handle_after_turn + fan-out.
+#       GET /status returns hook count and last fire time.
+
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+_last_afterturn_fire: Optional[str] = None
+_sidecar_started = False
+
+
+class _AfterTurnHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        global _last_afterturn_fire
+        if self.path == "/afterTurn":
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len) if content_len else b"{}"
+                params = json.loads(body) if body else {}
+                handle_after_turn(params)
+                _last_afterturn_fire = __import__("datetime").datetime.now().isoformat()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "fired": _last_afterturn_fire}).encode())
+            except Exception as exc:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": str(exc)}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "hooks_loaded": len(_module_hooks),
+                "modules": list(_module_hooks.keys()),
+                "cached_text": "SET" if _cached_text else None,
+                "last_afterturn": _last_afterturn_fire,
+            }).encode())
+        elif self.path.startswith('/bunyan/'):
+            self._handle_bunyan()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _handle_bunyan(self):
+        """Bunyan user bucket — extraction from the live substrate."""
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        q = qs.get('q', [''])[0]
+
+        hook = _module_hooks.get('bunyan')
+        if hook is None:
+            self._json_response(503, {'error': 'Bunyan not loaded'})
+            return
+        if not q:
+            self._json_response(400, {'error': 'Missing q parameter'})
+            return
+
+        try:
+            if parsed.path == '/bunyan/query':
+                depth = int(qs.get('depth', [0])[0]) or None
+                k = int(qs.get('k', [0])[0]) or None
+                result = hook.query_story(q, max_depth=depth, similar_k=k)
+                if result is None:
+                    self._json_response(200, {'narrative': None, 'message': 'No matching events in substrate'})
+                else:
+                    self._json_response(200, result)
+            elif parsed.path == '/bunyan/similar':
+                k = int(qs.get('k', [5])[0])
+                result = hook.find_similar_events(q, k=k)
+                self._json_response(200, {'events': result})
+            else:
+                self._json_response(404, {'error': 'Unknown bunyan endpoint'})
+        except Exception as exc:
+            self._json_response(500, {'error': str(exc)})
+
+    def _json_response(self, code, data):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, default=str).encode())
+
+    def log_message(self, format, *args):
+        pass
+
+
+def _start_http_sidecar(port: int = 8850) -> None:
+    global _sidecar_started
+    if _sidecar_started:
+        return
+    try:
+        server = HTTPServer(("127.0.0.1", port), _AfterTurnHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        _sidecar_started = True
+        logger.info("afterTurn HTTP sidecar listening on 127.0.0.1:%d", port)
+    except Exception as exc:
+        logger.error("Failed to start afterTurn sidecar: %s", exc)
+
 # ── JSON-RPC Server ───────────────────────────────────────────────────
 
 METHODS = {
@@ -1095,6 +1324,41 @@ def main() -> None:
     })
     sys.stdout.write(ready_msg + "\n")
     sys.stdout.flush()
+
+    # Self-bootstrap on startup — the organism is born when the process
+    # starts, not when the first message arrives.  OpenClaw's bootstrap
+    # RPC will hit the "already_initialized" guard and mode-swap.
+    #
+    # Runs in a background thread because module loading produces hundreds
+    # of log lines to stderr. If bootstrap runs synchronously before the
+    # stdin loop, the 64KB OS pipe buffer fills before the TS plugin can
+    # drain it, and the Python process blocks on write. Background thread
+    # lets the stdin loop start immediately so the pipe stays drained.
+    # Force-clean any stale sentinel from a previous process BEFORE
+    # starting the bootstrap thread. This runs synchronously — it's a
+    # single file check, no log output, no pipe risk. Must happen before
+    # anything calls handle_bootstrap() (self-bootstrap thread OR TS
+    # plugin RPC) so the sentinel is gone before either path checks it.
+    try:
+        import topology_owner
+        sentinel = topology_owner._sentinel_path()
+        if sentinel.exists():
+            existing_pid = int(sentinel.read_text().strip())
+            if existing_pid != os.getpid():
+                sentinel.unlink(missing_ok=True)
+                logger.info("Cleared stale sentinel (PID %d) on startup", existing_pid)
+    except Exception:
+        pass
+
+    def _self_bootstrap():
+        try:
+            result = handle_bootstrap({"sessionId": "auto-startup"})
+            logger.info("Self-bootstrap: %s", result)
+        except Exception as exc:
+            logger.error("Self-bootstrap failed: %s — will retry on first RPC", exc)
+
+    import threading
+    threading.Thread(target=_self_bootstrap, name="self-bootstrap", daemon=True).start()
 
     for line in sys.stdin:
         line = line.strip()
