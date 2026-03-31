@@ -8,6 +8,13 @@ Covers:
 - SurfacingMonitor: scoring, queue management, formatting
 - CESMonitoring: health context, logger, dashboard
 - Integration: CES wired into NeuroGraphMemory
+
+# ---- Changelog ----
+# [2026-03-26] Claude Code Opus — Punchlist #102: Fix stale tests from embedding migration
+# What: Updated test dimensions from 384→768 to match current embedding pipeline
+# Why: Punchlist #102 — tests obsoleted by snowflake-arctic-embed-m-v1.5 migration
+# How: Updated expected dimensions and test fixture generation
+# -------------------
 """
 
 import json
@@ -416,7 +423,7 @@ class TestStreamParserEmbedding:
 
         def fake_embed(text):
             called["count"] += 1
-            return np.ones(64, dtype=np.float32)
+            return np.ones(768, dtype=np.float32)
 
         parser = StreamParser(
             graph, vector_db, ces_config, fallback_embedder=fake_embed
@@ -436,7 +443,9 @@ class TestStreamParserEmbedding:
         try:
             parser._ollama_available = False
             result = parser._embed_chunk("test text")
-            assert result is None
+            # After embedding migration, ng_embed provides a 768-dim fallback
+            assert result is not None
+            assert len(result) == 768
         finally:
             parser.stop()
 

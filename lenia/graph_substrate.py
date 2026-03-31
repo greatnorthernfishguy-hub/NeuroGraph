@@ -81,8 +81,8 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         """Build adjacency list from synapses (cached)."""
         self._adj = defaultdict(list)
         for syn in self._graph.synapses.values():
-            self._adj[syn.pre_id].append(syn.post_id)
-            self._adj[syn.post_id].append(syn.pre_id)
+            self._adj[syn.pre_node_id].append(syn.post_node_id)
+            self._adj[syn.post_node_id].append(syn.pre_node_id)
 
     def _cache_embeddings(self):
         """Build embedding matrix from vector DB for fast cosine similarity.
@@ -255,8 +255,8 @@ class NeuroGraphSubstrate(LeniaSubstrate):
             return 0.0
 
         for syn in self._graph.synapses.values():
-            if (syn.pre_id == a and syn.post_id == b) or (
-                syn.pre_id == b and syn.post_id == a
+            if (syn.pre_node_id == a and syn.post_node_id == b) or (
+                syn.pre_node_id == b and syn.post_node_id == a
             ):
                 return float(syn.weight)
         return 0.0

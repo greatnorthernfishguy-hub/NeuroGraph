@@ -50,6 +50,11 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-03-26] Claude Code Opus — Punchlist #44: Adaptive relevance thresholds
+#   What: Made tract bridge relevance_threshold a tunable parameter
+#   Why: Punchlist #44 — threshold should adapt based on event volume and absorption quality
+#   How: Added set_relevance_threshold() method. NGLite.update_tunable() pushes new
+#     value when Elmer tunes relevance_threshold via the TuningSocket.
 # [2026-03-23] Claude (Opus 4.6) — Myelination transport (punchlist #53 v0.4)
 #   What: MmapTract double-buffer class, myelinate/demyelinate methods on
 #         NGTractBridge, explore-exploit for myelinated tracts.
@@ -524,6 +529,20 @@ class NGTractBridge(NGBridge):
         self._connected = True
         logger.info("NGTractBridge reconnected for '%s'", self.module_id)
 
+    def set_relevance_threshold(self, value: float) -> None:
+        """Update relevance threshold from external tuning (Punchlist #44).
+
+        Called by NGLite.update_tunable() when Elmer adjusts the
+        relevance_threshold parameter.  The bridge uses this threshold
+        to gate which peer events are absorbed during recommendations.
+        """
+        old = self._relevance_threshold
+        self._relevance_threshold = value
+        logger.info(
+            "Relevance threshold tuned: %.3f → %.3f",
+            old, value,
+        )
+
     # -------------------------------------------------------------------
     # Internal: Tract deposit
     # -------------------------------------------------------------------
@@ -600,7 +619,7 @@ class NGTractBridge(NGBridge):
             self._peer_events = self._peer_events[-self._peer_events_max:]
 
         if new_events:
-            logger.info(
+            logger.debug(
                 "Tract drain #%d: absorbed %d events from %d peers",
                 self._drain_count, len(new_events),
                 len(set(e.get("module_id", "") for e in new_events)),

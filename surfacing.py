@@ -251,7 +251,7 @@ class SurfacingMonitor:
         # Count hyperedge memberships
         he_count = 0
         for he in self._graph.hyperedges.values():
-            if node_id in he.member_node_ids:
+            if node_id in getattr(he, 'member_nodes', getattr(he, 'member_node_ids', [])):
                 he_count += 1
         he_norm = min(he_count / 10.0, 1.0)
 

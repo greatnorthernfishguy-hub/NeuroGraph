@@ -1016,12 +1016,8 @@ def handle_dispose(params: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-    # Lenia FlowGraph — stop engine, preserve field state in mmap
-    if _lenia_kill_switch is not None and _lenia_kill_switch.enabled:
-        try:
-            _lenia_kill_switch.disable(reason="dispose")
-        except Exception:
-            logger.exception("Lenia shutdown failed")
+    # Lenia FlowGraph — #109: stays running between conversations.
+    # Dispose is subtraction, not destruction. Field dynamics continue.
 
     _memory.save()
     logger.info("Final save on dispose")

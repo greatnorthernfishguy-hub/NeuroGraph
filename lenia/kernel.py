@@ -112,8 +112,8 @@ class DistanceCache:
         if graph is not None:
             for syn in graph.synapses.values():
                 try:
-                    i = substrate.entity_index(syn.pre_id)
-                    j = substrate.entity_index(syn.post_id)
+                    i = substrate.entity_index(syn.pre_node_id)
+                    j = substrate.entity_index(syn.post_node_id)
                     connected_pairs.add((min(i, j), max(i, j)))
                 except (KeyError, ValueError):
                     continue

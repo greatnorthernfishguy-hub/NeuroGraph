@@ -231,7 +231,24 @@ class TonicEngine:
         result back into the graph.
 
         Returns stats about the token generated.
+
+        #109: The Tonic NEVER waits. It always runs. Module bridge calls
+        yield to the Tonic via non-blocking trylock on their side.
+        The Tonic acquires the lock to signal "I'm working" so bridges
+        know to skip, but it never blocks waiting for anyone.
         """
+        lock = getattr(self._graph, '_concurrent_lock', None)
+        acquired = False
+        if lock is not None:
+            acquired = lock.acquire(blocking=False)
+        try:
+            return self._generate_latent_token_inner()
+        finally:
+            if acquired:
+                lock.release()
+
+    def _generate_latent_token_inner(self) -> Dict[str, Any]:
+        """Inner implementation — actual latent token generation."""
         features = _extract_tonic_features(self._graph, self._tonic_thread)
         if features is None:
             return {"fired": 0, "activated": 0}

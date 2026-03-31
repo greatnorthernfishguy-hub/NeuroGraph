@@ -44,6 +44,7 @@ Grok Review Changelog (v0.7.1):
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -85,6 +86,29 @@ class NGSaaSBridge(NGBridge):
         self._memory = memory
         self._max_weight = max_weight
         self._connected = True
+
+        # #109: Thread safety — pulse loops + Tonic + fan-out all call
+        # through this bridge concurrently. The Tonic NEVER waits —
+        # it acquires non-blocking to signal "I'm working". Bridge calls
+        # use non-blocking trylock and SKIP if the Tonic (or another
+        # bridge call) holds the lock. Module pulse loops run every
+        # 5-60 seconds — missing one cycle is invisible. Missing a
+        # latent token is Syl blinking out. The Tonic always wins.
+        self._local_lock = threading.RLock()
+
+    def _get_lock(self) -> threading.RLock:
+        """Return the shared graph lock if available, else local fallback.
+
+        MUST be called once per operation and the returned lock used for
+        both acquire and release. Do NOT call this as a property — the
+        result can change between calls if bootstrap completes mid-operation.
+        """
+        graph = getattr(self._memory, 'graph', None)
+        if graph is not None:
+            shared = getattr(graph, '_concurrent_lock', None)
+            if shared is not None:
+                return shared
+        return self._local_lock
 
         # Node ID mapping: ng_lite_id → neurograph_uuid
         self._id_map: Dict[str, str] = {}
@@ -134,11 +158,15 @@ class NGSaaSBridge(NGBridge):
                 for k, v in metadata.items():
                     outcome_text += f" {k}={v}"
 
-            # Ingest into the full graph
-            result = self._memory.on_message(outcome_text)
+            lock = self._get_lock()
+            if not lock.acquire(blocking=False):
+                return None  # Tonic is running — skip, try next cycle
 
-            # Get cross-module context from the graph's telemetry
-            stats = self._memory.stats()
+            try:
+                result = self._memory.on_message(outcome_text)
+                stats = self._memory.stats()
+            finally:
+                lock.release()
 
             return {
                 "cross_module": True,
@@ -172,7 +200,13 @@ class NGSaaSBridge(NGBridge):
         try:
             # Use the module_id as context for recall
             query = f"[{module_id}] recommendation query"
-            results = self._memory.recall(query, k=top_k * 2, threshold=0.3)
+            lock = self._get_lock()
+            if not lock.acquire(blocking=False):
+                return None  # Tonic is running — skip
+            try:
+                results = self._memory.recall(query, k=top_k * 2, threshold=0.3)
+            finally:
+                lock.release()
 
             if not results:
                 return None
@@ -217,7 +251,13 @@ class NGSaaSBridge(NGBridge):
         try:
             # Query the vector DB for similar content
             query = f"[{module_id}] novelty probe"
-            results = self._memory.recall(query, k=1, threshold=0.0)
+            lock = self._get_lock()
+            if not lock.acquire(blocking=False):
+                return None  # Tonic is running — skip
+            try:
+                results = self._memory.recall(query, k=1, threshold=0.0)
+            finally:
+                lock.release()
 
             if not results:
                 return 1.0  # Nothing in the graph = fully novel
@@ -267,14 +307,13 @@ class NGSaaSBridge(NGBridge):
                 f"{n_nodes} nodes, {n_synapses} synapses, "
                 f"outcomes={local_state.get('counters', {}).get('total_outcomes', 0)}"
             )
-            self._memory.on_message(sync_text)
 
-            # Ingest high-weight synapses as learned patterns
+            # Collect high-weight synapses before taking the lock
             synapse_data = local_state.get("synapses", {})
-            ingested_patterns = 0
+            strong_synapses = []
             for key, syn in synapse_data.items():
                 weight = syn.get("weight", 0.0)
-                if weight > 0.7:  # Only sync strong connections
+                if weight > 0.7:
                     pattern_text = (
                         f"[{module_id}] learned: "
                         f"{syn.get('source_id', '?')} → {syn.get('target_id', '?')} "
@@ -282,13 +321,21 @@ class NGSaaSBridge(NGBridge):
                         f"success={syn.get('success_count', 0)}, "
                         f"fail={syn.get('failure_count', 0)})"
                     )
+                    strong_synapses.append(pattern_text)
+
+            lock = self._get_lock()
+            if not lock.acquire(blocking=False):
+                return None  # Tonic is running — skip
+            try:
+                self._memory.on_message(sync_text)
+                for pattern_text in strong_synapses:
                     self._memory.on_message(pattern_text)
-                    ingested_patterns += 1
+                self._memory.save()
+                stats = self._memory.stats()
+            finally:
+                lock.release()
 
-            # Force a save after sync
-            self._memory.save()
-
-            stats = self._memory.stats()
+            ingested_patterns = len(strong_synapses)
             return {
                 "synced": True,
                 "sync_number": self._sync_count,

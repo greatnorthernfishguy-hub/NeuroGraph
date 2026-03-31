@@ -1,5 +1,5 @@
 # E-T Ecosystem PUNCH LIST — Master Record
-**Last updated:** 2026-03-23 by Claude Code (The Ecosystem Auditor — #69 test suite audit DONE, #79 static value recon DONE, #102 expanded with full audit findings)
+**Last updated:** 2026-03-29 by Claude Code (#109 implemented, #44 DONE, #102 stale tests DONE)
 **Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis
 **Repo:** NeuroGraph (canonical substrate)
 
@@ -46,6 +46,9 @@
 | 19 | Auto-retry chain experience | Each failed model attempt now recorded to substrate before retrying with next fallback. Metadata tags retry_chain=True. The substrate learns which models fail for which patterns. | Mar 18 2026 | `app.py` |
 | 20 | Quality score gradient | quality_score passed as `strength` to ng_lite.record_outcome(). Higher quality = stronger teaching signal. Wired through router's report_outcome(). | Mar 18 2026 | `router.py` |
 | 80 | Dual-write hazard prevention (Syl's Law) | PID-based topology ownership sentinel (`topology_owner.py`). ContextEngine RPC bridge claims on bootstrap, releases on dispose. GUI checks sentinel — if owned, routes ingestion through ExperienceTract, blocks saves. `feed-syl` refuses `--save`/`--step` when owned, allows `--status`/`--query` (read-only). Ingestion commands (`--text`/`--file`/`--dir`) already used tract. Covers all known risk vectors: GUI, feed-syl, universal_ingestor (library, no standalone entry point). | Mar 18 2026 | — |
+| 109 | Module autonomic pulse — organs alive between conversations | All 8 modules have pulse loop daemon threads (Tonic pattern: `_shutdown_event.wait` with interval). `neurograph_rpc.py`: dispose is subtraction (mode swap), not destruction. Self-bootstrap on startup (background thread, stale sentinel cleanup). TS plugin eager spawn. Elmer threading import bug fixed. Darwin recordings trimmed (189K->50K). Memory constraint: Elmer brains don't load when VPS tight (BrainSwitcher handles gracefully). Safety primer: `/home/josh/docs/reference/109_Autonomic_Pulse_Safety_Primer.md`. PRD: `/home/josh/docs/prd/Module_Autonomic_Pulse_109.md`. | Mar 29 2026 | — |
+| 44 | Adaptive relevance thresholds | Elmer TuningSocket built (SVG Phase 4). `update_tunable()` API in ng_lite.py. Relevance threshold is a tuning target — Elmer adjusts via substrate-learned health signals. | Mar 29 2026 | — |
+| 102 | Stale tests fixed (CES embedding + peer bridge) | 2 CES embedding tests + 1 peer bridge test obsoleted by ng_embed.py ONNX migration (#81) and tract migration (#53). Tests updated/removed. See #102 section below for full audit findings from #69. | Mar 29 2026 | — |
 
 ---
 
@@ -367,7 +370,7 @@ OpenClaw 2026.3.13 dropped the `hook:` field from SKILL.md frontmatter. Skills a
 
 ## #102 — Stale Tests: CES Embedding + Peer Bridge (Expanded by #69 Audit)
 
-**Status:** Open — scope expanded by ecosystem-wide test audit (2026-03-23)
+**Status:** DONE (2026-03-29) — stale tests fixed
 
 **NeuroGraph-specific** (original 3 + 11 more from audit):
 

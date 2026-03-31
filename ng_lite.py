@@ -66,6 +66,12 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-03-26] Claude Code Opus — Punchlist #44: Adaptive relevance thresholds
+# What: Made peer bridge relevance_threshold a tunable parameter
+# Why: Punchlist #44 — threshold should adapt based on event volume and absorption quality
+# How: Added to DEFAULT_CONFIG (0.30) and TUNABLE_PARAMS (0.10–0.70) in ng_lite.py,
+#   update_tunable() pushes new value to connected bridge via set_relevance_threshold().
+#   Wired through peer/tract bridges, Elmer tunes via TuningSocket absorption rate metric.
 # [2026-03-24] Claude Code (Opus 4.6) — Dynamic tuning API (Phase 4)
 # What: Added update_tunable() and get_tunables() methods to NGLite.
 #   TUNABLE_PARAMS class dict defines which config keys can be changed at
@@ -194,6 +200,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # Pruning
     "pruning_threshold": 0.01,  # Synapses below this weight get pruned
+
+    # Peer bridge relevance (#44)
+    "relevance_threshold": 0.30,  # Min cosine similarity to absorb cross-module events
 
     # Embedding
     "embedding_dim": 768,       # Expected embedding dimensionality (BAAI/bge-base-en-v1.5)
@@ -1037,6 +1046,7 @@ class NGLite:
         "pruning_threshold":          (0.001, 0.10),
         "receptor_ema_alpha":         (0.0001, 0.01),
         "receptor_prototype_threshold": (0.50, 0.95),
+        "relevance_threshold":        (0.10,  0.70),   # Punchlist #44
     }
 
     def update_tunable(self, key: str, value: float) -> Dict[str, Any]:
@@ -1063,6 +1073,12 @@ class NGLite:
             key, old_value, new_value,
             " (clamped)" if clamped else "",
         )
+
+        # Punchlist #44: push relevance_threshold to connected bridge
+        if key == "relevance_threshold" and self._bridge is not None:
+            if hasattr(self._bridge, 'set_relevance_threshold'):
+                self._bridge.set_relevance_threshold(new_value)
+
         return {
             "key": key,
             "old_value": old_value,

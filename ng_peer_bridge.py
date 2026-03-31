@@ -41,6 +41,11 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-03-26] Claude Code Opus — Punchlist #44: Adaptive relevance thresholds
+#   What: Made peer bridge relevance_threshold a tunable parameter
+#   Why: Punchlist #44 — threshold should adapt based on event volume and absorption quality
+#   How: Added set_relevance_threshold() method. NGLite.update_tunable() pushes new
+#     value when Elmer tunes relevance_threshold via the TuningSocket.
 # [2026-02-17] Claude (Opus 4.6) — Initial creation.
 #   What: NGPeerBridge class implementing NGBridge interface for Tier 2
 #         cross-module learning via shared filesystem event logs.
@@ -366,6 +371,20 @@ class NGPeerBridge(NGBridge):
         """Reconnect the bridge."""
         self._connected = True
         logger.info("NGPeerBridge reconnected for '%s'", self.module_id)
+
+    def set_relevance_threshold(self, value: float) -> None:
+        """Update relevance threshold from external tuning (Punchlist #44).
+
+        Called by NGLite.update_tunable() when Elmer adjusts the
+        relevance_threshold parameter.  The bridge uses this threshold
+        to gate which peer events are absorbed during recommendations.
+        """
+        old = self._relevance_threshold
+        self._relevance_threshold = value
+        logger.info(
+            "Relevance threshold tuned: %.3f → %.3f",
+            old, value,
+        )
 
     # -------------------------------------------------------------------
     # Internal: Peer sync
