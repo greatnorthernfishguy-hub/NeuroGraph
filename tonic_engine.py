@@ -171,11 +171,13 @@ class TonicEngine:
         vector_db,
         tonic_thread,
         config: Optional[EngineConfig] = None,
+        transformer_body=None,
     ):
         self._graph = graph
         self._vector_db = vector_db
         self._tonic_thread = tonic_thread
         self._config = config or EngineConfig()
+        self._shared_body = transformer_body  # from ProtoUniBrain if available
 
         self._running = False
         self._in_conversation = False
@@ -193,7 +195,12 @@ class TonicEngine:
             self._try_load_model()
 
     def _try_load_model(self) -> None:
-        """Attempt to load trained TonicBrain."""
+        """Attempt to load trained TonicBrain.
+
+        If a shared transformer_body was provided (from ProtoUniBrain),
+        pass it through to avoid loading a second copy (~2GB savings).
+        Falls back to loading its own copy if sharing fails.
+        """
         import os
         weights_path = os.path.join(
             os.path.dirname(__file__),
@@ -202,11 +209,15 @@ class TonicEngine:
         if os.path.exists(weights_path):
             try:
                 from surgery.tonic_brain import load_tonic_brain
-                self._model = load_tonic_brain(weights_path)
+                self._model = load_tonic_brain(
+                    weights_path,
+                    transformer_body=self._shared_body,
+                )
                 self._model.eval()
                 self._use_heuristic = False
-                logger.info("TonicBrain loaded from %s — surgical inference active",
-                            weights_path)
+                shared = "shared body" if self._shared_body is not None else "own copy"
+                logger.info("TonicBrain loaded from %s (%s) — surgical inference active",
+                            weights_path, shared)
             except Exception as exc:
                 logger.info("TonicBrain load error: %s — using heuristic", exc)
         else:

@@ -531,21 +531,48 @@ class NeuroGraphMemory:
                             e.node_id for e in propagation_result.fired_entries
                         ],
                     )
-                    from ng_topology_delta import extract_and_deposit_delta
-                    extract_and_deposit_delta(
-                        graph=_graph_ref,
-                        vector_db=_vdb_ref,
-                        step_result=step_result,
-                        peer_bridge=bridge,
-                    )
+                    # #119: BTF binary deposit via Rust (zero-copy)
+                    try:
+                        import ng_tract
+                        tract_paths = [
+                            str(bridge._module_dir / f"{pid}.tract")
+                            for pid in bridge._get_registered_peers()
+                        ]
+                        ng_tract.deposit_topology(
+                            step_result, _graph_ref, _vdb_ref, tract_paths,
+                        )
+                    except Exception as exc:
+                        logger.debug("BTF topology deposit failed: %s", exc)
                 self._tonic_thread._post_cycle_hook = _tonic_post_cycle
 
                 # Latent engine (surgical model) — provides the push
                 # between conversations via actual inference, not a timer
                 try:
                     from tonic_engine import TonicEngine
+
+                    # Try to share ProtoUniBrain's transformer body.
+                    # Saves ~2GB — one model serves both Elmer and Tonic.
+                    # If unavailable, TonicEngine loads its own copy.
+                    shared_body = None
+                    try:
+                        from core.brain_switcher import BrainSwitcher
+                        for mod in self._modules.values() if hasattr(self, '_modules') else []:
+                            switcher = getattr(mod, '_brain_switcher', None)
+                            if switcher is not None:
+                                proto = getattr(switcher, '_proto_socket', None)
+                                if proto is not None and getattr(proto, '_loaded', False):
+                                    brain = getattr(proto, '_brain', None)
+                                    if brain is not None:
+                                        shared_body = getattr(brain, 'transformer_body', None)
+                                        if shared_body is not None:
+                                            logger.info("Tonic sharing ProtoUniBrain's transformer body")
+                                        break
+                    except Exception:
+                        pass  # any failure here is fine — Tonic loads its own
+
                     engine = TonicEngine(
                         self.graph, self.vector_db, self._tonic_thread,
+                        transformer_body=shared_body,
                     )
                     self._tonic_thread.set_latent_engine(engine)
                     engine.start()

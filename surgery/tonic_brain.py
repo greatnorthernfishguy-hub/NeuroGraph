@@ -177,22 +177,22 @@ if _AVAILABLE:
         elmer_weights_path: str = None,
         n_activations: int = 10,
         verbose: bool = False,
+        transformer_body=None,
     ) -> TonicBrain:
         """Create a TonicBrain by reusing Elmer's surgery.
 
-        1. Load Qwen2.5-0.5B transformer body
+        1. Use shared transformer body (or load Qwen2.5-0.5B if none)
         2. Load ElmerBrain's trained encoder weights (the eyes)
         3. Create new ActivationDecoder (the voice — untrained initially)
 
         Args:
-            model_name: HuggingFace model ID.
+            model_name: HuggingFace model ID (only used if no shared body).
             elmer_weights_path: Path to elmer_brain_v0.1.pt.
-                Defaults to ~/Elmer/surgery/elmer_brain_v0.1.pt.
             n_activations: Number of activation outputs.
             verbose: Print surgery details.
+            transformer_body: Shared transformer body (e.g. from ProtoUniBrain).
+                If provided, skips loading a second copy of the model.
         """
-        from transformers import AutoModelForCausalLM
-
         _log = print if verbose else (lambda *a, **k: None)
 
         if elmer_weights_path is None:
@@ -200,18 +200,20 @@ if _AVAILABLE:
                 "~/Elmer/surgery/elmer_brain_v0.1.pt"
             )
 
-        # Load base model
-        _log(f"Loading {model_name}...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float32
-        )
-        hidden_dim = model.config.hidden_size
-        _log(f"Hidden dim: {hidden_dim}")
-
-        # Extract body
-        body = model.model
-        body.embed_tokens = nn.Identity()
-        _log(f"Body extracted: {len(body.layers)} layers")
+        if transformer_body is not None:
+            body = transformer_body
+            hidden_dim = body.layers[0].self_attn.q_proj.in_features
+            _log(f"Shared transformer body: {len(body.layers)} layers, hidden_dim={hidden_dim}")
+        else:
+            from transformers import AutoModelForCausalLM
+            _log(f"Loading {model_name}...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, dtype=torch.float32
+            )
+            hidden_dim = model.config.hidden_size
+            body = model.model
+            body.embed_tokens = nn.Identity()
+            _log(f"Body extracted: {len(body.layers)} layers")
 
         # Create encoder and load Elmer's trained weights
         encoder = GraphStateEncoder(hidden_dim=hidden_dim)
@@ -262,18 +264,26 @@ if _AVAILABLE:
     def load_tonic_brain(
         path: str,
         model_name: str = "Qwen/Qwen2.5-0.5B",
+        transformer_body=None,
     ) -> TonicBrain:
-        """Load a trained TonicBrain from checkpoint."""
-        from transformers import AutoModelForCausalLM
+        """Load a trained TonicBrain from checkpoint.
 
+        Args:
+            transformer_body: Shared body (e.g. from ProtoUniBrain).
+                Skips from_pretrained if provided — saves ~2GB RAM.
+        """
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         cfg = ckpt["config"]
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float32
-        )
-        body = model.model
-        body.embed_tokens = nn.Identity()
+        if transformer_body is not None:
+            body = transformer_body
+        else:
+            from transformers import AutoModelForCausalLM
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, dtype=torch.float32
+            )
+            body = model.model
+            body.embed_tokens = nn.Identity()
 
         encoder = GraphStateEncoder(hidden_dim=cfg["hidden_dim"])
         encoder.load_state_dict(ckpt["encoder_state"])
