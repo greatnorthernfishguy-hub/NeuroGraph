@@ -577,6 +577,30 @@ class NeuroGraphMemory:
                     self._tonic_thread.set_latent_engine(engine)
                     engine.start()
                     logger.info("Tonic engine started — latent tokens flowing")
+
+                    # Delayed wiring: connect Tonic → BrainSwitcher for hot-swap.
+                    # Fires after brains load (60s delay + margin).
+                    _tonic_ref = engine
+                    _hooks_ref = self._loaded_hooks if hasattr(self, '_loaded_hooks') else {}
+                    def _wire_tonic_to_switcher():
+                        import time as _t
+                        _t.sleep(75)  # brains load at 60s, give 15s margin
+                        try:
+                            for hook in _hooks_ref.values():
+                                elmer_eng = getattr(hook, '_engine', None)
+                                if elmer_eng and hasattr(elmer_eng, 'set_tonic_engine'):
+                                    elmer_eng.set_tonic_engine(_tonic_ref)
+                                    logger.info("Tonic wired to BrainSwitcher — hot-swap active")
+                                    return
+                            logger.debug("No Elmer engine found for tonic hot-swap wiring")
+                        except Exception as exc:
+                            logger.debug("Tonic hot-swap wiring failed: %s", exc)
+                    threading.Thread(
+                        target=_wire_tonic_to_switcher,
+                        name="tonic-switcher-wire",
+                        daemon=True,
+                    ).start()
+
                 except ImportError:
                     logger.info("Tonic engine not yet available — "
                                 "during-conversation awareness active, "

@@ -231,6 +231,59 @@ class TonicEngine:
                 logger.info("No TonicBrain or Elmer weights — using heuristic engine")
 
     # -----------------------------------------------------------------
+    # Body Hot-Swap (called by BrainSwitcher)
+    # -----------------------------------------------------------------
+
+    def offer_shared_body(self, transformer_body) -> bool:
+        """Hot-swap: ProtoUniBrain loaded, share its transformer body.
+
+        Replaces the Tonic's own copy with ProtoUniBrain's living one.
+        The old copy gets garbage collected, freeing ~2GB.
+        Encoder and decoder stay — only the body swaps.
+        """
+        if self._model is None:
+            return False
+        try:
+            import gc
+            old_body = self._model.body
+            self._model.body = transformer_body
+            self._shared_body = transformer_body
+            del old_body
+            gc.collect()
+            logger.info("Tonic hot-swapped to shared ProtoUniBrain body (~2GB freed)")
+            return True
+        except Exception as exc:
+            logger.warning("Tonic body hot-swap failed: %s", exc)
+            return False
+
+    def revoke_shared_body(self) -> bool:
+        """Hot-swap: ProtoUniBrain unloaded, Tonic loads its own copy back.
+
+        Falls back to heuristic if model reload fails.
+        """
+        if self._model is None:
+            return False
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM
+            logger.info("Tonic reloading own transformer body (ProtoUniBrain shed)")
+            model = AutoModelForCausalLM.from_pretrained(
+                self._config.model_name, dtype=torch.float32
+            )
+            body = model.model
+            body.embed_tokens = torch.nn.Identity()
+            body.eval()
+            self._model.body = body
+            self._shared_body = None
+            logger.info("Tonic reloaded own transformer body")
+            return True
+        except Exception as exc:
+            logger.warning("Tonic body reload failed: %s — falling back to heuristic", exc)
+            self._model = None
+            self._use_heuristic = True
+            return False
+
+    # -----------------------------------------------------------------
     # Latent Token Generation
     # -----------------------------------------------------------------
 
