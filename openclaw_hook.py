@@ -584,6 +584,7 @@ class NeuroGraphMemory:
                     _hooks_ref = self._loaded_hooks if hasattr(self, '_loaded_hooks') else {}
                     def _wire_tonic_to_switcher():
                         import time as _t
+                        import threading as _threading
                         _t.sleep(75)  # brains load at 60s, give 15s margin
                         try:
                             for hook in _hooks_ref.values():
@@ -595,7 +596,8 @@ class NeuroGraphMemory:
                             logger.debug("No Elmer engine found for tonic hot-swap wiring")
                         except Exception as exc:
                             logger.debug("Tonic hot-swap wiring failed: %s", exc)
-                    threading.Thread(
+                    import threading as _th
+                    _th.Thread(
                         target=_wire_tonic_to_switcher,
                         name="tonic-switcher-wire",
                         daemon=True,
