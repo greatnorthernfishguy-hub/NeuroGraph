@@ -581,11 +581,11 @@ class NeuroGraphMemory:
                     # Delayed wiring: connect Tonic → BrainSwitcher for hot-swap.
                     # Fires after brains load (60s delay + margin).
                     _tonic_ref = engine
-                    _hooks_ref = self._loaded_hooks if hasattr(self, '_loaded_hooks') else {}
+                    _hooks_ref = _fanout_hooks if _fanout_hooks is not None else {}
                     def _wire_tonic_to_switcher():
                         import time as _t
                         import threading as _threading
-                        _t.sleep(75)  # brains load at 60s, give 15s margin
+                        _t.sleep(65)  # brains load at 60s, wire ASAP after
                         try:
                             for hook in _hooks_ref.values():
                                 elmer_eng = getattr(hook, '_engine', None)
