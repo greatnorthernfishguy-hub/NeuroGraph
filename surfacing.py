@@ -17,6 +17,13 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-04-08] Claude (Opus 4.6) — Punchlist #55: Read attention params from substrate
+#   What: _decay_queue() reads surfacing_decay_rate and surfacing_min_confidence
+#         from graph.config (substrate) instead of frozen CES dataclass.
+#   Why:  CES attention params are now in TUNABLE_PARAMS (ng_lite.py). Elmer
+#         tunes them via update_tunable(). SurfacingMonitor must read the live
+#         substrate value, not the bootstrap default. CES config is fallback only.
+#   How:  getattr(self._graph, 'config', {}).get() with self._cfg fallback.
 # [2026-04-07] Claude (Opus 4.6) — Fix temporal stuttering: decay before read
 #   What: get_surfaced() now calls _decay_queue() before returning items.
 #   Why:  Lifecycle ordering bug — assemble() reads the surfacing queue before
@@ -325,8 +332,10 @@ class SurfacingMonitor:
             return  # Already decayed this step
         self._last_decay_step = current_step
 
-        decay_rate = self._cfg.decay_rate
-        min_confidence = self._cfg.min_confidence
+        # Read from substrate config (tunable via Elmer) with CES config fallback
+        graph_config = getattr(self._graph, 'config', {})
+        decay_rate = graph_config.get("surfacing_decay_rate", self._cfg.decay_rate)
+        min_confidence = graph_config.get("surfacing_min_confidence", self._cfg.min_confidence)
 
         surviving: List[_SurfacedItem] = []
         for item in self._queue:

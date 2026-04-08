@@ -31,6 +31,15 @@ Design principles (PRD §2.1):
 #   How:  TUNABLE_PARAMS dict with (min, max) bounds. update_tunable() validates,
 #     clamps, updates config dict AND propagates to STDPRule/HomeostaticRule/
 #     HyperedgePlasticityRule objects. Matches ng_lite.py pattern.
+# [2026-04-08] Claude Code (Opus 4.6) — Punchlist #55: CES attention tunables
+#   What: Added surfacing_decay_rate, surfacing_min_confidence to DEFAULT_CONFIG
+#     and TUNABLE_PARAMS. Added prediction_window to TUNABLE_PARAMS (was in
+#     DEFAULT_CONFIG but not tunable).
+#   Why:  CES attention params were static — Elmer couldn't tune them. Temporal
+#     stuttering requires substrate-driven attention dynamics. SurfacingMonitor
+#     reads these from graph.config, so they're live once set here.
+#   How:  Dict entries only. No structural changes. update_tunable() handles
+#     them generically via clamp-and-set.
 # [2026-03-24] Claude Code (Opus 4.6) — Homeostasis audit: 6 remaining fixes
 # What: (1) Threshold ceiling at 5.0 prevents unbounded growth. (2) prediction_window
 #   dataclass default aligned to 10 (was 5, conflicting with Phase 3 config).
@@ -982,6 +991,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Zero-firing circuit breaker — detects prolonged substrate silence
     "zero_fire_alert_steps": 50,      # Steps of zero firing before warning event
     "zero_fire_breaker_steps": 200,   # Steps of zero firing before emergency intervention
+    # CES attention dynamics (#55) — substrate-tuned via Elmer
+    "surfacing_decay_rate": 0.95,     # Per-step score decay in surfacing queue
+    "surfacing_min_confidence": 0.3,  # Below this, surfaced items are pruned
 }
 
 
@@ -1303,6 +1315,11 @@ class Graph:
         "he_salience_decay_rate":       (0.0001, 0.01),
         # Consolidation
         "he_consolidation_adapt_rate":  (0.001, 0.05),
+        # Predictive coding window
+        "prediction_window":            (3,     20),
+        # CES attention dynamics (#55)
+        "surfacing_decay_rate":         (0.80,  0.99),
+        "surfacing_min_confidence":     (0.10,  0.50),
     }
 
     def update_tunable(self, key: str, value: float) -> Dict[str, Any]:

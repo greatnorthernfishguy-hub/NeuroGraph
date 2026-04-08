@@ -66,6 +66,15 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-04-08] Claude Code (Opus 4.6) — Punchlist #55: CES attention tunables
+# What: Added surfacing_decay_rate, surfacing_min_confidence, prediction_window
+#   to DEFAULT_CONFIG and TUNABLE_PARAMS.
+# Why: CES attention parameters were static in ces_config.py — Elmer couldn't
+#   tune them. Temporal stuttering (stale context persisting across turns) requires
+#   substrate-driven attention dynamics. Same tuning path as all other params.
+# How: Three entries in DEFAULT_CONFIG (bootstrap values match ces_config.py),
+#   three entries in TUNABLE_PARAMS with bounds. update_tunable() already handles
+#   any key in the dict generically. SurfacingMonitor reads from graph.config.
 # [2026-04-05] Claude Code (Opus 4.6) — #119 Step 5: Rust core interior
 # What: Hot-path methods delegate to Rust NGLiteCore via PyO3 when available.
 #   save/load use binary msgpack persistence (no JSON in the data path).
@@ -220,6 +229,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # Persistence
     "snapshot_version": "1.0.0",
+
+    # CES attention dynamics (#55) — substrate-tuned via Elmer
+    "surfacing_decay_rate": 0.95,     # Per-step score decay in surfacing queue
+    "surfacing_min_confidence": 0.3,  # Below this, surfaced items are pruned
+    "prediction_window": 10,          # Steps a prediction pre-charges targets
 
     # Receptor Layer (#43) — vector quantization via adaptive prototypes
     "receptor_layer_enabled": True,
@@ -1151,6 +1165,10 @@ class NGLite:
         "receptor_ema_alpha":         (0.0001, 0.01),
         "receptor_prototype_threshold": (0.50, 0.95),
         "relevance_threshold":        (0.10,  0.70),   # Punchlist #44
+        # CES attention dynamics (#55)
+        "surfacing_decay_rate":       (0.80,  0.99),
+        "surfacing_min_confidence":   (0.10,  0.50),
+        "prediction_window":          (3.0,   20.0),
     }
 
     def update_tunable(self, key: str, value: float) -> Dict[str, Any]:
