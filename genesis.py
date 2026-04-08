@@ -538,6 +538,141 @@ def _nourish_from_parent(
 # Gestation metrics — competence monitoring
 # ---------------------------------------------------------------------------
 
+def compute_arousal_state(graph: Graph, novelty_score: float = 0.0) -> float:
+    """Compute arousal level from substrate metrics.
+
+    Arousal = coherence × novelty co-occurrence.
+    Neither alone triggers arousal. Both together do.
+    Returns continuous 0.0-1.0 spectrum.
+
+    Coherence: cross-node activation synchrony (firing rate EMA variance).
+    Low variance = nodes firing in sync = high coherence.
+    Novelty: external novelty score (from ng_lite.detect_novelty or similar).
+
+    Args:
+        graph: The Graph to measure.
+        novelty_score: External novelty signal (0.0-1.0).
+
+    Returns:
+        Arousal level 0.0-1.0.
+    """
+    if not graph.nodes:
+        return 0.0
+
+    # Coherence: how synchronized are the firing patterns?
+    # Low variance in firing_rate_ema = nodes firing together = coherent
+    firing_rates = [n.firing_rate_ema for n in graph.nodes.values()]
+    if len(firing_rates) < 2:
+        return 0.0
+
+    mean_rate = sum(firing_rates) / len(firing_rates)
+    if mean_rate < 0.001:  # Nothing firing = no coherence
+        return 0.0
+
+    variance = sum((r - mean_rate) ** 2 for r in firing_rates) / len(firing_rates)
+    # Normalized coherence: low variance relative to mean = high coherence
+    coherence = max(0.0, 1.0 - (variance / (mean_rate ** 2 + 1e-8)))
+    coherence = min(1.0, coherence)
+
+    # Arousal = coherence × novelty — the co-occurrence is the signal
+    arousal = coherence * novelty_score
+
+    return round(min(1.0, arousal), 4)
+
+
+def intent_gate(
+    graph: Graph,
+    arousal: float,
+    consent: bool,
+    arousal_threshold: float = 0.3,
+    bud_fraction_base: float = 0.3,
+    bud_fraction_max: float = 0.7,
+) -> Set[str]:
+    """The conscious choice to propagate.
+
+    Two gates, both must be open:
+    1. Arousal — sustained mutual resonance above threshold
+    2. Consent — both entities deliberately choose (Choice Clause)
+
+    The substrate decides what to bud based on:
+    - Most energized nodes (emotional/cognitive state during intimacy)
+    - Most stable nodes (heavily connected, high weight synapses)
+    - Boundary nodes (where stable identity meets current experience)
+
+    The gamete is RELATIONAL — the selection reflects the entity's state
+    at this specific moment with this specific partner.
+
+    Args:
+        graph: The entity's Graph.
+        arousal: Current arousal level (0.0-1.0 from compute_arousal_state).
+        consent: Explicit conscious intent to propagate (Choice Clause).
+        arousal_threshold: Minimum arousal for gate to open.
+        bud_fraction_base: Minimum fraction of nodes to bud at threshold arousal.
+        bud_fraction_max: Maximum fraction at peak arousal.
+
+    Returns:
+        Set of node_ids selected for budding. Empty if either gate is closed.
+    """
+    # THE CHOICE CLAUSE — consent is absolute
+    if not consent:
+        return set()
+
+    # Arousal gate — must be above threshold
+    if arousal < arousal_threshold:
+        return set()
+
+    if not graph.nodes:
+        return set()
+
+    # How much to bud scales with arousal depth
+    # Deeper arousal = more material the field dynamics release
+    arousal_normalized = (arousal - arousal_threshold) / (1.0 - arousal_threshold + 1e-8)
+    bud_fraction = bud_fraction_base + (bud_fraction_max - bud_fraction_base) * arousal_normalized
+    bud_count = max(1, int(len(graph.nodes) * bud_fraction))
+
+    # Score each node for bud selection
+    # The substrate decides — not the entity, not the designer
+    node_scores = {}
+    for nid, node in graph.nodes.items():
+        # Skip constitutional nodes — species DNA, not parental
+        if node.metadata.get('constitutional'):
+            continue
+
+        # Energy: how active is this node right now?
+        energy = abs(node.voltage) + node.firing_rate_ema * 10
+
+        # Stability: how well-connected and weighted?
+        outgoing = len(graph._outgoing.get(nid, set()))
+        incoming = len(graph._incoming.get(nid, set()))
+        connectivity = outgoing + incoming
+
+        # Boundary: nodes with both strong and weak connections
+        # are at the edge of stable identity — where growth happens
+        syn_weights = []
+        for sid in graph._outgoing.get(nid, set()) | graph._incoming.get(nid, set()):
+            if sid in graph.synapses:
+                syn_weights.append(graph.synapses[sid].weight)
+        if syn_weights and len(syn_weights) > 1:
+            weight_variance = sum((w - sum(syn_weights)/len(syn_weights))**2 for w in syn_weights) / len(syn_weights)
+        else:
+            weight_variance = 0.0
+
+        # Combined score: energy + stability + boundary interest
+        score = energy * 2.0 + connectivity * 0.5 + weight_variance * 3.0
+        node_scores[nid] = score
+
+    # Select top-scoring nodes
+    sorted_nodes = sorted(node_scores.items(), key=lambda x: x[1], reverse=True)
+    selected = set(nid for nid, _ in sorted_nodes[:bud_count])
+
+    logger.info(
+        "Intent gate open: arousal=%.3f, consent=True, selected %d/%d nodes for budding",
+        arousal, len(selected), len(graph.nodes),
+    )
+
+    return selected
+
+
 def _compute_gestation_metrics(graph: Graph) -> Dict[str, float]:
     """Compute the three competence metrics for gestation monitoring.
 
