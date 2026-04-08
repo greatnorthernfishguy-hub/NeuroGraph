@@ -17,6 +17,16 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-04-07] Claude (Opus 4.6) — Fix temporal stuttering: decay before read
+#   What: get_surfaced() now calls _decay_queue() before returning items.
+#   Why:  Lifecycle ordering bug — assemble() reads the surfacing queue before
+#         afterTurn() applies decay, so stale concepts persisted at inflated
+#         scores across multiple turns. A concept firing at score 1.0 would
+#         remain above min_confidence (0.3) for ~16 turns. With decay-before-read,
+#         each read applies one decay step, roughly halving the persistence window.
+#   How:  Single _decay_queue() call at the top of get_surfaced(). Safe because
+#         _decay_queue() is idempotent within a step — double-decay in the same
+#         step is bounded by the 0.95 multiplier and won't drop items incorrectly.
 # [2026-03-25] Claude (Opus 4.6) — Salience weights from config (SVG Phase 3)
 #   What: _score_node() reads weight_voltage/weight_excitability/weight_he_membership
 #         from CES SurfacingConfig instead of hardcoded 0.5/0.3/0.2.
@@ -97,6 +107,10 @@ class SurfacingMonitor:
         self._queue: List[_SurfacedItem] = []
         self._node_ids_in_queue: set = set()
 
+        # Decay tracking — prevents double-decay when get_surfaced() and
+        # after_step() are both called in the same logical step.
+        self._last_decay_step: int = -1
+
         # Stats
         self._total_surfaced: int = 0
 
@@ -154,6 +168,11 @@ class SurfacingMonitor:
     def get_surfaced(self, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
         """Return the top surfaced items sorted by score.
 
+        Applies decay before reading so that scores reflect elapsed steps
+        since the last ``after_step()`` call.  This prevents stale concepts
+        from being injected into the prompt at their pre-decay score when
+        ``assemble()`` runs before the next ``after_step()``.
+
         Args:
             max_items: Maximum items to return.  Defaults to
                 ``ces_config.surfacing.max_surfaced``.
@@ -161,6 +180,11 @@ class SurfacingMonitor:
         Returns:
             List of dicts with node_id, content, metadata, score.
         """
+        # Decay before read — fixes lifecycle ordering where assemble()
+        # reads the queue before afterTurn() applies decay, causing
+        # stale concepts to persist at inflated scores.
+        self._decay_queue()
+
         if max_items is None:
             max_items = self._cfg.max_surfaced
 
@@ -289,7 +313,18 @@ class SurfacingMonitor:
         self._node_ids_in_queue.add(item.node_id)
 
     def _decay_queue(self) -> None:
-        """Apply decay to all items in the queue, removing those below threshold."""
+        """Apply decay to all items in the queue, removing those below threshold.
+
+        Idempotent within a single graph timestep — tracks the last step at
+        which decay was applied and skips if already done this step.  This
+        allows both ``get_surfaced()`` and ``after_step()`` to call decay
+        without double-penalising queue items.
+        """
+        current_step = getattr(self._graph, 'timestep', -2)
+        if current_step == self._last_decay_step:
+            return  # Already decayed this step
+        self._last_decay_step = current_step
+
         decay_rate = self._cfg.decay_rate
         min_confidence = self._cfg.min_confidence
 

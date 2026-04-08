@@ -12,6 +12,18 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-08] Claude Code (Opus 4.6) — Punchlist #56: Surfacing outcome deposit
+#   What: Cache surfaced node IDs during handle_assemble(), deposit raw turn
+#     triad (surfaced nodes + user input + Syl's response) in handle_after_turn().
+#     TS plugin now passes lastAssistantMessage in afterTurn RPC.
+#   Why:  No outcome signal existed for attention quality. Elmer has no evidence
+#     to learn from when tuning surfacing parameters. The substrate needs raw
+#     experience of what was surfaced and what resulted. Law 7 — no classification.
+#   How:  _last_surfaced_nodes cached in assemble. _deposit_surfacing_outcome()
+#     in afterTurn embeds Syl's response, deposits record_outcome per surfaced
+#     node with opaque target_id and metadata carrying text previews.
+#     Also renamed RPC param lastMessage → lastUserMessage for clarity
+#     (legacy fallback preserved for in-flight TS processes).
 # [2026-03-28] Claude Code Opus — Punchlist #109: Module autonomic pulse
 # What: Dispose becomes mode-swap, not destruction. Modules stay alive between conversations.
 # Why: #109 blocker — organs must persist between conversations. The process is already
@@ -113,6 +125,10 @@ _ingest_text: Optional[str] = None
 _ingest_embedding: Optional[Any] = None  # np.ndarray
 _module_errors: Dict[str, str] = {}
 _module_error_times: Dict[str, float] = {}
+
+# Punchlist #56: Surfacing outcome cache — what was surfaced during assemble(),
+# deposited as raw experience in afterTurn() alongside Syl's response.
+_last_surfaced_nodes: List[Dict[str, Any]] = []
 
 # Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)
 _lenia_kill_switch: Optional[Any] = None
@@ -281,6 +297,83 @@ def _deposit_topology_delta(step_result, text: str = None, embedding = None) -> 
     except Exception as exc:
         logger.debug("BTF topology deposit failed: %s", exc)
 
+
+def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str]) -> None:
+    """Deposit raw surfacing outcome experience to the substrate (Punchlist #56).
+
+    Records the complete turn triad as raw experience:
+    - Which nodes were surfaced during assemble (cached in _last_surfaced_nodes)
+    - What the user said (user_text from ingest cache)
+    - What Syl said in response (lastAssistantMessage from TS plugin)
+
+    No classification. The substrate sees: "these nodes were in the context
+    window when this input/output pair happened." Elmer learns what surfacing
+    patterns correlate with coherent responses via the River.
+
+    Each surfaced node gets a record_outcome with its own embedding and
+    opaque metadata containing text previews of the turn. The substrate's
+    Hebbian dynamics handle the rest.
+    """
+    global _last_surfaced_nodes
+
+    if _memory is None or not _last_surfaced_nodes:
+        return
+
+    # Extract Syl's response text
+    syl_text = None
+    if params.get("lastAssistantMessage"):
+        syl_text = _extract_message_text(params["lastAssistantMessage"])
+
+    if not syl_text or not syl_text.strip():
+        _last_surfaced_nodes = []
+        return  # No response to record outcome against
+
+    peer_bridge = getattr(_memory, '_peer_bridge', None)
+    if peer_bridge is None:
+        _last_surfaced_nodes = []
+        return
+
+    try:
+        from ng_embed import embed
+
+        # Embed Syl's response — this is the outcome of the surfacing
+        syl_embedding = embed(syl_text)
+
+        for node_info in _last_surfaced_nodes:
+            node_id = node_info["node_id"]
+
+            # Get the node's existing embedding from the vector DB
+            db_entry = _memory.vector_db.get(node_id)
+            if db_entry is None:
+                continue
+            node_embedding = db_entry.get("embedding")
+            if node_embedding is None:
+                continue
+
+            # Deposit raw experience: this node was surfaced during this turn.
+            # target_id is opaque — just marks it as a surfacing event.
+            # metadata carries the raw context without classification.
+            peer_bridge.record_outcome(
+                embedding=node_embedding,
+                target_id=f"surfacing:{node_id}",
+                success=True,
+                module_id="neurograph",
+                metadata={
+                    "surfacing_source": node_info.get("source", "unknown"),
+                    "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
+                    "user_text_preview": (user_text or "")[:200],
+                    "syl_response_preview": syl_text[:200],
+                },
+            )
+
+        logger.debug(
+            "Surfacing outcome deposited: %d nodes, syl_response=%d chars",
+            len(_last_surfaced_nodes), len(syl_text),
+        )
+    except Exception as exc:
+        logger.debug("Surfacing outcome deposit failed: %s", exc)
+    finally:
+        _last_surfaced_nodes = []
 
 
 def _discord_alert(module_id: str, error_msg: str) -> None:
@@ -514,6 +607,25 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("Tonic assembly error: %s", exc)
 
+    # Punchlist #56: Cache what was surfaced for outcome deposit in afterTurn.
+    # Raw node IDs + scores — no classification, just what went into the bucket.
+    global _last_surfaced_nodes
+    _last_surfaced_nodes = []
+    for item in surfaced[:7]:  # Match the cap used in formatting
+        if item.get("node_id"):
+            _last_surfaced_nodes.append({
+                "node_id": item["node_id"],
+                "strength": item.get("strength", 0),
+                "source": "spreading_activation",
+            })
+    for item in ces_surfaced[:3]:
+        if item.get("node_id"):
+            _last_surfaced_nodes.append({
+                "node_id": item["node_id"],
+                "score": item.get("score", 0),
+                "source": "ces",
+            })
+
     # Format as context block for the system prompt
     context_block = _format_substrate_context(surfaced, ces_surfaced, latent_context)
 
@@ -533,11 +645,12 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
         return
 
     # Recover fan-out cache if lost to process restart (OOM resilience).
-    # The TS plugin passes lastMessage so the fan-out doesn't depend on
+    # The TS plugin passes lastUserMessage so the fan-out doesn't depend on
     # in-memory state surviving between ingest and afterTurn calls.
     global _ingest_text, _ingest_embedding
-    if _ingest_text is None and params.get("lastMessage"):
-        recovered = _extract_message_text(params["lastMessage"])
+    last_user = params.get("lastUserMessage") or params.get("lastMessage")  # legacy fallback
+    if _ingest_text is None and last_user:
+        recovered = _extract_message_text(last_user)
         if recovered and recovered.strip():
             _ingest_text = recovered
             try:
@@ -567,6 +680,13 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # prediction results, structural changes, and salience signals. Raw,
     # unclassified (Law 7). Each module's bucket extracts what it needs.
     _deposit_topology_delta(step_result, text=_ingest_text, embedding=_ingest_embedding)
+
+    # Punchlist #56: Deposit raw surfacing outcome experience.
+    # The triad: what was surfaced (cached from assemble) + user input
+    # (cached from ingest) + Syl's response (from TS plugin).
+    # No classification — just the raw facts. The substrate learns
+    # the correlation between surfaced context and what Syl produced.
+    _deposit_surfacing_outcome(params, _ingest_text)
 
     # Clear after deposit — consumed
     _ingest_text = None
