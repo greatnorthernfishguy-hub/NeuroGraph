@@ -3727,6 +3727,64 @@ class Graph:
             },
         }
 
+    # ---- Changelog ----
+    # [2026-04-08] Josh + Claude — Genesis: Subgraph extraction
+    # What: Extract a topology fragment (subset of nodes + connected synapses + hyperedges)
+    # Why: Genesis gamete budding requires extracting a partial topology from a parent Graph
+    # How: Filters existing serialization methods by node ID set. Read-only — does not modify graph.
+    # -------------------
+    def extract_subgraph(self, node_ids: set) -> Dict[str, Any]:
+        """Extract a topology fragment: specified nodes + their interconnections.
+
+        Returns a dict in the same format as _serialize_full() but containing
+        only the specified nodes, synapses where BOTH pre and post are in the
+        set, and hyperedges where ALL members are in the set.
+
+        This is a read-only operation — the parent graph is not modified.
+        The extracted fragment is a copy, not a reference.
+
+        Args:
+            node_ids: Set of node IDs to extract.
+
+        Returns:
+            Dict with keys: version, nodes, synapses, hyperedges, config,
+            extraction_metadata (source info for the receiving graph).
+        """
+        # Filter nodes
+        extracted_nodes = {}
+        for nid in node_ids:
+            if nid in self.nodes:
+                extracted_nodes[nid] = self._serialize_node(self.nodes[nid])
+
+        # Filter synapses — both endpoints must be in the extracted set
+        extracted_synapses = {}
+        for sid, syn in self.synapses.items():
+            if syn.pre_node_id in node_ids and syn.post_node_id in node_ids:
+                extracted_synapses[sid] = self._serialize_synapse(syn)
+
+        # Filter hyperedges — all members must be in the extracted set
+        extracted_hyperedges = {}
+        for hid, he in self.hyperedges.items():
+            if he.member_nodes and he.member_nodes.issubset(node_ids):
+                extracted_hyperedges[hid] = self._serialize_hyperedge(he)
+
+        return {
+            "version": "0.4.1",
+            "extraction": True,
+            "source_timestep": self.timestep,
+            "config": self.config,
+            "nodes": extracted_nodes,
+            "synapses": extracted_synapses,
+            "hyperedges": extracted_hyperedges,
+            "extraction_metadata": {
+                "requested_nodes": len(node_ids),
+                "extracted_nodes": len(extracted_nodes),
+                "extracted_synapses": len(extracted_synapses),
+                "extracted_hyperedges": len(extracted_hyperedges),
+                "missing_nodes": list(node_ids - set(extracted_nodes.keys())),
+            },
+        }
+
     def _deserialize(self, data: Dict[str, Any]) -> None:
         """Restore full graph state from serialized data."""
         self.config = {**DEFAULT_CONFIG, **data.get("config", {})}
