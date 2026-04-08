@@ -45,8 +45,7 @@ Concurrency model:
 
 from __future__ import annotations
 
-import fcntl
-import json
+import json  # retained for residual JSONL drain only
 import logging
 import os
 import time
@@ -103,33 +102,17 @@ class ExperienceTract:
             metadata: Optional additional context.  Not interpreted by
                       the tract — passed through as-is.
         """
-        entry = {
-            "content": content,
-            "source": source,
-            "content_type": content_type,
-            "timestamp": time.time(),
-        }
-        if metadata:
-            entry["metadata"] = metadata
-
-        line = json.dumps(entry, default=str) + "\n"
-
+        # BTF binary deposit via Rust — raw bytes, no JSON, no inflation.
+        # Content enters as-is and stays that way until extraction.  Law 7.
         try:
-            fd = os.open(
-                str(self._tract_path),
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o664,
+            import ng_tract
+            ng_tract.deposit_experience(
+                content=content,
+                source=source,
+                tract_path=str(self._tract_path),
+                content_type=content_type,
             )
-            try:
-                # Exclusive lock for the duration of the write.
-                # Other depositors wait; drain() uses a different path
-                # (rename), so no deadlock.
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                os.write(fd, line.encode("utf-8"))
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-        except OSError as exc:
+        except Exception as exc:
             logger.warning("Tract deposit failed: %s", exc)
 
     # ── Consumer API ──────────────────────────────────────────────────
@@ -159,18 +142,28 @@ class ExperienceTract:
             logger.warning("Tract drain rename failed: %s", exc)
             return []
 
-        # Read the drained entries
+        # Read the drained entries — BTF binary via Rust TractReader
         entries: List[Dict[str, Any]] = []
         try:
-            with open(drain_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        logger.warning("Skipped malformed tract entry")
+            with open(drain_path, "rb") as f:
+                raw = f.read()
+            if raw:
+                import ng_tract
+                reader = ng_tract.TractReader(raw)
+                for entry in reader:
+                    if isinstance(entry, bytes):
+                        # Residual JSONL from pre-BTF era
+                        try:
+                            entries.append(json.loads(entry))
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            pass
+                    elif entry.entry_type == ng_tract.ENTRY_EXPERIENCE:
+                        entries.append({
+                            "content": entry.content,
+                            "source": entry.source,
+                            "content_type": entry.content_type,
+                            "timestamp": entry.timestamp,
+                        })
         except OSError as exc:
             logger.warning("Tract drain read failed: %s", exc)
             return entries
@@ -193,9 +186,17 @@ class ExperienceTract:
         try:
             if not self._tract_path.exists():
                 return 0
-            with open(self._tract_path) as f:
-                return sum(1 for line in f if line.strip())
-        except OSError:
+            with open(self._tract_path, "rb") as f:
+                raw = f.read()
+            if not raw:
+                return 0
+            import ng_tract
+            count = 0
+            reader = ng_tract.TractReader(raw)
+            for _ in reader:
+                count += 1
+            return count
+        except Exception:
             return 0
 
     def stats(self) -> Dict[str, Any]:

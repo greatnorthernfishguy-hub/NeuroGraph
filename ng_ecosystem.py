@@ -11,7 +11,7 @@ three-tier learning architecture:
                         learning via per-pair tracts (~/.et_modules/tracts/)
                         or legacy JSONL (~/.et_modules/shared_learning/).
                         Auto-connects.  Tract bridge preferred when present.
-  Tier 3 (Full SNN):    NGSaaSBridge to full NeuroGraph Foundation.
+  Tier 3 (Full SNN):    Removed — modules extract via buckets/tracts.
                         Auto-upgrades when NeuroGraph is detected on
                         the same host via ETModuleManager.
 
@@ -124,7 +124,7 @@ REGISTRY_PATH = ET_MODULES_ROOT / "registry.json"
 
 TIER_STANDALONE = 1  # NGLite only
 TIER_PEER = 2        # + NGPeerBridge
-TIER_FULL_SNN = 3    # + NGSaaSBridge (full NeuroGraph)
+TIER_FULL_SNN = 3    # historical — bridge removed, modules use tracts
 
 TIER_NAMES = {
     TIER_STANDALONE: "Standalone (Tier 1)",
@@ -234,7 +234,7 @@ class NGEcosystem:
                 "sync_interval": 100,
             },
             "tier3_upgrade": {
-                "enabled": True,
+                "enabled": False,  # disabled — modules use tracts, not bridge bypass
                 "poll_interval": 300.0,
             },
         }
@@ -253,17 +253,14 @@ class NGEcosystem:
         # Internal state
         self._tier = TIER_STANDALONE
         self._ng: Any = None              # NGLite instance
+        self._ng_memory: Any = None       # NeuroGraphMemory ref (set externally at Tier 3)
         self._peer_bridge: Any = None     # NGPeerBridge instance
-        self._saas_bridge: Any = None     # NGSaaSBridge instance
-        self._ng_memory: Any = None       # NeuroGraphMemory (Tier 3)
-        self._upgrade_thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
         self._ops_lock = threading.Lock()
 
         # Boot sequence
         self._init_ng_lite()
         self._init_peer_bridge()
-        self._init_tier3_upgrade()
 
         logger.info(
             "[%s] NGEcosystem ready at %s",
@@ -366,147 +363,11 @@ class NGEcosystem:
 
         self._ng.connect_bridge(bridge)
         self._peer_bridge = bridge
-        self._tier = TIER_PEER
+        self._tier = TIER_FULL_SNN  # tract bridge = full substrate access
 
     # -----------------------------------------------------------------
     # Tier 3: NeuroGraph auto-upgrade
     # -----------------------------------------------------------------
-
-    def _init_tier3_upgrade(self) -> None:
-        """Start background thread that polls for NeuroGraph availability."""
-        if not self._config["tier3_upgrade"]["enabled"]:
-            return
-
-        # Try once immediately (NeuroGraph may already be running)
-        self._try_tier3_upgrade()
-        if self._tier == TIER_FULL_SNN:
-            return  # Already upgraded; no need for polling thread
-
-        poll_interval = self._config["tier3_upgrade"]["poll_interval"]
-        t = threading.Thread(
-            target=self._upgrade_loop,
-            args=(poll_interval,),
-            daemon=True,
-            name=f"ng_eco_upgrade_{self.module_id}",
-        )
-        t.start()
-        self._upgrade_thread = t
-
-    def _upgrade_loop(self, interval: float) -> None:
-        """Background polling loop for Tier 3 upgrade."""
-        while not self._shutdown_event.wait(timeout=interval):
-            if self._tier == TIER_FULL_SNN:
-                break
-            self._try_tier3_upgrade()
-
-    def _try_tier3_upgrade(self) -> bool:
-        """Detect NeuroGraph on this host and upgrade to Tier 3 if found.
-
-        Detection strategy (in order):
-          1. Check if NeuroGraphMemory is already imported (same process).
-          2. Query ETModuleManager for NeuroGraph's install path.
-          3. Check known install paths directly.
-
-        Returns True if upgrade succeeded.
-        """
-        if self._ng is None:
-            return False
-
-        ng_memory = self._find_neurograph_memory()
-        if ng_memory is None:
-            return False
-
-        try:
-            from ng_bridge import NGSaaSBridge  # vendored from NeuroGraph
-
-            bridge = NGSaaSBridge(ng_memory)
-            with self._ops_lock:
-                self._ng.connect_bridge(bridge)
-                self._saas_bridge = bridge
-                self._ng_memory = ng_memory
-                self._tier = TIER_FULL_SNN
-
-            logger.info(
-                "[%s] Upgraded to NGSaaSBridge -> full NeuroGraph SNN (Tier 3)",
-                self.module_id,
-            )
-            return True
-
-        except Exception as exc:
-            logger.debug("[%s] Tier 3 upgrade attempt failed: %s", self.module_id, exc)
-            return False
-
-    def _find_neurograph_memory(self) -> Optional[Any]:
-        """Return a live NeuroGraphMemory instance if NeuroGraph is available,
-        else None.
-
-        Three-probe strategy, each fully guarded:
-          1. Already-imported singleton (same Python process).
-          2. ETModuleManager registry lookup + dynamic import.
-          3. Direct filesystem probe of known install paths.
-        """
-        # --- Probe 1: same process ---
-        try:
-            from openclaw_hook import NeuroGraphMemory
-            mem = NeuroGraphMemory.get_instance()
-            if mem is not None:
-                logger.debug("[%s] NeuroGraph found in-process", self.module_id)
-                return mem
-        except Exception:
-            pass
-
-        # --- Probe 2: ETModuleManager registry ---
-        try:
-            ng_path = self._neurograph_path_from_registry()
-            if ng_path:
-                return self._import_neurograph_memory(ng_path)
-        except Exception:
-            pass
-
-        # --- Probe 3: Known filesystem paths ---
-        for candidate in _NEUROGRAPH_KNOWN_PATHS:
-            path = Path(candidate).expanduser()
-            if path.exists():
-                mem = self._import_neurograph_memory(str(path))
-                if mem is not None:
-                    return mem
-
-        return None
-
-    def _neurograph_path_from_registry(self) -> Optional[str]:
-        """Read ETModuleManager registry and return NeuroGraph install path."""
-        if not REGISTRY_PATH.exists():
-            return None
-        with open(REGISTRY_PATH) as f:
-            registry = json.load(f)
-        modules = registry.get("modules", {})
-        ng_entry = modules.get("neurograph", {})
-        install_path = ng_entry.get("install_path", "")
-        return install_path if install_path else None
-
-    def _import_neurograph_memory(self, ng_path: str) -> Optional[Any]:
-        """Dynamically import NeuroGraphMemory from ng_path."""
-        import sys
-
-        orig_path = sys.path[:]
-        try:
-            if ng_path not in sys.path:
-                sys.path.insert(0, ng_path)
-            from openclaw_hook import NeuroGraphMemory
-            return NeuroGraphMemory.get_instance()
-        except Exception as exc:
-            logger.debug(
-                "[%s] Dynamic NeuroGraph import from %s failed: %s",
-                self.module_id, ng_path, exc,
-            )
-            return None
-        finally:
-            sys.path[:] = orig_path
-
-    # -----------------------------------------------------------------
-    # Public API (framework-agnostic)
-    # -----------------------------------------------------------------
-
     @property
     def tier(self) -> int:
         """Current learning tier (1, 2, or 3)."""

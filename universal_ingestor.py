@@ -1822,7 +1822,7 @@ class EmbeddingEngine:
         if self._model_available and hasattr(self, "_fe_model") and self._fe_model is not None:
             try:
                 embeddings = list(self._fe_model.embed(texts))
-                return [np.array(e) for e in embeddings]
+                return [np.asarray(e, dtype=np.float32) for e in embeddings]
             except Exception as exc:
                 self._logger.warning(
                     "fastembed encode failed (%s). Falling back to hash embeddings "

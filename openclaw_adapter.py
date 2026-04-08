@@ -128,6 +128,7 @@ class OpenClawAdapter(ABC):
     WORKSPACE_ENV: str = ""
     DEFAULT_WORKSPACE: str = ""
     AUTO_SAVE_INTERVAL: int = 10  # messages between auto-saves
+    SKIP_ECOSYSTEM: bool = False  # True = no local NGEcosystem (module uses tracts only)
 
     def __init__(self) -> None:
         if not self.MODULE_ID:
@@ -140,17 +141,20 @@ class OpenClawAdapter(ABC):
         (self._workspace / "memory").mkdir(exist_ok=True)
         self._events_log = self._workspace / "memory" / "events.jsonl"
 
-        # NGEcosystem (shared with the rest of the module)
-        import ng_ecosystem
-        self._eco = ng_ecosystem.init(
-            module_id=self.MODULE_ID,
-            state_path=str(self._workspace / "ng_lite_state.json"),
-        )
+        # NGEcosystem — only if module needs a local substrate
+        if self.SKIP_ECOSYSTEM:
+            self._eco = None
+            logger.info("[%s] OpenClawAdapter ready (no local ecosystem — tract-only)", self.MODULE_ID)
+        else:
+            import ng_ecosystem
+            self._eco = ng_ecosystem.init(
+                module_id=self.MODULE_ID,
+                state_path=str(self._workspace / "ng_lite_state.json"),
+            )
+            logger.info("[%s] OpenClawAdapter ready (tier %d)", self.MODULE_ID, self._eco.tier)
 
         self._message_count = 0
         self._start_time = time.time()
-
-        logger.info("[%s] OpenClawAdapter ready (tier %d)", self.MODULE_ID, self._eco.tier)
 
     # -----------------------------------------------------------------
     # Abstract methods — module must implement
@@ -201,7 +205,7 @@ class OpenClawAdapter(ABC):
             }
         """
         if not text or not text.strip():
-            return {"status": "skipped", "tier": self._eco.tier, "message_count": self._message_count}
+            return {"status": "skipped", "tier": self._eco.tier if self._eco else 0, "message_count": self._message_count}
 
         self._message_count += 1
 
@@ -222,20 +226,21 @@ class OpenClawAdapter(ABC):
             "_substrate_success",
             True,
         )
-        self._eco.record_outcome(
-            embedding,
-            target_id=substrate_target,
-            success=substrate_success,
-            metadata={"source": "openclaw", "module": self.MODULE_ID},
-        )
-
-        # Context from ecosystem
-        ctx = self._eco.get_context(embedding)
+        if self._eco:
+            self._eco.record_outcome(
+                embedding,
+                target_id=substrate_target,
+                success=substrate_success,
+                metadata={"source": "openclaw", "module": self.MODULE_ID},
+            )
+            ctx = self._eco.get_context(embedding)
+        else:
+            ctx = {"recommendations": [], "novelty": 0.0}
 
         result = {
             "status": "ingested",
-            "tier": self._eco.tier,
-            "tier_name": self._eco.tier_name,
+            "tier": self._eco.tier if self._eco else 0,
+            "tier_name": self._eco.tier_name if self._eco else "tract-only",
             "message_count": self._message_count,
             "module_results": module_results,
             "recommendations": ctx["recommendations"],
@@ -245,7 +250,7 @@ class OpenClawAdapter(ABC):
         self._write_event("message", result)
 
         # Auto-save
-        if self._message_count % self.AUTO_SAVE_INTERVAL == 0:
+        if self._eco and self._message_count % self.AUTO_SAVE_INTERVAL == 0:
             self._eco.save()
 
         return result
@@ -264,13 +269,16 @@ class OpenClawAdapter(ABC):
             }
         """
         embedding = self._embed(query)
-        ctx = self._eco.get_context(embedding, top_k=top_k)
+        if self._eco:
+            ctx = self._eco.get_context(embedding, top_k=top_k)
+        else:
+            ctx = {"recommendations": [], "novelty": 0.0, "tier": 0}
         self._write_event("recall", {"query": query[:200], **ctx})
         return ctx
 
     def stats(self) -> Dict[str, Any]:
         """Return unified stats for OpenClaw skill telemetry."""
-        eco = self._eco.stats()
+        eco = self._eco.stats() if self._eco else {"tier": 0, "tier_name": "tract-only"}
         module = self._module_stats()
         uptime = time.time() - self._start_time
 

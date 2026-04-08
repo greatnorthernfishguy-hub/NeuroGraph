@@ -737,7 +737,7 @@ class IngestionManager:
                 import topology_owner
                 if topology_owner.is_owned():
                     self._topology_owned = True
-                    from ng_tract import ExperienceTract
+                    from ng_experience_tract import ExperienceTract
                     self._tract = ExperienceTract()
                     logger.info(
                         "Topology owned by PID %s — GUI using tract mode "

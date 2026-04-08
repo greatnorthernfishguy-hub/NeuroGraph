@@ -21,8 +21,6 @@ Directory structure:
     ├── elmer/
     │   ├── immunis.tract         # Elmer → Immunis
     │   └── ...
-    └── _tract_registry.json      # Active module registry
-
 Concurrency model:
   - deposit: flock(LOCK_EX) + append per tract file.
   - drain: atomic rename → read → delete.  New deposits go to a fresh
@@ -50,6 +48,23 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-04-04] Claude (Opus 4.6) — Punchlist #119 Step 6: Bucket extraction API
+#   What: Eliminated dict conversion on BTF drain; modules now receive typed
+#         entry objects (PyOutcomeEntry, PyTopologyEntry, PyExperienceEntry)
+#         directly from _peer_events cache.  Added entry_types filtering.
+#   Why:  _btf_entry_to_dict() called .embedding_as_numpy().tolist(), copying
+#         the zero-copy numpy array into a Python list.  This is the inflation
+#         point that Step 2 (binary deposit) was designed to eliminate on the
+#         drain side.  Typed objects keep embeddings as numpy arrays.
+#   How:  - _drain_single_tract() stores BTF entries as-is; JSONL stays as dicts
+#         - Removed _btf_entry_to_dict() entirely
+#         - get_recommendations() and detect_novelty() use _get_embedding() /
+#           _get_module_id() / _get_target_id() helpers that handle both typed
+#           objects and legacy dicts via duck typing
+#         - Added entry_types parameter to _drain_single_tract() for bucket-shape
+#           filtering at drain time (Law 7 compliant — no classification in deposit)
+#         - Fixed latent NameError: `line` undefined when BTF deposit succeeds
+#           but legacy_compat=True tried to reference it
 # [2026-03-26] Claude Code Opus — Punchlist #44: Adaptive relevance thresholds
 #   What: Made tract bridge relevance_threshold a tunable parameter
 #   Why: Punchlist #44 — threshold should adapt based on event volume and absorption quality
@@ -92,7 +107,7 @@ import random
 import struct
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -219,11 +234,20 @@ class MmapTract:
 
     def preload(self, events: List[Dict[str, Any]]) -> None:
         """Preload events into the write buffer (used during upgrade)."""
+        import ng_tract
         for event in events:
-            line = json.dumps(event, default=str) + "\n"
-            if not self.deposit(line.encode("utf-8")):
-                logger.warning("Preload overflow — %d events dropped", len(events))
-                break
+            emb = event.get("embedding", [])
+            if emb:
+                data = ng_tract.write_outcome(
+                    timestamp=event.get("timestamp", 0.0),
+                    module_id=event.get("module_id", "unknown"),
+                    target_id=event.get("target_id", "unknown"),
+                    success=bool(event.get("success", False)),
+                    embedding=list(emb) if not isinstance(emb, list) else emb,
+                )
+                if not self.deposit(data):
+                    logger.warning("Preload overflow — %d events dropped", len(events))
+                    break
 
     def close(self) -> None:
         """Release mmap and file descriptor."""
@@ -267,7 +291,6 @@ class NGTractBridge(NGBridge):
         ├── elmer/
         │   ├── neurograph.tract     # Elmer → NeuroGraph
         │   └── ...
-        └── _tract_registry.json
     """
 
     def __init__(
@@ -276,7 +299,7 @@ class NGTractBridge(NGBridge):
         tracts_dir: Optional[str] = None,
         sync_interval: int = 100,
         relevance_threshold: float = 0.3,
-        legacy_compat: bool = True,
+        legacy_compat: bool = False,
     ):
         """
         Args:
@@ -313,7 +336,9 @@ class NGTractBridge(NGBridge):
         self._last_drain_time = 0.0
 
         # Cross-module event cache (for recommendations and novelty)
-        self._peer_events: List[Dict[str, Any]] = []
+        # Holds typed BTF entry objects (PyOutcomeEntry, PyTopologyEntry,
+        # PyExperienceEntry) and/or legacy dicts from JSONL fallback.
+        self._peer_events: List[Any] = []
         self._peer_events_max = 500
 
         # Myelination state (runtime only — not persisted)
@@ -363,36 +388,23 @@ class NGTractBridge(NGBridge):
         if not self._connected:
             return None
 
-        # Build event
-        event = {
-            "timestamp": time.time(),
-            "module_id": module_id,
-            "target_id": target_id,
-            "success": success,
-            "embedding": embedding.tolist(),
-            "metadata": metadata or {},
-        }
-        line = json.dumps(event, default=str) + "\n"
-        line_bytes = line.encode("utf-8")
-
         # Fan-out deposit to per-peer tracts
         peers = self._get_registered_peers()
-        for peer_id in peers:
-            if peer_id in self._myelinated and random.random() > self._explore_rate:
-                # Myelinated path — mmap deposit
-                mmap_tract = self._myelinated[peer_id]
-                if not mmap_tract.deposit(line_bytes):
-                    # Buffer full — fall back to file for this deposit
-                    tract_path = self._module_dir / f"{peer_id}.tract"
-                    self._deposit_to_tract(tract_path, line_bytes)
-            else:
-                # Unmyelinated path (or explore-exploit probe)
-                tract_path = self._module_dir / f"{peer_id}.tract"
-                self._deposit_to_tract(tract_path, line_bytes)
 
-        # Legacy dual-write: also append to JSONL for unupgraded peers
-        if self._legacy_compat:
-            self._legacy_write(line)
+        # BTF binary deposit via Rust (zero-copy, Python never touches bytes)
+        import ng_tract
+        tract_paths = [
+            str(self._module_dir / f"{peer_id}.tract")
+            for peer_id in peers
+        ]
+        ng_tract.deposit_outcome(
+            module_id=module_id,
+            target_id=target_id,
+            success=success,
+            embedding=np.asarray(embedding, dtype=np.float32),
+            tract_paths=tract_paths,
+            metadata=metadata,
+        )
 
         # Drain check
         self._outcomes_since_drain += 1
@@ -407,8 +419,8 @@ class NGTractBridge(NGBridge):
                 "cross_module": True,
                 "peer_events_cached": peer_count,
                 "peer_modules": list(set(
-                    e["module_id"] for e in self._peer_events
-                    if e["module_id"] != self.module_id
+                    self._get_module_id(e) for e in self._peer_events
+                    if self._get_module_id(e) != self.module_id
                 )),
             }
 
@@ -432,21 +444,21 @@ class NGTractBridge(NGBridge):
 
         scored: List[Tuple[str, float, str]] = []
         for event in self._peer_events:
-            if event["module_id"] == module_id:
+            event_module = self._get_module_id(event)
+            if event_module == module_id:
                 continue
 
-            peer_emb = np.array(event.get("embedding", []))
-            if peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
+            peer_emb = self._get_embedding(event)
+            if peer_emb is None or peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
                 continue
 
             peer_emb = self._normalize(peer_emb)
             similarity = float(np.dot(emb, peer_emb))
 
             if similarity >= self._relevance_threshold:
-                target = event.get("target_id", "unknown")
-                source_module = event.get("module_id", "unknown")
+                target = self._get_target_id(event)
                 reasoning = (
-                    f"Cross-module recommendation from {source_module} "
+                    f"Cross-module recommendation from {event_module} "
                     f"(similarity={similarity:.3f})"
                 )
                 scored.append((target, similarity, reasoning))
@@ -483,8 +495,8 @@ class NGTractBridge(NGBridge):
         max_similarity = 0.0
 
         for event in self._peer_events:
-            peer_emb = np.array(event.get("embedding", []))
-            if peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
+            peer_emb = self._get_embedding(event)
+            if peer_emb is None or peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
                 continue
 
             peer_emb = self._normalize(peer_emb)
@@ -510,8 +522,8 @@ class NGTractBridge(NGBridge):
             "drain_count": self._drain_count,
             "peer_events_cached": len(self._peer_events),
             "peer_modules": list(set(
-                e["module_id"] for e in self._peer_events
-                if e["module_id"] != self.module_id
+                self._get_module_id(e) for e in self._peer_events
+                if self._get_module_id(e) != self.module_id
             )),
         }
 
@@ -587,7 +599,7 @@ class NGTractBridge(NGBridge):
         self._drain_count += 1
         self._last_drain_time = time.time()
 
-        new_events: List[Dict[str, Any]] = []
+        new_events: List[Any] = []
 
         # Drain from per-pair tracts (file-based)
         registered_peers = self._get_registered_peers()
@@ -622,16 +634,35 @@ class NGTractBridge(NGBridge):
             logger.debug(
                 "Tract drain #%d: absorbed %d events from %d peers",
                 self._drain_count, len(new_events),
-                len(set(e.get("module_id", "") for e in new_events)),
+                len(set(self._get_module_id(e) for e in new_events)),
             )
 
     def _drain_single_tract(
         self, tract_path: Path, peer_id: str,
-    ) -> List[Dict[str, Any]]:
+        entry_types: Optional[Set[int]] = None,
+    ) -> List[Any]:
         """Atomically drain a single tract file.
 
         Rename → read → delete.  New deposits go to a fresh file
         immediately after rename.  No data loss, no read/write collision.
+
+        Handles mixed BTF/JSONL tracts during the flush cycle:
+        - 0x42 ('B') first byte → BTF binary entry, read via TractReader
+        - 0x7B ('{') first byte → residual JSONL, parse with json.loads
+
+        BTF entries are stored as typed objects (PyOutcomeEntry,
+        PyTopologyEntry, PyExperienceEntry) — no dict conversion.
+        Embeddings stay as numpy arrays (zero-copy from Rust).
+        JSONL fallback entries remain as dicts.
+
+        Args:
+            tract_path: Path to the tract file to drain.
+            peer_id: The depositing module's ID.
+            entry_types: Optional set of BTF entry type constants
+                (e.g., {ng_tract.ENTRY_OUTCOME}) to filter by.
+                Only BTF entries matching these types are returned.
+                JSONL dicts always pass (no type tag to filter on).
+                None means accept all entry types.
         """
         drain_path = tract_path.parent / f".draining.{os.getpid()}.{self.module_id}.tract"
 
@@ -646,10 +677,39 @@ class NGTractBridge(NGBridge):
             )
             return []
 
-        entries: List[Dict[str, Any]] = []
+        entries: List[Any] = []
         try:
-            with open(drain_path, "r") as f:
-                for line in f:
+            with open(drain_path, "rb") as f:
+                raw = f.read()
+            if not raw:
+                return entries
+
+            # Dispatch on first byte: BTF binary or residual JSONL
+            try:
+                import ng_tract
+                _has_btf = True
+            except ImportError:
+                _has_btf = False
+
+            if _has_btf and raw[0:1] == b"B":
+                # BTF tract — typed entry objects, no dict conversion
+                reader = ng_tract.TractReader(raw)
+                for entry in reader:
+                    if isinstance(entry, bytes):
+                        # Residual JSONL line returned as bytes
+                        try:
+                            entries.append(json.loads(entry))
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            pass
+                    else:
+                        # BTF typed entry — filter by entry_type if requested
+                        if entry_types is not None and hasattr(entry, "entry_type"):
+                            if entry.entry_type not in entry_types:
+                                continue
+                        entries.append(entry)
+            else:
+                # FLUSH CYCLE: residual JSONL — remove after tracts are clean (#120)
+                for line in raw.decode("utf-8", errors="replace").splitlines():
                     line = line.strip()
                     if not line:
                         continue
@@ -670,6 +730,42 @@ class NGTractBridge(NGBridge):
                 pass
 
         return entries
+
+    # -------------------------------------------------------------------
+    # Internal: Duck-typing accessors for mixed typed/dict peer events
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _get_module_id(event: Any) -> str:
+        """Extract module_id from a typed BTF entry or a legacy dict."""
+        if isinstance(event, dict):
+            return event.get("module_id", "")
+        return getattr(event, "module_id", "")
+
+    @staticmethod
+    def _get_target_id(event: Any) -> str:
+        """Extract target_id from a typed BTF entry or a legacy dict."""
+        if isinstance(event, dict):
+            return event.get("target_id", "unknown")
+        return getattr(event, "target_id", "unknown")
+
+    @staticmethod
+    def _get_embedding(event: Any) -> Optional[np.ndarray]:
+        """Extract embedding as numpy array from a typed BTF entry or dict.
+
+        For BTF PyOutcomeEntry: calls .embedding_as_numpy() — zero-copy.
+        For dicts (JSONL fallback): converts list to np.array.
+        For entries without embeddings (topology, experience): returns None.
+        """
+        if isinstance(event, dict):
+            emb_list = event.get("embedding", [])
+            if not emb_list:
+                return None
+            return np.array(emb_list, dtype=np.float32)
+        # Typed BTF entry — use zero-copy numpy accessor if available
+        if hasattr(event, "embedding_as_numpy"):
+            return event.embedding_as_numpy()
+        return None
 
     def _drain_myelinated_tract(
         self, mmap_path: Path, peer_id: str,
@@ -756,10 +852,18 @@ class NGTractBridge(NGBridge):
 
             # Deposit drained signals to file-based tract so they aren't lost
             if pending:
-                tract_path = self._module_dir / f"{peer_id}.tract"
+                import ng_tract
+                tract_path = str(self._module_dir / f"{peer_id}.tract")
                 for event in pending:
-                    line = json.dumps(event, default=str) + "\n"
-                    self._deposit_to_tract(tract_path, line.encode("utf-8"))
+                    emb = self._get_embedding(event)
+                    if emb is not None:
+                        ng_tract.deposit_outcome(
+                            module_id=self._get_module_id(event) or self.module_id,
+                            target_id=self._get_target_id(event) or "unknown",
+                            success=event.get("success", True) if isinstance(event, dict) else getattr(event, "success", True),
+                            embedding=np.asarray(emb, dtype=np.float32),
+                            tract_paths=[tract_path],
+                        )
 
             logger.info(
                 "Demyelinated tract %s→%s (recovered=%d signals)",
@@ -850,43 +954,28 @@ class NGTractBridge(NGBridge):
     # -------------------------------------------------------------------
 
     def _register_module(self) -> None:
-        """Register this module in the tract registry."""
-        registry_path = self._tracts_dir / "_tract_registry.json"
+        """Ensure this module's tract directory exists.
 
-        try:
-            if registry_path.exists():
-                with open(registry_path, "r") as f:
-                    registry = json.load(f)
-            else:
-                registry = {"modules": {}}
-
-            registry["modules"][self.module_id] = {
-                "registered_at": time.time(),
-                "tract_dir": str(self._module_dir),
-                "pid": os.getpid(),
-            }
-
-            # Atomic write
-            tmp = registry_path.with_suffix(".tmp")
-            with open(tmp, "w") as f:
-                json.dump(registry, f, indent=2)
-            tmp.replace(registry_path)
-
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to update tract registry: %s", exc)
+        The directory structure IS the registry — each subdirectory under
+        tracts_dir is a registered module.  No separate JSON file needed.
+        """
+        self._module_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_registered_peers(self) -> List[str]:
-        """Return list of registered peer module IDs (excluding self)."""
-        registry_path = self._tracts_dir / "_tract_registry.json"
+        """Return list of registered peer module IDs (excluding self).
 
+        Scans the tracts directory for subdirectories.  Each subdirectory
+        IS a registered module — the filesystem is the registry.
+        """
         try:
-            if not registry_path.exists():
-                return []
-            with open(registry_path, "r") as f:
-                registry = json.load(f)
-            peers = list(registry.get("modules", {}).keys())
-            return [p for p in peers if p != self.module_id]
-        except (OSError, json.JSONDecodeError):
+            return [
+                entry.name
+                for entry in self._tracts_dir.iterdir()
+                if entry.is_dir()
+                and entry.name != self.module_id
+                and not entry.name.startswith(("_", "."))
+            ]
+        except OSError:
             return []
 
     # -------------------------------------------------------------------

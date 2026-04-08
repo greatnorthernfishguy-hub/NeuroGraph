@@ -173,7 +173,7 @@ _tract = None
 def _get_tract():
     global _tract
     if _tract is None:
-        from ng_tract import ExperienceTract
+        from ng_experience_tract import ExperienceTract
         _tract = ExperienceTract()
     return _tract
 

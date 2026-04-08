@@ -66,16 +66,6 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
-# [2026-04-05] Claude Code (Opus 4.6) — #119 Step 5: Rust core interior
-# What: Hot-path methods delegate to Rust NGLiteCore via PyO3 when available.
-#   save/load use binary msgpack persistence (no JSON in the data path).
-# Why: #119 Rust Substrate Layer — eliminate serialize→JSON→deserialize chain.
-#   3-5x speedup on record_outcome, similarity search, novelty detection.
-# How: self._core = NGLiteCore(module_id, config) in __init__. All hot-path
-#   methods check self._core first, delegate if present, fall back to Python.
-#   save() writes .msgpack via Rust, load() reads .msgpack or migrates from
-#   .json on first load. Python fallback path unchanged. Zero API changes.
-# -------------------
 # [2026-03-26] Claude Code Opus — Punchlist #44: Adaptive relevance thresholds
 # What: Made peer bridge relevance_threshold a tunable parameter
 # Why: Punchlist #44 — threshold should adapt based on event volume and absorption quality
@@ -461,20 +451,7 @@ class NGLite:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self._bridge = bridge
 
-        # Rust core — if available, all hot-path methods delegate here.
-        # Python fallback remains intact for modules without the wheel.
-        self._core = None
-        try:
-            from ng_tract import NGLiteCore
-            self._core = NGLiteCore(module_id, self.config)
-            # Seed constitutional nodes in Rust core
-            entries = self.config.get("constitutional_embeddings", [])
-            if entries:
-                self._core.seed_constitutional(entries)
-        except ImportError:
-            pass  # Pure Python fallback
-
-        # Core collections (used by Python fallback, also for bridge/stats)
+        # Core collections
         self.nodes: Dict[str, NGLiteNode] = {}
         self.synapses: Dict[Tuple[str, str], NGLiteSynapse] = {}
 
@@ -561,21 +538,6 @@ class NGLite:
         Returns:
             The matched or newly created NGLiteNode.
         """
-        # Rust fast path
-        if self._core is not None:
-            result = self._core.find_or_create_node(embedding)
-            # Return a lightweight node-like object for callers that need it
-            emb_hash = result.get("embedding_hash", "")
-            if emb_hash not in self.nodes:
-                self.nodes[emb_hash] = NGLiteNode(
-                    node_id=result["node_id"],
-                    embedding_hash=emb_hash,
-                    activation_count=result.get("activation_count", 1),
-                    last_activation=time.time(),
-                    constitutional=result.get("constitutional", False),
-                )
-            return self.nodes[emb_hash]
-
         emb = self._normalize(embedding)
 
         # Receptor layer: snap to nearest prototype before node lookup (#43)
@@ -663,30 +625,6 @@ class NGLite:
         Raises:
             ValueError: If embedding is not a 1-D numpy array.
         """
-        # Rust fast path — Hebbian learning, Welford variance, all in Rust
-        if self._core is not None:
-            result = self._core.record_outcome(
-                embedding, target_id, success, strength, metadata,
-            )
-            # Bridge forwarding stays in Python
-            if self._bridge and self._bridge.is_connected():
-                try:
-                    bridge_meta = dict(metadata or {})
-                    bridge_meta["strength"] = strength
-                    enriched = self._bridge.record_outcome(
-                        embedding=embedding, target_id=target_id,
-                        success=success, module_id=self.module_id,
-                        metadata=bridge_meta,
-                    )
-                    if enriched:
-                        result["bridge_response"] = enriched
-                except Exception as e:
-                    logger.warning("Bridge record_outcome failed: %s", e)
-            self._total_outcomes += 1
-            if success:
-                self._total_successes += 1
-            return result
-
         # Input validation (Grok review: defensive boundary check)
         if not isinstance(embedding, np.ndarray) or embedding.ndim != 1:
             raise ValueError(
@@ -821,11 +759,7 @@ class NGLite:
             except Exception as e:
                 logger.warning("Bridge get_recommendations failed: %s", e)
 
-        # Rust fast path
-        if self._core is not None:
-            return self._core.get_recommendations(embedding, top_k)
-
-        # Local learning (Python fallback)
+        # Local learning
         node = self.find_or_create_node(embedding)
 
         # Cricket rim: constitutional nodes return empty — the bucket
@@ -903,11 +837,7 @@ class NGLite:
             except Exception as e:
                 logger.warning("Bridge detect_novelty failed: %s", e)
 
-        # Rust fast path
-        if self._core is not None:
-            return self._core.detect_novelty(embedding)
-
-        # Local novelty detection (Python fallback)
+        # Local novelty detection
         if not self._embedding_cache:
             return 1.0  # Everything is novel when we know nothing
 
@@ -973,23 +903,14 @@ class NGLite:
     # -------------------------------------------------------------------
 
     def save(self, filepath: str) -> None:
-        """Save full state to binary (msgpack) via Rust.
+        """Save full state to JSON file.
 
-        Falls back to JSON if Rust core is unavailable.
-        Binary path: Rust serializes directly to bytes, writes to disk.
-        No Python dicts, no JSON, no inflation.
+        Saves all nodes, synapses, configuration, and counters.
+        Embedding cache is NOT saved (too large, reconstructed on use).
 
         Args:
-            filepath: Path to write the state file.
+            filepath: Path to write the JSON state file.
         """
-        if self._core is not None:
-            # Binary persistence — Rust handles everything
-            bin_path = filepath.replace(".json", ".msgpack")
-            self._core.save_binary(bin_path)
-            logger.info("NG-Lite state saved (binary) to %s", bin_path)
-            return
-
-        # Python fallback — JSON
         state = self._export_state()
         with open(filepath, "w") as f:
             json.dump(state, f, indent=2)
@@ -997,44 +918,19 @@ class NGLite:
                      filepath, len(self.nodes), len(self.synapses))
 
     def load(self, filepath: str) -> None:
-        """Load state from binary (msgpack) or JSON.
+        """Restore state from a JSON file.
 
-        Tries binary first (.msgpack), falls back to JSON (.json).
-        If loading JSON into Rust core, migrates via import_state.
+        Replaces all current state with the loaded data.
+        Embedding cache starts empty and rebuilds on use.
 
         Args:
-            filepath: Path to the state file (.json or .msgpack).
+            filepath: Path to the JSON state file.
         """
-        import os
-
-        bin_path = filepath.replace(".json", ".msgpack")
-
-        if self._core is not None:
-            # Try binary first
-            if os.path.exists(bin_path):
-                self._core.load_binary(bin_path)
-                logger.info("NG-Lite state loaded (binary) from %s", bin_path)
-                return
-            # JSON migration — read JSON, import into Rust core, then
-            # save binary so next load is native
-            if os.path.exists(filepath):
-                with open(filepath, "r") as f:
-                    state = json.load(f)
-                self._core.import_state(state)
-                self._core.save_binary(bin_path)
-                logger.info(
-                    "NG-Lite state migrated from JSON to binary: %s → %s",
-                    filepath, bin_path,
-                )
-                return
-
-        # Pure Python fallback
-        if os.path.exists(filepath):
-            with open(filepath, "r") as f:
-                state = json.load(f)
-            self._import_state(state)
-            logger.info("NG-Lite state loaded from %s (%d nodes, %d synapses)",
-                         filepath, len(self.nodes), len(self.synapses))
+        with open(filepath, "r") as f:
+            state = json.load(f)
+        self._import_state(state)
+        logger.info("NG-Lite state loaded from %s (%d nodes, %d synapses)",
+                     filepath, len(self.nodes), len(self.synapses))
 
     def _export_state(self) -> Dict[str, Any]:
         """Export full state as a serializable dict.
@@ -1162,13 +1058,6 @@ class NGLite:
         Returns dict with old_value, new_value, clamped (bool).
         Raises KeyError if key is not tunable.
         """
-        # Update Rust core if present
-        if self._core is not None:
-            try:
-                self._core.update_config(key, float(value))
-            except Exception:
-                pass  # Rust core may not have this key yet
-
         if key not in self.TUNABLE_PARAMS:
             raise KeyError(
                 f"'{key}' is not a tunable parameter. "

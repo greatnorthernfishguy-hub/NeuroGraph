@@ -212,20 +212,18 @@ class NGPeerBridge(NGBridge):
         if not self._connected:
             return None
 
-        # Write event to shared file
-        event = {
-            "timestamp": time.time(),
-            "module_id": module_id,
-            "target_id": target_id,
-            "success": success,
-            "embedding": embedding.tolist(),
-            "metadata": metadata or {},
-        }
-
+        # BTF binary deposit via Rust — no JSONL, no .tolist(), no inflation
         try:
-            with open(self._event_file, "a") as f:
-                f.write(json.dumps(event, default=str) + "\n")
-        except OSError as e:
+            import ng_tract
+            ng_tract.deposit_outcome(
+                module_id=module_id,
+                target_id=target_id,
+                success=success,
+                embedding=np.asarray(embedding, dtype=np.float32),
+                tract_paths=[str(self._event_file)],
+                metadata=metadata,
+            )
+        except Exception as e:
             logger.warning("Failed to write peer event: %s", e)
             return None
 
@@ -272,7 +270,7 @@ class NGPeerBridge(NGBridge):
             if event["module_id"] == module_id:
                 continue  # Skip own events
 
-            peer_emb = np.array(event.get("embedding", []))
+            peer_emb = np.array(event.get("embedding", []), dtype=np.float32)
             if peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
                 continue
 
@@ -322,7 +320,7 @@ class NGPeerBridge(NGBridge):
         max_similarity = 0.0
 
         for event in self._peer_events:
-            peer_emb = np.array(event.get("embedding", []))
+            peer_emb = np.array(event.get("embedding", []), dtype=np.float32)
             if peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
                 continue
 
