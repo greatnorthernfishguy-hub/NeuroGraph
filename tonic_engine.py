@@ -178,6 +178,7 @@ class TonicEngine:
         self._tonic_thread = tonic_thread
         self._config = config or EngineConfig()
         self._shared_body = transformer_body  # from ProtoUniBrain if available
+        self._body_lock = None  # shared with ProtoUniBrain — set via set_body_lock()
 
         self._running = False
         self._in_conversation = False
@@ -282,6 +283,10 @@ class TonicEngine:
             self._model = None
             self._use_heuristic = True
             return False
+
+    def set_body_lock(self, lock) -> None:
+        """Accept the shared body access lock from BrainSwitcher."""
+        self._body_lock = lock
 
     # -----------------------------------------------------------------
     # Latent Token Generation
@@ -436,8 +441,11 @@ class TonicEngine:
             return self._heuristic_inference(features)
 
         # Forward through TonicBrain — the actual push
-        with torch.no_grad():
-            output = self._model(graph_features)
+        import contextlib
+        _lock_ctx = self._body_lock if self._body_lock is not None else contextlib.nullcontext()
+        with _lock_ctx:
+            with torch.no_grad():
+                output = self._model(graph_features)
 
         # Map activation strengths to actual nodes
         activation_strengths = output["activations"]
