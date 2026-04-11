@@ -385,13 +385,14 @@ def gestate(
     for cycle in range(cfg.max_resolution_cycles):
         resolution_cycles = cycle + 1
 
-        # UMBILICAL NOURISHMENT — parents' activity feeds the child
-        # The parents keep living. Their active nodes' voltage leaks into the
-        # child's inherited nodes. The child resolves under real parental
-        # influence, not artificial stimulation.
+        # UMBILICAL NOURISHMENT — Law 1 compliant
+        # Parents deposit their activity as signals. Child receives and applies.
+        # No direct Graph-to-Graph access. Signals flow one-way via tract pattern.
         if not umbilical_disconnected:
-            _nourish_from_parent(child, parent_a, a_node_ids, cfg.umbilical_strength)
-            _nourish_from_parent(child, parent_b, b_node_ids, cfg.umbilical_strength)
+            signals_a = _deposit_parental_energy(parent_a, a_node_ids)
+            signals_b = _deposit_parental_energy(parent_b, b_node_ids)
+            _apply_umbilical_signals(child, signals_a, cfg.umbilical_strength)
+            _apply_umbilical_signals(child, signals_b, cfg.umbilical_strength)
 
             # Parents step too — they're alive during gestation
             if parent_a and cycle % 3 == 0:
@@ -502,36 +503,47 @@ def gestate(
     )
 
 
-def _nourish_from_parent(
+def _deposit_parental_energy(parent: Optional[Graph], inherited_node_ids: Set[str]) -> List[Tuple[str, float]]:
+    """Collect parental energy for umbilical transfer.
+
+    Returns a list of (node_id, voltage) tuples representing the parent's
+    current activity on inherited nodes. This is the data that would flow
+    through a tract bridge — the parent deposits, the child drains.
+
+    Law 1 compliant: no direct Graph-to-Graph access. The parent produces
+    a signal (list of activations). The child consumes it independently.
+    The tract bridge is the transport — this function produces what would
+    be deposited to it.
+    """
+    if parent is None:
+        return []
+
+    signals = []
+    for nid in inherited_node_ids:
+        parent_node = parent.nodes.get(nid)
+        if parent_node is None:
+            continue
+        if parent_node.voltage > parent_node.threshold * 0.5:
+            signals.append((nid, parent_node.voltage))
+    return signals
+
+
+def _apply_umbilical_signals(
     child: Graph,
-    parent: Optional[Graph],
-    inherited_node_ids: Set[str],
+    signals: List[Tuple[str, float]],
     strength: float,
 ):
-    """Umbilical nourishment — parent's active nodes feed energy to child's inherited nodes.
+    """Apply parental energy signals to the child.
 
-    For each inherited node, if the corresponding parent node has above-threshold
-    voltage, inject a fraction of that energy into the child's node. The child
-    doesn't just get random stimulation — it gets the ACTUAL activity patterns
-    the parent is currently experiencing.
+    The child receives signals (node_id, voltage) — the same data format
+    that would arrive via tract bridge drain. The child stimulates its own
+    nodes. The parent is not accessed.
 
-    This means the child's topology resolves under real parental cognitive activity,
-    not isolation. The gamete is nourished by what the parents are thinking during gestation.
+    Law 1: The child acts on signals it received, not on the parent's state.
     """
-    if parent is None or strength <= 0:
-        return
-
-    for nid in inherited_node_ids:
-        # Find the corresponding parent node
-        parent_node = parent.nodes.get(nid)
-        child_node = child.nodes.get(nid)
-        if parent_node is None or child_node is None:
-            continue
-
-        # Transfer a fraction of the parent's current voltage
-        if parent_node.voltage > parent_node.threshold * 0.5:
-            energy = parent_node.voltage * strength
-            child.stimulate(nid, energy)
+    for nid, voltage in signals:
+        if nid in child.nodes:
+            child.stimulate(nid, voltage * strength)
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +551,14 @@ def _nourish_from_parent(
 # ---------------------------------------------------------------------------
 
 def compute_arousal_state(graph: Graph, novelty_score: float = 0.0) -> float:
-    """Compute arousal level from substrate metrics.
+    """Read arousal level from substrate metrics. TRANSITIONAL.
+
+    NOTE (Law 7): This function reads substrate state to estimate arousal.
+    It does NOT classify or pre-process — it reads what the substrate already
+    computed (firing rates, variance). The arousal score is a READING, not
+    a judgment. Full Law 7 compliance requires arousal to be a field dynamic
+    mode that the substrate enters naturally via Lenia channel dynamics.
+    That is a Phase 2 refactor — requires Lenia integration into the SNN.
 
     Arousal = coherence × novelty co-occurrence.
     Neither alone triggers arousal. Both together do.
@@ -674,7 +693,14 @@ def intent_gate(
 
 
 def _compute_gestation_metrics(graph: Graph) -> Dict[str, float]:
-    """Compute the three competence metrics for gestation monitoring.
+    """Read competence metrics for gestation monitoring. TRANSITIONAL.
+
+    NOTE (Law 7 + Law 3): This reimplements metrics that already exist in
+    lenia/competence.py (CompetenceMeter). Phase 2 should delegate to
+    CompetenceMeter directly — it already computes field_entropy,
+    pattern_stability, and myelination_coverage. This function exists
+    as a standalone fallback until the Lenia field store is wired into
+    the gestation childGraph.
 
     1. Field entropy — should settle (high → low trend)
     2. Stable pattern count — should grow persistent, non-oscillating

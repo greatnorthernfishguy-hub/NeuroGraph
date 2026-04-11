@@ -142,10 +142,11 @@ class ETModuleManager:
     """
 
     # Known install locations to scan for modules
+    # Canonical paths per ~/docs/ROUTING.md Module Registry (2026-04-07)
     KNOWN_LOCATIONS = [
-        "~/.openclaw/workspace/skills/neurograph",      # NeuroGraph
-        "/opt/inference-difference",           # The-Inference-Difference
-        "/opt/trollguard",                     # TrollGuard
+        "~/NeuroGraph/",                      # NeuroGraph
+        "~/The-Inference-Difference/",        # TID
+        "~/TrollGuard/",                      # TrollGuard
         "~/.et_modules/modules",              # Generic module install dir
     ]
 
