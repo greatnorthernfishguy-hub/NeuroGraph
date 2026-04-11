@@ -8,3 +8,5 @@ build/
 *.log
 data/
 *.backup-*
+*.bak
+*.msgpack
