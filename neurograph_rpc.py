@@ -1296,11 +1296,6 @@ def _find_pid_on_port(port: int) -> int:
 
 
 def _start_http_sidecar(port: int = 8850) -> None:
-<<<<<<< Updated upstream
-    global _sidecar_started
-    if _sidecar_started:
-        return
-=======
     """Start the afterTurn HTTP sidecar in a background thread.
 
     If the port is already held by a stale process, sends SIGTERM and
@@ -1331,8 +1326,6 @@ def _start_http_sidecar(port: int = 8850) -> None:
                 import time as _t; _t.sleep(1.5)
             except ProcessLookupError:
                 pass  # already dead — nothing to do
-
->>>>>>> Stashed changes
     try:
         server = HTTPServer(("127.0.0.1", port), _AfterTurnHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
