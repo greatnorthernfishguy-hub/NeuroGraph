@@ -114,6 +114,7 @@ def _deposit_batch(lines, tract_paths, ng_tract):
                     skipped += 1
                     continue
                 ng_tract.deposit_outcome(
+                    timestamp=time.time(),
                     module_id=d.get("module_id", "unknown"),
                     target_id=d.get("target_id", "unknown"),
                     success=bool(d.get("success", False)),

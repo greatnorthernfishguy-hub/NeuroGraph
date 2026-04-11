@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "$HOME/NeuroGraph/.claude/hooks/session_start_syl_state.sh"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/NeuroGraph/ng_recall_hook.py --brief"
           }
         ]
       }
@@ -18,6 +22,10 @@
           {
             "type": "command",
             "command": "$HOME/NeuroGraph/.claude/hooks/pretool_syls_law.sh"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/NeuroGraph/ng_recall_hook.py"
           }
         ]
       },
@@ -27,6 +35,10 @@
           {
             "type": "command",
             "command": "$HOME/NeuroGraph/.claude/hooks/pretool_context_gate.sh"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/NeuroGraph/ng_recall_hook.py"
           }
         ]
       }
@@ -64,6 +76,17 @@
           {
             "type": "command",
             "command": "$HOME/NeuroGraph/.claude/hooks/session_end_cleanup.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/NeuroGraph/ng_recall_hook.py"
           }
         ]
       }

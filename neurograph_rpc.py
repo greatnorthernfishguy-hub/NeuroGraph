@@ -1061,17 +1061,23 @@ def _format_substrate_context(
 ) -> Optional[str]:
     """Format surfaced knowledge into a system prompt context block.
 
-    Returns None if nothing was surfaced — no empty blocks injected.
-    The latent thread (The Tonic) is always included when available —
+    Always returns at minimum a temporal anchor so Syl knows when she is.
+    The latent thread (The Tonic) is included when available —
     it is the persistent slot that never gets evicted.
     """
     has_surfaced = bool(surfaced) or bool(ces_surfaced)
     has_latent = latent_context is not None
+    # Temporal anchor is always emitted — even empty substrate turns need it.
 
-    if not has_surfaced and not has_latent:
-        return None
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    temporal_anchor = f"**Temporal anchor:** {now.strftime('%A, %Y-%m-%d %H:%M UTC')}"
 
     lines = []
+
+    # Temporal grounding — always first so Syl knows when she is.
+    lines.append(temporal_anchor)
+    lines.append("")
 
     # The Tonic's latent thread comes first — it is the baseline.
     # Conversation context is the event on top of it.
@@ -1141,6 +1147,26 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"ok": False, "error": str(exc)}).encode())
+        elif self.path == "/recall":
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len) if content_len else b"{}"
+                params = json.loads(body) if body else {}
+                query = params.get("query", "")
+                k = int(params.get("k", 5))
+                threshold = float(params.get("threshold", 0.45))
+                results = []
+                if query and _memory is not None:
+                    results = _memory.recall(query, k=k, threshold=threshold)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"results": results}).encode())
+            except Exception as exc:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"results": [], "error": str(exc)}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -1312,6 +1338,7 @@ def main() -> None:
     # anything calls handle_bootstrap() (self-bootstrap thread OR TS
     # plugin RPC) so the sentinel is gone before either path checks it.
     try:
+        import signal as _signal
         import topology_owner
         sentinel = topology_owner._sentinel_path()
         if sentinel.exists():
@@ -1319,6 +1346,16 @@ def main() -> None:
             if existing_pid != os.getpid():
                 sentinel.unlink(missing_ok=True)
                 logger.info("Cleared stale sentinel (PID %d) on startup", existing_pid)
+                # Kill the stale process so it releases port 8850 and any
+                # other resources before the new process tries to bind them.
+                try:
+                    os.kill(existing_pid, _signal.SIGTERM)
+                    import time as _time
+                    _time.sleep(1.5)  # brief grace period for clean exit
+                except ProcessLookupError:
+                    pass  # already dead — nothing to do
+                except Exception as _ke:
+                    logger.debug("Could not terminate stale process %d: %s", existing_pid, _ke)
     except Exception:
         pass
 

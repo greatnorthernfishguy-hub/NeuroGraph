@@ -398,6 +398,7 @@ class NGTractBridge(NGBridge):
             for peer_id in peers
         ]
         ng_tract.deposit_outcome(
+            timestamp=time.time(),
             module_id=module_id,
             target_id=target_id,
             success=success,
@@ -858,6 +859,7 @@ class NGTractBridge(NGBridge):
                     emb = self._get_embedding(event)
                     if emb is not None:
                         ng_tract.deposit_outcome(
+                            timestamp=time.time(),
                             module_id=self._get_module_id(event) or self.module_id,
                             target_id=self._get_target_id(event) or "unknown",
                             success=event.get("success", True) if isinstance(event, dict) else getattr(event, "success", True),

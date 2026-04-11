@@ -216,6 +216,7 @@ class NGPeerBridge(NGBridge):
         try:
             import ng_tract
             ng_tract.deposit_outcome(
+                timestamp=time.time(),
                 module_id=module_id,
                 target_id=target_id,
                 success=success,
