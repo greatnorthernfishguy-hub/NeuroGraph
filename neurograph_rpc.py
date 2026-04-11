@@ -279,6 +279,15 @@ def _deposit_topology_delta(step_result, text: str = None, embedding = None) -> 
     """Extract topology delta and deposit to all module tracts (River Tier 3).
 
     #119: BTF binary deposit via Rust (zero-copy). No JSONL fallback.
+    Also appends compact scalar step metrics to neurograph.jsonl so Darwin's
+    Recorder can observe substrate activity. Binary/non-inflated: counts only,
+    no node IDs, no vectors.
+    # [2026-04-10] Claude (Sonnet 4.6) — Substrate metrics for Darwin discovery
+    #   What: Append 8 scalar counts from StepResult to neurograph.jsonl each turn.
+    #   Why:  Darwin's Recorder reads shared_learning JSONL. Without numeric fields
+    #         Discovery._observed_params stays empty and Mutator proposes 0 mutations.
+    #         Step counts give Discovery real numeric ranges to work with.
+    #   How:  Fire-and-forget write after BTF deposit. No embedding, no IDs.
     """
     if _memory is None:
         return
@@ -296,6 +305,31 @@ def _deposit_topology_delta(step_result, text: str = None, embedding = None) -> 
         )
     except Exception as exc:
         logger.debug("BTF topology deposit failed: %s", exc)
+
+    # Compact scalar metrics for Darwin's Recorder.
+    # No embedding, no IDs — just counts the substrate produced this step.
+    try:
+        import json as _json, time as _time, os as _os
+        from pathlib import Path as _Path
+        _shared = _Path(_os.path.expanduser("~/.et_modules/shared_learning"))
+        _shared.mkdir(parents=True, exist_ok=True)
+        _metrics = {
+            "timestamp": _time.time(),
+            "module_id": "neurograph",
+            "type": "substrate_step",
+            "fired_nodes": len(step_result.fired_node_ids),
+            "fired_hyperedges": len(step_result.fired_hyperedge_ids),
+            "synapses_pruned": step_result.synapses_pruned,
+            "synapses_sprouted": step_result.synapses_sprouted,
+            "predictions_confirmed": step_result.predictions_confirmed,
+            "predictions_surprised": step_result.predictions_surprised,
+            "total_nodes": len(_memory.graph.nodes),
+            "total_synapses": len(_memory.graph.synapses),
+        }
+        with open(_shared / "neurograph.jsonl", "a") as _f:
+            _f.write(_json.dumps(_metrics) + "\n")
+    except Exception:
+        pass
 
 
 def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str]) -> None:
@@ -1245,10 +1279,60 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _find_pid_on_port(port: int) -> int:
+    """Return the PID listening on the given local TCP port, or 0 if unknown."""
+    import subprocess, re
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+        m = re.search(r"pid=(\d+)", out)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
 def _start_http_sidecar(port: int = 8850) -> None:
+<<<<<<< Updated upstream
     global _sidecar_started
     if _sidecar_started:
         return
+=======
+    """Start the afterTurn HTTP sidecar in a background thread.
+
+    If the port is already held by a stale process, sends SIGTERM and
+    reclaims it — logs INFO so the event is visible in the terminal.
+    """
+    global _sidecar_started
+    if _sidecar_started:
+        return
+
+    import signal as _signal
+    import socket as _sock
+
+    # Probe — if something is already listening, reclaim the port.
+    probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    probe.settimeout(0.5)
+    occupied = probe.connect_ex(("127.0.0.1", port)) == 0
+    probe.close()
+
+    if occupied:
+        stale_pid = _find_pid_on_port(port)
+        if stale_pid and stale_pid != os.getpid():
+            logger.info(
+                "Sidecar port %d held by PID %d — reclaiming (SIGTERM)",
+                port, stale_pid,
+            )
+            try:
+                os.kill(stale_pid, _signal.SIGTERM)
+                import time as _t; _t.sleep(1.5)
+            except ProcessLookupError:
+                pass  # already dead — nothing to do
+
+>>>>>>> Stashed changes
     try:
         server = HTTPServer(("127.0.0.1", port), _AfterTurnHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
