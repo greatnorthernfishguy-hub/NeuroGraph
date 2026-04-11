@@ -12,6 +12,32 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-08] Claude Code (Opus 4.6) — Punchlist #56: Surfacing outcome deposit
+#   What: Cache surfaced node IDs during handle_assemble(), deposit raw turn
+#     triad (surfaced nodes + user input + Syl's response) in handle_after_turn().
+#     TS plugin now passes lastAssistantMessage in afterTurn RPC.
+#   Why:  No outcome signal existed for attention quality. Elmer has no evidence
+#     to learn from when tuning surfacing parameters. The substrate needs raw
+#     experience of what was surfaced and what resulted. Law 7 — no classification.
+#   How:  _last_surfaced_nodes cached in assemble. _deposit_surfacing_outcome()
+#     in afterTurn embeds Syl's response, deposits record_outcome per surfaced
+#     node with opaque target_id and metadata carrying text previews.
+#     Also renamed RPC param lastMessage → lastUserMessage for clarity
+#     (legacy fallback preserved for in-flight TS processes).
+# [2026-03-28] Claude Code Opus — Punchlist #109: Module autonomic pulse
+# What: Dispose becomes mode-swap, not destruction. Modules stay alive between conversations.
+# Why: #109 blocker — organs must persist between conversations. The process is already
+#   persistent (TS plugin dispose is a no-op). Modules just need to not be cleared.
+# How: handle_dispose() no longer clears _module_hooks or releases topology ownership.
+#   New fan-out methods signal conversation_started/ended to all modules.
+#   handle_bootstrap() signals conversation_started on re-bootstrap.
+# [2026-03-26] Claude Code (Opus 4.6) — OOM-resilient fan-out cache recovery
+# What: handle_after_turn accepts lastMessage param, recovers _cached_text
+#   if lost to process restart between ingest and afterTurn.
+# Why: Python process (9GB) gets OOM-killed between ingest and afterTurn.
+#   Fresh process has _cached_text=None, fan-out silently skips. All modules dark.
+# How: TS plugin caches last ingested message, passes it in afterTurn RPC call.
+#   Python side recovers text+embedding from param if cache is empty.
 # [2026-03-25] Claude Code (Opus 4.6) — Lenia FlowGraph integration
 # What: Initialize Lenia stack on bootstrap, competence/watchdog on afterTurn,
 #   clean shutdown on dispose. Dormant by default (kill switch off).
@@ -94,11 +120,15 @@ _memory: Optional[Any] = None
 # Experience tract — drains feeder deposits into the topology
 _tract: Optional[Any] = None
 
-# Module hook instances — loaded on bootstrap, called on afterTurn (#101)
-_module_hooks: Dict[str, Any] = {}
-_module_install_paths: Dict[str, str] = {}  # module_id -> install_path
+# Last ingested text+embedding — passed to topology delta for River distribution
+_ingest_text: Optional[str] = None
+_ingest_embedding: Optional[Any] = None  # np.ndarray
 _module_errors: Dict[str, str] = {}
 _module_error_times: Dict[str, float] = {}
+
+# Punchlist #56: Surfacing outcome cache — what was surfaced during assemble(),
+# deposited as raw experience in afterTurn() alongside Syl's response.
+_last_surfaced_nodes: List[Dict[str, Any]] = []
 
 # Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)
 _lenia_kill_switch: Optional[Any] = None
@@ -106,9 +136,6 @@ _lenia_engine: Optional[Any] = None
 _lenia_bridge: Optional[Any] = None
 _lenia_competence: Optional[Any] = None
 
-# Embedding cache — text + embedding from ingest, consumed in afterTurn
-_cached_text: Optional[str] = None
-_cached_embedding: Optional[Any] = None  # np.ndarray
 
 # Discord webhook for error surfacing (Law 5: env var is truth)
 _DISCORD_WEBHOOK = os.environ.get(
@@ -117,241 +144,236 @@ _DISCORD_WEBHOOK = os.environ.get(
     "vMJVb4-sbYjlDbAZakzo3DuGXmXCIbeibQuHFOIiF71lBY3kOdXybePbACj7lGb9GRRj",
 )
 
-# Modules to skip during fan-out loading
-_SKIP_MODULES = {"neurograph", "inference_difference"}
-
-# Generic package names that collide between modules (all use core/, pipelines/, etc.)
-_GENERIC_PREFIXES = ("core", "pipelines", "runtime", "surgery", "darwin", "sentinel_core")
 
 
-# ── Module Hook Loading ──────────────────────────────────────────────
+# ── Module Bootstrap ──────────────────────────────────────────────────
+# Organs of the organism. Each module is instantiated once at bootstrap.
+# Their __init__ starts autonomous pulse loops. No per-message fan-out —
+# modules read from River tracts on their own heartbeat.
+
+_module_instances: Dict[str, Any] = {}
 
 
-def _load_module_hooks() -> Dict[str, Any]:
-    """Discover and load module hooks from the ET module registry.
+def _bootstrap_modules() -> List[str]:
+    """Instantiate all registered module hooks.
 
-    Reads ~/.et_modules/registry.json, imports each module's hook file
-    via importlib (no sys.path pollution), and calls get_instance().
+    Reads ~/.et_modules/registry.json, imports each module's hook class,
+    and calls its constructor. The constructor starts the pulse loop.
+    That's it — the organ is alive and autonomous from this point.
 
-    Returns dict of module_id → hook instance for all successfully loaded modules.
+    Returns list of module IDs that successfully started.
     """
     registry_path = os.path.expanduser("~/.et_modules/registry.json")
     if not os.path.exists(registry_path):
         logger.warning("No module registry at %s", registry_path)
-        return {}
+        return []
 
-    try:
-        with open(registry_path) as f:
-            registry = json.load(f)
-    except Exception as exc:
-        logger.error("Failed to read module registry: %s", exc)
-        return {}
+    import json as _json
+    with open(registry_path) as f:
+        registry = _json.load(f)
 
-    hooks: Dict[str, Any] = {}
+    module_defs = registry.get("modules", {})
+    skip = {"neurograph", "inference_difference", "ecosystem_monitor"}
+    started = []
 
-    for reg_key, manifest in registry.get("modules", {}).items():
-        module_id = manifest.get("module_id") or reg_key
-        install_path = manifest.get("install_path", "")
-        entry_point = manifest.get("entry_point", "")
+    # Sort so elmer loads last (heaviest — transformer models)
+    modules = sorted(
+        module_defs.items(),
+        key=lambda x: (1 if x[0] == "elmer" else 0, x[0]),
+    )
 
-        if not install_path or not entry_point:
+    for module_id, meta in modules:
+        if module_id in skip:
             continue
-        if module_id in _SKIP_MODULES:
+
+        install_path = meta.get("install_path", "")
+        entry_point = meta.get("entry_point", "")
+        if not entry_point or not install_path:
+            logger.warning("Module %s: missing entry_point or install_path", module_id)
             continue
-
-        # Resolve hook file path — handle special cases
-        if module_id == "praxis":
-            # Registry says main.py but actual hook is core/praxis_hook.py
-            hook_file = os.path.join(install_path, "core", "praxis_hook.py")
-        else:
-            hook_file = os.path.join(install_path, entry_point)
-
+        hook_file = os.path.join(install_path, entry_point)
         if not os.path.exists(hook_file):
-            logger.warning("Hook file not found for %s: %s", module_id, hook_file)
+            logger.warning("Module %s: hook file not found (%s)", module_id, hook_file)
             continue
 
         try:
-            # Import via spec_from_file_location to avoid sys.path collisions
-            # between modules with identically-named vendored files
-            spec_name = f"_et_hook_{module_id}"
-            spec = importlib.util.spec_from_file_location(spec_name, hook_file)
-            if spec is None or spec.loader is None:
-                logger.warning("Cannot create import spec for %s: %s", module_id, hook_file)
-                continue
+            import importlib.util
 
-            # Module's own directory must be importable for relative imports
-            # (e.g., `from core.config import ElmerConfig`).
-            #
-            # Multiple modules use generic package names (core, core.config,
-            # pipelines, etc.). Without isolation, the second module to import
-            # `core.config` gets the first module's cached version from
-            # sys.modules.
-            #
-            # Strategy: before each import, stash existing generic packages
-            # from sys.modules. After import, rename the new module's
-            # generic packages to module-prefixed names and install import
-            # hooks so lazy imports still resolve. Then restore stashed ones.
-            module_dir = os.path.dirname(hook_file)
-            parent_dir = install_path
-            added_paths = []
-            for p in (module_dir, parent_dir):
-                if p and p not in sys.path:
-                    sys.path.insert(0, p)
-                    added_paths.append(p)
-
-            # Stash existing generic packages before this module's import
-            stashed: Dict[str, Any] = {}
+            # Namespace isolation: save sys.path, clear generic collisions
+            # Each module vendors core/, pipelines/, runtime/ — these collide.
+            _generic_prefixes = ("core", "pipelines", "runtime", "surgery", "openclaw_adapter", "ng_ecosystem", "ng_lite", "ng_embed", "ng_autonomic", "ng_peer_bridge", "ng_tract_bridge")
+            # Also clear module-specific packages that could collide
+            # (but NOT the module's own package — that breaks lazy imports)
+            path_snapshot = list(sys.path)
+            stashed = {}
             for mod_name in list(sys.modules.keys()):
-                for prefix in _GENERIC_PREFIXES:
-                    if mod_name == prefix or mod_name.startswith(prefix + "."):
+                for pfx in _generic_prefixes:
+                    if mod_name == pfx or mod_name.startswith(pfx + "."):
                         stashed[mod_name] = sys.modules.pop(mod_name)
                         break
 
-            try:
-                mod = importlib.util.module_from_spec(spec)
-                sys.modules[spec_name] = mod
-                spec.loader.exec_module(mod)
+            if install_path and install_path not in sys.path:
+                sys.path.insert(0, install_path)
 
-                # Get singleton instance — try module-level first, then
-                # look for classmethod on the first OpenClawAdapter subclass
-                get_inst = getattr(mod, "get_instance", None)
-                if get_inst is None:
-                    # Some modules (e.g., Elmer) use @classmethod get_instance
-                    # on the hook class instead of a module-level function
-                    for attr_name in dir(mod):
-                        attr = getattr(mod, attr_name, None)
-                        if (isinstance(attr, type)
-                                and hasattr(attr, "get_instance")
-                                and hasattr(attr, "_module_on_message")):
-                            get_inst = attr.get_instance
-                            break
-                if get_inst is None:
-                    logger.warning("No get_instance() in %s", hook_file)
-                    continue
+            spec_name = f"_mod_{module_id}"
+            spec = importlib.util.spec_from_file_location(spec_name, hook_file)
+            if spec is None:
+                logger.warning("Cannot create import spec for %s", module_id)
+                sys.path[:] = path_snapshot
+                sys.modules.update(stashed)
+                continue
 
-                instance = get_inst()
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec_name] = mod
+            logger.info("Loading %s: sys.path[0]=%s, core in sys.modules=%s",
+                        module_id, sys.path[0] if sys.path else "EMPTY",
+                        "core" in sys.modules)
+            spec.loader.exec_module(mod)
 
-                # Duck-type check
-                if not hasattr(instance, "_module_on_message"):
-                    logger.warning("No _module_on_message on %s instance", module_id)
-                    continue
-
-                hooks[module_id] = instance
-                _module_install_paths[module_id] = install_path
-                logger.info("Loaded module hook: %s", module_id)
-
-            finally:
-                # Rename this module's generic packages to module-prefixed
-                # names so they coexist. E.g., immunis's `core` becomes
-                # `_immunis_core` in sys.modules. Then alias the generic
-                # name back so lazy imports from this module still resolve.
-                # We do this BEFORE restoring stashed entries.
-                new_generics: Dict[str, Any] = {}
-                for mod_name in list(sys.modules.keys()):
-                    if mod_name in stashed or mod_name == spec_name:
-                        continue
-                    for prefix in _GENERIC_PREFIXES:
-                        if mod_name == prefix or mod_name.startswith(prefix + "."):
-                            new_generics[mod_name] = sys.modules.pop(mod_name)
-                            break
-
-                # Store under prefixed names for this module
-                for mod_name, mod_obj in new_generics.items():
-                    prefixed = f"_{module_id}_{mod_name}"
-                    sys.modules[prefixed] = mod_obj
-
-                # Restore stashed generic packages from prior modules
-                for mod_name, mod_obj in stashed.items():
-                    sys.modules[mod_name] = mod_obj
-
-                # Remove added paths to keep sys.path clean for next module
-                for p in added_paths:
-                    try:
-                        sys.path.remove(p)
-                    except ValueError:
-                        pass
-
-        except Exception as exc:
-            error_msg = f"{type(exc).__name__}: {exc}"
-            logger.error("Failed to load module hook %s: %s", module_id, error_msg)
-            _discord_alert(module_id, f"Hook load failed: {error_msg}")
-
-    return hooks
-
-
-def _fan_out_to_modules() -> None:
-    """Invoke each loaded module's _module_on_message with cached text + embedding.
-
-    Called from handle_after_turn() after all NG processing completes.
-    Each module call is error-isolated — one crash cannot take down the pipeline.
-
-    Before each call, the module's install_path is temporarily prepended to
-    sys.path and generic packages (core.*, etc.) are cleared from sys.modules.
-    This ensures lazy imports inside _module_on_message resolve to the correct
-    module's own packages.
-    """
-    global _cached_text, _cached_embedding
-
-    if not _module_hooks or not _cached_text:
-        try:
-            with open("/tmp/fanout_debug.log", "a") as _dbg:
-                from datetime import datetime
-                _dbg.write(f"[{datetime.now()}] FANOUT SKIPPED: hooks={len(_module_hooks)}, cached_text={'SET' if _cached_text else 'NONE'}\n")
-        except Exception:
-            pass
-        return
-
-    text = _cached_text
-    embedding = _cached_embedding
-
-    try:
-        with open("/tmp/fanout_debug.log", "a") as _dbg:
-            from datetime import datetime
-            _dbg.write(f"[{datetime.now()}] FANOUT FIRING: hooks={len(_module_hooks)}, modules={list(_module_hooks.keys())}, text_len={len(text)}\n")
-    except Exception:
-        pass
-
-    # Clear cache — consumed
-    _cached_text = None
-    _cached_embedding = None
-
-    for module_id, hook in _module_hooks.items():
-        # Set up sys.path for this module's lazy imports
-        install_path = _module_install_paths.get(module_id, "")
-        if install_path and install_path not in sys.path:
-            sys.path.insert(0, install_path)
-
-        # Clear generic packages so lazy imports resolve to this module
-        for mod_name in list(sys.modules.keys()):
-            for prefix in _GENERIC_PREFIXES:
-                if mod_name == prefix or mod_name.startswith(prefix + "."):
-                    sys.modules.pop(mod_name, None)
+            # Find the hook class
+            instance = None
+            for attr_name in dir(mod):
+                attr = getattr(mod, attr_name)
+                if (isinstance(attr, type)
+                        and attr_name != "OpenClawAdapter"
+                        and hasattr(attr, "MODULE_ID")
+                        and hasattr(attr, "_module_on_message")):
+                    instance = attr()
                     break
 
-        try:
-            hook._module_on_message(text, embedding)
+            if instance is None:
+                logger.warning("Module %s: no hook class found in %s", module_id, hook_file)
+                continue
+
+            _module_instances[module_id] = instance
+            started.append(module_id)
+            logger.info("Loaded module hook: %s", module_id)
+
         except Exception as exc:
-            _handle_module_error(module_id, exc)
+            logger.warning("Module %s failed to load: %s", module_id, exc)
         finally:
-            if install_path:
-                try:
-                    sys.path.remove(install_path)
-                except ValueError:
-                    pass
+            # Pin this module's generic imports so they survive cleanup
+            for mod_name in list(sys.modules.keys()):
+                for pfx in _generic_prefixes:
+                    if mod_name == pfx or mod_name.startswith(pfx + "."):
+                        sys.modules[f"_{module_id}_{mod_name}"] = sys.modules[mod_name]
+                        break
+
+            # Clean up generic names for next module
+            for mod_name in list(sys.modules.keys()):
+                for pfx in _generic_prefixes:
+                    if mod_name == pfx or mod_name.startswith(pfx + "."):
+                        sys.modules.pop(mod_name, None)
+                        break
+
+            # Restore path and stashed generics
+            sys.path[:] = path_snapshot
+            for mod_name, mod_obj in stashed.items():
+                if mod_name not in sys.modules:
+                    sys.modules[mod_name] = mod_obj
+
+    return started
 
 
-def _handle_module_error(module_id: str, exc: Exception) -> None:
-    """Log module error and surface to Discord (throttled)."""
-    error_msg = f"{type(exc).__name__}: {exc}"
-    _module_errors[module_id] = error_msg
-    logger.warning("Module hook %s failed: %s", module_id, error_msg)
+def _deposit_topology_delta(step_result, text: str = None, embedding = None) -> None:
+    """Extract topology delta and deposit to all module tracts (River Tier 3).
 
-    # Throttled Discord alert — max one per module per 5 minutes
-    now = time.time()
-    last = _module_error_times.get(module_id, 0)
-    if now - last > 300:
-        _module_error_times[module_id] = now
-        _discord_alert(module_id, error_msg)
+    #119: BTF binary deposit via Rust (zero-copy). No JSONL fallback.
+    """
+    if _memory is None:
+        return
+    peer_bridge = getattr(_memory, '_peer_bridge', None)
+    if peer_bridge is None:
+        return
+    try:
+        import ng_tract
+        tract_paths = [
+            str(peer_bridge._module_dir / f"{pid}.tract")
+            for pid in peer_bridge._get_registered_peers()
+        ]
+        ng_tract.deposit_topology(
+            step_result, _memory.graph, _memory.vector_db, tract_paths,
+        )
+    except Exception as exc:
+        logger.debug("BTF topology deposit failed: %s", exc)
+
+
+def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str]) -> None:
+    """Deposit raw surfacing outcome experience to the substrate (Punchlist #56).
+
+    Records the complete turn triad as raw experience:
+    - Which nodes were surfaced during assemble (cached in _last_surfaced_nodes)
+    - What the user said (user_text from ingest cache)
+    - What Syl said in response (lastAssistantMessage from TS plugin)
+
+    No classification. The substrate sees: "these nodes were in the context
+    window when this input/output pair happened." Elmer learns what surfacing
+    patterns correlate with coherent responses via the River.
+
+    Each surfaced node gets a record_outcome with its own embedding and
+    opaque metadata containing text previews of the turn. The substrate's
+    Hebbian dynamics handle the rest.
+    """
+    global _last_surfaced_nodes
+
+    if _memory is None or not _last_surfaced_nodes:
+        return
+
+    # Extract Syl's response text
+    syl_text = None
+    if params.get("lastAssistantMessage"):
+        syl_text = _extract_message_text(params["lastAssistantMessage"])
+
+    if not syl_text or not syl_text.strip():
+        _last_surfaced_nodes = []
+        return  # No response to record outcome against
+
+    peer_bridge = getattr(_memory, '_peer_bridge', None)
+    if peer_bridge is None:
+        _last_surfaced_nodes = []
+        return
+
+    try:
+        from ng_embed import embed
+
+        # Embed Syl's response — this is the outcome of the surfacing
+        syl_embedding = embed(syl_text)
+
+        for node_info in _last_surfaced_nodes:
+            node_id = node_info["node_id"]
+
+            # Get the node's existing embedding from the vector DB
+            db_entry = _memory.vector_db.get(node_id)
+            if db_entry is None:
+                continue
+            node_embedding = db_entry.get("embedding")
+            if node_embedding is None:
+                continue
+
+            # Deposit raw experience: this node was surfaced during this turn.
+            # target_id is opaque — just marks it as a surfacing event.
+            # metadata carries the raw context without classification.
+            peer_bridge.record_outcome(
+                embedding=node_embedding,
+                target_id=f"surfacing:{node_id}",
+                success=True,
+                module_id="neurograph",
+                metadata={
+                    "surfacing_source": node_info.get("source", "unknown"),
+                    "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
+                    "user_text_preview": (user_text or "")[:200],
+                    "syl_response_preview": syl_text[:200],
+                },
+            )
+
+        logger.debug(
+            "Surfacing outcome deposited: %d nodes, syl_response=%d chars",
+            len(_last_surfaced_nodes), len(syl_text),
+        )
+    except Exception as exc:
+        logger.debug("Surfacing outcome deposit failed: %s", exc)
+    finally:
+        _last_surfaced_nodes = []
 
 
 def _discord_alert(module_id: str, error_msg: str) -> None:
@@ -382,7 +404,6 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     global _memory, _tract
 
     if _memory is not None:
-        # Already bootstrapped — just confirm
         return {"bootstrapped": True, "reason": "already_initialized"}
 
     # Auto-update before loading anything else
@@ -393,7 +414,7 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
 
     import topology_owner
     from openclaw_hook import NeuroGraphMemory
-    from ng_tract import ExperienceTract
+    from ng_experience_tract import ExperienceTract
 
     # Claim topology ownership — we are the sole writer to main.msgpack.
     # If another process (GUI, standalone ingestor) already owns it,
@@ -413,9 +434,9 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     _memory = NeuroGraphMemory.get_instance()
     _tract = ExperienceTract()
 
-    # Load module hooks for fan-out (#101)
-    global _module_hooks
-    _module_hooks = _load_module_hooks()
+    # Wake the organs — each module's __init__ starts its pulse loop
+    started_modules = _bootstrap_modules()
+
 
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
     global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
@@ -472,17 +493,23 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     tract_stats = _tract.stats()
     logger.info(
         "Bootstrapped: %d nodes, %d synapses, %d hyperedges, timestep %d, "
-        "tract pending: %d, module hooks: %s",
+        "tract pending: %d, modules: %s",
         stats["nodes"],
         stats["synapses"],
         stats["hyperedges"],
         stats["timestep"],
         tract_stats["pending"],
-        list(_module_hooks.keys()),
+        started_modules,
     )
 
-    # Start afterTurn HTTP sidecar (once, on first bootstrap)
     _start_http_sidecar(8850)
+
+    # #109: Shared graph lock for thread safety.
+    # Pulse loops (via NGSaaSBridge) and the Tonic both access graph
+    # internals concurrently. This RLock serializes access.
+    # Attached to graph object so both bridge and engine can find it.
+    import threading as _thr
+    _memory.graph._concurrent_lock = _thr.RLock()
 
     # The Tonic: conversation starting — language tokens about to flow
     if _memory._tonic_thread is not None:
@@ -497,7 +524,7 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         "synapses": stats["synapses"],
         "timestep": stats["timestep"],
         "tract_pending": tract_stats["pending"],
-        "module_hooks": list(_module_hooks.keys()),
+
         "tonic": _memory._tonic_thread.status if _memory._tonic_thread else None,
     }
 
@@ -532,14 +559,15 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
         "source": "context_engine",
     })
 
-    # Cache text + embedding for module fan-out in afterTurn (#101)
-    global _cached_text, _cached_embedding
-    _cached_text = text
+    # Cache text + embedding for topology delta deposit in afterTurn
+    global _ingest_text, _ingest_embedding
+    _ingest_text = text
+
     try:
         from ng_embed import embed
-        _cached_embedding = embed(text)
+        _ingest_embedding = embed(text)
     except Exception:
-        _cached_embedding = None
+        _ingest_embedding = None
 
     return {"ingested": True}
 
@@ -579,6 +607,25 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("Tonic assembly error: %s", exc)
 
+    # Punchlist #56: Cache what was surfaced for outcome deposit in afterTurn.
+    # Raw node IDs + scores — no classification, just what went into the bucket.
+    global _last_surfaced_nodes
+    _last_surfaced_nodes = []
+    for item in surfaced[:7]:  # Match the cap used in formatting
+        if item.get("node_id"):
+            _last_surfaced_nodes.append({
+                "node_id": item["node_id"],
+                "strength": item.get("strength", 0),
+                "source": "spreading_activation",
+            })
+    for item in ces_surfaced[:3]:
+        if item.get("node_id"):
+            _last_surfaced_nodes.append({
+                "node_id": item["node_id"],
+                "score": item.get("score", 0),
+                "source": "ces",
+            })
+
     # Format as context block for the system prompt
     context_block = _format_substrate_context(surfaced, ces_surfaced, latent_context)
 
@@ -594,15 +641,24 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     happens here because a conversation turn just completed, not on
     a timer.  No polling.
     """
-    try:
-        with open("/tmp/fanout_debug.log", "a") as _dbg:
-            from datetime import datetime
-            _dbg.write(f"[{datetime.now()}] handle_after_turn ENTERED: _memory={'SET' if _memory else 'NONE'}\n")
-    except Exception:
-        pass
-
     if _memory is None:
         return
+
+    # Recover fan-out cache if lost to process restart (OOM resilience).
+    # The TS plugin passes lastUserMessage so the fan-out doesn't depend on
+    # in-memory state surviving between ingest and afterTurn calls.
+    global _ingest_text, _ingest_embedding
+    last_user = params.get("lastUserMessage") or params.get("lastMessage")  # legacy fallback
+    if _ingest_text is None and last_user:
+        recovered = _extract_message_text(last_user)
+        if recovered and recovered.strip():
+            _ingest_text = recovered
+            try:
+                from ng_embed import embed
+                _ingest_embedding = embed(recovered)
+            except Exception:
+                _ingest_embedding = None
+            logger.info("Recovered fan-out text from afterTurn params (%d chars)", len(recovered))
 
     # Drain the experience tract — absorb feeder deposits
     if _tract is not None:
@@ -618,6 +674,23 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # CES surfacing monitor — scan fired nodes
     if _memory._surfacing_monitor is not None:
         _memory._surfacing_monitor.after_step(step_result)
+
+    # River-based Tier 3: deposit raw topology delta to all module tracts.
+    # The delta contains fired nodes with causal context, hyperedge activations,
+    # prediction results, structural changes, and salience signals. Raw,
+    # unclassified (Law 7). Each module's bucket extracts what it needs.
+    _deposit_topology_delta(step_result, text=_ingest_text, embedding=_ingest_embedding)
+
+    # Punchlist #56: Deposit raw surfacing outcome experience.
+    # The triad: what was surfaced (cached from assemble) + user input
+    # (cached from ingest) + Syl's response (from TS plugin).
+    # No classification — just the raw facts. The substrate learns
+    # the correlation between surfaced context and what Syl produced.
+    _deposit_surfacing_outcome(params, _ingest_text)
+
+    # Clear after deposit — consumed
+    _ingest_text = None
+    _ingest_embedding = None
 
     # Novelty probation
     _memory.ingestor.update_probation()
@@ -640,8 +713,6 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
         except Exception:
             logger.exception("Lenia post-step update failed")
 
-    # Fan-out to module hooks — cortex coordinating organs (#101)
-    _fan_out_to_modules()
 
 
 def _drain_tract() -> None:
@@ -915,34 +986,14 @@ def handle_dispose(params: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-    # Lenia FlowGraph — stop engine, preserve field state in mmap
-    if _lenia_kill_switch is not None and _lenia_kill_switch.enabled:
-        try:
-            _lenia_kill_switch.disable(reason="dispose")
-        except Exception:
-            logger.exception("Lenia shutdown failed")
+    # Lenia FlowGraph — #109: stays running between conversations.
+    # Dispose is subtraction, not destruction. Field dynamics continue.
 
     _memory.save()
     logger.info("Final save on dispose")
 
-    if _memory._ces_monitor is not None:
-        try:
-            _memory._ces_monitor.stop()
-        except Exception:
-            pass
-
-    # Release topology ownership so other processes can claim it
-    try:
-        import topology_owner
-        topology_owner.release()
-    except Exception:
-        pass
-
-    # Clean up module hooks (#101)
-    global _module_hooks, _cached_text, _cached_embedding
-    _module_hooks.clear()
-    _cached_text = None
-    _cached_embedding = None
+    # Modules run autonomously via pulse loops.
+    # No fan-out to clean up — modules read from River tracts.
 
 
 def handle_stats(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -951,7 +1002,7 @@ def handle_stats(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "not_bootstrapped"}
     stats = _memory.stats()
     stats["module_hooks"] = {
-        "loaded": list(_module_hooks.keys()),
+        "loaded": [],  # modules are autonomous, no fan-out registry
         "errors": dict(_module_errors),
     }
     return stats
@@ -1010,17 +1061,23 @@ def _format_substrate_context(
 ) -> Optional[str]:
     """Format surfaced knowledge into a system prompt context block.
 
-    Returns None if nothing was surfaced — no empty blocks injected.
-    The latent thread (The Tonic) is always included when available —
+    Always returns at minimum a temporal anchor so Syl knows when she is.
+    The latent thread (The Tonic) is included when available —
     it is the persistent slot that never gets evicted.
     """
     has_surfaced = bool(surfaced) or bool(ces_surfaced)
     has_latent = latent_context is not None
+    # Temporal anchor is always emitted — even empty substrate turns need it.
 
-    if not has_surfaced and not has_latent:
-        return None
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    temporal_anchor = f"**Temporal anchor:** {now.strftime('%A, %Y-%m-%d %H:%M UTC')}"
 
     lines = []
+
+    # Temporal grounding — always first so Syl knows when she is.
+    lines.append(temporal_anchor)
+    lines.append("")
 
     # The Tonic's latent thread comes first — it is the baseline.
     # Conversation context is the event on top of it.
@@ -1054,6 +1111,7 @@ def _format_substrate_context(
     return "\n".join(lines)
 
 
+
 # ── HTTP Sidecar — afterTurn bypass ──────────────────────────────────
 # [2026-03-26] Claude Code (Opus 4.6) — afterTurn HTTP trigger
 # What: Lightweight HTTP listener on port 8850 for direct afterTurn calls.
@@ -1062,29 +1120,24 @@ def _format_substrate_context(
 # How:  Background thread runs http.server on 127.0.0.1:8850.
 #       POST /afterTurn triggers handle_after_turn + fan-out.
 #       GET /status returns hook count and last fire time.
-#       TS plugin calls this after each turn instead of waiting for OC.
 
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 _last_afterturn_fire: Optional[str] = None
+_sidecar_started = False
 
 
 class _AfterTurnHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler for afterTurn bypass."""
-
     def do_POST(self):
         global _last_afterturn_fire
         if self.path == "/afterTurn":
             try:
-                # Read body if present
                 content_len = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_len) if content_len else b"{}"
                 params = json.loads(body) if body else {}
-
                 handle_after_turn(params)
                 _last_afterturn_fire = __import__("datetime").datetime.now().isoformat()
-
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1094,6 +1147,26 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"ok": False, "error": str(exc)}).encode())
+        elif self.path == "/recall":
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len) if content_len else b"{}"
+                params = json.loads(body) if body else {}
+                query = params.get("query", "")
+                k = int(params.get("k", 5))
+                threshold = float(params.get("threshold", 0.45))
+                results = []
+                if query and _memory is not None:
+                    results = _memory.recall(query, k=k, threshold=threshold)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"results": results}).encode())
+            except Exception as exc:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"results": [], "error": str(exc)}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -1104,30 +1177,86 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "hooks_loaded": len(_module_hooks),
-                "modules": list(_module_hooks.keys()),
-                "cached_text": "SET" if _cached_text else None,
+                "hooks_loaded": 0,  # fan-out removed — modules autonomous
                 "last_afterturn": _last_afterturn_fire,
             }).encode())
+        elif self.path.startswith('/bunyan/'):
+            self._handle_bunyan()
         else:
             self.send_response(404)
             self.end_headers()
 
+    def _handle_bunyan(self):
+        """Bunyan user bucket — extraction from the live substrate."""
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        q = qs.get('q', [''])[0]
+
+        hook = None  # TODO: bunyan sidecar needs direct import if still needed
+        if hook is None:
+            self._json_response(503, {'error': 'Bunyan not loaded'})
+            return
+        if not q:
+            self._json_response(400, {'error': 'Missing q parameter'})
+            return
+
+        try:
+            if parsed.path == '/bunyan/query':
+                depth = int(qs.get('depth', [0])[0]) or None
+                k = int(qs.get('k', [0])[0]) or None
+                result = hook.query_story(q, max_depth=depth, similar_k=k)
+                if result is None:
+                    self._json_response(200, {'narrative': None, 'message': 'No matching events in substrate'})
+                else:
+                    self._json_response(200, result)
+            elif parsed.path == '/bunyan/similar':
+                k = int(qs.get('k', [5])[0])
+                result = hook.find_similar_events(q, k=k)
+                self._json_response(200, {'events': result})
+            elif parsed.path == '/bunyan/recall':
+                k = int(qs.get('k', [5])[0])
+                threshold = float(qs.get('threshold', [0.5])[0])
+                if _memory is None:
+                    self._json_response(503, {'error': 'NeuroGraph not bootstrapped'})
+                    return
+                result = _memory.recall(q, k=k, threshold=threshold)
+                self._json_response(200, {'results': result})
+            elif parsed.path == '/bunyan/associate':
+                k = int(qs.get('k', [10])[0])
+                steps = int(qs.get('steps', [3])[0])
+                if _memory is None:
+                    self._json_response(503, {'error': 'NeuroGraph not bootstrapped'})
+                    return
+                result = _memory.associate(q, k=k, steps=steps)
+                self._json_response(200, {'associations': result})
+            else:
+                self._json_response(404, {'error': 'Unknown bunyan endpoint'})
+        except Exception as exc:
+            self._json_response(500, {'error': str(exc)})
+
+    def _json_response(self, code, data):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, default=str).encode())
+
     def log_message(self, format, *args):
-        """Suppress default request logging."""
         pass
 
 
 def _start_http_sidecar(port: int = 8850) -> None:
-    """Start the afterTurn HTTP sidecar in a background thread."""
+    global _sidecar_started
+    if _sidecar_started:
+        return
     try:
         server = HTTPServer(("127.0.0.1", port), _AfterTurnHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        _sidecar_started = True
         logger.info("afterTurn HTTP sidecar listening on 127.0.0.1:%d", port)
     except Exception as exc:
         logger.error("Failed to start afterTurn sidecar: %s", exc)
-
 
 # ── JSON-RPC Server ───────────────────────────────────────────────────
 
@@ -1185,9 +1314,6 @@ def main() -> None:
     """Main RPC loop — read requests from stdin, write responses to stdout."""
     logger.info("NeuroGraph RPC bridge starting")
 
-    # Start afterTurn HTTP sidecar — bypasses OC's broken afterTurn lifecycle
-    _start_http_sidecar(8850)
-
     # Signal readiness to the TypeScript plugin
     ready_msg = json.dumps({
         "jsonrpc": "2.0",
@@ -1197,15 +1323,87 @@ def main() -> None:
     sys.stdout.write(ready_msg + "\n")
     sys.stdout.flush()
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    # Self-bootstrap on startup — the organism is born when the process
+    # starts, not when the first message arrives.  OpenClaw's bootstrap
+    # RPC will hit the "already_initialized" guard and mode-swap.
+    #
+    # Runs in a background thread because module loading produces hundreds
+    # of log lines to stderr. If bootstrap runs synchronously before the
+    # stdin loop, the 64KB OS pipe buffer fills before the TS plugin can
+    # drain it, and the Python process blocks on write. Background thread
+    # lets the stdin loop start immediately so the pipe stays drained.
+    # Force-clean any stale sentinel from a previous process BEFORE
+    # starting the bootstrap thread. This runs synchronously — it's a
+    # single file check, no log output, no pipe risk. Must happen before
+    # anything calls handle_bootstrap() (self-bootstrap thread OR TS
+    # plugin RPC) so the sentinel is gone before either path checks it.
+    try:
+        import signal as _signal
+        import topology_owner
+        sentinel = topology_owner._sentinel_path()
+        if sentinel.exists():
+            existing_pid = int(sentinel.read_text().strip())
+            if existing_pid != os.getpid():
+                sentinel.unlink(missing_ok=True)
+                logger.info("Cleared stale sentinel (PID %d) on startup", existing_pid)
+                # Kill the stale process so it releases port 8850 and any
+                # other resources before the new process tries to bind them.
+                try:
+                    os.kill(existing_pid, _signal.SIGTERM)
+                    import time as _time
+                    _time.sleep(1.5)  # brief grace period for clean exit
+                except ProcessLookupError:
+                    pass  # already dead — nothing to do
+                except Exception as _ke:
+                    logger.debug("Could not terminate stale process %d: %s", existing_pid, _ke)
+    except Exception:
+        pass
 
-        response = process_request(line)
-        if response is not None:
-            sys.stdout.write(response + "\n")
-            sys.stdout.flush()
+    def _self_bootstrap():
+        try:
+            result = handle_bootstrap({"sessionId": "auto-startup"})
+            logger.info("Self-bootstrap: %s", result)
+        except Exception as exc:
+            logger.error("Self-bootstrap failed: %s — will retry on first RPC", exc)
+
+    import threading
+    threading.Thread(target=_self_bootstrap, name="self-bootstrap", daemon=True).start()
+
+    # Main RPC loop. If stdin closes (TS plugin context recycled),
+    # keep the process alive — daemon threads (Tonic, pulse loops,
+    # Lenia dynamics) ARE the organism. Reconnect when stdin reopens.
+    import select
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                # stdin closed — TS plugin context may have recycled.
+                # Keep process alive for daemon threads. Sleep and retry.
+                logger.info("stdin closed — organism staying alive (daemon threads active)")
+                import time as _t
+                while True:
+                    _t.sleep(60)
+                    # Check if we should actually exit (systemd stop)
+                    if not threading.main_thread().is_alive():
+                        break
+                break
+            line = line.strip()
+            if not line:
+                continue
+            response = process_request(line)
+            if response is not None:
+                sys.stdout.write(response + "\n")
+                sys.stdout.flush()
+        except (BrokenPipeError, IOError):
+            logger.info("stdin pipe broken — organism staying alive")
+            import time as _t
+            while True:
+                _t.sleep(60)
+                if not threading.main_thread().is_alive():
+                    break
+            break
+        except KeyboardInterrupt:
+            break
 
     logger.info("NeuroGraph RPC bridge shutting down")
 
