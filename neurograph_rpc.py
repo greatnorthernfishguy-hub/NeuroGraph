@@ -12,6 +12,12 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-12] Claude Code (Opus 4.6) — Time-based auto-save fallback
+#   What: Auto-save now fires on 5-minute interval in addition to every-10-messages.
+#   Why:  _message_count resets to 0 on every gateway restart. With frequent restarts
+#         (8+/day), the count never reached 10 — checkpoint hadn't been saved since
+#         April 6 (6 days). All substrate learning lost on each restart.
+#   How:  _last_save_time tracks wall clock. afterTurn checks both count and time.
 # [2026-04-12] Claude Code (Opus 4.6) — River backflow: drain inbound peer tracts
 #   What: _drain_peer_tracts() absorbs organ experience into Tier 3 Graph.
 #     Uses pre-computed embeddings from source modules (skip re-embedding).
@@ -139,6 +145,11 @@ _module_error_times: Dict[str, float] = {}
 # Punchlist #56: Surfacing outcome cache — what was surfaced during assemble(),
 # deposited as raw experience in afterTurn() alongside Syl's response.
 _last_surfaced_nodes: List[Dict[str, Any]] = []
+
+# Time-based auto-save fallback — _message_count resets on restart,
+# so count-based auto-save never fires if the gateway restarts frequently.
+_last_save_time: float = 0.0
+_SAVE_INTERVAL_SECS: float = 300.0  # 5 minutes
 
 # Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)
 _lenia_kill_switch: Optional[Any] = None
@@ -742,10 +753,24 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # Novelty probation
     _memory.ingestor.update_probation()
 
-    # Auto-save (every 10 messages, matching existing interval)
-    if _memory._message_count > 0 and _memory._message_count % _memory.auto_save_interval == 0:
+    # Auto-save: count-based (every 10 messages) OR time-based (every 5 min).
+    # _message_count resets on restart, so without the time fallback,
+    # frequent restarts prevent checkpoints from ever being written.
+    global _last_save_time
+    now = time.time()
+    count_trigger = (
+        _memory._message_count > 0
+        and _memory._message_count % _memory.auto_save_interval == 0
+    )
+    time_trigger = (now - _last_save_time) >= _SAVE_INTERVAL_SECS
+    if count_trigger or time_trigger:
         _memory.save()
-        logger.info("Auto-save at message %d", _memory._message_count)
+        _last_save_time = now
+        logger.info(
+            "Auto-save at message %d (%s)",
+            _memory._message_count,
+            "count" if count_trigger else "time",
+        )
 
     # Lenia FlowGraph — post-step competence update and energy watchdog
     if _lenia_kill_switch is not None and _lenia_kill_switch.enabled:
