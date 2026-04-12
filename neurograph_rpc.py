@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-12] Claude Code (Opus 4.6) — River backflow: drain inbound peer tracts
+#   What: _drain_peer_tracts() absorbs organ experience into Tier 3 Graph.
+#     Uses pre-computed embeddings from source modules (skip re-embedding).
+#     Called in afterTurn alongside feeder tract drain. 50 events/cycle cap.
+#   Why:  River was one-directional — NG deposited to modules but never drained
+#     their tracts back. Organs were talking; cortex wasn't listening. Elmer's
+#     tuning, Immunis's observations, all stopped at the tract file boundary.
+#   How:  bridge._drain_all() populates peer cache, new events registered via
+#     ingestor.registrar + associator with pre-computed embeddings. Cursor
+#     tracks position to avoid reprocessing. Law 7 — raw experience in.
 # [2026-04-08] Claude Code (Opus 4.6) — Punchlist #56: Surfacing outcome deposit
 #   What: Cache surfaced node IDs during handle_assemble(), deposit raw turn
 #     triad (surfaced nodes + user input + Syl's response) in handle_after_turn().
@@ -698,6 +708,9 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     if _tract is not None:
         _drain_tract()
 
+    # Drain inbound peer module tracts — River backflow
+    _drain_peer_tracts()
+
     # SNN learning step — STDP, structural plasticity, predictions
     step_result = _memory.graph.step()
 
@@ -786,6 +799,77 @@ def _drain_tract() -> None:
             )
         except Exception as exc:
             logger.warning("Tract drain entry failed (%s): %s", source, exc)
+
+
+# River backflow cursor — tracks position in _peer_events cache
+_peer_drain_cursor: int = 0
+
+def _drain_peer_tracts() -> None:
+    """Drain inbound peer module tracts into the Tier 3 topology.
+
+    Closes the River backflow circuit: organ modules deposit experience
+    to their tracts, this function drains and absorbs them into the
+    Tier 3 Graph. Uses pre-computed embeddings from the source module
+    when available (skips re-embedding). Falls back to full ingestor
+    pipeline for events without embeddings.
+
+    Raw experience in, no classification (Law 7).
+    """
+    global _peer_drain_cursor
+    if _memory is None:
+        return
+    bridge = getattr(_memory, '_peer_bridge', None)
+    if bridge is None:
+        return
+
+    bridge._drain_all()
+
+    total = len(bridge._peer_events)
+    if total == 0:
+        return
+
+    # Handle list trimming (max 500) — reset cursor if list shrank
+    if total < _peer_drain_cursor:
+        _peer_drain_cursor = 0
+
+    new_events = bridge._peer_events[_peer_drain_cursor:]
+    if not new_events:
+        return
+    _peer_drain_cursor = total
+
+    MAX_PER_CYCLE = 50
+    ingested = 0
+
+    for event in new_events[:MAX_PER_CYCLE]:
+        target = bridge._get_target_id(event)
+        module_id = bridge._get_module_id(event)
+        if not target or target == "unknown":
+            continue
+
+        try:
+            embedding = bridge._get_embedding(event)
+            if embedding is not None and len(embedding) > 0:
+                from universal_ingestor import Chunk, EmbeddedChunk
+                chunk = Chunk(
+                    text=target,
+                    metadata={"source_module": module_id, "river_backflow": True},
+                    token_count=max(1, len(target.split())),
+                )
+                ec = EmbeddedChunk(chunk=chunk, vector=embedding)
+                node_ids = _memory.ingestor.registrar.register(
+                    [ec], {"source": f"river:{module_id}", "source_type": "PEER_TRACT"},
+                )
+                _memory.ingestor.associator.associate(
+                    [ec], node_ids, _memory.vector_db,
+                )
+            else:
+                _memory.ingestor.ingest(target)
+            ingested += 1
+        except Exception as exc:
+            logger.debug("River backflow entry failed (%s): %s", module_id, exc)
+
+    if ingested:
+        logger.info("River backflow: %d peer events absorbed into Tier 3", ingested)
 
 
 def handle_compact(params: Dict[str, Any]) -> Dict[str, Any]:
