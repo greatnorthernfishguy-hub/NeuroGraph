@@ -28,6 +28,13 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-04-12] Claude Code (Opus 4.6) — Fix stale checkpoint config overwriting code tuning
+#   What: Re-apply snn_config after graph.restore() so Mar 24 tuning survives checkpoint
+#   Why:  _deserialize() overwrites config from saved checkpoint, which contained
+#         pre-tuning values (threshold 1.0, decay 0.95). Substrate was running 17%
+#         harder threshold and 40% faster decay than intended since last restart.
+#   How:  graph.config.update(snn_config) after restore(). Code defaults always win
+#         over checkpoint-saved config. Per-node learned thresholds are unaffected.
 # [2026-03-24] Claude Code (Opus 4.6) — The Tonic: latent thread integration
 #   What: Replaced SylDaemon init with TonicThread. Ouroboros cycle runs
 #     on every on_message() before ingestion. Tonic status in stats().
@@ -357,6 +364,9 @@ class NeuroGraphMemory:
         if self._checkpoint_path.exists():
             try:
                 self.graph.restore(str(self._checkpoint_path))
+                # Re-apply code config over stale checkpoint config —
+                # restore() deserializes saved config which may predate tuning
+                self.graph.config.update(snn_config)
                 logger.info(
                     "Restored graph from %s (%d nodes, %d synapses)",
                     self._checkpoint_path,
