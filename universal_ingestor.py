@@ -38,6 +38,19 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-04-13] Claude (Sonnet 4.6) — Migrate embedding backend from fastembed to ng_embed
+#   What: Replaced _try_load_fastembed() with _try_load_ng_embed(). EmbeddingEngine
+#         now uses ng_embed.NGEmbed singleton (ONNX Runtime, Snowflake arctic-embed-m-v1.5,
+#         768-dim) instead of fastembed (BAAI/bge-base-en-v1.5, 384-dim, not installed).
+#   Why:  fastembed is not installed on the laptop CC instance; ng_embed.py is the
+#         ecosystem-wide ONNX embedding engine built specifically so no external
+#         embedding service (Ollama, HF Inference) is needed. Also unifies the
+#         embedding system — one ONNX backend, one model, everywhere. fastembed was
+#         always an intermediate solution after sentence-transformers was removed.
+#   How:  _try_load_fastembed() → _try_load_ng_embed() using NGEmbed.get_instance().
+#         Model lazy-loads on first embed() call (singleton, thread-safe).
+#         _encode_batch() updated to call self._ng_embed.embed_batch(texts).
+#         self.dimension set to 768 explicitly (ng_embed always produces 768-dim).
 # [2026-03-25] Claude Code (Opus 4.6) — Code def weight from config (SVG Phase 3)
 #   What: Hardcoded 0.4 dampening multiplier for code def→usage synapses now
 #         reads from config as code_def_weight (default 0.4).
@@ -1601,7 +1614,7 @@ class EmbeddingEngine:
         self.use_model = self.config.get("use_model", True)
         self.device = self.config.get("device", "auto")
         self._model = None
-        self._fe_model = None  # fastembed TextEmbedding instance
+        self._ng_embed = None  # NGEmbed singleton instance
         self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._model_available = False
         self._active_device: Optional[str] = None  # actual device after resolution
@@ -1691,57 +1704,45 @@ class EmbeddingEngine:
             warnings.filterwarnings("ignore", message=pattern)
 
     def _try_load_model(self) -> None:
-        """Attempt to load the sentence-transformers model.
+        """Load the embedding backend (ng_embed ONNX singleton).
 
-        Suppresses API key warnings from inference providers (OpenAI, Google,
-        Voyage) that were added in sentence-transformers v5+ / transformers v5+.
-        NeuroGraph uses local torch-based embeddings only — no external API
-        keys are needed.
-
+        ng_embed.py is the ecosystem-wide embedding engine — ONNX Runtime,
+        Snowflake arctic-embed-m-v1.5, 768-dim, no external service required.
         Logs the outcome so silent failures are visible to operators.
         """
-        # fastembed (ONNX Runtime, no torch dependency) is the only
-        # real embedding backend. sentence-transformers removed 2026-03-19
-        # after it broke and degraded the ecosystem to hash fallbacks.
-        if self._try_load_fastembed():
+        if self._try_load_ng_embed():
             return
         self._model_available = False
-        self._fallback_reason = "fastembed not installed or failed to load"
+        self._fallback_reason = "ng_embed not available or failed to load"
         self._logger.warning(
             "No embedding backend available. "
             "Using deterministic hash-based fallback embeddings."
         )
 
-    def _try_load_fastembed(self) -> bool:
-        """Try loading via fastembed (ONNX Runtime). Returns True on success."""
+    def _try_load_ng_embed(self) -> bool:
+        """Load via ng_embed (NGEmbed ONNX singleton, 768-dim). Returns True on success."""
         try:
-            from fastembed import TextEmbedding
-
-            # fastembed model names use the full HF path
-            fe_model_map = {
-                "BAAI/bge-base-en-v1.5": "BAAI/bge-base-en-v1.5",
-            }
-            fe_name = fe_model_map.get(self.model_name, self.model_name)
-            self._fe_model = TextEmbedding(fe_name)
-            # Probe dimension with a test embed
-            test = list(self._fe_model.embed(["test"]))
-            self.dimension = len(test[0])
+            from ng_embed import NGEmbed
+            self._ng_embed = NGEmbed.get_instance()
+            # Dimension is always 768 — ng_embed produces 768-dim in both ONNX and hash-fallback paths
+            self.dimension = 768
+            self.model_name = "Snowflake/snowflake-arctic-embed-m-v1.5"
             self._model_available = True
             self._active_device = "cpu/onnx"
             self._logger.info(
-                "Loaded embedding model '%s' via fastembed (ONNX Runtime, dim=%d)",
-                self.model_name, self.dimension,
+                "Loaded embedding engine via ng_embed (ONNX Runtime, dim=768)"
             )
             return True
         except ImportError:
             return False
         except Exception as exc:
-            self._logger.info(
-                "fastembed failed for '%s': %s. Trying sentence-transformers.",
-                self.model_name, exc,
-            )
+            self._logger.info("ng_embed failed: %s", exc)
             return False
 
+    # _try_load_fastembed removed 2026-04-13 — replaced by _try_load_ng_embed.
+    # fastembed (BAAI/bge-base-en-v1.5, 384-dim) was not installed on all instances
+    # and was always an intermediate solution after sentence-transformers was removed
+    # 2026-03-19. ng_embed.py is the canonical ecosystem embedding engine.
     # _try_load_sentence_transformers removed 2026-03-19.
     # sentence-transformers (torch) broke and degraded ecosystem to hash
     # fallbacks, then deposited 384-dim vectors into the 768-dim substrate.
@@ -1819,13 +1820,12 @@ class EmbeddingEngine:
         out-of-memory, driver error), falls back to hash embeddings for this
         batch rather than crashing the entire pipeline.
         """
-        if self._model_available and hasattr(self, "_fe_model") and self._fe_model is not None:
+        if self._model_available and self._ng_embed is not None:
             try:
-                embeddings = list(self._fe_model.embed(texts))
-                return [np.asarray(e, dtype=np.float32) for e in embeddings]
+                return self._ng_embed.embed_batch(texts)
             except Exception as exc:
                 self._logger.warning(
-                    "fastembed encode failed (%s). Falling back to hash embeddings "
+                    "ng_embed encode failed (%s). Falling back to hash embeddings "
                     "for this batch of %d texts.",
                     exc, len(texts),
                 )
