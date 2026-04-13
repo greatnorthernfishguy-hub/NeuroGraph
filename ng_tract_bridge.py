@@ -48,6 +48,13 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-04-13] Claude (Opus 4.6) — Fix metadata serialization for Rust BTF
+#   What: Serialize metadata dict to msgpack bytes before passing to
+#         ng_tract.deposit_outcome(). Rust expects PyBytes, not dict.
+#   Why:  Every record_outcome() with metadata failed at the Python/Rust
+#         boundary: "'dict' object cannot be converted to 'PyBytes'".
+#         River deposits silently broken for all modules using tracts.
+#   How:  msgpack.packb(metadata) — binary dict, zero inflation.
 # [2026-04-04] Claude (Opus 4.6) — Punchlist #119 Step 6: Bucket extraction API
 #   What: Eliminated dict conversion on BTF drain; modules now receive typed
 #         entry objects (PyOutcomeEntry, PyTopologyEntry, PyExperienceEntry)
@@ -397,6 +404,14 @@ class NGTractBridge(NGBridge):
             str(self._module_dir / f"{peer_id}.tract")
             for peer_id in peers
         ]
+        # Rust expects metadata as PyBytes (msgpack binary dict), not raw dict
+        meta_bytes = None
+        if metadata is not None:
+            try:
+                import msgpack
+                meta_bytes = msgpack.packb(metadata)
+            except Exception:
+                meta_bytes = None
         ng_tract.deposit_outcome(
             timestamp=time.time(),
             module_id=module_id,
@@ -404,7 +419,7 @@ class NGTractBridge(NGBridge):
             success=success,
             embedding=np.asarray(embedding, dtype=np.float32),
             tract_paths=tract_paths,
-            metadata=metadata,
+            metadata=meta_bytes,
         )
 
         # Drain check
