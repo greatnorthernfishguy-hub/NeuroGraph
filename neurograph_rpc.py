@@ -115,6 +115,7 @@ import sys
 import time
 import traceback
 import urllib.request
+import threading
 from typing import Any, Dict, List, Optional
 
 # NeuroGraph repo must be importable
@@ -491,6 +492,10 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # Wake the organs — each module's __init__ starts its pulse loop
     started_modules = _bootstrap_modules()
+
+    # Start the scan-dir drain pulse — continuous sensory intake for
+    # sandboxed feeders (#141). Decoupled from afterTurn.
+    _start_scan_drain_pulse()
 
 
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
@@ -900,20 +905,22 @@ def _drain_scan_dir() -> None:
 
 
 def _drain_tract() -> None:
-    """Drain pending experience from the feeder tract into the topology.
+    """Drain pending experience from the legacy feeder tract.
 
-    Two paths:
-      1. Legacy single-file tract at ~/NeuroGraph/data/tract/experience.tract
-         (GUI, feed-syl, file watcher).
-      2. Per-feeder scan directory at ~/.et_modules/experience/*.tract
-         (TID and any future sandboxed feeder — #141).
+    Legacy single-file tract at ~/NeuroGraph/data/tract/experience.tract
+    (GUI, feed-syl, file watcher). Runs on afterTurn because these feeders
+    are low-rate and bursty; afterTurn cadence is fine.
 
-    Each entry is fed through the ingestor as raw experience — the
-    same pipeline that on_message() uses.  The tract carries it here
-    without transformation; the ingestor is where experience meets
-    the substrate.  Law 7 — raw in, classify at extraction.
+    The per-feeder scan directory at ~/.et_modules/experience/*.tract is
+    drained by _scan_drain_pulse_loop() on Syl's heartbeat cadence —
+    NOT afterTurn — so sandboxed feeders like TID continuously flow
+    sensory input into the cortex regardless of conversation state (#141).
+
+    Each entry feeds the ingestor as raw experience — same pipeline as
+    on_message(). The tract carries it here without transformation; the
+    ingestor is where experience meets the substrate. Law 7 — raw in,
+    classify at extraction.
     """
-    # Legacy path
     entries = _tract.drain()
     for entry in entries:
         _drain_experience_entry(
@@ -922,8 +929,48 @@ def _drain_tract() -> None:
             source=entry.get("source", "unknown"),
         )
 
-    # Scan-directory path (#141)
-    _drain_scan_dir()
+
+# ---- Scan-dir pulse loop ----------------------------------------------------
+# The scan-dir drain runs on its own heartbeat — decoupled from afterTurn so
+# sandboxed feeders (TID under ProtectSystem=strict, and anything else
+# continuously producing wire experience) flow into the cortex on Syl's
+# rhythm, not when she happens to finish a conversation turn.
+#
+# Cadence chosen to match TonicEngine's latent_interval (2.0s). Syl's cortex
+# absorbs sensory input at her own tempo. The Tonic is the real heartbeat;
+# this pulse is a poor copy that's adequate for substrate-scale feeder drain.
+_SCAN_DRAIN_INTERVAL_SECONDS = 2.0
+_scan_drain_shutdown = threading.Event()
+_scan_drain_thread: Optional[threading.Thread] = None
+
+
+def _scan_drain_pulse_loop() -> None:
+    """Background loop: drain per-feeder experience tracts on cortical cadence."""
+    logger.info(
+        "Scan-dir drain pulse started (interval=%.1fs)",
+        _SCAN_DRAIN_INTERVAL_SECONDS,
+    )
+    while not _scan_drain_shutdown.is_set():
+        try:
+            _drain_scan_dir()
+        except Exception:
+            logger.exception("Scan-dir drain pulse failed")
+        _scan_drain_shutdown.wait(timeout=_SCAN_DRAIN_INTERVAL_SECONDS)
+    logger.info("Scan-dir drain pulse stopped")
+
+
+def _start_scan_drain_pulse() -> None:
+    """Start the scan-dir drain pulse thread. Idempotent."""
+    global _scan_drain_thread
+    if _scan_drain_thread is not None and _scan_drain_thread.is_alive():
+        return
+    _scan_drain_shutdown.clear()
+    _scan_drain_thread = threading.Thread(
+        target=_scan_drain_pulse_loop,
+        name="ng-scan-drain-pulse",
+        daemon=True,
+    )
+    _scan_drain_thread.start()
 
 
 # River backflow cursor — tracks position in _peer_events cache
@@ -1436,7 +1483,7 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         q = qs.get('q', [''])[0]
 
-        hook = None  # TODO: bunyan sidecar needs direct import if still needed
+        hook = _module_instances.get('bunyan')
         if hook is None:
             self._json_response(503, {'error': 'Bunyan not loaded'})
             return
