@@ -812,6 +812,18 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
 
 _EXPERIENCE_SCAN_DIR = os.path.expanduser("~/.et_modules/experience")
 
+# Throttle added 2026-04-15 after OOM loop (15 crashes, peak 14.5GB RSS).
+# The ingestor's 5-stage knowledge pipeline (chunk + embed + register +
+# associate) isn't the right absorption shape for huge raw HTTP bodies —
+# one 300k-token deposit creates thousands of substrate nodes + vectors.
+# As a stop-the-bleed, each pulse drains AT MOST _ENTRIES_PER_PULSE
+# entries. Leftover entries are re-deposited to the main tract and
+# picked up on the next pulse. No truncation, no shelving — every byte
+# is preserved; absorption just spread across time. Proper fix (a
+# wire-specific absorption path that stores raw bytes as metadata on a
+# single node, no chunk-embed-associate) is the followup.
+_ENTRIES_PER_PULSE = 1
+
 
 def _drain_experience_entry(content: str, content_type: str, source: str) -> None:
     """Feed one drained experience entry through the ingestor."""
@@ -881,20 +893,41 @@ def _drain_scan_dir() -> None:
             if not raw:
                 continue
             reader = ng_tract.TractReader(raw)
-            count = 0
-            for entry in reader:
-                if isinstance(entry, bytes):
-                    continue  # unexpected residual; ignore
-                if getattr(entry, "entry_type", None) != ng_tract.ENTRY_EXPERIENCE:
-                    continue
+            all_entries = [
+                e for e in reader
+                if not isinstance(e, bytes)
+                and getattr(e, "entry_type", None) == ng_tract.ENTRY_EXPERIENCE
+            ]
+            # Throttle: process only _ENTRIES_PER_PULSE this cycle; the
+            # rest get re-deposited to the main tract for the next pulse.
+            to_process = all_entries[:_ENTRIES_PER_PULSE]
+            leftover = all_entries[_ENTRIES_PER_PULSE:]
+
+            for entry in to_process:
                 _drain_experience_entry(
-                    content=entry.content,
+                    content=entry.content or "",
                     content_type=entry.content_type,
                     source=entry.source,
                 )
-                count += 1
-            if count:
-                logger.info("Scan-dir drain: %d entries from %s", count, tract_path.name)
+
+            for entry in leftover:
+                # Re-deposit to the main tract so next pulse picks it up.
+                # Preserves every byte — absorption just spread over time.
+                try:
+                    ng_tract.deposit_experience(
+                        content=entry.content or "",
+                        source=entry.source or "unknown",
+                        tract_path=str(tract_path),
+                        content_type=entry.content_type or "text",
+                    )
+                except Exception as exc:
+                    logger.warning("Re-deposit failed during throttle: %s", exc)
+
+            if to_process or leftover:
+                logger.info(
+                    "Scan-dir drain: %d ingested, %d re-deposited (throttle) from %s",
+                    len(to_process), len(leftover), tract_path.name,
+                )
         except Exception as exc:
             logger.warning("Scan-dir drain read failed (%s): %s", tract_path.name, exc)
         finally:
