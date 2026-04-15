@@ -493,6 +493,10 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # Wake the organs — each module's __init__ starts its pulse loop
     started_modules = _bootstrap_modules()
 
+    # Rescue orphan .draining.<dead_pid>.* files left by prior crashes.
+    # Each is renamed into a fresh .tract file the scan loop will pick up.
+    _rescue_orphan_draining_files()
+
     # Start the scan-dir drain pulse — continuous sensory intake for
     # sandboxed feeders (#141). Decoupled from afterTurn.
     _start_scan_drain_pulse()
@@ -826,9 +830,41 @@ _ENTRIES_PER_PULSE = 1
 
 
 def _drain_experience_entry(content: str, content_type: str, source: str) -> None:
-    """Feed one drained experience entry through the ingestor."""
+    """Feed one drained experience entry through the appropriate path.
+
+    Dispatch:
+      - `tid.http.*` / `wire:*`  → sensory-deposit path (wire_absorption).
+        Wire events aren't knowledge for Syl to absorb word-by-word; they
+        get ONE event node + up to 16 slice children, raw body on disk.
+      - everything else          → universal ingestor (knowledge path).
+    """
     if not content or not content.strip():
         return
+
+    if source and (source.startswith("tid.http.") or source.startswith("wire:")):
+        try:
+            from wire_absorption import absorb_wire_deposit, legacy_json_to_wire_text
+            from ng_embed import NGEmbed
+            # Legacy JSON-wrapped deposits from earlier today get adapted
+            # to raw wire text; same absorption path handles both.
+            if content.lstrip().startswith("{"):
+                adapted = legacy_json_to_wire_text(content)
+                if adapted is not None:
+                    content = adapted
+            res = absorb_wire_deposit(
+                memory=_memory,
+                embedder=NGEmbed.get_instance(),
+                content=content,
+                source=source,
+            )
+            logger.info(
+                "Wire drain: %s body=%dB slices=%d",
+                source, res.get("body_bytes", 0), res.get("slices_created", 0),
+            )
+        except Exception as exc:
+            logger.warning("Wire drain failed (%s): %s", source, exc)
+        return
+
     try:
         if content_type == "file":
             result = _memory.ingest_file(content)
@@ -1004,6 +1040,60 @@ def _start_scan_drain_pulse() -> None:
         daemon=True,
     )
     _scan_drain_thread.start()
+
+
+def _rescue_orphan_draining_files() -> None:
+    """Promote `.draining.<dead_pid>.<name>` files back to `<name>.<ts>.rescue.tract`
+    so the scan glob picks them up. Only rescues files whose PID is no
+    longer live — in-flight drains from the current process are left alone.
+    """
+    from pathlib import Path as _P
+    scan_dir = _P(_EXPERIENCE_SCAN_DIR)
+    if not scan_dir.exists():
+        return
+    try:
+        orphans = sorted(scan_dir.glob(".draining.*.tract"))
+    except OSError:
+        return
+    if not orphans:
+        return
+
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    rescued = 0
+    for orphan in orphans:
+        # Filename shape: .draining.<pid>.<original_tract_name>
+        parts = orphan.name.split(".", 3)  # ["", "draining", "<pid>", "<rest>"]
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[2])
+        except (ValueError, IndexError):
+            continue
+        if _pid_alive(pid):
+            continue  # still in-flight somewhere, don't touch
+        original = parts[3]  # e.g. "inference_difference.tract"
+        base = original[:-len(".tract")] if original.endswith(".tract") else original
+        target = scan_dir / f"{base}.{int(time.time()*1e9)}.rescue.tract"
+        try:
+            os.rename(str(orphan), str(target))
+            rescued += 1
+        except OSError as exc:
+            logger.warning("Rescue rename failed (%s): %s", orphan.name, exc)
+    if rescued:
+        logger.info(
+            "Rescued %d orphan .draining files in %s",
+            rescued, _EXPERIENCE_SCAN_DIR,
+        )
 
 
 # River backflow cursor — tracks position in _peer_events cache
