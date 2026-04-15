@@ -29,6 +29,9 @@ Schema Version History:
              version bump for tracking)
     0.4.1  — Phase 4.1: Consolidation Lifecycle (ConsolidationState enum,
              synapse salience, hyperedge creation_time, consolidation config)
+    0.4.2  — Hibernation fix: delay_buffer, recent_spikes, steps_since_last_fire,
+             homeostatic_steps_since_scaling serialized (no-op migration — new
+             fields are optional in _deserialize, defaults applied if absent)
 
 Grok Review Changelog (v0.7.1):
     No code changes.  Grok's suggestions for neurograph_migrate.py evaluated:
@@ -64,10 +67,10 @@ except ImportError:
 
 
 # Ordered list of all schema versions
-SCHEMA_VERSIONS = ["0.1.0", "0.2.0", "0.2.5", "0.3.0", "0.3.5", "0.4.0", "0.4.1"]
+SCHEMA_VERSIONS = ["0.1.0", "0.2.0", "0.2.5", "0.3.0", "0.3.5", "0.4.0", "0.4.1", "0.4.2"]
 
 # Current target version
-CURRENT_VERSION = "0.4.1"
+CURRENT_VERSION = "0.4.2"
 
 
 def _version_tuple(v: str) -> Tuple[int, ...]:
@@ -242,6 +245,25 @@ def _migrate_0_4_0_to_0_4_1(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _migrate_0_4_1_to_0_4_2(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Phase 4.1 → 4.2: Hibernation fix — no-op schema migration.
+
+    The four new fields (delay_buffer, recent_spikes, steps_since_last_fire,
+    homeostatic_steps_since_scaling) are optional in _deserialize() and
+    default to zero/empty when absent. There is no data to backfill — old
+    checkpoints simply won't have in-flight state to restore, which is
+    correct: the buffer was empty at save time in the old code. The version
+    bump ensures that once a checkpoint is saved by v0.4.2 code it carries
+    the hibernation fields and won't be needlessly migrated again.
+    """
+    data.setdefault("delay_buffer", {})
+    data.setdefault("recent_spikes", {})
+    data.setdefault("steps_since_last_fire", 0)
+    data.setdefault("homeostatic_steps_since_scaling", 0)
+    data["version"] = "0.4.2"
+    return data
+
+
 # Migration registry: (from_version, to_version) → migration function
 MIGRATIONS: List[Tuple[str, str, Callable]] = [
     ("0.1.0", "0.2.0", _migrate_0_1_0_to_0_2_0),
@@ -250,6 +272,7 @@ MIGRATIONS: List[Tuple[str, str, Callable]] = [
     ("0.3.0", "0.3.5", _migrate_0_3_0_to_0_3_5),
     ("0.3.5", "0.4.0", _migrate_0_3_5_to_0_4_0),
     ("0.4.0", "0.4.1", _migrate_0_4_0_to_0_4_1),
+    ("0.4.1", "0.4.2", _migrate_0_4_1_to_0_4_2),
 ]
 
 

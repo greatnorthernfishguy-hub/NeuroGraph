@@ -19,6 +19,23 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-04-14] Claude (Sonnet 4.6) — v0.4.2 Hibernation fix: serialize ephemeral process state
+# What: Added 4 previously unserialised fields to _serialize_full()/_deserialize():
+#   _delay_buffer (in-flight spike currents), _recent_spikes (structural plasticity
+#   co-activation history), _steps_since_last_fire (zero-firing circuit breaker),
+#   HomeostaticRule._steps_since_scaling (homeostatic scaling counter).
+#   Version bumped 0.4.1 → 0.4.2.
+# Why: Every ephemeral subprocess (CC hook, Codemine worker) loads the checkpoint
+#   cold — these fields reset to 0. With scaling_interval=25 and a single step() per
+#   call, homeostatic scaling never fired. Silent nodes never got their excitability
+#   boost. In-flight spikes were dropped. Structural plasticity lost co-activation
+#   context between calls. The substrate was effectively starting fresh each call.
+#   This is the canonical "hibernation" fix: the process believes it never stopped.
+# How: _serialize_full() adds delay_buffer (timestep→entries), recent_spikes
+#   (nid→list), steps_since_last_fire (int), homeostatic_steps_since_scaling (int).
+#   _deserialize() restores all four. Delay buffer validates delivery timestep > current
+#   and node existence. Homeostatic counter applied post plasticity-rules re-init.
+#   Migration v0.4.1→v0.4.2 is a no-op (old checkpoints get defaults on next save).
 # [2026-03-25] Claude Code (Opus 4.6) — Dynamic tuning API (SVG Phase 5)
 #   What: Added TUNABLE_PARAMS, update_tunable(), get_tunables() to Graph class.
 #     12 SNN parameters tunable at runtime with validated bounds: learning_rate,
@@ -3632,7 +3649,7 @@ class Graph:
 
     def _serialize_full(self) -> Dict[str, Any]:
         return {
-            "version": "0.4.1",
+            "version": "0.4.2",
             "timestep": self.timestep,
             "config": self.config,
             "nodes": {nid: self._serialize_node(n) for nid, n in self.nodes.items()},
@@ -3703,6 +3720,26 @@ class Graph:
             # Phase 2.5b: Output target learning state
             "he_last_fired_step":  self._he_last_fired_step,
             "he_output_candidates": self._he_output_candidates,
+            # v0.4.2 Hibernation state — ephemeral process counters serialized so
+            # subprocess loads (CC hook, Codemine worker) believe the process never
+            # stopped. Without these, homeostatic scaling never fires, in-flight spikes
+            # are dropped, structural plasticity loses co-activation context, and the
+            # zero-firing circuit breaker loses streak continuity across calls.
+            "delay_buffer": {
+                str(ts): [[nid, curr] for nid, curr in entries]
+                for ts, entries in self._delay_buffer.items()
+            },
+            "recent_spikes": {
+                nid: list(spikes)
+                for nid, spikes in self._recent_spikes.items()
+                if spikes
+            },
+            "steps_since_last_fire": self._steps_since_last_fire,
+            "homeostatic_steps_since_scaling": next(
+                (r._steps_since_scaling for r in self._plasticity_rules
+                 if isinstance(r, HomeostaticRule)),
+                0,
+            ),
         }
 
     def _serialize_incremental(self) -> Dict[str, Any]:
@@ -3828,6 +3865,25 @@ class Graph:
             self._incoming[nid] = set()
             self._node_hyperedges[nid] = set()
             self._recent_spikes[nid] = deque(maxlen=20)
+
+        # v0.4.2: Restore recent spike history (structural plasticity co-activation)
+        cap = self.config.get("co_activation_window", 5) * 2
+        for nid, spike_list in data.get("recent_spikes", {}).items():
+            if nid in self._recent_spikes and spike_list:
+                self._recent_spikes[nid] = deque(spike_list, maxlen=cap)
+
+        # v0.4.2: Restore in-flight spike buffer (currents scheduled for future delivery)
+        # Keys may be int (msgpack) or str (JSON) — normalise to int.
+        # Drop entries with delivery timestep <= current timestep (already processed).
+        node_ids_set = set(self.nodes.keys())
+        for ts_key, entries in data.get("delay_buffer", {}).items():
+            ts = int(ts_key)
+            if ts <= self.timestep:
+                continue  # stale — would have fired before save
+            valid = [(str(nid), float(curr)) for nid, curr in entries
+                     if str(nid) in node_ids_set]
+            if valid:
+                self._delay_buffer[ts] = valid
 
         # Restore synapses
         for sid, sd in data.get("synapses", {}).items():
@@ -4074,6 +4130,21 @@ class Graph:
                 evolution_initial_weight=self.config["he_member_evolution_initial_weight"],
             ),
         ]
+
+        # v0.4.2: Restore zero-firing circuit breaker streak count.
+        # Without this a subprocess always starts at 0, losing continuity
+        # and potentially masking persistent silence across calls.
+        self._steps_since_last_fire = data.get("steps_since_last_fire", 0)
+
+        # v0.4.2: Restore homeostatic scaling counter.
+        # HomeostaticRule.__init__ always sets _steps_since_scaling = 0 above.
+        # Restore the saved value so homeostatic scaling fires at the correct
+        # interval regardless of how many subprocess boundaries have been crossed.
+        homeostatic_steps = data.get("homeostatic_steps_since_scaling", 0)
+        for rule in self._plasticity_rules:
+            if isinstance(rule, HomeostaticRule):
+                rule._steps_since_scaling = homeostatic_steps
+                break
 
         self._dirty_nodes.clear()
         self._dirty_synapses.clear()
