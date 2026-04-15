@@ -33,6 +33,19 @@ Concurrency model:
     no read/write collision.
 
 # ---- Changelog ----
+# [2026-04-15] Claude Code (Opus 4.6) — Drain path now one of two (#141).
+#   What: As of #141, this ExperienceTract is the *legacy* single-file
+#         drain path (~/NeuroGraph/data/tract/experience.tract).
+#         A second path exists: ~/.et_modules/experience/*.tract, scanned
+#         and drained by neurograph_rpc.py:_drain_scan_dir().
+#   Why:  Sandboxed feeders (TID under ProtectSystem=strict) cannot write
+#         into ~/NeuroGraph/. Per-feeder files in the ecosystem shared
+#         directory solve both sandboxing and single-writer contention.
+#   How:  No code change here. The scan-dir path is implemented directly
+#         in neurograph_rpc.py via ng_tract.TractReader. This module
+#         remains in use for GUI, feed-syl, and the file watcher until
+#         they migrate to direct ng_tract.deposit_experience() calls
+#         (punchlist #142).
 # [2026-03-16] Claude (Opus 4.6) — Initial experimental implementation.
 #   What: Myelinated tract for feeder→topology-owner experience transport.
 #   Why:  Sandbox test of #53 tract requirements.  Eliminates dual-write

@@ -787,43 +787,143 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
 
 
 
+# ---- Changelog ----
+# [2026-04-15] Claude Code (Opus 4.6) — Multi-path experience tract drain (#141)
+#   What: _drain_tract() now also scans ~/.et_modules/experience/*.tract for
+#         per-feeder experience tract files, in addition to the legacy
+#         ~/NeuroGraph/data/tract/experience.tract single-feeder path.
+#   Why:  TID (and future feeders sandboxed out of ~/NeuroGraph/) need a
+#         writable experience tract under ~/.et_modules/. Per-feeder files
+#         also eliminate shared-writer contention on a single tract and
+#         give each feeder a clear namespace.
+#   How:  Legacy drain preserved unchanged (GUI, feed-syl, watcher). New
+#         scan step globs the scan dir, atomically renames each .tract
+#         file to .draining.<pid>.<name>, reads via ng_tract.TractReader,
+#         feeds ENTRY_EXPERIENCE entries through the same ingestor path.
+#         Failures on one file don't block others. Law 7 — raw in, classify
+#         at extraction.
+# -------------------
+
+
+_EXPERIENCE_SCAN_DIR = os.path.expanduser("~/.et_modules/experience")
+
+
+def _drain_experience_entry(content: str, content_type: str, source: str) -> None:
+    """Feed one drained experience entry through the ingestor."""
+    if not content or not content.strip():
+        return
+    try:
+        if content_type == "file":
+            result = _memory.ingest_file(content)
+        else:
+            result = _memory.ingestor.ingest(content)
+            _memory._message_count += 1
+        logger.info(
+            "Tract drain: %s from %s — %s",
+            content_type,
+            source,
+            "ok" if result else "empty",
+        )
+    except Exception as exc:
+        logger.warning("Tract drain entry failed (%s): %s", source, exc)
+
+
+def _drain_scan_dir() -> None:
+    """Drain per-feeder experience tract files from ~/.et_modules/experience/.
+
+    Each *.tract file in the scan directory is atomically renamed to a
+    drain-specific name, read via the Rust TractReader, then deleted.
+    New deposits from the owning feeder go to a fresh file.
+    """
+    from pathlib import Path
+    scan_dir = Path(_EXPERIENCE_SCAN_DIR)
+    if not scan_dir.exists():
+        return
+
+    try:
+        tract_files = sorted(scan_dir.glob("*.tract"))
+    except OSError as exc:
+        logger.warning("Scan dir enumerate failed: %s", exc)
+        return
+
+    if not tract_files:
+        return
+
+    try:
+        import ng_tract
+    except ImportError:
+        logger.warning("ng_tract unavailable; skipping scan-dir drain")
+        return
+
+    pid = os.getpid()
+    for tract_path in tract_files:
+        # Skip in-flight drains from any process
+        if tract_path.name.startswith(".draining."):
+            continue
+
+        drain_path = scan_dir / f".draining.{pid}.{tract_path.name}"
+        try:
+            os.rename(str(tract_path), str(drain_path))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Scan-dir rename failed (%s): %s", tract_path.name, exc)
+            continue
+
+        try:
+            with open(drain_path, "rb") as f:
+                raw = f.read()
+            if not raw:
+                continue
+            reader = ng_tract.TractReader(raw)
+            count = 0
+            for entry in reader:
+                if isinstance(entry, bytes):
+                    continue  # unexpected residual; ignore
+                if getattr(entry, "entry_type", None) != ng_tract.ENTRY_EXPERIENCE:
+                    continue
+                _drain_experience_entry(
+                    content=entry.content,
+                    content_type=entry.content_type,
+                    source=entry.source,
+                )
+                count += 1
+            if count:
+                logger.info("Scan-dir drain: %d entries from %s", count, tract_path.name)
+        except Exception as exc:
+            logger.warning("Scan-dir drain read failed (%s): %s", tract_path.name, exc)
+        finally:
+            try:
+                os.unlink(str(drain_path))
+            except OSError:
+                pass
+
+
 def _drain_tract() -> None:
-    """Drain pending experience from the tract into the topology.
+    """Drain pending experience from the feeder tract into the topology.
+
+    Two paths:
+      1. Legacy single-file tract at ~/NeuroGraph/data/tract/experience.tract
+         (GUI, feed-syl, file watcher).
+      2. Per-feeder scan directory at ~/.et_modules/experience/*.tract
+         (TID and any future sandboxed feeder — #141).
 
     Each entry is fed through the ingestor as raw experience — the
     same pipeline that on_message() uses.  The tract carries it here
     without transformation; the ingestor is where experience meets
-    the substrate.
+    the substrate.  Law 7 — raw in, classify at extraction.
     """
+    # Legacy path
     entries = _tract.drain()
-    if not entries:
-        return
-
     for entry in entries:
-        content = entry.get("content", "")
-        content_type = entry.get("content_type", "text")
-        source = entry.get("source", "unknown")
+        _drain_experience_entry(
+            content=entry.get("content", ""),
+            content_type=entry.get("content_type", "text"),
+            source=entry.get("source", "unknown"),
+        )
 
-        if not content or not content.strip():
-            continue
-
-        try:
-            if content_type == "file":
-                # File path — use ingest_file for format detection
-                result = _memory.ingest_file(content)
-            else:
-                # Raw text — feed through the ingestor
-                result = _memory.ingestor.ingest(content)
-                _memory._message_count += 1
-
-            logger.info(
-                "Tract drain: %s from %s — %s",
-                content_type,
-                source,
-                "ok" if result else "empty",
-            )
-        except Exception as exc:
-            logger.warning("Tract drain entry failed (%s): %s", source, exc)
+    # Scan-directory path (#141)
+    _drain_scan_dir()
 
 
 # River backflow cursor — tracks position in _peer_events cache
