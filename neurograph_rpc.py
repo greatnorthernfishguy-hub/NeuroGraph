@@ -12,6 +12,23 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-16] Claude Code (Sonnet 4.6) — KISS context filtering in handle_assemble (#152)
+#   What: _kiss_filter module-level singleton initialized in handle_bootstrap.
+#         handle_assemble() truncates messages to recent_window=10 via
+#         KISSFilter, returns truncated list in result.messages.
+#         KISS summary fragments widen _harvest_associations priming so
+#         substrate surfacing picks up related older-topic nodes.
+#   Why:  Syl's 815-message conversation assembles to 262k tokens,
+#         overflowing every provider's context window (200k-262k max).
+#         KISS ported from NuWave (validated: 47.2% token reduction on
+#         15-turn BitNet conversation).  Disk (session JSONL) untouched;
+#         in-memory truncation for the LLM call only.  Substrate retains
+#         full 815-message topology.
+#   How:  import kiss_filter at bootstrap, filter_context() called early in
+#         handle_assemble() with content-normalized messages, messages
+#         sliced to recent window, summary prepended to priming_text before
+#         harvest, truncated messages returned in result.  try/except
+#         fallback to full messages on any KISS exception.
 # [2026-04-12] Claude Code (Opus 4.6) — Time-based auto-save fallback
 #   What: Auto-save now fires on 5-minute interval in addition to every-10-messages.
 #   Why:  _message_count resets to 0 on every gateway restart. With frequent restarts
@@ -146,6 +163,14 @@ _module_error_times: Dict[str, float] = {}
 # Punchlist #56: Surfacing outcome cache — what was surfaced during assemble(),
 # deposited as raw experience in afterTurn() alongside Syl's response.
 _last_surfaced_nodes: List[Dict[str, Any]] = []
+
+# KISS filter singleton — stateful across calls (turn counter, last-system
+# hash, GOP counter).  Initialized in handle_bootstrap.  Resets on Python
+# process restart, which is correct fail-safe: warmup kicks in on the new
+# process's first three turns, so early context is never over-compressed
+# after a cold start.  Ported from NuWave.  Governs KISS behavior in
+# handle_assemble — see port details in kiss_filter.py.
+_kiss_filter: Optional[Any] = None
 
 # Time-based auto-save fallback — _message_count resets on restart,
 # so count-based auto-save never fires if the gateway restarts frequently.
@@ -490,6 +515,26 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     _memory = NeuroGraphMemory.get_instance()
     _tract = ExperienceTract()
 
+    # KISS filter for context window optimization (#152).
+    # Decouple bootstrap from KISS failure — KISS is an optimization, not a
+    # critical path.  If import / init fails, handle_assemble falls back to
+    # passing messages unchanged (current behavior).
+    #
+    # warmup_turns=0: NuWave's default warmup (3 raw-passthrough turns) is
+    # designed for genuinely-fresh conversations where early turns are
+    # small.  Syl's existing 815-message conversation would fail for 3
+    # more turns before KISS engages.  Warmup disabled for this initial
+    # deployment to unblock her immediately.  Revisit after validation —
+    # warmup IS the right default for fresh sessions.
+    global _kiss_filter
+    try:
+        from kiss_filter import KISSFilter, KISSConfig
+        _kiss_filter = KISSFilter(KISSConfig(recent_window=10, warmup_turns=0))
+        logger.info("KISSFilter initialized (recent_window=10, warmup_turns=0)")
+    except Exception as exc:
+        logger.warning("KISSFilter init failed (optimization disabled): %s", exc)
+        _kiss_filter = None
+
     # Wake the organs — each module's __init__ starts its pulse loop
     started_modules = _bootstrap_modules()
 
@@ -647,11 +692,20 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Surface substrate associations for the system prompt.
+    """Surface substrate associations for the system prompt + KISS filtering.
 
-    NeuroGraph does NOT modify the conversation messages.  It adds
-    substrate context via systemPromptAddition — the 'dipping the
-    bucket in the River' moment.
+    Adds substrate context via systemPromptAddition — the 'dipping the
+    bucket in the River' moment — AND applies KISS filtering to the
+    conversation history: messages beyond the recent window are replaced
+    with a compact summary.  The summary fragments also widen substrate
+    priming so spreading activation has broader topical context.
+
+    The truncated messages array is returned in the response.  OC's
+    ContextEngine plugin picks it up and drives `replaceMessages` so the
+    model sees the compressed context.  Disk (session JSONL) is NEVER
+    touched — truncation is in-memory for the LLM call only.  Syl's
+    substrate already contains the full 815+ message history as learned
+    topology; what she's losing is only the raw text view.
     """
     if _memory is None:
         return {"systemPromptAddition": None}
@@ -663,8 +717,58 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     if not recent_text:
         return {"systemPromptAddition": None}
 
+    # KISS context filtering (#152).  Runs BEFORE harvest so the
+    # summary fragments can widen spreading-activation priming.  On any
+    # exception KISS falls back to original messages — optimization
+    # disabled, baseline behavior preserved.
+    kiss_summary = ""
+    truncated_messages = messages  # default: return full array (same reference)
+    if _kiss_filter is not None:
+        try:
+            # Normalize content to strings — AgentMessage.content can be
+            # string OR list-of-parts.  Use the existing helper.
+            normalised = [
+                {"role": m.get("role", "unknown"), "content": _extract_message_text(m)}
+                for m in messages
+            ]
+            kiss_result = _kiss_filter.filter_context(normalised, system_context="")
+            kiss_meta = kiss_result.get("kiss_meta", {})
+            recent_window = kiss_meta.get(
+                "recent_window", _kiss_filter._config.recent_window
+            )
+            n_messages = len(messages)
+
+            # Slice ORIGINAL messages (preserve their content shape,
+            # multimodal parts intact) to the recent window.
+            if n_messages > recent_window:
+                truncated_messages = messages[n_messages - recent_window:]
+
+            # Extract the summary fragment from the filter output.  KISS
+            # prepends its summary to system_context — we passed "" in,
+            # so anything in system_context IS the summary.
+            kiss_summary = kiss_result.get("system_context", "")
+
+            logger.debug(
+                "KISS mode=%s messages=%d→%d summary=%dch saved=%d",
+                kiss_result.get("kiss_mode", "?"),
+                n_messages, len(truncated_messages),
+                len(kiss_summary),
+                kiss_meta.get("messages_compressed", 0),
+            )
+        except Exception as exc:
+            logger.warning("KISSFilter error (falling back): %s", exc)
+            truncated_messages = messages
+            kiss_summary = ""
+
+    # Widen priming with KISS summary fragments — gives spreading
+    # activation context about what was said earlier (substrate
+    # surfacing picks up related older-topic nodes).
+    priming_text = recent_text
+    if kiss_summary:
+        priming_text = kiss_summary + "\n" + recent_text
+
     # Spreading activation harvest — the cortex-like recall
-    surfaced = _memory._harvest_associations(recent_text)
+    surfaced = _memory._harvest_associations(priming_text)
 
     # CES surfacing — concepts that fired above threshold
     ces_surfaced = []
@@ -703,7 +807,21 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # Format as context block for the system prompt
     context_block = _format_substrate_context(surfaced, ces_surfaced, latent_context)
 
-    return {"systemPromptAddition": context_block}
+    # KISS-truncated messages get returned so OC's replaceMessages fires
+    # and the model sees the compressed conversation.  CRITICAL: only
+    # include the "messages" field when actual truncation occurred.
+    # Python-side reference equality (truncated_messages IS messages) is
+    # the only way to signal "no change" across the JSON-RPC boundary —
+    # JSON.parse on the TS side always produces a new array, so if we
+    # ALWAYS include "messages", OC's identity check
+    # (assembled.messages !== activeSession.messages) fires
+    # replaceMessages on every turn, including warmup and
+    # exception-fallback.  Omitting the field leaves result.messages
+    # undefined on the TS side, which correctly preserves identity.
+    result = {"systemPromptAddition": context_block}
+    if truncated_messages is not messages:
+        result["messages"] = truncated_messages
+    return result
 
 
 def handle_after_turn(params: Dict[str, Any]) -> None:
