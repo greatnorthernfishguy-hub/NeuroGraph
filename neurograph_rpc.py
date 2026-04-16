@@ -765,8 +765,8 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
             # so anything in system_context IS the summary.
             kiss_summary = kiss_result.get("system_context", "")
 
-            logger.debug(
-                "KISS mode=%s messages=%d→%d summary=%dch saved=%d",
+            logger.info(
+                "KISS mode=%s messages=%d→%d summary=%dch compressed=%d",
                 kiss_result.get("kiss_mode", "?"),
                 n_messages, len(truncated_messages),
                 len(kiss_summary),
