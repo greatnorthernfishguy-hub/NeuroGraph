@@ -24,6 +24,10 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-04-16] Claude (Sonnet 4.6) — engine.status property fix (#160)
+# What: engine.status() → engine.status (no parens) — TonicEngine.status is @property
+# Why: TypeError: 'dict' object is not callable on every status request
+# How: Remove () from line 228 call in _handle_status()
 # [2026-04-16] Claude (Opus 4.6) — Initial Path B implementation
 # What: CC NG hosted inside neurograph_rpc.py process; Unix socket for hooks
 # Why: Subprocess-per-hook architecture dead (earlier phases), Path B gives
@@ -225,7 +229,7 @@ def _handle_status(_data):
             eng_status = None
             if engine is not None:
                 try:
-                    eng_status = engine.status()
+                    eng_status = engine.status
                 except Exception as exc:
                     eng_status = {"error": str(exc)}
             tonic_info = {
