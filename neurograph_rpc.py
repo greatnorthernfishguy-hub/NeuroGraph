@@ -582,6 +582,16 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # Path B: host CC's NeuroGraph inside this process. Completely isolated
+    # from Syl (different workspace, different checkpoint, peer_bridge OFF).
+    # Failures here MUST NOT affect Syl — wrapped defensively.
+    # Authorized by Josh 2026-04-16 with protected-file backups confirmed.
+    try:
+        import cc_ng_host
+        cc_ng_host.init_cc_host()
+    except Exception as exc:
+        logger.warning("CC NG host init failed (Syl unaffected): %s", exc)
+
     return {
         "bootstrapped": True,
         "nodes": stats["nodes"],
