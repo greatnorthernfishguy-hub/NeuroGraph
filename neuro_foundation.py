@@ -19,6 +19,16 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-04-16] Claude (Sonnet 4.6) — #163: Tonic firings now trigger synapse sprouting
+# What: prime_and_propagate(write_mode=True) now records fired nodes in _recent_spikes
+#       and calls _sprout_synapses() after each cycle. Previously: 1,155 Tonic firings
+#       produced 0 synapses because _recent_spikes was only populated by step().
+# Why: _sprout_synapses() exclusively reads _recent_spikes for co-activation candidates.
+#      Tonic firings via prime_and_propagate bypass this tracking → structural plasticity
+#      never fired → substrate nodes never wired together despite continuous activity.
+# How: Collect all_fired across the prop loop. Record at self.timestep-1 (not prop_timestep
+#      which is in the future) so 0 < (self.timestep - t) <= window passes. Call
+#      _sprout_synapses(all_fired) under write_mode guard before returning.
 # [2026-04-14] Claude (Sonnet 4.6) — v0.4.2 Hibernation fix: serialize ephemeral process state
 # What: Added 4 previously unserialised fields to _serialize_full()/_deserialize():
 #   _delay_buffer (in-flight spike currents), _recent_spikes (structural plasticity
@@ -2190,6 +2200,22 @@ class Graph:
                 node.refractory_remaining = saved_refractory.get(nid, 0)
             for hid, he in self.hyperedges.items():
                 he.refractory_remaining = saved_he_refractory.get(hid, 0)
+
+        # --- WRITE MODE: synapse sprouting for Tonic co-activations (#163) ---
+        # prime_and_propagate bypasses step()'s _recent_spikes tracking, so
+        # Tonic firings are invisible to _sprout_synapses. Fix: record all
+        # p&p-fired nodes at self.timestep-1 (past → window check passes),
+        # then call _sprout_synapses so co-activating nodes wire together.
+        if write_mode:
+            all_fired = list({e.node_id for e in result.fired_entries})
+            if all_fired:
+                _record_ts = self.timestep - 1 if self.timestep > 0 else 0
+                _window_cap = self.config["co_activation_window"] * 2
+                for _nid in all_fired:
+                    self._recent_spikes.setdefault(
+                        _nid, deque(maxlen=_window_cap)
+                    ).append(_record_ts)
+                self._sprout_synapses(all_fired)
 
         return result
 

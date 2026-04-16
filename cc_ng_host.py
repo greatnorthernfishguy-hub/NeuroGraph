@@ -24,6 +24,13 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-04-16] Claude (Sonnet 4.6) — #161: export + import socket handlers for IPC sync
+# What: _handle_export and _handle_import added to socket dispatch. cc-ng-sync.py
+#       can now export/import via socket instead of touching checkpoint files directly.
+# Why: Direct msgpack reads during live graph operation risk torn checkpoints.
+#      Socket handlers run under the daemon's own lifecycle — no race.
+# How: export: live graph snapshot under _concurrent_lock -> export.jsonl
+#      import: trickle on_message + idle steps + save, all in-process.
 # [2026-04-16] Claude (Sonnet 4.6) — engine.status property fix (#160)
 # What: engine.status() → engine.status (no parens) — TonicEngine.status is @property
 # Why: TypeError: 'dict' object is not callable on every status request
@@ -321,9 +328,79 @@ def _handle_post_tool_use(data):
     return {"ok": True}
 
 
+def _handle_export(data):
+    """Export top-N nodes to export.jsonl from live graph (no checkpoint race)."""
+    ng = _STATE.cc_ng
+    if ng is None:
+        return {"ok": False, "error": "NG not initialized"}
+    n = int(data.get("n", 200))
+    ranked = []
+    with ng.graph._concurrent_lock:
+        for nid, node in ng.graph.nodes.items():
+            ema = getattr(node, "firing_rate_ema", 0.0) or 0.0
+            if ema > 0:
+                entry = ng.vector_db.get(nid)
+                content = (entry or {}).get("content", "")
+                if content:
+                    ranked.append((ema, content))
+    ranked.sort(key=lambda x: -x[0])
+    export_path = os.path.join(CC_NG_WORKSPACE, "export.jsonl")
+    written = 0
+    try:
+        with open(export_path, "w") as f:
+            for ema, content in ranked[:n]:
+                f.write(json.dumps({"content": content, "weight": round(ema, 6)}) + "\n")
+                written += 1
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    logger.info("CC export: %d nodes -> %s", written, export_path)
+    return {"ok": True, "exported": written}
+
+
+def _handle_import(data):
+    """Import trickle from remote_export.jsonl into live graph (no second NG instance)."""
+    ng = _STATE.cc_ng
+    if ng is None:
+        return {"ok": False, "error": "NG not initialized"}
+    path = data.get("path", os.path.join(CC_NG_WORKSPACE, "remote_export.jsonl"))
+    batch_size = int(data.get("batch_size", 25))
+    idle_steps = int(data.get("idle_steps", 250))
+    if not os.path.exists(path):
+        return {"ok": True, "imported": 0, "note": "no file"}
+    try:
+        with open(path, "r") as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+    except Exception as exc:
+        return {"ok": False, "error": "read failed: " + str(exc)}
+    total = 0
+    for i in range(0, len(entries), batch_size):
+        batch = entries[i:i + batch_size]
+        for entry in batch:
+            content = entry.get("content", "")
+            if content:
+                try:
+                    ng.on_message(content)  # on_message acquires its own lock
+                    total += 1
+                except Exception:
+                    pass
+        # Idle consolidation — sleep consolidation between batches (FatherGraph Finding 3)
+        with ng.graph._concurrent_lock:
+            for _ in range(idle_steps):
+                ng.graph.step()
+    try:
+        with ng.graph._concurrent_lock:
+            ng.save()
+        logger.info("CC import: %d nodes ingested, saved", total)
+    except Exception as exc:
+        return {"ok": False, "error": "save failed: " + str(exc)}
+    return {"ok": True, "imported": total}
+
+
 _DISPATCH = {
     "ping": _handle_ping,
     "status": _handle_status,
+    "export": _handle_export,
+    "import": _handle_import,
     "SessionStart": _handle_session_start,
     "SessionStop": _handle_session_stop,
     "UserPromptSubmit": _handle_user_prompt_submit,
