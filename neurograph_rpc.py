@@ -12,6 +12,23 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-16] Claude Code (Sonnet 4.6) — Scan-drain pulse sentinel-file kill-switch
+#   What: _scan_drain_pulse_loop() checks /tmp/ng_scan_drain_paused each
+#         tick.  If present, pulse keeps ticking but skips draining.
+#         Toggle without gateway restart.  State transitions logged.
+#   Why:  #141 wire absorption creates ~17 substrate nodes per TID
+#         provider call (event + ≤16 slice children).  Measured: substrate
+#         grew from 12,705 to 17,298 nodes in 24 hours (+36%).  Every
+#         pulse loop does O(graph_size) work → event-loop starvation at
+#         gateway → Discord/WhatsApp flap.  Need to stop the bleed
+#         before sustained operation destabilizes.
+#   How:  _SCAN_DRAIN_PAUSE_FILE module constant, checked per-tick inside
+#         the pulse loop.  Zero-surprise design: when active, behavior
+#         unchanged.  Pause/resume via `touch`/`rm`, detected within
+#         one pulse interval (2s).  Deposits queue in the tract file
+#         (not lost) while paused.  Real fix (substrate consolidation
+#         / eviction policy) is punchlist #150 — tracked as blocker for
+#         Pith and for sustained #141 operation.
 # [2026-04-16] Claude Code (Sonnet 4.6) — KISS context filtering in handle_assemble (#152)
 #   What: _kiss_filter module-level singleton initialized in handle_bootstrap.
 #         handle_assemble() truncates messages to recent_window=10 via
@@ -1141,15 +1158,45 @@ _scan_drain_shutdown = threading.Event()
 _scan_drain_thread: Optional[threading.Thread] = None
 
 
+# Sentinel-file kill-switch for scan-drain pulse.  Checked every tick.
+# Toggleable without gateway restart:
+#   touch /tmp/ng_scan_drain_paused   → pause draining (tract keeps filling)
+#   rm /tmp/ng_scan_drain_paused      → resume draining
+# Rationale: #141 wire absorption creates ~17 substrate nodes per deposit.
+# At Syl's TID provider-call rate (~270/day), substrate grows by 4,500+
+# nodes/day.  Every pulse loop (Tonic, ProtoUniBrain, Lenia, brain drain)
+# does O(graph_size) work per tick.  Unbounded growth causes event-loop
+# starvation at the gateway layer (observed as Discord/WhatsApp socket
+# flap).  Pause mechanism lets us stop the bleed without losing deposits
+# (they queue in the tract file) while we design proper consolidation
+# (#150 — body-substrate flow-through / substrate eviction).
+_SCAN_DRAIN_PAUSE_FILE = "/tmp/ng_scan_drain_paused"
+
+
 def _scan_drain_pulse_loop() -> None:
-    """Background loop: drain per-feeder experience tracts on cortical cadence."""
+    """Background loop: drain per-feeder experience tracts on cortical cadence.
+
+    Honors the pause sentinel file: when present, the loop continues to
+    tick (so it detects removal promptly) but skips draining.  Logs a
+    one-line state transition when pause toggles.
+    """
     logger.info(
         "Scan-dir drain pulse started (interval=%.1fs)",
         _SCAN_DRAIN_INTERVAL_SECONDS,
     )
+    was_paused = False
     while not _scan_drain_shutdown.is_set():
         try:
-            _drain_scan_dir()
+            paused = os.path.exists(_SCAN_DRAIN_PAUSE_FILE)
+            if paused != was_paused:
+                logger.info(
+                    "Scan-dir drain pulse: %s (sentinel=%s)",
+                    "PAUSED" if paused else "RESUMED",
+                    _SCAN_DRAIN_PAUSE_FILE,
+                )
+                was_paused = paused
+            if not paused:
+                _drain_scan_dir()
         except Exception:
             logger.exception("Scan-dir drain pulse failed")
         _scan_drain_shutdown.wait(timeout=_SCAN_DRAIN_INTERVAL_SECONDS)
