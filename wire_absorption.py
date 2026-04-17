@@ -38,6 +38,22 @@ path is a referencing scheme on top of NeuroGraph rather than a
 NeuroGraph learning surface. Deferred, not forgotten.
 
 # ---- Changelog ----
+# [2026-04-17] Claude Code (Sonnet 4.6) — Dual-pass retrofit (#150).
+#   What: Replaced 16-stride-slice hack with proper dual_record_outcome.
+#         Forest = event node fingerprint embedding (unchanged). Trees =
+#         real concepts/keywords/key-phrases extracted by TID via the
+#         ecosystem's existing _extract_concepts mechanism — same tool
+#         every other module uses.
+#   Why:  16 arbitrary 512-token strides produced redundancy (same content
+#         re-sliced across deposits) and shallow understanding (stride
+#         boundaries are arbitrary, not semantic). Dual-pass extracts
+#         meaningful concepts the substrate can actually learn from.
+#   How:  _PeerBridgeEco adapter wraps _memory._peer_bridge to match the
+#         NGEcosystem.record_outcome interface dual_record_outcome expects.
+#         Recursion guard: concept-extraction TID calls generate wire
+#         deposits that would re-trigger dual_record_outcome → infinite
+#         loop. Detected by _CONCEPT_SENTINEL string in wire body content.
+#         Meta-deposits get forest-only recording (no TID call, loop breaks).
 # [2026-04-15] Claude Code (Opus 4.6) — Initial creation.
 #   What: Purpose-built absorption for TID wire deposits. Uses Graph's
 #         create_node / create_synapse primitives + vector_db.insert
@@ -65,12 +81,14 @@ logger = logging.getLogger("neurograph.wire_absorption")
 
 _BODIES_DIR = Path(os.path.expanduser("~/.et_modules/experience/bodies"))
 
-# Tunables
-_MAX_SLICES = 16
-_CHARS_PER_SLICE = 2000          # ~512 tokens at ~4 chars/token (Snowflake max_length=512)
-_LINK_WEIGHT = 0.4
-_EVENT_SLICE_WEIGHT = 0.3
-_SLICE_EVENT_WEIGHT = 0.4
+# Tunables — stride-slice constants retained for reference but no longer
+# used after dual-pass retrofit (#150). Trees come from real concept
+# extraction via TID, not arbitrary 512-token strides.
+# _MAX_SLICES = 16  # REMOVED — dual-pass extracts up to 20 concepts
+# _CHARS_PER_SLICE = 2000  # REMOVED — dual-pass uses first 2000 chars
+# _LINK_WEIGHT = 0.4  # REMOVED — dual-pass uses 0.4 / 0.28 from ng_embed
+# _EVENT_SLICE_WEIGHT = 0.3  # REMOVED
+# _SLICE_EVENT_WEIGHT = 0.4  # REMOVED
 
 _SENSITIVE_HEADER_KEYS = frozenset({
     "authorization", "x-api-key", "api-key", "openai-api-key",
@@ -121,18 +139,11 @@ def _store_body(content: str, body_sha: str) -> Optional[Path]:
         return None
 
 
-def _stride_windows(text: str, max_slices: int, chars_per: int) -> List[str]:
-    """Up to max_slices 512-token-ish windows across text."""
-    if len(text) <= chars_per:
-        return []
-    full_count = (len(text) + chars_per - 1) // chars_per
-    if full_count <= max_slices:
-        return [text[i * chars_per:(i + 1) * chars_per] for i in range(full_count)]
-    step = (len(text) - chars_per) / (max_slices - 1)
-    return [
-        text[int(i * step): int(i * step) + chars_per]
-        for i in range(max_slices)
-    ]
+# _stride_windows REMOVED — dual-pass retrofit (#150) replaced stride
+# slicing with proper concept extraction via dual_record_outcome. Trees
+# are real keywords/concepts/key-phrases extracted by TID, not arbitrary
+# 512-token windows. The substrate learns routing patterns from meaningful
+# concepts, not stride-boundary artifacts.
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +224,6 @@ def absorb_wire_deposit(
     embedder,          # NGEmbed instance (has .embed(text), .embed_batch(texts))
     content: str,
     source: str,
-    max_slices: int = _MAX_SLICES,
 ) -> Dict[str, Any]:
     """Absorb one wire deposit into the substrate.
 
@@ -306,52 +316,80 @@ def absorb_wire_deposit(
         logger.warning("Event node create failed (%s): %s", source, exc)
         return result
 
-    # 3. Slice nodes (only if body larger than one window)
-    windows = _stride_windows(content, max_slices, _CHARS_PER_SLICE)
-    if not windows:
+    # 3. Proper 2nd-pass embedding via dual_record_outcome (#150).
+    #
+    # Replaces the 16-stride-slice hack with the ecosystem's own dual-pass
+    # mechanism: Forest (gestalt) + Trees (real concepts/keywords/key-phrases
+    # extracted by TID). Same tool every other module uses — TrollGuard,
+    # Elmer, Praxis, Agent Zero, Faux_Clawdbot all call dual_record_outcome.
+    #
+    # Recursion guard: _extract_concepts calls TID → TID wire_deposit
+    # captures outbound → scan-drain absorbs → dual_record_outcome again.
+    # Break: if the wire body contains the concept-extraction system prompt
+    # ("You extract concepts from text"), this IS a meta-deposit from our
+    # own tree-extraction path. Forest-only for those, no TID call.
+    _CONCEPT_SENTINEL = "You extract concepts from text"
+
+    peer_bridge = getattr(memory, '_peer_bridge', None)
+    if peer_bridge is None:
         return result
 
-    try:
-        slice_embs = embedder.embed_batch(windows)
-    except Exception as exc:
-        logger.warning("Slice embed_batch failed (%s): %s", source, exc)
-        return result
+    is_meta_deposit = _CONCEPT_SENTINEL in content[:2000]
 
-    for i, (window, emb) in enumerate(zip(windows, slice_embs)):
-        slice_node_id = f"{event_node_id}::slice::{i}"
-        slice_meta = {
-            "source_type": "wire_slice",
-            "parent_event": event_node_id,
-            "slice_index": i,
-            "slice_chars": len(window),
-            "body_sha256": sha,
-        }
+    if is_meta_deposit:
+        # Forest only — no tree extraction, breaks recursion.
         try:
-            if slice_node_id not in graph.nodes:
-                graph.create_node(node_id=slice_node_id, metadata=slice_meta)
-                try:
-                    vector_db.insert(
-                        id=slice_node_id,
-                        embedding=emb,
-                        content=window[:200],  # small preview only
-                        metadata=slice_meta,
+            peer_bridge.record_outcome(
+                embedding=fingerprint_emb,
+                target_id=event_node_id,
+                success=True,
+                module_id="neurograph",
+                metadata=event_meta,
+            )
+        except Exception:
+            pass
+    else:
+        # Full dual-pass: Forest + Trees via TID concept extraction.
+        # Adapter wraps peer_bridge to match NGEcosystem.record_outcome
+        # signature that NGEmbed.dual_record_outcome expects.
+        try:
+            from ng_embed import NGEmbed
+
+            class _PeerBridgeEco:
+                """Adapt peer_bridge for dual_record_outcome's ecosystem API."""
+                def __init__(self, bridge):
+                    self._bridge = bridge
+                def record_outcome(self, embedding, target_id, success,
+                                   strength=1.0, metadata=None):
+                    meta = dict(metadata or {})
+                    if strength != 1.0:
+                        meta["_strength"] = strength
+                    return self._bridge.record_outcome(
+                        embedding, target_id, success,
+                        "neurograph", meta,
                     )
-                except Exception:
-                    pass
-        except Exception:
-            continue
 
-        # 4. Bidirectional synapses (weight is bootstrap; STDP adjusts).
-        try:
-            graph.create_synapse(event_node_id, slice_node_id, weight=_EVENT_SLICE_WEIGHT)
-        except Exception:
-            pass
-        try:
-            graph.create_synapse(slice_node_id, event_node_id, weight=_SLICE_EVENT_WEIGHT)
-        except Exception:
-            pass
-
-        result["slice_node_ids"].append(slice_node_id)
-        result["slices_created"] += 1
+            eco_adapter = _PeerBridgeEco(peer_bridge)
+            dp_result = NGEmbed.get_instance().dual_record_outcome(
+                ecosystem=eco_adapter,
+                content=content[:2000],   # first 2000 chars — same as all callers
+                embedding=fingerprint_emb,
+                target_id=event_node_id,
+                success=True,
+                strength=1.0,
+                metadata=event_meta,
+            )
+            result["tree_ids"] = dp_result.get("tree_ids", [])
+            result["concepts"] = dp_result.get("concepts", [])
+            result["slices_created"] = len(result["tree_ids"])
+            logger.info(
+                "Wire dual-pass: %s → %d trees from %d concepts",
+                source, len(result["tree_ids"]),
+                len(result.get("concepts", [])),
+            )
+        except Exception as exc:
+            # Dual-pass failed — forest already recorded above via
+            # graph.create_node. Not fatal; just no trees this time.
+            logger.warning("Wire dual-pass failed (%s): %s", source, exc)
 
     return result

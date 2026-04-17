@@ -917,6 +917,32 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # the correlation between surfaced context and what Syl produced.
     _deposit_surfacing_outcome(params, _ingest_text)
 
+    # Change α (#150): Substrate self-observation via record_outcome.
+    # Deposits a raw snapshot of the substrate's own state as an outcome
+    # pattern.  The substrate learns what "healthy" vs "stressed" looks
+    # like through Hebbian co-firing with concurrent activity.  No field
+    # curation — str(get_stats()) dumps whatever the graph natively
+    # reports. Content can evolve as the graph's stats API evolves.
+    # Downstream modules (Elmer, Immunis, THC, Bunyan) extract what
+    # matters to their specialty at read time.  Law 7 compliant.
+    try:
+        peer_bridge = getattr(_memory, '_peer_bridge', None)
+        if peer_bridge is not None:
+            _stats = _memory.graph.get_stats() if hasattr(_memory.graph, 'get_stats') else {}
+            _stats["total_nodes"] = len(_memory.graph.nodes)
+            _stats_text = str(_stats)
+            from ng_embed import embed as _embed_fn
+            _stats_emb = _embed_fn(_stats_text)
+            peer_bridge.record_outcome(
+                embedding=_stats_emb,
+                target_id="substrate:self_observation",
+                success=True,
+                module_id="neurograph",
+                metadata=_stats,
+            )
+    except Exception as exc:
+        logger.debug("Self-observation deposit failed (non-fatal): %s", exc)
+
     # Clear after deposit — consumed
     _ingest_text = None
     _ingest_embedding = None
@@ -1204,12 +1230,26 @@ def _scan_drain_pulse_loop() -> None:
     was_paused = False
     while not _scan_drain_shutdown.is_set():
         try:
-            paused = os.path.exists(_SCAN_DRAIN_PAUSE_FILE)
+            # Two pause sources: sentinel file (manual) + autonomic state (automatic).
+            # Either one pauses draining. Both must be clear to resume.
+            sentinel_paused = os.path.exists(_SCAN_DRAIN_PAUSE_FILE)
+            autonomic_paused = False
+            try:
+                import ng_autonomic
+                autonomic_paused = ng_autonomic.get_state() == "SYMPATHETIC"
+            except Exception:
+                pass
+            paused = sentinel_paused or autonomic_paused
             if paused != was_paused:
+                reason = []
+                if sentinel_paused:
+                    reason.append(f"sentinel={_SCAN_DRAIN_PAUSE_FILE}")
+                if autonomic_paused:
+                    reason.append("autonomic=SYMPATHETIC")
                 logger.info(
-                    "Scan-dir drain pulse: %s (sentinel=%s)",
+                    "Scan-dir drain pulse: %s (%s)",
                     "PAUSED" if paused else "RESUMED",
-                    _SCAN_DRAIN_PAUSE_FILE,
+                    ", ".join(reason) if reason else "all clear",
                 )
                 was_paused = paused
             if not paused:
