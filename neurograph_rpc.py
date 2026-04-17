@@ -651,6 +651,23 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     try:
         import cc_ng_host
         cc_ng_host.init_cc_host()
+        # Register CC's Tonic with BrainSwitcher for ProtoUniBrain body sharing (#159).
+        # cc_ng_host is in-process — no IPC needed. BrainSwitcher passes _body_lock
+        # (threading) + flock file path to CC's TonicEngine via register_tonic_engine().
+        try:
+            _cc_state = getattr(cc_ng_host, '_STATE', None)
+            _cc_ng = getattr(_cc_state, 'cc_ng', None) if _cc_state else None
+            _cc_tt = getattr(_cc_ng, '_tonic_thread', None) if _cc_ng else None
+            _cc_engine = getattr(_cc_tt, '_latent_engine', None) if _cc_tt else None
+            if _cc_engine is not None:
+                for _mod in (getattr(_memory, '_modules', {}) or {}).values():
+                    _switcher = getattr(_mod, '_brain_switcher', None)
+                    if _switcher is not None:
+                        _switcher.register_tonic_engine(_cc_engine)
+                        logger.info("CC Tonic registered with BrainSwitcher for body sharing")
+                        break
+        except Exception as _bse:
+            logger.debug("CC Tonic BrainSwitcher registration failed (non-fatal): %s", _bse)
     except Exception as exc:
         logger.warning("CC NG host init failed (Syl unaffected): %s", exc)
 

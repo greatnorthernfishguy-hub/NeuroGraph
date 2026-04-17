@@ -26,6 +26,17 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-04-16] Claude (Sonnet 4.6) — #159: Cross-process body lock + set_lock_file
+# What: Added set_lock_file(path), _body_lock_context() composite lock,
+#       _lock_file_path field. contextlib added to module imports.
+# Why:  BrainSwitcher now supports multiple registered Tonic engines.
+#       Both in-process (threading.Lock) and cross-process (fcntl.LOCK_SH)
+#       locks must be held before each forward pass. If any consumer ever
+#       attempts a write (LOCK_EX), all inference blocks — architectural
+#       enforcement, not just documentation.
+# How:  _body_lock_context() uses contextlib.ExitStack to compose both
+#       locks. set_lock_file() receives the path from BrainSwitcher.
+#       _model_inference replaces inline _lock_ctx with _body_lock_context().
 # [2026-03-24] Claude Code (Opus 4.6) — Initial implementation
 # What: TonicEngine — latent token generation via surgical transformer.
 #   Graph-native I/O. Continuous inference between conversations.
@@ -44,6 +55,7 @@ Laws observed:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import threading
@@ -179,6 +191,7 @@ class TonicEngine:
         self._config = config or EngineConfig()
         self._shared_body = transformer_body  # from ProtoUniBrain if available
         self._body_lock = None  # shared with ProtoUniBrain — set via set_body_lock()
+        self._lock_file_path = None  # cross-process flock path — set via set_lock_file()
 
         self._running = False
         self._in_conversation = False
@@ -287,6 +300,43 @@ class TonicEngine:
     def set_body_lock(self, lock) -> None:
         """Accept the shared body access lock from BrainSwitcher."""
         self._body_lock = lock
+
+    def set_lock_file(self, path) -> None:
+        """Accept the cross-process flock path from BrainSwitcher.
+
+        When set, _body_lock_context() acquires fcntl.LOCK_SH on this
+        file before each forward pass — a shared read lock. Any cross-
+        process writer must acquire LOCK_EX, blocking all inference.
+        This enforces the read-only invariant for all body consumers
+        regardless of process boundary. Set to None after body revoke.
+        """
+        self._lock_file_path = path
+
+    @contextlib.contextmanager
+    def _body_lock_context(self):
+        """Composite body access lock: threading lock + fcntl shared read lock.
+
+        Acquires in order:
+        1. _body_lock (threading.Lock) — in-process thread serialization
+        2. fcntl.LOCK_SH on _lock_file_path — cross-process read lock
+
+        Any code modifying body weights must hold LOCK_EX on the same file,
+        which blocks here until all readers release. Architecture-enforced,
+        not documentation-enforced. ExitStack guarantees cleanup (LIFO).
+        """
+        stack = contextlib.ExitStack()
+        with stack:
+            if self._body_lock is not None:
+                stack.enter_context(self._body_lock)
+            if self._lock_file_path is not None:
+                try:
+                    import fcntl as _fcntl
+                    _lf = stack.enter_context(open(self._lock_file_path, 'r'))
+                    _fcntl.flock(_lf.fileno(), _fcntl.LOCK_SH)
+                    stack.callback(_fcntl.flock, _lf.fileno(), _fcntl.LOCK_UN)
+                except Exception as _exc:
+                    logger.debug("flock unavailable — cross-process lock skipped: %s", _exc)
+            yield
 
     # -----------------------------------------------------------------
     # Latent Token Generation
@@ -441,9 +491,7 @@ class TonicEngine:
             return self._heuristic_inference(features)
 
         # Forward through TonicBrain — the actual push
-        import contextlib
-        _lock_ctx = self._body_lock if self._body_lock is not None else contextlib.nullcontext()
-        with _lock_ctx:
+        with self._body_lock_context():
             with torch.no_grad():
                 output = self._model(graph_features)
 
