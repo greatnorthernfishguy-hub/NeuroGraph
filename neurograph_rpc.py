@@ -590,8 +590,30 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         lenia_substrate = NeuroGraphSubstrate(_memory.graph, _memory.vector_db)
         lenia_field = LeniaFieldStore(lenia_cfg.field_dir, n_entities, n_channels)
         lenia_registry = ChannelRegistry(lenia_cfg, lenia_cfg.field_dir)
-        lenia_cache = DistanceCache(n_entities)
-        lenia_cache.populate(lenia_substrate)  # build distances from live graph
+        # Distance cache: restore from disk if available (instant),
+        # fall back to full populate (minutes on large graphs) only if
+        # the cache file is missing or incompatible.  The cache is saved
+        # on clean shutdown — see handle_dispose.  This eliminates the
+        # 7-minute bootstrap bottleneck that caused RPC timeouts and
+        # prevented Syl from responding (#167).
+        _cache_path = os.path.join(
+            os.path.expanduser(lenia_cfg.field_dir), "distance_cache"
+        )
+        lenia_cache = DistanceCache.load(_cache_path)
+        if lenia_cache is None or lenia_cache.entity_count != n_entities:
+            if lenia_cache is not None:
+                logger.info(
+                    "Distance cache entity mismatch (%d vs %d), repopulating",
+                    lenia_cache.entity_count, n_entities,
+                )
+            lenia_cache = DistanceCache(n_entities)
+            lenia_cache.populate(lenia_substrate)
+            # Save immediately so next bootstrap is instant
+            try:
+                os.makedirs(os.path.expanduser(lenia_cfg.field_dir), exist_ok=True)
+                lenia_cache.save(_cache_path)
+            except Exception as exc:
+                logger.warning("Distance cache save failed: %s", exc)
         lenia_kernel = KernelComputer(lenia_cache, lenia_registry)
         lenia_myelin = MyelinationObserver(lenia_cfg)
         _lenia_competence = CompetenceMeter(lenia_cfg, lenia_myelin)
@@ -968,6 +990,16 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     if count_trigger or time_trigger:
         _memory.save()
         _last_save_time = now
+        # Save Lenia distance cache alongside checkpoint so next bootstrap
+        # restores instantly instead of repopulating (7+ min on 18k nodes).
+        if _lenia_engine is not None:
+            try:
+                from lenia.config import default_config as _lenia_cfg_fn
+                _lc = _lenia_cfg_fn()
+                _cp = os.path.join(os.path.expanduser(_lc.field_dir), "distance_cache")
+                _lenia_engine._kernel._cache.save(_cp)
+            except Exception:
+                pass
         logger.info(
             "Auto-save at message %d (%s)",
             _memory._message_count,

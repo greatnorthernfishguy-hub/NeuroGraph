@@ -80,6 +80,66 @@ class DistanceCache:
     def populated(self) -> bool:
         return self._populated
 
+    def save(self, path: str) -> None:
+        """Save the distance cache to disk.
+
+        Serializes all CSR component matrices + metadata as a single
+        numpy .npz archive.  Restore skips the 7-minute populate()
+        call entirely if the graph hasn't changed since save.
+        """
+        if not self._populated:
+            return
+        self._rebuild_csr()  # ensure CSR is current
+        data = {
+            "entity_count": np.array([self._n]),
+            "num_components": np.array([NUM_DIST_COMPONENTS]),
+        }
+        for c in range(NUM_DIST_COMPONENTS):
+            csr = self._components_csr[c]
+            data[f"c{c}_data"] = csr.data
+            data[f"c{c}_indices"] = csr.indices
+            data[f"c{c}_indptr"] = csr.indptr
+            data[f"c{c}_shape"] = np.array(csr.shape)
+        np.savez_compressed(path, **data)
+        logger.info("Distance cache saved: %s (%d entities, %d components)",
+                     path, self._n, NUM_DIST_COMPONENTS)
+
+    @classmethod
+    def load(cls, path: str) -> Optional["DistanceCache"]:
+        """Restore a distance cache from disk.
+
+        Returns None if the file doesn't exist or is incompatible.
+        The caller should fall back to populate() on None.
+        """
+        import os
+        actual = path if path.endswith(".npz") else path + ".npz"
+        if not os.path.exists(actual):
+            return None
+        try:
+            arch = np.load(actual, allow_pickle=False)
+            n = int(arch["entity_count"][0])
+            nc = int(arch["num_components"][0])
+            if nc != NUM_DIST_COMPONENTS:
+                logger.warning("Distance cache component mismatch (%d vs %d), repopulating",
+                               nc, NUM_DIST_COMPONENTS)
+                return None
+            cache = cls(n)
+            cache._components_csr = []
+            for c in range(nc):
+                csr = sparse.csr_matrix(
+                    (arch[f"c{c}_data"], arch[f"c{c}_indices"], arch[f"c{c}_indptr"]),
+                    shape=tuple(arch[f"c{c}_shape"]),
+                )
+                cache._components_csr.append(csr)
+                cache._components_lil[c] = csr.tolil()
+            cache._populated = True
+            cache._rebuild_csr()  # rebuilds magnitude too
+            logger.info("Distance cache restored: %s (%d entities)", actual, n)
+            return cache
+        except Exception as exc:
+            logger.warning("Distance cache restore failed (%s): %s", actual, exc)
+            return None
+
     def set_distance(
         self, i: int, j: int, component: int, value: float
     ):
