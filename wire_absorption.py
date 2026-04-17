@@ -216,7 +216,184 @@ def legacy_json_to_wire_text(content: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Batch forest absorption (fast path)
+# ---------------------------------------------------------------------------
+
+# Batch size for drain pulse — how many entries to embed+record per tick.
+# At 50: ~900ms embedding + fast record_outcome calls.  Leaves room in
+# a 2s tick for other pulse work.  Clears a 2000-entry backlog in ~40 ticks
+# (~80 seconds) instead of the old 1-per-tick throttle (67 minutes).
+_DRAIN_BATCH_SIZE = 50
+
+
+def batch_absorb_forests(
+    memory,
+    embedder,
+    entries: List[Dict[str, str]],  # each: {"content": str, "source": str}
+) -> List[Dict[str, Any]]:
+    """Batch-absorb wire deposits as forest nodes only.
+
+    Fast path: one embed_batch call for all fingerprints, then individual
+    peer_bridge.record_outcome calls.  No TID calls, no concept extraction,
+    no blocking network I/O.
+
+    Returns a list of result dicts (one per entry) with event_node_id and
+    content_preview populated — the concept pulse uses these to add trees
+    later.
+    """
+    if not entries:
+        return []
+
+    graph = getattr(memory, "graph", None)
+    vector_db = getattr(memory, "vector_db", None)
+    peer_bridge = getattr(memory, "_peer_bridge", None)
+    if graph is None or vector_db is None:
+        return []
+
+    # 1. Compute fingerprints (first non-empty line of each body)
+    firsts = [_first_line(e["content"]) or e["source"] for e in entries]
+
+    # 2. Batch embed all fingerprints in one call
+    try:
+        embeddings = embedder.embed_batch(firsts)
+    except Exception as exc:
+        logger.warning("Batch fingerprint embed failed: %s", exc)
+        return []
+
+    # 3. For each entry: store body, create/reinforce event node, record forest
+    results = []
+    for entry, first, emb in zip(entries, firsts, embeddings):
+        content = entry["content"]
+        source = entry["source"]
+        sha = _sha256_hex(content)
+        body_path = _store_body(content, sha)
+        event_node_id = f"wire:{source}:{sha[:12]}"
+
+        event_meta = {
+            "source_type": "wire",
+            "source": source,
+            "first_line": first,
+            "body_bytes": len(content),
+            "body_sha256": sha,
+            "body_file": str(body_path) if body_path else None,
+        }
+
+        # Create/reinforce event node in the graph
+        try:
+            if event_node_id in graph.nodes:
+                existing = graph.nodes[event_node_id]
+                hits = existing.metadata.get("wire_hits", 1) + 1
+                existing.metadata["wire_hits"] = hits
+                existing.metadata["last_seen"] = time.time()
+            else:
+                graph.create_node(node_id=event_node_id, metadata=event_meta)
+                try:
+                    vector_db.insert(
+                        id=event_node_id, embedding=emb,
+                        content=first, metadata=event_meta,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+        # Record forest outcome via peer bridge (River deposit)
+        if peer_bridge is not None:
+            try:
+                peer_bridge.record_outcome(
+                    embedding=emb, target_id=event_node_id,
+                    success=True, module_id="neurograph",
+                    metadata=event_meta,
+                )
+            except Exception:
+                pass
+
+        results.append({
+            "event_node_id": event_node_id,
+            "content_preview": content[:2000],
+            "source": source,
+            "body_file": str(body_path) if body_path else None,
+            "body_bytes": len(content),
+            "body_sha256": sha,
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Concept extraction (slow path — deferred from drain pulse)
+# ---------------------------------------------------------------------------
+
+# Sentinel for recursion detection — concept-extraction TID calls
+# produce wire deposits that get re-absorbed.  If the wire body
+# contains this prompt fragment, it's a meta-deposit from our own
+# concept extraction — skip trees, record forest only.
+_CONCEPT_SENTINEL = "You extract concepts from text"
+
+
+def absorb_trees_for_entry(
+    memory,
+    embedder,
+    content_preview: str,
+    source: str,
+    event_node_id: str,
+) -> Dict[str, Any]:
+    """Add concept trees to an existing forest node.
+
+    Slow path: calls _extract_concepts via TID (blocking network I/O),
+    embeds concepts, records tree outcomes + cross-links.  Called from
+    the concept pulse, NOT from the drain pulse.
+
+    Returns tree extraction results or empty dict on failure.
+    """
+    result = {"tree_ids": [], "concepts": [], "trees_created": 0}
+
+    if _CONCEPT_SENTINEL in content_preview:
+        return result  # recursion guard — meta-deposit, no trees
+
+    peer_bridge = getattr(memory, "_peer_bridge", None)
+    if peer_bridge is None:
+        return result
+
+    try:
+        from ng_embed import NGEmbed
+
+        class _PeerBridgeEco:
+            def __init__(self, bridge):
+                self._bridge = bridge
+            def record_outcome(self, embedding, target_id, success,
+                               strength=1.0, metadata=None):
+                meta = dict(metadata or {})
+                if strength != 1.0:
+                    meta["_strength"] = strength
+                return self._bridge.record_outcome(
+                    embedding, target_id, success, "neurograph", meta,
+                )
+
+        fingerprint_emb = embedder.embed(
+            _first_line(content_preview) or source
+        )
+        eco_adapter = _PeerBridgeEco(peer_bridge)
+        dp_result = NGEmbed.get_instance().dual_record_outcome(
+            ecosystem=eco_adapter,
+            content=content_preview,
+            embedding=fingerprint_emb,
+            target_id=event_node_id,
+            success=True,
+            strength=1.0,
+            metadata={"source": source, "source_type": "wire"},
+        )
+        result["tree_ids"] = dp_result.get("tree_ids", [])
+        result["concepts"] = dp_result.get("concepts", [])
+        result["trees_created"] = len(result["tree_ids"])
+    except Exception as exc:
+        logger.warning("Tree extraction failed (%s): %s", source, exc)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Legacy single-entry entry point (retained for non-batch callers)
 # ---------------------------------------------------------------------------
 
 def absorb_wire_deposit(

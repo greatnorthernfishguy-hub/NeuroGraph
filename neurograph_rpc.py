@@ -563,6 +563,11 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # sandboxed feeders (#141). Decoupled from afterTurn.
     _start_scan_drain_pulse()
 
+    # Start the concept extraction pulse — slow path for tree-level
+    # dual-pass on wire deposits.  Runs every 30s, isolated from the
+    # drain pulse so TID blocking calls never stall the event loop.
+    _start_concept_pulse()
+
 
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
     global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
@@ -1004,55 +1009,44 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
 
 _EXPERIENCE_SCAN_DIR = os.path.expanduser("~/.et_modules/experience")
 
-# Throttle added 2026-04-15 after OOM loop (15 crashes, peak 14.5GB RSS).
-# The ingestor's 5-stage knowledge pipeline (chunk + embed + register +
-# associate) isn't the right absorption shape for huge raw HTTP bodies —
-# one 300k-token deposit creates thousands of substrate nodes + vectors.
-# As a stop-the-bleed, each pulse drains AT MOST _ENTRIES_PER_PULSE
-# entries. Leftover entries are re-deposited to the main tract and
-# picked up on the next pulse. No truncation, no shelving — every byte
-# is preserved; absorption just spread across time. Proper fix (a
-# wire-specific absorption path that stores raw bytes as metadata on a
-# single node, no chunk-embed-associate) is the followup.
-_ENTRIES_PER_PULSE = 1
+# Two-pulse architecture for wire deposit absorption (2026-04-17).
+#
+# FAST PATH (drain pulse, every 2s):
+#   Drain ALL entries from tract, batch-embed fingerprints in one call,
+#   record forest outcomes.  No TID calls, no blocking network I/O.
+#   A batch of 50 fingerprints embeds in ~900ms (vs 50×47ms = 2.3s
+#   sequential).  Clears a 2000-entry backlog in ~80 seconds.
+#
+# SLOW PATH (concept pulse, every 30s):
+#   Pop entries from the concept queue, call TID for concept extraction,
+#   record tree outcomes + cross-links.  Blocking TID calls are isolated
+#   to this pulse — they never stall the drain pulse or the Node.js
+#   event loop.  This is what was causing Discord WebSocket drops: the
+#   old design made a blocking TID call on every drain tick (every 2s),
+#   stalling the Python RPC process, which stalled Node waiting for RPC
+#   responses, which missed Discord heartbeats.
+#
+# The concept queue bridges the two: drain adds entries, concept pulse
+# consumes them.  If concept extraction is slow or TID is down, forests
+# still accumulate — trees arrive when providers are available.
+
+_CONCEPT_QUEUE: List[Dict[str, Any]] = []
+_CONCEPT_QUEUE_MAX = 5000  # don't let queue grow unbounded in memory
+_CONCEPT_PULSE_INTERVAL_SECONDS = 30.0
+_CONCEPT_ENTRIES_PER_PULSE = 3  # TID calls per concept tick — bounded
+_concept_pulse_thread: Optional[threading.Thread] = None
+_concept_pulse_shutdown = threading.Event()
 
 
 def _drain_experience_entry(content: str, content_type: str, source: str) -> None:
     """Feed one drained experience entry through the appropriate path.
 
-    Dispatch:
-      - `tid.http.*` / `wire:*`  → sensory-deposit path (wire_absorption).
-        Wire events aren't knowledge for Syl to absorb word-by-word; they
-        get ONE event node + up to 16 slice children, raw body on disk.
-      - everything else          → universal ingestor (knowledge path).
+    Non-wire entries go through the universal ingestor (knowledge path).
+    Wire entries are handled by the batch drain in _drain_scan_dir_batch.
+    This function only handles the non-wire case now.
     """
     if not content or not content.strip():
         return
-
-    if source and (source.startswith("tid.http.") or source.startswith("wire:")):
-        try:
-            from wire_absorption import absorb_wire_deposit, legacy_json_to_wire_text
-            from ng_embed import NGEmbed
-            # Legacy JSON-wrapped deposits from earlier today get adapted
-            # to raw wire text; same absorption path handles both.
-            if content.lstrip().startswith("{"):
-                adapted = legacy_json_to_wire_text(content)
-                if adapted is not None:
-                    content = adapted
-            res = absorb_wire_deposit(
-                memory=_memory,
-                embedder=NGEmbed.get_instance(),
-                content=content,
-                source=source,
-            )
-            logger.info(
-                "Wire drain: %s body=%dB slices=%d",
-                source, res.get("body_bytes", 0), res.get("slices_created", 0),
-            )
-        except Exception as exc:
-            logger.warning("Wire drain failed (%s): %s", source, exc)
-        return
-
     try:
         if content_type == "file":
             result = _memory.ingest_file(content)
@@ -1061,8 +1055,7 @@ def _drain_experience_entry(content: str, content_type: str, source: str) -> Non
             _memory._message_count += 1
         logger.info(
             "Tract drain: %s from %s — %s",
-            content_type,
-            source,
+            content_type, source,
             "ok" if result else "empty",
         )
     except Exception as exc:
@@ -1070,11 +1063,16 @@ def _drain_experience_entry(content: str, content_type: str, source: str) -> Non
 
 
 def _drain_scan_dir() -> None:
-    """Drain per-feeder experience tract files from ~/.et_modules/experience/.
+    """Drain per-feeder experience tract files — batch-embed forests.
 
-    Each *.tract file in the scan directory is atomically renamed to a
-    drain-specific name, read via the Rust TractReader, then deleted.
-    New deposits from the owning feeder go to a fresh file.
+    Fast path: reads ALL entries from each tract file, separates wire
+    vs non-wire, batch-embeds wire fingerprints, records forest outcomes,
+    queues entries for concept extraction (slow path).  Non-wire entries
+    still go through the universal ingestor one-at-a-time.
+
+    No re-deposit, no throttle.  A batch of 50 entries embeds in ~900ms.
+    The blocking TID concept-extraction call is NEVER made here — it
+    runs on the separate concept pulse (every 30s).
     """
     from pathlib import Path
     scan_dir = Path(_EXPERIENCE_SCAN_DIR)
@@ -1098,7 +1096,6 @@ def _drain_scan_dir() -> None:
 
     pid = os.getpid()
     for tract_path in tract_files:
-        # Skip in-flight drains from any process
         if tract_path.name.startswith(".draining."):
             continue
 
@@ -1122,35 +1119,61 @@ def _drain_scan_dir() -> None:
                 if not isinstance(e, bytes)
                 and getattr(e, "entry_type", None) == ng_tract.ENTRY_EXPERIENCE
             ]
-            # Throttle: process only _ENTRIES_PER_PULSE this cycle; the
-            # rest get re-deposited to the main tract for the next pulse.
-            to_process = all_entries[:_ENTRIES_PER_PULSE]
-            leftover = all_entries[_ENTRIES_PER_PULSE:]
 
-            for entry in to_process:
+            # Separate wire vs non-wire entries
+            wire_entries = []
+            non_wire_entries = []
+            for entry in all_entries:
+                content = entry.content or ""
+                source = entry.source or "unknown"
+                if source.startswith("tid.http.") or source.startswith("wire:"):
+                    # Legacy JSON adapter
+                    if content.lstrip().startswith("{"):
+                        try:
+                            from wire_absorption import legacy_json_to_wire_text
+                            adapted = legacy_json_to_wire_text(content)
+                            if adapted is not None:
+                                content = adapted
+                        except Exception:
+                            pass
+                    wire_entries.append({"content": content, "source": source})
+                else:
+                    non_wire_entries.append(entry)
+
+            # FAST PATH: batch-absorb wire entries as forests
+            wire_absorbed = 0
+            if wire_entries and _memory is not None:
+                try:
+                    from wire_absorption import batch_absorb_forests, _DRAIN_BATCH_SIZE
+                    from ng_embed import NGEmbed
+
+                    # Process in batches of _DRAIN_BATCH_SIZE
+                    for i in range(0, len(wire_entries), _DRAIN_BATCH_SIZE):
+                        batch = wire_entries[i:i + _DRAIN_BATCH_SIZE]
+                        results = batch_absorb_forests(
+                            _memory, NGEmbed.get_instance(), batch,
+                        )
+                        wire_absorbed += len(results)
+                        # Queue for concept extraction (slow path)
+                        for res in results:
+                            if len(_CONCEPT_QUEUE) < _CONCEPT_QUEUE_MAX:
+                                _CONCEPT_QUEUE.append(res)
+                except Exception as exc:
+                    logger.warning("Batch forest drain failed: %s", exc)
+
+            # Non-wire entries: universal ingestor (one at a time)
+            for entry in non_wire_entries:
                 _drain_experience_entry(
                     content=entry.content or "",
                     content_type=entry.content_type,
                     source=entry.source,
                 )
 
-            for entry in leftover:
-                # Re-deposit to the main tract so next pulse picks it up.
-                # Preserves every byte — absorption just spread over time.
-                try:
-                    ng_tract.deposit_experience(
-                        content=entry.content or "",
-                        source=entry.source or "unknown",
-                        tract_path=str(tract_path),
-                        content_type=entry.content_type or "text",
-                    )
-                except Exception as exc:
-                    logger.warning("Re-deposit failed during throttle: %s", exc)
-
-            if to_process or leftover:
+            if wire_absorbed or non_wire_entries:
                 logger.info(
-                    "Scan-dir drain: %d ingested, %d re-deposited (throttle) from %s",
-                    len(to_process), len(leftover), tract_path.name,
+                    "Scan-dir drain: %d wire forests + %d non-wire from %s (concept queue: %d)",
+                    wire_absorbed, len(non_wire_entries),
+                    tract_path.name, len(_CONCEPT_QUEUE),
                 )
         except Exception as exc:
             logger.warning("Scan-dir drain read failed (%s): %s", tract_path.name, exc)
@@ -1272,6 +1295,80 @@ def _start_scan_drain_pulse() -> None:
         daemon=True,
     )
     _scan_drain_thread.start()
+
+
+# ---- Concept extraction pulse (slow path) ----------------------------------
+# Consumes entries from _CONCEPT_QUEUE that the drain pulse populated.
+# Each tick pops up to _CONCEPT_ENTRIES_PER_PULSE entries and calls TID
+# for concept extraction.  This is the ONLY place in the ecosystem where
+# a blocking TID call runs inside the NG plugin process.  Isolated to its
+# own thread + 30s cadence so it never stalls the drain pulse, the RPC
+# handler, or the Node.js event loop.
+
+def _concept_extraction_pulse_loop() -> None:
+    """Background loop: extract concepts from queued wire deposits via TID."""
+    logger.info(
+        "Concept extraction pulse started (interval=%.0fs, entries/tick=%d)",
+        _CONCEPT_PULSE_INTERVAL_SECONDS, _CONCEPT_ENTRIES_PER_PULSE,
+    )
+    while not _concept_pulse_shutdown.is_set():
+        try:
+            if not _CONCEPT_QUEUE or _memory is None:
+                _concept_pulse_shutdown.wait(timeout=_CONCEPT_PULSE_INTERVAL_SECONDS)
+                continue
+
+            # Pop up to N entries
+            batch = []
+            for _ in range(_CONCEPT_ENTRIES_PER_PULSE):
+                if not _CONCEPT_QUEUE:
+                    break
+                batch.append(_CONCEPT_QUEUE.pop(0))
+
+            if not batch:
+                _concept_pulse_shutdown.wait(timeout=_CONCEPT_PULSE_INTERVAL_SECONDS)
+                continue
+
+            from wire_absorption import absorb_trees_for_entry
+            from ng_embed import NGEmbed
+
+            trees_total = 0
+            for entry in batch:
+                try:
+                    res = absorb_trees_for_entry(
+                        memory=_memory,
+                        embedder=NGEmbed.get_instance(),
+                        content_preview=entry.get("content_preview", ""),
+                        source=entry.get("source", "unknown"),
+                        event_node_id=entry.get("event_node_id", ""),
+                    )
+                    trees_total += res.get("trees_created", 0)
+                except Exception as exc:
+                    logger.debug("Concept extraction failed for %s: %s",
+                                 entry.get("event_node_id", "?"), exc)
+
+            if trees_total:
+                logger.info(
+                    "Concept pulse: %d trees from %d entries (queue: %d remaining)",
+                    trees_total, len(batch), len(_CONCEPT_QUEUE),
+                )
+        except Exception:
+            logger.exception("Concept extraction pulse failed")
+        _concept_pulse_shutdown.wait(timeout=_CONCEPT_PULSE_INTERVAL_SECONDS)
+    logger.info("Concept extraction pulse stopped")
+
+
+def _start_concept_pulse() -> None:
+    """Start the concept extraction pulse thread. Idempotent."""
+    global _concept_pulse_thread
+    if _concept_pulse_thread is not None and _concept_pulse_thread.is_alive():
+        return
+    _concept_pulse_shutdown.clear()
+    _concept_pulse_thread = threading.Thread(
+        target=_concept_extraction_pulse_loop,
+        name="ng-concept-pulse",
+        daemon=True,
+    )
+    _concept_pulse_thread.start()
 
 
 def _rescue_orphan_draining_files() -> None:
