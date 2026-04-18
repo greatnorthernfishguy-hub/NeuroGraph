@@ -1235,11 +1235,18 @@ def _drain_tract() -> None:
     """
     entries = _tract.drain()
     for entry in entries:
-        _drain_experience_entry(
-            content=entry.get("content", ""),
-            content_type=entry.get("content_type", "text"),
-            source=entry.get("source", "unknown"),
-        )
+        if isinstance(entry, dict):
+            _drain_experience_entry(
+                content=entry.get("content", ""),
+                content_type=entry.get("content_type", "text"),
+                source=entry.get("source", "unknown"),
+            )
+        else:
+            _drain_experience_entry(
+                content=entry.content or "",
+                content_type=entry.content_type,
+                source=entry.source or "unknown",
+            )
 
 
 # ---- Scan-dir pulse loop ----------------------------------------------------

@@ -63,7 +63,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger("neurograph.tract")
 
@@ -130,7 +130,7 @@ class ExperienceTract:
 
     # ── Consumer API ──────────────────────────────────────────────────
 
-    def drain(self) -> List[Dict[str, Any]]:
+    def drain(self) -> List[Union["ng_tract.PyExperienceEntry", Dict[str, Any]]]:
         """Drain all pending experience from the tract.
 
         This is the topology-owner-side API.  Called during afterTurn
@@ -171,12 +171,7 @@ class ExperienceTract:
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             pass
                     elif entry.entry_type == ng_tract.ENTRY_EXPERIENCE:
-                        entries.append({
-                            "content": entry.content,
-                            "source": entry.source,
-                            "content_type": entry.content_type,
-                            "timestamp": entry.timestamp,
-                        })
+                        entries.append(entry)
         except OSError as exc:
             logger.warning("Tract drain read failed: %s", exc)
             return entries
