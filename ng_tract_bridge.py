@@ -48,6 +48,15 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-04-18] Claude Code (Sonnet 4.6) — Punchlist #155: Fix _peer_events_max drop-at-intake
+#   What: Raised _peer_events_max 500 —> 50_000. Extracted rolling-window eviction into
+#         _enforce_window_limit() and call it at end of _drain_all() instead of inline.
+#   Why:  500-item cap silently discarded the oldest River events on every drain cycle.
+#         With 8+ active modules depositing, 500 saturates in a single drain. Raw
+#         experience was being dropped at the intake layer — a Law 7 violation baked
+#         into the River infrastructure itself. Darwin uses 50k; same pattern adopted here.
+#   How:  _enforce_window_limit() trims accumulated buffer AFTER extending with new events.
+#         All events drained from disk are absorbed without cap. Re-vendor to all modules.
 # [2026-04-13] Claude (Sonnet 4.6) — Fix #123: River absorption gap
 #   What: Added self._drain_all() at entry of get_recommendations() and
 #         detect_novelty() before operating on cached _peer_events.
@@ -357,7 +366,7 @@ class NGTractBridge(NGBridge):
         # Holds typed BTF entry objects (PyOutcomeEntry, PyTopologyEntry,
         # PyExperienceEntry) and/or legacy dicts from JSONL fallback.
         self._peer_events: List[Any] = []
-        self._peer_events_max = 500
+        self._peer_events_max = 50_000
 
         # Myelination state (runtime only — not persisted)
         self._myelinated: Dict[str, MmapTract] = {}
@@ -659,8 +668,7 @@ class NGTractBridge(NGBridge):
 
         # Add to cache, maintaining bounded size
         self._peer_events.extend(new_events)
-        if len(self._peer_events) > self._peer_events_max:
-            self._peer_events = self._peer_events[-self._peer_events_max:]
+        self._enforce_window_limit()
 
         if new_events:
             logger.debug(
@@ -668,6 +676,17 @@ class NGTractBridge(NGBridge):
                 self._drain_count, len(new_events),
                 len(set(self._get_module_id(e) for e in new_events)),
             )
+
+    def _enforce_window_limit(self) -> None:
+        """Trim accumulated peer events to rolling-window max.
+
+        Absorb ALL events at drain time; evict oldest only after absorption
+        exceeds the window. Matches Darwin recorder._enforce_window_limit
+        (50k). Never cap mid-drain -- Law 7: no experience dropped at intake.
+        """
+        if len(self._peer_events) > self._peer_events_max:
+            excess = len(self._peer_events) - self._peer_events_max
+            self._peer_events = self._peer_events[excess:]
 
     def _drain_single_tract(
         self, tract_path: Path, peer_id: str,
