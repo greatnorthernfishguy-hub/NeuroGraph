@@ -33,6 +33,17 @@ Concurrency model:
     no read/write collision.
 
 # ---- Changelog ----
+# [2026-04-17] Claude Code (Sonnet 4.6) — Remove dict inflation in BTF path (#126).
+#   What: drain() BTF path returned PyExperienceEntry wrapped in a 4-key dict.
+#         Now returns the entry directly. Caller (_drain_tract in neurograph_rpc.py)
+#         updated with isinstance(entry, dict) guard to handle both BTF
+#         (PyExperienceEntry) and legacy JSONL bytes (dict from json.loads()).
+#         Return type updated to List[Union[PyExperienceEntry, Dict[str, Any]]].
+#         Union added to typing imports.
+#   Why:  Unnecessary allocation per entry; callers use .content/.source etc.
+#         directly. Eliminates the dict wrapper without breaking legacy path.
+#   How:  Single entries.append(entry) replaces the 6-line dict literal.
+#         isinstance guard in the only caller (neurograph_rpc.py:_drain_tract).
 # [2026-04-15] Claude Code (Opus 4.6) — Drain path now one of two (#141).
 #   What: As of #141, this ExperienceTract is the *legacy* single-file
 #         drain path (~/NeuroGraph/data/tract/experience.tract).
