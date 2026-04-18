@@ -12,6 +12,14 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-17] Claude Code (Sonnet 4.6) — Resource-gated sequential module boot (#111)
+#   What: Memory availability check added before each module load in _bootstrap_modules().
+#         Waits until psutil reports >= 500 MB free before proceeding. Uses time.sleep(2)
+#         + gc.collect() while below threshold. ImportError on psutil is silently skipped.
+#   Why:  Staggered sort (elmer last) helps but doesn't adapt to actual memory pressure.
+#         OOM during bootstrap on 15GB VPS caused by back-to-back heavy module loads.
+#   How:  Inline psutil + gc import (matching file's _json pattern). Gate inserted
+#         immediately before the try: import importlib.util block in each loop iteration.
 # [2026-04-16] Claude Code (Sonnet 4.6) — Scan-drain pulse sentinel-file kill-switch
 #   What: _scan_drain_pulse_loop() checks /tmp/ng_scan_drain_paused each
 #         tick.  If present, pulse keeps ticking but skips draining.
@@ -259,6 +267,19 @@ def _bootstrap_modules() -> List[str]:
         if not os.path.exists(hook_file):
             logger.warning("Module %s: hook file not found (%s)", module_id, hook_file)
             continue
+
+        # Memory gate — wait for 500 MB free before loading each module (#111)
+        try:
+            import psutil as _psutil
+            import gc as _gc
+            _avail_mb = _psutil.virtual_memory().available >> 20
+            while _avail_mb < 500:
+                logger.info("Module boot gate: %d MB free — waiting for 500 MB free", _avail_mb)
+                time.sleep(2)
+                _gc.collect()
+                _avail_mb = _psutil.virtual_memory().available >> 20
+        except ImportError:
+            pass  # psutil not installed — proceed without memory gating
 
         try:
             import importlib.util
