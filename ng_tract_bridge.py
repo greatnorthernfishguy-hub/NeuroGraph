@@ -48,6 +48,15 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-04-19] Claude Code (Sonnet 4.6) — Punchlist #155 test: stub bridge similarity methods
+#   What: get_recommendations() and detect_novelty() now return None immediately after
+#         _drain_all() instead of scanning _peer_events.
+#   Why:  _peer_events is an ever-growing in-memory list that shadows the substrate in
+#         ng_lite.py's fallback chain. Returning None forces the fallback to
+#         _core.get_recommendations() / _core.detect_novelty() (the Hebbian substrate)
+#         which does this job better and already contains peer experience via pulse loops.
+#         Test run before full _peer_events deletion.
+# -------------------
 # [2026-04-18] Claude Code (Sonnet 4.6) — Punchlist #155: Fix _peer_events_max drop-at-intake
 #   What: Raised _peer_events_max 500 —> 50_000. Extracted rolling-window eviction into
 #         _enforce_window_limit() and call it at end of _drain_all() instead of inline.
@@ -473,11 +482,10 @@ class NGTractBridge(NGBridge):
         Searches cached peer events for similar embeddings and returns
         their targets as recommendations.
         """
-        # Absorb from River before querying -- ensures modules with low
-        # outcome throughput see current peer data, not a stale cache (#123)
+        # Substrate handles cross-module similarity -- drain River then defer to substrate
+        # (#155 test: returning None lets ng_lite.py fall through to _core.get_recommendations)
         self._drain_all()
-        if not self._connected or not self._peer_events:
-            return None
+        return None
 
         emb = self._normalize(embedding)
 
@@ -527,10 +535,10 @@ class NGTractBridge(NGBridge):
         Checks if this embedding is novel not just to this module,
         but to ALL peer modules on this host.
         """
-        # Absorb from River before querying (#123)
+        # Substrate handles cross-module novelty -- drain River then defer to substrate
+        # (#155 test: returning None lets ng_lite.py fall through to _core.detect_novelty)
         self._drain_all()
-        if not self._connected or not self._peer_events:
-            return None
+        return None
 
         emb = self._normalize(embedding)
         max_similarity = 0.0
