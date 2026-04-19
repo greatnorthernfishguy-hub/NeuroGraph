@@ -2,6 +2,12 @@
 OpenClaw Adapter — E-T Systems Module Integration for OpenClaw Skills
 
 # ---- Changelog ----
+# [2026-04-19] CC (punchlist #143) -- Module backflow deposit for SKIP_ECOSYSTEM modules
+#   What: When _eco is None (SKIP_ECOSYSTEM=True), deposit outcome directly to
+#          tracts/{module_id}/neurograph.tract via ng_tract (BTF, zero-copy).
+#   Why:  In-process modules had no deposit path with SKIP_ECOSYSTEM=True,
+#          leaving tracts/{module_id}/ permanently empty. River backflow broken.
+#   How:  Direct ng_tract.deposit_outcome() call, substrate-only (not fan-out).
 # [2026-03-26] Claude (Opus 4.6) — Domain-specific substrate outcomes (punchlist #18)
 #   What: on_message() now runs _module_on_message() BEFORE record_outcome().
 #     Modules can return _substrate_target_id and _substrate_success in their
@@ -235,6 +241,34 @@ class OpenClawAdapter(ABC):
             )
             ctx = self._eco.get_context(embedding)
         else:
+            # Tract-only mode: deposit directly to NG substrate via BTF
+            try:
+                import ng_tract as _ng_tract
+                import time as _t
+                import os as _os
+                from pathlib import Path as _Path
+                _tracts_dir = _Path(
+                    _os.environ.get("ET_TRACTS_DIR", "~/.et_modules/tracts")
+                ).expanduser()
+                _tract_path = _tracts_dir / self.MODULE_ID / "neurograph.tract"
+                _tract_path.parent.mkdir(parents=True, exist_ok=True)
+                _meta = None
+                try:
+                    import msgpack as _mp
+                    _meta = _mp.packb({"source": "openclaw", "module": self.MODULE_ID})
+                except Exception:
+                    pass
+                _ng_tract.deposit_outcome(
+                    timestamp=_t.time(),
+                    module_id=self.MODULE_ID,
+                    target_id=substrate_target,
+                    success=substrate_success,
+                    embedding=np.asarray(embedding, dtype=np.float32),
+                    tract_paths=[str(_tract_path)],
+                    metadata=_meta,
+                )
+            except Exception as _e:
+                logger.debug("[%s] Tract deposit skipped: %s", self.MODULE_ID, _e)
             ctx = {"recommendations": [], "novelty": 0.0}
 
         result = {
