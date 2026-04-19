@@ -87,6 +87,15 @@ to an existing NeuroGraphMemory call.
 #         sliced to recent window, summary prepended to priming_text before
 #         harvest, truncated messages returned in result.  try/except
 #         fallback to full messages on any KISS exception.
+# [2026-04-19] Claude Code (Sonnet 4.6) — Fix stdin-closed orphan accumulation
+#   What: main() now checkpoints and exits cleanly when stdin closes, instead
+#         of entering an infinite sleep loop ("organism staying alive").
+#   Why:  Sleep-loop orphans blocked topology acquisition on gateway restart
+#         (startup sentinel cleanup sends SIGTERM but orphan survived). Two
+#         orphans were accumulating per restart, consuming 75%+ RAM.
+#   How:  On readline() returning empty string or BrokenPipeError, call
+#         _memory.save() then break. The startup code in main() already
+#         handles stale-sentinel cleanup via SIGTERM + sentinel delete.
 # [2026-04-12] Claude Code (Opus 4.6) — Time-based auto-save fallback
 #   What: Auto-save now fires on 5-minute interval in addition to every-10-messages.
 #   Why:  _message_count resets to 0 on every gateway restart. With frequent restarts
@@ -2276,23 +2285,23 @@ def main() -> None:
     import threading
     threading.Thread(target=_self_bootstrap, name="self-bootstrap", daemon=True).start()
 
-    # Main RPC loop. If stdin closes (TS plugin context recycled),
-    # keep the process alive — daemon threads (Tonic, pulse loops,
-    # Lenia dynamics) ARE the organism. Reconnect when stdin reopens.
-    import select
+    # Main RPC loop. On stdin close (gateway exited), checkpoint and exit
+    # cleanly so the next gateway startup gets a clean slate. The startup
+    # sentinel cleanup in main() handles topology ownership transition.
     while True:
         try:
             line = sys.stdin.readline()
             if not line:
-                # stdin closed — TS plugin context may have recycled.
-                # Keep process alive for daemon threads. Sleep and retry.
-                logger.info("stdin closed — organism staying alive (daemon threads active)")
-                import time as _t
-                while True:
-                    _t.sleep(60)
-                    # Check if we should actually exit (systemd stop)
-                    if not threading.main_thread().is_alive():
-                        break
+                # stdin closed — gateway exited. Checkpoint and exit cleanly
+                # so the startup sentinel cleanup in the next invocation can
+                # claim topology without fighting a live orphan.
+                logger.info("stdin closed — checkpointing and exiting cleanly")
+                try:
+                    if _memory is not None:
+                        _memory.save()
+                        logger.info("Checkpoint saved on clean exit")
+                except Exception as _ce:
+                    logger.warning("Checkpoint on exit failed: %s", _ce)
                 break
             line = line.strip()
             if not line:
@@ -2302,12 +2311,7 @@ def main() -> None:
                 sys.stdout.write(response + "\n")
                 sys.stdout.flush()
         except (BrokenPipeError, IOError):
-            logger.info("stdin pipe broken — organism staying alive")
-            import time as _t
-            while True:
-                _t.sleep(60)
-                if not threading.main_thread().is_alive():
-                    break
+            logger.info("stdin pipe broken — exiting cleanly")
             break
         except KeyboardInterrupt:
             break
