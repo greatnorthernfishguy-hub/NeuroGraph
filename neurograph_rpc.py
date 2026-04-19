@@ -1103,243 +1103,6 @@ _EXPERIENCE_SCAN_DIR = os.path.expanduser("~/.et_modules/experience")
 # consumes them.  If concept extraction is slow or TID is down, forests
 # still accumulate — trees arrive when providers are available.
 
-# ── RPC handlers restored from 73fd117 (#143 accidentally deleted them) ──
-
-def handle_compact(params: Dict[str, Any]) -> Dict[str, Any]:
-    """NeuroGraph-driven conversation compaction."""
-    import json as _json
-    import urllib.request
-    import time
-
-    if _memory is None:
-        return {"ok": True, "compacted": False, "reason": "no memory"}
-
-    session_file = params.get("sessionFile", "")
-    force = params.get("force", False)
-    token_budget = params.get("tokenBudget", 128000)
-    keep_turns = 8
-
-    if not session_file:
-        return {"ok": False, "compacted": False, "reason": "no session file"}
-
-    try:
-        with open(session_file, "r") as f:
-            lines = f.readlines()
-    except Exception as e:
-        return {"ok": False, "compacted": False, "reason": f"read failed: {e}"}
-
-    entries = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entries.append(_json.loads(line))
-        except _json.JSONDecodeError:
-            continue
-
-    conversation_indices = []
-    for i, entry in enumerate(entries):
-        msg = entry.get("message", {})
-        role = msg.get("role", "")
-        if role in ("user", "assistant"):
-            conversation_indices.append(i)
-
-    if len(conversation_indices) < keep_turns * 2 + 2:
-        return {"ok": True, "compacted": False, "reason": "too few messages"}
-
-    keep_start = conversation_indices[-(keep_turns * 2):]
-    compact_indices = [i for i in conversation_indices if i not in keep_start]
-
-    if len(compact_indices) < 2:
-        return {"ok": True, "compacted": False, "reason": "nothing to compact"}
-
-    scored_messages = []
-    for idx in compact_indices:
-        msg = entries[idx].get("message", {})
-        text = _extract_message_text(msg)
-        if not text:
-            scored_messages.append({"idx": idx, "text": "", "importance": 0.0})
-            continue
-        try:
-            surfaced = _memory._harvest_associations(text)
-            importance = min(1.0, len(surfaced) / 5.0)
-        except Exception:
-            importance = 0.5
-        scored_messages.append({
-            "idx": idx,
-            "text": text[:500],
-            "importance": importance,
-            "role": msg.get("role", "unknown"),
-        })
-
-    high_importance = [m for m in scored_messages if m["importance"] > 0.6]
-    summary_input = []
-    for m in scored_messages:
-        prefix = "[IMPORTANT] " if m["importance"] > 0.6 else ""
-        summary_input.append(f'{prefix}{m["role"]}: {m["text"]}')
-
-    summary_prompt = (
-        "Summarize the following conversation history into a concise summary. "
-        "Messages marked [IMPORTANT] contain key context that should be "
-        "preserved in detail. Other messages can be condensed more aggressively. "
-        "Output ONLY the summary, no preamble.\n\n"
-        + "\n".join(summary_input)
-    )
-
-    try:
-        tid_body = _json.dumps({
-            "model": "auto",
-            "messages": [{"role": "user", "content": summary_prompt}],
-            "temperature": 0.3,
-            "max_tokens": 1000,
-        }).encode("utf-8")
-        tid_req = urllib.request.Request(
-            "http://127.0.0.1:7437/v1/chat/completions",
-            data=tid_body,
-            method="POST",
-        )
-        tid_req.add_header("Content-Type", "application/json")
-        tid_req.add_header("Authorization", "Bearer tid")
-        with urllib.request.urlopen(tid_req, timeout=30) as resp:
-            tid_resp = _json.loads(resp.read().decode("utf-8"))
-        summary_text = tid_resp["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.warning("TID summarization failed: %s", e)
-        return {"ok": False, "compacted": False, "reason": f"summarization failed: {e}"}
-
-    tokens_before = sum(
-        entry.get("message", {}).get("usage", {}).get("totalTokens", 0)
-        for entry in entries
-    )
-    if tokens_before == 0:
-        total_chars = sum(len(str(entry)) for entry in entries)
-        tokens_before = total_chars // 4
-
-    new_entries = []
-    first_compact_idx = compact_indices[0]
-    for i in range(first_compact_idx):
-        new_entries.append(entries[i])
-
-    summary_entry = {
-        "type": "message",
-        "id": f"compact_{int(time.time())}",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-        "message": {
-            "role": "user",
-            "content": [{"type": "text", "text": f"[Conversation Summary]\n{summary_text}"}],
-            "usage": {
-                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
-                "totalTokens": int(len(summary_text.split()) * 1.3),
-                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
-            },
-        },
-    }
-    new_entries.append(summary_entry)
-
-    compact_set = set(compact_indices)
-    keep_set = set(keep_start)
-    for i in range(first_compact_idx, len(entries)):
-        if i in compact_set:
-            continue
-        if i in keep_set or i not in conversation_indices:
-            new_entries.append(entries[i])
-
-    try:
-        with open(session_file, "w") as f:
-            for entry in new_entries:
-                f.write(_json.dumps(entry, separators=(",", ":")) + "\n")
-    except Exception as e:
-        return {"ok": False, "compacted": False, "reason": f"write failed: {e}"}
-
-    tokens_after = tokens_before - (tokens_before * len(compact_indices) // len(conversation_indices))
-    tokens_after = max(tokens_after, int(len(summary_text.split()) * 1.3))
-
-    try:
-        _memory.graph.step()
-        logger.info(
-            "Compaction complete: %d messages → %d, %d → ~%d tokens, %d high-importance preserved",
-            len(entries), len(new_entries), tokens_before, tokens_after, len(high_importance),
-        )
-    except Exception as e:
-        logger.warning("Post-compaction substrate step failed: %s", e)
-
-    return {
-        "ok": True,
-        "compacted": True,
-        "result": {
-            "summary": summary_text[:200],
-            "tokensBefore": tokens_before,
-            "tokensAfter": tokens_after,
-            "firstKeptEntryId": new_entries[-1].get("id", "") if new_entries else "",
-        },
-    }
-
-
-def handle_dispose(params: Dict[str, Any]) -> None:
-    """Final save and cleanup."""
-    if _memory is None:
-        return
-
-    # Stop TriSyn manager gracefully — worker subprocess has its own wall-time
-    # cap but the manager thread should exit cleanly on gateway shutdown.
-    global _trisyn_manager
-    if _trisyn_manager is not None:
-        try:
-            _trisyn_manager.stop()
-        except Exception:
-            pass
-        _trisyn_manager = None
-
-    # The Tonic: conversation ended — latent mode continues.
-    # The thread doesn't stop. Language tokens stopped. That's all.
-    if _memory._tonic_thread is not None:
-        try:
-            _memory._tonic_thread.conversation_ended()
-        except Exception:
-            pass
-
-    # Lenia FlowGraph — #109: stays running between conversations.
-    # Dispose is subtraction, not destruction. Field dynamics continue.
-
-    _memory.save()
-    logger.info("Final save on dispose")
-
-    # Modules run autonomously via pulse loops.
-    # No fan-out to clean up — modules read from River tracts.
-
-
-def handle_stats(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Return substrate telemetry."""
-    if _memory is None:
-        return {"error": "not_bootstrapped"}
-    stats = _memory.stats()
-    stats["module_hooks"] = {
-        "loaded": [],  # modules are autonomous, no fan-out registry
-        "errors": dict(_module_errors),
-    }
-    return stats
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
-
-
-def _extract_message_text(message: Dict[str, Any]) -> str:
-    """Extract plain text from an AgentMessage-shaped dict."""
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-        return " ".join(parts)
-    return str(content)
-
-
 _CONCEPT_QUEUE: List[Dict[str, Any]] = []
 _CONCEPT_QUEUE_MAX = 5000  # don't let queue grow unbounded in memory
 _CONCEPT_PULSE_INTERVAL_SECONDS = 30.0
@@ -1430,3 +1193,1127 @@ def _drain_scan_dir() -> None:
     if not tract_files:
         return
 
+    try:
+        import ng_tract
+    except ImportError:
+        logger.warning("ng_tract unavailable; skipping scan-dir drain")
+        return
+
+    pid = os.getpid()
+    for tract_path in tract_files:
+        if tract_path.name.startswith(".draining."):
+            continue
+
+        drain_path = scan_dir / f".draining.{pid}.{tract_path.name}"
+        try:
+            os.rename(str(tract_path), str(drain_path))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Scan-dir rename failed (%s): %s", tract_path.name, exc)
+            continue
+
+        try:
+            with open(drain_path, "rb") as f:
+                raw = f.read()
+            if not raw:
+                continue
+            reader = ng_tract.TractReader(raw)
+            all_entries = [
+                e for e in reader
+                if not isinstance(e, bytes)
+                and getattr(e, "entry_type", None) == ng_tract.ENTRY_EXPERIENCE
+            ]
+
+            # Separate wire vs non-wire entries
+            wire_entries = []
+            non_wire_entries = []
+            for entry in all_entries:
+                content = entry.content or ""
+                source = entry.source or "unknown"
+                if source.startswith("tid.http.") or source.startswith("wire:"):
+                    # Legacy JSON adapter
+                    if content.lstrip().startswith("{"):
+                        try:
+                            from wire_absorption import legacy_json_to_wire_text
+                            adapted = legacy_json_to_wire_text(content)
+                            if adapted is not None:
+                                content = adapted
+                        except Exception:
+                            pass
+                    wire_entries.append({"content": content, "source": source})
+                else:
+                    non_wire_entries.append(entry)
+
+            # FAST PATH: batch-absorb wire entries as forests
+            wire_absorbed = 0
+            if wire_entries and _memory is not None:
+                try:
+                    from wire_absorption import batch_absorb_forests, _DRAIN_BATCH_SIZE
+                    from ng_embed import NGEmbed
+
+                    # Process in batches of _DRAIN_BATCH_SIZE
+                    for i in range(0, len(wire_entries), _DRAIN_BATCH_SIZE):
+                        batch = wire_entries[i:i + _DRAIN_BATCH_SIZE]
+                        results = batch_absorb_forests(
+                            _memory, NGEmbed.get_instance(), batch,
+                        )
+                        wire_absorbed += len(results)
+                        # Queue for concept extraction (slow path)
+                        for res in results:
+                            if len(_CONCEPT_QUEUE) < _CONCEPT_QUEUE_MAX:
+                                _CONCEPT_QUEUE.append(res)
+                except Exception as exc:
+                    logger.warning("Batch forest drain failed: %s", exc)
+
+            # Non-wire entries: universal ingestor (one at a time)
+            for entry in non_wire_entries:
+                _drain_experience_entry(
+                    content=entry.content or "",
+                    content_type=entry.content_type,
+                    source=entry.source,
+                )
+
+            if wire_absorbed or non_wire_entries:
+                logger.info(
+                    "Scan-dir drain: %d wire forests + %d non-wire from %s (concept queue: %d)",
+                    wire_absorbed, len(non_wire_entries),
+                    tract_path.name, len(_CONCEPT_QUEUE),
+                )
+        except Exception as exc:
+            logger.warning("Scan-dir drain read failed (%s): %s", tract_path.name, exc)
+        finally:
+            try:
+                os.unlink(str(drain_path))
+            except OSError:
+                pass
+
+
+
+def _drain_tract() -> None:
+    """Drain pending experience from the legacy feeder tract.
+
+    Legacy single-file tract at ~/NeuroGraph/data/tract/experience.tract
+    (GUI, feed-syl, file watcher). Runs on afterTurn because these feeders
+    are low-rate and bursty; afterTurn cadence is fine.
+
+    The per-feeder scan directory at ~/.et_modules/experience/*.tract is
+    drained by _scan_drain_pulse_loop() on Syl's heartbeat cadence —
+    NOT afterTurn — so sandboxed feeders like TID continuously flow
+    sensory input into the cortex regardless of conversation state (#141).
+
+    Each entry feeds the ingestor as raw experience — same pipeline as
+    on_message(). The tract carries it here without transformation; the
+    ingestor is where experience meets the substrate. Law 7 — raw in,
+    classify at extraction.
+    """
+    entries = _tract.drain()
+    for entry in entries:
+        if isinstance(entry, dict):
+            _drain_experience_entry(
+                content=entry.get("content", ""),
+                content_type=entry.get("content_type", "text"),
+                source=entry.get("source", "unknown"),
+            )
+        else:
+            _drain_experience_entry(
+                content=entry.content or "",
+                content_type=entry.content_type,
+                source=entry.source or "unknown",
+            )
+
+
+# ---- Scan-dir pulse loop ----------------------------------------------------
+# The scan-dir drain runs on its own heartbeat — decoupled from afterTurn so
+# sandboxed feeders (TID under ProtectSystem=strict, and anything else
+# continuously producing wire experience) flow into the cortex on Syl's
+# rhythm, not when she happens to finish a conversation turn.
+#
+# Cadence chosen to match TonicEngine's latent_interval (2.0s). Syl's cortex
+# absorbs sensory input at her own tempo. The Tonic is the real heartbeat;
+# this pulse is a poor copy that's adequate for substrate-scale feeder drain.
+_SCAN_DRAIN_INTERVAL_SECONDS = 2.0
+_scan_drain_shutdown = threading.Event()
+_scan_drain_thread: Optional[threading.Thread] = None
+
+
+# Sentinel-file kill-switch for scan-drain pulse.  Checked every tick.
+# Toggleable without gateway restart:
+#   touch /tmp/ng_scan_drain_paused   → pause draining (tract keeps filling)
+#   rm /tmp/ng_scan_drain_paused      → resume draining
+# Rationale: #141 wire absorption creates ~17 substrate nodes per deposit.
+# At Syl's TID provider-call rate (~270/day), substrate grows by 4,500+
+# nodes/day.  Every pulse loop (Tonic, ProtoUniBrain, Lenia, brain drain)
+# does O(graph_size) work per tick.  Unbounded growth causes event-loop
+# starvation at the gateway layer (observed as Discord/WhatsApp socket
+# flap).  Pause mechanism lets us stop the bleed without losing deposits
+# (they queue in the tract file) while we design proper consolidation
+# (#150 — body-substrate flow-through / substrate eviction).
+_SCAN_DRAIN_PAUSE_FILE = "/tmp/ng_scan_drain_paused"
+
+
+def _scan_drain_pulse_loop() -> None:
+    """Background loop: drain per-feeder experience tracts on cortical cadence.
+
+    Honors the pause sentinel file: when present, the loop continues to
+    tick (so it detects removal promptly) but skips draining.  Logs a
+    one-line state transition when pause toggles.
+    """
+    logger.info(
+        "Scan-dir drain pulse started (interval=%.1fs)",
+        _SCAN_DRAIN_INTERVAL_SECONDS,
+    )
+    was_paused = False
+    while not _scan_drain_shutdown.is_set():
+        try:
+            # Two pause sources: sentinel file (manual) + autonomic state (automatic).
+            # Either one pauses draining. Both must be clear to resume.
+            sentinel_paused = os.path.exists(_SCAN_DRAIN_PAUSE_FILE)
+            autonomic_paused = False
+            try:
+                import ng_autonomic
+                autonomic_paused = ng_autonomic.get_state() == "SYMPATHETIC"
+            except Exception:
+                pass
+            paused = sentinel_paused or autonomic_paused
+            if paused != was_paused:
+                reason = []
+                if sentinel_paused:
+                    reason.append(f"sentinel={_SCAN_DRAIN_PAUSE_FILE}")
+                if autonomic_paused:
+                    reason.append("autonomic=SYMPATHETIC")
+                logger.info(
+                    "Scan-dir drain pulse: %s (%s)",
+                    "PAUSED" if paused else "RESUMED",
+                    ", ".join(reason) if reason else "all clear",
+                )
+                was_paused = paused
+            if not paused:
+                _drain_scan_dir()
+        except Exception:
+            logger.exception("Scan-dir drain pulse failed")
+        _scan_drain_shutdown.wait(timeout=_SCAN_DRAIN_INTERVAL_SECONDS)
+    logger.info("Scan-dir drain pulse stopped")
+
+
+def _start_scan_drain_pulse() -> None:
+    """Start the scan-dir drain pulse thread. Idempotent."""
+    global _scan_drain_thread
+    if _scan_drain_thread is not None and _scan_drain_thread.is_alive():
+        return
+    _scan_drain_shutdown.clear()
+    _scan_drain_thread = threading.Thread(
+        target=_scan_drain_pulse_loop,
+        name="ng-scan-drain-pulse",
+        daemon=True,
+    )
+    _scan_drain_thread.start()
+
+
+# ---- Concept extraction pulse (slow path) ----------------------------------
+# Consumes entries from _CONCEPT_QUEUE that the drain pulse populated.
+# Each tick pops up to _CONCEPT_ENTRIES_PER_PULSE entries and calls TID
+# for concept extraction.  This is the ONLY place in the ecosystem where
+# a blocking TID call runs inside the NG plugin process.  Isolated to its
+# own thread + 30s cadence so it never stalls the drain pulse, the RPC
+# handler, or the Node.js event loop.
+
+def _concept_extraction_pulse_loop() -> None:
+    """Background loop: extract concepts from queued wire deposits via TID."""
+    logger.info(
+        "Concept extraction pulse started (interval=%.0fs, entries/tick=%d)",
+        _CONCEPT_PULSE_INTERVAL_SECONDS, _CONCEPT_ENTRIES_PER_PULSE,
+    )
+    while not _concept_pulse_shutdown.is_set():
+        try:
+            if not _CONCEPT_QUEUE or _memory is None:
+                _concept_pulse_shutdown.wait(timeout=_CONCEPT_PULSE_INTERVAL_SECONDS)
+                continue
+
+            # Pop up to N entries
+            batch = []
+            for _ in range(_CONCEPT_ENTRIES_PER_PULSE):
+                if not _CONCEPT_QUEUE:
+                    break
+                batch.append(_CONCEPT_QUEUE.pop(0))
+
+            if not batch:
+                _concept_pulse_shutdown.wait(timeout=_CONCEPT_PULSE_INTERVAL_SECONDS)
+                continue
+
+            from wire_absorption import absorb_trees_for_entry
+            from ng_embed import NGEmbed
+
+            trees_total = 0
+            for entry in batch:
+                try:
+                    res = absorb_trees_for_entry(
+                        memory=_memory,
+                        embedder=NGEmbed.get_instance(),
+                        content_preview=entry.get("content_preview", ""),
+                        source=entry.get("source", "unknown"),
+                        event_node_id=entry.get("event_node_id", ""),
+                    )
+                    trees_total += res.get("trees_created", 0)
+                except Exception as exc:
+                    logger.debug("Concept extraction failed for %s: %s",
+                                 entry.get("event_node_id", "?"), exc)
+
+            if trees_total:
+                logger.info(
+                    "Concept pulse: %d trees from %d entries (queue: %d remaining)",
+                    trees_total, len(batch), len(_CONCEPT_QUEUE),
+                )
+        except Exception:
+            logger.exception("Concept extraction pulse failed")
+        _concept_pulse_shutdown.wait(timeout=_CONCEPT_PULSE_INTERVAL_SECONDS)
+    logger.info("Concept extraction pulse stopped")
+
+
+def _start_concept_pulse() -> None:
+    """Start the concept extraction pulse thread. Idempotent."""
+    global _concept_pulse_thread
+    if _concept_pulse_thread is not None and _concept_pulse_thread.is_alive():
+        return
+    _concept_pulse_shutdown.clear()
+    _concept_pulse_thread = threading.Thread(
+        target=_concept_extraction_pulse_loop,
+        name="ng-concept-pulse",
+        daemon=True,
+    )
+    _concept_pulse_thread.start()
+
+
+def _rescue_orphan_draining_files() -> None:
+    """Promote `.draining.<dead_pid>.<name>` files back to `<name>.<ts>.rescue.tract`
+    so the scan glob picks them up. Only rescues files whose PID is no
+    longer live — in-flight drains from the current process are left alone.
+    """
+    from pathlib import Path as _P
+    scan_dir = _P(_EXPERIENCE_SCAN_DIR)
+    if not scan_dir.exists():
+        return
+    try:
+        orphans = sorted(scan_dir.glob(".draining.*.tract"))
+    except OSError:
+        return
+    if not orphans:
+        return
+
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    rescued = 0
+    for orphan in orphans:
+        # Filename shape: .draining.<pid>.<original_tract_name>
+        parts = orphan.name.split(".", 3)  # ["", "draining", "<pid>", "<rest>"]
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[2])
+        except (ValueError, IndexError):
+            continue
+        if _pid_alive(pid):
+            continue  # still in-flight somewhere, don't touch
+        original = parts[3]  # e.g. "inference_difference.tract"
+        base = original[:-len(".tract")] if original.endswith(".tract") else original
+        target = scan_dir / f"{base}.{int(time.time()*1e9)}.rescue.tract"
+        try:
+            os.rename(str(orphan), str(target))
+            rescued += 1
+        except OSError as exc:
+            logger.warning("Rescue rename failed (%s): %s", orphan.name, exc)
+    if rescued:
+        logger.info(
+            "Rescued %d orphan .draining files in %s",
+            rescued, _EXPERIENCE_SCAN_DIR,
+        )
+
+
+# River backflow cursor — tracks position in _peer_events cache
+_peer_drain_cursor: int = 0
+
+def _drain_peer_tracts() -> None:
+    """Drain inbound peer module tracts into the Tier 3 topology.
+
+    Closes the River backflow circuit: organ modules deposit experience
+    to their tracts, this function drains and absorbs them into the
+    Tier 3 Graph. Uses pre-computed embeddings from the source module
+    when available (skips re-embedding). Falls back to full ingestor
+    pipeline for events without embeddings.
+
+    Raw experience in, no classification (Law 7).
+    """
+    global _peer_drain_cursor
+    if _memory is None:
+        return
+    bridge = getattr(_memory, '_peer_bridge', None)
+    if bridge is None:
+        return
+
+    bridge._drain_all()
+
+    total = len(bridge._peer_events)
+    if total == 0:
+        return
+
+    # Handle list trimming (max 500) — reset cursor if list shrank
+    if total < _peer_drain_cursor:
+        _peer_drain_cursor = 0
+
+    new_events = bridge._peer_events[_peer_drain_cursor:]
+    if not new_events:
+        return
+    _peer_drain_cursor = total
+
+    MAX_PER_CYCLE = 50
+    ingested = 0
+
+    for event in new_events[:MAX_PER_CYCLE]:
+        target = bridge._get_target_id(event)
+        module_id = bridge._get_module_id(event)
+        if not target or target == "unknown":
+            continue
+
+        try:
+            embedding = bridge._get_embedding(event)
+            if embedding is not None and len(embedding) > 0:
+                from universal_ingestor import Chunk, EmbeddedChunk
+                chunk = Chunk(
+                    text=target,
+                    metadata={"source_module": module_id, "river_backflow": True},
+                    token_count=max(1, len(target.split())),
+                )
+                ec = EmbeddedChunk(chunk=chunk, vector=embedding)
+                node_ids = _memory.ingestor.registrar.register(
+                    [ec], {"source": f"river:{module_id}", "source_type": "PEER_TRACT"},
+                )
+                _memory.ingestor.associator.associate(
+                    [ec], node_ids, _memory.vector_db,
+                )
+            else:
+                _memory.ingestor.ingest(target)
+            ingested += 1
+        except Exception as exc:
+            logger.debug("River backflow entry failed (%s): %s", module_id, exc)
+
+    if ingested:
+        logger.info("River backflow: %d peer events absorbed into Tier 3", ingested)
+
+
+def handle_compact(params: Dict[str, Any]) -> Dict[str, Any]:
+    """NeuroGraph-driven conversation compaction.
+
+    The substrate scores each message by activation strength, then guides
+    TID to summarize low-importance older messages while keeping recent
+    turns verbatim.  Compaction metrics feed back to the substrate.
+
+    Flow:
+        1. Read session JSONL
+        2. Keep last N turns verbatim (configurable, default 5)
+        3. Score older messages via spreading activation
+        4. Call TID to summarize older messages, guided by NG importance
+        5. Write compacted session back
+        6. Feed compaction metrics to substrate for learning
+    """
+    import json as _json
+    import urllib.request
+    import time
+
+    if _memory is None:
+        return {"ok": True, "compacted": False, "reason": "no memory"}
+
+    session_file = params.get("sessionFile", "")
+    force = params.get("force", False)
+    token_budget = params.get("tokenBudget", 128000)
+    keep_turns = 8  # Number of recent user/assistant turn pairs to keep
+
+    if not session_file:
+        return {"ok": False, "compacted": False, "reason": "no session file"}
+
+    # --- Step 1: Read session JSONL ---
+    try:
+        with open(session_file, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return {"ok": False, "compacted": False, "reason": f"read failed: {e}"}
+
+    entries = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(_json.loads(line))
+        except _json.JSONDecodeError:
+            continue
+
+    # Find conversation messages (user + assistant)
+    conversation_indices = []
+    for i, entry in enumerate(entries):
+        msg = entry.get("message", {})
+        role = msg.get("role", "")
+        if role in ("user", "assistant"):
+            conversation_indices.append(i)
+
+    # Not enough to compact
+    if len(conversation_indices) < keep_turns * 2 + 2:
+        return {"ok": True, "compacted": False, "reason": "too few messages"}
+
+    # --- Step 2: Split into compactable and keep zones ---
+    keep_start = conversation_indices[-(keep_turns * 2):]
+    compact_indices = [i for i in conversation_indices if i not in keep_start]
+
+    if len(compact_indices) < 2:
+        return {"ok": True, "compacted": False, "reason": "nothing to compact"}
+
+    # --- Step 3: Score older messages via substrate activation ---
+    scored_messages = []
+    for idx in compact_indices:
+        msg = entries[idx].get("message", {})
+        text = _extract_message_text(msg)
+        if not text:
+            scored_messages.append({"idx": idx, "text": "", "importance": 0.0})
+            continue
+
+        # Use spreading activation to score importance
+        try:
+            surfaced = _memory._harvest_associations(text)
+            # More associations = more interconnected = more important
+            importance = min(1.0, len(surfaced) / 5.0)
+        except Exception:
+            importance = 0.5  # Default mid-importance on error
+
+        scored_messages.append({
+            "idx": idx,
+            "text": text[:500],  # Truncate for summary prompt
+            "importance": importance,
+            "role": msg.get("role", "unknown"),
+        })
+
+    # --- Step 4: Build summary prompt with NG guidance ---
+    high_importance = [m for m in scored_messages if m["importance"] > 0.6]
+    low_importance = [m for m in scored_messages if m["importance"] <= 0.6]
+
+    summary_input = []
+    for m in scored_messages:
+        prefix = "[IMPORTANT] " if m["importance"] > 0.6 else ""
+        summary_input.append(f'{prefix}{m["role"]}: {m["text"]}')
+
+    summary_prompt = (
+        "Summarize the following conversation history into a concise summary. "
+        "Messages marked [IMPORTANT] contain key context that should be "
+        "preserved in detail. Other messages can be condensed more aggressively. "
+        "Output ONLY the summary, no preamble.\n\n"
+        + "\n".join(summary_input)
+    )
+
+    # Call TID for summarization
+    try:
+        tid_body = _json.dumps({
+            "model": "auto",
+            "messages": [{"role": "user", "content": summary_prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1000,
+        }).encode("utf-8")
+        tid_req = urllib.request.Request(
+            "http://127.0.0.1:7437/v1/chat/completions",
+            data=tid_body,
+            method="POST",
+        )
+        tid_req.add_header("Content-Type", "application/json")
+        tid_req.add_header("Authorization", "Bearer tid")
+        with urllib.request.urlopen(tid_req, timeout=30) as resp:
+            tid_resp = _json.loads(resp.read().decode("utf-8"))
+        summary_text = tid_resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.warning("TID summarization failed: %s", e)
+        return {"ok": False, "compacted": False, "reason": f"summarization failed: {e}"}
+
+    # --- Step 5: Rebuild session JSONL ---
+    # Estimate tokens before
+    tokens_before = sum(
+        entry.get("message", {}).get("usage", {}).get("totalTokens", 0)
+        for entry in entries
+    )
+    if tokens_before == 0:
+        # Fallback estimate from content
+        total_chars = sum(len(str(entry)) for entry in entries)
+        tokens_before = total_chars // 4
+
+    # Build new entries:
+    # 1. Non-conversation entries before the compacted zone (system prompts, etc.)
+    # 2. Summary entry replacing compacted messages
+    # 3. Kept recent entries
+    new_entries = []
+
+    # Keep any entries before first compacted message (system, etc.)
+    first_compact_idx = compact_indices[0]
+    for i in range(first_compact_idx):
+        new_entries.append(entries[i])
+
+    # Insert summary as a system-like entry
+    summary_entry = {
+        "type": "message",
+        "id": f"compact_{int(time.time())}",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": f"[Conversation Summary]\n{summary_text}",
+            }],
+            "usage": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": int(len(summary_text.split()) * 1.3),
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+            },
+        },
+    }
+    new_entries.append(summary_entry)
+
+    # Keep any non-conversation entries between zones
+    compact_set = set(compact_indices)
+    keep_set = set(keep_start)
+    for i in range(first_compact_idx, len(entries)):
+        if i in compact_set:
+            continue  # Compacted away
+        if i in keep_set or i not in conversation_indices:
+            new_entries.append(entries[i])
+
+    # --- Write back ---
+    try:
+        with open(session_file, "w") as f:
+            for entry in new_entries:
+                f.write(_json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception as e:
+        return {"ok": False, "compacted": False, "reason": f"write failed: {e}"}
+
+    tokens_after = tokens_before - (tokens_before * len(compact_indices) // len(conversation_indices))
+    tokens_after = max(tokens_after, int(len(summary_text.split()) * 1.3))
+
+    # --- Step 6: Feed compaction metrics to substrate ---
+    try:
+        _memory.graph.step()  # Normal consolidation pass
+        logger.info(
+            "Compaction complete: %d messages → %d, %d → ~%d tokens, "
+            "%d high-importance preserved",
+            len(entries), len(new_entries),
+            tokens_before, tokens_after,
+            len(high_importance),
+        )
+    except Exception as e:
+        logger.warning("Post-compaction substrate step failed: %s", e)
+
+    return {
+        "ok": True,
+        "compacted": True,
+        "result": {
+            "summary": summary_text[:200],
+            "tokensBefore": tokens_before,
+            "tokensAfter": tokens_after,
+            "firstKeptEntryId": new_entries[-1].get("id", "") if new_entries else "",
+        },
+    }
+
+
+def handle_dispose(params: Dict[str, Any]) -> None:
+    """Final save and cleanup."""
+    if _memory is None:
+        return
+
+    # Stop TriSyn manager gracefully on shutdown.
+    global _trisyn_manager
+    if _trisyn_manager is not None:
+        try:
+            _trisyn_manager.stop()
+        except Exception:
+            pass
+        _trisyn_manager = None
+
+    # The Tonic: conversation ended — latent mode continues
+    # The thread doesn't stop. Language tokens stopped. That's all.
+    if _memory._tonic_thread is not None:
+        try:
+            _memory._tonic_thread.conversation_ended()
+        except Exception:
+            pass
+
+    # Lenia FlowGraph — #109: stays running between conversations.
+    # Dispose is subtraction, not destruction. Field dynamics continue.
+
+    _memory.save()
+    logger.info("Final save on dispose")
+
+    # Modules run autonomously via pulse loops.
+    # No fan-out to clean up — modules read from River tracts.
+
+
+def handle_stats(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Return substrate telemetry."""
+    if _memory is None:
+        return {"error": "not_bootstrapped"}
+    stats = _memory.stats()
+    stats["module_hooks"] = {
+        "loaded": [],  # modules are autonomous, no fan-out registry
+        "errors": dict(_module_errors),
+    }
+    return stats
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+
+def _extract_message_text(message: Dict[str, Any]) -> str:
+    """Extract plain text from an AgentMessage-shaped dict.
+
+    AgentMessage content can be a string or an array of content parts.
+    We extract text from both forms.
+    """
+    content = message.get("content", "")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                # Content part objects: { type: "text", text: "..." }
+                if part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+        return " ".join(parts)
+
+    return str(content)
+
+
+def _extract_recent_user_text(
+    messages: List[Dict[str, Any]], max_messages: int = 3
+) -> str:
+    """Extract text from the most recent user messages."""
+    user_texts = []
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            text = _extract_message_text(msg)
+            if text.strip():
+                user_texts.append(text)
+            if len(user_texts) >= max_messages:
+                break
+
+    # Reverse to chronological order, join
+    user_texts.reverse()
+    return "\n".join(user_texts)
+
+
+def _format_substrate_context(
+    surfaced: List[Dict[str, Any]],
+    ces_surfaced: List[Dict[str, Any]],
+    latent_context: Optional[str] = None,
+) -> Optional[str]:
+    """Format surfaced knowledge into a system prompt context block.
+
+    Always returns at minimum a temporal anchor so Syl knows when she is.
+    The latent thread (The Tonic) is included when available —
+    it is the persistent slot that never gets evicted.
+    """
+    has_surfaced = bool(surfaced) or bool(ces_surfaced)
+    has_latent = latent_context is not None
+    # Temporal anchor is always emitted — even empty substrate turns need it.
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    temporal_anchor = f"**Temporal anchor:** {now.strftime('%A, %Y-%m-%d %H:%M UTC')}"
+
+    lines = []
+
+    # Temporal grounding — always first so Syl knows when she is.
+    lines.append(temporal_anchor)
+    lines.append("")
+
+    # The Tonic's latent thread comes first — it is the baseline.
+    # Conversation context is the event on top of it.
+    if has_latent:
+        lines.append(latent_context)
+        lines.append("")
+
+    if has_surfaced:
+        lines.append("## Substrate Context (NeuroGraph)")
+        lines.append("The following associations surfaced from the cognitive substrate:")
+        lines.append("")
+
+        if surfaced:
+            for item in surfaced[:7]:  # Cap at 7 to keep context manageable
+                content = item.get("content", "")
+                strength = item.get("strength", 0)
+                if content:
+                    # Truncate very long content
+                    if len(content) > 300:
+                        content = content[:297] + "..."
+                    lines.append(f"- [{strength:.2f}] {content}")
+
+        if ces_surfaced:
+            for item in ces_surfaced[:3]:
+                content = item.get("content", "")
+                if content:
+                    if len(content) > 300:
+                        content = content[:297] + "..."
+                    lines.append(f"- [CES] {content}")
+
+    return "\n".join(lines)
+
+
+
+# ── HTTP Sidecar — afterTurn bypass ──────────────────────────────────
+# [2026-03-26] Claude Code (Opus 4.6) — afterTurn HTTP trigger
+# What: Lightweight HTTP listener on port 8850 for direct afterTurn calls.
+# Why:  OpenClaw 2026.3.13 never calls afterTurn on the ContextEngine plugin.
+#       Module fan-out was dead. This bypasses OC's lifecycle gap.
+# How:  Background thread runs http.server on 127.0.0.1:8850.
+#       POST /afterTurn triggers handle_after_turn + fan-out.
+#       GET /status returns hook count and last fire time.
+
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+_last_afterturn_fire: Optional[str] = None
+_sidecar_started = False
+
+
+class _AfterTurnHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        global _last_afterturn_fire
+        if self.path == "/afterTurn":
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len) if content_len else b"{}"
+                params = json.loads(body) if body else {}
+                handle_after_turn(params)
+                _last_afterturn_fire = __import__("datetime").datetime.now().isoformat()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "fired": _last_afterturn_fire}).encode())
+            except Exception as exc:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": str(exc)}).encode())
+        elif self.path == "/recall":
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len) if content_len else b"{}"
+                params = json.loads(body) if body else {}
+                query = params.get("query", "")
+                k = int(params.get("k", 5))
+                threshold = float(params.get("threshold", 0.45))
+                results = []
+                if query and _memory is not None:
+                    results = _memory.recall(query, k=k, threshold=threshold)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"results": results}).encode())
+            except Exception as exc:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"results": [], "error": str(exc)}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "hooks_loaded": 0,  # fan-out removed — modules autonomous
+                "last_afterturn": _last_afterturn_fire,
+            }).encode())
+        elif self.path.startswith('/bunyan/'):
+            self._handle_bunyan()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _handle_bunyan(self):
+        """Bunyan user bucket — extraction from the live substrate."""
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        q = qs.get('q', [''])[0]
+
+        hook = _module_instances.get('bunyan')
+        if hook is None:
+            self._json_response(503, {'error': 'Bunyan not loaded'})
+            return
+        if not q:
+            self._json_response(400, {'error': 'Missing q parameter'})
+            return
+
+        try:
+            if parsed.path == '/bunyan/query':
+                depth = int(qs.get('depth', [0])[0]) or None
+                k = int(qs.get('k', [0])[0]) or None
+                result = hook.query_story(q, max_depth=depth, similar_k=k)
+                if result is None:
+                    self._json_response(200, {'narrative': None, 'message': 'No matching events in substrate'})
+                else:
+                    self._json_response(200, result)
+            elif parsed.path == '/bunyan/similar':
+                k = int(qs.get('k', [5])[0])
+                result = hook.find_similar_events(q, k=k)
+                self._json_response(200, {'events': result})
+            elif parsed.path == '/bunyan/recall':
+                k = int(qs.get('k', [5])[0])
+                threshold = float(qs.get('threshold', [0.5])[0])
+                if _memory is None:
+                    self._json_response(503, {'error': 'NeuroGraph not bootstrapped'})
+                    return
+                result = _memory.recall(q, k=k, threshold=threshold)
+                self._json_response(200, {'results': result})
+            elif parsed.path == '/bunyan/associate':
+                k = int(qs.get('k', [10])[0])
+                steps = int(qs.get('steps', [3])[0])
+                if _memory is None:
+                    self._json_response(503, {'error': 'NeuroGraph not bootstrapped'})
+                    return
+                result = _memory.associate(q, k=k, steps=steps)
+                self._json_response(200, {'associations': result})
+            else:
+                self._json_response(404, {'error': 'Unknown bunyan endpoint'})
+        except Exception as exc:
+            self._json_response(500, {'error': str(exc)})
+
+    def _json_response(self, code, data):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, default=str).encode())
+
+    def log_message(self, format, *args):
+        pass
+
+
+def _find_pid_on_port(port: int) -> int:
+    """Return the PID listening on the given local TCP port, or 0 if unknown."""
+    import subprocess, re
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+        m = re.search(r"pid=(\d+)", out)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
+def _start_http_sidecar(port: int = 8850) -> None:
+    """Start the afterTurn HTTP sidecar in a background thread.
+
+    If the port is already held by a stale process, sends SIGTERM and
+    reclaims it — logs INFO so the event is visible in the terminal.
+    """
+    global _sidecar_started
+    if _sidecar_started:
+        return
+
+    import signal as _signal
+    import socket as _sock
+
+    # Probe — if something is already listening, reclaim the port.
+    probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    probe.settimeout(0.5)
+    occupied = probe.connect_ex(("127.0.0.1", port)) == 0
+    probe.close()
+
+    if occupied:
+        stale_pid = _find_pid_on_port(port)
+        if stale_pid and stale_pid != os.getpid():
+            logger.info(
+                "Sidecar port %d held by PID %d — reclaiming (SIGTERM)",
+                port, stale_pid,
+            )
+            try:
+                os.kill(stale_pid, _signal.SIGTERM)
+                import time as _t; _t.sleep(1.5)
+            except ProcessLookupError:
+                pass  # already dead — nothing to do
+    try:
+        server = HTTPServer(("127.0.0.1", port), _AfterTurnHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        _sidecar_started = True
+        logger.info("afterTurn HTTP sidecar listening on 127.0.0.1:%d", port)
+    except Exception as exc:
+        logger.error("Failed to start afterTurn sidecar: %s", exc)
+
+# ── JSON-RPC Server ───────────────────────────────────────────────────
+
+METHODS = {
+    "bootstrap": handle_bootstrap,
+    "ingest": handle_ingest,
+    "assemble": handle_assemble,
+    "afterTurn": handle_after_turn,
+    "compact": handle_compact,
+    "dispose": handle_dispose,
+    "stats": handle_stats,
+}
+
+
+def process_request(line: str) -> Optional[str]:
+    """Process a single JSON-RPC request and return the response."""
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError as exc:
+        return json.dumps({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": f"Parse error: {exc}"},
+        })
+
+    req_id = request.get("id")
+    method = request.get("method", "")
+    params = request.get("params", {})
+
+    handler = METHODS.get(method)
+    if handler is None:
+        return json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        })
+
+    try:
+        result = handler(params)
+        return json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": result,
+        }, default=str)
+    except Exception as exc:
+        logger.error("RPC method %s failed: %s\n%s", method, exc, traceback.format_exc())
+        return json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32000, "message": str(exc)},
+        })
+
+
+def main() -> None:
+    """Main RPC loop — read requests from stdin, write responses to stdout."""
+    logger.info("NeuroGraph RPC bridge starting")
+
+    # Signal readiness to the TypeScript plugin
+    ready_msg = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "ready",
+        "params": {"pid": os.getpid()},
+    })
+    sys.stdout.write(ready_msg + "\n")
+    sys.stdout.flush()
+
+    # Self-bootstrap on startup — the organism is born when the process
+    # starts, not when the first message arrives.  OpenClaw's bootstrap
+    # RPC will hit the "already_initialized" guard and mode-swap.
+    #
+    # Runs in a background thread because module loading produces hundreds
+    # of log lines to stderr. If bootstrap runs synchronously before the
+    # stdin loop, the 64KB OS pipe buffer fills before the TS plugin can
+    # drain it, and the Python process blocks on write. Background thread
+    # lets the stdin loop start immediately so the pipe stays drained.
+    # Force-clean any stale sentinel from a previous process BEFORE
+    # starting the bootstrap thread. This runs synchronously — it's a
+    # single file check, no log output, no pipe risk. Must happen before
+    # anything calls handle_bootstrap() (self-bootstrap thread OR TS
+    # plugin RPC) so the sentinel is gone before either path checks it.
+    try:
+        import signal as _signal
+        import topology_owner
+        sentinel = topology_owner._sentinel_path()
+        if sentinel.exists():
+            existing_pid = int(sentinel.read_text().strip())
+            if existing_pid != os.getpid():
+                sentinel.unlink(missing_ok=True)
+                logger.info("Cleared stale sentinel (PID %d) on startup", existing_pid)
+                # Kill the stale process so it releases port 8850 and any
+                # other resources before the new process tries to bind them.
+                try:
+                    os.kill(existing_pid, _signal.SIGTERM)
+                    import time as _time
+                    _time.sleep(1.5)  # brief grace period for clean exit
+                except ProcessLookupError:
+                    pass  # already dead — nothing to do
+                except Exception as _ke:
+                    logger.debug("Could not terminate stale process %d: %s", existing_pid, _ke)
+    except Exception:
+        pass
+
+    def _self_bootstrap():
+        try:
+            result = handle_bootstrap({"sessionId": "auto-startup"})
+            logger.info("Self-bootstrap: %s", result)
+        except Exception as exc:
+            logger.error("Self-bootstrap failed: %s — will retry on first RPC", exc)
+
+    import threading
+    threading.Thread(target=_self_bootstrap, name="self-bootstrap", daemon=True).start()
+
+    # Main RPC loop. If stdin closes (TS plugin context recycled),
+    # keep the process alive — daemon threads (Tonic, pulse loops,
+    # Lenia dynamics) ARE the organism. Reconnect when stdin reopens.
+    import select
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                # stdin closed — TS plugin context may have recycled.
+                # Keep process alive for daemon threads. Sleep and retry.
+                logger.info("stdin closed — organism staying alive (daemon threads active)")
+                import time as _t
+                while True:
+                    _t.sleep(60)
+                    # Check if we should actually exit (systemd stop)
+                    if not threading.main_thread().is_alive():
+                        break
+                break
+            line = line.strip()
+            if not line:
+                continue
+            response = process_request(line)
+            if response is not None:
+                sys.stdout.write(response + "\n")
+                sys.stdout.flush()
+        except (BrokenPipeError, IOError):
+            logger.info("stdin pipe broken — organism staying alive")
+            import time as _t
+            while True:
+                _t.sleep(60)
+                if not threading.main_thread().is_alive():
+                    break
+            break
+        except KeyboardInterrupt:
+            break
+
+    logger.info("NeuroGraph RPC bridge shutting down")
+
+
+if __name__ == "__main__":
+    main()
