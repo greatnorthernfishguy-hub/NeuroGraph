@@ -12,6 +12,10 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-19] Claude Code — RESTORE: handle_dispose/compact/stats/_extract_message_text deleted by 73fd117
+#   What: Restored 4 functions accidentally removed in #143 refactor
+#   Why: _extract_message_text live NameError; handle_dispose breaks OC dispose RPC; handle_dispose also stops TriSyn
+#   How: Recovered from git diff of 73fd117; added _trisyn_manager.stop() to handle_dispose per TriSyn design
 # [2026-04-19] CC (punchlist #143) -- Abolish NG topology fan-out (substrate bypass)
 #   What: Removed deposit_topology() call; renamed _deposit_topology_delta
 #          -> _deposit_substrate_metrics(); stripped unused text/embedding params.
@@ -1098,6 +1102,243 @@ _EXPERIENCE_SCAN_DIR = os.path.expanduser("~/.et_modules/experience")
 # The concept queue bridges the two: drain adds entries, concept pulse
 # consumes them.  If concept extraction is slow or TID is down, forests
 # still accumulate — trees arrive when providers are available.
+
+# ── RPC handlers restored from 73fd117 (#143 accidentally deleted them) ──
+
+def handle_compact(params: Dict[str, Any]) -> Dict[str, Any]:
+    """NeuroGraph-driven conversation compaction."""
+    import json as _json
+    import urllib.request
+    import time
+
+    if _memory is None:
+        return {"ok": True, "compacted": False, "reason": "no memory"}
+
+    session_file = params.get("sessionFile", "")
+    force = params.get("force", False)
+    token_budget = params.get("tokenBudget", 128000)
+    keep_turns = 8
+
+    if not session_file:
+        return {"ok": False, "compacted": False, "reason": "no session file"}
+
+    try:
+        with open(session_file, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return {"ok": False, "compacted": False, "reason": f"read failed: {e}"}
+
+    entries = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(_json.loads(line))
+        except _json.JSONDecodeError:
+            continue
+
+    conversation_indices = []
+    for i, entry in enumerate(entries):
+        msg = entry.get("message", {})
+        role = msg.get("role", "")
+        if role in ("user", "assistant"):
+            conversation_indices.append(i)
+
+    if len(conversation_indices) < keep_turns * 2 + 2:
+        return {"ok": True, "compacted": False, "reason": "too few messages"}
+
+    keep_start = conversation_indices[-(keep_turns * 2):]
+    compact_indices = [i for i in conversation_indices if i not in keep_start]
+
+    if len(compact_indices) < 2:
+        return {"ok": True, "compacted": False, "reason": "nothing to compact"}
+
+    scored_messages = []
+    for idx in compact_indices:
+        msg = entries[idx].get("message", {})
+        text = _extract_message_text(msg)
+        if not text:
+            scored_messages.append({"idx": idx, "text": "", "importance": 0.0})
+            continue
+        try:
+            surfaced = _memory._harvest_associations(text)
+            importance = min(1.0, len(surfaced) / 5.0)
+        except Exception:
+            importance = 0.5
+        scored_messages.append({
+            "idx": idx,
+            "text": text[:500],
+            "importance": importance,
+            "role": msg.get("role", "unknown"),
+        })
+
+    high_importance = [m for m in scored_messages if m["importance"] > 0.6]
+    summary_input = []
+    for m in scored_messages:
+        prefix = "[IMPORTANT] " if m["importance"] > 0.6 else ""
+        summary_input.append(f'{prefix}{m["role"]}: {m["text"]}')
+
+    summary_prompt = (
+        "Summarize the following conversation history into a concise summary. "
+        "Messages marked [IMPORTANT] contain key context that should be "
+        "preserved in detail. Other messages can be condensed more aggressively. "
+        "Output ONLY the summary, no preamble.\n\n"
+        + "\n".join(summary_input)
+    )
+
+    try:
+        tid_body = _json.dumps({
+            "model": "auto",
+            "messages": [{"role": "user", "content": summary_prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1000,
+        }).encode("utf-8")
+        tid_req = urllib.request.Request(
+            "http://127.0.0.1:7437/v1/chat/completions",
+            data=tid_body,
+            method="POST",
+        )
+        tid_req.add_header("Content-Type", "application/json")
+        tid_req.add_header("Authorization", "Bearer tid")
+        with urllib.request.urlopen(tid_req, timeout=30) as resp:
+            tid_resp = _json.loads(resp.read().decode("utf-8"))
+        summary_text = tid_resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.warning("TID summarization failed: %s", e)
+        return {"ok": False, "compacted": False, "reason": f"summarization failed: {e}"}
+
+    tokens_before = sum(
+        entry.get("message", {}).get("usage", {}).get("totalTokens", 0)
+        for entry in entries
+    )
+    if tokens_before == 0:
+        total_chars = sum(len(str(entry)) for entry in entries)
+        tokens_before = total_chars // 4
+
+    new_entries = []
+    first_compact_idx = compact_indices[0]
+    for i in range(first_compact_idx):
+        new_entries.append(entries[i])
+
+    summary_entry = {
+        "type": "message",
+        "id": f"compact_{int(time.time())}",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": f"[Conversation Summary]\n{summary_text}"}],
+            "usage": {
+                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": int(len(summary_text.split()) * 1.3),
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+            },
+        },
+    }
+    new_entries.append(summary_entry)
+
+    compact_set = set(compact_indices)
+    keep_set = set(keep_start)
+    for i in range(first_compact_idx, len(entries)):
+        if i in compact_set:
+            continue
+        if i in keep_set or i not in conversation_indices:
+            new_entries.append(entries[i])
+
+    try:
+        with open(session_file, "w") as f:
+            for entry in new_entries:
+                f.write(_json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception as e:
+        return {"ok": False, "compacted": False, "reason": f"write failed: {e}"}
+
+    tokens_after = tokens_before - (tokens_before * len(compact_indices) // len(conversation_indices))
+    tokens_after = max(tokens_after, int(len(summary_text.split()) * 1.3))
+
+    try:
+        _memory.graph.step()
+        logger.info(
+            "Compaction complete: %d messages → %d, %d → ~%d tokens, %d high-importance preserved",
+            len(entries), len(new_entries), tokens_before, tokens_after, len(high_importance),
+        )
+    except Exception as e:
+        logger.warning("Post-compaction substrate step failed: %s", e)
+
+    return {
+        "ok": True,
+        "compacted": True,
+        "result": {
+            "summary": summary_text[:200],
+            "tokensBefore": tokens_before,
+            "tokensAfter": tokens_after,
+            "firstKeptEntryId": new_entries[-1].get("id", "") if new_entries else "",
+        },
+    }
+
+
+def handle_dispose(params: Dict[str, Any]) -> None:
+    """Final save and cleanup."""
+    if _memory is None:
+        return
+
+    # Stop TriSyn manager gracefully — worker subprocess has its own wall-time
+    # cap but the manager thread should exit cleanly on gateway shutdown.
+    global _trisyn_manager
+    if _trisyn_manager is not None:
+        try:
+            _trisyn_manager.stop()
+        except Exception:
+            pass
+        _trisyn_manager = None
+
+    # The Tonic: conversation ended — latent mode continues.
+    # The thread doesn't stop. Language tokens stopped. That's all.
+    if _memory._tonic_thread is not None:
+        try:
+            _memory._tonic_thread.conversation_ended()
+        except Exception:
+            pass
+
+    # Lenia FlowGraph — #109: stays running between conversations.
+    # Dispose is subtraction, not destruction. Field dynamics continue.
+
+    _memory.save()
+    logger.info("Final save on dispose")
+
+    # Modules run autonomously via pulse loops.
+    # No fan-out to clean up — modules read from River tracts.
+
+
+def handle_stats(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Return substrate telemetry."""
+    if _memory is None:
+        return {"error": "not_bootstrapped"}
+    stats = _memory.stats()
+    stats["module_hooks"] = {
+        "loaded": [],  # modules are autonomous, no fan-out registry
+        "errors": dict(_module_errors),
+    }
+    return stats
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+
+def _extract_message_text(message: Dict[str, Any]) -> str:
+    """Extract plain text from an AgentMessage-shaped dict."""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+        return " ".join(parts)
+    return str(content)
+
 
 _CONCEPT_QUEUE: List[Dict[str, Any]] = []
 _CONCEPT_QUEUE_MAX = 5000  # don't let queue grow unbounded in memory
