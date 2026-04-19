@@ -268,18 +268,31 @@ class MmapTract:
 
         return entries
 
-    def preload(self, events: List[Dict[str, Any]]) -> None:
+    def preload(self, events: List[Any]) -> None:
         """Preload events into the write buffer (used during upgrade)."""
         import ng_tract
         for event in events:
-            emb = event.get("embedding", [])
-            if emb:
+            if isinstance(event, dict):
+                emb = event.get("embedding", [])
+                ts  = event.get("timestamp", 0.0)
+                mid = event.get("module_id", "unknown")
+                tid = event.get("target_id", "unknown")
+                ok  = bool(event.get("success", False))
+            else:
+                # Typed BTF entry (PyOutcomeEntry) — use attribute access
+                emb = event.embedding_as_numpy() if hasattr(event, "embedding_as_numpy") else []
+                ts  = getattr(event, "timestamp", 0.0)
+                mid = getattr(event, "module_id", "unknown")
+                tid = getattr(event, "target_id", "unknown")
+                ok  = bool(getattr(event, "success", False))
+            if emb is not None and len(emb):
+                emb_list = emb.tolist() if hasattr(emb, "tolist") else list(emb)
                 data = ng_tract.write_outcome(
-                    timestamp=event.get("timestamp", 0.0),
-                    module_id=event.get("module_id", "unknown"),
-                    target_id=event.get("target_id", "unknown"),
-                    success=bool(event.get("success", False)),
-                    embedding=list(emb) if not isinstance(emb, list) else emb,
+                    timestamp=ts,
+                    module_id=mid,
+                    target_id=tid,
+                    success=ok,
+                    embedding=emb_list,
                 )
                 if not self.deposit(data):
                     logger.warning("Preload overflow — %d events dropped", len(events))
