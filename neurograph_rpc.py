@@ -402,7 +402,7 @@ def _bootstrap_modules() -> List[str]:
     return started
 
 
-def _deposit_substrate_metrics(step_result) -> None:
+def _deposit_substrate_metrics(step_result, embedding=None) -> None:
     """Write compact scalar substrate metrics to neurograph.jsonl (Darwin Recorder).
 
     # [2026-04-10] Claude (Sonnet 4.6) — Substrate metrics for Darwin discovery
@@ -434,6 +434,72 @@ def _deposit_substrate_metrics(step_result) -> None:
         }
         with open(_shared / "neurograph.jsonl", "a") as _f:
             _f.write(_json.dumps(_metrics) + "\n")
+
+        # Forward River deposit (BLK-NG-FWDRIVER-001)
+        # [2026-04-19] Claude Code -- restore forward River NG to peer tracts
+        #   What: Deposit raw step_result to tracts/neurograph/{peer}.tract per active module.
+        #   Why:  #143 abolished topology fan-out (correct). Left forward River empty.
+        #         Peer NG-Lites get zero substrate experience. Restores via correct
+        #         mechanism: ng_tract directly, registry peer list, full step_result (Law 7).
+        #   How:  ng_tract.deposit_outcome() directly -- bypasses record_outcome() which
+        #         re-introduces filesystem-scan fan-out. List caps are size guards only.
+        try:
+            import ng_tract as _ng_tract
+            import msgpack as _msgpack
+            import numpy as _np_fwd
+            from pathlib import Path as _FwdPath
+            import json as _fw_json
+
+            _reg_path = _FwdPath(_os.path.expanduser("~/.et_modules/registry.json"))
+            _fwd_peers = []
+            if _reg_path.exists():
+                with open(_reg_path) as _rf:
+                    _reg_data = _fw_json.load(_rf)
+                _fwd_peers = [
+                    k for k in _reg_data.get("modules", {}).keys()
+                    if k != "neurograph"
+                ]
+
+            if _fwd_peers:
+                _fwd_tract_dir = _FwdPath(_os.path.expanduser("~/.et_modules/tracts/neurograph"))
+                _fwd_tract_dir.mkdir(parents=True, exist_ok=True)
+
+                _fwd_emb = embedding
+                if _fwd_emb is None:
+                    try:
+                        from ng_embed import embed as _fwd_embed_fn
+                        _fwd_emb = _fwd_embed_fn(str(_metrics))
+                    except Exception:
+                        _fwd_emb = _np_fwd.zeros(768, dtype=_np_fwd.float32)
+                _fwd_emb = _np_fwd.asarray(_fwd_emb, dtype=_np_fwd.float32)
+
+                _fwd_meta = {
+                    "event_type": "substrate_step",
+                    "fired_nodes": _metrics["fired_nodes"],
+                    "fired_hyperedges": _metrics["fired_hyperedges"],
+                    "synapses_pruned": step_result.synapses_pruned,
+                    "synapses_sprouted": step_result.synapses_sprouted,
+                    "predictions_confirmed": step_result.predictions_confirmed,
+                    "predictions_surprised": step_result.predictions_surprised,
+                    "total_nodes": _metrics["total_nodes"],
+                    "total_synapses": _metrics["total_synapses"],
+                    "fired_node_ids": list(step_result.fired_node_ids)[:200],
+                    "fired_hyperedge_ids": list(step_result.fired_hyperedge_ids)[:50],
+                }
+                _fwd_meta_bytes = _msgpack.packb(_fwd_meta)
+
+                _fwd_paths = [str(_fwd_tract_dir / f"{_p}.tract") for _p in _fwd_peers]
+                _ng_tract.deposit_outcome(
+                    timestamp=_time.time(),
+                    module_id="neurograph",
+                    target_id="substrate:step",
+                    success=True,
+                    embedding=_fwd_emb,
+                    tract_paths=_fwd_paths,
+                    metadata=_fwd_meta_bytes,
+                )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -980,7 +1046,7 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # The delta contains fired nodes with causal context, hyperedge activations,
     # prediction results, structural changes, and salience signals. Raw,
     # unclassified (Law 7). Each module's bucket extracts what it needs.
-    _deposit_substrate_metrics(step_result)
+    _deposit_substrate_metrics(step_result, _ingest_embedding)
 
     # Punchlist #56: Deposit raw surfacing outcome experience.
     # The triad: what was surfaced (cached from assemble) + user input
