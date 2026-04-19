@@ -2,6 +2,11 @@
 OpenClaw Adapter — E-T Systems Module Integration for OpenClaw Skills
 
 # ---- Changelog ----
+# [2026-04-19] CC (punchlist #5) -- Add NGTractBridge River drain to base adapter
+#   What: __init__ initializes NGTractBridge for all modules; _drain_river() drains
+#          tracts/*/neurograph.tract and calls overridable _on_river_events().
+#   Why:  Pulse loops had no drain path after SKIP_ECOSYSTEM removed the eco bridge.
+#   How:  NGTractBridge init unconditional (all modes). _drain_river() in base.
 # [2026-04-19] CC (punchlist #143) -- Module backflow deposit for SKIP_ECOSYSTEM modules
 #   What: When _eco is None (SKIP_ECOSYSTEM=True), deposit outcome directly to
 #          tracts/{module_id}/neurograph.tract via ng_tract (BTF, zero-copy).
@@ -159,6 +164,15 @@ class OpenClawAdapter(ABC):
             )
             logger.info("[%s] OpenClawAdapter ready (tier %d)", self.MODULE_ID, self._eco.tier)
 
+
+        # NGTractBridge — River drain for all modules (SKIP_ECOSYSTEM or not)
+        try:
+            from ng_tract_bridge import NGTractBridge as _NTB
+            self._tract_bridge: Any = _NTB(module_id=self.MODULE_ID)
+        except Exception as _exc:
+            self._tract_bridge = None
+            logger.debug("[%s] Tract bridge init skipped: %s", self.MODULE_ID, _exc)
+
         self._message_count = 0
         self._start_time = time.time()
 
@@ -192,6 +206,38 @@ class OpenClawAdapter(ABC):
     # -----------------------------------------------------------------
     # OpenClaw skill interface
     # -----------------------------------------------------------------
+
+    def _drain_river(self) -> int:
+        """Drain inbound River tracts and invoke _on_river_events with new events.
+
+        Call from each module pulse cycle to pull substrate signals.
+        Returns number of new events absorbed.
+        """
+        if self._tract_bridge is None:
+            return 0
+        events_before = len(getattr(self._tract_bridge, "_peer_events", []))
+        try:
+            self._tract_bridge._drain_all()
+        except Exception as _e:
+            logger.debug("[%s] River drain error: %s", self.MODULE_ID, _e)
+            return 0
+        events_after = len(getattr(self._tract_bridge, "_peer_events", []))
+        new_count = events_after - events_before
+        if new_count > 0:
+            new_events = list(self._tract_bridge._peer_events[events_before:])
+            try:
+                self._on_river_events(new_events)
+            except Exception as _e:
+                logger.debug("[%s] _on_river_events error: %s", self.MODULE_ID, _e)
+        return new_count
+
+    def _on_river_events(self, events: list) -> None:
+        """Override to process new River events through domain bucket.
+
+        events is a list of BTF peer-event objects drained from
+        tracts/neurograph/{module_id}.tract (and any other peer tracts).
+        """
+        logger.debug("[%s] River: %d new events", self.MODULE_ID, len(events))
 
     def on_message(self, text: str) -> Dict[str, Any]:
         """Process one OpenClaw conversation turn.
