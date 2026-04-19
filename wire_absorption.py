@@ -38,6 +38,16 @@ path is a referencing scheme on top of NeuroGraph rather than a
 NeuroGraph learning surface. Deferred, not forgotten.
 
 # ---- Changelog ----
+# [2026-04-19] Claude Code (Opus 4.7, 1M) — forest_embedding in batch result
+#   What: batch_absorb_forests() now includes "forest_embedding": emb in
+#     each result dict. Passed through _CONCEPT_QUEUE and into TriSyn
+#     worker's handoff file.
+#   Why:  TriSyn worker runs in a subprocess and would otherwise re-derive
+#     the embedding from content first-line — which would diverge from
+#     the actual forest-node embedding already written to vector_db.
+#     Advisor flag 2026-04-18: carry what was created, don't re-derive.
+#   How:  Single dict-entry addition. No behavioral change for existing
+#     callers (extra key is ignored if not consumed).
 # [2026-04-17] Claude Code (Sonnet 4.6) — Dual-pass retrofit (#150).
 #   What: Replaced 16-stride-slice hack with proper dual_record_outcome.
 #         Forest = event node fingerprint embedding (unchanged). Trees =
@@ -315,6 +325,10 @@ def batch_absorb_forests(
             "body_file": str(body_path) if body_path else None,
             "body_bytes": len(content),
             "body_sha256": sha,
+            # TriSyn subprocess worker reads this at spawn to avoid
+            # re-deriving the embedding from content first-line (which
+            # would diverge from the actual forest-node embedding).
+            "forest_embedding": emb,
         })
 
     return results
