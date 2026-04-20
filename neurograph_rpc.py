@@ -12,12 +12,6 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
-# [2026-04-19] Codemine (BLK-NG-184) -- Fix peer_bridge NameError at both deposit sites
-#   What: Added getattr(_memory, '_peer_bridge', None) guard at surfacing and self-observation sites
-#   Why:  peer_bridge was never assigned in these scopes (punchlist #184); both deposits were silently
-#          failing inside try/except with NameError. Surfacing and self-obs deposits never actually fired.
-#   How:  Site1 (_deposit_surfacing_outcome): _pb = getattr guard wraps record_outcome call.
-#          Site2 (handle_after_turn): peer_bridge assigned via getattr before if-guard.
 # [2026-04-19] Claude Code — RESTORE: handle_dispose/compact/stats/_extract_message_text deleted by 73fd117
 #   What: Restored 4 functions accidentally removed in #143 refactor
 #   Why: _extract_message_text live NameError; handle_dispose breaks OC dispose RPC; handle_dispose also stops TriSyn
@@ -93,15 +87,6 @@ to an existing NeuroGraphMemory call.
 #         sliced to recent window, summary prepended to priming_text before
 #         harvest, truncated messages returned in result.  try/except
 #         fallback to full messages on any KISS exception.
-# [2026-04-19] Claude Code (Sonnet 4.6) — Fix stdin-closed orphan accumulation
-#   What: main() now checkpoints and exits cleanly when stdin closes, instead
-#         of entering an infinite sleep loop ("organism staying alive").
-#   Why:  Sleep-loop orphans blocked topology acquisition on gateway restart
-#         (startup sentinel cleanup sends SIGTERM but orphan survived). Two
-#         orphans were accumulating per restart, consuming 75%+ RAM.
-#   How:  On readline() returning empty string or BrokenPipeError, call
-#         _memory.save() then break. The startup code in main() already
-#         handles stale-sentinel cleanup via SIGTERM + sentinel delete.
 # [2026-04-12] Claude Code (Opus 4.6) — Time-based auto-save fallback
 #   What: Auto-save now fires on 5-minute interval in addition to every-10-messages.
 #   Why:  _message_count resets to 0 on every gateway restart. With frequent restarts
@@ -408,7 +393,7 @@ def _bootstrap_modules() -> List[str]:
     return started
 
 
-def _deposit_substrate_metrics(step_result, embedding=None) -> None:
+def _deposit_substrate_metrics(step_result) -> None:
     """Write compact scalar substrate metrics to neurograph.jsonl (Darwin Recorder).
 
     # [2026-04-10] Claude (Sonnet 4.6) — Substrate metrics for Darwin discovery
@@ -440,72 +425,6 @@ def _deposit_substrate_metrics(step_result, embedding=None) -> None:
         }
         with open(_shared / "neurograph.jsonl", "a") as _f:
             _f.write(_json.dumps(_metrics) + "\n")
-
-        # Forward River deposit (BLK-NG-FWDRIVER-001)
-        # [2026-04-19] Claude Code -- restore forward River NG to peer tracts
-        #   What: Deposit raw step_result to tracts/neurograph/{peer}.tract per active module.
-        #   Why:  #143 abolished topology fan-out (correct). Left forward River empty.
-        #         Peer NG-Lites get zero substrate experience. Restores via correct
-        #         mechanism: ng_tract directly, registry peer list, full step_result (Law 7).
-        #   How:  ng_tract.deposit_outcome() directly -- bypasses record_outcome() which
-        #         re-introduces filesystem-scan fan-out. List caps are size guards only.
-        try:
-            import ng_tract as _ng_tract
-            import msgpack as _msgpack
-            import numpy as _np_fwd
-            from pathlib import Path as _FwdPath
-            import json as _fw_json
-
-            _reg_path = _FwdPath(_os.path.expanduser("~/.et_modules/registry.json"))
-            _fwd_peers = []
-            if _reg_path.exists():
-                with open(_reg_path) as _rf:
-                    _reg_data = _fw_json.load(_rf)
-                _fwd_peers = [
-                    k for k in _reg_data.get("modules", {}).keys()
-                    if k != "neurograph"
-                ]
-
-            if _fwd_peers:
-                _fwd_tract_dir = _FwdPath(_os.path.expanduser("~/.et_modules/tracts/neurograph"))
-                _fwd_tract_dir.mkdir(parents=True, exist_ok=True)
-
-                _fwd_emb = embedding
-                if _fwd_emb is None:
-                    try:
-                        from ng_embed import embed as _fwd_embed_fn
-                        _fwd_emb = _fwd_embed_fn(str(_metrics))
-                    except Exception:
-                        _fwd_emb = _np_fwd.zeros(768, dtype=_np_fwd.float32)
-                _fwd_emb = _np_fwd.asarray(_fwd_emb, dtype=_np_fwd.float32)
-
-                _fwd_meta = {
-                    "event_type": "substrate_step",
-                    "fired_nodes": _metrics["fired_nodes"],
-                    "fired_hyperedges": _metrics["fired_hyperedges"],
-                    "synapses_pruned": step_result.synapses_pruned,
-                    "synapses_sprouted": step_result.synapses_sprouted,
-                    "predictions_confirmed": step_result.predictions_confirmed,
-                    "predictions_surprised": step_result.predictions_surprised,
-                    "total_nodes": _metrics["total_nodes"],
-                    "total_synapses": _metrics["total_synapses"],
-                    "fired_node_ids": list(step_result.fired_node_ids)[:200],
-                    "fired_hyperedge_ids": list(step_result.fired_hyperedge_ids)[:50],
-                }
-                _fwd_meta_bytes = _msgpack.packb(_fwd_meta)
-
-                _fwd_paths = [str(_fwd_tract_dir / f"{_p}.tract") for _p in _fwd_peers]
-                _ng_tract.deposit_outcome(
-                    timestamp=_time.time(),
-                    module_id="neurograph",
-                    target_id="substrate:step",
-                    success=True,
-                    embedding=_fwd_emb,
-                    tract_paths=_fwd_paths,
-                    metadata=_fwd_meta_bytes,
-                )
-        except Exception:
-            pass
     except Exception:
         pass
 
@@ -563,20 +482,18 @@ def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str])
             # Deposit raw experience: this node was surfaced during this turn.
             # target_id is opaque — just marks it as a surfacing event.
             # metadata carries the raw context without classification.
-            _pb = getattr(_memory, '_peer_bridge', None)
-            if _pb is not None:
-                _pb.record_outcome(
-                    embedding=node_embedding,
-                    target_id=f"surfacing:{node_id}",
-                    success=True,
-                    module_id="neurograph",
-                    metadata={
-                        "surfacing_source": node_info.get("source", "unknown"),
-                        "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
-                        "user_text_preview": (user_text or "")[:200],
-                        "syl_response_preview": syl_text[:200],
-                    },
-                )
+            peer_bridge.record_outcome(
+                embedding=node_embedding,
+                target_id=f"surfacing:{node_id}",
+                success=True,
+                module_id="neurograph",
+                metadata={
+                    "surfacing_source": node_info.get("source", "unknown"),
+                    "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
+                    "user_text_preview": (user_text or "")[:200],
+                    "syl_response_preview": syl_text[:200],
+                },
+            )
 
         logger.debug(
             "Surfacing outcome deposited: %d nodes, syl_response=%d chars",
@@ -1054,7 +971,7 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # The delta contains fired nodes with causal context, hyperedge activations,
     # prediction results, structural changes, and salience signals. Raw,
     # unclassified (Law 7). Each module's bucket extracts what it needs.
-    _deposit_substrate_metrics(step_result, _ingest_embedding)
+    _deposit_substrate_metrics(step_result)
 
     # Punchlist #56: Deposit raw surfacing outcome experience.
     # The triad: what was surfaced (cached from assemble) + user input
@@ -1072,7 +989,6 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # Downstream modules (Elmer, Immunis, THC, Bunyan) extract what
     # matters to their specialty at read time.  Law 7 compliant.
     try:
-        peer_bridge = getattr(_memory, '_peer_bridge', None)
         if peer_bridge is not None:
             _stats = _memory.graph.get_stats() if hasattr(_memory.graph, 'get_stats') else {}
             _stats["total_nodes"] = len(_memory.graph.nodes)
@@ -2363,6 +2279,8 @@ def main() -> None:
     # Main RPC loop. On stdin close (gateway exited), checkpoint and exit
     # cleanly so the next gateway startup gets a clean slate. The startup
     # sentinel cleanup in main() handles topology ownership transition.
+    # [2026-04-19] Changed from infinite sleep to clean exit — sleep loop
+    # caused orphan processes that blocked topology acquisition on restart.
     while True:
         try:
             line = sys.stdin.readline()
