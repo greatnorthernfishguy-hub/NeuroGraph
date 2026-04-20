@@ -12,6 +12,12 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-20] CC Sonnet 4.6 — #18: tool_use + tool_result ingestion
+#   What: _extract_message_text now extracts tool_use (name+input) and tool_result
+#         (content string or text blocks) alongside existing text parts.
+#   Why:  #18 — tool results were silently dropped; substrate never saw tool I/O.
+#   How:  tool_call:name {input_json} prefix for tool_use; tool_result: prefix for
+#         results. Both truncated (500/1000 chars) to avoid substrate flooding.
 # [2026-04-19] Claude Code — RESTORE: handle_dispose/compact/stats/_extract_message_text deleted by 73fd117
 #   What: Restored 4 functions accidentally removed in #143 refactor
 #   Why: _extract_message_text live NameError; handle_dispose breaks OC dispose RPC; handle_dispose also stops TriSyn
@@ -1878,8 +1884,8 @@ def handle_stats(params: Dict[str, Any]) -> Dict[str, Any]:
 def _extract_message_text(message: Dict[str, Any]) -> str:
     """Extract plain text from an AgentMessage-shaped dict.
 
-    AgentMessage content can be a string or an array of content parts.
-    We extract text from both forms.
+    Handles text, tool_use, and tool_result content blocks so tool
+    calls and their results reach the substrate (#18).
     """
     content = message.get("content", "")
 
@@ -1892,9 +1898,27 @@ def _extract_message_text(message: Dict[str, Any]) -> str:
             if isinstance(part, str):
                 parts.append(part)
             elif isinstance(part, dict):
-                # Content part objects: { type: "text", text: "..." }
-                if part.get("type") == "text":
+                ptype = part.get("type", "")
+                if ptype == "text":
                     parts.append(part.get("text", ""))
+                elif ptype == "tool_use":
+                    # Serialize tool call: name + input args
+                    name = part.get("name", "unknown_tool")
+                    inp = part.get("input", {})
+                    try:
+                        inp_str = json.dumps(inp, ensure_ascii=False)[:500]
+                    except Exception:
+                        inp_str = str(inp)[:500]
+                    parts.append(f"tool_call:{name} {inp_str}")
+                elif ptype == "tool_result":
+                    # tool_result content can be string or list of text blocks
+                    result_content = part.get("content", "")
+                    if isinstance(result_content, str):
+                        parts.append(f"tool_result: {result_content[:1000]}")
+                    elif isinstance(result_content, list):
+                        for rc in result_content:
+                            if isinstance(rc, dict) and rc.get("type") == "text":
+                                parts.append(f"tool_result: {rc.get('text','')[:1000]}")
         return " ".join(parts)
 
     return str(content)
