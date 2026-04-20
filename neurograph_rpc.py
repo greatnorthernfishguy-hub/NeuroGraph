@@ -12,6 +12,12 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-19] Codemine (BLK-NG-184) -- Fix peer_bridge NameError at both deposit sites
+#   What: Added getattr(_memory, '_peer_bridge', None) guard at surfacing and self-observation sites
+#   Why:  peer_bridge was never assigned in these scopes (punchlist #184); both deposits were silently
+#          failing inside try/except with NameError. Surfacing and self-obs deposits never actually fired.
+#   How:  Site1 (_deposit_surfacing_outcome): _pb = getattr guard wraps record_outcome call.
+#          Site2 (handle_after_turn): peer_bridge assigned via getattr before if-guard.
 # [2026-04-19] Claude Code — RESTORE: handle_dispose/compact/stats/_extract_message_text deleted by 73fd117
 #   What: Restored 4 functions accidentally removed in #143 refactor
 #   Why: _extract_message_text live NameError; handle_dispose breaks OC dispose RPC; handle_dispose also stops TriSyn
@@ -557,18 +563,20 @@ def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str])
             # Deposit raw experience: this node was surfaced during this turn.
             # target_id is opaque — just marks it as a surfacing event.
             # metadata carries the raw context without classification.
-            peer_bridge.record_outcome(
-                embedding=node_embedding,
-                target_id=f"surfacing:{node_id}",
-                success=True,
-                module_id="neurograph",
-                metadata={
-                    "surfacing_source": node_info.get("source", "unknown"),
-                    "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
-                    "user_text_preview": (user_text or "")[:200],
-                    "syl_response_preview": syl_text[:200],
-                },
-            )
+            _pb = getattr(_memory, '_peer_bridge', None)
+            if _pb is not None:
+                _pb.record_outcome(
+                    embedding=node_embedding,
+                    target_id=f"surfacing:{node_id}",
+                    success=True,
+                    module_id="neurograph",
+                    metadata={
+                        "surfacing_source": node_info.get("source", "unknown"),
+                        "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
+                        "user_text_preview": (user_text or "")[:200],
+                        "syl_response_preview": syl_text[:200],
+                    },
+                )
 
         logger.debug(
             "Surfacing outcome deposited: %d nodes, syl_response=%d chars",
@@ -1064,6 +1072,7 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # Downstream modules (Elmer, Immunis, THC, Bunyan) extract what
     # matters to their specialty at read time.  Law 7 compliant.
     try:
+        peer_bridge = getattr(_memory, '_peer_bridge', None)
         if peer_bridge is not None:
             _stats = _memory.graph.get_stats() if hasattr(_memory.graph, 'get_stats') else {}
             _stats["total_nodes"] = len(_memory.graph.nodes)
