@@ -24,11 +24,10 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
-# [2026-04-19] Claude (Sonnet 4.6) — Fix _recall() silent empty-context bug
-# What: _recall() was reading r.get("text","") but query_similar() returns "content" key.
-# Why:  Every recall result was silently dropped → context always "". 548 recalls, 0
-#       errors, all empty. query_similar() contract: {id, similarity, content, metadata}.
-# How:  Line 186: r.get("text","") → r.get("content",""). One-line fix.
+# [2026-04-19] Claude (Sonnet 4.6) — Fix _recall() empty-context bug (#188)
+# What: r.get("text","") → r.get("content","") — query_similar() returns 'content' key.
+# Why:  Same bug as NeuroGraph cc_ng_host.py fix (efe7a92). Codemine worker recall broken.
+# How:  One-line fix, line 186.
 # [2026-04-16] Claude (Sonnet 4.6) — #161: export + import socket handlers for IPC sync
 # What: _handle_export and _handle_import added to socket dispatch. cc-ng-sync.py
 #       can now export/import via socket instead of touching checkpoint files directly.
