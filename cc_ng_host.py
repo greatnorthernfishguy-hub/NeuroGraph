@@ -24,6 +24,11 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-04-19] Claude (Sonnet 4.6) — Fix _recall() silent empty-context bug
+# What: _recall() was reading r.get("text","") but query_similar() returns "content" key.
+# Why:  Every recall result was silently dropped → context always "". 548 recalls, 0
+#       errors, all empty. query_similar() contract: {id, similarity, content, metadata}.
+# How:  Line 186: r.get("text","") → r.get("content",""). One-line fix.
 # [2026-04-16] Claude (Sonnet 4.6) — #161: export + import socket handlers for IPC sync
 # What: _handle_export and _handle_import added to socket dispatch. cc-ng-sync.py
 #       can now export/import via socket instead of touching checkpoint files directly.
@@ -183,7 +188,7 @@ def _recall(query: str, k: int) -> str:
             return ""
         lines = ["[NeuroGraph] Relevant context:"]
         for r in results:
-            text = r.get("text", "") if isinstance(r, dict) else str(r)
+            text = r.get("content", "") if isinstance(r, dict) else str(r)
             if text.strip():
                 lines.append("- " + text.strip()[:200])
         return "\n".join(lines) if len(lines) > 1 else ""
