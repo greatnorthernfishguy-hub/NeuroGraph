@@ -48,6 +48,14 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-04-20] Codemine (BLK-NG-155) -- delete _peer_events dead code (#155 cleanup)
+#   What: Removed _peer_events list, _peer_events_max, _enforce_window_limit(),
+#          dead code in get_recommendations() and detect_novelty(), and all
+#          _peer_events refs from record_outcome(), sync_state(), _drain_all(), stats().
+#   Why:  Test period (2026-04-19) confirmed no regressions. get_recommendations()
+#         and detect_novelty() now permanently defer to _core substrate (ng_lite.py).
+#         _peer_events was an ever-growing cache that shadowed Hebbian learning.
+#   How:  8 targeted replacements. All count==1 guards passed before apply.
 # [2026-04-19] Claude Code (Sonnet 4.6) — Punchlist #155 test: stub bridge similarity methods
 #   What: get_recommendations() and detect_novelty() now return None immediately after
 #         _drain_all() instead of scanning _peer_events.
@@ -384,11 +392,6 @@ class NGTractBridge(NGBridge):
         self._drain_count = 0
         self._last_drain_time = 0.0
 
-        # Cross-module event cache (for recommendations and novelty)
-        # Holds typed BTF entry objects (PyOutcomeEntry, PyTopologyEntry,
-        # PyExperienceEntry) and/or legacy dicts from JSONL fallback.
-        self._peer_events: List[Any] = []
-        self._peer_events_max = 50_000
 
         # Myelination state (runtime only — not persisted)
         self._myelinated: Dict[str, MmapTract] = {}
@@ -470,18 +473,6 @@ class NGTractBridge(NGBridge):
             self._drain_all()
             self._outcomes_since_drain = 0
 
-        # Return cross-module insights from cached peer events
-        peer_count = len(self._peer_events)
-        if peer_count > 0:
-            return {
-                "cross_module": True,
-                "peer_events_cached": peer_count,
-                "peer_modules": list(set(
-                    self._get_module_id(e) for e in self._peer_events
-                    if self._get_module_id(e) != self.module_id
-                )),
-            }
-
         return {"cross_module": True, "peer_events_cached": 0}
 
     def get_recommendations(
@@ -496,47 +487,9 @@ class NGTractBridge(NGBridge):
         their targets as recommendations.
         """
         # Substrate handles cross-module similarity -- drain River then defer to substrate
-        # (#155 test: returning None lets ng_lite.py fall through to _core.get_recommendations)
+        # Substrate handles cross-module similarity; drain River then defer to _core.
         self._drain_all()
         return None
-
-        emb = self._normalize(embedding)
-
-        scored: List[Tuple[str, float, str]] = []
-        for event in self._peer_events:
-            event_module = self._get_module_id(event)
-            if event_module == module_id:
-                continue
-
-            peer_emb = self._get_embedding(event)
-            if peer_emb is None or peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
-                continue
-
-            peer_emb = self._normalize(peer_emb)
-            similarity = float(np.dot(emb, peer_emb))
-
-            if similarity >= self._relevance_threshold:
-                target = self._get_target_id(event)
-                reasoning = (
-                    f"Cross-module recommendation from {event_module} "
-                    f"(similarity={similarity:.3f})"
-                )
-                scored.append((target, similarity, reasoning))
-
-        if not scored:
-            return None
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        seen_targets: set = set()
-        deduped: List[Tuple[str, float, str]] = []
-        for target, sim, reason in scored:
-            if target not in seen_targets:
-                seen_targets.add(target)
-                deduped.append((target, sim, reason))
-                if len(deduped) >= top_k:
-                    break
-
-        return deduped
 
     def detect_novelty(
         self,
@@ -549,24 +502,9 @@ class NGTractBridge(NGBridge):
         but to ALL peer modules on this host.
         """
         # Substrate handles cross-module novelty -- drain River then defer to substrate
-        # (#155 test: returning None lets ng_lite.py fall through to _core.detect_novelty)
+        # Substrate handles cross-module novelty; drain River then defer to _core.
         self._drain_all()
         return None
-
-        emb = self._normalize(embedding)
-        max_similarity = 0.0
-
-        for event in self._peer_events:
-            peer_emb = self._get_embedding(event)
-            if peer_emb is None or peer_emb.size == 0 or peer_emb.shape[0] != emb.shape[0]:
-                continue
-
-            peer_emb = self._normalize(peer_emb)
-            similarity = float(np.dot(emb, peer_emb))
-            if similarity > max_similarity:
-                max_similarity = similarity
-
-        return max(0.0, 1.0 - max_similarity)
 
     def sync_state(
         self,
@@ -582,11 +520,8 @@ class NGTractBridge(NGBridge):
         return {
             "synced": True,
             "drain_count": self._drain_count,
-            "peer_events_cached": len(self._peer_events),
-            "peer_modules": list(set(
-                self._get_module_id(e) for e in self._peer_events
-                if self._get_module_id(e) != self.module_id
-            )),
+            "peer_events_cached": 0,
+            "peer_modules": [],
         }
 
     # -------------------------------------------------------------------
@@ -687,27 +622,12 @@ class NGTractBridge(NGBridge):
             legacy_events = self._legacy_read(registered_peers)
             new_events.extend(legacy_events)
 
-        # Add to cache, maintaining bounded size
-        self._peer_events.extend(new_events)
-        self._enforce_window_limit()
-
         if new_events:
             logger.debug(
                 "Tract drain #%d: absorbed %d events from %d peers",
                 self._drain_count, len(new_events),
                 len(set(self._get_module_id(e) for e in new_events)),
             )
-
-    def _enforce_window_limit(self) -> None:
-        """Trim accumulated peer events to rolling-window max.
-
-        Absorb ALL events at drain time; evict oldest only after absorption
-        exceeds the window. Matches Darwin recorder._enforce_window_limit
-        (50k). Never cap mid-drain -- Law 7: no experience dropped at intake.
-        """
-        if len(self._peer_events) > self._peer_events_max:
-            excess = len(self._peer_events) - self._peer_events_max
-            self._peer_events = self._peer_events[excess:]
 
     def _drain_single_tract(
         self, tract_path: Path, peer_id: str,
@@ -1074,7 +994,7 @@ class NGTractBridge(NGBridge):
             "module_dir": str(self._module_dir),
             "drain_count": self._drain_count,
             "outcomes_since_drain": self._outcomes_since_drain,
-            "peer_events_cached": len(self._peer_events),
+            "peer_events_cached": 0,
             "sync_interval": self._sync_interval,
             "relevance_threshold": self._relevance_threshold,
             "registered_peers": peers,
