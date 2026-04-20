@@ -1886,6 +1886,7 @@ def _extract_message_text(message: Dict[str, Any]) -> str:
 
     Handles text, tool_use, and tool_result content blocks so tool
     calls and their results reach the substrate (#18).
+    Raw experience in — no JSON serialization, no classification labels.
     """
     content = message.get("content", "")
 
@@ -1902,23 +1903,17 @@ def _extract_message_text(message: Dict[str, Any]) -> str:
                 if ptype == "text":
                     parts.append(part.get("text", ""))
                 elif ptype == "tool_use":
-                    # Serialize tool call: name + input args
-                    name = part.get("name", "unknown_tool")
-                    inp = part.get("input", {})
-                    try:
-                        inp_str = json.dumps(inp, ensure_ascii=False)[:500]
-                    except Exception:
-                        inp_str = str(inp)[:500]
-                    parts.append(f"tool_call:{name} {inp_str}")
+                    # Raw experience: what tool was called (name only — BTF carries full input)
+                    parts.append(part.get("name", ""))
                 elif ptype == "tool_result":
-                    # tool_result content can be string or list of text blocks
+                    # tool_result content is string or list of text blocks — raw as-is
                     result_content = part.get("content", "")
                     if isinstance(result_content, str):
-                        parts.append(f"tool_result: {result_content[:1000]}")
+                        parts.append(result_content[:2000])
                     elif isinstance(result_content, list):
                         for rc in result_content:
                             if isinstance(rc, dict) and rc.get("type") == "text":
-                                parts.append(f"tool_result: {rc.get('text','')[:1000]}")
+                                parts.append(rc.get("text", "")[:2000])
         return " ".join(parts)
 
     return str(content)
