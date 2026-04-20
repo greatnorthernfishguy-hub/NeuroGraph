@@ -12,12 +12,19 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-20] CC Sonnet 4.6 — #18 part 2: tool_use input → BTF via absorb_wire_deposit
+#   What: _deposit_tool_inputs_btf() called from handle_ingest. Converts tool_use
+#         input dict values to strings, deposits each via absorb_wire_deposit so
+#         full tool arguments reach the substrate through the BTF body-file path.
+#   Why:  text ingest carries only the tool name; arguments were still lost.
+#   How:  Iterates tool_use blocks in message content; joins input values as plain
+#         text; calls absorb_wire_deposit(source="oc.tool_use.<name>"). Silent on
+#         failure — a dead embedder must never block ingest.
 # [2026-04-20] CC Sonnet 4.6 — #18: tool_use + tool_result ingestion
 #   What: _extract_message_text now extracts tool_use (name+input) and tool_result
 #         (content string or text blocks) alongside existing text parts.
 #   Why:  #18 — tool results were silently dropped; substrate never saw tool I/O.
-#   How:  tool_call:name {input_json} prefix for tool_use; tool_result: prefix for
-#         results. Both truncated (500/1000 chars) to avoid substrate flooding.
+#   How:  tool name only via text path; tool_result raw content up to 2000 chars.
 # [2026-04-19] Claude Code — RESTORE: handle_dispose/compact/stats/_extract_message_text deleted by 73fd117
 #   What: Restored 4 functions accidentally removed in #143 refactor
 #   Why: _extract_message_text live NameError; handle_dispose breaks OC dispose RPC; handle_dispose also stops TriSyn
@@ -747,6 +754,48 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _deposit_tool_inputs_btf(message: Dict[str, Any]) -> None:
+    """Deposit tool_use input arguments into the substrate via BTF (#18).
+
+    Text ingest carries only the tool name (semantic signal). Full input
+    arguments go through absorb_wire_deposit — body-file path, raw experience,
+    no JSON formatting. Silent on any failure.
+    """
+    if _memory is None:
+        return
+    content = message.get("content", "")
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_use":
+            continue
+        name = part.get("name", "unknown_tool")
+        inp = part.get("input", {})
+        if not inp:
+            continue
+        # Flatten input values to plain text — no JSON syntax in the substrate
+        raw_parts = []
+        for v in inp.values():
+            if isinstance(v, str):
+                raw_parts.append(v)
+            elif v is not None:
+                raw_parts.append(str(v))
+        raw = " ".join(raw_parts).strip()
+        if not raw:
+            continue
+        try:
+            from wire_absorption import absorb_wire_deposit
+            from ng_embed import NGEmbed
+            absorb_wire_deposit(
+                memory=_memory,
+                embedder=NGEmbed.get_instance(),
+                content=raw[:4000],
+                source=f"oc.tool_use.{name}",
+            )
+        except Exception as exc:
+            logger.debug("BTF deposit for tool_use %s failed (non-fatal): %s", name, exc)
+
+
 def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
     """Ingest a single message through the 5-stage pipeline."""
     if _memory is None:
@@ -757,6 +806,9 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ingested": False}
 
     result = _memory.ingestor.ingest(text)
+
+    # Deposit tool_use input arguments via BTF (#18)
+    _deposit_tool_inputs_btf(params.get("message", {}))
 
     # Feed CES stream parser (background node nudging)
     if _memory._stream_parser is not None:
