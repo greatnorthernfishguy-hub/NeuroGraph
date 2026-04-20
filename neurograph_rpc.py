@@ -12,6 +12,12 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-20] CC Sonnet 4.6 — #65: session-as-activation-context
+#   What: handle_bootstrap embeds sessionId, searches vector_db (k=20, thresh=0.3),
+#         nudges matching node voltages by sim*0.15 — context-dependent priming.
+#   Why:  sessionId flowed in but was unused; hippocampal context retrieval missing.
+#   How:  Gentle nudge (capped at 2x threshold). Skips "auto"/"auto-startup" IDs.
+#         Silent on failure. Concurrent sessions activate different topology regions.
 # [2026-04-20] CC Sonnet 4.6 — #18 part 2: tool_use input → BTF via absorb_wire_deposit
 #   What: _deposit_tool_inputs_btf() called from handle_ingest. Converts tool_use
 #         input dict values to strings, deposits each via absorb_wire_deposit so
@@ -742,6 +748,30 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
             logger.debug("CC Tonic BrainSwitcher registration failed (non-fatal): %s", _bse)
     except Exception as exc:
         logger.warning("CC NG host init failed (Syl unaffected): %s", exc)
+
+    # Session-as-activation-context (#65): prime topology toward associations
+    # relevant to this session's context. Embed the sessionId string, find
+    # similar nodes in the vector_db, nudge their voltage — hippocampal
+    # context-dependent retrieval. Concurrent sessions activate different
+    # regions of the same topology without interference.
+    session_id = params.get("sessionId") or params.get("session_id") or ""
+    if session_id and session_id not in ("auto", "auto-startup"):
+        try:
+            from ng_embed import embed
+            session_emb = embed(session_id)
+            if session_emb is not None and _memory.vector_db is not None:
+                similar = _memory.vector_db.search(session_emb, k=20, threshold=0.3)
+                nudged = 0
+                for node_id, _sim in similar:
+                    node = _memory.graph.nodes.get(node_id)
+                    if node is not None and node.refractory_remaining == 0:
+                        nudge = _sim * 0.15  # gentle — context cue, not a spike
+                        node.voltage = min(node.voltage + nudge, node.threshold * 2.0)
+                        nudged += 1
+                if nudged:
+                    logger.info("Session context primed: %d nodes nudged for session=%s", nudged, session_id[:40])
+        except Exception as exc:
+            logger.debug("Session context priming failed (non-fatal): %s", exc)
 
     return {
         "bootstrapped": True,
