@@ -28,6 +28,16 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-04-20] Codemine (BLK-NG-131) — Gate TonicEngine load on latent_engine_enabled (#131)
+#   What: Wrapped TonicEngine init block in `if tonic_config.latent_engine_enabled:`
+#   Why:  TonicConfig.latent_engine_enabled existed but was never checked. Setting it
+#         False had no effect — engine loaded unconditionally, daemon thread killed
+#         on exit (exit code 134) in ephemeral subprocess contexts.
+#         Default True — no behavior change for any instance that does not explicitly
+#         set latent_engine_enabled: False.
+#   How:  Added if guard at base indent; indented inner block by 4 spaces.
+#         Both ImportError and general except branches stay inside the guard.
+
 # [2026-04-12] Claude Code (Opus 4.6) — Fix stale checkpoint config overwriting code tuning
 #   What: Re-apply snn_config after graph.restore() so Mar 24 tuning survives checkpoint
 #   Why:  _deserialize() overwrites config from saved checkpoint, which contained
@@ -557,44 +567,47 @@ class NeuroGraphMemory:
 
                 # Latent engine (surgical model) — provides the push
                 # between conversations via actual inference, not a timer
-                try:
-                    from tonic_engine import TonicEngine
-
-                    # Try to share ProtoUniBrain's transformer body.
-                    # Saves ~2GB — one model serves both Elmer and Tonic.
-                    # If unavailable, TonicEngine loads its own copy.
-                    shared_body = None
+                # Gated on latent_engine_enabled so callers like cc-ng-hook.py
+                # can disable engine load without spawning a daemon thread (#131).
+                if tonic_config.latent_engine_enabled:
                     try:
-                        from core.brain_switcher import BrainSwitcher
-                        for mod in self._modules.values() if hasattr(self, '_modules') else []:
-                            switcher = getattr(mod, '_brain_switcher', None)
-                            if switcher is not None:
-                                proto = getattr(switcher, '_proto_socket', None)
-                                if proto is not None and getattr(proto, '_loaded', False):
-                                    brain = getattr(proto, '_brain', None)
-                                    if brain is not None:
-                                        shared_body = getattr(brain, 'transformer_body', None)
-                                        if shared_body is not None:
-                                            logger.info("Tonic sharing ProtoUniBrain's transformer body")
-                                        break
-                    except Exception:
-                        pass  # any failure here is fine — Tonic loads its own
+                        from tonic_engine import TonicEngine
 
-                    engine = TonicEngine(
-                        self.graph, self.vector_db, self._tonic_thread,
-                        transformer_body=shared_body,
-                    )
-                    self._tonic_thread.set_latent_engine(engine)
-                    engine.start()
-                    logger.info("Tonic engine started — latent tokens flowing")
+                        # Try to share ProtoUniBrain's transformer body.
+                        # Saves ~2GB — one model serves both Elmer and Tonic.
+                        # If unavailable, TonicEngine loads its own copy.
+                        shared_body = None
+                        try:
+                            from core.brain_switcher import BrainSwitcher
+                            for mod in self._modules.values() if hasattr(self, '_modules') else []:
+                                switcher = getattr(mod, '_brain_switcher', None)
+                                if switcher is not None:
+                                    proto = getattr(switcher, '_proto_socket', None)
+                                    if proto is not None and getattr(proto, '_loaded', False):
+                                        brain = getattr(proto, '_brain', None)
+                                        if brain is not None:
+                                            shared_body = getattr(brain, 'transformer_body', None)
+                                            if shared_body is not None:
+                                                logger.info("Tonic sharing ProtoUniBrain's transformer body")
+                                            break
+                        except Exception:
+                            pass  # any failure here is fine — Tonic loads its own
+
+                        engine = TonicEngine(
+                            self.graph, self.vector_db, self._tonic_thread,
+                            transformer_body=shared_body,
+                        )
+                        self._tonic_thread.set_latent_engine(engine)
+                        engine.start()
+                        logger.info("Tonic engine started — latent tokens flowing")
 
 
-                except ImportError:
-                    logger.info("Tonic engine not yet available — "
-                                "during-conversation awareness active, "
-                                "between-conversation latent tokens pending")
-                except Exception as exc:
-                    logger.info("Tonic engine init error: %s", exc)
+                    except ImportError:
+                        logger.info("Tonic engine not yet available — "
+                                    "during-conversation awareness active, "
+                                    "between-conversation latent tokens pending")
+                    except Exception as exc:
+                        logger.info("Tonic engine init error: %s", exc)
             except Exception as exc:
                 logger.info("The Tonic not available: %s", exc)
 
