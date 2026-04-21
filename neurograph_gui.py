@@ -993,6 +993,173 @@ class EcosystemPoller:
 
 
 # ---------------------------------------------------------------------------
+# 4c. TopologySnapshot, TopologyLoader, TopologyRenderer
+# ---------------------------------------------------------------------------
+
+
+class TopologySnapshot:
+    """Immutable data bag for a read-only NeuroGraph topology snapshot."""
+
+    def __init__(
+        self,
+        node_embeddings: List[Any],
+        node_ids: List[str],
+        node_voltages: List[float],
+        synapse_pairs: List[Any],
+        synapse_weights: List[float],
+    ) -> None:
+        self.node_embeddings = node_embeddings
+        self.node_ids = node_ids
+        self.node_voltages = node_voltages
+        self.synapse_pairs = synapse_pairs
+        self.synapse_weights = synapse_weights
+
+
+class TopologyLoader:
+    """Read-only loader for NeuroGraph checkpoints.
+
+    NEVER instantiates NeuroGraphMemory — reads main.msgpack directly
+    via msgpack.unpackb().  Runs on a daemon thread; results delivered
+    via callback through GUIMessageQueue.
+    """
+
+    _DEFAULT_CHECKPOINT = Path.home() / "NeuroGraph" / "data" / "main.msgpack"
+
+    def __init__(
+        self,
+        on_result: Callable[[TopologySnapshot], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        self._on_result = on_result
+        self._on_error = on_error
+
+    def load(self, checkpoint_path: Optional[Path] = None) -> None:
+        path = checkpoint_path or self._DEFAULT_CHECKPOINT
+        threading.Thread(target=self._worker, args=(path,), daemon=True).start()
+
+    def _worker(self, path: Path) -> None:
+        try:
+            snapshot = self._read(path)
+            self._on_result(snapshot)
+        except Exception as exc:
+            self._on_error(exc)
+
+    def _read(self, path: Path) -> TopologySnapshot:
+        if not _HAS_MSGPACK:
+            raise RuntimeError("msgpack not installed — pip install msgpack")
+        with open(path, "rb") as fh:
+            raw = _msgpack.unpackb(fh.read(), raw=False, strict_map_key=False)
+        nodes = raw.get("nodes") or raw.get("node_map") or {}
+        edges = raw.get("edges") or raw.get("synapses") or {}
+        node_ids = list(nodes.keys()) if isinstance(nodes, dict) else []
+        node_embeddings: List[Any] = []
+        node_voltages: List[float] = []
+        for nid in node_ids:
+            nd = nodes[nid] if isinstance(nodes, dict) else {}
+            emb = nd.get("embedding") or nd.get("vector") or []
+            node_embeddings.append(emb if emb else [0.0] * 768)
+            node_voltages.append(float(nd.get("voltage", 0.0)))
+        synapse_pairs: List[Any] = []
+        synapse_weights: List[float] = []
+        if isinstance(edges, dict):
+            for _, edge in edges.items():
+                src = edge.get("src") or edge.get("source") or ""
+                tgt = edge.get("tgt") or edge.get("target") or ""
+                w = float(edge.get("weight", 0.0))
+                if src and tgt:
+                    synapse_pairs.append((src, tgt))
+                    synapse_weights.append(w)
+        elif isinstance(edges, list):
+            for edge in edges:
+                if isinstance(edge, (list, tuple)) and len(edge) >= 2:
+                    synapse_pairs.append((str(edge[0]), str(edge[1])))
+                    synapse_weights.append(float(edge[2]) if len(edge) > 2 else 1.0)
+        return TopologySnapshot(
+            node_embeddings=node_embeddings,
+            node_ids=node_ids,
+            node_voltages=node_voltages,
+            synapse_pairs=synapse_pairs,
+            synapse_weights=synapse_weights,
+        )
+
+
+class TopologyRenderer:
+    """Projects topology to 3D via PCA and renders a matplotlib 3D scatter.
+
+    Uses sklearn PCA if available; falls back to numpy SVD.
+    Embeds result as FigureCanvasTkAgg into the provided parent frame.
+    """
+
+    def __init__(
+        self,
+        on_result: Callable[[Any], None],
+        on_error: Callable[[Exception], None],
+        max_synapses: int = 200,
+    ) -> None:
+        self._on_result = on_result
+        self._on_error = on_error
+        self.max_synapses = max_synapses
+
+    def render(self, snapshot: TopologySnapshot, parent_frame: Any) -> None:
+        threading.Thread(
+            target=self._worker, args=(snapshot, parent_frame), daemon=True
+        ).start()
+
+    def _worker(self, snapshot: TopologySnapshot, parent_frame: Any) -> None:
+        try:
+            canvas = self._build(snapshot, parent_frame)
+            self._on_result(canvas)
+        except Exception as exc:
+            self._on_error(exc)
+
+    def _project(self, embeddings: List[Any]) -> Any:
+        import numpy as np
+        arr = np.array(embeddings, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] < 3 or arr.shape[1] < 3:
+            return np.zeros((max(arr.shape[0], 1), 3))
+        if _HAS_SKLEARN:
+            pca = _PCA(n_components=3)
+            return pca.fit_transform(arr)
+        centered = arr - arr.mean(axis=0)
+        _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+        return centered @ Vt[:3].T
+
+    def _build(self, snapshot: TopologySnapshot, parent_frame: Any) -> Any:
+        import numpy as np
+        if not _HAS_MATPLOTLIB:
+            raise RuntimeError("matplotlib not installed — pip install matplotlib")
+        coords = self._project(snapshot.node_embeddings)
+        voltages = np.array(snapshot.node_voltages, dtype=float)
+        fig = _plt.Figure(figsize=(6, 5), tight_layout=True)
+        ax = fig.add_subplot(111, projection="3d")
+        scatter = ax.scatter(
+            coords[:, 0], coords[:, 1], coords[:, 2],
+            c=voltages, cmap="plasma", s=10, alpha=0.7,
+        )
+        fig.colorbar(scatter, ax=ax, shrink=0.5, label="Voltage")
+        ax.set_title(f"{len(snapshot.node_ids)} nodes — read-only snapshot")
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_zlabel("PC3")
+        id_to_idx = {nid: i for i, nid in enumerate(snapshot.node_ids)}
+        pairs_w = list(zip(snapshot.synapse_pairs, snapshot.synapse_weights))
+        pairs_w.sort(key=lambda x: abs(x[1]), reverse=True)
+        for (src, tgt), _ in pairs_w[:self.max_synapses]:
+            si = id_to_idx.get(src)
+            ti = id_to_idx.get(tgt)
+            if si is not None and ti is not None:
+                ax.plot(
+                    [coords[si, 0], coords[ti, 0]],
+                    [coords[si, 1], coords[ti, 1]],
+                    [coords[si, 2], coords[ti, 2]],
+                    "b-", alpha=0.1, linewidth=0.3,
+                )
+        canvas = _FigureCanvasTkAgg(fig, master=parent_frame)
+        return canvas
+
+
+
+# ---------------------------------------------------------------------------
 # 5. IngestionManager
 # ---------------------------------------------------------------------------
 
@@ -1391,6 +1558,7 @@ class NeuroGraphGUI:
         self._build_updates_tab()
         self._build_modules_tab()
         self._build_dashboard_tab()
+        self._build_topology_tab()
         self._build_logs_tab()
 
     def _build_status_bar(self) -> None:
@@ -2200,6 +2368,75 @@ class NeuroGraphGUI:
             self._dashboard_after_id = self.root.after(interval_s * 1000, _tick)
 
         self._dashboard_after_id = self.root.after(interval_s * 1000, _tick)
+
+    # ---- Topology Tab ----
+
+    def _build_topology_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text=" Topology ")
+
+        hdr = ttk.Frame(frame)
+        hdr.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(hdr, text="Topology Snapshot (Read-Only)", font=("", 13, "bold")).pack(side=tk.LEFT)
+        self._topo_load_btn = ttk.Button(
+            hdr, text="Load Snapshot", command=self._load_topology_snapshot
+        )
+        self._topo_load_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Label(hdr, text="Max synapses:").pack(side=tk.RIGHT)
+        self._topo_max_synapses_var = tk.StringVar(
+            value=str(self.config.get("topology_max_synapses", 200))
+        )
+        ttk.Entry(
+            hdr, textvariable=self._topo_max_synapses_var, width=6
+        ).pack(side=tk.RIGHT, padx=(0, 4))
+
+        self._topo_status_var = tk.StringVar(
+            value="No snapshot loaded. Click 'Load Snapshot' to begin."
+        )
+        ttk.Label(frame, textvariable=self._topo_status_var, foreground="gray").pack(anchor=tk.W)
+        self._topo_canvas_frame = ttk.Frame(frame)
+        self._topo_canvas_frame.pack(fill=tk.BOTH, expand=True)
+        self._topo_canvas: Optional[Any] = None
+
+    def _load_topology_snapshot(self) -> None:
+        try:
+            max_s = max(1, int(self._topo_max_synapses_var.get()))
+        except ValueError:
+            max_s = 200
+        self.config.set("topology_max_synapses", max_s)
+        self._topo_load_btn.configure(state=tk.DISABLED)
+        self._topo_status_var.set("Loading checkpoint\u2026")
+        TopologyLoader(
+            on_result=lambda snap: self.msg_queue.put(
+                self._on_topology_loaded, snap, max_s
+            ),
+            on_error=lambda exc: self.msg_queue.put(self._on_topo_error, exc),
+        ).load()
+
+    def _on_topology_loaded(self, snapshot: Any, max_synapses: int) -> None:
+        n = len(snapshot.node_ids) if hasattr(snapshot, "node_ids") else 0
+        s = len(snapshot.synapse_pairs) if hasattr(snapshot, "synapse_pairs") else 0
+        self._topo_status_var.set(f"{n} nodes, {s} synapses loaded \u2014 rendering\u2026")
+        TopologyRenderer(
+            on_result=lambda canvas: self.msg_queue.put(
+                self._on_topology_rendered, canvas
+            ),
+            on_error=lambda exc: self.msg_queue.put(self._on_topo_error, exc),
+            max_synapses=max_synapses,
+        ).render(snapshot, self._topo_canvas_frame)
+
+    def _on_topology_rendered(self, canvas: Any) -> None:
+        if self._topo_canvas is not None:
+            self._topo_canvas.get_tk_widget().destroy()
+        self._topo_canvas = canvas
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        canvas.draw()
+        self._topo_status_var.set("Rendered (read-only \u2014 no writes to checkpoint).")
+        self._topo_load_btn.configure(state=tk.NORMAL)
+
+    def _on_topo_error(self, exc: Exception) -> None:
+        self._topo_status_var.set(f"Error: {exc}")
+        self._topo_load_btn.configure(state=tk.NORMAL)
 
     # ---- Settings Dialog ----
 
