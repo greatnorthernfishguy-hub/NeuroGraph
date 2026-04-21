@@ -12,6 +12,11 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-21] Claude Code (Sonnet 4.6) — Fix _drain_peer_tracts crash on NGTractBridge
+# What: Added hasattr(_peer_events) guard after bridge._drain_all() in _drain_peer_tracts().
+# Why:  #155 cleanup deleted _peer_events from NGTractBridge; cursor code still accessed it,
+#       crashing afterTurn on every message. NGTractBridge absorbs in _drain_all() — no cache.
+# How:  Early return after _drain_all() when bridge has no _peer_events attribute.
 # [2026-04-20] Claude (Sonnet 4.6) — Enable CES dashboard unconditionally
 # What: os.environ.setdefault("NEUROGRAPH_CES_DASHBOARD","1") added after imports.
 # Why:  .bashrc export not inherited by gateway child process — dashboard never
@@ -1664,6 +1669,11 @@ def _drain_peer_tracts() -> None:
         return
 
     bridge._drain_all()
+
+    # NGTractBridge absorbs tract events inside _drain_all() — no _peer_events cache.
+    # The _peer_events cursor pattern is NGPeerBridge-only (#155 removed it from tracts).
+    if not hasattr(bridge, '_peer_events'):
+        return
 
     total = len(bridge._peer_events)
     if total == 0:
