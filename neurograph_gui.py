@@ -77,6 +77,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "watcher_enabled": True,
     "watcher_stability_seconds": 1.0,
     "status_refresh_seconds": 5,
+    "dashboard_refresh_seconds": 30,
+    "topology_max_synapses": 200,
 }
 
 SUPPORTED_EXTENSIONS = {
@@ -116,6 +118,40 @@ try:
     _HAS_DND = True
 except ImportError:
     _HAS_DND = False
+
+try:
+    import msgpack as _msgpack
+    _HAS_MSGPACK = True
+except ImportError:
+    _HAS_MSGPACK = False
+
+try:
+    from sklearn.decomposition import PCA as _PCA
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
+
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as _plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg as _FigureCanvasTkAgg
+    from mpl_toolkits.mplot3d import Axes3D as _Axes3D  # noqa: F401
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    """Return hex SHA-256 of *path*, or None if the file doesn't exist."""
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # 1. GUIConfig
@@ -437,14 +473,7 @@ class GitUpdater:
 
     @staticmethod
     def _file_sha256(path: Path) -> Optional[str]:
-        """Return hex SHA-256 of *path*, or None if the file doesn't exist."""
-        if not path.is_file():
-            return None
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
+        return _sha256_file(path)
 
     def _count_stale_deployed_files(self) -> int:
         """Compare repo files to deployed files using the neurograph-patch MANIFEST.
@@ -641,7 +670,7 @@ class GitUpdater:
             # Phase 6: NG-Lite + bridge
             "ng_lite.py", "ng_bridge.py",
             # Phase 7: Peer bridge + ET Module Manager
-            "ng_peer_bridge.py", "et_module.json",
+            "ng_peer_bridge.py", "ng_tract_bridge.py", "ng_embed.py", "et_module.json",
             "et_modules/__init__.py", "et_modules/manager.py",
         ]
         patched = 0
@@ -675,7 +704,198 @@ class GitUpdater:
 
 
 # ---------------------------------------------------------------------------
-# 4. IngestionManager
+# 4. ModuleRegistry, VendoredFileStalenessChecker, VendoredFileSyncer, EcosystemRestarter
+# ---------------------------------------------------------------------------
+
+_VENDORED_FILES: List[str] = [
+    "ng_lite.py",
+    "ng_tract_bridge.py",
+    "ng_peer_bridge.py",
+    "ng_ecosystem.py",
+    "openclaw_adapter.py",
+    "ng_autonomic.py",
+    "ng_embed.py",
+]
+
+_CANONICAL_ROOT = Path.home() / "NeuroGraph"
+
+
+class ModuleRegistry:
+    """Load ~/.et_modules/registry.json and expose the module list."""
+
+    REGISTRY_PATH = Path.home() / ".et_modules" / "registry.json"
+
+    def __init__(self) -> None:
+        self._modules: List[Dict[str, Any]] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if not self.REGISTRY_PATH.exists():
+                _logger.warning("registry.json not found: %s", self.REGISTRY_PATH)
+                return
+            data = json.loads(self.REGISTRY_PATH.read_text())
+            raw = data.get("modules", {})
+            if isinstance(raw, dict):
+                self._modules = list(raw.values())
+            elif isinstance(raw, list):
+                self._modules = raw
+        except Exception as exc:
+            _logger.warning("Registry load failed: %s", exc)
+
+    def get_modules(self) -> List[Dict[str, Any]]:
+        return list(self._modules)
+
+    def reload(self) -> None:
+        self._modules = []
+        self._load()
+
+
+class VendoredFileStalenessChecker:
+    """SHA-256 diff of each module's vendored files vs canonical ~/NeuroGraph/."""
+
+    def check_module(self, module: Dict[str, Any]) -> int:
+        """Return count of stale or missing vendored files for *module*."""
+        install_path = module.get("install_path", "")
+        if not install_path:
+            return 0
+        module_dir = Path(install_path)
+        stale = 0
+        for fname in _VENDORED_FILES:
+            canonical = _CANONICAL_ROOT / fname
+            if not canonical.exists():
+                continue
+            candidates = [
+                module_dir / fname,
+                module_dir / "inference_difference" / fname,
+            ]
+            found = next((p for p in candidates if p.exists()), None)
+            if found is None:
+                stale += 1
+            elif _sha256_file(canonical) != _sha256_file(found):
+                stale += 1
+        return stale
+
+
+class VendoredFileSyncer:
+    """Copy vendored files from canonical ~/NeuroGraph/ into a module directory."""
+
+    def __init__(
+        self,
+        on_status: Callable[[str], None],
+        on_complete: Callable[[Dict[str, Any]], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        self._on_status = on_status
+        self._on_complete = on_complete
+        self._on_error = on_error
+
+    def sync_module(self, module: Dict[str, Any]) -> None:
+        threading.Thread(
+            target=self._sync_worker, args=(module,), daemon=True,
+        ).start()
+
+    def _sync_worker(self, module: Dict[str, Any]) -> None:
+        try:
+            install_path = module.get("install_path", "")
+            if not install_path:
+                self._on_error(ValueError(
+                    f"No install_path for {module.get('module_id')}"
+                ))
+                return
+            module_dir = Path(install_path)
+            synced = 0
+            for fname in _VENDORED_FILES:
+                canonical = _CANONICAL_ROOT / fname
+                if not canonical.exists():
+                    continue
+                candidates = [
+                    module_dir / fname,
+                    module_dir / "inference_difference" / fname,
+                ]
+                dst = next((p for p in candidates if p.exists()), module_dir / fname)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(canonical), str(dst))
+                synced += 1
+                self._on_status(f"  Synced {fname}")
+            self._on_complete({"success": True, "files_synced": synced})
+        except Exception as exc:
+            self._on_error(exc)
+
+
+class EcosystemRestarter:
+    """Restart the full ecosystem in fixed sequence: TID \u2192 TrollGuard \u2192 gateway."""
+
+    RESTART_SEQUENCE = [
+        ("TID", "sudo systemctl restart inference-difference"),
+        ("TrollGuard", "sudo systemctl restart trollguard"),
+        ("OpenClaw Gateway", "openclaw gateway restart"),
+    ]
+
+    def __init__(
+        self,
+        on_status: Callable[[str, str], None],
+        on_complete: Callable[[Dict[str, Any]], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        self._on_status = on_status
+        self._on_complete = on_complete
+        self._on_error = on_error
+        self._running = False
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def restart(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        threading.Thread(target=self._restart_worker, daemon=True).start()
+
+    def _restart_worker(self) -> None:
+        results: List[Dict[str, Any]] = []
+        try:
+            for name, cmd in self.RESTART_SEQUENCE:
+                self._on_status(name, "running")
+                try:
+                    r = subprocess.run(
+                        cmd, shell=True,
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if r.returncode == 0:
+                        self._on_status(name, "done")
+                        results.append({"step": name, "success": True})
+                    else:
+                        stderr = r.stderr.strip()
+                        if "sudo" in cmd and (
+                            "permission" in stderr.lower()
+                            or "password" in stderr.lower()
+                        ):
+                            self._on_status(name, "sudo_required")
+                            results.append({
+                                "step": name, "success": False,
+                                "cmd": cmd, "reason": "sudo_required",
+                            })
+                        else:
+                            self._on_status(name, "failed")
+                            results.append({
+                                "step": name, "success": False,
+                                "reason": stderr[:200],
+                            })
+                except subprocess.TimeoutExpired:
+                    self._on_status(name, "timeout")
+                    results.append({"step": name, "success": False, "reason": "timeout"})
+                except Exception as exc:
+                    self._on_status(name, "failed")
+                    results.append({"step": name, "success": False, "reason": str(exc)})
+        finally:
+            self._running = False
+            self._on_complete({"results": results})
+
+
+# ---------------------------------------------------------------------------
+# 5. IngestionManager
 # ---------------------------------------------------------------------------
 
 
@@ -973,8 +1193,8 @@ class NeuroGraphGUI:
             raise RuntimeError("tkinter is required for the GUI. Install python3-tk.")
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("900x650")
-        self.root.minsize(750, 520)
+        self.root.geometry("1100x750")
+        self.root.minsize(900, 600)
 
         self.config = GUIConfig()
         created = self.config.ensure_directories()
@@ -1009,6 +1229,19 @@ class NeuroGraphGUI:
             workspace_dir=self.config.get("workspace_dir"),
             on_status=lambda s: self.msg_queue.put(self._on_update_status, s),
             on_complete=lambda r: self.msg_queue.put(self._on_update_complete, r),
+            on_error=lambda e: self.msg_queue.put(self._on_update_error, e),
+        )
+        self.module_registry = ModuleRegistry()
+        self.vendored_file_syncer = VendoredFileSyncer(
+            on_status=lambda s: self.msg_queue.put(self._on_update_status, s),
+            on_complete=lambda r: self.msg_queue.put(self._on_sync_complete, r),
+            on_error=lambda e: self.msg_queue.put(self._on_update_error, e),
+        )
+        self.ecosystem_restarter = EcosystemRestarter(
+            on_status=lambda step, status: self.msg_queue.put(
+                self._on_restart_step_status, step, status
+            ),
+            on_complete=lambda r: self.msg_queue.put(self._on_restart_complete, r),
             on_error=lambda e: self.msg_queue.put(self._on_update_error, e),
         )
         self.file_watcher: Optional[FileWatcher] = None
@@ -1053,6 +1286,7 @@ class NeuroGraphGUI:
         self._build_status_tab()
         self._build_ingestion_tab()
         self._build_updates_tab()
+        self._build_modules_tab()
         self._build_logs_tab()
 
     def _build_status_bar(self) -> None:
@@ -1539,6 +1773,114 @@ class NeuroGraphGUI:
         self._update_log.insert(tk.END, f"[{ts}] {text}\n")
         self._update_log.see(tk.END)
         self._update_log.config(state=tk.DISABLED)
+
+    # ---- Modules Tab ----
+
+    def _build_modules_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text=" Modules ")
+
+        hdr = ttk.Frame(frame)
+        hdr.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(hdr, text="Ecosystem Command Center", font=("", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Button(hdr, text="Refresh", command=self._refresh_modules).pack(side=tk.RIGHT, padx=(0, 4))
+        self._restart_btn = ttk.Button(
+            hdr, text="Restart Ecosystem", command=self._on_restart_ecosystem,
+        )
+        self._restart_btn.pack(side=tk.RIGHT, padx=(0, 4))
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        cols = ("Name", "Version", "Service", "Stale Files", "Action")
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self._module_tree = ttk.Treeview(
+            tree_frame, columns=cols, show="headings",
+            yscrollcommand=scrollbar.set, selectmode="browse",
+        )
+        scrollbar.config(command=self._module_tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._module_tree.pack(fill=tk.BOTH, expand=True)
+        col_widths = {"Name": 180, "Version": 70, "Service": 90, "Stale Files": 80, "Action": 140}
+        for col in cols:
+            self._module_tree.heading(col, text=col)
+            self._module_tree.column(col, width=col_widths[col], anchor=tk.W)
+        self._module_tree.bind("<ButtonRelease-1>", self._on_module_tree_click)
+
+        self._restart_progress_var = tk.StringVar(value="")
+        ttk.Label(
+            frame, textvariable=self._restart_progress_var,
+            wraplength=750, justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(6, 0))
+
+        self._refresh_modules()
+
+    def _refresh_modules(self) -> None:
+        self.module_registry.reload()
+        checker = VendoredFileStalenessChecker()
+        for iid in self._module_tree.get_children():
+            self._module_tree.delete(iid)
+        for mod in self.module_registry.get_modules():
+            name = mod.get("display_name") or mod.get("module_id", "?")
+            version = mod.get("version", "?")
+            svc = mod.get("service_name") or "plugin"
+            stale = checker.check_module(mod)
+            stale_str = str(stale) if stale > 0 else "\u2014"
+            self._module_tree.insert(
+                "", tk.END,
+                values=(name, version, svc, stale_str, "Sync Vendored Files"),
+                tags=(mod.get("module_id", ""),),
+            )
+
+    def _on_module_tree_click(self, event: Any) -> None:
+        if self._module_tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self._module_tree.identify_column(event.x) != "#5":
+            return
+        iid = self._module_tree.identify_row(event.y)
+        if not iid:
+            return
+        tags = self._module_tree.item(iid, "tags")
+        module_id = tags[0] if tags else None
+        mod = next(
+            (m for m in self.module_registry.get_modules() if m.get("module_id") == module_id),
+            None,
+        )
+        if mod:
+            self._on_module_sync(mod)
+
+    def _on_module_sync(self, module: Dict[str, Any]) -> None:
+        name = module.get("display_name") or module.get("module_id", "?")
+        self._on_update_status(f"Syncing vendored files for {name}\u2026")
+        self.vendored_file_syncer.sync_module(module)
+
+    def _on_sync_complete(self, result: Dict[str, Any]) -> None:
+        synced = result.get("files_synced", 0)
+        self._on_update_status(f"Sync complete: {synced} files copied.")
+        self._refresh_modules()
+
+    def _on_restart_ecosystem(self) -> None:
+        if self.ecosystem_restarter.running:
+            return
+        self._restart_btn.configure(state=tk.DISABLED)
+        self._restart_progress_var.set("Starting ecosystem restart\u2026")
+        self.ecosystem_restarter.restart()
+
+    def _on_restart_step_status(self, step: str, status: str) -> None:
+        icons = {"running": "\u2026", "done": "\u2713", "failed": "\u2717", "timeout": "\u2717", "sudo_required": "!"}
+        icon = icons.get(status, "?")
+        current = self._restart_progress_var.get()
+        line = f"{icon} {step}: {status}"
+        self._restart_progress_var.set(f"{current}\n{line}" if current else line)
+
+    def _on_restart_complete(self, result: Dict[str, Any]) -> None:
+        self._restart_btn.configure(state=tk.NORMAL)
+        sudo_cmds = [r["cmd"] for r in result.get("results", []) if r.get("reason") == "sudo_required"]
+        if sudo_cmds:
+            cmds_text = "\n".join(sudo_cmds)
+            current = self._restart_progress_var.get()
+            self._restart_progress_var.set(
+                f"{current}\n\nRun these in terminal:\n{cmds_text}"
+            )
 
     # ---- Logs Tab ----
 
