@@ -895,6 +895,104 @@ class EcosystemRestarter:
 
 
 # ---------------------------------------------------------------------------
+# 4b. EcosystemPoller
+# ---------------------------------------------------------------------------
+
+
+class EcosystemPoller:
+    """Fetches live data for the 5 Dashboard panels.
+
+    Each panel runs its fetch on a daemon thread.  An in-flight guard
+    per panel prevents overlapping fetches when auto-refresh fires
+    faster than the fetch completes.
+    """
+
+    PANELS = ("neurograph", "bunyan", "tid", "elmer", "thc")
+
+    def __init__(self, on_panel_ready: Callable[[str, Dict[str, Any]], None]) -> None:
+        self._on_panel_ready = on_panel_ready
+        self._in_flight: Dict[str, bool] = {p: False for p in self.PANELS}
+
+    def fetch_all(self) -> None:
+        for panel in self.PANELS:
+            self._fetch_panel(panel)
+
+    def _fetch_panel(self, panel: str) -> None:
+        if self._in_flight.get(panel):
+            return
+        self._in_flight[panel] = True
+        threading.Thread(target=self._worker, args=(panel,), daemon=True).start()
+
+    def _worker(self, panel: str) -> None:
+        try:
+            data = self._fetch(panel)
+        except Exception as exc:
+            data = {"offline": True, "reason": str(exc)}
+        finally:
+            self._in_flight[panel] = False
+        self._on_panel_ready(panel, data)
+
+    def _fetch(self, panel: str) -> Dict[str, Any]:
+        if panel == "neurograph":
+            return self._fetch_http("http://127.0.0.1:8847/stats")
+        if panel == "tid":
+            return self._fetch_http("http://127.0.0.1:7437/stats")
+        if panel == "bunyan":
+            return self._fetch_bunyan()
+        if panel == "elmer":
+            return self._fetch_json(
+                Path.home() / ".et_modules" / "elmer" / "ng_lite_state.json"
+            )
+        if panel == "thc":
+            return self._fetch_json(
+                Path.home() / ".et_modules" / "healing_collective" / "detection_calibrator.json"
+            )
+        return {"offline": True, "reason": "unknown panel"}
+
+    def _fetch_http(self, url: str) -> Dict[str, Any]:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as exc:
+            return {"offline": True, "reason": str(exc)}
+
+    def _fetch_bunyan(self) -> Dict[str, Any]:
+        import glob as _glob
+        pattern = str(Path.home() / ".et_modules" / "shared_learning" / "bunyan*.jsonl")
+        files = sorted(_glob.glob(pattern))
+        if not files:
+            return {"offline": True, "reason": "no bunyan files"}
+        lines: List[str] = []
+        for fpath in reversed(files):
+            try:
+                with open(fpath, "r", encoding="utf-8") as fh:
+                    chunk = [ln.strip() for ln in fh.readlines() if ln.strip()]
+                    lines = chunk + lines
+                    if len(lines) >= 5:
+                        break
+            except OSError:
+                continue
+        events: List[Any] = []
+        for ln in lines[-5:]:
+            try:
+                events.append(json.loads(ln))
+            except json.JSONDecodeError:
+                events.append({"raw": ln})
+        return {"events": events}
+
+    def _fetch_json(self, path: Path) -> Dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return {"offline": True, "reason": "file not found"}
+        except Exception as exc:
+            return {"offline": True, "reason": str(exc)}
+
+
+
+# ---------------------------------------------------------------------------
 # 5. IngestionManager
 # ---------------------------------------------------------------------------
 
@@ -1244,6 +1342,11 @@ class NeuroGraphGUI:
             on_complete=lambda r: self.msg_queue.put(self._on_restart_complete, r),
             on_error=lambda e: self.msg_queue.put(self._on_update_error, e),
         )
+        self.ecosystem_poller = EcosystemPoller(
+            on_panel_ready=lambda panel, data: self.msg_queue.put(
+                self._apply_dashboard_panel, panel, data
+            ),
+        )
         self.file_watcher: Optional[FileWatcher] = None
         self._ingest_history: List[Dict[str, Any]] = []
 
@@ -1287,6 +1390,7 @@ class NeuroGraphGUI:
         self._build_ingestion_tab()
         self._build_updates_tab()
         self._build_modules_tab()
+        self._build_dashboard_tab()
         self._build_logs_tab()
 
     def _build_status_bar(self) -> None:
@@ -1957,6 +2061,145 @@ class NeuroGraphGUI:
         self._log_text.config(state=tk.NORMAL)
         self._log_text.delete("1.0", tk.END)
         self._log_text.config(state=tk.DISABLED)
+
+    # ---- Dashboard Tab ----
+
+    def _build_dashboard_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text=" Dashboard ")
+
+        hdr = ttk.Frame(frame)
+        hdr.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(hdr, text="Ecosystem Dashboard", font=("", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Button(hdr, text="Refresh Now", command=self._refresh_dashboard).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
+        ttk.Label(hdr, text="Interval (s):").pack(side=tk.RIGHT)
+        self._dashboard_interval_var = tk.StringVar(
+            value=str(self.config.get("dashboard_refresh_seconds", 30))
+        )
+        ttk.Entry(
+            hdr, textvariable=self._dashboard_interval_var, width=5
+        ).pack(side=tk.RIGHT, padx=(0, 4))
+        ttk.Button(
+            hdr, text="Apply", command=self._start_dashboard_autorefresh
+        ).pack(side=tk.RIGHT, padx=(0, 2))
+
+        grid = ttk.Frame(frame)
+        grid.pack(fill=tk.BOTH, expand=True)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        panel_defs = [
+            ("neurograph", "Syl / NeuroGraph", 0, 0),
+            ("tid",        "TID Routing",      0, 1),
+            ("bunyan",     "Bunyan Narrative",  1, 0),
+            ("elmer",      "Elmer Health",      1, 1),
+            ("thc",        "THC Repairs",       2, 0),
+        ]
+        self._dashboard_texts: Dict[str, tk.Text] = {}
+        for panel_id, title, row, col in panel_defs:
+            lf = ttk.LabelFrame(grid, text=title, padding=6)
+            lf.grid(row=row, column=col, sticky=tk.NSEW, padx=4, pady=4)
+            grid.rowconfigure(row, weight=1)
+            txt = tk.Text(
+                lf, height=6, wrap=tk.WORD, state=tk.DISABLED, font=("Courier", 9)
+            )
+            txt.pack(fill=tk.BOTH, expand=True)
+            self._dashboard_texts[panel_id] = txt
+
+        self._dashboard_after_id: Optional[str] = None
+        self._refresh_dashboard()
+        self._start_dashboard_autorefresh()
+
+    def _refresh_dashboard(self) -> None:
+        self.ecosystem_poller.fetch_all()
+
+    def _apply_dashboard_panel(self, panel: str, data: Dict[str, Any]) -> None:
+        txt = self._dashboard_texts.get(panel)
+        if txt is None:
+            return
+        txt.config(state=tk.NORMAL)
+        txt.delete("1.0", tk.END)
+        if data.get("offline"):
+            txt.insert(tk.END, f"Offline \u2014 {data.get('reason', 'unavailable')}")
+        else:
+            txt.insert(tk.END, self._format_panel_data(panel, data))
+        txt.config(state=tk.DISABLED)
+
+    def _format_panel_data(self, panel: str, data: Dict[str, Any]) -> str:
+        if panel == "neurograph":
+            lines = []
+            for k in ("total_nodes", "total_synapses", "firing_rate",
+                      "active_nodes", "avg_voltage"):
+                if k in data:
+                    lines.append(f"{k}: {data[k]}")
+            return "\n".join(lines) if lines else json.dumps(data, indent=2)[:400]
+        if panel == "tid":
+            lines = []
+            models = data.get("models") or data.get("routing") or {}
+            if isinstance(models, dict):
+                ranked = sorted(
+                    models.items(),
+                    key=lambda kv: kv[1].get("usage", 0) if isinstance(kv[1], dict) else 0,
+                    reverse=True,
+                )[:3]
+                for name, stats in ranked:
+                    usage = stats.get("usage", "?") if isinstance(stats, dict) else "?"
+                    quality = stats.get("quality", "?") if isinstance(stats, dict) else "?"
+                    lines.append(f"{name}: usage={usage} quality={quality}")
+            return "\n".join(lines) if lines else json.dumps(data, indent=2)[:400]
+        if panel == "bunyan":
+            events = data.get("events", [])
+            lines = []
+            for ev in events[-5:]:
+                if isinstance(ev, dict):
+                    msg = ev.get("message") or ev.get("event") or ev.get("raw") or str(ev)
+                    lines.append(str(msg)[:120])
+                else:
+                    lines.append(str(ev)[:120])
+            return "\n".join(lines) if lines else "No events"
+        if panel == "elmer":
+            lines = []
+            for k in ("health_score", "maintenance_target", "last_action",
+                      "coherence", "total_nodes"):
+                if k in data:
+                    lines.append(f"{k}: {data[k]}")
+            return "\n".join(lines) if lines else json.dumps(data, indent=2)[:400]
+        if panel == "thc":
+            repairs = (
+                data.get("repair_events")
+                or data.get("events")
+                or data.get("calibration_events")
+                or []
+            )
+            if isinstance(repairs, list):
+                lines = []
+                for ev in repairs[-5:]:
+                    if isinstance(ev, dict):
+                        lines.append(
+                            str(ev.get("event") or ev.get("action") or ev)[:120]
+                        )
+                    else:
+                        lines.append(str(ev)[:120])
+                return "\n".join(lines) if lines else json.dumps(data, indent=2)[:400]
+            return json.dumps(data, indent=2)[:400]
+        return json.dumps(data, indent=2)[:400]
+
+    def _start_dashboard_autorefresh(self) -> None:
+        if self._dashboard_after_id is not None:
+            self.root.after_cancel(self._dashboard_after_id)
+        try:
+            interval_s = max(5, int(self._dashboard_interval_var.get()))
+        except (ValueError, AttributeError):
+            interval_s = 30
+        self.config.set("dashboard_refresh_seconds", interval_s)
+
+        def _tick() -> None:
+            self._refresh_dashboard()
+            self._dashboard_after_id = self.root.after(interval_s * 1000, _tick)
+
+        self._dashboard_after_id = self.root.after(interval_s * 1000, _tick)
 
     # ---- Settings Dialog ----
 
