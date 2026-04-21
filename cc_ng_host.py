@@ -24,6 +24,19 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-04-20] Claude (Sonnet 4.6) — Wire all three surfacing paths
+# What: Fix _recall() (remove blocking lock, add SurfacingMonitor primary path).
+#       Add _nudge() (StreamParser L1 cache pre-activation). Wire _nudge() into
+#       _handle_user_prompt_submit and _handle_pre_tool_use. Make deposit async.
+# Why:  _concurrent_lock in _recall() caused hook timeouts (Tonic holds lock).
+#       Synchronous deposit in UserPromptSubmit (1-4s) blew 2s hook timeout.
+#       SurfacingMonitor + StreamParser paths designed to work together — nudge
+#       first, recall second. CES disabled now but paths are defensive (getattr
+#       fallback) so they activate automatically when CES is enabled.
+# How:  _recall: SurfacingMonitor primary (O(1)); lock-free vector fallback.
+#       _nudge: wraps ng._stream_parser.feed() — non-blocking, ~0ms.
+#       _handle_user_prompt_submit: _nudge -> async deposit -> _recall.
+#       _handle_pre_tool_use: _nudge -> _recall.
 # [2026-04-19] Claude (Sonnet 4.6) — Fix _recall() empty-context bug (#188)
 # What: r.get("text","") → r.get("content","") — query_similar() returns 'content' key.
 # Why:  Same bug as NeuroGraph cc_ng_host.py fix (efe7a92). Codemine worker recall broken.
@@ -181,8 +194,15 @@ def _recall(query: str, k: int) -> str:
     with _STATE.stats_lock:
         _STATE.stats["recalls"] += 1
     try:
-        with ng.graph._concurrent_lock:
-            results = ng.recall(query, k=k, threshold=RECALL_THRESHOLD)
+        # Primary: CES SurfacingMonitor (O(1) — active when CES enabled)
+        monitor = getattr(ng, '_surfacing_monitor', None)
+        if monitor is not None:
+            ctx = monitor.format_context()
+            if ctx:
+                return ctx
+        # Fallback: vector recall without lock (read-only; RuntimeError on dict
+        # mutation race is caught cleanly — Tonic can't block this path)
+        results = ng.recall(query, k=k, threshold=RECALL_THRESHOLD)
         if not results:
             return ""
         lines = ["[NeuroGraph] Relevant context:"]
@@ -191,11 +211,29 @@ def _recall(query: str, k: int) -> str:
             if text.strip():
                 lines.append("- " + text.strip()[:200])
         return "\n".join(lines) if len(lines) > 1 else ""
+    except RuntimeError:
+        return ""  # dict mutation race during concurrent deposit
     except Exception as exc:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1
         logger.debug("CC recall failed: %s", exc)
         return ""
+
+
+def _nudge(text: str) -> None:
+    """StreamParser feed — subliminal pre-activation (L1 cache).
+    Non-blocking: queues text for StreamParser's background thread.
+    No-ops gracefully when CES is disabled (_stream_parser is None).
+    """
+    ng = _STATE.cc_ng
+    if ng is None:
+        return
+    try:
+        parser = getattr(ng, '_stream_parser', None)
+        if parser is not None:
+            parser.feed(text)
+    except Exception as exc:
+        logger.debug("CC nudge failed: %s", exc)
 
 
 def _reward(value: float) -> None:
@@ -289,7 +327,10 @@ def _handle_user_prompt_submit(data):
     prompt = data.get("prompt", "")
     if not prompt:
         return {"ok": True, "context": ""}
-    _deposit(prompt)
+    # L1 cache nudge first — raises related node voltages before recall
+    _nudge(prompt)
+    # Deposit async — on_message() runs a full SNN step (1-4s); hook timeout is 2s
+    threading.Thread(target=_deposit, args=(prompt,), daemon=True).start()
     context = _recall(prompt, RECALL_K)
     return {"ok": True, "context": context}
 
@@ -301,6 +342,8 @@ def _handle_pre_tool_use(data):
     query = (tool + " " + file_path).strip()
     if not query:
         return {"ok": True, "context": ""}
+    # L1 cache nudge — pre-activates nodes related to this file/tool before recall
+    _nudge(query)
     context = _recall(query, RECALL_K)
     return {"ok": True, "context": context}
 
