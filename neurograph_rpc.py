@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-20] Claude (Sonnet 4.6) — Enable CES dashboard unconditionally
+# What: os.environ.setdefault("NEUROGRAPH_CES_DASHBOARD","1") added after imports.
+# Why:  .bashrc export not inherited by gateway child process — dashboard never
+#       started despite env var being set. Self-contained fix: rpc.py sets it.
+# How:  setdefault so explicit env override (=0) still works.
+# [2026-04-20] Claude (Sonnet 4.6) — Enable CES dashboard unconditionally
+# What: os.environ.setdefault("NEUROGRAPH_CES_DASHBOARD","1") added after imports.
+# Why:  .bashrc not inherited by gateway child process — dashboard never started.
+#       Self-contained fix: rpc.py sets it before CES init runs.
+# How:  setdefault so explicit env override (=0) still suppresses it.
 # [2026-04-20] CC Sonnet 4.6 — #65: session-as-activation-context
 #   What: handle_bootstrap embeds sessionId, searches vector_db (k=20, thresh=0.3),
 #         nudges matching node voltages by sim*0.15 — context-dependent priming.
@@ -216,6 +226,12 @@ from typing import Any, Dict, List, Optional
 _ng_dir = os.path.expanduser("~/NeuroGraph")
 if _ng_dir not in sys.path:
     sys.path.insert(0, _ng_dir)
+
+# CES monitoring dashboard on port 8847 — always on when gateway is up
+os.environ.setdefault("NEUROGRAPH_CES_DASHBOARD", "1")
+
+# CES monitoring dashboard on port 8847 — always on when gateway is up
+os.environ.setdefault("NEUROGRAPH_CES_DASHBOARD", "1")
 
 # All logging to stderr — stdout is the RPC channel
 logging.basicConfig(
