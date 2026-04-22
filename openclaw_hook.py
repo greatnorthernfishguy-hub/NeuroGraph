@@ -28,6 +28,23 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-04-22] Claude Code (Sonnet 4.6) — #206: remove _write_peer_learning_event (Law 7), resilient on_message
+#   What: Removed _write_peer_learning_event() — pre-classified experience (success,
+#         nodes_created, fired, text_preview) before depositing to peer bridge.
+#         Restructured on_message(): ingestor.ingest() wrapped in try/except;
+#         graph.step() now always runs regardless of ingest success/failure.
+#         Post-step BTF deposit added after graph.step() so learning-step topology
+#         (including empty steps from failed turns) flows to the River immediately.
+#   Why:  Law 7 — classification belongs at extraction, not deposit. A failed turn
+#         is a timestep. The substrate steps through it. The River carries the truth.
+#         Peer modules (Bunyan) need the complete picture at their extraction boundary.
+#         Ecosystem audit confirmed no module extraction bucket consumed the classified
+#         signal from _write_peer_learning_event().
+#   How:  ingest() wrapped in try/except; step always runs; inject_reward /
+#         stream_parser.feed / update_probation gated on ingest success;
+#         event_data returns status="error" + error_type on ingest failure.
+#         Post-step BTF via ng_tract.deposit_topology (same pattern as
+#         _tonic_post_cycle_hook). _write_peer_learning_event() deleted.
 # [2026-04-20] Codemine (BLK-NG-131) — Gate TonicEngine load on latent_engine_enabled (#131)
 #   What: Wrapped TonicEngine init block in `if tonic_config.latent_engine_enabled:`
 #   Why:  TonicConfig.latent_engine_enabled existed but was never checked. Setting it
@@ -705,31 +722,61 @@ class NeuroGraphMemory:
             self._syl_daemon.josh_arrived()
 
         # Stage 1-5: Extract → Chunk → Embed → Register → Associate
-        result = self.ingestor.ingest(text, source_type=source_type)
-        new_node_ids = set(result.nodes_created)
+        # Wrapped in try/except — graph.step() runs regardless of outcome.
+        # A failed turn is a timestep. The substrate steps through it.
+        result = None
+        new_node_ids: set = set()
+        ingest_error: Optional[Exception] = None
+        try:
+            result = self.ingestor.ingest(text, source_type=source_type)
+            new_node_ids = set(result.nodes_created)
+        except Exception as exc:
+            logger.warning("Ingestion failed: %s", exc)
+            ingest_error = exc
 
-        # --- AUTO-KNOWLEDGE: Spreading Activation Harvest ---
+        # --- AUTO-KNOWLEDGE: Spreading Activation Harvest (success path only) ---
         surfaced: List[Dict[str, Any]] = []
-        snn_config = self.graph.config
-        if snn_config.get("auto_knowledge_enabled", True) and self.vector_db.count() > 0:
-            surfaced = self._harvest_associations(text, new_node_ids)
+        if result is not None:
+            snn_config = self.graph.config
+            if snn_config.get("auto_knowledge_enabled", True) and self.vector_db.count() > 0:
+                surfaced = self._harvest_associations(text, new_node_ids)
 
-        # Run SNN learning step (separate from propagation — this one
-        # applies STDP, structural plasticity, predictions, etc.)
+        # Run SNN learning step — always, even on ingest failure.
+        # A failed turn is a timestep. The substrate steps through it.
         step_result = self.graph.step()
 
-        # Baseline conversational engagement reward.
+        # Post-step BTF deposit — carries learning-step topology to the River
+        # immediately. Gives peer modules (Bunyan especially) the complete picture
+        # including empty steps from failed turns. Same pattern as _tonic_post_cycle_hook.
+        try:
+            _bridge = self._peer_bridge
+            if _bridge is not None:
+                import ng_tract
+                from neuro_foundation import StepResult as _StepResult
+                _post_sr = _StepResult(
+                    timestep=self.graph.timestep,
+                    fired_node_ids=list(step_result.fired_node_ids),
+                )
+                _tract_paths = [
+                    str(_bridge._module_dir / f"{pid}.tract")
+                    for pid in _bridge._get_registered_peers()
+                ]
+                ng_tract.deposit_topology(_post_sr, self.graph, self.vector_db, _tract_paths)
+        except Exception as exc:
+            logger.debug("Post-step BTF deposit failed: %s", exc)
+
+        # Baseline conversational engagement reward (success path only).
         # The continuation of conversation is a mild positive signal —
         # previous learning was not wrong enough to end the interaction.
         # Weak strength: surprise-driven crystallization is the primary
         # reward pathway. This is the heartbeat, not the main event.
         # TODO: Extract to config as "baseline_engagement_reward" when
         # neuromodulatory mixer (#55+) arrives.
-        if self.graph.config.get("three_factor_enabled", False):
+        if result is not None and self.graph.config.get("three_factor_enabled", False):
             self.graph.inject_reward(0.1)
 
-        # CES: Feed stream parser (async background processing)
-        if self._stream_parser is not None:
+        # CES: Feed stream parser (success path only)
+        if self._stream_parser is not None and result is not None:
             self._stream_parser.feed(text)
 
         # CES: Surfacing monitor — scan fired nodes for relevant concepts
@@ -738,8 +785,8 @@ class NeuroGraphMemory:
             self._surfacing_monitor.after_step(step_result)
             ces_surfaced = self._surfacing_monitor.get_surfaced()
 
-        # Update novelty probation for ingested nodes
-        graduated = self.ingestor.update_probation()
+        # Update novelty probation for ingested nodes (success path only)
+        graduated = self.ingestor.update_probation() if result is not None else []
 
         self._message_count += 1
 
@@ -747,27 +794,30 @@ class NeuroGraphMemory:
         if self._message_count % self.auto_save_interval == 0:
             self.save()
 
-        event_data = {
-            "status": "ingested",
-            "nodes_created": len(result.nodes_created),
-            "synapses_created": len(result.synapses_created),
-            "hyperedges_created": len(result.hyperedges_created),
-            "chunks": result.chunks_created,
-            "fired": len(step_result.fired_node_ids),
-            "graduated": len(graduated),
-            "message_count": self._message_count,
-            "surfaced": surfaced,
-            "ces_surfaced": ces_surfaced,
-        }
+        if ingest_error is not None:
+            event_data = {
+                "status": "error",
+                "reason": str(ingest_error),
+                "error_type": type(ingest_error).__name__,
+                "fired": len(step_result.fired_node_ids),
+                "message_count": self._message_count,
+            }
+        else:
+            event_data = {
+                "status": "ingested",
+                "nodes_created": len(result.nodes_created),
+                "synapses_created": len(result.synapses_created),
+                "hyperedges_created": len(result.hyperedges_created),
+                "chunks": result.chunks_created,
+                "fired": len(step_result.fired_node_ids),
+                "graduated": len(graduated),
+                "message_count": self._message_count,
+                "surfaced": surfaced,
+                "ces_surfaced": ces_surfaced,
+            }
 
         # Write to memory/ for OpenClaw consumption
         self._write_memory_event("ingestion", event_data)
-
-        # Write learning event to shared directory for peer modules.
-        # This is how sibling modules (TrollGuard, TID, etc.) absorb
-        # NeuroGraph's learning without a direct SaaS connection.
-        self._write_peer_learning_event(text, result, step_result)
-
 
         # [2026-03-27] Fan-out disabled here — now handled by neurograph_rpc.py's
         # _fan_out_to_modules() which has proper namespace isolation (stash/restore).
@@ -853,39 +903,6 @@ class NeuroGraphMemory:
         except Exception as exc:
             logger.debug("Auto-knowledge harvest failed: %s", exc)
             return []
-
-    def _write_peer_learning_event(
-        self, text: str, result: Any, step_result: Any
-    ) -> None:
-        """Write a learning event to the shared peer directory.
-
-        Called after each ingestion so sibling modules can absorb
-        NeuroGraph's patterns via NGPeerBridge.  Uses the ingestor's
-        embedding engine to generate the event embedding.
-        """
-        if self._peer_bridge is None:
-            return
-
-        try:
-            import numpy as np
-
-            # Embed the ingested text for cross-module similarity matching
-            embedding = self.ingestor.embedder.embed_text(text)
-
-            # Record as a peer learning event
-            self._peer_bridge.record_outcome(
-                embedding=embedding,
-                target_id=f"ingestion_{self._message_count}",
-                success=True,
-                module_id="neurograph",
-                metadata={
-                    "nodes_created": len(result.nodes_created),
-                    "fired": len(step_result.fired_node_ids),
-                    "text_preview": text[:200],
-                },
-            )
-        except Exception as exc:
-            logger.debug("Peer learning event write failed: %s", exc)
 
     def get_peer_modules(self) -> List[Dict[str, Any]]:
         """Discover peer E-T Systems modules on this host.
