@@ -1,11 +1,11 @@
 """
-CES Stream Parser — Real-time text processing with Ollama embeddings.
+CES Stream Parser — Real-time text processing with ng_embed embeddings.
 
 Runs a background daemon thread that consumes text fed via ``feed()``,
-chunks it into overlapping phrases, embeds each chunk via the Ollama API
-(with fallback to the ingestor's embedding engine), finds similar nodes
-in the vector DB, nudges their voltages, and triggers hyperedge pattern
-completion.
+chunks it into overlapping phrases, embeds each chunk via ng_embed
+(Snowflake/snowflake-arctic-embed-m-v1.5, ONNX Runtime, 768-dim —
+the ecosystem standard), finds similar nodes in the vector DB, nudges
+their voltages, and triggers hyperedge pattern completion.
 
 This creates a continuous "attention stream" that pre-activates relevant
 parts of the SNN graph while new text is being processed, so related
@@ -14,7 +14,7 @@ concepts are already warm when the next full ``graph.step()`` runs.
 Usage::
 
     from stream_parser import StreamParser
-    parser = StreamParser(graph, vector_db, ces_config)
+    parser = StreamParser(graph, vector_db, ces_config, fallback_embedder=embedder)
     parser.feed("The quick brown fox jumps over the lazy dog")
     # ... chunks are processed asynchronously in background thread
     parser.stop()
@@ -25,18 +25,24 @@ Usage::
 #         pipeline, and graceful fallback to hash/sentence-transformers.
 #   Why:  Real-time attention stream keeps SNN primed as text arrives,
 #         enabling faster pattern completion and surfacing.
+# [2026-04-21] Claude (Sonnet 4.6) — Promote ng_embed to primary embedder.
+#   What: Removed Ollama as primary embedding path. ng_embed (passed via
+#         fallback_embedder parameter) is now the sole embedder. Removed
+#         _check_ollama(), _embed_via_ollama(), and all Ollama state.
+#   Why:  Porting VPS fix (commit 129415d) to laptop CC NG copy. Ollama is
+#         not the ecosystem standard. ollama_available was always null,
+#         chunks_processed always 0 — L1 surfacing path fully idle.
+#   How:  _embed_chunk() calls _fallback_embedder directly. Parameter name
+#         unchanged — cc-ng-daemon.py passes ng_embed via it.
 # -------------------
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import queue
 import threading
 import time
-import urllib.error
-import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -53,9 +59,9 @@ class StreamParser:
         graph: The NeuroGraph ``Graph`` instance.
         vector_db: ``SimpleVectorDB`` for similarity lookups.
         ces_config: ``CESConfig`` with streaming parameters.
-        fallback_embedder: Optional embedding callable that accepts a
-            string and returns an ndarray.  Used when Ollama is
-            unavailable.  If ``None``, no fallback is available.
+        fallback_embedder: Embedding callable — accepts a string, returns
+            an ndarray.  Should be ``ng_embed.embed_text`` (768-dim ONNX).
+            If ``None``, the parser runs but all chunks are dropped.
     """
 
     def __init__(
@@ -84,11 +90,6 @@ class StreamParser:
         self._chunks_processed = 0
         self._nudges_applied = 0
         self._completions_triggered = 0
-
-        # Ollama availability (lazy-checked)
-        self._ollama_available: Optional[bool] = None
-        self._ollama_last_check: float = 0.0
-        self._embedding_dim: Optional[int] = None
 
         # Start the processing thread
         self._thread = threading.Thread(
@@ -145,7 +146,7 @@ class StreamParser:
             "completions_triggered": self._completions_triggered,
             "queue_depth": self._queue.qsize(),
             "is_running": self.is_running,
-            "ollama_available": self._ollama_available,
+            "embedder": "ng_embed" if self._fallback_embedder is not None else "none",
         }
 
     # ── Background thread ──────────────────────────────────────────────
@@ -213,81 +214,22 @@ class StreamParser:
         return chunks
 
     def _embed_chunk(self, chunk: str) -> Optional[np.ndarray]:
-        """Embed a text chunk, trying Ollama first then fallback.
+        """Embed a text chunk via ng_embed (ecosystem standard, 768-dim).
 
         Returns an L2-normalised vector or None on failure.
         """
-        # Try Ollama first
-        if self._check_ollama():
-            vec = self._embed_via_ollama(chunk)
+        if self._fallback_embedder is None:
+            return None
+        try:
+            vec = self._fallback_embedder(chunk)
             if vec is not None:
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
                 return vec
-
-        # Fallback to provided embedder
-        if self._fallback_embedder is not None:
-            try:
-                vec = self._fallback_embedder(chunk)
-                if vec is not None:
-                    norm = np.linalg.norm(vec)
-                    if norm > 0:
-                        vec = vec / norm
-                    return vec
-            except Exception as exc:
-                logger.debug("Fallback embedder failed: %s", exc)
-
-        return None
-
-    def _embed_via_ollama(self, text: str) -> Optional[np.ndarray]:
-        """Call the Ollama embeddings API."""
-        url = f"{self._cfg.ollama_url}/api/embeddings"
-        payload = json.dumps({
-            "model": self._cfg.ollama_model,
-            "prompt": text,
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                embedding = data.get("embedding")
-                if embedding is not None:
-                    vec = np.array(embedding, dtype=np.float32)
-                    norm = np.linalg.norm(vec)
-                    if norm > 0:
-                        vec = vec / norm
-                    self._embedding_dim = len(vec)
-                    return vec
         except Exception as exc:
-            logger.debug("Ollama embedding failed: %s", exc)
-            self._ollama_available = False
-
+            logger.debug("Embedder failed: %s", exc)
         return None
-
-    def _check_ollama(self) -> bool:
-        """Check Ollama availability (cached with periodic re-check)."""
-        now = time.time()
-        if (
-            self._ollama_available is not None
-            and now - self._ollama_last_check < self._cfg.ollama_check_interval
-        ):
-            return self._ollama_available
-
-        self._ollama_last_check = now
-        try:
-            url = f"{self._cfg.ollama_url}/api/tags"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                resp.read()
-            self._ollama_available = True
-        except Exception:
-            self._ollama_available = False
-
-        return self._ollama_available
 
     def _find_similar(
         self, embedding: np.ndarray
