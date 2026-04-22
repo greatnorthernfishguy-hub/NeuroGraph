@@ -634,7 +634,7 @@ class TonicEngine:
             try:
                 self._generate_latent_token()
             except Exception as exc:
-                logger.debug("Latent token error: %s", exc)
+                logger.debug("Latent generation error: %s", exc)
 
             interval = (
                 self._config.conversation_interval
