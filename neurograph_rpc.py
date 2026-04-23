@@ -2480,9 +2480,9 @@ def main() -> None:
                 parts.append(f"salient:{eb.get('salient_nodes', 0)}")
                 parts.append(m.get("autonomic_state", ""))
             elif mid == "darwin":
-                led = m.get("ledger") or {}
-                parts.append(f"events:{led.get('total_events', 0)}")
-                parts.append(f"gen:{led.get('generations', 0)}")
+                rec = m.get("recorder") or {}
+                parts.append(f"events:{rec.get('total_events_observed', 0)}")
+                parts.append(f"gen:{m.get('generation', 0)}")
             elif mid == "healing_collective":
                 cal = m.get("detection_calibrator") or {}
                 parts.append(f"tier:{cal.get('tier', '?')}")
