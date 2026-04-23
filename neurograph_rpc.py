@@ -2183,15 +2183,27 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
             }).encode())
         elif self.path == "/modules":
             # Per-module live stats — queried by status probes that declined
-            # to claim topology. Returns each loaded module's stats() output
-            # so `openclaw status` can log them without bootstrapping a
-            # competing substrate.
+            # to claim topology. Each module stats() call runs with a 2s
+            # timeout so a slow/blocked module can't hang the whole response.
+            import concurrent.futures as _cf
             modules = {}
-            for mid, instance in _module_instances.items():
-                try:
-                    modules[mid] = instance.stats() if hasattr(instance, "stats") else {}
-                except Exception as exc:
-                    modules[mid] = {"error": str(exc)}
+            def _get_stats(mid, instance):
+                if hasattr(instance, "stats"):
+                    return instance.stats()
+                return {}
+            with _cf.ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {
+                    pool.submit(_get_stats, mid, inst): mid
+                    for mid, inst in _module_instances.items()
+                }
+                for fut in _cf.as_completed(futures, timeout=10):
+                    mid = futures[fut]
+                    try:
+                        modules[mid] = fut.result(timeout=2)
+                    except _cf.TimeoutError:
+                        modules[mid] = {"error": "stats() timed out"}
+                    except Exception as exc:
+                        modules[mid] = {"error": str(exc)}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
