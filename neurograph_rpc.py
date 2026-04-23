@@ -2485,7 +2485,7 @@ def main() -> None:
                 parts.append(f"gen:{m.get('generation', 0)}")
             elif mid == "healing_collective":
                 cal = m.get("detection_calibrator") or {}
-                parts.append(f"tier:{cal.get('tier', '?')}")
+                parts.append(f"cal:{cal.get('tier', '?')}")
                 parts.append(f"repairs:{m.get('repairs_executed', 0)}")
                 hm = m.get("health_monitor") or {}
                 if not hm.get("last_healthy", True):
