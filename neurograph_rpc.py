@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-23] Claude Code (Sonnet 4.6) — Fix status-probe SIGTERM killing live substrate
+#   What: Startup sentinel cleanup now only removes stale sentinels from DEAD processes.
+#         Removed SIGTERM that unconditionally killed the existing PID.
+#   Why:  `openclaw status` spawns its own Python child via the same code path.
+#         That child was SIGTERMing the real gateway substrate (e.g. PID 66713)
+#         on every `openclaw status` call, causing a kill/watchdog-respawn cycle
+#         that disrupted the substrate and produced inconsistent status output.
+#   How:  Added _pid_is_alive() check before unlinking sentinel. If process is alive,
+#         leave the sentinel alone — claim() in _self_bootstrap() will fail gracefully
+#         with "already owned" and no SIGTERM fires.
 # [2026-04-21] Claude Code (Sonnet 4.6) — Fix _drain_peer_tracts crash on NGTractBridge
 # What: Added hasattr(_peer_events) guard after bridge._drain_all() in _drain_peer_tracts().
 # Why:  #155 cleanup deleted _peer_events from NGTractBridge; cursor code still accessed it,
@@ -2366,30 +2376,30 @@ def main() -> None:
     # stdin loop, the 64KB OS pipe buffer fills before the TS plugin can
     # drain it, and the Python process blocks on write. Background thread
     # lets the stdin loop start immediately so the pipe stays drained.
-    # Force-clean any stale sentinel from a previous process BEFORE
-    # starting the bootstrap thread. This runs synchronously — it's a
-    # single file check, no log output, no pipe risk. Must happen before
-    # anything calls handle_bootstrap() (self-bootstrap thread OR TS
-    # plugin RPC) so the sentinel is gone before either path checks it.
+    # Clean up stale sentinels from DEAD processes before starting bootstrap.
+    # Runs synchronously — single file check, no pipe risk. Must happen before
+    # anything calls handle_bootstrap() (self-bootstrap thread OR TS plugin RPC).
+    #
+    # IMPORTANT: only remove the sentinel if the existing PID is dead.
+    # If it is alive, leave it — claim() in _self_bootstrap() will detect
+    # "already owned" and skip bootstrap gracefully. This file runs inside
+    # BOTH the gateway's Python child (legitimate substrate) AND inside any
+    # `openclaw status` probe process. Sending SIGTERM to a live PID here
+    # would kill the real running substrate on every status check.
     try:
-        import signal as _signal
         import topology_owner
         sentinel = topology_owner._sentinel_path()
         if sentinel.exists():
-            existing_pid = int(sentinel.read_text().strip())
-            if existing_pid != os.getpid():
+            try:
+                existing_pid = int(sentinel.read_text().strip())
+                if existing_pid != os.getpid():
+                    if not topology_owner._pid_is_alive(existing_pid):
+                        sentinel.unlink(missing_ok=True)
+                        logger.info("Cleared stale sentinel (PID %d) on startup", existing_pid)
+                    # else: alive — leave it; claim() will fail gracefully
+            except (ValueError, OSError):
                 sentinel.unlink(missing_ok=True)
-                logger.info("Cleared stale sentinel (PID %d) on startup", existing_pid)
-                # Kill the stale process so it releases port 8850 and any
-                # other resources before the new process tries to bind them.
-                try:
-                    os.kill(existing_pid, _signal.SIGTERM)
-                    import time as _time
-                    _time.sleep(1.5)  # brief grace period for clean exit
-                except ProcessLookupError:
-                    pass  # already dead — nothing to do
-                except Exception as _ke:
-                    logger.debug("Could not terminate stale process %d: %s", existing_pid, _ke)
+                logger.warning("Corrupt sentinel file — removed on startup")
     except Exception:
         pass
 
