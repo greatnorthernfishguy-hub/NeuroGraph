@@ -2458,45 +2458,59 @@ def main() -> None:
                         topology_owner.owner_pid(), exc)
             return
 
+        if not modules:
+            logger.info("Substrate alive (PID %s) — bootstrap in progress, no modules yet",
+                        topology_owner.owner_pid())
+            return
+
         owner = topology_owner.owner_pid()
         logger.info("Substrate alive (PID %s) — %d modules loaded:", owner, len(modules))
-        for mid, stats in sorted(modules.items()):
-            if "error" in stats:
-                logger.warning("  %-20s  ERROR: %s", mid, stats["error"])
+        for mid, data in sorted(modules.items()):
+            if "error" in data:
+                logger.warning("  %-20s  ERROR: %s", mid, data["error"])
                 continue
-            # Build a concise one-line summary per module
-            parts = []
-            # River / peer bridge
-            pb = stats.get("peer_bridge") or stats.get("ng_lite_bridge") or {}
-            if pb.get("connected"):
-                parts.append("River:connected")
-            # Autonomic state
-            auto = stats.get("autonomic_state") or stats.get("autonomic") or ""
-            if auto:
-                parts.append(f"autonomic:{auto}")
-            # Module-specific highlights
+            m = data.get("module") or {}
+            eco = data.get("ecosystem") or {}
+            tier = eco.get("tier_name", "")
+            uptime = int(data.get("uptime_seconds", 0))
+            parts = [f"up:{uptime}s", f"tier:{tier}"] if tier else [f"up:{uptime}s"]
             if mid == "bunyan":
-                parts.append(f"nodes:{stats.get('recent_nodes', '?')}")
+                parts.append(f"nodes:{m.get('recent_nodes', 0)}")
+                eb = m.get("extraction_bucket") or {}
+                parts.append(f"salient:{eb.get('salient_nodes', 0)}")
+                parts.append(m.get("autonomic_state", ""))
             elif mid == "darwin":
-                led = stats.get("ledger") or {}
-                parts.append(f"ledger:{led.get('total_events', '?')}")
+                led = m.get("ledger") or {}
+                parts.append(f"events:{led.get('total_events', 0)}")
+                parts.append(f"gen:{led.get('generations', 0)}")
             elif mid == "healing_collective":
-                cal = stats.get("calibration") or {}
+                cal = m.get("detection_calibrator") or {}
                 parts.append(f"tier:{cal.get('tier', '?')}")
+                parts.append(f"repairs:{m.get('repairs_executed', 0)}")
+                hm = m.get("health_monitor") or {}
+                if not hm.get("last_healthy", True):
+                    parts.append("UNHEALTHY")
             elif mid == "immunis":
-                arm = stats.get("armory") or {}
-                parts.append(f"armory:{arm.get('total', '?')}")
+                arm = m.get("armory") or {}
+                parts.append(f"armory:{arm.get('total_entries', 0)}")
+                qm = m.get("quartermaster") or {}
+                parts.append(f"threats:{qm.get('total_threats', 0)}")
+                parts.append(m.get("autonomic_state", ""))
             elif mid == "elmer":
-                sockets = stats.get("sockets") or {}
-                parts.append(f"sockets:{len(sockets)}")
+                # module dict is currently empty — just show uptime
+                pass
             elif mid == "quantumgraph":
-                parts.append(f"ops:{stats.get('operations', '?')}")
+                parts.append(f"msgs:{m.get('message_count', 0)}")
             elif mid == "praxis":
-                cps = stats.get("cps") or {}
-                parts.append(f"entries:{cps.get('total', '?')}")
+                cps = m.get("cps") or {}
+                parts.append(f"cps:{cps.get('total_entries', 0)}")
+                parts.append(m.get("autonomic_state", ""))
             elif mid == "trollguard":
-                parts.append(f"threats:{stats.get('threats_blocked', '?')}")
-            summary = "  ".join(parts) if parts else "ok"
+                parts.append(f"scans:{m.get('scan_count', 0)}")
+                threats = m.get("threat_count", 0)
+                if threats:
+                    parts.append(f"THREATS:{threats}")
+            summary = "  ".join(p for p in parts if p)
             logger.info("  %-20s  %s", mid, summary)
 
     import threading
