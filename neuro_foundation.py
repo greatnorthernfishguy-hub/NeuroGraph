@@ -19,6 +19,18 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-04-22] Claude (Sonnet 4.6) — Fix autosave race in _serialize_full()
+# What: Snapshot all mutable dicts at the top of _serialize_full() via list()
+#       before building the return dict.
+# Why:  Tonic runs prime_and_propagate(write_mode=True) concurrently without
+#       holding _concurrent_lock (by design — latent tokens must keep flowing).
+#       This adds/removes nodes and synapses while _serialize_full() iterates
+#       them, causing RuntimeError: dictionary changed size during iteration.
+#       Autosave had been silently failing on every cycle since at least Apr 20.
+# How:  One list(dict.items()) snapshot per mutable dict at method entry.
+#       The save captures a consistent moment; any Tonic writes after that point
+#       are picked up by the next autosave cycle 60s later. Zero impact on any
+#       learning pathway — only the serialization path changes.
 # [2026-04-19] CC (punchlist #167) — Add threading.RLock to Graph.step()
 #   What: self._step_lock (RLock) acquired for entire step() body
 #   Why:  TriSyn worker calls record_outcome() concurrently with
@@ -3682,21 +3694,36 @@ class Graph:
         }
 
     def _serialize_full(self) -> Dict[str, Any]:
+        # Snapshot all mutable dicts before building the return value.
+        # Tonic runs prime_and_propagate(write_mode=True) concurrently and
+        # can add nodes/synapses between iterations — list() gives us a
+        # stable view without pausing the latent thread.
+        _nodes      = list(self.nodes.items())
+        _synapses   = list(self.synapses.items())
+        _hyperedges = list(self.hyperedges.items())
+        _archived   = list(self._archived_hyperedges.items())
+        _act_preds  = list(self.active_predictions.items())
+        _syn_hist   = list(self._synapse_confirmation_history.items())
+        _he_preds   = list(self._active_predictions.items())
+        _he_window  = list(self._prediction_window_fired.items())
+        _delay_buf  = list(self._delay_buffer.items())
+        _recent_spk = [(nid, spikes) for nid, spikes
+                       in self._recent_spikes.items() if spikes]
         return {
             "version": "0.4.2",
             "timestep": self.timestep,
             "config": self.config,
-            "nodes": {nid: self._serialize_node(n) for nid, n in self.nodes.items()},
-            "synapses": {sid: self._serialize_synapse(s) for sid, s in self.synapses.items()},
-            "hyperedges": {hid: self._serialize_hyperedge(h) for hid, h in self.hyperedges.items()},
+            "nodes": {nid: self._serialize_node(n) for nid, n in _nodes},
+            "synapses": {sid: self._serialize_synapse(s) for sid, s in _synapses},
+            "hyperedges": {hid: self._serialize_hyperedge(h) for hid, h in _hyperedges},
             "archived_hyperedges": {
                 hid: self._serialize_hyperedge(h)
-                for hid, h in self._archived_hyperedges.items()
+                for hid, h in _archived
             },
             # Phase 3: Active synapse-level predictions
             "active_predictions": {
                 pid: self._serialize_prediction(pred)
-                for pid, pred in self.active_predictions.items()
+                for pid, pred in _act_preds
             },
             # Phase 3: Recent prediction outcomes
             "prediction_outcomes": [
@@ -3711,7 +3738,7 @@ class Graph:
             # Phase 3: Per-synapse confirmation history
             "synapse_confirmation_history": {
                 syn_id: list(history)
-                for syn_id, history in self._synapse_confirmation_history.items()
+                for syn_id, history in _syn_hist
             },
             # Phase 3: Logs
             "novel_sequence_log": list(self._novel_sequence_log),
@@ -3719,12 +3746,12 @@ class Graph:
             # Phase 2.5: Active HE-level predictions
             "he_active_predictions": {
                 pid: self._serialize_prediction_state(ps)
-                for pid, ps in self._active_predictions.items()
+                for pid, ps in _he_preds
             },
             # Phase 2.5: Window-fired tracking
             "he_prediction_window_fired": {
                 pid: list(nodes)
-                for pid, nodes in self._prediction_window_fired.items()
+                for pid, nodes in _he_window
             },
             # Phase 2.5: Counter for unique HE prediction IDs
             "he_prediction_counter": self._prediction_counter,
@@ -3761,12 +3788,11 @@ class Graph:
             # zero-firing circuit breaker loses streak continuity across calls.
             "delay_buffer": {
                 str(ts): [[nid, curr] for nid, curr in entries]
-                for ts, entries in self._delay_buffer.items()
+                for ts, entries in _delay_buf
             },
             "recent_spikes": {
                 nid: list(spikes)
-                for nid, spikes in self._recent_spikes.items()
-                if spikes
+                for nid, spikes in _recent_spk
             },
             "steps_since_last_fire": self._steps_since_last_fire,
             "homeostatic_steps_since_scaling": next(
