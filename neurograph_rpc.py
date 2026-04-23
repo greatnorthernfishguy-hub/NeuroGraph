@@ -610,6 +610,12 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
             "reason": f"topology_owned_by_pid_{existing}",
         }
 
+    # Start the HTTP sidecar immediately after claiming topology so
+    # openclaw status probes can query /modules even while bootstrap
+    # is still running (modules dict will be empty or partial, but
+    # the endpoint responds rather than refusing connections).
+    _start_http_sidecar(8850)
+
     _memory = NeuroGraphMemory.get_instance()
     _tract = ExperienceTract()
 
@@ -736,8 +742,6 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         tract_stats["pending"],
         started_modules,
     )
-
-    _start_http_sidecar(8850)
 
     # #109: Shared graph lock for thread safety.
     # Pulse loops (via NGSaaSBridge) and the Tonic both access graph
