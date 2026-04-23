@@ -81,8 +81,8 @@ def claim(checkpoint_dir: Optional[str] = None) -> bool:
         try:
             existing_pid = int(sentinel.read_text().strip())
             if _pid_is_alive(existing_pid) and existing_pid != my_pid:
-                logger.warning(
-                    "Topology already owned by PID %d — cannot claim",
+                logger.info(
+                    "Topology owned by PID %d — substrate active, declining claim",
                     existing_pid,
                 )
                 return False

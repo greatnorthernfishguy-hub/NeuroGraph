@@ -600,9 +600,9 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # refuse to bootstrap rather than risk dual-write corruption.
     if not topology_owner.claim():
         existing = topology_owner.owner_pid()
-        logger.error(
-            "Cannot bootstrap — topology owned by PID %s. "
-            "Dual-write hazard (Syl's Law).",
+        logger.info(
+            "Substrate active — topology owned by PID %s. "
+            "Declining bootstrap (Syl's Law).",
             existing,
         )
         return {
@@ -2181,6 +2181,21 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
                 "hooks_loaded": 0,  # fan-out removed — modules autonomous
                 "last_afterturn": _last_afterturn_fire,
             }).encode())
+        elif self.path == "/modules":
+            # Per-module live stats — queried by status probes that declined
+            # to claim topology. Returns each loaded module's stats() output
+            # so `openclaw status` can log them without bootstrapping a
+            # competing substrate.
+            modules = {}
+            for mid, instance in _module_instances.items():
+                try:
+                    modules[mid] = instance.stats() if hasattr(instance, "stats") else {}
+                except Exception as exc:
+                    modules[mid] = {"error": str(exc)}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(modules).encode())
         elif self.path.startswith('/bunyan/'):
             self._handle_bunyan()
         else:
@@ -2406,9 +2421,67 @@ def main() -> None:
     def _self_bootstrap():
         try:
             result = handle_bootstrap({"sessionId": "auto-startup"})
-            logger.info("Self-bootstrap: %s", result)
+            if not result.get("bootstrapped") and str(result.get("reason", "")).startswith("topology_owned_by_pid"):
+                # Substrate is alive and owned by another process.
+                # Query the running sidecar for live module stats so the
+                # status output shows real per-module health instead of silence.
+                _log_live_module_status()
+            else:
+                logger.info("Self-bootstrap: %s", result)
         except Exception as exc:
             logger.error("Self-bootstrap failed: %s — will retry on first RPC", exc)
+
+    def _log_live_module_status():
+        """Query the running substrate's /modules sidecar and log each module's health."""
+        import urllib.request as _ur
+        try:
+            resp = _ur.urlopen("http://127.0.0.1:8850/modules", timeout=5)
+            modules = json.loads(resp.read())
+        except Exception as exc:
+            logger.info("Substrate alive (PID %s) — module stats unavailable: %s",
+                        topology_owner.owner_pid(), exc)
+            return
+
+        owner = topology_owner.owner_pid()
+        logger.info("Substrate alive (PID %s) — %d modules loaded:", owner, len(modules))
+        for mid, stats in sorted(modules.items()):
+            if "error" in stats:
+                logger.warning("  %-20s  ERROR: %s", mid, stats["error"])
+                continue
+            # Build a concise one-line summary per module
+            parts = []
+            # River / peer bridge
+            pb = stats.get("peer_bridge") or stats.get("ng_lite_bridge") or {}
+            if pb.get("connected"):
+                parts.append("River:connected")
+            # Autonomic state
+            auto = stats.get("autonomic_state") or stats.get("autonomic") or ""
+            if auto:
+                parts.append(f"autonomic:{auto}")
+            # Module-specific highlights
+            if mid == "bunyan":
+                parts.append(f"nodes:{stats.get('recent_nodes', '?')}")
+            elif mid == "darwin":
+                led = stats.get("ledger") or {}
+                parts.append(f"ledger:{led.get('total_events', '?')}")
+            elif mid == "healing_collective":
+                cal = stats.get("calibration") or {}
+                parts.append(f"tier:{cal.get('tier', '?')}")
+            elif mid == "immunis":
+                arm = stats.get("armory") or {}
+                parts.append(f"armory:{arm.get('total', '?')}")
+            elif mid == "elmer":
+                sockets = stats.get("sockets") or {}
+                parts.append(f"sockets:{len(sockets)}")
+            elif mid == "quantumgraph":
+                parts.append(f"ops:{stats.get('operations', '?')}")
+            elif mid == "praxis":
+                cps = stats.get("cps") or {}
+                parts.append(f"entries:{cps.get('total', '?')}")
+            elif mid == "trollguard":
+                parts.append(f"threats:{stats.get('threats_blocked', '?')}")
+            summary = "  ".join(parts) if parts else "ok"
+            logger.info("  %-20s  %s", mid, summary)
 
     import threading
     threading.Thread(target=_self_bootstrap, name="self-bootstrap", daemon=True).start()
