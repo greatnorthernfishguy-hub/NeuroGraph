@@ -2560,7 +2560,7 @@ def main() -> None:
                 parts.append(f"cal:{cal.get('tier', '?')}")
                 parts.append(f"repairs:{m.get('repairs_executed', 0)}")
                 hm = m.get("health_monitor") or {}
-                if not hm.get("last_healthy", True):
+                if hm.get("last_healthy") is False:
                     parts.append("UNHEALTHY")
             elif mid == "immunis":
                 arm = m.get("armory") or {}
