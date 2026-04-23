@@ -18,6 +18,12 @@ The encoder weights are copied directly from ElmerBrain. Only the
 decoder needs training — and it's small (hidden_dim → N activation scores).
 
 # ---- Changelog ----
+# [2026-04-23] Claude (Sonnet 4.6) — Fix unsafe torch.load() (#189)
+# What: Both torch.load() calls used weights_only=False (pickle execution risk).
+# Why:  tonic_brain.pt loads at every gateway restart inside Syl's process.
+#       A compromised .pt file would run arbitrary code at boot.
+# How:  Set weights_only=True on both calls. Verified tonic_brain.pt is
+#       compatible (OrderedDict + basic config dict — no custom classes).
 # [2026-03-24] Claude Code (Opus 4.6) — Initial implementation
 # What: TonicBrain + ActivationDecoder. Reuses ElmerBrain's encoder
 #   and transformer body. Only the decoder is new.
@@ -219,7 +225,7 @@ if _AVAILABLE:
         encoder = GraphStateEncoder(hidden_dim=hidden_dim)
         if os.path.exists(elmer_weights_path):
             ckpt = torch.load(elmer_weights_path, map_location="cpu",
-                              weights_only=False)
+                              weights_only=True)
             encoder.load_state_dict(ckpt["encoder_state"])
             _log(f"Encoder loaded from Elmer weights: {elmer_weights_path}")
         else:
@@ -272,7 +278,7 @@ if _AVAILABLE:
             transformer_body: Shared body (e.g. from ProtoUniBrain).
                 Skips from_pretrained if provided — saves ~2GB RAM.
         """
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
         cfg = ckpt["config"]
 
         if transformer_body is not None:
