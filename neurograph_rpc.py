@@ -12,6 +12,14 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-22] Claude Code (Sonnet 4.6) — Full status restoration: substrate+Tonic+TID+Darwin dreams+Elmer
+#   What: _log_live_module_status() now queries 8847 (substrate/CES/Tonic), 7437 (TID DreamCycle),
+#         and 8850 (fan-out modules). Darwin shows creative/nightmare/consolidation dream breakdown.
+#         Elmer shows proto_unibrain status and socket health count.
+#   Why:  openclaw status was missing Tonic, CES, TID DreamCycle, Elmer ProtoUniBrain,
+#         and Darwin dream type breakdown. Data existed at 8847/8850/7437 but was never queried.
+#   How:  Three-block query: substrate first, TID second, fan-out modules third.
+#         Each block degrades gracefully to "unavailable" if port unreachable.
 # [2026-04-23] Claude Code (Sonnet 4.6) — Fix status-probe SIGTERM killing live substrate
 #   What: Startup sentinel cleanup now only removes stale sentinels from DEAD processes.
 #         Removed SIGTERM that unconditionally killed the existing PID.
@@ -2448,23 +2456,80 @@ def main() -> None:
             logger.error("Self-bootstrap failed: %s — will retry on first RPC", exc)
 
     def _log_live_module_status():
-        """Query the running substrate's /modules sidecar and log each module's health."""
+        """Query substrate sidecar (8850), CES dashboard (8847), and TID (7437)."""
         import urllib.request as _ur
+
+        owner = topology_owner.owner_pid()
+
+        # --- Substrate block (port 8847) ---
+        try:
+            resp = _ur.urlopen("http://127.0.0.1:8847/stats", timeout=5)
+            sg = json.loads(resp.read())
+            tonic = sg.get("tonic") or {}
+            ces = sg.get("ces") or {}
+            sp = ces.get("stream_parser") or {}
+            surf = ces.get("surfacing") or {}
+            emb = sg.get("embedding") or {}
+            logger.info(
+                "Substrate (PID %s)  nodes:%s  synapses:%s  hyperedges:%s"
+                "  step:%s  pred_acc:%.0f%%  firing:%.4f",
+                owner,
+                sg.get("nodes", "?"), sg.get("synapses", "?"),
+                sg.get("hyperedges", "?"), sg.get("timestep", "?"),
+                sg.get("prediction_accuracy", 0) * 100,
+                sg.get("firing_rate", 0),
+            )
+            logger.info(
+                "  embed:%-38s  CES  stream:%s nudges:%s  surfaced:%s",
+                emb.get("model_name", "?"),
+                sp.get("chunks_processed", 0), sp.get("nudges_applied", 0),
+                surf.get("total_surfaced", 0),
+            )
+            tonic_eng = tonic.get("engine") or {}
+            logger.info(
+                "  Tonic  active:%-5s  model:%-5s  cycles:%s  firings:%s"
+                "  mode:%s  tokens:%s",
+                tonic.get("active", False),
+                tonic_eng.get("model_loaded", False),
+                tonic.get("cycle_count", 0),
+                tonic.get("total_firings", 0),
+                tonic_eng.get("mode", "?"),
+                tonic_eng.get("tokens_generated", 0),
+            )
+        except Exception as exc:
+            logger.info("Substrate stats (8847) unavailable: %s", exc)
+
+        # --- TID DreamCycle block (port 7437) ---
+        try:
+            resp = _ur.urlopen("http://127.0.0.1:7437/stats", timeout=5)
+            tid = json.loads(resp.read())
+            dc = tid.get("dream_cycle") or {}
+            routes = dc.get("routes_tracked") or {}
+            route_str = "  ".join(f"{r}:{n}" for r, n in sorted(routes.items()))
+            logger.info(
+                "  TID DreamCycle  outcomes:%s  insights:%s  routes:[%s]"
+                "  substrate_teaches:%s",
+                dc.get("total_outcomes", 0),
+                dc.get("total_insights", 0),
+                route_str,
+                dc.get("substrate_teach_count", 0),
+            )
+        except Exception as exc:
+            logger.info("TID DreamCycle (7437) unavailable: %s", exc)
+
+        # --- Fan-out modules (port 8850) ---
         try:
             resp = _ur.urlopen("http://127.0.0.1:8850/modules", timeout=5)
             modules = json.loads(resp.read())
         except Exception as exc:
-            logger.info("Substrate alive (PID %s) — module stats unavailable: %s",
-                        topology_owner.owner_pid(), exc)
+            logger.info("Module stats (8850) unavailable: %s", exc)
             return
 
         if not modules:
-            logger.info("Substrate alive (PID %s) — bootstrap in progress, no modules yet",
-                        topology_owner.owner_pid())
+            logger.info("8 modules — bootstrap in progress")
             return
 
-        owner = topology_owner.owner_pid()
-        logger.info("Substrate alive (PID %s) — %d modules loaded:", owner, len(modules))
+        logger.info("Modules (%d loaded):", len(modules))
         for mid, data in sorted(modules.items()):
             if "error" in data:
                 logger.warning("  %-20s  ERROR: %s", mid, data["error"])
@@ -2483,6 +2548,13 @@ def main() -> None:
                 rec = m.get("recorder") or {}
                 parts.append(f"events:{rec.get('total_events_observed', 0)}")
                 parts.append(f"gen:{m.get('generation', 0)}")
+                drm = m.get("dream") or {}
+                parts.append(
+                    f"dreams:{drm.get('dreams_run', 0)}"
+                    f"(c:{drm.get('creative_dreams', 0)}"
+                    f"/n:{drm.get('nightmares_run', 0)}"
+                    f"/x:{drm.get('consolidation_updates', 0)})"
+                )
             elif mid == "healing_collective":
                 cal = m.get("detection_calibrator") or {}
                 parts.append(f"cal:{cal.get('tier', '?')}")
@@ -2497,8 +2569,12 @@ def main() -> None:
                 parts.append(f"threats:{qm.get('total_threats', 0)}")
                 parts.append(m.get("autonomic_state", ""))
             elif mid == "elmer":
-                # module dict is currently empty — just show uptime
-                pass
+                proto = m.get("proto_unibrain", "offline")
+                parts.append(f"proto:{proto}")
+                sockets = m.get("sockets") or {}
+                n_healthy = sum(1 for s in sockets.values() if s == "healthy")
+                parts.append(f"sockets:{n_healthy}/{len(sockets)}")
+                parts.append(m.get("autonomic_state", ""))
             elif mid == "quantumgraph":
                 parts.append(f"msgs:{m.get('message_count', 0)}")
             elif mid == "praxis":
