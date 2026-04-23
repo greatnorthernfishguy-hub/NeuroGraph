@@ -912,6 +912,23 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         _ingest_embedding = None
 
+    # [2026-04-23] CC (#208) — TrollGuard sidecar: perimeter defense sees every ingest.
+    # scan_text() = Layer 4 VectorSentry (real-time live I/O protection). Targeted
+    # single call for the security layer — not a fan-out broadcast. Daemon thread,
+    # error-isolated. scan_count/_threat_count in TrollGuardHook now increment.
+    _tg = _module_instances.get("trollguard")
+    if _tg is not None:
+        _tg_text = text
+        _tg_emb = _ingest_embedding
+        def _tg_scan(_hook=_tg, _t=_tg_text, _e=_tg_emb):
+            try:
+                import numpy as _np
+                _e = _e if _e is not None else _np.zeros(768)
+                _hook._module_on_message(_t, _e)
+            except Exception as _exc:
+                logger.debug("TrollGuard sidecar error: %s", _exc)
+        threading.Thread(target=_tg_scan, daemon=True).start()
+
     return {"ingested": True}
 
 
