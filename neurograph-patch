@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 MANIFEST = [
     ("neuro_foundation.py",   ["skill:neuro_foundation.py"], False),
     ("universal_ingestor.py",  ["skill:universal_ingestor.py"], False),
-    ("openclaw_hook.py",       ["skill:openclaw_hook.py"], False),
+    ("openclaw_hook.py",       ["skill:openclaw_hook.py", "skill:scripts/openclaw_hook.py"], False),
     ("neurograph_migrate.py",  ["skill:neurograph_migrate.py"], False),
     ("SKILL.md",               ["skill:SKILL.md"], False),
     ("feed-syl",               ["bin:feed-syl", "home:feed-syl"], True),

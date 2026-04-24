@@ -183,7 +183,8 @@ class TestPatchExecution:
         assert mtime_before == mtime_after
 
     def test_multi_target_both_updated(self, mock_deploy):
-        ngpatch.run_patch(mock_deploy, no_backup=True)
+        with mock.patch.object(ngpatch, "validate_patch", return_value=(True, "OK")):
+            ngpatch.run_patch(mock_deploy, no_backup=True)
         source = (mock_deploy["repo"] / "openclaw_hook.py").read_text()
         assert (mock_deploy["skill"] / "openclaw_hook.py").read_text() == source
         assert (mock_deploy["skill"] / "scripts" / "openclaw_hook.py").read_text() == source
