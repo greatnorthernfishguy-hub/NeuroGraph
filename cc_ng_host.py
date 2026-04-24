@@ -24,6 +24,13 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-04-24] Claude (Sonnet 4.6) — Fix _cleanup_stale_socket restart race (#202)
+# What: Add 3-attempt retry loop (1s sleep) before raising RuntimeError.
+# Why:  On gateway restart the old process is still dying — connect() succeeds
+#       briefly, old code raised immediately → CC NG init failed, watchdog
+#       recovered 30s later. Retry gives the old socket time to close.
+# How:  Loop 3×; if connect() fails at any attempt → remove socket file + return;
+#       only raise RuntimeError after all 3 attempts find a live socket.
 # [2026-04-20] Claude (Sonnet 4.6) — Wire all three surfacing paths
 # What: Fix _recall() (remove blocking lock, add SurfacingMonitor primary path).
 #       Add _nudge() (StreamParser L1 cache pre-activation). Wire _nudge() into
@@ -530,22 +537,29 @@ def _autosave_loop() -> None:
 
 def _cleanup_stale_socket() -> None:
     """Remove stale socket file if present (e.g., standalone daemon was up)."""
-    if os.path.exists(SOCKET_PATH):
+    if not os.path.exists(SOCKET_PATH):
+        return
+    # Allow up to 3 retries (1s apart) — previous gateway may be mid-shutdown
+    # and still accepting briefly before its socket closes (#202).
+    for attempt in range(3):
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(0.5)
             s.connect(SOCKET_PATH)
             s.close()
-            raise RuntimeError(
-                "CC NG socket at %s is in use by another process — "
-                "refusing to bind (would dual-serve)" % SOCKET_PATH
-            )
         except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError):
             try:
                 os.remove(SOCKET_PATH)
                 logger.info("Removed stale CC socket at %s", SOCKET_PATH)
             except Exception:
                 pass
+            return
+        logger.info("CC socket alive (attempt %d/3), waiting 1s for shutdown...", attempt + 1)
+        time.sleep(1.0)
+    raise RuntimeError(
+        "CC NG socket at %s is in use by another process — "
+        "refusing to bind (would dual-serve)" % SOCKET_PATH
+    )
 
 
 def init_cc_host() -> bool:
