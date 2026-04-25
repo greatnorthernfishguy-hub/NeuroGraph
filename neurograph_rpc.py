@@ -12,6 +12,11 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-25] Codemine (BLK-NG-209) -- Remove stale _write_peer_learning_event call (#206 residue)
+#   What: Deleted dead _write_peer_learning_event() call from handle_ingest (method removed in #206).
+#   Why:  NeuroGraphMemory._write_peer_learning_event deleted 2026-04-22. Every valid ingest
+#         threw AttributeError, returning JSON-RPC error. Substrate ingestion silently broken.
+#   How:  Removed 2-line comment+call block. Ingestion proceeds to _message_count increment.
 # [2026-04-24] Codemine (BLK-NG-142) — Retire ng_experience_tract.py wrapper
 #   What: Removed ExperienceTract import/init from bootstrap; removed tract_stats log
 #         arg; inlined atomic-rename + ng_tract.TractReader drain loop in _drain_tract().
@@ -891,9 +896,6 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
     # Feed CES stream parser (background node nudging)
     if _memory._stream_parser is not None:
         _memory._stream_parser.feed(text)
-
-    # Write peer learning event for sibling modules
-    _memory._write_peer_learning_event(text, result, type("R", (), {"fired_node_ids": []})())
 
     _memory._message_count += 1
 
