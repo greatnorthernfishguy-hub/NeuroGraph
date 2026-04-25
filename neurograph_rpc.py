@@ -12,6 +12,15 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-24] Codemine (BLK-NG-142) — Retire ng_experience_tract.py wrapper
+#   What: Removed ExperienceTract import/init from bootstrap; removed tract_stats log
+#         arg; inlined atomic-rename + ng_tract.TractReader drain loop in _drain_tract().
+#         neurograph_gui.py and neurograph_mcp.py deposit calls migrated to direct
+#         ng_tract.deposit_experience(). ng_experience_tract.py deleted.
+#   Why:  ExperienceTract was a Python wrapper around ng_tract that no longer added value
+#         after the BTF deposit path (ng_tract.deposit_experience) was added in #119.
+#         Law 3 — restore, do not maintain shrapnel.
+#   How:  Inline drain from ExperienceTract.drain(); direct deposit_experience() calls.
 # [2026-04-22] Claude Code (Sonnet 4.6) — Full status restoration: substrate+Tonic+TID+Darwin dreams+Elmer
 #   What: _log_live_module_status() now queries 8847 (substrate/CES/Tonic), 7437 (TID DreamCycle),
 #         and 8850 (fan-out modules). Darwin shows creative/nightmare/consolidation dream breakdown.
@@ -601,7 +610,6 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
 
     import topology_owner
     from openclaw_hook import NeuroGraphMemory
-    from ng_experience_tract import ExperienceTract
 
     # Claim topology ownership — we are the sole writer to main.msgpack.
     # If another process (GUI, standalone ingestor) already owns it,
@@ -625,7 +633,6 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     _start_http_sidecar(8850)
 
     _memory = NeuroGraphMemory.get_instance()
-    _tract = ExperienceTract()
 
     # KISS filter for context window optimization (#152).
     # Decouple bootstrap from KISS failure — KISS is an optimization, not a
@@ -739,15 +746,13 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         _lenia_competence = None
 
     stats = _memory.stats()
-    tract_stats = _tract.stats()
     logger.info(
         "Bootstrapped: %d nodes, %d synapses, %d hyperedges, timestep %d, "
-        "tract pending: %d, modules: %s",
+        "modules: %s",
         stats["nodes"],
         stats["synapses"],
         stats["hyperedges"],
         stats["timestep"],
-        tract_stats["pending"],
         started_modules,
     )
 
@@ -1455,7 +1460,36 @@ def _drain_tract() -> None:
     ingestor is where experience meets the substrate. Law 7 — raw in,
     classify at extraction.
     """
-    entries = _tract.drain()
+    import ng_tract as _ng_tract
+    _legacy_path = os.path.expanduser("~/NeuroGraph/data/tract/experience.tract")
+    _drain_path = f"{_legacy_path}.draining.{os.getpid()}"
+    entries: list = []
+    try:
+        os.rename(_legacy_path, _drain_path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("Tract drain rename failed: %s", exc)
+        return
+    try:
+        with open(_drain_path, "rb") as _f:
+            _raw = _f.read()
+        if _raw:
+            for _e in _ng_tract.TractReader(_raw):
+                if isinstance(_e, bytes):
+                    try:
+                        entries.append(json.loads(_e))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                elif getattr(_e, "entry_type", None) == _ng_tract.ENTRY_EXPERIENCE:
+                    entries.append(_e)
+    except OSError as exc:
+        logger.warning("Tract drain read failed: %s", exc)
+    finally:
+        try:
+            os.unlink(_drain_path)
+        except OSError:
+            pass
     for entry in entries:
         if isinstance(entry, dict):
             _drain_experience_entry(

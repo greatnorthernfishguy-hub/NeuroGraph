@@ -166,16 +166,8 @@ class SubstrateReader:
 # Singleton reader instance
 _reader = SubstrateReader()
 
-# Experience tract for deposits
-_tract = None
-
-
-def _get_tract():
-    global _tract
-    if _tract is None:
-        from ng_experience_tract import ExperienceTract
-        _tract = ExperienceTract()
-    return _tract
+# Legacy feeder tract path — used by deposit_experience() and substrate_status()
+_LEGACY_TRACT_PATH = os.path.expanduser("~/NeuroGraph/data/tract/experience.tract")
 
 
 # ── MCP Tools ─────────────────────────────────────────────────────────
@@ -304,9 +296,6 @@ def substrate_status() -> str:
 
     try:
         tel = _reader.graph.get_telemetry()
-        tract = _get_tract()
-        tract_stats = tract.stats()
-
         lines = [
             "## Substrate Status",
             f"- Nodes: {tel.total_nodes}",
@@ -320,7 +309,7 @@ def substrate_status() -> str:
             f"- Prediction accuracy: {tel.prediction_accuracy:.4f}",
             f"- Novel sequences: {tel.total_novel_sequences}",
             f"- Pruned synapses: {tel.total_pruned}",
-            f"- Experience tract pending: {tract_stats['pending']}",
+            f"- Experience tract pending: (ContextEngine /stats for live count)",
             f"- Checkpoint: {_CHECKPOINT_PATH}",
             f"- Last loaded: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_reader._checkpoint_mtime))}",
         ]
@@ -349,15 +338,14 @@ def deposit_experience(
         content_type: Type of content ("text" or "file" path).
     """
     try:
-        tract = _get_tract()
-        tract.deposit(
+        import ng_tract
+        ng_tract.deposit_experience(
             content=content,
             source=source,
+            tract_path=_LEGACY_TRACT_PATH,
             content_type=content_type,
-            metadata={"via": "mcp", "timestamp": time.time()},
         )
-        pending = tract.pending_count()
-        return f"Deposited. Tract has {pending} pending entries awaiting drain."
+        return "Deposited. Entry queued for drain on next afterTurn."
     except Exception as exc:
         logger.error("Deposit failed: %s", exc)
         return f"Deposit failed: {exc}"

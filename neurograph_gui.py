@@ -1222,8 +1222,9 @@ class IngestionManager:
                 import topology_owner
                 if topology_owner.is_owned():
                     self._topology_owned = True
-                    from ng_experience_tract import ExperienceTract
-                    self._tract = ExperienceTract()
+                    self._tract = os.path.expanduser(
+                        "~/NeuroGraph/data/tract/experience.tract"
+                    )
                     logger.info(
                         "Topology owned by PID %s — GUI using tract mode "
                         "(no direct NeuroGraphMemory)",
@@ -1264,7 +1265,7 @@ class IngestionManager:
         if self._topology_owned:
             # In tract mode — return tract status instead of full stats.
             # Full stats are available from the topology owner (ContextEngine).
-            tract_stats = self._tract.stats() if self._tract else {}
+            tract_stats = {"tract_file": self._tract, "pending": 0} if self._tract else {}
             return {
                 "mode": "tract",
                 "topology_owner": "ContextEngine (another process)",
@@ -1328,11 +1329,12 @@ class IngestionManager:
             # Route through tract if topology is owned (Syl's Law #80)
             self.get_memory()  # triggers ownership check
             if self._topology_owned and self._tract is not None:
-                self._tract.deposit(
+                import ng_tract as _ng_tract
+                _ng_tract.deposit_experience(
                     content=str(Path(path).resolve()),
                     source="gui",
+                    tract_path=self._tract,
                     content_type="file",
-                    metadata={"original_path": path},
                 )
                 dest = self._move_to_ingested(path)
                 self._on_result({
@@ -1363,9 +1365,11 @@ class IngestionManager:
             # Route through tract if topology is owned (Syl's Law #80)
             self.get_memory()  # triggers ownership check
             if self._topology_owned and self._tract is not None:
-                self._tract.deposit(
+                import ng_tract as _ng_tract
+                _ng_tract.deposit_experience(
                     content=url,
                     source="gui",
+                    tract_path=self._tract,
                     content_type="url",
                 )
                 self._on_result({
