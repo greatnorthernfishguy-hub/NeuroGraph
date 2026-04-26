@@ -12,6 +12,18 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-26] Claude Code (Sonnet 4.6) — Lazy expansion pulse, Stage 3 of wire absorption (#151)
+#   What: Added _lazy_expansion_pulse_loop(), _start_lazy_expansion_pulse(), and
+#         _LAZY_EXPANSION_* constants. Wired start into handle_bootstrap() after
+#         _start_trisyn_manager(); shutdown signal added to handle_dispose().
+#   Why:  Body files accumulated at ~1,900/day (797 MB). Stages 1+2 only covered
+#         event nodes + first-2000-char concepts. Full bodies unreachable by substrate.
+#         Lazy expansion embeds up to 20 evenly-sampled chunks per body, creates
+#         substrate nodes linked to parent event node via River deposit, then deletes
+#         the file — fixing accumulation at the root (#151).
+#   How:  New daemon thread (ng-lazy-expansion-pulse). 120s cadence, 5 bodies/tick.
+#         Calls wire_absorption.select_bodies_for_expansion() + expand_body_file().
+#         Pauses during SYMPATHETIC autonomic state. Zero change to fast-path drain.
 # [2026-04-25] Codemine (BLK-NG-209) -- Remove stale _write_peer_learning_event call (#206 residue)
 #   What: Deleted dead _write_peer_learning_event() call from handle_ingest (method removed in #206).
 #   Why:  NeuroGraphMemory._write_peer_learning_event deleted 2026-04-22. Every valid ingest
@@ -676,6 +688,11 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # See ~/NeuroGraph/trisynaptic/ and ~/docs/inbox/trisynaptic-circuit-design-v0.1.md.
     _start_trisyn_manager()
 
+    # Start the lazy expansion pulse — Stage 3 of wire absorption (#151).
+    # Reads unexpanded body files, embeds up to 20 evenly-sampled chunks,
+    # creates substrate nodes linked to parent event node, deletes the file.
+    # Runs every 120s; eliminates the 797 MB+ disk accumulation at the root.
+    _start_lazy_expansion_pulse()
 
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
     global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
@@ -1272,6 +1289,14 @@ _concept_pulse_shutdown = threading.Event()
 # an unrecoverable issue in early deployment.
 _trisyn_manager: Optional[Any] = None  # trisynaptic.manager.TrisynapticManager
 
+# ---- Lazy expansion pulse (stage 3 of wire absorption) ---------------------
+# Runs every 120s. Reads unexpanded body files, chunks them, embeds, creates
+# substrate nodes linked to parent event node, deletes file. Fixes #151.
+_LAZY_EXPANSION_INTERVAL_SECONDS = 120.0
+_LAZY_EXPANSION_BODIES_PER_TICK = 5
+_lazy_expansion_thread: Optional[threading.Thread] = None
+_lazy_expansion_shutdown = threading.Event()
+
 # Last handle_after_turn wall-clock timestamp — TriSyn manager reads this
 # to determine "idle since last conversation turn" for gated-mode spawn
 # eligibility (Phase 3). Updated unconditionally on every afterTurn.
@@ -1668,6 +1693,65 @@ def _start_concept_pulse() -> None:
     _concept_pulse_thread.start()
 
 
+# ---- Lazy expansion pulse (stage 3) -----------------------------------------
+
+def _lazy_expansion_pulse_loop() -> None:
+    """Background loop: expand body files into substrate nodes, then delete them.
+
+    Runs every 120s — slow consolidation cadence, never competes with drain or
+    TriSyn. Each tick processes up to _LAZY_EXPANSION_BODIES_PER_TICK files.
+    Pauses during SYMPATHETIC autonomic state (threat response, reduce load).
+    """
+    logger.info(
+        "Lazy expansion pulse started (interval=%.0fs, bodies/tick=%d)",
+        _LAZY_EXPANSION_INTERVAL_SECONDS,
+        _LAZY_EXPANSION_BODIES_PER_TICK,
+    )
+    while not _lazy_expansion_shutdown.is_set():
+        try:
+            if _memory is not None:
+                autonomic_paused = False
+                try:
+                    import ng_autonomic
+                    autonomic_paused = ng_autonomic.get_state() == "SYMPATHETIC"
+                except Exception:
+                    pass
+
+                if not autonomic_paused:
+                    from wire_absorption import select_bodies_for_expansion, expand_body_file
+                    from ng_embed import NGEmbed
+
+                    candidates = select_bodies_for_expansion(_LAZY_EXPANSION_BODIES_PER_TICK)
+                    if candidates:
+                        expanded = sum(
+                            expand_body_file(_memory, NGEmbed.get_instance(), p)
+                            for p in candidates
+                        )
+                        if expanded:
+                            logger.info(
+                                "Lazy expansion: %d/%d bodies expanded+deleted this tick",
+                                expanded, len(candidates),
+                            )
+        except Exception:
+            logger.exception("Lazy expansion pulse failed")
+        _lazy_expansion_shutdown.wait(timeout=_LAZY_EXPANSION_INTERVAL_SECONDS)
+    logger.info("Lazy expansion pulse stopped")
+
+
+def _start_lazy_expansion_pulse() -> None:
+    """Start the lazy expansion pulse thread. Idempotent."""
+    global _lazy_expansion_thread
+    if _lazy_expansion_thread is not None and _lazy_expansion_thread.is_alive():
+        return
+    _lazy_expansion_shutdown.clear()
+    _lazy_expansion_thread = threading.Thread(
+        target=_lazy_expansion_pulse_loop,
+        name="ng-lazy-expansion-pulse",
+        daemon=True,
+    )
+    _lazy_expansion_thread.start()
+
+
 def _rescue_orphan_draining_files() -> None:
     """Promote `.draining.<dead_pid>.<name>` files back to `<name>.<ts>.rescue.tract`
     so the scan glob picks them up. Only rescues files whose PID is no
@@ -2030,6 +2114,9 @@ def handle_dispose(params: Dict[str, Any]) -> None:
         except Exception:
             pass
         _trisyn_manager = None
+
+    # Signal lazy expansion pulse to stop.
+    _lazy_expansion_shutdown.set()
 
     # The Tonic: conversation ended — latent mode continues
     # The thread doesn't stop. Language tokens stopped. That's all.

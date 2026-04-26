@@ -1,5 +1,20 @@
 """
 Wire Absorption — sensory-deposit path for raw HTTP wire events.
+# ---- Changelog ----
+# [2026-04-26] Claude Code (Sonnet 4.6) — Lazy expansion pulse, Stage 3 (#151)
+#   What: Added _chunk_body(), select_bodies_for_expansion(), expand_body_file().
+#         Expands full body content into up to 20 evenly-sampled 1800-char chunk
+#         nodes linked to the parent event node, then deletes the body file.
+#   Why:  Body files accumulated at ~1,900/day (797 MB+). Stages 1+2 only
+#         covered the first 2000 chars via concept extraction. The full body was
+#         referenced but never searchable in the substrate. Lazy expansion makes
+#         it searchable then removes the raw file — fixing the root cause of #151.
+#   How:  select_bodies_for_expansion() returns oldest N .body files. expand_body_file()
+#         reads body, skips files ≤2000 chars (fully covered by stages 1+2),
+#         samples ≤20 evenly-spaced windows, batch-embeds, creates chunk nodes
+#         in graph + vector_db + River deposit linked to parent event node, then
+#         unlinks the file. Called by _lazy_expansion_pulse_loop() in rpc.py every 120s.
+# -------------------
 
 Distinct from:
   - The universal ingestor (knowledge path) — designed for documents and
@@ -404,6 +419,173 @@ def absorb_trees_for_entry(
         logger.warning("Tree extraction failed (%s): %s", source, exc)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Lazy expansion (stage 3 — full body → substrate nodes → delete file)
+# ---------------------------------------------------------------------------
+#
+# Stage 1 (drain pulse, every 2s): fingerprint embedding → event node → forest
+# Stage 2 (TriSyn, async):         first 2000 chars → concept tree nodes
+# Stage 3 (expansion pulse, 120s): full body → up to 20 evenly-sampled chunk
+#                                  nodes linked to parent event node → delete
+#
+# Stages 1+2 are latency-sensitive; Stage 3 runs during quiet periods.
+# Once all body files are expanded they are gone — #151 resolved at root.
+
+_EXPANSION_CHUNK_CHARS = 1800    # chars per chunk (~512 tokens at ~3.5 chars/tok)
+_EXPANSION_CHUNK_OVERLAP = 200   # overlap between adjacent chunks
+_EXPANSION_MAX_CHUNKS = 20       # cap per body — prevents O(body_size) node explosion
+
+
+def _chunk_body(text: str) -> List[str]:
+    """Extract up to _EXPANSION_MAX_CHUNKS evenly-spaced windows from text.
+
+    Short texts: consecutive windows (possibly 1). Long texts: evenly sampled
+    positions so a 1.2M-char provider response doesn't create 667 nodes.
+    """
+    if not text:
+        return []
+    stride = _EXPANSION_CHUNK_CHARS - _EXPANSION_CHUNK_OVERLAP
+    full_count = max(1, (len(text) - _EXPANSION_CHUNK_OVERLAP + stride - 1) // stride)
+
+    if full_count <= _EXPANSION_MAX_CHUNKS:
+        # Short enough to expand completely
+        chunks: List[str] = []
+        pos = 0
+        while pos < len(text):
+            chunks.append(text[pos:pos + _EXPANSION_CHUNK_CHARS])
+            pos += stride
+        return chunks
+    else:
+        # Sample _EXPANSION_MAX_CHUNKS evenly across the body
+        span = len(text) - _EXPANSION_CHUNK_CHARS
+        return [
+            text[max(0, int(i * span / (_EXPANSION_MAX_CHUNKS - 1))):
+                 max(0, int(i * span / (_EXPANSION_MAX_CHUNKS - 1))) + _EXPANSION_CHUNK_CHARS]
+            for i in range(_EXPANSION_MAX_CHUNKS)
+        ]
+
+
+def select_bodies_for_expansion(n: int) -> List[Path]:
+    """Return up to n body files, oldest first (by embedded timestamp)."""
+    if not _BODIES_DIR.exists():
+        return []
+    try:
+        def _ts(p: Path) -> int:
+            try:
+                return int(p.stem.split("-")[1])
+            except (IndexError, ValueError):
+                return 0
+        return sorted(_BODIES_DIR.glob("*.body"), key=_ts)[:n]
+    except OSError:
+        return []
+
+
+def expand_body_file(memory, embedder, body_path: Path) -> bool:
+    """Expand one body file into substrate chunk nodes, then delete it.
+
+    Returns True when the body file has been deleted (either expanded or
+    determined to be fully covered by stages 1+2).  Returns False on any
+    failure — file stays for retry on the next expansion tick.
+    """
+    try:
+        text = body_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        logger.warning("Expansion read failed (%s): %s", body_path.name, exc)
+        return False
+
+    if not text:
+        body_path.unlink(missing_ok=True)
+        return True
+
+    # Bodies ≤ 2000 chars were fully processed by concept extraction (stage 2).
+    # No new substrate nodes needed — just remove the file.
+    if len(text) <= 2000:
+        body_path.unlink(missing_ok=True)
+        return True
+
+    graph = getattr(memory, "graph", None)
+    vector_db = getattr(memory, "vector_db", None)
+    peer_bridge = getattr(memory, "_peer_bridge", None)
+    if graph is None or vector_db is None:
+        return False
+
+    # Locate parent event node — id format: wire:{source}:{sha[:12]}
+    # Filename format: {sha[:16]}-{ts_ns}.body
+    sha_prefix = body_path.stem.split("-")[0]   # first 16 hex chars of sha256
+    node_tail = sha_prefix[:12]                  # matches event node id tail
+    parent_event_id: Optional[str] = None
+    for node_id in list(graph.nodes.keys()):
+        if node_id.startswith("wire:") and node_id.endswith(f":{node_tail}"):
+            parent_event_id = node_id
+            break
+
+    chunks = _chunk_body(text)
+    if not chunks:
+        body_path.unlink(missing_ok=True)
+        return True
+
+    try:
+        embeddings = embedder.embed_batch(chunks)
+    except Exception as exc:
+        logger.warning("Expansion embed_batch failed (%s): %s", body_path.name, exc)
+        return False
+
+    expanded_count = 0
+    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        chunk_node_id = f"wire:expand:{node_tail}:c{i:04d}"
+        chunk_meta = {
+            "source_type": "wire_expansion",
+            "body_sha_prefix": sha_prefix,
+            "chunk_index": i,
+            "chunk_count": len(chunks),
+            "parent_event_id": parent_event_id,
+        }
+        try:
+            if chunk_node_id not in graph.nodes:
+                graph.create_node(node_id=chunk_node_id, metadata=chunk_meta)
+                try:
+                    vector_db.insert(
+                        id=chunk_node_id, embedding=emb,
+                        content=chunk[:200],
+                        metadata=chunk_meta,
+                    )
+                except Exception:
+                    pass
+
+            # River deposit — Hebbian association between chunk and parent event
+            if peer_bridge is not None and parent_event_id is not None:
+                try:
+                    peer_bridge.record_outcome(
+                        embedding=emb,
+                        target_id=parent_event_id,
+                        success=True,
+                        module_id="neurograph",
+                        metadata=chunk_meta,
+                    )
+                except Exception:
+                    pass
+
+            expanded_count += 1
+        except Exception as exc:
+            logger.warning(
+                "Expansion chunk %d failed (%s): %s", i, body_path.name, exc
+            )
+
+    if expanded_count == 0:
+        return False
+
+    try:
+        body_path.unlink(missing_ok=True)
+        logger.info(
+            "Expanded+deleted: %s — %d chunks → %s",
+            body_path.name, expanded_count, parent_event_id or "no parent",
+        )
+        return True
+    except OSError as exc:
+        logger.warning("Body delete failed (%s): %s", body_path.name, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
