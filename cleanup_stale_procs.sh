@@ -4,11 +4,12 @@
 # gateway restarts and orphaned CC sessions.
 #
 # [2026-03-27] Claude (Opus 4.6) — Stale process cleanup
+# [2026-04-26] CC Sonnet 4.6 — Remove dead fanout_daemon.py pattern (#56 audit)
 # Safe: only kills processes owned by $USER that match known patterns.
 
 GATEWAY_PID=$(systemctl --user show openclaw-gateway -p MainPID --value 2>/dev/null)
 
-for pid in $(pgrep -u "$USER" -f "neurograph_rpc\.py|neurograph_mcp\.py|fanout_daemon\.py"); do
+for pid in $(pgrep -u "$USER" -f "neurograph_rpc\.py|neurograph_mcp\.py"); do
     # Skip if it's a child of the current gateway
     if [ -n "$GATEWAY_PID" ] && [ "$GATEWAY_PID" != "0" ]; then
         parent=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
