@@ -1139,6 +1139,12 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     if _memory._surfacing_monitor is not None:
         _memory._surfacing_monitor.after_step(step_result)
 
+    # Hyperedge discovery — co-activation pattern detection (PRD §4.3)
+    try:
+        _memory.graph.discover_hyperedges(step_result.fired_node_ids)
+    except Exception:
+        pass
+
     # River-based Tier 3: deposit raw topology delta to all module tracts.
     # The delta contains fired nodes with causal context, hyperedge activations,
     # prediction results, structural changes, and salience signals. Raw,
