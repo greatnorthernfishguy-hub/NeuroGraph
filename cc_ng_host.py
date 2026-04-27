@@ -24,6 +24,21 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-04-27] Claude (Opus 4.7) — Enrich PostToolUse deposit content (LAW 7)
+# What: PostToolUse experience strings now extract structured fields from
+#       tool_input (Edit's old/new_string, Write's content, Read's response)
+#       at richer budgets (1000-2000 chars per field) instead of relying on
+#       str(tool_response)[:300] which collapsed Edit/Write into truncated
+#       success-message boilerplate plus oldString prefix.
+# Why:  The 300-char dict-stringification was pre-classifying which bytes
+#       of an event NG should learn from — a LAW 7 violation. NG already has
+#       canonical surprise/novelty machinery (detect_novelty,
+#       surprise_reward_scaling, surprise_sprouting_weight, three-factor
+#       learning) that handles ingestion-time prioritization. The hook's job
+#       is to deliver raw experience without bias, not to pre-truncate.
+# How:  Add explicit Edit/Write/Read branches that pull structured fields
+#       from tool_input. Widen budgets across all branches so the substrate
+#       sees actual content rather than dict-repr prefixes.
 # [2026-04-24] Claude (Sonnet 4.6) — Fix _cleanup_stale_socket restart race (#202)
 # What: Add 3-attempt retry loop (1s sleep) before raising RuntimeError.
 # Why:  On gateway restart the old process is still dying — connect() succeeds
@@ -362,12 +377,21 @@ def _handle_post_tool_use(data):
     file_path = tool_input.get("file_path", tool_input.get("path", ""))
     command = tool_input.get("command", "")
 
-    if file_path:
-        experience = "tool:" + tool + " file:" + file_path + " result:" + str(tool_response)[:300]
+    if tool == "Edit":
+        old = str(tool_input.get("old_string", ""))[:1000]
+        new = str(tool_input.get("new_string", ""))[:1000]
+        experience = "tool:Edit file:" + file_path + " old:" + old + " new:" + new
+    elif tool == "Write":
+        content = str(tool_input.get("content", ""))[:2000]
+        experience = "tool:Write file:" + file_path + " content:" + content
+    elif tool == "Read":
+        experience = "tool:Read file:" + file_path + " content:" + str(tool_response)[:2000]
+    elif file_path:
+        experience = "tool:" + tool + " file:" + file_path + " result:" + str(tool_response)[:1000]
     elif command:
-        experience = "bash:" + str(command)[:100] + " result:" + str(tool_response)[:300]
+        experience = "bash:" + str(command)[:200] + " result:" + str(tool_response)[:1500]
     else:
-        experience = "tool:" + tool + " result:" + str(tool_response)[:300]
+        experience = "tool:" + tool + " result:" + str(tool_response)[:1000]
 
     _deposit(experience)
 
