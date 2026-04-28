@@ -19,6 +19,19 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-04-27] Claude (Sonnet 4.6) — Replace exact-set hyperedge discovery with overlap-based candidate matching
+# What: discover_hyperedges() now uses Jaccard overlap (threshold: he_discovery_overlap_threshold=0.5,
+#       bootstrap value — candidate for competency graduation via Elmer's TuningSocket) to match
+#       the current fired set against existing candidates. Best match refines to the intersection
+#       (the reliable co-activation core); no match starts a new candidate from the full fired set.
+# Why:  Exact-set key tuple(sorted(fired_node_ids)) never accumulated counts in a live substrate —
+#       any variation in the fired set (even one node) created a different bucket, so counters
+#       reset constantly and no hyperedge ever crossed min_co_fires. Zero hyperedges formed since
+#       discover_hyperedges was wired in (2026-04-26, commit 62364c4).
+# How:  Added he_discovery_overlap_threshold to DEFAULT_CONFIG. In discover_hyperedges(), iterate
+#       candidates, compute Jaccard, find best match >= threshold, refine key to intersection,
+#       increment count. New candidates start from full fired set as before. Threshold/creation
+#       logic unchanged — only the candidate-matching strategy changed.
 # [2026-04-22] Claude (Sonnet 4.6) — Fix autosave race in _serialize_full()
 # What: Snapshot all mutable dicts at the top of _serialize_full() via list()
 #       before building the return dict.
@@ -999,6 +1012,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_discovery_window": 10,
     "he_discovery_min_co_fires": 5,
     "he_discovery_min_nodes": 3,
+    "he_discovery_overlap_threshold": 0.5,  # bootstrap — candidate for Elmer TuningSocket graduation
     "he_consolidation_overlap": 0.8,
     "he_member_evolution_window": 50,
     "he_member_evolution_min_co_fires": 10,
@@ -3163,33 +3177,58 @@ class Graph:
         window = self.config["he_discovery_window"]
         min_fires = self.config["he_discovery_min_co_fires"]
         min_nodes = self.config["he_discovery_min_nodes"]
+        overlap_threshold = self.config["he_discovery_overlap_threshold"]
 
         # Reset discovery counts periodically
         if self.timestep - self._he_discovery_last_reset > window * 2:
             self._he_discovery_counts.clear()
             self._he_discovery_last_reset = self.timestep
 
-        # Build sorted key from fired nodes (order-independent)
-        fired_sorted = tuple(sorted(fired_node_ids))
+        fired_set = set(fired_node_ids)
 
-        # Track all subsets of size >= min_nodes would be too expensive,
-        # so we track the full fired set as a co-activation pattern.
-        self._he_discovery_counts[fired_sorted] = (
-            self._he_discovery_counts.get(fired_sorted, 0) + 1
-        )
+        # Find the existing candidate with the best Jaccard overlap.
+        # Refining to the intersection on each match converges the candidate
+        # toward the reliable co-activation core, discarding peripheral nodes
+        # that don't fire consistently together.
+        best_key: Optional[Tuple[str, ...]] = None
+        best_jaccard = 0.0
+        for candidate_key in list(self._he_discovery_counts.keys()):
+            candidate_set = set(candidate_key)
+            union_size = len(fired_set | candidate_set)
+            if not union_size:
+                continue
+            jaccard = len(fired_set & candidate_set) / union_size
+            if jaccard >= overlap_threshold and jaccard > best_jaccard:
+                best_jaccard = jaccard
+                best_key = candidate_key
+
+        if best_key is not None:
+            # Refine candidate to intersection — drop nodes not in this firing
+            refined = tuple(sorted(fired_set & set(best_key)))
+            count = self._he_discovery_counts.pop(best_key)
+            if len(refined) < min_nodes:
+                # Intersection shrank below minimum — discard candidate
+                return []
+            self._he_discovery_counts[refined] = count + 1
+            active_key = refined
+        else:
+            # No overlapping candidate — start a new one from the full fired set
+            fired_sorted = tuple(sorted(fired_node_ids))
+            self._he_discovery_counts[fired_sorted] = (
+                self._he_discovery_counts.get(fired_sorted, 0) + 1
+            )
+            active_key = fired_sorted
 
         discovered: List[Hyperedge] = []
 
-        if self._he_discovery_counts[fired_sorted] >= min_fires:
-            # Check no existing hyperedge already covers this exact set
-            fired_set = set(fired_node_ids)
+        if self._he_discovery_counts.get(active_key, 0) >= min_fires:
+            active_set = set(active_key)
             already_exists = any(
-                he.member_nodes == fired_set
+                he.member_nodes == active_set
                 for he in self.hyperedges.values()
             )
-            if not already_exists and len(fired_set) >= min_nodes:
-                # Verify all nodes still exist
-                valid_nodes = {nid for nid in fired_set if nid in self.nodes}
+            if not already_exists and len(active_set) >= min_nodes:
+                valid_nodes = {nid for nid in active_set if nid in self.nodes}
                 if len(valid_nodes) >= min_nodes:
                     he = self.create_hyperedge(
                         valid_nodes,
@@ -3202,7 +3241,7 @@ class Graph:
                     self._total_he_discovered += 1
                     self._emit("hyperedge_discovered", hid=he.hyperedge_id)
             # Reset this pattern's counter
-            del self._he_discovery_counts[fired_sorted]
+            del self._he_discovery_counts[active_key]
 
         return discovered
 
