@@ -76,27 +76,17 @@ Design principles (PRD §2.1):
 #   _deserialize() restores all four. Delay buffer validates delivery timestep > current
 #   and node existence. Homeostatic counter applied post plasticity-rules re-init.
 #   Migration v0.4.1→v0.4.2 is a no-op (old checkpoints get defaults on next save).
-# [2026-03-25] Claude Code (Opus 4.6) — Dynamic tuning API (SVG Phase 5)
-#   What: Added TUNABLE_PARAMS, update_tunable(), get_tunables() to Graph class.
-#     12 SNN parameters tunable at runtime with validated bounds: learning_rate,
-#     decay_rate, default_threshold, target_firing_rate, surprise_reward_scaling,
-#     he_member_weight_lr, he_threshold_lr, he_pattern_completion_strength,
-#     prediction_confirm_bonus, prediction_error_penalty, he_salience_decay_rate,
-#     he_consolidation_adapt_rate. Updates propagate to cached plasticity rule objects.
-#   Why:  SVG Phase 5 — the substrate's own parameters are the substrate's concern.
-#     Elmer's TuningSocket can now adjust the SNN engine itself, not just ng_lite.
-#   How:  TUNABLE_PARAMS dict with (min, max) bounds. update_tunable() validates,
-#     clamps, updates config dict AND propagates to STDPRule/HomeostaticRule/
-#     HyperedgePlasticityRule objects. Matches ng_lite.py pattern.
-# [2026-04-08] Claude Code (Opus 4.6) — Punchlist #55: CES attention tunables
-#   What: Added surfacing_decay_rate, surfacing_min_confidence to DEFAULT_CONFIG
-#     and TUNABLE_PARAMS. Added prediction_window to TUNABLE_PARAMS (was in
-#     DEFAULT_CONFIG but not tunable).
-#   Why:  CES attention params were static — Elmer couldn't tune them. Temporal
-#     stuttering requires substrate-driven attention dynamics. SurfacingMonitor
-#     reads these from graph.config, so they're live once set here.
-#   How:  Dict entries only. No structural changes. update_tunable() handles
-#     them generically via clamp-and-set.
+# [2026-04-27] Claude Code (Sonnet 4.6) — Remove TUNABLE_PARAMS from Graph class (#224)
+#   What: Deleted TUNABLE_PARAMS class dict, update_tunable(), and get_tunables()
+#     from the Graph class. Both changelog entries above (2026-03-25, 2026-04-08)
+#     describe the addition — removed here.
+#   Why:  Law 1 violation exposure. These were added with the explicit intent
+#     "Elmer's TuningSocket can now adjust the SNN engine itself." No module
+#     writes directly to another module's config. Zero live callers of
+#     Graph.update_tunable() confirmed before removal. ng_lite.py TUNABLE_PARAMS
+#     (legitimate — Elmer calls update_tunable() on its own NGLite instance) untouched.
+#   How:  Deleted SVG Phase 5 comment block, TUNABLE_PARAMS dict, update_tunable(),
+#     and get_tunables(). No callers affected.
 # [2026-03-24] Claude Code (Opus 4.6) — Homeostasis audit: 6 remaining fixes
 # What: (1) Threshold ceiling at 5.0 prevents unbounded growth. (2) prediction_window
 #   dataclass default aligned to 10 (was 5, conflicting with Phase 3 config).
@@ -1352,87 +1342,6 @@ class Graph:
     # -----------------------------------------------------------------------
     # Topology Management (PRD §2.2.4)
     # -----------------------------------------------------------------------
-
-    # --- SVG Phase 5: Dynamic Tuning API ---
-    # Parameters Elmer (or any organ) is permitted to adjust at runtime.
-    # Keys map to (min, max) bounds. Anything not in this dict is frozen.
-    # Matches the ng_lite.py TUNABLE_PARAMS pattern.
-    TUNABLE_PARAMS: Dict[str, Tuple[float, float]] = {
-        # STDP / learning
-        "learning_rate":                (0.001, 0.1),
-        "decay_rate":                   (0.90,  0.99),
-        "default_threshold":            (0.5,   2.0),
-        "target_firing_rate":           (0.01,  0.2),
-        "surprise_reward_scaling":      (0.1,   2.0),
-        # Hyperedge plasticity
-        "he_member_weight_lr":          (0.005, 0.2),
-        "he_threshold_lr":              (0.001, 0.05),
-        "he_pattern_completion_strength": (0.1, 1.0),
-        # Predictive coding
-        "prediction_confirm_bonus":     (0.001, 0.1),
-        "prediction_error_penalty":     (0.001, 0.1),
-        # Salience
-        "he_salience_decay_rate":       (0.0001, 0.01),
-        # Consolidation
-        "he_consolidation_adapt_rate":  (0.001, 0.05),
-        # Predictive coding window
-        "prediction_window":            (3,     20),
-        # CES attention dynamics (#55)
-        "surfacing_decay_rate":         (0.80,  0.99),
-        "surfacing_min_confidence":     (0.10,  0.50),
-    }
-
-    def update_tunable(self, key: str, value: float) -> Dict[str, Any]:
-        """Update a tunable config parameter at runtime.
-
-        Only parameters listed in TUNABLE_PARAMS are accepted.
-        Values are clamped to their declared bounds.
-
-        When learning/plasticity parameters change, the corresponding
-        plasticity rule objects are updated to stay in sync.
-
-        Returns dict with old_value, new_value, clamped (bool).
-        Raises KeyError if key is not tunable.
-        """
-        if key not in self.TUNABLE_PARAMS:
-            raise KeyError(
-                f"'{key}' is not a tunable parameter. "
-                f"Allowed: {sorted(self.TUNABLE_PARAMS.keys())}"
-            )
-        lo, hi = self.TUNABLE_PARAMS[key]
-        old_value = self.config[key]
-        clamped = value < lo or value > hi
-        new_value = max(lo, min(hi, float(value)))
-        self.config[key] = new_value
-
-        # Propagate to plasticity rule objects that cache these values
-        for rule in self._plasticity_rules:
-            if isinstance(rule, STDPRule) and key == "learning_rate":
-                rule.learning_rate = new_value
-            elif isinstance(rule, HomeostaticRule) and key == "target_firing_rate":
-                rule.target_firing_rate = new_value
-            elif isinstance(rule, HyperedgePlasticityRule):
-                if key == "he_member_weight_lr":
-                    rule.member_weight_lr = new_value
-                elif key == "he_threshold_lr":
-                    rule.threshold_lr = new_value
-
-        logger.info(
-            "Tunable update: %s = %.6f → %.6f%s",
-            key, old_value, new_value, " (clamped)" if clamped else "",
-        )
-        return {"old_value": old_value, "new_value": new_value, "clamped": clamped}
-
-    def get_tunables(self) -> Dict[str, Dict[str, float]]:
-        """Return current tunable values and their bounds."""
-        result = {}
-        for key, (lo, hi) in self.TUNABLE_PARAMS.items():
-            result[key] = {
-                "value": self.config[key],
-                "min": lo,
-                "max": hi,
-            }
-        return result
 
     def create_node(
         self,
