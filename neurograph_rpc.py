@@ -12,6 +12,15 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-27] Claude Code (Sonnet 4.6) — he_discovery_overlap_threshold self-tuning (#222)
+#   What: Added _tune_he_overlap_threshold() helper and 4 module-level tuning state globals.
+#         discover_hyperedges() return value now captured; _he_discovered_in_window accumulates.
+#         Every 50 turns: discovery_rate + net HE growth → ±0.03 nudge, bounds (0.2, 0.9).
+#   Why:  Bootstrap 0.5 is a prior, not a permanent value. Coordinator self-tunes its own
+#         algorithm's threshold based on observed discovery statistics (Law 1 compliant —
+#         NeuroGraph tunes NeuroGraph's param; Elmer observes only via River).
+#   How:  Three edits: globals block, _tune_he_overlap_threshold() before _deposit_substrate_metrics,
+#         discover_hyperedges try block updated to accumulate + trigger every _HE_TUNE_WINDOW turns.
 # [2026-04-26] Claude Code (Sonnet 4.6) — Lazy expansion pulse, Stage 3 of wire absorption (#151)
 #   What: Added _lazy_expansion_pulse_loop(), _start_lazy_expansion_pulse(), and
 #         _LAZY_EXPANSION_* constants. Wired start into handle_bootstrap() after
@@ -325,6 +334,15 @@ _lenia_engine: Optional[Any] = None
 _lenia_bridge: Optional[Any] = None
 _lenia_competence: Optional[Any] = None
 
+# he_discovery_overlap_threshold self-tuning state (#222)
+# NeuroGraph tunes its own param — coordinator owns this (Law 1: no cross-module writes).
+_he_tune_turn_count: int = 0
+_he_discovered_in_window: int = 0
+_he_count_at_window_start: int = 0
+_HE_TUNE_WINDOW: int = 50
+_HE_TUNE_STEP: float = 0.03
+_HE_TUNE_BOUNDS: tuple = (0.2, 0.9)
+
 
 # Discord webhook for error surfacing (Law 5: env var is truth)
 _DISCORD_WEBHOOK = os.environ.get(
@@ -475,6 +493,46 @@ def _bootstrap_modules() -> List[str]:
                     sys.modules[mod_name] = mod_obj
 
     return started
+
+
+def _tune_he_overlap_threshold() -> None:
+    """Self-tune he_discovery_overlap_threshold based on discovery rate (#222).
+
+    Called every _HE_TUNE_WINDOW turns from handle_after_turn. NeuroGraph
+    tunes its own parameter — no cross-module writes (Law 1).
+
+    Logic:
+      - Low discovery rate (<0.1/turn): threshold too tight → lower it
+      - High rate (>0.5/turn) + fast growth (>10 new HEs): too loose → raise it
+      - Otherwise: leave unchanged
+    """
+    global _he_discovered_in_window, _he_count_at_window_start
+    if _memory is None or not hasattr(_memory, "graph"):
+        return
+
+    discovery_rate = _he_discovered_in_window / _HE_TUNE_WINDOW
+    current_he_count = len(_memory.graph.hyperedges)
+    net_growth = current_he_count - _he_count_at_window_start
+
+    current = _memory.graph.config.get("he_discovery_overlap_threshold", 0.5)
+    adjustment = 0.0
+
+    if discovery_rate < 0.1:
+        adjustment = -_HE_TUNE_STEP
+    elif discovery_rate > 0.5 and net_growth > 10:
+        adjustment = +_HE_TUNE_STEP
+
+    if adjustment != 0.0:
+        new_val = max(_HE_TUNE_BOUNDS[0], min(_HE_TUNE_BOUNDS[1], current + adjustment))
+        _memory.graph.config["he_discovery_overlap_threshold"] = new_val
+        logger.debug(
+            "he_discovery_overlap_threshold tuned %.3f → %.3f "
+            "(rate=%.2f/turn net_growth=%d)",
+            current, new_val, discovery_rate, net_growth,
+        )
+
+    _he_discovered_in_window = 0
+    _he_count_at_window_start = current_he_count
 
 
 def _deposit_substrate_metrics(step_result) -> None:
@@ -1140,8 +1198,14 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
         _memory._surfacing_monitor.after_step(step_result)
 
     # Hyperedge discovery — co-activation pattern detection (PRD §4.3)
+    global _he_tune_turn_count, _he_discovered_in_window
     try:
-        _memory.graph.discover_hyperedges(step_result.fired_node_ids)
+        new_hes = _memory.graph.discover_hyperedges(step_result.fired_node_ids)
+        _he_discovered_in_window += len(new_hes)
+        _he_tune_turn_count += 1
+        if _he_tune_turn_count >= _HE_TUNE_WINDOW:
+            _tune_he_overlap_threshold()
+            _he_tune_turn_count = 0
     except Exception:
         pass
 
