@@ -24,6 +24,14 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-04-27] Claude Code (Sonnet 4.6) — Wire discover_hyperedges into _deposit (#220)
+# What: After ng.on_message(text), derive fired nodes from _recent_spikes and call
+#       discover_hyperedges(). Fired = nodes whose last spike == current timestep.
+# Why:  CC NG never called discover_hyperedges. Co-activation patterns accumulate but
+#       are never crystallised into hyperedges. Punchlist #220 wire-up check.
+#       Can't call via on_message() return value (returns str). _recent_spikes is the
+#       correct source — updated by step() inside on_message(), survives hibernation.
+# How:  Inside the existing _concurrent_lock block, after on_message(). Error-isolated.
 # [2026-04-27] Claude (Opus 4.7) — Enrich PostToolUse deposit content (LAW 7)
 # What: PostToolUse experience strings now extract structured fields from
 #       tool_input (Edit's old/new_string, Write's content, Read's response)
@@ -203,6 +211,12 @@ def _deposit(text: str) -> None:
     try:
         with ng.graph._concurrent_lock:
             ng.on_message(text)
+            fired = [
+                nid for nid, spikes in ng.graph._recent_spikes.items()
+                if spikes and spikes[-1] == ng.graph.timestep
+            ]
+            if fired:
+                ng.graph.discover_hyperedges(fired)
     except Exception as exc:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1
