@@ -48,6 +48,10 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-04-29] Claude (Sonnet 4.6) — _drain_all() return fix
+#   What: _drain_all() returned None; _drain_river() in openclaw_adapter silently got 0 events.
+#   Why:  #155 deleted _peer_events but didn't update _drain_river() consumer or add return value.
+#   How:  Changed -> None to -> List[Any], added return new_events at end of _drain_all().
 # [2026-04-20] Codemine (BLK-NG-155) -- delete _peer_events dead code (#155 cleanup)
 #   What: Removed _peer_events list, _peer_events_max, _enforce_window_limit(),
 #          dead code in get_recommendations() and detect_novelty(), and all
@@ -583,7 +587,7 @@ class NGTractBridge(NGBridge):
     # Internal: Tract drain
     # -------------------------------------------------------------------
 
-    def _drain_all(self) -> None:
+    def _drain_all(self) -> List[Any]:
         """Drain all incoming tracts directed at this module.
 
         Scans every peer's tract directory for a file named
@@ -628,6 +632,7 @@ class NGTractBridge(NGBridge):
                 self._drain_count, len(new_events),
                 len(set(self._get_module_id(e) for e in new_events)),
             )
+        return new_events
 
     def _drain_single_tract(
         self, tract_path: Path, peer_id: str,

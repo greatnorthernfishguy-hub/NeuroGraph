@@ -2,6 +2,12 @@
 OpenClaw Adapter — E-T Systems Module Integration for OpenClaw Skills
 
 # ---- Changelog ----
+# [2026-04-29] Claude (Sonnet 4.6) — _drain_river() fix: use _drain_all() return value
+#   What: _drain_river() counted events via _peer_events delta — deleted in #155.
+#         getattr(..., '_peer_events', []) always returned [] so new_count=0 always.
+#         _on_river_events() never called. All modules blind to River events since #155.
+#   Why:  #155 removed _peer_events but didn't update _drain_river() consumer.
+#   How:  events = self._tract_bridge._drain_all() or []; call _on_river_events(events).
 # [2026-04-19] CC (punchlist #5) -- Add NGTractBridge River drain to base adapter
 #   What: __init__ initializes NGTractBridge for all modules; _drain_river() drains
 #          tracts/*/neurograph.tract and calls overridable _on_river_events().
@@ -215,21 +221,17 @@ class OpenClawAdapter(ABC):
         """
         if self._tract_bridge is None:
             return 0
-        events_before = len(getattr(self._tract_bridge, "_peer_events", []))
         try:
-            self._tract_bridge._drain_all()
+            new_events = self._tract_bridge._drain_all() or []
         except Exception as _e:
             logger.debug("[%s] River drain error: %s", self.MODULE_ID, _e)
             return 0
-        events_after = len(getattr(self._tract_bridge, "_peer_events", []))
-        new_count = events_after - events_before
-        if new_count > 0:
-            new_events = list(self._tract_bridge._peer_events[events_before:])
+        if new_events:
             try:
                 self._on_river_events(new_events)
             except Exception as _e:
                 logger.debug("[%s] _on_river_events error: %s", self.MODULE_ID, _e)
-        return new_count
+        return len(new_events)
 
     def _on_river_events(self, events: list) -> None:
         """Override to process new River events through domain bucket.
