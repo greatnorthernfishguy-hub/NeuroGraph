@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-29] Claude (Sonnet 4.6) — #225 fix pt2: BTF path+format
+#   What: _deposit_topology_to_river wrote JSONL to inverted path tracts/{peer}/neurograph.tract.
+#         JSONL has no place in BTF tracts. Path was backwards.
+#   Why:  Should write to tracts/neurograph/{peer}.tract (what peers drain).
+#   How:  ng_tract.deposit_topology(step_result, graph, vector_db, tract_paths). 60→8 lines.
+# [2026-04-29] Claude (Sonnet 4.6) — #225 fix pt2: BTF path+format
+#   What: _deposit_topology_to_river wrote JSONL to inverted path tracts/{peer}/neurograph.tract.
+#         JSONL has no place in BTF tracts. Path was backwards.
+#   Why:  Should write to tracts/neurograph/{peer}.tract (what peers drain).
+#   How:  ng_tract.deposit_topology(step_result, graph, vector_db, tract_paths). 60->8 lines.
 # [2026-04-28] Claude (Sonnet 4.6) — #225 River fix: initialize outbound tract bridge, deposit topology
 #   What: Added _ng_tract_bridge (NGTractBridge module_id="neurograph") initialized in
 #         handle_bootstrap(). Added _deposit_topology_to_river(step_result) called each
@@ -21,10 +31,7 @@ to an existing NeuroGraphMemory call.
 #         Both call sites inside try/except silently swallowed NameError every turn.
 #         No topology deltas ever flowed to module tracts. Bunyan nodes:0, salient:0
 #         since deployment. QuantumGraph msgs:0. All River-dependent module inboxes empty.
-#   How:  JSONL topology_delta written to tracts/neurograph/{peer_id}.tract for all
-#         registered peers. Raw only — fired node embeddings, synapse weights,
-#         hyperedge membership. Law 7 compliant. Each module's extraction bucket
-#         interprets at read time.
+#   How:  See 2026-04-29 entry for corrected implementation.
 # [2026-04-27] Claude Code (Sonnet 4.6) — he_discovery_overlap_threshold self-tuning (#222)
 #   What: Added _tune_he_overlap_threshold() helper and 4 module-level tuning state globals.
 #         discover_hyperedges() return value now captured; _he_discovered_in_window accumulates.
@@ -588,95 +595,28 @@ def _deposit_substrate_metrics(step_result) -> None:
 
 
 def _deposit_topology_to_river(step_result) -> None:
-    """Write raw topology delta to every registered module's inbound tract.
+    """Deposit raw topology delta to every registered module's inbound tract (BTF).
 
-    # [2026-04-28] Claude (Sonnet 4.6) — #225 River fix
-    #   What: NeuroGraph emits raw step output to all module tracts each afterTurn.
-    #   Why:  peer_bridge was undefined (NameError, silently caught) since fanout
-    #         removal 2026-04-05. No topology data flowed. Bunyan nodes:0,
-    #         salient:0 for all time. QuantumGraph msgs:0. All module inboxes empty.
-    #   How:  JSONL topology_delta written to tracts/neurograph/{peer_id}.tract.
-    #         Raw only — fired node embeddings, synapse weights, hyperedge membership.
-    #         Law 7: no classification before deposit. Each module's extraction
-    #         bucket interprets at read time.
-
-    Law 7: raw unclassified substrate output. The fired node embeddings, synapse
-    weights, and hyperedge memberships are the substrate's mechanical step output —
-    no labels, no categories added here. Bunyan's TopologyDeltaIndex, Elmer's
-    health checks, Immunis's threat sensors all interpret at extraction.
+    Law 7: raw unclassified substrate output. Rust serializes directly from
+    StepResult + Graph objects. Each module's extraction bucket interprets at read time.
     """
     if _ng_tract_bridge is None or _memory is None:
         return
     try:
-        import json as _json
-
-        # Build fired_nodes with raw embeddings + outgoing synapse weights.
-        # Cap at 40 nodes — River signal, not a flood.
-        fired_nodes = []
-        for nid in step_result.fired_node_ids[:40]:
-            db_entry = _memory.vector_db.get(nid)
-            if db_entry is None:
-                continue
-            emb = db_entry.get("embedding")
-            if emb is None:
-                continue
-            emb_list = emb.tolist() if hasattr(emb, "tolist") else list(emb)
-
-            outgoing = []
-            for syn in _memory.graph.synapses.values():
-                if syn.pre_node_id == nid:
-                    outgoing.append({
-                        "post_node_id": syn.post_node_id,
-                        "weight": float(syn.weight),
-                        "eligibility_trace": float(syn.eligibility_trace),
-                    })
-                    if len(outgoing) >= 10:
-                        break
-
-            fired_nodes.append({
-                "node_id": nid,
-                "label": db_entry.get("label", ""),
-                "embedding": emb_list,
-                "outgoing_synapses": outgoing,
-            })
-
-        # Fired hyperedges — raw membership lists.
-        fired_hes = []
-        for he_id in step_result.fired_hyperedge_ids:
-            he = _memory.graph.hyperedges.get(he_id)
-            if he is None:
-                continue
-            fired_hes.append({
-                "hyperedge_id": he_id,
-                "label": getattr(he, "label", ""),
-                "member_nodes": list(getattr(he, "member_node_ids", [])),
-            })
-
-        delta = {
-            "type": "topology_delta",
-            "timestep": int(_memory.graph.timestep),
-            "fired_nodes": fired_nodes,
-            "fired_hyperedges": fired_hes,
-            "predictions": {
-                "confirmed": int(step_result.predictions_confirmed),
-                "surprised": int(step_result.predictions_surprised),
-            },
-        }
-        line = (_json.dumps(delta) + "\n").encode()
-
-        # Fan-out: deposit to each registered peer's inbound tract
+        import ng_tract
         peers = _ng_tract_bridge._get_registered_peers()
-        tracts_dir = _ng_tract_bridge._tracts_dir
-        for peer_id in peers:
-            peer_dir = tracts_dir / peer_id
-            tract_path = peer_dir / "neurograph.tract"
-            try:
-                peer_dir.mkdir(parents=True, exist_ok=True)
-                with open(tract_path, "ab") as _f:
-                    _f.write(line)
-            except Exception as _e:
-                logger.debug("Topology deposit to %s failed: %s", peer_id, _e)
-
+        if not peers:
+            return
+        tract_paths = [
+            str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
+            for peer_id in peers
+        ]
+        ng_tract.deposit_topology(
+            step_result,
+            _memory.graph,
+            _memory.vector_db,
+            tract_paths,
+        )
     except Exception as exc:
         logger.debug("_deposit_topology_to_river failed (non-fatal): %s", exc)
 
