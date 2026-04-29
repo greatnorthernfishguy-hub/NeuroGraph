@@ -12,6 +12,14 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-04-29] Claude (Sonnet 4.6) — #226 Bunyan: deposit raw conversation experience to River
+#   What: Added _deposit_experience_to_river(text) — raw conversation text to every
+#         registered module's inbound tract via ng_tract.deposit_experience() (single-path
+#         API, loop over peers). Called in handle_after_turn alongside topology deposit.
+#   Why:  Bunyan needs raw semantic experience, not just structural topology metadata.
+#         Law 7: text enters as-is, no embedding at deposit. Bunyan embeds at its own
+#         extraction boundary in _on_river_events(PyExperienceEntry handler).
+#   How:  _deposit_experience_to_river(_ingest_text) after _deposit_topology_to_river.
 # [2026-04-29] Claude (Sonnet 4.6) — #225 fix pt2: BTF path+format
 #   What: _deposit_topology_to_river wrote JSONL to inverted path tracts/{peer}/neurograph.tract.
 #         JSONL has no place in BTF tracts. Path was backwards.
@@ -619,6 +627,27 @@ def _deposit_topology_to_river(step_result) -> None:
         )
     except Exception as exc:
         logger.debug("_deposit_topology_to_river failed (non-fatal): %s", exc)
+
+
+def _deposit_experience_to_river(text: "Optional[str]") -> None:
+    """Deposit raw conversation text to every registered module's inbound tract.
+
+    Law 7: raw unclassified experience. Text enters as-is — no embedding,
+    no classification. Each module embeds at its own extraction boundary.
+    deposit_experience() takes a single path; loop over registered peers.
+    """
+    if _ng_tract_bridge is None or not text or not text.strip():
+        return
+    try:
+        import ng_tract as _ngt
+        peers = _ng_tract_bridge._get_registered_peers()
+        if not peers:
+            return
+        for peer_id in peers:
+            tract_path = str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
+            _ngt.deposit_experience(text, "neurograph", tract_path)
+    except Exception as exc:
+        logger.debug("_deposit_experience_to_river failed (non-fatal): %s", exc)
 
 
 def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str]) -> None:
@@ -1277,6 +1306,7 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # unclassified (Law 7). Each module's bucket extracts what it needs.
     _deposit_substrate_metrics(step_result)
     _deposit_topology_to_river(step_result)
+    _deposit_experience_to_river(_ingest_text)
 
     # Punchlist #56: Deposit raw surfacing outcome experience.
     # The triad: what was surfaced (cached from assemble) + user input
