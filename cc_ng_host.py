@@ -82,6 +82,9 @@ were confirmed before this module was enabled.
 # What: engine.status() → engine.status (no parens) — TonicEngine.status is @property
 # Why: TypeError: 'dict' object is not callable on every status request
 # How: Remove () from line 228 call in _handle_status()
+# [2026-04-29] Claude (Sonnet 4.6) — Update stale comment: body-sharing wired (#159)
+#   What: Lines 128-129 and 168 said "body-sharing is follow-up". Now wired.
+#   Why:  Registration moved to Elmer elmer_hook.py _delayed_brain_load() — correct timing.
 # [2026-04-16] Claude (Opus 4.6) — Initial Path B implementation
 # What: CC NG hosted inside neurograph_rpc.py process; Unix socket for hooks
 # Why: Subprocess-per-hook architecture dead (earlier phases), Path B gives
@@ -125,8 +128,8 @@ REWARD_CRASH = -0.5
 # peer_bridge disabled: CC is not a peer module (would collide with Syl's
 # module_id="neurograph" in the tract directory).
 # ces disabled: CC doesn't need real-time attention stream.
-# tonic enabled (own Qwen for now, body-sharing with Syl via BrainSwitcher
-# is a follow-up that requires multi-tonic-engine support in BrainSwitcher).
+# tonic enabled (own Qwen loaded at init; BrainSwitcher hot-swaps to shared
+# ProtoUniBrain body 60s post-startup via Elmer's _delayed_brain_load (#159)).
 _CC_SNN_CONFIG = {
     "learning_rate": 0.03,
     "tau_plus": 10.0,
@@ -165,7 +168,7 @@ _CC_SNN_CONFIG = {
     "he_experience_threshold": 100,
     "peer_bridge": {"enabled": False},  # CC is not a peer module
     "ces": {"enabled": False},          # No real-time attention stream needed
-    "tonic": {"enabled": True},         # Own Qwen body; body-sharing is follow-up
+    "tonic": {"enabled": True},         # Own Qwen initially; body shared 60s post-startup
 }
 
 

@@ -20,16 +20,18 @@ to an existing NeuroGraphMemory call.
 #         Law 7: text enters as-is, no embedding at deposit. Bunyan embeds at its own
 #         extraction boundary in _on_river_events(PyExperienceEntry handler).
 #   How:  _deposit_experience_to_river(_ingest_text) after _deposit_topology_to_river.
+# [2026-04-29] Claude (Sonnet 4.6) — Remove dead CC Tonic bootstrap registration (#159)
+#   What: Removed the inner try block in handle_bootstrap() that attempted to register
+#         CC's Tonic with BrainSwitcher. Replaced with comment pointing to correct location.
+#   Why:  At bootstrap, _memory._modules is empty — registration was always a no-op.
+#         Correct location: Elmer's _delayed_brain_load() (elmer_hook.py), which fires
+#         60s post-startup after BrainSwitcher has loaded brains.
+#   How:  Deleted the try block; added a 3-line comment for future reference.
 # [2026-04-29] Claude (Sonnet 4.6) — #225 fix pt2: BTF path+format
 #   What: _deposit_topology_to_river wrote JSONL to inverted path tracts/{peer}/neurograph.tract.
 #         JSONL has no place in BTF tracts. Path was backwards.
 #   Why:  Should write to tracts/neurograph/{peer}.tract (what peers drain).
 #   How:  ng_tract.deposit_topology(step_result, graph, vector_db, tract_paths). 60→8 lines.
-# [2026-04-29] Claude (Sonnet 4.6) — #225 fix pt2: BTF path+format
-#   What: _deposit_topology_to_river wrote JSONL to inverted path tracts/{peer}/neurograph.tract.
-#         JSONL has no place in BTF tracts. Path was backwards.
-#   Why:  Should write to tracts/neurograph/{peer}.tract (what peers drain).
-#   How:  ng_tract.deposit_topology(step_result, graph, vector_db, tract_paths). 60->8 lines.
 # [2026-04-28] Claude (Sonnet 4.6) — #225 River fix: initialize outbound tract bridge, deposit topology
 #   What: Added _ng_tract_bridge (NGTractBridge module_id="neurograph") initialized in
 #         handle_bootstrap(). Added _deposit_topology_to_river(step_result) called each
@@ -948,23 +950,9 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     try:
         import cc_ng_host
         cc_ng_host.init_cc_host()
-        # Register CC's Tonic with BrainSwitcher for ProtoUniBrain body sharing (#159).
-        # cc_ng_host is in-process — no IPC needed. BrainSwitcher passes _body_lock
-        # (threading) + flock file path to CC's TonicEngine via register_tonic_engine().
-        try:
-            _cc_state = getattr(cc_ng_host, '_STATE', None)
-            _cc_ng = getattr(_cc_state, 'cc_ng', None) if _cc_state else None
-            _cc_tt = getattr(_cc_ng, '_tonic_thread', None) if _cc_ng else None
-            _cc_engine = getattr(_cc_tt, '_latent_engine', None) if _cc_tt else None
-            if _cc_engine is not None:
-                for _mod in (getattr(_memory, '_modules', {}) or {}).values():
-                    _switcher = getattr(_mod, '_brain_switcher', None)
-                    if _switcher is not None:
-                        _switcher.register_tonic_engine(_cc_engine)
-                        logger.info("CC Tonic registered with BrainSwitcher for body sharing")
-                        break
-        except Exception as _bse:
-            logger.debug("CC Tonic BrainSwitcher registration failed (non-fatal): %s", _bse)
+        # CC Tonic body-sharing is handled in Elmer's _delayed_brain_load() (#159).
+        # At bootstrap _modules is empty — registering here was always a no-op.
+        # Elmer fires 60s post-startup, after BrainSwitcher loads brains — correct timing.
     except Exception as exc:
         logger.warning("CC NG host init failed (Syl unaffected): %s", exc)
 
