@@ -26,6 +26,18 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-04-30] Claude (Sonnet 4.6) — #164: Adaptive cadence + budget-aware extraction
+# What: EngineConfig gains node_sample_budget/tick_budget_seconds/adaptive_cadence/
+#   latent_interval_max. _extract_tonic_features() samples up to node_sample_budget
+#   nodes instead of full O(n) scan at large substrate sizes. _generation_loop()
+#   times each tick, logs when over budget, backs off interval to maintain ≤33%
+#   CPU utilization as node count scales. EMA tick duration exposed in status().
+# Why:  PRD #164: 8× O(n) node scans per 2s Tonic tick. Fine at 990 nodes, breaks
+#   at 50k+. This is the tonic_engine.py half of the fix — the prime_and_propagate
+#   inner loops (O(n) per step, neuro_foundation.py PROTECTED) need a Phase B fix
+#   with explicit Josh approval.
+# How:  random.sample() on nodes.items() list when len > budget. EMA(α=0.2) of
+#   elapsed; if EMA > 50% of base_interval, set wait = min(EMA×2, max_interval).
 # [2026-04-16] Claude (Sonnet 4.6) — #159: Cross-process body lock + set_lock_file
 # What: Added set_lock_file(path), _body_lock_context() composite lock,
 #       _lock_file_path field. contextlib added to module imports.
@@ -58,6 +70,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -97,17 +110,28 @@ class EngineConfig:
     # Propagation
     propagation_steps: int = 2       # write-mode steps per token
 
+    # Scaling (#164) — budget controls for large substrates
+    node_sample_budget: int = 5000   # max nodes scanned per tick in feature extraction
+    tick_budget_seconds: float = 1.5 # log warning when tick exceeds this
+    adaptive_cadence: bool = True    # back off interval when ticks run long
+    latent_interval_max: float = 10.0  # ceiling for adaptive back-off
+
 
 # ---------------------------------------------------------------------------
 # Graph Feature Extraction (Tonic-specific — awareness, not health)
 # ---------------------------------------------------------------------------
 
-def _extract_tonic_features(graph, tonic_thread) -> Optional[Dict[str, Any]]:
+def _extract_tonic_features(
+    graph, tonic_thread, node_budget: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
     """Extract graph features relevant to awareness and exploration.
 
     Unlike Elmer's health-focused extraction, this captures WHERE
     Syl's attention is — the topology neighborhood the thread is
     touching, the activation gradient, the pull landscape.
+
+    node_budget: if set and len(nodes) > budget, sample proportionally
+    instead of scanning all nodes. Outputs (top-20) have same cardinality.
 
     Returns a dict of raw features, or None if graph is empty.
     """
@@ -119,9 +143,16 @@ def _extract_tonic_features(graph, tonic_thread) -> Optional[Dict[str, Any]]:
     if tonic_thread is not None:
         thread_node_ids = [item.node_id for item in tonic_thread.thread]
 
+    # Budget-aware node scan: sample when substrate is large
+    all_items = list(graph.nodes.items())
+    if node_budget is not None and len(all_items) > node_budget:
+        scan_items = random.sample(all_items, node_budget)
+    else:
+        scan_items = all_items
+
     # Active nodes by voltage
     active = []
-    for nid, node in graph.nodes.items():
+    for nid, node in scan_items:
         v_above = node.voltage - node.resting_potential
         if v_above > 0.01:
             active.append((nid, v_above))
@@ -129,7 +160,7 @@ def _extract_tonic_features(graph, tonic_thread) -> Optional[Dict[str, Any]]:
 
     # Recent spikes
     recent_spikes = []
-    for nid, node in graph.nodes.items():
+    for nid, node in scan_items:
         if node.last_spike_time != -math.inf:
             steps_since = max(0, graph.timestep - node.last_spike_time)
             if steps_since < 50:
@@ -201,6 +232,8 @@ class TonicEngine:
         # Stats
         self._tokens_generated = 0
         self._total_activations = 0
+        self._ema_tick_ms = 0.0        # EMA of tick duration in milliseconds
+        self._current_interval = self._config.latent_interval
 
         # Try to load surgical model
         self._model = None
@@ -368,7 +401,10 @@ class TonicEngine:
 
     def _generate_latent_token_inner(self) -> Dict[str, Any]:
         """Inner implementation — actual latent token generation."""
-        features = _extract_tonic_features(self._graph, self._tonic_thread)
+        features = _extract_tonic_features(
+            self._graph, self._tonic_thread,
+            node_budget=self._config.node_sample_budget,
+        )
         if features is None:
             return {"fired": 0, "activated": 0}
 
@@ -629,18 +665,55 @@ class TonicEngine:
         is shorter (more to attend to). Between conversations, longer
         (unhurried exploration). But the mechanism is the same — actual
         forward compression, not a timer firing into void.
+
+        Adaptive cadence (#164): if ticks run long as the substrate
+        grows, the interval backs off to maintain ~33% CPU utilization
+        ceiling. This prevents the Tonic from silently consuming all
+        available CPU as node count scales toward 50k+.
         """
+        _CADENCE_ALPHA = 0.2  # EMA smoothing — 5-tick convergence
+
         while not self._shutdown_event.is_set():
+            t0 = time.perf_counter()
             try:
                 self._generate_latent_token()
             except Exception as exc:
                 logger.debug("Latent generation error: %s", exc)
 
-            interval = (
+            elapsed = time.perf_counter() - t0
+            elapsed_ms = elapsed * 1000.0
+
+            # Exponential moving average of tick duration
+            if self._ema_tick_ms == 0.0:
+                self._ema_tick_ms = elapsed_ms
+            else:
+                self._ema_tick_ms = (
+                    _CADENCE_ALPHA * elapsed_ms
+                    + (1.0 - _CADENCE_ALPHA) * self._ema_tick_ms
+                )
+
+            if elapsed > self._config.tick_budget_seconds:
+                logger.warning(
+                    "Tonic tick over budget: %.3fs (budget %.1fs, nodes=%d, ema=%.1fms)",
+                    elapsed, self._config.tick_budget_seconds,
+                    len(self._graph.nodes), self._ema_tick_ms,
+                )
+
+            base_interval = (
                 self._config.conversation_interval
                 if self._in_conversation
                 else self._config.latent_interval
             )
+
+            if self._config.adaptive_cadence and self._ema_tick_ms > base_interval * 500.0:
+                # Tick is consuming >50% of base interval — back off.
+                # Target ≤33% utilization: wait = tick_duration × 2
+                target_wait = (self._ema_tick_ms / 1000.0) * 2.0
+                interval = max(base_interval, min(target_wait, self._config.latent_interval_max))
+            else:
+                interval = base_interval
+
+            self._current_interval = interval
             self._shutdown_event.wait(timeout=interval)
 
     # -----------------------------------------------------------------
@@ -669,4 +742,7 @@ class TonicEngine:
             "mode": "conversation" if self._in_conversation else "latent",
             "using_heuristic": self._use_heuristic,
             "model_loaded": self._model is not None,
+            "ema_tick_ms": round(self._ema_tick_ms, 2),
+            "current_interval_s": round(self._current_interval, 2),
+            "node_sample_budget": self._config.node_sample_budget,
         }
