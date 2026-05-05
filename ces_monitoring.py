@@ -18,6 +18,18 @@ Usage::
     monitor.stop()
 
 # ---- Changelog ----
+# [2026-05-05] Claude (Sonnet 4.6) — #237 Async stats cache for MonitoringDashboard
+# What: Added _StatsCache (write-behind cache, refreshed every health_interval by
+#       CESMonitor._health_check_tick). HTTP handlers in _DashboardHandler now serve
+#       from the cache instead of calling ng_memory.stats() on each request.
+# Why:  _health_data() called ng_memory.stats() synchronously on every /health request.
+#       During Tonic ticks the HTTP handler thread blocked (step_lock contention or GIL
+#       saturation from the Qwen forward pass). Gateway watchdog got BrokenPipeErrors
+#       every 30-60s, generated 15-line tracebacks, kept Node.js event loop at ~80% CPU.
+#       Fix: HTTP handlers never block — they serve the last-known snapshot immediately.
+# How:  _StatsCache thread-safe wrapper around a dict + timestamp. CESMonitor.get_health()
+#       feeds it. MonitoringDashboard receives it at init. _DashboardHandler class attrs
+#       updated; _health_data() and _stats_data() serve cache with cache_age_seconds field.
 # [2026-02-22] Claude (Opus 4.6) — Initial implementation.
 #   What: CESMonitor with health_context, CESLogger with rotating file
 #         handler, MonitoringDashboard HTTP server on port 8847.
@@ -40,6 +52,34 @@ from typing import Any, Dict, Optional
 from ces_config import CESConfig
 
 logger = logging.getLogger("neurograph.ces.monitoring")
+
+
+# ── Stats cache (write-behind, feeds HTTP handlers) ───────────────────
+
+
+class _StatsCache:
+    """Thread-safe write-behind cache for ng_memory.stats() snapshots.
+
+    Refreshed by CESMonitor._health_check_tick every health_interval seconds.
+    HTTP handlers serve from this cache instantly without blocking on the GIL
+    or step_lock during Tonic ticks.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: Dict[str, Any] = {}
+        self._updated_at: float = 0.0
+
+    def set(self, stats: Dict[str, Any]) -> None:
+        with self._lock:
+            self._data = dict(stats)
+            self._updated_at = time.time()
+
+    def get(self) -> tuple:
+        """Return (stats_dict, age_seconds). age is -1 if never populated."""
+        with self._lock:
+            age = (time.time() - self._updated_at) if self._updated_at else -1.0
+            return dict(self._data), age
 
 
 # ── Health context (Layer 1) ───────────────────────────────────────────
@@ -137,6 +177,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     # Set by MonitoringDashboard before server starts
     ng_memory: Any = None
     ces_monitor: Any = None
+    stats_cache: Optional["_StatsCache"] = None
 
     def do_GET(self) -> None:
         """Handle GET requests."""
@@ -150,20 +191,26 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
 
     def _health_data(self) -> Dict[str, Any]:
-        """Minimal health check response."""
-        return {
-            "status": "ok",
-            "timestamp": time.time(),
-            "context": health_context(self.ng_memory) if self.ng_memory else "unavailable",
-        }
+        """Minimal health check — served from cache, never blocks."""
+        result: Dict[str, Any] = {"status": "ok", "timestamp": time.time()}
+        if self.stats_cache is not None:
+            cached, age = self.stats_cache.get()
+            result["cache_age_seconds"] = round(age, 1)
+            if cached:
+                result["nodes"] = cached.get("nodes", 0)
+                result["synapses"] = cached.get("synapses", 0)
+            else:
+                result["status"] = "initializing"
+        return result
 
     def _stats_data(self) -> Dict[str, Any]:
-        """Full telemetry response."""
-        if self.ng_memory is not None:
-            try:
-                return self.ng_memory.stats()
-            except Exception as exc:
-                return {"error": str(exc)}
+        """Full telemetry — served from cache, never blocks."""
+        if self.stats_cache is not None:
+            cached, age = self.stats_cache.get()
+            if cached:
+                cached["cache_age_seconds"] = round(age, 1)
+                return cached
+            return {"status": "initializing", "cache_age_seconds": -1}
         return {"error": "not initialized"}
 
     def _surfaced_data(self) -> Dict[str, Any]:
@@ -204,6 +251,7 @@ class MonitoringDashboard:
         ces_config: CESConfig,
         ng_memory: Any = None,
         ces_monitor: Any = None,
+        stats_cache: Optional[_StatsCache] = None,
     ) -> None:
         self._cfg = ces_config.monitoring
         self._server: Optional[HTTPServer] = None
@@ -212,6 +260,7 @@ class MonitoringDashboard:
         # Share refs with the handler class
         _DashboardHandler.ng_memory = ng_memory
         _DashboardHandler.ces_monitor = ces_monitor
+        _DashboardHandler.stats_cache = stats_cache
 
     def start(self) -> None:
         """Start the HTTP server in a daemon thread."""
@@ -265,8 +314,10 @@ class CESMonitor:
         self._ng_memory = ng_memory
         self._cfg = ces_config
         self._ces_logger = CESLogger(ces_config)
+        self._stats_cache = _StatsCache()
         self._dashboard = MonitoringDashboard(
-            ces_config, ng_memory=ng_memory, ces_monitor=self
+            ces_config, ng_memory=ng_memory, ces_monitor=self,
+            stats_cache=self._stats_cache,
         )
 
         # Access to surfacing monitor (set by openclaw_hook after init)
@@ -288,7 +339,7 @@ class CESMonitor:
             self._health_timer = None
 
     def get_health(self) -> Dict[str, Any]:
-        """Return comprehensive health status."""
+        """Return comprehensive health status and refresh the stats cache."""
         result: Dict[str, Any] = {
             "timestamp": time.time(),
             "dashboard_running": self._dashboard.is_running,
@@ -297,6 +348,7 @@ class CESMonitor:
 
         try:
             stats = self._ng_memory.stats()
+            self._stats_cache.set(stats)
             result["nodes"] = stats.get("nodes", 0)
             result["synapses"] = stats.get("synapses", 0)
             result["prediction_accuracy"] = stats.get("prediction_accuracy", 0)
