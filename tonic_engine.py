@@ -26,6 +26,16 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-05-05] Claude (Sonnet 4.6) — #237 Raise tick_budget_seconds default; add env-var override
+# What: tick_budget_seconds default 1.5 → 30.0; EngineConfig.__post_init__ reads
+#       NEUROGRAPH_TONIC_BUDGET_SECONDS env var so it can be tuned without code changes.
+#       import os added.
+# Why:  1.5s was a GPU target. On AMD EPYC CPU-only VPS the tick takes 153s (pre-orphan-fix)
+#       or ~5-30s (post-fix). With default=1.5 the WARNING logged on every tick, generating
+#       log volume that kept Node.js gateway event loop at elevated CPU. 30s is a reasonable
+#       CPU-appropriate threshold that won't fire at all once node count normalises post-fix.
+# How:  __post_init__ reads and validates the env var; falls back to 30.0 silently on
+#       ValueError so a misconfigured value doesn't crash the engine on start.
 # [2026-04-30] Claude (Sonnet 4.6) — #164: Adaptive cadence + budget-aware extraction
 # What: EngineConfig gains node_sample_budget/tick_budget_seconds/adaptive_cadence/
 #   latent_interval_max. _extract_tonic_features() samples up to node_sample_budget
@@ -70,6 +80,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -112,9 +123,17 @@ class EngineConfig:
 
     # Scaling (#164) — budget controls for large substrates
     node_sample_budget: int = 5000   # max nodes scanned per tick in feature extraction
-    tick_budget_seconds: float = 1.5 # log warning when tick exceeds this
+    tick_budget_seconds: float = 30.0  # log warning when tick exceeds this; overridden by NEUROGRAPH_TONIC_BUDGET_SECONDS
     adaptive_cadence: bool = True    # back off interval when ticks run long
     latent_interval_max: float = 10.0  # ceiling for adaptive back-off
+
+    def __post_init__(self) -> None:
+        env = os.environ.get("NEUROGRAPH_TONIC_BUDGET_SECONDS")
+        if env:
+            try:
+                self.tick_budget_seconds = float(env)
+            except ValueError:
+                pass
 
 
 # ---------------------------------------------------------------------------
