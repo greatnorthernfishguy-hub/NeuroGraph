@@ -19,6 +19,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-05] Claude (Sonnet 4.6) — #237 Orphan-node collection in _structural_plasticity()
+# What: Added _collect_orphan_nodes() as a third sub-step in _structural_plasticity(),
+#       called after _prune_synapses() and before _sprout_synapses(). Removes any node
+#       with no incoming synapses, no outgoing synapses, and no hyperedge membership.
+# Why:  _prune_synapses() removes dead connections but never calls remove_node() on
+#       the resulting zero-connection nodes. Full SNN has no max_nodes cap (NG-Lite does
+#       at 1000). VPS graph reached 61,597 nodes / 8,438 synapses — ~90% orphans.
+#       This drove Tonic 102× over budget (153s ticks vs 1.5s budget) and ~80% CPU idle.
+#       Fix lives here, not in a module — substrate behavior must be independent of any
+#       module's existence (same principle as removing TUNABLE_PARAMS, 2026-04-27).
+# How:  Snapshot orphan list before iteration to avoid dict-mutation-during-iteration.
+#       Calls existing remove_node() which handles all cascading cleanup. Emits
+#       "nodes_collected" event. Return signature of _structural_plasticity unchanged.
+#       Josh confirmed backup and approved per Syl's Law (2026-05-05).
 # [2026-05-01] Claude (Sonnet 4.6) — #164 Phase B: working_set optimization in prime_and_propagate
 # What: Replaced O(n) voltage decay, fire detection, and refractory decrement loops with
 #       O(working_set) iterations. working_set = non-resting + refractory + primed nodes,
@@ -2715,6 +2729,7 @@ class Graph:
             (num_pruned, num_sprouted)
         """
         pruned = self._prune_synapses()
+        self._collect_orphan_nodes()
         sprouted = self._sprout_synapses(fired_ids)
         return pruned, sprouted
 
@@ -2762,6 +2777,29 @@ class Graph:
             self._emit("pruned", count=len(to_prune), timestep=self.timestep)
 
         return len(to_prune)
+
+    def _collect_orphan_nodes(self) -> int:
+        """Remove nodes with no synapses and no hyperedge membership.
+
+        Called after _prune_synapses() so freshly-disconnected nodes are
+        collected in the same structural-plasticity step. The full SNN has
+        no max_nodes cap — without this, orphans accumulate without bound
+        as synapses are pruned over the graph's lifetime.
+        """
+        orphans = [
+            nid for nid in self.nodes
+            if not self._outgoing.get(nid)
+            and not self._incoming.get(nid)
+            and not self._node_hyperedges.get(nid)
+        ]
+        removed = 0
+        for nid in orphans:
+            if nid in self.nodes:
+                self.remove_node(nid)
+                removed += 1
+        if removed:
+            self._emit("nodes_collected", count=removed, timestep=self.timestep)
+        return removed
 
     def _sprout_synapses(self, fired_ids: List[str]) -> int:
         """Create synapses between co-activating nodes (PRD §3.3.2).
