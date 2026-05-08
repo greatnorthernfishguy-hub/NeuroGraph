@@ -51,6 +51,12 @@ to an existing NeuroGraphMemory call.
 #         NeuroGraph tunes NeuroGraph's param; Elmer observes only via River).
 #   How:  Three edits: globals block, _tune_he_overlap_threshold() before _deposit_substrate_metrics,
 #         discover_hyperedges try block updated to accumulate + trigger every _HE_TUNE_WINDOW turns.
+# [2026-05-08] Claude (Sonnet 4.6) — Raise lazy expansion batch size 5→50
+#   What: _LAZY_EXPANSION_BODIES_PER_TICK increased from 5 to 50.
+#   Why:  30,706 body files accumulated in ~/.et_modules/experience/bodies/ — TID's
+#         deposition rate (~200/hr) outpaced the 5/tick design (150/hr processed).
+#         At 50/tick the backlog clears in ~24h; sustainable thereafter.
+#   How:  Single constant change. No behavior change to expansion logic itself.
 # [2026-04-26] Claude Code (Sonnet 4.6) — Lazy expansion pulse, Stage 3 of wire absorption (#151)
 #   What: Added _lazy_expansion_pulse_loop(), _start_lazy_expansion_pulse(), and
 #         _LAZY_EXPANSION_* constants. Wired start into handle_bootstrap() after
@@ -1444,7 +1450,7 @@ _trisyn_manager: Optional[Any] = None  # trisynaptic.manager.TrisynapticManager
 # Runs every 120s. Reads unexpanded body files, chunks them, embeds, creates
 # substrate nodes linked to parent event node, deletes file. Fixes #151.
 _LAZY_EXPANSION_INTERVAL_SECONDS = 120.0
-_LAZY_EXPANSION_BODIES_PER_TICK = 5
+_LAZY_EXPANSION_BODIES_PER_TICK = 50
 _lazy_expansion_thread: Optional[threading.Thread] = None
 _lazy_expansion_shutdown = threading.Event()
 
