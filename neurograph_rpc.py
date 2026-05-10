@@ -658,6 +658,85 @@ def _deposit_experience_to_river(text: "Optional[str]") -> None:
         logger.debug("_deposit_experience_to_river failed (non-fatal): %s", exc)
 
 
+def deposit_outbound_intent(text: str, channel_id: str = "cli") -> None:
+    """Deposit raw text to Animus's outbound tract as a BTF frame.
+
+    Law 7: raw experience in. The text is deposited as-is — no classification,
+    no intent labeling beyond the structural BTF metadata required for the reader.
+    Being in the outbound tract IS the signal; the Animus Outbound Initiator
+    reads this tract and processes all frames as outbound turns.
+
+    The outbound tract path is read from ANIMUS_OUTBOUND_TRACT env var.
+    Law 5: no hardcoded paths.
+
+    # ---- Changelog ----
+    # [2026-05-10] Claude (Sonnet 4.6) — deposit_outbound_intent (Animus BTF tract writer)
+    #   What: Writes a native BTF frame to Animus's outbound tract file.
+    #         24-byte envelope: MAGIC=0x4254, VERSION=1, entry_type=1,
+    #         total_length (LE u32), timestamp (LE f64), CRC32 of payload (LE u32),
+    #         endian_flag=0x01, 3-byte padding. Payload: 4-byte LE u32 meta_len +
+    #         msgpack-encoded metadata dict with module_id, event_type, payload{text, channel_id}.
+    #   Why:  Animus Outbound Initiator reads BTF natively (tract_writer.rs format).
+    #         Both sides must speak the same wire format. No intermediate JSONL.
+    #   How:  struct + zlib.crc32 + msgpack. Path from ANIMUS_OUTBOUND_TRACT env var
+    #         with fallback to ~/.et_modules/shared_learning/animus_outbound.tract.
+    # -------------------
+    """
+    import struct
+    import time
+    import zlib
+    import os
+
+    try:
+        import msgpack
+    except ImportError:
+        logger.warning("deposit_outbound_intent: msgpack not installed — skipping")
+        return
+
+    outbound_tract = os.environ.get("ANIMUS_OUTBOUND_TRACT")
+    if not outbound_tract:
+        home = os.environ.get("HOME", "")
+        if not home:
+            logger.warning(
+                "deposit_outbound_intent: HOME and ANIMUS_OUTBOUND_TRACT both unset — skipping"
+            )
+            return
+        outbound_tract = os.path.join(
+            home, ".et_modules", "shared_learning", "animus_outbound.tract"
+        )
+
+    metadata = {
+        "module_id": "neurograph",
+        "event_type": "outbound_intent",
+        "payload": {"text": text, "channel_id": channel_id},
+    }
+    msgpack_bytes = msgpack.packb(metadata, use_bin_type=True)
+    meta_len = struct.pack("<I", len(msgpack_bytes))  # 4-byte LE u32
+    payload_bytes = meta_len + msgpack_bytes
+
+    MAGIC = struct.pack("<H", 0x4254)       # 2 bytes, LE (native on Linux x86)
+    VERSION = struct.pack("B", 1)           # 1 byte
+    ENTRY_OUTCOME = struct.pack("B", 1)     # 1 byte
+    total_length = struct.pack("<I", 24 + len(payload_bytes))   # 4 bytes
+    timestamp = struct.pack("<d", time.time())                   # 8 bytes
+    crc32_val = struct.pack("<I", zlib.crc32(payload_bytes) & 0xFFFFFFFF)  # 4 bytes
+    endian_flag = struct.pack("B", 0x01)    # 1 byte (LE)
+    padding = b"\x00\x00\x00"              # 3 bytes
+
+    envelope = (
+        MAGIC + VERSION + ENTRY_OUTCOME + total_length
+        + timestamp + crc32_val + endian_flag + padding
+    )
+    assert len(envelope) == 24
+
+    try:
+        with open(outbound_tract, "ab") as f:
+            f.write(envelope)
+            f.write(payload_bytes)
+    except OSError as exc:
+        logger.warning("deposit_outbound_intent: write failed: %s", exc)
+
+
 def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str]) -> None:
     """Deposit raw surfacing outcome experience to the substrate (Punchlist #56).
 
