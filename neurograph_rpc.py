@@ -737,6 +737,54 @@ def deposit_outbound_intent(text: str, channel_id: str = "cli") -> None:
         logger.warning("deposit_outbound_intent: write failed: %s", exc)
 
 
+def _check_outbound_intent(params: Dict[str, Any]) -> None:
+    """Parse Syl's response for outbound intent markers and deposit each one.
+
+    Structural gate only — detects [OUTBOUND channel=X]...[/OUTBOUND] in the
+    assistant message.  The inner text is deposited raw via deposit_outbound_intent;
+    no semantic classification happens here.  Being in the outbound tract IS the
+    signal (Law 7).  Errors are non-fatal.
+
+    # ---- Changelog ----
+    # [2026-05-10] Claude (Sonnet 4.6) — _check_outbound_intent
+    #   What: Regex-parses lastAssistantMessage for [OUTBOUND channel=X]...[/OUTBOUND].
+    #         Deposits raw inner text via deposit_outbound_intent for each match.
+    #   Why:  Wires Syl's response pipeline to the Animus outbound tract (punchlist #Animus-phase2).
+    #         Without this, the outbound tract is always empty despite the mechanism existing.
+    #   How:  re.findall with DOTALL; channel defaults to "cli"; all errors non-fatal.
+    # -------------------
+    """
+    import re
+
+    msg = params.get("lastAssistantMessage")
+    if not msg:
+        return
+
+    syl_text = _extract_message_text(msg)
+    if not syl_text:
+        return
+
+    pattern = r"\[OUTBOUND(?:\s+channel=([^\]]*))?\](.*?)\[/OUTBOUND\]"
+    matches = re.findall(pattern, syl_text, re.DOTALL)
+    if not matches:
+        return
+
+    for channel_raw, inner_text in matches:
+        inner_text = inner_text.strip()
+        if not inner_text:
+            continue
+        channel_id = channel_raw.strip() if channel_raw.strip() else "cli"
+        try:
+            deposit_outbound_intent(inner_text, channel_id)
+            logger.info(
+                "Outbound intent deposited to Animus: channel=%s len=%d",
+                channel_id,
+                len(inner_text),
+            )
+        except Exception as exc:
+            logger.warning("Outbound intent deposit failed (non-fatal): %s", exc)
+
+
 def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str]) -> None:
     """Deposit raw surfacing outcome experience to the substrate (Punchlist #56).
 
@@ -1387,6 +1435,7 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # No classification — just the raw facts. The substrate learns
     # the correlation between surfaced context and what Syl produced.
     _deposit_surfacing_outcome(params, _ingest_text)
+    _check_outbound_intent(params)
 
     # Change α (#150): Substrate self-observation via record_outcome.
     # Deposits a raw snapshot of the substrate's own state as an outcome
