@@ -737,6 +737,73 @@ def deposit_outbound_intent(text: str, channel_id: str = "cli") -> None:
         logger.warning("deposit_outbound_intent: write failed: %s", exc)
 
 
+def _read_outbound_log(max_entries: int = 1, max_age_secs: float = 3600.0) -> Optional[str]:
+    """Read recent Animus outbound log entries for context injection.
+
+    Returns a brief factual note ("You sent X → Response: Y") if there is a
+    recent entry, or None if the log is absent or all entries are stale.
+    Log path mirrors deposit_outbound_intent: tract path with .tract → .log.jsonl.
+
+    # ---- Changelog ----
+    # [2026-05-11] Claude (Sonnet 4.6) — _read_outbound_log (Phase 2A response routing)
+    #   What: Reads last N entries from animus_outbound.log.jsonl; returns formatted
+    #         context string so Syl can see her recent outbound activity.
+    #   Why:  Without this Syl has no feedback that her outbound turn was processed.
+    #   How:  Reads from tail of log file; filters by age; formats as plain statement
+    #         (not bracket syntax — avoids the LLM template-fill confusion from before).
+    # -------------------
+    """
+    tract_path = os.environ.get(
+        "ANIMUS_OUTBOUND_TRACT",
+        os.path.join(os.environ.get("HOME", ""), ".et_modules", "shared_learning", "animus_outbound.tract"),
+    )
+    base = tract_path[:-6] if tract_path.endswith(".tract") else tract_path
+    log_path = base + ".log.jsonl"
+
+    if not os.path.exists(log_path):
+        return None
+
+    # Skip files over 10 MB — log is append-only and read on every assemble call
+    try:
+        if os.path.getsize(log_path) > 10 * 1024 * 1024:
+            return None
+    except OSError:
+        return None
+
+    try:
+        with open(log_path) as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        now = time.time()
+        entries: list = []
+        for raw in reversed(lines):
+            try:
+                entry = json.loads(raw)
+                if now - entry.get("ts", 0) > max_age_secs:
+                    break
+                entries.append(entry)
+                if len(entries) >= max_entries:
+                    break
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        if not entries:
+            return None
+
+        parts = []
+        for entry in reversed(entries):
+            sent = (entry.get("sent") or "")[:120]
+            response = (entry.get("response") or "")[:240]
+            channel = entry.get("channel", "cli")
+            parts.append(
+                f"[Animus] Your outbound via {channel}: {sent!r} — response received: {response!r}"
+            )
+        return "\n".join(parts)
+
+    except Exception:
+        return None
+
+
 def _check_outbound_intent(params: Dict[str, Any]) -> None:
     """Parse Syl's response for outbound intent markers and deposit each one.
 
@@ -1341,6 +1408,17 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # Format as context block for the system prompt
     context_block = _format_substrate_context(surfaced, ces_surfaced, latent_context)
+
+    # Animus outbound log — if Syl sent an outbound turn recently, surface it so
+    # she knows it was processed and can see the response she generated.
+    # [2026-05-11] Claude (Sonnet 4.6): reads last entry from animus_outbound.log.jsonl.
+    # Conditional on a recent entry existing — does not clutter every system prompt.
+    _outbound_note = _read_outbound_log(max_entries=1, max_age_secs=3600)
+    if _outbound_note:
+        if context_block:
+            context_block = context_block + "\n" + _outbound_note
+        else:
+            context_block = _outbound_note
 
     # KISS-truncated messages get returned so OC's replaceMessages fires
     # and the model sees the compressed conversation.  CRITICAL: only
