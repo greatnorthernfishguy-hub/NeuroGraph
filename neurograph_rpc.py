@@ -1342,19 +1342,6 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # Format as context block for the system prompt
     context_block = _format_substrate_context(surfaced, ces_surfaced, latent_context)
 
-    # Animus outbound capability — tell Syl the mechanism exists every turn.
-    # [2026-05-10] Claude (Sonnet 4.6): injected alongside substrate context so
-    # Syl knows she can originate turns without waiting for an inbound message.
-    _OUTBOUND_NOTE = (
-        "\n[Animus] You can originate a turn without waiting for Josh. "
-        "Include [OUTBOUND channel=cli]your message[/OUTBOUND] anywhere in your "
-        "response and Animus will process it through the full pipeline on its next pulse."
-    )
-    if context_block:
-        context_block = context_block + _OUTBOUND_NOTE
-    else:
-        context_block = _OUTBOUND_NOTE.strip()
-
     # KISS-truncated messages get returned so OC's replaceMessages fires
     # and the model sees the compressed conversation.  CRITICAL: only
     # include the "messages" field when actual truncation occurred.
