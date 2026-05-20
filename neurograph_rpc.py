@@ -949,6 +949,66 @@ def _discord_alert(module_id: str, error_msg: str) -> None:
         logger.debug("Discord alert failed: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Tonic Bridge + Spec A shared file helpers
+# ---------------------------------------------------------------------------
+# ---- Changelog ----
+# [2026-05-15] Claude (Sonnet 4.6) — Spec B Task 1: shared file helpers
+# What: _wants_register_path, _budget_flag_path, _write_wants_register,
+#       _read_unacted_wants, _read_budget_flag — shared contract with Spec A (Rust).
+# Why:  TonicBridge (Spec B) and Animus reaction loop (Spec A) share these files.
+#       Paths are fixed HOME-based — not derived from tract name — so both sides
+#       always resolve to the same file regardless of env config.
+# How:  Pure file I/O, no subprocess, no substrate access.
+# -------------------
+
+def _wants_register_path() -> str:
+    """Fixed path to the wants register — used by both Rust (Spec A) and Python (Spec B)."""
+    home = os.environ.get("HOME", "")
+    return os.path.join(home, ".et_modules", "shared_learning", "animus_wants.jsonl")
+
+
+def _budget_flag_path() -> str:
+    """Fixed path to the inference budget flag file."""
+    home = os.environ.get("HOME", "")
+    return os.path.join(home, ".et_modules", "shared_learning", "inference_budget.json")
+
+
+def _write_wants_register(path: str, text: str, source: str) -> None:
+    """Append one entry to the wants register (append-only log)."""
+    entry = json.dumps({
+        "ts": time.time(),
+        "text": text,
+        "source": source,
+        "acted": False,
+    })
+    try:
+        with open(path, "a") as f:
+            f.write(entry + "\n")
+    except OSError as exc:
+        logger.debug("wants register write failed: %s", exc)
+
+
+def _read_unacted_wants(path: str, max_age_days: int = 7) -> list:
+    """Return unacted wants newer than max_age_days."""
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        with open(path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        return [e for e in lines if not e.get("acted") and e.get("ts", 0) > cutoff]
+    except Exception:
+        return []
+
+
+def _read_budget_flag(path: str) -> dict:
+    """Read inference_budget.json; returns {} on any error (safe default)."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 # ── RPC Dispatch ──────────────────────────────────────────────────────
 
 
