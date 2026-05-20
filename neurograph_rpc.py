@@ -992,12 +992,21 @@ def _write_wants_register(path: str, text: str, source: str) -> None:
 def _read_unacted_wants(path: str, max_age_days: int = 7) -> list:
     """Return unacted wants newer than max_age_days."""
     cutoff = time.time() - max_age_days * 86400
+    results = []
     try:
         with open(path) as f:
-            lines = [json.loads(line) for line in f if line.strip()]
-        return [e for e in lines if not e.get("acted") and e.get("ts", 0) > cutoff]
-    except Exception:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not e.get("acted") and e.get("ts", 0) > cutoff:
+                    results.append(e)
+    except OSError:
         return []
+    return results
 
 
 def _read_budget_flag(path: str) -> dict:

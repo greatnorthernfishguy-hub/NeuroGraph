@@ -51,6 +51,7 @@ class TestWantsRegisterHelpers(unittest.TestCase):
             self.assertFalse(first["acted"])
             second = json.loads(lines[1])
             self.assertEqual(second["source"], "tonic_emergent")
+            self.assertEqual(second["text"], "explore hyperedges")
 
     def test_read_unacted_wants_skips_acted(self):
         with tempfile.TemporaryDirectory() as d:
@@ -62,6 +63,7 @@ class TestWantsRegisterHelpers(unittest.TestCase):
             result = rpc._read_unacted_wants(path, max_age_days=7)
             self.assertEqual(len(result), 1)
             self.assertEqual(result[0]["text"], "pending")
+            self.assertAlmostEqual(result[0]["ts"], recent, delta=2.0)
 
     def test_read_unacted_wants_skips_stale(self):
         with tempfile.TemporaryDirectory() as d:
@@ -83,14 +85,16 @@ class TestWantsRegisterHelpers(unittest.TestCase):
     def test_read_budget_flag_parses_critical_true(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "budget.json")
-            open(path, "w").write(json.dumps({"critical": True, "low": True, "remaining_usd": 1.5}))
+            with open(path, "w") as f:
+                f.write(json.dumps({"critical": True, "low": True, "remaining_usd": 1.5}))
             result = rpc._read_budget_flag(path)
             self.assertTrue(result.get("critical"))
 
     def test_read_budget_flag_parses_critical_false(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "budget.json")
-            open(path, "w").write(json.dumps({"critical": False, "remaining_usd": 50.0}))
+            with open(path, "w") as f:
+                f.write(json.dumps({"critical": False, "remaining_usd": 50.0}))
             result = rpc._read_budget_flag(path)
             self.assertFalse(result.get("critical"))
 
