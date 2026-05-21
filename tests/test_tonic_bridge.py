@@ -99,5 +99,85 @@ class TestWantsRegisterHelpers(unittest.TestCase):
             self.assertFalse(result.get("critical"))
 
 
+class TestMarkerHandling(unittest.TestCase):
+
+    def test_strip_removes_outbound_marker(self):
+        text = "Here is [OUTBOUND channel=cli]some outbound text[/OUTBOUND] clean part"
+        result = rpc._strip_structural_markers(text)
+        self.assertNotIn("[OUTBOUND", result)
+        self.assertNotIn("[/OUTBOUND]", result)
+        self.assertIn("clean part", result)
+
+    def test_strip_removes_tool_marker(self):
+        text = "Before [TOOL name=web_search]query here[/TOOL] after"
+        result = rpc._strip_structural_markers(text)
+        self.assertNotIn("[TOOL", result)
+        self.assertIn("after", result)
+
+    def test_strip_removes_want_marker(self):
+        text = "I [WANT]learn about STDP[/WANT] today"
+        result = rpc._strip_structural_markers(text)
+        self.assertNotIn("[WANT]", result)
+        self.assertIn("today", result)
+
+    def test_strip_multiline(self):
+        text = "[OUTBOUND channel=discord]\nmultiline\ncontent\n[/OUTBOUND]\nafter"
+        result = rpc._strip_structural_markers(text)
+        self.assertNotIn("multiline", result)
+        self.assertIn("after", result)
+
+    def test_strip_plain_text_unchanged(self):
+        text = "No markers here, just plain text."
+        self.assertEqual(rpc._strip_structural_markers(text), text)
+
+    def test_check_wants_register_writes_want(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "wants.jsonl")
+            params = {
+                "source": "josh",
+                "lastAssistantMessage": "I think I [WANT]learn more about hyperedges[/WANT] soon.",
+            }
+            with patch.object(rpc, '_wants_register_path', return_value=path):
+                rpc._check_wants_register(params)
+            lines = open(path).readlines()
+            self.assertEqual(len(lines), 1)
+            entry = json.loads(lines[0])
+            self.assertEqual(entry["text"], "learn more about hyperedges")
+            self.assertEqual(entry["source"], "syl_explicit")
+
+    def test_check_wants_register_skips_autonomous_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "wants.jsonl")
+            for source in ("syl_outbound", "tonic_bridge"):
+                params = {
+                    "source": source,
+                    "lastAssistantMessage": "I [WANT]do something[/WANT]",
+                }
+                with patch.object(rpc, '_wants_register_path', return_value=path):
+                    rpc._check_wants_register(params)
+            # No entries written — autonomous sources handled by Animus
+            self.assertFalse(os.path.exists(path))
+
+    def test_check_wants_register_no_want_marker_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "wants.jsonl")
+            params = {"source": "josh", "lastAssistantMessage": "No markers here."}
+            with patch.object(rpc, '_wants_register_path', return_value=path):
+                rpc._check_wants_register(params)
+            self.assertFalse(os.path.exists(path))
+
+    def test_session_briefing_sent_once(self):
+        original = rpc._briefing_sent
+        try:
+            rpc._briefing_sent = False
+            first = rpc._animus_session_briefing()
+            second = rpc._animus_session_briefing()
+            self.assertIn("[Animus]", first)
+            self.assertIn("[OUTBOUND", first)
+            self.assertEqual(second, "")
+        finally:
+            rpc._briefing_sent = original
+
+
 if __name__ == "__main__":
     unittest.main()

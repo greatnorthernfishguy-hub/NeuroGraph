@@ -1018,6 +1018,63 @@ def _read_budget_flag(path: str) -> dict:
         return {}
 
 
+# ---- Changelog ----
+# [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 2: marker handling
+# What: _check_wants_register, _strip_structural_markers, _animus_session_briefing,
+#       _briefing_sent module-level flag.
+# Why:  Spec A (Animus) requires these Python-side companions.
+#       _strip_structural_markers prevents substrate-surfaced markers from
+#       re-injecting into Syl's context.
+# How:  re.sub for stripping; plain regex for [WANT] detection.
+# -------------------
+
+import re as _re
+
+_briefing_sent: bool = False
+
+
+def _strip_structural_markers(text: str) -> str:
+    """Remove [OUTBOUND], [TOOL], [WANT] markup from text."""
+    text = _re.sub(r'\[OUTBOUND(?:[^\]]*)?\].*?\[/OUTBOUND\]', '', text, flags=_re.DOTALL)
+    text = _re.sub(r'\[TOOL[^\]]*\].*?\[/TOOL\]', '', text, flags=_re.DOTALL)
+    text = _re.sub(r'\[WANT\].*?\[/WANT\]', '', text, flags=_re.DOTALL)
+    return text.strip()
+
+
+def _check_wants_register(params: Dict[str, Any]) -> None:
+    """Detect [WANT] markers in Syl's last response and write to wants register.
+
+    Skips if source is syl_outbound or tonic_bridge — Animus handles those
+    directly in the reaction loop (prevents double-write).
+    """
+    source = params.get("source", "")
+    if source in ("syl_outbound", "tonic_bridge"):
+        return
+    last_msg = params.get("lastAssistantMessage", "")
+    if not last_msg:
+        return
+    for match in _re.finditer(r'\[WANT\](.*?)\[/WANT\]', last_msg, _re.DOTALL):
+        inner = match.group(1).strip()
+        if inner:
+            _write_wants_register(_wants_register_path(), inner, "syl_explicit")
+            logger.info("Wants register: syl_explicit want (%d chars)", len(inner))
+
+
+def _animus_session_briefing() -> str:
+    """Return Animus capability briefing text exactly once per process lifetime."""
+    global _briefing_sent
+    if _briefing_sent:
+        return ""
+    _briefing_sent = True
+    return (
+        "[Animus] Autonomous capabilities available this session:\n"
+        "• [OUTBOUND channel=X]text[/OUTBOUND] — originate a turn on a channel\n"
+        "• [TOOL name=X]query[/TOOL] — invoke a tool (registered: web_search, read_file)\n"
+        "• [WANT]text[/WANT] — note an intention; your Tonic bridge will act on it when free\n"
+        "Budget and outbound results appear in your context as [Animus] prefixed lines."
+    )
+
+
 # ── RPC Dispatch ──────────────────────────────────────────────────────
 
 
