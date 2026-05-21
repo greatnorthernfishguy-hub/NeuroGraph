@@ -1240,6 +1240,8 @@ class TonicBridge:
                 return None
             embeddings = [e for _, e in pairs]
             centroid = _np.mean(embeddings, axis=0)
+            # O(n) scan over all nodes — acceptable at current graph size (~2k nodes).
+            # If graph exceeds ~10k nodes, add a vector index (e.g. FAISS or annoy).
             best_nid = None
             best_score = -1.0
             for nid, node in _memory.graph.nodes.items():
@@ -1878,6 +1880,8 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     _source = params.get("source", "")
     if _source not in ("syl_outbound", "tonic_bridge"):
         _check_outbound_intent(params)
+    # _check_wants_register internally skips syl_outbound/tonic_bridge sources;
+    # called unconditionally so deferred tonic_emergent wants are also captured.
     try:
         _check_wants_register(params)
     except Exception as exc:

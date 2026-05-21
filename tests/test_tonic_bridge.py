@@ -302,9 +302,10 @@ class TestTonicBridge(unittest.TestCase):
             with patch.object(bridge, '_maybe_defer') as mock_defer:
                 pred = self._make_prediction("p1", "n1", "n2", 0.9)
                 bridge._curiosity_signal = MagicMock(return_value=[pred])
-                with patch.object(rpc, 'deposit_outbound_intent', MagicMock()):
+                with patch.object(rpc, 'deposit_outbound_intent') as mock_deposit:
                     bridge._tick()
                     mock_defer.assert_called_once()
+                    mock_deposit.assert_not_called()
 
     def test_tick_skips_when_budget_critical(self):
         mem = self._make_mock_memory(in_conversation=False)
