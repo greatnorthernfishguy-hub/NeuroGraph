@@ -353,5 +353,39 @@ class TestTonicBridge(unittest.TestCase):
         self.assertIn("learning→memory", seed)
 
 
+class TestBootstrapIntegration(unittest.TestCase):
+
+    def test_tonic_bridge_not_started_without_env_var(self):
+        """TonicBridge must not start when ANIMUS_TONIC_BRIDGE_ENABLED is absent."""
+        original = rpc._tonic_bridge
+        try:
+            rpc._tonic_bridge = None
+            env_without = {k: v for k, v in os.environ.items() if k != "ANIMUS_TONIC_BRIDGE_ENABLED"}
+            with patch.dict(os.environ, env_without, clear=True):
+                with patch.object(rpc.TonicBridge, 'start') as mock_start:
+                    if os.environ.get("ANIMUS_TONIC_BRIDGE_ENABLED"):
+                        rpc._tonic_bridge = rpc.TonicBridge()
+                        rpc._tonic_bridge.start()
+                    mock_start.assert_not_called()
+                    self.assertIsNone(rpc._tonic_bridge)
+        finally:
+            rpc._tonic_bridge = original
+
+    def test_tonic_bridge_started_with_env_var(self):
+        """TonicBridge must start when ANIMUS_TONIC_BRIDGE_ENABLED=1."""
+        original = rpc._tonic_bridge
+        try:
+            rpc._tonic_bridge = None
+            with patch.dict(os.environ, {"ANIMUS_TONIC_BRIDGE_ENABLED": "1"}):
+                with patch.object(rpc.TonicBridge, 'start') as mock_start:
+                    if os.environ.get("ANIMUS_TONIC_BRIDGE_ENABLED"):
+                        rpc._tonic_bridge = rpc.TonicBridge()
+                        rpc._tonic_bridge.start()
+                    mock_start.assert_called_once()
+                    self.assertIsNotNone(rpc._tonic_bridge)
+        finally:
+            rpc._tonic_bridge = original
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -374,6 +374,9 @@ _lenia_engine: Optional[Any] = None
 _lenia_bridge: Optional[Any] = None
 _lenia_competence: Optional[Any] = None
 
+# TonicBridge — started by handle_bootstrap when ANIMUS_TONIC_BRIDGE_ENABLED is set
+_tonic_bridge: Optional["TonicBridge"] = None
+
 # he_discovery_overlap_threshold self-tuning state (#222)
 # NeuroGraph tunes its own param — coordinator owns this (Law 1: no cross-module writes).
 _he_tune_turn_count: int = 0
@@ -1525,6 +1528,15 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
                     logger.info("Session context primed: %d nodes nudged for session=%s", nudged, session_id[:40])
         except Exception as exc:
             logger.debug("Session context priming failed (non-fatal): %s", exc)
+
+    # TonicBridge startup — Animus-spawned instance only
+    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 5
+    # ANIMUS_TONIC_BRIDGE_ENABLED must be absent from OpenClaw's environment.
+    global _tonic_bridge
+    if os.environ.get("ANIMUS_TONIC_BRIDGE_ENABLED"):
+        _tonic_bridge = TonicBridge()
+        _tonic_bridge.start()
+        logger.info("TonicBridge started (interval=%.0fs)", _tonic_bridge._interval)
 
     return {
         "bootstrapped": True,
