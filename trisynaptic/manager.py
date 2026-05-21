@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-05-21] Claude Code (Sonnet 4.6) — Cap .failed.json accumulation
+# What: Added _trim_failed_files() — after each .failed.json is created, deletes
+#   the oldest files beyond _MAX_FAILED_FILES (20). Called from both
+#   _finalize_worker_exit() and _requeue_orphans().
+# Why: OpenRouter credit exhaustion caused 146+ failed workers, each leaving a
+#   24MB .failed.json in /tmp, filling the 193GB VPS disk to 100%.
+# How: Lists all *.failed.json in HANDOFF_DIR by mtime, unlinks oldest beyond cap.
 # [2026-04-19] Claude Code (Opus 4.7, 1M) — TriSyn Phase 1 initial
 # What: In-process thread that watches _CONCEPT_QUEUE depth, spawns a
 #   worker subprocess via systemd-run when trisyn_high_water is crossed.
@@ -41,6 +48,9 @@ _PULSE_INTERVAL_S = 10.0
 # Path to NG's venv python (used to launch worker under systemd-run).
 # Falls back to current interpreter if venv not detected.
 _NG_VENV_PY = "/home/josh/NeuroGraph/venv/bin/python"
+
+# Maximum number of .failed.json triage files to keep in HANDOFF_DIR.
+_MAX_FAILED_FILES = 20
 
 
 class TrisynapticManager:
@@ -116,6 +126,7 @@ class TrisynapticManager:
                     failed_path = path.with_suffix(".failed.json")
                     path.rename(failed_path)
                     failed_paths.append(failed_path)
+                    self._trim_failed_files()
                 except OSError:
                     pass
         logger.warning(
@@ -230,6 +241,22 @@ class TrisynapticManager:
             except OSError:
                 pass
 
+    def _trim_failed_files(self) -> None:
+        failed = sorted(
+            HANDOFF_DIR.glob(f"{HANDOFF_PREFIX}*.failed.json"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        to_delete = failed[:-_MAX_FAILED_FILES] if len(failed) > _MAX_FAILED_FILES else []
+        for p in to_delete:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        if to_delete:
+            logger.info(
+                "Trimmed %d old .failed.json files (cap=%d)", len(to_delete), _MAX_FAILED_FILES,
+            )
+
     def _requeue_front(self, batch: List[Dict[str, Any]]) -> None:
         """Put a batch back at the front of the queue, preserving order."""
         for entry in reversed(batch):
@@ -266,6 +293,7 @@ class TrisynapticManager:
                     "Worker failed — handoff preserved at %s for triage",
                     failed_path,
                 )
+                self._trim_failed_files()
             except OSError:
                 pass
         self._worker_scope = None
