@@ -202,12 +202,14 @@ class TestHandleWiring(unittest.TestCase):
                                             rpc._memory.graph.step.return_value = MagicMock(fired_node_ids=[])
                                             rpc._memory.graph.config.get.return_value = False
                                             rpc._memory._surfacing_monitor = None
+                                            rpc._memory._message_count = 1
+                                            rpc._memory.auto_save_interval = 10
                                             rpc._tract = None
                                             params = {"source": "syl_outbound", "lastAssistantMessage": "test"}
                                             try:
                                                 rpc.handle_after_turn(params)
-                                            except Exception:
-                                                pass
+                                            except Exception as exc:
+                                                self.fail(f"handle_after_turn raised unexpectedly: {exc}")
                                             mock_check.assert_not_called()
 
     def test_handle_after_turn_calls_wants_register_for_human_turn(self):
@@ -224,12 +226,14 @@ class TestHandleWiring(unittest.TestCase):
                                             rpc._memory.graph.step.return_value = MagicMock(fired_node_ids=[])
                                             rpc._memory.graph.config.get.return_value = False
                                             rpc._memory._surfacing_monitor = None
+                                            rpc._memory._message_count = 1
+                                            rpc._memory.auto_save_interval = 10
                                             rpc._tract = None
                                             params = {"source": "josh", "lastAssistantMessage": "hello"}
                                             try:
                                                 rpc.handle_after_turn(params)
-                                            except Exception:
-                                                pass
+                                            except Exception as exc:
+                                                self.fail(f"handle_after_turn raised unexpectedly: {exc}")
                                             mock_wants.assert_called_once()
 
 

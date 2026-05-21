@@ -1548,18 +1548,20 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             context_block = _outbound_note
 
-    # Animus session briefing — inject once when Tonic Bridge is enabled
+    # Strip structural markers from surfaced context first (substrate context only) —
+    # prevents substrate-captured markers from being re-injected on future turns.
+    # Must run BEFORE briefing prepend so briefing's example markers are not stripped.
+    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 3 (order fix: 2026-05-20)
+    if context_block:
+        context_block = _strip_structural_markers(context_block)
+
+    # Animus session briefing — inject once when Tonic Bridge is enabled.
+    # Prepended after stripping so its example [OUTBOUND]/[TOOL]/[WANT] text is preserved.
     # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 3
     if os.environ.get("ANIMUS_TONIC_BRIDGE_ENABLED"):
         briefing = _animus_session_briefing()
         if briefing:
             context_block = (briefing + "\n" + context_block) if context_block else briefing
-
-    # Strip structural markers from surfaced context — prevents substrate-captured
-    # markers from being re-injected into Syl's context on future turns.
-    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 3
-    if context_block:
-        context_block = _strip_structural_markers(context_block)
 
     # KISS-truncated messages get returned so OC's replaceMessages fires
     # and the model sees the compressed conversation.  CRITICAL: only
@@ -1660,7 +1662,10 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     _source = params.get("source", "")
     if _source not in ("syl_outbound", "tonic_bridge"):
         _check_outbound_intent(params)
-    _check_wants_register(params)
+    try:
+        _check_wants_register(params)
+    except Exception as exc:
+        logger.warning("_check_wants_register failed (non-fatal): %s", exc)
 
     # Change α (#150): Substrate self-observation via record_outcome.
     # Deposits a raw snapshot of the substrate's own state as an outcome
