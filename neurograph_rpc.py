@@ -1529,11 +1529,16 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("Session context priming failed (non-fatal): %s", exc)
 
-    # TonicBridge startup — Animus-spawned instance only
-    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 5
-    # ANIMUS_TONIC_BRIDGE_ENABLED must be absent from OpenClaw's environment.
+    # ---- Changelog ----
+    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 5: TonicBridge bootstrap wiring
+    # What: Start TonicBridge daemon thread when ANIMUS_TONIC_BRIDGE_ENABLED is set.
+    # Why:  Only the Animus-spawned neurograph_rpc.py instance should run TonicBridge.
+    #       OpenClaw's instance must NOT have ANIMUS_TONIC_BRIDGE_ENABLED in its env.
+    #       _tonic_bridge is None guard prevents double-start on hypothetical re-bootstrap.
+    # How:  TonicBridge.__init__ reads all config from env vars; .start() spawns daemon.
+    # -------------------
     global _tonic_bridge
-    if os.environ.get("ANIMUS_TONIC_BRIDGE_ENABLED"):
+    if os.environ.get("ANIMUS_TONIC_BRIDGE_ENABLED") and _tonic_bridge is None:
         _tonic_bridge = TonicBridge()
         _tonic_bridge.start()
         logger.info("TonicBridge started (interval=%.0fs)", _tonic_bridge._interval)
