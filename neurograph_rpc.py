@@ -1548,6 +1548,19 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             context_block = _outbound_note
 
+    # Animus session briefing — inject once when Tonic Bridge is enabled
+    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 3
+    if os.environ.get("ANIMUS_TONIC_BRIDGE_ENABLED"):
+        briefing = _animus_session_briefing()
+        if briefing:
+            context_block = (briefing + "\n" + context_block) if context_block else briefing
+
+    # Strip structural markers from surfaced context — prevents substrate-captured
+    # markers from being re-injected into Syl's context on future turns.
+    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 3
+    if context_block:
+        context_block = _strip_structural_markers(context_block)
+
     # KISS-truncated messages get returned so OC's replaceMessages fires
     # and the model sees the compressed conversation.  CRITICAL: only
     # include the "messages" field when actual truncation occurred.
@@ -1641,7 +1654,13 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # No classification — just the raw facts. The substrate learns
     # the correlation between surfaced context and what Syl produced.
     _deposit_surfacing_outcome(params, _ingest_text)
-    _check_outbound_intent(params)
+    # [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 3
+    # Autonomous turns (syl_outbound, tonic_bridge) are handled by Animus reaction
+    # loop directly — skip _check_outbound_intent to prevent double-deposit.
+    _source = params.get("source", "")
+    if _source not in ("syl_outbound", "tonic_bridge"):
+        _check_outbound_intent(params)
+    _check_wants_register(params)
 
     # Change α (#150): Substrate self-observation via record_outcome.
     # Deposits a raw snapshot of the substrate's own state as an outcome

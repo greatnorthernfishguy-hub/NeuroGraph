@@ -186,5 +186,52 @@ class TestMarkerHandling(unittest.TestCase):
             rpc._briefing_sent = original
 
 
+class TestHandleWiring(unittest.TestCase):
+
+    def test_handle_after_turn_skips_outbound_check_for_autonomous_source(self):
+        """_check_outbound_intent must NOT be called when source is syl_outbound."""
+        with patch.object(rpc, '_memory', MagicMock()):
+            with patch.object(rpc, '_check_outbound_intent') as mock_check:
+                with patch.object(rpc, '_check_wants_register') as mock_wants:
+                    with patch.object(rpc, '_drain_tract', MagicMock()):
+                        with patch.object(rpc, '_drain_peer_tracts', MagicMock()):
+                            with patch.object(rpc, '_deposit_substrate_metrics', MagicMock()):
+                                with patch.object(rpc, '_deposit_topology_to_river', MagicMock()):
+                                    with patch.object(rpc, '_deposit_experience_to_river', MagicMock()):
+                                        with patch.object(rpc, '_deposit_surfacing_outcome', MagicMock()):
+                                            rpc._memory.graph.step.return_value = MagicMock(fired_node_ids=[])
+                                            rpc._memory.graph.config.get.return_value = False
+                                            rpc._memory._surfacing_monitor = None
+                                            rpc._tract = None
+                                            params = {"source": "syl_outbound", "lastAssistantMessage": "test"}
+                                            try:
+                                                rpc.handle_after_turn(params)
+                                            except Exception:
+                                                pass
+                                            mock_check.assert_not_called()
+
+    def test_handle_after_turn_calls_wants_register_for_human_turn(self):
+        """_check_wants_register must be called regardless of source."""
+        with patch.object(rpc, '_memory', MagicMock()):
+            with patch.object(rpc, '_check_outbound_intent', MagicMock()):
+                with patch.object(rpc, '_check_wants_register') as mock_wants:
+                    with patch.object(rpc, '_drain_tract', MagicMock()):
+                        with patch.object(rpc, '_drain_peer_tracts', MagicMock()):
+                            with patch.object(rpc, '_deposit_substrate_metrics', MagicMock()):
+                                with patch.object(rpc, '_deposit_topology_to_river', MagicMock()):
+                                    with patch.object(rpc, '_deposit_experience_to_river', MagicMock()):
+                                        with patch.object(rpc, '_deposit_surfacing_outcome', MagicMock()):
+                                            rpc._memory.graph.step.return_value = MagicMock(fired_node_ids=[])
+                                            rpc._memory.graph.config.get.return_value = False
+                                            rpc._memory._surfacing_monitor = None
+                                            rpc._tract = None
+                                            params = {"source": "josh", "lastAssistantMessage": "hello"}
+                                            try:
+                                                rpc.handle_after_turn(params)
+                                            except Exception:
+                                                pass
+                                            mock_wants.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
