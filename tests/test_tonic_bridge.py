@@ -237,5 +237,120 @@ class TestHandleWiring(unittest.TestCase):
                                             mock_wants.assert_called_once()
 
 
+class TestTonicBridge(unittest.TestCase):
+
+    def _make_mock_memory(self, active_predictions=None, nodes=None,
+                          hyperedges=None, vector_db=None, in_conversation=False):
+        mem = MagicMock()
+        mem.graph.active_predictions = active_predictions or {}
+        mem.graph.nodes = nodes or {}
+        mem.graph.hyperedges = hyperedges or {}
+        mem.vector_db = vector_db or {}
+        tonic = MagicMock()
+        tonic._in_conversation = in_conversation
+        mem._tonic_thread = tonic
+        return mem
+
+    def _make_prediction(self, pred_id, src_id, tgt_id, confidence):
+        p = MagicMock()
+        p.prediction_id = pred_id
+        p.source_node_id = src_id
+        p.target_node_id = tgt_id
+        p.confidence = confidence
+        return p
+
+    def test_cosine_sim_identical_vectors(self):
+        import numpy as np
+        v = [1.0, 0.0, 0.0]
+        self.assertAlmostEqual(rpc._cosine_sim(v, v), 1.0)
+
+    def test_cosine_sim_orthogonal_vectors(self):
+        self.assertAlmostEqual(rpc._cosine_sim([1, 0], [0, 1]), 0.0)
+
+    def test_cosine_sim_zero_vector(self):
+        self.assertEqual(rpc._cosine_sim([0, 0], [1, 0]), 0.0)
+
+    def test_curiosity_signal_filters_by_confidence(self):
+        pred_high = self._make_prediction("p1", "n1", "n2", 0.9)
+        pred_low = self._make_prediction("p2", "n3", "n4", 0.3)
+        mem = self._make_mock_memory(active_predictions={"p1": pred_high, "p2": pred_low})
+        bridge = rpc.TonicBridge()
+        bridge._confidence_threshold = 0.6
+        with patch.object(rpc, '_memory', mem):
+            result = bridge._curiosity_signal()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].confidence, 0.9)
+
+    def test_curiosity_signal_sorted_by_confidence_desc(self):
+        preds = {
+            f"p{i}": self._make_prediction(f"p{i}", f"n{i}", f"m{i}", 0.6 + i * 0.1)
+            for i in range(5)
+        }
+        mem = self._make_mock_memory(active_predictions=preds)
+        bridge = rpc.TonicBridge()
+        bridge._confidence_threshold = 0.6
+        bridge._max_seeds = 3
+        with patch.object(rpc, '_memory', mem):
+            result = bridge._curiosity_signal()
+        self.assertEqual(len(result), 3)
+        self.assertGreater(result[0].confidence, result[1].confidence)
+
+    def test_tick_skips_when_in_conversation(self):
+        mem = self._make_mock_memory(in_conversation=True)
+        bridge = rpc.TonicBridge()
+        with patch.object(rpc, '_memory', mem):
+            with patch.object(bridge, '_maybe_defer') as mock_defer:
+                pred = self._make_prediction("p1", "n1", "n2", 0.9)
+                bridge._curiosity_signal = MagicMock(return_value=[pred])
+                with patch.object(rpc, 'deposit_outbound_intent', MagicMock()):
+                    bridge._tick()
+                    mock_defer.assert_called_once()
+
+    def test_tick_skips_when_budget_critical(self):
+        mem = self._make_mock_memory(in_conversation=False)
+        bridge = rpc.TonicBridge()
+        with tempfile.TemporaryDirectory() as d:
+            budget_path = os.path.join(d, "budget.json")
+            with open(budget_path, "w") as f:
+                f.write(json.dumps({"critical": True}))
+            bridge._budget_path = budget_path
+            with patch.object(rpc, '_memory', mem):
+                with patch.object(rpc, 'deposit_outbound_intent') as mock_deposit:
+                    with patch.object(bridge, '_curiosity_signal', return_value=[]):
+                        bridge._tick()
+                        mock_deposit.assert_not_called()
+
+    def test_node_label_returns_metadata_label(self):
+        node = MagicMock()
+        node.metadata = {"label": "curiosity"}
+        mem = self._make_mock_memory(nodes={"n1": node})
+        bridge = rpc.TonicBridge()
+        with patch.object(rpc, '_memory', mem):
+            label = bridge._node_label("n1")
+        self.assertEqual(label, "curiosity")
+
+    def test_node_label_returns_node_id_when_no_label(self):
+        node = MagicMock()
+        node.metadata = {}
+        mem = self._make_mock_memory(nodes={"n1": node})
+        bridge = rpc.TonicBridge()
+        with patch.object(rpc, '_memory', mem):
+            label = bridge._node_label("n1")
+        self.assertEqual(label, "n1")
+
+    def test_compose_seed_format(self):
+        pred = self._make_prediction("p1", "n1", "n2", 0.9)
+        bridge = rpc.TonicBridge()
+        node_src = MagicMock()
+        node_src.metadata = {"label": "learning"}
+        node_tgt = MagicMock()
+        node_tgt.metadata = {"label": "memory"}
+        mem = self._make_mock_memory(nodes={"n1": node_src, "n2": node_tgt})
+        with patch.object(rpc, '_memory', mem):
+            seed = bridge._compose_seed([pred], "substrate dynamics")
+        self.assertIn("tonic-triggered: substrate dynamics", seed)
+        self.assertIn("learning→memory", seed)
+
+
 if __name__ == "__main__":
     unittest.main()

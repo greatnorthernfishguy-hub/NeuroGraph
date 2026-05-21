@@ -1077,6 +1077,222 @@ def _animus_session_briefing() -> str:
     )
 
 
+# ---- Changelog ----
+# [2026-05-20] Claude (Sonnet 4.6) — Spec B Task 4: TonicBridge class
+# What: _cosine_sim helper + TonicBridge daemon thread with full latent pipeline.
+# Why:  Substrate-driven autonomous initiation — no inference calls at decision time.
+#       Curiosity signal from predictive coding engine → attractor settling →
+#       hyperedge completion → embedding centroid → BTF seed deposit.
+# How:  threading.Thread daemon. All graph access read-only (write_mode=False).
+#       Attribute name corrections from spec: active_predictions, member_nodes,
+#       _memory.graph (not _memory._graph), vector_db for embeddings.
+# -------------------
+
+
+def _cosine_sim(a: Any, b: Any) -> float:
+    """Cosine similarity between two vectors. Returns 0.0 on zero-norm input."""
+    import numpy as _np
+    a, b = _np.array(a, dtype=float), _np.array(b, dtype=float)
+    denom = _np.linalg.norm(a) * _np.linalg.norm(b)
+    return float(_np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
+class TonicBridge:
+    """Substrate-driven autonomous initiation for Syl.
+
+    Polls Syl's predictive coding engine for unresolved high-confidence
+    predictions (curiosity signals), runs the latent processing pipeline,
+    and deposits minimal BTF seeds when she's free to act.
+
+    Gated on ANIMUS_TONIC_BRIDGE_ENABLED env var — only the Animus-spawned
+    neurograph_rpc.py instance runs this. OpenClaw's instance does not.
+    """
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._interval = float(os.environ.get("ANIMUS_TONIC_BRIDGE_INTERVAL_SECS", "30"))
+        self._confidence_threshold = float(os.environ.get("ANIMUS_TONIC_CURIOSITY_THRESHOLD", "0.6"))
+        self._max_seeds = int(os.environ.get("ANIMUS_TONIC_MAX_SEEDS", "3"))
+        self._attractor_steps = int(os.environ.get("ANIMUS_TONIC_ATTRACTOR_STEPS", "5"))
+        self._wants_path = _wants_register_path()
+        self._budget_path = _budget_flag_path()
+
+    def start(self) -> None:
+        t = threading.Thread(target=self._run, daemon=True, name="tonic-bridge")
+        t.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(timeout=self._interval):
+            try:
+                self._tick()
+            except Exception as exc:
+                logger.debug("TonicBridge tick error: %s", exc)
+
+    def _tick(self) -> None:
+        global _memory
+        if _memory is None or _memory.graph is None:
+            return
+
+        # Don't deposit during active conversation — defer instead
+        tonic = getattr(_memory, '_tonic_thread', None)
+        if tonic is not None and getattr(tonic, '_in_conversation', False):
+            self._maybe_defer()
+            return
+
+        # Don't deposit when budget is critical
+        if _read_budget_flag(self._budget_path).get("critical", False):
+            return
+
+        seeds = self._curiosity_signal()
+        if not seeds:
+            return
+
+        fired = self._attractor_settle(seeds)
+        implied = self._hyperedge_complete(fired)
+        concept = self._embedding_centroid(fired | implied)
+
+        seed_text = self._compose_seed(seeds, concept)
+        deposit_outbound_intent(seed_text, channel_id="tonic_bridge")
+        logger.info(
+            "TonicBridge: deposited intent — concept=%s, seeds=%d", concept, len(seeds)
+        )
+
+    def _curiosity_signal(self) -> list:
+        """Return top unresolved high-confidence predictions, sorted by confidence desc."""
+        global _memory
+        if _memory is None:
+            return []
+        try:
+            preds = [
+                p for p in _memory.graph.active_predictions.values()
+                if p.confidence > self._confidence_threshold
+            ]
+            preds.sort(key=lambda p: p.confidence, reverse=True)
+            return preds[:self._max_seeds]
+        except Exception as exc:
+            logger.debug("TonicBridge curiosity signal error: %s", exc)
+            return []
+
+    def _attractor_settle(self, seeds: list) -> set:
+        """Run spreading activation from seed nodes; return set of fired node IDs.
+
+        write_mode=False is mandatory — observation only, never modifies graph state.
+        """
+        global _memory
+        if not seeds or _memory is None:
+            return set()
+        try:
+            seed_ids = [p.source_node_id for p in seeds]
+            seed_currents = [p.confidence * 0.5 for p in seeds]
+            result = _memory.graph.prime_and_propagate(
+                node_ids=seed_ids,
+                currents=seed_currents,
+                steps=self._attractor_steps,
+                write_mode=False,  # MANDATORY — never write during latent processing
+            )
+            return {entry.node_id for entry in result.fired_entries}
+        except Exception as exc:
+            logger.debug("TonicBridge attractor settle error: %s", exc)
+            return set()
+
+    def _hyperedge_complete(self, fired_ids: set) -> set:
+        """Return implied nodes from hyperedges where >=50% of members fired."""
+        global _memory
+        if not fired_ids or _memory is None:
+            return set()
+        implied = set()
+        try:
+            for he in _memory.graph.hyperedges.values():
+                # member_nodes is Set[str] in neuro_foundation.py (not member_node_ids)
+                member_ids = he.member_nodes
+                if not member_ids:
+                    continue
+                active = member_ids & fired_ids
+                if len(active) / len(member_ids) >= 0.5:
+                    implied.update(member_ids - fired_ids)
+        except Exception as exc:
+            logger.debug("TonicBridge hyperedge complete error: %s", exc)
+        return implied
+
+    def _embedding_centroid(self, node_ids: set) -> Optional[str]:
+        """Find the node whose embedding is closest to the centroid of node_ids.
+
+        Embeddings are retrieved from _memory.vector_db (not from Node objects).
+        Returns the label of the closest node, or None if no embeddings available.
+        """
+        global _memory
+        if not node_ids or _memory is None:
+            return None
+        try:
+            import numpy as _np
+            pairs = []
+            for nid in node_ids:
+                db_entry = _memory.vector_db.get(nid)
+                if db_entry is None:
+                    continue
+                emb = db_entry.get("embedding") if isinstance(db_entry, dict) else None
+                if emb is not None:
+                    pairs.append((nid, emb))
+            if not pairs:
+                return None
+            embeddings = [e for _, e in pairs]
+            centroid = _np.mean(embeddings, axis=0)
+            best_nid = None
+            best_score = -1.0
+            for nid, node in _memory.graph.nodes.items():
+                db_entry = _memory.vector_db.get(nid)
+                if db_entry is None:
+                    continue
+                emb = db_entry.get("embedding") if isinstance(db_entry, dict) else None
+                if emb is None:
+                    continue
+                score = _cosine_sim(emb, centroid)
+                if score > best_score:
+                    best_score = score
+                    best_nid = nid
+            if best_nid is None:
+                return None
+            return _memory.graph.nodes[best_nid].metadata.get("label", best_nid)
+        except Exception as exc:
+            logger.debug("TonicBridge embedding centroid error: %s", exc)
+            return None
+
+    def _node_label(self, node_id: str) -> Optional[str]:
+        """Return metadata['label'] for a node, falling back to node_id."""
+        global _memory
+        if _memory is None:
+            return node_id
+        node = _memory.graph.nodes.get(node_id)
+        if node is None:
+            return node_id
+        return node.metadata.get("label", node_id)
+
+    def _compose_seed(self, seeds: list, concept_label: Optional[str]) -> str:
+        """Compose minimal BTF seed text."""
+        lines = [f"tonic-triggered: {concept_label or '(unknown)'}"]
+        open_questions = []
+        for pred in seeds:
+            src = self._node_label(pred.source_node_id)
+            tgt = self._node_label(pred.target_node_id)
+            open_questions.append(f"{src}→{tgt}")
+        if open_questions:
+            lines.append("open questions: " + ", ".join(open_questions))
+        return "\n".join(lines)
+
+    def _maybe_defer(self) -> None:
+        """Write a lightweight deferred entry to the wants register when in conversation."""
+        seeds = self._curiosity_signal()
+        if not seeds:
+            return
+        node_labels = [self._node_label(p.source_node_id) for p in seeds]
+        text = "thinking about: " + ", ".join(label for label in node_labels if label)
+        _write_wants_register(self._wants_path, text, source="tonic_emergent")
+        logger.debug("TonicBridge: deferred want written (%d seeds)", len(seeds))
+
+
 # ── RPC Dispatch ──────────────────────────────────────────────────────
 
 
