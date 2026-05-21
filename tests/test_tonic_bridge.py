@@ -130,6 +130,14 @@ class TestMarkerHandling(unittest.TestCase):
         text = "No markers here, just plain text."
         self.assertEqual(rpc._strip_structural_markers(text), text)
 
+    def test_strip_nested_open_tag_consumed(self):
+        """Document known behavior: malformed/nested open tag is consumed up to next close."""
+        text = "[WANT]first[WANT]second[/WANT]"
+        result = rpc._strip_structural_markers(text)
+        # The regex consumes from first [WANT] to the only [/WANT], eating both.
+        self.assertNotIn("[WANT]", result)
+        self.assertNotIn("[/WANT]", result)
+
     def test_check_wants_register_writes_want(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "wants.jsonl")
@@ -146,17 +154,16 @@ class TestMarkerHandling(unittest.TestCase):
             self.assertEqual(entry["source"], "syl_explicit")
 
     def test_check_wants_register_skips_autonomous_source(self):
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "wants.jsonl")
-            for source in ("syl_outbound", "tonic_bridge"):
+        for source in ("syl_outbound", "tonic_bridge"):
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "wants.jsonl")
                 params = {
                     "source": source,
                     "lastAssistantMessage": "I [WANT]do something[/WANT]",
                 }
                 with patch.object(rpc, '_wants_register_path', return_value=path):
                     rpc._check_wants_register(params)
-            # No entries written — autonomous sources handled by Animus
-            self.assertFalse(os.path.exists(path))
+                self.assertFalse(os.path.exists(path), f"source={source!r} should not write")
 
     def test_check_wants_register_no_want_marker_writes_nothing(self):
         with tempfile.TemporaryDirectory() as d:

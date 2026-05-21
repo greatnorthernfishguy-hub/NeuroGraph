@@ -309,6 +309,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 import time
 import traceback
@@ -1028,16 +1029,14 @@ def _read_budget_flag(path: str) -> dict:
 # How:  re.sub for stripping; plain regex for [WANT] detection.
 # -------------------
 
-import re as _re
-
 _briefing_sent: bool = False
 
 
 def _strip_structural_markers(text: str) -> str:
     """Remove [OUTBOUND], [TOOL], [WANT] markup from text."""
-    text = _re.sub(r'\[OUTBOUND(?:[^\]]*)?\].*?\[/OUTBOUND\]', '', text, flags=_re.DOTALL)
-    text = _re.sub(r'\[TOOL[^\]]*\].*?\[/TOOL\]', '', text, flags=_re.DOTALL)
-    text = _re.sub(r'\[WANT\].*?\[/WANT\]', '', text, flags=_re.DOTALL)
+    text = re.sub(r'\[OUTBOUND(?:[^\]]*)?\].*?\[/OUTBOUND\]', '', text, flags=re.DOTALL)
+    text = re.sub(r'\[TOOL[^\]]*\].*?\[/TOOL\]', '', text, flags=re.DOTALL)
+    text = re.sub(r'\[WANT\].*?\[/WANT\]', '', text, flags=re.DOTALL)
     return text.strip()
 
 
@@ -1053,15 +1052,18 @@ def _check_wants_register(params: Dict[str, Any]) -> None:
     last_msg = params.get("lastAssistantMessage", "")
     if not last_msg:
         return
-    for match in _re.finditer(r'\[WANT\](.*?)\[/WANT\]', last_msg, _re.DOTALL):
+    register_path = _wants_register_path()
+    for match in re.finditer(r'\[WANT\](.*?)\[/WANT\]', last_msg, re.DOTALL):
         inner = match.group(1).strip()
         if inner:
-            _write_wants_register(_wants_register_path(), inner, "syl_explicit")
+            _write_wants_register(register_path, inner, "syl_explicit")
             logger.info("Wants register: syl_explicit want (%d chars)", len(inner))
 
 
 def _animus_session_briefing() -> str:
     """Return Animus capability briefing text exactly once per process lifetime."""
+    # _briefing_sent has no lock — benign race: two simultaneous calls both return
+    # the briefing. Acceptable under OpenClaw's sequential per-session model.
     global _briefing_sent
     if _briefing_sent:
         return ""
