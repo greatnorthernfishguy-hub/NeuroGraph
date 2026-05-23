@@ -12,6 +12,19 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-23] Claude Code (Sonnet 4.6) — Checkpoint safety + drain node cap
+#   What: Two fixes: (1) Move time-based auto-save into _scan_drain_pulse_loop() so it
+#         fires unconditionally every 5 min even when message_count stays 0 (no convs).
+#         (2) Add _MAX_DRAIN_NODES cap to _drain_scan_dir() — skip drain when node
+#         count >= cap to prevent TID experience flooding causing unbounded RAM growth.
+#   Why:  PID 97886 grew to 87,814 nodes / 4.8GB RAM from TID experience flooding while
+#         message_count=0. Both count-based and time-based saves were inside
+#         handle_after_turn() and never fired. Node explosion → OOM crash → May 15
+#         checkpoint loaded, losing all learning since disk filled.
+#   How:  _scan_drain_pulse_loop() now checks _last_save_time on every tick (fires after
+#         _drain_scan_dir or even when paused, using global _last_save_time shared with
+#         the afterTurn save path). _drain_scan_dir() returns early when node count >=
+#         _MAX_DRAIN_NODES (default 15000, ~3x organic growth headroom from current 4,673).
 # [2026-04-29] Claude (Sonnet 4.6) — #226 Bunyan: deposit raw conversation experience to River
 #   What: Added _deposit_experience_to_river(text) — raw conversation text to every
 #         registered module's inbound tract via ng_tract.deposit_experience() (single-path
@@ -367,6 +380,7 @@ _kiss_filter: Optional[Any] = None
 # so count-based auto-save never fires if the gateway restarts frequently.
 _last_save_time: float = 0.0
 _SAVE_INTERVAL_SECS: float = 300.0  # 5 minutes
+_MAX_DRAIN_NODES: int = 15000  # Stop experience ingestion above this node count
 
 # Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)
 _lenia_kill_switch: Optional[Any] = None
@@ -2111,6 +2125,12 @@ def _drain_scan_dir() -> None:
     The blocking TID concept-extraction call is NEVER made here — it
     runs on the separate concept pulse (every 30s).
     """
+    # Node count safety cap. TID experience flooding grew NG to 87,814 nodes /
+    # 4.8GB RAM while message_count stayed 0 (no conversations). Above the cap,
+    # new ingestion is skipped until natural pruning or manual intervention clears
+    # headroom. The cap is generous (~3x organic growth from current baseline).
+    if _memory is not None and len(_memory.graph.nodes) >= _MAX_DRAIN_NODES:
+        return
     from pathlib import Path
     scan_dir = Path(_EXPERIENCE_SCAN_DIR)
     if not scan_dir.exists():
@@ -2351,6 +2371,18 @@ def _scan_drain_pulse_loop() -> None:
                 was_paused = paused
             if not paused:
                 _drain_scan_dir()
+            # Time-based auto-save — fires on every tick, paused or not.
+            # Shared _last_save_time with the afterTurn save path; whichever
+            # fires first resets the clock so we don't double-save.
+            global _last_save_time
+            _now = time.time()
+            if _memory is not None and (_now - _last_save_time) >= _SAVE_INTERVAL_SECS:
+                try:
+                    _memory.save()
+                    _last_save_time = _now
+                    logger.info("Auto-save: checkpoint written (scan-drain loop)")
+                except Exception:
+                    logger.exception("Auto-save failed in scan-drain loop")
         except Exception:
             logger.exception("Scan-dir drain pulse failed")
         _scan_drain_shutdown.wait(timeout=_SCAN_DRAIN_INTERVAL_SECONDS)
