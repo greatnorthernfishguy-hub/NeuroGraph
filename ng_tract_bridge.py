@@ -765,7 +765,8 @@ class NGTractBridge(NGBridge):
 
     def _write_cursor(self, tract_path: Path, offset: int, entries_total: int) -> None:
         cp = self._cursor_path(tract_path)
-        tmp = cp.with_suffix(".cursor.tmp")
+        # with_name avoids fragile multi-dot suffix handling
+        tmp = cp.with_name(cp.name + ".tmp")
         try:
             tmp.write_text(json.dumps({
                 "offset": offset, "ts": time.time(), "entries": entries_total,
@@ -824,21 +825,30 @@ class NGTractBridge(NGBridge):
         start_offset: int = cursor_state["offset"]
         entries_so_far: int = cursor_state["entries"]
 
+        # Read only the unread slice — avoids loading 6GB into memory for
+        # large backlogs. file_size captured inside the same open() call so
+        # the EOF check uses a consistent snapshot.
         try:
             with open(tract_path, "rb") as f:
-                raw = f.read()
+                file_size = os.fstat(f.fileno()).st_size
+                if not file_size or start_offset >= file_size:
+                    return []
+                if start_offset:
+                    f.seek(start_offset)
+                raw_slice = f.read()
         except OSError as exc:
             logger.warning("Tract read failed (%s/%s): %s", peer_id, self.module_id, exc)
             return []
 
-        if not raw or start_offset >= len(raw):
+        if not raw_slice:
             return []
 
         entries: List[Any] = []
         new_offset = start_offset
         try:
             import ng_tract
-            reader = ng_tract.TractReader(raw, start_pos=start_offset)
+            # raw_slice starts at byte 0 relative to start_offset — no start_pos needed
+            reader = ng_tract.TractReader(raw_slice)
             for entry in reader:
                 if isinstance(entry, bytes):
                     try:
@@ -850,7 +860,7 @@ class NGTractBridge(NGBridge):
                         if entry.entry_type not in entry_types:
                             continue
                     entries.append(entry)
-            new_offset = reader.position()
+            new_offset = start_offset + reader.position()
         except ImportError:
             # ng_tract not available — fall back to destructive rename+delete
             return self._drain_single_tract(tract_path, peer_id, entry_types)
@@ -861,9 +871,9 @@ class NGTractBridge(NGBridge):
         if new_offset > start_offset:
             new_total = entries_so_far + len(entries)
             self._write_cursor(tract_path, new_offset, new_total)
-            # Only compact when we drained to EOF — guarantees compact file
-            # starts on a clean entry boundary, not a partial BTF frame.
-            if new_offset == len(raw) and new_offset >= _COMPACT_THRESHOLD_BYTES:
+            # Only compact when reader consumed entire slice (== EOF at snapshot).
+            # This guarantees the compact file starts on a clean entry boundary.
+            if reader.position() == len(raw_slice) and new_offset >= _COMPACT_THRESHOLD_BYTES:
                 self._compact_tract(tract_path, new_offset)
 
         return entries
