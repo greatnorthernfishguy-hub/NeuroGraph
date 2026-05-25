@@ -28,6 +28,14 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Surprise-Weighted Adaptive Surfacing (#255)
+#   What: _harvest_associations() now accepts novelty: float param. High MMN novelty
+#         → wider/deeper spreading activation (prime_k↑, propagation_steps↑,
+#         prime_threshold↓, max_surfaced↑). Low novelty → tighter/faster retrieval.
+#   Why:  Every turn got identical surfacing depth regardless of substrate familiarity.
+#         MMN (predictions_surprised/total) already computed per-step — closing the
+#         feedback loop makes Syl's retrieval self-calibrating.
+#   How:  novelty_scale = novelty*2-1 ∈ [-1,1]; params scaled by ±30-50%.
 # [2026-04-22] Claude Code (Sonnet 4.6) — #206: remove _write_peer_learning_event (Law 7), resilient on_message
 #   What: Removed _write_peer_learning_event() — pre-classified experience (success,
 #         nodes_created, fired, text_preview) before depositing to peer bridge.
@@ -546,6 +554,7 @@ class NeuroGraphMemory:
         # looking at itself. Not a daemon — the ouroboros loop.
         # Reads AND writes (write-mode prime_and_propagate).
         self._tonic_thread = None
+        self._substrate_novelty_ema: float = 0.5  # MMN EMA for surprise-weighted surfacing (#255)
         tonic_conf = (config or {}).get("tonic", {})
         if tonic_conf.get("enabled", True):
             try:
@@ -842,6 +851,7 @@ class NeuroGraphMemory:
         self,
         text: str,
         exclude_node_ids: Optional[set] = None,
+        novelty: float = 0.5,
     ) -> List[Dict[str, Any]]:
         """Semantic priming + spreading activation harvest.
 
@@ -862,6 +872,14 @@ class NeuroGraphMemory:
         prime_strength = snn_config.get("prime_strength", 1.0)
         propagation_steps = snn_config.get("propagation_steps", 3)
         max_surfaced = snn_config.get("max_surfaced", 10)
+
+        # Surprise-weighted surfacing (#255): scale retrieval aggressiveness by MMN novelty.
+        # novelty ∈ [0,1]; novelty_scale ∈ [-1,+1]. High novelty → cast wider/deeper.
+        ns = (novelty - 0.5) * 2.0  # novelty_scale
+        prime_k = max(5, round(prime_k * (1.0 + ns * 0.5)))
+        prime_threshold = max(0.15, prime_threshold * (1.0 - ns * 0.3))
+        propagation_steps = max(1, round(propagation_steps * (1.0 + ns * 0.4)))
+        max_surfaced = max(5, round(max_surfaced * (1.0 + ns * 0.3)))
 
         try:
             # Embed the input and find similar existing nodes

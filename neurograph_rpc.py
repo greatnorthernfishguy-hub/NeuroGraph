@@ -12,6 +12,11 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Surprise-Weighted Adaptive Surfacing (#255)
+#   What: handle_after_turn updates _memory._substrate_novelty_ema (EMA of MMN).
+#         handle_assemble passes current novelty to _harvest_associations().
+#   Why:  Closes the MMN feedback loop into retrieval. High surprise → deeper surfacing.
+#   How:  EMA alpha=0.1, neutral start=0.5. Novelty read in assemble via getattr guard.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Kill _deposit_substrate_metrics() JSONL call sites
 #   What: Removed both calls to _deposit_substrate_metrics() — one from handle_on_message
 #         (afterTurn flow, line ~1936) and one from _scan_drain_pulse_loop (autonomous step).
@@ -1800,7 +1805,8 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
         priming_text = kiss_summary + "\n" + recent_text
 
     # Spreading activation harvest — the cortex-like recall
-    surfaced = _memory._harvest_associations(priming_text)
+    _surfacing_novelty = getattr(_memory, "_substrate_novelty_ema", 0.5)
+    surfaced = _memory._harvest_associations(priming_text, novelty=_surfacing_novelty)
 
     # CES surfacing — concepts that fired above threshold
     ces_surfaced = []
@@ -1923,6 +1929,14 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
 
     # SNN learning step — STDP, structural plasticity, predictions
     step_result = _memory.graph.step()
+
+    # Update MMN novelty EMA for surprise-weighted surfacing (#255)
+    _pc_total = step_result.predictions_confirmed + step_result.predictions_surprised
+    if _pc_total > 0:
+        _raw_novelty = step_result.predictions_surprised / _pc_total
+        _memory._substrate_novelty_ema = (
+            0.9 * _memory._substrate_novelty_ema + 0.1 * _raw_novelty
+        )
 
     # Baseline conversational engagement reward (heartbeat)
     if _memory.graph.config.get("three_factor_enabled", False):
