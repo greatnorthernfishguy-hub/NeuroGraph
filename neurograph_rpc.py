@@ -12,6 +12,17 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Wire River drain into autonomic pulse
+#   What: Added _drain_peer_tracts() call inside _scan_drain_pulse_loop() alongside
+#         _drain_scan_dir(). River drain now runs every 2s unconditionally, not only
+#         during afterTurn (conversation-gated).
+#   Why:  Post-fanout removal, NeuroGraph was the only module whose peer tract drain
+#         depended on conversation turns. Between conversations, module deposits to
+#         tracts/*/neurograph.tract accumulated unread. All peer modules (Elmer, Darwin,
+#         TrollGuard, etc.) already drain on their own pulse — NG had the gap.
+#   How:  _drain_peer_tracts() is safe from the pulse: returns early when bridge is None;
+#         for NGTractBridge calls bridge._drain_all() then exits (no _peer_events). The
+#         cursor mechanism makes idle calls cheap (fstat + early exit when no new data).
 # [2026-05-23] Claude Code (Sonnet 4.6) — Checkpoint safety + drain node cap
 #   What: Two fixes: (1) Move time-based auto-save into _scan_drain_pulse_loop() so it
 #         fires unconditionally every 5 min even when message_count stays 0 (no convs).
@@ -2371,6 +2382,8 @@ def _scan_drain_pulse_loop() -> None:
                 was_paused = paused
             if not paused:
                 _drain_scan_dir()
+                _drain_peer_tracts()
+                _drain_peer_tracts()
             # Time-based auto-save — fires on every tick, paused or not.
             # Shared _last_save_time with the afterTurn save path; whichever
             # fires first resets the clock so we don't double-save.
