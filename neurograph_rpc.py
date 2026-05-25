@@ -12,6 +12,17 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Fix tract_stats NameError + autonomous substrate step
+#   What: (1) Removed dangling tract_stats["pending"] from handle_bootstrap return dict — variable
+#         was deleted in a prior session but usage was left behind, causing NameError on every
+#         startup self-bootstrap. (2) Added graph.step() + _deposit_substrate_metrics +
+#         _deposit_topology_to_river to _scan_drain_pulse_loop, after _drain_peer_tracts().
+#         Substrate now steps every 2s unconditionally. Topology deposits to River autonomously.
+#   Why:  (1) Self-bootstrap failure on every restart. (2) Topology deposits were conversation-
+#         gated (afterTurn only). Ecosystem must not depend on a conversation taking place.
+#         Josh: "We do NOT want ANYTHING dependent on a conversation needing to take place."
+#   How:  (1) Removed one line from handle_bootstrap return dict. (2) Pulse loop gains a
+#         try/except step block after draining — deposit_experience excluded (requires text).
 # [2026-05-25] Claude Code (Sonnet 4.6) — Fix severed River deposit in deposit_topology/experience
 #   What: _deposit_topology_to_river now msgpack-packs StepResult scalars and calls
 #         ng_tract.deposit_topology(raw_bytes, "neurograph", tract_paths). 
@@ -1591,8 +1602,6 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         "nodes": stats["nodes"],
         "synapses": stats["synapses"],
         "timestep": stats["timestep"],
-        "tract_pending": tract_stats["pending"],
-
         "tonic": _memory._tonic_thread.status if _memory._tonic_thread else None,
     }
 
@@ -2401,6 +2410,15 @@ def _scan_drain_pulse_loop() -> None:
             if not paused:
                 _drain_scan_dir()
                 _drain_peer_tracts()
+                # Autonomous substrate step — topology evolves every pulse, not per conversation.
+                # Law 7: raw StepResult deposited to River. Classification at extraction.
+                if _memory is not None:
+                    try:
+                        _auto_step = _memory.graph.step()
+                        _deposit_substrate_metrics(_auto_step)
+                        _deposit_topology_to_river(_auto_step)
+                    except Exception as _exc:
+                        logger.debug("Autonomous substrate step failed: %s", _exc)
             # Time-based auto-save — fires on every tick, paused or not.
             # Shared _last_save_time with the afterTurn save path; whichever
             # fires first resets the clock so we don't double-save.
