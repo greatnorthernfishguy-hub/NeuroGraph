@@ -19,6 +19,14 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Degree-Aware Firing Thresholds (#104)
+#   What: Added degree_sensitivity config + per-node adjusted firing targets to HomeostaticRule.
+#   Why:  Single global target_firing_rate causes hub nodes (high degree) to dominate with noisy
+#         spikes while peripheral nodes (low degree) are starved silent. DAS-GNN fix: hubs get
+#         a lower effective target (threshold raised faster); peripherals get a higher effective
+#         target (threshold lowered faster). Equalizes firing rates across the topology.
+#   How:  Log-scaled deg_norm per node. node_target = global * max(0.1, 1-(norm-0.5)*2*sens).
+#         _refresh_degree_targets() updates at scaling_interval cadence. One new config param.
 # [2026-05-05] Claude (Sonnet 4.6) — #237 Orphan-node collection in _structural_plasticity()
 # What: Added _collect_orphan_nodes() as a third sub-step in _structural_plasticity(),
 #       called after _prune_synapses() and before _sprout_synapses(). Removes any node
@@ -831,6 +839,7 @@ class HomeostaticRule(PlasticityRule):
         excitability_rate: float = 0.01,
         threshold_rate: float = 0.001,
         ema_alpha: float = 0.01,
+        degree_sensitivity: float = 0.4,
     ):
         self.target_firing_rate = target_firing_rate
         self.scaling_interval = scaling_interval
@@ -838,7 +847,28 @@ class HomeostaticRule(PlasticityRule):
         self.excitability_rate = excitability_rate
         self.threshold_rate = threshold_rate
         self.ema_alpha = ema_alpha
+        self.degree_sensitivity = degree_sensitivity
+        self._degree_targets: Dict[str, float] = {}
         self._steps_since_scaling = 0
+
+    def _refresh_degree_targets(self, graph: "Graph") -> None:
+        """Compute per-node firing targets adjusted for vertex degree (DAS-GNN, #104)."""
+        if not self.degree_sensitivity or not graph.nodes:
+            self._degree_targets = {}
+            return
+        degrees = {
+            nid: len(graph._incoming.get(nid, ())) + len(graph._outgoing.get(nid, ()))
+            for nid in graph.nodes
+        }
+        max_deg = max(degrees.values(), default=1) or 1
+        log_max = math.log(max_deg + 1)
+        self._degree_targets = {}
+        for nid, deg in degrees.items():
+            deg_norm = math.log(deg + 1) / log_max if log_max > 0 else 0.5
+            # Center at 0.5: hub (deg_norm=1) → scale<1 → target lower → faster dampening
+            # Peripheral (deg_norm=0) → scale>1 → target higher → faster threshold drop
+            scale = max(0.1, 1.0 - (deg_norm - 0.5) * 2.0 * self.degree_sensitivity)
+            self._degree_targets[nid] = self.target_firing_rate * scale
 
     def apply(
         self,
@@ -860,19 +890,22 @@ class HomeostaticRule(PlasticityRule):
         threshold_ceiling = graph.config.get("threshold_ceiling", 5.0)
         for nid, node in graph.nodes.items():
             rate = node.firing_rate_ema
-            if rate > self.target_firing_rate * 1.2:
+            node_target = self._degree_targets.get(nid, self.target_firing_rate)
+            if rate > node_target * 1.2:
                 node.threshold = min(node.threshold + self.threshold_rate, threshold_ceiling)
-            elif rate < self.target_firing_rate * 0.8:
+            elif rate < node_target * 0.8:
                 node.threshold = max(0.01, node.threshold - self.threshold_rate)
 
         self._steps_since_scaling += 1
         if self._steps_since_scaling < self.scaling_interval:
             return
         self._steps_since_scaling = 0
+        self._refresh_degree_targets(graph)
 
         # Synaptic scaling & intrinsic excitability (every N steps)
         for nid, node in graph.nodes.items():
             rate = node.firing_rate_ema
+            node_target = self._degree_targets.get(nid, self.target_firing_rate)
             if rate < 1e-9:
                 # Silent node → boost excitability (PRD §3.1.2 Silent Death mitigation)
                 node.intrinsic_excitability = min(
@@ -881,7 +914,7 @@ class HomeostaticRule(PlasticityRule):
                 )
                 continue
 
-            ratio = self.target_firing_rate / rate
+            ratio = node_target / rate
 
             # Intrinsic excitability adjustment
             if ratio > 1.0:
@@ -1001,6 +1034,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "target_firing_rate": 0.05,
     "threshold_ceiling": 5.0,
     "scaling_interval": 25,
+    "degree_sensitivity": 0.4,           # DAS-GNN: hub/peripheral threshold balance (#104)
     "weight_threshold": 0.01,
     "grace_period": 500,
     "inactivity_threshold": 1000,
@@ -1136,6 +1170,7 @@ class Graph:
             HomeostaticRule(
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
+                degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
             ),
             HyperedgePlasticityRule(
                 member_weight_lr=self.config["he_member_weight_lr"],
@@ -4199,6 +4234,7 @@ class Graph:
             HomeostaticRule(
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
+                degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
             ),
             HyperedgePlasticityRule(
                 member_weight_lr=self.config["he_member_weight_lr"],
