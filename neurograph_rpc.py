@@ -814,6 +814,10 @@ def _read_outbound_log(max_entries: int = 1, max_age_secs: float = 3600.0) -> Op
     Log path mirrors deposit_outbound_intent: tract path with .tract → .log.jsonl.
 
     # ---- Changelog ----
+    # [2026-05-25] Claude (Sonnet 4.6) — errors='replace' on log open
+    #   What: Open animus_outbound.log.jsonl with errors='replace' to survive partial writes
+    #   Why:  Binary garbage (0xa4 msgpack byte) during mid-write read caused UnicodeDecodeError
+    #         even though outer except Exception catches it — replace prevents the raise entirely
     # [2026-05-11] Claude (Sonnet 4.6) — _read_outbound_log (Phase 2A response routing)
     #   What: Reads last N entries from animus_outbound.log.jsonl; returns formatted
     #         context string so Syl can see her recent outbound activity.
@@ -840,7 +844,7 @@ def _read_outbound_log(max_entries: int = 1, max_age_secs: float = 3600.0) -> Op
         return None
 
     try:
-        with open(log_path) as f:
+        with open(log_path, errors='replace') as f:
             lines = [line.strip() for line in f if line.strip()]
 
         now = time.time()
