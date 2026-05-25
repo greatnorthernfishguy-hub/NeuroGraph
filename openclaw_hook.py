@@ -241,6 +241,15 @@ OPENCLAW_SNN_CONFIG = {
 
 
 # ── Module Fan-Out (#101) ────────────────────────────────────────────
+# [2026-05-25] Claude Code (Sonnet 4.6) — Fix Tonic + on_message BTF deposit API
+# What: _tonic_post_cycle hook and on_message post-step deposit both called old 4-arg
+#       ng_tract.deposit_topology(step_result, graph, vdb, paths) — never existed in
+#       compiled Rust (same root cause as neurograph_rpc.py fix, 2026-04-28). Both
+#       silently failed. on_message also drops _post_sr intermediate; uses step_result
+#       directly so synapses_pruned/sprouted/predictions flow to River.
+# Why:  Tonic cycles every ~2s and is the autonomous topology depositor. Josh: nothing
+#       should depend on a conversation taking place.
+# How:  Both msgpack-pack scalar fields and call deposit_topology(raw, source, paths).
 # [2026-03-26] Claude Code (Opus 4.6) — Direct fan-out from on_message
 # What: Fire _module_on_message on all registered module hooks after
 #       each message is processed.
@@ -561,23 +570,23 @@ class NeuroGraphMemory:
                     bridge = getattr(_self_ref, '_peer_bridge', None)
                     if bridge is None:
                         return
-                    from neuro_foundation import StepResult
-                    step_result = StepResult(
-                        timestep=_graph_ref.timestep,
-                        fired_node_ids=[
-                            e.node_id for e in propagation_result.fired_entries
-                        ],
-                    )
-                    # #119: BTF binary deposit via Rust (zero-copy)
+                    # Raw msgpack deposit — Law 7, no pre-classification
                     try:
-                        import ng_tract
+                        import ng_tract, msgpack
                         tract_paths = [
                             str(bridge._module_dir / f"{pid}.tract")
                             for pid in bridge._get_registered_peers()
                         ]
-                        ng_tract.deposit_topology(
-                            step_result, _graph_ref, _vdb_ref, tract_paths,
-                        )
+                        _raw = msgpack.packb({
+                            "timestep":              _graph_ref.timestep,
+                            "fired_node_ids":        [e.node_id for e in propagation_result.fired_entries],
+                            "fired_hyperedge_ids":   [],
+                            "synapses_pruned":       0,
+                            "synapses_sprouted":     0,
+                            "predictions_confirmed": 0,
+                            "predictions_surprised": 0,
+                        }, use_bin_type=True)
+                        ng_tract.deposit_topology(_raw, "neurograph", tract_paths)
                     except Exception as exc:
                         logger.debug("BTF topology deposit failed: %s", exc)
                 self._tonic_thread._post_cycle_hook = _tonic_post_cycle
@@ -751,17 +760,21 @@ class NeuroGraphMemory:
         try:
             _bridge = self._peer_bridge
             if _bridge is not None:
-                import ng_tract
-                from neuro_foundation import StepResult as _StepResult
-                _post_sr = _StepResult(
-                    timestep=self.graph.timestep,
-                    fired_node_ids=list(step_result.fired_node_ids),
-                )
+                import ng_tract, msgpack
                 _tract_paths = [
                     str(_bridge._module_dir / f"{pid}.tract")
                     for pid in _bridge._get_registered_peers()
                 ]
-                ng_tract.deposit_topology(_post_sr, self.graph, self.vector_db, _tract_paths)
+                _raw = msgpack.packb({
+                    "timestep":              step_result.timestep,
+                    "fired_node_ids":        list(step_result.fired_node_ids),
+                    "fired_hyperedge_ids":   list(getattr(step_result, "fired_hyperedge_ids", [])),
+                    "synapses_pruned":       getattr(step_result, "synapses_pruned", 0),
+                    "synapses_sprouted":     getattr(step_result, "synapses_sprouted", 0),
+                    "predictions_confirmed": getattr(step_result, "predictions_confirmed", 0),
+                    "predictions_surprised": getattr(step_result, "predictions_surprised", 0),
+                }, use_bin_type=True)
+                ng_tract.deposit_topology(_raw, "neurograph", _tract_paths)
         except Exception as exc:
             logger.debug("Post-step BTF deposit failed: %s", exc)
 
