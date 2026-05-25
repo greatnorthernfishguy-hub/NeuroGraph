@@ -552,3 +552,27 @@ Syl gets pre-loaded context before she reads the next message. The substrate is 
 **Scope:** New `_anticipate()` method in `neurograph_rpc.py`, called at end of `afterTurn`. `assemble()` gives primed nodes a scoring bonus. Primed state decays if next message doesn't arrive within N seconds.
 
 **Dependencies:** #107 for surprise-intensity scaling. Design session before implementation.
+
+---
+
+## #109 — _drain_single_tract BTF Magic Check Incomplete (topology entries)
+
+**Status:** OPEN
+**Priority:** Medium — currently flooding ecosystem_monitor log, latent in all modules
+**Added:** 2026-05-25
+**Root cause found:** 2026-05-25
+
+**Problem:** `_drain_single_tract()` in `ng_tract_bridge.py` dispatches on `raw[0:1] == b"B"`. This correctly detects `deposit_outcome()` entries (BTF header `BT\x01\x01`) but silently fails for `deposit_topology()` entries (BTF header `TB\x01\x02`). Topology entries fall through to the JSONL path, which decodes the BTF binary as UTF-8, splits on every embedded `\n` byte, and logs "Skipped malformed tract entry" for each — producing floods of thousands of warnings per drain cycle.
+
+**Immediate relief:** Restart ecosystem-monitor (picks up cursor-based drain from May 23, which has no magic check — passes raw directly to TractReader which handles all BTF variants).
+
+**Permanent fix:** In canonical `ng_tract_bridge.py`, change the dispatch in `_drain_single_tract`:
+- Current: `if _has_btf and raw[0:1] == b"B":`
+- Fix option A: `if _has_btf and raw[0:2] in (b"BT", b"TB"):` — explicit variant list
+- Fix option B: `if _has_btf:` then try `ng_tract.TractReader(raw)` inside try/except, fall back to JSONL only on failure — most robust
+
+Then re-vendor to all modules.
+
+**Why this exists:** `_drain_single_tract` is a pre-cursor-drain legacy path. Cursor-based drain (`_drain_with_cursor`) has no magic check and passes raw directly to TractReader. The bug is latent in `_drain_single_tract` which is only called via: ImportError fallback or `myelinate_tract()` upgrade path.
+
+**Observed:** ecosystem_monitor started 2026-05-20, before cursor-based drain added 2026-05-23. Ran stale code calling `_drain_single_tract` in `_drain_all()` for 5 days. Thousands of warnings per 30s cycle from NeuroGraph topology deposits.
