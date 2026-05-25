@@ -12,6 +12,17 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Fix severed River deposit in deposit_topology/experience
+#   What: _deposit_topology_to_river now msgpack-packs StepResult scalars and calls
+#         ng_tract.deposit_topology(raw_bytes, "neurograph", tract_paths). 
+#         _deposit_experience_to_river now encodes text as UTF-8 and calls
+#         ng_tract.deposit_experience(raw_bytes, "neurograph", tract_paths) with a list.
+#         Both silent logger.debug failures promoted to logger.error.
+#   Why:  Both functions called non-existent Rust API since 2026-04-28. ng_tract had no
+#         deposit_topology/deposit_experience until today — AttributeError silently
+#         swallowed at DEBUG. Zero bytes deposited to River for >3 weeks.
+#   How:  Rust functions now implemented in ng-tract-rs. Payload is raw msgpack (Law 7 —
+#         no pre-classification). Consumers decode at extraction time.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Wire River drain into autonomic pulse
 #   What: Added _drain_peer_tracts() call inside _scan_drain_pulse_loop() alongside
 #         _drain_scan_dir(). River drain now runs every 2s unconditionally, not only
@@ -642,8 +653,8 @@ def _deposit_substrate_metrics(step_result) -> None:
 def _deposit_topology_to_river(step_result) -> None:
     """Deposit raw topology delta to every registered module's inbound tract (BTF).
 
-    Law 7: raw unclassified substrate output. Rust serializes directly from
-    StepResult + Graph objects. Each module's extraction bucket interprets at read time.
+    Law 7: raw unclassified substrate output. StepResult scalars are msgpack-packed
+    and deposited as raw bytes. Each module's extraction bucket interprets at read time.
     """
     if _ng_tract_bridge is None or _memory is None:
         return
@@ -656,14 +667,19 @@ def _deposit_topology_to_river(step_result) -> None:
             str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
             for peer_id in peers
         ]
-        ng_tract.deposit_topology(
-            step_result,
-            _memory.graph,
-            _memory.vector_db,
-            tract_paths,
-        )
+        import msgpack
+        raw = msgpack.packb({
+            "timestep":              step_result.timestep,
+            "fired_node_ids":        list(step_result.fired_node_ids),
+            "fired_hyperedge_ids":   list(step_result.fired_hyperedge_ids),
+            "synapses_pruned":       step_result.synapses_pruned,
+            "synapses_sprouted":     step_result.synapses_sprouted,
+            "predictions_confirmed": step_result.predictions_confirmed,
+            "predictions_surprised": step_result.predictions_surprised,
+        }, use_bin_type=True)
+        ng_tract.deposit_topology(raw, "neurograph", tract_paths)
     except Exception as exc:
-        logger.debug("_deposit_topology_to_river failed (non-fatal): %s", exc)
+        logger.error("_deposit_topology_to_river failed: %s", exc)
 
 
 def _deposit_experience_to_river(text: "Optional[str]") -> None:
@@ -671,7 +687,7 @@ def _deposit_experience_to_river(text: "Optional[str]") -> None:
 
     Law 7: raw unclassified experience. Text enters as-is — no embedding,
     no classification. Each module embeds at its own extraction boundary.
-    deposit_experience() takes a single path; loop over registered peers.
+    deposit_experience() receives a list of paths; all peers receive the same frame.
     """
     if _ng_tract_bridge is None or not text or not text.strip():
         return
@@ -680,11 +696,13 @@ def _deposit_experience_to_river(text: "Optional[str]") -> None:
         peers = _ng_tract_bridge._get_registered_peers()
         if not peers:
             return
-        for peer_id in peers:
-            tract_path = str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
-            _ngt.deposit_experience(text, "neurograph", tract_path)
+        tract_paths = [
+            str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
+            for peer_id in peers
+        ]
+        _ngt.deposit_experience(text.encode("utf-8"), "neurograph", tract_paths)
     except Exception as exc:
-        logger.debug("_deposit_experience_to_river failed (non-fatal): %s", exc)
+        logger.error("_deposit_experience_to_river failed: %s", exc)
 
 
 def deposit_outbound_intent(text: str, channel_id: str = "cli") -> None:
