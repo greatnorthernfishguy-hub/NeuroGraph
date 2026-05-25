@@ -48,7 +48,14 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
-# [2026-05-23] Claude Code (Sonnet 4.6) — Read-cursor incremental drain (#243)
+# [2026-05-25] Claude Code (Sonnet 4.6) — Fix _drain_single_tract BTF magic check (#109)
+#   What: Removed raw[0:1]==b"B" first-byte pre-filter. Always routes through TractReader.
+#   Why:  BTF magic 0x4254 in LE = first byte 0x54 ('T'), not 0x42 ('B'). Check never
+#         matched; all BTF frames fell to JSONL path causing json.JSONDecodeError floods.
+#         _drain_with_cursor already does this correctly — _drain_single_tract now matches.
+#   How:  Deleted if/else split on first byte. _has_btf branch unconditionally uses
+#         TractReader. JSONL-only else kept for ImportError fallback only.
+# # [2026-05-23] Claude Code (Sonnet 4.6) — Read-cursor incremental drain (#243)
 #   What: Replaced atomic rename→read→delete drain with cursor-sidecar incremental reads.
 #         Added _cursor_path(), _read_cursor(), _write_cursor(), _compact_tract(),
 #         _drain_with_cursor(). New constants: _CURSOR_SUFFIX, _COMPACT_THRESHOLD_BYTES.
@@ -662,9 +669,10 @@ class NGTractBridge(NGBridge):
         Rename → read → delete.  New deposits go to a fresh file
         immediately after rename.  No data loss, no read/write collision.
 
-        Handles mixed BTF/JSONL tracts during the flush cycle:
-        - 0x42 ('B') first byte → BTF binary entry, read via TractReader
-        - 0x7B ('{') first byte → residual JSONL, parse with json.loads
+        Handles mixed BTF/JSONL tracts during the flush cycle via TractReader,
+        which dispatches on each frame's entry_type internally:
+        - BTF frames yield typed objects (PyOutcomeEntry, PyTopologyEntry, PyExperienceEntry)
+        - Residual JSONL lines yield raw bytes for Python to parse with json.loads
 
         BTF entries are stored as typed objects (PyOutcomeEntry,
         PyTopologyEntry, PyExperienceEntry) — no dict conversion.
@@ -700,15 +708,16 @@ class NGTractBridge(NGBridge):
             if not raw:
                 return entries
 
-            # Dispatch on first byte: BTF binary or residual JSONL
+            # Route all data through TractReader — handles BTF and residual JSONL.
+            # NOTE: BTF magic 0x4254 in LE = first byte 0x54 ('T'), not 0x42 ('B').
+            # Do NOT add a first-byte pre-filter here; TractReader already dispatches.
             try:
                 import ng_tract
                 _has_btf = True
             except ImportError:
                 _has_btf = False
 
-            if _has_btf and raw[0:1] == b"B":
-                # BTF tract — typed entry objects, no dict conversion
+            if _has_btf:
                 reader = ng_tract.TractReader(raw)
                 for entry in reader:
                     if isinstance(entry, bytes):
@@ -724,7 +733,7 @@ class NGTractBridge(NGBridge):
                                 continue
                         entries.append(entry)
             else:
-                # FLUSH CYCLE: residual JSONL — remove after tracts are clean (#120)
+                # JSONL-only fallback when ng_tract is unavailable (ImportError)
                 for line in raw.decode("utf-8", errors="replace").splitlines():
                     line = line.strip()
                     if not line:
