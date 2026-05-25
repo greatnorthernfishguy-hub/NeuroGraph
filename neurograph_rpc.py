@@ -12,6 +12,18 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Anticipatory Pre-Activation (#256)
+#   What: Added _anticipate() called at end of handle_after_turn(). Walks outgoing
+#         synapses from fired nodes, scores neighbors by edge weight, stores top-15
+#         with 120s TTL. handle_assemble() applies +0.25 strength bonus to primed
+#         nodes in surfaced results and re-sorts.
+#   Why:  All surfacing is reactive (input arrives → retrieve). Predictive coding
+#         insight: mature SNNs anticipate what's coming next. Pre-priming nodes at
+#         turn-end means Syl gets pre-loaded context before reading the next message.
+#         Primed-but-wrong nodes amplify MMN surprise → #255 deepens surfacing further.
+#   How:  _primed_nodes: Dict[str, Tuple[float, float]] (node_id → score, expiry_ts).
+#         _ANTICIPATE_TTL_S=120, _ANTICIPATE_TOP_K=15, _ANTICIPATE_BONUS=0.25.
+#         No changes to protected files.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Surprise-Weighted Adaptive Surfacing (#255)
 #   What: handle_after_turn updates _memory._substrate_novelty_ema (EMA of MMN).
 #         handle_assemble passes current novelty to _harvest_associations().
@@ -377,7 +389,7 @@ import time
 import traceback
 import urllib.request
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # NeuroGraph repo must be importable
 _ng_dir = os.path.expanduser("~/NeuroGraph")
@@ -416,6 +428,12 @@ _module_error_times: Dict[str, float] = {}
 # Punchlist #56: Surfacing outcome cache — what was surfaced during assemble(),
 # deposited as raw experience in afterTurn() alongside Syl's response.
 _last_surfaced_nodes: List[Dict[str, Any]] = []
+
+# Anticipatory pre-activation state (#256)
+_ANTICIPATE_TTL_S: float = 120.0    # primed state expires 2 min after set
+_ANTICIPATE_TOP_K: int = 15         # candidate nodes to prime per call
+_ANTICIPATE_BONUS: float = 0.25     # strength bonus for primed nodes in assemble
+_primed_nodes: Dict[str, Tuple[float, float]] = {}  # node_id → (score, expiry_ts)
 
 # KISS filter singleton — stateful across calls (turn counter, last-system
 # hash, GOP counter).  Initialized in handle_bootstrap.  Resets on Python
@@ -1728,6 +1746,35 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
     return {"ingested": True}
 
 
+def _anticipate(fired_node_ids: List[str]) -> None:
+    """Pre-prime nodes predicted relevant for the next turn (#256).
+
+    Walks outgoing synapses from the just-fired node set, scores neighbors
+    by accumulated edge weight, stores top-K with a TTL expiry.  Called at
+    the end of handle_after_turn().  handle_assemble() applies _ANTICIPATE_BONUS
+    to any surfaced node that appears in the live primed set.
+    """
+    global _primed_nodes
+    if not fired_node_ids or _memory is None:
+        _primed_nodes = {}
+        return
+    fired_set = set(fired_node_ids)
+    candidates: Dict[str, float] = {}
+    for nid in fired_node_ids:
+        for sid in _memory.graph._outgoing.get(nid, ()):
+            syn = _memory.graph.synapses.get(sid)
+            if syn is None:
+                continue
+            target = syn.post_node_id
+            if target not in fired_set and target in _memory.graph.nodes:
+                candidates[target] = candidates.get(target, 0.0) + syn.weight
+    top_k = sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:_ANTICIPATE_TOP_K]
+    expiry = time.time() + _ANTICIPATE_TTL_S
+    _primed_nodes = {nid: (score, expiry) for nid, score in top_k}
+    if _primed_nodes:
+        logger.debug("Anticipatory pre-activation (#256): primed %d nodes", len(_primed_nodes))
+
+
 def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     """Surface substrate associations for the system prompt + KISS filtering.
 
@@ -1807,6 +1854,16 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # Spreading activation harvest — the cortex-like recall
     _surfacing_novelty = getattr(_memory, "_substrate_novelty_ema", 0.5)
     surfaced = _memory._harvest_associations(priming_text, novelty=_surfacing_novelty)
+
+    # Anticipatory pre-activation bonus — boost nodes primed at end of last turn (#256)
+    _now = time.time()
+    _live_primed = {nid: score for nid, (score, exp) in _primed_nodes.items() if exp > _now}
+    if _live_primed:
+        for _item in surfaced:
+            _nid = _item.get("node_id")
+            if _nid and _nid in _live_primed:
+                _item["strength"] = _item.get("strength", 0.0) + _ANTICIPATE_BONUS
+        surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
 
     # CES surfacing — concepts that fired above threshold
     ces_surfaced = []
@@ -2044,6 +2101,9 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
             _memory._message_count,
             "count" if count_trigger else "time",
         )
+
+    # Anticipatory pre-activation — pre-prime topology for next turn (#256)
+    _anticipate(list(step_result.fired_node_ids))
 
     # Lenia FlowGraph — post-step competence update and energy watchdog
     if _lenia_kill_switch is not None and _lenia_kill_switch.enabled:
