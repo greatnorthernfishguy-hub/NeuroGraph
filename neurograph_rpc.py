@@ -530,7 +530,7 @@ def _bootstrap_modules() -> List[str]:
                     break
 
             if instance is None:
-                logger.warning("Module %s: no hook class found in %s", module_id, hook_file)
+                logger.error("Module %s: no hook class found in %s — check registry entry_point", module_id, hook_file)
                 continue
 
             _module_instances[module_id] = instance
