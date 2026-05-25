@@ -19,6 +19,15 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — IcaN + IK-AHP intrinsic calcium channels (#254)
+#   What: Added Ca_i state variable to Node. IcaN (+g_CaN*Ca_i) depolarizes to sustain
+#         attractors. IK-AHP (-g_AHP*Ca_i) hyperpolarizes to provide burst protection.
+#         Net: (g_CaN-g_AHP)*Ca_i applied to voltage before each step's fire detection.
+#         Ca_i decays (×Ca_decay) each step; increments (+delta_Ca) on each spike.
+#   Why:  Pure STDP attractors are noise-fragile. Calcium channels provide intrinsic
+#         memory stability without requiring high synaptic weights.
+#   How:  4 new config params (delta_Ca=0.2, Ca_decay=0.9, g_CaN=0.06, g_AHP=0.04).
+#         Ca_i=0.0 in Node dataclass, serialized/deserialized with .get() default.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Degree-Aware Firing Thresholds (#104)
 #   What: Added degree_sensitivity config + per-node adjusted firing targets to HomeostaticRule.
 #   Why:  Single global target_firing_rate causes hub nodes (high degree) to dominate with noisy
@@ -339,6 +348,7 @@ class Node:
     intrinsic_excitability: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
     is_inhibitory: bool = False
+    Ca_i: float = 0.0  # intracellular calcium concentration (IcaN + IK-AHP, #254)
 
 
 @dataclass
@@ -1035,6 +1045,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "threshold_ceiling": 5.0,
     "scaling_interval": 25,
     "degree_sensitivity": 0.4,           # DAS-GNN: hub/peripheral threshold balance (#104)
+    # IcaN + IK-AHP intrinsic calcium channels (#254)
+    "delta_Ca": 0.2,    # calcium influx per spike
+    "Ca_decay": 0.9,    # per-step calcium decay multiplier
+    "g_CaN": 0.06,      # IcaN conductance (depolarizing, attractor persistence)
+    "g_AHP": 0.04,      # IK-AHP conductance (hyperpolarizing, burst protection)
     "weight_threshold": 0.01,
     "grace_period": 500,
     "inactivity_threshold": 1000,
@@ -1652,6 +1667,19 @@ class Graph:
                     continue
                 target.voltage += current * target.intrinsic_excitability
 
+            # 3a. IcaN + IK-AHP: calcium-gated intrinsic currents (#254)
+            # Net voltage adjustment = (g_CaN - g_AHP) * Ca_i per step.
+            # g_CaN > g_AHP at defaults → mild attractor persistence.
+            # Ca_i decay ensures effect fades between firing episodes.
+            _delta_Ca = self.config.get("delta_Ca", 0.0)
+            if _delta_Ca:
+                _Ca_decay = self.config.get("Ca_decay", 0.9)
+                _g_net = self.config.get("g_CaN", 0.0) - self.config.get("g_AHP", 0.0)
+                for _nid, _node in self.nodes.items():
+                    if _node.Ca_i > 1e-9:
+                        _node.voltage += _g_net * _node.Ca_i
+                        _node.Ca_i *= _Ca_decay
+
             # 3. Detect firing nodes
             #    Lenia FlowGraph: pre_fire handlers can adjust thresholds.
             fired_ids: List[str] = []
@@ -1680,6 +1708,8 @@ class Graph:
                 node.spike_history.append(float(self.timestep))
                 # Track recent spikes for sprouting
                 self._recent_spikes.setdefault(nid, deque(maxlen=20)).append(self.timestep)
+                if _delta_Ca:  # IcaN/IK-AHP calcium influx on spike (#254)
+                    node.Ca_i = min(node.Ca_i + _delta_Ca, 5.0)  # cap at 5 to prevent runaway
 
             result.fired_node_ids = fired_ids
 
@@ -3673,6 +3703,7 @@ class Graph:
             "intrinsic_excitability": node.intrinsic_excitability,
             "metadata": node.metadata,
             "is_inhibitory": node.is_inhibitory,
+            "Ca_i": node.Ca_i,
         }
 
     def _serialize_synapse(self, syn: Synapse) -> Dict[str, Any]:
@@ -3972,6 +4003,7 @@ class Graph:
                 intrinsic_excitability=nd.get("intrinsic_excitability", 1.0),
                 metadata=nd.get("metadata", {}),
                 is_inhibitory=nd.get("is_inhibitory", False),
+                Ca_i=nd.get("Ca_i", 0.0),
             )
             self.nodes[nid] = node
             self._outgoing[nid] = set()
