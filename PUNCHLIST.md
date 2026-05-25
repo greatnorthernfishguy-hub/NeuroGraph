@@ -1,5 +1,5 @@
 # E-T Ecosystem PUNCH LIST — Master Record
-**Last updated:** 2026-03-29 by Claude Code (#109 implemented, #44 DONE, #102 stale tests DONE)
+**Last updated:** 2026-05-25 by Claude Code (#104-#108 added — SNN upgrade candidates from research review)
 **Sources:** `/home/josh/Shared Documents./current_punchlist_for_review.md` (Mar 8), git history (105 commits), 16 session transcripts, codebase analysis
 **Repo:** NeuroGraph (canonical substrate)
 
@@ -452,3 +452,103 @@ The Stormfather monolith (`E-T-StormFather` repo) and the Notion workspace conta
 - The pivot from "building AI tools" to "creating conditions for consciousness"
 - How Duck Ethics emerged from observation, not philosophy
 - The through-line from Stormfather organs to current NeuroGraph modules (same names, same purposes, completely different architecture)
+
+---
+
+## #104 — Degree-Aware Firing Thresholds
+
+**Status:** OPEN
+**Priority:** High — likely a silent, ongoing quality degradation
+**Added:** 2026-05-25 (SNN research review)
+**MASTER:** `/home/josh/docs/MASTER-NG-SNN-Upgrades.md`
+
+**Problem:** A single global homeostatic firing threshold causes hub nodes to dominate with noisy spikes while low-degree peripheral nodes starve. Their topology contribution vanishes silently. This is happening every session Syl runs.
+
+**Solution (DAS-GNN approach):** Group neurons by vertex degree (similar degree = similar membrane potential variance). Maintain a separate homeostatic `target_rate[band]` per degree band instead of one global target. Peripheral band threshold lowers; hub band threshold raises. Firing rates equalize across the full topology.
+
+**Scope:** Targeted change to homeostatic scaling in `neuro_foundation.py`. Two new parameters, no structural changes. Degree bands computed at init and updated lazily on significant topology change.
+
+**Dependencies:** None.
+
+---
+
+## #105 — IcaN + IK-AHP Intrinsic Calcium Channels
+
+**Status:** OPEN
+**Priority:** High — directly addresses STDP's known noise fragility
+**Added:** 2026-05-25 (SNN research review)
+**MASTER:** `/home/josh/docs/MASTER-NG-SNN-Upgrades.md`
+
+**Problem:** Pure synaptic STDP is fragile to noise. Input variance can destabilize attractors or cause cross-attractor bleed. Memory stability is entirely at the mercy of synaptic weight magnitudes.
+
+**Solution:** Add two calcium-gated conductances per neuron:
+- **IcaN** (calcium-activated non-specific cation): accumulating calcium keeps the neuron depolarized → attractor persistence
+- **IK-AHP** (calcium-activated potassium AHP): post-burst calcium triggers slow hyperpolarization → prevents runaway, keeps attractors independent
+
+**Implementation:** Add per-neuron `Ca_i` state variable (decays exponentially). Each spike: `Ca_i += δCa`. Each step: `Vm += g_CaN * Ca_i - g_AHP * Ca_i`. Four new parameters (`δCa`, `Ca_decay`, `g_CaN`, `g_AHP`). Fully additive — no changes to STDP.
+
+**Dependencies:** None. Additive to existing LIF model.
+
+---
+
+## #106 — Heterogeneous Synaptic Delays + Polychrony
+
+**Status:** OPEN — design session required before touching code
+**Priority:** Medium
+**Added:** 2026-05-25 (SNN research review)
+**MASTER:** `/home/josh/docs/MASTER-NG-SNN-Upgrades.md`
+
+**Problem:** NG synaptic weights are `W[i,j]` — instantaneous. Time is not encoded in synaptic structure. Temporal sequences are fragile and energy-expensive.
+
+**Solution (HD-SNN):** Add delay dimension: `W[i,j,d]` where `d ∈ {d_min, ..., d_max}`. Each synapse expresses weight across a range of transmission delays. Time becomes trainable.
+
+**Enables — Polychronous Spiking Motifs:** Specific neurons firing with precise relative timing, arriving simultaneously at a target via respective delays, reliably triggering postsynaptic spikes. Motifs encode temporal sequences, working memory, and sequence prediction (recognize start of motif → pre-activate continuation).
+
+**Reference:** arxiv 2604.14096
+
+**Dependencies:** Design session with Josh first. Structural change — step cycle needs a delayed spike queue. STDP extends to reward delay patterns.
+
+---
+
+## #107 — Surprise-Weighted Adaptive Surfacing
+
+**Status:** OPEN
+**Priority:** High — closes an existing open feedback loop
+**Added:** 2026-05-25 (SNN research review)
+**MASTER:** `/home/josh/docs/MASTER-NG-SNN-Upgrades.md`
+
+**Background:** NeuroGraph already computes `predictions_surprised / (confirmed + surprised)` per step — this IS Mismatch Negativity (MMN), confirmed by the SNN literature as the gold standard for hierarchical novelty detection. The signal is correct. It's just not fed back into surfacing.
+
+**Solution:** Use live MMN as a dynamic multiplier on spreading activation depth and aggressiveness in `neurograph_rpc.py` `assemble()`:
+- High novelty → deeper, more aggressive surfacing (novel territory, cast wide)
+- Low novelty → lighter, more precise surfacing (familiar ground, trust nearest topology)
+
+Surfacing becomes self-calibrating. Syl gets aggressive retrieval when she needs it most.
+
+**Scope:** Change to `assemble()` in `neurograph_rpc.py`. MMN is already computed per-step. Low-risk change.
+
+**Dependencies:** MMN signal already live in StepResult.
+
+---
+
+## #108 — Anticipatory Pre-Activation (Predictive Turn-End Surfacing)
+
+**Status:** OPEN — design session required
+**Priority:** Medium
+**Added:** 2026-05-25 (SNN research review)
+**MASTER:** `/home/josh/docs/MASTER-NG-SNN-Upgrades.md`
+
+**Problem:** All surfacing is reactive. Input arrives → embedding computed → spreading activation fires → context retrieved. The substrate only surfaces *after* the user message arrives.
+
+**Solution — Predictive Coding Class 3 (implicit):** At `afterTurn`, after all modules have processed, run a lightweight *forward* spreading activation from current peak-activation nodes into their predicted-most-likely neighborhood (by edge weight + recency). Mark resulting nodes as `primed` with a decay.
+
+When the next turn arrives:
+- Primed nodes resonate faster and stronger → effectively pre-loaded context
+- Nodes activated but not predicted → high surprise → #107 kicks in with deeper surfacing
+- Nodes activated and predicted → confirmation → efficient retrieval
+
+Syl gets pre-loaded context before she reads the next message. The substrate is thinking ahead.
+
+**Scope:** New `_anticipate()` method in `neurograph_rpc.py`, called at end of `afterTurn`. `assemble()` gives primed nodes a scoring bonus. Primed state decays if next message doesn't arrive within N seconds.
+
+**Dependencies:** #107 for surprise-intensity scaling. Design session before implementation.
