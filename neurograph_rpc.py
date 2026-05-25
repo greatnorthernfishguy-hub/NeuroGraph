@@ -2383,7 +2383,6 @@ def _scan_drain_pulse_loop() -> None:
             if not paused:
                 _drain_scan_dir()
                 _drain_peer_tracts()
-                _drain_peer_tracts()
             # Time-based auto-save — fires on every tick, paused or not.
             # Shared _last_save_time with the afterTurn save path; whichever
             # fires first resets the clock so we don't double-save.
