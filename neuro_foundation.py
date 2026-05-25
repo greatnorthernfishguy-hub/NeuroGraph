@@ -19,6 +19,18 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Heterogeneous Synaptic Delays (#257)
+#   What: Added d_min/d_max to DEFAULT_CONFIG. _sprout_synapses() now samples
+#         delay=random.randint(d_min, d_max) for each new synapse (default 1–5 steps).
+#         Existing synapses load delay=1 (backward-compat via sd.get('delay', 1)).
+#         _delay_buffer, step() routing, and serialization were already present.
+#   Why:  Heterogeneous delays enable polychronous spiking motifs: neuron combos
+#         with precise relative firing timing whose delayed signals arrive
+#         simultaneously at a target, reliably triggering post-synaptic spikes.
+#         Encodes temporal sequences (turn structure, recurring patterns, procedural
+#         memory) as first-class topology. STDP unchanged — coincident delayed
+#         arrivals cause firing → STDP naturally selects the causal delay patterns.
+#   How:  import random added. 2 config params. 1 create_synapse call in sprout.
 # [2026-05-25] Claude Code (Sonnet 4.6) — IcaN + IK-AHP intrinsic calcium channels (#254)
 #   What: Added Ca_i state variable to Node. IcaN (+g_CaN*Ca_i) depolarizes to sustain
 #         attractors. IK-AHP (-g_AHP*Ca_i) hyperpolarizes to provide burst protection.
@@ -198,6 +210,7 @@ import copy
 import json
 import logging
 import math
+import random
 import threading
 import uuid
 from collections import deque
@@ -1050,6 +1063,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "Ca_decay": 0.9,    # per-step calcium decay multiplier
     "g_CaN": 0.06,      # IcaN conductance (depolarizing, attractor persistence)
     "g_AHP": 0.04,      # IK-AHP conductance (hyperpolarizing, burst protection)
+    # Heterogeneous Synaptic Delays + Polychrony (#257)
+    "d_min": 1,         # minimum synaptic delay in timesteps
+    "d_max": 5,         # maximum synaptic delay in timesteps (range enables polychrony)
     "weight_threshold": 0.01,
     "grace_period": 500,
     "inactivity_threshold": 1000,
@@ -2921,7 +2937,11 @@ class Graph:
                     continue
                 if (other_id, nid) in existing_pairs:
                     continue
-                self.create_synapse(nid, other_id, weight=initial_w)
+                _delay = random.randint(
+                    self.config.get("d_min", 1),
+                    self.config.get("d_max", 5),
+                )
+                self.create_synapse(nid, other_id, weight=initial_w, delay=_delay)
                 existing_pairs.add((nid, other_id))
                 count += 1
 
