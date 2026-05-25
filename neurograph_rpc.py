@@ -12,6 +12,17 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Kill _deposit_substrate_metrics() JSONL call sites
+#   What: Removed both calls to _deposit_substrate_metrics() — one from handle_on_message
+#         (afterTurn flow, line ~1936) and one from _scan_drain_pulse_loop (autonomous step).
+#         Function definition retained but is now dead code pending explicit removal.
+#   Why:  Josh's explicit request: JSONL path was Darwin's legacy feed before BTF tracts.
+#         Darwin now receives topology events via _on_river_events() + BTF tracts (direct
+#         deposit from _deposit_topology_to_river). The JSONL feed was redundant and pre-Law-7
+#         (it wrote labeled metric names, not raw embeddings). Killing it removes the parallel
+#         mechanism and ensures Darwin only sees raw substrate topology via the River.
+#   How:  Two single-line deletions. _deposit_topology_to_river() immediately follows both
+#         and remains — it is the correct Law 7 deposit path.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Fix tract_stats NameError + autonomous substrate step
 #   What: (1) Removed dangling tract_stats["pending"] from handle_bootstrap return dict — variable
 #         was deleted in a prior session but usage was left behind, causing NameError on every
@@ -1933,7 +1944,6 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # The delta contains fired nodes with causal context, hyperedge activations,
     # prediction results, structural changes, and salience signals. Raw,
     # unclassified (Law 7). Each module's bucket extracts what it needs.
-    _deposit_substrate_metrics(step_result)
     _deposit_topology_to_river(step_result)
     _deposit_experience_to_river(_ingest_text)
 
@@ -2415,7 +2425,6 @@ def _scan_drain_pulse_loop() -> None:
                 if _memory is not None:
                     try:
                         _auto_step = _memory.graph.step()
-                        _deposit_substrate_metrics(_auto_step)
                         _deposit_topology_to_river(_auto_step)
                     except Exception as _exc:
                         logger.debug("Autonomous substrate step failed: %s", _exc)
