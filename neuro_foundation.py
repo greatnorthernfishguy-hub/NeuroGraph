@@ -19,6 +19,22 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — DiffPC: Difference Predictive Coding layer hierarchy
+#   What: Added diffpc_layer (0=novel/input, 1=mid, 2=hub), pred_weights (Dict[str,float]),
+#         pred_error_ema (float) to Node. HomeostaticRule._refresh_degree_targets() now
+#         also assigns diffpc_layer by degree percentile (p33/p67) each scaling interval.
+#         _diffpc_step() computes ternary prediction errors (±1,0) from Layer-L → Layer-L-1
+#         prediction weights, updates pred_weights by gradient, accumulates pred_error_ema.
+#         Called at step 7b (after STDP, before structural plasticity).
+#         New DEFAULT_CONFIG: diffpc_epsilon=0.2, diffpc_pred_lr=0.01.
+#         Backward-compat: old checkpoints load diffpc_layer=0, pred_weights={}, pred_error_ema=0.0.
+#   Why:  Semantic layer hierarchy for DiffPC. Degree bands become a 3-layer predictive
+#         coding architecture. Ternary errors are sparse vs. dense floats — efficient,
+#         biologically plausible. Birth thresholds seeded from River novelty (neurograph_rpc.py)
+#         give semantically meaningful layer placement before organic connections form.
+#   How:  Layer: degree percentile p33/p67, refreshed at each scaling_interval alongside
+#         DAS-GNN targets. _diffpc_step(): for each fired Layer-L node, walk outgoing synapses
+#         to Layer-L-1 targets, compute error=actual−pred_weight, ternary-quantize, update weight.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Heterogeneous Synaptic Delays (#257)
 #   What: Added d_min/d_max to DEFAULT_CONFIG. _sprout_synapses() now samples
 #         delay=random.randint(d_min, d_max) for each new synapse (default 1–5 steps).
@@ -362,6 +378,9 @@ class Node:
     metadata: Dict[str, Any] = field(default_factory=dict)
     is_inhibitory: bool = False
     Ca_i: float = 0.0  # intracellular calcium concentration (IcaN + IK-AHP, #254)
+    diffpc_layer: int = 0                           # DiffPC layer: 0=novel/input, 1=mid, 2=hub
+    pred_weights: Dict[str, float] = field(default_factory=dict)  # nid → prediction weight
+    pred_error_ema: float = 0.0                     # EMA of ternary prediction error received
 
 
 @dataclass
@@ -893,6 +912,17 @@ class HomeostaticRule(PlasticityRule):
             scale = max(0.1, 1.0 - (deg_norm - 0.5) * 2.0 * self.degree_sensitivity)
             self._degree_targets[nid] = self.target_firing_rate * scale
 
+        # DiffPC: assign layer 0/1/2 by degree percentile (p33/p67 cut points)
+        if degrees:
+            sorted_degs = sorted(degrees.values())
+            n = len(sorted_degs)
+            p33 = sorted_degs[n // 3]
+            p67 = sorted_degs[(2 * n) // 3]
+            for nid, deg in degrees.items():
+                node = graph.nodes.get(nid)
+                if node is not None:
+                    node.diffpc_layer = 0 if deg <= p33 else (1 if deg <= p67 else 2)
+
     def apply(
         self,
         graph: "Graph",
@@ -1066,6 +1096,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Heterogeneous Synaptic Delays + Polychrony (#257)
     "d_min": 1,         # minimum synaptic delay in timesteps
     "d_max": 5,         # maximum synaptic delay in timesteps (range enables polychrony)
+    # DiffPC: Difference Predictive Coding (#DiffPC)
+    "diffpc_epsilon": 0.2,   # ternary threshold: |error| > epsilon → ±1 spike, else 0
+    "diffpc_pred_lr": 0.01,  # prediction weight learning rate
     "weight_threshold": 0.01,
     "grace_period": 500,
     "inactivity_threshold": 1000,
@@ -1953,6 +1986,10 @@ class Graph:
                 for rule in self._plasticity_rules:
                     rule.apply(self, fired_ids, self.timestep)
 
+            # 7b. DiffPC: ternary prediction error + prediction weight update
+            if fired_ids:
+                self._diffpc_step(fired_ids)
+
             # 8. Structural plasticity
             pruned, sprouted = self._structural_plasticity(fired_ids)
             result.synapses_pruned = pruned
@@ -2798,6 +2835,49 @@ class Graph:
         Returns pre-charged unfired nodes that the system expects to fire.
         """
         return list(self.active_predictions.values())
+
+    # -----------------------------------------------------------------------
+    # DiffPC: Difference Predictive Coding (#DiffPC)
+    # -----------------------------------------------------------------------
+
+    def _diffpc_step(self, fired_ids: List[str]) -> None:
+        """Ternary prediction error computation + prediction weight update (DiffPC).
+
+        For each fired node in Layer L, walk outgoing synapses to Layer L-1 targets.
+        Compare actual activation (fired/not) to prediction weight → ternary error (±1, 0).
+        Update pred_weight by gradient; accumulate pred_error_ema on target node.
+        Called at step 7b (after STDP, before structural plasticity) so weights are current.
+        """
+        epsilon = self.config.get("diffpc_epsilon", 0.2)
+        pred_lr = self.config.get("diffpc_pred_lr", 0.01)
+        fired_set = set(fired_ids)
+
+        for nid in fired_ids:
+            node = self.nodes[nid]
+            layer = node.diffpc_layer
+            if layer == 0:
+                continue  # input layer generates no predictions downward
+            for sid in self._outgoing.get(nid, set()):
+                syn = self.synapses.get(sid)
+                if syn is None:
+                    continue
+                target = self.nodes.get(syn.post_node_id)
+                if target is None or target.diffpc_layer >= layer:
+                    continue  # only predict toward lower layers
+                predicted = node.pred_weights.get(syn.post_node_id, 0.5)
+                actual = 1.0 if syn.post_node_id in fired_set else 0.0
+                error = actual - predicted
+                if error > epsilon:
+                    ternary = 1
+                elif error < -epsilon:
+                    ternary = -1
+                else:
+                    ternary = 0
+                if ternary != 0:
+                    node.pred_weights[syn.post_node_id] = max(0.0, min(1.0,
+                        predicted + pred_lr * ternary
+                    ))
+                    target.pred_error_ema = 0.9 * target.pred_error_ema + 0.1 * abs(error)
 
     # -----------------------------------------------------------------------
     # Structural Plasticity (PRD §3.3)
@@ -3724,6 +3804,9 @@ class Graph:
             "metadata": node.metadata,
             "is_inhibitory": node.is_inhibitory,
             "Ca_i": node.Ca_i,
+            "diffpc_layer": node.diffpc_layer,
+            "pred_weights": node.pred_weights,
+            "pred_error_ema": node.pred_error_ema,
         }
 
     def _serialize_synapse(self, syn: Synapse) -> Dict[str, Any]:
@@ -4024,6 +4107,9 @@ class Graph:
                 metadata=nd.get("metadata", {}),
                 is_inhibitory=nd.get("is_inhibitory", False),
                 Ca_i=nd.get("Ca_i", 0.0),
+                diffpc_layer=nd.get("diffpc_layer", 0),
+                pred_weights=nd.get("pred_weights", {}),
+                pred_error_ema=nd.get("pred_error_ema", 0.0),
             )
             self.nodes[nid] = node
             self._outgoing[nid] = set()

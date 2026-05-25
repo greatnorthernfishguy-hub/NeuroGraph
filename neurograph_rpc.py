@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — DiffPC River deposit cluster tracker
+#   What: Added _update_deposit_cluster() + birth threshold scaling for newly ingested nodes.
+#         _deposit_centroid tracks running EMA of River deposit embeddings (alpha=0.05).
+#         At ingest, novelty (cosine distance from centroid) maps to birth threshold:
+#         novel → lower threshold (Layer 0 seed), familiar → higher (Layer 2 bootstrap).
+#   Why:  New nodes start with zero graph connections — DAS-GNN has nothing to calibrate.
+#         Bootstrap birth threshold from cross-message semantic novelty so DiffPC layer
+#         assignment is semantically meaningful before organic connections accumulate.
+#   How:  Birth threshold = default_threshold × (0.7 + 0.6 × (1 − novelty)),
+#         clamped [0.5×dt, 1.2×dt]. Applied to result.nodes_created after ingest.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Anticipatory Pre-Activation (#256)
 #   What: Added _anticipate() called at end of handle_after_turn(). Walks outgoing
 #         synapses from fired nodes, scores neighbors by edge weight, stores top-15
@@ -434,6 +444,10 @@ _ANTICIPATE_TTL_S: float = 120.0    # primed state expires 2 min after set
 _ANTICIPATE_TOP_K: int = 15         # candidate nodes to prime per call
 _ANTICIPATE_BONUS: float = 0.25     # strength bonus for primed nodes in assemble
 _primed_nodes: Dict[str, Tuple[float, float]] = {}  # node_id → (score, expiry_ts)
+# DiffPC: River deposit cluster tracker (semantic novelty at birth)
+_DEPOSIT_CLUSTER_ALPHA: float = 0.05
+_deposit_centroid: Optional[Any] = None           # np.ndarray running centroid
+_deposit_centroid_lock: threading.Lock = threading.Lock()
 
 # KISS filter singleton — stateful across calls (turn counter, last-system
 # hash, GOP counter).  Initialized in handle_bootstrap.  Resets on Python
@@ -1726,6 +1740,19 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         _ingest_embedding = None
 
+    # DiffPC: seed birth threshold for newly created nodes from semantic novelty.
+    # Novel deposits (far from centroid) → lower threshold (Layer 0 input seed).
+    # Familiar deposits (close to centroid) → higher threshold (Layer 2 bootstrap).
+    if _ingest_embedding is not None and result.nodes_created:
+        _novelty = _update_deposit_cluster(_ingest_embedding)
+        _dt = _memory.graph.config["default_threshold"]
+        _birth_t = _dt * (0.7 + 0.6 * (1.0 - _novelty))
+        _birth_t = max(0.5 * _dt, min(1.2 * _dt, _birth_t))
+        for _nid in result.nodes_created:
+            _nd = _memory.graph.nodes.get(_nid)
+            if _nd is not None:
+                _nd.threshold = _birth_t
+
     # [2026-04-23] CC (#208) — TrollGuard sidecar: perimeter defense sees every ingest.
     # scan_text() = Layer 4 VectorSentry (real-time live I/O protection). Targeted
     # single call for the security layer — not a fan-out broadcast. Daemon thread,
@@ -1744,6 +1771,30 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
         threading.Thread(target=_tg_scan, daemon=True).start()
 
     return {"ingested": True}
+
+
+def _update_deposit_cluster(embedding: Any) -> float:
+    """Update running centroid of River deposits; return novelty score [0, 1].
+
+    High novelty (low cosine similarity to centroid) → Layer 0 seed at birth.
+    Low novelty (familiar concept) → Layer 2 bootstrap threshold at birth.
+    Called from handle_ingest() when _ingest_embedding is available.
+    """
+    global _deposit_centroid
+    import numpy as _np
+    with _deposit_centroid_lock:
+        if _deposit_centroid is None:
+            _deposit_centroid = embedding.copy()
+            return 1.0  # first deposit = maximally novel
+        norm_e = embedding / (_np.linalg.norm(embedding) + 1e-9)
+        norm_c = _deposit_centroid / (_np.linalg.norm(_deposit_centroid) + 1e-9)
+        cos_sim = float(_np.dot(norm_e, norm_c))
+        novelty = (1.0 - cos_sim) / 2.0   # map cosine [-1,1] → novelty [0,1]
+        _deposit_centroid = (
+            (1.0 - _DEPOSIT_CLUSTER_ALPHA) * _deposit_centroid
+            + _DEPOSIT_CLUSTER_ALPHA * embedding
+        )
+        return novelty
 
 
 def _anticipate(fired_node_ids: List[str]) -> None:
