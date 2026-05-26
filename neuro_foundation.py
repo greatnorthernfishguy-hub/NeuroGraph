@@ -19,6 +19,19 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — GSG Phase 2: curvature-modulated STDP (neuro_foundation.py)
+#   What: Added _GSG_CURVATURE_TABLE (3×3) before STDPRule. In STDPRule.apply(), both _apply_dw()
+#         call sites (incoming + outgoing loops) now multiply dw by the table lookup
+#         _GSG_CURVATURE_TABLE[pre_layer][post_layer] before committing the weight change.
+#   Why:  Poincaré ball curvature κ(x) = 1/(1-||x||²) grows as ||x|| → 1 (boundary).
+#         Layer 0 nodes (boundary, novel/input) have κ≈1.96; Layer 2 hubs (center) have κ≈1.10.
+#         Multiplying dw by the normalized average curvature means STDP learns faster between
+#         boundary nodes (novel concept pairs) and at baseline between hub nodes. This respects
+#         the DiffPC hierarchy: new semantic structure forms quickly at the input layer where
+#         concepts are novel, while consolidated hub topology remains stable.
+#   How:  Precomputed 3×3 table indexed by (pre_layer, post_layer). getattr guard on diffpc_layer
+#         (defaults to 2 = hub baseline if attribute absent) ensures backward-compat with
+#         checkpoints predating DiffPC. No serialization changes. No config changes.
 # [2026-05-25] Claude Code (Sonnet 4.6) — DiffPC Phase 2: eligibility trace modulation + StepResult telemetry
 #   What: _diffpc_step() now returns (ternary_spike_count, mean_pred_error) and modulates
 #         syn.eligibility_trace by ±diffpc_trace_boost (default 0.05) when ternary fires.
@@ -740,6 +753,19 @@ class PlasticityRule:
         raise NotImplementedError
 
 
+# GSG Phase 2: curvature-modulated STDP weight changes.
+# Rows = pre_layer, cols = post_layer (0=novel/boundary, 1=mid, 2=hub/center).
+# Values = avg Poincaré curvature κ(layer)=1/(1-norm²) for norms [0.70,0.50,0.30],
+# normalized by Layer-2 baseline κ≈1.099. Layer 0↔0 = 1.784× (maximum amplification),
+# Layer 2↔2 = 1.000× (baseline). Defaulting to layer=2 when diffpc_layer absent
+# ensures pre-DiffPC checkpoints receive no modulation (factor=1.0).
+_GSG_CURVATURE_TABLE: List[List[float]] = [
+    [1.784, 1.499, 1.392],  # pre=Layer 0 (novel/input, near boundary)
+    [1.499, 1.213, 1.107],  # pre=Layer 1 (mid)
+    [1.392, 1.107, 1.000],  # pre=Layer 2 (hub/familiar, near center)
+]
+
+
 class STDPRule(PlasticityRule):
     """Spike-Timing-Dependent Plasticity (PRD §3.1).
 
@@ -837,6 +863,10 @@ class STDPRule(PlasticityRule):
                     scale = (syn.max_weight - syn.weight) / syn.max_weight
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
 
+                # GSG Phase 2: amplify dw by Poincaré curvature of pre/post layer
+                _pre_l = getattr(pre_node, "diffpc_layer", 2)
+                _post_l = getattr(post_node, "diffpc_layer", 2)
+                dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
                 self._apply_dw(syn, dw, timestep, three_factor)
 
             # Also handle outgoing synapses (post-before-pre → LTD from
@@ -871,6 +901,10 @@ class STDPRule(PlasticityRule):
                 else:
                     continue  # already handled in incoming pass
 
+                # GSG Phase 2: post_node is pre here (outgoing from it); other_node is post
+                _pre_l = getattr(post_node, "diffpc_layer", 2)
+                _post_l = getattr(other_node, "diffpc_layer", 2)
+                dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
                 self._apply_dw(syn, dw, timestep, three_factor)
 
 
