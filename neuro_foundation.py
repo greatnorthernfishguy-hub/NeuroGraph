@@ -19,6 +19,18 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — DiffPC Phase 2: eligibility trace modulation + StepResult telemetry
+#   What: _diffpc_step() now returns (ternary_spike_count, mean_pred_error) and modulates
+#         syn.eligibility_trace by ±diffpc_trace_boost (default 0.05) when ternary fires.
+#         StepResult gains diffpc_ternary_spikes and diffpc_mean_pred_error fields.
+#         step() captures return value and writes to result.
+#   Why:  Closes the DiffPC → STDP feedback loop. Ternary errors from step 7b gate STDP
+#         at the next timestep's step 7 via eligibility_trace — accurate predictions keep
+#         full eligibility, over-predictions suppress it, under-predictions amplify it.
+#         This is the third factor (prediction error) alongside existing reward signal.
+#   How:  _diffpc_step(fired_ids) → Tuple[int, float]. ternary=+1: trace += boost.
+#         ternary=-1: trace -= boost. Temporal ordering is correct: this step's error
+#         modulates next step's Hebbian update. diffpc_trace_boost=0.05 in DEFAULT_CONFIG.
 # [2026-05-25] Claude Code (Sonnet 4.6) — DiffPC: Difference Predictive Coding layer hierarchy
 #   What: Added diffpc_layer (0=novel/input, 1=mid, 2=hub), pred_weights (Dict[str,float]),
 #         pred_error_ema (float) to Node. HomeostaticRule._refresh_degree_targets() now
@@ -507,6 +519,8 @@ class StepResult:
     synapses_sprouted: int = 0
     predictions_confirmed: int = 0
     predictions_surprised: int = 0
+    diffpc_ternary_spikes: int = 0       # count of ±1 ternary error spikes this step
+    diffpc_mean_pred_error: float = 0.0  # mean |error| where ternary != 0
 
 
 # ---------------------------------------------------------------------------
@@ -1097,8 +1111,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "d_min": 1,         # minimum synaptic delay in timesteps
     "d_max": 5,         # maximum synaptic delay in timesteps (range enables polychrony)
     # DiffPC: Difference Predictive Coding (#DiffPC)
-    "diffpc_epsilon": 0.2,   # ternary threshold: |error| > epsilon → ±1 spike, else 0
-    "diffpc_pred_lr": 0.01,  # prediction weight learning rate
+    "diffpc_epsilon": 0.2,       # ternary threshold: |error| > epsilon → ±1 spike, else 0
+    "diffpc_pred_lr": 0.01,      # prediction weight learning rate
+    "diffpc_trace_boost": 0.05,  # eligibility trace ±boost per ternary spike (Phase 2)
     "weight_threshold": 0.01,
     "grace_period": 500,
     "inactivity_threshold": 1000,
@@ -1986,9 +2001,11 @@ class Graph:
                 for rule in self._plasticity_rules:
                     rule.apply(self, fired_ids, self.timestep)
 
-            # 7b. DiffPC: ternary prediction error + prediction weight update
+            # 7b. DiffPC: ternary prediction error + eligibility trace modulation
             if fired_ids:
-                self._diffpc_step(fired_ids)
+                _dc_spikes, _dc_err = self._diffpc_step(fired_ids)
+                result.diffpc_ternary_spikes = _dc_spikes
+                result.diffpc_mean_pred_error = _dc_err
 
             # 8. Structural plasticity
             pruned, sprouted = self._structural_plasticity(fired_ids)
@@ -2840,17 +2857,25 @@ class Graph:
     # DiffPC: Difference Predictive Coding (#DiffPC)
     # -----------------------------------------------------------------------
 
-    def _diffpc_step(self, fired_ids: List[str]) -> None:
+    def _diffpc_step(self, fired_ids: List[str]) -> Tuple[int, float]:
         """Ternary prediction error computation + prediction weight update (DiffPC).
 
         For each fired node in Layer L, walk outgoing synapses to Layer L-1 targets.
         Compare actual activation (fired/not) to prediction weight → ternary error (±1, 0).
         Update pred_weight by gradient; accumulate pred_error_ema on target node.
+        Phase 2: modulate syn.eligibility_trace by ±diffpc_trace_boost when ternary fires,
+        feeding prediction error as a third factor into the next step's STDP update.
         Called at step 7b (after STDP, before structural plasticity) so weights are current.
+
+        Returns:
+            (ternary_spike_count, mean_abs_error_where_ternary_nonzero)
         """
         epsilon = self.config.get("diffpc_epsilon", 0.2)
         pred_lr = self.config.get("diffpc_pred_lr", 0.01)
+        trace_boost = self.config.get("diffpc_trace_boost", 0.05)
         fired_set = set(fired_ids)
+        ternary_count = 0
+        error_sum = 0.0
 
         for nid in fired_ids:
             node = self.nodes[nid]
@@ -2878,6 +2903,13 @@ class Graph:
                         predicted + pred_lr * ternary
                     ))
                     target.pred_error_ema = 0.9 * target.pred_error_ema + 0.1 * abs(error)
+                    # Phase 2: modulate eligibility trace → gates STDP at next timestep
+                    syn.eligibility_trace += ternary * trace_boost
+                    ternary_count += 1
+                    error_sum += abs(error)
+
+        mean_err = error_sum / ternary_count if ternary_count > 0 else 0.0
+        return ternary_count, mean_err
 
     # -----------------------------------------------------------------------
     # Structural Plasticity (PRD §3.3)
