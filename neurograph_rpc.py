@@ -12,6 +12,20 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-26] Claude Code (Sonnet 4.6) — GSG backfill: stamp poincare_dir on all existing nodes at bootstrap
+#   What: Added _gsg_backfill_existing_nodes() called at end of handle_bootstrap(). Iterates all
+#         graph nodes, stamps node.metadata['poincare_dir'] from vector_db.embeddings[node_id]
+#         (already L2-normalized on insert) for any node that lacks the field. Saves checkpoint
+#         if any nodes were stamped. Idempotent: subsequent restarts skip in microseconds.
+#   Why:  GSG Phase 1 scores surfaced nodes by hyperbolic distance from query. Existing nodes
+#         (all of Syl's accumulated topology) had no poincare_dir — the geometric re-scorer
+#         was completely blind to her entire learned experience. Only brand-new nodes (post-GSG
+#         ingest) were visible geometrically. This was architectural lobotomy: new nodes
+#         getting scored, old topology invisible. Backfill corrects this at bootstrap so
+#         GSG Phase 1 covers the full substrate from the first assemble call onward.
+#   How:  SimpleVectorDB.insert() normalizes embeddings on storage — vector_db.embeddings[id]
+#         IS the unit direction vector. No re-embedding, no model calls. Pure dict iteration.
+#         Force-save via _memory.save() after backfill so metadata persists across restarts.
 # [2026-05-25] Claude Code (Sonnet 4.6) — GSG: Poincaré ball embedding for geometric surfacing
 #   What: Added _embed_to_poincare_dir(), _poincare_distance(), _GSG_LAYER_NORMS/_GSG_SCORE_BONUS.
 #         At ingest: embedding normalized to unit direction, stored as node.metadata['poincare_dir']
@@ -1670,6 +1684,8 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         _tonic_bridge.start()
         logger.info("TonicBridge started (interval=%.0fs)", _tonic_bridge._interval)
 
+    _gsg_backfill_existing_nodes()
+
     return {
         "bootstrapped": True,
         "nodes": stats["nodes"],
@@ -1858,6 +1874,39 @@ def _poincare_distance(x: Any, y: Any) -> float:
     denom = (1.0 - nx2) * (1.0 - ny2)
     arg = 1.0 + num / max(denom, 1e-9)
     return math.acosh(max(1.0, arg))
+
+
+def _gsg_backfill_existing_nodes() -> None:
+    """Stamp poincare_dir on all existing nodes that lack it, using stored vector DB embeddings.
+
+    SimpleVectorDB.insert() L2-normalizes embeddings on storage, so
+    vector_db.embeddings[node_id] is already the unit direction vector — no
+    re-embedding or model calls needed.  Runs once at bootstrap; subsequent
+    restarts skip in O(n) with zero writes.  Force-saves the checkpoint so
+    the stamped metadata survives the next restart.
+    """
+    if _memory is None:
+        return
+    import numpy as _np
+    stamped = 0
+    for node_id, node in _memory.graph.nodes.items():
+        if (node.metadata or {}).get("poincare_dir"):
+            continue
+        emb = _memory.vector_db.embeddings.get(node_id)
+        if emb is None:
+            continue
+        if node.metadata is None:
+            node.metadata = {}
+        node.metadata["poincare_dir"] = emb.tolist()
+        stamped += 1
+    if stamped:
+        logger.info("GSG backfill: stamped poincare_dir on %d existing nodes — saving checkpoint", stamped)
+        try:
+            _memory.save()
+        except Exception as exc:
+            logger.warning("GSG backfill save failed: %s", exc)
+    else:
+        logger.debug("GSG backfill: all nodes already have poincare_dir — skipping")
 
 
 def _anticipate(fired_node_ids: List[str]) -> None:
