@@ -12,6 +12,20 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — GSG: Poincaré ball embedding for geometric surfacing
+#   What: Added _embed_to_poincare_dir(), _poincare_distance(), _GSG_LAYER_NORMS/_GSG_SCORE_BONUS.
+#         At ingest: embedding normalized to unit direction, stored as node.metadata['poincare_dir']
+#         for each newly created node. At assemble: query projected to Poincaré ball (Layer 0 norm),
+#         each surfaced node projected using its current diffpc_layer; hyperbolic distance computed;
+#         closer nodes receive a strength bonus (max +0.30), re-sorted.
+#   Why:  DiffPC Phase 1 assigned semantic hierarchy (Layer 0=novel/input, 2=hub) but cosine
+#         similarity is topology-blind. Hyperbolic geometry respects tree-like semantic structure:
+#         Layer 0 near boundary (high curvature, novel concepts distinguished), Layer 2 near center
+#         (hub/familiar concepts cluster tightly). Poincaré distance rewards retrieval of nodes
+#         that are semantically close AND at the appropriate hierarchy level for the query.
+#   How:  Pure numpy (no geoopt). poincare_dir stored in node.metadata; layer norm applied
+#         dynamically at assemble from current diffpc_layer. River stays Euclidean. No vendored
+#         file changes. Backward-compat: nodes without poincare_dir skip GSG scoring silently.
 # [2026-05-25] Claude (Sonnet 4.6) — Phase 3: POST /assemble endpoint
 #   What: Add /assemble handler to _AfterTurnHandler.do_POST
 #   Why:  Animus ContextBuilder needs HTTP access to handle_assemble() for spreading activation
@@ -452,6 +466,9 @@ _primed_nodes: Dict[str, Tuple[float, float]] = {}  # node_id → (score, expiry
 _DEPOSIT_CLUSTER_ALPHA: float = 0.05
 _deposit_centroid: Optional[Any] = None           # np.ndarray running centroid
 _deposit_centroid_lock: threading.Lock = threading.Lock()
+# GSG: layer-specific Poincaré ball norms (Layer 0=novel/input near boundary, Layer 2=hub near center)
+_GSG_LAYER_NORMS: List[float] = [0.70, 0.50, 0.30]
+_GSG_SCORE_BONUS: float = 0.30   # max strength bonus from hyperbolic proximity
 
 # KISS filter singleton — stateful across calls (turn counter, last-system
 # hash, GOP counter).  Initialized in handle_bootstrap.  Resets on Python
@@ -1752,10 +1769,15 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
         _dt = _memory.graph.config["default_threshold"]
         _birth_t = _dt * (0.7 + 0.6 * (1.0 - _novelty))
         _birth_t = max(0.5 * _dt, min(1.2 * _dt, _birth_t))
+        _poincare_dir = _embed_to_poincare_dir(_ingest_embedding)
         for _nid in result.nodes_created:
             _nd = _memory.graph.nodes.get(_nid)
             if _nd is not None:
                 _nd.threshold = _birth_t
+                # GSG: store Poincaré direction; layer norm applied dynamically at assemble
+                if not hasattr(_nd, "metadata") or _nd.metadata is None:
+                    _nd.metadata = {}
+                _nd.metadata["poincare_dir"] = _poincare_dir.tolist()
 
     # [2026-04-23] CC (#208) — TrollGuard sidecar: perimeter defense sees every ingest.
     # scan_text() = Layer 4 VectorSentry (real-time live I/O protection). Targeted
@@ -1799,6 +1821,43 @@ def _update_deposit_cluster(embedding: Any) -> float:
             + _DEPOSIT_CLUSTER_ALPHA * embedding
         )
         return novelty
+
+
+def _embed_to_poincare_dir(embedding: Any) -> Any:
+    """Normalize an embedding to a unit direction vector for Poincaré ball storage.
+
+    The full Poincaré point is computed dynamically at query time as
+    `poincare_dir * _GSG_LAYER_NORMS[node.diffpc_layer]`, so the node's
+    geometric position updates automatically when its layer changes.
+    """
+    import numpy as _np
+    norm = _np.linalg.norm(embedding)
+    if norm < 1e-9:
+        return embedding.copy()
+    return embedding / norm
+
+
+def _poincare_distance(x: Any, y: Any) -> float:
+    """Geodesic distance between two points in the Poincaré ball.
+
+    d(x, y) = acosh(1 + 2‖x-y‖² / ((1-‖x‖²)(1-‖y‖²)))
+
+    Both x and y must have norm strictly < 1.  Points near the boundary
+    (high norm ≈ Layer 0) are spread far apart even for small Euclidean
+    differences; points near the center (low norm ≈ Layer 2) cluster tightly.
+    This respects the tree-like semantic hierarchy encoded by diffpc_layer.
+    """
+    import numpy as _np
+    import math
+    nx2 = float(_np.dot(x, x))
+    ny2 = float(_np.dot(y, y))
+    nx2 = min(nx2, 0.9999)
+    ny2 = min(ny2, 0.9999)
+    diff = x - y
+    num = 2.0 * float(_np.dot(diff, diff))
+    denom = (1.0 - nx2) * (1.0 - ny2)
+    arg = 1.0 + num / max(denom, 1e-9)
+    return math.acosh(max(1.0, arg))
 
 
 def _anticipate(fired_node_ids: List[str]) -> None:
@@ -1919,6 +1978,46 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
             if _nid and _nid in _live_primed:
                 _item["strength"] = _item.get("strength", 0.0) + _ANTICIPATE_BONUS
         surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
+
+    # GSG: hyperbolic distance re-scoring — nodes geometrically close to the query
+    # in Poincaré ball space receive a strength bonus (max _GSG_SCORE_BONUS).
+    # Query is projected at Layer 0 norm (fresh input); each surfaced node uses its
+    # current diffpc_layer norm so the bonus reflects semantic hierarchy alignment.
+    try:
+        import numpy as _gsg_np
+        _query_emb = None
+        try:
+            from ng_embed import embed as _gsg_embed
+            _query_emb = _gsg_embed(priming_text)
+        except Exception:
+            pass
+        if _query_emb is not None:
+            _query_dir = _embed_to_poincare_dir(_query_emb)
+            _query_pt = _query_dir * _GSG_LAYER_NORMS[0]  # fresh query = Layer 0
+            _gsg_applied = 0
+            for _item in surfaced:
+                _nid = _item.get("node_id")
+                if _nid is None:
+                    continue
+                _nd = _memory.graph.nodes.get(_nid)
+                if _nd is None:
+                    continue
+                _pdir = (_nd.metadata or {}).get("poincare_dir") if hasattr(_nd, "metadata") else None
+                if _pdir is None:
+                    continue
+                _layer = getattr(_nd, "diffpc_layer", 0)
+                _layer = max(0, min(2, _layer))
+                _node_pt = _gsg_np.array(_pdir) * _GSG_LAYER_NORMS[_layer]
+                _hdist = _poincare_distance(_query_pt, _node_pt)
+                # Closer in hyperbolic space → higher bonus; saturates at hdist=0
+                _bonus = _GSG_SCORE_BONUS / (1.0 + _hdist)
+                _item["strength"] = _item.get("strength", 0.0) + _bonus
+                _gsg_applied += 1
+            if _gsg_applied:
+                surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
+                logger.debug("GSG: hyperbolic re-scoring applied to %d nodes", _gsg_applied)
+    except Exception as _gsg_exc:
+        logger.debug("GSG re-scoring skipped: %s", _gsg_exc)
 
     # CES surfacing — concepts that fired above threshold
     ces_surfaced = []
