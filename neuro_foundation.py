@@ -47,6 +47,22 @@ Design principles (PRD §2.1):
 #         stamp, orphan check age guard, serializer field, restore default.
 #         Backward-compatible (.get() with default=0). Re-vendored to
 #         NuWave/nuwave/substrate/neuro_foundation.py.
+# [2026-05-26] Claude Code (Sonnet 4.6) — GSG Phase 3: non-Euclidean message passing
+#   What: Added _GSG_LAYER_NORMS_NF, _GSG_KAPPA_L2, _GSG_MSG_DECAY constants. Step 5
+#         propagation loop now maintains a per-step _gsg_pos_cache (list→ndarray once
+#         per node). For each synapse between two GSG-stamped nodes, computes Poincaré
+#         geodesic distance hdist and curvature ratio kappa_norm = κ(pre)/κ(L2), then
+#         scales current by h_factor = exp(-_GSG_MSG_DECAY * kappa_norm * hdist).
+#   Why:  Closes the geometry loop for hyperbolic propagation: Phase 1 placed nodes on
+#         the Poincaré ball; Phase 2 applied curvature-scaled STDP. Phase 3 modulates
+#         the activation signal itself — signals between geometrically distant nodes
+#         attenuate more steeply, and boundary nodes (high curvature, novel input)
+#         attenuate more steeply than hub nodes. Grounded in GSG paper (arXiv
+#         2508.06793): γ_ij * hdist maps to kappa_norm * hdist for scalar propagation.
+#   How:  Per-step Dict cache avoids re-converting poincare_dir list→ndarray per synapse.
+#         Nodes without poincare_dir silently skip (h_factor=1.0, backward-compatible).
+#         Geodesic: acosh(1 + 2||x-y||² / ((1-||x||²)(1-||y||²))). Norms clamped to
+#         0.9999 to avoid division-by-zero at ball boundary.
 # [2026-05-25] Claude Code (Sonnet 4.6) — GSG Phase 2: curvature-modulated STDP (neuro_foundation.py)
 #   What: Added _GSG_CURVATURE_TABLE (3×3) before STDPRule. In STDPRule.apply(), both _apply_dw()
 #         call sites (incoming + outgoing loops) now multiply dw by the table lookup
@@ -793,6 +809,11 @@ _GSG_CURVATURE_TABLE: List[List[float]] = [
     [1.499, 1.213, 1.107],  # pre=Layer 1 (mid)
     [1.392, 1.107, 1.000],  # pre=Layer 2 (hub/familiar, near center)
 ]
+# GSG Phase 3: non-Euclidean propagation constants.
+_GSG_LAYER_NORMS_NF: List[float] = [0.70, 0.50, 0.30]  # L0/L1/L2 Poincaré ball radii
+# κ(L2) = 1/(1-0.30²) ≈ 1.099 — hub baseline for curvature normalization
+_GSG_KAPPA_L2: float = 1.0 / (1.0 - 0.30 ** 2)
+_GSG_MSG_DECAY: float = 0.15  # geodesic decay rate; 0.0=Euclidean, 0.15=gentle; tunable
 
 
 class STDPRule(PlasticityRule):
@@ -1843,19 +1864,48 @@ class Graph:
             result.fired_node_ids = fired_ids
 
             # 5. Propagate spikes through outgoing synapses (with delay)
+            # GSG Phase 3: per-step Poincaré position cache (list→ndarray once per node)
+            _gsg_pos_cache: Dict[str, Any] = {}
             for nid in fired_ids:
                 node = self.nodes[nid]
                 sign = -1.0 if node.is_inhibitory else 1.0
+                # GSG Phase 3: resolve pre-node position on Poincaré ball (cached this step)
+                if nid not in _gsg_pos_cache:
+                    _pdir = (node.metadata or {}).get("poincare_dir")
+                    if _pdir is not None:
+                        _l = max(0, min(2, getattr(node, "diffpc_layer", 2)))
+                        _gsg_pos_cache[nid] = np.array(_pdir, dtype=np.float32) * _GSG_LAYER_NORMS_NF[_l]
+                    else:
+                        _gsg_pos_cache[nid] = None
+                _pre_pos = _gsg_pos_cache[nid]
                 for syn_id in self._outgoing.get(nid, set()):
                     syn = self.synapses.get(syn_id)
                     if syn is None:
                         logger.debug("Stale synapse ref %s in outgoing[%s]", syn_id, nid)
                         continue
-                    # Effective current is weight × sign
                     effective_type_sign = sign
                     if syn.synapse_type == SynapseType.INHIBITORY:
                         effective_type_sign = -1.0
                     current = syn.weight * effective_type_sign
+                    # GSG Phase 3: modulate by curvature-aware hyperbolic geodesic proximity
+                    if _pre_pos is not None:
+                        _post_node = self.nodes.get(syn.post_node_id)
+                        if _post_node is not None:
+                            if syn.post_node_id not in _gsg_pos_cache:
+                                _pdir2 = (_post_node.metadata or {}).get("poincare_dir")
+                                if _pdir2 is not None:
+                                    _l2 = max(0, min(2, getattr(_post_node, "diffpc_layer", 2)))
+                                    _gsg_pos_cache[syn.post_node_id] = np.array(_pdir2, dtype=np.float32) * _GSG_LAYER_NORMS_NF[_l2]
+                                else:
+                                    _gsg_pos_cache[syn.post_node_id] = None
+                            _post_pos = _gsg_pos_cache[syn.post_node_id]
+                            if _post_pos is not None:
+                                _nx2 = min(float(np.dot(_pre_pos, _pre_pos)), 0.9999)
+                                _ny2 = min(float(np.dot(_post_pos, _post_pos)), 0.9999)
+                                _diff = _pre_pos - _post_pos
+                                _hdist = math.acosh(max(1.0, 1.0 + 2.0 * float(np.dot(_diff, _diff)) / max((1.0 - _nx2) * (1.0 - _ny2), 1e-9)))
+                                _kappa_norm = (1.0 / max(1.0 - _nx2, 1e-6)) / _GSG_KAPPA_L2
+                                current *= math.exp(-_GSG_MSG_DECAY * _kappa_norm * _hdist)
                     arrival = self.timestep + syn.delay
                     self._delay_buffer.setdefault(arrival, []).append(
                         (syn.post_node_id, current)
