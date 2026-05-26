@@ -12,6 +12,10 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-25] Claude (Sonnet 4.6) — Phase 3: POST /assemble endpoint
+#   What: Add /assemble handler to _AfterTurnHandler.do_POST
+#   Why:  Animus ContextBuilder needs HTTP access to handle_assemble() for spreading activation
+#   How:  elif block identical in structure to /recall; always returns HTTP 200 (error-in-body pattern)
 # [2026-05-25] Claude Code (Sonnet 4.6) — DiffPC River deposit cluster tracker
 #   What: Added _update_deposit_cluster() + birth threshold scaling for newly ingested nodes.
 #         _deposit_centroid tracks running EMA of River deposit embeddings (alpha=0.05).
@@ -3290,6 +3294,21 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"results": [], "error": str(exc)}).encode())
+        elif self.path == "/assemble":
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len) if content_len else b"{}"
+                params = json.loads(body) if body else {}
+                result = handle_assemble(params)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(result, default=str).encode())
+            except Exception as exc:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"systemPromptAddition": None, "error": str(exc)}).encode())
         else:
             self.send_response(404)
             self.end_headers()
