@@ -19,6 +19,34 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-05-26] Claude Opus 4.7 (1M ctx) — #258 Orphan-node grace period
+#   What: Added orphan_node_grace_period config (default 25 steps); added
+#         creation_time field to Node dataclass; create_node() now stamps
+#         it; _collect_orphan_nodes() now checks (timestep - creation_time)
+#         > grace before sweeping. Serialization + restore handle the new
+#         field with default=0 for backward compatibility with existing
+#         msgpacks (restored nodes look ancient → grace passes → same
+#         sweep behavior as before this patch).
+#   Why:  #237 orphan collection has no grace period — sweeps zero-synapse
+#         nodes on every step(). This is fine for a populated substrate
+#         (Syl) because spreading activation through existing synapses
+#         fires co-activation partners in the same step, STDP creates
+#         synapses at step 7, orphan check at step 8 finds the new node
+#         already has synapses. But empty-substrate bootstrap (NuWave
+#         with NUWAVE_FRESH_START=1) has NO existing synapses for
+#         spreading activation to traverse — first deposit creates an
+#         isolated node, no co-firing happens, orphan check sweeps it.
+#         Substrate can never grow past zero. NuWave's A.1 Run 3 sidecar
+#         empirically confirmed this: 24 turns of deposits, substrate_nodes
+#         stayed at 0 throughout. Grace period gives canonical mechanisms
+#         time to wire new nodes — 25 steps default matches scaling_interval
+#         pattern (same as homeostatic regulation cadence). Latent defensive
+#         depth for Syl too: protects against bootstrap-from-empty if her
+#         substrate ever needs to be restored from a clean state.
+#   How:  6 surgical additions: dataclass field, config key, create_node
+#         stamp, orphan check age guard, serializer field, restore default.
+#         Backward-compatible (.get() with default=0). Re-vendored to
+#         NuWave/nuwave/substrate/neuro_foundation.py.
 # [2026-05-25] Claude Code (Sonnet 4.6) — GSG Phase 2: curvature-modulated STDP (neuro_foundation.py)
 #   What: Added _GSG_CURVATURE_TABLE (3×3) before STDPRule. In STDPRule.apply(), both _apply_dw()
 #         call sites (incoming + outgoing loops) now multiply dw by the table lookup
@@ -406,6 +434,7 @@ class Node:
     diffpc_layer: int = 0                           # DiffPC layer: 0=novel/input, 1=mid, 2=hub
     pred_weights: Dict[str, float] = field(default_factory=dict)  # nid → prediction weight
     pred_error_ema: float = 0.0                     # EMA of ternary prediction error received
+    creation_time: int = 0                          # Timestep when node was created (#258 orphan grace)
 
 
 @dataclass
@@ -1150,6 +1179,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "diffpc_trace_boost": 0.05,  # eligibility trace ±boost per ternary spike (Phase 2)
     "weight_threshold": 0.01,
     "grace_period": 500,
+    "orphan_node_grace_period": 25,      # Steps before orphan-node sweep (#258). Prevents empty-substrate bootstrap failure.
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
@@ -1540,6 +1570,7 @@ class Graph:
             refractory_period=self.config["refractory_period"],
             metadata=metadata or {},
             is_inhibitory=is_inhibitory,
+            creation_time=int(self.timestep),
         )
         self.nodes[nid] = node
         self._outgoing[nid] = set()
@@ -3012,12 +3043,27 @@ class Graph:
         collected in the same structural-plasticity step. The full SNN has
         no max_nodes cap — without this, orphans accumulate without bound
         as synapses are pruned over the graph's lifetime.
+
+        Honors orphan_node_grace_period (#258): newly-created nodes get a
+        window for canonical mechanisms (STDP via spreading activation
+        through existing synapses, sprouting via co-firing detection) to
+        wire them before sweep. Without grace, empty-substrate bootstrap
+        fails — the very first deposit gets swept on the next step()
+        because no co-firing partners exist yet to anchor synapses. Mature
+        substrates (Syl) are unaffected: new nodes already get wired via
+        spreading activation within the same step() before the orphan
+        check runs at step 8, so grace passes but isn't load-bearing.
+        Restored nodes from older msgpacks default to creation_time=0
+        and thus age = full current timestep, well past grace — same
+        sweep behavior as before this patch.
         """
+        grace = self.config.get("orphan_node_grace_period", 0)
         orphans = [
             nid for nid in self.nodes
             if not self._outgoing.get(nid)
             and not self._incoming.get(nid)
             and not self._node_hyperedges.get(nid)
+            and (self.timestep - self.nodes[nid].creation_time) > grace
         ]
         removed = 0
         for nid in orphans:
@@ -3873,6 +3919,7 @@ class Graph:
             "diffpc_layer": node.diffpc_layer,
             "pred_weights": node.pred_weights,
             "pred_error_ema": node.pred_error_ema,
+            "creation_time": node.creation_time,
         }
 
     def _serialize_synapse(self, syn: Synapse) -> Dict[str, Any]:
@@ -4176,6 +4223,7 @@ class Graph:
                 diffpc_layer=nd.get("diffpc_layer", 0),
                 pred_weights=nd.get("pred_weights", {}),
                 pred_error_ema=nd.get("pred_error_ema", 0.0),
+                creation_time=nd.get("creation_time", 0),
             )
             self.nodes[nid] = node
             self._outgoing[nid] = set()
