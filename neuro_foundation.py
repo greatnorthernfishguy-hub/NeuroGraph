@@ -65,21 +65,6 @@ Design principles (PRD §2.1):
 #   How:  Spherical pos = poincare_dir (already unit-normalized, lives on unit sphere).
 #         Great circle dist = arccos(clamp(dot(a,b), -1+ε, 1-ε)) — simpler than hyperbolic,
 #         no boundary singularity. Co-confirm via graph._outgoing/_incoming synapse scan.
-# # [2026-05-28] Claude Code (Sonnet 4.6) — GSG Phase 4: spherical manifold for attractor nodes
-#   What: Added manifold_type field to Node. _GSG_MSG_DECAY_SPHER constant.
-#         gsg_spherical_fraction config key (default 0.20).
-#         HomeostaticRule assigns manifold_type via two-pass: (1) candidates with
-#         abs(pred_error_ema) <= 20th-pct threshold; (2) co-confirmed only if
-#         at least one synapse neighbor is also a candidate (pair labeling).
-#         Step 5 cache stores (pos_array, mtype): sphere+sphere -> arccos great
-#         circle; hyp+hyp -> existing Poincare (Phase 3); cross -> neutral.
-#         Serialization: manifold_type saved/loaded, backward-compat default hyperbolic.
-#   Why:  Source GSG paper specifies S x E x H mixed manifolds. H-only is incomplete.
-#         Attractor dynamics are cyclical (closed loops) -- spherical geometry handles
-#         this naturally. pred_error_ema (DiffPC Phase 2) identifies stable attractor
-#         nodes. Co-assignment ensures pairs/groups are labeled together.
-#   How:  Spherical pos = poincare_dir (unit vec, already on unit sphere). Great circle
-#         dist = arccos(clamp(dot(a,b),-1+e,1-e)). Co-confirm via synapse scan.
 # [2026-05-26] Claude Code (Sonnet 4.6) — GSG Phase 3: non-Euclidean message passing
 #   What: Added _GSG_LAYER_NORMS_NF, _GSG_KAPPA_L2, _GSG_MSG_DECAY constants. Step 5
 #         propagation loop now maintains a per-step _gsg_pos_cache (list→ndarray once
@@ -849,7 +834,6 @@ _GSG_LAYER_NORMS_NF: List[float] = [0.70, 0.50, 0.30]  # L0/L1/L2 Poincaré ball
 _GSG_KAPPA_L2: float = 1.0 / (1.0 - 0.30 ** 2)
 _GSG_MSG_DECAY: float = 0.15  # geodesic decay rate; 0.0=Euclidean, 0.15=gentle; tunable
 _GSG_MSG_DECAY_SPHER: float = 0.15  # great circle decay for sphere+sphere synapses
-_GSG_MSG_DECAY_SPHER: float = 0.15  # great circle decay rate for sphere+sphere synapses
 
 
 class STDPRule(PlasticityRule):
@@ -1262,7 +1246,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "d_max": 5,         # maximum synaptic delay in timesteps (range enables polychrony)
     # DiffPC: Difference Predictive Coding (#DiffPC)
     "diffpc_epsilon": 0.2,
-    "gsg_spherical_fraction": 0.20,  # fraction of nodes assigned spherical manifold (Phase 4)       # ternary threshold: |error| > epsilon → ±1 spike, else 0
+    "gsg_spherical_fraction": 0.20,  # fraction of nodes assigned spherical manifold (Phase 4)
     "diffpc_pred_lr": 0.01,      # prediction weight learning rate
     "diffpc_trace_boost": 0.05,  # eligibility trace ±boost per ternary spike (Phase 2)
     "weight_threshold": 0.01,
