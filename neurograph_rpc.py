@@ -12,6 +12,12 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-05-28] Claude Code (Sonnet 4.6) — GSG Phase 4: spherical surfacing
+#   What: assemble() GSG re-scoring now checks node.manifold_type. Spherical nodes
+#         use great circle distance arccos(dot(query_dir, node_dir)); hyperbolic
+#         nodes use existing Poincare geodesic (Phase 1). Cross-manifold: neutral.
+#   Why:  Completes S component of S x E x H mixed manifold from source GSG paper.
+#   How:  getattr(nd, 'manifold_type', 'hyperbolic'); arccos on clamped dot product.
 # [2026-05-26] Claude Code (Sonnet 4.6) — GSG backfill: stamp poincare_dir on all existing nodes at bootstrap
 #   What: Added _gsg_backfill_existing_nodes() called at end of handle_bootstrap(). Iterates all
 #         graph nodes, stamps node.metadata['poincare_dir'] from vector_db.embeddings[node_id]
@@ -2056,10 +2062,19 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 _layer = getattr(_nd, "diffpc_layer", 0)
                 _layer = max(0, min(2, _layer))
-                _node_pt = _gsg_np.array(_pdir) * _GSG_LAYER_NORMS[_layer]
-                _hdist = _poincare_distance(_query_pt, _node_pt)
-                # Closer in hyperbolic space → higher bonus; saturates at hdist=0
-                _bonus = _GSG_SCORE_BONUS / (1.0 + _hdist)
+                _mtype = getattr(_nd, "manifold_type", "hyperbolic")
+                if _mtype == "spherical":
+                    # GSG Phase 4: great circle distance (query_dir and node_dir are unit vecs)
+                    _node_dir = _gsg_np.array(_pdir, dtype=_gsg_np.float32)
+                    _cos = float(_gsg_np.clip(
+                        _gsg_np.dot(_query_dir, _node_dir), -1.0 + 1e-7, 1.0 - 1e-7))
+                    import math as _gsg_math
+                    _bonus = _GSG_SCORE_BONUS / (1.0 + _gsg_math.acos(_cos))
+                else:
+                    # Hyperbolic: scale to Poincare ball, compute geodesic (Phase 1)
+                    _node_pt = _gsg_np.array(_pdir) * _GSG_LAYER_NORMS[_layer]
+                    _hdist = _poincare_distance(_query_pt, _node_pt)
+                    _bonus = _GSG_SCORE_BONUS / (1.0 + _hdist)
                 _item["strength"] = _item.get("strength", 0.0) + _bonus
                 _gsg_applied += 1
             if _gsg_applied:
