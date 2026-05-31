@@ -47,6 +47,16 @@ Design principles (PRD §2.1):
 #         stamp, orphan check age guard, serializer field, restore default.
 #         Backward-compatible (.get() with default=0). Re-vendored to
 #         NuWave/nuwave/substrate/neuro_foundation.py.
+# [2026-05-29] Claude Code (Sonnet 4.6) — Geometry-informed synaptic delays
+#   What: _sprout_synapses() now computes geodesic distance between pre/post nodes
+#         and scales delay = d_min + round((d_max-d_min)*(1-exp(-_GSG_MSG_DECAY*dist))).
+#         Sphere+sphere: great circle arccos(dot). Hyp+hyp: Poincare geodesic.
+#         Cross-manifold or missing poincare_dir: falls back to random.randint.
+#   Why:  Biologically, synaptic delay = axon travel time (physical distance).
+#         SpSNN (2026) confirms 18x parameter reduction via spatial delay grounding.
+#         Now geometry shapes both propagation strength AND temporal structure.
+#   How:  Same decay constant (_GSG_MSG_DECAY=0.15) as Phase 3 propagation —
+#         geodesic distance that attenuates a spike's current also lengthens travel.
 # [2026-05-28] Claude Code (Sonnet 4.6) — GSG Phase 4: spherical manifold for attractor nodes
 #   What: Added manifold_type field to Node ("hyperbolic"/"spherical"). Constants:
 #         _GSG_MSG_DECAY_SPHER. Config key gsg_spherical_fraction (default 0.20).
@@ -3246,10 +3256,39 @@ class Graph:
                     continue
                 if (other_id, nid) in existing_pairs:
                     continue
-                _delay = random.randint(
-                    self.config.get("d_min", 1),
-                    self.config.get("d_max", 5),
-                )
+                _d_min = self.config.get("d_min", 1)
+                _d_max = self.config.get("d_max", 5)
+                _delay = random.randint(_d_min, _d_max)  # fallback
+                # GSG: geometry-informed delay — geodesic distance → travel time
+                _pn = self.nodes.get(nid)
+                _on = self.nodes.get(other_id)
+                if _pn and _on:
+                    _pd1 = (_pn.metadata or {}).get("poincare_dir")
+                    _pd2 = (_on.metadata or {}).get("poincare_dir")
+                    if _pd1 and _pd2:
+                        _a = np.array(_pd1, dtype=np.float32)
+                        _b = np.array(_pd2, dtype=np.float32)
+                        _mt1 = getattr(_pn, "manifold_type", "hyperbolic")
+                        _mt2 = getattr(_on, "manifold_type", "hyperbolic")
+                        _gdist = None
+                        if _mt1 == "spherical" and _mt2 == "spherical":
+                            _cos = max(-1.0+1e-7, min(1.0-1e-7, float(np.dot(_a, _b))))
+                            _gdist = math.acos(_cos)
+                        elif _mt1 == "hyperbolic" and _mt2 == "hyperbolic":
+                            _l1 = max(0, min(2, getattr(_pn, "diffpc_layer", 2)))
+                            _l2 = max(0, min(2, getattr(_on, "diffpc_layer", 2)))
+                            _pa = _a * _GSG_LAYER_NORMS_NF[_l1]
+                            _pb = _b * _GSG_LAYER_NORMS_NF[_l2]
+                            _nx2 = min(float(np.dot(_pa, _pa)), 0.9999)
+                            _ny2 = min(float(np.dot(_pb, _pb)), 0.9999)
+                            _dv = _pa - _pb
+                            _gdist = math.acosh(max(1.0, 1.0 + 2.0 *
+                                float(np.dot(_dv, _dv)) /
+                                max((1.0 - _nx2) * (1.0 - _ny2), 1e-9)))
+                        if _gdist is not None:
+                            _t = 1.0 - math.exp(-_GSG_MSG_DECAY * _gdist)
+                            _delay = max(_d_min, min(_d_max,
+                                         round(_d_min + (_d_max - _d_min) * _t)))
                 self.create_synapse(nid, other_id, weight=initial_w, delay=_delay)
                 existing_pairs.add((nid, other_id))
                 count += 1
