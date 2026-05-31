@@ -339,7 +339,23 @@ class CESMonitor:
             self._health_timer = None
 
     def get_health(self) -> Dict[str, Any]:
-        """Return comprehensive health status and refresh the stats cache."""
+        """Return comprehensive health status and refresh the stats cache.
+
+        # ---- Changelog ----
+        # [2026-05-31] Claude Code (Opus 4.7, 1M) — Fix infinite mutual recursion
+        # What: Read substrate directly (graph.nodes, graph.synapses, telemetry, vector_db.count)
+        #       instead of calling self._ng_memory.stats(). Also rebuilt the stats cache
+        #       payload locally from the same direct reads.
+        # Why:  openclaw_hook.stats() builds its "monitor" key by calling self._ces_monitor.get_health(),
+        #       which previously called back into stats() — INFINITE MUTUAL RECURSION. Each /health
+        #       request to the CES dashboard (port 8847) pegged a whole CPU core indefinitely.
+        #       Root cause of the "VPS 100% CPU" incident 2026-05-31 (misdiagnosed earlier as GSG
+        #       Phase 4 / synaptic-delay perf regression).
+        # How:  Replace `self._ng_memory.stats()` call with direct attribute reads — same data,
+        #       no recursion path. Cache payload reduced to the 4 fields actually consumed.
+        # Discovered via py-spy dump showing stats → get_health → stats → get_health stack alternation.
+        # -------------------
+        """
         result: Dict[str, Any] = {
             "timestamp": time.time(),
             "dashboard_running": self._dashboard.is_running,
@@ -347,12 +363,33 @@ class CESMonitor:
         }
 
         try:
-            stats = self._ng_memory.stats()
-            self._stats_cache.set(stats)
-            result["nodes"] = stats.get("nodes", 0)
-            result["synapses"] = stats.get("synapses", 0)
-            result["prediction_accuracy"] = stats.get("prediction_accuracy", 0)
-            result["vector_db_count"] = stats.get("vector_db_count", 0)
+            # Read substrate directly — calling self._ng_memory.stats() causes mutual
+            # recursion with openclaw_hook.stats() (its "monitor" key calls back here).
+            graph = self._ng_memory.graph
+            nodes_cnt = len(graph.nodes)
+            syn_cnt = len(graph.synapses)
+            try:
+                tel = graph.get_telemetry()
+                pred_acc = round(tel.prediction_accuracy, 4)
+            except Exception:
+                pred_acc = 0
+            try:
+                vdb_cnt = self._ng_memory.vector_db.count()
+            except Exception:
+                vdb_cnt = 0
+
+            result["nodes"] = nodes_cnt
+            result["synapses"] = syn_cnt
+            result["prediction_accuracy"] = pred_acc
+            result["vector_db_count"] = vdb_cnt
+
+            # Refresh stats cache with the 4 fields actually consumed (no recursion path).
+            self._stats_cache.set({
+                "nodes": nodes_cnt,
+                "synapses": syn_cnt,
+                "prediction_accuracy": pred_acc,
+                "vector_db_count": vdb_cnt,
+            })
         except Exception:
             result["status"] = "stats_unavailable"
 
