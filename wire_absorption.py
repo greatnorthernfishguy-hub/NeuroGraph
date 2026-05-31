@@ -1,6 +1,26 @@
 """
 Wire Absorption — sensory-deposit path for raw HTTP wire events.
 # ---- Changelog ----
+# [2026-05-30] Claude Code (Opus 4.7, 1M) — Phase 3 step 1: BTF migration of peer_bridge.record_outcome
+#   What: Replaced 3 direct peer_bridge.record_outcome calls (lines 328, 560, 715)
+#         with _deposit_outcome_to_river helper from neurograph_rpc (BTF). Site 3's
+#         early-return guard relocated to else-branch only (is_meta_deposit branch
+#         no longer requires peer_bridge). Dual-pass else-branch retains peer_bridge
+#         for _PeerBridgeEco adapter wrapping dual_record_outcome — that path migrates
+#         under separate work item (Workstream 2: D2 source-level fix in ng_embed.py +
+#         ng_ecosystem.py vendored, per audit #273 + Path C resolution).
+#   Why:  PRD §4.13 Phase 3 step 1. Migrate active peer_bridge call sites to BTF.
+#         Peer bridge being retired. wire_absorption sites are NG's forward-River
+#         deposits to peer module tracts — fan-out by caller via _get_registered_peers()
+#         + per-peer tract path pattern (post-#185 forward-River). Per LAW 7 we deposit
+#         raw experience and let consumers classify at extraction — no judgment of
+#         whether current consumers "value" these broadcasts. Bunyan consumes today
+#         (legacy dict fallback); Immunis/THC/Elmer mature into consumption as their
+#         Tier 3 reach extends. Removing the broadcast would silently strand future
+#         capability — same drift-by-vacuum pattern as #271 (Darwin recorder).
+#   How:  Lazy import of helper inside try/except (avoids circular import). _PeerBridgeEco
+#         adapter usage at line ~745 NOT migrated this round — separate Workstream 2
+#         filed as new punchlist item.
 # [2026-04-26] Claude Code (Sonnet 4.6) — Lazy expansion pulse, Stage 3 (#151)
 #   What: Added _chunk_body(), select_bodies_for_expansion(), expand_body_file().
 #         Expands full body content into up to 20 evenly-sampled 1800-char chunk
@@ -322,16 +342,12 @@ def batch_absorb_forests(
         except Exception:
             continue
 
-        # Record forest outcome via peer bridge (River deposit)
-        if peer_bridge is not None:
-            try:
-                peer_bridge.record_outcome(
-                    embedding=emb, target_id=event_node_id,
-                    success=True, module_id="neurograph",
-                    metadata=event_meta,
-                )
-            except Exception:
-                pass
+        # River deposit — outcome to all peer module tracts (BTF) per PRD §4.13.
+        try:
+            from neurograph_rpc import _deposit_outcome_to_river
+            _deposit_outcome_to_river(emb, event_node_id, True, event_meta)
+        except Exception:
+            pass
 
         results.append({
             "event_node_id": event_node_id,
@@ -554,16 +570,11 @@ def expand_body_file(memory, embedder, body_path: Path) -> bool:
                 except Exception:
                     pass
 
-            # River deposit — Hebbian association between chunk and parent event
-            if peer_bridge is not None and parent_event_id is not None:
+            # River deposit — Hebbian association between chunk and parent event (BTF) per PRD §4.13.
+            if parent_event_id is not None:
                 try:
-                    peer_bridge.record_outcome(
-                        embedding=emb,
-                        target_id=parent_event_id,
-                        success=True,
-                        module_id="neurograph",
-                        metadata=chunk_meta,
-                    )
+                    from neurograph_rpc import _deposit_outcome_to_river
+                    _deposit_outcome_to_river(emb, parent_event_id, True, chunk_meta)
                 except Exception:
                     pass
 
@@ -704,24 +715,22 @@ def absorb_wire_deposit(
     _CONCEPT_SENTINEL = "You extract concepts from text"
 
     peer_bridge = getattr(memory, '_peer_bridge', None)
-    if peer_bridge is None:
-        return result
+    # Note: peer_bridge still required by _PeerBridgeEco adapter in else-branch below.
+    # Workstream 2 (D2 source-level fix in vendored ng_embed.py + ng_ecosystem.py)
+    # removes that dependency. Meta-deposit branch uses BTF directly — no peer_bridge needed.
 
     is_meta_deposit = _CONCEPT_SENTINEL in content[:2000]
 
     if is_meta_deposit:
-        # Forest only — no tree extraction, breaks recursion.
+        # Forest only — no tree extraction, breaks recursion. BTF River deposit per PRD §4.13.
         try:
-            peer_bridge.record_outcome(
-                embedding=fingerprint_emb,
-                target_id=event_node_id,
-                success=True,
-                module_id="neurograph",
-                metadata=event_meta,
-            )
+            from neurograph_rpc import _deposit_outcome_to_river
+            _deposit_outcome_to_river(fingerprint_emb, event_node_id, True, event_meta)
         except Exception:
             pass
     else:
+        if peer_bridge is None:
+            return result
         # Full dual-pass: Forest + Trees via TID concept extraction.
         # Adapter wraps peer_bridge to match NGEcosystem.record_outcome
         # signature that NGEmbed.dual_record_outcome expects.

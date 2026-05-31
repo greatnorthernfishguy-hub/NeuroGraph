@@ -805,6 +805,70 @@ def _deposit_experience_to_river(text: "Optional[str]") -> None:
         logger.error("_deposit_experience_to_river failed: %s", exc)
 
 
+def _deposit_outcome_to_river(
+    embedding: "np.ndarray",
+    target_id: str,
+    success: bool,
+    metadata: "Optional[Dict[str, Any]]" = None,
+) -> None:
+    """Deposit an outcome to every registered module's inbound tract (BTF).
+
+    Mirrors _deposit_topology_to_river / _deposit_experience_to_river. NG-internal
+    helper; broadcast is NG-specific (only NG fan-outs to all peer tracts; other
+    modules deposit single-target). Replaces direct peer_bridge.record_outcome
+    calls per substrate-as-protocol restoration PRD §4.13 Phase 3 step 1
+    (wire_absorption.py migration).
+
+    Per LAW 7: each peer's bucket interprets at extraction time. Per audit #273
+    (2026-05-30): all 5 active _on_river_events overrides are push-dependent in
+    aggregate; wire_absorption broadcasts particularly serve Bunyan today
+    (legacy dict fallback) and Immunis/THC/Elmer once their Tier 3 reach
+    matures — preserving the broadcast preserves their future bucket-extraction
+    surface.
+
+    # ---- Changelog ----
+    # [2026-05-30] Claude Code (Opus 4.7, 1M) — Phase 3 step 1: BTF outcome helper
+    # What: New helper mirroring _deposit_topology_to_river + _deposit_experience_to_river.
+    #       Broadcasts outcome to all registered-module tracts via ng_tract.deposit_outcome.
+    # Why:  Replaces 3 direct peer_bridge.record_outcome calls in wire_absorption.py.
+    #       PRD §4.13 Phase 3 step 1 — migrate active peer_bridge call sites to BTF.
+    #       Path A confirmed per audit #273; consumer push-dependency mapped.
+    # How:  Mirrors existing helper pattern. Metadata msgpack-packed to bytes per
+    #       canonical signature. Fan-out targeting matches post-#185 forward-River.
+    # -------------------
+    """
+    if _ng_tract_bridge is None:
+        return
+    try:
+        import ng_tract as _ngt
+        import msgpack as _mp
+        import time as _t
+        peers = _ng_tract_bridge._get_registered_peers()
+        if not peers:
+            return
+        tract_paths = [
+            str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
+            for peer_id in peers
+        ]
+        _meta_bytes = None
+        if metadata:
+            try:
+                _meta_bytes = _mp.packb(metadata, use_bin_type=True)
+            except Exception:
+                _meta_bytes = None
+        _ngt.deposit_outcome(
+            timestamp=_t.time(),
+            module_id="neurograph",
+            target_id=target_id,
+            success=success,
+            embedding=np.asarray(embedding, dtype=np.float32),
+            tract_paths=tract_paths,
+            metadata=_meta_bytes,
+        )
+    except Exception as exc:
+        logger.error("_deposit_outcome_to_river failed: %s", exc)
+
+
 def deposit_outbound_intent(text: str, channel_id: str = "cli") -> None:
     """Deposit raw text to Animus's outbound tract as a BTF frame.
 
