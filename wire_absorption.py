@@ -714,10 +714,13 @@ def absorb_wire_deposit(
     # own tree-extraction path. Forest-only for those, no TID call.
     _CONCEPT_SENTINEL = "You extract concepts from text"
 
-    peer_bridge = getattr(memory, '_peer_bridge', None)
-    # Note: peer_bridge still required by _PeerBridgeEco adapter in else-branch below.
-    # Workstream 2 (D2 source-level fix in vendored ng_embed.py + ng_ecosystem.py)
-    # removes that dependency. Meta-deposit branch uses BTF directly — no peer_bridge needed.
+    # Workstream 2 (#274, 2026-05-31): peer_bridge dependency removed. Meta-deposit
+    # branch uses _deposit_outcome_to_river (BTF helper, Workstream 1). Dual-pass
+    # branch uses _NGBroadcastEco — in-NG ecosystem-shape wrapper that delegates
+    # to the canonical BTF helper. NG has NO NG-Lite to record outcomes to (NG
+    # IS the canonical substrate, not a module wrapping one); the substrate
+    # already learned from this wire event via the prior graph.create_node +
+    # vector_db.add calls. dual_record_outcome's role here is purely peer broadcast.
 
     is_meta_deposit = _CONCEPT_SENTINEL in content[:2000]
 
@@ -729,29 +732,42 @@ def absorb_wire_deposit(
         except Exception:
             pass
     else:
-        if peer_bridge is None:
-            return result
         # Full dual-pass: Forest + Trees via TID concept extraction.
-        # Adapter wraps peer_bridge to match NGEcosystem.record_outcome
-        # signature that NGEmbed.dual_record_outcome expects.
+        # Workstream 2 (#274): _NGBroadcastEco replaces prior _PeerBridgeEco adapter.
+        # Justified for NG's canonical-substrate role — delegates to the canonical
+        # _deposit_outcome_to_river helper, no synthesis of new behavior. LAW 4
+        # acknowledged: bridging the ecosystem-shape API to NG's no-NG-Lite reality.
+        # Other modules use vendored NGEcosystem.record_outcome_broadcast directly
+        # once they receive the re-vendored ng_ecosystem.py + ng_embed.py.
         try:
             from ng_embed import NGEmbed
+            from neurograph_rpc import _deposit_outcome_to_river
 
-            class _PeerBridgeEco:
-                """Adapt peer_bridge for dual_record_outcome's ecosystem API."""
-                def __init__(self, bridge):
-                    self._bridge = bridge
+            class _NGBroadcastEco:
+                """In-NG ecosystem-shape for dual_record_outcome — broadcast only.
+
+                NG's substrate already learned from the wire event via the prior
+                graph.create_node + vector_db.add calls. dual_record_outcome's
+                role here is BTF broadcast of forest + tree outcomes to peer
+                module tracts so peers learn from NG's concept extractions.
+                """
                 def record_outcome(self, embedding, target_id, success,
                                    strength=1.0, metadata=None):
-                    meta = dict(metadata or {})
-                    if strength != 1.0:
-                        meta["_strength"] = strength
-                    return self._bridge.record_outcome(
-                        embedding, target_id, success,
-                        "neurograph", meta,
-                    )
+                    # No local NG-Lite to record to (NG IS the canonical substrate).
+                    # Return truthy sentinel so dual_record_outcome's tree-gate
+                    # (ng_embed.py:454 `if tree_result:`) counts the tree.
+                    return {"deposited": True}
 
-            eco_adapter = _PeerBridgeEco(peer_bridge)
+                def record_outcome_broadcast(self, embedding, target_id, success,
+                                             strength=1.0, metadata=None):
+                    # BTF broadcast via canonical helper.
+                    try:
+                        _deposit_outcome_to_river(embedding, target_id, success, metadata)
+                        return {"deposited": True, "broadcast": True}
+                    except Exception:
+                        return None
+
+            eco_adapter = _NGBroadcastEco()
             dp_result = NGEmbed.get_instance().dual_record_outcome(
                 ecosystem=eco_adapter,
                 content=content[:2000],   # first 2000 chars — same as all callers

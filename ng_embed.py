@@ -414,11 +414,21 @@ class NGEmbed:
                 "pass2_attempted": bool,
             }
         """
-        # Pass 1: Forest — standard record_outcome with gestalt embedding
-        forest_result = ecosystem.record_outcome(
-            embedding, target_id, success,
-            strength=strength, metadata=metadata,
-        )
+        # Pass 1: Forest — broadcast outcome to peers AND deposit locally.
+        # Workstream 2 (#274, 2026-05-31): use record_outcome_broadcast when
+        # the ecosystem supports it (NGEcosystem does post-Workstream-2 re-vendor);
+        # fall back to record_outcome for backward compat with consumers that
+        # pass a custom ecosystem-shape object that pre-dates the broadcast method.
+        if hasattr(ecosystem, "record_outcome_broadcast"):
+            forest_result = ecosystem.record_outcome_broadcast(
+                embedding, target_id, success,
+                strength=strength, metadata=metadata,
+            )
+        else:
+            forest_result = ecosystem.record_outcome(
+                embedding, target_id, success,
+                strength=strength, metadata=metadata,
+            )
 
         result = {
             "forest_result": forest_result,
@@ -445,11 +455,19 @@ class NGEmbed:
             tree_meta["_concept"] = concept
 
             tree_target = f"{target_id}::tree::{concept[:64]}"
-            tree_result = ecosystem.record_outcome(
-                tree_emb, tree_target, success,
-                strength=strength * 0.8,  # Trees slightly softer than forest
-                metadata=tree_meta,
-            )
+            # Workstream 2 (#274, 2026-05-31): use broadcast variant when available.
+            if hasattr(ecosystem, "record_outcome_broadcast"):
+                tree_result = ecosystem.record_outcome_broadcast(
+                    tree_emb, tree_target, success,
+                    strength=strength * 0.8,  # Trees slightly softer than forest
+                    metadata=tree_meta,
+                )
+            else:
+                tree_result = ecosystem.record_outcome(
+                    tree_emb, tree_target, success,
+                    strength=strength * 0.8,  # Trees slightly softer than forest
+                    metadata=tree_meta,
+                )
 
             if tree_result:
                 result["tree_ids"].append(tree_target)

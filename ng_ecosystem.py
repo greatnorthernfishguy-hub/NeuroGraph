@@ -401,6 +401,92 @@ class NGEcosystem:
                 embedding, target_id, success, strength=strength, metadata=metadata
             )
 
+    def record_outcome_broadcast(
+        self,
+        embedding: np.ndarray,
+        target_id: str,
+        success: bool,
+        strength: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record outcome locally AND broadcast via BTF to peer module tracts.
+
+        Companion to record_outcome (local-only). Use when the outcome should
+        be visible to peer modules' substrates — primarily called by
+        dual_record_outcome's forest+tree deposits so peers learn from
+        this module's concept extractions.
+
+        Returns the same dict shape as record_outcome (local result).
+
+        # ---- Changelog ----
+        # [2026-05-31] Claude Code (Opus 4.7, 1M) — Workstream 2 #274: BTF broadcast method
+        # What: New method that does both record_outcome (local Hebbian) AND
+        #       ng_tract.deposit_outcome (BTF broadcast to peer module tracts).
+        # Why:  Replaces _PeerBridgeEco shim pattern in callers — moves the
+        #       broadcast responsibility from consumer-side adapter to the
+        #       canonical ecosystem facade per LAW 4 fix-at-source. Resolves
+        #       PRD §4.13 Phase 3 step covering wire_absorption else-branch.
+        # How:  self._peer_bridge holds NGTractBridge when tracts are enabled
+        #       (line 365 in _init_peer_bridge; prefers tract, falls back to
+        #       legacy NGPeerBridge). Uses _get_registered_peers + _module_dir
+        #       for per-peer tract path (post-#185 forward-River pattern).
+        #       Metadata msgpack-packed. Falls back to local-only result if
+        #       no tract bridge available (legacy NGPeerBridge load OR no bridge).
+        # -------------------
+        """
+        # Pass 1: Local deposit via the existing record_outcome path
+        local_result = self.record_outcome(
+            embedding, target_id, success, strength=strength, metadata=metadata
+        )
+
+        # Pass 2: BTF broadcast to all registered peer module tracts
+        try:
+            bridge = self._peer_bridge
+            if bridge is None:
+                return local_result
+
+            # _peer_bridge holds NGTractBridge when tracts enabled; verify by
+            # checking for tract-bridge-specific attributes (skips legacy NGPeerBridge).
+            if not (hasattr(bridge, "_get_registered_peers") and hasattr(bridge, "_module_dir")):
+                return local_result  # legacy NGPeerBridge — no BTF broadcast path
+
+            import ng_tract as _ngt
+            import time as _t
+
+            peers = bridge._get_registered_peers()
+            if not peers:
+                return local_result
+
+            tract_paths = [
+                str(bridge._module_dir / f"{peer_id}.tract")
+                for peer_id in peers
+            ]
+
+            meta_bytes = None
+            if metadata:
+                try:
+                    import msgpack as _mp
+                    meta_bytes = _mp.packb(metadata, use_bin_type=True)
+                except Exception:
+                    meta_bytes = None
+
+            _ngt.deposit_outcome(
+                timestamp=_t.time(),
+                module_id=self.module_id,
+                target_id=target_id,
+                success=success,
+                embedding=np.asarray(embedding, dtype=np.float32),
+                tract_paths=tract_paths,
+                metadata=meta_bytes,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] record_outcome_broadcast: BTF broadcast failed: %s",
+                self.module_id, exc,
+            )
+
+        return local_result
+
     def dual_record_outcome(
         self,
         content: str,
