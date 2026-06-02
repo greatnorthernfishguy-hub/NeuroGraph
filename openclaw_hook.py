@@ -147,6 +147,20 @@ Usage:
 #         If not, fall back to ng_peer_bridge.  Config key
 #         peer_bridge.use_tracts (default True) can force legacy mode.
 # -------------------
+# [2026-06-02] Claude Code (Opus 4.7) — Phase 3 Step 2 (substrate-as-protocol PRD §4.13)
+#   What: Removed NGPeerBridge legacy JSONL fallback construction block.
+#         NGTractBridge (per-pair tracts) is now the sole peer bridge.
+#         self._peer_bridge holds either NGTractBridge or None (standalone).
+#   Why:  Phase 3 of substrate-as-protocol restoration — callers stop
+#         depending on the legacy JSONL bridge before canonical-side
+#         deletion (Step 4) and ng_peer_bridge.py removal (Step 5).
+#         Tract bridge has been the preferred path since 2026-03-20;
+#         legacy fallback no longer carries any traffic in production.
+#   How:  Deleted the `if self._peer_bridge is None: ... NGPeerBridge(...)`
+#         block.  Updated leading comment to reflect single-bridge init.
+#         Cleaned up tract-bridge except handlers (no "trying legacy"
+#         since there's no legacy to try).
+# -------------------
 #
 # ---- Grok Review Changelog (v0.7.1) ----
 # Accepted: Added file size guard in ingest_file() — warns and skips files
@@ -461,45 +475,30 @@ class NeuroGraphMemory:
         # --- ET Module Manager: Peer bridge for cross-module learning ---
         # NeuroGraph is the Tier 3 backend.  We also participate as a
         # Tier 2 peer so sibling modules can absorb our learning events.
-        # Prefers tract bridge (per-pair directional tracts) with legacy
-        # JSONL fallback.
+        # Uses NGTractBridge (per-pair directional tracts).  Legacy JSONL
+        # NGPeerBridge fallback removed 2026-06-02 (substrate-as-protocol
+        # PRD Phase 3 Step 2).
         self._peer_bridge = None
         peer_config = (config or {}).get("peer_bridge", {})
-        if peer_config.get("enabled", True):
-            # Tract bridge (v0.3+) — preferred
-            if peer_config.get("use_tracts", True):
-                try:
-                    from ng_tract_bridge import NGTractBridge
-                    self._peer_bridge = NGTractBridge(
-                        module_id="neurograph",
-                        sync_interval=peer_config.get("sync_interval", 50),
-                        relevance_threshold=peer_config.get(
-                            "relevance_threshold", 0.3
-                        ),
-                    )
-                    logger.info("NGTractBridge connected for cross-module learning")
-                except ImportError:
-                    pass
-                except Exception as exc:
-                    logger.info("NGTractBridge failed, trying legacy: %s", exc)
-
-            # Legacy fallback — JSONL broadcast bridge
-            if self._peer_bridge is None:
-                try:
-                    from ng_peer_bridge import NGPeerBridge
-                    self._peer_bridge = NGPeerBridge(
-                        module_id="neurograph",
-                        shared_dir=peer_config.get("shared_dir"),
-                        sync_interval=peer_config.get("sync_interval", 50),
-                        relevance_threshold=peer_config.get(
-                            "relevance_threshold", 0.3
-                        ),
-                    )
-                    logger.info("NGPeerBridge connected for cross-module learning")
-                except Exception as exc:
-                    logger.info(
-                        "No peer bridge available (standalone mode): %s", exc
-                    )
+        if peer_config.get("enabled", True) and peer_config.get("use_tracts", True):
+            try:
+                from ng_tract_bridge import NGTractBridge
+                self._peer_bridge = NGTractBridge(
+                    module_id="neurograph",
+                    sync_interval=peer_config.get("sync_interval", 50),
+                    relevance_threshold=peer_config.get(
+                        "relevance_threshold", 0.3
+                    ),
+                )
+                logger.info("NGTractBridge connected for cross-module learning")
+            except ImportError as exc:
+                logger.info(
+                    "NGTractBridge unavailable (standalone mode): %s", exc
+                )
+            except Exception as exc:
+                logger.info(
+                    "NGTractBridge failed (standalone mode): %s", exc
+                )
 
         # --- CES: Cognitive Enhancement Suite ---
         # Optional real-time cognitive modules: stream parser (Ollama
