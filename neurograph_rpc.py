@@ -12,6 +12,11 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-02] Claude (Sonnet 4.6) — Add GET /stats to HTTP sidecar
+# What: New GET /stats route in do_GET calls handle_stats({}) — same data as JSON-RPC "stats"
+# Why: Anima GUI's NG Status tab needs substrate telemetry (nodes, synapses, timestep, etc.)
+#      via HTTP; only /status and /modules were previously exposed; /stats was JSON-RPC only
+# How: Single elif branch — delegates to existing handle_stats(), zero new logic
 # [2026-05-28] Claude Code (Sonnet 4.6) — GSG Phase 4: spherical surfacing
 #   What: assemble() GSG re-scoring now checks node.manifold_type. Spherical nodes
 #         use great circle distance arccos(dot(query_dir, node_dir)); hyperbolic
@@ -3549,6 +3554,12 @@ class _AfterTurnHandler(BaseHTTPRequestHandler):
                 "hooks_loaded": 0,  # fan-out removed — modules autonomous
                 "last_afterturn": _last_afterturn_fire,
             }).encode())
+        elif self.path == "/stats":
+            result = handle_stats({})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result, default=str).encode())
         elif self.path == "/modules":
             # Per-module live stats — queried by status probes that declined
             # to claim topology. Each module stats() call runs with a 2s
