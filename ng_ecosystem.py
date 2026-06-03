@@ -94,6 +94,25 @@ License: AGPL-3.0
 #   How:  Lazy import of ng_embed to avoid circular deps. Passes self
 #         (the ecosystem instance) to NGEmbed.dual_record_outcome().
 # -------------------
+# [2026-06-03] Claude Code (Opus 4.7) — Phase 3 Step 4 (substrate-as-protocol PRD §4.13)
+#   What: Removed legacy NGPeerBridge fallback from _init_peer_bridge() and
+#         "peer_bridge" output field from stats(). NGTractBridge is now the
+#         sole peer bridge across the ecosystem; if it fails to construct,
+#         the module runs standalone (no peer bridge).
+#   Why:  Phase 3 of substrate-as-protocol restoration — after Steps 1-3
+#         retired the last callers depending on the legacy JSONL bridge,
+#         this is the canonical-side fix-at-source (LAW 4) to delete the
+#         drift accumulation. ng_peer_bridge.py file deletion is Step 5.
+#   How:  Deleted the `if bridge is None: from ng_peer_bridge import ...`
+#         legacy fallback in _init_peer_bridge(); replaced with clean
+#         standalone-mode return.  Deleted peer_stats collection + the
+#         "peer_bridge" field from stats() output dict. Section + inline
+#         comments updated to reflect single-bridge state.  Tests at
+#         NG/tests/test_et_modules.py:574-589 are UNAFFECTED (they test
+#         openclaw_hook.py's NeuroGraphMemory.stats(), not this file's
+#         NGEcosystem.stats()). TrollGuard/main.py:670 uses .get() and
+#         degrades gracefully (cosmetic — just stops printing a line).
+# -------------------
 """
 
 from __future__ import annotations
@@ -254,7 +273,7 @@ class NGEcosystem:
         self._tier = TIER_STANDALONE
         self._ng: Any = None              # NGLite instance
         self._ng_memory: Any = None       # NeuroGraphMemory ref (set externally at Tier 3)
-        self._peer_bridge: Any = None     # NGPeerBridge instance
+        self._peer_bridge: Any = None     # NGTractBridge instance (or None in standalone)
         self._shutdown_event = threading.Event()
         self._ops_lock = threading.Lock()
 
@@ -318,11 +337,15 @@ class NGEcosystem:
             self._ng = None
 
     # -----------------------------------------------------------------
-    # Tier 2: NGPeerBridge init
+    # Tier 2: NGTractBridge init
     # -----------------------------------------------------------------
 
     def _init_peer_bridge(self) -> None:
-        """Try to connect Tier 2 bridge. Prefers tract bridge, falls back to legacy JSONL."""
+        """Try to connect Tier 2 bridge (NGTractBridge). Standalone mode if unavailable.
+
+        Legacy NGPeerBridge fallback removed 2026-06-03 (substrate-as-protocol
+        PRD Phase 3 Step 4) — see changelog header.
+        """
         if not self._config["peer_bridge"]["enabled"]:
             return
         if self._ng is None:
@@ -330,7 +353,7 @@ class NGEcosystem:
 
         bridge = None
 
-        # Tract bridge (v0.3+) — per-pair directional tracts
+        # Tract bridge (v0.3+) — per-pair directional tracts; sole peer bridge.
         if self._config["peer_bridge"].get("use_tracts", True):
             try:
                 from ng_tract_bridge import NGTractBridge  # vendored alongside
@@ -341,25 +364,13 @@ class NGEcosystem:
                     sync_interval=self._config["peer_bridge"]["sync_interval"],
                 )
                 logger.info("[%s] NGTractBridge connected (tract-based River)", self.module_id)
-            except ImportError:
-                pass
+            except ImportError as exc:
+                logger.debug("[%s] NGTractBridge unavailable (standalone mode): %s", self.module_id, exc)
             except Exception as exc:
-                logger.debug("[%s] NGTractBridge failed: %s", self.module_id, exc)
+                logger.debug("[%s] NGTractBridge failed (standalone mode): %s", self.module_id, exc)
 
-        # Legacy fallback — JSONL broadcast bridge
         if bridge is None:
-            try:
-                from ng_peer_bridge import NGPeerBridge  # vendored alongside
-
-                bridge = NGPeerBridge(
-                    module_id=self.module_id,
-                    shared_dir=str(SHARED_LEARNING_DIR),
-                    sync_interval=self._config["peer_bridge"]["sync_interval"],
-                )
-                logger.info("[%s] NGPeerBridge connected (legacy JSONL River)", self.module_id)
-            except Exception as exc:
-                logger.debug("[%s] No peer bridge available: %s", self.module_id, exc)
-                return
+            return  # standalone mode — no peer bridge
 
         self._ng.connect_bridge(bridge)
         self._peer_bridge = bridge
@@ -603,13 +614,6 @@ class NGEcosystem:
             except Exception:
                 pass
 
-        peer_stats: Dict[str, Any] = {}
-        if self._peer_bridge is not None:
-            try:
-                peer_stats = self._peer_bridge.get_stats()
-            except Exception:
-                pass
-
         ng_memory_stats: Dict[str, Any] = {}
         if self._ng_memory is not None:
             try:
@@ -623,7 +627,6 @@ class NGEcosystem:
             "tier": self._tier,
             "tier_name": self.tier_name,
             "ng_lite": ng_stats,
-            "peer_bridge": peer_stats if peer_stats else None,
             "ng_memory": (
                 {
                     "connected": True,
