@@ -6,9 +6,10 @@ three-tier learning architecture:
 
   Tier 1 (Standalone):  NGLite alone.  Local Hebbian learning.
                         Zero deps beyond ng_lite.py.
-  Tier 2 (Peer-pooled): NGTractBridge (preferred) or NGPeerBridge
-                        (legacy fallback).  Co-located modules share
-                        learning via per-pair tracts (~/.et_modules/tracts/)
+  Tier 2 (Peer-pooled): NGTractBridge (sole peer bridge as of 2026-06-03,
+                        substrate-as-protocol PRD Phase 3 Step 5).
+                        Co-located modules share learning via per-pair
+                        tracts (~/.et_modules/tracts/)
                         or legacy JSONL (~/.et_modules/shared_learning/).
                         Auto-connects.  Tract bridge preferred when present.
   Tier 3 (Full SNN):    Removed — modules extract via buckets/tracts.
@@ -142,7 +143,7 @@ SHARED_LEARNING_DIR = ET_MODULES_ROOT / "shared_learning"
 REGISTRY_PATH = ET_MODULES_ROOT / "registry.json"
 
 TIER_STANDALONE = 1  # NGLite only
-TIER_PEER = 2        # + NGPeerBridge
+TIER_PEER = 2        # + NGTractBridge (sole peer bridge as of 2026-06-03)
 TIER_FULL_SNN = 3    # historical — bridge removed, modules use tracts
 
 TIER_NAMES = {
@@ -437,12 +438,12 @@ class NGEcosystem:
         #       broadcast responsibility from consumer-side adapter to the
         #       canonical ecosystem facade per LAW 4 fix-at-source. Resolves
         #       PRD §4.13 Phase 3 step covering wire_absorption else-branch.
-        # How:  self._peer_bridge holds NGTractBridge when tracts are enabled
-        #       (line 365 in _init_peer_bridge; prefers tract, falls back to
-        #       legacy NGPeerBridge). Uses _get_registered_peers + _module_dir
-        #       for per-peer tract path (post-#185 forward-River pattern).
-        #       Metadata msgpack-packed. Falls back to local-only result if
-        #       no tract bridge available (legacy NGPeerBridge load OR no bridge).
+        # How:  self._peer_bridge holds NGTractBridge (sole bridge as of
+        #       2026-06-03 — substrate-as-protocol PRD Phase 3 Step 5) or
+        #       None in standalone mode. Uses _get_registered_peers +
+        #       _module_dir for per-peer tract path (post-#185 forward-River
+        #       pattern). Metadata msgpack-packed. Falls back to local-only
+        #       result if no bridge available (standalone mode).
         # -------------------
         """
         # Pass 1: Local deposit via the existing record_outcome path
@@ -457,9 +458,10 @@ class NGEcosystem:
                 return local_result
 
             # _peer_bridge holds NGTractBridge when tracts enabled; verify by
-            # checking for tract-bridge-specific attributes (skips legacy NGPeerBridge).
+            # Defensive: ensure bridge has the tract-bridge interface (should
+            # always pass post-2026-06-03 since NGTractBridge is sole bridge).
             if not (hasattr(bridge, "_get_registered_peers") and hasattr(bridge, "_module_dir")):
-                return local_result  # legacy NGPeerBridge — no BTF broadcast path
+                return local_result  # bridge missing tract interface — no BTF broadcast path
 
             import ng_tract as _ngt
             import time as _t

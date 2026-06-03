@@ -22,11 +22,11 @@ Design principles (aligned with NeuroGraph Foundation PRD §2.1):
 Connectivity tiers:
     Tier 1 — Isolated: Module runs its own NG-Lite independently.
     Tier 2 — Peer-pooled: Co-located modules share learning via
-             NGPeerBridge (not yet implemented). Two NG-Lite instances
-             exchange nodes and synapse weights for mutual benefit
-             without requiring NeuroGraph SaaS. Uses the same NGBridge
+             NGTractBridge (per-pair directional tracts). Sole peer
+             bridge as of 2026-06-03 (substrate-as-protocol PRD Phase 3
+             Step 5 deleted the legacy NGPeerBridge). Uses the NGBridge
              interface — the module doesn't know or care whether its
-             bridge partner is a sibling module or the full SaaS.
+             bridge partner is a sibling module's tract or the full SaaS.
     Tier 3 — Full SaaS: NG-Lite delegates to NeuroGraph for cross-module
              learning, STDP, hyperedges, and predictive coding.
 
@@ -160,6 +160,20 @@ Date: February 2026
 #   on exact hash match (always) and similarity match (only if None).
 #   New nodes born with embedding. _export_state()/_import_state() handle
 #   numpy<->list conversion. Old state files load cleanly (embedding=None).
+# -------------------
+# [2026-06-03] Claude Code (Opus 4.7) — Phase 3 Step 5 prep (substrate-as-protocol PRD §4.13)
+# What: Doc-only cleanup of drift-vector references — file-level docstring
+#   "Connectivity tiers" rewritten to describe NGTractBridge as sole Tier 2
+#   peer bridge (was: "NGPeerBridge (not yet implemented)"). NGBridge class
+#   docstring rewritten from "Two planned implementations: NGPeerBridge /
+#   NGSaaSBridge" to current reality (NGTractBridge / NGSaaSBridge).
+# Why: Drift-vector inoculation. The previous wording described NGPeerBridge
+#   as a not-yet-implemented planned class — a future CC reading "two
+#   planned implementations" would naturally try to "complete" it by
+#   re-adding the legacy bridge. After Phase 3 Steps 1-4 retired all
+#   NGPeerBridge callers and Step 5 deletes the file, the docs must reflect
+#   that reality so they cannot be misread as a TODO.
+# How: Two targeted string edits in this file's docstrings. Code unchanged.
 # -------------------
 
 Grok Review Changelog (v0.7.1):
@@ -348,11 +362,12 @@ class NGLiteSynapse:
 class NGBridge(ABC):
     """Interface for delegating to a higher-tier learning backend.
 
-    Two planned implementations:
-        1. NGPeerBridge (Tier 2): Connects two co-located NG-Lite
-           instances for shared learning. When modules run together
-           (e.g., Inference Difference + Cricket on the same host),
-           they pool their pattern knowledge for mutual benefit.
+    Implementations:
+        1. NGTractBridge (Tier 2): Connects co-located modules via
+           per-pair directional tracts written to ~/.et_modules/tracts/.
+           Sole peer bridge as of 2026-06-03 (substrate-as-protocol PRD
+           Phase 3 Step 5 deleted the legacy NGPeerBridge — see that
+           PRD for historical context).
         2. NGSaaSBridge (Tier 3): Connects to full NeuroGraph SaaS
            for cross-module STDP, hyperedges, and predictive coding.
 

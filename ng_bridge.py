@@ -10,8 +10,10 @@ to higher-tier learning backends:
         and NeuroGraph's full SNN with STDP, hyperedges, and predictive
         coding (weights [0,5], msgpack, UUIDs).
 
-    NGPeerBridge (Tier 2): [Planned] Connects two co-located NG-Lite
-        instances for shared learning without requiring NeuroGraph SaaS.
+    NGTractBridge (Tier 2): Connects co-located modules via per-pair
+        directional tracts written to ~/.et_modules/tracts/. Sole peer
+        bridge as of 2026-06-03 (substrate-as-protocol PRD Phase 3 Step 5
+        deleted the legacy NGPeerBridge).
 
 Weight normalization:
     NG-Lite weights are in [0.0, 1.0].

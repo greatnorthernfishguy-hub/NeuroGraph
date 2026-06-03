@@ -39,6 +39,15 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 #   NeuroGraph canonical (if reachable), graceful failure on all
 #   error paths. Ecosystem mode iterates peer registry.
 # -------------------
+# [2026-06-03] Claude Code (Opus 4.7) — Phase 3 Step 5 prep (substrate-as-protocol PRD §4.13)
+# What: Removed "ng_peer_bridge.py" from VENDORED_FILES sync list.
+# Why: ng_peer_bridge.py is being deleted from NeuroGraph canonical
+#   in Phase 3 Step 5 — after Steps 1-4 retired all callers. Without
+#   removing it from VENDORED_FILES first, the auto-updater would keep
+#   trying to sync a non-existent canonical → error or silent failure.
+# How: Single-line deletion from VENDORED_FILES list. List now reflects
+#   the actual 4 vendored files post-deletion + ng_updater self.
+# -------------------
 """
 
 from __future__ import annotations
@@ -56,9 +65,12 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger("ng_updater")
 
 # Vendored files that must be synced from NeuroGraph canonical
+# Note: ng_peer_bridge.py removed 2026-06-03 (substrate-as-protocol PRD Phase 3
+# Step 5) — see changelog header. ng_tract_bridge.py + ng_embed.py are also
+# vendored ecosystem-wide but not historically tracked here; auto-sync of
+# those still relies on the canonical-source pattern elsewhere.
 VENDORED_FILES = [
     "ng_lite.py",
-    "ng_peer_bridge.py",
     "ng_ecosystem.py",
     "ng_autonomic.py",
     "openclaw_adapter.py",
