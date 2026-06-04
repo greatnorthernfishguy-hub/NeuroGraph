@@ -2202,7 +2202,7 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # Complements spreading activation (associative) with targeted retrieval
     # of what the substrate knows about what the user is asking right now.
     _recall_k = int(os.environ.get("ANIMA_RECALL_K", "5"))
-    _recall_threshold = float(os.environ.get("ANIMA_RECALL_THRESHOLD", "0.45"))
+    _recall_threshold = float(os.environ.get("ANIMA_RECALL_THRESHOLD", "0.40"))  # confidence_recommend
     if recent_text and _memory is not None:
         try:
             _recall_results = _memory.recall(recent_text, k=_recall_k, threshold=_recall_threshold)
