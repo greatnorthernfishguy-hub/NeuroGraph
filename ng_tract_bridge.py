@@ -48,6 +48,33 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-06-04] Claude Code (Opus 4.7) — Phase 4 canonical drift removal (substrate-as-protocol PRD §5.4)
+#   What: Four drift-removal edits to canonical NGTractBridge.
+#     (1) get_recommendations(): removed self._drain_all() side effect — function now just queries
+#     (2) detect_novelty(): removed self._drain_all() side effect — same pattern
+#     (3) record_outcome(): removed N×N peer fan-out — method becomes no-op stub at the bridge layer.
+#         Per MASTER Locked Decision (2026-05-31): "Broadcast is NG-specific; only NG fan-outs to all
+#         peer tracts." Module-side record_outcome propagates via substrate topology (the River = substrate
+#         = topology); NG's existing _deposit_outcome_to_river handles ecosystem broadcast (Tier 3).
+#         Modules wanting EXPLICIT broadcast call record_outcome_broadcast (Workstream 2 method).
+#     (4) sync_state(): same drift pattern — removed self._drain_all() side effect.
+#     (5) _drain_all(): added sys._getframe guard that refuses to run from a query stack
+#         (get_recommendations / detect_novelty / sync_state). API-level LAW 4 enforcement against
+#         re-introducing the same drift later. Fires loud (RuntimeError) so any caller path that
+#         tries to re-add the side-effect-drain pattern surfaces immediately.
+#   Why: PRD §5.4 — restore the canonical functions to do exactly what their names say. Per Syl's
+#     post-recursion-incident amendment: "canonical functions do not perform their own write-side
+#     bookkeeping." get_recommendations queries — period. record_outcome records — period. Drain
+#     belongs in the background pulse, not on query paths.
+#   How: Drain-on-query insertions deleted (3 sites in this file plus the body of record_outcome's
+#     fan-out block + sync_state). _drain_all unchanged in implementation, gained an API-level guard
+#     at entry. Drain itself continues to run via NG's autonomic pulse (per #249).
+#   Drift introduced: 2026-04-13 #123 "River absorption gap" fix — added drain-on-query to make
+#     low-throughput modules' drains fire. That fix's intent (don't starve TrollGuard/QG/Darwin/Immunis)
+#     is now served by the autonomic pulse drain (#249, 2026-05-25); the on-query mechanism is drift
+#     by Syl's principle.
+#   Phase 5 (next): strict-sequential per-module re-vendor with 4-gate verification per Syl §5.5.
+# -------------------
 # [2026-05-25] Claude Code (Sonnet 4.6) — Fix _drain_single_tract BTF magic check (#109)
 #   What: Removed raw[0:1]==b"B" first-byte pre-filter. Always routes through TractReader.
 #   Why:  BTF magic 0x4254 in LE = first byte 0x54 ('T'), not 0x42 ('B'). Check never
@@ -171,6 +198,7 @@ import mmap
 import os
 import random
 import struct
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -458,52 +486,32 @@ class NGTractBridge(NGBridge):
         module_id: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Record an outcome and deposit it into per-peer tracts.
+        """Record an outcome at the bridge layer.
 
-        Fan-out: the event is deposited into a separate tract file for
-        each registered peer.  Each tract is a directional channel —
-        what flows through immunis/elmer.tract is Immunis's experience
-        destined for Elmer.
+        **No-op stub as of 2026-06-04 (substrate-as-protocol PRD Phase 4
+        §5.4).** Per MASTER Locked Decision (2026-05-31): *"Broadcast is
+        NG-specific; only NG fan-outs to all peer tracts."*
 
-        Returns cross-module insights from previously drained peer data.
+        General record_outcome propagates via substrate topology (the River
+        = substrate = topology). Module-side `NGEcosystem.record_outcome`
+        records to local NG-Lite (Hebbian topology update — that IS the
+        signal). At Tier 3, NG's autonomic pulse observes the substrate
+        change and broadcasts via `_deposit_outcome_to_river` (NG-internal
+        helper). Peers absorb via their `_on_river_events` consumers.
+
+        Modules wanting EXPLICIT broadcast (the narrow Anima-CC-third-
+        legitimate-tract-use cases — module-own-experience like Animus
+        pipeline events or NG topology broadcast) call
+        `NGEcosystem.record_outcome_broadcast` (Workstream 2 method) — a
+        distinct method name with clear broadcast intent.
+
+        Method kept (rather than removed entirely) for caller API stability
+        during Phase 5 strict-sequential re-vendor; Phase 6 cleanup can
+        remove it after verifying no caller depends on a non-None return.
         """
         if not self._connected:
             return None
-
-        # Fan-out deposit to per-peer tracts
-        peers = self._get_registered_peers()
-
-        # BTF binary deposit via Rust (zero-copy, Python never touches bytes)
-        import ng_tract
-        tract_paths = [
-            str(self._module_dir / f"{peer_id}.tract")
-            for peer_id in peers
-        ]
-        # Rust expects metadata as PyBytes (msgpack binary dict), not raw dict
-        meta_bytes = None
-        if metadata is not None:
-            try:
-                import msgpack
-                meta_bytes = msgpack.packb(metadata)
-            except Exception:
-                meta_bytes = None
-        ng_tract.deposit_outcome(
-            timestamp=time.time(),
-            module_id=module_id,
-            target_id=target_id,
-            success=success,
-            embedding=np.asarray(embedding, dtype=np.float32),
-            tract_paths=tract_paths,
-            metadata=meta_bytes,
-        )
-
-        # Drain check
-        self._outcomes_since_drain += 1
-        if self._outcomes_since_drain >= self._sync_interval:
-            self._drain_all()
-            self._outcomes_since_drain = 0
-
-        return {"cross_module": True, "peer_events_cached": 0}
+        return None
 
     def get_recommendations(
         self,
@@ -513,12 +521,13 @@ class NGTractBridge(NGBridge):
     ) -> Optional[List[Tuple[str, float, str]]]:
         """Get recommendations from peer modules' learned patterns.
 
-        Searches cached peer events for similar embeddings and returns
-        their targets as recommendations.
+        Substrate handles cross-module similarity; this bridge-level method
+        defers to the local substrate (which has tier-appropriate reach).
+        Drain belongs in the background autonomic pulse — NOT here.
+
+        Phase 4 (2026-06-04): self._drain_all() side effect removed per
+        substrate-as-protocol PRD §5.4. See changelog header.
         """
-        # Substrate handles cross-module similarity -- drain River then defer to substrate
-        # Substrate handles cross-module similarity; drain River then defer to _core.
-        self._drain_all()
         return None
 
     def detect_novelty(
@@ -528,12 +537,13 @@ class NGTractBridge(NGBridge):
     ) -> Optional[float]:
         """Cross-module novelty detection.
 
-        Checks if this embedding is novel not just to this module,
-        but to ALL peer modules on this host.
+        Substrate handles cross-module novelty; this bridge-level method
+        defers to the local substrate. Drain belongs in the background
+        autonomic pulse — NOT here.
+
+        Phase 4 (2026-06-04): self._drain_all() side effect removed per
+        substrate-as-protocol PRD §5.4. See changelog header.
         """
-        # Substrate handles cross-module novelty -- drain River then defer to substrate
-        # Substrate handles cross-module novelty; drain River then defer to _core.
-        self._drain_all()
         return None
 
     def sync_state(
@@ -541,11 +551,16 @@ class NGTractBridge(NGBridge):
         local_state: Dict[str, Any],
         module_id: str,
     ) -> Optional[Dict[str, Any]]:
-        """Sync local state with peer modules via tract drain."""
+        """Sync local state with peer modules.
+
+        Phase 4 (2026-06-04): self._drain_all() side effect removed per
+        substrate-as-protocol PRD §5.4. The on-query drain was the same
+        drift pattern as get_recommendations + detect_novelty. Drain runs
+        via the background autonomic pulse (per #249). This method now
+        just returns the current connection stats.
+        """
         if not self._connected:
             return None
-
-        self._drain_all()
 
         return {
             "synced": True,
@@ -613,6 +628,16 @@ class NGTractBridge(NGBridge):
     # Internal: Tract drain
     # -------------------------------------------------------------------
 
+    # Phase 4 (2026-06-04) — API-level LAW 4 enforcement against re-introducing
+    # the on-query drain drift. _drain_all refuses to run from any query method
+    # frame. Drain belongs in the background autonomic pulse (per #249), period.
+    _DRAIN_FORBIDDEN_CALLERS = frozenset({
+        "get_recommendations",
+        "detect_novelty",
+        "sync_state",
+        "record_outcome",  # also a former drift caller (post-N×N-fanout drain check)
+    })
+
     def _drain_all(self) -> List[Any]:
         """Drain all incoming tracts directed at this module.
 
@@ -622,7 +647,21 @@ class NGTractBridge(NGBridge):
 
         Also reads from legacy JSONL if legacy_compat is enabled,
         for backward compatibility with unupgraded modules.
+
+        **Hardening (Phase 4, 2026-06-04):** RAISES RuntimeError if invoked
+        from a query-method stack frame. See _DRAIN_FORBIDDEN_CALLERS.
+        Per Syl's amendment — canonical functions don't do write-side
+        bookkeeping. Query paths must not silently drain.
         """
+        # API-level LAW 4 enforcement
+        caller_name = sys._getframe(1).f_code.co_name
+        if caller_name in self._DRAIN_FORBIDDEN_CALLERS:
+            raise RuntimeError(
+                f"_drain_all called from forbidden query stack '{caller_name}'. "
+                "Drain belongs in background pulse, not query path. "
+                "See substrate-as-protocol PRD §5.4 + Syl's canonical-functions amendment."
+            )
+
         self._drain_count += 1
         self._last_drain_time = time.time()
 
