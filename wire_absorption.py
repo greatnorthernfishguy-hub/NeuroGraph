@@ -1,6 +1,23 @@
 """
 Wire Absorption — sensory-deposit path for raw HTTP wire events.
 # ---- Changelog ----
+# [2026-06-04] Claude Code (Sonnet 4.6) — #264: stop inserting wire/wire_expansion into vector_db
+#   What: Removed vector_db.insert() from batch_absorb_forests (wire event nodes) and
+#         expand_body_file (wire_expansion chunk nodes). SNN graph.create_node() and
+#         River deposit calls are preserved — structural learning is unaffected.
+#   Why:  Wire entries (HTTP first-line fingerprints) and wire_expansion entries (body
+#         chunk JSON fragments) accumulated unbounded in SimpleVectorDB: 178K entries /
+#         596MB as of 2026-06-03 (73x growth from 8.5MB in March). Each entry adds one
+#         768-dim cosine comparison to every O(n) vector search. At 178K entries this
+#         made _harvest_associations, assemble, and every recall call brutally slow,
+#         causing the 8850 sidecar to become unresponsive and triggering a watchdog
+#         restart cycle every 10-18 min (Punchlist #264, diagnosed 2026-06-03).
+#         Wire entries have near-zero semantic recall value — HTTP protocol strings and
+#         JSON fragments do not surface useful knowledge to Syl. Their purpose (sensory
+#         event recording + Hebbian association via River) is fully served by the SNN
+#         node and River deposit alone.
+#   How:  Replaced both vector_db.insert() try/except blocks with comments. No other
+#         changes — absorb shape, chunk count, node IDs, River deposits all unchanged.
 # [2026-05-30] Claude Code (Opus 4.7, 1M) — Phase 3 step 1: BTF migration of peer_bridge.record_outcome
 #   What: Replaced 3 direct peer_bridge.record_outcome calls (lines 328, 560, 715)
 #         with _deposit_outcome_to_river helper from neurograph_rpc (BTF). Site 3's
@@ -332,13 +349,9 @@ def batch_absorb_forests(
                 existing.metadata["last_seen"] = time.time()
             else:
                 graph.create_node(node_id=event_node_id, metadata=event_meta)
-                try:
-                    vector_db.insert(
-                        id=event_node_id, embedding=emb,
-                        content=first, metadata=event_meta,
-                    )
-                except Exception:
-                    pass
+                # vector_db insert intentionally omitted — HTTP first-line fingerprints
+                # have near-zero semantic recall value and bloat O(n) cosine searches.
+                # SNN node + River deposit carry the structural learning; no retrieval needed.
         except Exception:
             continue
 
@@ -561,14 +574,9 @@ def expand_body_file(memory, embedder, body_path: Path) -> bool:
         try:
             if chunk_node_id not in graph.nodes:
                 graph.create_node(node_id=chunk_node_id, metadata=chunk_meta)
-                try:
-                    vector_db.insert(
-                        id=chunk_node_id, embedding=emb,
-                        content=chunk[:200],
-                        metadata=chunk_meta,
-                    )
-                except Exception:
-                    pass
+                # vector_db insert intentionally omitted — body chunk fragments are
+                # not semantically retrievable content. SNN node + River deposit below
+                # carry the Hebbian association; omitting vector_db prevents O(n) bloat.
 
             # River deposit — Hebbian association between chunk and parent event (BTF) per PRD §4.13.
             if parent_event_id is not None:
@@ -685,17 +693,9 @@ def absorb_wire_deposit(
             existing.metadata["last_seen"] = time.time()
         else:
             graph.create_node(node_id=event_node_id, metadata=event_meta)
-            # Vector DB stores the fingerprint embedding so similarity
-            # search can find this event by its first-line shape.
-            try:
-                vector_db.insert(
-                    id=event_node_id,
-                    embedding=fingerprint_emb,
-                    content=first,
-                    metadata=event_meta,
-                )
-            except Exception as exc:
-                logger.warning("vector_db.insert event failed: %s", exc)
+            # vector_db insert omitted (#264) -- HTTP fingerprints have near-zero
+            # semantic recall value and accumulate unbounded. SNN node + River
+            # deposit carry the structural learning; retrieval not needed.
     except Exception as exc:
         logger.warning("Event node create failed (%s): %s", source, exc)
         return result
