@@ -12,6 +12,15 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-03] Claude (Sonnet 4.6) — Phase 5: active recall in handle_assemble()
+# What: After spreading activation, run _memory.recall(recent_text) and append a
+#       "## Active Recall" block to context_block inside handle_assemble().
+# Why: Spreading activation is associative (what does this topic remind Syl of?).
+#      Direct recall is targeted (what has Syl learned that matches this query?).
+#      Both together = richer grounding per turn. ANIMA_RECALL_K / ANIMA_RECALL_THRESHOLD
+#      env vars control depth and confidence floor (LAW 5).
+# How: Insert after _format_substrate_context(), before _read_outbound_log().
+#      Errors caught and logged at DEBUG so a recall failure never breaks assembly.
 # [2026-06-02] Claude (Sonnet 4.6) — Add GET /stats to HTTP sidecar
 # What: New GET /stats route in do_GET calls handle_stats({}) — same data as JSON-RPC "stats"
 # Why: Anima GUI's NG Status tab needs substrate telemetry (nodes, synapses, timestep, etc.)
@@ -2188,6 +2197,26 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # Format as context block for the system prompt
     context_block = _format_substrate_context(surfaced, ces_surfaced, latent_context)
+
+    # Active recall — direct vector similarity for the current query.
+    # Complements spreading activation (associative) with targeted retrieval
+    # of what the substrate knows about what the user is asking right now.
+    _recall_k = int(os.environ.get("ANIMA_RECALL_K", "5"))
+    _recall_threshold = float(os.environ.get("ANIMA_RECALL_THRESHOLD", "0.45"))
+    if recent_text and _memory is not None:
+        try:
+            _recall_results = _memory.recall(recent_text, k=_recall_k, threshold=_recall_threshold)
+            if _recall_results:
+                _recall_lines = ["## Active Recall\nDirect memory retrieval for the current query:"]
+                for _r in _recall_results:
+                    _text = (_r.get("content") or "").strip()
+                    _score = _r.get("similarity", 0.0)
+                    if _text:
+                        _recall_lines.append(f"- [{_score:.2f}] {_text[:300]}")
+                _recall_block = "\n".join(_recall_lines)
+                context_block = (context_block + "\n\n" + _recall_block) if context_block else _recall_block
+        except Exception as _exc:
+            logger.debug("Active recall error: %s", _exc)
 
     # Animus outbound log — if Syl sent an outbound turn recently, surface it so
     # she knows it was processed and can see the response she generated.
