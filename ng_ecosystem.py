@@ -95,6 +95,19 @@ License: AGPL-3.0
 #   How:  Lazy import of ng_embed to avoid circular deps. Passes self
 #         (the ecosystem instance) to NGEmbed.dual_record_outcome().
 # -------------------
+# [2026-06-05] Claude Code (Opus 4.7) — Phase 6 drift-bait removal (substrate-as-protocol PRD §6)
+#   What: Removed dead-defined module-level constant `SHARED_LEARNING_DIR`.
+#         Was `ET_MODULES_ROOT / "shared_learning"`, defined at module load.
+#         Zero callers across the active ecosystem since NGPeerBridge deletion.
+#   Why:  Drift-bait removal. Future CCs reading the constant would assume it's
+#         used somewhere and might either re-add a caller "to fix the broken
+#         feature" or build new code on top of it. The env-var `ET_SHARED_LEARNING_DIR`
+#         (different surface — read by ng_tract_bridge for legacy path override)
+#         is intentionally UNAFFECTED by this removal.
+#   How:  Single-constant deletion with inline replacement comment explaining
+#         WHY it was removed (inoculation against future re-add). Re-vendor cycle
+#         to 12 active ecosystem modules follows.
+# -------------------
 # [2026-06-03] Claude Code (Opus 4.7) — Phase 3 Step 4 (substrate-as-protocol PRD §4.13)
 #   What: Removed legacy NGPeerBridge fallback from _init_peer_bridge() and
 #         "peer_bridge" output field from stats(). NGTractBridge is now the
@@ -139,7 +152,11 @@ __version__ = "1.0.0"
 # --------------------------------------------------------------------------
 
 ET_MODULES_ROOT = Path.home() / ".et_modules"
-SHARED_LEARNING_DIR = ET_MODULES_ROOT / "shared_learning"
+# SHARED_LEARNING_DIR removed 2026-06-05 (Phase 6 drift-bait removal).
+# Was: ET_MODULES_ROOT / "shared_learning". Zero callers across the active
+# ecosystem since NGPeerBridge deletion (Phase 3 Step 5). The env-var
+# `ET_SHARED_LEARNING_DIR` (different surface, read by ng_tract_bridge for
+# legacy path override) is unaffected by this removal.
 REGISTRY_PATH = ET_MODULES_ROOT / "registry.json"
 
 TIER_STANDALONE = 1  # NGLite only
