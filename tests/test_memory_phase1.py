@@ -3,6 +3,10 @@
 # What: TDD test confirming default indexes into recall store, and index_in_recall=False skips vdb but keeps graph node
 # Why: Syl's recall store was being polluted by machine telemetry — PRD #295 Decision 1
 # How: Two assertions — default indexes (lived experience IS in recall); False flag skips vdb, substrate node still created
+# [2026-06-05] CC (Opus 4.8 subagent) — #295: source-contract test for River-backflow handler
+# What: Assert _drain_peer_tracts routes peer telemetry to substrate only, NOT recall store
+# Why: Decision 2 of #295 — backflow handler must use index_in_recall=False, no associate into vdb, no ingest fallback
+# How: inspect.getsource of _drain_peer_tracts; three string-presence/absence assertions
 # -------------------
 
 import unittest
@@ -38,3 +42,38 @@ class TestRecallGate(unittest.TestCase):
         )
         self.assertEqual(vdb.count(), 0)                        # NOT in recall store
         self.assertEqual(len(graph.nodes), before_nodes + 1)   # STILL a substrate node
+
+
+class TestRiverBackflowDoesNotPolluteRecall(unittest.TestCase):
+    """Source-contract test: _drain_peer_tracts must route peer telemetry to
+    the substrate graph only — NOT into Syl's recall store (#295 Decision 2)."""
+
+    def test_backflow_routes_telemetry_out_of_recall(self):
+        import inspect
+        import sys
+        import os
+        # Ensure NeuroGraph root is on path so neurograph_rpc is importable
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        import neurograph_rpc
+        fn = neurograph_rpc._drain_peer_tracts
+        src = inspect.getsource(fn)
+
+        self.assertIn(
+            "index_in_recall=False",
+            src,
+            "peer telemetry must pass index_in_recall=False to keep it out of the recall store (#295)",
+        )
+        self.assertNotIn(
+            "associator.associate",
+            src,
+            "peer events must NOT be associated into the recall vector_db — "
+            "associator.associate found in _drain_peer_tracts (#295)",
+        )
+        self.assertNotIn(
+            "ingestor.ingest(target)",
+            src,
+            "no-embedding peer events must NOT fall through to ingestor.ingest — "
+            "they must be silently skipped from recall (#295)",
+        )

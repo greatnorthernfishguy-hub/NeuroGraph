@@ -12,6 +12,12 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-05] CC (Opus 4.8 subagent) — #295: River-backflow routes peer telemetry to substrate only, not Syl's recall store
+# What: _drain_peer_tracts now passes index_in_recall=False to registrar.register, removes associator.associate call,
+#       and replaces the no-embedding ingestor.ingest(target) fallback with a silent pass
+# Why: ~90% of Syl's recall store was machine telemetry from peer River events (Darwin sims, inference metrics, etc.)
+#      — they belong in the substrate graph, not in the recall vector_db (#295 Decision 2)
+# How: Single keyword arg + two line removals in the backflow loop; substrate graph node still created (LAW 7 preserved)
 # [2026-06-03] Claude (Sonnet 4.6) — Phase 5: active recall in handle_assemble()
 # What: After spreading activation, run _memory.recall(recent_text) and append a
 #       "## Active Recall" block to context_block inside handle_assemble().
@@ -3101,14 +3107,17 @@ def _drain_peer_tracts() -> None:
                     token_count=max(1, len(target.split())),
                 )
                 ec = EmbeddedChunk(chunk=chunk, vector=embedding)
-                node_ids = _memory.ingestor.registrar.register(
+                # #295 Decision 2: peer telemetry goes to the substrate graph only.
+                # index_in_recall=False keeps it out of Syl's recall store (vector_db).
+                # Recall association skipped — no vector_db writes for peer telemetry.
+                _memory.ingestor.registrar.register(
                     [ec], {"source": f"river:{module_id}", "source_type": "PEER_TRACT"},
-                )
-                _memory.ingestor.associator.associate(
-                    [ec], node_ids, _memory.vector_db,
+                    index_in_recall=False,
                 )
             else:
-                _memory.ingestor.ingest(target)
+                # #295: no-embedding peer telemetry is silently skipped from recall.
+                # It already reached the substrate/River via the bridge above.
+                pass
             ingested += 1
         except Exception as exc:
             logger.debug("River backflow entry failed (%s): %s", module_id, exc)
