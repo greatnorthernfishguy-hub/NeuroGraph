@@ -59,21 +59,25 @@ class TestRiverBackflowDoesNotPolluteRecall(unittest.TestCase):
         import neurograph_rpc
         fn = neurograph_rpc._drain_peer_tracts
         src = inspect.getsource(fn)
+        # Source-contract checks must match actual CODE, not explanatory comments.
+        # Strip everything after '#' on each line (this function has no '#' inside
+        # string literals) so a comment mentioning an old call can't false-fail.
+        code_src = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
 
         self.assertIn(
             "index_in_recall=False",
-            src,
+            code_src,
             "peer telemetry must pass index_in_recall=False to keep it out of the recall store (#295)",
         )
         self.assertNotIn(
             "associator.associate",
-            src,
+            code_src,
             "peer events must NOT be associated into the recall vector_db — "
             "associator.associate found in _drain_peer_tracts (#295)",
         )
         self.assertNotIn(
             "ingestor.ingest(target)",
-            src,
+            code_src,
             "no-embedding peer events must NOT fall through to ingestor.ingest — "
             "they must be silently skipped from recall (#295)",
         )

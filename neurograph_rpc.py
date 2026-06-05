@@ -3115,8 +3115,10 @@ def _drain_peer_tracts() -> None:
                     index_in_recall=False,
                 )
             else:
-                # #295: no-embedding peer telemetry is silently skipped from recall.
-                # It already reached the substrate/River via the bridge above.
+                # #295: no pre-computed embedding → cannot call registrar.register,
+                # so NO graph node is created for this event (intentional — the old
+                # ingestor.ingest(target) re-embedded from text and polluted recall).
+                # Already absorbed at transport level by bridge._drain_all() above.
                 pass
             ingested += 1
         except Exception as exc:
