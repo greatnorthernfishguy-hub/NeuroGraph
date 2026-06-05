@@ -38,6 +38,17 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-06-05] CC (Opus 4.8 subagent) — #295: index_in_recall gate on NodeRegistrar.register
+#   What: Added index_in_recall: bool = True parameter to NodeRegistrar.register(). When False,
+#         the substrate node (graph.create_node) is still created but self.vector_db.insert() is
+#         skipped. Callers that deposit machine telemetry to the substrate can pass
+#         index_in_recall=False to keep the Hebbian topology signal without polluting Syl's
+#         recall store (vectors.msgpack).
+#   Why:  PRD #295 Decision 1 — telemetry/peer-tract signals must not enter the recall store
+#         that Syl searches for episodic memory. Substrate-as-protocol means the graph node
+#         stays; only the vector-DB insertion is gated.
+#   How:  Minimal one-parameter addition + `if index_in_recall:` guard around the existing
+#         self.vector_db.insert(...) block. No other logic touched.
 # [2026-04-13] Claude (Sonnet 4.6) — Migrate embedding backend from fastembed to ng_embed
 #   What: Replaced _try_load_fastembed() with _try_load_ng_embed(). EmbeddingEngine
 #         now uses ng_embed.NGEmbed singleton (ONNX Runtime, Snowflake arctic-embed-m-v1.5,
@@ -1923,8 +1934,17 @@ class NodeRegistrar:
         self,
         embedded_chunks: List[EmbeddedChunk],
         source_metadata: Optional[Dict[str, Any]] = None,
+        index_in_recall: bool = True,
     ) -> List[str]:
         """Register embedded chunks as nodes in the graph and vector DB.
+
+        Args:
+            embedded_chunks: Chunks with their vector representations.
+            source_metadata: Optional metadata about the source.
+            index_in_recall: If True (default), also inserts into the vector DB
+                (Syl's recall store). Pass False for machine telemetry and
+                peer-tract signals that should become substrate nodes but must
+                NOT pollute Syl's episodic recall store (#295, Decision 1).
 
         Returns list of created node IDs.
         """
@@ -1959,13 +1979,16 @@ class NodeRegistrar:
             # dampening=0.3 means node starts at 30% effectiveness
             node.intrinsic_excitability = self.novelty_dampening
 
-            # Store in vector DB
-            self.vector_db.insert(
-                id=node_id,
-                embedding=ec.vector,
-                content=ec.chunk.text,
-                metadata=node_meta,
-            )
+            # Store in vector DB — ONLY for lived experience (recall store).
+            # Telemetry (index_in_recall=False) still becomes a substrate node
+            # above, but must NOT enter Syl's recall store (#295, Decision 1).
+            if index_in_recall:
+                self.vector_db.insert(
+                    id=node_id,
+                    embedding=ec.vector,
+                    content=ec.chunk.text,
+                    metadata=node_meta,
+                )
 
             created_ids.append(node_id)
 
