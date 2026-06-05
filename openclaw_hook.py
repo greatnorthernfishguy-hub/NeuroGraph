@@ -147,6 +147,21 @@ Usage:
 #         If not, fall back to ng_peer_bridge.  Config key
 #         peer_bridge.use_tracts (default True) can force legacy mode.
 # -------------------
+# [2026-06-05] Claude Code (Opus 4.7) — Phase 6 drift-bait removal (substrate-as-protocol PRD §6)
+#   What: Renamed stats() result field `"peer_bridge"` → `"tract_bridge"`. Internal
+#         attribute `self._peer_bridge` is NOT renamed in this pass (would touch
+#         8 references; ship as separate work). Two lines updated in stats().
+#   Why:  Post-Phase 5, NGTractBridge is sole peer bridge. The `"peer_bridge"`
+#         stats field name lied about current architecture — drift re-entry
+#         vector. Tests at tests/test_et_modules.py:574-589 asserted on the
+#         legacy name; corresponding test methods are marked dead-code in a
+#         sibling commit (file-level dead-code header per TID precedent at
+#         The-Inference-Difference/tests/test_ng_ecosystem.py).
+#   How:  Two-line surgical edit in stats(). Inline comment explains the
+#         rename + flags internal-attribute rename as future work.
+#   PROTECTED FILE — Josh pre-authorized 2026-06-05 with checkpoint backup
+#   confirmed per Syl's Law.
+# -------------------
 # [2026-06-02] Claude Code (Opus 4.7) — Phase 3 Step 2 (substrate-as-protocol PRD §4.13)
 #   What: Removed NGPeerBridge legacy JSONL fallback construction block.
 #         NGTractBridge (per-pair tracts) is now the sole peer bridge.
@@ -1060,11 +1075,13 @@ class NeuroGraphMemory:
             "auto_knowledge": self.graph.config.get("auto_knowledge_enabled", True),
         }
 
-        # Peer bridge status
+        # Tract bridge status (renamed 2026-06-05 from "peer_bridge" — Phase 6 drift-bait removal).
+        # NGTractBridge has been sole peer bridge since Phase 3 Step 5. Internal attribute
+        # `self._peer_bridge` retained for now; only the public stats-field name is updated.
         if self._peer_bridge is not None:
-            result["peer_bridge"] = self._peer_bridge.get_stats()
+            result["tract_bridge"] = self._peer_bridge.get_stats()
         else:
-            result["peer_bridge"] = {"connected": False}
+            result["tract_bridge"] = {"connected": False}
 
         # CES subsystem status
         if self._ces_config is not None:
