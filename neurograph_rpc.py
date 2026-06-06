@@ -12,6 +12,15 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-05] CC (Sonnet 4.6) — #297: bounded non-cyclic pass-2 retry-queue, drained on the autonomic pulse
+# What: Split _conversational_dual_pass into _run_conversational_dual_pass (core, returns bool, no enqueue)
+#       and _conversational_dual_pass (wrapper, enqueues on failure). Added _retry_queue(), _enqueue_failed_extraction(),
+#       _drain_pass2_retries(). Drain wired into handle_after_turn after self-observation block.
+# Why:  Failed pass-2 extractions were silently dropped forever. Retry-queue gives bounded recovery.
+#       Non-cyclic by construction: drain uses core (no enqueue path), items at max_attempts are dropped
+#       not re-queued, preventing the wire->absorb->extract OOM-recursion class.
+# How:  memory_retry_queue.RetryQueue (msgpack-backed, dedup by target_id). Path/attempts from env vars
+#       ANIMA_PASS2_RETRY_PATH / ANIMA_PASS2_RETRY_MAX_ATTEMPTS (LAW 5). Drain on pulse = off ingest hot path.
 # [2026-06-05] CC (Sonnet 4.6) — #296a fix: target_id hashes full text (collision-safe across turns)
 # What: _conversational_dual_pass target_id changed from sha1(text[:256])[:16] to sha1(text) (full text, full hex).
 # Why: Two turns sharing the same first-256-char prefix produced the same target_id → same ::tree:: id →
@@ -1879,18 +1888,17 @@ class _ConversationalDualPassEco:
         return self.record_outcome(embedding, target_id, success, strength, metadata)
 
 
-def _conversational_dual_pass(text: str, embedding: Any) -> None:
-    """#296a: run the vendored dual-pass on a conversational turn so its
-    fine-grained concepts become searchable tree atoms in Syl's recall store.
+def _run_conversational_dual_pass(text: str, embedding: Any) -> bool:
+    """Core dual-pass on a turn. Returns True on success, False on failure.
+    Does NOT enqueue — so the retry drain can call this without re-cycling (#297).
 
-    Named caller-side step — NOT buried inside dual_record_outcome (LAW 4).
-    ng_embed.py is invoked, never modified (LAW 2).
-    Non-fatal on any failure — pass-1 chunk ingest already completed.
-
-    NOTE: retry-queue enqueue is wired in Task 4 (#297). For now, log only.
+    # [2026-06-05] CC (Sonnet 4.6) — #297: split out core (no enqueue) so drain is non-cyclic
+    # What: Extracted from _conversational_dual_pass; returns bool; no side-effects on failure.
+    # Why: Retry drain must call core logic without re-triggering enqueue — else it re-cycles.
+    # How: try/except returns False on failure; caller decides whether to enqueue.
     """
     if _memory is None or embedding is None:
-        return
+        return False
     try:
         from ng_embed import NGEmbed
         import hashlib
@@ -1904,8 +1912,81 @@ def _conversational_dual_pass(text: str, embedding: Any) -> None:
             strength=1.0,
             metadata={"source": "conversation", "creation_mode": "conversational_tree"},
         )
+        return True
     except Exception as exc:
         logger.debug("Conversational dual-pass failed (non-fatal): %s", exc)
+        return False
+
+
+def _conversational_dual_pass(text: str, embedding: Any) -> None:
+    """#296a turn path: run the dual-pass; on failure, enqueue for bounded retry (#297).
+
+    # [2026-06-05] CC (Sonnet 4.6) — #297: enqueue on failure instead of silently dropping
+    # What: Calls _run_conversational_dual_pass; enqueues to retry-queue on failure.
+    # Why: Failed extractions were silently lost forever — now bounded-retry via pulse.
+    # How: Wrapper delegates to core; _enqueue_failed_extraction on False return.
+    """
+    if not _run_conversational_dual_pass(text, embedding):
+        _enqueue_failed_extraction(text, embedding)
+
+
+# ── Pass-2 retry-queue (#297) ─────────────────────────────────────────────────
+# Non-cyclic guarantee: drain uses _run_conversational_dual_pass (the CORE, no
+# enqueue), so a still-failing item is bounded by max_attempts and dropped —
+# it can never be re-enqueued during the drain pass.
+
+_RETRY_QUEUE = None
+
+
+def _retry_queue():
+    global _RETRY_QUEUE
+    if _RETRY_QUEUE is None:
+        from memory_retry_queue import RetryQueue
+        path = os.environ.get(
+            "ANIMA_PASS2_RETRY_PATH",
+            os.path.join(os.path.dirname(__file__), "data", "pass2_retry.msgpack"),
+        )
+        attempts = int(os.environ.get("ANIMA_PASS2_RETRY_MAX_ATTEMPTS", "3"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _RETRY_QUEUE = RetryQueue(path, max_attempts=attempts)
+    return _RETRY_QUEUE
+
+
+def _enqueue_failed_extraction(text: str, embedding: Any) -> None:
+    """Enqueue a failed pass-2 extraction for bounded retry on next pulse drain."""
+    try:
+        import hashlib
+        tid = "conv::" + hashlib.sha1(text.encode()).hexdigest()
+        _retry_queue().enqueue(tid, text[:2000])
+    except Exception as exc:
+        logger.debug("retry enqueue failed (non-fatal): %s", exc)
+
+
+def _drain_pass2_retries() -> None:
+    """Drain on the autonomic pulse — NOT during ingest (non-cyclic guarantee).
+    Uses the CORE (no enqueue), so a still-failing item is bounded by drain's
+    max_attempts and dropped, never re-cycled.
+
+    # [2026-06-05] CC (Sonnet 4.6) — #297: drain wired into handle_after_turn pulse
+    # What: One bounded drain pass per turn; re-embeds content and retries core.
+    # Why: Retries happen off the ingest hot path — pulse is the correct cadence.
+    # How: attempt() re-embeds item content then calls _run_conversational_dual_pass.
+    #      Returns bool to drain(); bounded by max_attempts in RetryQueue.drain().
+    """
+    if _memory is None:
+        return
+
+    def _attempt(item: dict) -> bool:
+        try:
+            from ng_embed import embed
+            return _run_conversational_dual_pass(item["content"], embed(item["content"]))
+        except Exception:
+            return False
+
+    try:
+        _retry_queue().drain(_attempt)
+    except Exception as exc:
+        logger.debug("pass-2 retry drain failed (non-fatal): %s", exc)
 
 
 def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -2472,6 +2553,12 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
             )
     except Exception as exc:
         logger.debug("Self-observation deposit failed (non-fatal): %s", exc)
+
+    # Bounded retry drain for failed pass-2 concept extractions (#297).
+    # Called here (pulse, NOT in ingest) — non-cyclic guarantee: drain uses
+    # _run_conversational_dual_pass (core, no enqueue), so failed items are
+    # bounded by max_attempts and dropped, never re-queued within this pass.
+    _drain_pass2_retries()
 
     # Clear after deposit — consumed
     _ingest_text = None

@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-06-05] CC (Sonnet 4.6) — #297: TestRetryQueue — bounded non-cyclic retry-queue tests
+# What: Three tests: enqueue+drain-to-success, drop-after-max-attempts, persist-across-instances.
+# Why: TDD requirement for memory_retry_queue.RetryQueue (spec §6.1 non-cyclic guarantee).
+# How: tempfile paths, attempt counters, fresh RetryQueue instances per assertion.
 # [2026-06-05] CC (Opus 4.8 subagent) — #295: test for index_in_recall gate on NodeRegistrar.register
 # What: TDD test confirming default indexes into recall store, and index_in_recall=False skips vdb but keeps graph node
 # Why: Syl's recall store was being polluted by machine telemetry — PRD #295 Decision 1
@@ -236,3 +240,68 @@ class TestConversationalDualPassStep(unittest.TestCase):
             "must NOT silently overwrite (#296a) — got "
             f"{mem.vector_db.count()} entry/entries instead of 2",
         )
+
+
+# ---------------------------------------------------------------------------
+# #297 — Bounded non-cyclic retry-queue
+# ---------------------------------------------------------------------------
+
+import tempfile
+import os as _os
+
+
+class TestRetryQueue(unittest.TestCase):
+    def test_enqueue_then_drain_retries_to_success(self):
+        from memory_retry_queue import RetryQueue
+        path = tempfile.mktemp(suffix=".msgpack")
+        try:
+            q = RetryQueue(path, max_attempts=3)
+            q.enqueue("conv::abc", "set work mode")
+            self.assertEqual(q.pending_count(), 1)
+            q.enqueue("conv::abc", "dup")  # dedup by id — still 1
+            self.assertEqual(q.pending_count(), 1)
+
+            calls = {"n": 0}
+
+            def attempt(item):
+                calls["n"] += 1
+                return calls["n"] >= 2  # fail first call, succeed second
+
+            # First drain: attempt #1 → False; item survives (attempts=1 < max_attempts=3)
+            result1 = q.drain(attempt)
+            self.assertEqual(result1, 0, "first drain: item fails → 0 succeeded")
+            self.assertEqual(q.pending_count(), 1, "item must survive after one failed attempt")
+
+            # Second drain: attempt #2 → True; item removed
+            result2 = q.drain(attempt)
+            self.assertEqual(result2, 1, "second drain: item succeeds → 1 succeeded")
+            self.assertEqual(q.pending_count(), 0, "succeeded item must be removed from queue")
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_drops_after_max_attempts_no_infinite_loop(self):
+        from memory_retry_queue import RetryQueue
+        path = tempfile.mktemp(suffix=".msgpack")
+        try:
+            q = RetryQueue(path, max_attempts=2)
+            q.enqueue("conv::xyz", "always fails")
+            q.drain(lambda item: False)  # attempt 1 — survives (1 < 2)
+            q.drain(lambda item: False)  # attempt 2 — dropped (2 >= 2)
+            q.drain(lambda item: False)  # extra drain — queue already empty, no cycle
+            self.assertEqual(q.pending_count(), 0,
+                "item must be dropped after max_attempts, never re-queued")
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_persists_across_instances(self):
+        from memory_retry_queue import RetryQueue
+        path = tempfile.mktemp(suffix=".msgpack")
+        try:
+            RetryQueue(path, max_attempts=3).enqueue("conv::p", "persist me")
+            self.assertEqual(RetryQueue(path, max_attempts=3).pending_count(), 1,
+                "item enqueued in one instance must be visible in a new instance (persistence)")
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
