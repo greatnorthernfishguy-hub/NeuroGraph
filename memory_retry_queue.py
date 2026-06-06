@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-06-05] CC (Sonnet 4.6) — #297 review fixes: atomic _save(), drain limit param, import os
+# What: _save() now writes to .tmp then os.replace() — atomic, no zero-byte corruption on kill.
+#       drain() gains optional limit= param — pulse processes only oldest N per pass.
+#       import os added at top of file.
+# Why: Kill mid-write previously left a zero-byte file; _load() silently returns [] losing all retries.
+#      Long outages could queue many items; unbounded drain stalls the single-threaded sidecar.
+# How: os.replace() is atomic on same filesystem (Linux). drain slices _items[:limit], retains rest.
 # [2026-06-05] CC (Sonnet 4.6) — #297: bounded non-cyclic retry-queue for failed pass-2 extractions
 # What: RetryQueue class — msgpack-backed, dedup by target_id, bounded by max_attempts.
 # Why: Failed _conversational_dual_pass calls silently dropped turn memories forever.
@@ -14,7 +21,7 @@
 Non-cyclic by construction: a drain pass NEVER re-enters extraction during the
 same pass, and any item reaching max_attempts is DROPPED (logged), never re-queued.
 The explicit guard against the wire->absorb->extract OOM recursion class (spec §6.1)."""
-import msgpack, logging
+import os, msgpack, logging
 from typing import Callable, Dict, Any, List
 logger = logging.getLogger(__name__)
 
@@ -35,8 +42,10 @@ class RetryQueue:
 
     def _save(self):
         try:
-            with open(self.path, "wb") as f:
+            tmp = self.path + ".tmp"
+            with open(tmp, "wb") as f:
                 f.write(msgpack.packb(self._items))
+            os.replace(tmp, self.path)  # atomic on same filesystem (Linux)
         except Exception as e:
             logger.warning("retry-queue save failed: %s", e)
 
@@ -49,12 +58,15 @@ class RetryQueue:
         self._items.append({"target_id": target_id, "content": content, "attempts": 0})
         self._save()
 
-    def drain(self, attempt: Callable[[Dict[str, Any]], bool]) -> int:
-        """One bounded pass. attempt(item)->bool. Succeeded items removed; items
-        at max_attempts dropped. Never re-queues within the pass. Returns #succeeded."""
+    def drain(self, attempt: Callable[[Dict[str, Any]], bool], limit=None) -> int:
+        """One bounded pass over up to `limit` items (oldest first; None = all).
+        attempt(item)->bool. Succeeded items removed; items at max_attempts dropped.
+        Never re-queues within the pass. Returns #succeeded."""
+        to_process = self._items if limit is None else self._items[:limit]
+        rest = [] if limit is None else self._items[limit:]
         survivors: List[Dict[str, Any]] = []
         succeeded = 0
-        for item in self._items:
+        for item in to_process:
             item["attempts"] += 1
             ok = False
             try:
@@ -68,6 +80,6 @@ class RetryQueue:
             else:
                 logger.info("retry-queue dropping %s after %d attempts",
                             item["target_id"], item["attempts"])
-        self._items = survivors
+        self._items = survivors + rest   # unprocessed items retained for next pulse
         self._save()
         return succeeded

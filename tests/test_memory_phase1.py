@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-06-05] CC (Sonnet 4.6) — #297 review fixes: strengthen drop test + 2 new tests (corrupt-file, drain-limit)
+# What: test_drops_after_max_attempts_no_infinite_loop gets mid-point assert (pending==1 after first fail).
+#       test_corrupt_file_recovers_empty: corrupt msgpack → RetryQueue starts empty, no crash.
+#       test_drain_limit_processes_only_n_per_pass: limit=2 on 4 items → 2 seen, all 4 still pending.
+# Why: Off-by-one (immediate-drop) bug would pass the old test but fail the new mid-point assert.
+#      Corrupt-file recovery and drain-cap are new paths introduced by Fix 1 & Fix 2.
+# How: tempfile paths, lambda seen-tracker, pending_count() assertions.
 # [2026-06-05] CC (Sonnet 4.6) — #297: TestRetryQueue — bounded non-cyclic retry-queue tests
 # What: Three tests: enqueue+drain-to-success, drop-after-max-attempts, persist-across-instances.
 # Why: TDD requirement for memory_retry_queue.RetryQueue (spec §6.1 non-cyclic guarantee).
@@ -287,6 +294,9 @@ class TestRetryQueue(unittest.TestCase):
             q = RetryQueue(path, max_attempts=2)
             q.enqueue("conv::xyz", "always fails")
             q.drain(lambda item: False)  # attempt 1 — survives (1 < 2)
+            # Fix 4: assert item survived the FIRST failure before subsequent drains
+            self.assertEqual(q.pending_count(), 1,
+                "item must survive after one failed attempt (off-by-one guard)")
             q.drain(lambda item: False)  # attempt 2 — dropped (2 >= 2)
             q.drain(lambda item: False)  # extra drain — queue already empty, no cycle
             self.assertEqual(q.pending_count(), 0,
@@ -294,6 +304,31 @@ class TestRetryQueue(unittest.TestCase):
         finally:
             if _os.path.exists(path):
                 _os.unlink(path)
+
+    def test_corrupt_file_recovers_empty(self):
+        from memory_retry_queue import RetryQueue
+        path = tempfile.mktemp(suffix=".msgpack")
+        with open(path, "wb") as f:
+            f.write(b"not valid msgpack \xff\xfe")
+        try:
+            q = RetryQueue(path, max_attempts=3)
+            self.assertEqual(q.pending_count(), 0)  # corrupt load → empty, no crash
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_drain_limit_processes_only_n_per_pass(self):
+        from memory_retry_queue import RetryQueue
+        path = tempfile.mktemp(suffix=".msgpack")
+        q = RetryQueue(path, max_attempts=5)
+        for i in range(4):
+            q.enqueue(f"id{i}", f"c{i}")
+        seen = []
+        q.drain(lambda item: (seen.append(item["target_id"]), False)[1], limit=2)
+        self.assertEqual(len(seen), 2)            # only 2 processed this pass
+        self.assertEqual(q.pending_count(), 4)    # all 4 still queued (2 attempted+survive, 2 untouched)
+        if _os.path.exists(path):
+            _os.unlink(path)
 
     def test_persists_across_instances(self):
         from memory_retry_queue import RetryQueue

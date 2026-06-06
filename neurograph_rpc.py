@@ -21,6 +21,13 @@ to an existing NeuroGraphMemory call.
 #       not re-queued, preventing the wire->absorb->extract OOM-recursion class.
 # How:  memory_retry_queue.RetryQueue (msgpack-backed, dedup by target_id). Path/attempts from env vars
 #       ANIMA_PASS2_RETRY_PATH / ANIMA_PASS2_RETRY_MAX_ATTEMPTS (LAW 5). Drain on pulse = off ingest hot path.
+# [2026-06-05] CC (Sonnet 4.6) — #297 review fixes: per-pulse drain cap (LAW 5) + remove unused embedding param
+# What: _drain_pass2_retries reads ANIMA_PASS2_RETRY_MAX_PER_PULSE (default 5) and passes as limit= to drain().
+#       _enqueue_failed_extraction(text, embedding) → _enqueue_failed_extraction(text); embedding never persisted.
+# Why: Unbounded drain on a long-outage queue would make one ONNX embed call per item, stalling the sidecar.
+#      LAW 5: config cap belongs in env var, not hardcoded. Unused param was misleading — implied embedding stored.
+# How: os.environ.get("ANIMA_PASS2_RETRY_MAX_PER_PULSE", "5") cap passed to RetryQueue.drain(limit=cap).
+#      Single signature change + single call-site update in _conversational_dual_pass wrapper.
 # [2026-06-05] CC (Sonnet 4.6) — #296a fix: target_id hashes full text (collision-safe across turns)
 # What: _conversational_dual_pass target_id changed from sha1(text[:256])[:16] to sha1(text) (full text, full hex).
 # Why: Two turns sharing the same first-256-char prefix produced the same target_id → same ::tree:: id →
@@ -1927,7 +1934,7 @@ def _conversational_dual_pass(text: str, embedding: Any) -> None:
     # How: Wrapper delegates to core; _enqueue_failed_extraction on False return.
     """
     if not _run_conversational_dual_pass(text, embedding):
-        _enqueue_failed_extraction(text, embedding)
+        _enqueue_failed_extraction(text)
 
 
 # ── Pass-2 retry-queue (#297) ─────────────────────────────────────────────────
@@ -1952,7 +1959,7 @@ def _retry_queue():
     return _RETRY_QUEUE
 
 
-def _enqueue_failed_extraction(text: str, embedding: Any) -> None:
+def _enqueue_failed_extraction(text: str) -> None:
     """Enqueue a failed pass-2 extraction for bounded retry on next pulse drain."""
     try:
         import hashlib
@@ -1983,8 +1990,9 @@ def _drain_pass2_retries() -> None:
         except Exception:
             return False
 
+    cap = int(os.environ.get("ANIMA_PASS2_RETRY_MAX_PER_PULSE", "5"))
     try:
-        _retry_queue().drain(_attempt)
+        _retry_queue().drain(_attempt, limit=cap)
     except Exception as exc:
         logger.debug("pass-2 retry drain failed (non-fatal): %s", exc)
 
