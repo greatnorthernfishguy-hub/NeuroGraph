@@ -3320,7 +3320,12 @@ def _drain_peer_tracts() -> None:
     if bridge is None:
         return
 
-    bridge._drain_all()
+    drained = bridge._drain_all()
+
+    # #294 (LAW 3): the drained experience list was previously discarded. Capture it
+    # and route Anima-sourced conversational frames into recall (forest+trees). Peer
+    # telemetry in the same list is ignored by _absorb (stays out of recall, #295).
+    _absorb_conversational_experience(drained)
 
     # NGTractBridge absorbs tract events inside _drain_all() — no _peer_events cache.
     # The _peer_events cursor pattern is NGPeerBridge-only (#155 removed it from tracts).

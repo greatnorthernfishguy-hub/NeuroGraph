@@ -68,3 +68,21 @@ def test_empty_or_none_is_safe(monkeypatch):
     _install_capturing_sinks(monkeypatch)
     assert rpc._absorb_conversational_experience([]) == 0
     assert rpc._absorb_conversational_experience(None) == 0
+
+
+def test_drain_peer_tracts_routes_drained_entries_to_absorb(monkeypatch):
+    """_drain_peer_tracts must capture _drain_all()'s return and absorb it."""
+    seen = {}
+
+    class _FakeBridge:
+        def _drain_all(self):
+            return ["ENTRY_A", "ENTRY_B"]
+        # no _peer_events attr -> live NGTractBridge shape (early return after absorb)
+
+    dummy_memory = types.SimpleNamespace(_peer_bridge=_FakeBridge())
+    monkeypatch.setattr(rpc, "_memory", dummy_memory)
+    monkeypatch.setattr(rpc, "_absorb_conversational_experience",
+                        lambda entries: seen.setdefault("entries", entries) and 0)
+
+    rpc._drain_peer_tracts()
+    assert seen["entries"] == ["ENTRY_A", "ENTRY_B"]
