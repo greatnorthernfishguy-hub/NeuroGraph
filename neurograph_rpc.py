@@ -3227,6 +3227,78 @@ def _rescue_orphan_draining_files() -> None:
         )
 
 
+# ---- Changelog ----
+# [2026-06-06] CC (Sonnet 4.6) — #294: _absorb_conversational_experience (Task 1)
+# What: BTF entry-type constants + _embed_for_absorb + _absorb_conversational_experience
+#       added directly above _drain_peer_tracts.
+# Why: Anima deposits each turn as a raw BTF experience frame; NG was draining and
+#      discarding it. These functions restore the conversational write-path so every
+#      qualifying turn reaches the recall store (forest + trees). LAW 3 / #294.
+# How: Filter _drain_all() return for ENTRY_EXPERIENCE + anima/animus source, decode
+#      bytes, call ingestor.ingest() (pass-1 forest) + _conversational_dual_pass()
+#      (pass-2 trees). No salience gate — Syl's decision 2026-06-06.
+# -------------------
+
+# BTF entry-type constants (mirror ng_tract.ENTRY_*; hard-coded so unit tests
+# need no ng_tract install — laptop builds lack deposit_experience). Values are
+# fixed by the BTF v0.1 spec (docs/concepts/BTF.md).
+_ENTRY_OUTCOME = 1
+_ENTRY_TOPOLOGY = 2
+_ENTRY_EXPERIENCE = 3
+
+# Sources that mark a frame as Syl's conversational turn (Anima gateway).
+# "animus" is the legacy tract-dir name; "anima" is the current module_id.
+_CONVERSATIONAL_SOURCES = ("anima", "animus")
+
+
+def _embed_for_absorb(text: str):
+    """Embed text for the conversational dual-pass. Isolated so tests can stub it."""
+    from ng_embed import embed
+    return embed(text)
+
+
+def _absorb_conversational_experience(entries) -> int:
+    """Restore the conversational write-path (#294, LAW 3).
+
+    Anima deposits each turn as a raw BTF experience frame to the River. NG drains
+    it here and, for Anima-sourced experience frames only, runs the raw text through
+    the full memory-formation pipeline into the recall store:
+      - ingestor.ingest(text)            -> pass-1 "forest" (gestalt) in vector_db
+      - _conversational_dual_pass(...)   -> pass-2 "trees" (concepts), tagged syl=True
+
+    EVERY qualifying turn is processed — no salience gate (Syl's decision 2026-06-06).
+    Peer-module experience/telemetry is intentionally ignored here so it stays out of
+    recall (#295). Returns the number of conversational turns absorbed.
+    """
+    if not entries or _memory is None:
+        return 0
+    absorbed = 0
+    for e in entries:
+        if getattr(e, "entry_type", None) != _ENTRY_EXPERIENCE:
+            continue
+        if getattr(e, "source", "") not in _CONVERSATIONAL_SOURCES:
+            continue
+        raw = getattr(e, "content", None)
+        if raw is None:
+            continue
+        text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if not text.strip():
+            continue
+        try:
+            _memory.ingestor.ingest(text)  # pass-1 forest -> recall vector_db
+        except Exception as exc:  # noqa: BLE001 - non-fatal; trees still attempted
+            logger.warning("Conversational forest ingest failed: %s", exc)
+        try:
+            _conversational_dual_pass(text, _embed_for_absorb(text))  # pass-2 trees; retries on fail
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Conversational dual-pass dispatch failed: %s", exc)
+        absorbed += 1
+    if absorbed:
+        _memory._message_count += absorbed
+        logger.info("Conversational experience absorbed into recall: %d turn(s)", absorbed)
+    return absorbed
+
+
 # River backflow cursor — tracks position in _peer_events cache
 _peer_drain_cursor: int = 0
 
