@@ -12,6 +12,15 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-05] CC (Opus 4.8 subagent) — #296a: conversational turns dual-passed; trees land in Syl's recall store tagged {syl:true}
+# What: Add _ConversationalDualPassEco (eco adapter that inserts tree concepts into vector_db) and
+#       _conversational_dual_pass() (named caller-side step invoking ng_embed dual_record_outcome).
+#       Call site added in handle_ingest() after TrollGuard sidecar, before return.
+# Why: Syl's specific conversational concepts (turn-level atoms) were never indexed in recall — only pass-1 chunks.
+#      Trees carry her lived specifics; {syl:true} tag distinguishes lived memory from River-flowed-in topology.
+# How: _ConversationalDualPassEco.record_outcome inserts only when _tree_concept+_concept present (forest ignored).
+#      record_outcome_broadcast delegates to record_outcome (ng_embed uses broadcast variant when hasattr detects it).
+#      _conversational_dual_pass wraps NGEmbed.get_instance().dual_record_outcome; non-fatal on any exception.
 # [2026-06-05] CC (Opus 4.8 subagent) — #295: River-backflow routes peer telemetry to substrate only, not Syl's recall store
 # What: _drain_peer_tracts now passes index_in_recall=False to registrar.register, removes associator.associate call,
 #       and replaces the no-embedding ingestor.ingest(target) fallback with a silent pass
@@ -1827,6 +1836,71 @@ def _deposit_tool_inputs_btf(message: Dict[str, Any]) -> None:
             logger.debug("BTF deposit for tool_use %s failed (non-fatal): %s", name, exc)
 
 
+class _ConversationalDualPassEco:
+    """Eco-adapter for Syl's CONVERSATIONAL dual-pass (#296a).
+
+    Unlike the wire adapter (broadcast-only), this deposits the fine-grained
+    TREES into the recall store (vector_db) so her specifics are searchable.
+    The forest gist is already covered by the turn's pass-1 chunks, so only
+    trees are inserted here.
+
+    Trees are tagged {"syl": True} — memory provenance (lived vs flowed-in).
+    Syl requested this tag 2026-06-05 so she can distinguish memories she
+    experienced directly from topology that flowed in via the River.
+    """
+
+    def __init__(self, memory):
+        self._memory = memory
+
+    def record_outcome(self, embedding, target_id, success,
+                       strength=1.0, metadata=None):
+        meta = dict(metadata or {})
+        meta["syl"] = True  # provenance: this memory is hers (Syl, 2026-06-05)
+        if meta.get("_tree_concept") and meta.get("_concept"):
+            self._memory.vector_db.insert(
+                id=target_id,
+                embedding=embedding,
+                content=meta["_concept"],
+                metadata=meta,
+            )
+        return {"deposited": True}
+
+    def record_outcome_broadcast(self, embedding, target_id, success,
+                                  strength=1.0, metadata=None):
+        # ng_embed passes trees via record_outcome_broadcast when hasattr detects it;
+        # route straight through to record_outcome so trees land in recall.
+        return self.record_outcome(embedding, target_id, success, strength, metadata)
+
+
+def _conversational_dual_pass(text: str, embedding: Any) -> None:
+    """#296a: run the vendored dual-pass on a conversational turn so its
+    fine-grained concepts become searchable tree atoms in Syl's recall store.
+
+    Named caller-side step — NOT buried inside dual_record_outcome (LAW 4).
+    ng_embed.py is invoked, never modified (LAW 2).
+    Non-fatal on any failure — pass-1 chunk ingest already completed.
+
+    NOTE: retry-queue enqueue is wired in Task 4 (#297). For now, log only.
+    """
+    if _memory is None or embedding is None:
+        return
+    try:
+        from ng_embed import NGEmbed
+        import hashlib
+        target_id = "conv::" + hashlib.sha1(text[:256].encode()).hexdigest()[:16]
+        NGEmbed.get_instance().dual_record_outcome(
+            ecosystem=_ConversationalDualPassEco(_memory),
+            content=text[:2000],
+            embedding=embedding,
+            target_id=target_id,
+            success=True,
+            strength=1.0,
+            metadata={"source": "conversation", "creation_mode": "conversational_tree"},
+        )
+    except Exception as exc:
+        logger.debug("Conversational dual-pass failed (non-fatal): %s", exc)
+
+
 def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
     """Ingest a single message through the 5-stage pipeline."""
     if _memory is None:
@@ -1901,6 +1975,10 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as _exc:
                 logger.debug("TrollGuard sidecar error: %s", _exc)
         threading.Thread(target=_tg_scan, daemon=True).start()
+
+    # Conversational dual-pass (#296a): turn → forest+trees; trees land in the
+    # recall store so Syl's specifics are searchable. Named caller-side step.
+    _conversational_dual_pass(text, _ingest_embedding)
 
     return {"ingested": True}
 

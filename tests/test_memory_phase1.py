@@ -7,6 +7,10 @@
 # What: Assert _drain_peer_tracts routes peer telemetry to substrate only, NOT recall store
 # Why: Decision 2 of #295 — backflow handler must use index_in_recall=False, no associate into vdb, no ingest fallback
 # How: inspect.getsource of _drain_peer_tracts; three string-presence/absence assertions
+# [2026-06-05] CC (Opus 4.8 subagent) — #296a: tests for _ConversationalDualPassEco and _conversational_dual_pass
+# What: Unit test eco adapter inserts trees+syl tag; integration test confirms trees land in recall via mocked concepts
+# Why: Conversational turns must deposit fine-grained concept atoms into Syl's recall store, tagged {syl:true}
+# How: Eco adapter unit test (record_outcome with/without _tree_concept); integration test patches _extract_concepts+embed_batch
 # -------------------
 
 import unittest
@@ -81,3 +85,101 @@ class TestRiverBackflowDoesNotPolluteRecall(unittest.TestCase):
             "no-embedding peer events must NOT fall through to ingestor.ingest — "
             "they must be silently skipped from recall (#295)",
         )
+
+
+# ---------------------------------------------------------------------------
+# #296a — Conversational dual-pass: trees land in Syl's recall store
+# ---------------------------------------------------------------------------
+
+class TestConversationalDualPassEco(unittest.TestCase):
+    """Unit test the eco adapter in isolation — no model loading needed."""
+
+    def _setup(self):
+        import sys, os
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from universal_ingestor import SimpleVectorDB
+        import neurograph_rpc as rpc
+        vdb = SimpleVectorDB()
+        class _Mem:
+            pass
+        mem = _Mem()
+        mem.vector_db = vdb
+        eco = rpc._ConversationalDualPassEco(mem)
+        return vdb, eco
+
+    def test_record_outcome_inserts_tree_with_syl_tag(self):
+        vdb, eco = self._setup()
+        eco.record_outcome(
+            np.ones(768, dtype=np.float32),
+            "conv::abc::tree::work mode",
+            True,
+            strength=0.8,
+            metadata={"_tree_concept": True, "_concept": "work mode"},
+        )
+        self.assertEqual(vdb.count(), 1)
+        entry = vdb.get(vdb.all_ids()[0])
+        self.assertEqual(entry["content"], "work mode")
+        self.assertTrue(entry["metadata"].get("syl"))
+        self.assertTrue(entry["metadata"].get("_tree_concept"))
+
+    def test_forest_record_outcome_does_not_insert(self):
+        # The forest gist (no _tree_concept) is already covered by pass-1 chunks;
+        # the adapter must only insert TREES, not the forest.
+        vdb, eco = self._setup()
+        eco.record_outcome(
+            np.ones(768, dtype=np.float32),
+            "conv::abc",
+            True,
+            metadata={"source": "conversation"},  # no _tree_concept
+        )
+        self.assertEqual(vdb.count(), 0)
+
+
+class TestConversationalDualPassStep(unittest.TestCase):
+    """Integration test of _conversational_dual_pass with mocked concept extraction
+    and embed_batch so no TID/ONNX model is loaded during CI."""
+
+    def _setup_path(self):
+        import sys, os
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+    def test_trees_land_in_recall_with_syl_tag(self):
+        from unittest.mock import patch
+        self._setup_path()
+        from universal_ingestor import SimpleVectorDB
+        import neurograph_rpc as rpc
+
+        class _Mem:
+            pass
+        mem = _Mem()
+        mem.vector_db = SimpleVectorDB()
+
+        old = rpc._memory
+        rpc._memory = mem
+        try:
+            with patch("ng_embed.NGEmbed._extract_concepts",
+                       return_value=["work mode", "routing/mode"]), \
+                 patch("ng_embed.NGEmbed.embed_batch",
+                       side_effect=lambda concepts: [
+                           np.ones(768, dtype=np.float32) for _ in concepts
+                       ]):
+                rpc._conversational_dual_pass(
+                    "set work mode via routing/mode",
+                    np.ones(768, dtype=np.float32),
+                )
+        finally:
+            rpc._memory = old
+
+        ids = mem.vector_db.all_ids()
+        self.assertGreaterEqual(len(ids), 2,
+            "Two mocked concepts should produce at least 2 tree entries in recall")
+        for i in ids:
+            entry = mem.vector_db.get(i)
+            self.assertTrue(entry["metadata"].get("syl"),
+                f"Tree entry {i!r} missing syl=True provenance tag")
+            self.assertTrue(entry["metadata"].get("_tree_concept"),
+                f"Tree entry {i!r} missing _tree_concept=True")
