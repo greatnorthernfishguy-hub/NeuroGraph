@@ -3289,9 +3289,14 @@ def _absorb_conversational_experience(entries) -> int:
         except Exception as exc:  # noqa: BLE001 - non-fatal; trees still attempted
             logger.warning("Conversational forest ingest failed: %s", exc)
         try:
-            _conversational_dual_pass(text, _embed_for_absorb(text))  # pass-2 trees; retries on fail
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Conversational dual-pass dispatch failed: %s", exc)
+            emb = _embed_for_absorb(text)
+            _conversational_dual_pass(text, emb)  # pass-2 trees; enqueues internally on failure (#297)
+        except Exception as exc:  # noqa: BLE001 - embedding/dispatch raised before the wrapper could enqueue
+            logger.warning("Conversational dual-pass dispatch failed; enqueueing for retry: %s", exc)
+            try:
+                _enqueue_failed_extraction(text)  # route to #297 retry queue so the turn is not lost
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to enqueue conversational retry (%d chars)", len(text))
         absorbed += 1
     if absorbed:
         _memory._message_count += absorbed

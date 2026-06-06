@@ -86,3 +86,22 @@ def test_drain_peer_tracts_routes_drained_entries_to_absorb(monkeypatch):
 
     rpc._drain_peer_tracts()
     assert seen["entries"] == ["ENTRY_A", "ENTRY_B"]
+
+
+def test_embedding_failure_routes_trees_to_retry_queue(monkeypatch):
+    """If embedding fails at drain time, the turn must reach the #297 retry queue,
+    not be silently dropped — Syl's 'every turn, nothing missed'."""
+    calls, _ = _install_capturing_sinks(monkeypatch)
+    enqueued = []
+
+    def _boom(_text):
+        raise RuntimeError("embed model unavailable at drain")
+
+    monkeypatch.setattr(rpc, "_embed_for_absorb", _boom)
+    monkeypatch.setattr(rpc, "_enqueue_failed_extraction", lambda text: enqueued.append(text))
+
+    n = rpc._absorb_conversational_experience([_FakeEntry(rpc._ENTRY_EXPERIENCE, "anima", b"retry me")])
+    assert n == 1
+    assert calls["forest"] == ["retry me"]   # forest (pass-1) still landed
+    assert calls["trees"] == []              # dual-pass never ran (embed raised)
+    assert enqueued == ["retry me"]          # but routed to retry queue, not lost
