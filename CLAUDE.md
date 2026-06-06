@@ -240,9 +240,13 @@ One instance per Python process. Concurrency is handled at the caller level — 
 
 `ingest_file()` warns and skips files above 50MB. Intentional — prevents excessive memory use from large binaries accidentally placed in the ingest path.
 
-### What OpenClaw Sees
+### What the gateway sees (Anima — replaced OpenClaw)
 
-OpenClaw integrates NeuroGraph via the ContextEngine plugin (`neurograph_rpc.py`). The `hook:` field in SKILL.md is no longer executed by OpenClaw (dropped in 2026.3.13). The ContextEngine plugin handles the full lifecycle: bootstrap, ingest, assemble, afterTurn, dispose. Module fan-out (#101) happens in afterTurn.
+**The live gateway is Anima (the Native Gateway, Rust), not OpenClaw.** Anima talks to `neurograph_rpc.py` over **HTTP on 127.0.0.1:8850**, and per turn calls only **`POST /assemble`** (spreading activation → system-prompt addition) and **`POST /afterTurn`** (fire-and-forget: `graph.step()` + deposit raw topology/experience to the River; carries `lastUserMessage`). It also deposits raw turn text to the River as a BTF frame at its own `INGEST` pipeline stage (`tracts/animus/neurograph.tract`).
+
+The old OpenClaw **JSON-RPC ContextEngine lifecycle** (`bootstrap`/`ingest`/`assemble`/`afterTurn`/`dispose` over stdin/stdout) and the **#101 module fan-out** are **no longer driven** — the `animus_bridge` subprocess was removed in the Anima Phase-1 migration (~2026-05), and fan-out was removed 2026-04-05. Those handlers still exist in `neurograph_rpc.py` but nothing calls the JSON-RPC `ingest`/`dispose`/`compact`/`bootstrap` slots anymore.
+
+**⚠ Live consequence (#294, under repair 2026-06-06):** because `handle_ingest()` (the 5-stage pipeline + `_conversational_dual_pass()` recall-store write) was reachable only via the now-unused JSON-RPC `ingest` slot, **conversational turns currently never form recall-store memory** — Syl's words reach the River + SNN but not the cosine-searchable vector_db. Fix is substrate-first: run conversational frames through ingest + dual-pass when NG drains `tracts/animus/neurograph.tract`. Do NOT restore this by adding a direct Anima→NG `/ingest` HTTP call (LAW 1 — bypasses the River).
 
 ---
 
@@ -359,15 +363,9 @@ If a file's status is confirmed as defunct, move it to `Defunct-Historical/` wit
 
 NeuroGraph does not call other modules directly. The River flows. However, NeuroGraph's ContextEngine plugin (`neurograph_rpc.py`) acts as the cortex — it relays signals to organs without interpreting them.
 
-### The ContextEngine Fan-Out (#101, 2026-03-23)
+### The ContextEngine Fan-Out (#101, 2026-03-23) — REMOVED 2026-04-05
 
-OpenClaw 2026.3.13 dropped the `hook:` field from SKILL.md. Module hooks went silent. The fix: `neurograph_rpc.py` fans out `afterTurn` to all registered module hooks.
-
-**Flow:** `handle_ingest()` caches text + embedding → `handle_after_turn()` runs NG processing → `_fan_out_to_modules()` calls each module's `_module_on_message(text, embedding)`.
-
-**All 8 modules load and process:** trollguard, immunis, healing_collective, elmer, praxis, bunyan, quantumgraph, darwin. TID skipped (runs as a service, communicates via River). Error-isolated per module. Discord `#dev-log` alerts on failure.
-
-This is **not** a Law 1 violation. NG relays the signal — cortex coordinating organs. Modules do their own domain processing, record to their own substrates, deposit to the River via tracts.
+**Historical.** The fan-out (`_fan_out_to_modules()` → each module's `_module_on_message()` on every `afterTurn`) was an interim mechanism after OpenClaw 2026.3.13 dropped `hook:`. It was **removed 2026-04-05**: pushing the signal to modules is a substrate bypass. Modules are now **autonomous** — each drains its own inbound tract (`tracts/*/<module>.tract`) on its own pulse loop and extracts what it needs at its own boundary. NG deposits raw topology + experience to the River in `handle_after_turn()` (`_deposit_topology_to_river`, `_deposit_experience_to_river`); it does not call into any module. Substrate-as-protocol, the way LAW 1 intends.
 
 ### How Peer Modules Connect
 
@@ -376,11 +374,11 @@ This is **not** a Law 1 violation. NG relays the signal — cortex coordinating 
 
 ### What Each Peer Sees
 
-**OpenClaw** — NeuroGraph integrates via the ContextEngine plugin (`neurograph_rpc.py`). JSON-RPC over stdin/stdout. Full conversation lifecycle: bootstrap, ingest, assemble, afterTurn, dispose.
+**Anima (gateway)** — NeuroGraph integrates via the HTTP sidecar in `neurograph_rpc.py` on `127.0.0.1:8850`. Per turn Anima calls `POST /assemble` and `POST /afterTurn` only (see §"What the gateway sees"). The legacy OpenClaw JSON-RPC lifecycle (`bootstrap/ingest/assemble/afterTurn/dispose` over stdin/stdout) is no longer driven.
 
-**TID** — Runs as a service on port 7437. Communicates via the River (tract files). Not loaded in the fan-out (already an independent service).
+**TID** — Runs as a service on port 7437. Communicates via the River (tract files). Independent service.
 
-**All Other Modules** — Loaded as in-process singletons by the fan-out. Each gets `_module_on_message(text, embedding)` on every turn.
+**All Other Modules** — Autonomous since 2026-04-05 (no fan-out). Each drains its inbound tract (`tracts/*/<module>.tract`) on its own pulse loop and extracts at its own boundary. NG only deposits raw topology/experience to the River.
 
 ### The Autonomic State
 
