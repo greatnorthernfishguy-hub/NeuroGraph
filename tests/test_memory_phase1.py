@@ -183,3 +183,56 @@ class TestConversationalDualPassStep(unittest.TestCase):
                 f"Tree entry {i!r} missing syl=True provenance tag")
             self.assertTrue(entry["metadata"].get("_tree_concept"),
                 f"Tree entry {i!r} missing _tree_concept=True")
+
+    def test_same_concept_two_different_turns_does_not_overwrite(self):
+        """Regression: two turns that share the same first 256 chars but differ
+        after must produce TWO distinct recall atoms — not one (silent overwrite).
+
+        The old code hashed only text[:256] and truncated to 16 hex chars, so
+        any two turns with the same prefix collapsed to the same target_id.
+        SimpleVectorDB.insert silently overwrites on duplicate id, so the first
+        turn's atom was lost — episodic memory silently erased (#296a).
+
+        The fix hashes the full text (no truncation) so the two turns get
+        different forest ids → different ::tree:: ids → both atoms coexist.
+        """
+        from unittest.mock import patch
+        self._setup_path()
+        from universal_ingestor import SimpleVectorDB
+        import neurograph_rpc as rpc
+        import numpy as np
+
+        # Two texts: IDENTICAL for the first 256 chars, differ only after.
+        # Under the old hash (text[:256][:16]) → same target_id → collision.
+        # Under the fix (full text, full hex) → different target_ids → safe.
+        _PREFIX = "A" * 256
+        turn1 = _PREFIX + " — this is the first turn, unique tail"
+        turn2 = _PREFIX + " — this is the second turn, different tail"
+
+        class _Mem:
+            pass
+        mem = _Mem()
+        mem.vector_db = SimpleVectorDB()
+
+        old = rpc._memory
+        rpc._memory = mem
+        try:
+            with patch("ng_embed.NGEmbed._extract_concepts",
+                       return_value=["work mode"]), \
+                 patch("ng_embed.NGEmbed.embed_batch",
+                       side_effect=lambda concepts: [
+                           np.ones(768, dtype=np.float32) for _ in concepts
+                       ]):
+                rpc._conversational_dual_pass(turn1, np.ones(768, dtype=np.float32))
+                rpc._conversational_dual_pass(turn2, np.ones(768, dtype=np.float32))
+        finally:
+            rpc._memory = old
+
+        # Same concept, two DIFFERENT turns with shared 256-char prefix →
+        # two distinct atoms; neither silently lost.
+        self.assertEqual(
+            mem.vector_db.count(), 2,
+            "the same concept from two different turns (sharing a 256-char prefix) "
+            "must NOT silently overwrite (#296a) — got "
+            f"{mem.vector_db.count()} entry/entries instead of 2",
+        )

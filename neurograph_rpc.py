@@ -12,6 +12,13 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-05] CC (Sonnet 4.6) — #296a fix: target_id hashes full text (collision-safe across turns)
+# What: _conversational_dual_pass target_id changed from sha1(text[:256])[:16] to sha1(text) (full text, full hex).
+# Why: Two turns sharing the same first-256-char prefix produced the same target_id → same ::tree:: id →
+#      SimpleVectorDB.insert silently overwrote the earlier atom. Episodic memory lost without error.
+#      Full-text hash guarantees genuinely different turns produce different forest ids → no collision.
+#      (Byte-identical turns still map to one id — acceptable: same content = same atom, Phase 3 consolidation handles it.)
+# How: Single line change. No other behavior altered. Regression test added in tests/test_memory_phase1.py.
 # [2026-06-05] CC (Opus 4.8 subagent) — #296a: conversational turns dual-passed; trees land in Syl's recall store tagged {syl:true}
 # What: Add _ConversationalDualPassEco (eco adapter that inserts tree concepts into vector_db) and
 #       _conversational_dual_pass() (named caller-side step invoking ng_embed dual_record_outcome).
@@ -1887,7 +1894,7 @@ def _conversational_dual_pass(text: str, embedding: Any) -> None:
     try:
         from ng_embed import NGEmbed
         import hashlib
-        target_id = "conv::" + hashlib.sha1(text[:256].encode()).hexdigest()[:16]
+        target_id = "conv::" + hashlib.sha1(text.encode()).hexdigest()
         NGEmbed.get_instance().dual_record_outcome(
             ecosystem=_ConversationalDualPassEco(_memory),
             content=text[:2000],
