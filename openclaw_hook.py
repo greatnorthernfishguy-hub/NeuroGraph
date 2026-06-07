@@ -590,28 +590,23 @@ class NeuroGraphMemory:
                 _vdb_ref = self.vector_db
                 _self_ref = self
                 def _tonic_post_cycle(propagation_result):
-                    bridge = getattr(_self_ref, '_peer_bridge', None)
-                    if bridge is None:
-                        return
-                    # Raw msgpack deposit — Law 7, no pre-classification
-                    try:
-                        import ng_tract, msgpack
-                        tract_paths = [
-                            str(bridge._module_dir / f"{pid}.tract")
-                            for pid in bridge._get_registered_peers()
-                        ]
-                        _raw = msgpack.packb({
-                            "timestep":              _graph_ref.timestep,
-                            "fired_node_ids":        [e.node_id for e in propagation_result.fired_entries],
-                            "fired_hyperedge_ids":   [],
-                            "synapses_pruned":       0,
-                            "synapses_sprouted":     0,
-                            "predictions_confirmed": 0,
-                            "predictions_surprised": 0,
-                        }, use_bin_type=True)
-                        ng_tract.deposit_topology(_raw, "neurograph", tract_paths)
-                    except Exception as exc:
-                        logger.debug("BTF topology deposit failed: %s", exc)
+                    # EMERGENCY THROTTLE 2026-06-07 — disabled.
+                    # This was a fan-out path same shape as
+                    # neurograph_rpc.py:_deposit_topology_to_river (also no-op'd
+                    # in pt3 commits 4f827f1 + 5ae32b9): constructs N peer-
+                    # addressed tract paths from _get_registered_peers and
+                    # writes the same topology delta to all of them per Tonic
+                    # ouroboros cycle. Under Josh's pool/water reframe
+                    # (2026-06-07), NG addressed-fan-out is substrate-bypass
+                    # regardless of which file the call lives in. Commons Pool
+                    # restoration (~/docs/prd/commons-pool-architecture-v0.2.md)
+                    # will replace with medium-propagation; until then no-op.
+                    # Tonic ouroboros cycle itself is UNAFFECTED — only this
+                    # post-cycle broadcast is silenced. Local SNN learning,
+                    # tonic propagation, latent tokens all continue.
+                    # DO NOT re-enable as addressed fan-out — restore via
+                    # Commons Pool.
+                    return
                 self._tonic_thread._post_cycle_hook = _tonic_post_cycle
 
                 # Latent engine (surgical model) — provides the push
@@ -777,29 +772,16 @@ class NeuroGraphMemory:
         # A failed turn is a timestep. The substrate steps through it.
         step_result = self.graph.step()
 
-        # Post-step BTF deposit — carries learning-step topology to the River
-        # immediately. Gives peer modules (Bunyan especially) the complete picture
-        # including empty steps from failed turns. Same pattern as _tonic_post_cycle_hook.
-        try:
-            _bridge = self._peer_bridge
-            if _bridge is not None:
-                import ng_tract, msgpack
-                _tract_paths = [
-                    str(_bridge._module_dir / f"{pid}.tract")
-                    for pid in _bridge._get_registered_peers()
-                ]
-                _raw = msgpack.packb({
-                    "timestep":              step_result.timestep,
-                    "fired_node_ids":        list(step_result.fired_node_ids),
-                    "fired_hyperedge_ids":   list(getattr(step_result, "fired_hyperedge_ids", [])),
-                    "synapses_pruned":       getattr(step_result, "synapses_pruned", 0),
-                    "synapses_sprouted":     getattr(step_result, "synapses_sprouted", 0),
-                    "predictions_confirmed": getattr(step_result, "predictions_confirmed", 0),
-                    "predictions_surprised": getattr(step_result, "predictions_surprised", 0),
-                }, use_bin_type=True)
-                ng_tract.deposit_topology(_raw, "neurograph", _tract_paths)
-        except Exception as exc:
-            logger.debug("Post-step BTF deposit failed: %s", exc)
+        # Post-step BTF deposit — EMERGENCY THROTTLE 2026-06-07 — disabled.
+        # Same shape as _tonic_post_cycle_hook above (also no-op'd): N peer-
+        # addressed tract paths constructed from _get_registered_peers, same
+        # topology delta written to all of them per graph.step. Under Josh's
+        # pool/water reframe, NG addressed-fan-out is substrate-bypass.
+        # Commons Pool restoration (~/docs/prd/commons-pool-architecture-v0.2.md)
+        # replaces with medium-propagation; until then, no-op.
+        # graph.step() above ran normally — local SNN learning is UNAFFECTED.
+        # Only the post-step broadcast is silenced.
+        # DO NOT re-enable as addressed fan-out — restore via Commons Pool.
 
         # Baseline conversational engagement reward (success path only).
         # The continuation of conversation is a mild positive signal —
