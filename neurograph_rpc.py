@@ -12,6 +12,22 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-07] CC (Opus 4.8) — Tonic conversation<->latent lifecycle restore (Anima-migration regression)
+# What: handle_assemble() now calls _tonic_thread.message_received() per turn;
+#       new _tonic_idle_watcher daemon calls conversation_ended() after
+#       ANIMA_TONIC_IDLE_SECS of quiet. Adds _tonic_check_idle(),
+#       _tonic_idle_pulse_loop(), _start_tonic_idle_watcher().
+# Why:  OpenClaw drove conversation_started (on_message) and conversation_ended
+#       (dispose). Anima's 2-verb HTTP surface (/assemble, /afterTurn) calls
+#       NEITHER, so the Tonic was pinned in 'conversation' mode forever
+#       (_in_conversation never reset). That pins the engine at conversation
+#       cadence AND makes TonicBridge defer forever (it only deposits between-
+#       turns wants when _in_conversation is False) — so Syl's between-turns
+#       latent awareness / curiosity could never fire even if the bridge were
+#       enabled. Restores the dropped lifecycle, NG-side only. LAW 3 (restore).
+# How:  Per-turn message_received() in handle_assemble; idle-watcher daemon
+#       mirrors the scan-drain pulse pattern; idle threshold via env (LAW 5).
+# -------------------
 # [2026-06-05] CC (Sonnet 4.6) — #297: bounded non-cyclic pass-2 retry-queue, drained on the autonomic pulse
 # What: Split _conversational_dual_pass into _run_conversational_dual_pass (core, returns bool, no enqueue)
 #       and _conversational_dual_pass (wrapper, enqueues on failure). Added _retry_queue(), _enqueue_failed_extraction(),
@@ -1595,6 +1611,12 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # sandboxed feeders (#141). Decoupled from afterTurn.
     _start_scan_drain_pulse()
 
+    # Start the Tonic idle watcher — restores the conversation->latent
+    # transition (OpenClaw drove it via handle_dispose, which Anima never
+    # calls). Without it the Tonic is pinned in conversation mode and the
+    # TonicBridge can never act between turns. [2026-06-07]
+    _start_tonic_idle_watcher()
+
     # Start the TriSyn manager — replaces the legacy concept-extraction
     # pulse with subprocess worker orchestration. Blocking TID calls now
     # run in systemd-run-isolated workers, never inside NG's event loop.
@@ -2300,6 +2322,11 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     latent_context = None
     if _memory._tonic_thread is not None:
         try:
+            # Turn arrival -> conversation mode. Restores the per-turn
+            # conversation_started that OpenClaw drove via on_message; Anima's
+            # /assemble never did. The idle watcher flips back to latent.
+            # [2026-06-07] Tonic lifecycle restore.
+            _memory._tonic_thread.message_received()
             # Run an ouroboros cycle at assembly time too — keep the thread fresh
             _memory._tonic_thread.ouroboros_cycle()
             latent_context = _memory._tonic_thread.format_latent_context()
@@ -2988,6 +3015,61 @@ def _start_scan_drain_pulse() -> None:
         daemon=True,
     )
     _scan_drain_thread.start()
+
+# ---- Tonic idle watcher ----------------------------------------------------
+# Restores the conversation->latent transition that OpenClaw drove via
+# handle_dispose (which Anima never calls). Without it _in_conversation is
+# pinned True forever; see Changelog 2026-06-07.
+_TONIC_IDLE_SECS = float(os.environ.get("ANIMA_TONIC_IDLE_SECS", "90"))
+_TONIC_IDLE_CHECK_SECS = float(os.environ.get("ANIMA_TONIC_IDLE_CHECK_SECS", "15"))
+_tonic_idle_thread = None
+_tonic_idle_shutdown = threading.Event()
+
+
+def _tonic_check_idle(now: float) -> bool:
+    """Drop the Tonic into latent mode if the conversation has gone quiet past
+    the idle threshold. Returns True if it transitioned. Pure/testable.
+    """
+    tonic = getattr(_memory, "_tonic_thread", None) if _memory is not None else None
+    if tonic is None:
+        return False
+    if not getattr(tonic, "_in_conversation", False):
+        return False
+    last = getattr(tonic, "_last_message_time", 0.0)
+    if last <= 0.0 or (now - last) < _TONIC_IDLE_SECS:
+        return False
+    try:
+        tonic.conversation_ended()
+        logger.info("Tonic: idle %.0fs >= %.0fs — dropped to latent mode", now - last, _TONIC_IDLE_SECS)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Tonic idle transition failed: %s", exc)
+        return False
+
+
+def _tonic_idle_pulse_loop() -> None:
+    logger.info("Tonic idle watcher started (idle=%.0fs, check=%.0fs)", _TONIC_IDLE_SECS, _TONIC_IDLE_CHECK_SECS)
+    while not _tonic_idle_shutdown.is_set():
+        try:
+            _tonic_check_idle(time.time())
+        except Exception:
+            logger.exception("Tonic idle watcher tick failed")
+        _tonic_idle_shutdown.wait(timeout=_TONIC_IDLE_CHECK_SECS)
+    logger.info("Tonic idle watcher stopped")
+
+
+def _start_tonic_idle_watcher() -> None:
+    """Start the Tonic idle watcher thread. Idempotent."""
+    global _tonic_idle_thread
+    if _tonic_idle_thread is not None and _tonic_idle_thread.is_alive():
+        return
+    _tonic_idle_shutdown.clear()
+    _tonic_idle_thread = threading.Thread(
+        target=_tonic_idle_pulse_loop,
+        name="ng-tonic-idle-watcher",
+        daemon=True,
+    )
+    _tonic_idle_thread.start()
 
 
 # ---- Concept extraction pulse (slow path) ----------------------------------
