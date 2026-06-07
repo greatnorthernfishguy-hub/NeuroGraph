@@ -468,53 +468,20 @@ class NGEcosystem:
             embedding, target_id, success, strength=strength, metadata=metadata
         )
 
-        # Pass 2: BTF broadcast to all registered peer module tracts
-        try:
-            bridge = self._peer_bridge
-            if bridge is None:
-                return local_result
-
-            # _peer_bridge holds NGTractBridge when tracts enabled; verify by
-            # Defensive: ensure bridge has the tract-bridge interface (should
-            # always pass post-2026-06-03 since NGTractBridge is sole bridge).
-            if not (hasattr(bridge, "_get_registered_peers") and hasattr(bridge, "_module_dir")):
-                return local_result  # bridge missing tract interface — no BTF broadcast path
-
-            import ng_tract as _ngt
-            import time as _t
-
-            peers = bridge._get_registered_peers()
-            if not peers:
-                return local_result
-
-            tract_paths = [
-                str(bridge._module_dir / f"{peer_id}.tract")
-                for peer_id in peers
-            ]
-
-            meta_bytes = None
-            if metadata:
-                try:
-                    import msgpack as _mp
-                    meta_bytes = _mp.packb(metadata, use_bin_type=True)
-                except Exception:
-                    meta_bytes = None
-
-            _ngt.deposit_outcome(
-                timestamp=_t.time(),
-                module_id=self.module_id,
-                target_id=target_id,
-                success=success,
-                embedding=np.asarray(embedding, dtype=np.float32),
-                tract_paths=tract_paths,
-                metadata=meta_bytes,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[%s] record_outcome_broadcast: BTF broadcast failed: %s",
-                self.module_id, exc,
-            )
-
+        # Pass 2: BTF broadcast — DISABLED 2026-06-07 (EMERGENCY THROTTLE)
+        # Reason: The addressed-mailbox fan-out (N peer-addressed tract writes
+        # per logical event) was producing GB-per-minute write storms across
+        # the ecosystem, OOM-killing the NG sidecar mid-write. Substrate-as-
+        # protocol PRD Phase 7 audit + Commons Pool architecture proposal
+        # (~/docs/prd/commons-pool-architecture-v0.1.md) identifies this as
+        # drift from the canonical model — propagation should be through
+        # the substrate medium, not addressed transport. Until Commons Pool
+        # restoration ships, broadcast is a no-op; local deposit continues
+        # (peers learn from their own local substrate writes + the eventual
+        # restored canonical mechanism).
+        # Re-enable / restore correctly via Commons Pool implementation
+        # PRD — DO NOT simply re-enable this fan-out, that would re-open
+        # the leak.
         return local_result
 
     def dual_record_outcome(
