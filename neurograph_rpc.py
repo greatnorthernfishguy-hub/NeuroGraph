@@ -608,6 +608,63 @@ _DISCORD_WEBHOOK = os.environ.get(
 _module_instances: Dict[str, Any] = {}
 
 
+class _SubstrateBucket:
+    """Read-only, asymmetric bucket accessor into NG's substrate (the Tier-3 medium).
+
+    # ---- Changelog ----
+    # [2026-06-07] Claude Code (Opus 4.7, 1M) — Tier-3 bucket handle (Commons Pool Phase 7)
+    # What: A read-only view a peer dips into to EXTRACT from NG's substrate. No write,
+    #       no graph mutation, no full traversal — peers pull what propagates to them.
+    # Why: At Tier 3 NG's SNN IS the shared medium. The substrate axiom is deposit/bucket;
+    #       this is the bucket side for peers. Replaces the throttled push fan-out
+    #       (_deposit_*_to_river) — peers PULL from the medium instead of NG PUSHING copies
+    #       into per-peer tracts. Asymmetric per Syl Q11 ("ocean feeds pools; pools don't
+    #       drain the ocean"): extract-only, NG controls its own intake separately.
+    # How: Wraps NeuroGraphMemory. Exposes two read primitives consumers shape their bucket
+    #       from — recall (semantic) + recent_activity (recency). A peer composes/interprets
+    #       these into its own bucket; if it needs another read primitive, add it here
+    #       (read-only). NOT a send/call surface — reading the shared medium is bucketing.
+    # -------------------
+    """
+
+    def __init__(self, memory: Any):
+        self._memory = memory
+
+    def recall(self, query: str, k: int = 5, threshold: float = 0.40):
+        """Semantic bucket — what the substrate associates with this query."""
+        try:
+            return self._memory.recall(query, k=k, threshold=threshold)
+        except Exception as exc:  # noqa: BLE001 — bucket failure never breaks the peer
+            logger.debug("_SubstrateBucket.recall failed: %s", exc)
+            return []
+
+    def recent_activity(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Recency bucket — substrate nodes that fired most recently (read-only).
+
+        Returns [{node_id, last_spike_time, content}] sorted most-recent-first. This is the
+        pull-equivalent of the topology deltas NG used to PUSH; a narrator (Bunyan) buckets
+        'what just happened' instead of receiving re-embedded postcards.
+        """
+        try:
+            graph = self._memory.graph
+            nodes = getattr(graph, "nodes", None)
+            if not nodes:
+                return []
+            scored = []
+            for nid, node in nodes.items():
+                lst = getattr(node, "last_spike_time", None)
+                if lst is None or lst == float("-inf"):
+                    continue
+                meta = getattr(node, "metadata", {}) or {}
+                content = meta.get("message") or meta.get("content") or meta.get("text") or ""
+                scored.append({"node_id": nid, "last_spike_time": float(lst), "content": content})
+            scored.sort(key=lambda d: d["last_spike_time"], reverse=True)
+            return scored[:limit]
+        except Exception as exc:  # noqa: BLE001 — bucket failure never breaks the peer
+            logger.debug("_SubstrateBucket.recent_activity failed: %s", exc)
+            return []
+
+
 def _bootstrap_modules() -> List[str]:
     """Instantiate all registered module hooks.
 
@@ -713,6 +770,15 @@ def _bootstrap_modules() -> List[str]:
                 continue
 
             _module_instances[module_id] = instance
+            # Tier-3 bucket handle: give the peer a read-only, asymmetric accessor into
+            # NG's substrate so it can PULL what it needs (bucket) instead of receiving
+            # pushed tracts. Peers that don't use it simply ignore the attribute.
+            # (Commons Pool Phase 7 — replaces the throttled push fan-out with pull buckets.)
+            if _memory is not None:
+                try:
+                    instance._ng_substrate = _SubstrateBucket(_memory)
+                except Exception as exc:  # noqa: BLE001 — never block module load on this
+                    logger.debug("Could not attach _ng_substrate to %s: %s", module_id, exc)
             started.append(module_id)
             logger.info("Loaded module hook: %s", module_id)
 
