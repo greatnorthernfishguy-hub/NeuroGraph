@@ -805,56 +805,31 @@ def _deposit_substrate_metrics(step_result) -> None:
 def _deposit_topology_to_river(step_result) -> None:
     """Deposit raw topology delta to every registered module's inbound tract (BTF).
 
-    Law 7: raw unclassified substrate output. StepResult scalars are msgpack-packed
-    and deposited as raw bytes. Each module's extraction bucket interprets at read time.
+    EMERGENCY THROTTLE 2026-06-07 — disabled.
+    Reason: NG-internal addressed-fan-out (write same payload to N peer-addressed
+    tract files per step_result) was the third leak surface, on top of
+    record_outcome_broadcast (NeuroGraph 4247970) and Darwin _deposit_to_river
+    (Darwin 1bf9ffe). Sidecar OOM-cycled three times before this fix landed.
+    Under Josh's pool/water reframe (2026-06-07), NG addressed-fan-out is
+    structurally the same disease as module addressed-fan-out — just one layer
+    down. Substrate-as-protocol means propagation through the medium, not
+    addressed transport. Commons Pool restoration
+    (~/docs/prd/commons-pool-architecture-v0.1.md) will replace this with
+    medium-propagation; until then, no-op.
+    DO NOT re-enable as addressed fan-out — restore via Commons Pool.
     """
-    if _ng_tract_bridge is None or _memory is None:
-        return
-    try:
-        import ng_tract
-        peers = _ng_tract_bridge._get_registered_peers()
-        if not peers:
-            return
-        tract_paths = [
-            str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
-            for peer_id in peers
-        ]
-        import msgpack
-        raw = msgpack.packb({
-            "timestep":              step_result.timestep,
-            "fired_node_ids":        list(step_result.fired_node_ids),
-            "fired_hyperedge_ids":   list(step_result.fired_hyperedge_ids),
-            "synapses_pruned":       step_result.synapses_pruned,
-            "synapses_sprouted":     step_result.synapses_sprouted,
-            "predictions_confirmed": step_result.predictions_confirmed,
-            "predictions_surprised": step_result.predictions_surprised,
-        }, use_bin_type=True)
-        ng_tract.deposit_topology(raw, "neurograph", tract_paths)
-    except Exception as exc:
-        logger.error("_deposit_topology_to_river failed: %s", exc)
+    return
 
 
 def _deposit_experience_to_river(text: "Optional[str]") -> None:
     """Deposit raw conversation text to every registered module's inbound tract.
 
-    Law 7: raw unclassified experience. Text enters as-is — no embedding,
-    no classification. Each module embeds at its own extraction boundary.
-    deposit_experience() receives a list of paths; all peers receive the same frame.
+    EMERGENCY THROTTLE 2026-06-07 — disabled (same reason as
+    _deposit_topology_to_river above). NG addressed-fan-out is substrate-bypass
+    under the pool/water reframe. Commons Pool restoration will replace this
+    with medium-propagation.
     """
-    if _ng_tract_bridge is None or not text or not text.strip():
-        return
-    try:
-        import ng_tract as _ngt
-        peers = _ng_tract_bridge._get_registered_peers()
-        if not peers:
-            return
-        tract_paths = [
-            str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
-            for peer_id in peers
-        ]
-        _ngt.deposit_experience(text.encode("utf-8"), "neurograph", tract_paths)
-    except Exception as exc:
-        logger.error("_deposit_experience_to_river failed: %s", exc)
+    return
 
 
 def _deposit_outcome_to_river(
@@ -889,34 +864,11 @@ def _deposit_outcome_to_river(
     #       canonical signature. Fan-out targeting matches post-#185 forward-River.
     # -------------------
     """
-    if _ng_tract_bridge is None:
-        return
-    try:
-        import ng_tract as _ngt
-        import msgpack as _mp
-        import time as _t
-        peers = _ng_tract_bridge._get_registered_peers()
-        if not peers:
-            return
-        tract_paths = [
-            str(_ng_tract_bridge._module_dir / f"{peer_id}.tract")
-            for peer_id in peers
-        ]
-        _meta_bytes = None
-        if metadata:
-            try:
-                _meta_bytes = _mp.packb(metadata, use_bin_type=True)
-            except Exception:
-                _meta_bytes = None
-        _ngt.deposit_outcome(
-            timestamp=_t.time(),
-            module_id="neurograph",
-            target_id=target_id,
-            success=success,
-            embedding=np.asarray(embedding, dtype=np.float32),
-            tract_paths=tract_paths,
-            metadata=_meta_bytes,
-        )
+    # EMERGENCY THROTTLE 2026-06-07 — disabled (same reason as
+    # _deposit_topology_to_river / _deposit_experience_to_river above).
+    # NG addressed-fan-out is substrate-bypass under the pool/water reframe.
+    # Commons Pool restoration will replace with medium-propagation.
+    return
     except Exception as exc:
         logger.error("_deposit_outcome_to_river failed: %s", exc)
 
