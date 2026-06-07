@@ -869,8 +869,6 @@ def _deposit_outcome_to_river(
     # NG addressed-fan-out is substrate-bypass under the pool/water reframe.
     # Commons Pool restoration will replace with medium-propagation.
     return
-    except Exception as exc:
-        logger.error("_deposit_outcome_to_river failed: %s", exc)
 
 
 def deposit_outbound_intent(text: str, channel_id: str = "cli") -> None:
