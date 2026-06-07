@@ -3733,7 +3733,7 @@ def _format_substrate_context(
 #       GET /status returns hook count and last fire time.
 
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 _last_afterturn_fire: Optional[str] = None
 _sidecar_started = False
@@ -3952,7 +3952,12 @@ def _start_http_sidecar(port: int = 8850) -> None:
             except ProcessLookupError:
                 pass  # already dead — nothing to do
     try:
-        server = HTTPServer(("127.0.0.1", port), _AfterTurnHandler)
+        # ThreadingHTTPServer isolates per-request failures from killing
+        # serve_forever loop. Fixes #285 — bad-fd in a single client's
+        # handler was crashing the whole HTTP layer, requiring sidecar
+        # restart to recover. Each request now runs in its own thread;
+        # a bad-fd in one request only kills that thread.
+        server = ThreadingHTTPServer(("127.0.0.1", port), _AfterTurnHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         _sidecar_started = True
