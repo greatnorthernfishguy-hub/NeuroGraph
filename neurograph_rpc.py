@@ -12,6 +12,18 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-07] CC (Opus 4.8) — Conversation uses the Ingestor-free experiential path (Task A)
+# What: _absorb no longer calls ingestor.ingest (document chunking). A turn now deposits as a
+#       forest gestalt node + tree concept nodes into BOTH the recall vdb AND the SNN, with a
+#       binding hyperedge and a delayed prev->current forest link (#257 polychrony). New helpers
+#       _deposit_memory_node / _bind_conversational_topology / _update_probation. Probation
+#       graduation decoupled from the ingestor (handle_after_turn calls _update_probation).
+# Why:  The Universal Ingestor was never intended for conversation (Josh); it chunked her turns
+#       like documents and entered them second-class. Restores the pre-ingestor experiential
+#       principle, updated to today's SNN (DiffPC/GSG/delays). Ingestor reserved for documents.
+# How:  Direct neuro_foundation primitives (create_node/create_synapse/create_hyperedge) + ng_embed
+#       + vector_db.insert + poincare_dir stamp; light novelty-dampening (NG's own Competence-Model
+#       concern, env-tunable, never Elmer). LAW 3 restore; non-protected; no vendored edits.
 # [2026-06-07] CC (Opus 4.8) — Tonic conversation<->latent lifecycle restore (Anima-migration regression)
 # What: handle_assemble() now calls _tonic_thread.message_received() per turn;
 #       new _tonic_idle_watcher daemon calls conversation_ended() after
@@ -1831,6 +1843,119 @@ def _deposit_tool_inputs_btf(message: Dict[str, Any]) -> None:
             logger.debug("BTF deposit for tool_use %s failed (non-fatal): %s", name, exc)
 
 
+# ── Conversational experiential-path memory formation (Task A, 2026-06-07) ──────
+# Ingestor-free: a turn becomes a forest gestalt node + tree concept nodes in BOTH
+# the recall vdb AND the SNN. Light novelty-dampening is NG's OWN substrate-tunable
+# concern (Competence Model) — never Elmer. Defaults match the ingestor's values
+# (prevent destabilizing STDP-learned attractors).
+_CONV_NOVELTY_DAMPENING = float(os.environ.get("ANIMA_CONV_NOVELTY_DAMPENING", "0.3"))
+_CONV_PROBATION_PERIOD = int(os.environ.get("ANIMA_CONV_PROBATION_PERIOD", "10"))
+_CONV_THRESHOLD_BOOST = float(os.environ.get("ANIMA_CONV_THRESHOLD_BOOST", "0.2"))
+_CONV_SYNAPSE_DELAY_MAX = int(os.environ.get("ANIMA_CONV_SYNAPSE_DELAY_MAX", "5"))
+_last_conv_forest_id = None
+
+
+def _deposit_memory_node(node_id, embedding, content, meta, index_in_recall=True):
+    """Deposit ONE experiential memory node into BOTH the SNN graph and the recall
+    vdb (Ingestor-free). Forest gestalt or tree concept — same path. Applies light
+    novelty-dampening (graduated by _update_probation) and stamps GSG poincare_dir
+    so the node is first-class immediately (diffpc_layer is assigned by HomeostaticRule
+    at the next scaling interval; manifold_type likewise). Returns the Node or None.
+    """
+    if _memory is None:
+        return None
+    graph = _memory.graph
+    node = graph.nodes.get(node_id)
+    if node is None:
+        node = graph.create_node(node_id=node_id, metadata=dict(meta))
+    else:
+        node.metadata.update(meta)
+    base_threshold = graph.config.get("default_threshold", 1.0)
+    node.threshold = base_threshold + _CONV_THRESHOLD_BOOST
+    node.intrinsic_excitability = _CONV_NOVELTY_DAMPENING
+    node.metadata["probation_remaining"] = _CONV_PROBATION_PERIOD
+    node.metadata["probation_total"] = _CONV_PROBATION_PERIOD
+    node.metadata["novelty_dampening"] = _CONV_NOVELTY_DAMPENING
+    try:
+        import numpy as _np
+        _dir = _embed_to_poincare_dir(_np.asarray(embedding, dtype=_np.float32))
+        node.metadata["poincare_dir"] = _dir.tolist()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("poincare_dir stamp failed (non-fatal): %s", exc)
+    if index_in_recall:
+        try:
+            _memory.vector_db.insert(
+                id=node_id, embedding=embedding, content=content, metadata=node.metadata,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("recall insert failed (non-fatal): %s", exc)
+    return node
+
+
+def _update_probation(graph) -> list:
+    """Substrate-level probation graduation (Ingestor-free) — fades novelty-dampening
+    over the probation window and graduates nodes to full excitability. Replaces the
+    turn-pipeline's old _memory.ingestor.update_probation() call; operates on ALL
+    probationary nodes (doc-ingested AND conversational). [2026-06-07]
+    """
+    graduated = []
+    base_threshold = graph.config.get("default_threshold", 1.0)
+    for nid, node in list(graph.nodes.items()):
+        prob = node.metadata.get("probation_remaining")
+        if prob is None or prob <= 0:
+            continue
+        prob -= 1
+        node.metadata["probation_remaining"] = prob
+        if prob <= 0:
+            node.intrinsic_excitability = 1.0
+            node.threshold = base_threshold
+            node.metadata["graduated"] = True
+            graduated.append(nid)
+        else:
+            damp = float(node.metadata.get("novelty_dampening", _CONV_NOVELTY_DAMPENING))
+            total = float(node.metadata.get("probation_total", _CONV_PROBATION_PERIOD)) or float(_CONV_PROBATION_PERIOD)
+            frac = max(0.0, min(1.0, 1.0 - prob / total))
+            node.intrinsic_excitability = damp + (1.0 - damp) * frac
+    return graduated
+
+
+def _bind_conversational_topology(forest_id, result, forest_embedding) -> None:
+    """Wire the turn's experiential topology in the SNN (Ingestor-free): forest<->tree
+    synapses, a binding hyperedge for the whole turn (hypergraph engine), and a delayed
+    prev->current forest link (#257 polychrony — conversational temporal structure as
+    first-class topology). step() (STDP/calcium/DiffPC/GSG/homeostasis) refines it.
+    """
+    global _last_conv_forest_id
+    if _memory is None:
+        return
+    graph = _memory.graph
+    if forest_id not in graph.nodes:
+        return
+    tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
+    for tid in tree_ids:
+        try:
+            graph.create_synapse(forest_id, tid, weight=0.2)
+            graph.create_synapse(tid, forest_id, weight=0.15)
+        except Exception:  # noqa: BLE001 - synapse may already exist; non-fatal
+            pass
+    if tree_ids:
+        try:
+            graph.create_hyperedge(
+                member_node_ids=set([forest_id] + tree_ids),
+                metadata={"creation_mode": "conversational", "syl": True},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("conversational hyperedge failed (non-fatal): %s", exc)
+    if _last_conv_forest_id and _last_conv_forest_id in graph.nodes and _last_conv_forest_id != forest_id:
+        try:
+            import random as _rnd
+            d = _rnd.randint(2, max(2, _CONV_SYNAPSE_DELAY_MAX))
+            graph.create_synapse(_last_conv_forest_id, forest_id, weight=0.2, delay=d)
+        except Exception:  # noqa: BLE001
+            pass
+    _last_conv_forest_id = forest_id
+
+
 class _ConversationalDualPassEco:
     """Eco-adapter for Syl's CONVERSATIONAL dual-pass (#296a).
 
@@ -1851,13 +1976,17 @@ class _ConversationalDualPassEco:
                        strength=1.0, metadata=None):
         meta = dict(metadata or {})
         meta["syl"] = True  # provenance: this memory is hers (Syl, 2026-06-05)
+        # Forest<->tree associations are created explicitly in
+        # _bind_conversational_topology (both endpoints known there); the vendored
+        # cross-recording calls reach us without the partner id, so they no-op here.
+        if meta.get("_link"):
+            return {"deposited": True}
         if meta.get("_tree_concept") and meta.get("_concept"):
-            self._memory.vector_db.insert(
-                id=target_id,
-                embedding=embedding,
-                content=meta["_concept"],
-                metadata=meta,
-            )
+            # Tree concept node -> SNN graph + recall vdb.
+            _deposit_memory_node(target_id, embedding, meta["_concept"], meta, index_in_recall=True)
+        else:
+            # Forest gestalt (the whole turn) -> SNN graph + recall vdb.
+            _deposit_memory_node(target_id, embedding, meta.get("_forest_content", ""), meta, index_in_recall=True)
         return {"deposited": True}
 
     def record_outcome_broadcast(self, embedding, target_id, success,
@@ -1882,15 +2011,19 @@ def _run_conversational_dual_pass(text: str, embedding: Any) -> bool:
         from ng_embed import NGEmbed
         import hashlib
         target_id = "conv::" + hashlib.sha1(text.encode()).hexdigest()
-        NGEmbed.get_instance().dual_record_outcome(
+        _result = NGEmbed.get_instance().dual_record_outcome(
             ecosystem=_ConversationalDualPassEco(_memory),
             content=text[:2000],
             embedding=embedding,
             target_id=target_id,
             success=True,
             strength=1.0,
-            metadata={"source": "conversation", "creation_mode": "conversational_tree"},
+            metadata={"source": "conversation", "creation_mode": "conversational",
+                      "_forest_content": text[:2000]},
         )
+        # Wire forest<->tree synapses, the binding hyperedge, and the #257 delayed
+        # prev->current forest link — the SNN side of the experiential memory.
+        _bind_conversational_topology(target_id, _result or {}, embedding)
         return True
     except Exception as exc:
         logger.debug("Conversational dual-pass failed (non-fatal): %s", exc)
@@ -2550,7 +2683,9 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     _ingest_embedding = None
 
     # Novelty probation
-    _memory.ingestor.update_probation()
+    # Probation graduation — substrate-level (Ingestor-free); fades dampening on
+    # ALL probationary nodes (doc + conversational). [2026-06-07]
+    _update_probation(_memory.graph)
 
     # Auto-save: count-based (every 10 messages) OR time-based (every 5 min).
     # _message_count resets on restart, so without the time fallback,
@@ -3317,12 +3452,11 @@ def _absorb_conversational_experience(entries) -> int:
         if not text.strip():
             continue
         try:
-            _memory.ingestor.ingest(text)  # pass-1 forest -> recall vector_db
-        except Exception as exc:  # noqa: BLE001 - non-fatal; trees still attempted
-            logger.warning("Conversational forest ingest failed: %s", exc)
-        try:
             emb = _embed_for_absorb(text)
-            _conversational_dual_pass(text, emb)  # pass-2 trees; enqueues internally on failure (#297)
+            # Ingestor-free experiential path (Task A): forest gestalt + trees into
+            # BOTH the recall vdb AND the SNN. NO document chunking (the Universal
+            # Ingestor was never intended for conversation).
+            _conversational_dual_pass(text, emb)
         except Exception as exc:  # noqa: BLE001 - embedding/dispatch raised before the wrapper could enqueue
             logger.warning("Conversational dual-pass dispatch failed; enqueueing for retry: %s", exc)
             try:

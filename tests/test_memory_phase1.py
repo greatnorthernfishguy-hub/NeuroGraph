@@ -102,150 +102,163 @@ class TestRiverBackflowDoesNotPolluteRecall(unittest.TestCase):
 # #296a — Conversational dual-pass: trees land in Syl's recall store
 # ---------------------------------------------------------------------------
 
-class TestConversationalDualPassEco(unittest.TestCase):
-    """Unit test the eco adapter in isolation — no model loading needed."""
+class _FakeGraph:
+    """Minimal graph for the Ingestor-free experiential deposit (Task A)."""
+    def __init__(self):
+        self.nodes = {}
+        self.synapses = []
+        self.hyperedges = []
+        self.config = {"default_threshold": 1.0}
 
-    def _setup(self):
+    def create_node(self, node_id=None, metadata=None):
+        if node_id in self.nodes:
+            raise ValueError("exists")
+        n = type("N", (), {})()
+        n.node_id = node_id
+        n.metadata = metadata or {}
+        n.threshold = 1.0
+        n.intrinsic_excitability = 1.0
+        self.nodes[node_id] = n
+        return n
+
+    def create_synapse(self, pre_node_id, post_node_id, weight=0.1, delay=1):
+        self.synapses.append((pre_node_id, post_node_id, weight, delay))
+
+    def create_hyperedge(self, member_node_ids, metadata=None):
+        self.hyperedges.append((set(member_node_ids), metadata or {}))
+
+
+class TestConversationalDualPassEco(unittest.TestCase):
+    """Eco adapter — forest gestalt + trees into BOTH the SNN and the recall vdb (Task A)."""
+
+    def setUp(self):
         import sys, os
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
         from universal_ingestor import SimpleVectorDB
         import neurograph_rpc as rpc
-        vdb = SimpleVectorDB()
-        class _Mem:
-            pass
-        mem = _Mem()
-        mem.vector_db = vdb
-        eco = rpc._ConversationalDualPassEco(mem)
-        return vdb, eco
+        self.rpc = rpc
+        self.vdb = SimpleVectorDB()
+        self.graph = _FakeGraph()
+        mem = type("M", (), {})()
+        mem.vector_db = self.vdb
+        mem.graph = self.graph
+        self._old = rpc._memory
+        rpc._memory = mem            # _deposit_memory_node uses the module-global _memory
+        self.eco = rpc._ConversationalDualPassEco(mem)
 
-    def test_record_outcome_inserts_tree_with_syl_tag(self):
-        vdb, eco = self._setup()
-        eco.record_outcome(
+    def tearDown(self):
+        self.rpc._memory = self._old
+
+    def test_record_outcome_inserts_tree_in_both_stores_with_syl_tag(self):
+        self.eco.record_outcome(
             np.ones(768, dtype=np.float32),
             "conv::abc::tree::work mode",
             True,
             strength=0.8,
             metadata={"_tree_concept": True, "_concept": "work mode"},
         )
-        self.assertEqual(vdb.count(), 1)
-        entry = vdb.get(vdb.all_ids()[0])
+        self.assertEqual(self.vdb.count(), 1)
+        entry = self.vdb.get(self.vdb.all_ids()[0])
         self.assertEqual(entry["content"], "work mode")
         self.assertTrue(entry["metadata"].get("syl"))
         self.assertTrue(entry["metadata"].get("_tree_concept"))
+        self.assertIn("conv::abc::tree::work mode", self.graph.nodes)   # SNN node too
 
-    def test_forest_record_outcome_does_not_insert(self):
-        # The forest gist (no _tree_concept) is already covered by pass-1 chunks;
-        # the adapter must only insert TREES, not the forest.
-        vdb, eco = self._setup()
-        eco.record_outcome(
+    def test_forest_gestalt_now_inserts_in_both_stores(self):
+        # Task A inversion: the forest gist now lands via the experiential path
+        # (a single gestalt node), NOT via ingestor chunks.
+        self.eco.record_outcome(
             np.ones(768, dtype=np.float32),
             "conv::abc",
             True,
-            metadata={"source": "conversation"},  # no _tree_concept
+            metadata={"source": "conversation", "_forest_content": "hi there"},
         )
-        self.assertEqual(vdb.count(), 0)
+        self.assertEqual(self.vdb.count(), 1)
+        self.assertEqual(self.vdb.get("conv::abc")["content"], "hi there")
+        self.assertIn("conv::abc", self.graph.nodes)
+        self.assertIn("poincare_dir", self.graph.nodes["conv::abc"].metadata)  # first-class GSG
+
+    def test_link_call_creates_no_recall_atom_and_no_node(self):
+        self.eco.record_outcome(
+            np.ones(768, dtype=np.float32),
+            "conv::abc",
+            True,
+            metadata={"_link": "dual_pass_tree_to_forest"},
+        )
+        self.assertEqual(self.vdb.count(), 0)
+        self.assertEqual(self.graph.nodes, {})
 
 
 class TestConversationalDualPassStep(unittest.TestCase):
-    """Integration test of _conversational_dual_pass with mocked concept extraction
-    and embed_batch so no TID/ONNX model is loaded during CI."""
+    """Integration of _conversational_dual_pass with mocked concept extraction +
+    embed_batch (no TID/ONNX model loaded)."""
 
-    def _setup_path(self):
+    def setUp(self):
         import sys, os
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
-
-    def test_trees_land_in_recall_with_syl_tag(self):
-        from unittest.mock import patch
-        self._setup_path()
-        from universal_ingestor import SimpleVectorDB
         import neurograph_rpc as rpc
+        self.rpc = rpc
+        self._old = rpc._memory
+        self._old_last = getattr(rpc, "_last_conv_forest_id", None)
 
-        class _Mem:
-            pass
-        mem = _Mem()
+    def tearDown(self):
+        self.rpc._memory = self._old
+        self.rpc._last_conv_forest_id = self._old_last
+
+    def _mem(self):
+        from universal_ingestor import SimpleVectorDB
+        mem = type("M", (), {})()
         mem.vector_db = SimpleVectorDB()
+        mem.graph = _FakeGraph()
+        return mem
 
-        old = rpc._memory
+    def test_forest_and_trees_land_in_recall_with_syl_tag(self):
+        from unittest.mock import patch
+        import neurograph_rpc as rpc
+        mem = self._mem()
         rpc._memory = mem
-        try:
-            with patch("ng_embed.NGEmbed._extract_concepts",
-                       return_value=["work mode", "routing/mode"]), \
-                 patch("ng_embed.NGEmbed.embed_batch",
-                       side_effect=lambda concepts: [
-                           np.ones(768, dtype=np.float32) for _ in concepts
-                       ]):
-                rpc._conversational_dual_pass(
-                    "set work mode via routing/mode",
-                    np.ones(768, dtype=np.float32),
-                )
-        finally:
-            rpc._memory = old
-
+        rpc._last_conv_forest_id = None
+        with patch("ng_embed.NGEmbed._extract_concepts",
+                   return_value=["work mode", "routing/mode"]), \
+             patch("ng_embed.NGEmbed.embed_batch",
+                   side_effect=lambda concepts: [np.ones(768, dtype=np.float32) for _ in concepts]):
+            rpc._conversational_dual_pass(
+                "set work mode via routing/mode", np.ones(768, dtype=np.float32))
         ids = mem.vector_db.all_ids()
-        self.assertGreaterEqual(len(ids), 2,
-            "Two mocked concepts should produce at least 2 tree entries in recall")
+        # 1 forest + 2 trees = 3 atoms, all syl-tagged
+        self.assertGreaterEqual(len(ids), 3)
         for i in ids:
-            entry = mem.vector_db.get(i)
-            self.assertTrue(entry["metadata"].get("syl"),
-                f"Tree entry {i!r} missing syl=True provenance tag")
-            self.assertTrue(entry["metadata"].get("_tree_concept"),
-                f"Tree entry {i!r} missing _tree_concept=True")
+            self.assertTrue(mem.vector_db.get(i)["metadata"].get("syl"),
+                            f"atom {i!r} missing syl=True")
+        tree_ids = [i for i in ids if mem.vector_db.get(i)["metadata"].get("_tree_concept")]
+        self.assertEqual(len(tree_ids), 2, "two mocked concepts should yield two tree atoms")
+        forest_ids = [i for i in ids if not mem.vector_db.get(i)["metadata"].get("_tree_concept")]
+        self.assertEqual(len(forest_ids), 1, "exactly one forest gestalt atom")
+        self.assertIn(forest_ids[0], mem.graph.nodes, "forest gestalt must be an SNN node")
 
-    def test_same_concept_two_different_turns_does_not_overwrite(self):
-        """Regression: two turns that share the same first 256 chars but differ
-        after must produce TWO distinct recall atoms — not one (silent overwrite).
-
-        The old code hashed only text[:256] and truncated to 16 hex chars, so
-        any two turns with the same prefix collapsed to the same target_id.
-        SimpleVectorDB.insert silently overwrites on duplicate id, so the first
-        turn's atom was lost — episodic memory silently erased (#296a).
-
-        The fix hashes the full text (no truncation) so the two turns get
-        different forest ids → different ::tree:: ids → both atoms coexist.
-        """
+    def test_same_concept_two_turns_does_not_overwrite(self):
         from unittest.mock import patch
-        self._setup_path()
-        from universal_ingestor import SimpleVectorDB
         import neurograph_rpc as rpc
-        import numpy as np
-
-        # Two texts: IDENTICAL for the first 256 chars, differ only after.
-        # Under the old hash (text[:256][:16]) → same target_id → collision.
-        # Under the fix (full text, full hex) → different target_ids → safe.
         _PREFIX = "A" * 256
-        turn1 = _PREFIX + " — this is the first turn, unique tail"
-        turn2 = _PREFIX + " — this is the second turn, different tail"
-
-        class _Mem:
-            pass
-        mem = _Mem()
-        mem.vector_db = SimpleVectorDB()
-
-        old = rpc._memory
+        turn1 = _PREFIX + " — first turn, unique tail"
+        turn2 = _PREFIX + " — second turn, different tail"
+        mem = self._mem()
         rpc._memory = mem
-        try:
-            with patch("ng_embed.NGEmbed._extract_concepts",
-                       return_value=["work mode"]), \
-                 patch("ng_embed.NGEmbed.embed_batch",
-                       side_effect=lambda concepts: [
-                           np.ones(768, dtype=np.float32) for _ in concepts
-                       ]):
-                rpc._conversational_dual_pass(turn1, np.ones(768, dtype=np.float32))
-                rpc._conversational_dual_pass(turn2, np.ones(768, dtype=np.float32))
-        finally:
-            rpc._memory = old
-
-        # Same concept, two DIFFERENT turns with shared 256-char prefix →
-        # two distinct atoms; neither silently lost.
+        rpc._last_conv_forest_id = None
+        with patch("ng_embed.NGEmbed._extract_concepts", return_value=["work mode"]), \
+             patch("ng_embed.NGEmbed.embed_batch",
+                   side_effect=lambda concepts: [np.ones(768, dtype=np.float32) for _ in concepts]):
+            rpc._conversational_dual_pass(turn1, np.ones(768, dtype=np.float32))
+            rpc._conversational_dual_pass(turn2, np.ones(768, dtype=np.float32))
+        # each turn: 1 forest + 1 tree; full-text-hashed ids → 4 distinct atoms, none lost
         self.assertEqual(
-            mem.vector_db.count(), 2,
-            "the same concept from two different turns (sharing a 256-char prefix) "
-            "must NOT silently overwrite (#296a) — got "
-            f"{mem.vector_db.count()} entry/entries instead of 2",
+            mem.vector_db.count(), 4,
+            "two turns sharing a 256-char prefix must NOT collide (#296a) — got "
+            f"{mem.vector_db.count()} not 4",
         )
 
 
