@@ -909,22 +909,65 @@ class NGTractBridge(NGBridge):
                             continue
                     entries.append(entry)
             new_offset = start_offset + reader.position()
+            clean_eof = reader.position() == len(raw_slice)
         except ImportError:
             # ng_tract not available — fall back to destructive rename+delete
             return self._drain_single_tract(tract_path, peer_id, entry_types)
         except Exception as exc:
-            logger.warning("Cursor drain failed (%s/%s): %s", peer_id, self.module_id, exc)
-            return entries
+            # #285: a bad start byte means the cursor landed mid-frame (partial frame
+            # at the read boundary) or hit a malformed/non-BTF frame. The old behavior
+            # left the cursor un-advanced → the SAME bad slice re-read every drain →
+            # permanent stall (observed 2026-06-08: cursor stranded 23 B before EOF on
+            # an old backlog, throwing "unknown entry start byte: 0x5f" every cycle).
+            # Self-heal instead: resync past the bad bytes to the next valid frame
+            # header, or to EOF if none remains. Guarantees forward progress so a
+            # mid-frame cursor never stalls again. Conservative header validation
+            # (magic+version+entry_type+plausible length) avoids landing on a
+            # coincidental payload byte-match. Never compact on this path (no clean EOF).
+            resync = self._resync_offset(raw_slice)
+            new_offset = start_offset + resync
+            clean_eof = False
+            logger.warning(
+                "Cursor drain resync (%s/%s): %s — advanced cursor +%d byte(s) past "
+                "unparseable region (%d good entries this pass)",
+                peer_id, self.module_id, exc, resync, len(entries),
+            )
 
         if new_offset > start_offset:
             new_total = entries_so_far + len(entries)
             self._write_cursor(tract_path, new_offset, new_total)
             # Only compact when reader consumed entire slice (== EOF at snapshot).
             # This guarantees the compact file starts on a clean entry boundary.
-            if reader.position() == len(raw_slice) and new_offset >= _COMPACT_THRESHOLD_BYTES:
+            # Never compact after a resync (clean_eof is False there).
+            if clean_eof and new_offset >= _COMPACT_THRESHOLD_BYTES:
                 self._compact_tract(tract_path, new_offset)
 
         return entries
+
+    @staticmethod
+    def _resync_offset(raw_slice: bytes) -> int:
+        """#285 self-heal: return the offset (within raw_slice) of the next valid BTF
+        frame header after a mid-frame/garbage region, or len(raw_slice) (skip to EOF)
+        if none remains.
+
+        Scans from byte 1 (past the current bad byte) for a header that validates as
+        magic(0x42 0x54) + version(0x01) + entry_type∈{1,2,3} + a plausible
+        total_length (>= envelope SIZE 24, not overrunning the slice). Conservative
+        validation avoids resyncing onto a coincidental `42 54` inside a payload.
+        Always returns a value > 0, so the caller's cursor strictly advances (no stall).
+        """
+        n = len(raw_slice)
+        i = 1
+        while True:
+            j = raw_slice.find(b"\x42\x54", i)
+            if j < 0 or j + 8 > n:
+                return n  # no valid header ahead — skip the unparseable tail to EOF
+            version = raw_slice[j + 2]
+            entry_type = raw_slice[j + 3]
+            total_length = int.from_bytes(raw_slice[j + 4:j + 8], "little")
+            if version == 1 and entry_type in (1, 2, 3) and 24 <= total_length <= (n - j):
+                return j  # plausible frame header — resync here
+            i = j + 2  # coincidental match; keep scanning
 
     # -------------------------------------------------------------------
     # Internal: Duck-typing accessors for mixed typed/dict peer events
