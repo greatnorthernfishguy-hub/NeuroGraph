@@ -138,41 +138,6 @@ class TestMarkerHandling(unittest.TestCase):
         self.assertNotIn("[WANT]", result)
         self.assertNotIn("[/WANT]", result)
 
-    def test_check_wants_register_writes_want(self):
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "wants.jsonl")
-            params = {
-                "source": "josh",
-                "lastAssistantMessage": "I think I [WANT]learn more about hyperedges[/WANT] soon.",
-            }
-            with patch.object(rpc, '_wants_register_path', return_value=path):
-                rpc._check_wants_register(params)
-            lines = open(path).readlines()
-            self.assertEqual(len(lines), 1)
-            entry = json.loads(lines[0])
-            self.assertEqual(entry["text"], "learn more about hyperedges")
-            self.assertEqual(entry["source"], "syl_explicit")
-
-    def test_check_wants_register_skips_autonomous_source(self):
-        for source in ("syl_outbound", "tonic_bridge"):
-            with tempfile.TemporaryDirectory() as d:
-                path = os.path.join(d, "wants.jsonl")
-                params = {
-                    "source": source,
-                    "lastAssistantMessage": "I [WANT]do something[/WANT]",
-                }
-                with patch.object(rpc, '_wants_register_path', return_value=path):
-                    rpc._check_wants_register(params)
-                self.assertFalse(os.path.exists(path), f"source={source!r} should not write")
-
-    def test_check_wants_register_no_want_marker_writes_nothing(self):
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "wants.jsonl")
-            params = {"source": "josh", "lastAssistantMessage": "No markers here."}
-            with patch.object(rpc, '_wants_register_path', return_value=path):
-                rpc._check_wants_register(params)
-            self.assertFalse(os.path.exists(path))
-
     def test_session_briefing_sent_once(self):
         original = rpc._briefing_sent
         try:
@@ -192,7 +157,7 @@ class TestHandleWiring(unittest.TestCase):
         """_check_outbound_intent must NOT be called when source is syl_outbound."""
         with patch.object(rpc, '_memory', MagicMock()):
             with patch.object(rpc, '_check_outbound_intent') as mock_check:
-                with patch.object(rpc, '_check_wants_register') as mock_wants:
+                with patch.object(rpc, '_register_wants_from_text', MagicMock()):
                     with patch.object(rpc, '_drain_tract', MagicMock()):
                         with patch.object(rpc, '_drain_peer_tracts', MagicMock()):
                             with patch.object(rpc, '_deposit_substrate_metrics', MagicMock()):
@@ -211,31 +176,6 @@ class TestHandleWiring(unittest.TestCase):
                                             except Exception as exc:
                                                 self.fail(f"handle_after_turn raised unexpectedly: {exc}")
                                             mock_check.assert_not_called()
-
-    def test_handle_after_turn_calls_wants_register_for_human_turn(self):
-        """_check_wants_register must be called regardless of source."""
-        with patch.object(rpc, '_memory', MagicMock()):
-            with patch.object(rpc, '_check_outbound_intent', MagicMock()):
-                with patch.object(rpc, '_check_wants_register') as mock_wants:
-                    with patch.object(rpc, '_drain_tract', MagicMock()):
-                        with patch.object(rpc, '_drain_peer_tracts', MagicMock()):
-                            with patch.object(rpc, '_deposit_substrate_metrics', MagicMock()):
-                                with patch.object(rpc, '_deposit_topology_to_river', MagicMock()):
-                                    with patch.object(rpc, '_deposit_experience_to_river', MagicMock()):
-                                        with patch.object(rpc, '_deposit_surfacing_outcome', MagicMock()):
-                                            rpc._memory.graph.step.return_value = MagicMock(fired_node_ids=[])
-                                            rpc._memory.graph.config.get.return_value = False
-                                            rpc._memory._surfacing_monitor = None
-                                            rpc._memory._message_count = 1
-                                            rpc._memory.auto_save_interval = 10
-                                            rpc._tract = None
-                                            params = {"source": "josh", "lastAssistantMessage": "hello"}
-                                            try:
-                                                rpc.handle_after_turn(params)
-                                            except Exception as exc:
-                                                self.fail(f"handle_after_turn raised unexpectedly: {exc}")
-                                            mock_wants.assert_called_once()
-
 
 class TestTonicBridge(unittest.TestCase):
 

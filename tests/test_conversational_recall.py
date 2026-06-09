@@ -227,3 +227,36 @@ def test_update_probation_graduates_and_fades(monkeypatch):
     assert grad_node.intrinsic_excitability == 1.0 and grad_node.metadata.get("graduated") is True
     assert fade_node.metadata["probation_remaining"] == 4
     assert 0.3 < fade_node.intrinsic_excitability < 1.0   # faded, not graduated
+
+
+
+# ── Step 1: her own (assistant) turns enter the substrate raw, via turn_exchange ──
+import msgpack  # noqa: E402
+
+
+def _make_turn_exchange(user="", assistant="", module_id="anima", target_id="turn_exchange"):
+    """Duck-typed ng_tract.PyOutcomeEntry for a raw turn_exchange deposit."""
+    meta = {"module_id": module_id, "event_type": "turn_exchange",
+            "payload": {"user": user, "assistant": assistant, "channel_id": "cli"}}
+    return types.SimpleNamespace(
+        entry_type=rpc._ENTRY_OUTCOME, module_id=module_id, target_id=target_id,
+        metadata=msgpack.packb(meta, use_bin_type=True))
+
+
+def test_absorbs_her_assistant_turn_raw_into_substrate(monkeypatch):
+    calls, mem = _install_absorb_sinks(monkeypatch)
+    e = _make_turn_exchange(user="hi", assistant="Yes. I [WANT]learn[/WANT] more.")
+    n = rpc._absorb_conversational_experience([e])
+    assert n == 1
+    assert calls["dual"] == ["Yes. I [WANT]learn[/WANT] more."]   # her words, raw, incl [WANT]
+    assert mem._message_count == 1
+
+
+def test_turn_exchange_peer_or_other_event_not_absorbed(monkeypatch):
+    calls, mem = _install_absorb_sinks(monkeypatch)
+    entries = [
+        _make_turn_exchange(assistant="[WANT]peer[/WANT]", module_id="elmer"),         # peer → skip
+        _make_turn_exchange(assistant="[WANT]other[/WANT]", target_id="turn_complete"), # not turn_exchange → skip
+    ]
+    assert rpc._absorb_conversational_experience(entries) == 0
+    assert calls["dual"] == []

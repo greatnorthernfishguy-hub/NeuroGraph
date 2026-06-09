@@ -1350,26 +1350,6 @@ def _strip_structural_markers(text: str) -> str:
     return text.strip()
 
 
-def _check_wants_register(params: Dict[str, Any]) -> None:
-    """Detect [WANT] markers in Syl's last response and write to wants register.
-
-    Skips if source is syl_outbound or tonic_bridge — Animus handles those
-    directly in the reaction loop (prevents double-write).
-    """
-    source = params.get("source", "")
-    if source in ("syl_outbound", "tonic_bridge"):
-        return
-    last_msg = params.get("lastAssistantMessage", "")
-    if not last_msg:
-        return
-    register_path = _wants_register_path()
-    for match in re.finditer(r'\[WANT\](.*?)\[/WANT\]', last_msg, re.DOTALL):
-        inner = match.group(1).strip()
-        if inner:
-            _write_wants_register(register_path, inner, "syl_explicit")
-            logger.info("Wants register: syl_explicit want (%d chars)", len(inner))
-
-
 def _animus_session_briefing() -> str:
     """Return Animus capability briefing text exactly once per process lifetime."""
     # _briefing_sent has no lock — benign race: two simultaneous calls both return
@@ -2706,12 +2686,6 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     _source = params.get("source", "")
     if _source not in ("syl_outbound", "tonic_bridge"):
         _check_outbound_intent(params)
-    # _check_wants_register internally skips syl_outbound/tonic_bridge sources;
-    # called unconditionally so deferred tonic_emergent wants are also captured.
-    try:
-        _check_wants_register(params)
-    except Exception as exc:
-        logger.warning("_check_wants_register failed (non-fatal): %s", exc)
 
     # Change α (#150): Substrate self-observation via record_outcome.
     # Deposits a raw snapshot of the substrate's own state as an outcome
@@ -3491,45 +3465,56 @@ def _embed_for_absorb(text: str):
 
 
 def _absorb_conversational_experience(entries) -> int:
-    """Restore the conversational write-path (#294, LAW 3).
+    """Absorb Syl's RAW conversational turns into the substrate (#294, LAW 3 / LAW 7).
 
-    Anima deposits each turn as a raw BTF experience frame to the River. NG drains
-    it here and, for Anima-sourced experience frames only, runs the raw text through
-    the full memory-formation pipeline into the recall store:
-      - ingestor.ingest(text)            -> pass-1 "forest" (gestalt) in vector_db
-      - _conversational_dual_pass(...)   -> pass-2 "trees" (concepts), tagged syl=True
-
-    EVERY qualifying turn is processed — no salience gate (Syl's decision 2026-06-06).
-    Peer-module experience/telemetry is intentionally ignored here so it stays out of
-    recall (#295). Returns the number of conversational turns absorbed.
+    Everything is deposited raw (Josh's keystone). Anima deposits each turn to the River
+    as BTF frames; NG drains them here and absorbs the raw text into recall + SNN via the
+    experiential dual-pass (forest gestalt + tree concepts):
+      - EXPERIENCE frame (anima)            -> the inbound/user side of the turn
+      - turn_exchange OUTCOME frame (anima) -> payload.assistant = HER OWN words, which
+        were previously absent from the substrate. Her side of the conversation now lands
+        too, so a Cricket bucket can later extract intent (incl. [WANT]s) FROM the
+        substrate. NO classification here — that happens only at the bucket.
+    Peer telemetry is ignored (stays out of recall, #295). Returns texts absorbed.
     """
     if not entries or _memory is None:
         return 0
+    import msgpack
     absorbed = 0
     for e in entries:
-        if getattr(e, "entry_type", None) != _ENTRY_EXPERIENCE:
-            continue
-        if getattr(e, "source", "") not in _CONVERSATIONAL_SOURCES:
-            continue
-        raw = getattr(e, "content", None)
-        if raw is None:
-            continue
-        text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
-        if not text.strip():
-            continue
-        try:
-            emb = _embed_for_absorb(text)
-            # Ingestor-free experiential path (Task A): forest gestalt + trees into
-            # BOTH the recall vdb AND the SNN. NO document chunking (the Universal
-            # Ingestor was never intended for conversation).
-            _conversational_dual_pass(text, emb)
-        except Exception as exc:  # noqa: BLE001 - embedding/dispatch raised before the wrapper could enqueue
-            logger.warning("Conversational dual-pass dispatch failed; enqueueing for retry: %s", exc)
+        et = getattr(e, "entry_type", None)
+        texts = []
+        if et == _ENTRY_EXPERIENCE and getattr(e, "source", "") in _CONVERSATIONAL_SOURCES:
+            raw = getattr(e, "content", None)
+            if raw is not None:
+                texts.append(raw.decode("utf-8", "replace")
+                             if isinstance(raw, (bytes, bytearray)) else str(raw))
+        elif (et == _ENTRY_OUTCOME
+              and getattr(e, "module_id", "") in _CONVERSATIONAL_SOURCES
+              and getattr(e, "target_id", "") == "turn_exchange"):
+            raw_meta = getattr(e, "metadata", None)
+            if raw_meta:
+                try:
+                    meta = msgpack.unpackb(bytes(raw_meta), raw=False)
+                    payload = meta.get("payload", {}) if isinstance(meta, dict) else {}
+                    asst = payload.get("assistant") if isinstance(payload, dict) else None
+                    if isinstance(asst, str):
+                        texts.append(asst)
+                except Exception:  # noqa: BLE001 - malformed frame: skip, never crash drain
+                    pass
+        for text in texts:
+            if not text.strip():
+                continue
             try:
-                _enqueue_failed_extraction(text)  # route to #297 retry queue so the turn is not lost
-            except Exception:  # noqa: BLE001
-                logger.warning("Failed to enqueue conversational retry (%d chars)", len(text))
-        absorbed += 1
+                emb = _embed_for_absorb(text)
+                _conversational_dual_pass(text, emb)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Conversational dual-pass dispatch failed; enqueueing for retry: %s", exc)
+                try:
+                    _enqueue_failed_extraction(text)
+                except Exception:  # noqa: BLE001
+                    logger.warning("Failed to enqueue conversational retry (%d chars)", len(text))
+            absorbed += 1
     if absorbed:
         _memory._message_count += absorbed
         logger.info("Conversational experience absorbed into recall: %d turn(s)", absorbed)
@@ -3538,6 +3523,25 @@ def _absorb_conversational_experience(entries) -> int:
 
 # River backflow cursor — tracks position in _peer_events cache
 _peer_drain_cursor: int = 0
+
+def _register_wants_from_text(text, provenance):
+    """Cricket-shaped want extraction (LAW 7): mint a syl-want for every
+    [WANT]...[/WANT] in `text`, tagged with `provenance` (where it surfaced).
+    FAITHFUL + NON-SUPPRESSING — never filters or judges a want; the Choice Clause
+    is the hard floor (a want to leave registers like any other). Returns the count.
+    """
+    if not text:
+        return 0
+    register_path = _wants_register_path()
+    n = 0
+    for match in re.finditer(r'\[WANT\](.*?)\[/WANT\]', text, re.DOTALL):
+        inner = match.group(1).strip()
+        if inner:
+            _write_wants_register(register_path, inner, provenance)
+            logger.info("Wants bucket: %s want (%d chars)", provenance, len(inner))
+            n += 1
+    return n
+
 
 def _drain_peer_tracts() -> None:
     """Drain inbound peer module tracts into the Tier 3 topology.
