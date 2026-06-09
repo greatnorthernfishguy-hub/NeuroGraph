@@ -2059,13 +2059,13 @@ def _run_conversational_dual_pass(text: str, embedding: Any) -> bool:
         target_id = "conv::" + hashlib.sha1(text.encode()).hexdigest()
         _result = NGEmbed.get_instance().dual_record_outcome(
             ecosystem=_ConversationalDualPassEco(_memory),
-            content=text[:2000],
+            content=text,
             embedding=embedding,
             target_id=target_id,
             success=True,
             strength=1.0,
             metadata={"source": "conversation", "creation_mode": "conversational",
-                      "_forest_content": text[:2000]},
+                      "_forest_content": text},
         )
         # Wire forest<->tree synapses, the binding hyperedge, and the #257 delayed
         # prev->current forest link — the SNN side of the experiential memory.
@@ -2115,7 +2115,7 @@ def _enqueue_failed_extraction(text: str) -> None:
     try:
         import hashlib
         tid = "conv::" + hashlib.sha1(text.encode()).hexdigest()
-        _retry_queue().enqueue(tid, text[:2000])
+        _retry_queue().enqueue(tid, text)
     except Exception as exc:
         logger.debug("retry enqueue failed (non-fatal): %s", exc)
 
