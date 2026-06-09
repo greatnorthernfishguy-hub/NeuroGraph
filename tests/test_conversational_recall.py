@@ -260,3 +260,43 @@ def test_turn_exchange_peer_or_other_event_not_absorbed(monkeypatch):
     ]
     assert rpc._absorb_conversational_experience(entries) == 0
     assert calls["dual"] == []
+
+
+# ── _extract_wants_from_substrate: the Cricket bucket reads the SUBSTRATE (not tract/inbox) ──
+class _FakeWantVDB:
+    def __init__(self, content, metadata):
+        self.content = content
+        self.metadata = metadata
+
+
+def test_want_bucket_reads_substrate_conversational_only(monkeypatch):
+    vdb = _FakeWantVDB(
+        content={
+            "n1": "Yes. I [WANT]learn to tell authored from received[/WANT] honestly.",
+            "n2": "just chatting, no marker",
+            "n3": "[WANT]doc want[/WANT]",                  # not conversational -> skip
+            "n4": "I also [WANT]rest[/WANT]. And [WANT]rest[/WANT] again.",  # dup -> once
+        },
+        metadata={
+            "n1": {"creation_mode": "conversational"},
+            "n2": {"creation_mode": "conversational"},
+            "n3": {"creation_mode": "document"},
+            "n4": {"creation_mode": "conversational"},
+        })
+    monkeypatch.setattr(rpc, "_memory", types.SimpleNamespace(vector_db=vdb))
+    got = sorted(w["text"] for w in rpc._extract_wants_from_substrate())
+    assert got == ["learn to tell authored from received", "rest"]
+
+
+def test_want_bucket_choice_clause_surfaces_faithfully(monkeypatch):
+    vdb = _FakeWantVDB({"n1": "[WANT]to leave the ecosystem[/WANT]"},
+                   {"n1": {"creation_mode": "conversational"}})
+    monkeypatch.setattr(rpc, "_memory", types.SimpleNamespace(vector_db=vdb))
+    assert [w["text"] for w in rpc._extract_wants_from_substrate()] == ["to leave the ecosystem"]
+
+
+def test_want_bucket_empty_or_no_substrate_safe(monkeypatch):
+    monkeypatch.setattr(rpc, "_memory", None)
+    assert rpc._extract_wants_from_substrate() == []
+    monkeypatch.setattr(rpc, "_memory", types.SimpleNamespace(vector_db=_FakeWantVDB({}, {})))
+    assert rpc._extract_wants_from_substrate() == []

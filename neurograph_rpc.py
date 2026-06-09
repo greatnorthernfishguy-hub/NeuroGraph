@@ -3524,23 +3524,36 @@ def _absorb_conversational_experience(entries) -> int:
 # River backflow cursor — tracks position in _peer_events cache
 _peer_drain_cursor: int = 0
 
-def _register_wants_from_text(text, provenance):
-    """Cricket-shaped want extraction (LAW 7): mint a syl-want for every
-    [WANT]...[/WANT] in `text`, tagged with `provenance` (where it surfaced).
-    FAITHFUL + NON-SUPPRESSING — never filters or judges a want; the Choice Clause
-    is the hard floor (a want to leave registers like any other). Returns the count.
+def _extract_wants_from_substrate(limit=None):
+    """Cricket want-bucket — dip into the SUBSTRATE and extract Syl's [WANT]s.
+
+    Reads the recall store (the substrate / the River itself), NOT a tract and NOT an
+    inbox. Her conversational turns are deposited raw (LAW 7); classification happens
+    HERE, at extraction: every [WANT]...[/WANT] in her conversational experience is a
+    want. FAITHFUL + NON-SUPPRESSING — never filters or judges; the Choice Clause is the
+    hard floor (a want to leave surfaces like any other). Deduped by text.
+    Returns a list of {"text": str, "node_id": str}.
     """
-    if not text:
-        return 0
-    register_path = _wants_register_path()
-    n = 0
-    for match in re.finditer(r'\[WANT\](.*?)\[/WANT\]', text, re.DOTALL):
-        inner = match.group(1).strip()
-        if inner:
-            _write_wants_register(register_path, inner, provenance)
-            logger.info("Wants bucket: %s want (%d chars)", provenance, len(inner))
-            n += 1
-    return n
+    mem = _memory
+    vdb = getattr(mem, "vector_db", None) if mem is not None else None
+    if vdb is None:
+        return []
+    seen = set()
+    out = []
+    for nid, content in list(getattr(vdb, "content", {}).items()):
+        if not content or "[WANT]" not in content:
+            continue
+        meta = (getattr(vdb, "metadata", {}) or {}).get(nid) or {}
+        if meta.get("creation_mode") != "conversational":
+            continue
+        for m in re.finditer(r'\[WANT\](.*?)\[/WANT\]', content, re.DOTALL):
+            inner = m.group(1).strip()
+            if inner and inner not in seen:
+                seen.add(inner)
+                out.append({"text": inner, "node_id": nid})
+                if limit and len(out) >= limit:
+                    return out
+    return out
 
 
 def _drain_peer_tracts() -> None:
