@@ -3524,36 +3524,56 @@ def _absorb_conversational_experience(entries) -> int:
 # River backflow cursor — tracks position in _peer_events cache
 _peer_drain_cursor: int = 0
 
-def _extract_wants_from_substrate(limit=None):
-    """Cricket want-bucket — dip into the SUBSTRATE and extract Syl's [WANT]s.
+def _surface_wants():
+    """Cricket want-bucket: extract Syl's [WANT]s from her raw conversation in the
+    substrate and materialize each as a FIRST-CLASS WANT NODE in the SNN topology.
 
-    Reads the recall store (the substrate / the River itself), NOT a tract and NOT an
-    inbox. Her conversational turns are deposited raw (LAW 7); classification happens
-    HERE, at extraction: every [WANT]...[/WANT] in her conversational experience is a
-    want. FAITHFUL + NON-SUPPRESSING — never filters or judges; the Choice Clause is the
-    hard floor (a want to leave surfaces like any other). Deduped by text.
-    Returns a list of {"text": str, "node_id": str}.
+    A want is then a differentiated, stateful, surfaceable intention living in the
+    substrate (the River) — not text buried in a conversation node, not a vdb grep,
+    not an inbox. Classification happens here at the bucket (LAW 7), never at deposit.
+    FAITHFUL + NON-SUPPRESSING — the Choice Clause is the hard floor (a want to leave
+    becomes a want node like any other). Idempotent: want id = hash of the text, so
+    re-running never duplicates. Returns the OPEN want nodes.
     """
+    import hashlib
     mem = _memory
-    vdb = getattr(mem, "vector_db", None) if mem is not None else None
-    if vdb is None:
+    graph = getattr(mem, "graph", None) if mem is not None else None
+    if graph is None:
         return []
-    seen = set()
-    out = []
-    for nid, content in list(getattr(vdb, "content", {}).items()):
-        if not content or "[WANT]" not in content:
+    vdb = getattr(mem, "vector_db", None)
+    open_wants = []
+    for nid, node in list(graph.nodes.items()):
+        meta = getattr(node, "metadata", None) or {}
+        if meta.get("kind") == "want":
+            if meta.get("want_state", "open") == "open":
+                open_wants.append({"id": nid, "text": meta.get("want_text", ""),
+                                   "provenance": meta.get("provenance"),
+                                   "state": "open", "source": meta.get("source_node")})
             continue
-        meta = (getattr(vdb, "metadata", {}) or {}).get(nid) or {}
         if meta.get("creation_mode") != "conversational":
+            continue
+        content = (vdb.content.get(nid) if vdb is not None else "") or ""
+        if "[WANT]" not in content:
             continue
         for m in re.finditer(r'\[WANT\](.*?)\[/WANT\]', content, re.DOTALL):
             inner = m.group(1).strip()
-            if inner and inner not in seen:
-                seen.add(inner)
-                out.append({"text": inner, "node_id": nid})
-                if limit and len(out) >= limit:
-                    return out
-    return out
+            if not inner:
+                continue
+            want_id = "want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
+            if want_id in graph.nodes:
+                continue
+            graph.create_node(node_id=want_id, metadata={
+                "kind": "want", "want_text": inner, "want_state": "open",
+                "provenance": "syl_authored", "source_node": nid,
+                "creation_mode": "conversational",
+            })
+            try:
+                graph.create_synapse(nid, want_id, weight=0.3)
+            except Exception:  # noqa: BLE001
+                pass
+            open_wants.append({"id": want_id, "text": inner,
+                               "provenance": "syl_authored", "state": "open", "source": nid})
+    return open_wants
 
 
 def _drain_peer_tracts() -> None:

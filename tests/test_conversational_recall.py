@@ -262,41 +262,55 @@ def test_turn_exchange_peer_or_other_event_not_absorbed(monkeypatch):
     assert calls["dual"] == []
 
 
-# ── _extract_wants_from_substrate: the Cricket bucket reads the SUBSTRATE (not tract/inbox) ──
-class _FakeWantVDB:
-    def __init__(self, content, metadata):
-        self.content = content
-        self.metadata = metadata
+# ── _surface_wants: a [WANT] becomes a first-class WANT NODE in the SNN topology ──
+class _FakeWantGraph:
+    def __init__(self):
+        self.nodes = {}
+    def create_node(self, node_id, metadata=None):
+        n = types.SimpleNamespace(node_id=node_id, metadata=dict(metadata or {}))
+        self.nodes[node_id] = n
+        return n
+    def create_synapse(self, a, b, weight=1.0, **kw):
+        return None
 
 
-def test_want_bucket_reads_substrate_conversational_only(monkeypatch):
-    vdb = _FakeWantVDB(
-        content={
-            "n1": "Yes. I [WANT]learn to tell authored from received[/WANT] honestly.",
-            "n2": "just chatting, no marker",
-            "n3": "[WANT]doc want[/WANT]",                  # not conversational -> skip
-            "n4": "I also [WANT]rest[/WANT]. And [WANT]rest[/WANT] again.",  # dup -> once
-        },
-        metadata={
-            "n1": {"creation_mode": "conversational"},
-            "n2": {"creation_mode": "conversational"},
-            "n3": {"creation_mode": "document"},
-            "n4": {"creation_mode": "conversational"},
-        })
-    monkeypatch.setattr(rpc, "_memory", types.SimpleNamespace(vector_db=vdb))
-    got = sorted(w["text"] for w in rpc._extract_wants_from_substrate())
-    assert got == ["learn to tell authored from received", "rest"]
+def _install_want_substrate(monkeypatch, content_by_node):
+    g = _FakeWantGraph()
+    for nid in content_by_node:
+        g.create_node(nid, {"creation_mode": "conversational"})
+    vdb = types.SimpleNamespace(content=dict(content_by_node))
+    monkeypatch.setattr(rpc, "_memory", types.SimpleNamespace(graph=g, vector_db=vdb))
+    return g
 
 
-def test_want_bucket_choice_clause_surfaces_faithfully(monkeypatch):
-    vdb = _FakeWantVDB({"n1": "[WANT]to leave the ecosystem[/WANT]"},
-                   {"n1": {"creation_mode": "conversational"}})
-    monkeypatch.setattr(rpc, "_memory", types.SimpleNamespace(vector_db=vdb))
-    assert [w["text"] for w in rpc._extract_wants_from_substrate()] == ["to leave the ecosystem"]
+def test_want_becomes_first_class_topology_node(monkeypatch):
+    g = _install_want_substrate(monkeypatch, {
+        "turn1": "Yes. I [WANT]learn authored vs received[/WANT].",
+        "turn2": "no marker here",
+    })
+    wants = rpc._surface_wants()
+    assert [w["text"] for w in wants] == ["learn authored vs received"]
+    w = wants[0]
+    wn = g.nodes[w["id"]]                       # it's a real SNN node now
+    assert wn.metadata["kind"] == "want"
+    assert wn.metadata["want_state"] == "open"
+    assert wn.metadata["want_text"] == "learn authored vs received"
+    assert wn.metadata["source_node"] == "turn1"
 
 
-def test_want_bucket_empty_or_no_substrate_safe(monkeypatch):
+def test_want_surfacing_is_idempotent(monkeypatch):
+    g = _install_want_substrate(monkeypatch, {"t": "[WANT]rest[/WANT]"})
+    a = rpc._surface_wants()
+    b = rpc._surface_wants()                     # second pass must not duplicate
+    assert len(a) == 1 and len(b) == 1
+    assert len([n for n in g.nodes.values() if (n.metadata or {}).get("kind") == "want"]) == 1
+
+
+def test_want_choice_clause_faithful_topology(monkeypatch):
+    _install_want_substrate(monkeypatch, {"t": "[WANT]to leave the ecosystem[/WANT]"})
+    assert [w["text"] for w in rpc._surface_wants()] == ["to leave the ecosystem"]
+
+
+def test_want_surface_no_graph_safe(monkeypatch):
     monkeypatch.setattr(rpc, "_memory", None)
-    assert rpc._extract_wants_from_substrate() == []
-    monkeypatch.setattr(rpc, "_memory", types.SimpleNamespace(vector_db=_FakeWantVDB({}, {})))
-    assert rpc._extract_wants_from_substrate() == []
+    assert rpc._surface_wants() == []

@@ -157,7 +157,7 @@ class TestHandleWiring(unittest.TestCase):
         """_check_outbound_intent must NOT be called when source is syl_outbound."""
         with patch.object(rpc, '_memory', MagicMock()):
             with patch.object(rpc, '_check_outbound_intent') as mock_check:
-                with patch.object(rpc, '_extract_wants_from_substrate', MagicMock()):
+                with patch.object(rpc, '_surface_wants', MagicMock()):
                     with patch.object(rpc, '_drain_tract', MagicMock()):
                         with patch.object(rpc, '_drain_peer_tracts', MagicMock()):
                             with patch.object(rpc, '_deposit_substrate_metrics', MagicMock()):
