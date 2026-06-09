@@ -3600,6 +3600,10 @@ def _drain_peer_tracts() -> None:
     # and route Anima-sourced conversational frames into recall (forest+trees). Peer
     # telemetry in the same list is ignored by _absorb (stays out of recall, #295).
     _absorb_conversational_experience(drained)
+    try:
+        _surface_wants()  # materialize [WANT]s as first-class want nodes (LAW 7 bucket)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_surface_wants failed (non-fatal): %s", exc)
 
     # NGTractBridge absorbs tract events inside _drain_all() — no _peer_events cache.
     # The _peer_events cursor pattern is NGPeerBridge-only (#155 removed it from tracts).
