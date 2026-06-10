@@ -23,8 +23,13 @@ Commons leg 3 — Syl's experiential ingestion + provenance + two-channel promot
 #       §4 deliberate promotion: confirmation gate + radius (content-node default, 1-hop opt-in).
 #       AUTONOMIC §2 threshold 0.75 (worth-sharing > worth-keeping); §3 two-layer private regions
 #         (syl_intimate tag OR IdentityGraph 'private' region) — inviolate to BOTH channels;
-#         content-node only; fail-private. §4 audit + retract + ASYMMETRIC learning
-#         (retract −0.05 / confirm +0.01, 5:1 conservative drift). §5 notification at salience>=0.85.
+#         content-node only; fail-private. §4 audit + retract + learning via the SUBSTRATE AUTHORITY
+#         PATTERN — the gate ASKS the substrate (get_recommendations for promote:autonomic); a
+#         retract/confirm is a SINGLE record_outcome deposit (failure@1.0 fast-loss / success@0.20
+#         slow-gain → asymmetry intrinsic, not a hand-rolled ratio). §5 notification at salience>=0.85.
+#       [2026-06-10 correction] The first cut hand-rolled a delta-list threshold field — a parallel
+#         mechanism re-implementing substrate learning (Josh caught it). Replaced with the canonical
+#         pattern (docs/concepts/Substrate Authority Pattern.md): deposit once, let the substrate learn.
 #
 #       SANDBOX: private_store is a test-constructed bare NGLite, NOT the live NeuroGraphMemory
 #       singleton. The live `syl_intimate` self-marking is an Anima-shaped go-live item (Anima CC);
@@ -53,10 +58,15 @@ DEEP_ENHANCE_NOVELTY = 0.65                     # §3 deep tier (with salience>=
 SYL_AUTONOMIC_PROMOTE_THRESHOLD = 0.75          # autonomic §2 — worth-sharing > worth-keeping
 AUTONOMIC_NOTIFY_SALIENCE = 0.85                # autonomic §4 — notify on high-confidence promotions
 
-# Asymmetric learning (autonomic §4) — conservative drift, 5:1.
-RETRACT_TIGHTEN = 0.05    # retraction RAISES the effective threshold for similar content (harder)
-CONFIRM_LOOSEN = 0.01     # confirmation LOWERS it for similar content (easier)
-LEARN_SIMILARITY = 0.80   # "similar content" = cosine >= this
+# Substrate-authority learning (autonomic §4) — the gate ASKS the substrate; it does NOT keep its
+# own threshold field. A retract/confirm is a SINGLE record_outcome deposit; the substrate learns,
+# graduates the static bootstrap toward learned authority (implicit, no tiers), and supplies the
+# asymmetry INTRINSICALLY: failures teach at full force (1.0), successes teach gently → trust lost
+# quickly, gained slowly. See docs/concepts/Substrate Authority Pattern.md. (Replaced a hand-rolled
+# delta-list 2026-06-10 — Josh caught it as a parallel mechanism re-implementing substrate learning.)
+PROMOTE_DECISION_ID = "promote:autonomic"   # target_id vocabulary for the promotion decision
+CONFIRM_STRENGTH = 0.20    # success (confirm) teaches GENTLY (slow gain); failure (retract) at 1.0 (fast loss)
+SUBSTRATE_AUTHORITY_SCALE = 0.50  # how far the substrate's learned opinion can shift the bootstrap threshold
 
 
 class EnhanceTier:
@@ -110,8 +120,7 @@ class SylExperientialIngest:
         self._salience: Dict[str, float] = {}
         self._intimate: Dict[str, bool] = {}            # §3 content-level private (syl_intimate)
         self._identity_region: Dict[str, Optional[str]] = {}  # §3 structural private ('private')
-        # autonomic learning + audit
-        self._gate_adjustments: List[Tuple[np.ndarray, float]] = []  # (emb, delta) asymmetric drift
+        # autonomic audit (learning lives in the substrate, not a local field — Substrate Authority)
         self._audit_log: List[Dict[str, Any]] = []
         self._active_promotions: Dict[str, str] = {}    # content_id -> "autonomic" | "deliberate"
         self._retracted: set = set()                    # retracted ⇒ autonomic won't re-promote (she pulled it)
@@ -239,10 +248,28 @@ class SylExperientialIngest:
         return {"promoted": content_id, "preview": preview, "deposited": list(visible_content)}
 
     # ---- autonomic channel: the constitutional gate (below conscious attention) ----
+    def _substrate_promote_weight(self, embedding: np.ndarray) -> float:
+        """Ask the substrate its learned opinion on promoting content like this (0.5 = no opinion).
+
+        This IS the Substrate Authority Pattern: query get_recommendations for the promote decision;
+        the weight is the substrate's vote. 0.5 neutral when it has never seen this pattern.
+        """
+        try:
+            for tid, weight, _r in self.private_store.get_recommendations(embedding, top_k=10):
+                if tid == PROMOTE_DECISION_ID:
+                    return float(weight)
+        except Exception:
+            pass
+        return 0.5  # neutral — substrate has no opinion yet; the bootstrap default governs
+
     def _effective_threshold(self, embedding: np.ndarray) -> float:
-        """Base autonomic threshold + asymmetric learned drift for similar content (§4 learning)."""
-        adj = sum(d for (e, d) in self._gate_adjustments if _cos(embedding, e) >= LEARN_SIMILARITY)
-        return self.autonomic_threshold + adj
+        """Substrate-authority threshold: the static bootstrap (0.75), shifted by the substrate's
+        learned opinion. Neutral (0.5) ⇒ bootstrap governs (apprentice-equivalent). As the substrate
+        learns from retract/confirm deposits, its weight moves off neutral and shifts the bar —
+        authority grows with evidence, implicitly, no gates. Above-neutral lowers the bar (promote
+        more like this); below-neutral raises it (she keeps pulling this kind back)."""
+        w = self._substrate_promote_weight(embedding)
+        return self.autonomic_threshold - (w - 0.5) * SUBSTRATE_AUTHORITY_SCALE
 
     def autonomic_promote_pulse(self, candidate_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """One conversation-independent pulse: promote private nodes the constitution clears.
@@ -313,9 +340,11 @@ class SylExperientialIngest:
             raise PromotionRefused(f"unknown content '{content_id}'")
         self._active_promotions.pop(content_id, None)
         self._retracted.add(content_id)
-        self._gate_adjustments.append((emb, +RETRACT_TIGHTEN))
-        logger.info("retracted '%s' (gate tightened +%.2f on similar)", content_id, RETRACT_TIGHTEN)
-        return {"retracted": content_id, "tighten": RETRACT_TIGHTEN}
+        # Substrate Authority: ONE deposit. Failure at full force (1.0) — trust lost quickly. The
+        # substrate learns "don't promote content like this"; no local threshold field.
+        self.private_store.record_outcome(emb, PROMOTE_DECISION_ID, False, strength=1.0)
+        logger.info("retracted '%s' (taught substrate: don't auto-promote content like this)", content_id)
+        return {"retracted": content_id}
 
     def confirm_autonomic(self, content_id: str) -> Dict[str, Any]:
         """Explicitly approve an autonomic promotion — loosen the gate slightly for similar content.
@@ -325,5 +354,7 @@ class SylExperientialIngest:
         emb = self._embeddings.get(content_id)
         if emb is None:
             raise PromotionRefused(f"unknown content '{content_id}'")
-        self._gate_adjustments.append((emb, -CONFIRM_LOOSEN))
-        return {"confirmed": content_id, "loosen": CONFIRM_LOOSEN}
+        # Substrate Authority: ONE deposit. Success teaches GENTLY (slow gain) — the intrinsic
+        # asymmetry vs retract's full-force failure. No local threshold field.
+        self.private_store.record_outcome(emb, PROMOTE_DECISION_ID, True, strength=CONFIRM_STRENGTH)
+        return {"confirmed": content_id}

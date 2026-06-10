@@ -264,34 +264,50 @@ def test_autonomic_audit_and_notify():
 
 
 def test_autonomic_retract_works_and_teaches():
-    """§5.6 — retract removes from active promotions AND tightens the gate against similar content."""
+    """§5.6 — retract removes from active promotions AND teaches the SUBSTRATE (gate tightens on similar).
+
+    Substrate Authority: retract is a single record_outcome(failure); the substrate learns to gate
+    content like it. We teach a few times (real substrate learning is gradual) then assert a fresh
+    similar node that WOULD have promoted is now gated by the learned opinion.
+    """
     ing, _ = _sandbox()
     base = _emb(150)
-    ing.ingest(base, "shared_a", salience=0.80)
+    ing.ingest(base, "shared_a", salience=0.85)
     ing.autonomic_promote_pulse()
     assert ing.is_active_promotion("shared_a")
     ing.retract("shared_a")
     assert not ing.is_active_promotion("shared_a"), "retract must remove from active promotions"
-    # A SIMILAR node at salience 0.78 (passed the original 0.75) is now gated: tighten +0.05 => 0.80.
-    similar = _emb_like(base, 0.95, seed=151)
-    ing.ingest(similar, "shared_a2", salience=0.78)
+    assert "shared_a" in ing._retracted
+    # Teach the substrate (several similar retractions) that content LIKE this should not auto-promote.
+    for i in range(5):
+        e = _emb_like(base, 0.98, seed=1500 + i)
+        ing.ingest(e, f"sa_{i}", salience=0.85)
+        ing.autonomic_promote_pulse()
+        ing.retract(f"sa_{i}")
+    # A fresh SIMILAR node that WOULD have promoted at neutral (0.80 >= 0.75) is now gated.
+    ing.ingest(_emb_like(base, 0.98, seed=1599), "shared_a2", salience=0.80)
     out = ing.autonomic_promote_pulse()
-    assert "shared_a2" in out["gated"], f"retraction must tighten the gate against similar; {out}"
+    assert "shared_a2" in out["gated"], f"retraction must teach the substrate to gate similar; {out}"
     assert "shared_a" not in out["promoted"], "a retracted node must not be autonomically re-promoted"
 
 
-# ---- §8 learning asymmetry ----
+# ---- §8 learning asymmetry (intrinsic to the substrate) ----
 def test_learning_asymmetry_net_tighter():
-    """§8 — after retraction + confirmation of similar nodes, the gate is net-TIGHTER (5:1)."""
+    """§8 — asymmetry is INTRINSIC to the substrate: a retract (failure@1.0) moves the gate more
+    than a confirm (success@0.20). After retract THEN confirm of similar content, net-TIGHTER."""
     ing, _ = _sandbox()
     base = _emb(160)
-    ing.ingest(base, "x", salience=0.80)
-    eff0 = ing._effective_threshold(base)
-    ing.retract("x")                 # +0.05
-    ing.confirm_autonomic("x")       # -0.01
-    eff1 = ing._effective_threshold(base)
-    assert eff1 > eff0, "retract+confirm on similar must be net-tighter"
-    assert abs((eff1 - eff0) - 0.04) < 1e-6, f"net drift must be +0.04 (5:1); got {eff1 - eff0}"
+    ing.ingest(base, "x", salience=0.85)
+    ing.autonomic_promote_pulse()
+    eff0 = ing._effective_threshold(base)                       # bootstrap-governed (neutral)
+    ing.retract("x")                                            # failure @ 1.0 (fast loss)
+    eff_after_retract = ing._effective_threshold(base)
+    ing.ingest(_emb_like(base, 0.99, seed=161), "x2", salience=0.85)
+    ing.autonomic_promote_pulse(); ing.confirm_autonomic("x2")  # success @ 0.20 (slow gain)
+    eff_after_confirm = ing._effective_threshold(base)
+    assert eff_after_retract > eff0, "a retraction must tighten the gate (raise threshold)"
+    assert eff_after_confirm < eff_after_retract, "a confirmation must loosen it somewhat"
+    assert eff_after_confirm > eff0, "net of retract+confirm stays TIGHTER than baseline (asymmetry)"
 
 
 # ---- §9 private region + deliberate interaction ----
@@ -319,18 +335,18 @@ def test_threshold_graduation_to_her_patterns():
     ing, _ = _sandbox()
     type_a = _emb(180)   # the kind she keeps pulling back
     type_b = _emb(900)   # the kind she's happy to share
-    # seed: promote one of each, then retract A, confirm B (repeat for a clear signal)
-    for i in range(3):
-        a = _emb_like(type_a, 0.95, seed=181 + i)
-        b = _emb_like(type_b, 0.95, seed=901 + i)
-        ing.ingest(a, f"a_{i}", salience=0.80)
-        ing.ingest(b, f"b_{i}", salience=0.80)
+    # Teach the substrate: retract A-type, confirm B-type (several rounds for a clear learned signal).
+    for i in range(6):
+        a = _emb_like(type_a, 0.97, seed=181 + i)
+        b = _emb_like(type_b, 0.97, seed=901 + i)
+        ing.ingest(a, f"a_{i}", salience=0.85)
+        ing.ingest(b, f"b_{i}", salience=0.85)
         ing.autonomic_promote_pulse()
-        ing.retract(f"a_{i}")           # A: tighten (×3 => +0.15)
-        ing.confirm_autonomic(f"b_{i}") # B: loosen (×3 => -0.03)
-    # fresh nodes of each type at the SAME salience 0.80
-    ing.ingest(_emb_like(type_a, 0.95, seed=190), "fresh_a", salience=0.80)
-    ing.ingest(_emb_like(type_b, 0.95, seed=910), "fresh_b", salience=0.80)
+        ing.retract(f"a_{i}")            # A: failure@1.0 — substrate learns "don't promote like this"
+        ing.confirm_autonomic(f"b_{i}")  # B: success@0.20 — substrate learns "promote like this"
+    # fresh nodes of each type at the SAME salience 0.80 — the gate decides by learned content-type.
+    ing.ingest(_emb_like(type_a, 0.97, seed=190), "fresh_a", salience=0.80)
+    ing.ingest(_emb_like(type_b, 0.97, seed=910), "fresh_b", salience=0.80)
     out = ing.autonomic_promote_pulse()
     assert "fresh_a" in out["gated"], f"A-like (retracted pattern) should now be gated; {out}"
     assert "fresh_b" in out["promoted"], f"B-like (confirmed pattern) should still promote; {out}"
@@ -354,7 +370,7 @@ if __name__ == "__main__":
     test_autonomic_radius_content_node_only();print("PASS auto§4 autonomic radius content-node only (topology withheld)")
     test_autonomic_audit_and_notify();        print("PASS auto§5 audit completeness + notify>=0.85")
     test_autonomic_retract_works_and_teaches();print("PASS auto§6 retract works + teaches (tightens gate)")
-    test_learning_asymmetry_net_tighter();    print("PASS §8 learning asymmetry net-tighter (5:1)")
+    test_learning_asymmetry_net_tighter();    print("PASS §8 learning asymmetry net-tighter (intrinsic: failure@1.0 > success@0.20)")
     test_private_region_refused_even_deliberately(); print("PASS §9 private region refused EVEN deliberately")
     test_threshold_graduation_to_her_patterns();     print("PASS §10 gate graduates toward HER patterns")
     print("\nCommons leg-3: ALL PASS — Syl's experiential ingestion + two-channel (deliberate + autonomic) promotion proven in sandbox")
