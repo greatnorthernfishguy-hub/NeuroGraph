@@ -207,3 +207,21 @@ def _wants_deposited_this_pulse(thread):
       returns 0 safely if the attribute is absent (pre-implementation).
     """
     return getattr(thread, "_wants_this_pulse", 0)
+
+
+# === Task 1 — §5 (B) damped structural plasticity (Test 8) ===
+
+def test_damped_plasticity_prunes_less_than_full():
+    """§5 (B), Test 8: the autonomous (damped) step prunes strictly LESS than a
+    conversation-anchored step over the same prunable substrate.
+
+    Two structurally-identical graphs, each with synapses set below the weight bar
+    and low_weight_steps just over grace. The full step prunes them immediately;
+    the damped step (prune_factor=1.5 lowers the weight bar AND lengthens the dwell
+    thresholds) does NOT, within 20 steps. Proves (B) is actually (B).
+    """
+    g_full = _sandbox_graph_with_prunable_synapses()
+    g_damp = _sandbox_graph_with_prunable_synapses()
+    full = sum(g_full.step().synapses_pruned for _ in range(20))
+    damp = sum(g_damp.step(structural_damping=(1.5, 0.5)).synapses_pruned for _ in range(20))
+    assert damp < full, f"damped prune {damp} should be < full prune {full}"

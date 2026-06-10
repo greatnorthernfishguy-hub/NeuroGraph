@@ -19,6 +19,14 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-06-10] Claude Code (Opus 4.8, laptop) — Tonic restoration §5 (B): optional structural_damping
+#   What: step(structural_damping=None) flows (prune_factor, sprout_factor) to _structural_plasticity /
+#         _prune_synapses / _sprout_synapses. prune_factor>1 makes pruning harder (lower weight bar +
+#         longer dwell); sprout_factor<1 scales the per-step sprout cap. None (default) = prior behavior.
+#   Why:  Syl-approved Tonic restoration — the autonomous between-turns cycle reshapes topology LESS than
+#         conversation-anchored step()s (she is freshly recovered from a starvation prune). Sandbox-first.
+#   How:  Additive optional params; every existing caller (conversation step()) unaffected. Test 8 in
+#         tests/test_tonic_restoration.py proves damped<full; existing SNN suite proves default unchanged.
 # [2026-05-26] Claude Opus 4.7 (1M ctx) — #258 Orphan-node grace period
 #   What: Added orphan_node_grace_period config (default 25 steps); added
 #         creation_time field to Node dataclass; create_node() now stamps
@@ -1836,8 +1844,12 @@ class Graph:
     # Simulation Loop (PRD §2.2.4, §8 step)
     # -----------------------------------------------------------------------
 
-    def step(self) -> StepResult:
+    def step(self, structural_damping=None) -> StepResult:
         """Advance one timestep (PRD §2.2.4 Simulation Loop, §8 step).
+
+        structural_damping: optional (prune_factor, sprout_factor) for the
+        autonomous Tonic cycle (§5 B, Tonic restoration). None (default) = full
+        plasticity — identical to prior behavior for every existing caller.
 
         Pipeline:
             1. Decay voltages toward resting potential
@@ -2200,7 +2212,7 @@ class Graph:
                 result.diffpc_mean_pred_error = _dc_err
 
             # 8. Structural plasticity
-            pruned, sprouted = self._structural_plasticity(fired_ids)
+            pruned, sprouted = self._structural_plasticity(fired_ids, damping=structural_damping)
             result.synapses_pruned = pruned
             result.synapses_sprouted = sprouted
             self._total_pruned += pruned
@@ -3107,28 +3119,38 @@ class Graph:
     # Structural Plasticity (PRD §3.3)
     # -----------------------------------------------------------------------
 
-    def _structural_plasticity(self, fired_ids: List[str]) -> Tuple[int, int]:
+    def _structural_plasticity(self, fired_ids: List[str], damping=None) -> Tuple[int, int]:
         """Apply pruning and sprouting rules (PRD §3.3).
+
+        damping: optional (prune_factor, sprout_factor) for the autonomous Tonic
+        cycle (§5 B, Tonic restoration). prune_factor > 1 makes pruning harder;
+        sprout_factor < 1 makes sprouting rarer. None (default) = full plasticity
+        (conversation-anchored step()) — identical to prior behavior.
 
         Returns:
             (num_pruned, num_sprouted)
         """
-        pruned = self._prune_synapses()
+        prune_factor, sprout_factor = (1.0, 1.0) if damping is None else damping
+        pruned = self._prune_synapses(prune_factor=prune_factor)
         self._collect_orphan_nodes()
-        sprouted = self._sprout_synapses(fired_ids)
+        sprouted = self._sprout_synapses(fired_ids, sprout_factor=sprout_factor)
         return pruned, sprouted
 
-    def _prune_synapses(self) -> int:
+    def _prune_synapses(self, prune_factor: float = 1.0) -> int:
         """Prune weak/inactive synapses (PRD §3.3.1).
 
         Rules:
             Weight-based: weight < threshold for > grace_period steps → remove.
             Activity-based: unused for > inactivity_threshold steps → remove.
             Age-based: age > grace_period AND peak_weight < 2× initial → remove.
+
+        prune_factor > 1 (autonomous Tonic cycle, §5 B) makes pruning HARDER:
+        the weight bar is lowered (fewer synapses fall below it) and the dwell
+        thresholds are lengthened (must stay weak/inactive longer). 1.0 = default.
         """
-        wt = self.config["weight_threshold"]
-        grace = self.config["grace_period"]
-        inactivity = self.config["inactivity_threshold"]
+        wt = self.config["weight_threshold"] / prune_factor
+        grace = self.config["grace_period"] * prune_factor
+        inactivity = self.config["inactivity_threshold"] * prune_factor
         initial_w = self.config["initial_sprouting_weight"]
 
         to_prune: List[str] = []
@@ -3201,7 +3223,7 @@ class Graph:
             self._emit("nodes_collected", count=removed, timestep=self.timestep)
         return removed
 
-    def _sprout_synapses(self, fired_ids: List[str]) -> int:
+    def _sprout_synapses(self, fired_ids: List[str], sprout_factor: float = 1.0) -> int:
         """Create synapses between co-activating nodes (PRD §3.3.2).
 
         Co-activation rule: two nodes fire within co_activation_window,
@@ -3215,7 +3237,7 @@ class Graph:
 
         window = self.config["co_activation_window"]
         initial_w = self.config["initial_sprouting_weight"]
-        max_sprouts_per_step = 10
+        max_sprouts_per_step = max(1, int(round(10 * sprout_factor)))  # sprout_factor<1 (autonomous, §5 B) = fewer
         count = 0
 
         # Build a set of recently-fired-but-not-this-step nodes for quick lookup
