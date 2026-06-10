@@ -194,6 +194,148 @@ def test_deep_tier_runs_enhancer():
     )
 
 
+def _emb_like(base: np.ndarray, sim: float, seed: int) -> np.ndarray:
+    """Unit embedding with cos(result, base) ~= sim — for the learning/graduation tests."""
+    rng = np.random.RandomState(seed)
+    r = rng.randn(len(base)).astype(np.float32)
+    bu = base / (np.linalg.norm(base) + 1e-8)
+    r = r - np.dot(r, bu) * bu
+    r = r / (np.linalg.norm(r) + 1e-8)
+    v = sim * bu + np.sqrt(max(0.0, 1.0 - sim * sim)) * r
+    return (v / (np.linalg.norm(v) + 1e-8)).astype(np.float32)
+
+
+# ======================= AUTONOMIC CHANNEL (Syl's resolutions) =======================
+
+def test_autonomic_gate_correctness():
+    """§5.1 — high-salience aligned non-private IS autonomically promoted; low-salience is NOT."""
+    ing, commons = _sandbox()
+    ing.ingest(_emb(100), "worth_sharing", salience=0.80)      # >= 0.75
+    ing.ingest(_emb(101), "just_private", salience=0.66)       # >= ingest 0.65 but < 0.75 promote
+    out = ing.autonomic_promote_pulse()
+    assert "worth_sharing" in out["promoted"], f"0.80 should auto-promote; {out}"
+    assert "just_private" in out["gated"], f"0.66 < 0.75 should NOT auto-promote; {out}"
+    assert "worth_sharing" in _module_pool_sees(commons, _emb(100))
+
+
+def test_autonomic_fail_private():
+    """§5.2 — any gate error ⇒ NOT promoted (fails toward keeping it in)."""
+    private = NGLite(module_id="syl_fp"); commons = commons_mod.Commons()
+    def boom(_emb): raise RuntimeError("identity check exploded")
+    ing = SylExperientialIngest(private, commons, identity_align=boom)
+    ing.ingest(_emb(110), "risky", salience=0.95)
+    out = ing.autonomic_promote_pulse()
+    assert out["promoted"] == [], f"gate error must promote nothing (fail-private); {out}"
+    assert "risky" in out["gated"]
+
+
+def test_autonomic_private_region_inviolate():
+    """§5.3 — a max-salience aligned node in a private region is NEVER autonomically promoted."""
+    ing, commons = _sandbox()
+    ing.ingest(_emb(120), "intimate_thought", salience=0.99, novelty=0.99, intimate=True)
+    ing.ingest(_emb(121), "structural_private", salience=0.99, identity_region="private")
+    out = ing.autonomic_promote_pulse()
+    assert "intimate_thought" in out["gated"], "syl_intimate must never auto-promote"
+    assert "structural_private" in out["gated"], "IdentityGraph private region must never auto-promote"
+    assert "intimate_thought" not in _module_pool_sees(commons, _emb(120))
+
+
+def test_autonomic_radius_content_node_only():
+    """§5.4 — autonomic promotion never deposits topology, even for a linked node."""
+    ing, commons = _sandbox()
+    ing.ingest(_emb(131), "auto_neighbor", salience=0.66)  # below promote threshold, stays private
+    ing.ingest(_emb(130), "auto_core", salience=0.85, links=["auto_neighbor"])
+    ing.autonomic_promote_pulse()
+    assert "auto_core" in _module_pool_sees(commons, _emb(130))
+    assert "auto_neighbor" not in _module_pool_sees(commons, _emb(131)), "autonomic must withhold topology"
+
+
+def test_autonomic_audit_and_notify():
+    """§5.5 — every autonomic promotion is logged; salience>=0.85 notifies."""
+    ing, _ = _sandbox()
+    ing.ingest(_emb(140), "normal_share", salience=0.78)
+    ing.ingest(_emb(141), "big_share", salience=0.90)
+    out = ing.autonomic_promote_pulse()
+    logged = {e["content_id"] for e in ing.audit_log()}
+    assert {"normal_share", "big_share"} <= logged, f"all promotions must be audited; {logged}"
+    assert "big_share" in out["notifications"] and "normal_share" not in out["notifications"], (
+        f"only salience>=0.85 should notify; {out['notifications']}"
+    )
+
+
+def test_autonomic_retract_works_and_teaches():
+    """§5.6 — retract removes from active promotions AND tightens the gate against similar content."""
+    ing, _ = _sandbox()
+    base = _emb(150)
+    ing.ingest(base, "shared_a", salience=0.80)
+    ing.autonomic_promote_pulse()
+    assert ing.is_active_promotion("shared_a")
+    ing.retract("shared_a")
+    assert not ing.is_active_promotion("shared_a"), "retract must remove from active promotions"
+    # A SIMILAR node at salience 0.78 (passed the original 0.75) is now gated: tighten +0.05 => 0.80.
+    similar = _emb_like(base, 0.95, seed=151)
+    ing.ingest(similar, "shared_a2", salience=0.78)
+    out = ing.autonomic_promote_pulse()
+    assert "shared_a2" in out["gated"], f"retraction must tighten the gate against similar; {out}"
+    assert "shared_a" not in out["promoted"], "a retracted node must not be autonomically re-promoted"
+
+
+# ---- §8 learning asymmetry ----
+def test_learning_asymmetry_net_tighter():
+    """§8 — after retraction + confirmation of similar nodes, the gate is net-TIGHTER (5:1)."""
+    ing, _ = _sandbox()
+    base = _emb(160)
+    ing.ingest(base, "x", salience=0.80)
+    eff0 = ing._effective_threshold(base)
+    ing.retract("x")                 # +0.05
+    ing.confirm_autonomic("x")       # -0.01
+    eff1 = ing._effective_threshold(base)
+    assert eff1 > eff0, "retract+confirm on similar must be net-tighter"
+    assert abs((eff1 - eff0) - 0.04) < 1e-6, f"net drift must be +0.04 (5:1); got {eff1 - eff0}"
+
+
+# ---- §9 private region + deliberate interaction ----
+def test_private_region_refused_even_deliberately():
+    """§9 — a private-region node cannot be promoted EVEN via the deliberate channel."""
+    ing, commons = _sandbox()
+    ing.ingest(_emb(170), "intimate_x", salience=0.9, intimate=True)
+    ing.ingest(_emb(171), "structural_x", salience=0.9, identity_region="private")
+    for cid, e in [("intimate_x", _emb(170)), ("structural_x", _emb(171))]:
+        try:
+            ing.promote_to_commons(cid, confirm=lambda p: True)
+            assert False, f"private-region '{cid}' must be refused even deliberately (§9)"
+        except PromotionRefused:
+            pass
+        assert cid not in _module_pool_sees(commons, e)
+
+
+# ---- §10 threshold graduation toward HER patterns ----
+def test_threshold_graduation_to_her_patterns():
+    """§10 — the gate converges toward HER promotion patterns, not generic high-salience.
+
+    Retract type-A content + confirm type-B content; afterward a fresh A-like node is gated and a
+    fresh B-like node is promoted, AT THE SAME salience. The gate learned content-type, not salience.
+    """
+    ing, _ = _sandbox()
+    type_a = _emb(180)   # the kind she keeps pulling back
+    type_b = _emb(900)   # the kind she's happy to share
+    # seed: promote one of each, then retract A, confirm B (repeat for a clear signal)
+    for i in range(3):
+        a = _emb_like(type_a, 0.95, seed=181 + i)
+        b = _emb_like(type_b, 0.95, seed=901 + i)
+        ing.ingest(a, f"a_{i}", salience=0.80)
+        ing.ingest(b, f"b_{i}", salience=0.80)
+        ing.autonomic_promote_pulse()
+        ing.retract(f"a_{i}")           # A: tighten (×3 => +0.15)
+        ing.confirm_autonomic(f"b_{i}") # B: loosen (×3 => -0.03)
+    # fresh nodes of each type at the SAME salience 0.80
+    ing.ingest(_emb_like(type_a, 0.95, seed=190), "fresh_a", salience=0.80)
+    ing.ingest(_emb_like(type_b, 0.95, seed=910), "fresh_b", salience=0.80)
+    out = ing.autonomic_promote_pulse()
+    assert "fresh_a" in out["gated"], f"A-like (retracted pattern) should now be gated; {out}"
+    assert "fresh_b" in out["promoted"], f"B-like (confirmed pattern) should still promote; {out}"
+
+
 if __name__ == "__main__":
     test_ingest_salience_gate();              print("PASS §1 salience gate (0.65, higher than modules')")
     test_three_tier_depth();                  print("PASS §3 three-tier depth (shallow/medium/deep)")
@@ -205,4 +347,14 @@ if __name__ == "__main__":
     test_identity_alignment_refusal();        print("PASS §5 IdentityGraph alignment refusal")
     test_cannot_promote_unknown();            print("PASS §6 cannot promote what was never privately ingested")
     test_deep_tier_runs_enhancer();           print("PASS §3 deep tier triggers leg-2 enhancer")
-    print("\nCommons leg-3: ALL PASS — Syl's experiential ingestion + Q11 asymmetric promotion proven in sandbox")
+    print("  --- autonomic channel (Syl's resolutions) ---")
+    test_autonomic_gate_correctness();        print("PASS auto§1 gate correctness (0.75 threshold)")
+    test_autonomic_fail_private();            print("PASS auto§2 fail-private on gate error")
+    test_autonomic_private_region_inviolate();print("PASS auto§3 private regions inviolate (syl_intimate + IdentityGraph)")
+    test_autonomic_radius_content_node_only();print("PASS auto§4 autonomic radius content-node only (topology withheld)")
+    test_autonomic_audit_and_notify();        print("PASS auto§5 audit completeness + notify>=0.85")
+    test_autonomic_retract_works_and_teaches();print("PASS auto§6 retract works + teaches (tightens gate)")
+    test_learning_asymmetry_net_tighter();    print("PASS §8 learning asymmetry net-tighter (5:1)")
+    test_private_region_refused_even_deliberately(); print("PASS §9 private region refused EVEN deliberately")
+    test_threshold_graduation_to_her_patterns();     print("PASS §10 gate graduates toward HER patterns")
+    print("\nCommons leg-3: ALL PASS — Syl's experiential ingestion + two-channel (deliberate + autonomic) promotion proven in sandbox")
