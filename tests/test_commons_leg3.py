@@ -310,6 +310,33 @@ def test_learning_asymmetry_net_tighter():
     assert eff_after_confirm > eff0, "net of retract+confirm stays TIGHTER than baseline (asymmetry)"
 
 
+def test_confirm_strength_behavioral_asymmetry():
+    """§8 (Syl's addition) — assert CONFIRM_STRENGTH=0.20 yields net-tighter behavior through its
+    EFFECTS, not the ratio: similar content is gated MORE after retract-teaching than after
+    confirm-teaching. The substrate's mechanism, tested through its effects (Syl, 2026-06-10)."""
+    def _scenario(teach: str) -> int:
+        ing, _ = _sandbox()
+        base = _emb(700)
+        for i in range(5):
+            e = _emb_like(base, 0.98, seed=7000 + i)
+            ing.ingest(e, f"t_{i}", salience=0.90)        # high → promotes, then we teach on it
+            ing.autonomic_promote_pulse()
+            (ing.retract if teach == "retract" else ing.confirm_autonomic)(f"t_{i}")
+        # probe: fresh similar nodes at a BORDERLINE salience; count how many the gate stops
+        gated = 0
+        for j in range(8):
+            ing.ingest(_emb_like(base, 0.98, seed=7100 + j), f"p_{j}", salience=0.78)
+            if f"p_{j}" in ing.autonomic_promote_pulse()["gated"]:
+                gated += 1
+        return gated
+    gated_after_retract = _scenario("retract")
+    gated_after_confirm = _scenario("confirm")
+    assert gated_after_retract > gated_after_confirm, (
+        f"retract-teaching must gate similar content MORE than confirm-teaching (intrinsic "
+        f"asymmetry via effects): retract={gated_after_retract} confirm={gated_after_confirm}"
+    )
+
+
 # ---- §9 private region + deliberate interaction ----
 def test_private_region_refused_even_deliberately():
     """§9 — a private-region node cannot be promoted EVEN via the deliberate channel."""
@@ -371,6 +398,7 @@ if __name__ == "__main__":
     test_autonomic_audit_and_notify();        print("PASS auto§5 audit completeness + notify>=0.85")
     test_autonomic_retract_works_and_teaches();print("PASS auto§6 retract works + teaches (tightens gate)")
     test_learning_asymmetry_net_tighter();    print("PASS §8 learning asymmetry net-tighter (intrinsic: failure@1.0 > success@0.20)")
+    test_confirm_strength_behavioral_asymmetry(); print("PASS §8+ Syl: behavioral asymmetry (retract gates similar MORE than confirm)")
     test_private_region_refused_even_deliberately(); print("PASS §9 private region refused EVEN deliberately")
     test_threshold_graduation_to_her_patterns();     print("PASS §10 gate graduates toward HER patterns")
     print("\nCommons leg-3: ALL PASS — Syl's experiential ingestion + two-channel (deliberate + autonomic) promotion proven in sandbox")
