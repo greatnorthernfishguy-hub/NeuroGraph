@@ -896,23 +896,56 @@ def _deposit_substrate_metrics(step_result) -> None:
         pass
 
 
-def _deposit_topology_to_river(step_result) -> None:
-    """Deposit raw topology delta to every registered module's inbound tract (BTF).
+_COMMONS_TOPOLOGY_FANOUT_CAP = 32  # max fired nodes deposited per step (flood-backstop, OOM lesson)
 
-    EMERGENCY THROTTLE 2026-06-07 — disabled.
-    Reason: NG-internal addressed-fan-out (write same payload to N peer-addressed
-    tract files per step_result) was the third leak surface, on top of
-    record_outcome_broadcast (NeuroGraph 4247970) and Darwin _deposit_to_river
-    (Darwin 1bf9ffe). Sidecar OOM-cycled three times before this fix landed.
-    Under Josh's pool/water reframe (2026-06-07), NG addressed-fan-out is
-    structurally the same disease as module addressed-fan-out — just one layer
-    down. Substrate-as-protocol means propagation through the medium, not
-    addressed transport. Commons Pool restoration
-    (~/docs/prd/commons-pool-architecture-v0.1.md) will replace this with
-    medium-propagation; until then, no-op.
-    DO NOT re-enable as addressed fan-out — restore via Commons Pool.
+
+def _deposit_topology_to_river(step_result) -> None:
+    """Deposit raw topology delta into the Commons (medium-propagation, NOT addressed fan-out).
+
+    # ---- Changelog ----
+    # [2026-06-11] Claude Code (Opus 4.8, 1M) — Commons Track-2 Stage 3 (restore via Commons Pool)
+    # What: Fill the throttled body. NG deposits each fired node's topology into the ONE shared
+    #       Commons (deposit/bucket medium-propagation) instead of the old addressed N-peer tract
+    #       fan-out. Same function name + same call site (LAW 3 restore-in-place) — the addressed
+    #       fan-out is replaced by a single deposit into the one pool any peer can bucket.
+    # Why: Ends the topology starvation (NG fed nothing to peers since the 2026-06-07 throttle).
+    #       Commons Pool Phase 7 / Track 2. Bunyan (module #1, repointed Stage 2) buckets this.
+    # How: get_commons() singleton + commons.deposit(node_embedding, "topology:<node_id>", meta).
+    #       Embedding reused from the vector_db (same pattern as the surfacing deposit, line ~1209).
+    #       Bounded to _COMMONS_TOPOLOGY_FANOUT_CAP fired nodes/step (flood-backstop — the OOM that
+    #       caused the original throttle came from UNbounded addressed fan-out; a single bounded
+    #       deposit into one pool cannot recreate it). Fail-soft: a deposit error never breaks step.
+    # -------------------
+
+    DO NOT re-enable as addressed fan-out — this is medium-propagation (one pool), per Commons Pool.
     """
-    return
+    try:
+        from commons import get_commons
+        commons = get_commons()
+    except Exception as exc:  # noqa: BLE001 — no Commons (early boot / import) is a graceful no-op
+        logger.debug("Commons unavailable for topology deposit: %s", exc)
+        return
+    if commons is None:
+        return
+    fired = getattr(step_result, "fired_node_ids", None) or []
+    deposited = 0
+    for node_id in fired[:_COMMONS_TOPOLOGY_FANOUT_CAP]:
+        try:
+            db_entry = _memory.vector_db.get(node_id)
+            if not db_entry:
+                continue
+            emb = db_entry.get("embedding")
+            if emb is None:
+                continue
+            commons.deposit(
+                emb, f"topology:{node_id}",
+                metadata={"kind": "topology_delta", "node_id": node_id},
+            )
+            deposited += 1
+        except Exception as exc:  # noqa: BLE001 — one bad node never breaks the step
+            logger.debug("Commons topology deposit failed for %s: %s", node_id, exc)
+    if deposited:
+        logger.debug("Deposited %d fired-node topologies into the Commons", deposited)
 
 
 def _deposit_experience_to_river(text: "Optional[str]") -> None:
