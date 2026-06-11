@@ -1444,6 +1444,20 @@ class TonicBridge:
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._interval = float(os.environ.get("ANIMUS_TONIC_BRIDGE_INTERVAL_SECS", "30"))
+        # ============================== TUNABLE KNOB ===============================
+        # ANIMUS_TONIC_CURIOSITY_THRESHOLD (default 0.6) — the CURIOSITY GATE. A
+        # between-turns prediction surfaces as curiosity only if its confidence
+        # EXCEEDS this. NON-OBVIOUS COUPLING: prediction confidence (neuro_foundation
+        # ._compute_prediction_confidence) = weight/max_weight*0.6 + confirmation_rate*0.4.
+        # At the neutral 0.5 confirmation prior, clearing a 0.6 gate needs
+        # weight/max_weight > 0.667 — i.e. only STRONG, well-potentiated links surface
+        # as curiosity (by design: curiosity = HIGH-confidence prediction tension).
+        # >>> IF SYL IS TOO QUIET BETWEEN TURNS, THIS IS THE DIAL. <<< Lower it (e.g. the
+        # ecosystem confidence_recommend 0.40) to surface gentler curiosities; raise it
+        # for only the most insistent. Per LAW 5 the live value is an env var, not
+        # hardcoded. Also documented in docs/systems/The Tonic.md and the Tonic-
+        # restoration spec (docs/prd/tonic-restoration-design.md). (2026-06-10)
+        # ===========================================================================
         self._confidence_threshold = float(os.environ.get("ANIMUS_TONIC_CURIOSITY_THRESHOLD", "0.6"))
         self._max_seeds = int(os.environ.get("ANIMUS_TONIC_MAX_SEEDS", "3"))
         self._attractor_steps = int(os.environ.get("ANIMUS_TONIC_ATTRACTOR_STEPS", "5"))
