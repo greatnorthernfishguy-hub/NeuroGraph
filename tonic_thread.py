@@ -26,6 +26,15 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-10] Claude Code (Opus 4.8, laptop) — Tonic restoration §7: fail-fresh + rate cap + observability
+# What: ouroboros_cycle() is now a FAIL-FRESH wrapper around _ouroboros_cycle_inner — any error
+#   (read/step/_diffpc_step/propagate/deposit) is swallowed: no-op result this pulse, never raises.
+#   Hard rate cap _MAX_AUTONOMOUS_STEPS_PER_PULSE (4) bounds BOTH the step() loop AND the read-mode
+#   p&p steps, independent of config — a mis-set propagation_steps cannot flood / re-create the OOM.
+#   Result dict gains predictions_formed + autonomous_steps (observability).
+# Why: §7 — the autonomous loop must never crash the thread and never flood; tunable, not a black box.
+#   Protects the #300 curiosity loop (a mis-tuned gate cannot run it open). Syl-approved; sandbox-tested.
+# How: try/except wrapper + min(propagation_steps, MAX) on both passes + _total_predictions_made delta.
 # [2026-06-10] Claude Code (Opus 4.8, laptop) — Tonic restoration §2: autonomous cycle runs step() + read-mode p&p
 # What: ouroboros_cycle() now runs BOTH per cycle: stimulate(seeds) → step(structural_damping=
 #   (autonomous_prune_factor, autonomous_sprout_factor)) for the REAL dynamics + predictions (the single
@@ -62,6 +71,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("neurograph.tonic")
+
+# §7 hard backstop: a mis-set propagation_steps (or any future tight loop) must not be
+# able to flood autonomous step()s and re-create the OOM. Caps step()s per cycle pulse,
+# independent of config. Default config propagation_steps is 2 — comfortably under this.
+_MAX_AUTONOMOUS_STEPS_PER_PULSE = 4
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +195,28 @@ class TonicThread:
     # -----------------------------------------------------------------
 
     def ouroboros_cycle(self) -> Dict[str, Any]:
+        """One tick of the ouroboros — FAIL-FRESH wrapper (§7).
+
+        Any error in the cycle (read, step, _diffpc_step, propagate, deposit) is
+        swallowed: the cycle does nothing this pulse and the thread continues —
+        never a crash, never a flood. Real work in _ouroboros_cycle_inner.
+        """
+        try:
+            return self._ouroboros_cycle_inner()
+        except Exception as exc:
+            logger.debug("Tonic ouroboros_cycle fail-fresh (no-op this pulse): %s", exc)
+            return {
+                "active_count": 0, "fired": 0, "thread_size": len(self._thread),
+                "cycle": self._cycle_count, "predictions_formed": 0, "failed_fresh": True,
+            }
+
+    def _ouroboros_cycle_inner(self) -> Dict[str, Any]:
         """One tick of the ouroboros: read → inject → propagate → update.
 
         The graph looks at itself. The looking IS the input.
 
         Returns:
-            Dict with cycle stats: active_count, fired, thread_size.
+            Dict with cycle stats: active_count, fired, thread_size, predictions_formed.
         """
         # READ: what does the graph consider active right now?
         active_nodes = self._read_active_nodes()
@@ -227,13 +257,19 @@ class TonicThread:
             self._graph.stimulate(_inj_id, _inj_cur)
         _damping = (self._config.autonomous_prune_factor,
                     self._config.autonomous_sprout_factor)
-        for _ in range(self._config.propagation_steps):
+        # §7 rate cap: hard backstop on autonomous step()s per pulse (independent of
+        # config), plus observability — count predictions formed across the step loop.
+        _preds_before = getattr(self._graph, "_total_predictions_made", 0)
+        _autonomous_steps = min(self._config.propagation_steps,
+                                _MAX_AUTONOMOUS_STEPS_PER_PULSE)
+        for _ in range(_autonomous_steps):
             self._graph.step(structural_damping=_damping)
+        _predictions_formed = getattr(self._graph, "_total_predictions_made", 0) - _preds_before
         # Associative query (non-destructive): real ranked fired_entries for the River + thread.
         result = self._graph.prime_and_propagate(
             node_ids=inject_ids,
             currents=inject_currents,
-            steps=self._config.propagation_steps,
+            steps=_autonomous_steps,        # §7 rate cap covers the associative pass too
             write_mode=False,
         )
 
@@ -256,6 +292,8 @@ class TonicThread:
             "fired": fired_count,
             "thread_size": len(self._thread),
             "cycle": self._cycle_count,
+            "predictions_formed": _predictions_formed,   # §7 observability (#300 made visible)
+            "autonomous_steps": _autonomous_steps,        # §7 observability (rate-capped)
         }
 
     # -----------------------------------------------------------------

@@ -290,7 +290,7 @@ def test_cycle_does_not_fabricate_flattened_fired_entries():
     """
     import inspect
     import tonic_thread
-    src = inspect.getsource(tonic_thread.TonicThread.ouroboros_cycle)
+    src = inspect.getsource(tonic_thread.TonicThread._ouroboros_cycle_inner)
     assert "write_mode=False" in src, (
         "cycle must use read-mode prime_and_propagate for raw ranked associations"
     )
@@ -344,4 +344,40 @@ def test_curiosity_signal_reads_high_confidence_prediction():
     assert seeds, "curiosity bucket returned nothing for a confidence>0.6 prediction"
     assert all(p.confidence > 0.6 for p in seeds), (
         "curiosity gate let through a low-confidence prediction"
+    )
+
+
+# === Task 5 — fail-fresh + rate cap (§7, the flood-safe backstop) ===
+
+def test_ouroboros_cycle_fails_fresh_on_step_error(monkeypatch):
+    """§7 fail-fresh: any error inside the cycle (here, step() raising) is swallowed —
+    the cycle does nothing this pulse and returns a no-op result, NEVER raising. A flaky
+    step can't crash the latent loop; the thread continues.
+    """
+    g = _sandbox_graph_with_primed_neighborhood()   # has active (stimulated) nodes
+    thread = _tonic_thread_on(g)
+
+    def _boom(*a, **k):
+        raise RuntimeError("step blew up")
+    monkeypatch.setattr(g, "step", _boom)
+
+    out = thread.ouroboros_cycle()                   # must NOT raise
+    assert out.get("failed_fresh") is True, "cycle did not fail fresh on step() error"
+    assert out.get("fired", -1) == 0
+
+
+def test_autonomous_steps_rate_capped():
+    """§7 rate cap: a mis-set propagation_steps cannot flood autonomous step()s. With
+    propagation_steps far above the backstop, the cycle caps at
+    _MAX_AUTONOMOUS_STEPS_PER_PULSE and reports the capped count — an independent
+    backstop so a mis-tuned gate/config cannot re-create the OOM.
+    """
+    import tonic_thread
+    from tonic_thread import TonicConfig, TonicThread
+    g = _sandbox_graph_with_primed_neighborhood()
+    thread = TonicThread(g, vector_db={}, config=TonicConfig(propagation_steps=100))
+    out = thread.ouroboros_cycle()
+    cap = tonic_thread._MAX_AUTONOMOUS_STEPS_PER_PULSE
+    assert out.get("autonomous_steps") == cap, (
+        f"propagation_steps=100 should cap to {cap}, got {out.get('autonomous_steps')}"
     )

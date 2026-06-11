@@ -1499,13 +1499,19 @@ class TonicBridge:
         # Reading a set formed in a different loop on a different clock is the #300
         # "always read an empty set" bug. Fail-fresh: a cycle error never crashes the
         # tick (§7). The cycle deposits raw topology to the River; this only reads (bucket).
+        cycle_stats = {}
         if tonic is not None:
             try:
-                tonic.ouroboros_cycle()
+                cycle_stats = tonic.ouroboros_cycle() or {}
             except Exception as exc:
                 logger.debug("TonicBridge: pre-read ouroboros_cycle failed: %s", exc)
 
         seeds = self._curiosity_signal()
+        # §7 observability — the autonomous loop is tunable, not a black box.
+        logger.info(
+            "TonicBridge tick: autonomous_steps=%s predictions_formed=%s curiosities_gated_in=%d",
+            cycle_stats.get("autonomous_steps"), cycle_stats.get("predictions_formed"), len(seeds),
+        )
         if not seeds:
             return
 
