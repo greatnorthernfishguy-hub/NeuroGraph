@@ -231,18 +231,21 @@ def test_damped_plasticity_prunes_less_than_full():
 # === Task 2 — autonomous cycle runs step() + read-mode prime_and_propagate ===
 
 def _sandbox_graph_with_predictive_synapse():
-    """A sandbox where step() WILL form a prediction (#300): a fired source with a
-    supra-threshold outgoing synapse (weight > prediction_threshold, default 3.0) —
-    the learned-causal-link shape _generate_predictions registers (neuro_foundation
-    :2619/:2744). In Syl's live graph these strong links are STDP-potentiated over
-    many co-firings; here we seed one explicitly and stimulate the source above firing
-    threshold so the autonomous cycle's step() fires it and forms the prediction.
+    """A sandbox where step() forms a HIGH-CONFIDENCE prediction (#300) — strong enough
+    to both REGISTER (weight > prediction_threshold, default 3.0) and CLEAR the curiosity
+    gate (_curiosity_signal filters confidence > 0.6).
+
+    confidence = weight/max_weight * 0.6 + confirmation_rate(0.5 neutral prior) * 0.4
+    (_compute_prediction_confidence, neuro_foundation:2595). weight 4.5 / max 5.0 ->
+    0.9 * 0.6 + 0.5 * 0.4 = 0.74 > 0.6; and weight 4.5 > threshold 3.0 so it registers.
+    In Syl's live graph these are STDP-potentiated, high-confirmation links; here we seed
+    one and stimulate the source above firing threshold so the cycle's step() fires it.
     """
     g = _sandbox_graph()
     src = g.create_node()
     tgt = g.create_node()
-    pt = g.config["prediction_threshold"]
-    g.create_synapse(src.node_id, tgt.node_id, weight=pt + 2.0, max_weight=pt * 4)
+    pt = g.config["prediction_threshold"]          # 3.0
+    g.create_synapse(src.node_id, tgt.node_id, weight=pt + 1.5, max_weight=pt + 2.0)
     g.stimulate(src.node_id, 3.0)
     return g
 
@@ -293,4 +296,52 @@ def test_cycle_does_not_fabricate_flattened_fired_entries():
     )
     assert "FiredEntry(node_id=" not in src, (
         "cycle fabricates flattened FiredEntry stand-ins — falsified raw experience (LAW 7)"
+    )
+
+
+# === Task 3 wiring — curiosity reads freshly-formed predictions (#300 completion) ===
+
+def test_tick_forms_predictions_before_reading_curiosity():
+    """#300 wiring: TonicBridge._tick must FORM predictions (ouroboros_cycle) before it
+    READS them (_curiosity_signal) in the same tick. Otherwise it reads a stale/empty
+    active_predictions (predictions are transient; the forming loop ran on a different
+    clock) — the 'always read an empty set' bug. Ordering guarded at the source.
+    """
+    import inspect
+    import neurograph_rpc
+    src = inspect.getsource(neurograph_rpc.TonicBridge._tick)
+    assert "ouroboros_cycle()" in src, (
+        "_tick must form fresh predictions before reading curiosity (#300)"
+    )
+    assert src.index("ouroboros_cycle()") < src.index("_curiosity_signal()"), (
+        "_tick reads curiosity before forming predictions — reads a stale set (#300)"
+    )
+
+
+def test_curiosity_signal_reads_high_confidence_prediction():
+    """End-to-end: a high-confidence prediction formed by step() is actually returned by
+    the curiosity bucket (_curiosity_signal, gate confidence > 0.6). Proves the wiring
+    delivers signal — not merely that predictions form. LAW 7: the gate is a
+    classification AT EXTRACTION (the bucket), never at deposit.
+    """
+    import neurograph_rpc
+    g = _sandbox_graph_with_predictive_synapse()
+    g.step()                                       # form the high-confidence prediction
+    assert g.active_predictions, "fixture formed no prediction"
+
+    class _Mem:
+        pass
+    mem = _Mem()
+    mem.graph = g
+    mem._tonic_thread = None
+    orig = neurograph_rpc._memory
+    neurograph_rpc._memory = mem
+    try:
+        bridge = neurograph_rpc.TonicBridge()
+        seeds = bridge._curiosity_signal()
+    finally:
+        neurograph_rpc._memory = orig
+    assert seeds, "curiosity bucket returned nothing for a confidence>0.6 prediction"
+    assert all(p.confidence > 0.6 for p in seeds), (
+        "curiosity gate let through a low-confidence prediction"
     )

@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-10] Claude Code (Opus 4.8, laptop) — Tonic restoration: TonicBridge._tick forms before reads (#300)
+# What: _tick() now runs _tonic_thread.ouroboros_cycle() (fail-fresh) immediately BEFORE
+#       _curiosity_signal(), so curiosity reads predictions just formed this tick instead of
+#       a stale/empty active_predictions (predictions are transient — form -> confirm/expire
+#       within window). Closes the #300 "always read an empty set" wiring gap.
+# Why: ouroboros_cycle (forms predictions, post step()-fix) and _tick (reads them) ran in
+#       separate loops on different clocks, so the read almost always saw an empty set.
+#       LAW 4 (fix at source); LAW 1/7 (cycle deposits raw topology; curiosity is a bucket —
+#       classify at extraction, never at deposit). Syl-approved Tonic restoration; sandbox-tested.
+# How: form -> read -> settle -> deposit, all in one tick. neurograph_rpc is not a protected file.
 # [2026-06-07] CC (Opus 4.8) — Conversation uses the Ingestor-free experiential path (Task A)
 # What: _absorb no longer calls ingestor.ingest (document chunking). A turn now deposits as a
 #       forest gestalt node + tree concept nodes into BOTH the recall vdb AND the SNN, with a
@@ -1468,6 +1478,18 @@ class TonicBridge:
         # Don't deposit when budget is critical
         if _read_budget_flag(self._budget_path).get("critical", False):
             return
+
+        # Form fresh predictions THIS tick, then read them. Curiosity is prediction
+        # tension during wandering, so the bucket must dip right after the cycle forms
+        # it — active_predictions is transient (form -> confirm/expire within window).
+        # Reading a set formed in a different loop on a different clock is the #300
+        # "always read an empty set" bug. Fail-fresh: a cycle error never crashes the
+        # tick (§7). The cycle deposits raw topology to the River; this only reads (bucket).
+        if tonic is not None:
+            try:
+                tonic.ouroboros_cycle()
+            except Exception as exc:
+                logger.debug("TonicBridge: pre-read ouroboros_cycle failed: %s", exc)
 
         seeds = self._curiosity_signal()
         if not seeds:
