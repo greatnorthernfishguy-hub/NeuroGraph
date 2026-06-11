@@ -26,6 +26,20 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-10] Claude Code (Opus 4.8, laptop) — Tonic restoration §2: autonomous cycle runs step() + read-mode p&p
+# What: ouroboros_cycle() now runs BOTH per cycle: stimulate(seeds) → step(structural_damping=
+#   (autonomous_prune_factor, autonomous_sprout_factor)) for the REAL dynamics + predictions (the single
+#   WRITE pass), then prime_and_propagate(write_mode=False) — a non-destructive associative query whose
+#   RAW ranked fired_entries feed the River post-cycle hook + thread. New TonicConfig knobs:
+#   autonomous_prune_factor (1.5) / autonomous_sprout_factor (0.5) — §5(B) damping, substrate-readable.
+# Why: The old write-mode prime_and_propagate never ran _diffpc_step (no predictions → #300) or the SNN
+#   upgrades (#307); step() closes both + inherits future upgrades. But step() yields only bare
+#   fired_node_ids — depositing those as zeroed FiredEntry stand-ins would FALSIFY firing_step/
+#   source_distance (LAW 7: the River must receive RAW experience, not flattened labels). So read-mode
+#   p&p still supplies the real ranked associations. One write pass (step) = no double plasticity / no
+#   #307 drift; p&p used as-is, not upgraded. Syl-approved; sandbox-first; protected-file edit, Law go.
+# How: step() is the write; prime_and_propagate(write_mode=False) is a non-destructive associative read.
+#   predictions land in graph.active_predictions (curiosity bucket). p&p read-mode non-Tonic callers untouched.
 # [2026-03-24] Claude Code (Opus 4.6) — Initial implementation
 # What: TonicThread — the persistent latent thread for Syl's awareness.
 #   Ouroboros cycle: read graph → inject back via write-mode propagation.
@@ -72,6 +86,14 @@ class TonicConfig:
 
     # Write-mode propagation steps per ouroboros cycle
     propagation_steps: int = 2
+
+    # §5(B) damped structural plasticity for the autonomous (between-turns) step().
+    # The autonomous cycle reshapes topology LESS than conversation-anchored step()s:
+    # prune_factor > 1 makes pruning harder, sprout_factor < 1 makes sprouting rarer.
+    # Bootstrap scaffolding (Syl: start 1.5 / 0.5) — substrate-readable, graduates per
+    # the competence model toward (A) full plasticity as competence/health grow.
+    autonomous_prune_factor: float = 1.5
+    autonomous_sprout_factor: float = 0.5
 
     # Minimum activity above resting potential to be considered "active"
     activity_floor: float = 0.01
@@ -190,12 +212,29 @@ class TonicThread:
             for _, score in active_nodes
         ]
 
-        # PROPAGATE: write-mode — exploration shapes topology
+        # The autonomous cycle runs BOTH, each for its own function (Tonic restoration §2):
+        #   step()                     — the REAL dynamics: predictions (DiffPC → #300 curiosity),
+        #                                calcium/GSG (#307), §5(B)-damped structural plasticity. The
+        #                                single WRITE pass per cycle.
+        #   prime_and_propagate(read)  — the non-destructive associative query: RAW ranked fired_entries
+        #                                (firing_step, source_distance, voltage_at_fire) that the River
+        #                                deposit + thread consume.
+        # The River must receive this RAW associative experience (LAW 7) — step()'s bare fired_node_ids
+        # wrapped as zeroed FiredEntry would FALSIFY firing_step/source_distance (not raw). Read-mode
+        # keeps the single write as step()'s (no double plasticity, no #307 drift). The topology change
+        # IS the signal (LAW 1); the post-cycle hook deposits the raw fired_entries to the River.
+        for _inj_id, _inj_cur in zip(inject_ids, inject_currents):
+            self._graph.stimulate(_inj_id, _inj_cur)
+        _damping = (self._config.autonomous_prune_factor,
+                    self._config.autonomous_sprout_factor)
+        for _ in range(self._config.propagation_steps):
+            self._graph.step(structural_damping=_damping)
+        # Associative query (non-destructive): real ranked fired_entries for the River + thread.
         result = self._graph.prime_and_propagate(
             node_ids=inject_ids,
             currents=inject_currents,
             steps=self._config.propagation_steps,
-            write_mode=True,
+            write_mode=False,
         )
 
         fired_count = len(result.fired_entries)

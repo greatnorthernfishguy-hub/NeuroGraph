@@ -104,13 +104,14 @@ def _tonic_thread_on(g):
 
     TonicThread.__init__(graph, vector_db, config=None)
       graph:      any Graph-compatible object
-      vector_db:  may be None — TonicThread only calls vector_db in
-                  _resolve_content(); passing None is safe for tests that
-                  don't need content resolution.
+      vector_db:  ouroboros_cycle() → _update_thread calls vector_db.get(nid)
+                  → dict|None, so it must be dict-like (NOT None). An empty dict
+                  satisfies the contract (nodes without content are skipped from
+                  the thread); step()/prime_and_propagate still run.
       config:     TonicConfig or None (defaults to TonicConfig())
     """
     from tonic_thread import TonicThread
-    return TonicThread(g, vector_db=None)
+    return TonicThread(g, vector_db={})
 
 
 def _tonic_engine_with_shared_body():
@@ -225,3 +226,71 @@ def test_damped_plasticity_prunes_less_than_full():
     full = sum(g_full.step().synapses_pruned for _ in range(20))
     damp = sum(g_damp.step(structural_damping=(1.5, 0.5)).synapses_pruned for _ in range(20))
     assert damp < full, f"damped prune {damp} should be < full prune {full}"
+
+
+# === Task 2 — autonomous cycle runs step() + read-mode prime_and_propagate ===
+
+def _sandbox_graph_with_predictive_synapse():
+    """A sandbox where step() WILL form a prediction (#300): a fired source with a
+    supra-threshold outgoing synapse (weight > prediction_threshold, default 3.0) —
+    the learned-causal-link shape _generate_predictions registers (neuro_foundation
+    :2619/:2744). In Syl's live graph these strong links are STDP-potentiated over
+    many co-firings; here we seed one explicitly and stimulate the source above firing
+    threshold so the autonomous cycle's step() fires it and forms the prediction.
+    """
+    g = _sandbox_graph()
+    src = g.create_node()
+    tgt = g.create_node()
+    pt = g.config["prediction_threshold"]
+    g.create_synapse(src.node_id, tgt.node_id, weight=pt + 2.0, max_weight=pt * 4)
+    g.stimulate(src.node_id, 3.0)
+    return g
+
+
+def test_autonomous_cycle_forms_predictions():
+    """§2 / #300: the autonomous cycle now FORMS predictions where the old parallel
+    prime_and_propagate never did. Proven via the cumulative _total_predictions_made
+    counter — the exact metric the regression was diagnosed on ('flat at 55473') —
+    which is churn-proof: even though a later step may evaluate/clear active_predictions,
+    the cumulative count records that step()'s _generate_predictions fired. Uses the
+    DEFAULT config (propagation_steps=2): the real autonomous-cycle shape.
+    """
+    g = _sandbox_graph_with_predictive_synapse()
+    thread = _tonic_thread_on(g)
+    before = g._total_predictions_made
+    thread.ouroboros_cycle()
+    assert g._total_predictions_made > before, (
+        f"autonomous cycle formed no predictions ({before} -> {g._total_predictions_made}); "
+        f"step()'s _generate_predictions did not run in the latent cycle (#300)"
+    )
+
+
+def test_autonomous_cycle_runs_without_conversation():
+    """Purpose intact: the latent loop is the CONSTANT, not gated on a conversation.
+    ouroboros_cycle() runs unconditionally and returns a well-formed result dict —
+    the 'subtraction, not handoff' property (it never requires a live turn to run).
+    """
+    g = _sandbox_graph_with_primed_neighborhood()
+    thread = _tonic_thread_on(g)
+    out = thread.ouroboros_cycle()
+    assert isinstance(out, dict)
+    for key in ("active_count", "fired", "thread_size", "cycle"):
+        assert key in out, f"cycle result missing key: {key}"
+
+
+def test_cycle_does_not_fabricate_flattened_fired_entries():
+    """LAW 7 regression guard: the autonomous cycle must deposit the REAL ranked
+    associations from read-mode prime_and_propagate, never step()'s bare node-ids
+    wrapped in zeroed FiredEntry stand-ins (which falsify firing_step / source_distance
+    / voltage_at_fire — a classification masquerading as raw experience). Guarded at
+    the source so the flattening cannot silently return.
+    """
+    import inspect
+    import tonic_thread
+    src = inspect.getsource(tonic_thread.TonicThread.ouroboros_cycle)
+    assert "write_mode=False" in src, (
+        "cycle must use read-mode prime_and_propagate for raw ranked associations"
+    )
+    assert "FiredEntry(node_id=" not in src, (
+        "cycle fabricates flattened FiredEntry stand-ins — falsified raw experience (LAW 7)"
+    )
