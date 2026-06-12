@@ -103,6 +103,47 @@ class Commons:
         """
         return self._ng.get_recommendations(query_embedding, top_k=top_k)
 
+    # ---- Verb 2b: bucket_recent (a TUNED bucket mode — temporal/recency structure extraction) ----
+    def bucket_recent(
+        self,
+        limit: int = 50,
+        since: float = 0.0,
+    ) -> List[Tuple[str, float, str]]:
+        """Recency bucket — recently-deposited targets, newest first.
+
+        # ---- Changelog ----
+        # [2026-06-12] Claude Code (Opus 4.8, 1M) — Commons Track-2 Stage-3 bucket tuning
+        # What: A recency/temporal bucket mode alongside the semantic bucket(). Returns the most
+        #       recently-deposited target_ids (newest first), NOT similarity-filtered.
+        # Why: Buckets are TUNABLE (Tier 3 Extraction: signal = semantic, STRUCTURE = temporal
+        #       sequence). A LOGGER (Bunyan) wants "what just happened" — recency-broad — not
+        #       "what's similar to my own context" (semantic bucket() surfaced almost none of NG's
+        #       topology feed live, because the embeddings diverge). This is the structure/temporal
+        #       mode of the same bucket — only Cricket's rim is frozen; the mesh tunes.
+        # How: reuse NGLiteSynapse.last_updated (set on every deposit, ng_lite:761) — no parallel
+        #       recency tracking. Sort synapses by last_updated desc, dedup target, return top `limit`.
+        #       `since` lets a caller (with a watermark) pull only deposits newer than its last pulse.
+        # -------------------
+
+        Returns (target_id, weight, reasoning) tuples — same shape as bucket(), so consumers'
+        extraction loops are unchanged. Same medium, a differently-shaped scoop.
+        """
+        seen: set = set()
+        out: List[Tuple[str, float, str]] = []
+        for syn in sorted(self._ng.synapses.values(),
+                          key=lambda s: getattr(s, "last_updated", 0.0), reverse=True):
+            ts = getattr(syn, "last_updated", 0.0)
+            if ts <= since:
+                break  # sorted desc — everything past here is older than the watermark
+            tid = getattr(syn, "target_id", None)
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append((tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}"))
+            if len(out) >= limit:
+                break
+        return out
+
     # ---- Persistence hooks (Tier 2 reference-counted survival — not yet lifecycle-wired) ----
     def persist(self, filepath: str) -> None:
         """Write the Commons medium to disk (full-herd-death recovery, Tier 2)."""
