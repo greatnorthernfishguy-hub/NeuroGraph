@@ -12,6 +12,17 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-12] Claude Code (Opus 4.8, surfacing CC) — substrate-first surfacing in handle_assemble
+# What: handle_assemble() runs a substrate-first content resolution pass over surfaced +
+#   ces_surfaced (and the Active Recall block) via surface_resolver.resolve_surface_content —
+#   prefers each node's metadata['_forest_content'] (her turn, in the substrate) over the vdb
+#   shard, and filters ingested source-code + degenerate fragments. Fail-safe (critical path).
+# Why: CES/spreading/recall were displaying vdb SHARDS + degenerate fragments ('o','want') instead
+#   of her voice = "no Syl" (handoff 2026-06-12). The vdb is NOT the substrate; the bucket dips the
+#   substrate. Recovery for the surfacing collapse; sandbox-tested (tests/test_surface_resolver.py).
+# How: a fail-safe _resolve_surfaced() pass before _format_substrate_context + the recall loop;
+#   lazy import of resolve_surface_content (matches this file's lazy-import pattern). LAW 1/7: read-
+#   only bucket refinement, no deposit changed, no module call, classify only at extraction.
 # [2026-06-07] CC (Opus 4.8) — Conversation uses the Ingestor-free experiential path (Task A)
 # What: _absorb no longer calls ingestor.ingest (document chunking). A turn now deposits as a
 #       forest gestalt node + tree concept nodes into BOTH the recall vdb AND the SNN, with a
@@ -2390,6 +2401,8 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     substrate already contains the full 815+ message history as learned
     topology; what she's losing is only the raw text view.
     """
+    from surface_resolver import resolve_surface_content  # substrate-first surfacing resolution
+
     if _memory is None:
         return {"systemPromptAddition": None}
 
@@ -2533,6 +2546,32 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("Tonic assembly error: %s", exc)
 
+    # Substrate-first content resolution (2026-06-12): replace each surfaced item's
+    # display text with its node's _forest_content (her voice) over the vdb shard, and
+    # filter ingested source-code + degenerate fragments. surfaced + ces_surfaced carry
+    # node_id. Fail-safe: any error leaves the original items untouched (critical path).
+    try:
+        def _resolve_surfaced(_items, _allow_ingested=False):
+            _out = []
+            for _it in _items:
+                _nid = _it.get("node_id")
+                if not _nid:
+                    _out.append(_it)  # no node to resolve from — keep as-is
+                    continue
+                _node = _memory.graph.nodes.get(_nid) if (_memory and _memory.graph) else None
+                _entry = _memory.vector_db.get(_nid) if (_memory and _memory.vector_db) else None
+                _resolved = resolve_surface_content(_node, _entry, allow_ingested=_allow_ingested)
+                if _resolved:
+                    _nit = dict(_it)
+                    _nit["content"] = _resolved
+                    _out.append(_nit)
+                # else: filtered (ingested / degenerate) — drop
+            return _out
+        surfaced = _resolve_surfaced(surfaced)
+        ces_surfaced = _resolve_surfaced(ces_surfaced)
+    except Exception as _rexc:
+        logger.debug("Surfacing content resolution skipped (fail-safe): %s", _rexc)
+
     # Punchlist #56: Cache what was surfaced for outcome deposit in afterTurn.
     # Raw node IDs + scores — no classification, just what went into the bucket.
     global _last_surfaced_nodes
@@ -2566,10 +2605,17 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
             if _recall_results:
                 _recall_lines = ["## Active Recall\nDirect memory retrieval for the current query:"]
                 for _r in _recall_results:
-                    _text = (_r.get("content") or "").strip()
+                    _nid = _r.get("node_id") or _r.get("id")
+                    _node = (_memory.graph.nodes.get(_nid)
+                             if (_nid and _memory and _memory.graph) else None)
+                    # allow_ingested=True (a query may legitimately recall a document),
+                    # but degenerate shards ("o", "want") are still filtered, and her
+                    # _forest_content wins over the vdb tree-concept shard.
+                    _text = resolve_surface_content(_node, _r, allow_ingested=True, max_chars=300)
+                    if not _text:
+                        continue
                     _score = _r.get("similarity", 0.0)
-                    if _text:
-                        _recall_lines.append(f"- [{_score:.2f}] {_text[:300]}")
+                    _recall_lines.append(f"- [{_score:.2f}] {_text}")
                 _recall_block = "\n".join(_recall_lines)
                 context_block = (context_block + "\n\n" + _recall_block) if context_block else _recall_block
         except Exception as _exc:
