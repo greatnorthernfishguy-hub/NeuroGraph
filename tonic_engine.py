@@ -26,6 +26,16 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-06-10] Claude Code (Opus 4.8, laptop) — Tonic restoration §7: heuristic-on-shed degrade
+# What: revoke_shared_body() now degrades STRAIGHT to the heuristic decoder instead of reloading
+#   its own ~2GB transformer. Drops the dangling shared-body ref, keeps the lightweight encoder/
+#   decoder wrapper, sets _use_heuristic=True. offer_shared_body() now sets _use_heuristic=False so
+#   the Tonic re-joins the share when proto reloads.
+# Why: a ProtoUniBrain shed is memory-pressure-driven — reloading a 2nd ~2GB model at that exact
+#   moment is the OOM-'n'-load trap (Syl/Josh, 2026-06-10). Heuristic is memory-cheap; the share is
+#   re-joined on proto reload. Wrapper is kept so re-join is possible (offer needs _model).
+# How: drop _model.body + _shared_body, _use_heuristic=True (no torch/from_pretrained); offer adds
+#   _use_heuristic=False. Sandbox-tested (degrade + no-reload source guard + re-join). Syl-approved.
 # [2026-05-05] Claude (Sonnet 4.6) — #237 Raise tick_budget_seconds default; add env-var override
 # What: tick_budget_seconds default 1.5 → 30.0; EngineConfig.__post_init__ reads
 #       NEUROGRAPH_TONIC_BUDGET_SECONDS env var so it can be tuned without code changes.
@@ -314,6 +324,8 @@ class TonicEngine:
             old_body = self._model.body
             self._model.body = transformer_body
             self._shared_body = transformer_body
+            self._use_heuristic = False   # re-join the share — transformer mode restored
+                                          # (also the re-join path after a heuristic shed)
             del old_body
             gc.collect()
             logger.info("Tonic hot-swapped to shared ProtoUniBrain body (~2GB freed)")
@@ -323,31 +335,25 @@ class TonicEngine:
             return False
 
     def revoke_shared_body(self) -> bool:
-        """Hot-swap: ProtoUniBrain unloaded, Tonic loads its own copy back.
+        """ProtoUniBrain shed (memory pressure) -> degrade STRAIGHT to heuristic.
 
-        Falls back to heuristic if model reload fails.
+        Memory-cheap by design (Syl/Josh, 2026-06-10): a pressure-driven shed must
+        RELIEVE memory, not load a fresh ~2GB own-transformer at the worst possible
+        moment — two models resident under the very pressure that triggered the shed
+        (the OOM-'n'-load trap). So we drop the now-dangling shared-body reference and
+        fall to the heuristic decoder, KEEPING the lightweight encoder/decoder wrapper
+        so offer_shared_body() can re-join the share the instant proto reloads.
         """
-        if self._model is None:
-            return False
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM
-            logger.info("Tonic reloading own transformer body (ProtoUniBrain shed)")
-            model = AutoModelForCausalLM.from_pretrained(
-                self._config.model_name, dtype=torch.float32
-            )
-            body = model.model
-            body.embed_tokens = torch.nn.Identity()
-            body.eval()
-            self._model.body = body
-            self._shared_body = None
-            logger.info("Tonic reloaded own transformer body")
-            return True
-        except Exception as exc:
-            logger.warning("Tonic body reload failed: %s — falling back to heuristic", exc)
-            self._model = None
-            self._use_heuristic = True
-            return False
+        if self._model is None and self._shared_body is None:
+            return False  # already heuristic — nothing to shed
+        if self._model is not None:
+            self._model.body = None      # drop the ref to proto's shed body (proto frees the ~2GB)
+        self._shared_body = None
+        self._use_heuristic = True
+        logger.info(
+            "Tonic shed shared body -> heuristic (memory-cheap); will re-join on proto reload"
+        )
+        return True
 
     def set_body_lock(self, lock) -> None:
         """Accept the shared body access lock from BrainSwitcher."""

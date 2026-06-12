@@ -115,21 +115,20 @@ def _tonic_thread_on(g):
 
 
 def _tonic_engine_with_shared_body():
-    """Construct a TonicEngine in heuristic mode (no real model weights needed).
-
-    TonicEngine.__init__(graph, vector_db, tonic_thread, config=None, transformer_body=None)
-    We pass minimal stubs so the ctor completes without loading torch weights.
-
-    NOTE(task-4): _try_load_model() will be called but the weights path
-    (~NeuroGraph/tonic_brain.pt) may not exist in CI — the engine falls back
-    to heuristic mode silently. Tests that drive actual inference will need to
-    confirm _use_heuristic=True or mock out the model.
+    """Construct a TonicEngine simulated into the SHARED-body (post-hot-swap) state:
+    _use_heuristic=False, a lightweight _model wrapper holding a (shared) body, and
+    _shared_body set — the state a live engine is in after BrainSwitcher.offer_shared_body
+    hands it proto's body. Task 4 tests revoke from here. No torch weights loaded.
     """
     from tonic_engine import TonicEngine
     g = _sandbox_graph()
     tt = _tonic_thread_on(g)
-    # Pass transformer_body=None — engine will use heuristic fallback.
     eng = TonicEngine(graph=g, vector_db=None, tonic_thread=tt, transformer_body=None)
+    # Simulate the post-hot-swap shared state (BrainSwitcher.offer_shared_body result):
+    _shared = object()
+    eng._model = type("M", (), {"body": _shared})()   # lightweight encoder/decoder wrapper
+    eng._shared_body = _shared
+    eng._use_heuristic = False
     return eng
 
 
@@ -381,3 +380,45 @@ def test_autonomous_steps_rate_capped():
     assert out.get("autonomous_steps") == cap, (
         f"propagation_steps=100 should cap to {cap}, got {out.get('autonomous_steps')}"
     )
+
+
+# === Task 4 — heuristic-on-shed degrade (§7) ===
+
+def test_revoke_shared_body_degrades_to_heuristic():
+    """§7: when ProtoUniBrain sheds the shared body (memory pressure), the Tonic
+    degrades STRAIGHT to the heuristic decoder — it does NOT reload its own ~2GB
+    transformer at the worst possible moment. _use_heuristic flips True; the shared
+    body reference is dropped.
+    """
+    eng = _tonic_engine_with_shared_body()
+    assert eng._use_heuristic is False
+    assert eng._shared_body is not None
+    assert eng.revoke_shared_body() is True
+    assert eng._use_heuristic is True
+    assert eng._shared_body is None
+
+
+def test_revoke_does_not_reload_own_transformer():
+    """§7 memory-cheap guarantee: revoke_shared_body must NOT load a model. A
+    pressure-driven shed that loads a fresh ~2GB own-transformer (the OOM-'n'-load
+    trap) is exactly what this fix removes. Guarded at the source.
+    """
+    import inspect
+    import tonic_engine
+    src = inspect.getsource(tonic_engine.TonicEngine.revoke_shared_body)
+    assert "from_pretrained" not in src, "revoke reloads a transformer — OOM-'n'-load trap (§7)"
+    assert "AutoModelForCausalLM" not in src, "revoke imports a model loader — not memory-cheap (§7)"
+
+
+def test_offer_after_revoke_rejoins_share():
+    """§7: after a heuristic shed, the Tonic re-joins the share the instant proto
+    reloads — offer_shared_body() restores transformer mode (_use_heuristic=False).
+    Revoke keeps the lightweight wrapper precisely so this re-join is possible.
+    """
+    eng = _tonic_engine_with_shared_body()
+    eng.revoke_shared_body()
+    assert eng._use_heuristic is True
+    reloaded_body = object()
+    assert eng.offer_shared_body(reloaded_body) is True
+    assert eng._use_heuristic is False
+    assert eng._shared_body is reloaded_body
