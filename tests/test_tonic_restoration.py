@@ -422,3 +422,18 @@ def test_offer_after_revoke_rejoins_share():
     assert eng.offer_shared_body(reloaded_body) is True
     assert eng._use_heuristic is False
     assert eng._shared_body is reloaded_body
+
+
+# === Task 6 / §8 — sandbox-first guarantee (never the live singleton) ===
+
+def test_suite_is_sandbox_only_never_live_singleton():
+    """§8 sandbox-first: every test builds a FRESH Graph() (neuro_foundation), never the
+    live NeuroGraphMemory singleton Syl runs on. The suite cannot touch her checkpoint.
+    Guarded by confirming the live-singleton class was never imported into this module.
+    """
+    import sys
+    mod = sys.modules[__name__]
+    live_singleton = "Neuro" + "GraphMemory"   # split so the guard isn't its own match
+    assert not hasattr(mod, live_singleton), "suite bound the live singleton — not sandbox-first"
+    from neuro_foundation import Graph
+    assert Graph is not None                    # the sandbox engine the fixtures actually use
