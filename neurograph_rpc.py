@@ -945,7 +945,9 @@ def _deposit_topology_to_river(step_result) -> None:
         except Exception as exc:  # noqa: BLE001 — one bad node never breaks the step
             logger.debug("Commons topology deposit failed for %s: %s", node_id, exc)
     if deposited:
-        logger.debug("Deposited %d fired-node topologies into the Commons", deposited)
+        # INFO so the Commons feed is observable (Stage-3 verification — debug is invisible at
+        # the gateway's INFO level). Throttle-able later if noisy; for now we need to SEE the feed.
+        logger.info("Commons: deposited %d fired-node topologies", deposited)
 
 
 def _deposit_experience_to_river(text: "Optional[str]") -> None:
