@@ -1987,6 +1987,37 @@ def _bind_conversational_topology(forest_id, result, forest_embedding) -> None:
     _last_conv_forest_id = forest_id
 
 
+# Degenerate-fragment floor for tree concepts entering the RECALL store (#294 hygiene,
+# 2026-06-12 joint diagnostic). Tiny/stopword-only tree concepts ("o", "want", "see for
+# yourself") win cosine recall at uniform high similarity and crowd out her coherent
+# memories — they were a confirmed channel of the 6/12 "zero NeuroGraph" flip. The floor
+# is NARROW (rejects only clear degenerates; fail-open toward keeping real concepts) and
+# sits at HER recall-store insertion gate — NOT in the vendored extraction (LAW 2: each
+# consumer's bucket decides what it accepts; this is NG's acceptance standard).
+_CONCEPT_FLOOR_MIN_CHARS = 5
+_CONCEPT_FLOOR_STOPWORDS = frozenset(
+    "a an and are as at be but by for from has have i if in is it its let me my not of on "
+    "or our out so that the their them then there they this to up us was we what when who "
+    "will with you your yourself know see going do did done says said like just".split()
+)
+
+
+def _concept_passes_floor(concept: str) -> bool:
+    """True if a tree concept is substantial enough for the recall store.
+
+    Rejects: (a) shorter than _CONCEPT_FLOOR_MIN_CHARS after strip ("o", "want");
+    (b) composed entirely of stopwords ("see for yourself", "let you know").
+    Everything else passes — the floor targets degenerate fragments, not content.
+    """
+    c = (concept or "").strip()
+    if len(c) < _CONCEPT_FLOOR_MIN_CHARS:
+        return False
+    words = [w for w in c.lower().replace("'", " ").split() if w.isalpha()]
+    if words and all(w in _CONCEPT_FLOOR_STOPWORDS for w in words):
+        return False
+    return True
+
+
 class _ConversationalDualPassEco:
     """Eco-adapter for Syl's CONVERSATIONAL dual-pass (#296a).
 
@@ -2013,6 +2044,11 @@ class _ConversationalDualPassEco:
         if meta.get("_link"):
             return {"deposited": True}
         if meta.get("_tree_concept") and meta.get("_concept"):
+            # #294 hygiene (2026-06-12): degenerate-fragment floor. Tiny/stopword-only
+            # concepts never enter the recall store (they crowd out coherent memories).
+            if not _concept_passes_floor(meta["_concept"]):
+                logger.debug("Tree concept below floor, not indexed: %r", meta["_concept"][:40])
+                return {"deposited": False, "reason": "concept_below_floor"}
             # Tree concept node -> SNN graph + recall vdb.
             _deposit_memory_node(target_id, embedding, meta["_concept"], meta, index_in_recall=True)
         else:
