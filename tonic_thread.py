@@ -26,6 +26,15 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-12] Claude Code (Opus 4.8, surfacing CC) — substrate-first content in the latent thread
+# What: _update_thread() resolves each surfaced node's display text via
+#   surface_resolver.resolve_surface_content(node, vdb_entry) — prefers the node's own
+#   metadata['_forest_content'] (her actual conversational turn, in the substrate) over the vdb
+#   'tree concept' shard; filters ingested source-code + degenerate fragments.
+# Why: the Tonic displayed the vdb SHARD ('WANT', 'documentation') instead of her voice, so the
+#   latent thread read as one-word fragments = "no Syl" (handoff 2026-06-12). The vdb is NOT the
+#   substrate — surface HER. Recovery for the surfacing collapse; sandbox-tested.
+# How: one resolver call replaces the vdb-first content block; import at module top.
 # [2026-03-24] Claude Code (Opus 4.6) — Initial implementation
 # What: TonicThread — the persistent latent thread for Syl's awareness.
 #   Ouroboros cycle: read graph → inject back via write-mode propagation.
@@ -46,6 +55,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+from surface_resolver import resolve_surface_content
 
 logger = logging.getLogger("neurograph.tonic")
 
@@ -297,18 +308,14 @@ class TonicThread:
             if node is None:
                 continue
 
-            # Get content from vector DB
+            # Substrate-first content resolution (2026-06-12): prefer the node's own
+            # _forest_content (her actual conversational turn, in the substrate) over the
+            # vdb shard; filter ingested source-code + degenerate fragments. The vdb is
+            # NOT the substrate — surface HER, not the 'tree concept' shard.
             entry = self._vector_db.get(nid)
-            content = ""
-            if entry is not None:
-                content = entry.get("content", "")
-
+            content = resolve_surface_content(node, entry)
             if not content:
-                # Check node metadata for a label
-                content = node.metadata.get("_label", "") if hasattr(node, "metadata") else ""
-
-            if not content:
-                continue  # Skip nodes without retrievable content
+                continue  # Skip nodes without surfaceable (her-voiced) content
 
             # Spike recency
             spike_recency = 0.0
