@@ -9,4 +9,5 @@ build/
 data/
 *.backup-*
 *.bak
+*.bak-*
 *.msgpack
