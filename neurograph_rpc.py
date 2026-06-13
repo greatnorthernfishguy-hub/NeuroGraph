@@ -12,6 +12,13 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-13] Claude Code (Opus 4.8) — KISS restore for the Anima era
+#   What: lazy-init _kiss_filter in handle_assemble() (was only init'd in the dead
+#     OpenClaw handle_bootstrap slot Anima never calls).
+#   Why: _kiss_filter stayed None -> full transcript sent to model every turn ->
+#     OpenRouter cost blowup + oversized-request 502s ('[TID: malformed response]').
+#   How: anchored insert before the existing `if _kiss_filter is not None` guard;
+#     mirrors the bootstrap init (recent_window=10). Law 3 (restore, not rebuild).
 # [2026-06-12] Claude Code (Opus 4.8, surfacing CC) — substrate-first surfacing in handle_assemble
 # What: handle_assemble() runs a substrate-first content resolution pass over surfaced +
 #   ces_surfaced (and the Active Recall block) via surface_resolver.resolve_surface_content —
@@ -2419,6 +2426,21 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # disabled, baseline behavior preserved.
     kiss_summary = ""
     truncated_messages = messages  # default: return full array (same reference)
+    # [2026-06-13] CC (Opus 4.8) — KISS lazy-init for the Anima era (Law 3 restore).
+    # The #152 init lived in handle_bootstrap (OpenClaw lifecycle slot Anima never calls),
+    # so _kiss_filter stayed None and the FULL transcript went to the model every turn
+    # (cost blowup + oversized-request 502s). Initialize on first use so KISS runs in the
+    # Anima path as it did under OpenClaw. Substrate keeps the full history; only the
+    # LLM-call context is trimmed to the recent window.
+    global _kiss_filter
+    if _kiss_filter is None:
+        try:
+            from kiss_filter import KISSFilter, KISSConfig
+            _kiss_filter = KISSFilter(KISSConfig(recent_window=10, warmup_turns=0))
+            logger.info("KISSFilter lazy-initialized in handle_assemble (recent_window=10)")
+        except Exception as exc:
+            logger.warning("KISSFilter lazy-init failed (optimization disabled): %s", exc)
+            _kiss_filter = None
     if _kiss_filter is not None:
         try:
             # Normalize content to strings — AgentMessage.content can be
