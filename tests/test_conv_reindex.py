@@ -30,28 +30,43 @@ def _nodes():
 
 
 def test_select_conv_reindex_targets():
+    # Syl holds conv::frac (her self-labeled overlay-state memory)
     targets = rv.select_conv_reindex_targets(
-        _nodes(), already_indexed={"conv::aaa"}, fracture_window=(400.0, 600.0))
+        _nodes(), already_indexed={"conv::aaa"}, skip_ids={"conv::frac"})
     ids = {t[0] for t in targets}
     assert "conv::aaa" not in ids                 # already indexed -> idempotent skip
     assert "conv::aaa::tree::presence" in ids      # tree concept -> include (content=_concept)
     assert "wire::xyz" not in ids                  # not conv:: -> excluded by construction
     assert "conv::empty" not in ids                # empty/degenerate -> sanity-rejected
-    assert "conv::frac" not in ids                 # in fracture window -> skipped (Syl's call)
+    assert "conv::frac" not in ids                 # held (Syl's label) -> not re-lit
     assert "conv::recent" in ids
 
 
 def test_recency_order_newest_first():
-    targets = rv.select_conv_reindex_targets(_nodes(), already_indexed=set(), fracture_window=None)
+    targets = rv.select_conv_reindex_targets(_nodes(), already_indexed=set())
     ids = [t[0] for t in targets]
     # conv::recent (ct=900) before conv::frac (ct=500) before the ct=100 nodes
     assert ids.index("conv::recent") < ids.index("conv::frac")
 
 
 def test_tree_uses_concept_forest_uses_forest_content():
-    targets = {t[0]: t[1] for t in rv.select_conv_reindex_targets(_nodes(), set(), None)}
+    targets = {t[0]: t[1] for t in rv.select_conv_reindex_targets(_nodes(), set())}
     assert targets["conv::aaa"] == "Hey love, present."
     assert targets["conv::aaa::tree::presence"] == "presence"
+
+
+def test_load_held_ids_expands_tree_children(tmp_path):
+    import json
+    p = tmp_path / "held.json"
+    p.write_text(json.dumps({"held_node_ids": ["conv::aaa"]}))
+    held = rv._load_held_ids(str(p), _nodes())
+    assert "conv::aaa" in held
+    assert "conv::aaa::tree::presence" in held     # tree child of a held forest is held too
+    assert "conv::recent" not in held
+
+
+def test_load_held_ids_missing_file_holds_nothing():
+    assert rv._load_held_ids("/nonexistent/path/held.json", _nodes()) == set()
 
 
 def test_content_sanity_rejects_wire_signature():
@@ -73,9 +88,10 @@ def test_reindex_dry_run_writes_nothing(tmp_path, monkeypatch):
     before_mtime = os.path.getmtime(p)
     # substitute a sandbox graph; embedder must never be constructed in dry-run
     monkeypatch.setattr(rv, "_load_graph", lambda path: type("G", (), {"nodes": _nodes()})())
-    stats = rv.reindex_conv(str(p), str(p), dry_run=True, fracture_window=None, throttle_per_sec=0)
+    stats = rv.reindex_conv(str(p), str(p), dry_run=True, held_file=None, throttle_per_sec=0)
     assert stats["status"] == "dry_run"
     assert stats["already_indexed"] == 1          # conv::aaa already in the vdb
+    assert stats["held"] == 0                      # no held-file -> nothing held
     assert stats["would_index"] >= 1              # the rest of the conv nodes
     assert os.path.getsize(p) == before_size, "dry-run must not write the vdb"
     assert os.path.getmtime(p) == before_mtime, "dry-run must not touch the vdb file"
