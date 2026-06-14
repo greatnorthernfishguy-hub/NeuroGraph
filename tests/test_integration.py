@@ -129,7 +129,7 @@ class TestSerialization:
         g.stimulate("A", 1.5)
         g.step()
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:  # #325: topology is msgpack-only
             path = f.name
 
         try:
@@ -189,13 +189,14 @@ class TestSerialization:
         g.create_node("B")
         g.step()
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:  # #325: topology is msgpack-only
             path = f.name
 
         try:
             g.checkpoint(path, CheckpointMode.INCREMENTAL)
-            with open(path) as f:
-                data = json.load(f)
+            import msgpack as _mp
+            with open(path, "rb") as f:
+                data = _mp.unpack(f, raw=False)
             assert data.get("incremental") is True
             # Dirty nodes should be in the checkpoint
             assert "A" in data["nodes"]

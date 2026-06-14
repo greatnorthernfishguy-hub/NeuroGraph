@@ -641,7 +641,7 @@ class TestPhase2Serialization:
             {he.hyperedge_id, he2.hyperedge_id},
         )
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:  # #325: topology is msgpack-only
             path = f.name
 
         import os

@@ -19,6 +19,18 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-06-14] Claude Code (Opus 4.8) — #325 checkpoint() enforces msgpack (kills lossy-JSON path)
+#   What: Graph.checkpoint() now RAISES on any non-.msgpack path instead of silently writing
+#         lossy JSON (json.dump default=str). restore() WARNS (RuntimeWarning) on a non-.msgpack
+#         path but still reads it, for one-time migration of legacy state. The .msgpack write/read
+#         paths are byte-identical to before.
+#   Why:  Format was inferred from the file extension; a consumer hardcoding a .json path (e.g.
+#         Morph's ng_substrate.py -> ng_lite_state.json) got FULL-mode topology persisted as JSON,
+#         which stringifies numpy/bytes/float32 to non-round-trippable reprs (silent corruption).
+#         All CheckpointMode values are full-fidelity, so JSON has no place on this path (Josh:
+#         "a bomb with no upside" — FULL becomes an enforcer, not a toggle). Syl is unaffected
+#         (she persists .msgpack). See punchlist #325.
+#   How:  Replace the else-JSON write with a loud ValueError; restore else-branch warns then reads.
 # [2026-05-26] Claude Opus 4.7 (1M ctx) — #258 Orphan-node grace period
 #   What: Added orphan_node_grace_period config (default 25 steps); added
 #         creation_time field to Node dataclass; create_node() now stamps
@@ -4034,14 +4046,22 @@ class Graph:
         else:
             raise ValueError(f"Unknown checkpoint mode: {mode}")
 
-        if path.endswith(".msgpack"):
-            if msgpack is None:
-                raise ImportError("msgpack required for .msgpack serialization")
-            with open(path, "wb") as f:
-                msgpack.pack(data, f, use_bin_type=True)
-        else:
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2, default=str)
+        # #325 — topology persistence is msgpack-ONLY. JSON is LOSSY here: json.dump(default=str)
+        # stringifies numpy/bytes/float32 fields (pred_weights, delay buffers, etc.) into reprs
+        # that cannot round-trip. All CheckpointMode values (FULL/INCREMENTAL/FORK) serialize
+        # full-fidelity SNN state, so the format is enforced by intent — NOT inferred from a file
+        # extension. A non-.msgpack path is refused LOUDLY at the source rather than silently
+        # corrupting state. (Was: else-branch silently wrote lossy JSON for any non-.msgpack path.)
+        if not path.endswith(".msgpack"):
+            raise ValueError(
+                f"Topology checkpoint requires a '.msgpack' path; got {path!r}. JSON serialization "
+                f"is lossy for full-fidelity SNN state and is not supported "
+                f"(CheckpointMode.{mode.name} enforces msgpack). See punchlist #325."
+            )
+        if msgpack is None:
+            raise ImportError("msgpack required for topology serialization")
+        with open(path, "wb") as f:
+            msgpack.pack(data, f, use_bin_type=True)
 
     def restore(self, path: str) -> None:
         """Load state from checkpoint (PRD §8 restore, §6)."""
@@ -4051,6 +4071,15 @@ class Graph:
             with open(path, "rb") as f:
                 data = msgpack.unpack(f, raw=False)
         else:
+            # #325 — legacy LOSSY JSON topology (pre-enforcer). Tolerated for ONE-TIME migration
+            # only; this state was already degraded at write time (json.dump default=str).
+            # Re-checkpoint to .msgpack immediately. Loud warn so it never passes silently.
+            import warnings
+            warnings.warn(
+                f"Restoring topology from non-'.msgpack' path {path!r}: legacy lossy-JSON state "
+                f"(pre-#325). Re-checkpoint to .msgpack to stop the loss.",
+                RuntimeWarning, stacklevel=2,
+            )
             with open(path, "r") as f:
                 data = json.load(f)
 
