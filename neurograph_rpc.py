@@ -840,40 +840,164 @@ def _tune_he_overlap_threshold() -> None:
     _he_count_at_window_start = current_he_count
 
 
+class _SubstrateMetricsGate:
+    """Salience-gated substrate-metrics deposit into the Commons (the metrics pipeline).
+
+    # ---- Changelog ----
+    # [2026-06-14] Claude Code (Fable 5) — Substrate Metrics Pipeline Part 1a (salience gate)
+    # What: Deposit substrate metrics into the Commons SALIENCE-GATED: deposit GRANULAR on the
+    #       substrate's OWN surprise/anomaly; summarize NOMINAL spans (aggregate counts, never
+    #       blind); run-length consecutive identical anomalies. Bounded at the SOURCE — no
+    #       per-step flood (OOM's First Law: don't overfill the container).
+    # Why: Metrics are substrate concern with many consumers (Bunyan logs, THC/Immunis health,
+    #       QG/Darwin novelty/evolution) — design prd/substrate-metrics-pipeline-design.md (#320).
+    #       LAW 7 (Josh-cleared): metrics are telemetry, gated by the substrate's OWN surprise,
+    #       not an imposed classification; the raw experience path stays raw.
+    # How: surprise = surprised/(confirmed+surprised); >= SURPRISE_THRESHOLD ⇒ anomalous. Nominal
+    #       steps accumulate into a span aggregate, flushed every NOMINAL_FLUSH_EVERY steps or when
+    #       broken by an anomaly. Repeated identical anomalies run-length into one summary. Deposits
+    #       via commons.deposit (embedding addresses the metric-kind; raw scalars in metadata).
+    #       Part 1a = STATIC threshold; Part 1b graduates it via the competence model (TuningSocket).
+    # Note: long-term synapse accumulation on the ~3 metric-kind nodes is slow (gated rate) and is a
+    #       separate Commons-lifecycle/prune concern — NOT the per-step flood this prevents.
+    # -------------------
+    """
+
+    SURPRISE_THRESHOLD = 0.50   # surprised/(confirmed+surprised) >= this ⇒ anomalous (1b graduates)
+    NOMINAL_FLUSH_EVERY = 60    # flush a nominal-span summary at least this often (~2 min at 2s/step)
+    _AGG_FIELDS = ("fired_nodes", "fired_hyperedges", "synapses_pruned",
+                   "synapses_sprouted", "predictions_confirmed", "predictions_surprised")
+
+    def __init__(self):
+        self._nominal_count = 0
+        self._nominal_agg = {}
+        self._run_sig = None
+        self._run_count = 0
+
+    def observe(self, metrics: "Dict[str, Any]") -> None:
+        try:
+            from commons import get_commons
+            commons = get_commons()
+        except Exception as exc:  # noqa: BLE001 — no Commons (early boot) is graceful
+            logger.debug("Commons unavailable for metrics gate: %s", exc)
+            return
+        if commons is None:
+            return
+        try:
+            confirmed = metrics.get("predictions_confirmed", 0)
+            surprised = metrics.get("predictions_surprised", 0)
+            total = confirmed + surprised
+            surprise = (surprised / total) if total else 0.0
+            if surprise >= self.SURPRISE_THRESHOLD:
+                self._on_anomaly(commons, metrics, surprise)
+            else:
+                self._on_nominal(commons, metrics)
+        except Exception as exc:  # noqa: BLE001 — the gate never breaks the step
+            logger.debug("Metrics gate failed: %s", exc)
+
+    def _on_anomaly(self, commons, metrics, surprise):
+        self._flush_nominal(commons)               # summarize the nominal span that preceded it
+        sig = (round(surprise, 1),
+               metrics.get("synapses_pruned", 0) > 0,
+               metrics.get("synapses_sprouted", 0) > 0)
+        if sig == self._run_sig:
+            self._run_count += 1                   # repeat — accumulate, deposit run summary when broken
+            return
+        self._flush_run(commons)                   # a different anomaly — close the prior run
+        self._run_sig, self._run_count = sig, 1
+        self._deposit(commons, "anomaly", {
+            "kind": "metrics", "metric_kind": "substrate_anomaly", "salience": "anomaly",
+            "surprise": round(surprise, 3), **{k: metrics.get(k, 0) for k in self._AGG_FIELDS},
+            "total_nodes": metrics.get("total_nodes", 0),
+        })
+
+    def _on_nominal(self, commons, metrics):
+        self._flush_run(commons)                   # an anomaly run just ended → summarize it
+        self._nominal_count += 1
+        for k in self._AGG_FIELDS:
+            self._nominal_agg[k] = self._nominal_agg.get(k, 0) + metrics.get(k, 0)
+        if self._nominal_count >= self.NOMINAL_FLUSH_EVERY:
+            self._flush_nominal(commons)
+
+    def _flush_nominal(self, commons):
+        if self._nominal_count <= 0:
+            return
+        self._deposit(commons, "nominal", {
+            "kind": "metrics", "metric_kind": "substrate_nominal_span", "salience": "nominal",
+            "span_steps": self._nominal_count, "aggregate": dict(self._nominal_agg),
+        })
+        self._nominal_count, self._nominal_agg = 0, {}
+
+    def _flush_run(self, commons):
+        if self._run_count > 1:                    # the anomaly repeated → one run-length summary
+            self._deposit(commons, "anomaly_run", {
+                "kind": "metrics", "metric_kind": "substrate_anomaly_run", "salience": "anomaly_run",
+                "signature": str(self._run_sig), "repeats": self._run_count,
+            })
+        self._run_sig, self._run_count = None, 0
+
+    def _deposit(self, commons, kind, metadata):
+        try:
+            import time as _t, hashlib
+            from ng_embed import embed
+            label = f"substrate metrics: {metadata.get('metric_kind', kind)}"
+            emb = embed(label)                     # embedding addresses the metric KIND (semantic + recency bucketable)
+            if emb is None:
+                return
+            ts = _t.time()
+            tid = f"metrics:neurograph:{kind}:{hashlib.sha1(repr(metadata).encode()).hexdigest()[:8]}:{ts:.3f}"
+            commons.deposit(emb, tid, metadata=metadata)
+            logger.info("Commons: deposited metrics (%s)", kind)
+        except Exception as exc:  # noqa: BLE001 — a deposit failure never breaks the step
+            logger.debug("Metrics Commons deposit failed: %s", exc)
+
+
+_metrics_gate = _SubstrateMetricsGate()
+
+
 def _deposit_substrate_metrics(step_result) -> None:
-    """Write compact scalar substrate metrics to neurograph.jsonl (Darwin Recorder).
+    """Write compact scalar substrate metrics to neurograph.jsonl (Darwin Recorder) AND
+    salience-gate them into the Commons (the substrate metrics pipeline).
 
     # [2026-04-10] Claude (Sonnet 4.6) — Substrate metrics for Darwin discovery
     #   What: Append 8 scalar counts from StepResult to neurograph.jsonl each turn.
     #   Why:  Darwin Recorder needs numeric fields; without them Discovery._observed_params
     #         stays empty and Mutator proposes 0 mutations.
+    # [2026-06-14] Claude Code (Fable 5) — also salience-gate into the Commons (#320 Part 1a)
+    #   What: After the jsonl write (kept — Darwin still reads it; retired later, design Part 3),
+    #         feed the same metrics to _metrics_gate.observe() → salience-gated Commons deposit.
+    #   Why: Metrics belong in the Commons (substrate concern, many consumers). Additive + fail-soft.
     """
     if _memory is None:
         return
-    # Compact scalar metrics for Darwin's Recorder.
-    # No embedding, no IDs — just counts the substrate produced this step.
+    # Compact scalar metrics the substrate produced this step. No embedding, no IDs — raw counts.
+    import time as _time
+    _metrics = {
+        "timestamp": _time.time(),
+        "module_id": "neurograph",
+        "type": "substrate_step",
+        "fired_nodes": len(step_result.fired_node_ids),
+        "fired_hyperedges": len(step_result.fired_hyperedge_ids),
+        "synapses_pruned": step_result.synapses_pruned,
+        "synapses_sprouted": step_result.synapses_sprouted,
+        "predictions_confirmed": step_result.predictions_confirmed,
+        "predictions_surprised": step_result.predictions_surprised,
+        "total_nodes": len(_memory.graph.nodes),
+        "total_synapses": len(_memory.graph.synapses),
+    }
+    # Sink 1: neurograph.jsonl (Darwin's Recorder — kept until design Part 3 retires it).
     try:
-        import json as _json, time as _time, os as _os
+        import json as _json, os as _os
         from pathlib import Path as _Path
         _shared = _Path(_os.path.expanduser("~/.et_modules/shared_learning"))
         _shared.mkdir(parents=True, exist_ok=True)
-        _metrics = {
-            "timestamp": _time.time(),
-            "module_id": "neurograph",
-            "type": "substrate_step",
-            "fired_nodes": len(step_result.fired_node_ids),
-            "fired_hyperedges": len(step_result.fired_hyperedge_ids),
-            "synapses_pruned": step_result.synapses_pruned,
-            "synapses_sprouted": step_result.synapses_sprouted,
-            "predictions_confirmed": step_result.predictions_confirmed,
-            "predictions_surprised": step_result.predictions_surprised,
-            "total_nodes": len(_memory.graph.nodes),
-            "total_synapses": len(_memory.graph.synapses),
-        }
         with open(_shared / "neurograph.jsonl", "a") as _f:
             _f.write(_json.dumps(_metrics) + "\n")
     except Exception:
         pass
+    # Sink 2: salience-gated Commons deposit (#320 Part 1a). Independently guarded — a jsonl
+    # failure must not skip the Commons, nor vice-versa. The gate itself is fail-soft.
+    _metrics_gate.observe(_metrics)
 
 
 _COMMONS_TOPOLOGY_FANOUT_CAP = 32  # max fired nodes deposited per step (flood-backstop, OOM lesson)
