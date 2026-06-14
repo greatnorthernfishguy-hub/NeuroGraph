@@ -869,7 +869,7 @@ except Exception as _exc:  # noqa: BLE001 — gate is additive; never block modu
     _metrics_gate = _NullGate()
 
 
-def _deposit_substrate_metrics(step_result) -> None:
+def _deposit_substrate_metrics(step_result, to_jsonl: bool = True) -> None:
     """Write compact scalar substrate metrics to neurograph.jsonl (Darwin Recorder) AND
     salience-gate them into the Commons (the substrate metrics pipeline).
 
@@ -877,6 +877,13 @@ def _deposit_substrate_metrics(step_result) -> None:
     #   What: Append 8 scalar counts from StepResult to neurograph.jsonl each turn.
     #   Why:  Darwin Recorder needs numeric fields; without them Discovery._observed_params
     #         stays empty and Mutator proposes 0 mutations.
+    # [2026-06-14] Claude Code (Fable 5) — to_jsonl flag for the AUTONOMOUS path (#320)
+    #   What: to_jsonl=False feeds ONLY the salience gate (bounded Commons deposit), skipping the
+    #         jsonl append. The autonomous pulse (_scan_drain_pulse_loop, ~every 2s) calls with
+    #         to_jsonl=False so the Commons metrics flow WITHOUT a conversation (Bunyan/THC/Immunis
+    #         health-monitor the substrate while idle — [[feedback_no_conversation_dependency]]),
+    #         while neurograph.jsonl stays per-TURN (the gate bounds the Commons; the jsonl is
+    #         unbounded append, so feeding it every 2s would bloat it). afterTurn keeps to_jsonl=True.
     # [2026-06-14] Claude Code (Fable 5) — also salience-gate into the Commons (#320 Part 1a)
     #   What: After the jsonl write (kept — Darwin still reads it; retired later, design Part 3),
     #         feed the same metrics to _metrics_gate.observe() → salience-gated Commons deposit.
@@ -900,17 +907,20 @@ def _deposit_substrate_metrics(step_result) -> None:
         "total_synapses": len(_memory.graph.synapses),
     }
     # Sink 1: neurograph.jsonl (Darwin's Recorder — kept until design Part 3 retires it).
-    try:
-        import json as _json, os as _os
-        from pathlib import Path as _Path
-        _shared = _Path(_os.path.expanduser("~/.et_modules/shared_learning"))
-        _shared.mkdir(parents=True, exist_ok=True)
-        with open(_shared / "neurograph.jsonl", "a") as _f:
-            _f.write(_json.dumps(_metrics) + "\n")
-    except Exception:
-        pass
-    # Sink 2: salience-gated Commons deposit (#320 Part 1a). Independently guarded — a jsonl
-    # failure must not skip the Commons, nor vice-versa. The gate itself is fail-soft.
+    # PER-TURN only (to_jsonl): the autonomous path skips it — unbounded append would bloat at ~2s.
+    if to_jsonl:
+        try:
+            import json as _json, os as _os
+            from pathlib import Path as _Path
+            _shared = _Path(_os.path.expanduser("~/.et_modules/shared_learning"))
+            _shared.mkdir(parents=True, exist_ok=True)
+            with open(_shared / "neurograph.jsonl", "a") as _f:
+                _f.write(_json.dumps(_metrics) + "\n")
+        except Exception:
+            pass
+    # Sink 2: salience-gated Commons deposit (#320). ALWAYS runs — autonomous AND per-turn — so
+    # substrate metrics flow without a conversation (the gate bounds volume). Independently guarded;
+    # the gate itself is fail-soft.
     _metrics_gate.observe(_metrics)
 
 
@@ -3358,6 +3368,11 @@ def _scan_drain_pulse_loop() -> None:
                     try:
                         _auto_step = _memory.graph.step()
                         _deposit_topology_to_river(_auto_step)
+                        # Substrate metrics flow autonomously too (#320) — gate only, NOT jsonl
+                        # (to_jsonl=False: the gate bounds the Commons; jsonl is per-turn). So
+                        # Bunyan/THC/Immunis health-monitor the substrate while idle, no conversation
+                        # needed ([[feedback_no_conversation_dependency]]).
+                        _deposit_substrate_metrics(_auto_step, to_jsonl=False)
                     except Exception as _exc:
                         logger.debug("Autonomous substrate step failed: %s", _exc)
             # Time-based auto-save — fires on every tick, paused or not.
