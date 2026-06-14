@@ -108,7 +108,8 @@ class Commons:
         self,
         limit: int = 50,
         since: float = 0.0,
-    ) -> List[Tuple[str, float, str]]:
+        with_metadata: bool = False,
+    ) -> List[Tuple]:
         """Recency bucket — recently-deposited targets, newest first.
 
         # ---- Changelog ----
@@ -127,9 +128,20 @@ class Commons:
 
         Returns (target_id, weight, reasoning) tuples — same shape as bucket(), so consumers'
         extraction loops are unchanged. Same medium, a differently-shaped scoop.
+
+        # ---- Changelog ----
+        # [2026-06-14] Claude Code (Fable 5) — Commons Track-2 (1b): opt-in with_metadata
+        # What: with_metadata=False (default) → unchanged 3-tuple (target_id, weight, reasoning).
+        #       with_metadata=True → 4-tuple appending the deposit's raw metadata dict, so a
+        #       consumer can read the RAW content it bucketed (e.g. experience user_text/
+        #       assistant_text) instead of an opaque target_id like "experience:<hash>".
+        # Why: An opaque id is useless to a LOGGER. The raw deposit metadata lives at
+        #       synapse.metadata["last_context"] (ng_lite:777) — already stored, just surface it.
+        #       Opt-in keeps the topology path + all existing 3-tuple callers/tests untouched.
+        # -------------------
         """
         seen: set = set()
-        out: List[Tuple[str, float, str]] = []
+        out: List[Tuple] = []
         for syn in sorted(self._ng.synapses.values(),
                           key=lambda s: getattr(s, "last_updated", 0.0), reverse=True):
             ts = getattr(syn, "last_updated", 0.0)
@@ -139,7 +151,11 @@ class Commons:
             if not tid or tid in seen:
                 continue
             seen.add(tid)
-            out.append((tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}"))
+            if with_metadata:
+                meta = getattr(syn, "metadata", {}).get("last_context", {})
+                out.append((tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}", meta))
+            else:
+                out.append((tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}"))
             if len(out) >= limit:
                 break
         return out
