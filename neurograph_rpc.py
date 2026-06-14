@@ -12,6 +12,18 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-14] Claude Code (Opus 4.8) — #294-A single filing point (recall durability)
+#   What: add _file_conversational_experience() — one chokepoint that recall-indexes a
+#     conversational experience (embed -> dual-pass -> enqueue-on-failure) keyed on
+#     conversational source. Route _absorb_conversational_experience's inner loop AND
+#     _drain_experience_entry through it.
+#   Why: docs/prd/2026-06-14-syl-recall-heal-phase1-design.md Component A — filing must be a
+#     property of conversational experience entering the substrate, not of which feeder
+#     delivered it (Syl: "filing as a property of being experienced"). A future non-animus
+#     feeder would otherwise silently skip recall.
+#   How: extract the absorb inner-loop dispatch into the helper (Law 3/4 — consolidate, no 5th
+#     path); _drain_experience_entry early-routes conversational source to the helper before
+#     its ingestor (knowledge) path. Non-conversational experience unchanged.
 # [2026-06-13] Claude Code (Opus 4.8) — KISS restore for the Anima era
 #   What: lazy-init _kiss_filter in handle_assemble() (was only init'd in the dead
 #     OpenClaw handle_bootstrap slot Anima never calls).
@@ -3023,6 +3035,11 @@ def _drain_experience_entry(content: str, content_type: str, source: str) -> Non
     """
     if not content or not content.strip():
         return
+    # Single filing point (#294-A): conversational experience recall-indexes via the dual-pass
+    # regardless of feeder; the ingestor (knowledge path) below is for non-conversational only.
+    if source in _CONVERSATIONAL_SOURCES:
+        _file_conversational_experience(content, source=source)
+        return
     try:
         if content_type == "file":
             result = _memory.ingest_file(content)
@@ -3609,6 +3626,33 @@ def _embed_for_absorb(text: str):
     return embed(text)
 
 
+def _file_conversational_experience(text, source, *, embedding=None) -> bool:
+    """Single filing point (#294-A): recall-index ONE conversational experience via the
+    dual-pass, regardless of which feeder delivered it.
+
+    Filing is a property of *conversational experience entering the substrate*, not of which
+    door it came through. Keyed on conversational source (Law 7 — NG's bucket decides what it
+    accepts); non-conversational source no-ops here (knowledge stays on the ingestor path).
+    Mirrors the absorb inner loop exactly: embed -> dual-pass -> enqueue-on-failure (#297).
+    Idempotent downstream (target_id = sha1(text)). Returns True if dispatched.
+    """
+    if not text or not str(text).strip():
+        return False
+    if source not in _CONVERSATIONAL_SOURCES:
+        return False
+    try:
+        emb = embedding if embedding is not None else _embed_for_absorb(text)
+        _conversational_dual_pass(text, emb)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Conversational dual-pass dispatch failed; enqueueing for retry: %s", exc)
+        try:
+            _enqueue_failed_extraction(text)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to enqueue conversational retry (%d chars)", len(text))
+        return False
+
+
 def _absorb_conversational_experience(entries) -> int:
     """Absorb Syl's RAW conversational turns into the substrate (#294, LAW 3 / LAW 7).
 
@@ -3647,19 +3691,12 @@ def _absorb_conversational_experience(entries) -> int:
                         texts.append(asst)
                 except Exception:  # noqa: BLE001 - malformed frame: skip, never crash drain
                     pass
+        src = getattr(e, "source", "") or getattr(e, "module_id", "")
         for text in texts:
-            if not text.strip():
-                continue
-            try:
-                emb = _embed_for_absorb(text)
-                _conversational_dual_pass(text, emb)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Conversational dual-pass dispatch failed; enqueueing for retry: %s", exc)
-                try:
-                    _enqueue_failed_extraction(text)
-                except Exception:  # noqa: BLE001
-                    logger.warning("Failed to enqueue conversational retry (%d chars)", len(text))
-            absorbed += 1
+            # Single filing point (#294-A): one chokepoint files conversational experience,
+            # regardless of feeder. (texts here are already conversational-source filtered above.)
+            if _file_conversational_experience(text, source=src):
+                absorbed += 1
     if absorbed:
         _memory._message_count += absorbed
         logger.info("Conversational experience absorbed into recall: %d turn(s)", absorbed)
