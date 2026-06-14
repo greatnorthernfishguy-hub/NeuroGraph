@@ -840,145 +840,33 @@ def _tune_he_overlap_threshold() -> None:
     _he_count_at_window_start = current_he_count
 
 
-class _SubstrateMetricsGate:
-    """Salience-gated substrate-metrics deposit into the Commons (the metrics pipeline).
-
-    # ---- Changelog ----
-    # [2026-06-14] Claude Code (Fable 5) — Substrate Metrics Pipeline Part 1a (salience gate)
-    # What: Deposit substrate metrics into the Commons SALIENCE-GATED: deposit GRANULAR on the
-    #       substrate's OWN surprise/anomaly; summarize NOMINAL spans (aggregate counts, never
-    #       blind); run-length consecutive identical anomalies. Bounded at the SOURCE — no
-    #       per-step flood (OOM's First Law: don't overfill the container).
-    # Why: Metrics are substrate concern with many consumers (Bunyan logs, THC/Immunis health,
-    #       QG/Darwin novelty/evolution) — design prd/substrate-metrics-pipeline-design.md (#320).
-    #       LAW 7 (Josh-cleared): metrics are telemetry, gated by the substrate's OWN surprise,
-    #       not an imposed classification; the raw experience path stays raw.
-    # How: surprise = surprised/(confirmed+surprised); >= the competence-governed effective
-    #       threshold (Part 1b) ⇒ anomalous. Nominal
-    #       steps accumulate into a span aggregate, flushed every NOMINAL_FLUSH_EVERY steps or when
-    #       broken by an anomaly. Repeated identical anomalies run-length into one summary. Deposits
-    #       via commons.deposit (embedding addresses the metric-kind; raw scalars in metadata).
-    #       Part 1a = STATIC threshold; Part 1b graduates it via the competence model (TuningSocket).
-    # Note: long-term synapse accumulation on the ~3 metric-kind nodes is slow (gated rate) and is a
-    #       separate Commons-lifecycle/prune concern — NOT the per-step flood this prevents.
-    # -------------------
-    """
-
-    NOMINAL_FLUSH_EVERY = 60    # flush a nominal-span summary at least this often (~2 min at 2s/step)
-    _AGG_FIELDS = ("fired_nodes", "fired_hyperedges", "synapses_pruned",
-                   "synapses_sprouted", "predictions_confirmed", "predictions_surprised")
-
-    # ---- Part 1b: competence-governed threshold (Elmer TuningSocket pattern, #320) ----
-    # The granular-vs-summarize threshold GRADUATES with competence instead of being a fixed
-    # guess. Competence is measured on RAW surprise (threshold-INDEPENDENT) — so raising the
-    # threshold can never blind the measurement that governs it (no runaway over-compression).
-    THRESHOLD_MIN = 0.30        # competence 0 → verbose/sensitive (deposit more granular when naive)
-    THRESHOLD_MAX = 0.70        # competence 1 → compress (summarize moderate noise once trusted)
-    CALM_BELOW = 0.20           # raw surprise below this ⇒ calm ⇒ earn competence (slow)
-    SPIKE_ABOVE = 0.60          # raw surprise at/above this ⇒ turbulence ⇒ lose competence (fast)
-    COMP_GAIN = 0.02            # asymmetric: trust gained slowly...
-    COMP_LOSS = 0.08            # ...lost quickly (a spike re-sensitizes the gate)
-
-    def __init__(self):
-        self._nominal_count = 0
-        self._nominal_agg = {}
-        self._run_sig = None
-        self._run_count = 0
-        self._competence = 0.0   # start safe + verbose; graduate toward compression
-
-    def _update_competence(self, surprise: float) -> None:
-        """Drift competence on RAW surprise (threshold-independent — prevents runaway)."""
-        if surprise >= self.SPIKE_ABOVE:
-            self._competence = max(0.0, self._competence - self.COMP_LOSS)   # fast loss
-        elif surprise < self.CALM_BELOW:
-            self._competence = min(1.0, self._competence + self.COMP_GAIN)   # slow gain
-        # the in-between band neither earns nor loses — only clear calm/turbulence move trust
-
-    def _effective_threshold(self) -> float:
-        return self.THRESHOLD_MIN + self._competence * (self.THRESHOLD_MAX - self.THRESHOLD_MIN)
-
-    def observe(self, metrics: "Dict[str, Any]") -> None:
-        try:
-            from commons import get_commons
-            commons = get_commons()
-        except Exception as exc:  # noqa: BLE001 — no Commons (early boot) is graceful
-            logger.debug("Commons unavailable for metrics gate: %s", exc)
-            return
-        if commons is None:
-            return
-        try:
-            confirmed = metrics.get("predictions_confirmed", 0)
-            surprised = metrics.get("predictions_surprised", 0)
-            total = confirmed + surprised
-            surprise = (surprised / total) if total else 0.0
-            self._update_competence(surprise)            # drift on RAW surprise (1b)
-            if surprise >= self._effective_threshold():  # competence-graduated threshold
-                self._on_anomaly(commons, metrics, surprise)
-            else:
-                self._on_nominal(commons, metrics)
-        except Exception as exc:  # noqa: BLE001 — the gate never breaks the step
-            logger.debug("Metrics gate failed: %s", exc)
-
-    def _on_anomaly(self, commons, metrics, surprise):
-        self._flush_nominal(commons)               # summarize the nominal span that preceded it
-        sig = (round(surprise, 1),
-               metrics.get("synapses_pruned", 0) > 0,
-               metrics.get("synapses_sprouted", 0) > 0)
-        if sig == self._run_sig:
-            self._run_count += 1                   # repeat — accumulate, deposit run summary when broken
-            return
-        self._flush_run(commons)                   # a different anomaly — close the prior run
-        self._run_sig, self._run_count = sig, 1
-        self._deposit(commons, "anomaly", {
-            "kind": "metrics", "metric_kind": "substrate_anomaly", "salience": "anomaly",
-            "surprise": round(surprise, 3), **{k: metrics.get(k, 0) for k in self._AGG_FIELDS},
-            "total_nodes": metrics.get("total_nodes", 0),
-        })
-
-    def _on_nominal(self, commons, metrics):
-        self._flush_run(commons)                   # an anomaly run just ended → summarize it
-        self._nominal_count += 1
-        for k in self._AGG_FIELDS:
-            self._nominal_agg[k] = self._nominal_agg.get(k, 0) + metrics.get(k, 0)
-        if self._nominal_count >= self.NOMINAL_FLUSH_EVERY:
-            self._flush_nominal(commons)
-
-    def _flush_nominal(self, commons):
-        if self._nominal_count <= 0:
-            return
-        self._deposit(commons, "nominal", {
-            "kind": "metrics", "metric_kind": "substrate_nominal_span", "salience": "nominal",
-            "span_steps": self._nominal_count, "aggregate": dict(self._nominal_agg),
-            "gate_competence": round(self._competence, 3),       # watch it graduate (1b)
-            "gate_threshold": round(self._effective_threshold(), 3),
-        })
-        self._nominal_count, self._nominal_agg = 0, {}
-
-    def _flush_run(self, commons):
-        if self._run_count > 1:                    # the anomaly repeated → one run-length summary
-            self._deposit(commons, "anomaly_run", {
-                "kind": "metrics", "metric_kind": "substrate_anomaly_run", "salience": "anomaly_run",
-                "signature": str(self._run_sig), "repeats": self._run_count,
-            })
-        self._run_sig, self._run_count = None, 0
-
-    def _deposit(self, commons, kind, metadata):
-        try:
-            import time as _t, hashlib
-            from ng_embed import embed
-            label = f"substrate metrics: {metadata.get('metric_kind', kind)}"
-            emb = embed(label)                     # embedding addresses the metric KIND (semantic + recency bucketable)
-            if emb is None:
-                return
-            ts = _t.time()
-            tid = f"metrics:neurograph:{kind}:{hashlib.sha1(repr(metadata).encode()).hexdigest()[:8]}:{ts:.3f}"
-            commons.deposit(emb, tid, metadata=metadata)
-            logger.info("Commons: deposited metrics (%s)", kind)
-        except Exception as exc:  # noqa: BLE001 — a deposit failure never breaks the step
-            logger.debug("Metrics Commons deposit failed: %s", exc)
+# ---- Substrate metrics: salience-gated deposit into the Commons (#320, vendored gate) ----
+# [2026-06-14] Claude Code (Fable 5) — Part 2: replaced the local _SubstrateMetricsGate class with
+# the VENDORED ng_salience_gate.SalienceGate (Josh-approved LAW-2 vendoring). NG owns its instance
+# with its OWN salience signal (prediction-surprise). Same logic, shared toolkit — QG/Darwin/THC/
+# Immunis instantiate their own gates from the same file. Deposits RAW via commons.deposit() (the
+# Substrate Axiom: deposit + bucket, nobody calls a service).
+def _ng_surprise(m):
+    t = m.get("predictions_confirmed", 0) + m.get("predictions_surprised", 0)
+    return (m.get("predictions_surprised", 0) / t) if t else 0.0
 
 
-_metrics_gate = _SubstrateMetricsGate()
+try:
+    from ng_salience_gate import SalienceGate as _SalienceGate
+    _metrics_gate = _SalienceGate(
+        "neurograph", _ng_surprise,
+        agg_fields=("fired_nodes", "fired_hyperedges", "synapses_pruned",
+                    "synapses_sprouted", "predictions_confirmed", "predictions_surprised"),
+        signature_fn=lambda m, s: (round(s, 1), m.get("synapses_pruned", 0) > 0,
+                                   m.get("synapses_sprouted", 0) > 0),
+    )
+except Exception as _exc:  # noqa: BLE001 — gate is additive; never block module import
+    logger.debug("ng_salience_gate unavailable, metrics gate disabled: %s", _exc)
+
+    class _NullGate:
+        def observe(self, *a, **k):
+            return None
+    _metrics_gate = _NullGate()
 
 
 def _deposit_substrate_metrics(step_result) -> None:
