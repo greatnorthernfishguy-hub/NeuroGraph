@@ -918,15 +918,61 @@ def _deposit_topology_to_river(step_result) -> None:
         logger.info("Commons: deposited %d fired-node topologies", deposited)
 
 
-def _deposit_experience_to_river(text: "Optional[str]") -> None:
-    """Deposit raw conversation text to every registered module's inbound tract.
+def _deposit_experience_to_river(
+    user_text: "Optional[str]", assistant_text: "Optional[str]" = None,
+) -> None:
+    """Deposit raw conversation experience (the full turn) into the Commons.
 
-    EMERGENCY THROTTLE 2026-06-07 — disabled (same reason as
-    _deposit_topology_to_river above). NG addressed-fan-out is substrate-bypass
-    under the pool/water reframe. Commons Pool restoration will replace this
-    with medium-propagation.
+    # ---- Changelog ----
+    # [2026-06-14] Claude Code (Fable 5) — Commons Track-2: retire the experience throttle
+    # What: Fill the throttled body. Deposit the RAW full turn (user + Syl's response, both
+    #       halves preserved, UNCLASSIFIED) into the one shared Commons, like the Stage-3
+    #       topology deposit. Replaces the old addressed N-peer fan-out with medium-propagation.
+    # Why: Substrate axiom + LAW 7 — deposit raw, classify at the bucket. "Experience" is not
+    #       pre-shaped for any one consumer: Bunyan buckets it to LOG the turn, TID for routing
+    #       signal, TrollGuard for threat, etc. — each module's bucket extracts its own view of
+    #       the SAME raw deposit (Josh, 2026-06-14: "different modules, different needs"). Both
+    #       halves are carried raw so no consumer's need is baked in at deposit time.
+    # How: combine user+assistant for the embedding (the turn's semantics); target_id
+    #       "experience:<hash>"; metadata carries user_text + assistant_text RAW. get_commons()
+    #       + commons.deposit (reused). Per-turn only (experience IS conversational; the
+    #       autonomous substrate pulse is the topology deposit, Stage 3 — no conversation-
+    #       dependency introduced). Fail-soft: never breaks the turn.
+    # -------------------
+
+    Bunyan narrating this richly (text over the opaque id) is the NEXT increment (1b:
+    bucket_recent with_metadata + Bunyan); this step just makes experience FLOW into the pool.
     """
-    return
+    parts = [p for p in (user_text, assistant_text) if p]
+    if not parts:
+        return  # no turn text (e.g. autonomic pulse) — nothing to deposit
+    raw = "\n\n".join(parts)
+    try:
+        from commons import get_commons
+        commons = get_commons()
+    except Exception as exc:  # noqa: BLE001 — no Commons (early boot) is a graceful no-op
+        logger.debug("Commons unavailable for experience deposit: %s", exc)
+        return
+    if commons is None:
+        return
+    try:
+        import hashlib
+        from ng_embed import embed
+        emb = embed(raw)
+        if emb is None:
+            return
+        target_id = "experience:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        commons.deposit(
+            emb, target_id,
+            metadata={
+                "kind": "experience",
+                "user_text": user_text or "",
+                "assistant_text": assistant_text or "",
+            },
+        )
+        logger.info("Commons: deposited experience (%d chars)", len(raw))
+    except Exception as exc:  # noqa: BLE001 — a deposit failure never breaks the turn
+        logger.debug("Commons experience deposit failed: %s", exc)
 
 
 def _deposit_outcome_to_river(
@@ -2761,7 +2807,17 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # prediction results, structural changes, and salience signals. Raw,
     # unclassified (Law 7). Each module's bucket extracts what it needs.
     _deposit_topology_to_river(step_result)
-    _deposit_experience_to_river(_ingest_text)
+    # Experience = the full RAW turn (user + Syl), both halves, unclassified — each module's
+    # bucket extracts its own view (LAW 7). Syl's response is in afterTurn params alongside the
+    # user message (the surfacing-outcome path uses the same lastAssistantMessage).
+    _assistant_text = None
+    _lam = params.get("lastAssistantMessage")
+    if _lam:
+        try:
+            _assistant_text = _extract_message_text(_lam)
+        except Exception:  # noqa: BLE001 — missing/odd assistant text never blocks the deposit
+            _assistant_text = None
+    _deposit_experience_to_river(_ingest_text, _assistant_text)
 
     # Punchlist #56: Deposit raw surfacing outcome experience.
     # The triad: what was surfaced (cached from assemble) + user input
