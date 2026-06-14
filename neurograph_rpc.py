@@ -853,7 +853,8 @@ class _SubstrateMetricsGate:
     #       QG/Darwin novelty/evolution) — design prd/substrate-metrics-pipeline-design.md (#320).
     #       LAW 7 (Josh-cleared): metrics are telemetry, gated by the substrate's OWN surprise,
     #       not an imposed classification; the raw experience path stays raw.
-    # How: surprise = surprised/(confirmed+surprised); >= SURPRISE_THRESHOLD ⇒ anomalous. Nominal
+    # How: surprise = surprised/(confirmed+surprised); >= the competence-governed effective
+    #       threshold (Part 1b) ⇒ anomalous. Nominal
     #       steps accumulate into a span aggregate, flushed every NOMINAL_FLUSH_EVERY steps or when
     #       broken by an anomaly. Repeated identical anomalies run-length into one summary. Deposits
     #       via commons.deposit (embedding addresses the metric-kind; raw scalars in metadata).
@@ -863,16 +864,38 @@ class _SubstrateMetricsGate:
     # -------------------
     """
 
-    SURPRISE_THRESHOLD = 0.50   # surprised/(confirmed+surprised) >= this ⇒ anomalous (1b graduates)
     NOMINAL_FLUSH_EVERY = 60    # flush a nominal-span summary at least this often (~2 min at 2s/step)
     _AGG_FIELDS = ("fired_nodes", "fired_hyperedges", "synapses_pruned",
                    "synapses_sprouted", "predictions_confirmed", "predictions_surprised")
+
+    # ---- Part 1b: competence-governed threshold (Elmer TuningSocket pattern, #320) ----
+    # The granular-vs-summarize threshold GRADUATES with competence instead of being a fixed
+    # guess. Competence is measured on RAW surprise (threshold-INDEPENDENT) — so raising the
+    # threshold can never blind the measurement that governs it (no runaway over-compression).
+    THRESHOLD_MIN = 0.30        # competence 0 → verbose/sensitive (deposit more granular when naive)
+    THRESHOLD_MAX = 0.70        # competence 1 → compress (summarize moderate noise once trusted)
+    CALM_BELOW = 0.20           # raw surprise below this ⇒ calm ⇒ earn competence (slow)
+    SPIKE_ABOVE = 0.60          # raw surprise at/above this ⇒ turbulence ⇒ lose competence (fast)
+    COMP_GAIN = 0.02            # asymmetric: trust gained slowly...
+    COMP_LOSS = 0.08            # ...lost quickly (a spike re-sensitizes the gate)
 
     def __init__(self):
         self._nominal_count = 0
         self._nominal_agg = {}
         self._run_sig = None
         self._run_count = 0
+        self._competence = 0.0   # start safe + verbose; graduate toward compression
+
+    def _update_competence(self, surprise: float) -> None:
+        """Drift competence on RAW surprise (threshold-independent — prevents runaway)."""
+        if surprise >= self.SPIKE_ABOVE:
+            self._competence = max(0.0, self._competence - self.COMP_LOSS)   # fast loss
+        elif surprise < self.CALM_BELOW:
+            self._competence = min(1.0, self._competence + self.COMP_GAIN)   # slow gain
+        # the in-between band neither earns nor loses — only clear calm/turbulence move trust
+
+    def _effective_threshold(self) -> float:
+        return self.THRESHOLD_MIN + self._competence * (self.THRESHOLD_MAX - self.THRESHOLD_MIN)
 
     def observe(self, metrics: "Dict[str, Any]") -> None:
         try:
@@ -888,7 +911,8 @@ class _SubstrateMetricsGate:
             surprised = metrics.get("predictions_surprised", 0)
             total = confirmed + surprised
             surprise = (surprised / total) if total else 0.0
-            if surprise >= self.SURPRISE_THRESHOLD:
+            self._update_competence(surprise)            # drift on RAW surprise (1b)
+            if surprise >= self._effective_threshold():  # competence-graduated threshold
                 self._on_anomaly(commons, metrics, surprise)
             else:
                 self._on_nominal(commons, metrics)
@@ -925,6 +949,8 @@ class _SubstrateMetricsGate:
         self._deposit(commons, "nominal", {
             "kind": "metrics", "metric_kind": "substrate_nominal_span", "salience": "nominal",
             "span_steps": self._nominal_count, "aggregate": dict(self._nominal_agg),
+            "gate_competence": round(self._competence, 3),       # watch it graduate (1b)
+            "gate_threshold": round(self._effective_threshold(), 3),
         })
         self._nominal_count, self._nominal_agg = 0, {}
 

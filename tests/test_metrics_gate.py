@@ -96,7 +96,7 @@ def test_anomaly_deposits_granular_and_flushes_nominal():
         anomaly = _deposits(commons, "anomaly")
         assert len(nominal) == 1 and nominal[0][1]["span_steps"] == 5, "preceding nominal span summarized"
         assert len(anomaly) == 1, "the anomaly deposited granular"
-        assert anomaly[0][1]["surprise"] >= gate.SURPRISE_THRESHOLD
+        assert anomaly[0][1]["surprise"] == 0.8 and anomaly[0][1]["surprise"] >= gate.THRESHOLD_MIN
         assert anomaly[0][1]["predictions_surprised"] == 8
     finally:
         _restore(orig)
@@ -146,8 +146,35 @@ def test_gate_failsoft_no_commons_and_bad_embed():
         _restore(orig)
 
 
+def test_competence_graduates_asymmetric():
+    """Part 1b: calm RAW surprise earns competence SLOWLY (threshold rises → compress more);
+    a spike loses it FAST (threshold drops → re-sensitize). Measured on raw surprise so raising
+    the threshold can't blind it (no runaway)."""
+    commons, gate, orig = _setup()
+    try:
+        assert gate._competence == 0.0 and gate._effective_threshold() == gate.THRESHOLD_MIN
+        # calm steps (surprise 0 < CALM_BELOW) earn slowly
+        for _ in range(10):
+            gate.observe(_nominal())
+        c_after_calm = gate._competence
+        assert 0.0 < c_after_calm <= 10 * gate.COMP_GAIN + 1e-9, "slow gain on calm"
+        assert gate._effective_threshold() > gate.THRESHOLD_MIN, "threshold rose with competence"
+        # one spike (surprise 0.8 >= SPIKE_ABOVE) loses FAST — asymmetric
+        gate.observe(_anomaly())
+        assert gate._competence < c_after_calm, "spike dropped competence"
+        assert (c_after_calm - gate._competence) >= gate.COMP_LOSS - 1e-9, "loss is the fast rate"
+        # raising the threshold never blinds the measurement (competence floor holds at 0)
+        for _ in range(50):
+            gate.observe(_anomaly())
+        assert gate._competence == 0.0, "sustained turbulence pins competence at the verbose floor"
+        assert gate._effective_threshold() == gate.THRESHOLD_MIN, "fully re-sensitized"
+    finally:
+        _restore(orig)
+
+
 if __name__ == "__main__":
     test_nominal_steps_do_not_flood();                print("PASS nominal steps don't flood; summary carries aggregate")
+    test_competence_graduates_asymmetric();           print("PASS competence graduates (slow calm-gain / fast spike-loss), no runaway")
     test_anomaly_deposits_granular_and_flushes_nominal(); print("PASS anomaly → granular + flushes preceding nominal span")
     test_repeated_anomaly_run_length();               print("PASS repeated anomaly → 1 granular + run-length(826)")
     test_distinct_anomalies_each_granular();           print("PASS distinct anomalies each deposit granular")
