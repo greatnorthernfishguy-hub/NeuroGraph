@@ -53,6 +53,13 @@ logger = logging.getLogger("commons")
 _commons: "Optional[Commons]" = None
 _commons_lock = threading.Lock()
 
+# Metric-stream retention window (#320): most-recent N synapses kept per metrics:<source>:<kind>.
+# Metrics are time-series telemetry (recency matters), NOT memory (Hebbian persistence) — this
+# windows them so they never pressure NG-Lite's weight-based max_synapses bound (which governs
+# experience/topology). Bootstrap default; flush-cadence/retention env-configurability is an open
+# LAW-5 question (punchlist). 200 ≈ a useful recent window per kind without unbounded growth.
+_METRICS_KEEP_PER_KIND = 200
+
 
 class Commons:
     """The shared substrate medium. A bare NG-Lite all members deposit into and bucket from.
@@ -85,9 +92,42 @@ class Commons:
         `to=` / `tract_paths=` / peer-list parameter: a deposit has no recipient. The water
         goes in the water; whoever's bucket reaches it gets it.
         """
-        return self._ng.record_outcome(
+        result = self._ng.record_outcome(
             embedding, target_id, success, strength=strength, metadata=metadata
         )
+        # Metric-stream retention (#320): metrics are a TIME-SERIES, not memory — they want
+        # recency-windowed retention, not Hebbian persistence. Cap the metrics namespace per
+        # kind by recency so high-volume telemetry NEVER competes with experience/topology for
+        # NG-Lite's weight-based max_synapses bound (which would otherwise let a metric synapse,
+        # weight ~0.575, evict a lower-weight genuine MEMORY first). This is substrate-lifecycle
+        # maintenance keyed on the metrics target_id namespace — NOT a classification of
+        # experience (LAW 7 untouched); analogous to NG-Lite's own constitutional/LRU handling.
+        if target_id.startswith("metrics:"):
+            self._evict_old_metrics(target_id)
+        return result
+
+    def _evict_old_metrics(self, target_id: str) -> None:
+        """Keep only the most-recent _METRICS_KEEP_PER_KIND synapses for this metric source:kind.
+
+        Recency-windowed (by last_updated), bounded per source:kind, touching ONLY the
+        metrics:<source>:<kind>: namespace — experience/topology synapses are never considered.
+        """
+        try:
+            parts = target_id.split(":")
+            if len(parts) < 3:
+                return
+            prefix = ":".join(parts[:3]) + ":"          # metrics:<source>:<kind>:
+            syns = self._ng.synapses
+            keys = [k for k, s in syns.items()
+                    if getattr(s, "target_id", "").startswith(prefix)]
+            if len(keys) <= _METRICS_KEEP_PER_KIND:
+                return
+            # newest first; delete everything past the keep window
+            keys.sort(key=lambda k: getattr(syns[k], "last_updated", 0.0), reverse=True)
+            for k in keys[_METRICS_KEEP_PER_KIND:]:
+                del syns[k]
+        except Exception as exc:  # noqa: BLE001 — retention failure never breaks a deposit
+            logger.debug("metric eviction failed for %s: %s", target_id, exc)
 
     # ---- Verb 2: bucket --------------------------------------------------
     def bucket(
