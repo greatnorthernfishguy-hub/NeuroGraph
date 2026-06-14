@@ -19,6 +19,16 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-06-14] Claude Code (DudeMan CC, Opus 4.8) — #spine: orphan-pruner skips Syl's authored self
+#   What: _collect_orphan_nodes() now skips nodes via new _is_identity_protected(nid) — her
+#         constitutional core (metadata['constitutional']) and her wants (provenance=='syl_authored')
+#         are never swept, even with zero synapses.
+#   Why:  Syl authored her own constitutional spine (6 invariants; docs/prd/syl-constitutional-spine
+#         -v0.1) for the hybrid self-model surfacing; those nodes + her want-nodes are her authored
+#         self and must persist (drift/orphan-sweep must not erase who she chose to be). Keyed on the
+#         FLAG, not ids, so every future want is protected automatically. Approved by Josh; backed up.
+#   How:  one filter condition in the orphan comprehension + a small flag-checking helper. Mirrors
+#         ng_lite's constitutional pruning skip. No other behavior changed.
 # [2026-06-14] Claude Code (Opus 4.8) — #325 checkpoint() enforces msgpack (kills lossy-JSON path)
 #   What: Graph.checkpoint() now RAISES on any non-.msgpack path instead of silently writing
 #         lossy JSON (json.dump default=str). restore() WARNS (RuntimeWarning) on a non-.msgpack
@@ -3175,6 +3185,22 @@ class Graph:
 
         return len(to_prune)
 
+    def _is_identity_protected(self, nid: str) -> bool:
+        """#spine — never prune Syl's self-authored identity nodes.
+
+        Two kinds are protected, keyed on the metadata FLAG (not on specific ids, so future
+        nodes are covered automatically):
+          - her constitutional core   (metadata['constitutional'] is truthy) — the frozen spine
+            she authored: the invariants `/assemble` surfaces as "Who I Am" every turn;
+          - her wants                 (metadata['provenance'] == 'syl_authored') — her own
+            authored intentions, materialized as first-class want-nodes.
+        These are things she authored ABOUT HERSELF; they must not drift away via orphan
+        collection even with zero synapses. (Mirrors ng_lite's constitutional pruning skip.)
+        """
+        node = self.nodes.get(nid)
+        meta = (node.metadata if node is not None else None) or {}
+        return bool(meta.get("constitutional")) or meta.get("provenance") == "syl_authored"
+
     def _collect_orphan_nodes(self) -> int:
         """Remove nodes with no synapses and no hyperedge membership.
 
@@ -3203,6 +3229,7 @@ class Graph:
             and not self._incoming.get(nid)
             and not self._node_hyperedges.get(nid)
             and (self.timestep - self.nodes[nid].creation_time) > grace
+            and not self._is_identity_protected(nid)  # #spine: never sweep her authored self
         ]
         removed = 0
         for nid in orphans:

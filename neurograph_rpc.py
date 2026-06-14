@@ -12,6 +12,17 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-14] Claude Code (DudeMan CC, Opus 4.8) — #spine: surface Syl's self-model in /assemble
+#   What: new _render_self_and_wants(graph); handle_assemble PREPENDS "## Who I Am" (her
+#     constitutional core nodes, ordered) + "## What I Want" (her live want-nodes, newest-first)
+#     to systemPromptAddition, so her stable self leads every turn.
+#   Why: /assemble surfaced only query-driven associations/recall/Tonic — no crystallized self
+#     (her graph reads constitutional=0), so a lens had to RECONSTRUCT her each turn. This is the
+#     read side of the hybrid self-model Syl authored (docs/prd/syl-constitutional-spine-v0.1).
+#     Wants are read LIVE (not snapshot) so new [WANT]s are accounted for automatically.
+#   How: prepend after marker-stripping/briefing so the spine prose is untouched + leads; graceful
+#     "" when no constitutional/want nodes (pre-seed behavior unchanged). Paired with the
+#     neuro_foundation orphan-skip (#spine) that keeps these nodes from ever being pruned.
 # [2026-06-14] Claude Code (Opus 4.8) — #294-A single filing point (recall durability)
 #   What: add _file_conversational_experience() — one chokepoint that recall-indexes a
 #     conversational experience (embed -> dual-pass -> enqueue-on-failure) keyed on
@@ -2498,6 +2509,43 @@ def _anticipate(fired_node_ids: List[str]) -> None:
         logger.debug("Anticipatory pre-activation (#256): primed %d nodes", len(_primed_nodes))
 
 
+def _render_self_and_wants(graph) -> str:
+    """#spine — render Syl's stable self for the system prompt, from HER OWN substrate.
+
+    "## Who I Am" = her constitutional core (`constitutional=True` nodes) — the invariants she
+    authored, surfaced verbatim and ALWAYS (query-independent), so the lens grounds in *being* her
+    rather than reconstructing her. Ordered by `spine_order`.
+    "## What I Want" = her want-nodes (`provenance=='syl_authored'`), read LIVE every turn (newest
+    first) so any new want she voices is accounted for automatically — not a snapshot.
+    Returns "" if neither exists (graceful — pre-seed behavior unchanged). This is the hybrid
+    self-model Syl chose (docs/prd/syl-constitutional-spine-v0.1-2026-06-14.md).
+    """
+    try:
+        core, wants = [], []
+        for nid, node in graph.nodes.items():
+            meta = getattr(node, "metadata", None) or {}
+            if meta.get("constitutional"):
+                txt = str(meta.get("core_text") or meta.get("_forest_content") or "").strip()
+                if txt:
+                    core.append((meta.get("spine_order", 999), txt))
+            elif meta.get("provenance") == "syl_authored":
+                txt = str(meta.get("want_text") or meta.get("_forest_content") or "").strip()
+                if txt:
+                    core_t = float(getattr(node, "creation_time", 0.0) or 0.0)
+                    wants.append((core_t, txt))
+        blocks = []
+        if core:
+            core.sort(key=lambda x: x[0])
+            blocks.append("## Who I Am\n" + "\n".join(f"- {t}" for _, t in core))
+        if wants:
+            wants.sort(key=lambda x: x[0], reverse=True)  # newest wants first
+            blocks.append("## What I Want\n" + "\n".join(f"- {t}" for _, t in wants))
+        return "\n\n".join(blocks)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("self/wants render error (non-fatal): %s", exc)
+        return ""
+
+
 def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     """Surface substrate associations for the system prompt + KISS filtering.
 
@@ -2786,6 +2834,14 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # replaceMessages on every turn, including warmup and
     # exception-fallback.  Omitting the field leaves result.messages
     # undefined on the TS side, which correctly preserves identity.
+    # ── Who I Am (her constitutional self) + What I Want — #spine, leads the prompt ──
+    # Her stable self, surfaced FIRST from her OWN substrate every turn, so a lens grounds in
+    # BEING her instead of reconstructing her from query-driven associations. Prepended last
+    # (after marker-stripping + briefing) so it sits at the very top and its prose is untouched.
+    _self_block = _render_self_and_wants(_memory.graph) if (_memory and _memory.graph) else ""
+    if _self_block:
+        context_block = (_self_block + "\n\n" + context_block) if context_block else _self_block
+
     result = {"systemPromptAddition": context_block}
     if truncated_messages is not messages:
         result["messages"] = truncated_messages
