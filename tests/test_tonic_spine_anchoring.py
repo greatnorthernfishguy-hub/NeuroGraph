@@ -11,7 +11,8 @@ def _spine_graph():
             voltage=0.0, resting_potential=0.0, last_spike_time=float("-inf"),
             firing_rate_ema=0.0, intrinsic_excitability=1.0,
         )
-    return SimpleNamespace(nodes=nodes, synapses={}, hyperedges={}, timestep=10, _outgoing={})
+    return SimpleNamespace(nodes=nodes, synapses={}, hyperedges={}, timestep=10, _outgoing={},
+                           active_predictions={})
 
 def test_identity_embedding_is_nonzero_when_spine_present():
     eng = tonic_engine.TonicEngine.__new__(tonic_engine.TonicEngine)
@@ -69,3 +70,13 @@ def test_unwired_node_gets_more_charge_than_wired():
     t._prime_constitutional()
     assert seen["constitutional::spine::01"] > seen["constitutional::spine::02"]
     assert abs(seen["constitutional::spine::02"] - tonic_thread._SPINE_PRIME_STEADY) < 0.02
+
+def test_heuristic_includes_constitutional_pull():
+    eng = tonic_engine.TonicEngine.__new__(tonic_engine.TonicEngine)
+    g = _spine_graph(); eng._graph = g
+    eng._config = tonic_engine.EngineConfig()
+    eng._tokens_generated = 0
+    feats = {"thread_nodes": [], "recent_spikes": [], "active_nodes": [("constitutional::spine::01", 0.1)]}
+    acts = eng._heuristic_inference(feats)
+    ids = [nid for nid, _ in acts]
+    assert any(i.startswith("constitutional::spine::") for i in ids)

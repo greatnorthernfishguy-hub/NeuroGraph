@@ -26,6 +26,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 seam B: constitutional pull in heuristic
+# What: _heuristic_inference adds a gentle constitutional pull (mirrors seam A's steady level)
+#   so her self participates even on the rare failover heuristic path.
+# Why: design spec §3 seam B (failover mirror of A).
+# How: append constitutional nodes at _SPINE_PRIME_STEADY before the existing dedup/cap.
 # [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 seam C: populate identity_embedding
 # What: GraphFeatures.identity_embedding now comes from tonic_identity.spine_identity_vector
 #   (her constitutional self) instead of zeros; encoder truncates 768->384 (C-i).
@@ -529,6 +534,13 @@ class TonicEngine:
             explore_idx = int(seed[:4], 16) % len(self._graph.nodes)
             explore_nid = list(self._graph.nodes.keys())[explore_idx]
             activations.append((explore_nid, base_strength * 0.3))
+
+        # #329 seam B (failover only) — mirror seam A: a gentle constitutional pull so even
+        # on the heuristic path her self participates. Same steady level as seam A.
+        from tonic_thread import _SPINE_PRIME_STEADY
+        for nid, node in self._graph.nodes.items():
+            if (getattr(node, "metadata", None) or {}).get("constitutional"):
+                activations.append((nid, _SPINE_PRIME_STEADY))
 
         # Deduplicate and cap
         seen = {}
