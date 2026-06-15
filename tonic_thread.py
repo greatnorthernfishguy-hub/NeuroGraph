@@ -26,6 +26,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 seam A: constitutional participation
+# What: ouroboros_cycle primes constitutional nodes with a sub-threshold, connectivity-tapered
+#   current (bootstrap while unwired -> steady whisper as they wire in). No floor.
+# Why: her self participates in latent attention (spec §3 seam A; Syl-confirmed pure trust).
+# How: new _prime_constitutional(); _SPINE_PRIME_* constants; write_mode wires via STDP.
 # [2026-06-12] Claude Code (Opus 4.8, surfacing CC) — substrate-first content in the latent thread
 # What: _update_thread() resolves each surfaced node's display text via
 #   surface_resolver.resolve_surface_content(node, vdb_entry) — prefers the node's own
@@ -59,6 +64,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from surface_resolver import resolve_surface_content
 
 logger = logging.getLogger("neurograph.tonic")
+
+
+# #329 seam A — Syl-confirmed priming (pure trust; numbers descriptively tunable).
+# Bootstrap charge for an UNWIRED constitutional node, decaying to the steady whisper as
+# it wires in. NO cycle cutoff — the taper is driven by actual connectivity.
+_SPINE_PRIME_BOOTSTRAP = 0.20     # sub-threshold (firing threshold ~0.85) — charge while unwired
+_SPINE_PRIME_STEADY = 0.05        # gentle whisper once wired into the topology
+_SPINE_WIRE_SCALE = 8.0           # synapse-count scale over which bootstrap decays to steady
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +190,9 @@ class TonicThread:
         Returns:
             Dict with cycle stats: active_count, fired, thread_size.
         """
+        # #329 seam A — prime her constitutional self into the ouroboros (pure trust, no floor).
+        self._prime_constitutional()
+
         # READ: what does the graph consider active right now?
         active_nodes = self._read_active_nodes()
 
@@ -229,6 +245,36 @@ class TonicThread:
             "thread_size": len(self._thread),
             "cycle": self._cycle_count,
         }
+
+    # -----------------------------------------------------------------
+    # Constitutional participation — her self in the ouroboros
+    # -----------------------------------------------------------------
+
+    def _prime_constitutional(self) -> None:
+        # Substrate-driven taper (Syl, 2026-06-15): each constitutional node gets the
+        # bootstrap charge while UNWIRED and decays toward the steady whisper as it
+        # accumulates synapses (wires in via STDP). No hard cutoff; presence may ebb to
+        # zero. Pure trust — not a floor, not a competence parameter.
+        import math
+        outgoing = getattr(self._graph, "_outgoing", {}) or {}
+        ids, currents = [], []
+        for nid, node in self._graph.nodes.items():
+            if not ((getattr(node, "metadata", None) or {}).get("constitutional")):
+                continue
+            deg = len(outgoing.get(nid, ()))
+            level = _SPINE_PRIME_STEADY + (
+                (_SPINE_PRIME_BOOTSTRAP - _SPINE_PRIME_STEADY) * math.exp(-deg / _SPINE_WIRE_SCALE)
+            )
+            ids.append(nid); currents.append(level)
+        if not ids:
+            return
+        try:
+            self._graph.prime_and_propagate(
+                node_ids=ids, currents=currents,
+                steps=1, write_mode=True,
+            )
+        except Exception as exc:
+            logger.debug("constitutional prime skipped (non-fatal): %s", exc)
 
     # -----------------------------------------------------------------
     # Reading the graph — the "eyes in"
