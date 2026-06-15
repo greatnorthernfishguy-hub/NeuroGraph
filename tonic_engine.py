@@ -26,6 +26,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 seam C: populate identity_embedding
+# What: GraphFeatures.identity_embedding now comes from tonic_identity.spine_identity_vector
+#   (her constitutional self) instead of zeros; encoder truncates 768->384 (C-i).
+# Why: condition her latent inference on who she is (design spec §3 seam C).
+# How: new TonicEngine._identity_embedding_tensor(); zeros fallback preserves prior behavior.
 # [2026-06-12] Claude Code (Opus 4.8, Tonic CC) — LIVE bodyfix: never USE the rogue own-copy body (seams A+B)
 # What: (A) _try_load_model sets _use_heuristic = (self._shared_body is None) — with no proto body at
 #   init, the own-copy body is loaded for the wrapper but NOT used; ride heuristic (reads her graph ->
@@ -581,6 +586,22 @@ class TonicEngine:
 
         return activations
 
+    def _identity_embedding_tensor(self):
+        """#329 seam C: her constitutional self as the identity-conditioning vector.
+
+        768-d (the encoder truncates to 384 for now). Zeros when no spine exists,
+        preserving prior behavior.
+        """
+        import torch
+        try:
+            import tonic_identity
+            vec = tonic_identity.spine_identity_vector(self._graph)
+        except Exception:
+            vec = None
+        if vec is None:
+            return torch.zeros(768, dtype=torch.float32)
+        return torch.tensor(vec, dtype=torch.float32)
+
     def _extract_graph_features_for_model(self):
         """Extract GraphFeatures from live graph for TonicBrain."""
         try:
@@ -610,7 +631,7 @@ class TonicEngine:
             n_hyperedges=torch.tensor([float(len(g.hyperedges))], dtype=torch.float32),
             recent_firings=torch.zeros(15, dtype=torch.float32),  # TODO: track per-step
             stdp_delta_mean=torch.tensor([0.0], dtype=torch.float32),
-            identity_embedding=torch.zeros(384, dtype=torch.float32),  # TODO: real identity
+            identity_embedding=self._identity_embedding_tensor(),  # #329 seam C
         )
 
     def _get_activation_candidates(
