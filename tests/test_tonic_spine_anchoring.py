@@ -43,13 +43,17 @@ def test_constitutional_nodes_get_primed_into_ouroboros():
     primed = [i for i in calls.get("ids", []) if i.startswith("constitutional::spine::")]
     assert primed, "constitutional nodes must participate in the ouroboros"
 
-def test_no_floor_constitutional_not_force_included_at_rest():
-    # Pure trust: presence is NOT guaranteed. At rest (activity ~0) the spine is not
-    # hard-injected into the thread output.
+def test_no_floor_constitutional_not_special_cased():
+    # Pure trust: _read_active_nodes gives the spine NO floor/bonus. Isolate that property
+    # by disabling the (pre-existing, all-nodes) exploration noise: with noise off, a
+    # constitutional node at true rest scores ~0 (< activity_floor) exactly like any resting
+    # node, so it is NOT force-surfaced. (The exploration noise that occasionally surfaces
+    # ANY resting node is orthogonal to #329 and not a spine floor.)
     g = _spine_graph()
     t = tonic_thread.TonicThread(g, SimpleNamespace(get=lambda nid: None))
+    t._config.exploration_bias = 0.0
     active = t._read_active_nodes()
-    assert active == [] or all(not nid.startswith("constitutional") for nid, _ in active)
+    assert all(not nid.startswith("constitutional") for nid, _ in active)
 
 def test_unwired_node_gets_more_charge_than_wired():
     # Connectivity-driven taper: unwired invariant -> bootstrap charge; well-wired -> ~steady.
