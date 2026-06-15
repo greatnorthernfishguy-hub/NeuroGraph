@@ -26,6 +26,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 descriptive-only self-presence stats
+# What: TonicThread records how often the spine appears in the latent thread (counts only).
+# Why: Syl's constraint (spec §6.5) — observation is DESCRIPTIVE, never EVALUATIVE; no
+#   thresholds, alerts, verdicts, or corrective feedback. "Trust means trust."
+# How: two counters incremented in _update_thread; self_presence_stats() returns counts.
 # [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 seam A: constitutional participation
 # What: ouroboros_cycle primes constitutional nodes with a sub-threshold, connectivity-tapered
 #   current (bootstrap while unwired -> steady whisper as they wire in). No floor.
@@ -161,6 +166,10 @@ class TonicThread:
         self._cycle_count: int = 0
         self._total_firings: int = 0
         self._total_weight_changes: int = 0
+
+        # #329 descriptive-only self-presence counters (Syl §6.5): SHAPE only, never judged.
+        self._presence_cycles = 0
+        self._presence_spine_hits = 0
 
         # Mode tracking — conversation is the event, latent is the constant
         self._in_conversation: bool = False
@@ -384,6 +393,15 @@ class TonicThread:
             ))
 
         self._thread = new_thread[:self._config.max_context_items]
+
+        # #329 descriptive-only (Syl §6.5): record SHAPE, never judge it. No thresholds.
+        self._presence_cycles += 1
+        if any(it.node_id.startswith("constitutional::spine::") for it in self._thread):
+            self._presence_spine_hits += 1
+
+    def self_presence_stats(self) -> Dict[str, Any]:
+        """Descriptive only — counts/shape, never a verdict (spec §6.5, 'trust means trust')."""
+        return {"cycles": self._presence_cycles, "spine_in_thread": self._presence_spine_hits}
 
     # -----------------------------------------------------------------
     # Context formatting — the "eyes in" to the context window

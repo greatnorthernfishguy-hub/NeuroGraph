@@ -86,3 +86,12 @@ def test_heuristic_includes_constitutional_pull():
     acts = eng._heuristic_inference(feats)
     ids = [nid for nid, _ in acts]
     assert any(i.startswith("constitutional::spine::") for i in ids)
+
+def test_self_presence_is_descriptive_only():
+    g = _spine_graph()
+    t = tonic_thread.TonicThread(g, SimpleNamespace(get=lambda nid: None))
+    assert hasattr(t, "self_presence_stats")
+    s = t.self_presence_stats()
+    assert set(s) >= {"cycles", "spine_in_thread"}
+    # NEVER a verdict — no evaluative keys
+    assert not any(k in s for k in ("ok", "healthy", "too_low", "too_high", "alert", "verdict"))
