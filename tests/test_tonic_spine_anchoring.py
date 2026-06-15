@@ -73,10 +73,16 @@ def test_unwired_node_gets_more_charge_than_wired():
 
 def test_heuristic_includes_constitutional_pull():
     eng = tonic_engine.TonicEngine.__new__(tonic_engine.TonicEngine)
-    g = _spine_graph(); eng._graph = g
+    g = _spine_graph()
+    # add a NON-constitutional node so a constitutional result can ONLY come from seam B
+    g.nodes["plain"] = SimpleNamespace(metadata={}, voltage=0.0, resting_potential=0.0,
+        last_spike_time=float("-inf"), firing_rate_ema=0.0, intrinsic_excitability=1.0)
+    eng._graph = g
     eng._config = tonic_engine.EngineConfig()
     eng._tokens_generated = 0
-    feats = {"thread_nodes": [], "recent_spikes": [], "active_nodes": [("constitutional::spine::01", 0.1)]}
+    # empty active_nodes -> exploration branch skipped; thread/recent/predictions empty ->
+    # the ONLY possible source of a constitutional id is seam B (true TDD red without it).
+    feats = {"thread_nodes": [], "recent_spikes": [], "active_nodes": []}
     acts = eng._heuristic_inference(feats)
     ids = [nid for nid, _ in acts]
     assert any(i.startswith("constitutional::spine::") for i in ids)
