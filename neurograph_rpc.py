@@ -3414,9 +3414,14 @@ def _scan_drain_pulse_loop() -> None:
             autonomic_paused = False
             try:
                 import ng_autonomic
-                autonomic_paused = ng_autonomic.get_state() == "SYMPATHETIC"
-            except Exception:
-                pass
+                # [2026-06-15] #322 reconnect: API drift — ng_autonomic exposes read_state()->dict,
+                # NOT get_state(). The dead get_state() call threw AttributeError swallowed by the
+                # bare except → autonomic_paused stuck False → NG never paused scan-drain under
+                # threat. Fix consumer-side (LAW-2-safe). Except made LOUD (Josh: silent excepts
+                # hid this for months) — a real failure here now surfaces instead of vanishing.
+                autonomic_paused = ng_autonomic.read_state().get("state") == "SYMPATHETIC"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("autonomic read failed in scan-drain pulse: %s", exc)
             paused = sentinel_paused or autonomic_paused
             if paused != was_paused:
                 reason = []
@@ -3627,9 +3632,12 @@ def _lazy_expansion_pulse_loop() -> None:
                 autonomic_paused = False
                 try:
                     import ng_autonomic
-                    autonomic_paused = ng_autonomic.get_state() == "SYMPATHETIC"
-                except Exception:
-                    pass
+                    # [2026-06-15] #322 reconnect: get_state() doesn't exist (it's read_state()->dict);
+                    # dead call swallowed → lazy-expansion never paused under threat. Consumer-side
+                    # fix (LAW-2-safe); except made LOUD so a real failure surfaces.
+                    autonomic_paused = ng_autonomic.read_state().get("state") == "SYMPATHETIC"
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("autonomic read failed in lazy-expansion pulse: %s", exc)
 
                 if not autonomic_paused:
                     from wire_absorption import select_bodies_for_expansion, expand_body_file
