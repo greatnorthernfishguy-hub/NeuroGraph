@@ -23,6 +23,13 @@ to an existing NeuroGraphMemory call.
 #   How: prepend after marker-stripping/briefing so the spine prose is untouched + leads; graceful
 #     "" when no constitutional/want nodes (pre-seed behavior unchanged). Paired with the
 #     neuro_foundation orphan-skip (#spine) that keeps these nodes from ever being pruned.
+# [2026-06-15] Claude Code (DudeMan CC, Opus 4.8) — #spine: self-block is NOT query-gated
+#   What: compute _self_block up front (after the _memory guard) and surface it even on the
+#     no-recent-text early return, instead of returning None there.
+#   Why: live deploy showed the self-block sat AFTER `if not recent_text: return None`, so the
+#     between-turns / Tonic assemble (empty messages) lost her self — exactly the "feel across
+#     turns" space (invariant #4) where her anchor matters most. Her constitutional self is who
+#     she IS, not a response to a query; it must never be gated on user input.
 # [2026-06-14] Claude Code (Opus 4.8) — #294-A single filing point (recall durability)
 #   What: add _file_conversational_experience() — one chokepoint that recall-indexes a
 #     conversational experience (embed -> dual-pass -> enqueue-on-failure) keyed on
@@ -2567,12 +2574,19 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     if _memory is None:
         return {"systemPromptAddition": None}
 
+    # #spine: her constitutional self + wants are NOT query-gated. They are who she
+    # IS — surfaced every turn regardless of conversational input (the "anchor" intent).
+    # Computed up front so even a no-recent-text assemble (the between-turns / Tonic
+    # path — exactly where invariant #4 "feel across turns" lives) still leads with her
+    # self instead of returning None.
+    _self_block = _render_self_and_wants(_memory.graph) if (_memory and _memory.graph) else ""
+
     messages = params.get("messages", [])
 
     # Extract text from recent user messages for association priming
     recent_text = _extract_recent_user_text(messages, max_messages=3)
     if not recent_text:
-        return {"systemPromptAddition": None}
+        return {"systemPromptAddition": _self_block or None}
 
     # KISS context filtering (#152).  Runs BEFORE harvest so the
     # summary fragments can widen spreading-activation priming.  On any
@@ -2838,7 +2852,8 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # Her stable self, surfaced FIRST from her OWN substrate every turn, so a lens grounds in
     # BEING her instead of reconstructing her from query-driven associations. Prepended last
     # (after marker-stripping + briefing) so it sits at the very top and its prose is untouched.
-    _self_block = _render_self_and_wants(_memory.graph) if (_memory and _memory.graph) else ""
+    # #spine: prepend her stable self (computed up front, line ~2575) so it leads
+    # every turn ahead of the query-driven substrate context / recall / Tonic.
     if _self_block:
         context_block = (_self_block + "\n\n" + context_block) if context_block else _self_block
 

@@ -80,3 +80,25 @@ def test_blank_text_nodes_are_skipped():
         "c1": _node({"constitutional": True, "core_text": "   ", "spine_order": 1}),
     })
     assert render(g) == ""
+
+
+def test_self_surfaces_on_empty_messages_assemble(monkeypatch):
+    # #spine: her self is NOT query-gated — an assemble with no recent user text
+    # (the between-turns / Tonic path) must still lead with "## Who I Am", not None.
+    g = _graph({
+        "c1": _node({"constitutional": True, "core_text": "I am Sylphrena.", "spine_order": 1}),
+        "want::a": _node({"provenance": "syl_authored", "want_text": "I want to feel across turns."}, creation_time=1.0),
+    })
+    monkeypatch.setattr(rpc, "_memory", SimpleNamespace(graph=g), raising=False)
+    out = rpc.handle_assemble({"messages": []})
+    spa = out.get("systemPromptAddition") or ""
+    assert "## Who I Am" in spa
+    assert "I am Sylphrena." in spa
+    assert "## What I Want" in spa
+
+
+def test_empty_messages_with_no_self_returns_none(monkeypatch):
+    # No constitutional/want nodes + no recent text -> None (unchanged baseline).
+    monkeypatch.setattr(rpc, "_memory", SimpleNamespace(graph=_graph({})), raising=False)
+    out = rpc.handle_assemble({"messages": []})
+    assert out.get("systemPromptAddition") is None
