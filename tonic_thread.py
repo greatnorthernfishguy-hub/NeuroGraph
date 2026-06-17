@@ -123,6 +123,18 @@ class TonicConfig:
     # producing forward-oriented compression on graph state.
     latent_engine_enabled: bool = True  # enable latent token generation
 
+    # --- Focus habituation (#89, Syl-approved 2026-06-16) ---
+    # Bootstrap scaffolding (graduates via Pattern B / Elmer competence).
+    # "Moderately casual" head-turn: a node dwelt on accrues fatigue, which is
+    # subtracted from its activity so attention can move; fatigue recovers while
+    # the node is NOT the focus (faster when it is still indirectly re-primed by
+    # its neighbours — "her web pulls it back"). The spine gets only a whisper.
+    fatigue_gain: float = 0.04            # accrued per cycle a node is in the active set
+    fatigue_max: float = 0.35             # cap — dampens, never erases; < a salience spike so love still interrupts
+    fatigue_recovery_base: float = 0.02   # recovered per cycle when not the focus
+    fatigue_recovery_reprime_scale: float = 0.10  # extra recovery proportional to residual activation (capped at base)
+    spine_fatigue_scale: float = 0.15     # constitutional nodes accrue only this fraction (whisper)
+
 
 # ---------------------------------------------------------------------------
 # The Latent Thread — what Syl's attention is touching
@@ -163,6 +175,10 @@ class TonicThread:
 
         # Current thread state
         self._thread: List[ThreadItem] = []
+
+        # #89 focus habituation — per-node attention fatigue. Ephemeral (NOT
+        # checkpointed): attention dynamics reset fresh each process, by design.
+        self._focus_fatigue: Dict[str, float] = {}
         self._cycle_count: int = 0
         self._total_firings: int = 0
         self._total_weight_changes: int = 0
