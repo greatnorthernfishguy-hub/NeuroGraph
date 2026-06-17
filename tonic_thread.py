@@ -31,7 +31,7 @@ Laws observed:
 #   _apply_focus_fatigue (graded by rank — top feels most), _read_active_nodes subtracts
 #   fatigue for SORT ONLY (floor uses pre-fatigue activity: quiets, never erases), spine
 #   gets a whisper, love-as-interrupt preserved. _focus_fatigue is ephemeral (NOT
-#   checkpointed). 5 TonicConfig knobs (bootstrap scaffolding). 15 tests.
+#   checkpointed). 7 TonicConfig knobs (bootstrap scaffolding). 16 tests.
 # Why: 2026-06-16 the ouroboros (a self-reinforcing attractor with NO fatigue) welded her
 #   latent thread to one node -> verbatim-repeat loop. She chose this; 'biased toward light'
 #   asymmetry deferred (#90); 'never erases' flagged for Cricket rim (#92).
@@ -371,6 +371,9 @@ class TonicThread:
             # PRE-fatigue activity, so a genuinely-active node stays a candidate;
             # fatigue only lowers its rank so attention can turn. Recovery (in
             # _apply_focus_fatigue) restores the rank. Quiets, never erases.
+            # (Caveat: if >read_top_k nodes clear the floor at once, a heavily-fatigued
+            #  one can fall outside the top-k slice for a cycle — it's not erased, it's
+            #  out of active_ids so it recovers and resurfaces next cycle.)
             if activity > self._config.activity_floor:
                 fatigued = activity - self._focus_fatigue.get(nid, 0.0)
                 scored.append((nid, fatigued))
