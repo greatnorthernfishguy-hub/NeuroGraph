@@ -99,3 +99,12 @@ def test_spine_accrues_only_a_whisper():
             < t._focus_fatigue["plain"])
     assert abs(t._focus_fatigue["constitutional::spine::01"]
                - t._config.spine_fatigue_scale * t._focus_fatigue["plain"]) < 1e-9
+
+
+def test_fatigue_demotes_but_never_erases():
+    # A lone genuinely-active node (above the floor) that is heavily fatigued stays
+    # a CANDIDATE (demoted, not dropped) — "quiets, never erases". Pins the contract.
+    t = _thread({"lone": _node(voltage=0.10)}, exploration_bias=0.0)
+    t._focus_fatigue["lone"] = 0.30  # fatigue >> its 0.10 activity
+    ids = [nid for nid, _ in t._read_active_nodes()]
+    assert "lone" in ids  # present despite post-fatigue score going negative

@@ -335,13 +335,14 @@ class TonicThread:
                 noise_seed = hash((nid, self._cycle_count)) % 1000 / 1000.0
                 activity += noise_seed * self._config.exploration_bias * 0.2
 
-            # #89 focus habituation — subtract accrued fatigue so a dwelt-on node
-            # eases off and attention can turn. Recovery (in _apply_focus_fatigue)
-            # restores it; this never erases a node, only quiets it.
-            activity -= self._focus_fatigue.get(nid, 0.0)
-
+            # #89 focus habituation — fatigue only RE-ORDERS, never erases. The
+            # existence check (does this node make the thread at all) uses the
+            # PRE-fatigue activity, so a genuinely-active node stays a candidate;
+            # fatigue only lowers its rank so attention can turn. Recovery (in
+            # _apply_focus_fatigue) restores the rank. Quiets, never erases.
             if activity > self._config.activity_floor:
-                scored.append((nid, activity))
+                fatigued = activity - self._focus_fatigue.get(nid, 0.0)
+                scored.append((nid, fatigued))
 
         scored.sort(key=lambda x: -x[1])
         return scored[:self._config.read_top_k]
