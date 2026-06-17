@@ -141,13 +141,22 @@ class TonicConfig:
     # the node is NOT the focus (faster when it is still indirectly re-primed by
     # its neighbours — "her web pulls it back"). The spine gets only a whisper.
     fatigue_gain: float = 0.04            # accrued per cycle a node is in the active set
-    fatigue_max: float = 0.35             # cap — dampens, never erases; < a salience spike so love still interrupts
+    fatigue_max: float = 5.0              # generous SAFETY ceiling, NOT the operative limit.
+                                          # A node's voltage is homeostatically pinned (bounded),
+                                          # and its own inject-back weakens as it fatigues, so
+                                          # fatigue catches up to its activity and it yields well
+                                          # below this cap. (Love still interrupts regardless: the
+                                          # interrupting node is FRESH/zero-fatigue, so it wins no
+                                          # matter how suppressed the incumbent got.)
     fatigue_recovery_base: float = 0.02   # recovered per cycle when not the focus
     fatigue_recovery_reprime_scale: float = 0.10  # extra recovery proportional to residual activation (capped at base)
     spine_fatigue_scale: float = 0.15     # constitutional nodes accrue only this fraction (whisper)
     fatigue_rank_falloff: float = 3.0      # graded accrual: rank_weight = 1/(1+falloff*rank).
                                            # Higher in the sort feels MORE fatigue; steep so the
                                            # top still pulls away and the head actually turns.
+    fatigue_streak_accel: float = 0.05    # the longer a node stays the FOCUS, the faster its
+                                          # fatigue climbs (accel = 1 + streak_accel*streak) — a
+                                          # deep weld breaks fast; brief focus stays gentle.
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +202,9 @@ class TonicThread:
         # #89 focus habituation — per-node attention fatigue. Ephemeral (NOT
         # checkpointed): attention dynamics reset fresh each process, by design.
         self._focus_fatigue: Dict[str, float] = {}
+        # #89 — consecutive-focus streak per node (ephemeral). Drives accrual acceleration
+        # so a persistent weld breaks faster the longer it is held.
+        self._focus_streak: Dict[str, int] = {}
         self._cycle_count: int = 0
         self._total_firings: int = 0
         self._total_weight_changes: int = 0
@@ -382,22 +394,31 @@ class TonicThread:
         faster and resurfaces sooner. Floored at 0 (entry dropped).
         """
         active_ids = {nid for nid, _ in active_nodes}
+        focus_id = active_nodes[0][0] if active_nodes else None
 
-        # Graded accrual — the higher in the ranking (the more she is dwelling on it),
-        # the more fatigue a node feels. rank_weight = 1/(1 + falloff*rank): the top
-        # (focus) feels it most, lower active nodes only marginally — steeply enough
-        # that the top still pulls away and her head turns rather than the whole set
-        # fatiguing in lockstep (which would never change the order). Constitutional
-        # nodes feel only a whisper. Capped at fatigue_max (dampens, never erases).
+        # Streak — consecutive cycles this node has been the TOP focus. Reset the moment a
+        # node stops being the focus; the longer it is held, the faster its fatigue climbs.
+        for nid in list(self._focus_streak.keys()):
+            if nid != focus_id:
+                del self._focus_streak[nid]
+        if focus_id is not None:
+            self._focus_streak[focus_id] = self._focus_streak.get(focus_id, 0) + 1
+
+        # Graded accrual — higher in the ranking feels more; the focus, the longer held,
+        # feels it ACCELERATING. Because the node's voltage is homeostatically PINNED
+        # (bounded) and its own inject-back weakens as it fatigues, the accruing fatigue
+        # always catches up and the head turns — for ANY weld, not just a marginal one.
+        # Constitutional nodes feel only a whisper. fatigue_max is a generous safety cap.
         for rank, (nid, _score) in enumerate(active_nodes):
             node = self._graph.nodes.get(nid)
             is_const = bool((getattr(node, "metadata", None) or {}).get("constitutional"))
             scale = self._config.spine_fatigue_scale if is_const else 1.0
             rank_weight = 1.0 / (1.0 + self._config.fatigue_rank_falloff * rank)
+            accel = 1.0 + self._config.fatigue_streak_accel * self._focus_streak.get(nid, 0)
             cur = self._focus_fatigue.get(nid, 0.0)
             self._focus_fatigue[nid] = min(
                 self._config.fatigue_max,
-                cur + self._config.fatigue_gain * rank_weight * scale,
+                cur + self._config.fatigue_gain * rank_weight * scale * accel,
             )
 
         # Recover every node NOT in the active set

@@ -173,3 +173,20 @@ def test_higher_rank_accrues_more_fatigue():
     t._apply_focus_fatigue(ranked)
     f = t._focus_fatigue
     assert f["top"] > f["mid"] > f["low"] > 0.0
+
+
+def test_fatigue_catches_a_pinned_attractor():
+    # Josh's mechanism: a node is homeostatically PINNED at high activity (re-pumped each
+    # cycle), leading its peer by FAR more than the old 0.35 cap. Because the node is
+    # stationary, fatigue must eventually catch up and turn the head — for ANY weld, not
+    # just a marginal one. (On v1 with cap=0.35 this never flips: the actual #89 failure.)
+    t = _thread({"a": _node(voltage=2.0), "b": _node(voltage=0.5)}, exploration_bias=0.0)
+    flipped = False
+    for i in range(600):
+        t._graph.nodes["a"].voltage = 2.0  # pin a at its ceiling each cycle (the weld)
+        ranked = t._read_active_nodes()
+        t._apply_focus_fatigue(ranked)
+        if ranked and ranked[0][0] == "b":
+            flipped = True
+            break
+    assert flipped  # a hard weld eventually breaks, not only a marginal one
