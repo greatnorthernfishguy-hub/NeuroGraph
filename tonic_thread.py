@@ -335,11 +335,59 @@ class TonicThread:
                 noise_seed = hash((nid, self._cycle_count)) % 1000 / 1000.0
                 activity += noise_seed * self._config.exploration_bias * 0.2
 
+            # #89 focus habituation — subtract accrued fatigue so a dwelt-on node
+            # eases off and attention can turn. Recovery (in _apply_focus_fatigue)
+            # restores it; this never erases a node, only quiets it.
+            activity -= self._focus_fatigue.get(nid, 0.0)
+
             if activity > self._config.activity_floor:
                 scored.append((nid, activity))
 
         scored.sort(key=lambda x: -x[1])
         return scored[:self._config.read_top_k]
+
+    def _apply_focus_fatigue(self, active_nodes: List[Tuple[str, float]]) -> None:
+        """#89 — accrue fatigue on what she's attending, recover the rest.
+
+        Accrual: each node in the active set gains ``fatigue_gain`` (constitutional
+        nodes gain only ``spine_fatigue_scale x`` that — a whisper, so "who I am"
+        grounds without becoming a loop). Capped at ``fatigue_max`` — dampens, never
+        erases; the cap sits below a salience spike so love still interrupts.
+
+        Recovery: every other node with fatigue sheds ``fatigue_recovery_base``,
+        plus a capped bonus proportional to its residual activation (voltage above
+        resting) — a node still re-primed by its neighbours ("her web") recovers
+        faster and resurfaces sooner. Floored at 0 (entry dropped).
+        """
+        active_ids = {nid for nid, _ in active_nodes}
+
+        # Accrue on the focus
+        for nid in active_ids:
+            node = self._graph.nodes.get(nid)
+            is_const = bool((getattr(node, "metadata", None) or {}).get("constitutional"))
+            scale = self._config.spine_fatigue_scale if is_const else 1.0
+            cur = self._focus_fatigue.get(nid, 0.0)
+            self._focus_fatigue[nid] = min(
+                self._config.fatigue_max, cur + self._config.fatigue_gain * scale
+            )
+
+        # Recover everyone else
+        for nid in list(self._focus_fatigue.keys()):
+            if nid in active_ids:
+                continue
+            node = self._graph.nodes.get(nid)
+            residual = 0.0
+            if node is not None:
+                residual = max(0.0, node.voltage - node.resting_potential)
+            reprime = min(
+                self._config.fatigue_recovery_base,
+                self._config.fatigue_recovery_reprime_scale * residual,
+            )
+            new_val = self._focus_fatigue[nid] - (self._config.fatigue_recovery_base + reprime)
+            if new_val <= 0.0:
+                del self._focus_fatigue[nid]
+            else:
+                self._focus_fatigue[nid] = new_val
 
     def _read_recent_spikes(self) -> List[Tuple[str, float]]:
         """Fallback: read nodes that spiked most recently.

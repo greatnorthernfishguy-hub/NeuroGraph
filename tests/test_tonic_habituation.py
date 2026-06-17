@@ -38,3 +38,64 @@ def test_config_has_fatigue_knobs():
 def test_fatigue_state_starts_empty():
     t = _thread({"a": _node(voltage=0.5)})
     assert t._focus_fatigue == {}
+
+
+# --- Task 2: _read_active_nodes subtracts fatigue ---
+
+def test_fatigue_lowers_effective_activity():
+    t = _thread({"a": _node(voltage=1.0), "b": _node(voltage=0.9)},
+                exploration_bias=0.0)
+    t._focus_fatigue["a"] = 0.30
+    ranked = t._read_active_nodes()
+    ids = [nid for nid, _ in ranked]
+    assert ids[0] == "b"  # a: 1.0 - 0.30 = 0.70 < b: 0.90
+
+
+def test_no_fatigue_unchanged_ranking():
+    t = _thread({"a": _node(voltage=1.0), "b": _node(voltage=0.9)},
+                exploration_bias=0.0)
+    ranked = t._read_active_nodes()
+    assert [nid for nid, _ in ranked][0] == "a"
+
+
+# --- Task 3: _apply_focus_fatigue (accrue + recover + spine whisper + reprime) ---
+
+def test_accrual_on_active_capped():
+    t = _thread({"a": _node(voltage=1.0)})
+    for _ in range(100):
+        t._apply_focus_fatigue([("a", 1.0)])
+    assert t._focus_fatigue["a"] == t._config.fatigue_max
+
+
+def test_recovery_when_not_focus():
+    t = _thread({"a": _node(voltage=0.0), "b": _node(voltage=0.0)})
+    t._focus_fatigue["a"] = 0.20
+    t._apply_focus_fatigue([("b", 0.5)])
+    assert 0.0 <= t._focus_fatigue.get("a", 0.0) < 0.20
+
+
+def test_recovery_floors_at_zero():
+    t = _thread({"a": _node(voltage=0.0)})
+    t._focus_fatigue["a"] = 0.001
+    t._apply_focus_fatigue([])
+    assert t._focus_fatigue.get("a", 0.0) == 0.0
+
+
+def test_contextual_reprime_speeds_recovery():
+    t = _thread({"hot": _node(voltage=0.8, resting=0.0),
+                 "cold": _node(voltage=0.0, resting=0.0),
+                 "x": _node(voltage=0.5)})
+    t._focus_fatigue["hot"] = 0.30
+    t._focus_fatigue["cold"] = 0.30
+    t._apply_focus_fatigue([("x", 0.5)])
+    assert t._focus_fatigue["hot"] < t._focus_fatigue["cold"]
+
+
+def test_spine_accrues_only_a_whisper():
+    t = _thread({"plain": _node(voltage=1.0),
+                 "constitutional::spine::01": _node(voltage=1.0, constitutional=True)})
+    t._apply_focus_fatigue([("plain", 1.0), ("constitutional::spine::01", 1.0)])
+    assert (t._focus_fatigue["constitutional::spine::01"]
+            < t._focus_fatigue["plain"])
+    assert abs(t._focus_fatigue["constitutional::spine::01"]
+               - t._config.spine_fatigue_scale * t._focus_fatigue["plain"]) < 1e-9
