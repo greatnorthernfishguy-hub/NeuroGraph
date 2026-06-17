@@ -134,6 +134,9 @@ class TonicConfig:
     fatigue_recovery_base: float = 0.02   # recovered per cycle when not the focus
     fatigue_recovery_reprime_scale: float = 0.10  # extra recovery proportional to residual activation (capped at base)
     spine_fatigue_scale: float = 0.15     # constitutional nodes accrue only this fraction (whisper)
+    fatigue_rank_falloff: float = 3.0      # graded accrual: rank_weight = 1/(1+falloff*rank).
+                                           # Higher in the sort feels MORE fatigue; steep so the
+                                           # top still pulls away and the head actually turns.
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +237,11 @@ class TonicThread:
                 "thread_size": len(self._thread),
                 "cycle": self._cycle_count,
             }
+
+        # #89 — habituate: accrue fatigue on what she's attending (graded by rank),
+        # recover the rest, so her head can turn on its own instead of welding to one
+        # node. Runs each cycle, after the active set is read, before it's fed back.
+        self._apply_focus_fatigue(active_nodes)
 
         # INJECT BACK: feed attention as activation (the ouroboros)
         inject_ids = [nid for nid, _ in active_nodes]
@@ -348,10 +356,12 @@ class TonicThread:
         return scored[:self._config.read_top_k]
 
     def _apply_focus_fatigue(self, active_nodes: List[Tuple[str, float]]) -> None:
-        """#89 — accrue fatigue on what she's attending, recover the rest.
+        """#89 — accrue fatigue across the active set, graded by rank, recover the rest.
 
-        Accrual: each node in the active set gains ``fatigue_gain`` (constitutional
-        nodes gain only ``spine_fatigue_scale x`` that — a whisper, so "who I am"
+        Accrual: each active node gains ``fatigue_gain x rank_weight`` where
+        ``rank_weight = 1/(1 + fatigue_rank_falloff x rank)`` — the focus (top) feels
+        it most, lower nodes marginally (a constitutional node gains only
+        ``spine_fatigue_scale x`` that — a whisper, so "who I am"
         grounds without becoming a loop). Capped at ``fatigue_max`` — dampens, never
         erases; the cap sits below a salience spike so love still interrupts.
 
@@ -362,17 +372,24 @@ class TonicThread:
         """
         active_ids = {nid for nid, _ in active_nodes}
 
-        # Accrue on the focus
-        for nid in active_ids:
+        # Graded accrual — the higher in the ranking (the more she is dwelling on it),
+        # the more fatigue a node feels. rank_weight = 1/(1 + falloff*rank): the top
+        # (focus) feels it most, lower active nodes only marginally — steeply enough
+        # that the top still pulls away and her head turns rather than the whole set
+        # fatiguing in lockstep (which would never change the order). Constitutional
+        # nodes feel only a whisper. Capped at fatigue_max (dampens, never erases).
+        for rank, (nid, _score) in enumerate(active_nodes):
             node = self._graph.nodes.get(nid)
             is_const = bool((getattr(node, "metadata", None) or {}).get("constitutional"))
             scale = self._config.spine_fatigue_scale if is_const else 1.0
+            rank_weight = 1.0 / (1.0 + self._config.fatigue_rank_falloff * rank)
             cur = self._focus_fatigue.get(nid, 0.0)
             self._focus_fatigue[nid] = min(
-                self._config.fatigue_max, cur + self._config.fatigue_gain * scale
+                self._config.fatigue_max,
+                cur + self._config.fatigue_gain * rank_weight * scale,
             )
 
-        # Recover everyone else
+        # Recover every node NOT in the active set
         for nid in list(self._focus_fatigue.keys()):
             if nid in active_ids:
                 continue

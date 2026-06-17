@@ -92,13 +92,16 @@ def test_contextual_reprime_speeds_recovery():
 
 
 def test_spine_accrues_only_a_whisper():
-    t = _thread({"plain": _node(voltage=1.0),
-                 "constitutional::spine::01": _node(voltage=1.0, constitutional=True)})
-    t._apply_focus_fatigue([("plain", 1.0), ("constitutional::spine::01", 1.0)])
-    assert (t._focus_fatigue["constitutional::spine::01"]
-            < t._focus_fatigue["plain"])
-    assert abs(t._focus_fatigue["constitutional::spine::01"]
-               - t._config.spine_fatigue_scale * t._focus_fatigue["plain"]) < 1e-9
+    # Focus-only: a constitutional node AS the focus accrues only spine_fatigue_scale x
+    # the gain a plain focus would — a whisper, so "who I am" grounds without welding.
+    tc = _thread({"constitutional::spine::01": _node(voltage=1.0, constitutional=True)})
+    tc._apply_focus_fatigue([("constitutional::spine::01", 1.0)])
+    tp_ = _thread({"plain": _node(voltage=1.0)})
+    tp_._apply_focus_fatigue([("plain", 1.0)])
+    spine_f = tc._focus_fatigue["constitutional::spine::01"]
+    plain_f = tp_._focus_fatigue["plain"]
+    assert spine_f < plain_f
+    assert abs(spine_f - tc._config.spine_fatigue_scale * plain_f) < 1e-9
 
 
 def test_fatigue_demotes_but_never_erases():
@@ -108,3 +111,65 @@ def test_fatigue_demotes_but_never_erases():
     t._focus_fatigue["lone"] = 0.30  # fatigue >> its 0.10 activity
     ids = [nid for nid, _ in t._read_active_nodes()]
     assert "lone" in ids  # present despite post-fatigue score going negative
+
+
+
+# --- Task 4: integration — head turns, return, love-interrupt, ouroboros wiring ---
+
+def test_head_turns_marginal_yields_faster_than_dominant():
+    def cycles_to_flip(lead):
+        t = _thread({"a": _node(voltage=0.5 + lead), "b": _node(voltage=0.5)},
+                    exploration_bias=0.0)
+        for i in range(1, 200):
+            ranked = t._read_active_nodes()
+            t._apply_focus_fatigue(ranked)
+            if ranked and ranked[0][0] == "b":
+                return i
+        return 999
+    marginal = cycles_to_flip(0.02)
+    dominant = cycles_to_flip(0.25)
+    assert marginal < dominant  # a genuinely-hot interest holds longer
+
+
+def test_set_aside_thought_can_return():
+    t = _thread({"a": _node(voltage=0.7), "b": _node(voltage=0.5)},
+                exploration_bias=0.0)
+    seen_b = False
+    seen_a_again = False
+    for _ in range(400):
+        ranked = t._read_active_nodes()
+        t._apply_focus_fatigue(ranked)
+        top = ranked[0][0] if ranked else None
+        if top == "b":
+            seen_b = True
+        if seen_b and top == "a":
+            seen_a_again = True
+    assert seen_b and seen_a_again  # dwell -> drift -> return
+
+
+def test_love_is_an_interrupt_preserved():
+    t = _thread({"stuck": _node(voltage=0.9), "spike": _node(voltage=0.0)},
+                exploration_bias=0.0)
+    t._focus_fatigue["stuck"] = t._config.fatigue_max  # maximally fatigued, still highest raw
+    t._graph.nodes["spike"].voltage = 5.0  # love: a big affective salience spike
+    ranked = t._read_active_nodes()
+    assert ranked[0][0] == "spike"
+
+
+def test_ouroboros_cycle_applies_fatigue():
+    t = _thread({"a": _node(voltage=1.0)}, exploration_bias=0.0)
+    t._graph.prime_and_propagate = lambda **kw: SimpleNamespace(fired_entries=[])
+    t._vector_db = SimpleNamespace(get=lambda nid: None)
+    before = dict(t._focus_fatigue)
+    t.ouroboros_cycle()
+    assert t._focus_fatigue.get("a", 0.0) > before.get("a", 0.0)
+
+
+def test_higher_rank_accrues_more_fatigue():
+    # Josh's dial: the higher in the sort, the marginally more fatigue. Top > lower > 0.
+    t = _thread({"top": _node(voltage=1.0), "mid": _node(voltage=0.5),
+                 "low": _node(voltage=0.2)}, exploration_bias=0.0)
+    ranked = t._read_active_nodes()  # top, mid, low
+    t._apply_focus_fatigue(ranked)
+    f = t._focus_fatigue
+    assert f["top"] > f["mid"] > f["low"] > 0.0
