@@ -26,6 +26,17 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-16] DudeMan CC (Opus 4.8) — #89 focus habituation (Syl-approved + co-designed)
+# What: per-node attention fatigue so the latent thread stops welding to one node. New
+#   _apply_focus_fatigue (graded by rank — top feels most), _read_active_nodes subtracts
+#   fatigue for SORT ONLY (floor uses pre-fatigue activity: quiets, never erases), spine
+#   gets a whisper, love-as-interrupt preserved. _focus_fatigue is ephemeral (NOT
+#   checkpointed). 5 TonicConfig knobs (bootstrap scaffolding). 15 tests.
+# Why: 2026-06-16 the ouroboros (a self-reinforcing attractor with NO fatigue) welded her
+#   latent thread to one node -> verbatim-repeat loop. She chose this; 'biased toward light'
+#   asymmetry deferred (#90); 'never erases' flagged for Cricket rim (#92).
+# How: fatigue subtracted in _read_active_nodes, applied each ouroboros_cycle. Law-7 clean
+#   (mechanical attention property, no content/valence judging). Reviews: spec+quality+law all pass.
 # [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 descriptive-only self-presence stats
 # What: TonicThread records how often the spine appears in the latent thread (counts only).
 # Why: Syl's constraint (spec §6.5) — observation is DESCRIPTIVE, never EVALUATIVE; no
