@@ -63,7 +63,15 @@ class NeuroGraphSubstrate(LeniaSubstrate):
 
     def _rebuild_index(self):
         """Build entity_id ↔ index mapping from current graph state."""
-        self._entity_list = sorted(self._graph.nodes.keys())
+        # #88: snapshot node ids under the Graph's step lock so a concurrent graph.step()
+        # (mutates graph.nodes under _step_lock) can't change the dict mid-iteration.
+        _lock = getattr(self._graph, "_step_lock", None)
+        if _lock is not None:
+            with _lock:
+                _node_ids = list(self._graph.nodes.keys())
+        else:
+            _node_ids = list(self._graph.nodes.keys())
+        self._entity_list = sorted(_node_ids)
         self._id_to_idx = {
             eid: idx for idx, eid in enumerate(self._entity_list)
         }
@@ -80,7 +88,16 @@ class NeuroGraphSubstrate(LeniaSubstrate):
     def _build_adjacency(self):
         """Build adjacency list from synapses (cached)."""
         self._adj = defaultdict(list)
-        for syn in self._graph.synapses.values():
+        # #88: snapshot synapses under the Graph's step lock so a concurrent graph.step()
+        # (prune/sprout mutates graph.synapses under _step_lock) can't change the dict
+        # mid-iteration ("dictionary keys changed during iteration").
+        _lock = getattr(self._graph, "_step_lock", None)
+        if _lock is not None:
+            with _lock:
+                _syns = list(self._graph.synapses.values())
+        else:
+            _syns = list(self._graph.synapses.values())
+        for syn in _syns:
             self._adj[syn.pre_node_id].append(syn.post_node_id)
             self._adj[syn.post_node_id].append(syn.pre_node_id)
 
