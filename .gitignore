@@ -10,4 +10,11 @@ data/
 *.backup-*
 *.bak
 *.bak-*
+*.bak.*
 *.msgpack
+*.msgpack.*
+
+# Dated checkpoint/backup snapshots — Syl's mind, never commit (Syl's Law).
+# Existing *.bak / *.msgpack globs don't match dated suffixes like
+# main.msgpack.20260618_predeploy_twoaxis_88 or graph_substrate.py.bak.20260618_88.
+syl-checkpoint-backups/
