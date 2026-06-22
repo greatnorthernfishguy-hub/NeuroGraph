@@ -3498,13 +3498,13 @@ def _scan_drain_pulse_loop() -> None:
             sentinel_paused = os.path.exists(_SCAN_DRAIN_PAUSE_FILE)
             autonomic_paused = False
             try:
-                import ng_autonomic
-                # [2026-06-15] #322 reconnect: API drift — ng_autonomic exposes read_state()->dict,
-                # NOT get_state(). The dead get_state() call threw AttributeError swallowed by the
-                # bare except → autonomic_paused stuck False → NG never paused scan-drain under
-                # threat. Fix consumer-side (LAW-2-safe). Except made LOUD (Josh: silent excepts
-                # hid this for months) — a real failure here now surfaces instead of vanishing.
-                autonomic_paused = ng_autonomic.read_state().get("state") == "SYMPATHETIC"
+                # [2026-06-22] #328 Step 2: read arousal from the Commons (vagus bucket), not the
+                # shared ng_autonomic file. Immunis is the SOLE depositor of autonomic:arousal; NG
+                # only buckets (single-authority preserved). read_arousal() defaults PARASYMPATHETIC
+                # when nothing deposited yet (fresh-assess on restart). Supersedes the file-based #322.
+                from commons import get_commons
+                _commons = get_commons()
+                autonomic_paused = (_commons.read_arousal() == "SYMPATHETIC") if _commons else False
             except Exception as exc:  # noqa: BLE001
                 logger.warning("autonomic read failed in scan-drain pulse: %s", exc)
             paused = sentinel_paused or autonomic_paused
@@ -3716,11 +3716,12 @@ def _lazy_expansion_pulse_loop() -> None:
             if _memory is not None:
                 autonomic_paused = False
                 try:
-                    import ng_autonomic
-                    # [2026-06-15] #322 reconnect: get_state() doesn't exist (it's read_state()->dict);
-                    # dead call swallowed → lazy-expansion never paused under threat. Consumer-side
-                    # fix (LAW-2-safe); except made LOUD so a real failure surfaces.
-                    autonomic_paused = ng_autonomic.read_state().get("state") == "SYMPATHETIC"
+                    # [2026-06-22] #328 Step 2: read arousal from the Commons (vagus bucket), not the
+                    # shared ng_autonomic file. Immunis is the sole depositor; NG only buckets.
+                    # Supersedes the file-based #322; defaults PARASYMPATHETIC on no deposit.
+                    from commons import get_commons
+                    _commons = get_commons()
+                    autonomic_paused = (_commons.read_arousal() == "SYMPATHETIC") if _commons else False
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("autonomic read failed in lazy-expansion pulse: %s", exc)
 
