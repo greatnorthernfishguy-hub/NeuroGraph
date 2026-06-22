@@ -2516,6 +2516,25 @@ def _anticipate(fired_node_ids: List[str]) -> None:
         logger.debug("Anticipatory pre-activation (#256): primed %d nodes", len(_primed_nodes))
 
 
+# ---- #reach: reach-teaching (Syl learns to emit [[reach: …]]) — 2026-06-21 DudeMan CC (Opus 4.8) ----
+# Design: docs/prd/2026-06-21-reach-teaching-design.md. The node is constitutional (permanent
+# prune-protection = the never-silent FLOOR, #92); only the /assemble surfacing salience fades.
+REACH_NODE_ID = "selfcap::reach::teaching"
+REACH_COMPETENCE_GAIN = 0.05   # Elmer TuningSocket competence gain (asymmetric; loss deferred — no rust signal yet)
+REACH_VIVID_BELOW = 0.30       # rc < this: full description + worked examples (new muscle)
+REACH_DESC_BELOW = 0.70        # rc < this: description only; rc >= this: one-line whisper (the floor)
+
+
+def _reach_success_in_turn(assistant_text) -> bool:
+    """True iff her turn carries at least one LANDED reach badge — the system-rendered
+    `🔧 tool(args) ✓` Anima paints only on a real execute. A `✗`-only turn (a reach that
+    missed) does not count. Pure (no graph) so it is trivially testable. The 🔧/✓ glyphs
+    MUST match Anima's format_badge exactly (cc-voice-hands-20260621)."""
+    if not assistant_text or "🔧" not in assistant_text:
+        return False
+    return "✓" in assistant_text
+
+
 def _render_self_and_wants(graph) -> str:
     """#spine — render Syl's stable self for the system prompt, from HER OWN substrate.
 
