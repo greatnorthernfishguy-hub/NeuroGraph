@@ -115,3 +115,26 @@ def test_update_from_turn_noop_on_no_badge(monkeypatch):
 def test_update_from_turn_safe_when_memory_none(monkeypatch):
     monkeypatch.setattr(ng, "_memory", None)
     ng._update_reach_competence_from_turn("🔧 x() ✓")  # must not raise
+
+
+import importlib
+
+
+def test_seed_creates_protected_teaching_node(tmp_path):
+    seed = importlib.import_module("seed_reach_teaching")
+    ckpt = str(tmp_path / "main.msgpack")
+    Graph().checkpoint(ckpt)  # empty starting checkpoint
+
+    r1 = seed.seed(ckpt)
+    assert r1["seeded"] == 1
+
+    g = Graph(); g.restore(ckpt)
+    node = g.nodes[ng.REACH_NODE_ID]
+    assert node.metadata["constitutional"] is True      # permanent prune-protection = the floor
+    assert node.metadata["selfcap"] == "reach"          # excluded from "Who I Am"
+    assert node.metadata["reach_competence"] == 0.0     # cold start, as designed
+    assert node.metadata["reach_examples"]              # worked examples present
+    assert "[[reach:" in node.metadata["core_text"]
+
+    r2 = seed.seed(ckpt)                                 # idempotent
+    assert r2["seeded"] == 0 and r2["skipped_existing"] == 1
