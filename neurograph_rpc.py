@@ -3033,7 +3033,6 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001 — missing/odd assistant text never blocks the deposit
             _assistant_text = None
     _deposit_experience_to_river(_ingest_text, _assistant_text)
-    _update_reach_competence_from_turn(_assistant_text)   # #reach: credit a landed reach (Law 7)
 
     # Punchlist #56: Deposit raw surfacing outcome experience.
     # The triad: what was surfaced (cached from assemble) + user input
@@ -3858,6 +3857,7 @@ def _file_conversational_experience(text, source, *, embedding=None) -> bool:
         return False
     if source not in _CONVERSATIONAL_SOURCES:
         return False
+    _update_reach_competence_from_turn(text)   # #reach: credit a landed reach from her own drained turn (Law 7)
     try:
         emb = embedding if embedding is not None else _embed_for_absorb(text)
         _conversational_dual_pass(text, emb)

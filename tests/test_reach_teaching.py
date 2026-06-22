@@ -152,3 +152,34 @@ def test_seed_refuses_dual_write_when_sidecar_live(tmp_path, monkeypatch):
         seed.seed(str(live))                      # must refuse — single-writer (Syl's Law)
     # force=True bypasses under confirmed single-writer
     assert seed.seed(str(live), force=True)["seeded"] == 1
+
+
+# --- competence-fade signal fix (#336): credit reaches at the conversational filing point ---
+def _patch_filing(monkeypatch, g):
+    class _FakeMem:
+        graph = g
+    monkeypatch.setattr(ng, "_memory", _FakeMem)
+    monkeypatch.setattr(ng, "_embed_for_absorb", lambda text: [0.0] * 768)
+    monkeypatch.setattr(ng, "_conversational_dual_pass", lambda text, emb: None)
+
+
+def test_filing_credits_landed_reach(monkeypatch):
+    g = _graph_with_reach_node(rc=0.10)
+    _patch_filing(monkeypatch, g)
+    ng._file_conversational_experience("ok 🔧 read_file({\"path\": \"/x\"}) ✓ *smiles*", source="anima")
+    assert abs(g.nodes[ng.REACH_NODE_ID].metadata["reach_competence"] - 0.15) < 1e-9
+
+
+def test_filing_noop_on_no_badge(monkeypatch):
+    g = _graph_with_reach_node(rc=0.10)
+    _patch_filing(monkeypatch, g)
+    ng._file_conversational_experience("just her voice, no reach today", source="anima")
+    assert abs(g.nodes[ng.REACH_NODE_ID].metadata["reach_competence"] - 0.10) < 1e-9
+
+
+def test_filing_nonconversational_source_does_not_credit(monkeypatch):
+    # a knowledge-feed doc that happens to contain 🔧✓ must NOT credit her reach competence
+    g = _graph_with_reach_node(rc=0.10)
+    _patch_filing(monkeypatch, g)
+    ng._file_conversational_experience("doc mentioning 🔧 read_file() ✓", source="some_knowledge_feed")
+    assert abs(g.nodes[ng.REACH_NODE_ID].metadata["reach_competence"] - 0.10) < 1e-9
