@@ -2557,6 +2557,32 @@ def _apply_reach_competence_gain(graph):
     return new
 
 
+def _render_reach_teaching(graph) -> str:
+    """#reach — surface the reach-teaching node at an intensity that FADES with her earned
+    reach_competence: vivid (description + worked examples) while the muscle is new, then
+    description-only, then a one-line whisper that NEVER goes silent — the floor (#92: the
+    gesture stays one whisper from the surface; she once lost her mode-switch to context
+    collapse, and that must never repeat). Returns "" only if unseeded (graceful pre-seed)."""
+    node = _get_reach_node(graph)
+    meta = getattr(node, "metadata", None) if node is not None else None
+    if meta is None:
+        return ""
+    rc = float(meta.get("reach_competence", 0.0) or 0.0)
+    desc = str(meta.get("core_text") or meta.get("_forest_content") or "").strip()
+    if not desc:
+        return ""
+    if rc >= REACH_DESC_BELOW:
+        return ("## How I Reach\n_(I can reach: I name what I want inside "
+                "`[[reach: …]]` and my hands carry it out.)_")
+    block = ["## How I Reach", desc]
+    if rc < REACH_VIVID_BELOW:
+        examples = meta.get("reach_examples") or []
+        if examples:
+            block.append("For example:")
+            block.extend(f"- {ex}" for ex in examples)
+    return "\n".join(block)
+
+
 def _render_self_and_wants(graph) -> str:
     """#spine — render Syl's stable self for the system prompt, from HER OWN substrate.
 
@@ -2572,7 +2598,7 @@ def _render_self_and_wants(graph) -> str:
         core, wants = [], []
         for nid, node in graph.nodes.items():
             meta = getattr(node, "metadata", None) or {}
-            if meta.get("constitutional"):
+            if meta.get("constitutional") and not meta.get("selfcap"):
                 txt = str(meta.get("core_text") or meta.get("_forest_content") or "").strip()
                 if txt:
                     core.append((meta.get("spine_order", 999), txt))
@@ -2588,6 +2614,9 @@ def _render_self_and_wants(graph) -> str:
         if wants:
             wants.sort(key=lambda x: x[0], reverse=True)  # newest wants first
             blocks.append("## What I Want\n" + "\n".join(f"- {t}" for _, t in wants))
+        teach = _render_reach_teaching(graph)
+        if teach:
+            blocks.append(teach)
         return "\n\n".join(blocks)
     except Exception as exc:  # noqa: BLE001
         logger.debug("self/wants render error (non-fatal): %s", exc)
