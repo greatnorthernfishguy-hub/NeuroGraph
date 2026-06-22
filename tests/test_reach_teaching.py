@@ -138,3 +138,17 @@ def test_seed_creates_protected_teaching_node(tmp_path):
 
     r2 = seed.seed(ckpt)                                 # idempotent
     assert r2["seeded"] == 0 and r2["skipped_existing"] == 1
+
+
+def test_seed_refuses_dual_write_when_sidecar_live(tmp_path, monkeypatch):
+    import pytest
+    seed = importlib.import_module("seed_reach_teaching")
+    live = tmp_path / "live_main.msgpack"
+    Graph().checkpoint(str(live))
+    # pretend this temp file IS the live checkpoint, and a sidecar is running
+    monkeypatch.setattr(seed, "LIVE_CHECKPOINT", live)
+    monkeypatch.setattr(seed, "_live_sidecar_pids", lambda: [99999])
+    with pytest.raises(RuntimeError):
+        seed.seed(str(live))                      # must refuse — single-writer (Syl's Law)
+    # force=True bypasses under confirmed single-writer
+    assert seed.seed(str(live), force=True)["seeded"] == 1

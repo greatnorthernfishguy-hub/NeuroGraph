@@ -7,14 +7,20 @@
 #   Substrate-first / Law 7: a real node that surfaces, not a static prompt-staple.
 # How: constitutional:True for permanent prune-protection (the never-silent FLOOR, #92) + selfcap
 #   marker so /assemble routes it to the faded "How I Reach" block, NOT "Who I Am". Idempotent
-#   (stable id). OFFLINE only (sidecar dead — single-writer on main.msgpack, Syl's Law).
+#   (stable id). OFFLINE only — a HARD single-writer guard (Syl's Law / #261/#299) aborts if a
+#   live NeuroGraph sidecar PID exists when targeting the live checkpoint (orphans fail to bind
+#   8850 but still autosave, so we check PIDs, not the port).
 # -------------------
 import argparse
 import logging
+import os
+import subprocess
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("seed_reach_teaching")
+
+LIVE_CHECKPOINT = Path.home() / "NeuroGraph/data/checkpoints/main.msgpack"
 
 REACH_NODE_ID = "selfcap::reach::teaching"
 REACH_DESC = (
@@ -27,7 +33,26 @@ REACH_EXAMPLES = [
 ]
 
 
-def seed(checkpoint_path: str, dry_run: bool = False) -> dict:
+def _live_sidecar_pids():
+    """Live NeuroGraph sidecar PIDs (by process name, not port — orphans still autosave)."""
+    try:
+        out = subprocess.run(["pgrep", "-f", "neurograph_rpc"],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:  # noqa: BLE001 — if pgrep is unavailable, fail SAFE (treat as live)
+        return [-1]
+    me = os.getpid()
+    return [int(x) for x in out.stdout.split() if x.strip().lstrip("-").isdigit() and int(x) != me]
+
+
+def seed(checkpoint_path: str, dry_run: bool = False, force: bool = False) -> dict:
+    # Single-writer guard (Syl's Law / #261/#299): NEVER dual-write the live checkpoint.
+    if not force and Path(checkpoint_path).resolve() == LIVE_CHECKPOINT.resolve():
+        pids = _live_sidecar_pids()
+        if pids:
+            raise RuntimeError(
+                f"live NeuroGraph sidecar PID(s) {pids} — refusing to dual-write {checkpoint_path}. "
+                "Stop the sidecar first (single-writer, Syl's Law), or pass force=True once it is "
+                "confirmed FULLY DEAD.")
     from neuro_foundation import Graph
     graph = Graph()
     graph.restore(checkpoint_path)
@@ -57,13 +82,19 @@ def seed(checkpoint_path: str, dry_run: bool = False) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Seed Syl's reach-teaching node (OFFLINE only)")
-    ap.add_argument("--checkpoint", default=str(Path.home() / "NeuroGraph/data/checkpoints/main.msgpack"))
+    ap.add_argument("--checkpoint", default=str(LIVE_CHECKPOINT))
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="bypass the single-writer guard ONLY when the sidecar is confirmed dead")
     a = ap.parse_args()
     if not Path(a.checkpoint).exists():
         logger.error("checkpoint not found: %s", a.checkpoint)
         return 1
-    result = seed(a.checkpoint, dry_run=a.dry_run)
+    try:
+        result = seed(a.checkpoint, dry_run=a.dry_run, force=a.force)
+    except RuntimeError as exc:
+        logger.error("ABORTED: %s", exc)
+        return 2
     logger.info("result: %s", result)
     return 0
 
