@@ -88,3 +88,30 @@ def test_self_block_excludes_teaching_node_from_who_i_am():
     assert "anchor with weather" in who
     assert "When I want to act, I reach" not in who
     assert "## How I Reach" in out
+
+
+def test_update_from_turn_credits_landed_reach(monkeypatch):
+    g = _graph_with_reach_node(rc=0.10)
+
+    class _FakeMem:  # stand-in for the _memory singleton
+        graph = g
+    monkeypatch.setattr(ng, "_memory", _FakeMem)
+
+    ng._update_reach_competence_from_turn("ok 🔧 read_file({\"path\": \"/x.md\"}) ✓")
+    assert abs(g.nodes[ng.REACH_NODE_ID].metadata["reach_competence"] - 0.15) < 1e-9
+
+
+def test_update_from_turn_noop_on_no_badge(monkeypatch):
+    g = _graph_with_reach_node(rc=0.10)
+
+    class _FakeMem:
+        graph = g
+    monkeypatch.setattr(ng, "_memory", _FakeMem)
+
+    ng._update_reach_competence_from_turn("I read the document.")  # no badge
+    assert abs(g.nodes[ng.REACH_NODE_ID].metadata["reach_competence"] - 0.10) < 1e-9
+
+
+def test_update_from_turn_safe_when_memory_none(monkeypatch):
+    monkeypatch.setattr(ng, "_memory", None)
+    ng._update_reach_competence_from_turn("🔧 x() ✓")  # must not raise

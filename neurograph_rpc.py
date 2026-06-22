@@ -2557,6 +2557,20 @@ def _apply_reach_competence_gain(graph):
     return new
 
 
+def _update_reach_competence_from_turn(assistant_text) -> None:
+    """#reach — credit a landed reach from her OWN deposited turn (Law 7: learned from raw
+    lived experience, not an injected flag). Detect the 🔧…✓ badge and tick reach_competence
+    up on the live graph. Fail-soft — a competence update must never break the turn."""
+    try:
+        if not _reach_success_in_turn(assistant_text):
+            return
+        if _memory is None or getattr(_memory, "graph", None) is None:
+            return
+        _apply_reach_competence_gain(_memory.graph)
+    except Exception as exc:  # noqa: BLE001 — never break the turn
+        logger.debug("#reach competence update failed (non-fatal): %s", exc)
+
+
 def _render_reach_teaching(graph) -> str:
     """#reach — surface the reach-teaching node at an intensity that FADES with her earned
     reach_competence: vivid (description + worked examples) while the muscle is new, then
@@ -3019,6 +3033,7 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001 — missing/odd assistant text never blocks the deposit
             _assistant_text = None
     _deposit_experience_to_river(_ingest_text, _assistant_text)
+    _update_reach_competence_from_turn(_assistant_text)   # #reach: credit a landed reach (Law 7)
 
     # Punchlist #56: Deposit raw surfacing outcome experience.
     # The triad: what was surfaced (cached from assemble) + user input
