@@ -119,3 +119,44 @@ class CommonsEco:
         except Exception as exc:  # noqa: BLE001 — a deposit failure never breaks the caller
             logger.debug("[%s] CommonsEco deposit failed: %s", self._source, exc)
             return None
+
+    # ⚠ DELIBERATELY ABSENT: record_outcome_broadcast. This is load-bearing LAW-1 architecture,
+    # NOT an unfinished gap in the drop-in. ng_embed.dual_record_outcome selects its write method
+    # by `hasattr(ecosystem, "record_outcome_broadcast")` — because CommonsEco lacks it, that check
+    # is False and every forest/tree write routes through self.record_outcome → commons.deposit
+    # (a pool put, no addressing). Adding record_outcome_broadcast here to "complete the NGEcosystem
+    # surface" would flip the hasattr True and silently re-route dual-pass deposits into the
+    # addressed-tract fan-out — re-opening the 2026-06-07 write-only leak. Do NOT add it. The
+    # Commons IS the broadcast (deposit/bucket); there is no addressed broadcast on the Commons.
+    def dual_record_outcome(self, content, embedding, target_id, success=True,
+                            strength: float = 1.0, metadata: Optional[Dict[str, Any]] = None):
+        """Faithful ng_ecosystem.dual_record_outcome drop-in — forest+tree dual-pass into the Commons.
+
+        # ---- Changelog ----
+        # [2026-06-22] Claude Code (Opus 4.8) — #328/dual-pass: CommonsEco gains dual_record_outcome
+        # What: Mirror NGEcosystem.dual_record_outcome so CommonsEco is a faithful drop-in for the
+        #       FULL ecosystem surface, not just record_outcome. Delegates to NGEmbed with
+        #       ecosystem=self → Pass 1 (forest) + Pass 2 (TID concepts → trees + forest↔tree links)
+        #       all route through self.record_outcome → commons.deposit, so the whole dual-pass
+        #       lands in the shared Commons (verified: _create_substrate_link never touches _ng).
+        # Why: Josh's directive — NOTHING in the ecosystem is single-pass; forest+tree is the point.
+        #       Modules migrating off ng_ecosystem (Immunis/THC/Elmer) must keep dual-pass when they
+        #       deposit to the Commons. One uniform path: eco.dual_record_outcome(...).
+        # How: import NGEmbed lazily; NGEmbed.dual_record_outcome(self, content, embedding, ...).
+        #       Fail-soft: if NGEmbed/engine is unavailable, degrade to a single forest deposit so a
+        #       deposit is NEVER lost (same graceful TID-down fallback ng_embed itself documents).
+        # -------------------
+        """
+        if embedding is None:
+            return None
+        try:
+            from ng_embed import NGEmbed
+            return NGEmbed.get_instance().dual_record_outcome(
+                self, content, embedding, target_id, success,
+                strength=strength, metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 — never lose the deposit; degrade to forest-only
+            logger.debug("[%s] CommonsEco dual_record_outcome → single-pass fallback: %s",
+                         self._source, exc)
+            return self.record_outcome(embedding, target_id, success,
+                                       strength=strength, metadata=metadata)

@@ -99,7 +99,57 @@ def test_string_namespace_coerced_not_charsplit():
     assert not any(str(r[0]).startswith("experience:") for r in recs), "char-split would have matched everything"
 
 
+def _tid_up():
+    import urllib.request
+    try:
+        urllib.request.urlopen("http://127.0.0.1:7437/health", timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+def test_dual_record_outcome_failsoft_to_forest():
+    """If dual-pass can't run (no embed engine), fall back to a single forest deposit — never lose it."""
+    import ng_embed
+    c = commons_mod.Commons()
+    eco = _eco(c, namespaces=("threat:",))
+    orig = ng_embed.NGEmbed.get_instance
+    def _boom(*a, **k):
+        raise RuntimeError("no engine")
+    ng_embed.NGEmbed.get_instance = staticmethod(_boom)
+    try:
+        eco.dual_record_outcome(content="x", embedding=_emb(1), target_id="threat:fb", success=True)
+    finally:
+        ng_embed.NGEmbed.get_instance = orig
+    targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
+    assert "threat:fb" in targets, "forest deposited on single-pass fallback"
+
+
+def test_dual_record_outcome_none_embedding_safe():
+    c = commons_mod.Commons()
+    assert _eco(c).dual_record_outcome(content="x", embedding=None, target_id="threat:n", success=True) is None
+
+
+def test_dual_record_outcome_forest_and_trees_live():
+    """Real dual-pass through CommonsEco: forest + TID-extracted trees land in the Commons (needs TID)."""
+    if not _tid_up():
+        print("SKIP live dual-pass (TID 7437 not reachable)"); return
+    import ng_embed
+    c = commons_mod.Commons()
+    eco = _eco(c, namespaces=("threat:",))
+    content = "SSH brute-force authentication failures and an outbound malware C2 connection on port 4444 from nginx."
+    emb = ng_embed.embed(content)
+    res = eco.dual_record_outcome(content=content, embedding=emb, target_id="threat:probe", success=True)
+    assert res and res.get("pass2_attempted"), "Pass 2 attempted"
+    targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
+    assert "threat:probe" in targets, "forest deposited"
+    assert sum(1 for t in targets if "::tree::" in t) > 0, "tree concepts deposited to the Commons"
+
+
 if __name__ == "__main__":
+    test_dual_record_outcome_failsoft_to_forest(); print("PASS dual_record_outcome fail-soft → single forest deposit")
+    test_dual_record_outcome_none_embedding_safe(); print("PASS dual_record_outcome None embedding safe")
+    test_dual_record_outcome_forest_and_trees_live(); print("PASS dual_record_outcome live forest+trees (or SKIP if no TID)")
     test_string_namespace_coerced_not_charsplit(); print("PASS string namespace coerced (footgun guarded)")
     test_get_context_faithful_shape();   print("PASS get_context faithful 5-key shape (tier/recommendations/novelty/...)")
     test_namespace_filter();             print("PASS namespace filter (threat:/response: only)")
