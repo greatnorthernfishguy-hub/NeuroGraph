@@ -87,7 +87,20 @@ def test_parameterized_for_different_module():
     assert recs and str(recs[0][0]).startswith("repair:")
 
 
+def test_string_namespace_coerced_not_charsplit():
+    """Footgun guard: a bare string namespace must NOT become a char-tuple (compliance #335)."""
+    c = commons_mod.Commons()
+    c.deposit(_emb(7), "threat:s", metadata={})
+    c.deposit(_emb(7), "experience:e", metadata={})
+    eco = CommonsEco(namespaces="threat:", commons_provider=lambda: c)  # bare string, the trap
+    assert eco._namespaces == ("threat:",), "string must coerce to a 1-tuple, not char-split"
+    recs = eco.get_context(_emb(7))["recommendations"]
+    assert recs and all(str(r[0]).startswith("threat:") for r in recs)
+    assert not any(str(r[0]).startswith("experience:") for r in recs), "char-split would have matched everything"
+
+
 if __name__ == "__main__":
+    test_string_namespace_coerced_not_charsplit(); print("PASS string namespace coerced (footgun guarded)")
     test_get_context_faithful_shape();   print("PASS get_context faithful 5-key shape (tier/recommendations/novelty/...)")
     test_namespace_filter();             print("PASS namespace filter (threat:/response: only)")
     test_no_filter_accepts_all();        print("PASS no-namespace → accept all")

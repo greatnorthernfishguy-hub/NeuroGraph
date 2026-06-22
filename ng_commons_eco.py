@@ -49,9 +49,21 @@ class CommonsEco:
         source_id: str = "",
         commons_provider: Optional[Callable[[], Any]] = None,
     ):
-        # namespaces: target_id prefixes this module's get_context restricts to (its own deposits).
-        # () = accept all Commons deposits (rarely what a module wants — usually pass your own prefix).
+        # namespaces: target_id prefix(es) this module's get_context restricts to (its OWN deposits).
+        # CONTRACT (every migrating module MUST pass its own namespace): on a private NGLite a
+        # module's substrate held only its own deposits; the shared Commons holds everyone's, so
+        # WITHOUT a namespace get_context returns other modules' deposits → silent cross-module
+        # extraction pollution. Deposit-side discipline: record_outcome target_ids MUST carry the
+        # same prefix(es), or the module won't surface its own deposits.
+        # NOTE: the filter restricts only RETURNED recommendations — cross-module learning still
+        # happens via Hebbian co-activation in the shared NGLite topology (by design).
+        if isinstance(namespaces, str):
+            namespaces = (namespaces,)   # guard the str→char-tuple footgun ("threat:" → ('t','h',...))
         self._namespaces = tuple(namespaces)
+        if not self._namespaces:
+            logger.warning("CommonsEco[%s] created with NO namespace — get_context will return ALL "
+                           "modules' deposits (cross-module extraction pollution). Pass your own prefix.",
+                           source_id or "?")
         self._top_k = top_k
         self._source = source_id
         self._commons_provider = commons_provider  # injectable for tests; else lazy get_commons
