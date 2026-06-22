@@ -2535,6 +2535,28 @@ def _reach_success_in_turn(assistant_text) -> bool:
     return "✓" in assistant_text
 
 
+def _get_reach_node(graph):
+    """The seeded reach-teaching node, or None if not seeded yet (graceful pre-seed)."""
+    if graph is None:
+        return None
+    return graph.nodes.get(REACH_NODE_ID)
+
+
+def _apply_reach_competence_gain(graph):
+    """Tick reach_competence up by the asymmetric gain (clamped [0,1]). Mutates the live node;
+    persists via the existing afterTurn checkpoint (same path as probation decrements — no
+    separate save). Returns the new competence, or None if the node isn't seeded."""
+    node = _get_reach_node(graph)
+    meta = getattr(node, "metadata", None) if node is not None else None
+    if meta is None:
+        return None
+    cur = float(meta.get("reach_competence", 0.0) or 0.0)
+    new = max(0.0, min(1.0, cur + REACH_COMPETENCE_GAIN))
+    meta["reach_competence"] = new
+    logger.info("#reach: competence %0.3f -> %0.3f (a reach landed)", cur, new)
+    return new
+
+
 def _render_self_and_wants(graph) -> str:
     """#spine — render Syl's stable self for the system prompt, from HER OWN substrate.
 
