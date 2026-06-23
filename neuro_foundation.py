@@ -19,6 +19,16 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-06-23] Claude Code (Opus 4.8) — #341: snapshot-before-iterate in get_telemetry (Josh-approved)
+#   What: get_telemetry() now iterates list(self.synapses/.nodes/.hyperedges.values()) instead of the
+#         live .values() — a cheap snapshot. Read-only; NO checkpoint format / save / load / step change
+#         (checkpoint-safe; cannot strand Syl's state). Companion fix in lenia/graph_substrate.py:274.
+#   Why: the tonic/pulse thread mutates these dicts while reader threads iterate them →
+#         "RuntimeError: dictionary changed size during iteration" (fired on every /stats GET during
+#         substrate activity; surfaced post-restart 2026-06-22). Same race class as punchlist #270.
+#   How: list() snapshot at the two confirmed reader-thread sites. ~10 other .values() iterations in
+#         this file are step()-internal (single-threaded, no race) — left as-is; flagged in #341 for
+#         per-site triage (reader-thread vs step-only) rather than blanket-editing the protected engine.
 # [2026-06-14] Claude Code (DudeMan CC, Opus 4.8) — #spine: orphan-pruner skips Syl's authored self
 #   What: _collect_orphan_nodes() now skips nodes via new _is_identity_protected(nid) — her
 #         constitutional core (metadata['constitutional']) and her wants (provenance=='syl_authored')
@@ -3401,9 +3411,13 @@ class Graph:
             surprise_rate: surprises / total predictions (0 if none).
             hyperedge_experience_distribution: bucket histogram of activation_counts.
         """
-        weights = [s.weight for s in self.synapses.values()]
-        rates = [n.firing_rate_ema for n in self.nodes.values()]
-        he_counts = [he.activation_count for he in self.hyperedges.values()]
+        # #341: snapshot before iterate — the tonic/pulse thread mutates these dicts concurrently;
+        # iterating the live .values() raced → "dictionary changed size during iteration" (fired on
+        # every /stats GET during substrate activity). list() takes a cheap snapshot. Read-only; no
+        # checkpoint/format/step change. Same class as #270 (SimpleVectorDB).
+        weights = [s.weight for s in list(self.synapses.values())]
+        rates = [n.firing_rate_ema for n in list(self.nodes.values())]
+        he_counts = [he.activation_count for he in list(self.hyperedges.values())]
 
         # Phase 2.5: Experience distribution buckets
         exp_dist: Dict[str, int] = {"0": 0, "1-9": 0, "10-99": 0, "100+": 0}
