@@ -122,3 +122,25 @@ def test_diffuse_does_not_mutate_graph():
     vf._diffuse(g, {"warm": 0.9})
     assert {nid: nd.voltage for nid, nd in g.nodes.items()} == before
     assert {sid: s.weight for sid, s in g.synapses.items()} == weights_before
+
+
+# ---------------------------------------------------------------------------
+# Task 4 tests — public compute() entry point
+# ---------------------------------------------------------------------------
+
+def test_compute_end_to_end_in_unit_range_and_neutral_absent():
+    vf = _light_field()
+    syn = {"s1": _syn("warm", "mid", 2.0)}
+    g = _graph(["warm", "cold", "mid", "island"], synapses=syn)  # island: no emb, no wires
+    vdb = _vdb({"warm": [1, 0], "cold": [-1, 0]})
+    field = vf.compute(g, vdb)
+    assert field["warm"] > 0.5 and field["cold"] < -0.5
+    assert field["mid"] > 0.1            # warmth reached it through her web
+    assert "island" not in field         # no seed, no wires -> neutral (absent)
+    assert all(-1.0 <= v <= 1.0 for v in field.values())
+
+
+def test_compute_empty_when_no_axis():
+    vf = ValenceField(ValenceConfig(), embed_fn=None, poles={"light": [], "dark": []})
+    g = _graph(["a"])
+    assert vf.compute(g, _vdb({"a": [1, 0]})) == {}

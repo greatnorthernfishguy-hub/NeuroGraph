@@ -45,7 +45,7 @@ class ValenceConfig:
     """Bootstrap scaffolding for the valence field. Substrate supersedes."""
     seed_gain: float = 3.0        # amplify the small raw projection into a usable seed (clamped [-1,1])
     diffusion_steps: int = 3      # how many label-propagation passes over her synapses
-    diffusion_alpha: float = 0.5  # blend: (1-a)*own-seed + a*neighbour-average
+    diffusion_alpha: float = 0.4  # blend: (1-a)*own-seed + a*neighbour-average
     pole_file: str = _POLE_FILE_DEFAULT
 
 
@@ -130,6 +130,16 @@ class ValenceField:
             st = getattr(syn, "synapse_type", None)
             sign = -1.0 if (st is not None and getattr(st, "name", "") == "INHIBITORY") else 1.0
             yield other, sign * float(syn.weight)
+
+    def compute(self, graph, vector_db) -> Dict[str, float]:
+        """The valence field: seed from her embeddings, spread through her synapses.
+
+        Read-only. Returns {} if the axis could not be built (no poles / no embedder).
+        """
+        if self.axis is None:
+            return {}
+        seed = self._seed(graph, vector_db)
+        return self._diffuse(graph, seed)
 
     def _diffuse(self, graph, seed: Dict[str, float]) -> Dict[str, float]:
         """Spread seeds across HER synapses: label propagation, read-only."""
