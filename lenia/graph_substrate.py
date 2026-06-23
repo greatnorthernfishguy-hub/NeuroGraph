@@ -271,7 +271,7 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         if b not in self._adj.get(a, []):
             return 0.0
 
-        for syn in self._graph.synapses.values():
+        for syn in list(self._graph.synapses.values()):   # #341: snapshot — pulse thread mutates concurrently
             if (syn.pre_node_id == a and syn.post_node_id == b) or (
                 syn.pre_node_id == b and syn.post_node_id == a
             ):
