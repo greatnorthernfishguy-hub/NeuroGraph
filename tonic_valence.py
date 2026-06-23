@@ -93,3 +93,23 @@ class ValenceField:
         if n == 0.0:
             return None
         return axis / n
+
+    def _seed(self, graph, vector_db) -> Dict[str, float]:
+        """Per-node valence from its own embedding projected onto the light<->dark axis."""
+        seed: Dict[str, float] = {}
+        if self.axis is None:
+            return seed
+        for nid in graph.nodes:
+            entry = vector_db.get(nid) if hasattr(vector_db, "get") else None
+            if not entry:
+                continue
+            emb = entry.get("embedding")
+            if emb is None:
+                continue
+            emb = np.asarray(emb, dtype=np.float32)
+            n = float(np.linalg.norm(emb))
+            if n == 0.0:
+                continue
+            proj = float(np.dot(emb / n, self.axis)) * self._config.seed_gain
+            seed[nid] = max(-1.0, min(1.0, proj))
+        return seed

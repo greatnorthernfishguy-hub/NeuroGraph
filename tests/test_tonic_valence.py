@@ -39,3 +39,47 @@ def test_axis_points_from_dark_to_light():
     assert vf.axis.shape == (2,)
     assert np.isclose(np.linalg.norm(vf.axis), 1.0)
     assert vf.axis[0] > 0.99  # points toward light
+
+
+# ---------------------------------------------------------------------------
+# Task 2 helpers — fake vdb and graph for seed tests
+# ---------------------------------------------------------------------------
+
+def _vdb(mapping, dim=2):
+    """Fake SimpleVectorDB: .get(id) -> {'embedding': ndarray} or None."""
+    store = {k: np.array(v, dtype=np.float32) for k, v in mapping.items()}
+    return SimpleNamespace(get=lambda i: ({"embedding": store[i]} if i in store else None))
+
+
+def _graph(node_ids, synapses=None):
+    nodes = {nid: SimpleNamespace(voltage=0.0, resting_potential=0.0, metadata={}) for nid in node_ids}
+    synapses = synapses or {}
+    outgoing, incoming = {nid: set() for nid in node_ids}, {nid: set() for nid in node_ids}
+    for sid, syn in synapses.items():
+        outgoing.setdefault(syn.pre_node_id, set()).add(sid)
+        incoming.setdefault(syn.post_node_id, set()).add(sid)
+    return SimpleNamespace(nodes=nodes, synapses=synapses, _outgoing=outgoing, _incoming=incoming)
+
+
+def _light_field():
+    poles = {"light": ["L"], "dark": ["D"]}
+    embed = _stub_embed({"L": [1, 0], "D": [-1, 0]}, dim=2)
+    return ValenceField(ValenceConfig(), embed_fn=embed, poles=poles)
+
+
+def test_seed_light_node_positive_dark_node_negative():
+    vf = _light_field()
+    g = _graph(["warm", "cold", "noemb"])
+    vdb = _vdb({"warm": [1, 0], "cold": [-1, 0]})  # 'noemb' has no embedding
+    seed = vf._seed(g, vdb)
+    assert seed["warm"] > 0.5
+    assert seed["cold"] < -0.5
+    assert "noemb" not in seed  # no embedding -> neutral (absent)
+
+
+def test_seed_clamped_to_unit_range():
+    vf = _light_field()  # seed_gain=3.0 would push a pure-light projection past 1.0
+    g = _graph(["x"])
+    vdb = _vdb({"x": [5, 0]})
+    seed = vf._seed(g, vdb)
+    assert -1.0 <= seed["x"] <= 1.0
