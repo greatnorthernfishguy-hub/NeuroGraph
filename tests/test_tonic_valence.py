@@ -83,3 +83,42 @@ def test_seed_clamped_to_unit_range():
     vdb = _vdb({"x": [5, 0]})
     seed = vf._seed(g, vdb)
     assert -1.0 <= seed["x"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Task 3 helpers — synapse factory for diffusion tests
+# ---------------------------------------------------------------------------
+
+def _syn(pre, post, weight, inhibitory=False):
+    st = SimpleNamespace(name=("INHIBITORY" if inhibitory else "EXCITATORY"))
+    return SimpleNamespace(pre_node_id=pre, post_node_id=post, weight=weight, synapse_type=st)
+
+
+def test_neutral_node_wired_to_light_picks_up_warmth():
+    vf = _light_field()
+    # 'mid' has no embedding (no seed) but is wired strongly to light-seeded 'warm'
+    syn = {"s1": _syn("warm", "mid", 2.0)}
+    g = _graph(["warm", "mid"], synapses=syn)
+    seed = {"warm": 0.9}  # mid absent
+    field = vf._diffuse(g, seed)
+    assert field["mid"] > 0.1  # warmth flowed across her synapse
+    assert field["mid"] < field["warm"]  # but it's a glow, not the source
+
+
+def test_inhibitory_synapse_flips_sign_of_influence():
+    vf = _light_field()
+    syn = {"s1": _syn("warm", "mid", 2.0, inhibitory=True)}
+    g = _graph(["warm", "mid"], synapses=syn)
+    field = vf._diffuse(g, {"warm": 0.9})
+    assert field["mid"] < 0.0  # inhibitory tie to a light node reads as shadow
+
+
+def test_diffuse_does_not_mutate_graph():
+    vf = _light_field()
+    syn = {"s1": _syn("warm", "mid", 2.0)}
+    g = _graph(["warm", "mid"], synapses=syn)
+    before = {nid: nd.voltage for nid, nd in g.nodes.items()}
+    weights_before = {sid: s.weight for sid, s in g.synapses.items()}
+    vf._diffuse(g, {"warm": 0.9})
+    assert {nid: nd.voltage for nid, nd in g.nodes.items()} == before
+    assert {sid: s.weight for sid, s in g.synapses.items()} == weights_before

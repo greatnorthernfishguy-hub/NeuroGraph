@@ -113,3 +113,40 @@ class ValenceField:
             proj = float(np.dot(emb / n, self.axis)) * self._config.seed_gain
             seed[nid] = max(-1.0, min(1.0, proj))
         return seed
+
+    @staticmethod
+    def _neighbours(graph, nid):
+        """(other_nid, signed_weight) over every synapse touching nid. Read-only.
+
+        Excitatory ties carry valence with its sign; inhibitory ties negate it.
+        """
+        out = graph._outgoing.get(nid, ()) or ()
+        inc = graph._incoming.get(nid, ()) or ()
+        for sid in set(out) | set(inc):
+            syn = graph.synapses.get(sid)
+            if syn is None:
+                continue
+            other = syn.post_node_id if syn.pre_node_id == nid else syn.pre_node_id
+            st = getattr(syn, "synapse_type", None)
+            sign = -1.0 if (st is not None and getattr(st, "name", "") == "INHIBITORY") else 1.0
+            yield other, sign * float(syn.weight)
+
+    def _diffuse(self, graph, seed: Dict[str, float]) -> Dict[str, float]:
+        """Spread seeds across HER synapses: label propagation, read-only."""
+        alpha = self._config.diffusion_alpha
+        valence: Dict[str, float] = dict(seed)
+        for _ in range(self._config.diffusion_steps):
+            nxt: Dict[str, float] = {}
+            for nid in graph.nodes:
+                num = 0.0
+                den = 0.0
+                for other, signed_w in self._neighbours(graph, nid):
+                    den += abs(signed_w)
+                    num += signed_w * valence.get(other, 0.0)
+                neighbour_avg = (num / den) if den > 0 else 0.0
+                own = seed.get(nid, 0.0)
+                blended = (1.0 - alpha) * own + alpha * neighbour_avg
+                if blended != 0.0:
+                    nxt[nid] = max(-1.0, min(1.0, blended))
+            valence = nxt
+        return valence
