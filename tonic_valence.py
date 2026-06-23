@@ -101,7 +101,7 @@ class ValenceField:
             return seed
         for nid in graph.nodes:
             entry = vector_db.get(nid) if hasattr(vector_db, "get") else None
-            if not entry:
+            if entry is None:
                 continue
             emb = entry.get("embedding")
             if emb is None:
