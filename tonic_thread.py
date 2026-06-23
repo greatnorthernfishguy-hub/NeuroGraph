@@ -234,6 +234,7 @@ class TonicThread:
                 self._valence_field = None
         else:
             self._valence_field = None
+        logger.info("Tonic valence field: %s", "live" if self._valence_field is not None else "disabled")
 
         # Current thread state
         self._thread: List[ThreadItem] = []

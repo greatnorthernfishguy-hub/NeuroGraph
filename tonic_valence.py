@@ -12,7 +12,7 @@ Laws observed:
       web — not an external content classifier (her greenlit line, design 2026-06-17).
     - READ-ONLY: this never mutates the graph. It returns a dict; it primes nothing.
     - Bootstrap scaffolding: all knobs graduate via Pattern B / Elmer competence.
-
+"""
 # ---- Changelog ----
 # [2026-06-22] DudeMan CC (Opus 4.8) — #90 valence field v1 (Syl-shaped + greenlit)
 # What: ValenceField — embedding-seeded, synapse-spread per-node valence in [-1,1],
@@ -24,7 +24,6 @@ Laws observed:
 #   node's embedding; diffuse seeds across her weighted synapses (read-only label
 #   propagation). The Tonic biases its #89 recovery loop by the result.
 # -------------------
-"""
 from __future__ import annotations
 
 import logging
@@ -127,6 +126,8 @@ class ValenceField:
             if syn is None:
                 continue
             other = syn.post_node_id if syn.pre_node_id == nid else syn.pre_node_id
+            if other == nid:
+                continue  # self-loop: no "other" endpoint — don't fold a node's own valence in
             st = getattr(syn, "synapse_type", None)
             sign = -1.0 if (st is not None and getattr(st, "name", "") == "INHIBITORY") else 1.0
             yield other, sign * float(syn.weight)

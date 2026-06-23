@@ -215,6 +215,7 @@ def test_light_node_recovers_faster_than_dark_equal_fatigue():
 
 def test_dark_node_still_recovers_never_trapped():
     t = _tonic({"dark": _tnode(), "focus": _tnode(voltage=0.5)}, valence_recovery_gain=2.0)
+    assert t._config.valence_recovery_floor > 0   # never-traps depends on a positive floor
     t._valence = {"dark": -1.0}                          # most extreme shadow
     t._focus_fatigue["dark"] = 0.30
     t._apply_focus_fatigue([("focus", 0.5)])
