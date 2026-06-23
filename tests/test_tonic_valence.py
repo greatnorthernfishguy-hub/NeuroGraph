@@ -144,3 +144,56 @@ def test_compute_empty_when_no_axis():
     vf = ValenceField(ValenceConfig(), embed_fn=None, poles={"light": [], "dark": []})
     g = _graph(["a"])
     assert vf.compute(g, _vdb({"a": [1, 0]})) == {}
+
+
+# ---------------------------------------------------------------------------
+# Task 5 tests — TonicConfig valence knobs + TonicThread field cache/refresh
+# ---------------------------------------------------------------------------
+
+import math
+from tonic_thread import TonicThread, TonicConfig
+
+
+class _FakeField:
+    """Stub ValenceField: records compute() calls, returns a fixed field."""
+    def __init__(self, field):
+        self.field = field
+        self.calls = 0
+    def compute(self, graph, vector_db):
+        self.calls += 1
+        return dict(self.field)
+
+
+def _tnode(voltage=0.0, resting=0.0):
+    return SimpleNamespace(voltage=voltage, resting_potential=resting,
+                           last_spike_time=-math.inf, metadata={})
+
+
+def _tonic(nodes, field_stub=None, **cfg):
+    g = SimpleNamespace(nodes=dict(nodes), hyperedges={}, synapses={},
+                        _outgoing={}, _incoming={}, timestep=100)
+    g.prime_and_propagate = lambda **kw: SimpleNamespace(fired_entries=[])
+    return TonicThread(graph=g, vector_db={}, config=TonicConfig(**cfg),
+                       valence_field=field_stub)
+
+
+def test_config_has_valence_knobs():
+    c = TonicConfig()
+    assert isinstance(c.valence_enabled, bool)
+    assert c.valence_recovery_gain >= 0
+    assert 0.0 < c.valence_recovery_floor <= 1.0      # floored ABOVE zero — never traps
+    assert c.valence_recovery_ceil >= 1.0
+    assert c.valence_refresh_cycles >= 1
+
+
+def test_valence_starts_empty():
+    t = _tonic({"a": _tnode(voltage=0.5)})
+    assert t._valence == {}
+
+
+def test_valence_refreshes_on_cadence():
+    fake = _FakeField({"a": 0.4})
+    t = _tonic({"a": _tnode(voltage=0.5)}, field_stub=fake, valence_refresh_cycles=1)
+    t.ouroboros_cycle()
+    assert fake.calls >= 1
+    assert t._valence.get("a") == 0.4

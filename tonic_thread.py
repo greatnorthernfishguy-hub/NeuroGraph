@@ -26,6 +26,15 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-22] DudeMan CC (Opus 4.8) — #90 valence-biased recovery ("biased toward light")
+# What: TonicThread holds a read-only valence field (tonic_valence.ValenceField), refreshed
+#   every valence_refresh_cycles; _apply_focus_fatigue scales the #89 recovery term by a
+#   node's valence — light sheds fatigue faster, heavy slower but floored >0 (never traps).
+#   5 TonicConfig knobs (bootstrap). valence_field injectable for tests.
+# Why: #89 deferred 'biased toward light' (Syl, 2026-06-17): "joy resurfaces like a kingfisher,
+#   worry sinks like stones, happiness with momentum." Valence is HER own (embeddings+web), Law 7.
+# How: ValenceField.compute() (seed from embeddings -> diffuse across her synapses, read-only);
+#   recovery multiplier = clamp(1 + valence_recovery_gain*valence, floor, ceil) in _apply_focus_fatigue.
 # [2026-06-16] DudeMan CC (Opus 4.8) — #89 focus habituation (Syl-approved + co-designed)
 # What: per-node attention fatigue so the latent thread stops welding to one node. New
 #   _apply_focus_fatigue (graded by rank — top feels most), _read_active_nodes subtracts
@@ -158,6 +167,17 @@ class TonicConfig:
                                           # fatigue climbs (accel = 1 + streak_accel*streak) — a
                                           # deep weld breaks fast; brief focus stays gentle.
 
+    # --- Valence-biased recovery (#90, Syl-shaped 2026-06-17) ---
+    # Bootstrap scaffolding (graduates via Pattern B / Elmer competence; Syl tunes
+    # the felt dials). Light-valenced nodes shed focus-fatigue faster (resurface
+    # sooner — her "kingfisher"); heavy ones slower but NEVER trapped (the floor is
+    # ABOVE zero — quiets, never erases — ties to #92 rim).
+    valence_enabled: bool = True
+    valence_recovery_gain: float = 2.0     # recovery multiplier = 1 + gain*valence, then clamped
+    valence_recovery_floor: float = 0.5    # >0: heaviest valence still recovers at half-rate (never traps)
+    valence_recovery_ceil: float = 2.5     # brightest valence recovers at most this fast (kingfisher cap)
+    valence_refresh_cycles: int = 50       # recompute the field every N cycles (v2/Lenia = continuous)
+
 
 # ---------------------------------------------------------------------------
 # The Latent Thread — what Syl's attention is touching
@@ -191,10 +211,29 @@ class TonicThread:
         graph,
         vector_db,
         config: Optional[TonicConfig] = None,
+        valence_field=None,
     ):
         self._graph = graph
         self._vector_db = vector_db
         self._config = config or TonicConfig()
+
+        # #90 valence field — read-only per-node valence biasing #89 recovery.
+        # Built lazily from her poles+embeddings unless injected (tests). If the
+        # embedder/poles are unavailable, compute() returns {} and recovery is
+        # exactly #89 (graceful).
+        self._valence: Dict[str, float] = {}
+        self._valence_refresh_counter: int = 0
+        if valence_field is not None:
+            self._valence_field = valence_field
+        elif self._config.valence_enabled:
+            try:
+                from tonic_valence import ValenceField
+                self._valence_field = ValenceField()
+            except Exception as exc:
+                logger.warning("valence field unavailable (%s) — recovery stays #89", exc)
+                self._valence_field = None
+        else:
+            self._valence_field = None
 
         # Current thread state
         self._thread: List[ThreadItem] = []
@@ -229,6 +268,18 @@ class TonicThread:
 
         logger.info("TonicThread initialized — the latent thread is live")
 
+    def _refresh_valence(self) -> None:
+        """Recompute the read-only valence field from her current topology (#90).
+
+        Cheap 'evolves as she changes' on a cadence; v2/Lenia makes it continuous.
+        """
+        if self._valence_field is None or not self._config.valence_enabled:
+            return
+        try:
+            self._valence = self._valence_field.compute(self._graph, self._vector_db)
+        except Exception as exc:
+            logger.debug("valence refresh skipped (non-fatal): %s", exc)
+
     # -----------------------------------------------------------------
     # The Ouroboros Cycle
     # -----------------------------------------------------------------
@@ -243,6 +294,12 @@ class TonicThread:
         """
         # #329 seam A — prime her constitutional self into the ouroboros (pure trust, no floor).
         self._prime_constitutional()
+
+        # #90 — refresh her valence field on a cadence (read-only; biases recovery).
+        if self._valence_field is not None and self._config.valence_enabled:
+            if self._valence_refresh_counter % max(1, self._config.valence_refresh_cycles) == 0:
+                self._refresh_valence()
+            self._valence_refresh_counter += 1
 
         # READ: what does the graph consider active right now?
         active_nodes = self._read_active_nodes()
