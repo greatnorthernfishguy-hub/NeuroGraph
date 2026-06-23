@@ -200,23 +200,24 @@ class Commons:
                 break
         return out
 
-    def read_arousal(self, default: str = "PARASYMPATHETIC") -> str:
-        """The vagus-nerve bucket — latest autonomic arousal state from the Commons (#328).
+    def arousal(self, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """The vagus-nerve bucket (full) — latest autonomic:arousal deposit metadata from the Commons.
 
         # ---- Changelog ----
         # [2026-06-22] Claude Code (Opus 4.8) — #328 Step 2: substrate-native arousal read.
-        # What: Return the newest "autonomic:arousal" deposit's state (Immunis is the SOLE depositor).
-        #       Every module reads arousal THIS way instead of ng_autonomic.read_state() on the file.
-        # Why: #328 — autonomic is just deposit (Immunis) + bucket (everyone). This is a bucket (a
-        #       read of the shared medium), NOT a new transport verb. Single-authority preserved:
-        #       readers never deposit autonomic:arousal; only Immunis does.
-        # How: DIRECT lookup of the single autonomic:arousal synapse (NOT a recency-window scan —
-        #       arousal is low-frequency and must NEVER be missed under deposit load, design subtlety
-        #       #2; the vagus is never missed). Snapshot synapses before iterating (punchlist #341 —
-        #       avoid concurrent iterate/mutate with the deposit/pulse threads). Fail-soft → default
-        #       PARASYMPATHETIC (fresh-assess when nothing deposited yet, design Decision #2).
+        # [2026-06-23] Claude Code (Opus 4.8) — split out arousal() (full dict) from read_arousal().
+        # What: Return the newest "autonomic:arousal" deposit's full metadata dict ({state, threat_level,
+        #       triggered_by, reason, ts}). read_arousal() is the state-only convenience over this; some
+        #       readers (Elmer engine) also need threat_level for modulation intensity.
+        # Why: #328 — autonomic is deposit (Immunis, SOLE depositor) + bucket (everyone). A bucket read,
+        #       not a transport verb. Single-authority preserved: readers never deposit, only bucket.
+        # How: DIRECT lookup of the single autonomic:arousal synapse (NOT a recency window — arousal is
+        #       low-frequency and must never be missed under deposit load, subtlety #2). Snapshot
+        #       synapses before iterating (#341). Fail-soft → default (fresh-assess, Decision #2).
         # -------------------
         """
+        if default is None:
+            default = {"state": "PARASYMPATHETIC", "threat_level": "none"}
         try:
             latest = None
             latest_ts = -1.0
@@ -229,10 +230,14 @@ class Commons:
                     latest = syn
             if latest is not None:
                 meta = getattr(latest, "metadata", {}).get("last_context", {}) or {}
-                return meta.get("state", default)
+                return meta or default
         except Exception as exc:  # noqa: BLE001 — a read failure never breaks the caller's pulse
-            logger.debug("read_arousal failed: %s", exc)
+            logger.debug("arousal read failed: %s", exc)
         return default
+
+    def read_arousal(self, default: str = "PARASYMPATHETIC") -> str:
+        """The vagus-nerve bucket — latest autonomic arousal STATE string (convenience over arousal())."""
+        return self.arousal().get("state", default)
 
     # ---- Persistence hooks (Tier 2 reference-counted survival — not yet lifecycle-wired) ----
     def persist(self, filepath: str) -> None:

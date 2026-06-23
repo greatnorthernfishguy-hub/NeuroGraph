@@ -54,10 +54,22 @@ def test_custom_default():
     assert commons_mod.Commons().read_arousal(default="PARASYMPATHETIC") == "PARASYMPATHETIC"
 
 
+def test_arousal_full_dict_carries_threat_level():
+    """arousal() returns the full latest deposit metadata (state + threat_level) for callers
+    that need modulation intensity (e.g. Elmer engine); read_arousal() is the state-only view."""
+    c = commons_mod.Commons()
+    assert c.arousal()["state"] == "PARASYMPATHETIC" and c.arousal()["threat_level"] == "none"
+    c.deposit(_emb(1), "autonomic:arousal", metadata={"state": "SYMPATHETIC", "threat_level": "critical"})
+    a = c.arousal()
+    assert a["state"] == "SYMPATHETIC" and a["threat_level"] == "critical"
+    assert c.read_arousal() == "SYMPATHETIC"  # delegation intact
+
+
 if __name__ == "__main__":
     test_default_parasympathetic_when_no_deposit(); print("PASS default PARASYMPATHETIC (fresh-assess)")
     test_returns_deposited_state();                 print("PASS returns deposited arousal state")
     test_latest_wins();                             print("PASS latest deposit wins")
     test_reliable_under_deposit_load();             print("PASS reliable under deposit load (vagus never missed)")
     test_custom_default();                          print("PASS custom default")
+    test_arousal_full_dict_carries_threat_level();  print("PASS arousal() full dict carries threat_level")
     print("\n#328 Step 2 (Commons.read_arousal): ALL PASS — the vagus-nerve bucket")
