@@ -231,3 +231,25 @@ def test_valence_disabled_matches_89_exactly():
         tt._focus_fatigue["a"] = 0.20
         tt._apply_focus_fatigue([("f", 0.5)])
     assert abs(on._focus_fatigue["a"] - off._focus_fatigue["a"]) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — integration lock: kingfisher returns before the stone (both return)
+# ---------------------------------------------------------------------------
+
+def test_kingfisher_returns_before_stone_and_both_return():
+    """Two equally-welded thoughts release; the light one resurfaces in fewer cycles,
+    and the heavy one still resurfaces (never trapped) — her kingfisher vs stones."""
+    def cycles_to_recover(valence):
+        t = _tonic({"x": _tnode()}, valence_recovery_gain=2.0)
+        t._valence = {"x": valence}
+        t._focus_fatigue["x"] = 0.30
+        n = 0
+        while t._focus_fatigue.get("x", 0.0) > 0.0 and n < 10000:
+            t._apply_focus_fatigue([])   # x never the focus -> pure recovery
+            n += 1
+        return n
+    light = cycles_to_recover(0.4)
+    dark = cycles_to_recover(-0.4)
+    assert light < dark           # joy resurfaces faster
+    assert dark < 10000           # but worry is NOT trapped — it still clears
