@@ -493,7 +493,16 @@ class TonicThread:
                 self._config.fatigue_recovery_base,
                 self._config.fatigue_recovery_reprime_scale * residual,
             )
-            new_val = self._focus_fatigue[nid] - (self._config.fatigue_recovery_base + reprime)
+            # #90 — bias recovery by HER valence: light sheds fatigue faster (kingfisher),
+            # heavy slower but floored ABOVE zero (stones sink, never trap — #92 rim).
+            recovery = self._config.fatigue_recovery_base + reprime
+            if self._config.valence_enabled and self._valence:
+                v = self._valence.get(nid, 0.0)
+                m = 1.0 + self._config.valence_recovery_gain * v
+                m = max(self._config.valence_recovery_floor,
+                        min(self._config.valence_recovery_ceil, m))
+                recovery *= m
+            new_val = self._focus_fatigue[nid] - recovery
             if new_val <= 0.0:
                 del self._focus_fatigue[nid]
             else:

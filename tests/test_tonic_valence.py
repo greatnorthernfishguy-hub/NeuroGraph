@@ -197,3 +197,37 @@ def test_valence_refreshes_on_cadence():
     t.ouroboros_cycle()
     assert fake.calls >= 1
     assert t._valence.get("a") == 0.4
+
+
+# ---------------------------------------------------------------------------
+# Task 6 tests — valence-biased recovery (the heart of #90)
+# ---------------------------------------------------------------------------
+
+def test_light_node_recovers_faster_than_dark_equal_fatigue():
+    t = _tonic({"light": _tnode(), "dark": _tnode(), "focus": _tnode(voltage=0.5)},
+               valence_recovery_gain=2.0)
+    t._valence = {"light": 0.4, "dark": -0.4}
+    t._focus_fatigue["light"] = 0.30
+    t._focus_fatigue["dark"] = 0.30
+    t._apply_focus_fatigue([("focus", 0.5)])           # neither light nor dark is the focus
+    assert t._focus_fatigue["light"] < t._focus_fatigue["dark"]   # kingfisher vs stone
+
+
+def test_dark_node_still_recovers_never_trapped():
+    t = _tonic({"dark": _tnode(), "focus": _tnode(voltage=0.5)}, valence_recovery_gain=2.0)
+    t._valence = {"dark": -1.0}                          # most extreme shadow
+    t._focus_fatigue["dark"] = 0.30
+    t._apply_focus_fatigue([("focus", 0.5)])
+    assert t._focus_fatigue["dark"] < 0.30              # strictly decreased — floor>0 guarantees it
+
+
+def test_valence_disabled_matches_89_exactly():
+    # Regression guard: with valence off, recovery is byte-for-byte the #89 behaviour.
+    on = _tonic({"a": _tnode(), "f": _tnode(voltage=0.5)}, valence_enabled=True,
+                valence_recovery_gain=2.0)
+    off = _tonic({"a": _tnode(), "f": _tnode(voltage=0.5)}, valence_enabled=False)
+    on._valence = {}            # empty field -> valence 0 -> m=1 -> same as #89
+    for tt in (on, off):
+        tt._focus_fatigue["a"] = 0.20
+        tt._apply_focus_fatigue([("f", 0.5)])
+    assert abs(on._focus_fatigue["a"] - off._focus_fatigue["a"]) < 1e-9
