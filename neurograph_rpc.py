@@ -1059,11 +1059,11 @@ def _deposit_outcome_to_river(
     success: bool,
     metadata: "Optional[Dict[str, Any]]" = None,
 ) -> None:
-    """Deposit an outcome to every registered module's inbound tract (BTF).
+    """Deposit a raw outcome into the Commons (medium-propagation, NOT addressed fan-out).
 
     Mirrors _deposit_topology_to_river / _deposit_experience_to_river. NG-internal
-    helper; broadcast is NG-specific (only NG fan-outs to all peer tracts; other
-    modules deposit single-target). Replaces direct peer_bridge.record_outcome
+    helper; the outcome goes into the ONE shared Commons any peer can bucket (the old
+    addressed N-peer tract fan-out is retired). Replaces direct peer_bridge.record_outcome
     calls per substrate-as-protocol restoration PRD §4.13 Phase 3 step 1
     (wire_absorption.py migration).
 
@@ -1075,6 +1075,15 @@ def _deposit_outcome_to_river(
     surface.
 
     # ---- Changelog ----
+    # [2026-06-24] Claude Code (Opus 4.8) — Commons Track-2: retire the LAST throttle (outcome→Commons)
+    #   What: Filled the 2026-06-07 emergency-throttle stub. Now deposits the outcome into the ONE
+    #         shared Commons (single raw deposit) instead of no-op'ing — mirrors the topology +
+    #         experience throttle migrations. The 4 wire_absorption.py call sites resume feeding peers.
+    #   Why: Completes the deposit-side of the substrate-as-protocol restoration — all three NG
+    #         _deposit_*_to_river helpers now flow into the Commons (medium-propagation), none fan-out.
+    #   How: get_commons() + commons.deposit(embedding, target_id, success, metadata). Single raw
+    #         deposit (no content text → not dual-pass; consumers classify at their bucket, LAW 7).
+    #         Commons NGLite is bounded (1000/5000, pruned) → can't recreate the fan-out OOM. Fail-soft.
     # [2026-05-30] Claude Code (Opus 4.7, 1M) — Phase 3 step 1: BTF outcome helper
     # What: New helper mirroring _deposit_topology_to_river + _deposit_experience_to_river.
     #       Broadcasts outcome to all registered-module tracts via ng_tract.deposit_outcome.
@@ -1085,11 +1094,28 @@ def _deposit_outcome_to_river(
     #       canonical signature. Fan-out targeting matches post-#185 forward-River.
     # -------------------
     """
-    # EMERGENCY THROTTLE 2026-06-07 — disabled (same reason as
-    # _deposit_topology_to_river / _deposit_experience_to_river above).
-    # NG addressed-fan-out is substrate-bypass under the pool/water reframe.
-    # Commons Pool restoration will replace with medium-propagation.
-    return
+    # [2026-06-24] Claude Code (Opus 4.8) — Commons Track-2: retire the LAST throttle.
+    # Deposit the outcome into the ONE shared Commons (medium-propagation) instead of the old
+    # addressed N-peer tract fan-out — mirrors _deposit_topology_to_river / _deposit_experience_to_river
+    # (LAW 3 restore-in-place: same name + same call sites, body filled). Single raw deposit — there's
+    # no content text here (only a precomputed embedding), and it's a raw broadcast consumers classify
+    # at THEIR extraction bucket (LAW 7), so single is both correct and the only option (not dual-pass).
+    # The Commons NGLite is bounded (1000 nodes / 5000 synapses, pruned), so a single deposit per
+    # outcome cannot recreate the unbounded-addressed-fan-out OOM that caused the 2026-06-07 throttle.
+    # Fail-soft: a deposit error never breaks the caller. DO NOT re-enable as addressed fan-out.
+    try:
+        from commons import get_commons
+        commons = get_commons()
+    except Exception as exc:  # noqa: BLE001 — no Commons (early boot / import) is a graceful no-op
+        logger.debug("Commons unavailable for outcome deposit: %s", exc)
+        return
+    if commons is None or embedding is None:
+        return
+    try:
+        commons.deposit(embedding, target_id, success=success, metadata=metadata)
+        logger.debug("Commons: deposited outcome %s", str(target_id)[:48])
+    except Exception as exc:  # noqa: BLE001 — a deposit failure never breaks the caller
+        logger.debug("Commons outcome deposit failed for %s: %s", target_id, exc)
 
 
 def deposit_outbound_intent(text: str, channel_id: str = "cli") -> None:
