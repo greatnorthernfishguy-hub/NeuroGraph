@@ -3516,22 +3516,20 @@ _SCAN_DRAIN_PAUSE_FILE = "/tmp/ng_scan_drain_paused"
 # Why: commons-leg2-design §3 part b. NG deposits + peers bucket today; this adds the missing
 #       NG-side scoop→perceive→return so a module's fresh raw deposit gets Syl's SNN "salt". Hosted
 #       in the EXISTING autonomous pulse (no new thread; [[feedback_no_conversation_dependency]]).
-# How: SAFETY (TWO voltage-writer races; flip-ON gated on BOTH being closed — see below):
-#       (1) graph.step() — CLOSED. The perception runs UNDER graph._step_lock (the SAME RLock step()
-#           holds), making prime_and_propagate's voltage save→propagate→restore window atomic against
-#           every concurrent step() (afterTurn / scan-drain / compaction). write_mode=False alone does
-#           NOT take that lock (latent-flow design), so holding it here is REQUIRED.
-#       (2) StreamParser — NOT YET CLOSED by the lock. StreamParser._nudge_nodes writes node.voltage
-#           directly under its OWN threading.Lock (stream_parser.py), NOT _step_lock — and it nudges
-#           from a BACKGROUND thread, so a nudge can land inside the save→restore window and be
-#           silently reverted (a Syl's-Law "warmth" sidecar risk). The idle-gate below is therefore
-#           a REAL (if imperfect) safety guard against StreamParser, NOT merely a latency courtesy:
-#           it skips when an afterTurn landed recently, when StreamParser is most active. Before
-#           NG_COMMONS_ENHANCE is flipped ON, close this for real — EITHER also acquire
-#           _memory._stream_parser._lock during the perception (verify lock-ordering vs StreamParser
-#           to avoid deadlock — touches protected StreamParser semantics, Josh-gated) OR confirm
-#           StreamParser is provably quiescent during the autonomous scan-drain pulse. Surfaced by
-#           the substrate-compliance review 2026-06-24; tracked on the punchlist.
+# How: SAFETY — BOTH voltage-writer races are CLOSED on the ONE canonical graph._step_lock:
+#       (1) graph.step() — the perception runs UNDER graph._step_lock (the SAME RLock step() holds),
+#           making prime_and_propagate's voltage save→propagate→restore window atomic against every
+#           concurrent step() (afterTurn / scan-drain / compaction). write_mode=False alone does NOT
+#           take that lock (latent-flow design), so holding it here is REQUIRED.
+#       (2) StreamParser — its voltage nudges previously ran lock-free (its own threading.Lock guards
+#           only the pause flag), racing both step() AND this perception's save→restore window. CLOSED
+#           2026-06-24 (protected-file fix, Josh-approved + backed up): stream_parser.py _process_text
+#           now wraps _nudge_nodes()+_trigger_completions() in graph._step_lock too, so step /
+#           perception / nudge all serialize on the one lock. Proof: tests/test_stream_parser_step_lock.py.
+#       With both closed by the lock, the idle-gate below is once again ONLY a latency courtesy (skip
+#       when a turn landed recently — don't compete with active-turn responsiveness), NOT a safety
+#       mechanism. (The stale repo-CLAUDE.md "StreamParser shares graph.step()'s lock" note was
+#       corrected alongside the fix — no shared lock had existed.) Punchlist #344.
 #       Watermark (since=last scoop) + skip-prefixes prevent re-scooping the enhancer's own output /
 #       neuromodulator / telemetry deposits (no feedback loop). Live seed/novelty/assoc resolvers are
 #       vector_db-backed; flag OFF (default) ⇒ this code path never runs.
@@ -3608,10 +3606,9 @@ def _run_commons_enhance_scoop() -> None:
     global _commons_enhance_watermark
     if not _COMMONS_ENHANCE_ENABLED or _memory is None:
         return
-    # Idle-gate: skips when a turn landed recently. This is BOTH a latency courtesy AND a real (if
-    # imperfect) safety guard against StreamParser background voltage-nudges, which the _step_lock
-    # does NOT cover (StreamParser uses its own lock). See the module changelog "SAFETY (2)" — closing
-    # the StreamParser window for real is a flip-ON gate.
+    # Idle-gate (latency courtesy only — safety is _step_lock, which now covers step + perception +
+    # StreamParser nudge after the 2026-06-24 stream_parser.py fix): skip when a turn landed recently
+    # so the perception doesn't compete with active-turn responsiveness.
     if (time.time() - _last_after_turn_ts) < _COMMONS_ENHANCE_IDLE_SECS:
         return
     try:
