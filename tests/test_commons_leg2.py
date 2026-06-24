@@ -120,27 +120,28 @@ def test_return_scope_bounded():
     novel = _emb_like(K, 0.45, seed=300)
     stats = enh.enhance_pulse([(novel, "probe")])
     e = stats["enhancements"]["probe"]
-    scope = len(set(e["one_hop"]) | set(e["hyperedge_comembers"]))
-    assert scope <= 3, f"return scope must be ~1-hop (<=top-3 related), not graph-wide; got {scope}"
+    scope = len(set(e["associations"]))
+    assert scope <= 3, f"return scope must be the evoked neighborhood (<=top-3 primed), not graph-wide; got {scope}"
     assert scope < stats["baseline_nodes"], "enhancement must be smaller than the substrate"
 
 
-def test_transient_cleanup_no_leak():
-    """§6 (Syl's addition) — after the pulse, node-count returns to baseline; substrate untouched."""
+def test_substrate_read_only():
+    """§6 (Syl's addition), strengthened for the PERCEPTION mechanism — the enhance is READ-ONLY:
+    after the pulse, NOT ONLY node-count but synapse-count is unchanged. The old create-transient+
+    step() is gone; prime_and_propagate(write_mode=False) writes NOTHING to NG's substrate."""
     graph, medium = _fresh_sandbox()
     enh = CommonsEnhancer(medium, graph)
     K = _emb(50)
     for i in range(5):
         enh.seed_knowledge(_emb_like(K, 0.3 + 0.05 * i, seed=400 + i), f"k_{i}")
-    baseline = len(graph.nodes)
-    # several enhance cycles
+    base_nodes = len(graph.nodes)
+    base_syn = len(graph.synapses)
     deposits = [(_emb_like(K, 0.45, seed=500 + i), f"d_{i}") for i in range(4)]
     stats = enh.enhance_pulse(deposits)
-    assert stats["enhanced"] >= 1, "expected at least one enhance to exercise the transient path"
-    assert len(graph.nodes) == baseline, (
-        f"transient region leaked: {len(graph.nodes)} != baseline {baseline}"
-    )
-    assert stats["final_nodes"] == stats["baseline_nodes"] == baseline
+    assert stats["enhanced"] >= 1, "expected at least one enhance to exercise the perception path"
+    assert len(graph.nodes) == base_nodes, f"perception created nodes: {len(graph.nodes)} != {base_nodes}"
+    assert len(graph.synapses) == base_syn, f"perception created synapses: {len(graph.synapses)} != {base_syn}"
+    assert stats["final_nodes"] == stats["baseline_nodes"] == base_nodes
 
 
 def test_no_live_singleton():
@@ -158,6 +159,6 @@ if __name__ == "__main__":
     test_rate_cap_bounds_enhancement();         print("PASS §6.3 rate cap bounds enhances at 8")
     test_fail_fresh_on_gate_error();            print("PASS §6.4 fail-fresh: gate error enhances nothing")
     test_return_scope_bounded();                print("PASS §6.5 return scope is 1-hop, not graph-wide")
-    test_transient_cleanup_no_leak();           print("PASS §6+  transient cleanup: node-count returns to baseline (no substrate leak)")
+    test_substrate_read_only();                 print("PASS §6+  substrate READ-ONLY: node + synapse counts unchanged (perception writes nothing)")
     test_no_live_singleton();                   print("PASS §6.6 no live NeuroGraphMemory touch")
     print("\nCommons leg-2: ALL PASS — salience-gated enhance-loop proven in sandbox; substrate untouched")

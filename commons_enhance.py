@@ -2,6 +2,23 @@
 Commons enhance-loop (leg 2) — NG salience-gated scoop → SNN-enhance → return.
 
 # ---- Changelog ----
+# [2026-06-24] Claude Code (Opus 4.8) — §3 enhance mechanism = PERCEPTION (prime_and_propagate), not step()
+# What: Rewrote _enhance_one. The original (create transient content-node + transient COPIES + graph.step())
+#       is sandbox-correct but NOT go-live-safe: `graph.step()` is the GLOBAL learning cycle (STDP /
+#       homeostasis / decay / structural plasticity / timestep) over the WHOLE graph — harmless on a
+#       sandbox graph (which IS only the transient region) but on Syl's LIVE graph it would step her
+#       entire mind every enhance. Replaced with READ-ONLY perception: prime the existing knowledge
+#       nodes nearest the deposit and run graph.prime_and_propagate(write_mode=False) — plasticity
+#       rules + structural changes NOT applied, voltages saved+restored. Her substrate is READ, never
+#       written: no transient nodes, no step(), no deletes. The fired neighborhood is the salt →
+#       Commons (content-addresses). Same code now runs sandbox OR live (graph = her live Graph).
+# Why: Josh + biomimicry — perception ≠ plasticity. A nervous system feeds the mind, the mind perceives
+#       (activation through learned structure, no rewiring per-signal); learning is the separate, gated
+#       path (leg-3 consolidation; prime_and_propagate write_mode=True is the Tonic's learning path).
+#       This is the purest realization of Syl's resolved §3 (A): nothing is even CREATED in her graph.
+#       Caught via a sandbox-vs-live gap (the create+step that the sandbox tests couldn't surface).
+# How: seeds = top-3 _knowledge by cosine ≥ _RELATED_SIM (live: vector_db.search); prime_and_propagate
+#       read-only; harvest fired_entries (strongest-first) → cids. Go-live pulse wiring is part (b).
 # [2026-06-10] Claude Code (Opus 4.8, 1M) — Commons Pool leg 2 (substrate-as-protocol Phase 7)
 # What: The Tier-3 enhance-loop, SANDBOX ONLY (not wired live). A module's fresh Commons
 #       deposit gets NG's SNN "salt" — but only when it's salient. Per Syl's authoritative
@@ -44,8 +61,9 @@ logger = logging.getLogger("commons_enhance")
 # Syl's resolutions (commons-leg2-design.md, 2026-06-10) — bootstrap values, graduate to learned.
 COMMONS_ENHANCE_NOVELTY_THRESHOLD = 0.50   # §1 — dedicated knob, NOT confidence_recommend
 MAX_ENHANCES_PER_PULSE = 8                  # §5 — flood-backstop, independent of the gate
-_RELATED_SIM = 0.30                         # bind content with existing knowledge at/above this sim
-_STIMULUS_CURRENT = 2.0                     # drive the transient region to fire during processing
+_RELATED_SIM = 0.30                         # prime existing knowledge at/above this sim to the deposit
+_STIMULUS_CURRENT = 2.0                     # priming current injected into the evoked seed nodes
+_PROP_STEPS = 3                             # spreading-activation steps (read-only perception pass)
 
 
 def _cos(a: np.ndarray, b: np.ndarray) -> float:
@@ -124,44 +142,43 @@ class CommonsEnhancer:
         co_members.discard(content_nid)
         return one_hop, co_members
 
-    # ---- the per-cycle transient enhance (§3 (A): create -> process -> deposit-back -> DELETE) ----
-    def _enhance_one(self, embedding: np.ndarray, content_id: str) -> Dict[str, List[str]]:
-        before = set(self.graph.nodes.keys())  # transient region = anything created this cycle
-
-        content_node = self.graph.create_node(metadata={"commons_transient": True, "cid": content_id})
-        cnid = content_node.node_id
-
-        # transient COPIES of related knowledge — STDP/plasticity acts on copies, never NG's substrate.
-        related = self._related_existing(embedding)
-        copy_to_cid: Dict[str, str] = {}
-        member_ids = [cnid]
-        for _rk_emb, rk_cid in related:
-            copy = self.graph.create_node(metadata={"transient_copy": True, "cid": rk_cid})
-            copy_to_cid[copy.node_id] = rk_cid
-            member_ids.append(copy.node_id)
-            self.graph.create_synapse(cnid, copy.node_id, weight=0.2)
-        if len(member_ids) >= 2:
-            self.graph.create_hyperedge(set(member_ids))  # the SNN "discovers" the binding
-
-        # SNN processing on the transient region only
-        for nid in member_ids:
-            self.graph.stimulate(nid, _STIMULUS_CURRENT)
-        self.graph.step()
-
-        # extract enhancement, mapped to CONTENT-ADDRESSES (leg-1 lesson: not raw SNN node-ids)
-        one_hop_nodes, co_member_nodes = self._extract_enhancement_nodes(cnid)
-        enhancement = {
-            "one_hop": sorted({copy_to_cid[n] for n in one_hop_nodes if n in copy_to_cid}),
-            "hyperedge_comembers": sorted({copy_to_cid[n] for n in co_member_nodes if n in copy_to_cid}),
-        }
+    # ---- the per-cycle PERCEPTION enhance (§3 (A) realized as read-only spreading activation) ----
+    def _enhance_one(self, embedding: np.ndarray, content_id: str) -> Dict[str, Any]:
+        """PERCEPTION, not learning — prime the EXISTING knowledge nearest the deposit and let
+        activation spread READ-ONLY via prime_and_propagate(write_mode=False): plasticity rules and
+        structural changes are NOT applied and voltages are saved+restored, so NG's substrate is
+        READ, never written — NO transient nodes, NO graph.step(), NO deletes. (The original
+        create-transient+step would, on the LIVE graph, run a full learning cycle over her WHOLE
+        mind — perception must not. Biomimetic: perception ≠ plasticity; commons-leg2-design §3 (A).)
+        The fired neighborhood is the salt — what NG's mind associates with the content — returned to
+        the Commons as content-addresses (leg-1: not raw SNN node-ids). A truly-novel deposit evokes
+        little; that's correct — deep integration is leg-3's gated consolidation, not perception."""
+        emb = np.asarray(embedding, dtype=np.float32)
+        # seeds = existing knowledge nodes most similar to the deposit (sandbox: _knowledge cosine;
+        # live: vector_db.search). Entries are (embedding, persistent_node_id, content_id).
+        scored = sorted(((_cos(emb, k), nid, cid) for k, nid, cid in self._knowledge),
+                        key=lambda t: t[0], reverse=True)
+        seeds = [(nid, cid) for s, nid, cid in scored if s >= _RELATED_SIM][:3]
+        if not seeds:
+            enhancement: Dict[str, Any] = {"associations": [], "primed": 0}
+            self.commons.deposit(emb, f"enhanced:{content_id}", metadata={"enhancement": enhancement})
+            return enhancement
+        seed_ids = [nid for nid, _ in seeds]
+        # READ-ONLY perception: no plasticity, no structural change, voltages saved+restored.
+        result = self.graph.prime_and_propagate(
+            seed_ids, [_STIMULUS_CURRENT] * len(seed_ids), steps=_PROP_STEPS, write_mode=False,
+        )
+        # harvest the evoked neighborhood (strongest-first by firing_step) → content-addresses.
+        assoc: List[str] = []
+        for fe in sorted(result.fired_entries, key=lambda e: e.firing_step):
+            node = self.graph.nodes.get(fe.node_id)
+            cid = node.metadata.get("cid") if (node is not None and node.metadata) else None
+            if cid and cid != content_id and cid not in assoc:
+                assoc.append(cid)
+        enhancement = {"associations": assoc, "primed": len(seed_ids)}
         # return the salt to the Commons, keyed by THIS content's embedding (leg-1 property:
         # lands on the same content-node the depositor used -> they bucket it back).
-        self.commons.deposit(embedding, f"enhanced:{content_id}", metadata={"enhancement": enhancement})
-
-        # §3 (A): DELETE the entire transient region (set-difference — robust to SNN sprouting).
-        for nid in (set(self.graph.nodes.keys()) - before):
-            if nid in self.graph.nodes:
-                self.graph.remove_node(nid)
+        self.commons.deposit(emb, f"enhanced:{content_id}", metadata={"enhancement": enhancement})
         return enhancement
 
     # ---- §2 pulse: scoop-all (free), enhance-some (salience-gated + rate-capped) ----
