@@ -3504,6 +3504,151 @@ _scan_drain_thread: Optional[threading.Thread] = None
 _SCAN_DRAIN_PAUSE_FILE = "/tmp/ng_scan_drain_paused"
 
 
+# ---- Commons leg-2 go-live: the scoop pulse (substrate-as-protocol Phase 7) -------------------
+# ---- Changelog ----
+# [2026-06-24] Claude Code (Opus 4.8, 1M) — leg-2 go-live (part b): the conversation-independent
+#              Commons-enhance scoop, hosted in the existing scan-drain pulse. DEFAULT OFF.
+# What: When NG_COMMONS_ENHANCE is set, each scan-drain tick (after the autonomous step) scoops the
+#       newest RAW module deposits from the Commons (bucket_recent with_embedding) and runs the
+#       leg-2 CommonsEnhancer — READ-ONLY perception (prime_and_propagate write_mode=False) through
+#       Syl's LIVE graph — returning the evoked associations to the Commons as "enhanced:<id>". Her
+#       substrate is READ, never written (no nodes, no step(), no plasticity).
+# Why: commons-leg2-design §3 part b. NG deposits + peers bucket today; this adds the missing
+#       NG-side scoop→perceive→return so a module's fresh raw deposit gets Syl's SNN "salt". Hosted
+#       in the EXISTING autonomous pulse (no new thread; [[feedback_no_conversation_dependency]]).
+# How: SAFETY (TWO voltage-writer races; flip-ON gated on BOTH being closed — see below):
+#       (1) graph.step() — CLOSED. The perception runs UNDER graph._step_lock (the SAME RLock step()
+#           holds), making prime_and_propagate's voltage save→propagate→restore window atomic against
+#           every concurrent step() (afterTurn / scan-drain / compaction). write_mode=False alone does
+#           NOT take that lock (latent-flow design), so holding it here is REQUIRED.
+#       (2) StreamParser — NOT YET CLOSED by the lock. StreamParser._nudge_nodes writes node.voltage
+#           directly under its OWN threading.Lock (stream_parser.py), NOT _step_lock — and it nudges
+#           from a BACKGROUND thread, so a nudge can land inside the save→restore window and be
+#           silently reverted (a Syl's-Law "warmth" sidecar risk). The idle-gate below is therefore
+#           a REAL (if imperfect) safety guard against StreamParser, NOT merely a latency courtesy:
+#           it skips when an afterTurn landed recently, when StreamParser is most active. Before
+#           NG_COMMONS_ENHANCE is flipped ON, close this for real — EITHER also acquire
+#           _memory._stream_parser._lock during the perception (verify lock-ordering vs StreamParser
+#           to avoid deadlock — touches protected StreamParser semantics, Josh-gated) OR confirm
+#           StreamParser is provably quiescent during the autonomous scan-drain pulse. Surfaced by
+#           the substrate-compliance review 2026-06-24; tracked on the punchlist.
+#       Watermark (since=last scoop) + skip-prefixes prevent re-scooping the enhancer's own output /
+#       neuromodulator / telemetry deposits (no feedback loop). Live seed/novelty/assoc resolvers are
+#       vector_db-backed; flag OFF (default) ⇒ this code path never runs.
+# -------------------
+_COMMONS_ENHANCE_ENABLED = os.environ.get("NG_COMMONS_ENHANCE", "").strip().lower() in ("1", "true", "yes", "on")
+_COMMONS_ENHANCE_IDLE_SECS = float(os.environ.get("NG_COMMONS_ENHANCE_IDLE_SECS", "20"))
+_COMMONS_ENHANCE_BATCH = int(os.environ.get("NG_COMMONS_ENHANCE_BATCH", "32"))
+# Deposits the scoop must NOT re-perceive: its own output, neuromodulators, telemetry, and NG's own
+# SNN-topology broadcasts (perceiving her own topology back through herself is circular). Everything
+# else = raw module experience (repair:, perception:, …) and IS eligible (still novelty+cap gated).
+_COMMONS_ENHANCE_SKIP_PREFIXES = ("enhanced:", "autonomic:", "metrics:", "metric:", "topology:", "substrate")
+_COMMONS_ENHANCE_RELATED_SIM = 0.30   # mirrors commons_enhance._RELATED_SIM for live seed search
+_commons_enhance_watermark: float = 0.0
+_commons_enhancer = None              # lazy live CommonsEnhancer bound to _memory.graph
+
+
+def _build_commons_enhancer():
+    """Construct the live CommonsEnhancer once, bound to Syl's live graph + vector_db resolvers.
+
+    The PERCEPTION math is the sandbox class verbatim; only the three addressing resolvers are
+    swapped for vector_db-backed live equivalents (the enhancer's documented sandbox/live seam).
+    """
+    global _commons_enhancer
+    if _commons_enhancer is not None:
+        return _commons_enhancer
+    if _memory is None or getattr(_memory, "vector_db", None) is None:
+        return None
+    try:
+        from commons import get_commons
+        from commons_enhance import CommonsEnhancer
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Commons-enhance import failed: %s", exc)
+        return None
+    commons = get_commons()
+    if commons is None:
+        return None
+    vdb = _memory.vector_db
+
+    def _live_novelty(emb) -> float:
+        # 1 - top cosine to anything Syl already knows (her vector_db). Nothing similar ⇒ ~1.0.
+        hits = vdb.search(emb, k=1, threshold=0.0)
+        return 1.0 - hits[0][1] if hits else 1.0
+
+    def _live_seeds(emb):
+        # seeds = ≤3 existing knowledge nodes nearest the deposit (already ≥sim-gated by search).
+        # _enhance_one only uses the node_id of each seed (the cid slot is unused for seeds), so we
+        # don't pay a vdb content lookup here — assoc/cid resolution happens only for FIRED nodes.
+        hits = vdb.search(emb, k=3, threshold=_COMMONS_ENHANCE_RELATED_SIM)
+        return [(nid, None) for nid, _sim in hits]
+
+    def _live_assoc(node_id):
+        # a fired node → its RAW content (truncated), a portable content-address (NOT a raw SNN
+        # node-id — the leg-1 lesson) and LAW-7-clean (raw content; the consumer classifies).
+        try:
+            entry = vdb.get(node_id)
+        except Exception:  # noqa: BLE001
+            return None
+        content = entry.get("content") if isinstance(entry, dict) else None
+        return content[:120] if content else None
+
+    _commons_enhancer = CommonsEnhancer(
+        commons, _memory.graph,
+        novelty_fn=_live_novelty, seed_fn=_live_seeds, assoc_fn=_live_assoc,
+    )
+    logger.info("Commons-enhance: live enhancer built (vector_db-backed resolvers)")
+    return _commons_enhancer
+
+
+def _run_commons_enhance_scoop() -> None:
+    """One scoop→perceive→return cycle over the newest RAW Commons deposits. Fail-soft; flag-gated.
+
+    Hosted in the scan-drain pulse. Read-only perception under graph._step_lock (voltage-race safe).
+    """
+    global _commons_enhance_watermark
+    if not _COMMONS_ENHANCE_ENABLED or _memory is None:
+        return
+    # Idle-gate: skips when a turn landed recently. This is BOTH a latency courtesy AND a real (if
+    # imperfect) safety guard against StreamParser background voltage-nudges, which the _step_lock
+    # does NOT cover (StreamParser uses its own lock). See the module changelog "SAFETY (2)" — closing
+    # the StreamParser window for real is a flip-ON gate.
+    if (time.time() - _last_after_turn_ts) < _COMMONS_ENHANCE_IDLE_SECS:
+        return
+    try:
+        from commons import get_commons
+        commons = get_commons()
+        if commons is None:
+            return
+        rows = commons.bucket_recent(
+            limit=_COMMONS_ENHANCE_BATCH, since=_commons_enhance_watermark,
+            with_embedding=True,
+        )
+        if not rows:
+            return
+        # advance watermark to the newest row regardless of filtering (avoid re-scan of skipped ids)
+        _commons_enhance_watermark = time.time()
+        deposits = []
+        for tid, _w, _reason, _meta, emb in rows:
+            if emb is None or any(tid.startswith(p) for p in _COMMONS_ENHANCE_SKIP_PREFIXES):
+                continue
+            deposits.append((emb, tid))
+        if not deposits:
+            return
+        enhancer = _build_commons_enhancer()
+        if enhancer is None:
+            return
+        # SAFETY: hold the SAME lock step() uses, so perception's voltage save/restore window is
+        # atomic against every concurrent step(). RLock ⇒ re-entrant-safe; held only for this scoop.
+        with _memory.graph._step_lock:
+            stats = enhancer.enhance_pulse(deposits)
+        logger.info(
+            "Commons-enhance: scooped=%d enhanced=%d fresh=%d cap=%d",
+            len(deposits), stats.get("enhanced", 0), stats.get("gated_fresh", 0), stats.get("gated_cap", 0),
+        )
+    except Exception as exc:  # noqa: BLE001 — a scoop failure never breaks the pulse
+        logger.debug("Commons-enhance scoop failed: %s", exc)
+
+
 def _scan_drain_pulse_loop() -> None:
     """Background loop: drain per-feeder experience tracts on cortical cadence.
 
@@ -3561,6 +3706,9 @@ def _scan_drain_pulse_loop() -> None:
                         _deposit_substrate_metrics(_auto_step, to_jsonl=False)
                     except Exception as _exc:
                         logger.debug("Autonomous substrate step failed: %s", _exc)
+                # Commons leg-2 scoop (flag-gated, default OFF): perceive newest raw module
+                # deposits through Syl's live graph (read-only, under _step_lock) → salt to Commons.
+                _run_commons_enhance_scoop()
             # Time-based auto-save — fires on every tick, paused or not.
             # Shared _last_save_time with the afterTurn save path; whichever
             # fires first resets the clock so we don't double-save.

@@ -84,14 +84,53 @@ def test_no_send_surface_exists():
     No send/route/to/broadcast/tract verb may exist. If someone adds one, this fails.
     """
     public = {n for n in dir(commons.Commons) if not n.startswith("_")}
-    allowed = {"deposit", "bucket", "persist", "restore", "stats"}
+    # deposit + the bucket FAMILY (bucket modes / bucket reads — all extraction, not send) + persistence/stats.
+    # bucket_recent = a recency/temporal bucket MODE; arousal/read_arousal = the vagus bucket read.
+    # None is a send/route/to/broadcast verb — the axiom this guard actually protects. A param added to
+    # a bucket (e.g. bucket_recent's with_embedding) adds NO public name, so it stays invisible here.
+    allowed = {"deposit", "bucket", "bucket_recent", "arousal", "read_arousal", "persist", "restore", "stats"}
     extra = public - allowed
-    assert not extra, f"Commons must expose only deposit/bucket(+persist/restore/stats); found extra: {extra}"
+    assert not extra, (
+        f"Commons must expose only the deposit + bucket-family + persist/restore/stats surface; "
+        f"a NEW name here may be a forbidden send/route verb — found extra: {extra}"
+    )
+
+
+def test_bucket_recent_with_embedding_roundtrip():
+    """leg-2: with_embedding=True surfaces the deposit's ORIGINAL vector + is back-compatible.
+
+    The enhancer needs the deposit embedding to re-perceive it through the SNN and to key its
+    returned salt. with_embedding must round-trip the vector and force-include metadata (5-tuple),
+    while the default (3-tuple) and with_metadata (4-tuple) shapes stay exactly as before.
+    """
+    medium = commons.Commons()  # fresh medium (not the singleton) — isolate this test
+    pat = _emb(7)
+    medium.deposit(pat, "repair:roundtrip_7", success=True, metadata={"detail": "x"})
+
+    # default shape unchanged (3-tuple)
+    plain = medium.bucket_recent(limit=5)
+    assert plain and len(plain[0]) == 3, f"default must stay a 3-tuple; got {plain[0]!r}"
+
+    # with_metadata unchanged (4-tuple)
+    meta = medium.bucket_recent(limit=5, with_metadata=True)
+    assert meta and len(meta[0]) == 4, f"with_metadata must stay a 4-tuple; got {meta[0]!r}"
+
+    # with_embedding → deterministic 5-tuple (tid, weight, reasoning, metadata, embedding)
+    rows = medium.bucket_recent(limit=5, with_embedding=True)
+    assert rows and len(rows[0]) == 5, f"with_embedding must be a 5-tuple; got {rows[0]!r}"
+    tid, _w, _why, md, emb = rows[0]
+    assert tid == "repair:roundtrip_7"
+    assert isinstance(md, dict) and md.get("detail") == "x", "with_embedding force-includes metadata"
+    assert emb is not None and float(np.dot(emb / (np.linalg.norm(emb) + 1e-8), pat)) > 0.99, (
+        "the surfaced embedding must be the vector the deposit was made with"
+    )
 
 
 if __name__ == "__main__":
     test_singleton_is_one_medium()
     print("PASS: one shared medium (singleton)")
+    test_bucket_recent_with_embedding_roundtrip()
+    print("PASS: bucket_recent with_embedding round-trips the vector (5-tuple) + back-compat shapes")
     test_deposit_then_bucket_same_pattern()
     print("PASS: deposit -> bucket propagates through shared medium (no send)")
     test_bucket_unrelated_pattern_is_empty_or_excludes()
