@@ -149,6 +149,7 @@ class Commons:
         limit: int = 50,
         since: float = 0.0,
         with_metadata: bool = False,
+        with_embedding: bool = False,
     ) -> List[Tuple]:
         """Recency bucket — recently-deposited targets, newest first.
 
@@ -179,9 +180,33 @@ class Commons:
         #       synapse.metadata["last_context"] (ng_lite:777) — already stored, just surface it.
         #       Opt-in keeps the topology path + all existing 3-tuple callers/tests untouched.
         # -------------------
+
+        # ---- Changelog ----
+        # [2026-06-24] Claude Code (Opus 4.8, 1M) — Commons leg-2 go-live: opt-in with_embedding
+        # What: with_embedding=True → the deposit's ORIGINAL embedding is appended as the LAST tuple
+        #       element AND metadata is force-included, so the shape is a deterministic 5-tuple
+        #       (target_id, weight, reasoning, metadata, embedding). with_embedding=False (default) is
+        #       untouched (3- or 4-tuple as before) — no existing caller/test sees a shape change.
+        # Why: Josh, 2026-06-24 ("buckets are what it's all about — modify an existing one if
+        #       possible"): leg-2's CommonsEnhancer must re-perceive a recent RAW deposit through
+        #       Syl's SNN, which needs the deposit's embedding (for SNN seed lookup + to key the
+        #       returned "enhanced:<id>" deposit so it lands on the depositor's own node). The recency
+        #       bucket already finds the deposit; this surfaces the vector it was deposited with —
+        #       same scoop, the full water. Embedding lives on the deposit's pattern node
+        #       (NGLiteNode.embedding, keyed by NGLiteSynapse.source_id). LAW 7: this is extraction
+        #       (a bucket mode), not a new send/transport verb.
+        # How: map syn.source_id → self._ng.nodes[...].embedding. Defensive: emb=None when the node
+        #       or its embedding is unavailable (e.g. a Rust-core node mirror miss) — the consumer
+        #       (enhancer) fail-fresh-skips a None-embedding deposit, never raises.
+        # -------------------
         """
         seen: set = set()
         out: List[Tuple] = []
+        want_meta = with_metadata or with_embedding   # embedding mode is always metadata-bearing
+        # synapse.source_id is NGLiteNode.node_id, but self._ng.nodes is keyed by embedding_hash —
+        # build a node_id→node map once (only when needed). The Commons is bounded (≤max_nodes), so
+        # this O(n) reverse index is cheap and avoids a per-synapse scan.
+        id_to_node = ({n.node_id: n for n in self._ng.nodes.values()} if with_embedding else {})
         for syn in sorted(self._ng.synapses.values(),
                           key=lambda s: getattr(s, "last_updated", 0.0), reverse=True):
             ts = getattr(syn, "last_updated", 0.0)
@@ -191,11 +216,15 @@ class Commons:
             if not tid or tid in seen:
                 continue
             seen.add(tid)
-            if with_metadata:
+            row: Tuple = (tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}")
+            if want_meta:
                 meta = getattr(syn, "metadata", {}).get("last_context", {})
-                out.append((tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}", meta))
-            else:
-                out.append((tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}"))
+                row = row + (meta,)
+            if with_embedding:
+                node = id_to_node.get(getattr(syn, "source_id", ""))
+                emb = getattr(node, "embedding", None) if node is not None else None
+                row = row + (emb,)
+            out.append(row)
             if len(out) >= limit:
                 break
         return out

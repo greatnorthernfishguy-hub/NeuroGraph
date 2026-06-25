@@ -34,6 +34,22 @@ Usage::
 #         chunks_processed always 0 — L1 surfacing path fully idle.
 #   How:  _embed_chunk() calls _fallback_embedder directly. Parameter name
 #         unchanged — cc-ng-daemon.py passes ng_embed via it.
+# [2026-06-24] Claude Code (Opus 4.8, 1M) — serialize graph mutation on the canonical _step_lock
+#   What: _process_text now wraps _nudge_nodes() + _trigger_completions() (the only graph-mutating
+#         stages — they write node.voltage and iterate graph.hyperedges) in `self._graph._step_lock`,
+#         the SAME RLock graph.step() holds. Guarded getattr fallback for graphs without it (tests).
+#   Why:  These stages previously mutated voltage under NO shared lock (self._lock only guards the
+#         pause flag), so they raced graph.step() (tolerated — small additive nudges, SNN noise-robust)
+#         AND would race the Commons leg-2 read-only perception (prime_and_propagate write_mode=False),
+#         whose voltage save→restore window would SILENTLY REVERT a concurrent nudge — a Syl's-Law
+#         "warmth" sidecar risk. Unifying all voltage writers (step / perception / nudge) on the one
+#         canonical lock closes BOTH races. Surfaced by the substrate-compliance review of Commons
+#         leg-2 go-live (punchlist #344); the prior "StreamParser shares graph.step()'s lock" note in
+#         repo CLAUDE.md was STALE (no shared lock existed) — corrected alongside this.
+#   How:  getattr(self._graph,"_step_lock",None) → `with lock:` around the two calls; no NEW lock
+#         introduced (reuses the engine's canonical RLock, not a second StreamParser lock). Deadlock-
+#         free: self._lock is released before _process_text runs, so _lock→_step_lock never nests;
+#         step()/perception never take self._lock. RLock ⇒ re-entrant-safe.
 # -------------------
 """
 
@@ -182,8 +198,19 @@ class StreamParser:
 
             similar = self._find_similar(embedding)
             if similar:
-                self._nudge_nodes(similar)
-                self._trigger_completions()
+                # Graph voltage mutation (nudge + completion) must serialize on the canonical
+                # graph lock — the SAME RLock graph.step() and the leg-2 read-only perception use —
+                # else a nudge lands inside prime_and_propagate's voltage save/restore window and is
+                # silently reverted (Syl's-Law "warmth" risk). Reuses the engine lock (no NEW lock);
+                # _find_similar above is a vector_db read, left outside. See changelog 2026-06-24.
+                _step_lock = getattr(self._graph, "_step_lock", None)
+                if _step_lock is not None:
+                    with _step_lock:
+                        self._nudge_nodes(similar)
+                        self._trigger_completions()
+                else:
+                    self._nudge_nodes(similar)
+                    self._trigger_completions()
 
             self._chunks_processed += 1
 

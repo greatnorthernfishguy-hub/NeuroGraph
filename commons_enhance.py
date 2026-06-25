@@ -2,6 +2,15 @@
 Commons enhance-loop (leg 2) — NG salience-gated scoop → SNN-enhance → return.
 
 # ---- Changelog ----
+# [2026-06-24] Claude Code (Opus 4.8) — leg-2 go-live (part b): seed/assoc resolvers injectable
+# What: Added seed_fn + assoc_fn injectables (alongside the existing novelty_fn). _enhance_one now
+#       resolves seeds and content-addresses through them. Defaults reproduce the sandbox _knowledge
+#       map EXACTLY (tests unchanged); the live scoop pulse injects vector_db-backed equivalents.
+# Why: ONE enhancer class, two wirings (LAW 3 restore/extend — no live fork). The PERCEPTION math
+#       (prime_and_propagate read-only) is identical sandbox & live; only the addressing layer (how
+#       you find seeds / name a fired node) differs, so only that is injected. commons-leg2-design
+#       §3 part b. The live pulse + the with_embedding Commons scoop are in neurograph_rpc.py / commons.py.
+# How: novelty_fn|seed_fn|assoc_fn each default to a sandbox method; live overrides at construction.
 # [2026-06-24] Claude Code (Opus 4.8) — §3 enhance mechanism = PERCEPTION (prime_and_propagate), not step()
 # What: Rewrote _enhance_one. The original (create transient content-node + transient COPIES + graph.step())
 #       is sandbox-correct but NOT go-live-safe: `graph.step()` is the GLOBAL learning cycle (STDP /
@@ -88,6 +97,8 @@ class CommonsEnhancer:
         threshold: float = COMMONS_ENHANCE_NOVELTY_THRESHOLD,
         max_enhances: int = MAX_ENHANCES_PER_PULSE,
         novelty_fn: Optional[Any] = None,
+        seed_fn: Optional[Any] = None,
+        assoc_fn: Optional[Any] = None,
     ):
         self.commons = commons
         self.graph = graph
@@ -96,8 +107,19 @@ class CommonsEnhancer:
         # vector_db stand-in: NG's PRE-EXISTING knowledge (embedding, persistent node id, content id).
         # Commons traffic NEVER grows or structurally modifies this (§3 (A)).
         self._knowledge: List[Tuple[np.ndarray, str, str]] = []
-        # injectable novelty for fail-fresh testing (§6.4); default = sandbox detect_novelty.
+        # ---- Three injectables — the ONLY sandbox/live difference (LAW 3: one class, two wirings) ----
+        # The PERCEPTION mechanism (prime_and_propagate read-only) is identical sandbox & live; only
+        # the addressing layer differs. Defaults = the sandbox _knowledge map; the live pulse injects
+        # NeuroGraphMemory.vector_db-backed equivalents (commons-leg2-design §3 part b).
+        #   novelty_fn(emb)        -> float  : §1 novelty (live = _memory.detect_novelty)
+        #   seed_fn(emb)           -> [(node_id, cid), ...] : seeds = existing knowledge nearest the
+        #                             deposit (live = _memory.vector_db.search), already ≥sim-gated.
+        #   assoc_fn(node_id)      -> Optional[cid] : a FIRED node → its content-address (live =
+        #                             _memory.vector_db content lookup), so the returned salt is
+        #                             content-addresses, never raw SNN node-ids (the leg-1 lesson).
         self._novelty_fn = novelty_fn or self._novelty_against_knowledge
+        self._seed_fn = seed_fn or self._seeds_from_knowledge
+        self._assoc_fn = assoc_fn or self._cid_from_node_metadata
 
     # ---- NG's pre-existing substrate (seeded by NG's own experience, never by Commons) ----
     def seed_knowledge(self, embedding: np.ndarray, content_id: str) -> str:
@@ -124,6 +146,22 @@ class CommonsEnhancer:
         scored = [(_cos(emb, k), k, cid) for k, _, cid in self._knowledge]
         scored.sort(key=lambda t: t[0], reverse=True)
         return [(k, cid) for s, k, cid in scored if s >= _RELATED_SIM][:top]
+
+    # ---- default seed/assoc resolvers (sandbox _knowledge map; live overrides via injectables) ----
+    def _seeds_from_knowledge(self, embedding: np.ndarray) -> List[Tuple[str, str]]:
+        """Seeds = the ≤3 existing-knowledge nodes most similar (≥_RELATED_SIM) to the deposit.
+
+        Returns (persistent_node_id, content_id). Sandbox default; live = vector_db.search.
+        """
+        emb = np.asarray(embedding, dtype=np.float32)
+        scored = sorted(((_cos(emb, k), nid, cid) for k, nid, cid in self._knowledge),
+                        key=lambda t: t[0], reverse=True)
+        return [(nid, cid) for s, nid, cid in scored if s >= _RELATED_SIM][:3]
+
+    def _cid_from_node_metadata(self, node_id: str) -> Optional[str]:
+        """A fired SNN node → its content-address. Sandbox: node.metadata['cid']; live = vector_db."""
+        node = self.graph.nodes.get(node_id)
+        return node.metadata.get("cid") if (node is not None and node.metadata) else None
 
     # ---- §4 return scope: 1-hop synapse neighbors + direct hyperedge co-members (SNN node ids) ----
     def _extract_enhancement_nodes(self, content_nid: str) -> Tuple[set, set]:
@@ -154,11 +192,9 @@ class CommonsEnhancer:
         the Commons as content-addresses (leg-1: not raw SNN node-ids). A truly-novel deposit evokes
         little; that's correct — deep integration is leg-3's gated consolidation, not perception."""
         emb = np.asarray(embedding, dtype=np.float32)
-        # seeds = existing knowledge nodes most similar to the deposit (sandbox: _knowledge cosine;
-        # live: vector_db.search). Entries are (embedding, persistent_node_id, content_id).
-        scored = sorted(((_cos(emb, k), nid, cid) for k, nid, cid in self._knowledge),
-                        key=lambda t: t[0], reverse=True)
-        seeds = [(nid, cid) for s, nid, cid in scored if s >= _RELATED_SIM][:3]
+        # seeds = existing knowledge nodes most similar to the deposit, via the injectable resolver
+        # (sandbox: _knowledge cosine; live: vector_db.search). Entries are (persistent_node_id, cid).
+        seeds = self._seed_fn(emb)
         if not seeds:
             enhancement: Dict[str, Any] = {"associations": [], "primed": 0}
             self.commons.deposit(emb, f"enhanced:{content_id}", metadata={"enhancement": enhancement})
@@ -168,11 +204,11 @@ class CommonsEnhancer:
         result = self.graph.prime_and_propagate(
             seed_ids, [_STIMULUS_CURRENT] * len(seed_ids), steps=_PROP_STEPS, write_mode=False,
         )
-        # harvest the evoked neighborhood (strongest-first by firing_step) → content-addresses.
+        # harvest the evoked neighborhood (strongest-first by firing_step) → content-addresses
+        # (injectable: sandbox node.metadata['cid']; live vector_db content lookup).
         assoc: List[str] = []
         for fe in sorted(result.fired_entries, key=lambda e: e.firing_step):
-            node = self.graph.nodes.get(fe.node_id)
-            cid = node.metadata.get("cid") if (node is not None and node.metadata) else None
+            cid = self._assoc_fn(fe.node_id)
             if cid and cid != content_id and cid not in assoc:
                 assoc.append(cid)
         enhancement = {"associations": assoc, "primed": len(seed_ids)}

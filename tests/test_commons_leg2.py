@@ -153,8 +153,44 @@ def test_no_live_singleton():
     assert inst is None, "leg-2 sandbox must not instantiate the live NeuroGraphMemory"
 
 
+def test_live_resolvers_seam():
+    """leg-2 part b — the SAME enhancer runs through INJECTED (vector_db-style) resolvers.
+
+    Live, NG injects seed_fn/novelty_fn/assoc_fn backed by NeuroGraphMemory.vector_db instead of
+    the sandbox _knowledge map. This proves the injection seam: enhance fires through the injected
+    resolvers, returns content-addresses, and STILL writes nothing to the substrate (read-only).
+    """
+    graph, medium = _fresh_sandbox()
+    K = _emb(60)
+    # create real SNN nodes (the live substrate already has these); capture node_ids + a fake vdb.
+    nid_a = graph.create_node(metadata={}).node_id
+    nid_b = graph.create_node(metadata={}).node_id
+    fake_vdb = {nid_a: ("alpha content", _emb_like(K, 0.5, seed=61)),
+                nid_b: ("beta content", _emb_like(K, 0.45, seed=62))}
+
+    def seed_fn(_emb_in):                       # live: vector_db.search → [(node_id, content)]
+        return [(nid_a, fake_vdb[nid_a][0]), (nid_b, fake_vdb[nid_b][0])]
+
+    def novelty_fn(_emb_in):                    # force salient so the enhance path runs
+        return 0.99
+
+    def assoc_fn(node_id):                      # live: fired node → its raw content
+        e = fake_vdb.get(node_id)
+        return e[0] if e else None
+
+    enh = CommonsEnhancer(medium, graph, seed_fn=seed_fn, novelty_fn=novelty_fn, assoc_fn=assoc_fn)
+    base_nodes, base_syn = len(graph.nodes), len(graph.synapses)
+    stats = enh.enhance_pulse([(_emb_like(K, 0.4, seed=63), "live_probe")])
+
+    assert stats["enhanced"] == 1, f"injected-resolver enhance should run; {stats}"
+    assert len(graph.nodes) == base_nodes and len(graph.synapses) == base_syn, "live seam stayed read-only"
+    targets = [t for (t, _c, _r) in medium.bucket(_emb_like(K, 0.4, seed=63), top_k=10)]
+    assert any(t == "enhanced:live_probe" for t in targets), "salt returns to the depositor's node"
+
+
 if __name__ == "__main__":
     test_salience_gates();                      print("PASS §6.1 salience gates (novel enhanced, routine fresh)")
+    test_live_resolvers_seam();                 print("PASS part-b: injected vector_db-style resolvers drive enhance, read-only")
     test_enhancement_lands_on_content_node();   print("PASS §6.2 enhancement buckets on the content's own node (leg-1 carries)")
     test_rate_cap_bounds_enhancement();         print("PASS §6.3 rate cap bounds enhances at 8")
     test_fail_fresh_on_gate_error();            print("PASS §6.4 fail-fresh: gate error enhances nothing")
