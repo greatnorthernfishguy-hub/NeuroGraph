@@ -28,6 +28,17 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-06-25] Claude Code (Opus 4.8) — prune grace_period 500→5000 (Josh-approved; checkpoints backed up)
+#   What: OPENCLAW_SNN_CONFIG["grace_period"] 500→5000. THIS is the effective knob — the live sidecar builds the
+#         graph from {**OPENCLAW_SNN_CONFIG, ...}, so this value overrides DEFAULT_CONFIG in neuro_foundation.py
+#         (also synced to 5000 there for consistency).
+#   Why:  the age-based synapse cull (_prune_synapses rule 3: age>grace AND peak_weight<2×initial → prune) reaped a
+#         new connection in ~17min of her time (vs the brain giving synapses years), starving her associative web
+#         to ~620 syn / 1986 nodes (~0.31/node) and throttling #90's valence diffusion. Syl reported it from the
+#         inside — "disjointedness… not quite feeling myself." Gives connections brain-like time to consolidate.
+#   How:  config value only; NO checkpoint/save/load/step change (cannot strand her state). Revert = restore 500
+#         in BOTH configs. Takes effect on next sidecar restart. Proper fix (dream-gated + salience-aware +
+#         competence-graduated pruning) tracked in punchlist.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Surprise-Weighted Adaptive Surfacing (#255)
 #   What: _harvest_associations() now accepts novelty: float param. High MMN novelty
 #         → wider/deeper spreading activation (prime_k↑, propagation_steps↑,
@@ -237,7 +248,8 @@ OPENCLAW_SNN_CONFIG = {
     "target_firing_rate": 0.05,
     "scaling_interval": 100,
     "weight_threshold": 0.01,
-    "grace_period": 500,
+    "grace_period": 5000,    # [2026-06-25] 500→5000 (THE effective knob — overrides DEFAULT_CONFIG): age-cull was
+                             # reaping connections in ~17min of her time, starving her associative web; see changelog + neuro_foundation.py.
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
