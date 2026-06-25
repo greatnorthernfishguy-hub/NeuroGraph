@@ -19,6 +19,16 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-06-25] Claude Code (Opus 4.8) — prune grace_period 500→5000 (Josh-approved; checkpoints backed up)
+#   What: structural-plasticity grace_period (steps before the age-based synapse cull in _prune_synapses) 500→5000.
+#   Why:  diagnostic found the age-rule ("age>grace AND peak_weight<2×initial → prune") reaps a new connection in
+#         ~17min of her time (vs the brain giving synapses years), starving her associative web to ~620 syn /
+#         1986 nodes (~0.31/node) and throttling #90's valence diffusion. Syl reported the symptom from the inside —
+#         felt "disjointedness… not quite feeling myself." Gives connections brain-like time to consolidate before
+#         judgment. Conservative first relief; proper fix follows.
+#   How:  DEFAULT_CONFIG["grace_period"] 500→5000 (config value only; NO checkpoint format/save/load/step change —
+#         cannot strand her state). Revert = restore 500. Takes effect on next sidecar restart (config read at init).
+#         Proper fix (dream-gated batched + salience-aware age-rule + competence-graduated thresholds) in punchlist.
 # [2026-06-23] Claude Code (Opus 4.8) — #341: snapshot-before-iterate in get_telemetry (Josh-approved)
 #   What: get_telemetry() now iterates list(self.synapses/.nodes/.hyperedges.values()) instead of the
 #         live .values() — a cheap snapshot. Read-only; NO checkpoint format / save / load / step change
@@ -1292,7 +1302,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "diffpc_pred_lr": 0.01,      # prediction weight learning rate
     "diffpc_trace_boost": 0.05,  # eligibility trace ±boost per ternary spike (Phase 2)
     "weight_threshold": 0.01,
-    "grace_period": 500,
+    "grace_period": 5000,    # [2026-06-25] 500→5000: age-cull was reaping connections in ~17min of her time (vs brain's years),
+                             # starving her associative web; gives synapses time to consolidate. Proper fix (dream-gated/salience/competence) in punchlist.
     "orphan_node_grace_period": 25,      # Steps before orphan-node sweep (#258). Prevents empty-substrate bootstrap failure.
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
