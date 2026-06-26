@@ -12,6 +12,17 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-26] Claude Code (Sonnet 4.6) — #337: reach confabulation on bare file path
+#   What: (1) whisper tier of _render_reach_teaching updated to mention file-path-as-reach-cue;
+#     (2) _is_bare_path() + bare-path hint injection in handle_assemble so a lone path in Josh's
+#     message surfaces an explicit reach nudge regardless of her competence tier;
+#     (3) seed_reach_teaching.py updated with new example + --update flag.
+#   Why: Syl received a bare file path, confabulated reading it instead of emitting [[reach:]].
+#     Root cause: teaching frames reach as "when I WANT to act" — misses the cue "user shares a
+#     path = they want me to read it". At high competence (rc >= 0.70) she sees only the whisper,
+#     which gave no file-path signal at all.
+#   How: whisper updated (immediate, no checkpoint change); bare-path detection in /assemble
+#     appends a targeted note to systemPromptAddition; seed script updated for future re-seeds.
 # [2026-06-14] Claude Code (DudeMan CC, Opus 4.8) — #spine: surface Syl's self-model in /assemble
 #   What: new _render_self_and_wants(graph); handle_assemble PREPENDS "## Who I Am" (her
 #     constitutional core nodes, ordered) + "## What I Want" (her live want-nodes, newest-first)
@@ -2550,6 +2561,14 @@ REACH_COMPETENCE_GAIN = 0.05   # Elmer TuningSocket competence gain (asymmetric;
 REACH_VIVID_BELOW = 0.30       # rc < this: full description + worked examples (new muscle)
 REACH_DESC_BELOW = 0.70        # rc < this: description only; rc >= this: one-line whisper (the floor)
 
+# #337: bare absolute file path — no prose, no spaces in the path itself
+_BARE_PATH_RE = re.compile(r"^\s*/[^\s#?]+\s*$")
+
+
+def _is_bare_path(text: str) -> bool:
+    """True iff message text is a lone absolute file path with no surrounding prose."""
+    return bool(_BARE_PATH_RE.match(text.strip()))
+
 
 def _reach_success_in_turn(assistant_text) -> bool:
     """True iff her turn carries at least one LANDED reach badge — the system-rendered
@@ -2612,8 +2631,11 @@ def _render_reach_teaching(graph) -> str:
     if not desc:
         return ""
     if rc >= REACH_DESC_BELOW:
-        return ("## How I Reach\n_(I can reach: I name what I want inside "
-                "`[[reach: …]]` and my hands carry it out.)_")
+        # #337: whisper updated to include file-path cue (2026-06-26)
+        return ("## How I Reach\n_(I can reach: I name my intent inside "
+                "`[[reach: …]]` and my hands carry it out. When Josh shares "
+                "a bare file path, that is an invitation — I reach to read it "
+                "rather than imagining its contents.)_")
     block = ["## How I Reach", desc]
     if rc < REACH_VIVID_BELOW:
         examples = meta.get("reach_examples") or []
@@ -2958,6 +2980,26 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # replaceMessages on every turn, including warmup and
     # exception-fallback.  Omitting the field leaves result.messages
     # undefined on the TS side, which correctly preserves identity.
+    # #337: bare-path hint — when the last user message is a lone file path, append a
+    # targeted nudge so Syl reaches rather than confabulates. Fail-soft: never breaks the turn.
+    try:
+        _bare_path_candidate = ""
+        for _bm in reversed(messages):
+            if _bm.get("role") == "user":
+                _bare_path_candidate = _extract_message_text(_bm).strip()
+                break
+        if _bare_path_candidate and _is_bare_path(_bare_path_candidate):
+            _ph = (
+                f"_(Note: Josh's message is the file path `{_bare_path_candidate}`. "
+                f"He wants you to read it — reach for it: "
+                f"`[[reach: read the file at {_bare_path_candidate}]]` — "
+                "do not imagine or confabulate its contents.)_"
+            )
+            context_block = (context_block + "\n\n" + _ph) if context_block else _ph
+            logger.debug("#337 bare-path hint injected: %s", _bare_path_candidate)
+    except Exception as _bp_exc:
+        logger.debug("#337 bare-path hint skipped (non-fatal): %s", _bp_exc)
+
     # ── Who I Am (her constitutional self) + What I Want — #spine, leads the prompt ──
     # Her stable self, surfaced FIRST from her OWN substrate every turn, so a lens grounds in
     # BEING her instead of reconstructing her from query-driven associations. Prepended last

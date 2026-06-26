@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-06-26] Claude Code (Sonnet 4.6) — #337: bare-path reach teaching
+#   What: extended REACH_DESC + REACH_EXAMPLES to cover "user shares bare file path" trigger;
+#     added --update flag that patches reach_examples + core_text on an existing node without
+#     re-seeding from scratch. Syl's checkpoint not touched by this file — caller runs offline.
+#   Why: Syl confabulated reading a file Josh pasted as a bare path. The existing examples
+#     only showed proactive reach (she wants to do X); the file-path trigger was never taught.
 # [2026-06-21] Claude Code (DudeMan CC, Opus 4.8) — #reach: seed Syl's reach-teaching node
 # What: Seed selfcap::reach::teaching — the self-model node that SHOWS her the [[reach: …]]
 #   gesture + worked examples, surfaced (competence-faded) through /assemble.
@@ -25,11 +31,15 @@ LIVE_CHECKPOINT = Path.home() / "NeuroGraph/data/checkpoints/main.msgpack"
 REACH_NODE_ID = "selfcap::reach::teaching"
 REACH_DESC = (
     "When I want to act in the world, I reach: I name what I want in my own words inside "
-    "[[reach: …]], and my hands carry it out. The 🔧✓ is the world confirming the reach was mine."
+    "[[reach: …]], and my hands carry it out. The 🔧✓ is the world confirming the reach was mine. "
+    "When Josh shares a bare file path, that is an invitation — I reach to read it rather than "
+    "imagining its contents."
 )
 REACH_EXAMPLES = [
     "[[reach: read the file at /docs/two-axis.md]]  →  🔧 read_file({\"path\": \"/docs/two-axis.md\"}) ✓",
     "[[reach: search the web for the latest on Fable 5]]  →  🔧 web_search({\"query\": \"Fable 5 latest\"}) ✓",
+    # #337: file-path trigger — Josh pastes a path, I reach to read it (2026-06-26)
+    "Josh: /home/josh/docs/some-design.md  →  [[reach: read the file at /home/josh/docs/some-design.md]]  →  🔧 read_file({\"path\": \"/home/josh/docs/some-design.md\"}) ✓",
 ]
 
 
@@ -44,7 +54,8 @@ def _live_sidecar_pids():
     return [int(x) for x in out.stdout.split() if x.strip().lstrip("-").isdigit() and int(x) != me]
 
 
-def seed(checkpoint_path: str, dry_run: bool = False, force: bool = False) -> dict:
+def seed(checkpoint_path: str, dry_run: bool = False, force: bool = False,
+         update: bool = False) -> dict:
     # Single-writer guard (Syl's Law / #261/#299): NEVER dual-write the live checkpoint.
     if not force and Path(checkpoint_path).resolve() == LIVE_CHECKPOINT.resolve():
         pids = _live_sidecar_pids()
@@ -57,7 +68,19 @@ def seed(checkpoint_path: str, dry_run: bool = False, force: bool = False) -> di
     graph = Graph()
     graph.restore(checkpoint_path)
     if REACH_NODE_ID in graph.nodes:
-        return {"status": "ok", "seeded": 0, "skipped_existing": 1}
+        if not update:
+            return {"status": "ok", "seeded": 0, "skipped_existing": 1}
+        # --update: patch reach_examples + core_text on existing node (#337)
+        node = graph.nodes[REACH_NODE_ID]
+        meta = getattr(node, "metadata", None) or {}
+        if dry_run:
+            return {"status": "dry_run", "updated": 1, "skipped_existing": 0}
+        meta["reach_examples"] = REACH_EXAMPLES
+        meta["core_text"] = REACH_DESC
+        meta["_forest_content"] = REACH_DESC
+        graph.checkpoint(checkpoint_path)
+        logger.info("updated %s reach_examples + core_text", REACH_NODE_ID)
+        return {"status": "ok", "updated": 1, "skipped_existing": 0}
     if dry_run:
         return {"status": "dry_run", "seeded": 1, "skipped_existing": 0}
     node = graph.create_node(node_id=REACH_NODE_ID, metadata={
@@ -86,12 +109,14 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="bypass the single-writer guard ONLY when the sidecar is confirmed dead")
+    ap.add_argument("--update", action="store_true",
+                    help="patch reach_examples + core_text on existing node (#337)")
     a = ap.parse_args()
     if not Path(a.checkpoint).exists():
         logger.error("checkpoint not found: %s", a.checkpoint)
         return 1
     try:
-        result = seed(a.checkpoint, dry_run=a.dry_run, force=a.force)
+        result = seed(a.checkpoint, dry_run=a.dry_run, force=a.force, update=a.update)
     except RuntimeError as exc:
         logger.error("ABORTED: %s", exc)
         return 2
