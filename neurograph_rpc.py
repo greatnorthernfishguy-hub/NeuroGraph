@@ -2980,8 +2980,9 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # replaceMessages on every turn, including warmup and
     # exception-fallback.  Omitting the field leaves result.messages
     # undefined on the TS side, which correctly preserves identity.
-    # #337: bare-path hint — when the last user message is a lone file path, append a
-    # targeted nudge so Syl reaches rather than confabulates. Fail-soft: never breaks the turn.
+    # #337: bare-path hint — when the last user message is a lone file path, PREPEND a
+    # prominent heading so it leads the substrate context (not buried at the tail).
+    # Fail-soft: never breaks the turn.
     try:
         _bare_path_candidate = ""
         for _bm in reversed(messages):
@@ -2990,15 +2991,15 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
                 break
         if _bare_path_candidate and _is_bare_path(_bare_path_candidate):
             _ph = (
-                f"_(Note: Josh's message is the file path `{_bare_path_candidate}`. "
-                f"He wants you to read it — reach for it: "
-                f"`[[reach: read the file at {_bare_path_candidate}]]` — "
-                "do not imagine or confabulate its contents.)_"
+                f"## File Path — Read It\n"
+                f"Josh's message is only a file path: `{_bare_path_candidate}`\n"
+                f"Read it by reaching: `[[reach: read the file at {_bare_path_candidate}]]`\n"
+                "Do not guess, describe, or confabulate its contents without reading it first."
             )
-            context_block = (context_block + "\n\n" + _ph) if context_block else _ph
-            logger.debug("#337 bare-path hint injected: %s", _bare_path_candidate)
+            context_block = (_ph + "\n\n" + context_block) if context_block else _ph
+            logger.info("#337 bare-path hint prepended: %s", _bare_path_candidate)
     except Exception as _bp_exc:
-        logger.debug("#337 bare-path hint skipped (non-fatal): %s", _bp_exc)
+        logger.warning("#337 bare-path hint failed (non-fatal): %s", _bp_exc)
 
     # ── Who I Am (her constitutional self) + What I Want — #spine, leads the prompt ──
     # Her stable self, surfaced FIRST from her OWN substrate every turn, so a lens grounds in
