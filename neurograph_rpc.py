@@ -2980,8 +2980,10 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
     # replaceMessages on every turn, including warmup and
     # exception-fallback.  Omitting the field leaves result.messages
     # undefined on the TS side, which correctly preserves identity.
-    # #337: bare-path hint — when the last user message is a lone file path, PREPEND a
-    # prominent heading so it leads the substrate context (not buried at the tail).
+    # #337 v2: bare-path hint — two layers:
+    # (1) system-prompt framing (leads context_block),
+    # (2) in-conversation system message appended AFTER Josh's bare-path message so it is
+    # the last thing the model sees before generating — maximally salient for format compliance.
     # Fail-soft: never breaks the turn.
     try:
         _bare_path_candidate = ""
@@ -2990,6 +2992,7 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
                 _bare_path_candidate = _extract_message_text(_bm).strip()
                 break
         if _bare_path_candidate and _is_bare_path(_bare_path_candidate):
+            # Layer 1 — system-prompt framing (background context)
             _ph = (
                 f"## File Path — Read It\n"
                 f"Josh's message is only a file path: `{_bare_path_candidate}`\n"
@@ -2997,7 +3000,20 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
                 "Do not guess, describe, or confabulate its contents without reading it first."
             )
             context_block = (_ph + "\n\n" + context_block) if context_block else _ph
-            logger.info("#337 bare-path hint prepended: %s", _bare_path_candidate)
+            # Layer 2 — in-conversation system message injected right before generation.
+            # Reassigning truncated_messages to a new list ensures result["messages"] is
+            # always returned (the `is not messages` guard fires), carrying the injection.
+            _reach_injection = {
+                "role": "system",
+                "content": (
+                    f"Bare file path: `{_bare_path_candidate}`. "
+                    f"Write `[[reach: read the file at {_bare_path_candidate}]]` "
+                    f"in your response — those exact characters — to have your hands read it. "
+                    f"Do not describe or imagine its contents."
+                ),
+            }
+            truncated_messages = list(truncated_messages) + [_reach_injection]
+            logger.info("#337 bare-path hint + reach injection: %s", _bare_path_candidate)
     except Exception as _bp_exc:
         logger.warning("#337 bare-path hint failed (non-fatal): %s", _bp_exc)
 
