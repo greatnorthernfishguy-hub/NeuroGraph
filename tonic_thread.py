@@ -26,6 +26,13 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-06-27] Claude Code (Sonnet 4.6) — #347 O(1) hyperedge index + constitutional cache
+#   What: _build_he_index() builds Dict[str,int] once per ouroboros_cycle; _prime_constitutional
+#     caches constitutional node IDs (rebuilt only when node count changes). Replaces O(N×H)
+#     per-node hyperedge scans in _read_active_nodes + _update_thread with O(1) index lookups.
+#   Why: Tonic ticks 32-67s over 30s budget at 2724 nodes; O(N×H) hyperedge scan was hot path.
+#   How: _build_he_index() inserted before _read_active_nodes; he_index passed as arg to both
+#     _read_active_nodes and _update_thread; _constitutional_ids cached as instance var.
 # [2026-06-22] DudeMan CC (Opus 4.8) — #90 valence-biased recovery ("biased toward light")
 # What: TonicThread holds a read-only valence field (tonic_valence.ValenceField), refreshed
 #   every valence_refresh_cycles; _apply_focus_fatigue scales the #89 recovery term by a
@@ -265,7 +272,12 @@ class TonicThread:
         # when nodes fired. Same thread — no concurrency risk.
         self._post_cycle_hook = None
 
-
+        # #347 perf: inverted hyperedge index — rebuilt once per ouroboros_cycle.
+        # Replaces O(N×H) per-node scans with O(1) lookups in _read_active_nodes + _update_thread.
+        self._he_index: Dict[str, int] = {}
+        # #347 perf: constitutional node ID cache — rebuilt only when node count changes.
+        self._constitutional_ids: Optional[Set[str]] = None
+        self._constitutional_node_count: int = 0
 
         logger.info("TonicThread initialized — the latent thread is live")
 
@@ -303,7 +315,8 @@ class TonicThread:
             self._valence_refresh_counter += 1
 
         # READ: what does the graph consider active right now?
-        active_nodes = self._read_active_nodes()
+        he_index = self._build_he_index()  # #347: built once, O(1) lookups below
+        active_nodes = self._read_active_nodes(he_index)
 
         if not active_nodes:
             # Nothing active. That's ok — rest is valid.
@@ -351,7 +364,7 @@ class TonicThread:
                 logger.debug("Post-cycle deposit error: %s", exc)
 
         # UPDATE THREAD: refresh with current graph state
-        self._update_thread(active_nodes, result)
+        self._update_thread(active_nodes, result, he_index)
 
         return {
             "active_count": len(active_nodes),
@@ -372,8 +385,18 @@ class TonicThread:
         import math
         outgoing = getattr(self._graph, "_outgoing", {}) or {}
         ids, currents = [], []
-        for nid, node in self._graph.nodes.items():
-            if not ((getattr(node, "metadata", None) or {}).get("constitutional")):
+        # #347: rebuild cache only when the node set changes (new STDP wiring may add/remove)
+        cur_count = len(self._graph.nodes)
+        if self._constitutional_ids is None or cur_count != self._constitutional_node_count:
+            self._constitutional_ids = {
+                nid for nid, node in self._graph.nodes.items()
+                if (getattr(node, "metadata", None) or {}).get("constitutional")
+            }
+            self._constitutional_node_count = cur_count
+
+        for nid in self._constitutional_ids:
+            node = self._graph.nodes.get(nid)
+            if node is None:
                 continue
             deg = len(outgoing.get(nid, ()))
             level = _SPINE_PRIME_STEADY + (
@@ -394,7 +417,20 @@ class TonicThread:
     # Reading the graph — the "eyes in"
     # -----------------------------------------------------------------
 
-    def _read_active_nodes(self) -> List[Tuple[str, float]]:
+    def _build_he_index(self) -> Dict[str, int]:
+        """Build inverted index: node_id → hyperedge membership count.
+
+        O(H × avg_members_per_hyperedge) — called once per ouroboros_cycle and passed
+        to _read_active_nodes + _update_thread, replacing their O(N×H) inner scans with
+        O(1) lookups. (#347)
+        """
+        idx: Dict[str, int] = {}
+        for he in self._graph.hyperedges.values():
+            for nid in he.member_nodes:
+                idx[nid] = idx.get(nid, 0) + 1
+        return idx
+
+    def _read_active_nodes(self, he_index: Dict[str, int]) -> List[Tuple[str, float]]:
         """Read the most active nodes in the graph.
 
         Activity = voltage above resting + spike recency + hyperedge bonus.
@@ -411,12 +447,8 @@ class TonicThread:
                 recency = 1.0 / (1.0 + steps_since)
                 activity += recency * 0.3
 
-            # Hyperedge membership bonus (pattern participation)
-            he_count = sum(
-                1 for he in self._graph.hyperedges.values()
-                if nid in he.member_nodes
-            )
-            activity += he_count * 0.05
+            # Hyperedge membership bonus — O(1) via pre-built index (#347)
+            activity += he_index.get(nid, 0) * 0.05
 
             # Exploration bias — add noise to prevent attractor collapse
             if self._config.exploration_bias > 0:
@@ -534,6 +566,7 @@ class TonicThread:
         self,
         active_nodes: List[Tuple[str, float]],
         result,
+        he_index: Dict[str, int],
     ) -> None:
         """Update the latent thread with current graph state.
 
@@ -562,10 +595,8 @@ class TonicThread:
                 spike_recency = 1.0 / (1.0 + max(0, self._graph.timestep - node.last_spike_time))
 
             # Hyperedge membership
-            he_count = sum(
-                1 for he in self._graph.hyperedges.values()
-                if nid in he.member_nodes
-            )
+            # Hyperedge membership — O(1) via pre-built index (#347)
+            he_count = he_index.get(nid, 0)
 
             new_thread.append(ThreadItem(
                 node_id=nid,
