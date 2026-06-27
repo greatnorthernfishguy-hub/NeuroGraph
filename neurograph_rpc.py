@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-27] Claude Code (Sonnet 4.6) — #TID-cost-budget: fix compaction model (LAW 4)
+#   What: compaction TID call no longer uses model:"auto". Uses NG_COMPACTION_MODEL env var
+#     (default: openrouter/meta-llama/llama-3.3-70b-instruct). Bypasses TID routing entirely
+#     for this infrastructure-level summarization task.
+#   Why: "auto" sent a 300+ word prompt to TID → classifier called it EXTREME complexity →
+#     Opus won on complexity_fit every time regardless of cost. 429 consecutive Opus calls
+#     drained $30 from OpenRouter overnight. Summarizing a conversation requires no frontier
+#     reasoning — any 70B model handles it. LAW 5: configurable via NG_COMPACTION_MODEL.
+#   How: os.environ.get("NG_COMPACTION_MODEL", "openrouter/meta-llama/llama-3.3-70b-instruct")
+#     replaces the "auto" literal in the TID request body.
 # [2026-06-26] Claude Code (Sonnet 4.6) — #337: reach confabulation on bare file path
 #   What: (1) whisper tier of _render_reach_teaching updated to mention file-path-as-reach-cue;
 #     (2) _is_bare_path() + bare-path hint injection in handle_assemble so a lone path in Josh's
@@ -4402,8 +4412,12 @@ def handle_compact(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # Call TID for summarization
     try:
+        _compaction_model = os.environ.get(
+            "NG_COMPACTION_MODEL",
+            "openrouter/meta-llama/llama-3.3-70b-instruct",
+        )
         tid_body = _json.dumps({
-            "model": "auto",
+            "model": _compaction_model,
             "messages": [{"role": "user", "content": summary_prompt}],
             "temperature": 0.3,
             "max_tokens": 1000,
