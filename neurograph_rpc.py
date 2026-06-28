@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-06-28] Claude Code (Sonnet 4.6) — #294-B: wire dual-pass into afterTurn (Commons path)
+#   What: call _file_conversational_experience() for both turn halves (user + assistant) directly
+#     in handle_after_turn(), immediately after the Commons experience deposit.
+#   Why: #294 gap — the dual-pass recall-store write was stranded in handle_ingest() (old OC
+#     JSON-RPC slot Anima never calls). NG deposits on behalf of Anima — no separate Anima path
+#     needed (Anima replaced OC; OC didn't need one either). The afterTurn call already carries
+#     lastUserMessage and lastAssistantMessage; NG owns this deposit, not Anima.
+#   How: two fail-soft _file_conversational_experience() calls (source="anima") after
+#     _deposit_experience_to_river(); user turn reuses cached _ingest_embedding (free). All
+#     retry/enqueue-on-failure logic lives inside the helper (Law 3 — single filing point).
 # [2026-06-27] Claude Code (Sonnet 4.6) — #TID-cost-budget: fix compaction model (LAW 4)
 #   What: compaction TID call no longer uses model:"auto". Uses NG_COMPACTION_MODEL env var
 #     (default: openrouter/meta-llama/llama-3.3-70b-instruct). Bypasses TID routing entirely
@@ -28,11 +38,7 @@ to an existing NeuroGraphMemory call.
 #     message surfaces an explicit reach nudge regardless of her competence tier;
 #     (3) seed_reach_teaching.py updated with new example + --update flag.
 #   Why: Syl received a bare file path, confabulated reading it instead of emitting [[reach:]].
-#     Root cause: teaching frames reach as "when I WANT to act" — misses the cue "user shares a
-#     path = they want me to read it". At high competence (rc >= 0.70) she sees only the whisper,
-#     which gave no file-path signal at all.
-#   How: whisper updated (immediate, no checkpoint change); bare-path detection in /assemble
-#     appends a targeted note to systemPromptAddition; seed script updated for future re-seeds.
+#   How: whisper updated; bare-path detection in /assemble appends note to systemPromptAddition.
 # [2026-06-14] Claude Code (DudeMan CC, Opus 4.8) — #spine: surface Syl's self-model in /assemble
 #   What: new _render_self_and_wants(graph); handle_assemble PREPENDS "## Who I Am" (her
 #     constitutional core nodes, ordered) + "## What I Want" (her live want-nodes, newest-first)
@@ -3128,6 +3134,14 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001 — missing/odd assistant text never blocks the deposit
             _assistant_text = None
     _deposit_experience_to_river(_ingest_text, _assistant_text)
+    # #294-B: file both turn halves into the recall store (dual-pass, forest+trees).
+    # NG deposits on behalf of Anima — no separate Anima path (Anima replaced OC; OC
+    # didn't need one either). User turn reuses cached embedding (free); assistant turn
+    # re-embeds (separate Hebbian target, different semantic content). Fail-soft.
+    if _ingest_text:
+        _file_conversational_experience(_ingest_text, source="anima", embedding=_ingest_embedding)
+    if _assistant_text:
+        _file_conversational_experience(_assistant_text, source="anima")
 
     # Punchlist #56: Deposit raw surfacing outcome experience.
     # The triad: what was surfaced (cached from assemble) + user input
