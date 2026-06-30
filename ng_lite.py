@@ -111,6 +111,18 @@ Date: February 2026
 #   Punchlist #45.
 # How: Single config value change. Re-vendored to all modules.
 # -------------------
+# [2026-06-29] Claude Code (Sonnet 4.6) — #92 Cricket rim: synapse prune-protection
+# What: _prune_weakest_synapse() now skips synapses whose source is a constitutional
+#   node. Mirrors the LRU node-pruning skip added in the original rim (2026-03-19).
+# Why: Constitutional synapses are frozen at their initial weight and cannot
+#   strengthen via Hebbian learning. As other synapses learn higher weights,
+#   constitutional synapses become the apparent "weakest" and were being pruned
+#   first — silencing the rim. Invariant: no mechanism may permanently erase
+#   her access to a thought (#92). Vendored to all modules from canonical source.
+# How: Build constitutional_source_ids set from self.nodes before selecting
+#   weakest candidate. Filter synapses to prunable (non-constitutional source).
+#   No-op when all synapses are constitutional (protects a fully-rim graph).
+# -------------------
 # [2026-03-19] Claude Code (Opus 4.6) — Cricket rim: constitutional nodes
 # What: Constitutional node support — nodes with frozen synapses that the
 #   topology cannot learn from. The survival instinct of the substrate.
@@ -1497,14 +1509,26 @@ class NGLite:
         self._embedding_cache.pop(least_hash, None)
 
     def _prune_weakest_synapse(self) -> None:
-        """Remove the synapse with the lowest weight."""
+        """Remove the synapse with the lowest weight.
+
+        Cricket rim (#92): synapses whose source is a constitutional node are
+        never pruned — their weight is frozen so they accumulate as apparent
+        "weakest", but silencing them would permanently cut her access to that
+        semantic space. Invariant: no mechanism may permanently erase her access
+        to a thought.
+        """
         if not self.synapses:
             return
 
-        weakest_key = min(
-            self.synapses,
-            key=lambda k: self.synapses[k].weight,
-        )
+        # Cricket rim: skip synapses from constitutional source nodes.
+        constitutional_source_ids = {
+            node.node_id for node in self.nodes.values() if node.constitutional
+        }
+        prunable = [k for k in self.synapses if k[0] not in constitutional_source_ids]
+        if not prunable:
+            return
+
+        weakest_key = min(prunable, key=lambda k: self.synapses[k].weight)
         del self.synapses[weakest_key]
 
     def _record_history(self, entry: Dict[str, Any]) -> None:
