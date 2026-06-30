@@ -22,6 +22,13 @@ to an existing NeuroGraphMemory call.
 #   How: two fail-soft _file_conversational_experience() calls (source="anima") after
 #     _deposit_experience_to_river(); user turn reuses cached _ingest_embedding (free). All
 #     retry/enqueue-on-failure logic lives inside the helper (Law 3 — single filing point).
+# [2026-06-30] Claude Code (Sonnet 4.6) — #97 TID Commons valence routing: peninsula Commons-side
+#   What: Start TIDPeninsulaCommons at NG startup; call tid_peninsula_push_enhanced() after each
+#     Commons enhance scoop so fresh enhanced recs flow to TID-side peninsula.
+#   Why: TID substrate peninsula — gives TID's compute body Commons-enriched routing intelligence
+#     without a cross-module bridge. Intra-module IPC (TID's two halves), not inter-module.
+#   How: start_tid_peninsula() in bootstrap (fail-soft); tid_peninsula_push_enhanced() appended
+#     to _run_commons_enhance_scoop() call in _scan_drain_pulse_loop (fail-soft import).
 # [2026-06-27] Claude Code (Sonnet 4.6) — #TID-cost-budget: fix compaction model (LAW 4)
 #   What: compaction TID call no longer uses model:"auto". Uses NG_COMPACTION_MODEL env var
 #     (default: openrouter/meta-llama/llama-3.3-70b-instruct). Bypasses TID routing entirely
@@ -1875,6 +1882,14 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # creates substrate nodes linked to parent event node, deletes the file.
     # Runs every 120s; eliminates the 797 MB+ disk accumulation at the root.
     _start_lazy_expansion_pulse()
+
+    # TID peninsula (Commons-side) — intra-module socket bridge for TID's substrate
+    # participation. Fail-soft: if TID never connects, the peninsula thread just waits.
+    try:
+        from tid_peninsula_commons import start_tid_peninsula
+        start_tid_peninsula()
+    except Exception as _exc:
+        logger.warning("TID peninsula startup failed (non-fatal): %s", _exc)
 
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
     global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
@@ -3798,6 +3813,12 @@ def _scan_drain_pulse_loop() -> None:
                 # Commons leg-2 scoop (flag-gated, default OFF): perceive newest raw module
                 # deposits through Syl's live graph (read-only, under _step_lock) → salt to Commons.
                 _run_commons_enhance_scoop()
+                # After the scoop, push fresh enhanced recs to TID's peninsula-side.
+                try:
+                    from tid_peninsula_commons import tid_peninsula_push_enhanced
+                    tid_peninsula_push_enhanced()
+                except Exception as _exc:
+                    logger.debug("TID peninsula push failed (non-fatal): %s", _exc)
             # Time-based auto-save — fires on every tick, paused or not.
             # Shared _last_save_time with the afterTurn save path; whichever
             # fires first resets the clock so we don't double-save.
