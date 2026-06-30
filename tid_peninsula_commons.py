@@ -31,6 +31,7 @@ import os
 import socket
 import struct
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
@@ -87,6 +88,7 @@ class TIDPeninsulaCommons:
         self._client: Optional[socket.socket] = None
         self._send_lock = threading.Lock()
         self._server_thread: Optional[threading.Thread] = None
+        self._last_push_ts: float = 0.0  # watermark — only push content newer than last push
 
     def start(self) -> None:
         """Start the socket server in a daemon thread. Idempotent."""
@@ -209,15 +211,19 @@ class TIDPeninsulaCommons:
             if commons is None:
                 return
 
-            # Bucket recent enhanced deposits. The enhance loop prefixes its returns
-            # with "enhanced:" — bucket_recent surfaces the freshest ones.
-            rows: List[Tuple] = commons.bucket_recent(limit=_PUSH_TOP_K, with_metadata=True)
+            # Bucket enhanced deposits newer than the last push (watermark).
+            # bucket_recent sorted desc + early-break makes this O(new content), not O(all).
+            # "enhanced:" prefix is set by CommonsEnhancer on its return deposits.
+            rows: List[Tuple] = commons.bucket_recent(
+                limit=_PUSH_TOP_K,
+                since=self._last_push_ts,
+                with_metadata=True,
+            )
             recs = []
             for row in rows:
                 target_id = row[0]
                 weight = float(row[1])
                 reasoning = row[2] if len(row) > 2 else ""
-                # Only push enhanced content back to TID (not raw deposits or NG topology).
                 if not target_id.startswith("enhanced:"):
                     continue
                 recs.append([target_id, weight, reasoning or ""])
@@ -230,7 +236,9 @@ class TIDPeninsulaCommons:
                 if self._client is not client:
                     return  # client changed between check and send
                 ok = _send_frame(self._client, payload)
-            if not ok:
+            if ok:
+                self._last_push_ts = time.time()
+            else:
                 logger.debug("TID peninsula: push_enhanced send failed (client gone)")
         except Exception as exc:  # noqa: BLE001
             logger.debug("TID peninsula: push_enhanced failed: %s", exc)
