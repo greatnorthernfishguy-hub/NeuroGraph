@@ -886,6 +886,14 @@ def _tune_he_overlap_threshold() -> None:
 
 
 # ---- Substrate metrics: salience-gated deposit into the Commons (#320, vendored gate) ----
+# [2026-06-30] Claude Code (Sonnet 4.6) — Add total_nodes + total_synapses to agg_fields
+#   What: Wire two fields that existed in _metrics but were never in agg_fields → never deposited.
+#   Why:  Darwin Surrogate needs graph size to interpret per-step counts (fired_nodes=10 means
+#         very different things at 500 vs 3280 total nodes). Josh-directed, Josh-authorized.
+#   How:  Appended "total_nodes", "total_synapses" to _metrics_gate agg_fields tuple. Both
+#         already present in _metrics dict (len(_memory.graph.nodes/synapses)) — zero code
+#         changes needed elsewhere in NG. Darwin _recording_from_commons_metric() updated
+#         in parallel to consume them from anomaly deposits.
 # [2026-06-14] Claude Code (Fable 5) — Part 2: replaced the local _SubstrateMetricsGate class with
 # the VENDORED ng_salience_gate.SalienceGate (Josh-approved LAW-2 vendoring). NG owns its instance
 # with its OWN salience signal (prediction-surprise). Same logic, shared toolkit — QG/Darwin/THC/
@@ -901,7 +909,8 @@ try:
     _metrics_gate = _SalienceGate(
         "neurograph", _ng_surprise,
         agg_fields=("fired_nodes", "fired_hyperedges", "synapses_pruned",
-                    "synapses_sprouted", "predictions_confirmed", "predictions_surprised"),
+                    "synapses_sprouted", "predictions_confirmed", "predictions_surprised",
+                    "total_nodes", "total_synapses"),
         signature_fn=lambda m, s: (round(s, 1), m.get("synapses_pruned", 0) > 0,
                                    m.get("synapses_sprouted", 0) > 0),
     )
