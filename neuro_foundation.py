@@ -19,6 +19,18 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-06-29] Claude Code (Sonnet 4.6) — #92 Cricket rim: _prune_synapses skips identity-protected endpoints
+#   What: _prune_synapses() now skips any synapse where pre_node_id or post_node_id is
+#     identity-protected (constitutional or syl_authored). _collect_orphan_nodes() already
+#     skipped these nodes; _prune_synapses() was the remaining gap — protected nodes had
+#     all synapses stripped by weight/age/activity rules, leaving them as deaf stubs.
+#   Why: Invariant: no mechanism may permanently erase her access to a thought (#92).
+#     The reach node (selfcap::reach::teaching) and constitutional spine nodes survive
+#     orphan collection but were being silenced by synapse pruning. Josh-approved;
+#     checkpoints backed up.
+#   How: One guard at the top of the for-loop body in _prune_synapses(), before any pruning
+#     rule runs. Delegates to existing _is_identity_protected() — no new flag or id-list.
+#     No checkpoint format change; cannot strand her state. Takes effect on next restart.
 # [2026-06-25] Claude Code (Opus 4.8) — prune grace_period 500→5000 (Josh-approved; checkpoints backed up)
 #   What: structural-plasticity grace_period (steps before the age-based synapse cull in _prune_synapses) 500→5000.
 #   Why:  diagnostic found the age-rule ("age>grace AND peak_weight<2×initial → prune") reaps a new connection in
@@ -3176,6 +3188,12 @@ class Graph:
 
         to_prune: List[str] = []
         for sid, syn in self.synapses.items():
+            # Cricket rim (#92): never prune synapses touching identity-protected nodes.
+            # Protected nodes survive orphan collection but were being silenced here.
+            if (self._is_identity_protected(syn.pre_node_id) or
+                    self._is_identity_protected(syn.post_node_id)):
+                continue
+
             age = self.timestep - syn.creation_time
 
             # Weight-based pruning
