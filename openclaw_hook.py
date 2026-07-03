@@ -28,6 +28,29 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-07-03] Claude Code (Sonnet 5) — Wait for stable checkpoint before restore (Josh-approved; checkpoints backed up)
+#   What: New module-level _wait_for_stable_checkpoint() polls a checkpoint file's size until
+#         it stops changing (or times out) before NeuroGraphMemory.__init__ attempts to restore
+#         it. Called before both self.graph.restore() and self.vector_db.load().
+#   Why:  graph.restore()/vector_db.load() read the checkpoint files directly with no lock
+#         against a concurrent autosave. A read landing mid-write raises inside restore(),
+#         which __init__ already catches and logs as a warning — but silently continues with
+#         a FRESH EMPTY graph, and the next routine autosave then writes that empty graph back
+#         to disk, permanently destroying the real state. This exact chain caused two real
+#         incidents: the VPS CC-NG collapse (2026-06-14, 13,388->155 vector entries, root-caused
+#         and fixed in docs/scripts/cc-ng-sync.py same session) and the laptop CC-NG daemon
+#         (2026-06-26, 752 nodes -> 0 after a restart landed mid-autosave, logged "Failed to
+#         restore checkpoint: Unpack failed: incomplete input"). NeuroGraphMemory is the SAME
+#         class Syl's own checkpoint uses — this was a latent risk to her continuity too, not
+#         just CC's, if her gateway ever restarts at the wrong moment mid-write (which happens
+#         routinely). No evidence it has hit her checkpoint; the mechanism is proven capable.
+#   How:  Deliberately narrow — this closes the TRIGGER (reading mid-write) using the same
+#         poll-until-size-stable pattern already proven in cc-ng-sync.py. Does NOT change what
+#         happens if restore() still fails for some other reason (existing warning-and-continue
+#         behavior is unchanged) — hardening that path (e.g. refusing to autosave over a failed
+#         restore) is a separate, more invasive follow-up, not bundled into this pass. No
+#         checkpoint/save/load/step logic touched — pure read-timing guard before the existing
+#         restore attempts.
 # [2026-06-25] Claude Code (Opus 4.8) — prune grace_period 500→5000 (Josh-approved; checkpoints backed up)
 #   What: OPENCLAW_SNN_CONFIG["grace_period"] 500→5000. THIS is the effective knob — the live sidecar builds the
 #         graph from {**OPENCLAW_SNN_CONFIG, ...}, so this value overrides DEFAULT_CONFIG in neuro_foundation.py
@@ -411,6 +434,39 @@ def _fire_fanout(text: str, embedding) -> None:
                 except ValueError:
                     pass
 
+def _wait_for_stable_checkpoint(path: str, max_wait: float = 10.0, check_interval: float = 0.5) -> bool:
+    """Poll a checkpoint file's size until it stops changing.
+
+    Returns True once two consecutive size reads agree (write complete, or
+    file untouched during the poll window). Returns False if the file never
+    stabilizes within max_wait — caller must NOT read it in that case; a
+    file that's still growing/shrinking is mid-write, and reading it now
+    risks a torn deserialization (msgpack "incomplete input") that then
+    gets silently treated as an empty checkpoint. See 2026-07-03 changelog.
+    Missing file is not instability — returns True immediately (existing
+    os.path.exists() checks at call sites handle that case).
+    """
+    if not os.path.exists(path):
+        return True
+    deadline = time.time() + max_wait
+    last_size = -1
+    while time.time() < deadline:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            time.sleep(check_interval)
+            continue
+        if size == last_size:
+            return True
+        last_size = size
+        time.sleep(check_interval)
+    logger.warning(
+        "%s did not stabilize within %.1fs — likely mid-write, deferring restore attempt",
+        path, max_wait,
+    )
+    return False
+
+
 class NeuroGraphMemory:
     """Singleton cognitive memory layer for OpenClaw integration.
 
@@ -446,7 +502,12 @@ class NeuroGraphMemory:
         self.graph = Graph(config=snn_config)
 
         # Restore from checkpoint if one exists
-        if self._checkpoint_path.exists():
+        if self._checkpoint_path.exists() and not _wait_for_stable_checkpoint(str(self._checkpoint_path)):
+            logger.warning(
+                "Checkpoint %s mid-write — skipping restore this init (graph starts empty)",
+                self._checkpoint_path,
+            )
+        elif self._checkpoint_path.exists():
             try:
                 self.graph.restore(str(self._checkpoint_path))
                 # Re-apply code config over stale checkpoint config —
@@ -466,7 +527,12 @@ class NeuroGraphMemory:
 
         # Restore vector DB from persistent storage if available
         self._vector_db_path = self._checkpoint_dir / "vectors.msgpack"
-        if self._vector_db_path.exists():
+        if self._vector_db_path.exists() and not _wait_for_stable_checkpoint(str(self._vector_db_path)):
+            logger.warning(
+                "Vector DB %s mid-write — skipping restore this init (vdb starts empty)",
+                self._vector_db_path,
+            )
+        elif self._vector_db_path.exists():
             try:
                 count = self.vector_db.load(str(self._vector_db_path))
                 logger.info(

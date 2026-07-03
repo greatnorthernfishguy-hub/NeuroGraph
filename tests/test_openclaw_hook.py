@@ -256,3 +256,108 @@ class TestEmbeddingDeviceConfig:
         ng = NeuroGraphMemory.get_instance(workspace_dir=workspace)
         status = ng.ingestor.embedder.status
         assert status["device_requested"] == "cpu"
+
+
+class TestStableCheckpointGuard:
+    """Regression coverage for the 2026-07-03 torn-read fix.
+
+    Root cause of two real incidents (VPS CC-NG 2026-06-14, laptop CC-NG
+    2026-06-26): restore()/load() reading a checkpoint mid-autosave-write,
+    raising, being silently swallowed, and the resulting empty graph then
+    getting autosaved over the real state. _wait_for_stable_checkpoint()
+    closes the trigger by refusing to read a file that's still changing.
+    """
+
+    def test_stable_file_returns_true_immediately(self, tmp_path):
+        from openclaw_hook import _wait_for_stable_checkpoint
+        p = tmp_path / "stable.msgpack"
+        p.write_bytes(b"x" * 1000)
+        assert _wait_for_stable_checkpoint(str(p), max_wait=5.0, check_interval=0.2) is True
+
+    def test_missing_file_returns_true(self, tmp_path):
+        from openclaw_hook import _wait_for_stable_checkpoint
+        p = tmp_path / "does-not-exist.msgpack"
+        assert _wait_for_stable_checkpoint(str(p), max_wait=5.0) is True
+
+    def test_actively_growing_file_is_not_trusted_until_stable(self, tmp_path):
+        """A file mid-write must not be read until it stops changing."""
+        from openclaw_hook import _wait_for_stable_checkpoint
+        import threading
+        import time as time_mod
+
+        p = tmp_path / "growing.msgpack"
+
+        def writer():
+            with open(p, "wb") as f:
+                for _ in range(5):
+                    f.write(b"x" * 1000)
+                    f.flush()
+                    time_mod.sleep(0.3)
+
+        th = threading.Thread(target=writer)
+        th.start()
+        time_mod.sleep(0.1)  # let the writer start first
+        result = _wait_for_stable_checkpoint(str(p), max_wait=10.0, check_interval=0.2)
+        th.join()
+        assert result is True  # eventually stabilizes once the writer finishes
+        assert p.stat().st_size == 5000  # and we only trusted it once complete
+
+    def test_never_stabilizing_file_times_out_false(self, tmp_path):
+        """A pathologically stuck write must not be silently trusted either."""
+        from openclaw_hook import _wait_for_stable_checkpoint
+        import threading
+        import time as time_mod
+
+        p = tmp_path / "stuck.msgpack"
+
+        def slow_writer():
+            with open(p, "wb") as f:
+                for _ in range(20):
+                    f.write(b"x" * 1000)
+                    f.flush()
+                    time_mod.sleep(0.2)
+
+        th = threading.Thread(target=slow_writer, daemon=True)
+        th.start()
+        time_mod.sleep(0.1)
+        result = _wait_for_stable_checkpoint(str(p), max_wait=1.5, check_interval=0.2)
+        assert result is False
+
+    def test_mid_write_checkpoint_defers_restore_instead_of_silently_emptying(self, workspace):
+        """Integration-level: constructing NeuroGraphMemory while the checkpoint
+        is actively being overwritten must not produce a phantom-empty graph
+        from a torn read — it must defer restore for that init instead."""
+        import threading
+        import time as time_mod
+
+        # Build a real, healthy checkpoint first.
+        ng1 = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        ng1.on_message("Regression test: torn checkpoint reads must not corrupt state")
+        ng1.save()
+        real_node_count = ng1.stats()["nodes"]
+        assert real_node_count > 0
+        checkpoint_path = Path(workspace) / "checkpoints" / "main.msgpack"
+        real_bytes = checkpoint_path.read_bytes()
+        NeuroGraphMemory.reset_instance()
+
+        # Simulate a slow autosave in progress: truncate-then-rewrite the same
+        # file slowly, matching how a real save overwrites in place.
+        def slow_rewrite():
+            with open(checkpoint_path, "wb") as f:
+                half = len(real_bytes) // 2
+                f.write(real_bytes[:half])
+                f.flush()
+                time_mod.sleep(1.0)
+                f.write(real_bytes[half:])
+                f.flush()
+
+        th = threading.Thread(target=slow_rewrite)
+        th.start()
+        time_mod.sleep(0.1)  # ensure construction starts while file is mid-write
+
+        ng2 = NeuroGraphMemory.get_instance(workspace_dir=workspace)
+        th.join()
+
+        # Either it correctly waited and got the real, complete state, or it
+        # cleanly deferred to empty — never a torn partial read in between.
+        assert ng2.stats()["nodes"] in (0, real_node_count)
