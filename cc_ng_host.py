@@ -24,6 +24,14 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-03] Claude Code (Sonnet 5) — Port Syl's grace_period fix to CC's config
+# What: _CC_SNN_CONFIG['grace_period'] 500->5000.
+# Why:  Same age-based synapse cull bug fixed for Syl on 2026-06-25 (openclaw_hook.py
+#       OPENCLAW_SNN_CONFIG, neuro_foundation.py DEFAULT_CONFIG) — never ported to CC's
+#       separate config. Found investigating laptop CC-NG's persistently sparse graph
+#       alongside the torn-read fix (openclaw_hook.py, same session). See
+#       docs/scripts/cc-ng-daemon.py changelog for full context.
+# How:  Config value only, matches Syl's already-proven fix exactly.
 # [2026-04-27] Claude Code (Sonnet 4.6) — Wire discover_hyperedges into _deposit (#220)
 # What: After ng.on_message(text), derive fired nodes from _recent_spikes and call
 #       discover_hyperedges(). Fired = nodes whose last spike == current timestep.
@@ -144,7 +152,7 @@ _CC_SNN_CONFIG = {
     "scaling_interval": 25,
     "threshold_ceiling": 5.0,
     "weight_threshold": 0.01,
-    "grace_period": 500,
+    "grace_period": 5000,  # [2026-07-03] 500->5000, porting Syl's 2026-06-25 fix — see docs/scripts/cc-ng-daemon.py changelog
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
