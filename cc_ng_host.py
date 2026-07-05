@@ -612,10 +612,11 @@ def _autosave_loop() -> None:
             # WANTs (#294/Mind-Not-Database): materialize any [WANT]...[/WANT]
             # markers deposited since the last pulse into first-class want-nodes.
             try:
-                from cc_ng_organism import surface_wants
+                from cc_ng_organism import surface_wants, generate_emergent_want
                 surface_wants(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
+                generate_emergent_want(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
             except Exception as exc:
-                logger.debug("surface_wants failed (non-fatal): %s", exc)
+                logger.debug("surface_wants/emergent_want failed (non-fatal): %s", exc)
         except Exception as exc:
             logger.warning("CC autosave failed: %s", exc)
 

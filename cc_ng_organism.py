@@ -256,18 +256,23 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
     return open_wants
 
 
-def render_wants(graph: Any, provenance: str = "cc_authored") -> str:
+def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -> str:
     """Render CC's own open want-nodes as a '## What I Want' block, newest
     first -- read LIVE every call (not a snapshot), so a want noted this
     session shows up immediately. Returns "" if none exist (graceful).
+
+    provenance accepts a single string or an iterable -- default covers both
+    text-marker wants (surface_wants, "cc_authored") and substrate-native
+    curiosity wants (generate_emergent_want, "cc_emergent") in one block.
     """
     if graph is None:
         return ""
+    allowed = {provenance} if isinstance(provenance, str) else set(provenance)
     try:
         wants = []
         for _nid, node in graph.nodes.items():
             meta = getattr(node, "metadata", None) or {}
-            if meta.get("kind") != "want" or meta.get("provenance") != provenance:
+            if meta.get("kind") != "want" or meta.get("provenance") not in allowed:
                 continue
             if meta.get("want_state", "open") != "open":
                 continue
@@ -281,6 +286,111 @@ def render_wants(graph: Any, provenance: str = "cc_authored") -> str:
     except Exception as exc:  # noqa: BLE001
         logger.debug("CC want-render error (non-fatal): %s", exc)
         return ""
+
+
+def generate_emergent_want(
+    graph: Any, vector_db: Any, *,
+    confidence_threshold: float = 0.6, max_seeds: int = 3, attractor_steps: int = 5,
+    provenance: str = "cc_emergent",
+) -> Optional[Dict[str, Any]]:
+    """Substrate-native curiosity -- the OTHER kind of want, distinct from
+    surface_wants()'s text-marker parsing. Extracted from neurograph_rpc.py's
+    TonicBridge (curiosity_signal -> attractor_settle -> hyperedge_complete ->
+    embedding_centroid -> compose), which polls unresolved high-confidence
+    predictions and read-only-settles what associates with them -- "the
+    substrate wondering", not text CC or a user wrote.
+
+    Deliberately does NOT port TonicBridge's deposit_outbound_intent() path
+    -- that's Anima's autonomous-turn-initiation channel (CC has no
+    equivalent; a CC session only runs while the user is actively in it).
+    Instead this materializes the result directly as a want-node, so it
+    surfaces via render_wants() like any other want -- no outbound channel
+    needed. Call periodically (e.g. the autosave pulse) when idle.
+
+    Returns the created want dict, or None if nothing was curious enough /
+    on any failure (fails soft -- an idle-time curiosity check must never
+    disrupt the daemon).
+    """
+    import hashlib
+    if graph is None:
+        return None
+    try:
+        preds = [
+            p for p in graph.active_predictions.values()
+            if p.confidence > confidence_threshold
+        ]
+        if not preds:
+            return None
+        preds.sort(key=lambda p: p.confidence, reverse=True)
+        seeds = preds[:max_seeds]
+
+        # Read-only attractor settle -- write_mode=False is MANDATORY, this
+        # is observation, never a graph mutation (matches TonicBridge exactly).
+        seed_ids = [p.source_node_id for p in seeds]
+        seed_currents = [p.confidence * 0.5 for p in seeds]
+        result = graph.prime_and_propagate(
+            node_ids=seed_ids, currents=seed_currents,
+            steps=attractor_steps, write_mode=False,
+        )
+        fired = {entry.node_id for entry in result.fired_entries}
+
+        # Hyperedge completion -- nodes implied by >=50% of a hyperedge's
+        # members firing, even though they didn't fire themselves.
+        implied: set = set()
+        for he in graph.hyperedges.values():
+            member_ids = he.member_nodes
+            if not member_ids:
+                continue
+            active = member_ids & fired
+            if len(active) / len(member_ids) >= 0.5:
+                implied.update(member_ids - fired)
+
+        node_ids = fired | implied
+        concept_label = None
+        if node_ids and vector_db is not None:
+            import numpy as _np
+            pairs = []
+            for nid in node_ids:
+                db_entry = vector_db.get(nid)
+                emb = db_entry.get("embedding") if isinstance(db_entry, dict) else None
+                if emb is not None:
+                    pairs.append(emb)
+            if pairs:
+                centroid = _np.mean(pairs, axis=0)
+                best_nid, best_score = None, -1.0
+                for nid, node in graph.nodes.items():
+                    db_entry = vector_db.get(nid)
+                    emb = db_entry.get("embedding") if isinstance(db_entry, dict) else None
+                    if emb is None:
+                        continue
+                    score = float(_np.dot(emb, centroid) /
+                                  ((_np.linalg.norm(emb) * _np.linalg.norm(centroid)) or 1e-9))
+                    if score > best_score:
+                        best_score, best_nid = score, nid
+                if best_nid is not None:
+                    concept_label = graph.nodes[best_nid].metadata.get("label", best_nid)
+
+        def _label(nid: str) -> str:
+            node = graph.nodes.get(nid)
+            return node.metadata.get("label", nid) if node is not None else nid
+
+        open_questions = [f"{_label(p.source_node_id)}→{_label(p.target_node_id)}" for p in seeds]
+        want_text = f"tonic-triggered: {concept_label or '(unknown)'}"
+        if open_questions:
+            want_text += " -- open questions: " + ", ".join(open_questions)
+
+        want_id = "cc:want::" + hashlib.sha1(want_text.encode("utf-8")).hexdigest()[:16]
+        if want_id in graph.nodes:
+            return None  # already materialized this exact curiosity, idempotent
+        graph.create_node(node_id=want_id, metadata={
+            "kind": "want", "want_text": want_text, "want_state": "open",
+            "provenance": provenance, "creation_mode": "emergent",
+        })
+        logger.info("CC emergent want materialized: %s", want_text)
+        return {"id": want_id, "text": want_text, "provenance": provenance, "state": "open"}
+    except Exception as exc:
+        logger.debug("generate_emergent_want failed (non-fatal): %s", exc)
+        return None
 
 
 def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
