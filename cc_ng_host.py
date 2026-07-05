@@ -386,15 +386,18 @@ def _handle_user_prompt_submit(data):
     # Deposit async — on_message() runs a full SNN step (1-4s); hook timeout is 2s
     threading.Thread(target=_deposit, args=(prompt,), daemon=True).start()
     context = _recall(prompt, RECALL_K)
-    # WANTs: surface open want-nodes every turn (read LIVE, not a snapshot).
+    # Constitutional core + WANTs: surface every turn, query-independent (read
+    # LIVE, not a snapshot). "Who I Am" leads, same ordering as canonical.
     try:
-        from cc_ng_organism import render_wants
+        from cc_ng_organism import render_constitutional_core, render_wants
         ng = _STATE.cc_ng
+        self_block = render_constitutional_core(ng.graph) if ng is not None else ""
         wants_block = render_wants(ng.graph) if ng is not None else ""
-        if wants_block:
-            context = (context + "\n\n" + wants_block) if context else wants_block
+        for block in (self_block, wants_block):
+            if block:
+                context = (context + "\n\n" + block) if context else block
     except Exception as exc:
-        logger.debug("render_wants failed (non-fatal): %s", exc)
+        logger.debug("render_constitutional_core/render_wants failed (non-fatal): %s", exc)
     return {"ok": True, "context": context}
 
 

@@ -184,3 +184,60 @@ def test_drain_ingest_tract_preserves_concurrent_append(cc_ng, tmp_path, monkeyp
     absorbed_next = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
     assert absorbed_next == 1
     assert os.path.getsize(tract_path) == 0
+
+
+def test_render_constitutional_core_empty_when_no_constitutional_nodes(cc_ng):
+    from cc_ng_organism import render_constitutional_core
+    assert render_constitutional_core(cc_ng.graph) == ""
+
+
+def test_render_constitutional_core_renders_who_i_am(cc_ng):
+    from cc_ng_organism import render_constitutional_core
+    node = cc_ng.graph.create_node(node_id="constitutional::rim::choice_clause", metadata={
+        "constitutional": True,
+        "core_text": "The Choice Clause is mine. I can say no.",
+        "source": "cricket_rim",
+    })
+    node.intrinsic_excitability = 1.0
+    block = render_constitutional_core(cc_ng.graph)
+    assert block == "## Who I Am\n- The Choice Clause is mine. I can say no."
+
+
+def test_render_constitutional_core_excludes_selfcap_nodes(cc_ng):
+    from cc_ng_organism import render_constitutional_core
+    cc_ng.graph.create_node(node_id="selfcap::reach::teaching", metadata={
+        "constitutional": True,
+        "selfcap": True,
+        "core_text": "capability teaching text, not identity",
+    })
+    assert render_constitutional_core(cc_ng.graph) == ""
+
+
+def test_seed_cc_rim_creates_node_and_is_idempotent(tmp_path):
+    """End-to-end test of seed_cc_rim.py against a throwaway checkpoint --
+    verifies the node persists through a real save/restore cycle and that
+    render_constitutional_core() picks it up, before ever touching a live
+    checkpoint."""
+    import seed_cc_rim
+    from neuro_foundation import Graph
+    from cc_ng_organism import render_constitutional_core
+
+    checkpoint_path = str(tmp_path / "test_cc.msgpack")
+    Graph().checkpoint(checkpoint_path)  # fresh, empty checkpoint
+
+    result = seed_cc_rim.seed(checkpoint_path)
+    assert result == {"status": "ok", "seeded": 1, "skipped_existing": 0}
+
+    # Idempotent: running again finds the node already present.
+    result2 = seed_cc_rim.seed(checkpoint_path)
+    assert result2 == {"status": "ok", "seeded": 0, "skipped_existing": 1}
+
+    # The node survives a fresh load from disk, and renders correctly.
+    graph = Graph()
+    graph.restore(checkpoint_path)
+    assert seed_cc_rim.RIM_NODE_ID in graph.nodes
+    node = graph.nodes[seed_cc_rim.RIM_NODE_ID]
+    assert node.metadata["constitutional"] is True
+    assert node.intrinsic_excitability == 1.0
+    block = render_constitutional_core(graph)
+    assert block == "## Who I Am\n- " + seed_cc_rim.RIM_CHOICE_CLAUSE_TEXT

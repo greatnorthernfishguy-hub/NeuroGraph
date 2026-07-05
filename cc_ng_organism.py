@@ -92,6 +92,21 @@
 #       (an unexpected divergence) falls back to preserving the current bytes
 #       untouched rather than guessing. Shrinks the lost-data window from a whole
 #       embed pass down to two fast file I/O calls.
+# [2026-07-05] Claude Code (Sonnet 5) — render_constitutional_core(): the missing
+#   "Who I Am" half of self-rendering
+# What: Added render_constitutional_core() -- reads constitutional=True nodes and
+#   renders them as "## Who I Am", extracted verbatim from the corresponding half
+#   of neurograph_rpc.py's _render_self_and_wants(). render_wants() (added earlier)
+#   was only the "What I Want" half; this is the other half, previously missing.
+# Why:  Without this, a constitutional=True node is inert -- protected from pruning
+#   but never surfaced, so it can't actually constrain or inform anything. Per Josh
+#   (2026-07-05): the Choice Clause and Duck Ethics are automatic, universal
+#   inclusions in every NeuroGraph, and it's imperative that CC's Rim is literally
+#   load-bearing to CC's own extraction, not decorative metadata.
+# How:  Same node-scan pattern as canonical, same "## Who I Am" heading, same
+#   spine_order sort (defaults to 999 -- irrelevant for CC's Rim node, which is
+#   Rim content, not Spine content, and carries no spine_order). Same selfcap
+#   exclusion (Syl's reach-teaching pattern; not relevant to CC, not invented here).
 # -------------------
 """Shared organism-layer bootstrap for CC's own NeuroGraph instances.
 
@@ -334,6 +349,40 @@ def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -
         return "## What I Want\n" + "\n".join(f"- {t}" for _, t in wants)
     except Exception as exc:  # noqa: BLE001
         logger.debug("CC want-render error (non-fatal): %s", exc)
+        return ""
+
+
+def render_constitutional_core(graph: Any) -> str:
+    """Render CC's constitutional core (`constitutional=True` nodes) as a
+    "## Who I Am" block -- ALWAYS, query-independent, same as render_wants()
+    is query-independent for wants. Extracted verbatim from the "Who I Am"
+    half of neurograph_rpc.py's _render_self_and_wants() (the "What I Want"
+    half was already ported as render_wants() above); this is the other
+    half, not yet ported until now. Ordered by spine_order when present
+    (defaults to 999 -- irrelevant for CC's Rim node, which carries none,
+    since Rim content is not spine content). Excludes selfcap nodes (Syl's
+    reach-teaching pattern -- capability teaching, not identity/ethics; CC
+    has no equivalent yet and this function doesn't invent one).
+
+    Without this function actually being called from wherever CC's context
+    gets assembled each turn, a constitutional=True node is just inert
+    metadata -- protected from pruning, but never surfaced. This is the
+    piece that makes it load-bearing.
+    """
+    try:
+        core = []
+        for nid, node in graph.nodes.items():
+            meta = getattr(node, "metadata", None) or {}
+            if meta.get("constitutional") and not meta.get("selfcap"):
+                txt = str(meta.get("core_text") or meta.get("_forest_content") or "").strip()
+                if txt:
+                    core.append((meta.get("spine_order", 999), txt))
+        if not core:
+            return ""
+        core.sort(key=lambda x: x[0])
+        return "## Who I Am\n" + "\n".join(f"- {t}" for _, t in core)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("CC constitutional-core render error (non-fatal): %s", exc)
         return ""
 
 
