@@ -57,3 +57,40 @@ def test_second_turn_links_to_previous_via_delayed_synapse(cc_ng):
         for s in outgoing.values()
     )
     assert linked
+
+
+def test_probation_graduation(cc_ng):
+    from cc_ng_organism import run_conversational_dual_pass, cc_update_probation, _CC_CONV_PROBATION_PERIOD
+    from ng_embed import embed
+    # Deposit a conversational node with probation
+    state = {"last_forest_id": None}
+    text = "probation test node"
+    ok = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, embed(text), state)
+    assert ok is True
+    node_id = state["last_forest_id"]
+    assert node_id is not None
+
+    # Node should initially be in probation
+    node = cc_ng.graph.nodes[node_id]
+    assert node.metadata.get("probation_remaining") == _CC_CONV_PROBATION_PERIOD
+    assert node.metadata.get("graduated") is not True
+    initial_excitability = node.intrinsic_excitability
+    assert initial_excitability < 1.0  # should be dampened
+
+    # Call cc_update_probation repeatedly until graduation
+    for i in range(_CC_CONV_PROBATION_PERIOD):
+        graduated = cc_update_probation(cc_ng.graph)
+        if i < _CC_CONV_PROBATION_PERIOD - 1:
+            # Should not graduate yet
+            assert node.metadata.get("probation_remaining") == _CC_CONV_PROBATION_PERIOD - i - 1
+            assert node.metadata.get("graduated") is not True
+        else:
+            # Final call should graduate
+            assert node_id in graduated
+            assert node.metadata.get("graduated") is True
+            assert node.metadata.get("probation_remaining") <= 0
+
+    # After graduation, node should be at full excitability
+    assert node.intrinsic_excitability == 1.0
+    base_threshold = cc_ng.graph.config.get("default_threshold", 1.0)
+    assert node.threshold == base_threshold

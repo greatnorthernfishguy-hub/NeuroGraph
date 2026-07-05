@@ -499,6 +499,7 @@ class _CCConversationalDualPassEco:
             return {"deposited": True}
         if meta.get("_tree_concept") and meta.get("_concept"):
             if not _cc_concept_passes_floor(meta["_concept"]):
+                logger.debug("Tree concept below floor, not indexed: %r", meta["_concept"][:40])
                 return {"deposited": False, "reason": "concept_below_floor"}
             _cc_deposit_memory_node(self._graph, self._vector_db, target_id, embedding,
                                      meta["_concept"], meta, index_in_recall=True)
@@ -544,6 +545,36 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
         except Exception:
             pass
     state["last_forest_id"] = forest_id
+
+
+def cc_update_probation(graph) -> list:
+    """Substrate-level probation graduation -- fades novelty-dampening over
+    the probation window and graduates nodes to full excitability. Mirrors
+    canonical's _update_probation exactly (neurograph_rpc.py:2145-2169) --
+    that function is already parameterized on graph alone, so this is a
+    near-verbatim port. Call once per pulse (autosave loop), after any
+    conversational deposits for that pulse -- operates on ALL probationary
+    nodes, not just ones just deposited.
+    """
+    graduated = []
+    base_threshold = graph.config.get("default_threshold", 1.0)
+    for nid, node in list(graph.nodes.items()):
+        prob = node.metadata.get("probation_remaining")
+        if prob is None or prob <= 0:
+            continue
+        prob -= 1
+        node.metadata["probation_remaining"] = prob
+        if prob <= 0:
+            node.intrinsic_excitability = 1.0
+            node.threshold = base_threshold
+            node.metadata["graduated"] = True
+            graduated.append(nid)
+        else:
+            damp = float(node.metadata.get("novelty_dampening", _CC_CONV_NOVELTY_DAMPENING))
+            total = float(node.metadata.get("probation_total", _CC_CONV_PROBATION_PERIOD)) or float(_CC_CONV_PROBATION_PERIOD)
+            frac = max(0.0, min(1.0, 1.0 - prob / total))
+            node.intrinsic_excitability = damp + (1.0 - damp) * frac
+    return graduated
 
 
 def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict) -> bool:
