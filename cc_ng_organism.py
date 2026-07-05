@@ -75,6 +75,23 @@
 #       get_cc_commons from this file and calls it -- same shared instance, zero further
 #       registration (this IS the whole point of Commons's deposit/bucket design -- no peer
 #       list, no address, no handshake).
+# [2026-07-05] Claude Code (Sonnet 5) — Fix truncation race in drain_ingest_tract
+# What: drain_ingest_tract's truncate step no longer blindly zeroes the whole tract
+#       file. It re-reads the file at truncation time and, if the current content
+#       still starts with the exact bytes already processed, writes back only the
+#       remainder. Added test_drain_ingest_tract_preserves_concurrent_append.
+# Why:  The final whole-branch review (2026-07-05) found the old `open(path, "wb")`
+#       blind truncate erased any entry miniTID appended during the drain loop's
+#       slow per-entry embed+dual-pass work -- directly contradicting this file's
+#       own prior claim (see the 2026-07-04 Haiku 4.5 entry's "How" section) that
+#       concurrent appends "land after this truncation... never lost." That claim
+#       was false; this fix makes it true.
+# How:  Truncation reads the file's current bytes, compares against the `data`
+#       buffer already drained (a plain string prefix check), and writes back only
+#       `current[len(data):]` when it still starts with that prefix -- otherwise
+#       (an unexpected divergence) falls back to preserving the current bytes
+#       untouched rather than guessing. Shrinks the lost-data window from a whole
+#       embed pass down to two fast file I/O calls.
 # -------------------
 """Shared organism-layer bootstrap for CC's own NeuroGraph instances.
 
