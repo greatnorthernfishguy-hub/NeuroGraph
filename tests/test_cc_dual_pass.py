@@ -1,7 +1,6 @@
 import sys
 sys.path.insert(0, '/home/josh/NeuroGraph')
 import tempfile, shutil
-import numpy as np
 import pytest
 
 
@@ -99,41 +98,30 @@ def test_probation_graduation(cc_ng):
 def test_drain_ingest_tract_absorbs_experience_entries(cc_ng, tmp_path):
     """Test that drain_ingest_tract reads and absorbs experience entries from a tract file.
 
-    Note: ng_tract v0.1.0 doesn't provide deposit_experience() yet (miniTID Tasks 4-7).
-    We mock the TractReader to return experience entries for testing.
+    Uses real BTF round-trips via ng_tract.deposit_experience() and TractReader.
     """
+    import ng_tract
     from cc_ng_organism import drain_ingest_tract
-    from unittest.mock import Mock, patch, MagicMock
-    import sys
 
     tract_path = str(tmp_path / "turns.tract")
 
-    # Create mock experience entries
-    ENTRY_EXPERIENCE = 0
+    # Use real ng_tract.deposit_experience() to write BTF entries
+    ng_tract.deposit_experience(
+        content=b"the user asked about numpy conflicts",
+        source="cc_gateway",
+        tract_path=tract_path,
+        content_type="text",
+    )
+    ng_tract.deposit_experience(
+        content=b"I should look into the ng_tract_venv.pth file",
+        source="cc_gateway",
+        tract_path=tract_path,
+        content_type="text",
+    )
 
-    class MockExperienceEntry:
-        def __init__(self, content, source):
-            self.entry_type = ENTRY_EXPERIENCE
-            self.source = source
-            self.content_type = "text"
-            self.content = content
-
-    # Write a placeholder file so drain_ingest_tract knows the file exists
-    with open(tract_path, 'wb') as f:
-        f.write(b"placeholder")
-
-    # Mock TractReader to return our experience entries
-    mock_entries = [
-        MockExperienceEntry("the user asked about numpy conflicts", "cc_gateway"),
-        MockExperienceEntry("I should look into the ng_tract_venv.pth file", "cc_gateway"),
-    ]
-
-    # Patch ng_tract in the context where it's imported (in drain_ingest_tract)
-    with patch('ng_tract.TractReader') as mock_reader_class:
-        mock_reader_class.return_value = iter(mock_entries)
-        state = {"last_forest_id": None}
-        absorbed = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
-        assert absorbed == 2
+    state = {"last_forest_id": None}
+    absorbed = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
+    assert absorbed == 2
 
     conv_nodes = [n for n in cc_ng.graph.nodes.values()
                   if n.metadata.get("creation_mode") == "conversational"]

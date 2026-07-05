@@ -15,8 +15,6 @@
 #       break the daemon's pulse. File truncates after successful drain (single reader,
 #       single appender miniTID; concurrent appends mid-drain land after truncation, picked
 #       up next pulse, never lost).
-# Note: ng_tract v0.1.0 doesn't yet support ENTRY_EXPERIENCE or deposit_experience() --
-#       those come in miniTID Tasks 4-7. Code gracefully degrades via getattr fallback.
 # [2026-07-04] Claude Code (Sonnet 5) — Parameterized conversational dual-pass core for CC
 # What: Added run_conversational_dual_pass(), _CCConversationalDualPassEco, and supporting
 #       functions (_cc_deposit_memory_node, _cc_bind_conversational_topology,
@@ -665,7 +663,6 @@ def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
 # Drains BTF entries from miniTID's turn-deposit tract file, running each
 # through the conversational dual-pass (Task 1). Feeder (miniTID) deposits,
 # this drains independently -- no handshake, matching the established tract model.
-_ENTRY_EXPERIENCE = 0  # Experience entry type (distinct from ng_tract's ENTRY_OUTCOME/ENTRY_TOPOLOGY)
 
 _DEFAULT_CC_GATEWAY_TRACT_PATH = os.path.expanduser(
     "~/.claude/plugins/neurograph/tracts/cc_gateway/turns.tract"
@@ -714,10 +711,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
     try:
         reader = ng_tract.TractReader(data)
         for entry in reader:
-            # Check entry type (use locally-defined ENTRY_EXPERIENCE since ng_tract v0.1.0
-            # doesn't support experience entries yet -- miniTID Tasks 4-7 will add this)
-            entry_type_to_check = getattr(ng_tract, 'ENTRY_EXPERIENCE', _ENTRY_EXPERIENCE)
-            if entry.entry_type != entry_type_to_check:
+            # Check entry type using ng_tract.ENTRY_EXPERIENCE (the real module constant)
+            if entry.entry_type != ng_tract.ENTRY_EXPERIENCE:
                 continue
             if entry.source != "cc_gateway":
                 continue
