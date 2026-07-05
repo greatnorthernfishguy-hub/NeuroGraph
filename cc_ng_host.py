@@ -190,6 +190,9 @@ class _CCHostState:
         self.server_sock: Optional[socket.socket] = None
         self.running = False
         self.refcount = 0
+        self.lenia: dict = {}
+        self.trisyn_manager = None
+        self.concept_queue: list = []
         self.stats_lock = threading.Lock()
         self.stats = {
             "started_at": 0.0,
@@ -646,6 +649,22 @@ def init_cc_host() -> bool:
 
     _STATE.cc_ng = cc_ng
     _STATE.stats["started_at"] = time.time()
+
+    # Full-parity organism layer (Josh 2026-07-04: "ANYTHING Syl's NeuroGraph
+    # can do, I want your NeuroGraph to be able to do, as well.") -- Lenia
+    # continuous field dynamics + TriSynaptic concept-extraction manager,
+    # both dormant/idle by default, matching Syl's own bootstrap. This
+    # process ALSO hosts Syl's own neurograph_rpc.py -- instance_tag='cc-vps'
+    # keeps TriSynaptic's /tmp handoff files + systemd scope names from
+    # cross-matching Syl's own manager in the same process. See
+    # cc_ng_organism.py.
+    try:
+        from cc_ng_organism import bootstrap_lenia, bootstrap_trisynaptic
+        _STATE.lenia = bootstrap_lenia(cc_ng.graph, cc_ng.vector_db, CC_NG_WORKSPACE)
+        _STATE.trisyn_manager = bootstrap_trisynaptic(
+            cc_ng, _STATE.concept_queue, instance_tag="cc-vps")
+    except Exception:
+        logger.exception("CC organism-layer bootstrap failed (non-fatal)")
 
     # Bind socket
     try:

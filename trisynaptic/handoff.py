@@ -50,6 +50,11 @@ def read_handoff(path: Path) -> Dict[str, Any]:
         return json.load(fh)
 
 
-def list_orphan_handoffs() -> List[Path]:
-    """Return leftover handoff files (worker crash or NG restart orphans)."""
-    return sorted(HANDOFF_DIR.glob(f"{HANDOFF_PREFIX}*.json"))
+def list_orphan_handoffs(prefix: str = HANDOFF_PREFIX) -> List[Path]:
+    """Return leftover handoff files (worker crash or NG restart orphans).
+
+    prefix is overridable so multiple TrisynapticManager instances sharing
+    this machine's /tmp (e.g. Syl's + CC's own, co-located on the VPS) never
+    cross-match each other's orphaned handoffs.
+    """
+    return sorted(HANDOFF_DIR.glob(f"{prefix}*.json"))

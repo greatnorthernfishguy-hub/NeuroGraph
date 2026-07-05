@@ -61,11 +61,25 @@ class TrisynapticManager:
                 live tunable reads.
         queue:  Reference to neurograph_rpc._CONCEPT_QUEUE. Shared mutable
                 list; manager pops entries into the worker's handoff.
+        handoff_prefix: /tmp filename prefix for this instance's handoff
+                files. Defaults to canonical HANDOFF_PREFIX (Syl's own
+                manager). A second manager sharing this machine's /tmp
+                (e.g. CC's own instance, co-located on the VPS) must pass
+                a distinct prefix so orphan-scan and failed-file cleanup
+                never cross-match the other instance's files.
+        scope_prefix: systemd-run --unit scope name prefix. Defaults to
+                the original "trisyn" (Syl's exact existing behavior,
+                unchanged) -- pass a distinct value alongside handoff_prefix
+                for a co-located second instance.
     """
 
-    def __init__(self, memory: Any, queue: List[Dict[str, Any]]) -> None:
+    def __init__(self, memory: Any, queue: List[Dict[str, Any]],
+                 handoff_prefix: str = HANDOFF_PREFIX,
+                 scope_prefix: str = "trisyn") -> None:
         self._memory = memory
         self._queue = queue
+        self._handoff_prefix = handoff_prefix
+        self._scope_prefix = scope_prefix
         self._shutdown = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._worker_scope: Optional[str] = None
@@ -101,7 +115,7 @@ class TrisynapticManager:
         self._requeue_orphans()
 
     def _requeue_orphans(self) -> None:
-        orphans = list_orphan_handoffs()
+        orphans = list_orphan_handoffs(prefix=self._handoff_prefix)
         if not orphans:
             return
         requeued_total = 0
@@ -186,7 +200,7 @@ class TrisynapticManager:
             return
 
         ts = int(time.time())
-        handoff_path = HANDOFF_DIR / f"{HANDOFF_PREFIX}{ts}.json"
+        handoff_path = HANDOFF_DIR / f"{self._handoff_prefix}{ts}.json"
         payload = {
             "spawn_mode": "unconditional",  # Phase 1: only mode
             "config": {
@@ -205,7 +219,7 @@ class TrisynapticManager:
             self._requeue_front(batch)
             return
 
-        scope_name = f"trisyn-{ts}.scope"
+        scope_name = f"{self._scope_prefix}-{ts}.scope"
         python_exe = _NG_VENV_PY if Path(_NG_VENV_PY).exists() else sys.executable
         cmd = [
             "systemd-run",
@@ -243,7 +257,7 @@ class TrisynapticManager:
 
     def _trim_failed_files(self) -> None:
         failed = sorted(
-            HANDOFF_DIR.glob(f"{HANDOFF_PREFIX}*.failed.json"),
+            HANDOFF_DIR.glob(f"{self._handoff_prefix}*.failed.json"),
             key=lambda p: p.stat().st_mtime,
         )
         to_delete = failed[:-_MAX_FAILED_FILES] if len(failed) > _MAX_FAILED_FILES else []
