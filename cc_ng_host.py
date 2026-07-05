@@ -24,6 +24,29 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-05] CC (laptop) — Tool-call deposits: Commons-only, never the main substrate (Josh-approved)
+# What: Added _deposit_tool_experience(), used by _handle_post_tool_use() instead of the shared
+#   _deposit(). Tool-call telemetry (Read/Edit/Write/Bash) now deposits ONLY into CC's own
+#   Commons medium (deposit_cc_experience) -- it no longer calls on_message() into CC's main
+#   graph/vector_db, and no longer runs discover_hyperedges() on the main graph for this path.
+# Why:  Investigating why CC's own "[NeuroGraph Surfaced Knowledge]" hook context kept
+#   surfacing literal "tool:Edit file:..."/"bash:..." strings verbatim (including, live, what
+#   looked like a real API bearer token from a prior bash deposit). Root cause: tool-call
+#   experience went through the same on_message() path as everything else, landing in the
+#   main graph WITH a vector_db entry -- fully eligible for SurfacingMonitor, which has no
+#   creation_mode filtering at all. Josh confirmed canonical has an equivalent, recent (#97,
+#   2026-06-30) separation for TID's routing-outcome deposits: they land in Syl's Commons (a
+#   separate, bare NGLite medium), never her actual graph/vector_db -- still available to
+#   bucketing peer modules (Immunis, THC) via the substrate-as-protocol model, but never
+#   surfacing-eligible in her primary substrate. Same pattern applied here for CC.
+# How:  CC already had an isolated Commons medium (get_cc_commons() in cc_ng_organism.py, its
+#   own Commons(), not canonical's singleton) and already deposited tool-call text into it via
+#   deposit_cc_experience() -- the gap was that it ALSO went through on_message() into the main
+#   graph. Removed the on_message()/discover_hyperedges() calls for this path entirely; Commons
+#   deposit is unchanged. Genuine conversational memory is untouched -- it forms via the
+#   separate dual-pass path (run_conversational_dual_pass / drain_ingest_tract), fed by
+#   miniTID's turn-deposit tract, which was never part of this call path. Mirrored identically
+#   in cc-ng-daemon.py (laptop) -- same bug, same fix, same file pair as always.
 # [2026-07-05] Claude Code (Sonnet 5) — Never attempt CC's own Qwen load on the VPS
 # What: _CC_SNN_CONFIG['tonic'] gains latent_engine_enabled=False. CC's Tonic thread
 #   still constructs (heuristic, no model), but init_cc_host()'s synchronous
@@ -281,6 +304,36 @@ def _deposit(text: str) -> None:
         logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
 
 
+def _deposit_tool_experience(text: str) -> None:
+    """Tool-call experience -> CC's own Commons medium ONLY, never the main substrate.
+
+    Mirrors Syl's TID Substrate Peninsula (#97, 2026-06-30): TID's routing deposits land
+    in a Commons medium (a separate, bare NGLite instance) -- never Syl's actual graph/
+    vector_db -- so they still get Hebbian structure/topology, available to bucketing peer
+    modules (Immunis, THC) via the substrate-as-protocol model, but are never surfacing-
+    eligible in her primary substrate. Tool-call telemetry (Read/Edit/Write/Bash) previously
+    went through the same on_message() path as everything else -- landing in CC's main
+    graph WITH a vector_db entry, making it fully SurfacingMonitor-eligible, which is why
+    literal "tool:Edit file:..."/"bash:..." strings were showing up verbatim in CC's own
+    "[NeuroGraph Surfaced Knowledge]" hook context. Genuine conversational memory is
+    untouched -- it forms via the separate dual-pass path (run_conversational_dual_pass /
+    drain_ingest_tract, fed by miniTID's turn-deposit tract), not this function.
+    """
+    if not text:
+        return
+    with _STATE.stats_lock:
+        _STATE.stats["deposits"] += 1
+    try:
+        import hashlib
+        from cc_ng_organism import deposit_cc_experience
+        target_id = f"cc:experience:{hashlib.sha256(text.encode()).hexdigest()[:16]}"
+        deposit_cc_experience(text, target_id, CC_NG_WORKSPACE)
+    except Exception as exc:
+        with _STATE.stats_lock:
+            _STATE.stats["errors"] += 1
+        logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
+
+
 def _recall(query: str, k: int) -> str:
     ng = _STATE.cc_ng
     if ng is None or not query:
@@ -478,7 +531,7 @@ def _handle_post_tool_use(data):
     # "surprise-driven crystallization is the primary reward pathway,
     # this is the heartbeat, not the main event." Syl's tool-adjacent
     # experience gets reward the same way, with no external classification.
-    _deposit(experience)
+    _deposit_tool_experience(experience)
 
     return {"ok": True}
 

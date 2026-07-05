@@ -17,6 +17,22 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-07-05] CC (laptop) — Hyperedge-scan race fix; REVERTED an incorrect score-cap change
+# What: _score_node()'s hyperedge-membership scan now snapshots graph.hyperedges under
+#   _step_lock before iterating, instead of scanning the live dict directly. A separate
+#   change to the voltage_norm/excitability caps (2.0 -> 1.0) was tried and reverted --
+#   see _score_node()'s docstring for why.
+# Why:  I initially misdiagnosed the >100% "confidence" values seen in CC's own surfaced-
+#   knowledge hook output (178%, 176%...) as a normalization bug (weights summing to 1.0
+#   implying [0,1]-normalized components) and capped both at 1.0. That's wrong: the design
+#   range for voltage_norm/excitability is [1.0, 2.0], not [0,1] (test_ces.py's own comment
+#   documents a 0.8 baseline for a bare-minimum fired node), and capping at 1.0 makes
+#   voltage_norm CONSTANT for every fired node -- confirmed by test_higher_voltage_higher_score
+#   failing outright under the change. Reverted that part. The unguarded hyperedges.values()
+#   scan is a real, separate issue -- same class of race already found and fixed in
+#   lenia/graph_substrate.py's _hyperedge_similarity (2026-07-05) -- not yet observed
+#   crashing here, but the same unprotected pattern, called on every graph.step().
+# How:  See surfacing.py's _score_node() docstring for the full reasoning.
 # [2026-04-08] Claude (Opus 4.6) — Punchlist #55: Read attention params from substrate
 #   What: _decay_queue() reads surfacing_decay_rate and surfacing_min_confidence
 #         from graph.config (substrate) instead of frozen CES dataclass.
@@ -274,14 +290,42 @@ class SurfacingMonitor:
         Note: ``graph.step()`` resets fired nodes' voltage to resting potential
         before this method is called, so we use ``max(voltage, threshold)`` as
         the effective voltage — fired nodes reached at least their threshold.
+        This floors voltage_norm at 1.0 for EVERY fired node (effective_voltage
+        is never below threshold), so the design range for voltage_norm and
+        excitability is [1.0, 2.0], not [0, 1.0] -- a bare-minimum fired node
+        with default (1.0) excitability and no hyperedge membership scores
+        0.5*1.0 + 0.3*1.0 + 0.2*0 = 0.8 (see test_ces.py's own comment), and
+        the ceiling for a strongly-firing, highly-excitable, densely-connected
+        node is 0.5*2.0 + 0.3*2.0 + 0.2*1.0 = 1.8. [2026-07-05] CC: I initially
+        misread this as a bug (weights summing to 1.0 implying [0,1]-normalized
+        inputs) and capped both at 1.0 -- that broke test_higher_voltage_higher_score
+        outright (voltage_norm becomes CONSTANT 1.0 for every fired node, since
+        effective_voltage/threshold >= 1.0 always) and is not what's happening
+        here: the >100% "confidence" values are the intended salience range,
+        not an arithmetic bug. Reverted. The real issue, if any, is that
+        format_context() labels this a "confidence" and formats it as a percent
+        (implying a bounded probability) when it's actually an unbounded-above-
+        0.8 salience score -- a display/labeling question, not a scoring one.
         """
         effective_voltage = max(node.voltage, node.threshold)
         voltage_norm = min(effective_voltage / max(node.threshold, 0.01), 2.0)
         excitability = min(node.intrinsic_excitability, 2.0)
 
-        # Count hyperedge memberships
+        # Count hyperedge memberships. Snapshot under the Graph's step lock so a
+        # concurrent graph.step() (prune/sprout mutates graph.hyperedges under
+        # _step_lock) can't change the dict mid-iteration -- same race as
+        # lenia/graph_substrate.py's _hyperedge_similarity (fixed 2026-07-05),
+        # just not yet observed crashing here since after_step() runs on every
+        # single graph.step(), a much shorter window per call than Lenia's
+        # multi-hour populate(), but the same unguarded iteration.
+        _lock = getattr(self._graph, '_step_lock', None)
+        if _lock is not None:
+            with _lock:
+                _hes = list(self._graph.hyperedges.values())
+        else:
+            _hes = list(self._graph.hyperedges.values())
         he_count = 0
-        for he in self._graph.hyperedges.values():
+        for he in _hes:
             if node_id in getattr(he, 'member_nodes', getattr(he, 'member_node_ids', [])):
                 he_count += 1
         he_norm = min(he_count / 10.0, 1.0)
