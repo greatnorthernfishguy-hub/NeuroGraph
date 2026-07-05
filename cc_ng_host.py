@@ -24,6 +24,33 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — Never attempt CC's own Qwen load on the VPS
+# What: _CC_SNN_CONFIG['tonic'] gains latent_engine_enabled=False. CC's Tonic thread
+#   still constructs (heuristic, no model), but init_cc_host()'s synchronous
+#   NeuroGraphMemory(...) call no longer attempts to load CC's own copy of
+#   Qwen2.5-0.5B at all.
+# Why:  init_cc_host() constructs CC's NG synchronously inside handle_bootstrap's
+#   self-bootstrap thread. With tonic.enabled=True and no latent_engine_enabled
+#   gate, that construction tried to load CC's own Qwen copy at exactly the same
+#   moment ProtoUniBrain loads its own copy for Syl -- two simultaneous model
+#   loads contending for the same limited VPS resources. Confirmed via a live
+#   restart (2026-07-05): zero log output from CC's side at all -- no "CC NG
+#   construction failed" (which logger.exception would produce on a real
+#   raised exception), no "CC NG hosted" success line, socket never created --
+#   consistent with a silent hang in the model-load call, not a caught failure.
+#   Josh: "we disabled its own qwen load at first, to relieve resource
+#   pressures on the vps [but] didn't think about what happens the next time a
+#   CC session needs to start and there's nothing to keep the CC's tonic
+#   thread alive until the socket is ready" -- this config still read
+#   tonic.enabled=True with no deferred-load gate, so the intended disable
+#   was never actually in effect here.
+# How:  Same latent_engine_enabled flag the laptop's cc-ng-daemon.py already
+#   uses (canonical, defined on TonicConfig in tonic_thread.py, gated inside
+#   openclaw_hook.py's NeuroGraphMemory construction -- not a laptop-specific
+#   mechanism). CC's Tonic stays heuristic-only until BrainSwitcher shares
+#   ProtoUniBrain's body via Elmer's _delayed_brain_load (#159), exactly as
+#   the removed comment already described as the intent -- it just never had
+#   the gate needed to actually behave that way.
 # [2026-07-03] Claude Code (Sonnet 5) — Port Syl's grace_period fix to CC's config
 # What: _CC_SNN_CONFIG['grace_period'] 500->5000.
 # Why:  Same age-based synapse cull bug fixed for Syl on 2026-06-25 (openclaw_hook.py
@@ -173,7 +200,12 @@ _CC_SNN_CONFIG = {
     "he_experience_threshold": 100,
     "peer_bridge": {"enabled": False},  # CC is not a peer module
     "ces": {"enabled": False},          # No real-time attention stream needed
-    "tonic": {"enabled": True},         # Own Qwen initially; body shared 60s post-startup
+    # Heuristic only -- never attempt CC's own Qwen load (was silently hanging,
+    # contending with ProtoUniBrain's own load; see 2026-07-05 changelog above).
+    # BrainSwitcher shares ProtoUniBrain's body in 60s via Elmer's
+    # _delayed_brain_load (#159), same as it did before this fix -- this only
+    # removes the redundant, contention-prone own-copy load attempt.
+    "tonic": {"enabled": True, "latent_engine_enabled": False},
 }
 
 
