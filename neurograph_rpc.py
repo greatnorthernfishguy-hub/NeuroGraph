@@ -2041,8 +2041,11 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # Failures here MUST NOT affect Syl — wrapped defensively.
     # Authorized by Josh 2026-04-16 with protected-file backups confirmed.
     try:
+        logger.info("DIAG: handle_bootstrap() about to import cc_ng_host")
         import cc_ng_host
+        logger.info("DIAG: handle_bootstrap() cc_ng_host imported, calling init_cc_host()")
         cc_ng_host.init_cc_host()
+        logger.info("DIAG: handle_bootstrap() init_cc_host() call returned")
         # CC Tonic body-sharing is handled in Elmer's _delayed_brain_load() (#159).
         # At bootstrap _modules is empty — registering here was always a no-op.
         # Elmer fires 60s post-startup, after BrainSwitcher loads brains — correct timing.

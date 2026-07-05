@@ -684,11 +684,19 @@ def init_cc_host() -> bool:
 
     Returns True on success, False on failure.
     """
+    # TEMP DIAGNOSTIC (2026-07-05, remove once the silent-hang mystery is
+    # resolved): init_cc_host() has produced zero observable log output on
+    # the VPS across multiple restarts tonight -- no success line, no
+    # failure line, socket never created. This traces exactly how far
+    # execution gets before whatever is stopping it.
+    logger.info("DIAG: init_cc_host() ENTRY")
+
     if _STATE.cc_ng is not None:
         logger.info("CC NG already initialized")
         return True
 
     Path(CC_NG_WORKSPACE).mkdir(parents=True, exist_ok=True)
+    logger.info("DIAG: init_cc_host() workspace dir ready, constructing NeuroGraphMemory...")
 
     # Construct CC's NG directly (not via get_instance) — Syl already owns
     # the class-level _instance singleton. CC gets its own standalone object.
@@ -701,6 +709,7 @@ def init_cc_host() -> bool:
     except Exception:
         logger.exception("CC NG construction failed")
         return False
+    logger.info("DIAG: init_cc_host() NeuroGraphMemory constructed OK")
 
     # Disable NG-internal auto-save; we manage saves via our autosave thread
     cc_ng.auto_save_interval = 999999
@@ -728,6 +737,7 @@ def init_cc_host() -> bool:
         _STATE.commons = get_cc_commons(CC_NG_WORKSPACE)
     except Exception:
         logger.exception("CC organism-layer bootstrap failed (non-fatal)")
+    logger.info("DIAG: init_cc_host() organism-layer bootstrap done, binding socket...")
 
     # Bind socket
     try:
