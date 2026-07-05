@@ -21,6 +21,28 @@
 #       in neurograph_rpc.py; each CC daemon owns its own queue instead).
 #       Both dormant/inert by default, matching canonical's own bootstrap
 #       (Lenia's kill switch off, TriSynaptic idle until its queue has entries).
+# [2026-07-04] Claude Code (Sonnet 5) — get_cc_commons(): retire CC's legacy tract dependency
+# What: Added get_cc_commons() -- CC's own Commons singleton, structurally identical to
+#       canonical commons.get_commons() (same Commons class, same get-or-create-under-lock
+#       pattern) but with its OWN separate module-level singleton slot. Also added
+#       deposit_cc_experience() -- a thin, optional convenience wrapper for the common
+#       "deposit raw text as an embedding" case.
+# Why:  Josh confirmed (2026-07-04) canonical has moved off tract/bridge-based inter-module
+#       communication onto Commons ecosystem-wide (Elmer/Darwin/Praxis/Immunis/THC/Bunyan/QG
+#       all migrated; docs/concepts/The Commons.md calls the old bridges "illegal" -- LAW 1
+#       violations). CC's daemons inherited the legacy NGTractBridge dependency automatically
+#       via NeuroGraphMemory.__init__ (openclaw_hook.py) -- disabled via peer_bridge.enabled=False
+#       in CC_SNN_CONFIG/_CC_SNN_CONFIG, replaced with this. Josh also asked: make it easy to
+#       add a new module to CC's own ecosystem later.
+# How:  CANNOT call canonical's own get_commons() -- on the VPS, cc_ng_host.py runs inside the
+#       SAME process as neurograph_rpc.py, so canonical's get_commons() would return SYL'S OWN
+#       singleton (module-level global, per-process) -- joining her medium, not building CC's
+#       own. get_cc_commons() constructs commons.Commons(...) directly instead, under its own
+#       separate global + lock, so it can never collide with Syl's get_commons() call in the
+#       same process. Extensibility: any FUTURE CC-ecosystem module just imports
+#       get_cc_commons from this file and calls it -- same shared instance, zero further
+#       registration (this IS the whole point of Commons's deposit/bucket design -- no peer
+#       list, no address, no handshake).
 # -------------------
 """Shared organism-layer bootstrap for CC's own NeuroGraph instances.
 
@@ -28,15 +50,73 @@ Extracted from neurograph_rpc.py's bootstrap sequence. Not vendored (LAW 2 --
 that list is fixed at 7 files); this is CC-specific integration code that
 happens to live in the canonical NeuroGraph directory so both cc-ng-daemon.py
 (sys.path insert) and cc_ng_host.py (same directory) can import it directly.
+
+Adding a new module to CC's own ecosystem later: just import get_cc_commons
+from this file and call it -- you'll get the same shared medium CC's daemons
+deposit into. No registration, no peer list, no bridge. deposit()/bucket()
+are the only two verbs; see commons.Commons for the full API (bucket_recent,
+arousal, stats, persist/restore).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("cc_ng_organism")
+
+# CC's own Commons singleton -- separate from canonical commons._commons.
+# Process-wide within whichever process constructs it (the laptop's standalone
+# cc-ng-daemon.py, or the VPS's neurograph_rpc.py process hosting cc_ng_host.py).
+_cc_commons: "Optional[Any]" = None
+_cc_commons_lock = threading.Lock()
+
+
+def get_cc_commons(workspace_dir: str, config: Optional[Dict[str, Any]] = None) -> Any:
+    """Get-or-create CC's own Commons medium -- CC's ecosystem-of-one (for now).
+
+    Deliberately does NOT call canonical commons.get_commons(): that function's
+    singleton is a process-level global, and cc_ng_host.py shares its process
+    with Syl's own neurograph_rpc.py on the VPS -- calling it there would
+    return SYL'S Commons, not build a separate one for CC. Constructs
+    commons.Commons(...) directly instead, under CC's own lock, matching the
+    get-or-create-under-lock shape of the canonical function without touching
+    its global.
+
+    Ephemeral (in-memory only, resets on daemon restart) -- matching Syl's own
+    Commons today (its persist()/restore() hooks are wired but not yet called
+    on any lifecycle event either; not a CC-specific gap).
+    """
+    global _cc_commons
+    if _cc_commons is None:
+        with _cc_commons_lock:
+            if _cc_commons is None:  # double-checked under lock
+                from commons import Commons
+                _cc_commons = Commons(config=config)
+                logger.info("CC Commons medium initialized (workspace=%s)", workspace_dir)
+    return _cc_commons
+
+
+def deposit_cc_experience(text: str, target_id: str, workspace_dir: str,
+                           **kwargs: Any) -> Optional[Dict[str, Any]]:
+    """Convenience: embed `text` (via ng_embed, the same vendored embedder
+    every module uses) and deposit it into CC's own Commons.
+
+    Optional -- callers that already have an embedding on hand should call
+    get_cc_commons(workspace_dir).deposit(embedding, target_id, ...) directly
+    to avoid a redundant embed. Fails soft (returns None) -- a Commons
+    deposit must never break a hook.
+    """
+    try:
+        from ng_embed import embed as ng_embed_fn
+        commons = get_cc_commons(workspace_dir)
+        embedding = ng_embed_fn(text)
+        return commons.deposit(embedding, target_id, metadata={"text": text[:2000]}, **kwargs)
+    except Exception as exc:
+        logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
+        return None
 
 
 def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str, Optional[Any]]:

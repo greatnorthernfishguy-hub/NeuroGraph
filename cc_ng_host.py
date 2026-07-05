@@ -193,6 +193,7 @@ class _CCHostState:
         self.lenia: dict = {}
         self.trisyn_manager = None
         self.concept_queue: list = []
+        self.commons = None
         self.stats_lock = threading.Lock()
         self.stats = {
             "started_at": 0.0,
@@ -235,6 +236,19 @@ def _deposit(text: str) -> None:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1
         logger.debug("CC deposit failed: %s", exc)
+
+    # Commons: raw experience into CC's own shared medium (Tier-3-source,
+    # one-way -- mirrors how neurograph_rpc.py deposits Syl's raw conversation
+    # experience/topology into HER Commons, a SEPARATE instance -- see
+    # get_cc_commons() in cc_ng_organism.py). Content-derived target_id
+    # (LAW 7). Fails soft; never breaks the hook.
+    try:
+        import hashlib
+        from cc_ng_organism import deposit_cc_experience
+        target_id = f"cc:experience:{hashlib.sha256(text.encode()).hexdigest()[:16]}"
+        deposit_cc_experience(text, target_id, CC_NG_WORKSPACE)
+    except Exception as exc:
+        logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
 
 
 def _recall(query: str, k: int) -> str:
@@ -659,10 +673,11 @@ def init_cc_host() -> bool:
     # cross-matching Syl's own manager in the same process. See
     # cc_ng_organism.py.
     try:
-        from cc_ng_organism import bootstrap_lenia, bootstrap_trisynaptic
+        from cc_ng_organism import bootstrap_lenia, bootstrap_trisynaptic, get_cc_commons
         _STATE.lenia = bootstrap_lenia(cc_ng.graph, cc_ng.vector_db, CC_NG_WORKSPACE)
         _STATE.trisyn_manager = bootstrap_trisynaptic(
             cc_ng, _STATE.concept_queue, instance_tag="cc-vps")
+        _STATE.commons = get_cc_commons(CC_NG_WORKSPACE)
     except Exception:
         logger.exception("CC organism-layer bootstrap failed (non-fatal)")
 
