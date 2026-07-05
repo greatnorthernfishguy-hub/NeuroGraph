@@ -14,6 +14,28 @@
 # How: CSR sparse matrices for neighbor lookup, numpy broadcast for kernel
 #   evaluation. DistanceCache builds adjacency lists on populate() for
 #   fast per-channel neighbor gathering.
+# [2026-07-05] CC (laptop) — Incremental populate + entity_ids persistence
+# What: DistanceCache now saves/loads the entity_id ordering it was built
+#   against, and populate() accepts start_index to compute only pairs
+#   touching entities at or past that index instead of every connected
+#   pair in the graph. populate() also marks itself populated before the
+#   expensive loop, not after, so a mid-loop crash still leaves whatever
+#   was computed savable instead of discarding it.
+# Why: neurograph_rpc.py's bootstrap invalidated (and fully recomputed)
+#   the whole cache on ANY entity_count drift — on Syl's live graph this
+#   took up to ~8 hours, and every restart before this one raced the next
+#   restart before ever reaching save(), so the same full rebuild kept
+#   retriggering from scratch indefinitely. Root cause traced via
+#   journalctl history (2026-07-05): one successful save (Jun 30 -> Jul
+#   02, ~8hrs), then every subsequent restart re-populated from the same
+#   stale save and got interrupted before saving again. Entity indices
+#   are stable now only if NeuroGraphSubstrate is constructed with
+#   known_entity_order (see graph_substrate.py) — this is the cache-side
+#   half that makes an incremental extension possible at all.
+# How: resize()'s existing preserve-old-submatrix behavior already did
+#   the hard part; start_index just filters populate()'s connected_pairs
+#   down to ones touching a new entity so the expensive distance_vector
+#   loop only runs for the delta, not the whole graph.
 # -------------------
 
 """Vectorized multi-metric kernel computer with dual-pass embeddings.
@@ -58,8 +80,15 @@ class DistanceCache:
     Provides fast neighbor lookup via sparse row slicing.
     """
 
-    def __init__(self, entity_count: int):
+    def __init__(self, entity_count: int, entity_ids: Optional[List[str]] = None):
         self._n = entity_count
+        # The entity_id ordering this cache's rows/cols are keyed against.
+        # Persisted so a restart can tell which entities are genuinely new
+        # (append to the cache) vs. which are the same set it already has
+        # distances for (see NeuroGraphSubstrate's known_entity_order).
+        self._entity_ids: Optional[List[str]] = (
+            list(entity_ids) if entity_ids is not None else None
+        )
         # Build as lil for efficient updates, convert to CSR for fast reads
         self._components_lil: List[sparse.lil_matrix] = [
             sparse.lil_matrix((entity_count, entity_count), dtype=np.float64)
@@ -75,6 +104,10 @@ class DistanceCache:
     @property
     def entity_count(self) -> int:
         return self._n
+
+    @property
+    def entity_ids(self) -> Optional[List[str]]:
+        return self._entity_ids
 
     @property
     def populated(self) -> bool:
@@ -94,6 +127,10 @@ class DistanceCache:
             "entity_count": np.array([self._n]),
             "num_components": np.array([NUM_DIST_COMPONENTS]),
         }
+        if self._entity_ids is not None:
+            # numpy infers a fixed-width unicode dtype for a list of plain
+            # strings — no allow_pickle needed on either side.
+            data["entity_ids"] = np.array(self._entity_ids)
         for c in range(NUM_DIST_COMPONENTS):
             csr = self._components_csr[c]
             data[f"c{c}_data"] = csr.data
@@ -123,7 +160,10 @@ class DistanceCache:
                 logger.warning("Distance cache component mismatch (%d vs %d), repopulating",
                                nc, NUM_DIST_COMPONENTS)
                 return None
-            cache = cls(n)
+            entity_ids = (
+                arch["entity_ids"].tolist() if "entity_ids" in arch.files else None
+            )
+            cache = cls(n, entity_ids=entity_ids)
             cache._components_csr = []
             for c in range(nc):
                 csr = sparse.csr_matrix(
@@ -149,20 +189,36 @@ class DistanceCache:
         self._components_csr = None  # invalidate CSR cache
         self._magnitude_csr = None
 
-    def populate(self, substrate: LeniaSubstrate):
-        """Populate the entire cache from the substrate.
+    def populate(self, substrate: LeniaSubstrate, start_index: int = 0):
+        """Populate the cache from the substrate.
 
         Called once on startup. Subsequent updates use dirty flags.
         Uses adjacency-based approach: only compute distances for
         pairs that are synaptically connected or share hyperedges,
         plus a hop radius for topological neighbors.
+
+        Args:
+            start_index: 0 (default) rebuilds every connected pair from
+                scratch — used when the cache is empty or entity identities
+                have changed incompatibly (e.g. after a prune). >0 computes
+                only pairs that touch an entity whose index is >= this —
+                i.e. genuinely new entities appended since the last save.
+                Existing entity-to-entity distances already in the cache
+                are left untouched. Caller must already have called
+                resize() to grow the matrices to the new entity_count.
         """
         n = substrate.entity_count()
         if n == 0:
             return
 
         entities = substrate.entities()
-        logger.info("Populating distance cache for %d entities...", n)
+        if start_index > 0:
+            logger.info(
+                "Populating distance cache incrementally for entities "
+                "%d..%d (of %d total)...", start_index, n - 1, n,
+            )
+        else:
+            logger.info("Populating distance cache for %d entities...", n)
 
         # Get all connected pairs from the substrate
         connected_pairs = set()
@@ -206,8 +262,23 @@ class DistanceCache:
                         two_hop_pairs.add((min(node, second), max(node, second)))
         connected_pairs |= two_hop_pairs
 
+        if start_index > 0:
+            # Incremental: only pairs touching a genuinely new entity.
+            # Existing entity-to-entity distances are already in the cache
+            # (preserved by resize()) and don't need recomputing.
+            connected_pairs = {
+                (i, j) for (i, j) in connected_pairs
+                if i >= start_index or j >= start_index
+            }
+
         logger.info("Computing distances for %d connected pairs", len(connected_pairs))
 
+        # Mark populated before the expensive loop, not after — a save()
+        # following a mid-loop crash below (e.g. a concurrent graph
+        # mutation this snapshot-based code doesn't fully protect against)
+        # should still persist whatever was computed rather than
+        # discarding it because _populated never flipped true.
+        self._populated = True
         for i, j in connected_pairs:
             eid_i = substrate.index_to_entity(i)
             eid_j = substrate.index_to_entity(j)
@@ -218,7 +289,6 @@ class DistanceCache:
                     self._components_lil[c][j, i] = dvec[c]
 
         self._rebuild_csr()
-        self._populated = True
         logger.info("Distance cache populated: %d pairs", len(connected_pairs))
 
     def _rebuild_csr(self):
@@ -318,8 +388,17 @@ class DistanceCache:
         self._dirty.clear()
         self._rebuild_csr()
 
-    def resize(self, new_count: int):
-        """Resize for entity addition/removal."""
+    def resize(self, new_count: int, new_entity_ids: Optional[List[str]] = None):
+        """Resize for entity addition/removal.
+
+        new_entity_ids, if given, replaces the cache's known entity-id
+        ordering (e.g. the substrate's post-growth entities()) so a
+        subsequent save() keeps entity_ids in sync with the new size.
+        Existing rows/cols are preserved in place — callers doing an
+        append-only growth (via NeuroGraphSubstrate's known_entity_order)
+        can safely follow this with populate(start_index=old_count) to
+        fill in only the new entities instead of recomputing everything.
+        """
         new_components = []
         for comp in self._components_lil:
             new_mat = sparse.lil_matrix(
@@ -332,6 +411,8 @@ class DistanceCache:
         self._components_csr = None
         self._magnitude_csr = None
         self._n = new_count
+        if new_entity_ids is not None:
+            self._entity_ids = list(new_entity_ids)
 
     # Legacy compatibility for tests
     def set_distance_compat(self, i, j, component, value):

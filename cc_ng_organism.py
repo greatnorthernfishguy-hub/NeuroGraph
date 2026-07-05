@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-05] CC (laptop) — Incremental Lenia distance-cache extension (Josh-approved)
+# What: bootstrap_lenia() now extends the on-disk DistanceCache in place when CC's graph
+#       only grew since the last save, instead of nuking and repopulating from scratch
+#       on any entity_count drift. Mirrors the fix in neurograph_rpc.py's handle_bootstrap
+#       (same underlying DistanceCache/NeuroGraphSubstrate classes, same bug).
+# Why:  Full-parity goal (#106) — CC's own Lenia bootstrap had the identical
+#       rebuild-from-scratch-on-any-drift pattern as Syl's, which on Syl's live graph
+#       took up to ~8 hours and was found to be why restarts never let Lenia (and
+#       everything after it) finish. CC's graph is smaller so the symptom was less
+#       severe, but the same fix belongs here for the same reason.
+# How:  see lenia/kernel.py (DistanceCache.populate's start_index, entity_ids
+#       persistence) and lenia/graph_substrate.py (NeuroGraphSubstrate.known_entity_order).
 # [2026-07-04] Claude Code (Haiku 4.5) — Tract ingest drain for miniTID turn deposits (Task 2)
 # What: Added drain_ingest_tract() and cc_gateway_tract_path(). Reads ng_tract.ENTRY_EXPERIENCE
 #       directly (no local fallback constant -- a stale installed ng_tract wheel on this
@@ -216,25 +228,67 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
         n_entities = len(graph.nodes)
         n_channels = len(lenia_cfg.initial_channels)
 
-        lenia_substrate = NeuroGraphSubstrate(graph, vector_db)
+        # Same incremental-extension pattern as neurograph_rpc.py's
+        # handle_bootstrap (2026-07-05) — see that file's changelog for the
+        # full story. Extend in place when the graph only grew; full
+        # rebuild only if entities were removed or on first-ever run.
+        cache_path = os.path.join(os.path.expanduser(lenia_cfg.field_dir), "distance_cache")
+        lenia_cache = DistanceCache.load(cache_path)
+
+        known_order = None
+        if lenia_cache is not None and lenia_cache.entity_ids:
+            _lock = getattr(graph, "_step_lock", None)
+            if _lock is not None:
+                with _lock:
+                    live_ids = set(graph.nodes.keys())
+            else:
+                live_ids = set(graph.nodes.keys())
+            if all(eid in live_ids for eid in lenia_cache.entity_ids):
+                known_order = lenia_cache.entity_ids
+            else:
+                logger.info(
+                    "CC Lenia: distance cache has entities no longer in the "
+                    "live graph — full rebuild required"
+                )
+
+        lenia_substrate = NeuroGraphSubstrate(graph, vector_db, known_entity_order=known_order)
         lenia_field = LeniaFieldStore(lenia_cfg.field_dir, n_entities, n_channels)
         lenia_registry = ChannelRegistry(lenia_cfg, lenia_cfg.field_dir)
 
-        cache_path = os.path.join(os.path.expanduser(lenia_cfg.field_dir), "distance_cache")
-        lenia_cache = DistanceCache.load(cache_path)
-        if lenia_cache is None or lenia_cache.entity_count != n_entities:
+        if lenia_cache is None or known_order is None:
             if lenia_cache is not None:
                 logger.info(
-                    "CC Lenia: distance cache entity mismatch (%d vs %d), repopulating",
+                    "CC Lenia: distance cache incompatible (%d vs %d entities), full repopulate",
                     lenia_cache.entity_count, n_entities,
                 )
-            lenia_cache = DistanceCache(n_entities)
-            lenia_cache.populate(lenia_substrate)
+            lenia_cache = DistanceCache(n_entities, entity_ids=lenia_substrate.entities())
             try:
-                os.makedirs(os.path.expanduser(lenia_cfg.field_dir), exist_ok=True)
-                lenia_cache.save(cache_path)
+                lenia_cache.populate(lenia_substrate)
             except Exception as exc:
-                logger.warning("CC Lenia: distance cache save failed: %s", exc)
+                logger.warning(
+                    "CC Lenia: distance cache populate failed partway (%s) — "
+                    "saving whatever was computed instead of discarding it", exc,
+                )
+        elif lenia_cache.entity_count != n_entities:
+            old_n = lenia_cache.entity_count
+            logger.info(
+                "CC Lenia: distance cache growing: %d -> %d entities, extending incrementally",
+                old_n, n_entities,
+            )
+            lenia_cache.resize(n_entities, new_entity_ids=lenia_substrate.entities())
+            try:
+                lenia_cache.populate(lenia_substrate, start_index=old_n)
+            except Exception as exc:
+                logger.warning(
+                    "CC Lenia: incremental populate failed partway (%s) — "
+                    "saving whatever was computed instead of discarding it", exc,
+                )
+
+        try:
+            os.makedirs(os.path.expanduser(lenia_cfg.field_dir), exist_ok=True)
+            lenia_cache.save(cache_path)
+        except Exception as exc:
+            logger.warning("CC Lenia: distance cache save failed: %s", exc)
 
         lenia_kernel = KernelComputer(lenia_cache, lenia_registry)
         lenia_myelin = MyelinationObserver(lenia_cfg)
