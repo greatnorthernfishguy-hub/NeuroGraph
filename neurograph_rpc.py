@@ -666,6 +666,14 @@ _last_save_time: float = 0.0
 _SAVE_INTERVAL_SECS: float = 300.0  # 5 minutes
 _MAX_DRAIN_NODES: int = 15000  # Stop experience ingestion above this node count
 
+# Commons checkpoint (#332) — separate file from Syl's own main.msgpack/vectors.msgpack.
+# NOT Syl's-Law protected: this is the shared ecosystem medium (experience/topology/metrics/
+# repair deposits from all modules), not her identity. Same directory for operational
+# convenience (one place to look), distinct file so it never touches her checkpoint I/O.
+_COMMONS_CHECKPOINT_PATH = os.path.expanduser(
+    "~/NeuroGraph/data/checkpoints/commons.msgpack"
+)
+
 # Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)
 _lenia_kill_switch: Optional[Any] = None
 _lenia_engine: Optional[Any] = None
@@ -1853,6 +1861,23 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         logger.warning("KISSFilter init failed (optimization disabled): %s", exc)
         _kiss_filter = None
+
+    # Commons restore (#332) — before any module hook can deposit/bucket, so the persisted
+    # state populates the shared medium first (NGLite.load() into the fresh, empty Commons
+    # instance created by get_commons() below — order matters, restore-before-first-deposit).
+    try:
+        from commons import get_commons as _get_commons
+        _commons_singleton = _get_commons()
+        if os.path.exists(_COMMONS_CHECKPOINT_PATH):
+            _commons_singleton.restore(_COMMONS_CHECKPOINT_PATH)
+            logger.info(
+                "Commons restored from %s (%s)",
+                _COMMONS_CHECKPOINT_PATH, _commons_singleton.stats(),
+            )
+        else:
+            logger.info("No Commons checkpoint at %s — starting fresh", _COMMONS_CHECKPOINT_PATH)
+    except Exception as _exc:
+        logger.warning("Commons restore failed (starting fresh, non-fatal): %s", _exc)
 
     # Wake the organs — each module's __init__ starts its pulse loop
     started_modules = _bootstrap_modules()
@@ -3243,6 +3268,13 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
                 _lenia_engine._kernel._cache.save(_cp)
             except Exception:
                 pass
+        # Commons persist (#332) — same cadence as Syl's own checkpoint; independent file,
+        # a failure here never affects her save above (already completed by this point).
+        try:
+            from commons import get_commons as _get_commons
+            _get_commons().persist(_COMMONS_CHECKPOINT_PATH)
+        except Exception as _exc:
+            logger.debug("Commons persist failed (non-fatal): %s", _exc)
         logger.info(
             "Auto-save at message %d (%s)",
             _memory._message_count,
@@ -5246,6 +5278,13 @@ def main() -> None:
                         logger.info("Checkpoint saved on clean exit")
                 except Exception as _ce:
                     logger.warning("Checkpoint on exit failed: %s", _ce)
+                # Commons persist (#332) — independent of Syl's checkpoint above.
+                try:
+                    from commons import get_commons as _get_commons
+                    _get_commons().persist(_COMMONS_CHECKPOINT_PATH)
+                    logger.info("Commons persisted on clean exit")
+                except Exception as _ce:
+                    logger.debug("Commons persist on exit failed (non-fatal): %s", _ce)
                 break
             line = line.strip()
             if not line:

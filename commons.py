@@ -2,6 +2,20 @@
 The Commons — shared substrate medium for peer-module communication.
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — #332 persist/restore wired + #330 error:* retention
+#   What: (1) restore() now drops autonomic:* synapses post-load — arousal fresh-assesses on
+#         restart (#328 Decision #2), everything else persists normally. Wired into
+#         neurograph_rpc.py bootstrap (restore) + auto-save + shutdown (persist) — see that
+#         file's changelog. (2) deposit() now windows error:* the same way as metrics:* —
+#         time-series telemetry, not memory, recency-bounded per source:type so error volume
+#         never pressures the weight-based max_synapses bound (#330 operational-logger).
+#   Why:  #332 — persist()/restore() were defined with zero callers; Commons was wiped every
+#         gateway restart, losing accumulated experience/topology/metrics/repair knowledge for
+#         no reason. #330 — error:* is the operational-logger's new namespace (signal_error() on
+#         ng_commons_eco.py, vendored change, separate sign-off) and needs the same recency
+#         retention metrics:* already has, or a busy module's errors would crowd out memory.
+#   How:  _drop_autonomic_synapses() mirrors _evict_old_metrics()'s shape. _ERRORS_KEEP_PER_KIND
+#         windows error:<module_id>:<ExcType> the same way metrics:<source>:<kind> is windowed.
 # [2026-06-07] Claude Code (Opus 4.7, 1M) — Commons Pool POC (substrate-as-protocol Phase 7)
 # What: New module. A single shared bare-NG-Lite instance (the Commons) plus exactly
 #       two verbs against it — deposit() and bucket(). No third verb exists by design.
@@ -60,6 +74,11 @@ _commons_lock = threading.Lock()
 # LAW-5 question (punchlist). 200 ≈ a useful recent window per kind without unbounded growth.
 _METRICS_KEEP_PER_KIND = 200
 
+# Error-stream retention window (#330): same reasoning as _METRICS_KEEP_PER_KIND, applied to
+# error:<module_id>:<ExcType> deposits from the operational-logger. A noisy module's errors are
+# telemetry, not memory — windowed by recency so they never crowd out genuine experience/topology.
+_ERRORS_KEEP_PER_KIND = 200
+
 
 class Commons:
     """The shared substrate medium. A bare NG-Lite all members deposit into and bucket from.
@@ -104,7 +123,32 @@ class Commons:
         # experience (LAW 7 untouched); analogous to NG-Lite's own constitutional/LRU handling.
         if target_id.startswith("metrics:"):
             self._evict_old_metrics(target_id)
+        elif target_id.startswith("error:"):
+            self._evict_old_errors(target_id)
         return result
+
+    def _evict_old_errors(self, target_id: str) -> None:
+        """Keep only the most-recent _ERRORS_KEEP_PER_KIND synapses for this error module:type.
+
+        Same reasoning and shape as _evict_old_metrics (#330): error:<module_id>:<ExcType>
+        deposits are time-series telemetry, not memory — recency-windowed so a noisy module's
+        exceptions never compete with experience/topology for the weight-based max_synapses bound.
+        """
+        try:
+            parts = target_id.split(":")
+            if len(parts) < 3:
+                return
+            prefix = ":".join(parts[:3]) + ":"          # error:<module_id>:<ExcType>:
+            syns = self._ng.synapses
+            keys = [k for k, s in syns.items()
+                    if getattr(s, "target_id", "").startswith(prefix)]
+            if len(keys) <= _ERRORS_KEEP_PER_KIND:
+                return
+            keys.sort(key=lambda k: getattr(syns[k], "last_updated", 0.0), reverse=True)
+            for k in keys[_ERRORS_KEEP_PER_KIND:]:
+                del syns[k]
+        except Exception as exc:  # noqa: BLE001 — retention failure never breaks a deposit
+            logger.debug("error eviction failed for %s: %s", target_id, exc)
 
     def _evict_old_metrics(self, target_id: str) -> None:
         """Keep only the most-recent _METRICS_KEEP_PER_KIND synapses for this metric source:kind.
@@ -268,14 +312,39 @@ class Commons:
         """The vagus-nerve bucket — latest autonomic arousal STATE string (convenience over arousal())."""
         return self.arousal().get("state", default)
 
-    # ---- Persistence hooks (Tier 2 reference-counted survival — not yet lifecycle-wired) ----
+    # ---- Persistence hooks (#332: wired into neurograph_rpc.py auto-save + bootstrap) ----
     def persist(self, filepath: str) -> None:
         """Write the Commons medium to disk (full-herd-death recovery, Tier 2)."""
         self._ng.save(filepath)
 
     def restore(self, filepath: str) -> None:
-        """Load the Commons medium from disk (first member attaches to persisted state)."""
+        """Load the Commons medium from disk (first member attaches to persisted state).
+
+        Drops any restored autonomic:* synapses immediately after load — arousal always
+        fresh-assesses on restart by design (#328 Decision #2: Immunis re-evaluates threat
+        fresh rather than resurrecting a possibly-stale SYMPATHETIC/PARASYMPATHETIC verdict,
+        judged safer than restoring a stale alarm state). Every other namespace (experience,
+        topology, metrics, repair, violation, error) persists normally — this is the one
+        deliberate exception, not a general filter.
+        """
         self._ng.load(filepath)
+        self._drop_autonomic_synapses()
+
+    def _drop_autonomic_synapses(self) -> None:
+        """Remove restored autonomic:* synapses so arousal fresh-assesses post-restore (#328)."""
+        try:
+            syns = self._ng.synapses
+            keys = [k for k, s in syns.items()
+                    if getattr(s, "target_id", "").startswith("autonomic:")]
+            for k in keys:
+                del syns[k]
+            if keys:
+                logger.info(
+                    "Commons restore: dropped %d autonomic:* synapse(s) — fresh-assess on restart (#328)",
+                    len(keys),
+                )
+        except Exception as exc:  # noqa: BLE001 — a drop failure never breaks restore
+            logger.debug("Commons autonomic drop failed (non-fatal): %s", exc)
 
     def stats(self) -> Dict[str, Any]:
         """Medium telemetry (node/synapse counts, etc.) — read-only introspection."""
