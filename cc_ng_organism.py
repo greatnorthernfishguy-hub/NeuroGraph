@@ -731,12 +731,19 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
         logger.debug("CC ingest-tract parse failed (non-fatal): %s", exc)
         return absorbed
 
-    # Truncate only after a successful read+parse pass -- entries added
-    # mid-drain by a concurrent miniTID append land after this truncation
-    # and are picked up on the next pulse, never lost.
+    # Truncate only the bytes we actually consumed. miniTID is a separate
+    # process that only appends; if it appends between our initial read and
+    # this truncation, a blind `open(path, "wb")` would erase those new bytes
+    # along with the ones we already drained. Re-reading the current file and
+    # writing back only what comes after our consumed prefix closes that
+    # window down to the two file ops below, instead of spanning the whole
+    # embed+dual-pass pass above.
     try:
-        with open(path, "wb"):
-            pass
+        with open(path, "rb") as f:
+            current = f.read()
+        remainder = current[len(data):] if current.startswith(data) else current
+        with open(path, "wb") as f:
+            f.write(remainder)
     except Exception as exc:
         logger.debug("CC ingest-tract truncate failed (non-fatal): %s", exc)
 

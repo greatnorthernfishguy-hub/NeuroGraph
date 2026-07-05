@@ -1,5 +1,6 @@
 import sys
 sys.path.insert(0, '/home/josh/NeuroGraph')
+import os
 import tempfile, shutil
 import pytest
 
@@ -134,3 +135,52 @@ def test_drain_ingest_tract_is_idempotent_on_empty_file(cc_ng, tmp_path):
     state = {"last_forest_id": None}
     absorbed = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
     assert absorbed == 0
+
+
+def test_drain_ingest_tract_preserves_concurrent_append(cc_ng, tmp_path, monkeypatch):
+    """A miniTID append landing mid-drain (during the slow embed+dual-pass
+    loop, before truncation) must survive -- not be erased by a blind
+    truncate-to-empty. Regression test for the truncation race the final
+    whole-branch review found: truncation must only discard the bytes this
+    pass actually consumed."""
+    import ng_tract
+    import cc_ng_organism
+    from cc_ng_organism import drain_ingest_tract
+
+    tract_path = str(tmp_path / "turns.tract")
+    ng_tract.deposit_experience(
+        content=b"first entry, present at read time",
+        source="cc_gateway",
+        tract_path=tract_path,
+        content_type="text",
+    )
+
+    real_dual_pass = cc_ng_organism.run_conversational_dual_pass
+    appended = {"done": False}
+
+    def fake_dual_pass(graph, vector_db, text, emb, state):
+        if not appended["done"]:
+            appended["done"] = True
+            # Simulate miniTID appending a new turn while this drain pass is
+            # still mid-loop, before the truncation step below runs.
+            ng_tract.deposit_experience(
+                content=b"second entry, appended mid-drain",
+                source="cc_gateway",
+                tract_path=tract_path,
+                content_type="text",
+            )
+        return real_dual_pass(graph, vector_db, text, emb, state)
+
+    monkeypatch.setattr(cc_ng_organism, "run_conversational_dual_pass", fake_dual_pass)
+
+    state = {"last_forest_id": None}
+    absorbed = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
+    assert absorbed == 1  # only the entry present at this pass's read time
+
+    # The concurrently-appended entry must survive truncation.
+    assert os.path.getsize(tract_path) > 0
+
+    # It's absorbed cleanly on the next pulse, and the file is now empty.
+    absorbed_next = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
+    assert absorbed_next == 1
+    assert os.path.getsize(tract_path) == 0
