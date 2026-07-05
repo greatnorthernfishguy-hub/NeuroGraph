@@ -124,13 +124,10 @@ REFCOUNT_PATH = os.path.join(CC_NG_WORKSPACE, "refcount")
 # --- Cadence ---
 AUTOSAVE_INTERVAL = 60.0  # seconds
 
-# --- Recall / reward ---
+# --- Recall ---
 RECALL_THRESHOLD = 0.4
 RECALL_K = 5
 RECALL_K_BRIEF = 3
-REWARD_CLEAN = 0.1
-REWARD_ERROR = -0.2
-REWARD_CRASH = -0.5
 
 # --- CC's NG config ---
 # peer_bridge disabled: CC is not a peer module (would collide with Syl's
@@ -300,21 +297,6 @@ def _nudge(text: str) -> None:
         logger.debug("CC nudge failed: %s", exc)
 
 
-def _reward(value: float) -> None:
-    ng = _STATE.cc_ng
-    if ng is None:
-        return
-    with _STATE.stats_lock:
-        _STATE.stats["rewards"] += 1
-    try:
-        with ng.graph._concurrent_lock:
-            ng.graph.inject_reward(value)
-    except Exception as exc:
-        with _STATE.stats_lock:
-            _STATE.stats["errors"] += 1
-        logger.debug("CC inject_reward failed: %s", exc)
-
-
 def _write_refcount(n: int) -> None:
     try:
         with open(REFCOUNT_PATH, "w") as f:
@@ -451,15 +433,16 @@ def _handle_post_tool_use(data):
     else:
         experience = "tool:" + tool + " result:" + str(tool_response)[:1000]
 
+    # No reward pre-labeling (Josh, 2026-07-04): string-matching
+    # traceback/exception/error in tool_response to pick a reward value
+    # classifies the experience's valence at deposit time -- a LAW 7
+    # violation, and redundant besides. _deposit() already calls
+    # on_message(), which injects its own flat, content-independent
+    # baseline reward (0.1) on the success path (openclaw_hook.py) --
+    # "surprise-driven crystallization is the primary reward pathway,
+    # this is the heartbeat, not the main event." Syl's tool-adjacent
+    # experience gets reward the same way, with no external classification.
     _deposit(experience)
-
-    resp_lower = str(tool_response).lower()
-    if "traceback" in resp_lower or "exception" in resp_lower:
-        _reward(REWARD_CRASH)
-    elif "error" in resp_lower:
-        _reward(REWARD_ERROR)
-    else:
-        _reward(REWARD_CLEAN)
 
     return {"ok": True}
 
