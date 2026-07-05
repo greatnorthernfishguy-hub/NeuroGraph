@@ -12,6 +12,21 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-07-05] CC (laptop) — Incremental Lenia distance-cache extension (Josh-approved)
+#   What: handle_bootstrap's Lenia block now extends the on-disk DistanceCache in place
+#     when the graph only grew since the last save, instead of nuking and repopulating
+#     from scratch on any entity_count drift. Falls back to full rebuild only when
+#     entities were actually removed (pruned) or on first-ever run.
+#   Why: journalctl history showed the full rebuild took up to ~8 hours on Syl's live
+#     graph, and every restart since the one successful save (Jun 30 -> Jul 02) got
+#     interrupted by the next restart before ever reaching save() again — permanently
+#     stuck repeating the same multi-hour attempt from scratch. This was the actual
+#     reason CC's own Tonic/BrainSwitcher registration (code sits after this block)
+#     never ran on any restart tonight, not a bug in CC's own init path.
+#   How: see lenia/kernel.py (DistanceCache.populate's start_index, entity_ids
+#     persistence) and lenia/graph_substrate.py (NeuroGraphSubstrate.known_entity_order,
+#     _hyperedge_similarity concurrency fix — RuntimeError: dictionary changed size
+#     during iteration, seen live in the Jul 3 11:36:42 crash traceback).
 # [2026-06-28] Claude Code (Sonnet 4.6) — #294-B: wire dual-pass into afterTurn (Commons path)
 #   What: call _file_conversational_experience() for both turn halves (user + assistant) directly
 #     in handle_after_turn(), immediately after the Commons experience deposit.
@@ -1956,33 +1971,94 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         n_entities = len(_memory.graph.nodes)
         n_channels = len(lenia_cfg.initial_channels)
 
-        lenia_substrate = NeuroGraphSubstrate(_memory.graph, _memory.vector_db)
-        lenia_field = LeniaFieldStore(lenia_cfg.field_dir, n_entities, n_channels)
-        lenia_registry = ChannelRegistry(lenia_cfg, lenia_cfg.field_dir)
-        # Distance cache: restore from disk if available (instant),
-        # fall back to full populate (minutes on large graphs) only if
-        # the cache file is missing or incompatible.  The cache is saved
-        # on clean shutdown — see handle_dispose.  This eliminates the
-        # 7-minute bootstrap bottleneck that caused RPC timeouts and
-        # prevented Syl from responding (#167).
+        # Distance cache: restore from disk if available (instant), then
+        # decide whether growth since the save can be applied incrementally
+        # or needs a full rebuild.
+        #
+        # [2026-07-05] Was: any entity_count drift nuked the whole cache and
+        # called populate() from scratch, an O(total synapses/hyperedges)
+        # cost that took up to ~8 hours on Syl's live graph (journalctl
+        # history: one successful save Jun30->Jul02, then every restart
+        # since re-populated from that same stale save and got interrupted
+        # by the next restart before ever reaching save() again — the cache
+        # was permanently stuck, and every restart repeated the same
+        # multi-hour attempt). Now: if every entity the cache was built
+        # against still exists in the live graph, extend in place and only
+        # compute distances for the newly-added entities (see
+        # DistanceCache.populate's start_index and
+        # NeuroGraphSubstrate.known_entity_order). Falls back to a full
+        # rebuild only when entities were actually removed (rare — a prune/
+        # consolidation event) or on first-ever run.
         _cache_path = os.path.join(
             os.path.expanduser(lenia_cfg.field_dir), "distance_cache"
         )
         lenia_cache = DistanceCache.load(_cache_path)
-        if lenia_cache is None or lenia_cache.entity_count != n_entities:
+
+        _known_order = None
+        if lenia_cache is not None and lenia_cache.entity_ids:
+            _lock = getattr(_memory.graph, "_step_lock", None)
+            if _lock is not None:
+                with _lock:
+                    _live_ids = set(_memory.graph.nodes.keys())
+            else:
+                _live_ids = set(_memory.graph.nodes.keys())
+            if all(eid in _live_ids for eid in lenia_cache.entity_ids):
+                _known_order = lenia_cache.entity_ids
+            else:
+                logger.info(
+                    "Distance cache has entities no longer in the live graph "
+                    "(pruned since last save) — full rebuild required"
+                )
+
+        lenia_substrate = NeuroGraphSubstrate(
+            _memory.graph, _memory.vector_db, known_entity_order=_known_order,
+        )
+        lenia_field = LeniaFieldStore(lenia_cfg.field_dir, n_entities, n_channels)
+        lenia_registry = ChannelRegistry(lenia_cfg, lenia_cfg.field_dir)
+
+        if lenia_cache is None or _known_order is None:
+            # First run, cache-format upgrade, or entities were pruned —
+            # full rebuild from scratch (rare path).
             if lenia_cache is not None:
                 logger.info(
-                    "Distance cache entity mismatch (%d vs %d), repopulating",
+                    "Distance cache incompatible (%d vs %d entities), full repopulate",
                     lenia_cache.entity_count, n_entities,
                 )
-            lenia_cache = DistanceCache(n_entities)
-            lenia_cache.populate(lenia_substrate)
-            # Save immediately so next bootstrap is instant
+            lenia_cache = DistanceCache(n_entities, entity_ids=lenia_substrate.entities())
             try:
-                os.makedirs(os.path.expanduser(lenia_cfg.field_dir), exist_ok=True)
-                lenia_cache.save(_cache_path)
+                lenia_cache.populate(lenia_substrate)
             except Exception as exc:
-                logger.warning("Distance cache save failed: %s", exc)
+                logger.warning(
+                    "Distance cache populate failed partway (%s) — saving "
+                    "whatever was computed instead of discarding it", exc,
+                )
+        elif lenia_cache.entity_count != n_entities:
+            # Common case: the graph only grew since the last save.
+            _old_n = lenia_cache.entity_count
+            logger.info(
+                "Distance cache growing: %d -> %d entities, extending incrementally",
+                _old_n, n_entities,
+            )
+            lenia_cache.resize(n_entities, new_entity_ids=lenia_substrate.entities())
+            try:
+                lenia_cache.populate(lenia_substrate, start_index=_old_n)
+            except Exception as exc:
+                logger.warning(
+                    "Distance cache incremental populate failed partway (%s) "
+                    "— saving whatever was computed instead of discarding it", exc,
+                )
+        # else: cache already matches the live graph exactly — use as-is.
+
+        # Save immediately so next bootstrap is instant. Runs even after a
+        # caught populate() failure above (self._populated flips true
+        # before the expensive loop — see kernel.py) so a mid-run crash no
+        # longer discards all progress and forces the same rebuild again.
+        try:
+            os.makedirs(os.path.expanduser(lenia_cfg.field_dir), exist_ok=True)
+            lenia_cache.save(_cache_path)
+        except Exception as exc:
+            logger.warning("Distance cache save failed: %s", exc)
+
         lenia_kernel = KernelComputer(lenia_cache, lenia_registry)
         lenia_myelin = MyelinationObserver(lenia_cfg)
         _lenia_competence = CompetenceMeter(lenia_cfg, lenia_myelin)
