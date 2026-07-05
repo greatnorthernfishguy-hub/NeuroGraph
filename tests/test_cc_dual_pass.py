@@ -94,3 +94,55 @@ def test_probation_graduation(cc_ng):
     assert node.intrinsic_excitability == 1.0
     base_threshold = cc_ng.graph.config.get("default_threshold", 1.0)
     assert node.threshold == base_threshold
+
+
+def test_drain_ingest_tract_absorbs_experience_entries(cc_ng, tmp_path):
+    """Test that drain_ingest_tract reads and absorbs experience entries from a tract file.
+
+    Note: ng_tract v0.1.0 doesn't provide deposit_experience() yet (miniTID Tasks 4-7).
+    We mock the TractReader to return experience entries for testing.
+    """
+    from cc_ng_organism import drain_ingest_tract
+    from unittest.mock import Mock, patch, MagicMock
+    import sys
+
+    tract_path = str(tmp_path / "turns.tract")
+
+    # Create mock experience entries
+    ENTRY_EXPERIENCE = 0
+
+    class MockExperienceEntry:
+        def __init__(self, content, source):
+            self.entry_type = ENTRY_EXPERIENCE
+            self.source = source
+            self.content_type = "text"
+            self.content = content
+
+    # Write a placeholder file so drain_ingest_tract knows the file exists
+    with open(tract_path, 'wb') as f:
+        f.write(b"placeholder")
+
+    # Mock TractReader to return our experience entries
+    mock_entries = [
+        MockExperienceEntry("the user asked about numpy conflicts", "cc_gateway"),
+        MockExperienceEntry("I should look into the ng_tract_venv.pth file", "cc_gateway"),
+    ]
+
+    # Patch ng_tract in the context where it's imported (in drain_ingest_tract)
+    with patch('ng_tract.TractReader') as mock_reader_class:
+        mock_reader_class.return_value = iter(mock_entries)
+        state = {"last_forest_id": None}
+        absorbed = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
+        assert absorbed == 2
+
+    conv_nodes = [n for n in cc_ng.graph.nodes.values()
+                  if n.metadata.get("creation_mode") == "conversational"]
+    assert len(conv_nodes) == 2
+
+
+def test_drain_ingest_tract_is_idempotent_on_empty_file(cc_ng, tmp_path):
+    from cc_ng_organism import drain_ingest_tract
+    tract_path = str(tmp_path / "nonexistent.tract")
+    state = {"last_forest_id": None}
+    absorbed = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
+    assert absorbed == 0

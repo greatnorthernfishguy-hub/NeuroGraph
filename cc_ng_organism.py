@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-04] Claude Code (Haiku 4.5) — Tract ingest drain for miniTID turn deposits (Task 2)
+# What: Added drain_ingest_tract(), cc_gateway_tract_path(), and _ENTRY_EXPERIENCE constant.
+#       Drains BTF (binary tract format) entries from miniTID's turn-deposit file and runs
+#       each through the conversational dual-pass (Task 1), forming genuine recall memory.
+# Why:  CC's autosave pulse (Task 3) needs to drain miniTID's output independently -- no
+#       handshake, matching the established tract model (LAW 1: substrate-as-protocol).
+#       Each turn becomes a conversational memory node + vector DB entry, searchable
+#       via dual-pass (forest + tree concept extraction). CC_GATEWAY_TRACT_PATH env var
+#       (LAW 5) coordinates path between Rust producer (miniTID) and Python drainer.
+# How:  TractReader iterates binary entries. Each entry (type=ENTRY_EXPERIENCE, source=cc_gateway)
+#       gets embedded via ng_embed (same 768-dim ONNX model every module uses), then passed
+#       to run_conversational_dual_pass(). Fails soft -- ingest-tract drain failure must never
+#       break the daemon's pulse. File truncates after successful drain (single reader,
+#       single appender miniTID; concurrent appends mid-drain land after truncation, picked
+#       up next pulse, never lost).
+# Note: ng_tract v0.1.0 doesn't yet support ENTRY_EXPERIENCE or deposit_experience() --
+#       those come in miniTID Tasks 4-7. Code gracefully degrades via getattr fallback.
 # [2026-07-04] Claude Code (Sonnet 5) — Parameterized conversational dual-pass core for CC
 # What: Added run_conversational_dual_pass(), _CCConversationalDualPassEco, and supporting
 #       functions (_cc_deposit_memory_node, _cc_bind_conversational_topology,
@@ -642,3 +659,90 @@ def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
     except Exception:
         logger.exception("CC TriSynaptic manager failed to start — concept backlog will accumulate")
         return None
+
+
+# ---- Tract ingest drain (#294 miniTID integration) ----
+# Drains BTF entries from miniTID's turn-deposit tract file, running each
+# through the conversational dual-pass (Task 1). Feeder (miniTID) deposits,
+# this drains independently -- no handshake, matching the established tract model.
+_ENTRY_EXPERIENCE = 0  # Experience entry type (distinct from ng_tract's ENTRY_OUTCOME/ENTRY_TOPOLOGY)
+
+_DEFAULT_CC_GATEWAY_TRACT_PATH = os.path.expanduser(
+    "~/.claude/plugins/neurograph/tracts/cc_gateway/turns.tract"
+)
+
+
+def cc_gateway_tract_path() -> str:
+    """Resolve the CC gateway tract path from CC_GATEWAY_TRACT_PATH (LAW 5) --
+    both this drain side and miniTID's Rust producer independently read the
+    same env var, with the same default, so they can never desync onto
+    different files without either side being misconfigured identically."""
+    return os.environ.get("CC_GATEWAY_TRACT_PATH", _DEFAULT_CC_GATEWAY_TRACT_PATH)
+
+
+def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) -> int:
+    """Drain miniTID's turn-deposit tract file, running each raw experience
+    entry through the conversational dual-pass (Task 1). Feeder (miniTID)
+    deposits, this drains independently -- no handshake, matching the
+    established tract model. Truncates the file after a successful drain
+    (single reader, single writer-appender; safe because miniTID only ever
+    appends and this is the only drainer).
+
+    Returns the count of entries absorbed. Fails soft -- an ingest-tract
+    drain failure must never break the daemon's autosave pulse.
+    """
+    path = tract_path or cc_gateway_tract_path()
+    if not os.path.exists(path):
+        return 0
+    try:
+        import ng_tract
+        from ng_embed import embed as ng_embed_fn
+    except Exception as exc:
+        logger.debug("CC ingest-tract drain unavailable (non-fatal): %s", exc)
+        return 0
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as exc:
+        logger.debug("CC ingest-tract read failed (non-fatal): %s", exc)
+        return 0
+    if not data:
+        return 0
+
+    absorbed = 0
+    try:
+        reader = ng_tract.TractReader(data)
+        for entry in reader:
+            # Check entry type (use locally-defined ENTRY_EXPERIENCE since ng_tract v0.1.0
+            # doesn't support experience entries yet -- miniTID Tasks 4-7 will add this)
+            entry_type_to_check = getattr(ng_tract, 'ENTRY_EXPERIENCE', _ENTRY_EXPERIENCE)
+            if entry.entry_type != entry_type_to_check:
+                continue
+            if entry.source != "cc_gateway":
+                continue
+            text = entry.content
+            if not text or not text.strip():
+                continue
+            try:
+                emb = ng_embed_fn(text)
+                if run_conversational_dual_pass(graph, vector_db, text, emb, state):
+                    absorbed += 1
+            except Exception as exc:
+                logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
+    except Exception as exc:
+        logger.debug("CC ingest-tract parse failed (non-fatal): %s", exc)
+        return absorbed
+
+    # Truncate only after a successful read+parse pass -- entries added
+    # mid-drain by a concurrent miniTID append land after this truncation
+    # and are picked up on the next pulse, never lost.
+    try:
+        with open(path, "wb"):
+            pass
+    except Exception as exc:
+        logger.debug("CC ingest-tract truncate failed (non-fatal): %s", exc)
+
+    if absorbed:
+        logger.info("CC ingest-tract: absorbed %d turn(s) into recall", absorbed)
+    return absorbed
