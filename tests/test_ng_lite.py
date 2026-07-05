@@ -908,3 +908,34 @@ class TestEdgeCases:
 
     def test_version_string(self):
         assert __version__ == "1.0.0"
+
+
+# ---------------------------------------------------------------------------
+# embed() — real Snowflake semantic embeddings (2026-07-05)
+# ---------------------------------------------------------------------------
+
+class TestEmbed:
+
+    def test_embed_returns_768_dim_float32(self, ng):
+        vec = ng.embed("outcome.campaign_type:sort outcome.fitness:0.95")
+        assert vec.shape == (768,)
+        assert vec.dtype == np.float32
+
+    def test_embed_has_real_semantic_locality(self, ng):
+        """Related content should be far more similar than unrelated content —
+        the hash fallback this replaces had no semantic locality at all
+        (measured cosine ~0.0015, noise floor)."""
+        sort_a = ng.embed("outcome.campaign_type:sort outcome.fitness:0.95")
+        sort_b = ng.embed("outcome.campaign_type:sort outcome.fitness:0.90")
+        routing = ng.embed("outcome.campaign_type:routing outcome.fitness:0.10")
+
+        def cos(a, b):
+            return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+        same_campaign = cos(sort_a, sort_b)
+        diff_campaign = cos(sort_a, routing)
+        assert same_campaign > diff_campaign, (
+            "same-campaign content should be more similar than different-campaign "
+            f"content: same={same_campaign} diff={diff_campaign}"
+        )
+        assert same_campaign > 0.9

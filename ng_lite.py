@@ -66,6 +66,18 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — Add NGLite.embed() — real Snowflake embeddings, no hash
+# What: New embed(text) method wraps ng_embed.embed() (Snowflake/snowflake-arctic-embed-m-v1.5,
+#   768-dim, ONNX) — the ecosystem-standard real semantic embedding function.
+# Why: NGLite has never had its own embedding capability (by original design — callers bring
+#   pre-computed embeddings, per the class docstring's own Usage example). Consumer code
+#   (Darwin's Surrogate) checked `hasattr(self._ng_lite, 'embed')` expecting this convenience
+#   method, found it always False, and fell through to a hash-based fallback with no semantic
+#   locality — every embedding a caller thought was "real" was actually noise. Josh (2026-07-05):
+#   "NOTHING should be using hashes unless something has gone terribly wrong."
+# How: Thin wrapper, `from ng_embed import embed; return embed(text)`. No hash fallback here —
+#   NGLite raises on failure rather than silently degrading; fallback policy stays the caller's
+#   decision (as hook.py's own _embed() dispatcher already does correctly).
 # [2026-04-08] Claude Code (Opus 4.6) — Punchlist #55: CES attention tunables
 # What: Added surfacing_decay_rate, surfacing_min_confidence, prediction_window
 #   to DEFAULT_CONFIG and TUNABLE_PARAMS.
@@ -585,6 +597,32 @@ class NGLite:
     # -------------------------------------------------------------------
     # Core API
     # -------------------------------------------------------------------
+
+    def embed(self, text: str) -> np.ndarray:
+        """Embed text via the ecosystem's real semantic embedding function.
+
+        Thin wrapper around ng_embed.embed() (Snowflake/snowflake-arctic-embed-m-v1.5,
+        768-dim, ONNX) — the same embedding function every other real canonical caller
+        (neurograph_rpc.py, etc.) already uses. NGLite consumes pre-computed embeddings
+        by design (see class docstring's Usage example); this method exists so a caller
+        that only has raw text and no embedder of its own can get a REAL embedding
+        without reaching for a hash. No hash fallback here — a caller wanting graceful
+        degradation on failure is responsible for that policy itself (e.g. hook.py's
+        own _embed() dispatcher already does this correctly).
+
+        Args:
+            text: Raw text content to embed.
+
+        Returns:
+            768-dim float32 numpy array.
+
+        Raises:
+            Whatever ng_embed.embed() raises (e.g. if the ONNX model isn't available).
+            Never silently substitutes a hash — that would defeat the point of this
+            method existing.
+        """
+        from ng_embed import embed as _ng_embed
+        return _ng_embed(text)
 
     def find_or_create_node(self, embedding: np.ndarray) -> NGLiteNode:
         """Find existing node for this pattern or create a new one.
