@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-04] Claude Code (Sonnet 5) — Parameterized conversational dual-pass core for CC
+# What: Added run_conversational_dual_pass(), _CCConversationalDualPassEco, and supporting
+#       functions (_cc_deposit_memory_node, _cc_bind_conversational_topology,
+#       _cc_concept_passes_floor, _cc_embed_to_poincare_dir). Extracted from canonical
+#       neurograph_rpc.py's _run_conversational_dual_pass mechanism (#294).
+# Why:  Makes CC's own turn text become genuine recall-searchable memory (forest gestalt +
+#       tree concepts), not just an SNN step. on_message() alone only does graph.step() + CES;
+#       this adds the dual-pass embedding extraction so CC can form conversational memory
+#       like Syl's canonical instance. Parameterized on explicit graph/vector_db/state args
+#       instead of module-level globals so each CC daemon owns its own memory state.
+# How:  NGEmbed.dual_record_outcome() (vendored in ng_embed.py, canonical shared code) is
+#       called directly via _CCConversationalDualPassEco adapter. Nodes tagged cc=True
+#       to avoid confusion with Syl's own conversational memories if inspected together.
+#       state dict replaces canonical's _last_conv_forest_id module global so delayed
+#       prev->current forest synapses work correctly per-daemon (CC Tier 2).
 # [2026-07-04] Claude Code (Sonnet 5) — Full-parity organism extraction for CC's own NG
 # What: Surgical extraction of Lenia FlowGraph + TriSynaptic bootstrap from
 #       neurograph_rpc.py, parameterized on explicit graph/vector_db/workspace_dir
@@ -391,6 +406,173 @@ def generate_emergent_want(
     except Exception as exc:
         logger.debug("generate_emergent_want failed (non-fatal): %s", exc)
         return None
+
+
+# ---- Conversational dual-pass ingest (#294 analog for CC) ----
+# Extracted from neurograph_rpc.py's _run_conversational_dual_pass /
+# _ConversationalDualPassEco / _deposit_memory_node / _bind_conversational_topology,
+# parameterized on explicit graph/vector_db/state instead of the module-level
+# _memory global and _last_conv_forest_id global. This is what makes CC's turn
+# text become genuine recall-searchable memory, not just an SNN step -- calling
+# bare on_message() does NOT do this (it only runs graph.step() + CES).
+_CC_CONV_NOVELTY_DAMPENING = float(os.environ.get("CC_CONV_NOVELTY_DAMPENING", "0.3"))
+_CC_CONV_PROBATION_PERIOD = int(os.environ.get("CC_CONV_PROBATION_PERIOD", "10"))
+_CC_CONV_THRESHOLD_BOOST = float(os.environ.get("CC_CONV_THRESHOLD_BOOST", "0.2"))
+_CC_CONV_SYNAPSE_DELAY_MAX = int(os.environ.get("CC_CONV_SYNAPSE_DELAY_MAX", "5"))
+
+_CC_CONCEPT_FLOOR_MIN_CHARS = 5
+_CC_CONCEPT_FLOOR_STOPWORDS = frozenset(
+    "a an and are as at be but by for from has have i if in is it its let me my not of on "
+    "or our out so that the their them then there they this to up us was we what when who "
+    "will with you your yourself know see going do did done says said like just".split()
+)
+
+
+def _cc_concept_passes_floor(concept: str) -> bool:
+    """Degenerate-fragment floor -- rejects tiny/stopword-only tree concepts
+    that would otherwise crowd out real memories at uniform high cosine
+    similarity. Mirrors canonical's _concept_passes_floor exactly."""
+    c = (concept or "").strip()
+    if len(c) < _CC_CONCEPT_FLOOR_MIN_CHARS:
+        return False
+    words = [w for w in c.lower().replace("'", " ").split() if w.isalpha()]
+    if words and all(w in _CC_CONCEPT_FLOOR_STOPWORDS for w in words):
+        return False
+    return True
+
+
+def _cc_embed_to_poincare_dir(embedding):
+    """Unit-direction projection for Poincaré ball storage (GSG). Pure
+    embedding math, generic -- mirrors canonical's _embed_to_poincare_dir."""
+    import numpy as _np
+    arr = _np.asarray(embedding, dtype=_np.float32)
+    norm = _np.linalg.norm(arr)
+    if norm < 1e-9:
+        return arr.copy()
+    return arr / norm
+
+
+def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
+                             index_in_recall=True):
+    """Deposit ONE experiential memory node into both the SNN graph and the
+    recall vector_db. Mirrors canonical's _deposit_memory_node, parameterized
+    on graph/vector_db instead of the _memory global."""
+    node = graph.nodes.get(node_id)
+    if node is None:
+        node = graph.create_node(node_id=node_id, metadata=dict(meta))
+    else:
+        node.metadata.update(meta)
+    base_threshold = graph.config.get("default_threshold", 1.0)
+    node.threshold = base_threshold + _CC_CONV_THRESHOLD_BOOST
+    node.intrinsic_excitability = _CC_CONV_NOVELTY_DAMPENING
+    node.metadata["probation_remaining"] = _CC_CONV_PROBATION_PERIOD
+    node.metadata["probation_total"] = _CC_CONV_PROBATION_PERIOD
+    node.metadata["novelty_dampening"] = _CC_CONV_NOVELTY_DAMPENING
+    try:
+        node.metadata["poincare_dir"] = _cc_embed_to_poincare_dir(embedding).tolist()
+    except Exception as exc:
+        logger.debug("CC poincare_dir stamp failed (non-fatal): %s", exc)
+    if index_in_recall:
+        try:
+            vector_db.insert(id=node_id, embedding=embedding, content=content,
+                              metadata=node.metadata)
+        except Exception as exc:
+            logger.debug("CC recall insert failed (non-fatal): %s", exc)
+    return node
+
+
+class _CCConversationalDualPassEco:
+    """Eco-adapter for CC's conversational dual-pass. Mirrors canonical's
+    _ConversationalDualPassEco -- inserts fine-grained tree concepts into
+    the recall store, tagged {"cc": True} instead of {"syl": True} so the
+    two substrates' memories are never confused if ever inspected together.
+    """
+
+    def __init__(self, graph, vector_db):
+        self._graph = graph
+        self._vector_db = vector_db
+
+    def record_outcome(self, embedding, target_id, success, strength=1.0, metadata=None):
+        meta = dict(metadata or {})
+        meta["cc"] = True
+        if meta.get("_link"):
+            return {"deposited": True}
+        if meta.get("_tree_concept") and meta.get("_concept"):
+            if not _cc_concept_passes_floor(meta["_concept"]):
+                return {"deposited": False, "reason": "concept_below_floor"}
+            _cc_deposit_memory_node(self._graph, self._vector_db, target_id, embedding,
+                                     meta["_concept"], meta, index_in_recall=True)
+        else:
+            _cc_deposit_memory_node(self._graph, self._vector_db, target_id, embedding,
+                                     meta.get("_forest_content", ""), meta, index_in_recall=True)
+        return {"deposited": True}
+
+    def record_outcome_broadcast(self, embedding, target_id, success, strength=1.0, metadata=None):
+        return self.record_outcome(embedding, target_id, success, strength, metadata)
+
+
+def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding, state):
+    """Wire forest<->tree synapses, a binding hyperedge, and a delayed
+    prev->current forest link. `state` is a plain dict the caller owns
+    (holds "last_forest_id") -- replaces canonical's module-level
+    _last_conv_forest_id global, since each CC daemon needs its own,
+    not one shared across Syl and CC.
+    """
+    if forest_id not in graph.nodes:
+        return
+    tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
+    for tid in tree_ids:
+        try:
+            graph.create_synapse(forest_id, tid, weight=0.2)
+            graph.create_synapse(tid, forest_id, weight=0.15)
+        except Exception:
+            pass
+    if tree_ids:
+        try:
+            graph.create_hyperedge(
+                member_node_ids=set([forest_id] + tree_ids),
+                metadata={"creation_mode": "conversational", "cc": True},
+            )
+        except Exception as exc:
+            logger.debug("CC conversational hyperedge failed (non-fatal): %s", exc)
+    last_id = state.get("last_forest_id")
+    if last_id and last_id in graph.nodes and last_id != forest_id:
+        try:
+            import random as _rnd
+            d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
+            graph.create_synapse(last_id, forest_id, weight=0.2, delay=d)
+        except Exception:
+            pass
+    state["last_forest_id"] = forest_id
+
+
+def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict) -> bool:
+    """Core dual-pass on one turn's text. Returns True on success, False on
+    failure -- caller decides retry policy (this function does not enqueue).
+    Mirrors canonical's _run_conversational_dual_pass exactly, parameterized.
+    """
+    if graph is None or embedding is None:
+        return False
+    try:
+        from ng_embed import NGEmbed
+        import hashlib
+        target_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
+        eco = _CCConversationalDualPassEco(graph, vector_db)
+        _result = NGEmbed.get_instance().dual_record_outcome(
+            ecosystem=eco,
+            content=text,
+            embedding=embedding,
+            target_id=target_id,
+            success=True,
+            strength=1.0,
+            metadata={"source": "cc_gateway", "creation_mode": "conversational",
+                      "_forest_content": text},
+        )
+        _cc_bind_conversational_topology(graph, target_id, _result or {}, embedding, state)
+        return True
+    except Exception as exc:
+        logger.debug("CC conversational dual-pass failed (non-fatal): %s", exc)
+        return False
 
 
 def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
