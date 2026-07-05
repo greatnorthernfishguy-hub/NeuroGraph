@@ -962,6 +962,24 @@ def _deposit_substrate_metrics(step_result, to_jsonl: bool = True) -> None:
         return
     # Compact scalar metrics the substrate produced this step. No embedding, no IDs — raw counts.
     import time as _time
+    # #354: raw first/second moments of two already-native per-element quantities (synapse.weight,
+    # node.firing_rate_ema) — no verdict, no threshold applied here. THC's health_monitor buckets
+    # these and applies ITS OWN weight_divergence_threshold/min_firing_rate at extraction (LAW 7 —
+    # classify at the bucket, not before). Cheap: O(N) over synapses/nodes already iterated below
+    # for total_synapses/total_nodes.
+    _weight_mean = _weight_std = _firing_rate_mean = _firing_rate_std = 0.0
+    try:
+        import numpy as _np
+        _weights = [s.weight for s in _memory.graph.synapses.values()]
+        if _weights:
+            _weight_mean = float(_np.mean(_weights))
+            _weight_std = float(_np.std(_weights))
+        _rates = [n.firing_rate_ema for n in _memory.graph.nodes.values()]
+        if _rates:
+            _firing_rate_mean = float(_np.mean(_rates))
+            _firing_rate_std = float(_np.std(_rates))
+    except Exception:
+        pass
     _metrics = {
         "timestamp": _time.time(),
         "module_id": "neurograph",
@@ -974,6 +992,10 @@ def _deposit_substrate_metrics(step_result, to_jsonl: bool = True) -> None:
         "predictions_surprised": step_result.predictions_surprised,
         "total_nodes": len(_memory.graph.nodes),
         "total_synapses": len(_memory.graph.synapses),
+        "weight_mean": _weight_mean,
+        "weight_std": _weight_std,
+        "firing_rate_mean": _firing_rate_mean,
+        "firing_rate_std": _firing_rate_std,
     }
     # Sink 1: neurograph.jsonl (Darwin's Recorder — kept until design Part 3 retires it).
     # PER-TURN only (to_jsonl): the autonomous path skips it — unbounded append would bloat at ~2s.
