@@ -71,15 +71,24 @@ class TrisynapticManager:
                 the original "trisyn" (Syl's exact existing behavior,
                 unchanged) -- pass a distinct value alongside handoff_prefix
                 for a co-located second instance.
+        worker_module_id: module_id the spawned worker uses for its
+                NGTractBridge (determines which tracts_dir/<module_id>/
+                directory extracted concepts get deposited into -- NOT
+                just handoff-file naming). Defaults to "neurograph" (Syl's
+                exact existing behavior). A second manager MUST pass a
+                distinct value or its workers write into Syl's own tract
+                directory regardless of handoff_prefix/scope_prefix.
     """
 
     def __init__(self, memory: Any, queue: List[Dict[str, Any]],
                  handoff_prefix: str = HANDOFF_PREFIX,
-                 scope_prefix: str = "trisyn") -> None:
+                 scope_prefix: str = "trisyn",
+                 worker_module_id: str = "neurograph") -> None:
         self._memory = memory
         self._queue = queue
         self._handoff_prefix = handoff_prefix
         self._scope_prefix = scope_prefix
+        self._worker_module_id = worker_module_id
         self._shutdown = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._worker_scope: Optional[str] = None
@@ -208,6 +217,7 @@ class TrisynapticManager:
                 "trisyn_tid_fail_exit": tid_fail_exit,
                 "trisyn_max_runtime_s": max_runtime_s,
                 "trisyn_exit_water": exit_water,
+                "trisyn_worker_module_id": self._worker_module_id,
             },
             "entries": batch,
         }

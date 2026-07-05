@@ -126,12 +126,16 @@ def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
     get an inert-but-harmless manager, same as Syl's own bootstrap ordering
     (manager starts before the drain pulse that feeds it).
 
-    instance_tag distinguishes this manager's /tmp handoff files and
-    systemd scope names from Syl's own manager -- on the VPS, cc_ng_host.py
-    runs inside the SAME process as Syl's neurograph_rpc.py, so a second
-    TrisynapticManager sharing the canonical default HANDOFF_PREFIX/scope
-    name would cross-match Syl's orphaned handoffs and failed-file cleanup
-    (same class of bug as #302's tract fan-out contamination).
+    instance_tag distinguishes this manager's /tmp handoff files, systemd
+    scope names, AND its worker's NGTractBridge module_id from Syl's own
+    manager -- on the VPS, cc_ng_host.py runs inside the SAME process as
+    Syl's neurograph_rpc.py, so a second TrisynapticManager sharing the
+    canonical default handoff/scope naming OR worker module_id would
+    cross-match Syl's orphaned handoffs/failed-file cleanup, or worse,
+    have its workers deposit extracted concepts into Syl's own
+    tracts_dir/neurograph/ directory (same class of bug as #302's tract
+    fan-out contamination -- caught by code review before this ever
+    shipped with a populated queue).
 
     Returns the manager instance, or None on failure/unavailable.
     """
@@ -141,6 +145,7 @@ def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
             memory=memory, queue=queue,
             handoff_prefix=f"trisynaptic_handoff_{instance_tag}_",
             scope_prefix=f"trisyn-{instance_tag}",
+            worker_module_id=f"neurograph-{instance_tag}",
         )
         manager.start()
         logger.info("CC TriSynaptic manager started (instance_tag=%s)", instance_tag)

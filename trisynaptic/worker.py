@@ -117,16 +117,23 @@ def main() -> int:
     max_workers = int(config.get("trisyn_max_workers", 1))
     tid_fail_limit = int(config.get("trisyn_tid_fail_exit", 5))
     max_runtime_s = float(config.get("trisyn_max_runtime_s", 1800))
+    # Which tracts_dir/<module_id>/ this worker's extracted concepts land in.
+    # Defaults to "neurograph" (Syl's exact existing behavior) -- a manager
+    # instance for a different substrate (e.g. CC's own) MUST set this via
+    # TrisynapticManager(worker_module_id=...) or its workers silently write
+    # into Syl's own tract directory.
+    worker_module_id = str(config.get("trisyn_worker_module_id", "neurograph"))
 
     logger.info(
         "Starting run: mode=%s, entries=%d, max_workers=%d, "
-        "tid_fail_exit=%d, max_runtime=%.0fs",
+        "tid_fail_exit=%d, max_runtime=%.0fs, module_id=%s",
         mode, len(entries), max_workers, tid_fail_limit, max_runtime_s,
+        worker_module_id,
     )
 
     embedder = NGEmbed.get_instance()
-    bridge = NGTractBridge(module_id="neurograph")
-    eco = _PeerBridgeEco(bridge, module_id="neurograph")
+    bridge = NGTractBridge(module_id=worker_module_id)
+    eco = _PeerBridgeEco(bridge, module_id=worker_module_id)
 
     started = time.time()
     tid_failures = 0
@@ -180,7 +187,7 @@ def main() -> int:
             narrative_emb,
             f"trisyn:run:{int(started)}",
             exit_code == 0,
-            "neurograph",
+            worker_module_id,
             {
                 "narrative": narrative,
                 "mode": mode,
