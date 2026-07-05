@@ -130,6 +130,57 @@ def test_dual_record_outcome_none_embedding_safe():
     assert _eco(c).dual_record_outcome(content="x", embedding=None, target_id="threat:n", success=True) is None
 
 
+def test_signal_error_deposits_raw():
+    """signal_error deposits under error:<module>:<ExcType> with description + context, no severity."""
+    c = commons_mod.Commons()
+    eco = _eco(c, namespaces=("threat:",))
+    try:
+        raise ValueError("bad thing happened")
+    except ValueError as exc:
+        eco.signal_error(exc, {"where": "test"})
+    matches = [(s.target_id, s.metadata.get("last_context", {})) for s in c._ng.synapses.values()
+               if getattr(s, "target_id", "").startswith("error:")]
+    assert len(matches) == 1
+    target_id, meta = matches[0]
+    assert target_id == "error:threat:ValueError" or target_id.startswith("error:")
+    assert "bad thing happened" in meta["description"]
+    assert meta["context"] == {"where": "test"}
+    assert "severity" not in meta and "classification" not in meta
+
+
+def test_signal_error_target_id_shape_matches_retention():
+    """target_id is error:<module_id>:<ExcType> — matches _evict_old_errors's 3-segment prefix."""
+    c = commons_mod.Commons()
+    eco = _eco(c, namespaces=())
+    eco._source = "immunis"
+    try:
+        raise RuntimeError("x")
+    except RuntimeError as exc:
+        eco.signal_error(exc)
+    targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
+    assert "error:immunis:RuntimeError" in targets
+
+
+def test_signal_error_failsoft_no_commons():
+    eco = CommonsEco(namespaces=("threat:",), commons_provider=lambda: None)
+    try:
+        raise KeyError("x")
+    except KeyError as exc:
+        eco.signal_error(exc)  # must not raise
+
+
+def test_signal_error_no_context_defaults_empty():
+    c = commons_mod.Commons()
+    eco = _eco(c)
+    try:
+        raise TypeError("y")
+    except TypeError as exc:
+        eco.signal_error(exc)  # no context passed
+    matches = [s.metadata.get("last_context", {}) for s in c._ng.synapses.values()
+               if getattr(s, "target_id", "").startswith("error:")]
+    assert matches[0]["context"] == {}
+
+
 def test_dual_record_outcome_forest_and_trees_live():
     """Real dual-pass through CommonsEco: forest + TID-extracted trees land in the Commons (needs TID)."""
     if not _tid_up():
@@ -147,6 +198,10 @@ def test_dual_record_outcome_forest_and_trees_live():
 
 
 if __name__ == "__main__":
+    test_signal_error_deposits_raw();    print("PASS signal_error deposits raw description+context, no severity")
+    test_signal_error_target_id_shape_matches_retention(); print("PASS signal_error target_id matches retention shape")
+    test_signal_error_failsoft_no_commons(); print("PASS signal_error fail-soft when no Commons")
+    test_signal_error_no_context_defaults_empty(); print("PASS signal_error context defaults to {}")
     test_dual_record_outcome_failsoft_to_forest(); print("PASS dual_record_outcome fail-soft → single forest deposit")
     test_dual_record_outcome_none_embedding_safe(); print("PASS dual_record_outcome None embedding safe")
     test_dual_record_outcome_forest_and_trees_live(); print("PASS dual_record_outcome live forest+trees (or SKIP if no TID)")

@@ -2,6 +2,24 @@
 ng_commons_eco.py — VENDORED Commons-backed substrate adapter (the dead-ecosystem → Commons bridge).
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — signal_error() — the #330 operational-logger (Josh-approved)
+# What: New CommonsEco.signal_error(exc, context) — a one-line swap for `except: pass` sites.
+#       Embeds the exception's string form via ng_embed, deposits raw to the Commons under
+#       error:<module_id>:<ExcType>, metadata carries only the description + caller's raw
+#       context dict. NO severity/classification applied here (LAW 7 — that's Immunis/THC's
+#       job at their own extraction boundary). success=False (Hebbian bookkeeping, not a
+#       severity label — mirrors how repair outcomes already use success).
+# Why: Punchlist #330 — errors ecosystem-wide were silently swallowed by bare excepts, hiding
+#      the exact orphaning failures (#326/#327/#353/#354) this week spent finding one at a time.
+#      Immunis clusters error:* for threat correlation, THC feeds it into diagnosis intake,
+#      Bunyan narrates automatically — same substrate-native pattern as every other Commons
+#      consumer. target_id shape matches the error:* retention already shipped in commons.py
+#      (_evict_old_errors, previous session) — no new wiring needed there.
+# How: Lazy ng_embed import (fail-soft — an embed failure never breaks the caller). Lazy
+#      self._commons() (existing helper). Deposit wrapped in its own try/except, matching every
+#      other method in this file. Scope this session: the method itself + 2-3 real call-site
+#      swaps in Immunis and THC (the two the punchlist names) as a demonstration — an
+#      ecosystem-wide except:pass sweep is a separate, larger follow-up, not done here.
 # [2026-06-22] Claude Code (Fable 5) — NEW VENDORED FILE (Josh-approved, LAW 2; #335)
 # What: Parameterized `CommonsEco` — a faithful drop-in for the `ng_ecosystem` get_context/
 #       record_outcome interface, backed by THE COMMONS (deposit/bucket) instead of a per-module
@@ -119,6 +137,32 @@ class CommonsEco:
         except Exception as exc:  # noqa: BLE001 — a deposit failure never breaks the caller
             logger.debug("[%s] CommonsEco deposit failed: %s", self._source, exc)
             return None
+
+    def signal_error(self, exc: Exception, context: Optional[Dict[str, Any]] = None) -> None:
+        """Deposit a raw operational error to the Commons (#330 operational-logger).
+
+        One-line swap for `except: pass` sites: `self._eco.signal_error(exc, {...})`.
+        Raw experience only (LAW 7) — the exception's string form is the content; target_id
+        carries routing (module_id + exception type), NOT severity/classification. Consumers
+        (Immunis threat clustering, THC diagnosis intake, Bunyan narration) decide what an
+        error MEANS at their own extraction boundary — this method never does.
+        """
+        description = f"{type(exc).__name__}: {exc}"
+        try:
+            from ng_embed import embed
+            embedding = embed(description)
+        except Exception as embed_exc:  # noqa: BLE001 — never lose the signal to an embed failure
+            logger.debug("[%s] signal_error embed failed: %s", self._source, embed_exc)
+            return
+        target_id = f"error:{self._source or 'unknown'}:{type(exc).__name__}"
+        c = self._commons()
+        if c is None:
+            return
+        try:
+            c.deposit(embedding, target_id, success=False,
+                     metadata={"description": description, "context": context or {}})
+        except Exception as deposit_exc:  # noqa: BLE001 — a deposit failure never breaks the caller
+            logger.debug("[%s] signal_error deposit failed: %s", self._source, deposit_exc)
 
     # ⚠ DELIBERATELY ABSENT: record_outcome_broadcast. This is load-bearing LAW-1 architecture,
     # NOT an unfinished gap in the drop-in. ng_embed.dual_record_outcome selects its write method
