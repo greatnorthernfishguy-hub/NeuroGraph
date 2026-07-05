@@ -191,6 +191,7 @@ class _CCHostState:
         self.trisyn_manager = None
         self.concept_queue: list = []
         self.commons = None
+        self.conv_state = {"last_forest_id": None}
         self.stats_lock = threading.Lock()
         self.stats = {
             "started_at": 0.0,
@@ -595,11 +596,16 @@ def _autosave_loop() -> None:
             # WANTs (#294/Mind-Not-Database): materialize any [WANT]...[/WANT]
             # markers deposited since the last pulse into first-class want-nodes.
             try:
-                from cc_ng_organism import surface_wants, generate_emergent_want
+                from cc_ng_organism import (
+                    surface_wants, generate_emergent_want, drain_ingest_tract,
+                    cc_update_probation,
+                )
+                drain_ingest_tract(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
+                cc_update_probation(_STATE.cc_ng.graph)
                 surface_wants(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
                 generate_emergent_want(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
             except Exception as exc:
-                logger.debug("surface_wants/emergent_want failed (non-fatal): %s", exc)
+                logger.debug("ingest-tract/probation/surface_wants/emergent_want failed (non-fatal): %s", exc)
         except Exception as exc:
             logger.warning("CC autosave failed: %s", exc)
 
