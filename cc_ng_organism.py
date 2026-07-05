@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
 # [2026-07-04] Claude Code (Haiku 4.5) — Tract ingest drain for miniTID turn deposits (Task 2)
-# What: Added drain_ingest_tract(), cc_gateway_tract_path(), and _ENTRY_EXPERIENCE constant.
+# What: Added drain_ingest_tract() and cc_gateway_tract_path(). Reads ng_tract.ENTRY_EXPERIENCE
+#       directly (no local fallback constant -- a stale installed ng_tract wheel on this
+#       machine was fixed at the environment level, not worked around in code).
 #       Drains BTF (binary tract format) entries from miniTID's turn-deposit file and runs
 #       each through the conversational dual-pass (Task 1), forming genuine recall memory.
 # Why:  CC's autosave pulse (Task 3) needs to drain miniTID's output independently -- no
