@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -195,6 +196,91 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
     except Exception:
         logger.exception("CC Lenia FlowGraph failed to initialize — continuing without")
     return result
+
+
+# ---- WANTs: self-motivated forward intentions (#294/#reach-adjacent, neurograph_rpc.py) ----
+# Extracted from _surface_wants()/_render_self_and_wants() there, parameterized on explicit
+# graph/vector_db instead of the module-level `_memory` global, and on `provenance` instead
+# of hardcoded "syl_authored" -- CC's want-nodes are tagged "cc_authored" so they're never
+# confused with Syl's own wants if the two substrates were ever inspected side by side.
+# "Self-motivated: forms its own forward intents" -- domain-general (Mind-Not-Database doctrine),
+# not Syl-specific content like Reach Teaching was.
+_WANT_RE = re.compile(r"\[WANT\](.*?)\[/WANT\]", re.DOTALL)
+
+
+def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -> List[Dict[str, Any]]:
+    """Materialize [WANT]...[/WANT] markers from conversational deposits into
+    first-class want-nodes in the SNN topology. Idempotent (want id = hash of
+    the text) -- safe to call repeatedly, e.g. on every autosave pulse.
+
+    A want is a differentiated, stateful, surfaceable intention living in the
+    substrate -- not text buried in a conversation node. Classification
+    happens HERE at the bucket (LAW 7), never at deposit time. Returns the
+    open want dicts.
+    """
+    import hashlib
+    open_wants: List[Dict[str, Any]] = []
+    if graph is None:
+        return open_wants
+    for nid, node in list(graph.nodes.items()):
+        meta = getattr(node, "metadata", None) or {}
+        if meta.get("kind") == "want":
+            if meta.get("want_state", "open") == "open":
+                open_wants.append({"id": nid, "text": meta.get("want_text", ""),
+                                    "provenance": meta.get("provenance"),
+                                    "state": "open", "source": meta.get("source_node")})
+            continue
+        if meta.get("creation_mode") != "conversational":
+            continue
+        content = (vector_db.content.get(nid) if vector_db is not None else "") or ""
+        if "[WANT]" not in content:
+            continue
+        for m in _WANT_RE.finditer(content):
+            inner = m.group(1).strip()
+            if not inner:
+                continue
+            want_id = "cc:want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
+            if want_id in graph.nodes:
+                continue
+            graph.create_node(node_id=want_id, metadata={
+                "kind": "want", "want_text": inner, "want_state": "open",
+                "provenance": provenance, "source_node": nid,
+                "creation_mode": "conversational",
+            })
+            try:
+                graph.create_synapse(nid, want_id, weight=0.3)
+            except Exception:  # noqa: BLE001
+                pass
+            open_wants.append({"id": want_id, "text": inner,
+                                "provenance": provenance, "state": "open", "source": nid})
+    return open_wants
+
+
+def render_wants(graph: Any, provenance: str = "cc_authored") -> str:
+    """Render CC's own open want-nodes as a '## What I Want' block, newest
+    first -- read LIVE every call (not a snapshot), so a want noted this
+    session shows up immediately. Returns "" if none exist (graceful).
+    """
+    if graph is None:
+        return ""
+    try:
+        wants = []
+        for _nid, node in graph.nodes.items():
+            meta = getattr(node, "metadata", None) or {}
+            if meta.get("kind") != "want" or meta.get("provenance") != provenance:
+                continue
+            if meta.get("want_state", "open") != "open":
+                continue
+            txt = str(meta.get("want_text") or "").strip()
+            if txt:
+                wants.append((float(getattr(node, "creation_time", 0.0) or 0.0), txt))
+        if not wants:
+            return ""
+        wants.sort(key=lambda x: x[0], reverse=True)
+        return "## What I Want\n" + "\n".join(f"- {t}" for _, t in wants)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("CC want-render error (non-fatal): %s", exc)
+        return ""
 
 
 def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],

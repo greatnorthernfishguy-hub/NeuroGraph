@@ -377,6 +377,13 @@ def _handle_session_start(data):
     query = "session start " + cwd
     k = RECALL_K_BRIEF if brief else RECALL_K
     context = _recall(query, k)
+    # WANTs teaching hint (#294/Mind-Not-Database, mirrors Anima's
+    # _animus_session_briefing) -- once per SessionStart.
+    hint = ("[NeuroGraph] You can note a forward intention with "
+            "[WANT]text[/WANT] anywhere in your response -- it materializes "
+            "as a node in your own substrate and surfaces back to you in "
+            "later turns under '## What I Want'.")
+    context = (hint + "\n\n" + context) if context else hint
     return {"ok": True, "context": context, "refcount": _STATE.refcount}
 
 
@@ -396,6 +403,15 @@ def _handle_user_prompt_submit(data):
     # Deposit async — on_message() runs a full SNN step (1-4s); hook timeout is 2s
     threading.Thread(target=_deposit, args=(prompt,), daemon=True).start()
     context = _recall(prompt, RECALL_K)
+    # WANTs: surface open want-nodes every turn (read LIVE, not a snapshot).
+    try:
+        from cc_ng_organism import render_wants
+        ng = _STATE.cc_ng
+        wants_block = render_wants(ng.graph) if ng is not None else ""
+        if wants_block:
+            context = (context + "\n\n" + wants_block) if context else wants_block
+    except Exception as exc:
+        logger.debug("render_wants failed (non-fatal): %s", exc)
     return {"ok": True, "context": context}
 
 
@@ -593,6 +609,13 @@ def _autosave_loop() -> None:
             with _STATE.cc_ng.graph._concurrent_lock:
                 _STATE.cc_ng.save()
             logger.debug("CC autosave complete")
+            # WANTs (#294/Mind-Not-Database): materialize any [WANT]...[/WANT]
+            # markers deposited since the last pulse into first-class want-nodes.
+            try:
+                from cc_ng_organism import surface_wants
+                surface_wants(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
+            except Exception as exc:
+                logger.debug("surface_wants failed (non-fatal): %s", exc)
         except Exception as exc:
             logger.warning("CC autosave failed: %s", exc)
 
