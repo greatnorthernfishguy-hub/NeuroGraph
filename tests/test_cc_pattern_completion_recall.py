@@ -1,3 +1,10 @@
+# ---- Changelog ----
+# [2026-07-06] Claude Code (Sonnet 5) — Pattern-completion recall tests
+# What: Tests for cc_pattern_completion_recall(), _format_cc_recall_block(), gate_pattern_completion().
+# Why:  docs/prd/2026-07-06-cc-surfacing-pattern-completion-tier-drop.md.
+# How:  Real NeuroGraphMemory fixture (same pattern as test_cc_dual_pass.py's cc_ng fixture) for the
+#       recall/formatting tests; plain-dict tests for the pure gate function.
+# -------------------
 import sys
 sys.path.insert(0, '/home/josh/NeuroGraph')
 import tempfile, shutil

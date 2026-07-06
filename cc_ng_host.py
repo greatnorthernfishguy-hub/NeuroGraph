@@ -184,7 +184,6 @@ REFCOUNT_PATH = os.path.join(CC_NG_WORKSPACE, "refcount")
 AUTOSAVE_INTERVAL = 60.0  # seconds
 
 # --- Recall ---
-RECALL_THRESHOLD = 0.4
 RECALL_K = 5
 RECALL_K_BRIEF = 3
 
