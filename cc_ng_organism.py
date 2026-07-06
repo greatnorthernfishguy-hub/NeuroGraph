@@ -930,3 +930,32 @@ def _format_cc_recall_block(results: List[Dict[str, Any]]) -> str:
     for r in results:
         lines.append(f"- [{r['score']:.2f}] {r['content']}")
     return "\n".join(lines)
+
+
+PATTERN_COMPLETION_FILE_TTL = 1800.0  # seconds (30 min) -- see gate_pattern_completion()
+
+
+def gate_pattern_completion(cache: Dict[str, float], file_path: str, now: float,
+                              ttl: float = PATTERN_COMPLETION_FILE_TTL) -> bool:
+    """Per-file dedup gate for PreToolUse-triggered pattern-completion recall
+    (2026-07-06 refinement to the tier-drop design). Pure function over a
+    plain dict -- no I/O, no graph access.
+
+    PreToolUse fires on every tool call touching a file, far more often than
+    UserPromptSubmit -- without this gate, repeatedly touching the same file
+    during one task would re-pay cc_pattern_completion_recall()'s .recall()
+    cost every single time. Returns True (and records `now` in
+    cache[file_path]) when file_path has no entry or its entry is older than
+    `ttl` seconds -- the caller should run the pattern-completion pass.
+    Returns False (cache untouched) when the same file already got a pass
+    within the TTL window -- the caller should skip straight to
+    SurfacingMonitor-only context.
+
+    UserPromptSubmit never calls this gate -- every turn's prompt warrants a
+    fresh pattern-completion pass regardless of recency.
+    """
+    last = cache.get(file_path)
+    if last is None or (now - last) > ttl:
+        cache[file_path] = now
+        return True
+    return False

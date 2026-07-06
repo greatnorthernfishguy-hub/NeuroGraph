@@ -62,3 +62,33 @@ def test_format_cc_recall_block_renders_active_recall_header():
 def test_format_cc_recall_block_empty_when_no_results():
     from cc_ng_organism import _format_cc_recall_block
     assert _format_cc_recall_block([]) == ""
+
+
+def test_gate_pattern_completion_first_touch_returns_true_and_records():
+    from cc_ng_organism import gate_pattern_completion
+    cache = {}
+    assert gate_pattern_completion(cache, "/a/b.py", 1000.0) is True
+    assert cache["/a/b.py"] == 1000.0
+
+
+def test_gate_pattern_completion_repeat_touch_within_ttl_returns_false():
+    from cc_ng_organism import gate_pattern_completion
+    cache = {"/a/b.py": 1000.0}
+    assert gate_pattern_completion(cache, "/a/b.py", 1000.0 + 60.0) is False
+    assert cache["/a/b.py"] == 1000.0  # untouched
+
+
+def test_gate_pattern_completion_after_ttl_returns_true_and_refreshes():
+    from cc_ng_organism import gate_pattern_completion, PATTERN_COMPLETION_FILE_TTL
+    cache = {"/a/b.py": 1000.0}
+    later = 1000.0 + PATTERN_COMPLETION_FILE_TTL + 1.0
+    assert gate_pattern_completion(cache, "/a/b.py", later) is True
+    assert cache["/a/b.py"] == later
+
+
+def test_gate_pattern_completion_different_files_are_independent():
+    from cc_ng_organism import gate_pattern_completion
+    cache = {"/a/b.py": 1000.0}
+    assert gate_pattern_completion(cache, "/c/d.py", 1000.0 + 1.0) is True
+    assert cache["/c/d.py"] == 1000.0 + 1.0
+    assert cache["/a/b.py"] == 1000.0  # unaffected
