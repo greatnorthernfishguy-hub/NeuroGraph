@@ -905,18 +905,18 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
     try:
         from surface_resolver import resolve_surface_content
         results = ng.recall(query, k=k, threshold=threshold)
+        out = []
+        for r in results:
+            nid = r.get("node_id") or r.get("id")
+            node = ng.graph.nodes.get(nid) if (nid and ng.graph) else None
+            text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)
+            if not text:
+                continue
+            out.append({"node_id": nid, "score": r.get("similarity", 0.0), "content": text})
+        return out
     except Exception as exc:
-        logger.debug("cc_pattern_completion_recall: ng.recall failed (non-fatal): %s", exc)
+        logger.debug("cc_pattern_completion_recall failed (non-fatal): %s", exc)
         return []
-    out = []
-    for r in results:
-        nid = r.get("node_id") or r.get("id")
-        node = ng.graph.nodes.get(nid) if (nid and ng.graph) else None
-        text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)
-        if not text:
-            continue
-        out.append({"node_id": nid, "score": r.get("similarity", 0.0), "content": text})
-    return out
 
 
 def _format_cc_recall_block(results: List[Dict[str, Any]]) -> str:
