@@ -518,8 +518,11 @@ def _handle_pre_tool_use(data):
     # Per-file dedup gate (2026-07-06): see cc-ng-daemon.py's identical comment.
     allow_pc = True
     if file_path:
-        from cc_ng_organism import gate_pattern_completion
-        allow_pc = gate_pattern_completion(_STATE.pattern_completion_cache, file_path, time.time())
+        try:
+            from cc_ng_organism import gate_pattern_completion
+            allow_pc = gate_pattern_completion(_STATE.pattern_completion_cache, file_path, time.time())
+        except Exception as exc:
+            logger.debug("gate_pattern_completion failed (non-fatal): %s", exc)
     context = _recall(query, RECALL_K, allow_pattern_completion=allow_pc)
     return {"ok": True, "context": context}
 
