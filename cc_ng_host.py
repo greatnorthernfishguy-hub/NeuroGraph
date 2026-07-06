@@ -24,6 +24,15 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-06] Claude Code (Sonnet 5) — Wire pattern-completion recall + per-file cache
+# What: _recall() gains allow_pattern_completion kwarg; combines SurfacingMonitor's
+#       block with a new Active Recall block from cc_pattern_completion_recall().
+#       _handle_pre_tool_use() gates the latter per-file via gate_pattern_completion()
+#       (30 min TTL) so repeated touches to one file in a task don't re-pay the cost.
+# Why:  docs/prd/2026-07-06-cc-surfacing-pattern-completion-tier-drop.md — CC's
+#       surfacing was recency-biased only; this adds pattern-completion alongside it.
+# How:  cc_pattern_completion_recall/_format_cc_recall_block/gate_pattern_completion,
+#       all in cc_ng_organism.py (Tasks 1-2 of that PRD's implementation plan).
 # [2026-07-05] CC (laptop) — Tool-call deposits: Commons-only, never the main substrate (Josh-approved)
 # What: Added _deposit_tool_experience(), used by _handle_post_tool_use() instead of the shared
 #   _deposit(). Tool-call telemetry (Read/Edit/Write/Bash) now deposits ONLY into CC's own
@@ -247,6 +256,7 @@ class _CCHostState:
         self.concept_queue: list = []
         self.commons = None
         self.conv_state = {"last_forest_id": None}
+        self.pattern_completion_cache = {}  # file_path -> last pattern-completion timestamp (2026-07-06)
         self.stats_lock = threading.Lock()
         self.stats = {
             "started_at": 0.0,
@@ -334,37 +344,47 @@ def _deposit_tool_experience(text: str) -> None:
         logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
 
 
-def _recall(query: str, k: int) -> str:
+def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
+    """Return surfacing context for CC hook injection.
+
+    Combines SurfacingMonitor (recency) with Active Recall (pattern
+    completion via cc_pattern_completion_recall) — see docs/prd/2026-07-06-
+    cc-surfacing-pattern-completion-tier-drop.md. allow_pattern_completion=
+    False skips the Active Recall half — used by _handle_pre_tool_use() when
+    gate_pattern_completion() has already covered this file_path recently.
+    """
     ng = _STATE.cc_ng
     if ng is None or not query:
         return ""
     with _STATE.stats_lock:
         _STATE.stats["recalls"] += 1
+
+    monitor_ctx = ""
     try:
-        # Primary: CES SurfacingMonitor (O(1) — active when CES enabled)
         monitor = getattr(ng, '_surfacing_monitor', None)
         if monitor is not None:
-            ctx = monitor.format_context()
-            if ctx:
-                return ctx
-        # Fallback: vector recall without lock (read-only; RuntimeError on dict
-        # mutation race is caught cleanly — Tonic can't block this path)
-        results = ng.recall(query, k=k, threshold=RECALL_THRESHOLD)
-        if not results:
-            return ""
-        lines = ["[NeuroGraph] Relevant context:"]
-        for r in results:
-            text = r.get("content", "") if isinstance(r, dict) else str(r)
-            if text.strip():
-                lines.append("- " + text.strip()[:200])
-        return "\n".join(lines) if len(lines) > 1 else ""
+            monitor_ctx = monitor.format_context()
     except RuntimeError:
-        return ""  # dict mutation race during concurrent deposit
+        monitor_ctx = ""  # dict mutation race during concurrent deposit
     except Exception as exc:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1
         logger.debug("CC recall failed: %s", exc)
-        return ""
+        monitor_ctx = ""
+
+    pc_block = ""
+    if allow_pattern_completion:
+        try:
+            from cc_ng_organism import cc_pattern_completion_recall, _format_cc_recall_block
+            results = cc_pattern_completion_recall(ng, query, k)
+            pc_block = _format_cc_recall_block(results)
+        except Exception as exc:
+            logger.debug("Pattern-completion recall failed (non-fatal): %s", exc)
+            pc_block = ""
+
+    if monitor_ctx and pc_block:
+        return monitor_ctx + "\n\n" + pc_block
+    return monitor_ctx or pc_block
 
 
 def _nudge(text: str) -> None:
@@ -495,7 +515,12 @@ def _handle_pre_tool_use(data):
         return {"ok": True, "context": ""}
     # L1 cache nudge — pre-activates nodes related to this file/tool before recall
     _nudge(query)
-    context = _recall(query, RECALL_K)
+    # Per-file dedup gate (2026-07-06): see cc-ng-daemon.py's identical comment.
+    allow_pc = True
+    if file_path:
+        from cc_ng_organism import gate_pattern_completion
+        allow_pc = gate_pattern_completion(_STATE.pattern_completion_cache, file_path, time.time())
+    context = _recall(query, RECALL_K, allow_pattern_completion=allow_pc)
     return {"ok": True, "context": context}
 
 
