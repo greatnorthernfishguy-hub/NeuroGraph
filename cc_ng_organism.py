@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-06] Claude Code (Sonnet 5) — Pattern-completion recall (Active Recall block)
+# What: Added cc_pattern_completion_recall() and _format_cc_recall_block().
+# Why:  CC's surfacing was recency-biased only (SurfacingMonitor's fired-node queue) --
+#       no analog of hippocampal pattern completion (a query reactivating content
+#       regardless of when it was learned). This adds that second retrieval path,
+#       alongside SurfacingMonitor, not replacing it. See docs/prd/2026-07-06-cc-
+#       surfacing-pattern-completion-tier-drop.md.
+# How:  Thin wrapper over ng.recall() (already a NeuroGraphMemory method) +
+#       resolve_surface_content() (already generic/portable) -- mirrors canonical's
+#       handle_assemble() Active Recall block (neurograph_rpc.py:3085-3110) exactly.
 # [2026-07-05] CC (laptop) — Incremental Lenia distance-cache extension (Josh-approved)
 # What: bootstrap_lenia() now extends the on-disk DistanceCache in place when CC's graph
 #       only grew since the last save, instead of nuking and repopulating from scratch
@@ -870,3 +880,53 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
     if absorbed:
         logger.info("CC ingest-tract: absorbed %d turn(s) into recall", absorbed)
     return absorbed
+
+
+def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
+                                    threshold: float = 0.40) -> List[Dict[str, Any]]:
+    """Direct semantic recall for CC's own hook surfacing -- pattern
+    completion alongside SurfacingMonitor's recency-biased queue (2026-07-06
+    tier-drop design). Mirrors canonical's handle_assemble() Active Recall
+    block (neurograph_rpc.py:3085-3110) exactly, parameterized on `ng`
+    instead of the module-level `_memory` global -- same extraction pattern
+    as every other function in this file.
+
+    threshold default 0.40 is the ecosystem's confidence_recommend value
+    (ng_ecosystem.py) -- the same default canonical's own Active Recall uses
+    (ANIMA_RECALL_THRESHOLD env var default), not a new invented threshold.
+
+    Returns a list of {node_id, score, content} dicts -- content already
+    resolved substrate-first via resolve_surface_content (her _forest_content
+    over the vdb shard), degenerate/filtered results dropped. Fails soft:
+    any exception returns [].
+    """
+    if not query or ng is None:
+        return []
+    try:
+        from surface_resolver import resolve_surface_content
+        results = ng.recall(query, k=k, threshold=threshold)
+    except Exception as exc:
+        logger.debug("cc_pattern_completion_recall: ng.recall failed (non-fatal): %s", exc)
+        return []
+    out = []
+    for r in results:
+        nid = r.get("node_id") or r.get("id")
+        node = ng.graph.nodes.get(nid) if (nid and ng.graph) else None
+        text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)
+        if not text:
+            continue
+        out.append({"node_id": nid, "score": r.get("similarity", 0.0), "content": text})
+    return out
+
+
+def _format_cc_recall_block(results: List[Dict[str, Any]]) -> str:
+    """Format cc_pattern_completion_recall() results as an '## Active Recall'
+    block -- mirrors canonical's handle_assemble() Active Recall formatting
+    (neurograph_rpc.py:3094-3107) exactly. Returns '' when results is empty.
+    """
+    if not results:
+        return ""
+    lines = ["## Active Recall\nDirect memory retrieval for the current query:"]
+    for r in results:
+        lines.append(f"- [{r['score']:.2f}] {r['content']}")
+    return "\n".join(lines)
