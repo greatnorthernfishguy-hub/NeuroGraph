@@ -165,6 +165,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("cc_ng_organism")
@@ -703,10 +704,17 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
         try:
             import random as _rnd
             d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
+            # Create bidirectional delayed synapse: last → current (forward continuity)
+            # and current → last (backward anticipation for the next cycle)
             graph.create_synapse(last_id, forest_id, weight=0.2, delay=d)
+            graph.create_synapse(forest_id, last_id, weight=0.2, delay=d)
         except Exception:
             pass
     state["last_forest_id"] = forest_id
+    # Anticipatory pre-activation (#256 port): this turn's forest+trees are
+    # CC's "just fired" set — prime their synaptic neighborhood for the next
+    # recall. state carries primed_nodes to the daemons' _recall(). (#358)
+    cc_anticipate(graph, [forest_id] + tree_ids, state)
 
 
 def cc_update_probation(graph) -> list:
@@ -974,6 +982,43 @@ def gate_pattern_completion(cache: Dict[str, float], file_path: str, now: float,
         cache[file_path] = now
         return True
     return False
+
+
+def cc_anticipate(graph, fired_node_ids, state: dict) -> None:
+    """Anticipatory pre-activation for CC (#256 port, #358).
+
+    Verbatim port of canonical _anticipate() (neurograph_rpc.py:2716-2742)
+    with two mandated differences (law-review C1): the primed dict lives in
+    the caller's state dict — NOT a module global (cc_ng_host runs inside
+    Syl's process, where the _primed_nodes global is HERS) — and it walks
+    only the graph argument passed in, never _memory.graph.
+
+    Walks outgoing synapses from the just-fired set, scores neighbors by
+    accumulated edge weight, stores top-K with a TTL. The rebuilt
+    cc_pattern_completion_recall() applies _CC_ANTICIPATE_BONUS to surfaced
+    nodes still in the live primed set.
+    """
+    try:
+        if not fired_node_ids or graph is None:
+            state["primed_nodes"] = {}
+            return
+        fired_set = set(fired_node_ids)
+        candidates = {}
+        for nid in fired_node_ids:
+            for sid in graph._outgoing.get(nid, ()):
+                syn = graph.synapses.get(sid)
+                if syn is None:
+                    continue
+                target = syn.post_node_id
+                if target not in fired_set and target in graph.nodes:
+                    candidates[target] = candidates.get(target, 0.0) + syn.weight
+        top_k = sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:_CC_ANTICIPATE_TOP_K]
+        expiry = time.time() + _CC_ANTICIPATE_TTL_S
+        state["primed_nodes"] = {nid: (score, expiry) for nid, score in top_k}
+        if state["primed_nodes"]:
+            logger.debug("CC anticipatory pre-activation: primed %d nodes", len(state["primed_nodes"]))
+    except Exception as exc:
+        logger.debug("cc_anticipate failed (non-fatal): %s", exc)
 
 
 # --- Retrieval-enrichment constants (#358) ---

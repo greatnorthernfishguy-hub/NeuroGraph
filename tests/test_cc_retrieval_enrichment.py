@@ -93,3 +93,44 @@ def test_novelty_fails_soft_when_counters_missing():
         pass
 
     assert cc_novelty({}, Bare()) == 0.5
+
+
+# ---- Task 2: cc_anticipate ----
+
+def test_cc_anticipate_primes_synaptic_neighbors(cc_ng):
+    from cc_ng_organism import cc_anticipate
+    g = cc_ng.graph
+    g.create_node(node_id="fired_a")
+    g.create_node(node_id="neighbor_b")
+    g.create_node(node_id="neighbor_c")
+    g.create_synapse("fired_a", "neighbor_b", weight=0.9)
+    g.create_synapse("fired_a", "neighbor_c", weight=0.3)
+    state = {}
+    cc_anticipate(g, ["fired_a"], state)
+    primed = state["primed_nodes"]
+    assert "neighbor_b" in primed and "neighbor_c" in primed
+    assert "fired_a" not in primed            # fired nodes are not their own predictions
+    assert primed["neighbor_b"][0] > primed["neighbor_c"][0]   # scored by edge weight
+    assert primed["neighbor_b"][1] > time.time()               # future expiry
+
+
+def test_cc_anticipate_empty_fired_clears_primed(cc_ng):
+    from cc_ng_organism import cc_anticipate
+    state = {"primed_nodes": {"stale": (1.0, time.time() + 999)}}
+    cc_anticipate(cc_ng.graph, [], state)
+    assert state["primed_nodes"] == {}
+
+
+def test_dual_pass_drain_triggers_anticipation(cc_ng):
+    """Integration: the conversational dual-pass (the anticipate trigger site)
+    leaves a primed set in the same state dict the daemons pass around."""
+    from cc_ng_organism import run_conversational_dual_pass
+    from ng_embed import embed
+    state = {"last_forest_id": None}
+    text1 = "the lenia distance cache rebuild finished on the vps"
+    assert run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text1, embed(text1), state)
+    text2 = "next we verify the cc socket came alive after bootstrap"
+    assert run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text2, embed(text2), state)
+    # Turn 2's forest links back to turn 1's (delayed synapse) and forward to
+    # its trees — the anticipate walk from turn 2's nodes must prime something.
+    assert state.get("primed_nodes"), "dual-pass drain must populate primed_nodes"
