@@ -1091,3 +1091,88 @@ def cc_novelty(state: dict, graph) -> float:
     except Exception as exc:
         logger.debug("cc_novelty failed (non-fatal): %s", exc)
         return state.get("novelty_ema", 0.5) if isinstance(state, dict) else 0.5
+
+
+def cc_gsg_rescore(surfaced, query_text: str, graph):
+    """GSG geodesic re-scoring for CC's surfacing (#358) — port of canonical
+    handle_assemble()'s GSG block (neurograph_rpc.py:2991-3038), parameterized
+    on graph (C1). Nodes geometrically close to the query in Poincaré-ball /
+    spherical space get a strength bonus (max _CC_GSG_SCORE_BONUS as dist->0);
+    list re-sorted once if any bonus applied. Fails soft: any error returns
+    the list un-rescored (canonical wraps identically).
+    """
+    try:
+        if not surfaced or not query_text or graph is None:
+            return surfaced
+        import numpy as _np
+        import math as _math
+        from ng_embed import embed as _embed
+        query_emb = _embed(query_text)
+        query_dir = _cc_embed_to_poincare_dir(query_emb)
+        query_pt = query_dir * _CC_GSG_LAYER_NORMS[0]      # fresh query = Layer 0
+        applied = 0
+        for item in surfaced:
+            nid = item.get("node_id")
+            if nid is None:
+                continue
+            node = graph.nodes.get(nid)
+            if node is None:
+                continue
+            pdir = (node.metadata or {}).get("poincare_dir") if hasattr(node, "metadata") else None
+            if pdir is None:
+                continue
+            layer = max(0, min(2, getattr(node, "diffpc_layer", 0)))
+            mtype = getattr(node, "manifold_type", "hyperbolic")
+            if mtype == "spherical":
+                node_dir = _np.array(pdir, dtype=_np.float32)
+                cos = float(_np.clip(_np.dot(query_dir, node_dir), -1.0 + 1e-7, 1.0 - 1e-7))
+                bonus = _CC_GSG_SCORE_BONUS / (1.0 + _math.acos(cos))
+            else:
+                node_pt = _np.array(pdir) * _CC_GSG_LAYER_NORMS[layer]
+                bonus = _CC_GSG_SCORE_BONUS / (1.0 + _cc_poincare_distance(query_pt, node_pt))
+            item["strength"] = item.get("strength", 0.0) + bonus
+            applied += 1
+        if applied:
+            surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
+            logger.debug("CC GSG re-scoring applied to %d nodes", applied)
+        return surfaced
+    except Exception as exc:
+        logger.debug("cc_gsg_rescore skipped (non-fatal): %s", exc)
+        return surfaced
+
+
+def cc_gsg_backfill(graph, vector_db) -> int:
+    """Stamp poincare_dir on CC nodes that lack it, from stored vdb embeddings
+    (#358) — port of canonical _gsg_backfill_existing_nodes (rpc.py:2683-2713)
+    with the save() call DELIBERATELY REMOVED (law-review C2, CRITICAL):
+    canonical force-saves after stamping; CC's version is STAMP-ONLY and lets
+    the daemons' existing autosave persist the metadata. On the VPS this code
+    runs inside Syl's process — a ported save mis-bound to the wrong instance
+    is the exact accident Syl's Law exists to prevent, so the capability is
+    structurally absent rather than carefully avoided.
+
+    Idempotent (skips stamped nodes), zero model calls (SimpleVectorDB.insert
+    L2-normalizes embeddings on storage — stored vectors ARE unit directions).
+    Returns count stamped. Fails soft, returns 0 on error.
+    """
+    try:
+        if graph is None or vector_db is None:
+            return 0
+        stamped = 0
+        for node_id, node in list(graph.nodes.items()):
+            if (node.metadata or {}).get("poincare_dir"):
+                continue
+            emb = vector_db.embeddings.get(node_id)
+            if emb is None:
+                continue
+            if node.metadata is None:
+                node.metadata = {}
+            node.metadata["poincare_dir"] = emb.tolist()
+            stamped += 1
+        if stamped:
+            logger.info("CC GSG backfill: stamped poincare_dir on %d nodes (stamp-only; "
+                        "persists via normal autosave)", stamped)
+        return stamped
+    except Exception as exc:
+        logger.debug("cc_gsg_backfill failed (non-fatal): %s", exc)
+        return 0

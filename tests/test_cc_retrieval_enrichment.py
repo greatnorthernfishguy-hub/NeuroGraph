@@ -139,3 +139,78 @@ def test_dual_pass_drain_triggers_anticipation(cc_ng, monkeypatch):
     assert len(calls) == 1, "dual-pass must trigger cc_anticipate exactly once"
     assert state["last_forest_id"] in calls[0], "this turn's forest must be in the seed set"
     assert "primed_nodes" in state, "trigger must have populated the primed dict (possibly empty)"
+
+
+# ---- Task 3: GSG rescore + backfill ----
+
+def _mk_gsg_node(g, vdb, nid, text, direction):
+    """Node + vdb entry + poincare_dir stamp, for rescore tests."""
+    from ng_embed import embed
+    g.create_node(node_id=nid)
+    emb = embed(text)
+    vdb.insert(id=nid, embedding=emb, content=text)
+    g.nodes[nid].metadata["poincare_dir"] = direction.tolist()
+
+
+def test_gsg_rescore_bonuses_only_stamped_nodes(cc_ng):
+    from cc_ng_organism import cc_gsg_rescore, _cc_embed_to_poincare_dir
+    from ng_embed import embed
+    g, vdb = cc_ng.graph, cc_ng.vector_db
+    query = "lenia kernel distance cache"
+    qdir = _cc_embed_to_poincare_dir(embed(query))
+    # stamped node aligned with the query direction; unstamped node
+    _mk_gsg_node(g, vdb, "stamped", "lenia cache", qdir)
+    g.create_node(node_id="unstamped")
+    surfaced = [
+        {"node_id": "stamped", "strength": 1.0},
+        {"node_id": "unstamped", "strength": 1.0},
+    ]
+    out = cc_gsg_rescore(surfaced, query, g)
+    by_id = {r["node_id"]: r for r in out}
+    assert by_id["stamped"]["strength"] > 1.0          # got a bonus
+    assert by_id["unstamped"]["strength"] == 1.0        # untouched
+    assert by_id["stamped"]["strength"] <= 1.0 + 0.30   # bonus capped at _CC_GSG_SCORE_BONUS
+    assert out[0]["node_id"] == "stamped"               # re-sorted by strength
+
+
+def test_gsg_rescore_spherical_branch(cc_ng):
+    from cc_ng_organism import cc_gsg_rescore, _cc_embed_to_poincare_dir
+    from ng_embed import embed
+    g, vdb = cc_ng.graph, cc_ng.vector_db
+    query = "spherical attractor node test"
+    qdir = _cc_embed_to_poincare_dir(embed(query))
+    _mk_gsg_node(g, vdb, "sph", "spherical attractor", qdir)
+    g.nodes["sph"].manifold_type = "spherical"
+    out = cc_gsg_rescore([{"node_id": "sph", "strength": 1.0}], query, g)
+    assert out[0]["strength"] > 1.0                     # great-circle branch applied a bonus
+
+
+def test_gsg_rescore_fails_soft(cc_ng):
+    from cc_ng_organism import cc_gsg_rescore
+    surfaced = [{"node_id": "nope", "strength": 0.7}]
+    out = cc_gsg_rescore(surfaced, "", cc_ng.graph)     # empty query -> no embed
+    assert out == surfaced                              # unchanged, no raise
+
+
+def test_gsg_backfill_stamps_missing_skips_present_never_saves(cc_ng):
+    from cc_ng_organism import cc_gsg_backfill
+    from ng_embed import embed
+    g, vdb = cc_ng.graph, cc_ng.vector_db
+    g.create_node(node_id="old_node")                   # pre-GSG node: vdb entry, no stamp
+    vdb.insert(id="old_node", embedding=embed("an old memory"), content="an old memory")
+    g.create_node(node_id="already")                    # already stamped
+    vdb.insert(id="already", embedding=embed("stamped"), content="stamped")
+    g.nodes["already"].metadata["poincare_dir"] = [1.0, 0.0]
+    g.create_node(node_id="no_vdb")                     # graph-only, nothing to stamp from
+
+    save_calls = []
+    cc_ng.save = lambda *a, **k: save_calls.append("ng.save")          # C2 spies
+    g.checkpoint = lambda *a, **k: save_calls.append("graph.checkpoint")
+
+    stamped = cc_gsg_backfill(g, vdb)
+    assert stamped == 1
+    assert g.nodes["old_node"].metadata.get("poincare_dir")
+    assert g.nodes["already"].metadata["poincare_dir"] == [1.0, 0.0]   # untouched
+    assert "poincare_dir" not in (g.nodes["no_vdb"].metadata or {})
+    assert save_calls == []                             # C2: STAMP-ONLY, never persists
+    assert cc_gsg_backfill(g, vdb) == 0                 # idempotent second run
