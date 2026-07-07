@@ -24,6 +24,15 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-07] Claude Code (Fable 5) — #358 retrieval-enrichment wiring
+# What: _recall() passes _STATE.conv_state into cc_pattern_completion_recall
+#   (novelty EMA + primed-node bonus now live); init_cc_host() runs the
+#   stamp-only cc_gsg_backfill after organism bootstrap.
+# Why: #358 — CC recall rebuilt substrate-native in cc_ng_organism.py; the
+#   daemons carry only state plumbing. Spec: docs/superpowers/specs/
+#   2026-07-07-cc-retrieval-enrichment-design.md (law-review C1/C2/C4).
+# How: conv_state is the single organism-state dict (already flows through
+#   drain_ingest_tract); backfill is stamp-only — persistence rides autosave.
 # [2026-07-06] Claude Code (Sonnet 5) — Wire pattern-completion recall + per-file cache
 # What: _recall() gains allow_pattern_completion kwarg; combines SurfacingMonitor's
 #       block with a new Active Recall block from cc_pattern_completion_recall().
@@ -375,7 +384,7 @@ def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
     if allow_pattern_completion:
         try:
             from cc_ng_organism import cc_pattern_completion_recall, _format_cc_recall_block
-            results = cc_pattern_completion_recall(ng, query, k)
+            results = cc_pattern_completion_recall(ng, query, k, state=_STATE.conv_state)
             pc_block = _format_cc_recall_block(results)
         except Exception as exc:
             logger.debug("Pattern-completion recall failed (non-fatal): %s", exc)
@@ -815,6 +824,10 @@ def init_cc_host() -> bool:
         _STATE.trisyn_manager = bootstrap_trisynaptic(
             cc_ng, _STATE.concept_queue, instance_tag="cc-vps")
         _STATE.commons = get_cc_commons(CC_NG_WORKSPACE)
+        from cc_ng_organism import cc_gsg_backfill
+        _stamped = cc_gsg_backfill(cc_ng.graph, cc_ng.vector_db)
+        if _stamped:
+            logger.info("CC GSG backfill at init: %d nodes stamped (persists via autosave)", _stamped)
     except Exception:
         logger.exception("CC organism-layer bootstrap failed (non-fatal)")
     logger.info("DIAG: init_cc_host() organism-layer bootstrap done, binding socket...")
