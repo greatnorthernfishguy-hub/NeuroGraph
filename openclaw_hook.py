@@ -28,6 +28,21 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-07-07] Claude Code (Fable 5) — Skip orphaned prime seeds in _harvest_associations (Josh-approved)
+#   What: seed-selection loop gains `and entry_id in self.graph.nodes` — vdb search hits whose
+#         graph node was orphan-pruned (#237) are skipped instead of being handed to
+#         prime_and_propagate.
+#   Why:  one dead seed ID raised KeyError inside prime_and_propagate, the harvest's own
+#         try/except swallowed it at logger.debug, and the ENTIRE spreading-activation harvest
+#         silently returned [] — no surfaced associations for that turn, invisible at INFO
+#         logging. Constant for CC (204 live nodes vs 3,194 vdb entries post-cleanup — top-k
+#         seeds are almost always orphans); intermittent for Syl (her vdb carries orphans too,
+#         so any turn whose top similarity hits included one lost its harvest). Found while
+#         live-verifying the #358 substrate-native recall on the laptop; punchlist #358 thread,
+#         dev-log 2026-07-07_cc-retrieval-enrichment-358.md.
+#   How:  membership check only — no behavior change for live seeds, no signature change,
+#         code-only (no checkpoint/state format touched). Fix-at-source (LAW 4): every
+#         consumer (Syl's handle_assemble, associate(), CC's rebuilt recall) heals at once.
 # [2026-07-03] Claude Code (Sonnet 5) — Wait for stable checkpoint before restore (Josh-approved; checkpoints backed up)
 #   What: New module-level _wait_for_stable_checkpoint() polls a checkpoint file's size until
 #         it stops changing (or times out) before NeuroGraphMemory.__init__ attempts to restore
@@ -962,11 +977,15 @@ class NeuroGraphMemory:
                 query_vec, k=prime_k, threshold=prime_threshold
             )
 
-            # Filter out newly created nodes (they ARE the input)
+            # Filter out newly created nodes (they ARE the input) and vdb
+            # entries whose graph node no longer exists (orphaned by #237
+            # pruning) — a single dead seed ID raised KeyError inside
+            # prime_and_propagate and silently killed the ENTIRE harvest
+            # (caught below, returned [], logged at debug only). [2026-07-07]
             prime_ids = []
             prime_currents = []
             for entry_id, sim_score in similar:
-                if entry_id not in exclude_node_ids:
+                if entry_id not in exclude_node_ids and entry_id in self.graph.nodes:
                     prime_ids.append(entry_id)
                     prime_currents.append(sim_score * prime_strength)
 
