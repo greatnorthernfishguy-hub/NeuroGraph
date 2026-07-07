@@ -12,6 +12,20 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-07-06] Claude Code (Sonnet 5) — Periodic Lenia checkpointing during populate() (Josh-approved)
+#   What: both handle_bootstrap() populate() call sites now pass
+#     checkpoint_interval_secs=_LENIA_CHECKPOINT_INTERVAL_SECS (5 min, new
+#     module constant) and on_checkpoint=lambda: lenia_cache.save(_cache_path).
+#   Why: the 2026-07-05 incremental-extension fix made restarts cheaper but
+#     did nothing for a run interrupted mid-populate — the only save() call
+#     happened once, after the whole loop returned, unreachable on a hard
+#     process kill. Confirmed live with Josh 2026-07-06: distance_cache.npz
+#     was still dated 2026-07-02 after multiple full-day restart cycles,
+#     each discarding 100% of that attempt's progress and re-triggering the
+#     same "incompatible, full repopulate" path from the same stale save.
+#   How: see lenia/kernel.py's populate() — checkpointing happens inside its
+#     own loop now, time-checked every 1000 pairs, calling the caller's save
+#     callback rather than a hardcoded path.
 # [2026-07-05] CC (laptop) — Incremental Lenia distance-cache extension (Josh-approved)
 #   What: handle_bootstrap's Lenia block now extends the on-disk DistanceCache in place
 #     when the graph only grew since the last save, instead of nuking and repopulating
@@ -679,6 +693,7 @@ _kiss_filter: Optional[Any] = None
 # so count-based auto-save never fires if the gateway restarts frequently.
 _last_save_time: float = 0.0
 _SAVE_INTERVAL_SECS: float = 300.0  # 5 minutes
+_LENIA_CHECKPOINT_INTERVAL_SECS: float = 300.0  # 5 minutes — same cadence, applied inside populate()'s own loop
 _MAX_DRAIN_NODES: int = 15000  # Stop experience ingestion above this node count
 
 # Commons checkpoint (#332) — separate file from Syl's own main.msgpack/vectors.msgpack.
@@ -2026,7 +2041,11 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
                 )
             lenia_cache = DistanceCache(n_entities, entity_ids=lenia_substrate.entities())
             try:
-                lenia_cache.populate(lenia_substrate)
+                lenia_cache.populate(
+                    lenia_substrate,
+                    checkpoint_interval_secs=_LENIA_CHECKPOINT_INTERVAL_SECS,
+                    on_checkpoint=lambda: lenia_cache.save(_cache_path),
+                )
             except Exception as exc:
                 logger.warning(
                     "Distance cache populate failed partway (%s) — saving "
@@ -2041,7 +2060,11 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
             )
             lenia_cache.resize(n_entities, new_entity_ids=lenia_substrate.entities())
             try:
-                lenia_cache.populate(lenia_substrate, start_index=_old_n)
+                lenia_cache.populate(
+                    lenia_substrate, start_index=_old_n,
+                    checkpoint_interval_secs=_LENIA_CHECKPOINT_INTERVAL_SECS,
+                    on_checkpoint=lambda: lenia_cache.save(_cache_path),
+                )
             except Exception as exc:
                 logger.warning(
                     "Distance cache incremental populate failed partway (%s) "

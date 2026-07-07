@@ -1,4 +1,16 @@
 # ---- Changelog ----
+# [2026-07-06] Claude Code (Sonnet 5) — Periodic in-loop checkpointing tests
+# What: test_populate_periodic_checkpoint_saves_a_loadable_cache_before_loop_completes,
+#   test_populate_checkpoint_disabled_by_default_makes_no_checkpoint_calls.
+# Why: proves populate()'s new checkpoint_interval_secs/on_checkpoint actually
+#   produce a genuinely reloadable on-disk cache DURING the loop (not just
+#   that a callback fired) -- the real-world property that matters is "a
+#   process kill mid-populate now leaves something recoverable," not merely
+#   "the callback was invoked."
+# How: real DistanceCache/NeuroGraphSubstrate/Graph (matches this file's own
+#   no-mocks convention). idx=0 always satisfies the `idx % 1000 == 0` gate
+#   by construction, so a tiny checkpoint_interval_secs deterministically
+#   fires the very first check without needing a 1000+-pair graph.
 # [2026-07-05] CC (laptop) — Incremental Lenia distance-cache extension
 # What: Tests for DistanceCache.populate(start_index=...)/resize(new_entity_ids=...)/
 #   entity_ids save-load roundtrip, and NeuroGraphSubstrate's known_entity_order
@@ -191,3 +203,37 @@ def test_known_entity_order_appends_new_entities_after_known_ones():
     assert sub2.entities()[len(known_order):] == ["n5", "n6", "n7"]
     for eid in known_order:
         assert sub2.entity_index(eid) == known_order.index(eid)
+
+
+def test_populate_periodic_checkpoint_saves_a_loadable_cache_before_loop_completes(tmp_cache_path):
+    g = _build_chain_graph(10)
+    sub = NeuroGraphSubstrate(g, None)
+    cache = DistanceCache(sub.entity_count(), entity_ids=sub.entities())
+
+    checkpoint_calls = []
+
+    def _on_checkpoint():
+        cache.save(tmp_cache_path)
+        loaded = DistanceCache.load(tmp_cache_path)
+        checkpoint_calls.append(loaded is not None and loaded.entity_count == sub.entity_count())
+
+    cache.populate(
+        sub, checkpoint_interval_secs=1e-9, on_checkpoint=_on_checkpoint,
+    )
+
+    assert len(checkpoint_calls) >= 1, "expected at least one mid-loop checkpoint (idx=0 always qualifies)"
+    assert all(checkpoint_calls), "every checkpoint must produce a genuinely loadable cache, not just fire a callback"
+
+
+def test_populate_checkpoint_disabled_by_default_makes_no_checkpoint_calls():
+    """checkpoint_interval_secs=0.0 (the default) must be a true no-op --
+    existing callers that never pass these new kwargs get unchanged behavior."""
+    g = _build_chain_graph(10)
+    sub = NeuroGraphSubstrate(g, None)
+    cache = DistanceCache(sub.entity_count(), entity_ids=sub.entities())
+
+    checkpoint_calls = []
+    cache.populate(sub, on_checkpoint=lambda: checkpoint_calls.append(True))
+
+    assert checkpoint_calls == []
+    assert cache.populated is True  # the actual work still completed normally

@@ -36,6 +36,21 @@
 #   the hard part; start_index just filters populate()'s connected_pairs
 #   down to ones touching a new entity so the expensive distance_vector
 #   loop only runs for the delta, not the whole graph.
+# [2026-07-06] Claude Code (Sonnet 5) — Periodic in-loop checkpointing
+# What: populate() accepts checkpoint_interval_secs + on_checkpoint. Every
+#   1000 pairs, checks wall-clock elapsed since the last checkpoint and, if
+#   over the interval, rebuilds CSR and calls the caller's save callback.
+# Why: The 2026-07-05 fix made restarts cheaper (incremental vs full
+#   rebuild), but did nothing for a run that's interrupted mid-populate —
+#   the only save() call happened once, after the whole loop returned, which
+#   a hard process kill never reaches. Confirmed live: the distance cache
+#   file was still dated 2026-07-02 after multiple full-day restart cycles,
+#   each one discarding 100% of that attempt's progress. Root-caused with
+#   Josh 2026-07-06 while watching a stuck multi-hour populate() run.
+# How: checkpoint_interval_secs=0 (default) is a no-op — existing callers
+#   that don't pass it get unchanged behavior. neurograph_rpc.py's two
+#   populate() call sites pass a 5-minute interval + a lambda that calls
+#   the same cache.save(path) it already calls once at the end.
 # -------------------
 
 """Vectorized multi-metric kernel computer with dual-pass embeddings.
@@ -52,7 +67,8 @@ over entities in the hot path.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from scipy import sparse
@@ -189,7 +205,9 @@ class DistanceCache:
         self._components_csr = None  # invalidate CSR cache
         self._magnitude_csr = None
 
-    def populate(self, substrate: LeniaSubstrate, start_index: int = 0):
+    def populate(self, substrate: LeniaSubstrate, start_index: int = 0,
+                 checkpoint_interval_secs: float = 0.0,
+                 on_checkpoint: Optional[Callable[[], None]] = None):
         """Populate the cache from the substrate.
 
         Called once on startup. Subsequent updates use dirty flags.
@@ -206,6 +224,19 @@ class DistanceCache:
                 Existing entity-to-entity distances already in the cache
                 are left untouched. Caller must already have called
                 resize() to grow the matrices to the new entity_count.
+            checkpoint_interval_secs: if > 0, calls `on_checkpoint()` at
+                most once every this many wall-clock seconds of progress
+                through the loop below. This loop can run for hours; before
+                this parameter existed, the only save happened once, after
+                the whole loop returned — a hard process kill mid-loop never
+                reaches that point, so every restart discarded 100% of that
+                run's progress and re-triggered the same multi-hour attempt
+                from the same stale save. 0 (default) disables periodic
+                checkpointing — unchanged behavior otherwise.
+            on_checkpoint: callback invoked per the interval above —
+                typically the caller's own `lambda: cache.save(path)`. Kept
+                as a callback, not a hardcoded path, so this class stays
+                I/O-path-agnostic; neurograph_rpc.py already owns the path.
         """
         n = substrate.entity_count()
         if n == 0:
@@ -279,7 +310,8 @@ class DistanceCache:
         # should still persist whatever was computed rather than
         # discarding it because _populated never flipped true.
         self._populated = True
-        for i, j in connected_pairs:
+        _last_checkpoint = time.monotonic()
+        for idx, (i, j) in enumerate(connected_pairs):
             eid_i = substrate.index_to_entity(i)
             eid_j = substrate.index_to_entity(j)
             dvec = substrate.distance_vector(eid_i, eid_j)
@@ -287,6 +319,26 @@ class DistanceCache:
                 if abs(dvec[c]) > 1e-15:
                     self._components_lil[c][i, j] = dvec[c]
                     self._components_lil[c][j, i] = dvec[c]
+            # Periodic checkpoint, only time-checked every 1000 pairs so
+            # time.monotonic() itself doesn't add per-pair overhead across
+            # a loop that can run into the millions of iterations.
+            if (checkpoint_interval_secs > 0 and on_checkpoint is not None
+                    and idx % 1000 == 0):
+                _now = time.monotonic()
+                if _now - _last_checkpoint >= checkpoint_interval_secs:
+                    try:
+                        self._rebuild_csr()  # save() reads the CSR form
+                        on_checkpoint()
+                        _last_checkpoint = _now
+                        logger.info(
+                            "Lenia periodic checkpoint: %d/%d pairs processed",
+                            idx + 1, len(connected_pairs),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Periodic Lenia checkpoint failed (non-fatal) at "
+                            "pair %d/%d", idx + 1, len(connected_pairs),
+                        )
 
         self._rebuild_csr()
         logger.info("Distance cache populated: %d pairs", len(connected_pairs))
