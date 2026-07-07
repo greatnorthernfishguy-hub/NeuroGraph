@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-07] Claude Code (Fable 5) — Retrieval-enrichment extraction (#358)
+# What: cc_novelty (pull-based MMN EMA), cc_anticipate (#256 port),
+#   cc_gsg_rescore + _cc_poincare_distance + cc_gsg_backfill (GSG surfacing
+#   port, stamp-only backfill), cc_pattern_completion_recall rebuilt on
+#   _harvest_associations spreading activation. Constants copied verbatim
+#   from neurograph_rpc.py (C5 — test-pinned in test_cc_retrieval_enrichment).
+# Why: #358 audit — CC's recall was bare vector-cosine (VDB-primacy inversion);
+#   Syl's three retrieval-time enrichments lived only in neurograph_rpc.py.
+#   Spec: docs/superpowers/specs/2026-07-07-cc-retrieval-enrichment-design.md.
+# How: NuWave-extraction — all functions bind ONLY to passed-in ng/graph/state
+#   (law-review C1: cc_ng_host runs inside Syl's process; canonical globals
+#   are HERS). Backfill is stamp-only, no save (C2). Novelty reads the
+#   HE-level cumulative counters graph._total_confirmed/_total_surprised —
+#   the family canonical's EMA tracks, serialized as he_total_confirmed/
+#   he_total_surprised in every checkpoint (C3).
 # [2026-07-06] Claude Code (Sonnet 5) — Pattern-completion recall (Active Recall block)
 # What: Added cc_pattern_completion_recall() and _format_cc_recall_block().
 # Why:  CC's surfacing was recency-biased only (SurfacingMonitor's fired-node queue) --
@@ -959,3 +974,78 @@ def gate_pattern_completion(cache: Dict[str, float], file_path: str, now: float,
         cache[file_path] = now
         return True
     return False
+
+
+# --- Retrieval-enrichment constants (#358) ---
+# Copied VERBATIM from canonical neurograph_rpc.py (C5 — do not tune here;
+# canonical is the source of truth, test_cc_retrieval_enrichment pins these):
+#   _ANTICIPATE_TOP_K/_ANTICIPATE_TTL_S/_ANTICIPATE_BONUS — rpc.py:263-264, :674
+#   _GSG_LAYER_NORMS/_GSG_SCORE_BONUS — rpc.py GSG Phase 1 block
+#   novelty EMA 0.9/0.1 — rpc.py:3270-3271
+_CC_ANTICIPATE_TOP_K = 15
+_CC_ANTICIPATE_TTL_S = 120.0
+_CC_ANTICIPATE_BONUS = 0.25
+_CC_GSG_LAYER_NORMS = (0.70, 0.50, 0.30)   # diffpc_layer 0/1/2 -> Poincaré norm
+_CC_GSG_SCORE_BONUS = 0.30
+_CC_NOVELTY_EMA_KEEP = 0.9
+_CC_NOVELTY_EMA_GAIN = 0.1
+
+
+def _cc_poincare_distance(x, y) -> float:
+    """Geodesic distance in the Poincaré ball — verbatim port of canonical's
+    _poincare_distance (neurograph_rpc.py:2660-2681), free function form.
+    d(x, y) = acosh(1 + 2||x-y||^2 / ((1-||x||^2)(1-||y||^2)))."""
+    import numpy as _np
+    import math
+    nx2 = min(float(_np.dot(x, x)), 0.9999)
+    ny2 = min(float(_np.dot(y, y)), 0.9999)
+    diff = x - y
+    num = 2.0 * float(_np.dot(diff, diff))
+    denom = (1.0 - nx2) * (1.0 - ny2)
+    arg = 1.0 + num / max(denom, 1e-9)
+    return math.acosh(max(1.0, arg))
+
+
+def cc_novelty(state: dict, graph) -> float:
+    """Pull-based MMN novelty for CC's surfacing (#255 parity, #358).
+
+    Canonical updates _substrate_novelty_ema push-style per turn in
+    handle_after_turn() (rpc.py:3266-3272) from StepResult's HE-level
+    prediction counts. CC's deposits run graph.step() inside on_message()
+    (protected file) which discards those stats — so CC dips the bucket at
+    extraction time instead: read the HE-level CUMULATIVE counters, delta
+    them against the previous recall, EMA the windowed surprise ratio.
+
+    Counter names (C3, verified 2026-07-07): graph._total_confirmed /
+    graph._total_surprised (neuro_foundation.py:1434-1435, incremented
+    :2192/:2206) — the cumulative counterparts of StepResult.
+    predictions_confirmed/predictions_surprised (:2224-2225). Private-
+    prefixed but a de-facto stable contract: serialized in every checkpoint
+    as he_total_confirmed/he_total_surprised (:4326-4327). NOT the same
+    family as Telemetry.total_predictions_* (Phase-3 synapse-level).
+
+    Fails soft: missing counters (engine contract change) -> current EMA or
+    0.5, never raises. test_novelty_counters_exist_on_real_graph makes that
+    contract change loud in CI.
+    """
+    try:
+        confirmed = getattr(graph, "_total_confirmed", None)
+        surprised = getattr(graph, "_total_surprised", None)
+        if confirmed is None or surprised is None:
+            return state.get("novelty_ema", 0.5)
+        prev_c = state.get("last_confirmed")
+        prev_s = state.get("last_surprised")
+        state["last_confirmed"] = confirmed
+        state["last_surprised"] = surprised
+        if prev_c is None or prev_s is None:
+            return state.get("novelty_ema", 0.5)   # first call = baseline only
+        d_c = confirmed - prev_c
+        d_s = surprised - prev_s
+        if d_c + d_s > 0:
+            raw = d_s / (d_c + d_s)
+            state["novelty_ema"] = (_CC_NOVELTY_EMA_KEEP * state.get("novelty_ema", 0.5)
+                                    + _CC_NOVELTY_EMA_GAIN * raw)
+        return state.get("novelty_ema", 0.5)
+    except Exception as exc:
+        logger.debug("cc_novelty failed (non-fatal): %s", exc)
+        return state.get("novelty_ema", 0.5) if isinstance(state, dict) else 0.5
