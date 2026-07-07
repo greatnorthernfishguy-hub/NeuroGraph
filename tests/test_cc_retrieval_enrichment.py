@@ -214,3 +214,80 @@ def test_gsg_backfill_stamps_missing_skips_present_never_saves(cc_ng):
     assert "poincare_dir" not in (g.nodes["no_vdb"].metadata or {})
     assert save_calls == []                             # C2: STAMP-ONLY, never persists
     assert cc_gsg_backfill(g, vdb) == 0                 # idempotent second run
+
+
+# ---- Task 4: rebuilt recall — substrate primacy ----
+
+def test_recall_surfaces_synaptically_connected_not_cosine_similar(cc_ng):
+    """THE #358 property: content connected to the query only through learned
+    synaptic structure (NOT cosine-similar to it) can now surface. Bare
+    vector search structurally cannot do this."""
+    from cc_ng_organism import cc_pattern_completion_recall
+    from ng_embed import embed
+    g, vdb = cc_ng.graph, cc_ng.vector_db
+    query = "the lenia distance cache rebuild on the vps"
+    # Seed node: cosine-similar to the query (vdb finds it as a prime seed)
+    g.create_node(node_id="seed")
+    vdb.insert(id="seed", embedding=embed("lenia distance cache rebuild"),
+               content="lenia distance cache rebuild")
+    # Associate node: semantically UNRELATED text, strongly wired to seed
+    g.create_node(node_id="assoc")
+    vdb.insert(id="assoc", embedding=embed("the purple elephant memo from tuesday"),
+               content="the purple elephant memo from tuesday")
+    g.create_synapse("seed", "assoc", weight=0.95)
+    g.nodes["assoc"].threshold = 0.1        # deterministic firing for the test
+    results = cc_pattern_completion_recall(cc_ng, query, k=8, threshold=0.3)
+    ids = [r["node_id"] for r in results]
+    assert "assoc" in ids, (
+        "spreading activation must surface the synaptic associate; "
+        "bare cosine search cannot -- got %r" % ids)
+
+
+def test_recall_output_shape_unchanged(cc_ng):
+    """_format_cc_recall_block and the daemons depend on {node_id, score,
+    content} — the rebuild must not change the contract."""
+    from cc_ng_organism import cc_pattern_completion_recall, _format_cc_recall_block
+    from ng_embed import embed
+    g, vdb = cc_ng.graph, cc_ng.vector_db
+    g.create_node(node_id="n1")
+    vdb.insert(id="n1", embedding=embed("checkpoint save cadence"),
+               content="checkpoint save cadence")
+    results = cc_pattern_completion_recall(cc_ng, "checkpoint save timing", k=5, threshold=0.3)
+    for r in results:
+        assert set(r.keys()) == {"node_id", "score", "content"}
+    block = _format_cc_recall_block(results)
+    assert block == "" or block.startswith("## Active Recall")
+
+
+def test_recall_applies_anticipate_bonus(cc_ng):
+    from cc_ng_organism import cc_pattern_completion_recall
+    from ng_embed import embed
+    g, vdb = cc_ng.graph, cc_ng.vector_db
+    # Two seeds equally reachable; prime one via state
+    for nid, text in (("plain", "daemon autosave pulse"), ("primed", "daemon restart procedure")):
+        g.create_node(node_id=nid)
+        vdb.insert(id=nid, embedding=embed(text), content=text)
+        # Deterministic firing (same technique as
+        # test_recall_surfaces_synaptically_connected_not_cosine_similar's "assoc"
+        # node): real cosine similarity for these two short phrases against
+        # "daemon lifecycle" lands at ~0.80-0.85 -- a hair under the substrate's
+        # tuned default_threshold (0.85, neuro_foundation.py DEFAULT_CONFIG), so
+        # with the real embedding model neither seed reliably fires through
+        # graph.prime_and_propagate() on priming current alone. This test's
+        # purpose is the anticipate-bonus reordering (already covered for the
+        # raw-firing case by the headline test above), not raw cosine-vs-threshold
+        # closeness, so we lower the threshold to make firing deterministic.
+        g.nodes[nid].threshold = 0.5
+    state = {"primed_nodes": {"primed": (1.0, time.time() + 60)}}
+    r_with = cc_pattern_completion_recall(cc_ng, "daemon lifecycle", k=5, threshold=0.2, state=state)
+    scores = {r["node_id"]: r["score"] for r in r_with}
+    if "primed" in scores and "plain" in scores:
+        assert scores["primed"] > scores["plain"]      # bonus separated them
+    else:
+        assert "primed" in scores                      # at minimum the primed node surfaced
+
+
+def test_recall_fails_soft(cc_ng):
+    from cc_ng_organism import cc_pattern_completion_recall
+    assert cc_pattern_completion_recall(None, "anything") == []
+    assert cc_pattern_completion_recall(cc_ng, "") == []

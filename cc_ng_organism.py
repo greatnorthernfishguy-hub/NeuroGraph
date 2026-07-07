@@ -903,37 +903,73 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
 
 
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
-                                    threshold: float = 0.40) -> List[Dict[str, Any]]:
-    """Direct semantic recall for CC's own hook surfacing -- pattern
-    completion alongside SurfacingMonitor's recency-biased queue (2026-07-06
-    tier-drop design). Mirrors canonical's handle_assemble() Active Recall
-    block (neurograph_rpc.py:3085-3110) exactly, parameterized on `ng`
-    instead of the module-level `_memory` global -- same extraction pattern
-    as every other function in this file.
+                                    threshold: float = 0.40,
+                                    state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Substrate-native pattern-completion recall for CC's hook surfacing
+    (#358 rebuild -- replaces the bare ng.recall() cosine search this
+    function originally wrapped; LAW 3 rebuild-in-place, same contract).
 
-    threshold default 0.40 is the ecosystem's confidence_recommend value
-    (ng_ecosystem.py) -- the same default canonical's own Active Recall uses
-    (ANIMA_RECALL_THRESHOLD env var default), not a new invented threshold.
+    Spreading activation via ng._harvest_associations(): the vector_db only
+    seeds prime nodes; what surfaces is what FIRES through learned synaptic
+    structure (graph.prime_and_propagate) -- the substrate is the memory,
+    the VDB is secondary. Enrichments applied in canonical handle_assemble()
+    order (neurograph_rpc.py:2977-3038): MMN novelty scaling (cc_novelty,
+    pull-based), anticipatory primed-node bonus (#256 port), GSG geodesic
+    re-score.
 
-    Returns a list of {node_id, score, content} dicts -- content already
-    resolved substrate-first via resolve_surface_content (her _forest_content
-    over the vdb shard), degenerate/filtered results dropped. Fails soft:
-    any exception returns [].
+    threshold maps to prime_threshold (seed-selection floor -- same
+    conceptual role as the old cosine floor; 0.40 = confidence_recommend,
+    unchanged). k maps to max_surfaced. Config override mirrors canonical
+    associate() (openclaw_hook.py:1076-1085) -- save/restore around the call.
+
+    state: the daemon's conv_state dict (novelty_ema/last_confirmed/
+    last_surprised/primed_nodes). None (legacy call shape) = neutral novelty
+    0.5, no primed bonus -- still substrate-native.
+
+    Returns [{node_id, score, content}] -- same shape as before; content
+    substrate-first via resolve_surface_content, degenerate results dropped.
+    Fails soft: any exception returns [].
     """
     if not query or ng is None:
         return []
     try:
         from surface_resolver import resolve_surface_content
-        results = ng.recall(query, k=k, threshold=threshold)
+        novelty = cc_novelty(state, ng.graph) if state is not None else 0.5
+        cfg = ng.graph.config
+        old_max = cfg.get("max_surfaced", 10)
+        old_thresh = cfg.get("prime_threshold", 0.4)
+        cfg["max_surfaced"] = k
+        cfg["prime_threshold"] = threshold
+        try:
+            surfaced = ng._harvest_associations(query, novelty=novelty)
+        finally:
+            cfg["max_surfaced"] = old_max
+            cfg["prime_threshold"] = old_thresh
+
+        # Anticipatory bonus (#256 port) -- canonical rpc.py:2981-2989
+        if state is not None:
+            now = time.time()
+            live = {nid: s for nid, (s, exp) in (state.get("primed_nodes") or {}).items()
+                    if exp > now}
+            if live:
+                for item in surfaced:
+                    nid = item.get("node_id")
+                    if nid and nid in live:
+                        item["strength"] = item.get("strength", 0.0) + _CC_ANTICIPATE_BONUS
+                surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
+
+        # GSG geodesic re-score -- canonical rpc.py:2991-3038
+        surfaced = cc_gsg_rescore(surfaced, query, ng.graph)
+
         out = []
-        for r in results:
+        for r in surfaced:
             nid = r.get("node_id") or r.get("id")
             node = ng.graph.nodes.get(nid) if (nid and ng.graph) else None
             text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)
             if not text:
                 continue
-            out.append({"node_id": nid, "score": r.get("similarity", 0.0), "content": text})
-        return out
+            out.append({"node_id": nid, "score": r.get("strength", 0.0), "content": text})
+        return out[:k]
     except Exception as exc:
         logger.debug("cc_pattern_completion_recall failed (non-fatal): %s", exc)
         return []
