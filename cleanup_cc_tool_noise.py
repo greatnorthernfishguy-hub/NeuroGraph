@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-06] Claude Code (Sonnet 5) — Catch vector_db-only orphaned tool noise
+# What: find_tool_noise() only ever matched nodes reachable via graph.nodes.items() --
+#   any vector_db entry whose graph node had ALREADY been pruned (by #237's
+#   _collect_orphan_nodes(), or any other removal path) was invisible to it, so its
+#   tool:/bash: content was never deleted from vdb. Added find_orphan_vdb_tool_noise()
+#   to scan vdb.content directly for tool:/bash: entries with no matching graph node,
+#   and cleanup() now removes both classes (still-in-graph and orphan-only).
+# Why:  Confirmed empirically on the laptop's live checkpoint (read-only diagnostic,
+#   2026-07-06): only 5 of vdb's 12,219 entries were reachable via the graph (177 live
+#   nodes total), but 9,085 vdb entries still carried tool:/bash: content -- 9,080 of
+#   them orphaned (no graph node at all). This is why old tool-call content kept
+#   surfacing via cc_pattern_completion_recall()'s direct vector search even after the
+#   2026-07-05 cleanup pass: that pass's node-driven scan could only ever reach content
+#   still attached to a live node, and CC's graph naturally orphan-prunes low-activity
+#   nodes over time (the same #237 mechanism as Syl's graph) -- so tool-noise nodes that
+#   had already been orphan-pruned by the time the first cleanup ran were untouched.
+# How: Second scan directly over vdb.content.items() (not gated by graph membership),
+#   skip anything already caught by find_tool_noise() to avoid double-counting.
 # [2026-07-05] CC (laptop) — Remove legacy tool-call-derived nodes from CC's checkpoint
 # What: Offline cleanup pass. Finds nodes whose vector_db content starts with the
 #   tool-call experience prefixes built by handle_post_tool_use ("tool:" or "bash:"),
@@ -34,13 +52,26 @@ _TOOL_PREFIXES = ("tool:", "bash:")
 
 
 def find_tool_noise(graph, vdb) -> list:
-    """Return node_ids whose vector_db content is tool-call-derived."""
+    """Return node_ids (still in the graph) whose vector_db content is tool-call-derived."""
     matches = []
     for node_id, node in graph.nodes.items():
         meta = getattr(node, "metadata", None) or {}
         if meta.get("creation_mode") != "ingested":
             continue
         content = vdb.content.get(node_id, "")
+        if content.startswith(_TOOL_PREFIXES):
+            matches.append(node_id)
+    return matches
+
+
+def find_orphan_vdb_tool_noise(graph, vdb, already_matched: set) -> list:
+    """Return vector_db-only node_ids (no corresponding graph node) with tool-call
+    content -- content orphaned by graph pruning (#237) before the first cleanup ran,
+    invisible to find_tool_noise()'s graph-driven scan."""
+    matches = []
+    for node_id, content in vdb.content.items():
+        if node_id in already_matched or node_id in graph.nodes:
+            continue
         if content.startswith(_TOOL_PREFIXES):
             matches.append(node_id)
     return matches
@@ -58,31 +89,41 @@ def cleanup(main_path: str, vectors_path: str, apply: bool = False) -> dict:
     before_nodes = len(graph.nodes)
     before_vdb = vdb.count()
 
-    matches = find_tool_noise(graph, vdb)
-    logger.info("Found %d tool-call-derived nodes (of %d total, %d ingested)",
-                len(matches), before_nodes,
-                sum(1 for n in graph.nodes.values()
-                    if (getattr(n, "metadata", None) or {}).get("creation_mode") == "ingested"))
+    graph_matches = find_tool_noise(graph, vdb)
+    orphan_matches = find_orphan_vdb_tool_noise(graph, vdb, set(graph_matches))
+    logger.info("Found %d tool-call-derived nodes still in graph, %d orphaned vdb-only "
+                "entries (of %d total nodes, %d total vdb entries)",
+                len(graph_matches), len(orphan_matches), before_nodes, before_vdb)
 
     if not apply:
         return {
-            "status": "dry_run", "would_remove": len(matches),
+            "status": "dry_run",
+            "would_remove_graph": len(graph_matches),
+            "would_remove_orphan_vdb": len(orphan_matches),
+            "would_remove_total": len(graph_matches) + len(orphan_matches),
             "total_nodes_before": before_nodes, "total_vdb_before": before_vdb,
         }
 
-    removed = 0
-    for node_id in matches:
+    removed_graph = 0
+    for node_id in graph_matches:
         if node_id in graph.nodes:
             graph.remove_node(node_id)
-            removed += 1
+            removed_graph += 1
         vdb.delete(node_id)
+
+    removed_orphan = 0
+    for node_id in orphan_matches:
+        if vdb.delete(node_id):
+            removed_orphan += 1
 
     graph.checkpoint(main_path)
     vdb.save(vectors_path)
 
     return {
         "status": "ok",
-        "removed": removed,
+        "removed_graph": removed_graph,
+        "removed_orphan_vdb": removed_orphan,
+        "removed_total": removed_graph + removed_orphan,
         "total_nodes_before": before_nodes,
         "total_nodes_after": len(graph.nodes),
         "total_vdb_before": before_vdb,
