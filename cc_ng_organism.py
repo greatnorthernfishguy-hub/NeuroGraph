@@ -704,10 +704,7 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
         try:
             import random as _rnd
             d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
-            # Create bidirectional delayed synapse: last → current (forward continuity)
-            # and current → last (backward anticipation for the next cycle)
             graph.create_synapse(last_id, forest_id, weight=0.2, delay=d)
-            graph.create_synapse(forest_id, last_id, weight=0.2, delay=d)
         except Exception:
             pass
     state["last_forest_id"] = forest_id

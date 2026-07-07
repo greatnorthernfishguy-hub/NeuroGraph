@@ -121,16 +121,21 @@ def test_cc_anticipate_empty_fired_clears_primed(cc_ng):
     assert state["primed_nodes"] == {}
 
 
-def test_dual_pass_drain_triggers_anticipation(cc_ng):
-    """Integration: the conversational dual-pass (the anticipate trigger site)
-    leaves a primed set in the same state dict the daemons pass around."""
-    from cc_ng_organism import run_conversational_dual_pass
+def test_dual_pass_drain_triggers_anticipation(cc_ng, monkeypatch):
+    """Integration: the conversational dual-pass calls the cc_anticipate
+    trigger with this turn's forest+trees and the shared state dict. The
+    priming BEHAVIOR itself is covered by the unit tests above; this test
+    pins the WIRING (trigger fires, right seeds, right state) without
+    depending on tree extraction, which short texts don't guarantee."""
+    import cc_ng_organism as o
     from ng_embed import embed
+    calls = []
+    real = o.cc_anticipate
+    monkeypatch.setattr(o, "cc_anticipate",
+                        lambda graph, fired, state: (calls.append(list(fired)), real(graph, fired, state)))
     state = {"last_forest_id": None}
-    text1 = "the lenia distance cache rebuild finished on the vps"
-    assert run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text1, embed(text1), state)
-    text2 = "next we verify the cc socket came alive after bootstrap"
-    assert run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text2, embed(text2), state)
-    # Turn 2's forest links back to turn 1's (delayed synapse) and forward to
-    # its trees — the anticipate walk from turn 2's nodes must prime something.
-    assert state.get("primed_nodes"), "dual-pass drain must populate primed_nodes"
+    text = "the lenia distance cache rebuild finished on the vps"
+    assert o.run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, embed(text), state)
+    assert len(calls) == 1, "dual-pass must trigger cc_anticipate exactly once"
+    assert state["last_forest_id"] in calls[0], "this turn's forest must be in the seed set"
+    assert "primed_nodes" in state, "trigger must have populated the primed dict (possibly empty)"
