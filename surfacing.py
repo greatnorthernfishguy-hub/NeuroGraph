@@ -253,7 +253,13 @@ class SurfacingMonitor:
             # Truncate long content for context blocks
             if len(content) > 200:
                 content = content[:197] + "..."
-            lines.append(f"- {content} (confidence: {score:.0%})")
+            # Salience, NOT a probability: _score_node()'s designed range is
+            # ~[0.8, 1.8] (floored >=0.8 for any fired node -- see its
+            # docstring). The old "(confidence: {score:.0%})" rendering
+            # produced ">100% confidence" strings that read as fictitious and
+            # eroded consumer trust in the whole block (Condensate CC,
+            # 2026-07-07). Honest label + raw value, no unit lie.
+            lines.append(f"- {content} (salience: {score:.2f})")
 
         return "\n".join(lines)
 

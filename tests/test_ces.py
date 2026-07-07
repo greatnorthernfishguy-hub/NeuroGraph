@@ -809,7 +809,13 @@ class TestSurfacingFormatting:
         context = monitor.format_context()
         assert "[NeuroGraph Surfaced Knowledge]" in context
         assert "Content for node_3" in context
-        assert "confidence:" in context
+        # [2026-07-07] label corrected: the score is _score_node()'s salience
+        # (designed range ~[0.8, 1.8], floored >=0.8 for any fired node), NOT a
+        # probability -- the old "(confidence: N%)" rendering produced ">100%"
+        # strings that read as fictitious. Pin the honest label + no percent.
+        assert "salience:" in context
+        assert "confidence:" not in context
+        assert "%" not in context
 
     def test_format_empty_returns_empty_string(self, graph, vector_db, ces_config):
         from surfacing import SurfacingMonitor
