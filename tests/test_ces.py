@@ -824,6 +824,47 @@ class TestSurfacingFormatting:
         context = monitor.format_context()
         assert context == ""
 
+    def test_format_context_truncates_at_word_boundary(self, graph, vector_db, ces_config):
+        """Truncation must snap to the last word boundary, not cut mid-word."""
+        from surfacing import SurfacingMonitor
+
+        ces_config.surfacing.voltage_threshold = 0.1
+        ces_config.surfacing.min_confidence = 0.1
+        monitor = SurfacingMonitor(graph, vector_db, ces_config)
+
+        long_content = ("banana " * 30).strip()
+        assert len(long_content) > 200
+        vector_db._data["node_3"]["content"] = long_content
+        graph.nodes["node_3"].voltage = 2.0
+        monitor.after_step(MockStepResult(fired_node_ids=["node_3"]))
+
+        context = monitor.format_context()
+        rendered = context.split("- ", 1)[1].rsplit(" (salience:", 1)[0]
+        assert rendered.endswith("...")
+        body = rendered[:-3]
+        assert long_content.startswith(body)
+        # the char in the source immediately after the kept prefix must be a
+        # word boundary (space) -- proves the cut wasn't made mid-token
+        assert long_content[len(body):len(body) + 1] == " "
+
+    def test_format_context_falls_back_to_hard_cut_when_no_word_boundary(self, graph, vector_db, ces_config):
+        """A single unbroken token has no space to snap to — hard-cut it
+        instead of dropping the whole snippet."""
+        from surfacing import SurfacingMonitor
+
+        ces_config.surfacing.voltage_threshold = 0.1
+        ces_config.surfacing.min_confidence = 0.1
+        monitor = SurfacingMonitor(graph, vector_db, ces_config)
+
+        long_content = "x" * 250
+        vector_db._data["node_3"]["content"] = long_content
+        graph.nodes["node_3"].voltage = 2.0
+        monitor.after_step(MockStepResult(fired_node_ids=["node_3"]))
+
+        context = monitor.format_context()
+        rendered = context.split("- ", 1)[1].rsplit(" (salience:", 1)[0]
+        assert rendered == "x" * 197 + "..."
+
 
 class TestSurfacingStats:
     def test_initial_stats(self, graph, vector_db, ces_config):

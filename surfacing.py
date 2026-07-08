@@ -250,9 +250,12 @@ class SurfacingMonitor:
         for item in surfaced_items:
             content = item.get("content", "")
             score = item.get("score", 0.0)
-            # Truncate long content for context blocks
+            # Truncate long content for context blocks. Snap to the last word
+            # boundary at-or-before the cutoff so it doesn't end mid-word; fall
+            # back to a hard cut when no whitespace exists in range.
             if len(content) > 200:
-                content = content[:197] + "..."
+                cut = content.rfind(" ", 0, 197)
+                content = (content[:cut] if cut > 0 else content[:197]) + "..."
             # Salience, NOT a probability: _score_node()'s designed range is
             # ~[0.8, 1.8] (floored >=0.8 for any fired node -- see its
             # docstring). The old "(confidence: {score:.0%})" rendering

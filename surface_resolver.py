@@ -94,7 +94,11 @@ def resolve_surface_content(
     if len(text) < min_chars or text.lower() in _STOPWORD_SHARDS:
         return None
 
-    # Bound the snippet — never bloat the prompt with a full turn.
+    # Bound the snippet — never bloat the prompt with a full turn. Snap to the
+    # last word boundary at-or-before max_chars so a fired-off snippet doesn't
+    # end mid-word; fall back to a hard cut when no whitespace exists in range
+    # (e.g. one unbroken token, as in test_snippet_is_bounded).
     if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "…"
+        cut = text.rfind(" ", 0, max_chars)
+        text = (text[:cut] if cut > 0 else text[:max_chars]).rstrip() + "…"
     return text

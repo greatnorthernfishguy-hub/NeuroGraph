@@ -360,6 +360,10 @@ def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
     cc-surfacing-pattern-completion-tier-drop.md. allow_pattern_completion=
     False skips the Active Recall half — used by _handle_pre_tool_use() when
     gate_pattern_completion() has already covered this file_path recently.
+
+    Dedups by node_id across the two blocks: a node can be both recently-
+    fired (SurfacingMonitor) and semantically matching the query (Active
+    Recall) — without this it renders twice in the injected context.
     """
     ng = _STATE.cc_ng
     if ng is None or not query:
@@ -368,23 +372,29 @@ def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
         _STATE.stats["recalls"] += 1
 
     monitor_ctx = ""
+    monitor_node_ids: set = set()
     try:
         monitor = getattr(ng, '_surfacing_monitor', None)
         if monitor is not None:
-            monitor_ctx = monitor.format_context()
+            monitor_items = monitor.get_surfaced()
+            monitor_node_ids = {item.get("node_id") for item in monitor_items}
+            monitor_ctx = monitor.format_context(monitor_items)
     except RuntimeError:
         monitor_ctx = ""  # dict mutation race during concurrent deposit
+        monitor_node_ids = set()
     except Exception as exc:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1
         logger.debug("CC recall failed: %s", exc)
         monitor_ctx = ""
+        monitor_node_ids = set()
 
     pc_block = ""
     if allow_pattern_completion:
         try:
             from cc_ng_organism import cc_pattern_completion_recall, _format_cc_recall_block
             results = cc_pattern_completion_recall(ng, query, k, state=_STATE.conv_state)
+            results = [r for r in results if r.get("node_id") not in monitor_node_ids]
             pc_block = _format_cc_recall_block(results)
         except Exception as exc:
             logger.debug("Pattern-completion recall failed (non-fatal): %s", exc)

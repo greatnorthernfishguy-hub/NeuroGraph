@@ -43,6 +43,22 @@ def test_snippet_is_bounded():
     assert out.endswith("…")
 
 
+def test_snippet_truncates_at_word_boundary_not_mid_word():
+    """Truncation must snap to the last word boundary, not cut a word in half."""
+    forest = "Alpha bravo charlie delta echo foxtrot golf hotel india juliet"
+    node = _conv(forest=forest)
+    out = resolve_surface_content(node, {"content": "shard"}, max_chars=27)
+    assert out == "Alpha bravo charlie delta…"
+
+
+def test_snippet_falls_back_to_hard_cut_when_no_word_boundary():
+    """A single unbroken token has no space to snap to — hard-cut it instead
+    of dropping the whole snippet."""
+    node = _conv(forest="x" * 1000)
+    out = resolve_surface_content(node, {"content": "shard"}, max_chars=240)
+    assert out == "x" * 240 + "…"
+
+
 def test_vdb_fallback_when_no_forest():
     """No _forest_content → fall back to the vdb content (real sentence, not a shard)."""
     node = _conv()
