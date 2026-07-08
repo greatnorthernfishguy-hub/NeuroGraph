@@ -506,9 +506,14 @@ def _handle_user_prompt_submit(data):
         return {"ok": True, "context": ""}
     # L1 cache nudge first — raises related node voltages before recall
     _nudge(prompt)
-    # Deposit async — on_message() runs a full SNN step (1-4s); hook timeout is 2s
-    threading.Thread(target=_deposit, args=(prompt,), daemon=True).start()
+    # Recall BEFORE spawning the deposit [2026-07-08]: launching the deposit
+    # first meant _recall's prime_and_propagate raced its on_message() SNN
+    # step (1-4s) every prompt -- fail-soft tripped and Active Recall
+    # silently returned nothing (#359's daemon-side manifestation; see
+    # cc-ng-daemon.py's same-day changelog). Recall on quiet pre-deposit
+    # state, THEN the background deposit. Never BLOCK recall on the lock.
     context = _recall(prompt, RECALL_K)
+    threading.Thread(target=_deposit, args=(prompt,), daemon=True).start()
     # Constitutional core + WANTs: surface every turn, query-independent (read
     # LIVE, not a snapshot). "Who I Am" leads, same ordering as canonical.
     try:
