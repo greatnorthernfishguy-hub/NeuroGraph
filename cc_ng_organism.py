@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — Lenia checkpoint+resume wiring
+# What: bootstrap_lenia() passes checkpoint_interval_secs/on_checkpoint to both populate()
+#   calls and gains the resume-watermark elif between the full-rebuild and growth branches —
+#   mirroring neurograph_rpc.py's handle_bootstrap() (2026-07-06 checkpointing + 2026-07-08
+#   watermark, commit 11fae08). field_dir makedirs moved BEFORE the branch chain so the very
+#   first periodic checkpoint of a first-ever run has a directory to save into.
+# Why: the shared DistanceCache class carries both protections, but CC's call site (used by
+#   BOTH daemons) never passed the params — a hard kill mid-populate lost all progress, and a
+#   partial cache would have loaded as complete. CC's graphs were small enough not to care
+#   until the 2026-07-07 refeed grew the laptop graph ~7x (204 -> 1,450+ nodes), on the
+#   daemon with the ecosystem's most colorful kill history. One fix covers both daemons by
+#   construction — that's why this function lives in the organism, not the daemons.
+# How: same constant value as rpc (_LENIA_CHECKPOINT_INTERVAL_SECS = 300.0, source-annotated),
+#   same branch order (watermark elif BEFORE growth elif — an interrupted-and-grown cache
+#   must resume, not plain-extend).
 # [2026-07-07] Claude Code (Fable 5) — Retrieval-enrichment extraction (#358)
 # What: cc_novelty (pull-based MMN EMA), cc_anticipate (#256 port),
 #   cc_gsg_rescore + _cc_poincare_distance + cc_gsg_backfill (GSG surfacing
@@ -259,6 +274,9 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
         # full story. Extend in place when the graph only grew; full
         # rebuild only if entities were removed or on first-ever run.
         cache_path = os.path.join(os.path.expanduser(lenia_cfg.field_dir), "distance_cache")
+        # Ensure the field dir exists BEFORE populate — periodic checkpoints
+        # (below) can fire long before the post-populate save block.
+        os.makedirs(os.path.expanduser(lenia_cfg.field_dir), exist_ok=True)
         lenia_cache = DistanceCache.load(cache_path)
 
         known_order = None
@@ -289,11 +307,39 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
                 )
             lenia_cache = DistanceCache(n_entities, entity_ids=lenia_substrate.entities())
             try:
-                lenia_cache.populate(lenia_substrate)
+                lenia_cache.populate(
+                    lenia_substrate,
+                    checkpoint_interval_secs=_CC_LENIA_CHECKPOINT_INTERVAL_SECS,
+                    on_checkpoint=lambda: lenia_cache.save(cache_path),
+                )
             except Exception as exc:
                 logger.warning(
                     "CC Lenia: distance cache populate failed partway (%s) — "
                     "saving whatever was computed instead of discarding it", exc,
+                )
+        elif lenia_cache.watermark is not None:
+            # A prior rebuild was interrupted mid-run: the checkpoint carries
+            # its own resume point (see lenia/kernel.py 2026-07-08). Resume
+            # covers both the unfinished old region and (after resize) every
+            # pair touching entities appended since.
+            _wm = lenia_cache.watermark
+            logger.info(
+                "CC Lenia: distance cache carries resume watermark (%d, %d) — "
+                "resuming interrupted rebuild (%d -> %d entities)",
+                _wm[0], _wm[1], lenia_cache.entity_count, n_entities,
+            )
+            if lenia_cache.entity_count != n_entities:
+                lenia_cache.resize(n_entities, new_entity_ids=lenia_substrate.entities())
+            try:
+                lenia_cache.populate(
+                    lenia_substrate, resume_watermark=_wm,
+                    checkpoint_interval_secs=_CC_LENIA_CHECKPOINT_INTERVAL_SECS,
+                    on_checkpoint=lambda: lenia_cache.save(cache_path),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "CC Lenia: resume populate failed partway (%s) — saving "
+                    "whatever was computed instead of discarding it", exc,
                 )
         elif lenia_cache.entity_count != n_entities:
             old_n = lenia_cache.entity_count
@@ -303,7 +349,11 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
             )
             lenia_cache.resize(n_entities, new_entity_ids=lenia_substrate.entities())
             try:
-                lenia_cache.populate(lenia_substrate, start_index=old_n)
+                lenia_cache.populate(
+                    lenia_substrate, start_index=old_n,
+                    checkpoint_interval_secs=_CC_LENIA_CHECKPOINT_INTERVAL_SECS,
+                    on_checkpoint=lambda: lenia_cache.save(cache_path),
+                )
             except Exception as exc:
                 logger.warning(
                     "CC Lenia: incremental populate failed partway (%s) — "
@@ -1067,6 +1117,9 @@ _CC_GSG_LAYER_NORMS = (0.70, 0.50, 0.30)   # diffpc_layer 0/1/2 -> Poincaré nor
 _CC_GSG_SCORE_BONUS = 0.30
 _CC_NOVELTY_EMA_KEEP = 0.9
 _CC_NOVELTY_EMA_GAIN = 0.1
+# Copied from neurograph_rpc.py's _LENIA_CHECKPOINT_INTERVAL_SECS (2026-07-06) —
+# same cadence for CC's rebuilds as Syl's. Not a new invented value.
+_CC_LENIA_CHECKPOINT_INTERVAL_SECS: float = 300.0
 
 
 def _cc_poincare_distance(x, y) -> float:
