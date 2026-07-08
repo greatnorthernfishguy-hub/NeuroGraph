@@ -1,4 +1,17 @@
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — #371 removal-aware reconcile
+# What: DistanceCache.reconcile_removals() + _translate_watermark(): compact the six
+#   component matrices with an order-preserving keep-slice when cached entities were
+#   pruned from the live graph, remap the dirty set, translate the resume watermark
+#   (direct when both endpoints survive; else greatest surviving computed pair at or
+#   below the cut — DOWN only, never up). Returns survivors for known_entity_order,
+#   or None -> caller takes the legacy full-rebuild path.
+# Why: #371 — any node prune between save and restart forced callers to discard the
+#   ENTIRE cache (confirmed live on Syl 2026-07-08: ~1.79M pairs / 24.5% of a rebuild
+#   lost at one restart; with continuous pruning her cache could never complete).
+# How: monotone compaction preserves the canonical (max, min) pair order populate()
+#   depends on, so the computed-region invariant survives reindexing; callers fall
+#   through to the untouched watermark-resume/growth branches.
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — Resume watermark
 # What: DistanceCache gains a resume watermark: populate() iterates connected pairs in a
 #   canonical (max_idx, min_idx)-sorted order; each periodic checkpoint records the last
@@ -532,6 +545,132 @@ class DistanceCache:
         self._n = new_count
         if new_entity_ids is not None:
             self._entity_ids = list(new_entity_ids)
+
+    def reconcile_removals(self, live_ids: Set[str]) -> Optional[List[str]]:
+        """Compact the cache in place after entity removals (#371).
+
+        Drops every cached entity not in `live_ids` from the six component
+        matrices (order-preserving keep-slice, O(nnz) — trivial next to a
+        recompute), remaps the dirty set, and translates the resume
+        watermark through the reindex so an interrupted rebuild can still
+        resume after a prune. Before this method, ANY removal forced the
+        callers to discard the whole cache — hours (CC) to days (Syl) of
+        computed distances lost per restart-after-prune.
+
+        Returns the surviving entity ordering (callers pass it to
+        NeuroGraphSubstrate as known_entity_order), or None when the cache
+        cannot be preserved and the caller must take the legacy
+        full-rebuild path: no entity_ids on the cache (pre-2026-07
+        format), nothing survives, or an interrupted rebuild's cut cannot
+        be translated (no computed pair at or below it survives).
+
+        Safe because compaction is monotone — surviving indices keep
+        their relative order, so the canonical (max, min) pair ordering
+        populate() processes in is preserved, and "everything at or below
+        the cut is exactly the already-computed region" survives the
+        reindex. Does not widen the documented connectivity-drift blind
+        spot (see file header): the fallback cut only ever moves DOWN.
+        """
+        if not self._entity_ids:
+            return None
+        n_old = len(self._entity_ids)
+        keep_idx = [i for i, eid in enumerate(self._entity_ids)
+                    if eid in live_ids]
+        if len(keep_idx) == n_old:
+            return list(self._entity_ids)   # nothing removed — no-op
+        if not keep_idx:
+            return None                     # nothing survives
+
+        keep_mask = np.zeros(n_old, dtype=bool)
+        keep_mask[keep_idx] = True
+        new_index = np.full(n_old, -1, dtype=np.int64)
+        new_index[keep_idx] = np.arange(len(keep_idx), dtype=np.int64)
+
+        # Translate the watermark BEFORE slicing — the fallback scan reads
+        # the old-index nonzero coordinates.
+        old_wm = self._watermark
+        if old_wm is not None:
+            new_wm = self._translate_watermark(old_wm, keep_mask, new_index)
+            if new_wm is None:
+                return None   # cut untranslatable — caller full-rebuilds
+            self._watermark = new_wm
+
+        keep = np.asarray(keep_idx, dtype=np.int64)
+        self._components_lil = [
+            comp.tocsr()[keep][:, keep].tolil()
+            for comp in self._components_lil
+        ]
+        self._components_csr = None
+        self._magnitude_csr = None
+        self._dirty = {
+            (int(new_index[i]), int(new_index[j]), c)
+            for (i, j, c) in self._dirty
+            if 0 <= i < n_old and 0 <= j < n_old
+            and keep_mask[i] and keep_mask[j]
+        }
+        survivors = [self._entity_ids[i] for i in keep_idx]
+        self._n = len(keep_idx)
+        self._entity_ids = survivors
+        logger.info(
+            "Distance cache reconciled after prune: %d entities removed, "
+            "%d survive%s",
+            n_old - len(keep_idx), len(keep_idx),
+            "" if old_wm is None
+            else f"; resume watermark {old_wm} -> {self._watermark}",
+        )
+        return survivors
+
+    def _translate_watermark(
+        self,
+        wm: Tuple[int, int],
+        keep_mask: np.ndarray,
+        new_index: np.ndarray,
+    ) -> Optional[Tuple[int, int]]:
+        """Map an interrupted run's (min, max) watermark pair through a
+        removal reindex (#371).
+
+        Both endpoints alive -> direct translation (monotone compaction
+        preserves order). An endpoint dead -> the exact cut pair is gone;
+        fall back to the greatest surviving COMPUTED pair at or below the
+        cut in canonical (max, min) order, read from the matrices' nonzero
+        coordinates. The fallback only moves the cut DOWN: pairs between
+        the fallback cut and the true cut get recomputed on resume
+        (idempotent, safe); moving the cut up would silently skip
+        never-computed pairs. Returns None when no computed pair at or
+        below the cut survives — the caller falls back to a full rebuild.
+
+        Note the all-zero-vector corner: populate() only stores components
+        with |value| > 1e-15, so a computed pair whose entire distance
+        vector was ~0 has no nonzero coordinates and is invisible to the
+        fallback scan. That can only pick a LOWER cut than the true one —
+        the safe direction.
+        """
+        wi, wj = wm   # stored as (min, max) — see populate()'s loop
+        if keep_mask[wi] and keep_mask[wj]:
+            return (int(new_index[wi]), int(new_index[wj]))
+
+        wm_hi, wm_lo = wj, wi   # canonical key = (max, min)
+        best_key = None
+        best_pair = None
+        for comp in self._components_lil:
+            coo = comp.tocsr().tocoo()
+            r, c = coo.row, coo.col
+            upper = r < c          # symmetric storage — visit (min, max) once
+            r, c = r[upper], c[upper]
+            surv = keep_mask[r] & keep_mask[c]
+            r, c = r[surv], c[surv]
+            le_cut = (c < wm_hi) | ((c == wm_hi) & (r <= wm_lo))
+            r, c = r[le_cut], c[le_cut]
+            if r.size == 0:
+                continue
+            order = np.lexsort((r, c))   # sort by (c, r) = (max, min)
+            ri, ci = int(r[order[-1]]), int(c[order[-1]])
+            if best_key is None or (ci, ri) > best_key:
+                best_key = (ci, ri)
+                best_pair = (ri, ci)
+        if best_pair is None:
+            return None
+        return (int(new_index[best_pair[0]]), int(new_index[best_pair[1]]))
 
     # Legacy compatibility for tests
     def set_distance_compat(self, i, j, component, value):
