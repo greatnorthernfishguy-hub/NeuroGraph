@@ -96,6 +96,286 @@ def test_probation_graduation(cc_ng):
     assert node.threshold == base_threshold
 
 
+def test_kiss_redundancy_gate_reinforces_instead_of_duplicating(cc_ng):
+    """Real-KISS redundancy->reinforcement gate: an exact-repeat turn must
+    not create a second conversational node. It reinforces the existing one."""
+    from cc_ng_organism import run_conversational_dual_pass
+    from ng_embed import embed
+    state = {"last_forest_id": None}
+    text = "the redundant turn text for the KISS gate test"
+    emb = embed(text)
+
+    ok1 = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    assert ok1 is True
+    first_id = state["last_forest_id"]
+    conv_nodes = [n for n in cc_ng.graph.nodes.values()
+                  if n.metadata.get("creation_mode") == "conversational"]
+    assert len(conv_nodes) == 1
+
+    ok2 = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    assert ok2 is True
+    conv_nodes_after = [n for n in cc_ng.graph.nodes.values()
+                        if n.metadata.get("creation_mode") == "conversational"]
+    assert len(conv_nodes_after) == 1  # no duplicate node
+    assert state["last_forest_id"] == first_id  # reinforcement targeted the existing node
+
+    node = cc_ng.graph.nodes[first_id]
+    assert node.metadata.get("kiss_reinforcement_count") == 1
+
+
+def test_kiss_redundancy_gate_does_not_collapse_distinct_turns(cc_ng):
+    """Genuinely different content must not be gated -- the redundancy check
+    is pure change detection, not a bias toward fewer nodes."""
+    from cc_ng_organism import run_conversational_dual_pass
+    from ng_embed import embed
+    state = {"last_forest_id": None}
+    t1 = "talk about pizza toppings and cheese preferences"
+    t2 = "debugging a segfault in the kernel driver's interrupt handler"
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t1, embed(t1), state)
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t2, embed(t2), state)
+    conv_nodes = [n for n in cc_ng.graph.nodes.values()
+                  if n.metadata.get("creation_mode") == "conversational"]
+    assert len(conv_nodes) == 2
+
+
+def test_kiss_redundancy_gate_confirms_without_duplicating_across_distinct_turns(cc_ng):
+    """A redundant hit reinforces (bumps the confirmation counter) without
+    adding a node, even when other distinct turns exist in the substrate."""
+    from cc_ng_organism import run_conversational_dual_pass
+    from ng_embed import embed
+    state = {"last_forest_id": None}
+    t1 = "first distinct turn about numpy conflicts"
+    t2 = "second distinct turn about the tract bridge cleanup"
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t1, embed(t1), state)
+    id1 = state["last_forest_id"]
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t2, embed(t2), state)
+
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t1, embed(t1), state)
+    assert cc_ng.graph.nodes[id1].metadata.get("kiss_reinforcement_count") == 1
+    conv_nodes = [n for n in cc_ng.graph.nodes.values()
+                  if n.metadata.get("creation_mode") == "conversational"]
+    assert len(conv_nodes) == 2  # still only the two distinct nodes
+
+
+def test_kiss_gate_kill_switch_restores_fresh_deposit(cc_ng, monkeypatch):
+    """With CC_KISS_GATE_ENABLED off, the gate never fires -- an exact repeat
+    is not turned into reinforcement (pre-KISS behavior)."""
+    import cc_ng_organism
+    from cc_ng_organism import run_conversational_dual_pass
+    from ng_embed import embed
+    monkeypatch.setattr(cc_ng_organism, "_CC_KISS_GATE_ENABLED", False)
+    state = {"last_forest_id": None}
+    text = "kill switch test turn text"
+    emb = embed(text)
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    node_id = state["last_forest_id"]
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    assert "kiss_reinforcement_count" not in cc_ng.graph.nodes[node_id].metadata
+
+
+def test_kiss_gate_never_collapses_into_identity_protected_node(cc_ng, monkeypatch):
+    """Cricket bypass: a redundant turn must not fold into an identity-protected
+    (constitutional) node -- it deposits fresh instead."""
+    from cc_ng_organism import run_conversational_dual_pass
+    from ng_embed import embed
+    state = {"last_forest_id": None}
+    text = "identity protected collapse guard turn"
+    emb = embed(text)
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    first_id = state["last_forest_id"]
+
+    # Force the existing conversational node to read as identity-protected.
+    monkeypatch.setattr(type(cc_ng.graph), "_is_identity_protected",
+                        lambda self, nid: nid == first_id, raising=False)
+
+    # A near-duplicate (different text -> different target_id) must NOT collapse
+    # into the protected node; it deposits as its own fresh node.
+    text2 = text + " again"
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text2, embed(text2), state)
+    assert cc_ng.graph.nodes[first_id].metadata.get("kiss_reinforcement_count") is None
+    conv_nodes = [n for n in cc_ng.graph.nodes.values()
+                  if n.metadata.get("creation_mode") == "conversational"]
+    assert len(conv_nodes) == 2
+
+
+def test_kiss_reinforcement_accelerates_probation_instead_of_resetting(cc_ng):
+    """A redundant hit on a still-probationary node must tick it one step
+    closer to graduation, not restart the fixed probation window."""
+    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
+    from ng_embed import embed
+    state = {"last_forest_id": None}
+    text = "probation acceleration test text for the KISS gate"
+    emb = embed(text)
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    node_id = state["last_forest_id"]
+    node = cc_ng.graph.nodes[node_id]
+    assert node.metadata["probation_remaining"] == _CC_CONV_PROBATION_PERIOD
+
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    assert node.metadata["probation_remaining"] == _CC_CONV_PROBATION_PERIOD - 1
+    assert node.metadata.get("graduated") is not True
+
+
+def test_kiss_reinforcement_never_resets_a_graduated_node(cc_ng):
+    """Once a node has graduated out of probation, a later redundant hit must
+    not push it back into probation or dampen its excitability."""
+    from cc_ng_organism import run_conversational_dual_pass, cc_update_probation, _CC_CONV_PROBATION_PERIOD
+    from ng_embed import embed
+    state = {"last_forest_id": None}
+    text = "graduation reinforcement test text for the KISS gate"
+    emb = embed(text)
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    node_id = state["last_forest_id"]
+    node = cc_ng.graph.nodes[node_id]
+    for _ in range(_CC_CONV_PROBATION_PERIOD):
+        cc_update_probation(cc_ng.graph)
+    assert node.metadata.get("graduated") is True
+    assert node.intrinsic_excitability == 1.0
+
+    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+    assert node.metadata.get("graduated") is True
+    assert node.intrinsic_excitability == 1.0
+    base_threshold = cc_ng.graph.config.get("default_threshold", 1.0)
+    assert node.threshold == base_threshold
+
+
+class _FakePred:
+    def __init__(self, conf, src, tgt):
+        self.confidence = conf
+        self.source_node_id = src
+        self.target_node_id = tgt
+
+
+class _FakeFired:
+    def __init__(self, node_id):
+        self.node_id = node_id
+
+
+class _FakeResult:
+    def __init__(self, fired):
+        self.fired_entries = [_FakeFired(n) for n in fired]
+
+
+class _FakeNode:
+    def __init__(self, metadata=None):
+        self.metadata = dict(metadata or {})
+
+
+class _FakeVDB:
+    def __init__(self, embeddings):
+        self._e = embeddings  # {node_id: list/array}
+
+    def get(self, nid):
+        emb = self._e.get(nid)
+        return {"embedding": emb} if emb is not None else None
+
+
+class _FakeWantGraph:
+    """Minimal graph surface generate_emergent_want() actually touches:
+    active_predictions, prime_and_propagate (read-only), hyperedges, nodes,
+    create_node, config."""
+    def __init__(self):
+        self.active_predictions = {}
+        self.hyperedges = {}
+        self.nodes = {}
+        self.config = {"default_threshold": 1.0}
+        self._pp_fired = []
+
+    def prime_and_propagate(self, node_ids, currents, steps, write_mode):
+        assert write_mode is False  # curiosity is observation, never mutation
+        return _FakeResult(self._pp_fired)
+
+    def create_node(self, node_id, metadata=None):
+        n = _FakeNode(metadata)
+        self.nodes[node_id] = n
+        return n
+
+
+def test_emergent_want_same_concept_reinforces_single_node():
+    """Two curiosity pulses about the SAME concept (different open-question
+    snapshots) collapse to ONE cc:want:: node -- reinforced, not twinned."""
+    import numpy as np
+    from cc_ng_organism import generate_emergent_want
+
+    graph = _FakeWantGraph()
+    graph.nodes["concept_a"] = _FakeNode({"label": "alpha"})
+    graph._pp_fired = ["concept_a"]
+    vdb = _FakeVDB({"concept_a": np.array([1.0, 0.0, 0.0], dtype=np.float32)})
+
+    graph.active_predictions = {"p1": _FakePred(0.9, "src1", "tgt1")}
+    r1 = generate_emergent_want(graph, vdb)
+    assert r1 is not None
+    want_id = r1["id"]
+    first_text = r1["text"]
+
+    # Same concept, different open questions -> reinforce the one node.
+    graph.active_predictions = {"p1": _FakePred(0.9, "src2", "tgt2")}
+    r2 = generate_emergent_want(graph, vdb)
+    assert r2 is not None
+    assert r2["id"] == want_id
+    assert r2.get("reinforced") is True
+
+    want_nodes = [nid for nid in graph.nodes if nid.startswith("cc:want::")]
+    assert len(want_nodes) == 1
+    node = graph.nodes[want_id]
+    assert node.metadata.get("kiss_reinforcement_count") == 1
+    # want_text refreshed to the latest snapshot.
+    assert node.metadata.get("want_text") == r2["text"]
+    assert r2["text"] != first_text
+
+
+def test_emergent_want_distinct_concepts_make_distinct_nodes():
+    """Two curiosity pulses about DIFFERENT concepts create two want-nodes."""
+    import numpy as np
+    from cc_ng_organism import generate_emergent_want
+
+    graph = _FakeWantGraph()
+    graph.active_predictions = {"p1": _FakePred(0.9, "src", "tgt")}
+
+    graph.nodes["concept_a"] = _FakeNode({"label": "alpha"})
+    graph._pp_fired = ["concept_a"]
+    vdb = _FakeVDB({"concept_a": np.array([1.0, 0.0, 0.0], dtype=np.float32)})
+    r1 = generate_emergent_want(graph, vdb)
+    assert r1 is not None
+
+    graph.nodes["concept_b"] = _FakeNode({"label": "beta"})
+    graph._pp_fired = ["concept_b"]
+    vdb2 = _FakeVDB({"concept_b": np.array([0.0, 1.0, 0.0], dtype=np.float32)})
+    r2 = generate_emergent_want(graph, vdb2)
+    assert r2 is not None
+
+
+def test_emergent_want_unresolved_concepts_stay_distinct():
+    """When the concept does NOT resolve (nothing fires -> concept_label is
+    None), distinct label-less curiosities must NOT fold into a shared
+    '(unknown)' bucket -- each keeps its own per-want_text identity so genuine
+    distinct wants don't overwrite each other (LAW 7)."""
+    from cc_ng_organism import generate_emergent_want
+
+    graph = _FakeWantGraph()
+    graph._pp_fired = []   # nothing fires -> no concept node -> concept_label stays None
+    vdb = _FakeVDB({})     # no embeddings to resolve a concept from
+
+    graph.active_predictions = {"p1": _FakePred(0.9, "srcA", "tgtA")}
+    r1 = generate_emergent_want(graph, vdb)
+    assert r1 is not None
+
+    graph.active_predictions = {"p1": _FakePred(0.9, "srcB", "tgtB")}
+    r2 = generate_emergent_want(graph, vdb)
+    assert r2 is not None
+
+    # Distinct label-less wants -> two distinct nodes, neither a reinforcement.
+    assert r1["id"] != r2["id"]
+    assert r1.get("reinforced") is not True
+    assert r2.get("reinforced") is not True
+    want_nodes = [nid for nid in graph.nodes if nid.startswith("cc:want::")]
+    assert len(want_nodes) == 2
+
+    assert r1["id"] != r2["id"]
+    want_nodes = [nid for nid in graph.nodes if nid.startswith("cc:want::")]
+    assert len(want_nodes) == 2
+
+
 def test_drain_ingest_tract_absorbs_experience_entries(cc_ng, tmp_path):
     """Test that drain_ingest_tract reads and absorbs experience entries from a tract file.
 

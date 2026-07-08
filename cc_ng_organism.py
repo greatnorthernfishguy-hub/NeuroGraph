@@ -1,5 +1,45 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Sonnet 5) — Real-KISS redundancy->reinforcement gate
+# What: Added _cc_kiss_find_redundant_node() + _cc_kiss_reinforce_node(), wired
+#   into run_conversational_dual_pass() ahead of the deposit path behind a
+#   CC_KISS_GATE_ENABLED kill switch, with a prune-race fallback. Also re-keyed
+#   generate_emergent_want() to dedup by concept. Constant
+#   _CC_KISS_REDUNDANCY_THRESHOLD.
+# Why: docs/concepts/KISS.md's "Current State" (2026-07-08) calls for KISS
+#   finally applied where it belongs -- the input boundary -- on CC's own
+#   substrate deposit path, not the outbound resend (kiss_filter.py / Elmer's
+#   kiss.py / miniTID's disabled Rust port). Until now, a paraphrased or
+#   exact-repeat conversational turn duplicated a memory node (different text)
+#   or re-primed novelty on an already-known node (same text) -- repetition
+#   never registered as confirmation. Separately, generate_emergent_want()
+#   keyed its want_id on want_text, which embeds volatile per-pulse open-
+#   question UUID pairs -- so the Tonic spawned a brand-new cc:want:: node
+#   every pulse for the SAME concept, flooding "What I Want" with near-dup twins.
+# How: Delta Gate (KISS op 1) via cosine-similarity search against vector_db,
+#   scoped to {"cc": True, "creation_mode": "conversational"} whole-turn nodes
+#   (tree concepts still deposit normally). A match short-circuits the deposit
+#   into confirmation: a counter/timestamp bump plus, if the node is still in
+#   its probation window, one extra step toward graduation (NOT a reset) --
+#   repeated confirmation is evidence FOR the memory. No content classification
+#   in the gate (LAW 7). Cricket bypass: identity-protected nodes
+#   (Graph._is_identity_protected) are never collapse targets. Prune-race
+#   fallback: a stale vdb hit whose node was pruned before reinforce falls
+#   through to a fresh deposit (never silently lost). Emergent-want dedup
+#   re-keys want_id on "tonic-concept::<concept_label>" and reinforces the ONE
+#   existing want-node (refreshing its open-questions snapshot) instead of
+#   spawning a twin -- old-scheme flood nodes remain until age/orphan pruning
+#   clears them (intended; this only stops NEW duplicates). Dedup applies ONLY
+#   when the concept resolves; an unresolved concept_label keeps the original
+#   per-want_text identity so distinct label-less wants never fold into a shared
+#   "(unknown)" bucket (LAW 7 -- preserve distinct emergent states).
+#   Clutter-strip REMOVED (LAW 4): whole-turn harness rejection is miniTID's
+#   job and already runs there (Rust field-based isMeta/isCompactSummary/
+#   tool_result skip in extract_last_user_message). A second weaker string-
+#   prefix filter here was redundant AND risked a LAW-7 false-positive -- a
+#   genuine turn that quotes/discusses <system-reminder> / <task-notification>
+#   would be wrongly dropped and never reach the substrate.
+#   Synapse-weight LTP is deferred to a reviewed follow-up.
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — Lenia checkpoint+resume wiring
 # What: bootstrap_lenia() passes checkpoint_interval_secs/on_checkpoint to both populate()
 #   calls and gains the resume-watermark elif between the full-rebuild and growth branches —
@@ -607,12 +647,34 @@ def generate_emergent_want(
         if open_questions:
             want_text += " -- open questions: " + ", ".join(open_questions)
 
-        want_id = "cc:want::" + hashlib.sha1(want_text.encode("utf-8")).hexdigest()[:16]
-        if want_id in graph.nodes:
-            return None  # already materialized this exact curiosity, idempotent
+        # KISS dedup only when the concept RESOLVES -- a resolved concept_label is a
+        # substrate-produced structural key, so recurring curiosity about the same
+        # concept reinforces the ONE want-node instead of spawning a per-pulse twin
+        # (the "What I Want" flood fix). When the concept does NOT resolve, distinct
+        # label-less curiosities must stay distinct: folding them into a shared
+        # "(unknown)" bucket would overwrite genuine wants with each other (LAW 7 --
+        # preserve the substrate's distinct emergent states), so we keep the original
+        # per-want_text identity + idempotency there instead.
+        if concept_label:
+            want_key = "tonic-concept::" + str(concept_label)
+            want_id = "cc:want::" + hashlib.sha1(want_key.encode("utf-8")).hexdigest()[:16]
+            existing = graph.nodes.get(want_id)
+            if existing is not None:
+                existing.metadata["kiss_reinforcement_count"] = int(existing.metadata.get("kiss_reinforcement_count", 0)) + 1
+                existing.metadata["kiss_last_reinforced_ts"] = time.time()
+                existing.metadata["want_text"] = want_text
+                logger.info("CC emergent want reinforced (concept recurred): %s", want_text)
+                return {"id": want_id, "text": want_text, "provenance": provenance,
+                        "state": existing.metadata.get("want_state", "open"), "reinforced": True}
+            concept_key = want_key
+        else:
+            want_id = "cc:want::" + hashlib.sha1(want_text.encode("utf-8")).hexdigest()[:16]
+            if want_id in graph.nodes:
+                return None  # already materialized this exact curiosity, idempotent
+            concept_key = None
         graph.create_node(node_id=want_id, metadata={
             "kind": "want", "want_text": want_text, "want_state": "open",
-            "provenance": provenance, "creation_mode": "emergent",
+            "provenance": provenance, "creation_mode": "emergent", "concept_key": concept_key,
         })
         logger.info("CC emergent want materialized: %s", want_text)
         return {"id": want_id, "text": want_text, "provenance": provenance, "state": "open"}
@@ -632,6 +694,16 @@ _CC_CONV_NOVELTY_DAMPENING = float(os.environ.get("CC_CONV_NOVELTY_DAMPENING", "
 _CC_CONV_PROBATION_PERIOD = int(os.environ.get("CC_CONV_PROBATION_PERIOD", "10"))
 _CC_CONV_THRESHOLD_BOOST = float(os.environ.get("CC_CONV_THRESHOLD_BOOST", "0.2"))
 _CC_CONV_SYNAPSE_DELAY_MAX = int(os.environ.get("CC_CONV_SYNAPSE_DELAY_MAX", "5"))
+
+# ---- Real-KISS redundancy->reinforcement gate (input boundary, #KISS 2026-07-08) ----
+# See docs/concepts/KISS.md "Current State" / KISS_Pith_Combined_Architecture.md.
+# Delta Gate (KISS op 1) applied where KISS actually belongs -- CC's own substrate
+# deposit path -- instead of the outbound-resend layer. Cosine-similarity change
+# detection only, no content classification (LAW 7 stays satisfied).
+_CC_KISS_REDUNDANCY_THRESHOLD = float(os.environ.get("CC_KISS_REDUNDANCY_THRESHOLD", "0.95"))
+# Live-daemon safety valve: set CC_KISS_GATE_ENABLED=0 to fully bypass the gate
+# (turns deposit fresh, pre-KISS behavior) without a code change or restart-to-old.
+_CC_KISS_GATE_ENABLED = os.environ.get("CC_KISS_GATE_ENABLED", "1") not in ("0", "false", "False", "")
 
 _CC_CONCEPT_FLOOR_MIN_CHARS = 5
 _CC_CONCEPT_FLOOR_STOPWORDS = frozenset(
@@ -692,6 +764,83 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
         except Exception as exc:
             logger.debug("CC recall insert failed (non-fatal): %s", exc)
     return node
+
+
+def _cc_kiss_find_redundant_node(graph, vector_db, embedding) -> Optional[str]:
+    """Delta Gate (KISS op 1), applied at CC's own deposit boundary: is this
+    turn's embedding a near-duplicate of an existing conversational
+    (forest-level) memory already in `vector_db`? Pure cosine-similarity
+    change detection -- never reads `content`, never classifies (LAW 7).
+
+    Scoped to nodes tagged {"cc": True, "creation_mode": "conversational"} --
+    i.e. whole-turn forest nodes -- not fine-grained tree concepts, so a
+    genuinely new sub-concept inside a similar-sounding turn still gets its
+    own recall entry via the tree pass; only whole-turn duplication is gated
+    here. Returns the matched node_id, or None if nothing redundant is found
+    (including on any vector_db error -- caller falls back to a fresh
+    deposit, which is always safe).
+
+    Cricket bypass (LAW-conditioned): an identity-protected node
+    (constitutional / syl_authored, per Graph._is_identity_protected) is NEVER
+    returned as a collapse target -- a redundant turn must not fold into a
+    pinned node. Such matches are skipped; if only pinned nodes match, returns
+    None so the turn deposits fresh.
+    """
+    try:
+        hits = vector_db.search(embedding, k=5, threshold=_CC_KISS_REDUNDANCY_THRESHOLD)
+    except Exception as exc:
+        logger.debug("CC KISS redundancy search failed (non-fatal): %s", exc)
+        return None
+    for node_id, _sim in hits:
+        try:
+            entry = vector_db.get(node_id)
+        except Exception:
+            entry = None
+        meta = (entry or {}).get("metadata") or {}
+        if not (meta.get("cc") is True and meta.get("creation_mode") == "conversational"):
+            continue
+        try:
+            if graph._is_identity_protected(node_id):
+                continue
+        except AttributeError:
+            pass  # no such method -> treat as not protected
+        return node_id
+    return None
+
+
+def _cc_kiss_reinforce_node(graph, node_id: str) -> bool:
+    """Hebbian reinforcement for a redundant conversational turn -- the
+    real-KISS counterpart to a fresh deposit. Never drops the turn (LAW 7:
+    the substrate still responds to it) and never duplicates a memory node
+    for content it already represents; instead the topology that already
+    stands for this content is confirmed.
+
+    - Bumps a confirmation counter/timestamp on the node's metadata.
+    - If the node is still inside its novelty-probation window, graduation
+      is ACCELERATED (probation_remaining ticks down one extra step) rather
+      than restarted -- repeated confirmation is evidence FOR the memory, the
+      opposite of what a brand-new deposit's fixed probation window means. An
+      already-graduated node is never pushed back into probation.
+
+    Returns False (non-fatal) if node_id no longer resolves -- e.g. pruned
+    between the vector-db hit and this call -- so the caller can decide
+    whether to fall back to a fresh deposit instead.
+    """
+    node = graph.nodes.get(node_id)
+    if node is None:
+        return False
+    node.metadata["kiss_reinforcement_count"] = int(node.metadata.get("kiss_reinforcement_count", 0)) + 1
+    node.metadata["kiss_last_reinforced_ts"] = time.time()
+    # Synapse-level LTP reinforcement is a reviewed follow-up (kept out of v1 for cost + to validate the collapse behavior in isolation first).
+    prob = node.metadata.get("probation_remaining")
+    if prob is not None and prob > 0:
+        prob -= 1
+        node.metadata["probation_remaining"] = prob
+        if prob <= 0:
+            node.intrinsic_excitability = 1.0
+            node.threshold = graph.config.get("default_threshold", 1.0)
+            node.metadata["graduated"] = True
+    return True
 
 
 class _CCConversationalDualPassEco:
@@ -797,11 +946,27 @@ def cc_update_probation(graph) -> list:
 def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict) -> bool:
     """Core dual-pass on one turn's text. Returns True on success, False on
     failure -- caller decides retry policy (this function does not enqueue).
-    Mirrors canonical's _run_conversational_dual_pass exactly, parameterized.
+    Mirrors canonical's _run_conversational_dual_pass exactly, parameterized,
+    with one CC-first addition on top: the real-KISS redundancy->reinforcement
+    gate (docs/concepts/KISS.md "Current State", 2026-07-08). Before depositing
+    a new memory, checks whether `embedding` is a near-duplicate of an existing
+    conversational node. If so, the turn still touches the substrate -- via
+    confirmation of the matched node and the same topology binding/anticipation
+    a fresh deposit gets -- it just doesn't duplicate a node for content the
+    substrate already represents (LAW 7: reinforced, not dropped). The whole
+    gate is bypassable at runtime via CC_KISS_GATE_ENABLED=0.
     """
     if graph is None or embedding is None:
         return False
     try:
+        if _CC_KISS_GATE_ENABLED:
+            redundant_id = _cc_kiss_find_redundant_node(graph, vector_db, embedding)
+            if redundant_id is not None and _cc_kiss_reinforce_node(graph, redundant_id):
+                _cc_bind_conversational_topology(graph, redundant_id, {}, embedding, state)
+                return True
+            # else: the matched node was pruned between the vdb hit and the
+            # reinforce call (stale hit) -- fall through to the fresh-deposit
+            # path below so the turn is never silently lost (LAW 7).
         from ng_embed import NGEmbed
         import hashlib
         target_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
