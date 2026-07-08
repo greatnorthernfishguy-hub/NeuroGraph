@@ -25,3 +25,4 @@ fastembed_cache/
 venv/
 node_modules/
 .neurograph/
+.claude/worktrees/
