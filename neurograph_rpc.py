@@ -12,6 +12,11 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — Lenia resume branch
+# What: handle_bootstrap()'s Lenia block gains an elif between full-rebuild and growth:
+#   a loaded cache carrying a resume watermark resumes the interrupted rebuild (with
+#   resize first if the graph also grew) instead of being treated as complete.
+# Why/How: see lenia/kernel.py's 2026-07-08 changelog entry — this is the caller half.
 # [2026-07-06] Claude Code (Sonnet 5) — Periodic Lenia checkpointing during populate() (Josh-approved)
 #   What: both handle_bootstrap() populate() call sites now pass
 #     checkpoint_interval_secs=_LENIA_CHECKPOINT_INTERVAL_SECS (5 min, new
@@ -2050,6 +2055,32 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
                 logger.warning(
                     "Distance cache populate failed partway (%s) — saving "
                     "whatever was computed instead of discarding it", exc,
+                )
+        elif lenia_cache.watermark is not None:
+            # A prior rebuild was interrupted mid-run: the checkpoint carries
+            # its own resume point. Resume covers both the unfinished old
+            # region and (after resize) every pair touching entities appended
+            # since — new-entity pairs all sort after the watermark in the
+            # canonical (max, min) order. Without this branch a partial
+            # checkpoint was silently treated as a complete cache.
+            _wm = lenia_cache.watermark
+            logger.info(
+                "Distance cache carries resume watermark (%d, %d) — resuming "
+                "interrupted rebuild (%d -> %d entities)",
+                _wm[0], _wm[1], lenia_cache.entity_count, n_entities,
+            )
+            if lenia_cache.entity_count != n_entities:
+                lenia_cache.resize(n_entities, new_entity_ids=lenia_substrate.entities())
+            try:
+                lenia_cache.populate(
+                    lenia_substrate, resume_watermark=_wm,
+                    checkpoint_interval_secs=_LENIA_CHECKPOINT_INTERVAL_SECS,
+                    on_checkpoint=lambda: lenia_cache.save(_cache_path),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Distance cache resume populate failed partway (%s) — "
+                    "saving whatever was computed instead of discarding it", exc,
                 )
         elif lenia_cache.entity_count != n_entities:
             # Common case: the graph only grew since the last save.

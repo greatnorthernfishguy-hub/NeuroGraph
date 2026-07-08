@@ -1,4 +1,21 @@
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — Resume watermark
+# What: DistanceCache gains a resume watermark: populate() iterates connected pairs in a
+#   canonical (max_idx, min_idx)-sorted order; each periodic checkpoint records the last
+#   processed pair on the instance so save() persists it; load() restores it; populate(
+#   resume_watermark=...) skips pairs at or before it. neurograph_rpc.py resumes an
+#   interrupted rebuild instead of treating a partial checkpoint as complete.
+# Why: the 2026-07-06 periodic checkpoints made progress SURVIVE interruption but not
+#   RESUME — a partial cache loaded as if complete (silently hollow Lenia dynamics) or
+#   the growth path extended only new entities, never finishing the old region. On a
+#   rebuild measured in days (7.3M pairs, 2026-07-07) against a VPS that restarts more
+#   often than that, that gap was the difference between insurance and decoration.
+# How: sort connected_pairs by (p[1], p[0]) — deterministic under append-stable entity
+#   indexing, and all new-entity pairs sort after all old-old pairs, so resume+growth
+#   compose in one filter. Watermark = the pair VALUE (indices into a changed list are
+#   meaningless). Cleared on completion so a finished save carries no watermark.
+#   Known accepted blind spot: new old-old synapses created mid-interruption sort <=
+#   watermark and are skipped — same class as the start_index path's existing blind spot.
 # 2026-03-25 Claude Code — Initial creation
 # What: Multi-metric kernel computer with sparse distance cache
 # Why: Lenia kernels operate over composite distance, not single-metric
@@ -116,6 +133,10 @@ class DistanceCache:
         self._populated = False
         # Combined magnitude matrix for fast neighbor filtering
         self._magnitude_csr: Optional[sparse.csr_matrix] = None
+        # Resume watermark: the last (i, j) pair processed by an interrupted
+        # populate() run, in canonical (max, min) order. None = complete (or
+        # never checkpointed mid-run). Persisted by save(), restored by load().
+        self._watermark: Optional[Tuple[int, int]] = None
 
     @property
     def entity_count(self) -> int:
@@ -128,6 +149,11 @@ class DistanceCache:
     @property
     def populated(self) -> bool:
         return self._populated
+
+    @property
+    def watermark(self) -> Optional[Tuple[int, int]]:
+        """Last pair processed by an interrupted populate(), or None if complete."""
+        return self._watermark
 
     def save(self, path: str) -> None:
         """Save the distance cache to disk.
@@ -147,6 +173,8 @@ class DistanceCache:
             # numpy infers a fixed-width unicode dtype for a list of plain
             # strings — no allow_pickle needed on either side.
             data["entity_ids"] = np.array(self._entity_ids)
+        if self._watermark is not None:
+            data["watermark"] = np.array(list(self._watermark))
         for c in range(NUM_DIST_COMPONENTS):
             csr = self._components_csr[c]
             data[f"c{c}_data"] = csr.data
@@ -180,6 +208,10 @@ class DistanceCache:
                 arch["entity_ids"].tolist() if "entity_ids" in arch.files else None
             )
             cache = cls(n, entity_ids=entity_ids)
+            cache._watermark = (
+                (int(arch["watermark"][0]), int(arch["watermark"][1]))
+                if "watermark" in arch.files else None
+            )
             cache._components_csr = []
             for c in range(nc):
                 csr = sparse.csr_matrix(
@@ -207,7 +239,8 @@ class DistanceCache:
 
     def populate(self, substrate: LeniaSubstrate, start_index: int = 0,
                  checkpoint_interval_secs: float = 0.0,
-                 on_checkpoint: Optional[Callable[[], None]] = None):
+                 on_checkpoint: Optional[Callable[[], None]] = None,
+                 resume_watermark: Optional[Tuple[int, int]] = None):
         """Populate the cache from the substrate.
 
         Called once on startup. Subsequent updates use dirty flags.
@@ -237,6 +270,14 @@ class DistanceCache:
                 typically the caller's own `lambda: cache.save(path)`. Kept
                 as a callback, not a hardcoded path, so this class stays
                 I/O-path-agnostic; neurograph_rpc.py already owns the path.
+            resume_watermark: an (i, j) pair previously recorded by an
+                interrupted run's checkpoint (see DistanceCache.watermark).
+                Pairs at or before it in canonical (max, min) order are
+                skipped — they were already computed and saved. Because all
+                pairs touching a newly appended entity sort AFTER every
+                old-old pair, a resume on a grown graph covers both the
+                unfinished old region and all new pairs. None (default) =
+                no resume, unchanged behavior.
         """
         n = substrate.entity_count()
         if n == 0:
@@ -302,7 +343,25 @@ class DistanceCache:
                 if i >= start_index or j >= start_index
             }
 
-        logger.info("Computing distances for %d connected pairs", len(connected_pairs))
+        # Canonical processing order: (max, min)-sorted. Deterministic under
+        # append-stable entity indexing (a set's iteration order is not
+        # reproducible across processes), and every pair touching a newly
+        # appended entity sorts after all old-old pairs — which is what lets
+        # a resume_watermark compose with graph growth in one filter.
+        ordered_pairs = sorted(connected_pairs, key=lambda p: (p[1], p[0]))
+
+        if resume_watermark is not None:
+            _wm_key = (resume_watermark[1], resume_watermark[0])
+            _before = len(ordered_pairs)
+            ordered_pairs = [p for p in ordered_pairs if (p[1], p[0]) > _wm_key]
+            logger.info(
+                "Resuming distance-cache populate from watermark (%d, %d): "
+                "%d of %d pairs already done, %d remaining",
+                resume_watermark[0], resume_watermark[1],
+                _before - len(ordered_pairs), _before, len(ordered_pairs),
+            )
+
+        logger.info("Computing distances for %d connected pairs", len(ordered_pairs))
 
         # Mark populated before the expensive loop, not after — a save()
         # following a mid-loop crash below (e.g. a concurrent graph
@@ -311,7 +370,7 @@ class DistanceCache:
         # discarding it because _populated never flipped true.
         self._populated = True
         _last_checkpoint = time.monotonic()
-        for idx, (i, j) in enumerate(connected_pairs):
+        for idx, (i, j) in enumerate(ordered_pairs):
             eid_i = substrate.index_to_entity(i)
             eid_j = substrate.index_to_entity(j)
             dvec = substrate.distance_vector(eid_i, eid_j)
@@ -327,21 +386,29 @@ class DistanceCache:
                 _now = time.monotonic()
                 if _now - _last_checkpoint >= checkpoint_interval_secs:
                     try:
+                        # Record how far we got BEFORE saving, so the
+                        # checkpoint carries its own resume point. (i, j)
+                        # is complete at this line — the checkpoint sits
+                        # after the distance computation above.
+                        self._watermark = (i, j)
                         self._rebuild_csr()  # save() reads the CSR form
                         on_checkpoint()
                         _last_checkpoint = _now
                         logger.info(
                             "Lenia periodic checkpoint: %d/%d pairs processed",
-                            idx + 1, len(connected_pairs),
+                            idx + 1, len(ordered_pairs),
                         )
                     except Exception:
                         logger.exception(
                             "Periodic Lenia checkpoint failed (non-fatal) at "
-                            "pair %d/%d", idx + 1, len(connected_pairs),
+                            "pair %d/%d", idx + 1, len(ordered_pairs),
                         )
 
+        # Loop completed — the cache is whole; a finished save must not
+        # carry a resume point.
+        self._watermark = None
         self._rebuild_csr()
-        logger.info("Distance cache populated: %d pairs", len(connected_pairs))
+        logger.info("Distance cache populated: %d pairs", len(ordered_pairs))
 
     def _rebuild_csr(self):
         """Convert lil matrices to CSR for fast row access."""
