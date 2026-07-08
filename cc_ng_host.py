@@ -208,8 +208,8 @@ _CC_SNN_CONFIG = {
     "tau_minus": 10.0,
     "A_plus": 1.2,
     "A_minus": 1.4,
-    "decay_rate": 0.95,
-    "default_threshold": 1.0,
+    "decay_rate": 0.97,  # [2026-07-08] 0.95->0.97: same parity port -- slower voltage bleed lets accumulation reach threshold
+    "default_threshold": 0.85,  # [2026-07-08] 1.0->0.85: parity with canonical's 2026-03-23 substrate tuning -- at 1.0, prime injection (sim*1.0) can NEVER ignite a cold node; measured live (all seeds subthreshold)
     "refractory_period": 2,
     "max_weight": 5.0,
     "target_firing_rate": 0.05,
