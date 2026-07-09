@@ -26,3 +26,6 @@ venv/
 node_modules/
 .neurograph/
 .claude/worktrees/
+# Machine-local Claude Code permissions (accumulated per-session grants) — not shared.
+# Only settings.local.json is local; settings.json and hooks/ stay tracked.
+.claude/settings.local.json
