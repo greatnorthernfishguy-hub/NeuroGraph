@@ -28,6 +28,18 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-07-09] Claude Code (Fable 5 design / Haiku implementation) — #373 checkpoint guardian wiring (Josh-approved protected-file change; checkpoints backed up)
+# What: __init__ records the boot-restore outcome into checkpoint_guardian.SaveGate;
+#   save() routes through gate (refused -> quarantine, loud) -> atomic tmp+os.replace
+#   writes for graph + vdb -> manifest sidecar -> hardlinked generation ring. Guardian
+#   import is try/except-guarded (CES pattern): module absent = prior behavior exactly.
+# Why: #373 — the empty-writer clobber destroyed state 3x (2026-06-14, 2026-06-26,
+#   2026-07-08 ~1800→4-6 nodes); the 2026-07-03 entry below explicitly deferred this
+#   hardening. Both writers were non-atomic in-place opens — torn by mid-write death.
+# How: all mechanics live in non-protected checkpoint_guardian.py; this file only
+#   records outcomes and routes save(). No engine, restore-semantics, or format
+#   changes; activation-sidecar write untouched (protected CES module owns its path).
+# -------------------
 # [2026-07-07] Claude Code (Fable 5) — Skip orphaned prime seeds in _harvest_associations (Josh-approved)
 #   What: seed-selection loop gains `and entry_id in self.graph.nodes` — vdb search hits whose
 #         graph node was orphan-pruned (#237) are skipped instead of being handed to
@@ -268,6 +280,22 @@ from universal_ingestor import (
     get_ingestor_config,
     MEDIA_EXTENSIONS,
 )
+
+# #373 checkpoint guardian — guarded like the CES imports so every instance
+# without the module (e.g. the Codemine fork until its Dockerfile gains the
+# COPY line) behaves exactly as before.
+try:
+    from checkpoint_guardian import (
+        SaveGate,
+        atomic_file_write,
+        best_effort_git_hash,
+        quarantine_save,
+        rotate_generations,
+        write_manifest,
+    )
+    _GUARDIAN_AVAILABLE = True
+except Exception:
+    _GUARDIAN_AVAILABLE = False
 
 logger = logging.getLogger("neurograph")
 
@@ -516,12 +544,13 @@ class NeuroGraphMemory:
         snn_config = {**OPENCLAW_SNN_CONFIG, **(config or {})}
         self.graph = Graph(config=snn_config)
 
-        # Restore from checkpoint if one exists
+        _restore_outcome = "no_file"
         if self._checkpoint_path.exists() and not _wait_for_stable_checkpoint(str(self._checkpoint_path)):
             logger.warning(
                 "Checkpoint %s mid-write — skipping restore this init (graph starts empty)",
                 self._checkpoint_path,
             )
+            _restore_outcome = "skipped_unstable"
         elif self._checkpoint_path.exists():
             try:
                 self.graph.restore(str(self._checkpoint_path))
@@ -534,8 +563,17 @@ class NeuroGraphMemory:
                     len(self.graph.nodes),
                     len(self.graph.synapses),
                 )
+                _restore_outcome = "ok"
             except Exception as exc:
                 logger.warning("Failed to restore checkpoint: %s", exc)
+                _restore_outcome = "failed"
+
+        # #373: the gate records how boot went; a failed/skipped restore next
+        # to a real on-disk checkpoint puts saves into provisional-quarantine
+        # mode (the 2026-06-14 / 2026-06-26 / 2026-07-08 clobber class).
+        self._save_gate = SaveGate(self._checkpoint_path) if _GUARDIAN_AVAILABLE else None
+        if self._save_gate is not None:
+            self._save_gate.record_restore(_restore_outcome, len(self.graph.nodes))
 
         # Vector DB for semantic search
         self.vector_db = SimpleVectorDB()
@@ -1111,8 +1149,41 @@ class NeuroGraphMemory:
         return results
 
     def save(self) -> str:
-        """Save graph state to checkpoint. Returns the checkpoint path."""
-        self.graph.checkpoint(str(self._checkpoint_path), mode=CheckpointMode.FULL)
+        """Save graph state to checkpoint. Returns the checkpoint path —
+        or, when the #373 gate refuses (provisional boot / collapsed in-RAM
+        state), the QUARANTINE path the state was preserved at instead."""
+        live_nodes = len(self.graph.nodes)
+        if self._save_gate is not None:
+            _ok, _reason = self._save_gate.permit(live_nodes)
+            if not _ok:
+                logger.error(
+                    "Guardian REFUSED primary checkpoint write (%s). In-RAM "
+                    "state (%d nodes) quarantined; primary %s left untouched.",
+                    _reason, live_nodes, self._checkpoint_path,
+                )
+                qpath = quarantine_save(
+                    str(self._checkpoint_dir), "main",
+                    lambda p: self.graph.checkpoint(p, mode=CheckpointMode.FULL),
+                )
+                try:
+                    quarantine_save(
+                        str(self._checkpoint_dir), "vectors",
+                        lambda p: self.vector_db.save(p),
+                    )
+                except Exception as exc:
+                    logger.warning("Guardian: vector DB quarantine failed: %s", exc)
+                return qpath
+
+        if self._save_gate is not None:
+            # #373: atomic — a mid-write process death can no longer tear the
+            # only copy. Tmp name preserves .msgpack (both writers dispatch on
+            # the extension — see checkpoint_guardian.atomic_file_write).
+            atomic_file_write(
+                str(self._checkpoint_path),
+                lambda p: self.graph.checkpoint(p, mode=CheckpointMode.FULL),
+            )
+        else:
+            self.graph.checkpoint(str(self._checkpoint_path), mode=CheckpointMode.FULL)
         # CES: Save activation sidecar alongside checkpoint
         if self._activation_persistence is not None:
             self._activation_persistence.save(
@@ -1122,10 +1193,38 @@ class NeuroGraphMemory:
 
         # Save vector DB alongside graph checkpoint
         try:
-            vdb_count = self.vector_db.save(str(self._vector_db_path))
+            if self._save_gate is not None:
+                vdb_count = atomic_file_write(
+                    str(self._vector_db_path),
+                    lambda p: self.vector_db.save(p),
+                )
+            else:
+                vdb_count = self.vector_db.save(str(self._vector_db_path))
             logger.info("Vector DB saved to %s (%d entries)", self._vector_db_path, vdb_count)
         except Exception as exc:
             logger.warning("Failed to save vector DB: %s", exc)
+
+        if self._save_gate is not None:
+            # #373: manifest describes what is now on disk; generation ring
+            # hardlinks the consistent SET (never mixed across saves).
+            try:
+                write_manifest(self._checkpoint_path, {
+                    "nodes": live_nodes,
+                    "synapses": len(self.graph.synapses),
+                    "hyperedges": len(self.graph.hyperedges),
+                    "timestep": self.graph.timestep,
+                    "vdb_count": self.vector_db.count(),
+                    "git": best_effort_git_hash(os.path.dirname(os.path.abspath(__file__))),
+                })
+                rotate_generations(str(self._checkpoint_dir), [
+                    str(self._checkpoint_path),
+                    str(self._checkpoint_path) + ".activations.json",
+                    str(self._vector_db_path),
+                    str(self._checkpoint_path) + ".manifest.json",
+                ])
+            except Exception as exc:
+                logger.warning("Guardian: manifest/rotation failed (primary save "
+                               "itself succeeded): %s", exc)
 
         return str(self._checkpoint_path)
 
