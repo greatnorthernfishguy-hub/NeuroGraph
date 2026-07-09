@@ -1,4 +1,17 @@
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Fable 5 design / Fable 5 final review) — #371 reconcile wiring test
+# What: adds test_bootstrap_reconciles_pruned_cache_instead_of_full_rebuild — a
+#   bootstrap → prune → re-bootstrap round-trip asserting the on-disk cache is
+#   reconciled (kernel's "reconciled after prune" log) instead of discarded
+#   ("full repopulate"/"full rebuild required" absent). Also repoints the
+#   hardcoded sys.path.insert('/home/josh/NeuroGraph') to a __file__-relative
+#   form so the test imports the code of the checkout it lives in (worktree
+#   runs previously imported main's modules silently).
+# Why: #371 — the caller-side rewire in cc_ng_organism.py needs a bail-vs-
+#   reconcile pin at the bootstrap level; the kernel machinery is covered by
+#   tests/test_lenia_removal_reconcile.py.
+# How: real Graph + real bootstrap_lenia() twice against the same tmp
+#   workspace, caplog on the second run.
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — CC Lenia wiring tests
 # What: pins that bootstrap_lenia() actually PASSES the checkpoint/resume machinery to
 #   DistanceCache.populate() in all three branches, and that the resume branch is chosen
@@ -12,11 +25,14 @@
 #   of the lenia stack constructs for real (tmp field_dir), matching production flow.
 # -------------------
 import sys
-sys.path.insert(0, '/home/josh/NeuroGraph')
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile, shutil
+import logging
 import pytest
 
 from neuro_foundation import Graph
+from cc_ng_organism import bootstrap_lenia
 
 
 def _graph(n=6):
@@ -128,3 +144,28 @@ def test_field_dir_exists_before_first_checkpoint_could_fire(workspace, monkeypa
     monkeypatch.setattr(lk.DistanceCache, "populate", spy)
     bootstrap_lenia(_graph(), None, workspace)
     assert seen.get("dir_exists_at_populate") is True
+
+
+def test_bootstrap_reconciles_pruned_cache_instead_of_full_rebuild(tmp_path, caplog):
+    """#371: a node pruned between saves must NOT force a full repopulate —
+    bootstrap_lenia reconciles the on-disk cache and reuses it."""
+    g = Graph()
+    for i in range(8):
+        g.create_node(node_id=f"n{i}")
+    for i in range(7):
+        g.create_synapse(f"n{i}", f"n{i + 1}", weight=0.5)
+
+    ws = str(tmp_path / "ws")
+    first = bootstrap_lenia(g, None, ws)
+    assert first.get("engine") is not None  # populate completed + saved
+
+    g.remove_node("n4")
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        second = bootstrap_lenia(g, None, ws)
+    assert second.get("engine") is not None
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "reconciled after prune" in joined
+    assert "full repopulate" not in joined
+    assert "full rebuild required" not in joined

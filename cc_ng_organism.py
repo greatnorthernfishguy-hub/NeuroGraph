@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — #371 reconcile-not-discard
+# What: bootstrap_lenia: on pruned-entity mismatch, reconcile_removals() the cache
+#   and fall through to the existing watermark-resume/growth branches; full rebuild
+#   only when reconcile returns None. Mirror of neurograph_rpc.py's block.
+# Why: #371 — CC's continuous pruning (KISS-era churn included) re-triggered a
+#   ~7-minute full repopulate blackout on every restart-after-prune, and the same
+#   bail on Syl's scale costs days. See lenia/kernel.py's entry for the mechanism.
+# How: one-call swap at the decision point; downstream branches and fail-soft
+#   shape untouched.
 # [2026-07-08] Claude Code (Sonnet 5) — Real-KISS redundancy->reinforcement gate
 # What: Added _cc_kiss_find_redundant_node() + _cc_kiss_reinforce_node(), wired
 #   into run_conversational_dual_pass() ahead of the deposit path behind a
@@ -330,10 +339,17 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
             if all(eid in live_ids for eid in lenia_cache.entity_ids):
                 known_order = lenia_cache.entity_ids
             else:
-                logger.info(
-                    "CC Lenia: distance cache has entities no longer in the "
-                    "live graph — full rebuild required"
-                )
+                # #371: reconcile the pruned entities out of the cache and
+                # fall through to the same watermark/growth branches below —
+                # mirror of neurograph_rpc.py's block. None -> legacy full
+                # rebuild, as before.
+                known_order = lenia_cache.reconcile_removals(live_ids)
+                if known_order is None:
+                    logger.info(
+                        "CC Lenia: distance cache has entities no longer in "
+                        "the live graph and could not be reconciled — full "
+                        "rebuild required"
+                    )
 
         lenia_substrate = NeuroGraphSubstrate(graph, vector_db, known_entity_order=known_order)
         lenia_field = LeniaFieldStore(lenia_cfg.field_dir, n_entities, n_channels)
