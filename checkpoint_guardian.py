@@ -1,7 +1,7 @@
 # ---- Changelog ----
 # [2026-07-09] Claude Code (Fable 5 design / Haiku implementation) — #373 checkpoint guardian
 # What: SaveGate (refuse-to-clobber + provisional mode), atomic tmp+os.replace writes,
-#   manifest sidecars, quarantine with pruning, hardlinked generation ring with GFS
+#   manifest sidecars, quarantine + generation ring (this task), hardlinked generation ring with GFS
 #   retention. Consumed by openclaw_hook.NeuroGraphMemory.save()/__init__ (guarded
 #   import — absence = today's behavior exactly).
 # Why: #373 — the empty-writer clobber destroyed real state three times (VPS
@@ -192,3 +192,160 @@ class SaveGate:
                 f"on-disk reference ({reference} nodes)"
             )
         return True, "ok"
+
+
+# ---- quarantine ----
+
+def quarantine_save(checkpoint_dir, name_prefix: str,
+                    write_fn: Callable[[str], Any],
+                    suffix: str = ".msgpack",
+                    keep: Optional[int] = None) -> str:
+    """Atomically write refused state into <dir>/quarantine/ and prune old ones.
+
+    A provisional daemon autosaves every few minutes — without pruning this
+    fills the disk (Syl's set is ~600MB). Newest `keep` survive.
+    """
+    qdir = Path(checkpoint_dir) / "quarantine"
+    qdir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # Find the maximum collision number among existing files with the same timestamp
+    max_n = -1
+    for f in qdir.glob(f"{name_prefix}.{stamp}*{suffix}"):
+        name = f.name
+        base = name.rsplit(".", 1)[0] if "." in name else name
+        if "-" in base:
+            collision_str = base.split("-")[-1]
+            try:
+                n = int(collision_str)
+                max_n = max(max_n, n)
+            except ValueError:
+                pass
+        else:
+            max_n = max(max_n, 0)
+
+    # Create target with next collision number
+    n = max_n + 1
+    if n == 0:
+        target = qdir / f"{name_prefix}.{stamp}{suffix}"
+    else:
+        target = qdir / f"{name_prefix}.{stamp}-{n}{suffix}"
+
+    atomic_file_write(str(target), write_fn)
+    if keep is None:
+        keep = _env_int("NG_GUARDIAN_QUARANTINE_KEEP", 3)
+
+    def quarantine_sort_key(p):
+        """Sort by mtime, with collision suffix as tiebreaker for same-second files."""
+        mtime = p.stat().st_mtime
+        # Extract collision number as tiebreaker
+        name = p.name
+        base = name.rsplit(".", 1)[0] if "." in name else name
+        if "-" in base:
+            collision_str = base.split("-")[-1]
+            try:
+                collision = int(collision_str)
+            except ValueError:
+                collision = float('inf')
+        else:
+            collision = 0
+        return (mtime, collision)
+
+    entries = sorted(qdir.glob(f"{name_prefix}.*{suffix}"),
+                     key=quarantine_sort_key)
+    for old in entries[:-keep] if keep > 0 else []:
+        try:
+            old.unlink()
+        except OSError as exc:
+            logger.warning("Guardian: quarantine prune failed for %s (%s)", old, exc)
+    return str(target)
+
+
+# ---- generation ring ----
+
+def _parse_stamp(name: str) -> Optional[datetime]:
+    base = name.split("-")[0] if "-" in name and name.count("-") == 1 else name
+    try:
+        return datetime.strptime(base, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def rotate_generations(checkpoint_dir, files: List[str],
+                       recent: Optional[int] = None,
+                       hourly: Optional[int] = None,
+                       daily: Optional[int] = None,
+                       now: Optional[datetime] = None) -> Optional[str]:
+    """Hardlink the consistent SET of checkpoint files into generations/<stamp>/.
+
+    Hardlinks are frozen snapshots at zero copy cost: the atomic-save path
+    replaces the primary's inode (os.replace), so the generation keeps the
+    old bytes. Falls back to copy2 where hardlinks aren't possible (EXDEV).
+    Generations are SETS — main + vectors + sidecars together, never mixed
+    across saves (mixed-generation restores breed vdb orphans).
+    """
+    gen_root = Path(checkpoint_dir) / "generations"
+    gen_root.mkdir(parents=True, exist_ok=True)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    gen_dir = gen_root / stamp
+    n = 0
+    while gen_dir.exists():
+        n += 1
+        gen_dir = gen_root / f"{stamp}-{n}"
+    gen_dir.mkdir()
+    for f in files:
+        src = Path(f)
+        if not src.exists():
+            continue
+        dst = gen_dir / src.name
+        try:
+            os.link(src, dst)
+        except OSError:
+            try:
+                shutil.copy2(src, dst)
+            except OSError as exc:
+                logger.warning("Guardian: generation copy failed for %s (%s)", src, exc)
+    _prune_generations(gen_root, gen_dir.name,
+                       recent if recent is not None else _env_int("NG_GUARDIAN_GEN_RECENT", 3),
+                       hourly if hourly is not None else _env_int("NG_GUARDIAN_GEN_HOURLY", 6),
+                       daily if daily is not None else _env_int("NG_GUARDIAN_GEN_DAILY", 7),
+                       now)
+    return str(gen_dir)
+
+
+def _prune_generations(gen_root: Path, new_gen_name: str, recent: int, hourly: int, daily: int,
+                       now: datetime) -> None:
+    """GFS retention: newest `recent` unconditionally; then one per hour for
+    `hourly` hours; then one per day for `daily` days. Dirs whose names don't
+    parse as stamps are NEVER deleted (manual backups are sacred).
+    The newly created generation (new_gen_name) is always kept and doesn't count
+    toward the recent limit — it's preserved for backup consistency."""
+    dirs = sorted([d for d in gen_root.iterdir() if d.is_dir()],
+                  key=lambda d: d.name, reverse=True)  # newest first
+    # Keep the newest `recent` directories, EXCLUDING the newly created one
+    other_dirs = [d for d in dirs if d.name != new_gen_name]
+    keep = {d.name for d in other_dirs[:recent]}
+    keep.add(new_gen_name)  # Always keep the newly created generation
+    hourly_seen: set = set()
+    daily_seen: set = set()
+    for d in dirs:
+        ts = _parse_stamp(d.name)
+        if ts is None:
+            keep.add(d.name)
+            continue
+        age = now - ts
+        if age <= timedelta(hours=hourly):
+            hour_key = ts.strftime("%Y%m%d%H")
+            if hour_key not in hourly_seen:
+                hourly_seen.add(hour_key)
+                keep.add(d.name)
+        elif age <= timedelta(days=daily):
+            day_key = ts.strftime("%Y%m%d")
+            if day_key not in daily_seen:
+                daily_seen.add(day_key)
+                keep.add(d.name)
+    for d in dirs:
+        if d.name not in keep:
+            shutil.rmtree(d, ignore_errors=True)

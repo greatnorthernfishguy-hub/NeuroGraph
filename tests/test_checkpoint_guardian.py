@@ -15,6 +15,8 @@
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,6 +29,9 @@ from checkpoint_guardian import (
     manifest_path_for,
     read_manifest,
     write_manifest,
+    quarantine_save,
+    rotate_generations,
+    _parse_stamp,
 )
 
 
@@ -172,3 +177,119 @@ def test_gate_clear_provisional(tmp_path):
     assert not gate.provisional
     ok, _ = gate.permit(0)
     assert ok  # no reference either — permissive after operator clear
+
+
+# ---- quarantine ----
+
+def test_quarantine_writes_and_prunes(tmp_path):
+    paths = []
+    for i in range(5):
+        p = quarantine_save(tmp_path, "main",
+                            lambda t, i=i: open(t, "wb").write(b"q%d" % i),
+                            keep=3)
+        paths.append(p)
+    qdir = tmp_path / "quarantine"
+    kept = list(qdir.glob("main.*.msgpack"))
+    assert len(kept) == 3
+    assert os.path.exists(paths[-1]), "newest quarantine entry must survive"
+    assert not os.path.exists(paths[0]), "oldest must be pruned"
+
+
+def test_quarantine_write_is_atomic_suffix(tmp_path):
+    seen = {}
+    quarantine_save(tmp_path, "vectors",
+                    lambda t: (seen.__setitem__("p", t), open(t, "wb").write(b"v"))[1])
+    assert seen["p"].endswith(".msgpack")
+
+
+# ---- generation ring ----
+
+def _mk_set(tmp_path, content=b"DATA"):
+    main = tmp_path / "main.msgpack"
+    vec = tmp_path / "vectors.msgpack"
+    man = tmp_path / "main.msgpack.manifest.json"
+    main.write_bytes(content)
+    vec.write_bytes(content + b"v")
+    man.write_text("{}")
+    return [str(main), str(vec), str(man)]
+
+
+def test_rotation_hardlinks_frozen_set(tmp_path):
+    files = _mk_set(tmp_path)
+    gen = rotate_generations(tmp_path, files)
+    gen_main = Path(gen) / "main.msgpack"
+    assert gen_main.exists()
+    # hardlink: same inode as the current primary...
+    assert os.stat(gen_main).st_ino == os.stat(files[0]).st_ino
+    # ...until an atomic replace swaps the primary's inode — generation keeps old bytes.
+    atomic_file_write(files[0], lambda p: open(p, "wb").write(b"NEWER"))
+    assert gen_main.read_bytes() == b"DATA"
+    assert Path(files[0]).read_bytes() == b"NEWER"
+
+
+def test_rotation_skips_missing_set_members(tmp_path):
+    files = _mk_set(tmp_path)
+    files.append(str(tmp_path / "main.msgpack.activations.json"))  # not present
+    gen = rotate_generations(tmp_path, files)
+    assert not (Path(gen) / "main.msgpack.activations.json").exists()
+    assert (Path(gen) / "main.msgpack").exists()
+
+
+def test_rotation_stamp_collision_gets_suffix(tmp_path):
+    files = _mk_set(tmp_path)
+    now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=timezone.utc)
+    g1 = rotate_generations(tmp_path, files, now=now)
+    g2 = rotate_generations(tmp_path, files, now=now)
+    assert g1 != g2
+    assert Path(g2).name.startswith(Path(g1).name)
+
+
+def test_parse_stamp():
+    assert _parse_stamp("20260709T120000Z") == datetime(2026, 7, 9, 12, 0, 0,
+                                                        tzinfo=timezone.utc)
+    assert _parse_stamp("20260709T120000Z-2") == datetime(2026, 7, 9, 12, 0, 0,
+                                                          tzinfo=timezone.utc)
+    assert _parse_stamp("not-a-stamp") is None
+
+
+def test_gfs_retention(tmp_path):
+    files = _mk_set(tmp_path)
+    now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=timezone.utc)
+    ages = [
+        timedelta(minutes=0), timedelta(minutes=5), timedelta(minutes=10),   # recent 3
+        timedelta(minutes=90), timedelta(minutes=95),                        # same hour: keep 1
+        timedelta(hours=3),                                                  # another hour
+        timedelta(days=2), timedelta(days=2, hours=1),                       # same day: keep 1
+        timedelta(days=5),                                                   # another day
+        timedelta(days=30),                                                  # too old: drop
+    ]
+    gen_root = tmp_path / "generations"
+    gen_root.mkdir()
+    for age in ages:
+        stamp = (now - age).strftime("%Y%m%dT%H%M%SZ")
+        d = gen_root / stamp
+        d.mkdir(exist_ok=True)
+        (d / "main.msgpack").write_bytes(b"x")
+    # trigger a rotation at `now`, which also prunes
+    rotate_generations(tmp_path, files, recent=3, hourly=6, daily=7, now=now)
+    remaining = sorted(d.name for d in gen_root.iterdir())
+    # dropped: the 30-day-old; the same-hour and same-day duplicates
+    assert (now - timedelta(days=30)).strftime("%Y%m%dT%H%M%SZ") not in remaining
+    hour_bucket = [(now - timedelta(minutes=90)).strftime("%Y%m%dT%H%M%SZ"),
+                   (now - timedelta(minutes=95)).strftime("%Y%m%dT%H%M%SZ")]
+    assert sum(1 for n in hour_bucket if n in remaining) == 1
+    day_bucket = [(now - timedelta(days=2)).strftime("%Y%m%dT%H%M%SZ"),
+                  (now - timedelta(days=2, hours=1)).strftime("%Y%m%dT%H%M%SZ")]
+    assert sum(1 for n in day_bucket if n in remaining) == 1
+    # the newest 3 all survive (plus the rotation just made)
+    for age in ages[:3]:
+        assert (now - age).strftime("%Y%m%dT%H%M%SZ") in remaining
+
+
+def test_unknown_generation_dirs_never_deleted(tmp_path):
+    files = _mk_set(tmp_path)
+    gen_root = tmp_path / "generations"
+    gen_root.mkdir()
+    (gen_root / "keep-me-manual-backup").mkdir()
+    rotate_generations(tmp_path, files)
+    assert (gen_root / "keep-me-manual-backup").exists()
