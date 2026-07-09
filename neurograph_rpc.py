@@ -12,6 +12,18 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — #371 reconcile-not-discard
+# What: handle_bootstrap's Lenia block: on pruned-entity mismatch, call
+#   lenia_cache.reconcile_removals(_live_ids) and fall through to the existing
+#   watermark-resume/growth branches with the surviving order; full rebuild only
+#   when reconcile returns None.
+# Why: #371 — the subset-check bail ran BEFORE the watermark branch, so one pruned
+#   node discarded the whole cache incl. resume progress (Syl lost ~1.79M computed
+#   pairs at the 2026-07-08 07:50 restart; with continuous pruning the ~3-day
+#   rebuild could never complete).
+# How: reconcile compacts + translates in kernel.py; this block only swaps the
+#   bail for the call. Downstream branches, fail-soft shape, and the post-branch
+#   save are untouched.
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — Lenia resume branch
 # What: handle_bootstrap()'s Lenia block gains an elif between full-rebuild and growth:
 #   a loaded cache carrying a resume watermark resumes the interrupted rebuild (with
@@ -2025,10 +2037,20 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
             if all(eid in _live_ids for eid in lenia_cache.entity_ids):
                 _known_order = lenia_cache.entity_ids
             else:
-                logger.info(
-                    "Distance cache has entities no longer in the live graph "
-                    "(pruned since last save) — full rebuild required"
-                )
+                # #371: entities were pruned since the save. Reconcile the
+                # cache in place (drop their rows/cols, translate the resume
+                # watermark) instead of discarding hours-to-days of computed
+                # distances, then fall through to the SAME watermark-resume /
+                # growth branches below. None = cache unpreservable (no
+                # entity_ids, nothing survives, or an interrupted rebuild's
+                # cut is untranslatable) -> legacy full rebuild, as before.
+                _known_order = lenia_cache.reconcile_removals(_live_ids)
+                if _known_order is None:
+                    logger.info(
+                        "Distance cache has entities no longer in the live "
+                        "graph and could not be reconciled — full rebuild "
+                        "required"
+                    )
 
         lenia_substrate = NeuroGraphSubstrate(
             _memory.graph, _memory.vector_db, known_entity_order=_known_order,
