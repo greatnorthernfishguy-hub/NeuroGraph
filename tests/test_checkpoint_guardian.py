@@ -227,6 +227,36 @@ def test_rotation_hardlinks_frozen_set(tmp_path):
     assert Path(files[0]).read_bytes() == b"NEWER"
 
 
+def test_rotation_copies_json_sidecars(tmp_path):
+    """JSON sidecars (.json, .manifest.json) are copied, not hardlinked.
+
+    Sidecar writers (e.g. ActivationPersistence) write IN PLACE — they do not
+    use atomic replace. A hardlinked sidecar would alias every generation to
+    the live inode and be silently rewritten on each save. This test verifies
+    that sidecars are deep copies that survive primary rewrites.
+    """
+    files = _mk_set(tmp_path)
+    gen = rotate_generations(tmp_path, files)
+
+    # Check that the manifest sidecar exists
+    gen_manifest = Path(gen) / "main.msgpack.manifest.json"
+    assert gen_manifest.exists()
+
+    # Sidecars must NOT be hardlinks (different inodes)
+    primary_manifest = Path(files[2])
+    gen_manifest_ino = os.stat(gen_manifest).st_ino
+    primary_manifest_ino = os.stat(primary_manifest).st_ino
+    assert gen_manifest_ino != primary_manifest_ino, \
+        "sidecar must be copied (not hardlinked)"
+
+    # Simulate in-place rewrite of primary sidecar (as ActivationPersistence does)
+    primary_manifest.write_text('{"updated": true}')
+
+    # Generation sidecar should be unchanged
+    assert gen_manifest.read_text() == '{}'
+    assert primary_manifest.read_text() == '{"updated": true}'
+
+
 def test_rotation_skips_missing_set_members(tmp_path):
     files = _mk_set(tmp_path)
     files.append(str(tmp_path / "main.msgpack.activations.json"))  # not present

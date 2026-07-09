@@ -11,7 +11,9 @@
 #   of manifests. One implementation at the shared save path (LAW 4).
 # How: stdlib-only file mechanics; env-tunable knobs (LAW 5); every refusal is
 #   logger.error with the consequence spelled out and the state quarantined —
-#   nothing silently dropped (LAW 3).
+#   nothing silently dropped (LAW 3); generation ring hardlinks .msgpack only —
+#   in-place-written .json sidecars are copied (hardlinks would alias every
+#   generation to the live inode).
 # -------------------
 """Checkpoint resilience for NeuroGraph instances (#373).
 
@@ -300,8 +302,17 @@ def rotate_generations(checkpoint_dir, files: List[str],
         if not src.exists():
             continue
         dst = gen_dir / src.name
+        # Hardlink only .msgpack members: their writers replace the inode
+        # atomically (tmp + os.replace), so a linked generation is frozen.
+        # Sidecar .json files are written IN PLACE by their (protected)
+        # writers — a hardlink would alias every generation to the live
+        # file's inode and silently rewrite them all on each save. They are
+        # KB-scale; copy them for real.
         try:
-            os.link(src, dst)
+            if src.suffix == ".msgpack":
+                os.link(src, dst)
+            else:
+                shutil.copy2(src, dst)
         except OSError:
             try:
                 shutil.copy2(src, dst)
