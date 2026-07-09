@@ -291,6 +291,49 @@ def test_autonomic_retract_works_and_teaches():
     assert "shared_a" not in out["promoted"], "a retracted node must not be autonomically re-promoted"
 
 
+def test_retract_un_deposits_from_commons():
+    """#366 — retract must remove the content from the shared Commons medium itself, not just
+    the sandbox's local bookkeeping. Anti-Hebbian teaching alone does NOT achieve this: it has
+    no weight filter effect on bucket_recent() and record_outcome() bumps last_updated, which
+    would make the content MORE recently-visible, not less.
+    """
+    ing, commons = _sandbox()
+    emb = _emb(700)
+    ing.ingest(emb, "leaky", salience=0.85)
+    ing.autonomic_promote_pulse()
+    assert "leaky" in _module_pool_sees(commons, emb), "sanity: promoted content must be bucket-visible"
+    recent_ids = [tid for (tid, _w, _r) in commons.bucket_recent(limit=50)]
+    assert "leaky" in recent_ids, "sanity: promoted content must be recency-bucket-visible"
+
+    result = ing.retract("leaky")
+    assert result["un_deposited"] >= 1, f"retract must report a real removal; {result}"
+    assert "leaky" not in _module_pool_sees(commons, emb), (
+        "retracted content must no longer be semantically bucket-visible"
+    )
+    recent_ids_after = [tid for (tid, _w, _r) in commons.bucket_recent(limit=50)]
+    assert "leaky" not in recent_ids_after, "retracted content must no longer be recency-bucket-visible"
+
+
+def test_retract_of_never_promoted_content_is_a_safe_no_op():
+    """Retracting deliberate-only / never-promoted content must not raise and must report 0 removed."""
+    ing, _ = _sandbox()
+    ing.ingest(_emb(701), "private_only", salience=0.90, intimate=True)  # never reaches the Commons
+    result = ing.retract("private_only")
+    assert result["un_deposited"] == 0, f"nothing was ever deposited; expected 0, got {result}"
+
+
+def test_retract_does_not_touch_other_content():
+    """Retract must be surgical — only the target's own synapses are removed, siblings untouched."""
+    ing, commons = _sandbox()
+    ing.ingest(_emb(702), "keep_me", salience=0.85)
+    ing.ingest(_emb(703), "retract_me", salience=0.85)
+    ing.autonomic_promote_pulse()
+    ing.retract("retract_me")
+    recent_ids = [tid for (tid, _w, _r) in commons.bucket_recent(limit=50)]
+    assert "keep_me" in recent_ids, "an unrelated promoted item must survive a sibling's retraction"
+    assert "retract_me" not in recent_ids
+
+
 # ---- §8 learning asymmetry (intrinsic to the substrate) ----
 def test_learning_asymmetry_net_tighter():
     """§8 — asymmetry is INTRINSIC to the substrate: a retract (failure@1.0) moves the gate more

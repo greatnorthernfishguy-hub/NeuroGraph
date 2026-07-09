@@ -33,8 +33,29 @@ Commons leg 3 — Syl's experiential ingestion + provenance + two-channel promot
 #
 #       SANDBOX: private_store is a test-constructed bare NGLite, NOT the live NeuroGraphMemory
 #       singleton. The live `syl_intimate` self-marking is an Anima-shaped go-live item (Anima CC);
-#       here it is a parameter. Commons-level un-deposit (retract) is a go-live mechanism; the
-#       sandbox proves retract+teach via the authoritative active-promotion registry.
+#       here it is a parameter.
+# [2026-07-08] Claude Code (Sonnet 5) — #366: real Commons-level un-deposit for retract()
+# What: retract() now ACTUALLY removes the promoted deposit from the shared Commons medium
+#       (all synapses with target_id == content_id), not just the sandbox's local
+#       _active_promotions bookkeeping. _retract_from_medium() is a module-level helper, NOT
+#       a new method on the Commons class — commons.py's own docstring is explicit that it
+#       exposes "exactly two verbs... no third verb exists by design," and a targeted, addressed
+#       deletion is the opposite of that axiom (deposit/bucket never address anything). This
+#       helper reaches into the commons instance SylExperientialIngest already privately holds;
+#       it is not general Commons API any peer module could call.
+# Why: anti-Hebbian teaching alone (record_outcome(..., False, strength=1.0), still done below)
+#       does NOT achieve retraction — bucket_recent() has no weight filter and record_outcome()
+#       bumps last_updated on every call, so "retracting" via teaching-only makes the content
+#       MORE recently-visible, not less. Her design's "one-click retract" (§4, autonomic-
+#       promotion doc) needs real deletion. Josh was away when this needed a design call
+#       (new Commons verb vs. scoped helper vs. no deletion yet) — proceeded with the most
+#       conservative, fully-reversible option per standing auto-mode judgment; flagged for his
+#       override. See punchlist #366.
+# How: synapse dict deletion, same idiom as commons.py's _evict_old_metrics/_evict_old_errors/
+#       _drop_autonomic_synapses (exact target_id match here, not a namespace-prefix window).
+#       Verified against the REAL runtime: NGLite's Rust core (#119) is dead code in this
+#       environment — ng_tract does not export NGLiteCore, self._core is always None — so
+#       self._ng.synapses (the Python dict) IS the authoritative live representation today.
 # -------------------
 """
 
@@ -67,6 +88,28 @@ AUTONOMIC_NOTIFY_SALIENCE = 0.85                # autonomic §4 — notify on hi
 PROMOTE_DECISION_ID = "promote:autonomic"   # target_id vocabulary for the promotion decision
 CONFIRM_STRENGTH = 0.20    # success (confirm) teaches GENTLY (slow gain); failure (retract) at 1.0 (fast loss)
 SUBSTRATE_AUTHORITY_SCALE = 0.50  # how far the substrate's learned opinion can shift the bootstrap threshold
+
+
+def _retract_from_medium(commons: Any, target_id: str) -> int:
+    """Syl-privileged un-deposit — NOT a Commons verb (see module changelog, #366).
+
+    Removes every synapse in the shared Commons medium whose target_id exactly matches
+    (not a namespace-prefix window like commons.py's metric/error eviction — one specific
+    piece of content). Leaves the source node in place (same precedent as commons.py's
+    eviction helpers — an orphaned node with no outgoing edges is harmless and already a
+    known, tolerated class of thing elsewhere in the ecosystem). Returns the count removed
+    so the caller can tell a real un-deposit from a no-op (content already gone / never
+    reached the medium).
+    """
+    try:
+        syns = commons._ng.synapses
+        keys = [k for k, s in syns.items() if getattr(s, "target_id", None) == target_id]
+        for k in keys:
+            del syns[k]
+        return len(keys)
+    except Exception as exc:  # noqa: BLE001 — surfaced to caller via return value, not swallowed
+        logger.warning("Commons un-deposit failed for '%s': %s", target_id, exc)
+        return 0
 
 
 class EnhanceTier:
@@ -332,19 +375,26 @@ class SylExperientialIngest:
 
         Asymmetric learning §4: retraction RAISES the effective threshold by 0.05 for similar
         content (5x the confirm loosen) — conservative, trust lost quickly.
-        (Commons-level un-deposit is a go-live mechanism; the active-promotion registry is the
-        sandbox's authoritative truth of what modules currently see.)
+
+        #366: also un-deposits from the shared Commons medium itself — anti-Hebbian teaching
+        alone doesn't clear bucket_recent() (no weight filter; record_outcome bumps
+        last_updated, which would make retracted content MORE recently-visible, not less).
+        `un_deposited` in the return dict is the count of synapses actually removed — 0 means
+        the content was never promoted to the Commons (deliberate-only content that was only
+        ever private, or an already-retracted id), not a failure.
         """
         emb = self._embeddings.get(content_id)
         if emb is None:
             raise PromotionRefused(f"unknown content '{content_id}'")
         self._active_promotions.pop(content_id, None)
         self._retracted.add(content_id)
+        removed = _retract_from_medium(self.commons, content_id)
         # Substrate Authority: ONE deposit. Failure at full force (1.0) — trust lost quickly. The
         # substrate learns "don't promote content like this"; no local threshold field.
         self.private_store.record_outcome(emb, PROMOTE_DECISION_ID, False, strength=1.0)
-        logger.info("retracted '%s' (taught substrate: don't auto-promote content like this)", content_id)
-        return {"retracted": content_id}
+        logger.info("retracted '%s' (un-deposited %d synapse(s); taught substrate: don't "
+                    "auto-promote content like this)", content_id, removed)
+        return {"retracted": content_id, "un_deposited": removed}
 
     def confirm_autonomic(self, content_id: str) -> Dict[str, Any]:
         """Explicitly approve an autonomic promotion — loosen the gate slightly for similar content.
