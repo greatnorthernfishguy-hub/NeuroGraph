@@ -247,3 +247,101 @@ def test_reconcile_save_load_roundtrip(tmp_cache_path):
                 loaded.get_distance_vector(i, j),
                 cache.get_distance_vector(i, j),
             )
+
+
+def test_reconcile_then_resume_completes_correctly():
+    """The #371 end-to-end property: interrupt a rebuild, prune a node,
+    reconcile, resume — the result must contain every pair a from-scratch
+    rebuild of the pruned graph computes, with identical values. (The
+    reconciled cache may additionally retain stale pairs whose old
+    connectivity ran through the removed node — documented, harmless:
+    they read as slightly-generous neighbor edges, same class as the
+    pre-existing connectivity-drift blind spot.)"""
+    g = _build_chain_graph(10)
+    real = NeuroGraphSubstrate(g, None)
+    interrupting = _InterruptingSubstrate(real, allow=5)
+    cache = DistanceCache(real.entity_count(), entity_ids=real.entities())
+    with pytest.raises(RuntimeError):
+        cache.populate(interrupting, checkpoint_interval_secs=1e-9,
+                       on_checkpoint=lambda: None)
+    assert cache.watermark is not None
+    ids = list(cache.entity_ids)
+
+    # Prune a node ABOVE the watermark's endpoints (the idx=0 checkpoint
+    # pins the cut to the first canonical pair, whose endpoints are the
+    # two lowest indices) so direct translation applies.
+    removed_id = ids[6]
+    g.remove_node(removed_id)
+    live = set(g.nodes.keys())
+    survivors = cache.reconcile_removals(live)
+    assert survivors is not None
+    wm = cache.watermark
+    assert wm is not None
+
+    # Resume against the pruned graph, exactly as the callers do.
+    sub2 = NeuroGraphSubstrate(g, None, known_entity_order=survivors)
+    assert sub2.entities() == survivors  # no new nodes: order unchanged
+    cache.populate(sub2, resume_watermark=wm)
+    assert cache.watermark is None  # completed run clears the cut
+
+    # From-scratch reference on the pruned graph.
+    ref_sub = NeuroGraphSubstrate(g, None, known_entity_order=survivors)
+    ref = DistanceCache(ref_sub.entity_count(), entity_ids=ref_sub.entities())
+    ref.populate(ref_sub)
+
+    for a_pos in range(len(survivors)):
+        for b_pos in range(a_pos + 1, len(survivors)):
+            ref_vec = ref.get_distance_vector(a_pos, b_pos)
+            if np.any(np.abs(ref_vec) > 1e-15):
+                np.testing.assert_allclose(
+                    cache.get_distance_vector(a_pos, b_pos), ref_vec,
+                    err_msg=f"pair ({survivors[a_pos]}, {survivors[b_pos]})",
+                )
+
+
+def test_reconcile_then_growth_composes():
+    """Removal + growth in one restart: reconcile survivors, then the
+    existing resize + populate(start_index) path fills in only the pairs
+    touching genuinely-new entities, leaving survivor distances untouched."""
+    g, real, cache, _ = _populated_cache(8)
+    assert cache.watermark is None
+    ids = list(cache.entity_ids)
+
+    removed_id = ids[3]
+    g.remove_node(removed_id)
+    live = set(g.nodes.keys())
+    survivors = cache.reconcile_removals(live)
+    assert survivors is not None
+    survivor_snapshot = {
+        (a_pos, b_pos): cache.get_distance_vector(a_pos, b_pos)
+        for a_pos in range(len(survivors))
+        for b_pos in range(a_pos + 1, len(survivors))
+    }
+
+    # Grow: two new nodes, chained onto the end so they are connected.
+    g.create_node(node_id="z0")
+    g.create_node(node_id="z1")
+    g.create_synapse(ids[-1], "z0", weight=0.5)
+    g.create_synapse("z0", "z1", weight=0.5)
+
+    sub2 = NeuroGraphSubstrate(g, None, known_entity_order=survivors)
+    entities2 = sub2.entities()
+    assert entities2[: len(survivors)] == survivors
+    assert set(entities2[len(survivors):]) == {"z0", "z1"}
+
+    old_n = cache.entity_count
+    cache.resize(sub2.entity_count(), new_entity_ids=entities2)
+    rec = _RecordingSubstrate(sub2)
+    cache.populate(rec, start_index=old_n)
+
+    # Only pairs touching a new entity were computed.
+    for a, b in rec.pairs:
+        assert "z0" in (a, b) or "z1" in (a, b)
+    # Survivor distances byte-identical to the pre-growth snapshot.
+    for (a_pos, b_pos), vec in survivor_snapshot.items():
+        np.testing.assert_allclose(
+            cache.get_distance_vector(a_pos, b_pos), vec)
+    # And the new entities actually have distances now.
+    z0 = entities2.index("z0")
+    neighbors, _ = cache.get_neighbors_sparse(z0, max_range=float("inf"))
+    assert len(neighbors) > 0
