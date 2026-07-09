@@ -1,5 +1,45 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-08] Claude Code (Sonnet 5) — Pith Phase 0+1: CacheLine scaffold + Stage-1 clutter strip
+# What: Added CacheLine (@dataclass, cache-line-shaped view of a surfaced item --
+#   node_id/content/score/pinned/thermal/lod/coherence/manifold_type/keyframe/deltas,
+#   most fields inert until later phases) and PithMetrics (module singleton
+#   _PITH_METRICS: total_lines_in/clutter_stripped/combined counters + reset()/
+#   snapshot()). Both Phase 0 -- inert scaffolding, changes nothing at runtime.
+#   Phase 1 adds pith_stage1(cache_lines, conversation_text, novelty) -- cheap,
+#   pure, three-step survivor filter over the already-surfaced small set: (1)
+#   drop harness-marker lines (same marker tuple as miniTID's
+#   is_synthetic_harness_text -- not importable from Rust, inlined here), (2)
+#   drop lines whose content the model already sees in conversation_text
+#   (substring or Jaccard token-overlap >= a novelty-modulated threshold --
+#   familiar turns strip more, novel turns strip less), (3) write-combine
+#   near-identical survivors (token-overlap >= 0.95), keeping the higher score.
+#   Pinned lines (identity-protected nodes) always survive all three steps.
+#   Wired into cc-ng-daemon.py's _recall() behind CC_PITH_ENABLED (default OFF)
+#   -- gate-off path is byte-for-byte the pre-Pith behavior.
+# Why: First increment of the Pith extraction pipeline (CC's substrate) --
+#   today's surfacing renders every item SurfacingMonitor/Active Recall hand
+#   it, including near-duplicates of what's already in the live conversation
+#   and (per the deposit-side clutter-strip removal above) raw harness-marker
+#   text that made it into the substrate. Stage 1 is the cheap extraction-side
+#   pass that strips that clutter before it re-enters the hook-injected
+#   context, without spending any new embedding calls or substrate walks --
+#   pure string/set ops over the <20-item set _recall already assembled.
+# How: All Phase 1 cost is O(n) or small-n O(n^2) string/set ops over
+#   cache_lines (typically <20 items) -- no I/O, no embed, no graph walk.
+#   Threshold: thr = clamp(CC_PITH_CLUTTER_BASE + CC_PITH_CLUTTER_NOVELTY_K *
+#   novelty, 0.5, 0.98), defaults 0.85 / 0.3 -- NOTE: the spec draft literally
+#   wrote this as base MINUS k*novelty, but its own prose parenthetical and
+#   Test 3 both describe threshold INCREASING with novelty (high novelty ->
+#   strip LESS); implemented with a plus sign to match the doubly-stated
+#   intent over the single formula line -- flagged for spec-author
+#   confirmation, see the inline NOTE in pith_stage1(). novelty comes from
+#   cc_novelty() (state=STATE.conv_state, graph=STATE.ng.graph) -- same #358
+#   MMN pull-based EMA cc_pattern_completion_recall() already uses; fails
+#   soft to 0.0 (treated as "unknown/no signal" -- max clutter-stripping,
+#   matching cc_novelty's own fail-soft floor semantics is a later-phase
+#   concern, not this increment's).
+#   See docs/superpowers/plans/2026-07-08-pith-extraction-pipeline*.md.
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — #371 reconcile-not-discard
 # What: bootstrap_lenia: on pruned-entity mismatch, reconcile_removals() the cache
 #   and fall through to the existing watermark-resume/growth branches; full rebuild
@@ -230,6 +270,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("cc_ng_organism")
@@ -1446,3 +1487,214 @@ def cc_gsg_backfill(graph, vector_db) -> int:
     except Exception as exc:
         logger.debug("cc_gsg_backfill failed (non-fatal): %s", exc)
         return 0
+
+
+# =============================================================================
+# Pith extraction pipeline -- Phase 0 (CacheLine + metrics scaffold) + Phase 1
+# (Stage 1: ingest & clutter strip). Gated OFF by default (CC_PITH_ENABLED);
+# see the 2026-07-08 changelog entry at the top of this file.
+# =============================================================================
+
+_CC_PITH_ENABLED = os.environ.get("CC_PITH_ENABLED", "0") not in ("0", "false", "False", "")
+
+_CC_PITH_CLUTTER_BASE = float(os.environ.get("CC_PITH_CLUTTER_BASE", "0.85"))
+_CC_PITH_CLUTTER_NOVELTY_K = float(os.environ.get("CC_PITH_CLUTTER_NOVELTY_K", "0.3"))
+
+# Same marker tuple as miniTID's is_synthetic_harness_text (Condensate
+# rust_core/src/minitid.rs) -- not importable here (Rust, separate process),
+# so inlined verbatim rather than left unguarded on the extraction side.
+_PITH_HARNESS_MARKERS = (
+    "<task-notification>",
+    "<system-reminder>",
+    "<local-command-stdout>",
+    "<local-command-caveat>",
+)
+
+
+@dataclass
+class CacheLine:
+    """Cache-line-shaped view of one surfaced item, moving through the Pith
+    pipeline's stages. Most fields are inert placeholders for later phases
+    (thermal: Phase 2: lod/coherence/keyframe/deltas: Phase 3-5) -- Phase 0
+    only defines the shape; nothing constructs or reads these fields at
+    runtime yet outside pith_stage1().
+
+    score carries the emitter's existing score (SurfacingMonitor's salience
+    or cc_pattern_completion_recall's strength) verbatim -- Pith re-ranks and
+    filters, it does not re-derive relevance from scratch.
+    """
+
+    node_id: str
+    content: str
+    score: float = 0.0
+    pinned: bool = False
+    thermal: float = 0.0
+    lod: float = 1.0
+    coherence: str = "exclusive"
+    manifold_type: str = "hyperbolic"
+    keyframe: bool = True
+    deltas: list = field(default_factory=list)
+
+    @classmethod
+    def from_surfaced(cls, node_id: str, content: str, score: float = 0.0,
+                       pinned: bool = False, manifold_type: str = "hyperbolic") -> "CacheLine":
+        return cls(node_id=node_id, content=content, score=score, pinned=pinned,
+                    manifold_type=manifold_type)
+
+
+@dataclass
+class PithMetrics:
+    """Module-level counters for the Pith pipeline -- inert until a gated
+    stage function actually updates them (today: pith_stage1 only, and only
+    when CC_PITH_ENABLED is on)."""
+
+    total_lines_in: int = 0
+    clutter_stripped: int = 0
+    combined: int = 0
+
+    def reset(self) -> None:
+        self.total_lines_in = 0
+        self.clutter_stripped = 0
+        self.combined = 0
+
+    def snapshot(self) -> Dict[str, int]:
+        return {
+            "total_lines_in": self.total_lines_in,
+            "clutter_stripped": self.clutter_stripped,
+            "combined": self.combined,
+        }
+
+
+_PITH_METRICS = PithMetrics()
+
+
+def _pith_normalize(text: str) -> str:
+    """Lowercase + collapse whitespace -- cheap normalization shared by the
+    dedup and write-combine steps below."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _pith_jaccard(a: str, b: str) -> float:
+    """Word-set Jaccard overlap of two already-normalized strings. Empty/
+    empty is treated as no overlap (0.0), not a division-by-zero NaN."""
+    set_a = set(a.split())
+    set_b = set(b.split())
+    if not set_a or not set_b:
+        return 0.0
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
+
+
+def pith_stage1(cache_lines: List[CacheLine], conversation_text: str,
+                 novelty: float = 0.0) -> List[CacheLine]:
+    """Pith Stage 1: Ingest & Clutter Strip.
+
+    Cheap, pure, unit-testable -- string/set ops only over the already-
+    surfaced small set (typically <20 items), no I/O, no embed calls, no
+    substrate walk. Three steps, in order, each skipping pinned lines
+    (a pinned line always survives regardless of what steps 1-3 would
+    otherwise do to it):
+
+    1. Harness-marker skip: drop lines whose content starts (after
+       lstrip()) with a synthetic-harness marker (see
+       _PITH_HARNESS_MARKERS) -- extraction-side defense mirroring
+       miniTID's is_synthetic_harness_text, needed because the deposit-side
+       clutter strip was intentionally removed (2026-07-08, see this file's
+       changelog) so harness text CAN be sitting in the substrate.
+    2. Clutter dedup vs conversation_text: drop a line whose content the
+       model already sees in conversation_text -- substring match (after
+       normalizing both: lowercase, collapse whitespace) OR Jaccard word-
+       overlap >= a novelty-modulated threshold. High novelty -> higher
+       threshold -> strip LESS (an unfamiliar turn's near-echoes are more
+       likely to matter); familiar/low-novelty -> strip MORE.
+    3. Write-combine: collapse remaining near-identical lines (normalized-
+       content match, or Jaccard >= 0.95) into one survivor, keeping the
+       higher-score copy. O(n^2) over the small surfaced set is cheap and
+       fine here.
+
+    Updates the module-level _PITH_METRICS counters (total_lines_in,
+    clutter_stripped, combined) unconditionally -- callers that don't want
+    metrics touched should not call this function (there's no gate inside
+    it; the gate lives at the _recall() call site in cc-ng-daemon.py).
+
+    Returns survivors in input order (score ranking is the caller's/
+    upstream emitter's responsibility -- this function filters, it doesn't
+    re-sort).
+    """
+    _PITH_METRICS.total_lines_in += len(cache_lines)
+
+    conv_norm = _pith_normalize(conversation_text)
+    # NOTE (spec discrepancy, 2026-07-08): the design doc literally states
+    # `thr = BASE - K * novelty`, but its own prose parenthetical on the same
+    # line ("high novelty -> higher threshold -> strip LESS") and its Test 3
+    # requirement ("kept at high novelty, stripped at low novelty") both
+    # describe threshold INCREASING with novelty -- the opposite of what a
+    # minus sign produces (BASE=0.85 - K*novelty shrinks as novelty rises,
+    # which would strip MORE at high novelty). Implemented to match the
+    # doubly-stated intent (+ sign), not the single literal formula line;
+    # flagged for spec-author confirmation.
+    thr = _CC_PITH_CLUTTER_BASE + _CC_PITH_CLUTTER_NOVELTY_K * novelty
+    thr = max(0.5, min(0.98, thr))
+
+    # Steps 1-2: harness-marker skip + clutter dedup vs conversation.
+    survivors: List[CacheLine] = []
+    clutter_stripped = 0
+    for line in cache_lines:
+        if line.pinned:
+            survivors.append(line)
+            continue
+
+        stripped_content = (line.content or "").lstrip()
+        if stripped_content.startswith(_PITH_HARNESS_MARKERS):
+            clutter_stripped += 1
+            continue
+
+        line_norm = _pith_normalize(line.content)
+        if line_norm and conv_norm:
+            if line_norm in conv_norm:
+                clutter_stripped += 1
+                continue
+            if _pith_jaccard(line_norm, conv_norm) >= thr:
+                clutter_stripped += 1
+                continue
+
+        survivors.append(line)
+
+    # Step 3: write-combine near-identical remaining lines (pinned lines
+    # already passed through untouched above; re-touching them here would
+    # risk a pin losing to a higher-scored non-pinned near-duplicate, so
+    # pinned lines are excluded from combining entirely -- each stays its
+    # own line).
+    combined_out: List[CacheLine] = []
+    consumed = [False] * len(survivors)
+    combined_count = 0
+    for i, line in enumerate(survivors):
+        if consumed[i]:
+            continue
+        if line.pinned:
+            combined_out.append(line)
+            consumed[i] = True
+            continue
+        best = line
+        best_norm = _pith_normalize(line.content)
+        for j in range(i + 1, len(survivors)):
+            if consumed[j] or survivors[j].pinned:
+                continue
+            other = survivors[j]
+            other_norm = _pith_normalize(other.content)
+            same = (best_norm == other_norm) or (_pith_jaccard(best_norm, other_norm) >= 0.95)
+            if same:
+                consumed[j] = True
+                combined_count += 1
+                if other.score > best.score:
+                    best = other
+                    best_norm = other_norm
+        combined_out.append(best)
+        consumed[i] = True
+
+    _PITH_METRICS.clutter_stripped += clutter_stripped
+    _PITH_METRICS.combined += combined_count
+
+    return combined_out
