@@ -12,11 +12,13 @@
 #   of the lenia stack constructs for real (tmp field_dir), matching production flow.
 # -------------------
 import sys
-sys.path.insert(0, '/home/josh/NeuroGraph')
+sys.path.insert(0, '/home/josh/NeuroGraph/.claude/worktrees/lenia-removal-reconcile-371')
 import tempfile, shutil
+import logging
 import pytest
 
 from neuro_foundation import Graph
+from cc_ng_organism import bootstrap_lenia
 
 
 def _graph(n=6):
@@ -128,3 +130,28 @@ def test_field_dir_exists_before_first_checkpoint_could_fire(workspace, monkeypa
     monkeypatch.setattr(lk.DistanceCache, "populate", spy)
     bootstrap_lenia(_graph(), None, workspace)
     assert seen.get("dir_exists_at_populate") is True
+
+
+def test_bootstrap_reconciles_pruned_cache_instead_of_full_rebuild(tmp_path, caplog):
+    """#371: a node pruned between saves must NOT force a full repopulate —
+    bootstrap_lenia reconciles the on-disk cache and reuses it."""
+    g = Graph()
+    for i in range(8):
+        g.create_node(node_id=f"n{i}")
+    for i in range(7):
+        g.create_synapse(f"n{i}", f"n{i + 1}", weight=0.5)
+
+    ws = str(tmp_path / "ws")
+    first = bootstrap_lenia(g, None, ws)
+    assert first.get("engine") is not None  # populate completed + saved
+
+    g.remove_node("n4")
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        second = bootstrap_lenia(g, None, ws)
+    assert second.get("engine") is not None
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "reconciled after prune" in joined
+    assert "full repopulate" not in joined
+    assert "full rebuild required" not in joined
