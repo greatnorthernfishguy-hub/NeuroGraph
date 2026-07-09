@@ -3,7 +3,10 @@
 # What: kernel-level tests for DistanceCache.reconcile_removals — compaction
 #   preserves surviving distances exactly, watermark cut translation (direct,
 #   fallback-on-pruned-endpoint, untranslatable->None), dirty-set remap,
-#   save/load round-trip, no-op and empty-survivor contracts.
+#   save/load round-trip, no-op and empty-survivor contracts. Plus two
+#   pipeline tests: reconcile→resume completes to from-scratch equivalence
+#   on the pruned graph, and reconcile→growth composes with the existing
+#   resize + populate(start_index) path without touching survivor distances.
 # Why: #371 — the removal-bail discarded hours-to-days of computed progress
 #   (confirmed live on Syl 2026-07-08: ~1.79M pairs lost at one restart).
 #   These tests pin the invariant that makes reconcile safe: monotone
@@ -334,7 +337,9 @@ def test_reconcile_then_growth_composes():
     rec = _RecordingSubstrate(sub2)
     cache.populate(rec, start_index=old_n)
 
-    # Only pairs touching a new entity were computed.
+    # Only pairs touching a new entity were computed — and some genuinely
+    # were (the loop below would pass vacuously on an empty rec.pairs).
+    assert rec.pairs, "growth populate must compute at least one new-entity pair"
     for a, b in rec.pairs:
         assert "z0" in (a, b) or "z1" in (a, b)
     # Survivor distances byte-identical to the pre-growth snapshot.
