@@ -344,12 +344,7 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
                 # mirror of neurograph_rpc.py's block. None -> legacy full
                 # rebuild, as before.
                 known_order = lenia_cache.reconcile_removals(live_ids)
-                if known_order is not None:
-                    logger.info(
-                        "CC Lenia: distance cache reconciled after prune — "
-                        "reusing %d entities", len(known_order)
-                    )
-                else:
+                if known_order is None:
                     logger.info(
                         "CC Lenia: distance cache has entities no longer in "
                         "the live graph and could not be reconciled — full "

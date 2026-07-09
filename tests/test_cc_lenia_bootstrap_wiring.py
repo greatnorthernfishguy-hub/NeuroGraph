@@ -12,7 +12,8 @@
 #   of the lenia stack constructs for real (tmp field_dir), matching production flow.
 # -------------------
 import sys
-sys.path.insert(0, '/home/josh/NeuroGraph/.claude/worktrees/lenia-removal-reconcile-371')
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile, shutil
 import logging
 import pytest
