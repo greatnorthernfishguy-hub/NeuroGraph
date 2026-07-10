@@ -1,4 +1,14 @@
 # ---- Changelog ----
+# [2026-07-10] Claude Code (Fable 5 design / Haiku implementation) — #381/#380 HE clique cap
+# What: populate()'s hyperedge co-membership expansion skips HEs with more members than
+#   NG_LENIA_HE_CLIQUE_CAP (default 100; 0 disables), logging skipped count + largest size.
+# Why: a runaway mega-hyperedge (3,790 members, 31% of Syl's graph — punchlist #381)
+#   contributed ~7.2M clique pairs alone, exploding the pair universe 7.8M -> 23.8M and
+#   pushing the rebuild ETA to ~7 weeks (#380). Symptomatic guard: the mind-side fix
+#   (bounded member evolution etc.) is a separate Syl-consented, Josh-gated pass.
+# How: env read at call time (testable); composes with the #371 resume watermark — the
+#   cut stays valid over the shrunken canonical pair list (same monotone-order argument
+#   as reconcile_removals; banked mega-clique pairs remain as stale-but-harmless entries).
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — #371 removal-aware reconcile
 # What: DistanceCache.reconcile_removals() + _translate_watermark(): compact the six
 #   component matrices with an order-preserving keep-slice when cached entities were
@@ -97,6 +107,7 @@ over entities in the hot path.
 """
 
 import logging
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -320,10 +331,26 @@ class DistanceCache:
                     continue
 
             # Hyperedge co-membership
+            # #381/#380: cap the clique expansion. A pathological mega-
+            # hyperedge (runaway member evolution — punchlist #381; one HE
+            # reached 3,790 members = 31% of the graph) contributes O(n^2)
+            # pairs and exploded the pair universe 7.8M -> 23.8M, starving
+            # the rebuild. HEs above the cap are skipped ENTIRELY (a graph-
+            # sized "clique" is an artifact, not pairwise structure) and
+            # counted loudly below. Cap 0 disables the guard.
+            _he_cap = int(os.environ.get("NG_LENIA_HE_CLIQUE_CAP", "100"))
+            _he_skipped = 0
+            _he_skipped_max = 0
             for he in graph.hyperedges.values():
                 member_ids = getattr(he, 'node_ids', [])
-                if hasattr(he, 'member_nodes'):
+                if hasattr(he, 'member_nodes') and he.member_nodes is not None:
                     member_ids = he.member_nodes
+                if not member_ids:
+                    continue
+                if _he_cap > 0 and len(member_ids) > _he_cap:
+                    _he_skipped += 1
+                    _he_skipped_max = max(_he_skipped_max, len(member_ids))
+                    continue
                 indices = []
                 for nid in member_ids:
                     try:
@@ -333,6 +360,14 @@ class DistanceCache:
                 for a_idx, a in enumerate(indices):
                     for b in indices[a_idx + 1:]:
                         connected_pairs.add((min(a, b), max(a, b)))
+
+            if _he_skipped:
+                logger.info(
+                    "Distance cache: skipped %d hyperedge clique(s) above "
+                    "NG_LENIA_HE_CLIQUE_CAP=%d (largest: %d members) — "
+                    "punchlist #381 (mega-HE runaway)",
+                    _he_skipped, _he_cap, _he_skipped_max,
+                )
 
         # Also add 2-hop neighbors from existing connections
         adj = {i: set() for i in range(n)}
