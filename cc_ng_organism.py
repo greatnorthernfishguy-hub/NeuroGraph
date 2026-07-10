@@ -1,5 +1,37 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-09] Claude Code (Sonnet 5) — Pith Stage 3: unified rank + char budget
+# What: Added `stream: str = "recall"` field to CacheLine (+ matching kwarg on
+#   from_surfaced), and pith_stage3(cache_lines, budget_chars=None, weights=None)
+#   -- the L1 assembler core. Extended PithMetrics with ranked_in/ranked_kept/
+#   ranked_dropped/budget_chars_used counters (reset()/snapshot() updated).
+#   Wired into cc-ng-daemon.py's _recall() Pith branch: monitor_items tagged
+#   stream="monitor", pc_results tagged stream="pattern", and
+#   `survivors = pith_stage3(survivors)` runs right after pith_stage1.
+# Why: _recall() concatenated monitor_ctx + pc_block in block order -- every
+#   SurfacingMonitor recency item (score ~1.7) preceded every Active Recall
+#   relevance item (GSG-rescored score ~100s) regardless of actual score, so
+#   low-salience recency junk flooded the top of the injected context while
+#   query-relevant items sat buried underneath. Live probes confirmed this.
+#   Stage 3 replaces that block-order concat with a single ranked,
+#   budget-bounded read over both streams merged.
+# How: Per-stream min-max normalization (the two streams' raw score scales
+#   aren't comparable -- ~1.7 vs ~100s -- so normalizing within-stream first
+#   lets both signals actually contend) times a per-stream weight
+#   (CC_PITH_W_RELEVANCE default 1.0, CC_PITH_W_RECENCY default 0.6 --
+#   recency is a secondary prior to relevance, not equal), stable-sorted
+#   descending, then greedily filled against CC_PITH_L1_BUDGET (default 4000
+#   chars, clamped [500, 40000]) -- stops at the first line that would
+#   overflow, except a single line bigger than the whole budget is still kept
+#   when nothing has been added yet (never an empty L1). Pinned lines
+#   (_is_identity_protected) are split out first, kept unconditionally in
+#   original order, and reserved OFF-budget -- they never consume budget and
+#   are never evicted. Consumes emitter scores verbatim (no new embed()/
+#   GSG-rescore/vector_db scan/substrate walk -- pc_results already carry GSG
+#   proximity). Gate-OFF path (_CC_PITH_ENABLED unset) is untouched --
+#   pith_stage3 only runs inside the existing `if _CC_PITH_ENABLED:` branch.
+#   See docs/prd/Pith_PRD_v0.1.md + docs/concepts/Pith.md (design); the live
+#   arc's running record is ~/.claude/plans/reflective-launching-rainbow.md.
 # [2026-07-08] Claude Code (Sonnet 5) — Pith Phase 0+1: CacheLine scaffold + Stage-1 clutter strip
 # What: Added CacheLine (@dataclass, cache-line-shaped view of a surfaced item --
 #   node_id/content/score/pinned/thermal/lod/coherence/manifold_type/keyframe/deltas,
@@ -39,7 +71,8 @@
 #   soft to 0.0 (treated as "unknown/no signal" -- max clutter-stripping,
 #   matching cc_novelty's own fail-soft floor semantics is a later-phase
 #   concern, not this increment's).
-#   See docs/superpowers/plans/2026-07-08-pith-extraction-pipeline*.md.
+#   See docs/prd/Pith_PRD_v0.1.md + docs/concepts/Pith.md (design); the live
+#   arc's running record is ~/.claude/plans/reflective-launching-rainbow.md.
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — #371 reconcile-not-discard
 # What: bootstrap_lenia: on pruned-entity mismatch, reconcile_removals() the cache
 #   and fall through to the existing watermark-resume/growth branches; full rebuild
@@ -1500,6 +1533,15 @@ _CC_PITH_ENABLED = os.environ.get("CC_PITH_ENABLED", "0") not in ("0", "false", 
 _CC_PITH_CLUTTER_BASE = float(os.environ.get("CC_PITH_CLUTTER_BASE", "0.85"))
 _CC_PITH_CLUTTER_NOVELTY_K = float(os.environ.get("CC_PITH_CLUTTER_NOVELTY_K", "0.3"))
 
+# Stage 3 (unified rank + char budget) config -- LAW 5, env-config with sane
+# defaults, clamped. Relevance (pattern-completion / Active Recall) weighted
+# above recency (SurfacingMonitor) by default -- recency is a secondary prior
+# to relevance, not an equal signal.
+_CC_PITH_W_RELEVANCE = float(os.environ.get("CC_PITH_W_RELEVANCE", "1.0"))
+_CC_PITH_W_RECENCY = float(os.environ.get("CC_PITH_W_RECENCY", "0.6"))
+_CC_PITH_L1_BUDGET = int(os.environ.get("CC_PITH_L1_BUDGET", "4000"))
+_CC_PITH_L1_BUDGET = max(500, min(40000, _CC_PITH_L1_BUDGET))
+
 # Same marker tuple as miniTID's is_synthetic_harness_text (Condensate
 # rust_core/src/minitid.rs) -- not importable here (Rust, separate process),
 # so inlined verbatim rather than left unguarded on the extraction side.
@@ -1522,6 +1564,13 @@ class CacheLine:
     score carries the emitter's existing score (SurfacingMonitor's salience
     or cc_pattern_completion_recall's strength) verbatim -- Pith re-ranks and
     filters, it does not re-derive relevance from scratch.
+
+    stream tags which emitter this line came from (e.g. "monitor" for
+    SurfacingMonitor recency, "pattern" for Active Recall / GSG-rescored
+    relevance) -- Stage 3 (pith_stage3) uses it for per-stream score
+    normalization, since the two emitters' raw score scales are not
+    comparable. Defaults to "recall" (generic/unknown-stream) so existing
+    callers/tests that don't pass it are unaffected.
     """
 
     node_id: str
@@ -1534,30 +1583,40 @@ class CacheLine:
     manifold_type: str = "hyperbolic"
     keyframe: bool = True
     deltas: list = field(default_factory=list)
+    stream: str = "recall"
 
     @classmethod
     def from_surfaced(cls, node_id: str, content: str, score: float = 0.0,
-                       pinned: bool = False, manifold_type: str = "hyperbolic") -> "CacheLine":
+                       pinned: bool = False, manifold_type: str = "hyperbolic",
+                       stream: str = "recall") -> "CacheLine":
         return cls(node_id=node_id, content=content, score=score, pinned=pinned,
-                    manifold_type=manifold_type)
+                    manifold_type=manifold_type, stream=stream)
 
 
 @dataclass
 class PithMetrics:
     """Module-level counters for the Pith pipeline -- inert until a gated
-    stage function actually updates them (today: pith_stage1 only, and only
-    when CC_PITH_ENABLED is on)."""
+    stage function actually updates them (today: pith_stage1 and pith_stage3,
+    and only when CC_PITH_ENABLED is on)."""
 
     total_lines_in: int = 0
     clutter_stripped: int = 0
     combined: int = 0
     pith_failures: int = 0
+    ranked_in: int = 0
+    ranked_kept: int = 0
+    ranked_dropped: int = 0
+    budget_chars_used: int = 0
 
     def reset(self) -> None:
         self.total_lines_in = 0
         self.clutter_stripped = 0
         self.combined = 0
         self.pith_failures = 0
+        self.ranked_in = 0
+        self.ranked_kept = 0
+        self.ranked_dropped = 0
+        self.budget_chars_used = 0
 
     def record_failure(self) -> None:
         """Bump the fail-soft counter -- the Pith path swallows exceptions and
@@ -1572,6 +1631,10 @@ class PithMetrics:
             "clutter_stripped": self.clutter_stripped,
             "combined": self.combined,
             "pith_failures": self.pith_failures,
+            "ranked_in": self.ranked_in,
+            "ranked_kept": self.ranked_kept,
+            "ranked_dropped": self.ranked_dropped,
+            "budget_chars_used": self.budget_chars_used,
         }
 
 
@@ -1726,3 +1789,113 @@ def pith_stage1(cache_lines: List[CacheLine], conversation_text: str,
     _PITH_METRICS.combined += combined_count
 
     return combined_out
+
+
+def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None,
+                 weights: Optional[Dict[str, float]] = None) -> List[CacheLine]:
+    """Pith Stage 3: unified rank + char budget -- the L1 assembler core.
+
+    Replaces block-order concatenation (every recency item before every
+    relevance item, regardless of score) with a single ranked, budget-bounded
+    read. Consumes the emitter scores already carried on each CacheLine (does
+    NOT re-derive relevance -- no embed(), no GSG/Poincare rescore, no
+    vector_db scan, no substrate walk); normalization is a monotone transform
+    of the emitter's own score, nothing more.
+
+    Order of operations:
+
+    1. Split pinned vs unpinned. Pinned lines are ALWAYS kept, in their
+       original relative order, and never consume budget.
+    2. Per-stream min-max normalize the unpinned lines' `score` (grouped by
+       `.stream`) -- the two streams' raw scales (~1.7 for SurfacingMonitor
+       recency, ~100s for GSG-rescored pattern-completion relevance) are not
+       comparable, so normalizing within-stream first lets both signals
+       contribute instead of the larger-numbered stream always winning.
+       Single-item or all-equal-score streams normalize to 1.0 (top-of-
+       stream), never a div-by-zero.
+    3. Unified score = weights[stream] * norm. weights defaults to
+       {"pattern": CC_PITH_W_RELEVANCE, "monitor": CC_PITH_W_RECENCY,
+       "recall": CC_PITH_W_RELEVANCE}; an unknown stream fails open to 1.0
+       (kept in contention rather than zeroed out).
+    4. Stable-sort unpinned lines by unified score, descending.
+    5. Greedy budget fill over the sorted list, accumulating len(content):
+       keep while the running total stays <= budget_chars, stop at the first
+       line that would exceed it. A single line longer than the whole budget
+       is still kept if nothing has been added yet (never emit an empty L1
+       just because the top item is large), then fill stops.
+    6. Assemble: pinned lines first (original order), then kept unpinned
+       lines in ranked order.
+
+    budget_chars defaults to CC_PITH_L1_BUDGET (env, clamped [500, 40000]);
+    weights defaults to the CC_PITH_W_RELEVANCE / CC_PITH_W_RECENCY env pair.
+    Updates the module-level _PITH_METRICS counters (ranked_in, ranked_kept,
+    ranked_dropped, budget_chars_used) unconditionally, same convention as
+    pith_stage1. Pure function over the already-surfaced small set (<~30
+    items) -- cheap, hook-timeout-safe, no I/O.
+
+    Never raises on empty input (returns []) or degenerate scores.
+    """
+    _PITH_METRICS.ranked_in += len(cache_lines)
+
+    if not cache_lines:
+        return []
+
+    if budget_chars is None:
+        budget_chars = _CC_PITH_L1_BUDGET
+    if weights is None:
+        weights = {
+            "pattern": _CC_PITH_W_RELEVANCE,
+            "monitor": _CC_PITH_W_RECENCY,
+            "recall": _CC_PITH_W_RELEVANCE,
+        }
+
+    # Step 1: split pinned vs unpinned.
+    pinned_lines = [cl for cl in cache_lines if cl.pinned]
+    unpinned_lines = [cl for cl in cache_lines if not cl.pinned]
+
+    # Step 2: per-stream min/max over unpinned lines only.
+    stream_bounds: Dict[str, tuple] = {}
+    for cl in unpinned_lines:
+        lo, hi = stream_bounds.get(cl.stream, (cl.score, cl.score))
+        stream_bounds[cl.stream] = (min(lo, cl.score), max(hi, cl.score))
+
+    # Steps 2-3: normalize + weight -> unified score, index-paired with
+    # unpinned_lines so the stable sort in step 4 can carry input order
+    # through as an explicit tie-breaker (Python's sort is already stable,
+    # but pairing with the original index makes that ties-keep-input-order
+    # guarantee explicit rather than incidental).
+    scored: List[tuple] = []
+    for idx, cl in enumerate(unpinned_lines):
+        lo, hi = stream_bounds.get(cl.stream, (cl.score, cl.score))
+        norm = 1.0 if hi <= lo else (cl.score - lo) / (hi - lo)
+        weight = weights.get(cl.stream, 1.0)
+        unified = weight * norm
+        scored.append((unified, idx, cl))
+
+    # Step 4: stable sort by unified score, descending. Ties keep input
+    # order because idx (ascending) is the secondary sort key.
+    scored.sort(key=lambda t: (-t[0], t[1]))
+
+    # Step 5: greedy budget fill, STRICT rank-prefix -- keep the top-ranked
+    # run that fits and stop at the first line that would overflow. We do NOT
+    # keep scanning for smaller lower-ranked lines that happen to fit: that
+    # would let rank-20 recency junk jump ahead of a dropped rank-8 relevance
+    # block, inverting the very ordering Stage 3 exists to enforce. The first
+    # line is always kept (even if it alone exceeds the budget) so a large top
+    # item never yields an empty L1.
+    kept_unpinned: List[CacheLine] = []
+    running_total = 0
+    for _unified, _idx, cl in scored:
+        line_len = len(cl.content or "")
+        if kept_unpinned and running_total + line_len > budget_chars:
+            break
+        kept_unpinned.append(cl)
+        running_total += line_len
+    dropped = len(scored) - len(kept_unpinned)
+
+    _PITH_METRICS.ranked_kept += len(pinned_lines) + len(kept_unpinned)
+    _PITH_METRICS.ranked_dropped += dropped
+    _PITH_METRICS.budget_chars_used += running_total
+
+    # Step 6: assemble -- pinned first (original order), then ranked kept.
+    return pinned_lines + kept_unpinned
