@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-11] Claude Code (Fable 5) — #379: atomic write + manifest refresh
+# What: the apply-path checkpoint write goes through checkpoint_guardian.atomic_file_write
+#   (tmp + os.replace) and refreshes the manifest sidecar with post-pass counts.
+# Why: #379 (final-review finding on #373) — a direct in-place checkpoint() tears the file
+#   on mid-write death AND mutates the newest hardlinked guardian generation (shared
+#   inode); a stale manifest after an offline pass can trip the SaveGate falsely.
+# How: guardian import at the write site; manifest merged (read-modify-write) so fields
+#   this script doesn't know about survive; behavior otherwise unchanged.
 # [2026-07-06] Claude Code (Sonnet 5) — Catch vector_db-only orphaned tool noise
 # What: find_tool_noise() only ever matched nodes reachable via graph.nodes.items() --
 #   any vector_db entry whose graph node had ALREADY been pruned (by #237's
@@ -116,8 +124,19 @@ def cleanup(main_path: str, vectors_path: str, apply: bool = False) -> dict:
         if vdb.delete(node_id):
             removed_orphan += 1
 
-    graph.checkpoint(main_path)
-    vdb.save(vectors_path)
+    # #379: atomic writes + manifest refresh (see cc_threshold_rebaseline.py's
+    # note). The manifest update is load-bearing HERE: this script mass-deletes
+    # nodes, and a stale higher node-count in the manifest would make the
+    # SaveGate refuse the daemon's next legitimate save.
+    from checkpoint_guardian import atomic_file_write, read_manifest, write_manifest
+    atomic_file_write(main_path, lambda p: graph.checkpoint(p))
+    atomic_file_write(vectors_path, lambda p: vdb.save(p))
+    m = read_manifest(main_path) or {}
+    m.pop("version", None); m.pop("saved_at", None)
+    m.update({"nodes": len(graph.nodes), "synapses": len(graph.synapses),
+              "hyperedges": len(graph.hyperedges), "timestep": graph.timestep,
+              "vdb_count": vdb.count(), "offline_pass": "cleanup_cc_tool_noise"})
+    write_manifest(main_path, m)
 
     return {
         "status": "ok",

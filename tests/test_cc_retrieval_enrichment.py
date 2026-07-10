@@ -8,8 +8,9 @@
 #   the substrate-primacy property under test is exactly the interaction a
 #   mock would hide.
 # -------------------
+import os
 import sys
-sys.path.insert(0, '/home/josh/NeuroGraph')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import tempfile, shutil
 import numpy as np

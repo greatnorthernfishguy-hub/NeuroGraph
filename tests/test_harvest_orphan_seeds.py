@@ -13,8 +13,9 @@
 #   lowered threshold for deterministic firing (same technique as
 #   test_cc_retrieval_enrichment's substrate-primacy test).
 # -------------------
+import os
 import sys
-sys.path.insert(0, '/home/josh/NeuroGraph')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile, shutil
 import pytest
 

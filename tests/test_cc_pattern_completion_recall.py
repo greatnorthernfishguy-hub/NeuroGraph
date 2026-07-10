@@ -19,8 +19,9 @@
 #   Output shape and fail-soft behavior (the other 6 tests here) are unchanged.
 # How: see inline comments at each adjusted assertion.
 # -------------------
+import os
 import sys
-sys.path.insert(0, '/home/josh/NeuroGraph')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile, shutil
 import pytest
 
