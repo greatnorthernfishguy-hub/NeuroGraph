@@ -1,5 +1,36 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-10] Claude Code (Sonnet 5 + Opus 4.8) — Pith Stage 2: keyframe / LOD compression (concept-aware)
+# What: Added pith_stage2_keyframe(content, max_chars=None, query="") ->
+#   (keyframe, delta) -- a pure, deterministic EXTRACTIVE compressor. Not a
+#   head/first-sentence cut (which keeps the greeting and drops the payload):
+#   it segments the item, scores each segment by intrinsic information
+#   (_pith_salient_terms centroid + payload tokens like numbers/identifiers/
+#   `code`/file refs + a structural bonus for headings/def-class/labelled
+#   bullets, + query overlap when given), keeps the densest segments that fit
+#   max_chars in original reading order, marks elisions with "⋯" and appends a
+#   " ⋯[+N]" marker. Wired pith_stage3's Step-5 budget fill to try a keyframe
+#   before dropping a ranked line that overflows ("keep full, else keep
+#   keyframe, else stop" -- strict rank-prefix preserved); the kept line's
+#   `lod` records the retained fraction. Extended PithMetrics with
+#   compressed_count/chars_saved. New CC_PITH_KEYFRAME_CHARS env (default 220,
+#   clamped [60, 1000]).
+# Why: Stage 3's budget fill was a hard cliff -- a ranked item that didn't
+#   fit was dropped outright, even if a terse form would have fit. Graceful
+#   degradation: lower-priority context gets TERSER, not ABSENT -- and
+#   terser must mean "the concepts it carries," not "its first sentence."
+#   The visible marker keeps this honest -- the CC reading its own surfaced
+#   context can tell a keyframe from the whole item.
+# How: pith_stage2_keyframe + helpers (_pith_salient_terms, _pith_segment_score,
+#   _pith_cut_at_word_boundary) are pure/no-I/O (regex + string ops only over
+#   the one small item), never raise (empty/whitespace -> ("", "")), and are a
+#   no-op passthrough when content already fits (returns (content, "")). In
+#   pith_stage3's fill loop, each ranked unpinned line that doesn't fit full
+#   gets one keyframe attempt; kept only if the keyframe both fits the
+#   remaining budget AND is smaller than full -- cl.content/lod/keyframe/deltas
+#   are mutated in place on the (throwaway, per-recall) CacheLine. Pinned lines
+#   are never compressed (off-budget, load-bearing verbatim). Gate-OFF path
+#   (_CC_PITH_ENABLED unset) is untouched.
 # [2026-07-09] Claude Code (Sonnet 5) — Pith Stage 3: unified rank + char budget
 # What: Added `stream: str = "recall"` field to CacheLine (+ matching kwarg on
 #   from_surfaced), and pith_stage3(cache_lines, budget_chars=None, weights=None)
@@ -1542,6 +1573,10 @@ _CC_PITH_W_RECENCY = float(os.environ.get("CC_PITH_W_RECENCY", "0.6"))
 _CC_PITH_L1_BUDGET = int(os.environ.get("CC_PITH_L1_BUDGET", "4000"))
 _CC_PITH_L1_BUDGET = max(500, min(40000, _CC_PITH_L1_BUDGET))
 
+# Stage 2 (keyframe / LOD compression) config -- default keyframe size in
+# chars, clamped [60, 1000]. See pith_stage2_keyframe().
+_CC_PITH_KEYFRAME_CHARS = max(60, min(1000, int(os.environ.get("CC_PITH_KEYFRAME_CHARS", "220"))))
+
 # Same marker tuple as miniTID's is_synthetic_harness_text (Condensate
 # rust_core/src/minitid.rs) -- not importable here (Rust, separate process),
 # so inlined verbatim rather than left unguarded on the extraction side.
@@ -1581,7 +1616,7 @@ class CacheLine:
     lod: float = 1.0
     coherence: str = "exclusive"
     manifold_type: str = "hyperbolic"
-    keyframe: bool = True
+    keyframe: bool = False
     deltas: list = field(default_factory=list)
     stream: str = "recall"
 
@@ -1607,6 +1642,8 @@ class PithMetrics:
     ranked_kept: int = 0
     ranked_dropped: int = 0
     budget_chars_used: int = 0
+    compressed_count: int = 0
+    chars_saved: int = 0
 
     def reset(self) -> None:
         self.total_lines_in = 0
@@ -1617,6 +1654,8 @@ class PithMetrics:
         self.ranked_kept = 0
         self.ranked_dropped = 0
         self.budget_chars_used = 0
+        self.compressed_count = 0
+        self.chars_saved = 0
 
     def record_failure(self) -> None:
         """Bump the fail-soft counter -- the Pith path swallows exceptions and
@@ -1635,6 +1674,8 @@ class PithMetrics:
             "ranked_kept": self.ranked_kept,
             "ranked_dropped": self.ranked_dropped,
             "budget_chars_used": self.budget_chars_used,
+            "compressed_count": self.compressed_count,
+            "chars_saved": self.chars_saved,
         }
 
 
@@ -1791,6 +1832,182 @@ def pith_stage1(cache_lines: List[CacheLine], conversation_text: str,
     return combined_out
 
 
+# Tiny stopword set for the Stage-2 extractive keyframe -- just enough to keep
+# function words from diluting a segment's salient-term density. Not exhaustive
+# (this is a cheap heuristic, not an NLP pipeline).
+_PITH_STOPWORDS = frozenset("""
+a an the this that these those and or but if then else of to in on at by for with
+from as is are was were be been being it its i you he she they we me my your our
+their them us do does did done have has had will would can could should may not no
+yes so than too very just about into over under out up down off also which who whom
+what when where how why then there here their they're it's don't doesn't
+""".split())
+
+
+def _pith_salient_terms(content: str) -> Dict[str, int]:
+    """Term-frequency map over `content` (lowercased alnum tokens, length >= 3,
+    minus stopwords) -- the item's own recurring vocabulary. Used as the
+    centroid signal for extractive keyframe selection: a segment dense in the
+    item's repeated concepts is central to what the item is about."""
+    freq: Dict[str, int] = {}
+    for w in re.findall(r"[a-z0-9_]+", content.lower()):
+        if len(w) < 3 or w in _PITH_STOPWORDS:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    return freq
+
+
+def _pith_segment_score(seg: str, term_freq: Dict[str, int]) -> float:
+    """Informativeness of one segment (higher = keep). Combines the item's own
+    salient-term density (centroid, length-normalized so long filler can't win
+    on raw counts), payload-token count (numbers, dotted/underscored
+    identifiers, `code`, file refs -- the parts that carry facts), and a
+    structural bonus for headings / def-class signatures / labelled bullets.
+    Greetings and filler score near zero without any special-casing."""
+    s = seg.strip()
+    if not s:
+        return 0.0
+    words = re.findall(r"[a-z0-9_]+", s.lower())
+    if not words:
+        return 0.0
+    centroid = sum(term_freq.get(w, 0) for w in words) / len(words)
+    payload = len(re.findall(
+        r"\d+|[A-Za-z_]+[._][A-Za-z0-9_]+|`[^`]+`|#\d+", s))
+    structural = 0.0
+    if re.match(r"#{1,6}\s", s) or re.match(r"(?:def|class)\s+\w", s):
+        structural = 2.0
+    elif re.match(r"[-*]\s+\*\*", s):  # "- **Label:**" key-value bullet
+        structural = 1.0
+    return centroid + 0.5 * payload + structural
+
+
+def _pith_cut_at_word_boundary(text: str, limit: int) -> str:
+    """Hard-cut `text` to at most `limit` chars, backing up to the last space
+    so the cut never lands mid-word (unless `text` has no space within the
+    first `limit` chars, in which case a mid-word cut is unavoidable)."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    last_space = cut.rfind(" ")
+    if last_space > 0:
+        cut = cut[:last_space]
+    return cut.rstrip()
+
+
+def pith_stage2_keyframe(content: str, max_chars: Optional[int] = None,
+                          query: str = "") -> tuple:
+    """Pith Stage 2: keyframe / LOD compression -- concept-aware, extractive.
+
+    Cheap, pure, deterministic -- no LLM, no I/O. Compresses `content` to a
+    keyframe by keeping its highest-INFORMATION segments, NOT its head. A
+    positional "first sentence" keyframe keeps the setup and throws away the
+    payload -- "Good morning, my friend! Now, about those important things..."
+    would survive as just the greeting. Instead we score every segment by the
+    concepts it actually carries and keep the densest ones, in original order,
+    with elision marks where segments were skipped.
+
+    Scoring (see _pith_segment_score): a segment earns points for the item's
+    own recurring salient terms (centroid), for payload tokens (numbers,
+    dotted/underscored identifiers, `code`, file refs), for structural role
+    (headings / def-class signatures / labelled bullets), and -- when a `query`
+    is supplied -- for overlap with the query. Greetings and filler carry none
+    of these and fall to the bottom on their own; no greeting blacklist needed.
+
+    Returns `(keyframe, delta)`:
+    - `keyframe`: the compressed string, ending in a visible " ⋯[+N]" marker
+      (N = chars dropped) so a reader can never mistake it for the whole item;
+      interior "⋯" marks show where non-adjacent segments were joined. Empty
+      string for empty/whitespace input; `content` unchanged (empty delta) when
+      it already fits.
+    - `delta`: the dropped segments (original order), for `CacheLine.deltas`
+      (future victim-cache / expansion can restore it).
+
+    max_chars defaults to CC_PITH_KEYFRAME_CHARS (env, clamped [60, 1000]).
+    Never raises.
+    """
+    if max_chars is None:
+        max_chars = _CC_PITH_KEYFRAME_CHARS
+
+    if not content or not content.strip():
+        return ("", "")
+
+    if len(content) <= max_chars:
+        return (content, "")
+
+    # 1. Segment: lines, and split long prose lines into sentences so a single
+    #    dense paragraph can be sub-selected rather than kept/dropped whole.
+    raw_segs: List[str] = []
+    for ln in content.split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        if len(s) > 120 and re.search(r"[.?!]\s", s):
+            for part in re.split(r"(?<=[.?!])\s+", s):
+                if part.strip():
+                    raw_segs.append(part.strip())
+        else:
+            raw_segs.append(s)
+    if not raw_segs:
+        return ("", "")
+
+    segs = list(enumerate(raw_segs))  # (orig_index, text)
+
+    # 2. Score each segment by intrinsic information payload (+ query overlap).
+    term_freq = _pith_salient_terms(content)
+    qterms = set(re.findall(r"[a-z0-9_]+", query.lower())) if query else set()
+
+    def _score(idx_seg):
+        idx, seg = idx_seg
+        base = _pith_segment_score(seg, term_freq)
+        if qterms:
+            sw = re.findall(r"[a-z0-9_]+", seg.lower())
+            base += float(sum(1 for w in sw if w in qterms))
+        # Faint positional prior: only a tie-breaker so equally-informative
+        # segments keep reading order; far too small to override real signal.
+        return base - 0.001 * idx
+
+    ranked = sorted(segs, key=_score, reverse=True)
+
+    # 3. Greedily pack the most-informative segments until the budget is spent.
+    #    Unlike Stage 3's item-level strict-prefix, packing WITHIN one item is
+    #    correct -- a keyframe is a summary, so a shorter lower-ranked segment
+    #    that still fits is worth keeping.
+    marker_reserve = 12  # room for the trailing " ⋯[+NNNN]" marker
+    budget = max(1, max_chars - marker_reserve)
+    picked: List[tuple] = []  # (orig_index, text)
+    used = 0
+    for idx, seg in ranked:
+        piece = seg
+        if not picked and len(piece) > budget:
+            piece = _pith_cut_at_word_boundary(piece, budget)
+        add = len(piece) + (1 if picked else 0)
+        if picked and used + add > budget:
+            continue
+        picked.append((idx, piece))
+        used += add
+
+    if not picked:
+        return ("", content)
+
+    # 4. Restore reading order; mark elisions between non-adjacent segments.
+    picked.sort(key=lambda t: t[0])
+    out_parts: List[str] = []
+    prev_idx = None
+    for idx, piece in picked:
+        if prev_idx is not None and idx != prev_idx + 1:
+            out_parts.append("⋯")
+        out_parts.append(piece)
+        prev_idx = idx
+    body = " ".join(out_parts)
+
+    picked_idxs = {i for i, _ in picked}
+    delta = " ".join(seg for i, seg in segs if i not in picked_idxs)
+    dropped_chars = max(0, len(content) - len(body))
+    keyframe = body + (" ⋯[+%d]" % dropped_chars)
+
+    return (keyframe, delta)
+
+
 def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None,
                  weights: Optional[Dict[str, float]] = None) -> List[CacheLine]:
     """Pith Stage 3: unified rank + char budget -- the L1 assembler core.
@@ -1882,15 +2099,33 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
     # would let rank-20 recency junk jump ahead of a dropped rank-8 relevance
     # block, inverting the very ordering Stage 3 exists to enforce. The first
     # line is always kept (even if it alone exceeds the budget) so a large top
-    # item never yields an empty L1.
+    # item never yields an empty L1. Graceful degradation (Pith Stage 2): a
+    # line that doesn't fit at full fidelity gets one more chance as a
+    # keyframe (compressed head) before being dropped -- terser beats absent.
     kept_unpinned: List[CacheLine] = []
     running_total = 0
     for _unified, _idx, cl in scored:
-        line_len = len(cl.content or "")
-        if kept_unpinned and running_total + line_len > budget_chars:
-            break
-        kept_unpinned.append(cl)
-        running_total += line_len
+        full_len = len(cl.content or "")
+        if not kept_unpinned or running_total + full_len <= budget_chars:
+            kept_unpinned.append(cl)
+            running_total += full_len
+            continue
+
+        kf, delta = pith_stage2_keyframe(cl.content)
+        if running_total + len(kf) <= budget_chars and len(kf) < full_len:
+            cl.content = kf
+            # lod = fraction of the original retained (1.0 = full, matching the
+            # CacheLine default); a compressed line records how much survived.
+            cl.lod = len(kf) / full_len if full_len else 1.0
+            cl.keyframe = True
+            cl.deltas = [delta]
+            kept_unpinned.append(cl)
+            running_total += len(kf)
+            _PITH_METRICS.compressed_count += 1
+            _PITH_METRICS.chars_saved += (full_len - len(kf))
+            continue
+
+        break
     dropped = len(scored) - len(kept_unpinned)
 
     _PITH_METRICS.ranked_kept += len(pinned_lines) + len(kept_unpinned)
