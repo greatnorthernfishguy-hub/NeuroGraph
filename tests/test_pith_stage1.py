@@ -115,3 +115,37 @@ def test_pith_metrics_snapshot_reflects_counts():
     assert len(survivors) == 1
     assert survivors[0].node_id == "n4"
     assert survivors[0].score == 0.7
+
+
+# ---- Wiring / observability (Pith pre-flight, 2026-07-08) ----
+
+def test_from_surfaced_carries_score_and_pin_like_recall_builds_it():
+    # Mirrors how cc-ng-daemon _recall wraps a surfaced item into a CacheLine.
+    cl = CacheLine.from_surfaced("nX", "some surfaced memory", score=0.73, pinned=True)
+    assert cl.node_id == "nX"
+    assert cl.content == "some surfaced memory"
+    assert cl.score == 0.73
+    assert cl.pinned is True
+
+
+def test_mixed_set_pinned_and_genuine_survive_harness_and_dup_stripped():
+    # Closest to _recall reality: a pinned constitutional line that ALSO matches
+    # a strip condition, a harness line, a conversation-duplicate, and a genuine
+    # novel line -> only the pinned line and the genuine line survive.
+    conv = "the deploy pipeline breaks when redis is cold on first boot"
+    lines = [
+        CacheLine.from_surfaced("pin", "the deploy pipeline breaks when redis is cold", score=0.1, pinned=True),
+        CacheLine.from_surfaced("harness", "<task-notification>done</task-notification>", score=1.0),
+        CacheLine.from_surfaced("dup", "the deploy pipeline breaks when redis is cold", score=1.0),
+        CacheLine.from_surfaced("genuine", "an unrelated thought about hyperbolic geometry", score=0.5),
+    ]
+    survivors = pith_stage1(lines, conv, novelty=0.0)
+    ids = {l.node_id for l in survivors}
+    assert ids == {"pin", "genuine"}
+
+
+def test_record_failure_increments_and_shows_in_snapshot():
+    assert _PITH_METRICS.snapshot()["pith_failures"] == 0
+    _PITH_METRICS.record_failure()
+    _PITH_METRICS.record_failure()
+    assert _PITH_METRICS.snapshot()["pith_failures"] == 2

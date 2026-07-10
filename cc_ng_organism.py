@@ -1551,17 +1551,27 @@ class PithMetrics:
     total_lines_in: int = 0
     clutter_stripped: int = 0
     combined: int = 0
+    pith_failures: int = 0
 
     def reset(self) -> None:
         self.total_lines_in = 0
         self.clutter_stripped = 0
         self.combined = 0
+        self.pith_failures = 0
+
+    def record_failure(self) -> None:
+        """Bump the fail-soft counter -- the Pith path swallows exceptions and
+        falls back to un-Pithed rendering, so without this a 100%-failing Pith
+        pass is indistinguishable from a working one. Call from the caller's
+        fallback except-handler."""
+        self.pith_failures += 1
 
     def snapshot(self) -> Dict[str, int]:
         return {
             "total_lines_in": self.total_lines_in,
             "clutter_stripped": self.clutter_stripped,
             "combined": self.combined,
+            "pith_failures": self.pith_failures,
         }
 
 
