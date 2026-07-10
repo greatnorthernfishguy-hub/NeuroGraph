@@ -149,3 +149,20 @@ def test_record_failure_increments_and_shows_in_snapshot():
     _PITH_METRICS.record_failure()
     _PITH_METRICS.record_failure()
     assert _PITH_METRICS.snapshot()["pith_failures"] == 2
+
+
+def test_containment_strips_item_covered_by_longer_conversation():
+    # The old symmetric-Jaccard metric MISSED this: the item's words are fully
+    # present in a longer conversation, but Jaccard = 13/26 = 0.5 (< 0.85) so it
+    # was kept. Item-containment = 13/13 = 1.0 -> correctly stripped as redundant
+    # (the model already has all of it). This is the case the fix exists for.
+    item = "the save guard refuses to overwrite a healthy checkpoint with empty graph"
+    conversation_text = (
+        "earlier in this discussion we established that the save guard refuses to "
+        "overwrite a healthy checkpoint with empty graph and also rotates backups "
+        "logs a rate limited warning and seeds a node count reference on startup"
+    )
+    line = CacheLine.from_surfaced("n1", item, score=1.0)
+    survivors = pith_stage1([line], conversation_text, novelty=0.0)
+    assert survivors == []
+    assert _PITH_METRICS.snapshot()["clutter_stripped"] == 1

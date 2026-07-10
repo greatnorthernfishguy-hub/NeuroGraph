@@ -1586,7 +1586,9 @@ def _pith_normalize(text: str) -> str:
 
 def _pith_jaccard(a: str, b: str) -> float:
     """Word-set Jaccard overlap of two already-normalized strings. Empty/
-    empty is treated as no overlap (0.0), not a division-by-zero NaN."""
+    empty is treated as no overlap (0.0), not a division-by-zero NaN.
+    Symmetric -- used for write-combine (step 3), where mutual near-identity
+    is what we want."""
     set_a = set(a.split())
     set_b = set(b.split())
     if not set_a or not set_b:
@@ -1595,6 +1597,22 @@ def _pith_jaccard(a: str, b: str) -> float:
     if not union:
         return 0.0
     return len(set_a & set_b) / len(union)
+
+
+def _pith_containment(item: str, conv: str) -> float:
+    """Fraction of ITEM's words already present in the conversation --
+    |item ∩ conv| / |item|. ASYMMETRIC on purpose: it answers "does the model
+    already have essentially all of this item?", not "do they overlap at all".
+    A long memory that the conversation merely quotes a fragment of scores
+    LOW (it still carries the rest) and is kept; a memory whose content is
+    genuinely already in the conversation scores HIGH and is stripped as
+    redundant. Symmetric Jaccard got this wrong -- a long item's own large
+    word set sank the ratio far below threshold, so dedup almost never fired."""
+    set_item = set(item.split())
+    set_conv = set(conv.split())
+    if not set_item or not set_conv:
+        return 0.0
+    return len(set_item & set_conv) / len(set_item)
 
 
 def pith_stage1(cache_lines: List[CacheLine], conversation_text: str,
