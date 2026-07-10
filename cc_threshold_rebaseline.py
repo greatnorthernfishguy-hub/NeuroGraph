@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-11] Claude Code (Fable 5) — #379: atomic write + manifest refresh
+# What: the apply-path checkpoint write goes through checkpoint_guardian.atomic_file_write
+#   (tmp + os.replace) and refreshes the manifest sidecar with post-pass counts.
+# Why: #379 (final-review finding on #373) — a direct in-place checkpoint() tears the file
+#   on mid-write death AND mutates the newest hardlinked guardian generation (shared
+#   inode); a stale manifest after an offline pass can trip the SaveGate falsely.
+# How: guardian import at the write site; manifest merged (read-modify-write) so fields
+#   this script doesn't know about survive; behavior otherwise unchanged.
 # [2026-07-08] Claude Code (Fable 5) — One-time threshold re-baseline to the tuned physics
 # What: Offline pass setting every non-constitutional node's threshold to
 #   min(current, 0.85) — the canonical 2026-03-23 tuned value. Companion to the
@@ -64,8 +72,19 @@ def rebaseline(main_path: str, apply: bool = False) -> dict:
         "total_nodes": len(graph.nodes),
     }
     if apply and would_change:
-        graph.checkpoint(main_path)
-        logger.info("Re-baselined %d node thresholds to %.2f and saved", would_change, TUNED_THRESHOLD)
+        # #379: atomic write + manifest refresh. A direct in-place checkpoint()
+        # tears the file on a mid-write death AND mutates the newest hardlinked
+        # guardian generation (same inode); a stale manifest after an offline
+        # pass can also trip the SaveGate against the daemon's next save.
+        from checkpoint_guardian import atomic_file_write, read_manifest, write_manifest
+        atomic_file_write(main_path, lambda p: graph.checkpoint(p))
+        m = read_manifest(main_path) or {}
+        m.pop("version", None); m.pop("saved_at", None)
+        m.update({"nodes": len(graph.nodes), "synapses": len(graph.synapses),
+                  "hyperedges": len(graph.hyperedges), "timestep": graph.timestep,
+                  "offline_pass": "cc_threshold_rebaseline"})
+        write_manifest(main_path, m)
+        logger.info("Re-baselined %d node thresholds to %.2f and saved (atomic, manifest refreshed)", would_change, TUNED_THRESHOLD)
     return result
 
 
