@@ -1238,8 +1238,21 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
     return absorbed
 
 
+# [2026-07-10] Recall seed floor -- the query-driven substrate path
+# (_harvest_associations) VDB-searches for seed nodes above this cosine floor,
+# then SPREADS through learned synapses (the substrate does the real work; the
+# VDB only picks entry points). The old 0.40 was too high a bar for a
+# sentence-transformer -- genuinely-relevant memories at 0.25-0.40 cleared
+# nothing, so the query seeded ZERO nodes, the substrate never got to fire, and
+# query-independent recency (SurfacingMonitor) flooded the surfaced block. 0.22
+# lets the query actually seed the substrate. This is MORE substrate-primary,
+# not less: looser seeds, more of the deciding done by synaptic spread. Env-
+# tunable; novelty still scales it further down inside _harvest_associations.
+_CC_RECALL_PRIME_THRESHOLD = float(os.environ.get("CC_RECALL_PRIME_THRESHOLD", "0.22"))
+
+
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
-                                    threshold: float = 0.40,
+                                    threshold: float = _CC_RECALL_PRIME_THRESHOLD,
                                     state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Substrate-native pattern-completion recall for CC's hook surfacing
     (#358 rebuild -- replaces the bare ng.recall() cosine search this
@@ -1569,7 +1582,7 @@ _CC_PITH_CLUTTER_NOVELTY_K = float(os.environ.get("CC_PITH_CLUTTER_NOVELTY_K", "
 # above recency (SurfacingMonitor) by default -- recency is a secondary prior
 # to relevance, not an equal signal.
 _CC_PITH_W_RELEVANCE = float(os.environ.get("CC_PITH_W_RELEVANCE", "1.0"))
-_CC_PITH_W_RECENCY = float(os.environ.get("CC_PITH_W_RECENCY", "0.6"))
+_CC_PITH_W_RECENCY = float(os.environ.get("CC_PITH_W_RECENCY", "0.3"))
 _CC_PITH_L1_BUDGET = int(os.environ.get("CC_PITH_L1_BUDGET", "4000"))
 _CC_PITH_L1_BUDGET = max(500, min(40000, _CC_PITH_L1_BUDGET))
 
