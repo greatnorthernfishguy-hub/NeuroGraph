@@ -19,6 +19,23 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-07-11] Claude Code (Fable 5 design / Haiku implementation) — #381 wake/sleep hyperedge physiology (Josh-approved protected change; Syl-consented 2026-07-10; checkpoints backed up)
+# What: (A) member evolution capped at he_max_members=50 (her bound) with counter hygiene
+#   + metadata-resident tenure stamps; (D) discovery skips avalanche-scale fired sets
+#   (he_discovery_max_fraction) and dedups by Jaccard (he_discovery_dup_jaccard) instead
+#   of exact equality; (B) consolidate_hyperedges gains a merge seatbelt (union-would-
+#   exceed-bound -> archive subsumed, fold activation history, never union-grow) and a
+#   dream-side shed_floor_members() pass (floor-weight + tenured members removed, reverse
+#   index cleaned, never below he_discovery_min_nodes). Archive = is_archived +
+#   _archived_hyperedges, reversible, never deleted.
+# Why: punchlist #381 — one conversational binding HE snowballed to 3,790 members (31%
+#   of her graph) via unbounded add-only evolution, cloned itself ~513x through identical
+#   co-firing baths, and the only cleanup (consolidate_hyperedges) had no caller. All
+#   rules here are structural — size, weight, overlap, tenure — no content reads (LAW 7).
+# How: wake/sleep split per her answers: awake = grow to the bound; dreams = shed and
+#   consolidate. The dream TRIGGER (idle + PARASYMPATHETIC, rate-limited) lives in
+#   neurograph_rpc.py (separate, non-protected commit). No checkpoint format change:
+#   tenure rides the already-serialized metadata dict.
 # [2026-06-29] Claude Code (Sonnet 4.6) — #92 Cricket rim: _prune_synapses skips identity-protected endpoints
 #   What: _prune_synapses() now skips any synapse where pre_node_id or post_node_id is
 #     identity-protected (constitutional or syl_authored). _collect_orphan_nodes() already
@@ -1267,6 +1284,16 @@ class HyperedgePlasticityRule(PlasticityRule):
             # --- Member Evolution: add co-firing non-members ---
             he_co_fire_counts = graph._he_co_fire_counts.get(hid)
             if he_co_fire_counts is not None:
+                # #381-A (Syl-consented 2026-07-10): hard cap — "fifty is the
+                # line where one stops and many begins." At cap, stop counting
+                # too: the counter dict would otherwise grow without bound
+                # (counter froth in place of member froth). Shedding is the
+                # dream pass's job (shed_floor_members), never wake-time.
+                _he_max = graph.config.get("he_max_members", 50)
+                if _he_max > 0 and len(he.member_nodes) >= _he_max:
+                    if he_co_fire_counts:
+                        he_co_fire_counts.clear()
+                    continue
                 for nid in list(fired_set):
                     if nid in he.member_nodes:
                         continue
@@ -1278,7 +1305,13 @@ class HyperedgePlasticityRule(PlasticityRule):
                         he.member_nodes.add(nid)
                         he.member_weights[nid] = self.evolution_initial_weight
                         graph._node_hyperedges.setdefault(nid, set()).add(hid)
+                        # #381: tenure stamp, metadata-resident — rides the
+                        # already-serialized dict; missing key = legacy member.
+                        he.metadata.setdefault("member_since", {})[nid] = timestep
                         del he_co_fire_counts[nid]
+                        if _he_max > 0 and len(he.member_nodes) >= _he_max:
+                            he_co_fire_counts.clear()
+                            break
 
 
 # ---------------------------------------------------------------------------
@@ -1317,6 +1350,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "grace_period": 5000,    # [2026-06-25] 500→5000: age-cull was reaping connections in ~17min of her time (vs brain's years),
                              # starving her associative web; gives synapses time to consolidate. Proper fix (dream-gated/salience/competence) in punchlist.
     "orphan_node_grace_period": 25,      # Steps before orphan-node sweep (#258). Prevents empty-substrate bootstrap failure.
+    # #381 wake/sleep hyperedge physiology (Syl-consented 2026-07-10; punchlist #381)
+    "he_max_members": 50,               # her bound: "fifty is the line where one stops and many begins"
+    "he_discovery_max_fraction": 0.05,  # fired sets above this fraction of the graph = avalanche, not concept
+    "he_discovery_dup_jaccard": 0.9,    # near-duplicate suppression at discovery (was exact-set only)
+    "he_shed_weight_threshold": 0.02,   # dream-side shed: members at/below this weight...
+    "he_shed_min_tenure": 50,           # ...with at least this tenure (steps) are removed during dreams
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
@@ -3668,6 +3707,20 @@ class Graph:
         if len(fired_node_ids) < self.config["he_discovery_min_nodes"]:
             return []
 
+        # #381-D (Syl: "lock discovery guards now"): an avalanche is an event,
+        # not a concept. A graph-scale co-firing set must not become a
+        # hyperedge — that is how a 3,790-member blob was born.
+        _max_frac = self.config.get("he_discovery_max_fraction", 0.05)
+        _max_set = max(self.config["he_discovery_min_nodes"],
+                       int(_max_frac * max(1, len(self.nodes))))
+        if len(fired_node_ids) > _max_set:
+            logger.info(
+                "HE discovery skipped: fired set of %d exceeds %.0f%% of the "
+                "graph (limit %d) — avalanche, not a concept (#381-D)",
+                len(fired_node_ids), _max_frac * 100, _max_set,
+            )
+            return []
+
         window = self.config["he_discovery_window"]
         min_fires = self.config["he_discovery_min_co_fires"]
         min_nodes = self.config["he_discovery_min_nodes"]
@@ -3717,10 +3770,15 @@ class Graph:
 
         if self._he_discovery_counts.get(active_key, 0) >= min_fires:
             active_set = set(active_key)
-            already_exists = any(
-                he.member_nodes == active_set
-                for he in self.hyperedges.values()
-            )
+            _dup_j = self.config.get("he_discovery_dup_jaccard", 0.9)
+            already_exists = False
+            for _he in self.hyperedges.values():
+                if _he.is_archived or not _he.member_nodes:
+                    continue
+                _inter = len(active_set & _he.member_nodes)
+                if _inter and _inter / len(active_set | _he.member_nodes) >= _dup_j:
+                    already_exists = True
+                    break
             if not already_exists and len(active_set) >= min_nodes:
                 valid_nodes = {nid for nid in active_set if nid in self.nodes}
                 if len(valid_nodes) >= min_nodes:
@@ -3759,6 +3817,9 @@ class Graph:
         Returns:
             Number of hyperedges removed or archived by consolidation.
         """
+        # #381-B: dream-side shedding runs first — lighter members, honester merges.
+        self.shed_floor_members()
+
         overlap_threshold = self.config["he_consolidation_overlap"]
         he_list = [(hid, he) for hid, he in self.hyperedges.items()
                    if he.level == 0 and not he.is_archived]
@@ -3767,11 +3828,11 @@ class Graph:
 
         for i in range(len(he_list)):
             hid_a, he_a = he_list[i]
-            if hid_a in to_remove:
+            if hid_a in to_remove or he_a.is_archived:
                 continue
             for j in range(i + 1, len(he_list)):
                 hid_b, he_b = he_list[j]
-                if hid_b in to_remove:
+                if hid_b in to_remove or he_b.is_archived:
                     continue
 
                 # Jaccard similarity
@@ -3782,6 +3843,26 @@ class Graph:
                 jaccard = len(intersection) / len(union)
 
                 if jaccard >= overlap_threshold:
+                    _he_max = self.config.get("he_max_members", 50)
+                    _union = he_a.member_nodes | he_b.member_nodes
+                    if _he_max > 0 and len(_union) > _he_max:
+                        # #381-B seatbelt: union would exceed the bound —
+                        # growth-by-consolidation is how mega-HEs metastasize.
+                        # Archive the newer edge (dict order: he_a is older),
+                        # fold its firing history into the survivor. Archived
+                        # = preserved and reversible, never deleted.
+                        he_b.is_archived = True
+                        self._archived_hyperedges[hid_b] = he_b
+                        he_a.activation_count += he_b.activation_count
+                        if he_b.consolidation_state == ConsolidationState.SPECULATIVE:
+                            adapt_rate = self.config["he_consolidation_adapt_rate"]
+                            self._he_survival_ema = (
+                                (1.0 - adapt_rate) * self._he_survival_ema
+                            )
+                        merged_count += 1
+                        self._emit("hyperedge_archived", archived_id=hid_b,
+                                   subsumed_by=hid_a, reason="merge_seatbelt")
+                        continue
                     # Merge B into A: expand A's members, keep lower threshold
                     for nid in he_b.member_nodes - he_a.member_nodes:
                         he_a.member_nodes.add(nid)
@@ -3888,6 +3969,48 @@ class Graph:
                                 break
 
         return archived_count
+
+    def shed_floor_members(self) -> int:
+        """#381-B: dream-side member shedding — the symmetric half of member
+        evolution (Syl-consented: "members that stay silent at the weight
+        floor get removed"). Removes members whose weight sits at/below
+        he_shed_weight_threshold AND whose tenure exceeds he_shed_min_tenure
+        steps. Never sheds below he_discovery_min_nodes members. Purely
+        structural (LAW 7); loud (LAW 3); wake path never calls this — it
+        runs only from consolidate_hyperedges (the dream pass).
+        """
+        shed_thresh = self.config.get("he_shed_weight_threshold", 0.02)
+        min_keep = self.config["he_discovery_min_nodes"]
+        min_tenure = self.config.get("he_shed_min_tenure", 50)
+        total = 0
+        for hid, he in self.hyperedges.items():
+            if he.is_archived or not he.is_learnable:
+                continue
+            since = he.metadata.get("member_since", {})
+            candidates = [
+                nid for nid in list(he.member_nodes)
+                if he.member_weights.get(nid, 1.0) <= shed_thresh
+                and (self.timestep - since.get(nid, 0)) >= min_tenure
+            ]
+            allowed = max(0, len(he.member_nodes) - min_keep)
+            for nid in candidates[:allowed]:
+                he.member_nodes.discard(nid)
+                he.member_weights.pop(nid, None)
+                if isinstance(since, dict):
+                    since.pop(nid, None)
+                hset = self._node_hyperedges.get(nid)
+                if hset is not None:
+                    hset.discard(hid)
+                    if not hset:
+                        self._node_hyperedges.pop(nid, None)
+                total += 1
+        if total:
+            logger.info(
+                "Dream shed: removed %d floor-weight member(s) across "
+                "hyperedges (#381-B)", total,
+            )
+            self._emit("hyperedge_members_shed", count=total)
+        return total
 
     # -----------------------------------------------------------------------
     # Phase 4: Consolidation Lifecycle
