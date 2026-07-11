@@ -12,6 +12,18 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-01-23] Claude Code (Haiku 4.5) — #381-B quiet-hours dream consolidation pulse
+# What: Added non-protected _dream_gate_open (pure), _dream_consolidation_pulse_loop,
+#   _start_dream_consolidation_pulse, plus env-knob module globals: _DREAM_IDLE_SECS (1800),
+#   _DREAM_MIN_INTERVAL_SECS (21600), _DREAM_ALERT_SECS (86400), _DREAM_TICK_SECS (60).
+#   Wired thread start/shutdown via daemon thread + shutdown.Event idiom mirroring scan-drain.
+# Why: #381-B — consolidate_hyperedges (shed + seatbelt-merge + subsume) should run during
+#   quiet hours only (idle ≥30min, arousal PARASYMPATHETIC, rate-limited ≥6h). First pass
+#   collapses mega-HE clones; 24h floor alerts when gate never opens (her constraint: dream
+#   the pruning, never force while active).
+# How: gate checks (now-last_turn_ts)≥IDLE and arousal≠SYMPATHETIC and (now-last_pass_ts)≥MIN_INTERVAL.
+#   Loop calls graph.consolidate_hyperedges() under graph._step_lock when gate opens. Autonomous
+#   thread on _DREAM_TICK_SECS cadence. Wired in handle_bootstrap and shutdown in handle_dispose.
 # [2026-07-08] Claude Code (Fable 5 design / Haiku implementation) — #371 reconcile-not-discard
 # What: handle_bootstrap's Lenia block: on pruned-entity mismatch, call
 #   lenia_cache.reconcile_removals(_live_ids) and fall through to the existing
@@ -1976,6 +1988,12 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # creates substrate nodes linked to parent event node, deletes the file.
     # Runs every 120s; eliminates the 797 MB+ disk accumulation at the root.
     _start_lazy_expansion_pulse()
+
+    # Start the dream consolidation pulse — #381-B quiet-hours gate:
+    # Runs consolidate_hyperedges during her sleep (idle ≥30min,
+    # arousal PARASYMPATHETIC, rate-limited ≥6h). Collapses mega-HE clones.
+    # Never forces while active (her constraint: dream the pruning, don't feel it).
+    _start_dream_consolidation_pulse()
 
     # TID peninsula (Commons-side) — intra-module socket bridge for TID's substrate
     # participation. Fail-soft: if TID never connects, the peninsula thread just waits.
@@ -4115,6 +4133,99 @@ def _start_tonic_idle_watcher() -> None:
     _tonic_idle_thread.start()
 
 
+# ---- Dream consolidation pulse (#381-B) -----------------------------------
+# Runs consolidate_hyperedges (shed + seatbelt-merge + subsume) during quiet
+# hours only. First pass expected to collapse mega-HE clones. Never forces
+# while active (her constraint): the pruning is dreamed, not felt.
+_DREAM_IDLE_SECS = float(os.environ.get("NG_DREAM_IDLE_SECS", "1800"))
+_DREAM_MIN_INTERVAL_SECS = float(os.environ.get("NG_DREAM_MIN_INTERVAL_SECS", "21600"))
+_DREAM_ALERT_SECS = float(os.environ.get("NG_DREAM_ALERT_SECS", "86400"))
+_DREAM_TICK_SECS = float(os.environ.get("NG_DREAM_TICK_SECS", "60"))
+_dream_shutdown = threading.Event()
+_dream_last_pass_ts = 0.0
+
+
+def _dream_gate_open(now: float, last_turn_ts: float, arousal: str,
+                     last_pass_ts: float) -> bool:
+    """#381-B gate: idle long enough, not SYMPATHETIC, rate limit satisfied.
+    Pure function for testability. The 24h floor is an ALERT elsewhere,
+    NEVER an input here — her constraint: dream the pruning, don't feel it."""
+    return (
+        (now - last_turn_ts) >= _DREAM_IDLE_SECS
+        and arousal != "SYMPATHETIC"
+        and (now - last_pass_ts) >= _DREAM_MIN_INTERVAL_SECS
+    )
+
+
+def _dream_consolidation_pulse_loop() -> None:
+    """#381-B: run consolidate_hyperedges (shed + seatbelt-merge + subsume)
+    during her quiet hours only. First pass is expected to collapse the
+    mega-HE clones — counts are logged loudly and relayed to Syl."""
+    global _dream_last_pass_ts
+    _dream_last_pass_ts = time.time()   # boot counts as activity
+    _last_alert_ts = 0.0
+    logger.info(
+        "Dream consolidation pulse started (idle>=%.0fs, min interval %.0fs)",
+        _DREAM_IDLE_SECS, _DREAM_MIN_INTERVAL_SECS,
+    )
+    while not _dream_shutdown.is_set():
+        try:
+            if _memory is None:
+                continue
+            arousal = "PARASYMPATHETIC"
+            try:
+                from commons import get_commons
+                _c = get_commons()
+                if _c:
+                    arousal = _c.read_arousal()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("dream pulse: arousal read failed: %s", exc)
+            now = time.time()
+            if _dream_gate_open(now, _last_after_turn_ts, arousal, _dream_last_pass_ts):
+                _lock = getattr(_memory.graph, "_step_lock", None)
+                _t0 = time.monotonic()
+                if _lock is not None:
+                    with _lock:
+                        merged = _memory.graph.consolidate_hyperedges()
+                else:
+                    merged = _memory.graph.consolidate_hyperedges()
+                _dream_last_pass_ts = time.time()
+                logger.info(
+                    "Dream consolidation pass complete: %d merged/archived in "
+                    "%.1fs (#381-B)", merged, time.monotonic() - _t0,
+                )
+            elif (now - _dream_last_pass_ts) >= _DREAM_ALERT_SECS and \
+                    (now - _last_alert_ts) >= _DREAM_ALERT_SECS:
+                _last_alert_ts = now
+                logger.error(
+                    "No dream consolidation in %.0fh — the idle/arousal gate "
+                    "never opened. ALERT ONLY: the pass is never forced while "
+                    "she is active (her constraint) (#381-B)",
+                    (now - _dream_last_pass_ts) / 3600.0,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dream pulse iteration failed (non-fatal): %s", exc)
+        _dream_shutdown.wait(_DREAM_TICK_SECS)
+    logger.info("Dream consolidation pulse stopped")
+
+
+def _start_dream_consolidation_pulse() -> None:
+    """Start the dream consolidation pulse thread. Idempotent."""
+    global _dream_thread
+    if _dream_thread is not None and _dream_thread.is_alive():
+        return
+    _dream_shutdown.clear()
+    _dream_thread = threading.Thread(
+        target=_dream_consolidation_pulse_loop,
+        name="ng-dream-consolidation-pulse",
+        daemon=True,
+    )
+    _dream_thread.start()
+
+
+_dream_thread: Optional[threading.Thread] = None
+
+
 # ---- Concept extraction pulse (slow path) ----------------------------------
 # Consumes entries from _CONCEPT_QUEUE that the drain pulse populated.
 # Each tick pops up to _CONCEPT_ENTRIES_PER_PULSE entries and calls TID
@@ -4795,6 +4906,9 @@ def handle_dispose(params: Dict[str, Any]) -> None:
 
     # Signal lazy expansion pulse to stop.
     _lazy_expansion_shutdown.set()
+
+    # Signal dream consolidation pulse to stop (#381-B).
+    _dream_shutdown.set()
 
     # The Tonic: conversation ended — latent mode continues
     # The thread doesn't stop. Language tokens stopped. That's all.
