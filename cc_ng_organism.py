@@ -1267,6 +1267,10 @@ _CC_RECALL_PRIME_THRESHOLD = float(os.environ.get("CC_RECALL_PRIME_THRESHOLD", "
 _CC_RECALL_SELECTIVITY = os.environ.get("CC_RECALL_SELECTIVITY", "0") not in ("0", "false", "")
 _CC_RECALL_SELECTIVITY_EPS = float(os.environ.get("CC_RECALL_SELECTIVITY_EPS", "0.02"))
 _CC_RECALL_SELECTIVITY_OVERSAMPLE = max(1, int(os.environ.get("CC_RECALL_SELECTIVITY_OVERSAMPLE", "6")))
+# Experimental: cap prime_and_propagate steps to keep activation near the
+# query-specific seeds (0 = engine default of 3). Measured hypothesis: the spread
+# converges to the same hub attractor basin at 3 steps regardless of seed.
+_CC_RECALL_PROP_STEPS = int(os.environ.get("CC_RECALL_PROP_STEPS", "0"))
 
 
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
@@ -1305,16 +1309,23 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         cfg = ng.graph.config
         old_max = cfg.get("max_surfaced", 10)
         old_thresh = cfg.get("prime_threshold", 0.4)
+        old_steps = cfg.get("propagation_steps", 3)
         # Oversample the harvest when selectivity is on, so query-relevant but
         # lower-strength nodes are IN the pool for selectivity to promote past
         # the hubs (re-ranking only the top-k hubs the spread returns can't help).
         cfg["max_surfaced"] = k * _CC_RECALL_SELECTIVITY_OVERSAMPLE if _CC_RECALL_SELECTIVITY else k
         cfg["prime_threshold"] = threshold
+        # Experimental (measured): fewer propagation steps keeps activation near
+        # the query-specific SEEDS instead of flowing to the convergent hub
+        # attractor basin that erases the query signal. 0 = engine default.
+        if _CC_RECALL_PROP_STEPS > 0:
+            cfg["propagation_steps"] = _CC_RECALL_PROP_STEPS
         try:
             surfaced = ng._harvest_associations(query, novelty=novelty)
         finally:
             cfg["max_surfaced"] = old_max
             cfg["prime_threshold"] = old_thresh
+            cfg["propagation_steps"] = old_steps
 
         # Anticipatory bonus (#256 port) -- canonical rpc.py:2981-2989
         if state is not None:
