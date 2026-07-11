@@ -1252,6 +1252,23 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
 _CC_RECALL_PRIME_THRESHOLD = float(os.environ.get("CC_RECALL_PRIME_THRESHOLD", "0.40"))
 
 
+# [2026-07-11] Lever 2 -- rank-time diagnosticity / selectivity (gated OFF).
+# Measured root cause of query-blind recall: a handful of boilerplate HUB nodes
+# (degree 260-341 vs graph median 2) fire for EVERY query and dominate the
+# spread. Their firing_rate_ema sits at ~0.32-0.38 (near the 0.395 max) while
+# the graph median is 0.0 -- so rank by strength / (firing_rate_ema + eps) and
+# the always-firing hubs divide down hard while a node that fired UNUSUALLY for
+# THIS query (near-zero baseline) rises. Divisive normalization / diagnosticity:
+# a memory relevant to everything is relevant to nothing. OVERSAMPLE the harvest
+# (max_surfaced = k * oversample) so lower-strength query-relevant nodes are in
+# the pool at all -- re-ranking only the top-k hubs the spread returns can't
+# help. Non-vendored, env-tunable, off by default (LAW 5); consumes the engine's
+# own firing_rate_ema, derives nothing new.
+_CC_RECALL_SELECTIVITY = os.environ.get("CC_RECALL_SELECTIVITY", "0") not in ("0", "false", "")
+_CC_RECALL_SELECTIVITY_EPS = float(os.environ.get("CC_RECALL_SELECTIVITY_EPS", "0.02"))
+_CC_RECALL_SELECTIVITY_OVERSAMPLE = max(1, int(os.environ.get("CC_RECALL_SELECTIVITY_OVERSAMPLE", "6")))
+
+
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                                     threshold: float = _CC_RECALL_PRIME_THRESHOLD,
                                     state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -1288,7 +1305,10 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         cfg = ng.graph.config
         old_max = cfg.get("max_surfaced", 10)
         old_thresh = cfg.get("prime_threshold", 0.4)
-        cfg["max_surfaced"] = k
+        # Oversample the harvest when selectivity is on, so query-relevant but
+        # lower-strength nodes are IN the pool for selectivity to promote past
+        # the hubs (re-ranking only the top-k hubs the spread returns can't help).
+        cfg["max_surfaced"] = k * _CC_RECALL_SELECTIVITY_OVERSAMPLE if _CC_RECALL_SELECTIVITY else k
         cfg["prime_threshold"] = threshold
         try:
             surfaced = ng._harvest_associations(query, novelty=novelty)
@@ -1319,6 +1339,23 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             if not text:
                 continue
             out.append({"node_id": nid, "score": r.get("strength", 0.0), "content": text})
+
+        # Lever 2: selectivity re-rank (gated). Divide each candidate's strength
+        # by its baseline firing rate so hubs (fire for everything) sink and
+        # nodes that fired unusually for THIS query rise; then take top-k from
+        # the oversampled pool. firing_rate_ema is the engine's own signal --
+        # nothing re-derived. Fail-soft per node (missing ema -> 0 -> max boost).
+        if _CC_RECALL_SELECTIVITY and out:
+            eps = _CC_RECALL_SELECTIVITY_EPS
+            for item in out:
+                try:
+                    node = ng.graph.nodes.get(item["node_id"]) if ng.graph else None
+                    fre = float(getattr(node, "firing_rate_ema", 0.0) or 0.0)
+                except Exception:
+                    fre = 0.0
+                item["score"] = item["score"] / (fre + eps)
+            out.sort(key=lambda x: x["score"], reverse=True)
+
         return out[:k]
     except Exception as exc:
         logger.debug("cc_pattern_completion_recall failed (non-fatal): %s", exc)
