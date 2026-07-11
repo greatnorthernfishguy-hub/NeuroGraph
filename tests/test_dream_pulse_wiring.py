@@ -2,7 +2,7 @@
 #381-B — Quiet-hours dream consolidation pulse wiring.
 
 # ---- Changelog ----
-# [2026-01-23] Claude Code (Haiku 4.5) — dream pulse wiring tests
+# [2026-07-11] Claude Code (Haiku 4.5) — dream pulse wiring tests
 # What: Test the _dream_gate_open pure function truth table (idle-too-short / SYMPATHETIC /
 #       rate-limited / all-clear), and verify module-level env knobs expose documented defaults.
 # Why: TDD: gate logic is load-bearing. Truth table validates all four constraint axes.

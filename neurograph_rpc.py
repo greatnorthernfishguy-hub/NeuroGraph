@@ -12,7 +12,7 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
-# [2026-01-23] Claude Code (Haiku 4.5) — #381-B quiet-hours dream consolidation pulse
+# [2026-07-11] Claude Code (Haiku 4.5) — #381-B quiet-hours dream consolidation pulse
 # What: Added non-protected _dream_gate_open (pure), _dream_consolidation_pulse_loop,
 #   _start_dream_consolidation_pulse, plus env-knob module globals: _DREAM_IDLE_SECS (1800),
 #   _DREAM_MIN_INTERVAL_SECS (21600), _DREAM_ALERT_SECS (86400), _DREAM_TICK_SECS (60).
