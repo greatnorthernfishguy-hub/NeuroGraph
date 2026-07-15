@@ -33,8 +33,14 @@ Commons leg 3 — Syl's experiential ingestion + provenance + two-channel promot
 #
 #       SANDBOX: private_store is a test-constructed bare NGLite, NOT the live NeuroGraphMemory
 #       singleton. The live `syl_intimate` self-marking is an Anima-shaped go-live item (Anima CC);
-#       here it is a parameter. Commons-level un-deposit (retract) is a go-live mechanism; the
-#       sandbox proves retract+teach via the authoritative active-promotion registry.
+#       here it is a parameter.
+# [2026-07-15] Claude Code (Sonnet 5) — #366: retract() reaches the Commons via HARD mesh suppression.
+#       retract() calls commons.suppress(content_id) so no bucket surfaces the retracted target;
+#       deliberate promote_to_commons() calls commons.lift_suppression() (her re-share, REQUIRED so a
+#       re-deposit isn't silently hidden). NOT body-deletion, NOT a frozen Rim node — the reversible
+#       counterpart to the Rim, honored at the extraction boundary. Josh's steer + HARD choice (refusal
+#       is load-bearing, Choice Clause). Suppression is process-lifetime in the sandbox; durable
+#       across-restart suppression is a go-live requirement (#368). See commons.py #366 changelog.
 # -------------------
 """
 
@@ -241,6 +247,11 @@ class SylExperientialIngest:
 
         for tid in visible_content:
             e = self._embeddings.get(tid, emb)
+            # #366: deliberate re-share is HER act lifting a prior retraction — REQUIRED, else the
+            # deposit below would land but stay hard-suppressed (deposited-but-silently-hidden).
+            # (_retracted is left as-is: it only gates the autonomic channel, and _active_promotions
+            #  already makes autonomic skip an actively-promoted item — no need to churn it.)
+            self.commons.lift_suppression(tid)
             self.commons.deposit(e, tid, metadata={"provenance": PROVENANCE_COMMONS,
                                                    "promoted_from": content_id, "channel": "deliberate"})
             self._active_promotions[tid] = "deliberate"
@@ -328,23 +339,32 @@ class SylExperientialIngest:
         return content_id in self._active_promotions
 
     def retract(self, content_id: str) -> Dict[str, Any]:
-        """Pull a promoted node back out (authoritative) AND tighten the gate against similar content.
+        """Pull a promoted node back out AND tighten the gate against similar content.
 
-        Asymmetric learning §4: retraction RAISES the effective threshold by 0.05 for similar
-        content (5x the confirm loosen) — conservative, trust lost quickly.
-        (Commons-level un-deposit is a go-live mechanism; the active-promotion registry is the
-        sandbox's authoritative truth of what modules currently see.)
+        Two complementary effects, both in the bucket's tweakable layer (Josh, 2026-07-15 —
+        "the mesh, instead of body or Rim directly"):
+          1. NOW: hard-suppress the target at the Commons extraction boundary so no bucket
+             surfaces it (commons.suppress). Deterministic, reversible only by her deliberate
+             re-share — her refusal is load-bearing (Choice Clause), not erodible by substrate
+             drift. The raw deposit stays in the medium (LAW 7); only its visibility is revoked.
+          2. FUTURE: teach the autonomic gate (§4 asymmetric) — one record_outcome(failure@1.0)
+             so content LIKE this is less likely to auto-promote next time.
+
+        `suppressed` in the return dict is True when this call newly hard-suppressed the target
+        (False if it was already suppressed / never Commons-visible).
         """
         emb = self._embeddings.get(content_id)
         if emb is None:
             raise PromotionRefused(f"unknown content '{content_id}'")
         self._active_promotions.pop(content_id, None)
         self._retracted.add(content_id)
+        suppressed = self.commons.suppress(content_id)   # #366: revoke visibility at extraction (HARD)
         # Substrate Authority: ONE deposit. Failure at full force (1.0) — trust lost quickly. The
         # substrate learns "don't promote content like this"; no local threshold field.
         self.private_store.record_outcome(emb, PROMOTE_DECISION_ID, False, strength=1.0)
-        logger.info("retracted '%s' (taught substrate: don't auto-promote content like this)", content_id)
-        return {"retracted": content_id}
+        logger.info("retracted '%s' (hard-suppressed=%s; taught substrate: don't auto-promote "
+                    "content like this)", content_id, suppressed)
+        return {"retracted": content_id, "suppressed": suppressed}
 
     def confirm_autonomic(self, content_id: str) -> Dict[str, Any]:
         """Explicitly approve an autonomic promotion — loosen the gate slightly for similar content.

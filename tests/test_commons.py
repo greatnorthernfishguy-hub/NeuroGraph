@@ -79,21 +79,30 @@ def test_bucket_unrelated_pattern_is_empty_or_excludes():
 
 
 def test_no_send_surface_exists():
-    """Axiom guard: the Commons API exposes ONLY deposit + bucket (+ persistence/stats).
+    """Axiom guard: the Commons API exposes ONLY deposit + bucket (+ persistence/stats/suppression).
 
     No send/route/to/broadcast/tract verb may exist. If someone adds one, this fails.
     """
     public = {n for n in dir(commons.Commons) if not n.startswith("_")}
     # deposit + the bucket FAMILY (bucket modes / bucket reads — all extraction, not send) + persistence/stats.
     # bucket_recent = a recency/temporal bucket MODE; arousal/read_arousal = the vagus bucket read.
+    # suppress/lift_suppression/is_suppressed (#366) = extraction-boundary VISIBILITY control — the
+    #   reversible counterpart to Cricket's Rim (they revoke/restore what a bucket surfaces, honored at
+    #   extraction time; they do NOT send, route, address, or broadcast anything). Same non-verb category
+    #   as persist/stats — they shape/inspect the medium's extraction, they don't add a transport.
     # None is a send/route/to/broadcast verb — the axiom this guard actually protects. A param added to
     # a bucket (e.g. bucket_recent's with_embedding) adds NO public name, so it stays invisible here.
-    allowed = {"deposit", "bucket", "bucket_recent", "arousal", "read_arousal", "persist", "restore", "stats"}
+    allowed = {"deposit", "bucket", "bucket_recent", "arousal", "read_arousal", "persist", "restore",
+               "stats", "suppress", "lift_suppression", "is_suppressed"}
     extra = public - allowed
     assert not extra, (
-        f"Commons must expose only the deposit + bucket-family + persist/restore/stats surface; "
-        f"a NEW name here may be a forbidden send/route verb — found extra: {extra}"
+        f"Commons must expose only the deposit + bucket-family + persist/restore/stats/suppression "
+        f"surface; a NEW name here may be a forbidden send/route verb — found extra: {extra}"
     )
+    # And enforce the real intent directly: no send/route/address/broadcast/tract verb, ever.
+    forbidden_roots = ("send", "route", "broadcast", "tract", "emit", "push", "publish", "dispatch")
+    offenders = {n for n in public if any(root in n.lower() for root in forbidden_roots)}
+    assert not offenders, f"forbidden send/route-style verb(s) on Commons: {offenders}"
 
 
 def test_bucket_recent_with_embedding_roundtrip():

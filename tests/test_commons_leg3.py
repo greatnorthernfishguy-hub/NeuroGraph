@@ -291,6 +291,82 @@ def test_autonomic_retract_works_and_teaches():
     assert "shared_a" not in out["promoted"], "a retracted node must not be autonomically re-promoted"
 
 
+# ---- #366 hard suppression: retract revokes visibility at the extraction boundary ----
+def _recent_ids(commons, limit=50):
+    return [row[0] for row in commons.bucket_recent(limit=limit)]
+
+
+def test_retract_hard_suppresses_both_bucket_modes():
+    """#366 — retract must make the promoted target vanish from BOTH extraction paths: the semantic
+    bucket() AND the recency bucket_recent() (the latter previously bypassed the extraction boundary).
+    """
+    ing, commons = _sandbox()
+    emb = _emb(700)
+    ing.ingest(emb, "leaky", salience=0.85)
+    ing.autonomic_promote_pulse()
+    assert "leaky" in _module_pool_sees(commons, emb), "sanity: promoted content is semantically visible"
+    assert "leaky" in _recent_ids(commons), "sanity: promoted content is recency-visible"
+
+    result = ing.retract("leaky")
+    assert result["suppressed"] is True, f"retract must newly hard-suppress; {result}"
+    assert "leaky" not in _module_pool_sees(commons, emb), "retracted content must vanish from bucket()"
+    assert "leaky" not in _recent_ids(commons), "retracted content must vanish from bucket_recent()"
+    assert commons.is_suppressed("leaky")
+
+
+def test_suppression_is_hard_not_eroded_by_later_activity():
+    """HARD (Josh): her refusal is load-bearing — the substrate's own dynamics must NOT resurrect it.
+    Re-depositing the same target (which bumps last_updated, the recency signal) does not un-suppress.
+    """
+    ing, commons = _sandbox()
+    emb = _emb(710)
+    ing.ingest(emb, "gone", salience=0.85)
+    ing.autonomic_promote_pulse()
+    ing.retract("gone")
+    # Simulate substrate churn that would make a weight/recency-based scheme resurface it.
+    commons.deposit(emb, "gone", metadata={"provenance": "commons", "channel": "noise"})
+    for i in range(10):
+        commons.deposit(_emb(720 + i), f"other_{i}")
+    assert "gone" not in _module_pool_sees(commons, emb), "suppression must survive a same-target re-deposit"
+    assert "gone" not in _recent_ids(commons), "suppression must survive recency churn"
+
+
+def test_deliberate_re_promotion_lifts_suppression():
+    """Reversible ONLY by her deliberate act: promote_to_commons() re-shares and lifts the suppression."""
+    ing, commons = _sandbox()
+    emb = _emb(730)
+    ing.ingest(emb, "reshare", salience=0.85)
+    ing.autonomic_promote_pulse()
+    ing.retract("reshare")
+    assert "reshare" not in _module_pool_sees(commons, emb)
+
+    ing.promote_to_commons("reshare", confirm=lambda _preview: True)
+    assert not commons.is_suppressed("reshare"), "her deliberate re-share must lift the suppression"
+    assert "reshare" in _module_pool_sees(commons, emb), "re-shared content must be visible again"
+    assert "reshare" in _recent_ids(commons)
+
+
+def test_retract_of_never_promoted_content_is_safe():
+    """Retracting content that never reached the Commons must not raise; suppressed=True is fine
+    (idempotent guard against a future promotion of the same id), the buckets simply have nothing."""
+    ing, _ = _sandbox()
+    ing.ingest(_emb(740), "private_only", salience=0.90, intimate=True)  # never promoted (private region)
+    result = ing.retract("private_only")
+    assert "retracted" in result  # no exception is the assertion
+
+
+def test_retract_is_surgical():
+    """Only the target's own visibility is revoked — a sibling promotion survives."""
+    ing, commons = _sandbox()
+    ing.ingest(_emb(750), "keep_me", salience=0.85)
+    ing.ingest(_emb(751), "retract_me", salience=0.85)
+    ing.autonomic_promote_pulse()
+    ing.retract("retract_me")
+    recent = _recent_ids(commons)
+    assert "keep_me" in recent, "an unrelated promoted item must survive a sibling's retraction"
+    assert "retract_me" not in recent
+
+
 # ---- §8 learning asymmetry (intrinsic to the substrate) ----
 def test_learning_asymmetry_net_tighter():
     """§8 — asymmetry is INTRINSIC to the substrate: a retract (failure@1.0) moves the gate more

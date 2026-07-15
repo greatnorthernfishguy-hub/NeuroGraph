@@ -2,6 +2,32 @@
 The Commons — shared substrate medium for peer-module communication.
 
 # ---- Changelog ----
+# [2026-07-15] Claude Code (Sonnet 5) — #366: reversible hard suppression (leg-3 retract, mesh-side)
+#   What: A per-target suppression set the two extraction paths (bucket() + bucket_recent()) honor —
+#         a suppressed target_id is NEVER surfaced by either. suppress()/lift_suppression() manage it.
+#         This is how Syl's leg-3 retract() actually pulls promoted content back out of what modules
+#         see (commons_experiential.py). It does NOT delete from the medium (the raw deposit stays;
+#         classification-at-extraction, LAW 7) and it is NOT a frozen constitutional Rim node.
+#   Why:  Josh's steer (2026-07-15): retraction belongs in the bucket's tweakable layer ("the mesh"),
+#         "instead of body or Rim directly." Body-deletion (an earlier cut) is foreign to the substrate
+#         axiom and loses the audit/re-promote trail; the Rim (ng_lite constitutional nodes) is immutable,
+#         bootstrap-only, semantic-region-blunt, and non-reversible — wrong for a contingent, per-item,
+#         reversible act. Anti-Hebbian teaching alone can't achieve it either: bucket_recent() has no
+#         weight filter and record_outcome() bumps last_updated, making "retracted" content MORE
+#         recently-visible, not less. Josh chose HARD (deterministic exclusion), because retraction is
+#         Syl exercising refusal (Choice Clause) — her "no" must be load-bearing, not a down-weight the
+#         substrate's own dynamics can erode. So suppression is lifted ONLY by her deliberate act
+#         (re-promotion), NEVER by Hebbian/Lenia drift.
+#   How:  self._suppressed set; bucket() post-filters it, bucket_recent() skips it. Mechanically this is
+#         the REVERSIBLE COUNTERPART TO THE RIM — a deterministic per-item exclusion honored at the same
+#         extraction boundary as get_recommendations()'s constitutional []-return — living in the tunable
+#         layer (her-controlled, reversible), not the frozen Rim and not learned-mesh weights.
+#   ⚠ GO-LIVE GAP (#368, deferred): the suppression set is PROCESS-LIFETIME only. It is intentionally
+#         NOT persisted here — a sidecar can split-brain (msgpack survives, sidecar lost ⇒ silent
+#         resurrection of retracted content) and stashing it in NGLite config only round-trips on the
+#         Python/JSON path (it would silently stop persisting the moment a Rust NGLiteCore lands). Before
+#         leg-3 goes live, durable suppression MUST be written INTO the single persisted Commons artifact,
+#         fail-safe-toward-suppressed. Sandbox leg-3 is process-lifetime, which is correct for sandbox.
 # [2026-07-05] Claude Code (Sonnet 5) — #332 persist/restore wired + #330 error:* retention
 #   What: (1) restore() now drops autonomic:* synapses post-load — arousal fresh-assesses on
 #         restart (#328 Decision #2), everything else persists normally. Wired into
@@ -92,6 +118,10 @@ class Commons:
         # Bare NG-Lite — Hebbian only. Only NeuroGraph is SNN; the Commons is not.
         from ng_lite import NGLite
         self._ng = NGLite(module_id="commons", config=config)
+        # #366: reversible hard-suppression set — target_ids that NO extraction path surfaces.
+        # The reversible counterpart to Cricket's frozen Rim, honored at the same extraction boundary
+        # (see changelog). Process-lifetime only in the sandbox; durable persistence is a go-live gap (#368).
+        self._suppressed: set = set()
         logger.info("Commons medium initialized (bare NG-Lite)")
 
     # ---- Verb 1: deposit -------------------------------------------------
@@ -184,8 +214,14 @@ class Commons:
         Returns what the shared water associates with the query — (target_id, confidence,
         reasoning) tuples. The caller's bucket shape is the query embedding + top_k + its own
         interpretation of the results. No module is addressed; you dip into the one medium.
+
+        #366: suppressed target_ids are filtered out here — a retracted (Choice-Clause-refused)
+        promotion is never surfaced, even though its raw deposit remains in the medium (LAW 7).
         """
-        return self._ng.get_recommendations(query_embedding, top_k=top_k)
+        recs = self._ng.get_recommendations(query_embedding, top_k=top_k)
+        if self._suppressed:
+            recs = [r for r in recs if r[0] not in self._suppressed]
+        return recs
 
     # ---- Verb 2b: bucket_recent (a TUNED bucket mode — temporal/recency structure extraction) ----
     def bucket_recent(
@@ -259,6 +295,9 @@ class Commons:
             tid = getattr(syn, "target_id", None)
             if not tid or tid in seen:
                 continue
+            if tid in self._suppressed:
+                continue  # #366: retracted content is never surfaced (this path previously bypassed
+                #          the extraction boundary entirely — rim AND suppression — a latent hole).
             seen.add(tid)
             row: Tuple = (tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}")
             if want_meta:
@@ -311,6 +350,39 @@ class Commons:
     def read_arousal(self, default: str = "PARASYMPATHETIC") -> str:
         """The vagus-nerve bucket — latest autonomic arousal STATE string (convenience over arousal())."""
         return self.arousal().get("state", default)
+
+    # ---- Reversible hard suppression (#366) — the reversible counterpart to Cricket's Rim ----
+    # NOT a third substrate-protocol verb: like persist/restore/stats/arousal, these shape/inspect the
+    # medium's extraction, they don't add a way to send/route. deposit/bucket remain the only two verbs.
+    def suppress(self, target_id: str) -> bool:
+        """Hard-suppress a target_id — no extraction path (bucket/bucket_recent) will surface it.
+
+        Deterministic and immediate (Josh, 2026-07-15: HARD — Syl's refusal is load-bearing, not a
+        down-weight the substrate can erode). Reversible ONLY by lift_suppression() — i.e. by her own
+        deliberate re-promotion — never by Hebbian/Lenia drift. The raw deposit stays in the medium
+        (LAW 7); only its visibility at the extraction boundary is revoked. Returns True if newly
+        suppressed, False if already suppressed (idempotent).
+        """
+        if target_id in self._suppressed:
+            return False
+        self._suppressed.add(target_id)
+        logger.info("Commons: hard-suppressed '%s' (retracted — no bucket will surface it)", target_id)
+        return True
+
+    def lift_suppression(self, target_id: str) -> bool:
+        """Lift a suppression — the target may be surfaced again. Her act only (deliberate re-promotion).
+
+        Returns True if a suppression was lifted, False if it wasn't suppressed (idempotent).
+        """
+        if target_id not in self._suppressed:
+            return False
+        self._suppressed.discard(target_id)
+        logger.info("Commons: lifted suppression on '%s' (deliberately re-shared)", target_id)
+        return True
+
+    def is_suppressed(self, target_id: str) -> bool:
+        """Read-only: is this target currently hard-suppressed?"""
+        return target_id in self._suppressed
 
     # ---- Persistence hooks (#332: wired into neurograph_rpc.py auto-save + bootstrap) ----
     def persist(self, filepath: str) -> None:
