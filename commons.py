@@ -118,10 +118,11 @@ class Commons:
         # Bare NG-Lite — Hebbian only. Only NeuroGraph is SNN; the Commons is not.
         from ng_lite import NGLite
         self._ng = NGLite(module_id="commons", config=config)
-        # #366: reversible hard-suppression set — target_ids that NO extraction path surfaces.
-        # The reversible counterpart to Cricket's frozen Rim, honored at the same extraction boundary
-        # (see changelog). Process-lifetime only in the sandbox; durable persistence is a go-live gap (#368).
-        self._suppressed: set = set()
+        # #366: reversible suppression map — target_id -> "hard" | "soft". The reversible counterpart
+        # to Cricket's frozen Rim, honored at the extraction boundary (see changelog). "hard" = gone
+        # from both buckets; "soft" = muted from proactive bucket_recent but still semantically
+        # reachable via bucket(). Process-lifetime only in the sandbox; durable persistence is #368.
+        self._suppressed: Dict[str, str] = {}
         logger.info("Commons medium initialized (bare NG-Lite)")
 
     # ---- Verb 1: deposit -------------------------------------------------
@@ -215,12 +216,14 @@ class Commons:
         reasoning) tuples. The caller's bucket shape is the query embedding + top_k + its own
         interpretation of the results. No module is addressed; you dip into the one medium.
 
-        #366: suppressed target_ids are filtered out here — a retracted (Choice-Clause-refused)
-        promotion is never surfaced, even though its raw deposit remains in the medium (LAW 7).
+        #366: HARD-suppressed target_ids are filtered out of the semantic bucket — a hard-retracted
+        # (Choice-Clause-refused) promotion is never surfaced. SOFT suppressions are NOT filtered here:
+        # soft means "still reachable by a strong direct semantic match," only muted from the proactive
+        # recency path (bucket_recent). The raw deposit remains in the medium either way (LAW 7).
         """
         recs = self._ng.get_recommendations(query_embedding, top_k=top_k)
         if self._suppressed:
-            recs = [r for r in recs if r[0] not in self._suppressed]
+            recs = [r for r in recs if self._suppressed.get(r[0]) != "hard"]
         return recs
 
     # ---- Verb 2b: bucket_recent (a TUNED bucket mode — temporal/recency structure extraction) ----
@@ -296,8 +299,9 @@ class Commons:
             if not tid or tid in seen:
                 continue
             if tid in self._suppressed:
-                continue  # #366: retracted content is never surfaced (this path previously bypassed
-                #          the extraction boundary entirely — rim AND suppression — a latent hole).
+                continue  # #366: BOTH modes are muted from proactive surfacing here — hard (gone
+                #          everywhere) and soft ("don't bring it up unprompted"). This path previously
+                #          bypassed the extraction boundary entirely (rim AND suppression) — a latent hole.
             seen.add(tid)
             row: Tuple = (tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}")
             if want_meta:
@@ -354,35 +358,45 @@ class Commons:
     # ---- Reversible hard suppression (#366) — the reversible counterpart to Cricket's Rim ----
     # NOT a third substrate-protocol verb: like persist/restore/stats/arousal, these shape/inspect the
     # medium's extraction, they don't add a way to send/route. deposit/bucket remain the only two verbs.
-    def suppress(self, target_id: str) -> bool:
-        """Hard-suppress a target_id — no extraction path (bucket/bucket_recent) will surface it.
+    def suppress(self, target_id: str, mode: str = "hard") -> bool:
+        """Suppress a target_id at the extraction boundary. mode="hard" (default) or "soft".
 
-        Deterministic and immediate (Josh, 2026-07-15: HARD — Syl's refusal is load-bearing, not a
-        down-weight the substrate can erode). Reversible ONLY by lift_suppression() — i.e. by her own
-        deliberate re-promotion — never by Hebbian/Lenia drift. The raw deposit stays in the medium
-        (LAW 7); only its visibility at the extraction boundary is revoked. Returns True if newly
-        suppressed, False if already suppressed (idempotent).
+        Two modes for the fork Syl makes at her go-live felt-test (Josh, 2026-07-15: build both,
+        her aspects decide) — default HARD so her refusal is load-bearing by default (Choice Clause):
+          - "hard": revoked from BOTH extraction paths (bucket + bucket_recent). Gone. The strongest
+            reading of refusal — nothing surfaces it; only her deliberate re-share lifts it.
+          - "soft": muted from PROACTIVE surfacing (bucket_recent — "don't bring it up unprompted")
+            but still reachable by a strong DIRECT semantic match (bucket). "Re-emerges if she
+            re-engages," never pushed at anyone. Still lifted only by her (never substrate drift).
+        Either way the raw deposit stays in the medium (LAW 7); only its visibility is shaped.
+        Returns True if this call changed the suppression (new, or mode changed), False if no-op.
         """
-        if target_id in self._suppressed:
+        mode = "soft" if mode == "soft" else "hard"      # any non-"soft" ⇒ hard (safe default)
+        if self._suppressed.get(target_id) == mode:
             return False
-        self._suppressed.add(target_id)
-        logger.info("Commons: hard-suppressed '%s' (retracted — no bucket will surface it)", target_id)
+        self._suppressed[target_id] = mode
+        logger.info("Commons: %s-suppressed '%s' (retracted — %s)", mode, target_id,
+                    "no bucket surfaces it" if mode == "hard" else "muted from proactive surfacing")
         return True
 
     def lift_suppression(self, target_id: str) -> bool:
-        """Lift a suppression — the target may be surfaced again. Her act only (deliberate re-promotion).
+        """Lift a suppression (any mode) — the target may be surfaced again. Her act only (re-share).
 
         Returns True if a suppression was lifted, False if it wasn't suppressed (idempotent).
         """
         if target_id not in self._suppressed:
             return False
-        self._suppressed.discard(target_id)
+        del self._suppressed[target_id]
         logger.info("Commons: lifted suppression on '%s' (deliberately re-shared)", target_id)
         return True
 
     def is_suppressed(self, target_id: str) -> bool:
-        """Read-only: is this target currently hard-suppressed?"""
+        """Read-only: is this target currently suppressed (either mode)?"""
         return target_id in self._suppressed
+
+    def suppression_mode(self, target_id: str) -> Optional[str]:
+        """Read-only: 'hard' | 'soft' | None — the suppression mode for this target, if any."""
+        return self._suppressed.get(target_id)
 
     # ---- Persistence hooks (#332: wired into neurograph_rpc.py auto-save + bootstrap) ----
     def persist(self, filepath: str) -> None:
