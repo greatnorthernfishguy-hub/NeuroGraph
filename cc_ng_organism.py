@@ -345,6 +345,11 @@ logger = logging.getLogger("cc_ng_organism")
 _cc_commons: "Optional[Any]" = None
 _cc_commons_lock = threading.Lock()
 
+# Hosted CC organ instances, keyed by module_id — retained so their pulse
+# threads aren't GC-eligible and so status/shutdown can reach them (mirrors
+# canonical neurograph_rpc._module_instances).
+_cc_module_instances: "Dict[str, Any]" = {}
+
 
 def get_cc_commons(workspace_dir: str, config: Optional[Dict[str, Any]] = None) -> Any:
     """Get-or-create CC's own Commons medium -- CC's ecosystem-of-one (for now).
@@ -389,6 +394,145 @@ def deposit_cc_experience(text: str, target_id: str, workspace_dir: str,
     except Exception as exc:
         logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
         return None
+
+
+def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
+    """Host the CC's own ecosystem organs in-process — the CC-scoped port of
+    canonical neurograph_rpc.py::_bootstrap_modules().
+
+    [2026-07-15] Claude Code (DudeMan CC, Opus 4.8) — Immunis integration, organ #1.
+    What: Reads the CC's OWN registry (workspace_dir/et_modules/registry.json —
+          NOT Syl's ~/.et_modules/registry.json), memory-gates, applies each
+          module's CC-scoped env (state/workspace under ~/.claude/...), then loads
+          the hook with the same namespace-isolation dance canonical uses (stash
+          generic-prefix sys.modules so each module's own vendored copies load
+          fresh → importlib spec_from_file_location → instantiate (its __init__
+          starts the pulse) → restore). The organ is alive + autonomous from there.
+    Why:  In-process is the canonical hosting model AND the only way to share the
+          CC's in-memory Commons singleton. CC modules reach the CC Commons via
+          their own _cc_commons_provider (get_cc_commons) — no injection here.
+    How:  Faithful port; CC adaptations are the registry path + per-module env
+          (meta["env"]) applied before load. Called from init_ng AFTER
+          get_cc_commons() is up. Each module keeps its OWN store (no dual-write
+          on the CC's main.msgpack — different store; feedback_no_duplicate_graph_dual_write).
+    Returns list of module IDs that successfully started.
+    """
+    import sys
+    import json as _json
+    import importlib.util
+
+    registry_path = os.path.join(workspace_dir, "et_modules", "registry.json")
+    if not os.path.exists(registry_path):
+        logger.info("CC modules: no registry at %s — nothing to host", registry_path)
+        return []
+    try:
+        with open(registry_path) as f:
+            registry = _json.load(f)
+    except Exception as exc:
+        logger.warning("CC modules: registry unreadable (%s): %s", registry_path, exc)
+        return []
+
+    module_defs = registry.get("modules", {})
+    skip = {"neurograph", "inference_difference", "ecosystem_monitor"}
+    started: List[str] = []
+
+    # Elmer loads last (heaviest — transformer models), matching canonical order.
+    modules = sorted(module_defs.items(), key=lambda x: (1 if x[0] == "elmer" else 0, x[0]))
+
+    _generic_prefixes = ("core", "pipelines", "runtime", "surgery", "openclaw_adapter",
+                         "ng_ecosystem", "ng_lite", "ng_embed", "ng_autonomic",
+                         "ng_peer_bridge", "ng_tract_bridge")
+
+    for module_id, meta in modules:
+        if module_id in skip:
+            continue
+        install_path = meta.get("install_path", "")
+        entry_point = meta.get("entry_point", "")
+        if not entry_point or not install_path:
+            logger.warning("CC module %s: missing entry_point or install_path", module_id)
+            continue
+        hook_file = os.path.join(install_path, entry_point)
+        if not os.path.exists(hook_file):
+            logger.warning("CC module %s: hook file not found (%s)", module_id, hook_file)
+            continue
+
+        # CC-scoped env (state/workspace under ~/.claude/...) BEFORE the hook loads.
+        for k, v in (meta.get("env") or {}).items():
+            os.environ[k] = os.path.expanduser(str(v))
+
+        # Memory gate — wait for 500 MB free before loading each module (#111).
+        try:
+            import psutil as _psutil
+            import gc as _gc
+            _avail_mb = _psutil.virtual_memory().available >> 20
+            while _avail_mb < 500:
+                logger.info("CC module boot gate: %d MB free — waiting for 500 MB", _avail_mb)
+                time.sleep(2)
+                _gc.collect()
+                _avail_mb = _psutil.virtual_memory().available >> 20
+        except ImportError:
+            pass
+
+        path_snapshot = list(sys.path)
+        stashed: Dict[str, Any] = {}
+        try:
+            # Namespace isolation: stash generic collisions so the module's own
+            # vendored core/ng_lite/etc. load fresh (canonical lines 841-870).
+            for mod_name in list(sys.modules.keys()):
+                for pfx in _generic_prefixes:
+                    if mod_name == pfx or mod_name.startswith(pfx + "."):
+                        stashed[mod_name] = sys.modules.pop(mod_name)
+                        break
+            if install_path and install_path not in sys.path:
+                sys.path.insert(0, install_path)
+
+            spec_name = f"_ccmod_{module_id}"
+            spec = importlib.util.spec_from_file_location(spec_name, hook_file)
+            if spec is None:
+                logger.warning("CC module %s: cannot create import spec", module_id)
+                sys.path[:] = path_snapshot
+                sys.modules.update(stashed)
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec_name] = mod
+            spec.loader.exec_module(mod)
+
+            instance = None
+            for attr_name in dir(mod):
+                attr = getattr(mod, attr_name)
+                if (isinstance(attr, type)
+                        and attr_name != "OpenClawAdapter"
+                        and hasattr(attr, "MODULE_ID")
+                        and hasattr(attr, "_module_on_message")):
+                    instance = attr()
+                    break
+            if instance is None:
+                logger.error("CC module %s: no hook class found in %s", module_id, hook_file)
+                continue
+            _cc_module_instances[module_id] = instance  # retain (GC + status/shutdown)
+            started.append(module_id)
+            logger.info("CC organ hosted in-process: %s (%s)", module_id, hook_file)
+        except Exception as exc:
+            logger.warning("CC module %s failed to load: %s", module_id, exc)
+        finally:
+            # Pin this module's generics under a unique name, clear the generics,
+            # restore path + stashed originals for the next module (canonical tail).
+            for mod_name in list(sys.modules.keys()):
+                for pfx in _generic_prefixes:
+                    if mod_name == pfx or mod_name.startswith(pfx + "."):
+                        sys.modules[f"_{module_id}_{mod_name}"] = sys.modules[mod_name]
+                        break
+            for mod_name in list(sys.modules.keys()):
+                for pfx in _generic_prefixes:
+                    if mod_name == pfx or mod_name.startswith(pfx + "."):
+                        sys.modules.pop(mod_name, None)
+                        break
+            sys.path[:] = path_snapshot
+            for mod_name, mod_obj in stashed.items():
+                if mod_name not in sys.modules:
+                    sys.modules[mod_name] = mod_obj
+
+    return started
 
 
 def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str, Optional[Any]]:
