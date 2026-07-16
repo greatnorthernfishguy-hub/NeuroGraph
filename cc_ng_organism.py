@@ -2357,6 +2357,46 @@ def pith_victim_capture(kept: List[CacheLine], all_lines: List[CacheLine]) -> No
             del _PITH_VICTIM[:len(_PITH_VICTIM) - _CC_PITH_VICTIM_SIZE]
 
 
+def pith_compress_history(turn_texts: List[str], graph: Any, per_turn_chars: Optional[int] = None) -> List[str]:
+    """Pith over the OUTBOUND conversation history — the substrate-informed
+    replacement for miniTID's faux KISS. Given the ordered older-than-window
+    turns (miniTID owns the message array + ordering; the substrate has no
+    conversation identity -- turns are content-hashed nodes, sha1(text)), return
+    a positionally-aligned list of compressed turns miniTID can splice back in.
+
+    Substrate-INFORMED (the whole point of being connected to the NG): each
+    turn's own node warmth (cc_thermal: Ca_i + firing_rate_ema) scales how many
+    chars it keeps -- a turn the substrate has kept warm (recently reactivated,
+    load-bearing) is compressed LESS; a cold one more. The actual compression is
+    the existing salience-aware keyframe extractor (pith_stage2_keyframe) -- it
+    keeps the payload and drops filler, NOT the greeting-keeping first-sentence
+    cut faux KISS does. Fail-soft per turn: a turn with no node (e.g. reinforced
+    away by the KISS gate) or any error keeps warmth 0 -> base budget.
+
+    per_turn_chars: base keyframe budget (default CC_PITH_KEYFRAME_CHARS);
+    warmth scales it up to ~2x for the warmest turns."""
+    import hashlib
+    base = per_turn_chars if per_turn_chars is not None else _CC_PITH_KEYFRAME_CHARS
+    out: List[str] = []
+    for text in turn_texts:
+        if not text or not text.strip():
+            out.append(text)
+            continue
+        try:
+            node_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
+            warmth = cc_thermal(graph, node_id)  # 0.0 if node absent (fail-soft)
+            # normalize warmth into a [1.0, 2.0] budget multiplier: warmer = keep more.
+            # thermal is unbounded-ish; squash with a soft cap so one hot turn can't
+            # blow the budget. tanh-free cheap squash: w/(w+1) in [0,1).
+            mult = 1.0 + (warmth / (warmth + 1.0)) if warmth > 0 else 1.0
+            budget = max(60, min(1000, int(base * mult)))
+            keyframe, _delta = pith_stage2_keyframe(text, max_chars=budget)
+            out.append(keyframe if keyframe else text)
+        except Exception:
+            out.append(text)  # never drop a turn; worst case pass it through
+    return out
+
+
 def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None,
                  weights: Optional[Dict[str, float]] = None) -> List[CacheLine]:
     """Pith Stage 3: unified rank + char budget -- the L1 assembler core.
