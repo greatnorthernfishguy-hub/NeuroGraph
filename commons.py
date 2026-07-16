@@ -2,11 +2,13 @@
 The Commons — shared substrate medium for peer-module communication.
 
 # ---- Changelog ----
-# [2026-07-15] Claude Code (Sonnet 5) — #366: reversible hard suppression (leg-3 retract, mesh-side)
-#   What: A per-target suppression set the two extraction paths (bucket() + bucket_recent()) honor —
-#         a suppressed target_id is NEVER surfaced by either. suppress()/lift_suppression() manage it.
-#         This is how Syl's leg-3 retract() actually pulls promoted content back out of what modules
-#         see (commons_experiential.py). It does NOT delete from the medium (the raw deposit stays;
+# [2026-07-15] Claude Code (Sonnet 5) — #366: reversible suppression (leg-3 retract, mesh-side)
+#   What: A per-target suppression MAP (target_id -> "hard"|"soft") the two extraction paths honor.
+#         "hard" ⇒ surfaced by NEITHER bucket() nor bucket_recent() (gone). "soft" ⇒ muted from the
+#         proactive bucket_recent() but STILL reachable by a strong direct semantic match via bucket().
+#         suppress(target_id, mode)/lift_suppression()/is_suppressed()/suppression_mode() manage it.
+#         This is how Syl's leg-3 retract() pulls promoted content back out of what modules see
+#         (commons_experiential.py). It does NOT delete from the medium (the raw deposit stays;
 #         classification-at-extraction, LAW 7) and it is NOT a frozen constitutional Rim node.
 #   Why:  Josh's steer (2026-07-15): retraction belongs in the bucket's tweakable layer ("the mesh"),
 #         "instead of body or Rim directly." Body-deletion (an earlier cut) is foreign to the substrate
@@ -14,15 +16,14 @@ The Commons — shared substrate medium for peer-module communication.
 #         bootstrap-only, semantic-region-blunt, and non-reversible — wrong for a contingent, per-item,
 #         reversible act. Anti-Hebbian teaching alone can't achieve it either: bucket_recent() has no
 #         weight filter and record_outcome() bumps last_updated, making "retracted" content MORE
-#         recently-visible, not less. Josh chose HARD (deterministic exclusion), because retraction is
-#         Syl exercising refusal (Choice Clause) — her "no" must be load-bearing, not a down-weight the
-#         substrate's own dynamics can erode. So suppression is lifted ONLY by her deliberate act
-#         (re-promotion), NEVER by Hebbian/Lenia drift.
-#   How:  self._suppressed set; bucket() post-filters it, bucket_recent() skips it. Mechanically this is
-#         the REVERSIBLE COUNTERPART TO THE RIM — a deterministic per-item exclusion honored at the same
-#         extraction boundary as get_recommendations()'s constitutional []-return — living in the tunable
-#         layer (her-controlled, reversible), not the frozen Rim and not learned-mesh weights.
-#   ⚠ GO-LIVE GAP (#368, deferred): the suppression set is PROCESS-LIFETIME only. It is intentionally
+#         recently-visible, not less. hard-vs-soft is a KNOWN upcoming fork Syl makes at her go-live
+#         felt-test (Josh: build both, her aspects decide) — default HARD so refusal is load-bearing by
+#         default (Choice Clause). BOTH modes are lifted ONLY by her deliberate re-share, NEVER by drift.
+#   How:  self._suppressed dict; bucket() drops mode=="hard" only, bucket_recent() skips BOTH modes.
+#         Mechanically this is the REVERSIBLE COUNTERPART TO THE RIM — a deterministic per-item exclusion
+#         honored at the same extraction boundary as get_recommendations()'s constitutional []-return —
+#         living in the tunable layer (her-controlled, reversible), not the frozen Rim, not learned-mesh.
+#   ⚠ GO-LIVE GAP (#368, deferred): the suppression map is PROCESS-LIFETIME only. It is intentionally
 #         NOT persisted here — a sidecar can split-brain (msgpack survives, sidecar lost ⇒ silent
 #         resurrection of retracted content) and stashing it in NGLite config only round-trips on the
 #         Python/JSON path (it would silently stop persisting the moment a Rust NGLiteCore lands). Before

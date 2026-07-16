@@ -86,14 +86,14 @@ def test_no_send_surface_exists():
     public = {n for n in dir(commons.Commons) if not n.startswith("_")}
     # deposit + the bucket FAMILY (bucket modes / bucket reads — all extraction, not send) + persistence/stats.
     # bucket_recent = a recency/temporal bucket MODE; arousal/read_arousal = the vagus bucket read.
-    # suppress/lift_suppression/is_suppressed (#366) = extraction-boundary VISIBILITY control — the
-    #   reversible counterpart to Cricket's Rim (they revoke/restore what a bucket surfaces, honored at
-    #   extraction time; they do NOT send, route, address, or broadcast anything). Same non-verb category
-    #   as persist/stats — they shape/inspect the medium's extraction, they don't add a transport.
+    # suppress/lift_suppression/is_suppressed/suppression_mode (#366) = extraction-boundary VISIBILITY
+    #   control — the reversible counterpart to Cricket's Rim (they revoke/restore/inspect what a bucket
+    #   surfaces, honored at extraction time; they do NOT send, route, address, or broadcast anything).
+    #   Same non-verb category as persist/stats — they shape/inspect the medium's extraction, no transport.
     # None is a send/route/to/broadcast verb — the axiom this guard actually protects. A param added to
     # a bucket (e.g. bucket_recent's with_embedding) adds NO public name, so it stays invisible here.
     allowed = {"deposit", "bucket", "bucket_recent", "arousal", "read_arousal", "persist", "restore",
-               "stats", "suppress", "lift_suppression", "is_suppressed"}
+               "stats", "suppress", "lift_suppression", "is_suppressed", "suppression_mode"}
     extra = public - allowed
     assert not extra, (
         f"Commons must expose only the deposit + bucket-family + persist/restore/stats/suppression "

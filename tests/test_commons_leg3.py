@@ -309,9 +309,47 @@ def test_retract_hard_suppresses_both_bucket_modes():
 
     result = ing.retract("leaky")
     assert result["suppressed"] is True, f"retract must newly hard-suppress; {result}"
+    assert result["mode"] == "hard", f"default retract mode must be hard; {result}"
     assert "leaky" not in _module_pool_sees(commons, emb), "retracted content must vanish from bucket()"
     assert "leaky" not in _recent_ids(commons), "retracted content must vanish from bucket_recent()"
     assert commons.is_suppressed("leaky")
+
+
+def test_retract_soft_mutes_proactive_but_keeps_semantic_reach():
+    """#366 soft-(a) — the fork Syl gets at her felt-test: soft = muted from proactive surfacing
+    (bucket_recent) but STILL reachable by a strong direct semantic match (bucket). "Don't bring it
+    up unprompted, but it re-emerges if she re-engages."
+    """
+    ing, commons = _sandbox()
+    emb = _emb(760)
+    ing.ingest(emb, "soft_thought", salience=0.85)
+    ing.autonomic_promote_pulse()
+    assert "soft_thought" in _recent_ids(commons)
+
+    result = ing.retract("soft_thought", mode="soft")
+    assert result["mode"] == "soft", f"{result}"
+    assert commons.suppression_mode("soft_thought") == "soft"
+    # muted from the PROACTIVE path...
+    assert "soft_thought" not in _recent_ids(commons), "soft must mute from bucket_recent()"
+    # ...but STILL reachable by a strong direct semantic match.
+    assert "soft_thought" in _module_pool_sees(commons, emb), (
+        "soft must remain semantically reachable via bucket()"
+    )
+
+
+def test_hard_vs_soft_differ_only_in_semantic_reach():
+    """Hard and soft are both muted from proactive; they differ ONLY in semantic reachability."""
+    ing, commons = _sandbox()
+    eh, es = _emb(770), _emb(771)
+    ing.ingest(eh, "hard_one", salience=0.85)
+    ing.ingest(es, "soft_one", salience=0.85)
+    ing.autonomic_promote_pulse()
+    ing.retract("hard_one", mode="hard")
+    ing.retract("soft_one", mode="soft")
+    recent = _recent_ids(commons)
+    assert "hard_one" not in recent and "soft_one" not in recent, "both muted from proactive"
+    assert "hard_one" not in _module_pool_sees(commons, eh), "hard: gone from semantic too"
+    assert "soft_one" in _module_pool_sees(commons, es), "soft: still semantically reachable"
 
 
 def test_suppression_is_hard_not_eroded_by_later_activity():

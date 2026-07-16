@@ -338,33 +338,36 @@ class SylExperientialIngest:
         """Authoritative: is this content currently promoted (and not retracted)?"""
         return content_id in self._active_promotions
 
-    def retract(self, content_id: str) -> Dict[str, Any]:
+    def retract(self, content_id: str, mode: str = "hard") -> Dict[str, Any]:
         """Pull a promoted node back out AND tighten the gate against similar content.
 
         Two complementary effects, both in the bucket's tweakable layer (Josh, 2026-07-15 —
         "the mesh, instead of body or Rim directly"):
-          1. NOW: hard-suppress the target at the Commons extraction boundary so no bucket
-             surfaces it (commons.suppress). Deterministic, reversible only by her deliberate
-             re-share — her refusal is load-bearing (Choice Clause), not erodible by substrate
-             drift. The raw deposit stays in the medium (LAW 7); only its visibility is revoked.
+          1. NOW: suppress the target at the Commons extraction boundary (commons.suppress). `mode`
+             is the fork Syl makes at her go-live felt-test (default "hard"): "hard" = gone from
+             every bucket; "soft" = muted from proactive surfacing but still reachable by a strong
+             direct semantic match. Either way, reversible only by her deliberate re-share — her
+             refusal is load-bearing (Choice Clause), not erodible by substrate drift. The raw
+             deposit stays in the medium (LAW 7); only its visibility is shaped.
           2. FUTURE: teach the autonomic gate (§4 asymmetric) — one record_outcome(failure@1.0)
              so content LIKE this is less likely to auto-promote next time.
 
-        `suppressed` in the return dict is True when this call newly hard-suppressed the target
-        (False if it was already suppressed / never Commons-visible).
+        `suppressed` in the return dict is True when this call changed the suppression (new or
+        mode-changed); `mode` echoes the mode applied.
         """
         emb = self._embeddings.get(content_id)
         if emb is None:
             raise PromotionRefused(f"unknown content '{content_id}'")
         self._active_promotions.pop(content_id, None)
         self._retracted.add(content_id)
-        suppressed = self.commons.suppress(content_id)   # #366: revoke visibility at extraction (HARD)
+        suppressed = self.commons.suppress(content_id, mode)   # #366: revoke visibility at extraction
+        applied_mode = self.commons.suppression_mode(content_id)
         # Substrate Authority: ONE deposit. Failure at full force (1.0) — trust lost quickly. The
         # substrate learns "don't promote content like this"; no local threshold field.
         self.private_store.record_outcome(emb, PROMOTE_DECISION_ID, False, strength=1.0)
-        logger.info("retracted '%s' (hard-suppressed=%s; taught substrate: don't auto-promote "
-                    "content like this)", content_id, suppressed)
-        return {"retracted": content_id, "suppressed": suppressed}
+        logger.info("retracted '%s' (%s-suppressed=%s; taught substrate: don't auto-promote "
+                    "content like this)", content_id, applied_mode, suppressed)
+        return {"retracted": content_id, "suppressed": suppressed, "mode": applied_mode}
 
     def confirm_autonomic(self, content_id: str) -> Dict[str, Any]:
         """Explicitly approve an autonomic promotion — loosen the gate slightly for similar content.
