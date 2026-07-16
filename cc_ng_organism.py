@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-16] Claude Code (DudeMan CC, Opus 4.8) — Pith Stage 5: eviction & recapture (thermal + victim + breathing) + bootstrap_cc_modules
+# What: (Stage 5, #55) cc_thermal(graph, node) reads the substrate's own warmth
+#   (Ca_i + firing_rate_ema); the daemon populates CacheLine.thermal at
+#   construction and pith_stage3 folds it into the unified score as
+#   (1 + CC_PITH_THERMAL_GAIN * thermal) -- warm content preferred, no-op when
+#   thermal=0 (backward-safe). cc_l1_budget(commons) breathes the L1 char budget
+#   with the arousal Immunis deposits to the CC Commons (read_arousal):
+#   SYMPATHETIC contracts, PARASYMPATHETIC expands (gated CC_PITH_L1_BREATHE).
+#   pith_victim_capture/pith_victim_recover: budget-dropped lines fall to a
+#   bounded, TTL-aged FIFO victim buffer and get a second chance at L1 next turn
+#   ('go back to what you said'); new 'victim' stream weight. Constitutional pins
+#   already unconditional in stage3 (Stage 5 §5.5.3). (Hosting) bootstrap_cc_modules:
+#   CC-scoped port of neurograph_rpc._bootstrap_modules -- hosts the CC's own
+#   ecosystem organs in-process (Immunis #1) from the CC registry, importlib-
+#   isolated, per-module CC env; retained in _cc_module_instances.
+# Why: #55 Stage 5 completes the Pith bootstrap floor (Stages 1+5) and closes the
+#   Immunis-arousal -> Pith-breathing loop. Thermal makes recall warmth-aware;
+#   the victim buffer stops budget drops from vanishing; breathing makes L1
+#   size responsive to the organism's own autonomic state.
+# How: All env-gated (LAW 5), fail-soft, laptop cc-ng-daemon _recall wiring.
+#   28/28 Pith tests green (no regression). DEFERRED: Lenia field-energy thermal
+#   term (reserved, unwired); idle-pulse proximity re-promotion (TTL-aging is in
+#   recover() instead). NOTE: VPS cc_ng_host.py _recall is a diverged copy -- needs
+#   a parity port for the VPS CC to get Stage 5. Spec: docs/superpowers/plans/
+#   2026-07-15-pith-phase2-stage5-spec.md.
 # [2026-07-10] Claude Code (Sonnet 5 + Opus 4.8) — Pith Stage 2: keyframe / LOD compression (concept-aware)
 # What: Added pith_stage2_keyframe(content, max_chars=None, query="") ->
 #   (keyframe, delta) -- a pure, deterministic EXTRACTIVE compressor. Not a
@@ -1783,6 +1808,29 @@ _CC_PITH_L1_BUDGET = max(500, min(40000, _CC_PITH_L1_BUDGET))
 # chars, clamped [60, 1000]. See pith_stage2_keyframe().
 _CC_PITH_KEYFRAME_CHARS = max(60, min(1000, int(os.environ.get("CC_PITH_KEYFRAME_CHARS", "220"))))
 
+# Stage 5 (eviction & recapture) config -- LAW 5. Thermal is a continuous
+# warmth signal read from the substrate's OWN state (Ca_i persistence-of-
+# activation + firing_rate_ema + Lenia field energy), blended + min-max
+# normalized across the survivor set, then folded into the Stage-3 rank as a
+# gentle multiplier (1 + gain*thermal) so warm content is preferred without
+# overriding relevance. GAIN default keeps thermal a tiebreak, not a driver.
+# thermal defaults 0.0 on every CacheLine, so an un-populated line leaves the
+# Stage-3 rank byte-identical -- Stage 5 is additive/opt-in.
+_CC_PITH_THERMAL_W_CA = float(os.environ.get("CC_PITH_THERMAL_W_CA", "0.5"))
+_CC_PITH_THERMAL_W_FIRE = float(os.environ.get("CC_PITH_THERMAL_W_FIRE", "0.3"))
+_CC_PITH_THERMAL_W_FIELD = float(os.environ.get("CC_PITH_THERMAL_W_FIELD", "0.2"))
+_CC_PITH_THERMAL_GAIN = float(os.environ.get("CC_PITH_THERMAL_GAIN", "0.5"))
+_CC_PITH_VICTIM_SIZE = max(0, min(128, int(os.environ.get("CC_PITH_VICTIM_SIZE", "12"))))
+_CC_PITH_VICTIM_TTL = max(1, int(os.environ.get("CC_PITH_VICTIM_TTL", "20")))
+
+# Autonomic breathing (Pith §3.2): L1 budget expands under PARASYMPATHETIC
+# (exploratory/associative) and contracts under SYMPATHETIC (threat / tunnel
+# vision), reading the arousal Immunis deposits to the CC Commons. Gated
+# (CC_PITH_L1_BREATHE, default off); when off, the static budget is used.
+_CC_PITH_L1_BREATHE = os.environ.get("CC_PITH_L1_BREATHE", "0") not in ("0", "false", "False", "")
+_CC_PITH_BREATHE_SYMPATHETIC = float(os.environ.get("CC_PITH_BREATHE_SYMPATHETIC", "0.6"))
+_CC_PITH_BREATHE_PARASYMPATHETIC = float(os.environ.get("CC_PITH_BREATHE_PARASYMPATHETIC", "1.4"))
+
 # Same marker tuple as miniTID's is_synthetic_harness_text (Condensate
 # rust_core/src/minitid.rs) -- not importable here (Rust, separate process),
 # so inlined verbatim rather than left unguarded on the extraction side.
@@ -2214,6 +2262,101 @@ def pith_stage2_keyframe(content: str, max_chars: Optional[int] = None,
     return (keyframe, delta)
 
 
+def cc_thermal(graph: Any, node_id: str) -> float:
+    """Pith Stage 5 raw thermal (warmth) for a node, read from the substrate's
+    OWN state: Ca_i (persistence of recent activation -- decays each step,
+    bumps on spike) + firing_rate_ema (recent firing rate). Un-normalized here;
+    pith_stage3 min-max normalizes it across the survivor set before folding it
+    into the rank. The Lenia field-energy term (_CC_PITH_THERMAL_W_FIELD) is
+    reserved but not yet wired -- these two SNN signals carry the warmth today.
+    Read-only, fail-soft to 0.0 (a vanished/stateless node adds no warmth)."""
+    try:
+        node = graph.nodes.get(node_id) if graph is not None else None
+        if node is None:
+            return 0.0
+        ca = float(getattr(node, "Ca_i", 0.0) or 0.0)
+        fire = float(getattr(node, "firing_rate_ema", 0.0) or 0.0)
+        return _CC_PITH_THERMAL_W_CA * ca + _CC_PITH_THERMAL_W_FIRE * fire
+    except Exception:
+        return 0.0
+
+
+def cc_l1_budget(commons: Any) -> int:
+    """Pith §3.2 autonomic breathing: the L1 char budget breathes with arousal.
+    PARASYMPATHETIC (calm/exploratory) -> expanded; SYMPATHETIC (threat/tunnel
+    vision) -> contracted. Reads the single authoritative arousal Immunis
+    deposits to the CC Commons (commons.read_arousal). Gated by
+    CC_PITH_L1_BREATHE; off (or no Commons) -> the static budget. Fail-soft ->
+    static budget on any error, and clamped to the same [500, 40000] bounds."""
+    if not _CC_PITH_L1_BREATHE or commons is None:
+        return _CC_PITH_L1_BUDGET
+    try:
+        state = commons.read_arousal()
+        mult = _CC_PITH_BREATHE_SYMPATHETIC if state == "SYMPATHETIC" else _CC_PITH_BREATHE_PARASYMPATHETIC
+        return max(500, min(40000, int(_CC_PITH_L1_BUDGET * mult)))
+    except Exception:
+        return _CC_PITH_L1_BUDGET
+
+
+# Pith Stage 5 victim cache: cache lines surfaced but dropped from L1 (budget
+# overflow) land here instead of vanishing, so a near-future turn can recover
+# them ("wait, go back to what you said"). Bounded FIFO, TTL-aged by recall
+# turn. Module-level + lock (daemon recall + idle sweep touch it).
+_PITH_VICTIM: List[Dict[str, Any]] = []
+_PITH_VICTIM_LOCK = threading.Lock()
+
+
+def pith_victim_recover(candidates: List[CacheLine]) -> List[CacheLine]:
+    """Stage 5 recapture: merge still-live victim entries back into the
+    candidate set for a second chance at L1, and age the buffer one turn. A
+    victim not already among the fresh candidates is re-injected as a CacheLine
+    (stream='victim', carrying its cached thermal); entries past TTL are
+    evicted. No-op when the buffer is disabled (size<=0) or empty."""
+    if _CC_PITH_VICTIM_SIZE <= 0 or not _PITH_VICTIM:
+        return candidates
+    have = {cl.node_id for cl in candidates}
+    merged = list(candidates)
+    with _PITH_VICTIM_LOCK:
+        live = []
+        for v in _PITH_VICTIM:
+            v["ttl"] -= 1
+            if v["ttl"] <= 0:
+                continue
+            live.append(v)
+            if v["node_id"] not in have:
+                cl = CacheLine.from_surfaced(v["node_id"], v["content"],
+                                             score=v["score"], stream="victim")
+                cl.thermal = v.get("thermal", 0.0)
+                merged.append(cl)
+        _PITH_VICTIM[:] = live
+    return merged
+
+
+def pith_victim_capture(kept: List[CacheLine], all_lines: List[CacheLine]) -> None:
+    """Stage 5 eviction: unpinned lines that were surfaced but didn't make L1
+    (budget overflow) drop into the bounded victim buffer. Any victim promoted
+    back into L1 this turn is removed (it's resident again). FIFO-bounded to
+    CC_PITH_VICTIM_SIZE; TTL (re)set on capture. No-op when disabled."""
+    if _CC_PITH_VICTIM_SIZE <= 0:
+        return
+    kept_ids = {cl.node_id for cl in kept}
+    dropped = [cl for cl in all_lines
+               if not cl.pinned and cl.node_id not in kept_ids and cl.stream != "victim"]
+    with _PITH_VICTIM_LOCK:
+        # drop any victim that got promoted back into L1 this turn
+        _PITH_VICTIM[:] = [v for v in _PITH_VICTIM if v["node_id"] not in kept_ids]
+        existing = {v["node_id"]: v for v in _PITH_VICTIM}
+        for cl in dropped:
+            if cl.node_id in existing:
+                existing[cl.node_id]["ttl"] = _CC_PITH_VICTIM_TTL
+            else:
+                _PITH_VICTIM.append({"node_id": cl.node_id, "content": cl.content,
+                                     "score": cl.score, "stream": cl.stream,
+                                     "thermal": cl.thermal, "ttl": _CC_PITH_VICTIM_TTL})
+        if len(_PITH_VICTIM) > _CC_PITH_VICTIM_SIZE:
+            del _PITH_VICTIM[:len(_PITH_VICTIM) - _CC_PITH_VICTIM_SIZE]
+
+
 def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None,
                  weights: Optional[Dict[str, float]] = None) -> List[CacheLine]:
     """Pith Stage 3: unified rank + char budget -- the L1 assembler core.
@@ -2270,6 +2413,7 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
             "pattern": _CC_PITH_W_RELEVANCE,
             "monitor": _CC_PITH_W_RECENCY,
             "recall": _CC_PITH_W_RELEVANCE,
+            "victim": _CC_PITH_W_RECENCY,   # recovered drops: secondary prior, like recency
         }
 
     # Step 1: split pinned vs unpinned.
@@ -2292,7 +2436,10 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
         lo, hi = stream_bounds.get(cl.stream, (cl.score, cl.score))
         norm = 1.0 if hi <= lo else (cl.score - lo) / (hi - lo)
         weight = weights.get(cl.stream, 1.0)
-        unified = weight * norm
+        # Stage 5 thermal fold: warm content (high Ca_i/firing) is gently
+        # preferred. thermal defaults 0.0 -> multiplier 1.0 -> byte-identical
+        # to pre-Stage-5 ranking until the daemon populates cl.thermal.
+        unified = weight * norm * (1.0 + _CC_PITH_THERMAL_GAIN * cl.thermal)
         scored.append((unified, idx, cl))
 
     # Step 4: stable sort by unified score, descending. Ties keep input
