@@ -435,14 +435,39 @@ class NGEmbed:
             "tree_ids": [],
             "concepts": [],
             "pass2_attempted": False,
+            "extraction_failed": False,
         }
 
         # Pass 2: Trees — concept extraction via TID
         concepts = self._extract_concepts(content)
         result["pass2_attempted"] = True
+        # No silent failures (Josh, 2026-07-15): distinguish "TID extraction BROKE" (None) from
+        # "legitimately no concepts" ([]). A broken extraction silently losing the tree half of a
+        # foundational dual-pass is exactly the kind of invisible degradation we do not tolerate.
+        result["extraction_failed"] = concepts is None
+        if concepts is None:
+            # LOUD + SIGNALLED: the tree half (trees + forest↔tree links) was just lost because TID
+            # failed. Warn (not debug) and deposit to the Commons operational-logger (#330) via the
+            # ecosystem's signal_error if it has one — so the drop is measurable, not a debug line.
+            logger.warning(
+                "dual_record_outcome[%s]: concept extraction FAILED → forest-only degradation "
+                "(trees + forest↔tree links lost this deposit); cumulative TID extraction failures=%d",
+                target_id, self._failures,
+            )
+            _signal = getattr(ecosystem, "signal_error", None)
+            if callable(_signal):
+                try:
+                    _signal(
+                        RuntimeError("dual-pass concept extraction failed (forest-only degradation)"),
+                        {"target_id": target_id, "stage": "pass2_trees",
+                         "extraction_failures": self._failures},
+                    )
+                except Exception:  # noqa: BLE001 — signalling must never break the deposit
+                    pass
+            return result
 
         if not concepts:
-            return result
+            return result  # legitimate empty — nothing to extract, not a failure
 
         result["concepts"] = concepts
 
@@ -528,11 +553,14 @@ class NGEmbed:
         except Exception:
             pass
 
-    def _extract_concepts(self, text: str) -> List[str]:
+    def _extract_concepts(self, text: str) -> Optional[List[str]]:
         """Extract concepts from text via TID LLM call.
 
-        One LLM call per ingestion. Returns list of concept strings,
-        or empty list on failure (non-fatal).
+        One LLM call per ingestion. Returns the list of concept strings (possibly empty `[]`
+        when TID legitimately found none), or **`None`** when the call itself FAILED (TID down /
+        timeout / malformed response). The None-vs-[] distinction lets the caller surface a real
+        failure instead of silently treating a broken extraction as "no concepts" (no silent
+        failures).
         """
         import requests
 
@@ -566,9 +594,11 @@ class NGEmbed:
             return concepts[:self._config["max_concepts"]]
 
         except Exception as exc:
-            logger.debug("Concept extraction failed: %s", exc)
+            # No silent failures: a broken TID call is about to cost the tree half of a dual-pass.
+            # Warn (not debug), count it, and return None (distinct from a legitimate empty []).
+            logger.warning("Concept extraction FAILED (TID) — dual-pass degrades to forest-only: %s", exc)
             self._failures += 1
-            return []
+            return None
 
     @staticmethod
     def _parse_concepts(text: str) -> List[str]:
