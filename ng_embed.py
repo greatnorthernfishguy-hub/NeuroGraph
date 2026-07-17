@@ -136,6 +136,12 @@ class NGEmbed:
         self._extractions = 0
         self._concepts_total = 0
         self._failures = 0
+        # Forest-only warning rate-limit (2026-07-16): when TID is permanently
+        # absent (e.g. CC on a TID-less River), every deposit fails extraction —
+        # warn periodically with a suppressed-count instead of per-deposit, so the
+        # signal survives without flooding. self._failures stays the cumulative truth.
+        self._last_extract_warn = 0.0
+        self._failures_at_last_warn = 0
 
     # -- Singleton -----------------------------------------------------------
 
@@ -446,24 +452,29 @@ class NGEmbed:
         # foundational dual-pass is exactly the kind of invisible degradation we do not tolerate.
         result["extraction_failed"] = concepts is None
         if concepts is None:
-            # LOUD + SIGNALLED: the tree half (trees + forest↔tree links) was just lost because TID
-            # failed. Warn (not debug) and deposit to the Commons operational-logger (#330) via the
-            # ecosystem's signal_error if it has one — so the drop is measurable, not a debug line.
-            logger.warning(
-                "dual_record_outcome[%s]: concept extraction FAILED → forest-only degradation "
-                "(trees + forest↔tree links lost this deposit); cumulative TID extraction failures=%d",
-                target_id, self._failures,
-            )
-            _signal = getattr(ecosystem, "signal_error", None)
-            if callable(_signal):
-                try:
-                    _signal(
-                        RuntimeError("dual-pass concept extraction failed (forest-only degradation)"),
-                        {"target_id": target_id, "stage": "pass2_trees",
-                         "extraction_failures": self._failures},
-                    )
-                except Exception:  # noqa: BLE001 — signalling must never break the deposit
-                    pass
+            # Forest-only degradation (trees + forest↔tree links lost). Warn + signal
+            # RATE-LIMITED (see _extraction_warn_due): when TID is permanently absent
+            # every deposit fails, so per-deposit warning floods the log. self._failures
+            # is the cumulative truth (surfaced in status); we warn periodically with a
+            # suppressed-count so the signal survives without the flood.
+            _since = self._extraction_warn_due()
+            if _since:
+                logger.warning(
+                    "dual_record_outcome[%s]: concept extraction FAILED → forest-only degradation "
+                    "(trees + forest↔tree links lost); cumulative TID extraction failures=%d "
+                    "(+%d since last warn — TID absent/unreachable)",
+                    target_id, self._failures, _since,
+                )
+                _signal = getattr(ecosystem, "signal_error", None)
+                if callable(_signal):
+                    try:
+                        _signal(
+                            RuntimeError("dual-pass concept extraction failed (forest-only degradation)"),
+                            {"target_id": target_id, "stage": "pass2_trees",
+                             "extraction_failures": self._failures},
+                        )
+                    except Exception:  # noqa: BLE001 — signalling must never break the deposit
+                        pass
             return result
 
         if not concepts:
@@ -594,11 +605,28 @@ class NGEmbed:
             return concepts[:self._config["max_concepts"]]
 
         except Exception as exc:
-            # No silent failures: a broken TID call is about to cost the tree half of a dual-pass.
-            # Warn (not debug), count it, and return None (distinct from a legitimate empty []).
-            logger.warning("Concept extraction FAILED (TID) — dual-pass degrades to forest-only: %s", exc)
+            # Count every failure (self._failures is the cumulative truth, surfaced
+            # in status). The user-facing WARNING is emitted rate-limited by the
+            # caller (dual_record_outcome) so a permanently-absent TID doesn't flood
+            # the log; the per-call exception detail stays at debug.
             self._failures += 1
+            logger.debug("Concept extraction failed (TID): %s", exc)
             return None
+
+    def _extraction_warn_due(self) -> int:
+        """Rate-limit the forest-only degradation warning. Returns the number of
+        failures since the last emitted warning when a warning is due (>=1, truthy),
+        else 0. Interval via CC_EXTRACT_WARN_INTERVAL_S (default 60s). Attrs are
+        getattr-defaulted so it works regardless of construction path."""
+        interval = float(os.environ.get("CC_EXTRACT_WARN_INTERVAL_S", "60"))
+        now = time.monotonic()
+        last = getattr(self, "_last_extract_warn", 0.0)
+        if now - last >= interval:
+            since = self._failures - getattr(self, "_failures_at_last_warn", 0)
+            self._last_extract_warn = now
+            self._failures_at_last_warn = self._failures
+            return max(1, since)
+        return 0
 
     @staticmethod
     def _parse_concepts(text: str) -> List[str]:
