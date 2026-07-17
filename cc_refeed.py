@@ -214,8 +214,60 @@ def feed_batch(batch: list, tract_path: str) -> int:
     return written
 
 
+def collect_jsonl_turns(projects_glob: str, main_path: str, journal: set,
+                        min_chars: int = MIN_CHARS) -> list:
+    """Return [(sha1, content)] of conversational turns from CC session .jsonl
+    transcripts -- the RAW record (not the mangled vdb). Sessions oldest-first
+    (so origin leads); user+assistant text blocks only; harness/tool/meta lines
+    and hygiene-floor failures dropped; deduped vs journal + already-in-graph
+    (cc:conv::<sha1>). Same return shape as collect_orphans."""
+    import glob as _glob
+    import json as _json
+    import msgpack
+    if not _wait_for_stable_file(main_path):
+        raise RuntimeError(f"checkpoint mid-write, retry later: {main_path}")
+    with open(main_path, "rb") as f:
+        graph_node_ids = set((msgpack.unpack(f, raw=False).get("nodes") or {}).keys())
+    sessions = sorted(_glob.glob(projects_glob, recursive=True), key=os.path.getmtime)
+    out, seen = [], set()
+    for sp in sessions:
+        try:
+            with open(sp, "r") as fh:
+                for line in fh:
+                    try:
+                        o = _json.loads(line)
+                    except Exception:
+                        continue
+                    if o.get("type") not in ("user", "assistant"):
+                        continue
+                    c = (o.get("message") or {}).get("content")
+                    if isinstance(c, str):
+                        text = c
+                    elif isinstance(c, list):
+                        text = " ".join(b.get("text", "") for b in c
+                                        if isinstance(b, dict) and b.get("type") == "text")
+                    else:
+                        continue
+                    text = text.strip()
+                    if text.startswith("<"):        # harness markers (<system-reminder> etc.)
+                        continue
+                    if not passes_floor(text, min_chars):
+                        continue
+                    h = content_hash(text)
+                    if h in seen or h in journal:
+                        continue
+                    if f"cc:conv::{h}" in graph_node_ids:
+                        continue
+                    seen.add(h)
+                    out.append((h, text))
+        except Exception as exc:
+            logger.debug("session parse failed (non-fatal) %s: %s", sp, exc)
+    return out
+
+
 def run(workspace: str, batch_size: int = BATCH_SIZE, limit: int = 0,
-        dry_run: bool = False, cycle_sleep: float = CYCLE_SLEEP) -> dict:
+        dry_run: bool = False, cycle_sleep: float = CYCLE_SLEEP,
+        source: str = "orphans", projects_glob: str = None) -> dict:
     signal.signal(signal.SIGTERM, _request_stop)
     signal.signal(signal.SIGINT, _request_stop)
 
@@ -227,11 +279,15 @@ def run(workspace: str, batch_size: int = BATCH_SIZE, limit: int = 0,
     tract_path = os.path.join(tract_dir, "turns.tract")
 
     journal = load_journal(journal_path)
-    pending = collect_orphans(main_path, vectors_path, journal)
+    if source == "jsonl":
+        glob_pat = projects_glob or os.path.expanduser("~/.claude/projects/**/*.jsonl")
+        pending = collect_jsonl_turns(glob_pat, main_path, journal)
+    else:
+        pending = collect_orphans(main_path, vectors_path, journal)
     if limit:
         pending = pending[:limit]
-    logger.info("Refeed: %d orphaned memories pending (journal already covers %d)",
-                len(pending), len(journal))
+    logger.info("Refeed[%s]: %d turns pending (journal already covers %d)",
+                source, len(pending), len(journal))
     if dry_run or not pending:
         return {"status": "dry_run" if dry_run else "nothing_to_do", "pending": len(pending)}
 
@@ -277,8 +333,13 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--limit", type=int, default=0, help="Feed at most N entries (testing)")
     ap.add_argument("--dry-run", action="store_true", help="Count + report only, feed nothing")
+    ap.add_argument("--source", choices=("orphans", "jsonl"), default="orphans",
+                    help="orphans = vdb-orphan memories (default); jsonl = raw session transcripts")
+    ap.add_argument("--projects", default=None,
+                    help="jsonl source glob (default ~/.claude/projects/**/*.jsonl)")
     a = ap.parse_args()
-    r = run(a.workspace, batch_size=a.batch_size, limit=a.limit, dry_run=a.dry_run)
+    r = run(a.workspace, batch_size=a.batch_size, limit=a.limit, dry_run=a.dry_run,
+            source=a.source, projects_glob=a.projects)
     print(r)
     return 0
 
