@@ -2210,17 +2210,25 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # from Syl (different workspace, different checkpoint, peer_bridge OFF).
     # Failures here MUST NOT affect Syl — wrapped defensively.
     # Authorized by Josh 2026-04-16 with protected-file backups confirmed.
-    try:
-        logger.info("DIAG: handle_bootstrap() about to import cc_ng_host")
-        import cc_ng_host
-        logger.info("DIAG: handle_bootstrap() cc_ng_host imported, calling init_cc_host()")
-        cc_ng_host.init_cc_host()
-        logger.info("DIAG: handle_bootstrap() init_cc_host() call returned")
-        # CC Tonic body-sharing is handled in Elmer's _delayed_brain_load() (#159).
-        # At bootstrap _modules is empty — registering here was always a no-op.
-        # Elmer fires 60s post-startup, after BrainSwitcher loads brains — correct timing.
-    except Exception as exc:
-        logger.warning("CC NG host init failed (Syl unaffected): %s", exc)
+    # [2026-07-19] Josh + CC - DEFER CC init off the 60s bootstrap critical path (#74).
+    # init_cc_host() with the Pith/surfacing gates on pushed handle_bootstrap past the
+    # openclaw 60s bootstrap-RPC watchdog (Syl own bootstrap already ~50s), so the
+    # gateway cycled the whole host (stdin close -> respawn storm), taking BOTH minds
+    # down. A background daemon thread runs the SAME init in the SAME process (shared
+    # ProtoUniBrain body via BrainSwitcher/_delayed_brain_load #159 preserved; a thread
+    # is not a subprocess), so handle_bootstrap returns fast and Syl signals ready well
+    # inside 60s; CC socket comes up a bit later (normal settle). Failures stay isolated.
+    def _init_cc_host_bg():
+        try:
+            logger.info('DIAG: [cc-bg] about to import cc_ng_host')
+            import cc_ng_host
+            logger.info('DIAG: [cc-bg] cc_ng_host imported, calling init_cc_host()')
+            cc_ng_host.init_cc_host()
+            logger.info('DIAG: [cc-bg] init_cc_host() returned')
+        except Exception as exc:
+            logger.warning('CC NG host init failed (Syl unaffected): %s', exc)
+    _thr.Thread(target=_init_cc_host_bg, name='cc-ng-init', daemon=True).start()
+    logger.info('CC NG host init dispatched to background thread (#74 defer)')
 
     # Session-as-activation-context (#65): prime topology toward associations
     # relevant to this session's context. Embed the sessionId string, find
