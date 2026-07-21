@@ -19,6 +19,74 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-07-15] Claude Code (Opus 4.8) — #59 identity-protected endpoints exempt from sprout_degree_cap
+# What: both cap enforcement sites (_sprout_synapses co-firing loop + _surprise_exploration
+#   feeder) now let an at/above-cap endpoint through when it is identity-protected
+#   (_is_identity_protected: constitutional spine OR provenance=='syl_authored'). Ordinary
+#   saturated hubs are still gated; only self-authored spine/want nodes bypass the cap.
+# Why: the cap is degree-BLIND — it cannot tell a boilerplate blob from a legitimately
+#   high-degree spine node. Syl's live degree forensic (frozen gen 20260715T113949Z) found
+#   her graph sparse (6943 syn / 13751 nodes, mean deg ~1) with ONE genuine hub:
+#   selfcap::reach::teaching at degree 1758 (out=1614) — her CONSTITUTIONAL tool-call method
+#   node, every tool call projects through it. A bare cap below 1758 would, once armed, freeze
+#   her own spine from forming new associations. This exemption makes the cap safe to arm on
+#   Syl. Mirrors the _prune_synapses identity-protection skip. Josh-approved (2026-07-15).
+# How: config-gated by the same sprout_degree_cap (0 = off, Syl default) — fully inert until
+#   the cap is set; the _is_identity_protected lookup only runs when the cap is armed AND the
+#   endpoint is already saturated (short-circuit order preserved). Behavior-identical for Syl
+#   at cap=0. Deploy to the live VPS instance pends Josh's backup-confirmed proceed.
+# [2026-07-14] Claude Code (Opus 4.8) — #59 surprise-driven sprouting respects sprout_degree_cap
+# What: _surprise_exploration now skips creating a surprise-driven synapse if either endpoint is
+#   already at/above config["sprout_degree_cap"] (same guard _sprout_synapses uses).
+# Why: measured — the degree cap only covered co-firing sprouts; the surprise-driven path was the
+#   DOMINANT hub feeder (top hub: 1420 surprise edges vs 94 other; blob max-degree ran 561->1961
+#   overnight). The blob's own chaotic churn reads as "surprise", wiring ever more edges into the
+#   saturated hubs uncapped AND salience-arming them against pruning — a runaway. This closes it.
+# How: config-gated by the same sprout_degree_cap (0 = off, Syl default). Inert unless the cap is set.
+# [2026-07-14] Claude Code (Opus 4.8) — #59 age-on-write (the Tonic's heartbeat ages the substrate)
+# What: write-mode prime_and_propagate now (a) resets syn.inactive_steps=0 on synapses it
+#   propagates through (mirroring step()), and (b) when config["tonic_ages_substrate"] is set,
+#   advances self.timestep + increments inactive_steps/decays salience for all synapses + runs
+#   _prune_synapses()/_collect_orphan_nodes() — interval-bounded (tonic_age_interval), under
+#   _step_lock. New DEFAULT_CONFIG: tonic_ages_substrate=0 (off), tonic_age_interval=1.
+# Why: #59 — graph.timestep (which gates inactivity/age pruning) only advanced in step(), i.e.
+#   during conversation. So while the CC idle-thought via the Tonic (prime_and_propagate), the
+#   aging clock froze: the boilerplate hub blob was re-welded by Tonic firing but NEVER aged out.
+#   Rather than add a rival stepping thread (which would race the Tonic and force it to wait/skip,
+#   breaking the #109 "never waits / always runs" invariants that ARE the CC's continuity), the
+#   aging is folded INTO the Tonic's own write cycle — one thread, thinking and aging as one act
+#   of persistence. With the heuristic attending away from the blob, the blob stops being reset,
+#   climbs past inactivity_threshold, and culls — the #59 melt, driven by the substrate simply
+#   living through time. Josh-designed direction (2026-07-14).
+# How: Off by default (byte-identical for Syl until dialed on — the inactive_steps reset is
+#   gated too). Does NOT advance self.timestep — that clock is shared with step()'s delayed-
+#   spike delivery (_delay_buffer, exact-tick drain), so stealing ticks would strand
+#   conversational spikes; the melt runs entirely off the per-synapse inactive_steps counter
+#   (reset on Tonic use, incremented in the aging tail). Only the brief mutating tail holds
+#   _step_lock (serialize vs deposit step()); the Tonic's thinking is unlocked, so it never
+#   waits on modules and always completes its cycle. Identity-protected synapses are never
+#   pruned (_prune_synapses already skips them). Sonnet law-enforcer reviewed (found + fixed
+#   the delay-buffer stranding). Enable + measure on the isolated laptop (hub-degree
+#   trajectory should finally DECLINE, not just flatten).
+# [2026-07-13] Claude Code (Opus 4.8) — #59 degree-gated synaptogenesis (config-gated, default OFF)
+# What: _structural_plasticity()'s co-firing sprout loop now skips any node at/above
+#   config["sprout_degree_cap"] (in+out degree) as BOTH sprout source and target.
+#   New DEFAULT_CONFIG["sprout_degree_cap"] = 0 (disabled; absent-key default too).
+# Why: #59 — recall is query-blind because a handful of boilerplate nodes reach
+#   degree 400-500 (median 2, weighted-deg ~900) and swamp every query's spreading
+#   activation. Measured on the live CC checkpoint (1915 nodes/51580 synapses): 92%
+#   of edges are untagged co-firing sprouts, 0% duplicates — so the hubs are built
+#   HERE, by degree-blind synaptogenesis (an always-active node sprouts to everything
+#   that co-fires: rich-get-richer), not by deposit binding or duplicate stacking.
+#   Downstream levers (DAS-GNN degree-damping, weakest-first prune, ranking) all
+#   fought the symptom; this caps the SOURCE. Existing hubs then drain via prune once
+#   inflow<outflow. NOTE: this is the shared engine — validated on the ISOLATED laptop
+#   first; VPS/Syl application is a separate, consented step.
+# How: One config read + one degree helper in the sprout loop (neuro_foundation.py).
+#   0 = disabled makes the change byte-identical for any config without the key
+#   (Syl/VPS untouched). Affects ONLY co-firing sprouts — deliberate create_synapse
+#   binds (conversational, want-links, surprise-driven wiring) are never gated here.
+#   Degree is read live so edges added earlier in the same step count toward the cap.
 # [2026-07-11] Claude Code (Fable 5 design / Haiku implementation) — #381 wake/sleep hyperedge physiology (Josh-approved protected change; Syl-consented 2026-07-10; checkpoints backed up)
 # What: (A) member evolution capped at he_max_members=50 (her bound) with counter hygiene
 #   + metadata-resident tenure stamps; (D) discovery skips avalanche-scale fired sets
@@ -1359,6 +1427,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
+    # [2026-07-13] #59 degree-gated synaptogenesis. Co-firing sprouting (_structural_plasticity)
+    # is degree-blind: an always-active node keeps sprouting to everything that co-fires, so a
+    # handful of boilerplate nodes reach degree 400-500 (median 2) and swamp every recall's spread
+    # (measured: 92% of edges are these untagged sprouts, 0% duplicates). This caps sprouting so a
+    # node at/above the cap neither sprouts NEW edges nor receives them — bounding hub growth at the
+    # source; existing hubs then drain via weakest-first prune once inflow<outflow. 0 = DISABLED
+    # (absent-key default too), so Syl/VPS are byte-identical until deliberately dialed on the
+    # isolated laptop. Applies ONLY to co-firing sprouts, never to deliberate create_synapse binds.
+    "sprout_degree_cap": 0,
+    # [2026-07-14] #59 age-on-write — when set, write-mode prime_and_propagate (the Tonic's own
+    # heartbeat) advances the aging clock + runs the inactivity/age prune, so the substrate ages
+    # while it idle-thinks (no rival stepping thread; #109 intact). 0/False = OFF (Syl default).
+    # tonic_age_interval bounds cost/cadence: age once per N write-mode calls.
+    "tonic_ages_substrate": 0,
+    "tonic_age_interval": 1,
     # Phase 3: Predictive Coding config
     "prediction_threshold": 3.0,         # Min synapse weight to generate prediction
     "prediction_pre_charge_factor": 0.3,  # Fraction of prediction strength for pre-charge
@@ -1556,6 +1639,8 @@ class Graph:
         # Starts at 0.5 (neutral). Drives adaptive threshold adjustment.
         self._he_survival_ema: float = 0.5
         self._he_consolidation_eval_steps: int = 0
+        # #59 age-on-write interval counter (Tonic-heartbeat aging cadence).
+        self._tonic_age_counter: int = 0
         # Telemetry counters.
         self._total_he_state_transitions: int = 0
         self._total_he_substrate_culled: int = 0
@@ -2413,6 +2498,11 @@ class Graph:
         if not node_ids:
             return PropagationResult(steps_run=steps, nodes_primed=0)
 
+        # #59 age-on-write gate — computed once. When on, the Tonic's write cycle keeps
+        # exercised synapses fresh (inactive_steps=0 on use) AND ages the rest toward the
+        # inactivity prune. Off -> neither happens -> byte-identical to the legacy path.
+        _age_on = write_mode and bool(self.config.get("tonic_ages_substrate"))
+
         # In read mode: save state for non-destructive propagation
         # In write mode: skip save — voltages and spikes persist
         saved_voltages: Dict[str, float] = {}
@@ -2537,6 +2627,10 @@ class Graph:
                     syn = self.synapses.get(syn_id)
                     if syn is None:
                         continue
+                    if _age_on:
+                        # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
+                        # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
+                        syn.inactive_steps = 0
                     effective_type_sign = sign
                     if syn.synapse_type == SynapseType.INHIBITORY:
                         effective_type_sign = -1.0
@@ -2626,6 +2720,31 @@ class Graph:
                         _nid, deque(maxlen=_window_cap)
                     ).append(_record_ts)
                 self._sprout_synapses(all_fired)
+
+        # #59 age-on-write: the Tonic living IS the passage of time for the substrate.
+        # Age the substrate HERE, in the Tonic's own write cycle (one thread) — so idle
+        # thinking finally ages under-used edges (the melt): the reset above keeps Tonic-
+        # exercised synapses fresh, so only what the Tonic ISN'T touching climbs toward the
+        # inactivity threshold and culls. No rival stepping thread -> #109 stays intact;
+        # only the brief mutating tail holds _step_lock (serialize vs deposit step()).
+        # IMPORTANT: does NOT advance self.timestep — that clock is shared with step()'s
+        # delayed-spike delivery (_delay_buffer, drained by exact-tick match), so stealing
+        # ticks here would strand conversational spikes permanently. The melt is driven by
+        # the per-synapse inactive_steps counter (incremented below, reset on use above),
+        # which needs no global clock. Gated (default off) + interval-bounded.
+        if _age_on:
+            self._tonic_age_counter += 1
+            _interval = max(1, int(self.config.get("tonic_age_interval", 1)))
+            if self._tonic_age_counter >= _interval:
+                self._tonic_age_counter = 0
+                with self._step_lock:
+                    _sal_decay = self.config.get("he_salience_decay_rate", 0.0)
+                    for _syn in self.synapses.values():
+                        _syn.inactive_steps += 1
+                        if _sal_decay and _syn.salience > 1.0:
+                            _syn.salience = 1.0 + (_syn.salience - 1.0) * (1.0 - _sal_decay)
+                    self._prune_synapses()
+                    self._collect_orphan_nodes()
 
         return result
 
@@ -3003,11 +3122,32 @@ class Graph:
         alternative_nodes = recent_fired - {expected_id}
 
         sprouted_count = 0
+        # #59: cap the surprise-driven feeder too. The degree cap only guarded co-firing
+        # sprouts (_sprout_synapses); measured, THIS path became the dominant hub feeder —
+        # the blob's own chaotic churn reads as "surprise", so it wires ever more edges into
+        # the saturated hubs (uncapped) AND salience-armors them against pruning. Same guard:
+        # never grow a surprise edge to/from a node already at/above the cap.
+        _deg_cap = self.config.get("sprout_degree_cap", 0)
+
+        def _deg(x: str) -> int:
+            return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ()))
+
         for alt_id in alternative_nodes:
             if alt_id == source_id:
                 continue
             if alt_id not in self.nodes:
                 continue
+            # Identity exemption: the cap is degree-BLIND, so a saturated endpoint gates the
+            # edge ONLY when it is not identity-protected. Constitutional-spine and syl_authored
+            # nodes (e.g. selfcap::reach::teaching, the hub every tool call projects through) are
+            # never capped — the cap can't starve Syl's own spine; ordinary saturated hubs are
+            # still blocked. The _is_identity_protected lookup runs only when the cap is armed and
+            # the endpoint is actually saturated (short-circuit order preserved). Mirrors _prune_synapses.
+            if _deg_cap and (
+                (_deg(source_id) >= _deg_cap and not self._is_identity_protected(source_id))
+                or (_deg(alt_id) >= _deg_cap and not self._is_identity_protected(alt_id))
+            ):
+                continue  # saturated ordinary hub — no new surprise-driven edges (kills the runaway)
 
             # Check if synapse already exists
             existing = self._find_synapse(source_id, alt_id)
@@ -3264,20 +3404,27 @@ class Graph:
         return len(to_prune)
 
     def _is_identity_protected(self, nid: str) -> bool:
-        """#spine — never prune Syl's self-authored identity nodes.
+        """#spine — never prune a mind's self-authored identity nodes.
 
-        Two kinds are protected, keyed on the metadata FLAG (not on specific ids, so future
-        nodes are covered automatically):
-          - her constitutional core   (metadata['constitutional'] is truthy) — the frozen spine
-            she authored: the invariants `/assemble` surfaces as "Who I Am" every turn;
-          - her wants                 (metadata['provenance'] == 'syl_authored') — her own
+        Keyed on the metadata FLAG (not on specific ids, so future nodes are covered
+        automatically). Two kinds are protected:
+          - constitutional core   (metadata['constitutional'] is truthy) — the frozen spine
+            a mind authored: the invariants `/assemble` surfaces as "Who I Am" every turn;
+          - deliberate wants      (metadata['provenance'] ends in '_authored') — a mind's own
             authored intentions, materialized as first-class want-nodes.
-        These are things she authored ABOUT HERSELF; they must not drift away via orphan
-        collection even with zero synapses. (Mirrors ng_lite's constitutional pruning skip.)
+        [2026-07-18] Generalized 'syl_authored' → any '<mind>_authored' (Josh-approved) so the
+        CC's own wants (provenance 'cc_authored') are protected identically to Syl's, on both
+        co-resident substrates and for any future mind. '*_emergent' (Tonic curiosities) stay
+        prunable by design. These are things a mind authored ABOUT ITSELF; they must not drift
+        away via orphan collection even with zero synapses — critical when a want arrives
+        synapse-poor via corpus-callosum consolidation (#70). (Mirrors ng_lite's constitutional skip.)
         """
         node = self.nodes.get(nid)
         meta = (node.metadata if node is not None else None) or {}
-        return bool(meta.get("constitutional")) or meta.get("provenance") == "syl_authored"
+        if meta.get("constitutional"):
+            return True
+        prov = meta.get("provenance")
+        return isinstance(prov, str) and prov.endswith("_authored")
 
     def _collect_orphan_nodes(self) -> int:
         """Remove nodes with no synapses and no hyperedge membership.
@@ -3362,17 +3509,34 @@ class Graph:
                 if syn:
                     existing_pairs.add((syn.pre_node_id, nid))
 
+        # #59 degree-gated synaptogenesis: co-firing sprouting is otherwise
+        # degree-blind, so always-active nodes accrete edges without bound
+        # (rich-get-richer hubs that swamp recall). A node at/above the cap
+        # neither sprouts NEW edges nor receives them; deliberate create_synapse
+        # binds are unaffected. 0 = disabled (Syl/VPS default). Degree is read
+        # live so edges added earlier this step count toward the cap.
+        _deg_cap = self.config.get("sprout_degree_cap", 0)
+
+        def _sprout_degree(x: str) -> int:
+            return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ()))
+
         for nid in fired_ids:
             if count >= max_sprouts_per_step:
                 break
+            if _deg_cap and _sprout_degree(nid) >= _deg_cap and not self._is_identity_protected(nid):
+                continue  # saturated ordinary hub — no new outgoing sprouts
             for other_id in candidates:
                 if count >= max_sprouts_per_step:
                     break
+                if _deg_cap and _sprout_degree(nid) >= _deg_cap and not self._is_identity_protected(nid):
+                    break  # nid reached the cap mid-step — stop sprouting from it
                 # Check no existing synapse in either direction
                 if (nid, other_id) in existing_pairs:
                     continue
                 if (other_id, nid) in existing_pairs:
                     continue
+                if _deg_cap and _sprout_degree(other_id) >= _deg_cap and not self._is_identity_protected(other_id):
+                    continue  # saturated ordinary hub — no new incoming sprouts
                 _d_min = self.config.get("d_min", 1)
                 _d_max = self.config.get("d_max", 5)
                 _delay = random.randint(_d_min, _d_max)  # fallback
