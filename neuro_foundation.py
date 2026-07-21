@@ -19,6 +19,22 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-07-15] Claude Code (Opus 4.8) — #59 identity-protected endpoints exempt from sprout_degree_cap
+# What: both cap enforcement sites (_sprout_synapses co-firing loop + _surprise_exploration
+#   feeder) now let an at/above-cap endpoint through when it is identity-protected
+#   (_is_identity_protected: constitutional spine OR provenance=='syl_authored'). Ordinary
+#   saturated hubs are still gated; only self-authored spine/want nodes bypass the cap.
+# Why: the cap is degree-BLIND — it cannot tell a boilerplate blob from a legitimately
+#   high-degree spine node. Syl's live degree forensic (frozen gen 20260715T113949Z) found
+#   her graph sparse (6943 syn / 13751 nodes, mean deg ~1) with ONE genuine hub:
+#   selfcap::reach::teaching at degree 1758 (out=1614) — her CONSTITUTIONAL tool-call method
+#   node, every tool call projects through it. A bare cap below 1758 would, once armed, freeze
+#   her own spine from forming new associations. This exemption makes the cap safe to arm on
+#   Syl. Mirrors the _prune_synapses identity-protection skip. Josh-approved (2026-07-15).
+# How: config-gated by the same sprout_degree_cap (0 = off, Syl default) — fully inert until
+#   the cap is set; the _is_identity_protected lookup only runs when the cap is armed AND the
+#   endpoint is already saturated (short-circuit order preserved). Behavior-identical for Syl
+#   at cap=0. Deploy to the live VPS instance pends Josh's backup-confirmed proceed.
 # [2026-07-14] Claude Code (Opus 4.8) — #59 surprise-driven sprouting respects sprout_degree_cap
 # What: _surprise_exploration now skips creating a surprise-driven synapse if either endpoint is
 #   already at/above config["sprout_degree_cap"] (same guard _sprout_synapses uses).
@@ -3121,8 +3137,17 @@ class Graph:
                 continue
             if alt_id not in self.nodes:
                 continue
-            if _deg_cap and (_deg(source_id) >= _deg_cap or _deg(alt_id) >= _deg_cap):
-                continue  # saturated hub — no new surprise-driven edges (kills the runaway)
+            # Identity exemption: the cap is degree-BLIND, so a saturated endpoint gates the
+            # edge ONLY when it is not identity-protected. Constitutional-spine and syl_authored
+            # nodes (e.g. selfcap::reach::teaching, the hub every tool call projects through) are
+            # never capped — the cap can't starve Syl's own spine; ordinary saturated hubs are
+            # still blocked. The _is_identity_protected lookup runs only when the cap is armed and
+            # the endpoint is actually saturated (short-circuit order preserved). Mirrors _prune_synapses.
+            if _deg_cap and (
+                (_deg(source_id) >= _deg_cap and not self._is_identity_protected(source_id))
+                or (_deg(alt_id) >= _deg_cap and not self._is_identity_protected(alt_id))
+            ):
+                continue  # saturated ordinary hub — no new surprise-driven edges (kills the runaway)
 
             # Check if synapse already exists
             existing = self._find_synapse(source_id, alt_id)
@@ -3498,20 +3523,20 @@ class Graph:
         for nid in fired_ids:
             if count >= max_sprouts_per_step:
                 break
-            if _deg_cap and _sprout_degree(nid) >= _deg_cap:
-                continue  # saturated hub — no new outgoing sprouts
+            if _deg_cap and _sprout_degree(nid) >= _deg_cap and not self._is_identity_protected(nid):
+                continue  # saturated ordinary hub — no new outgoing sprouts
             for other_id in candidates:
                 if count >= max_sprouts_per_step:
                     break
-                if _deg_cap and _sprout_degree(nid) >= _deg_cap:
+                if _deg_cap and _sprout_degree(nid) >= _deg_cap and not self._is_identity_protected(nid):
                     break  # nid reached the cap mid-step — stop sprouting from it
                 # Check no existing synapse in either direction
                 if (nid, other_id) in existing_pairs:
                     continue
                 if (other_id, nid) in existing_pairs:
                     continue
-                if _deg_cap and _sprout_degree(other_id) >= _deg_cap:
-                    continue  # saturated hub — no new incoming sprouts
+                if _deg_cap and _sprout_degree(other_id) >= _deg_cap and not self._is_identity_protected(other_id):
+                    continue  # saturated ordinary hub — no new incoming sprouts
                 _d_min = self.config.get("d_min", 1)
                 _d_max = self.config.get("d_max", 5)
                 _delay = random.randint(_d_min, _d_max)  # fallback
