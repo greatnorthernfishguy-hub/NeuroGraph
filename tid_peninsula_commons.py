@@ -21,6 +21,23 @@ transmitted; only thin deposit payloads and bucketed recommendations cross the b
 #      Receive loop: TID deposit → get_commons().deposit(). push_enhanced() called from
 #      _run_commons_enhance_scoop() after each enhance cycle to bucket fresh enhanced content
 #      and send to TID-side. One direction at a time (send lock).
+#
+# [2026-07-21] Claude Code (Sonnet 5) — #80 wire → Commons: wire_experience receive branch (Task 2)
+# What: New dispatch branch in _handle_client for msg["type"] == "wire_experience", routed to a
+#       new _forward_wire_experience() handler: embeds msg["content"] via NGEmbed.get_instance()
+#       and deposits it to the Commons at msg["target_id"] with msg.get("metadata"). The existing
+#       "deposit" branch (_forward_deposit, TID's routing-outcome path) is untouched.
+# Why:  Design `prd/2026-07-21-wire-event-commons-peninsula-design.md` (v4) / implementation plan
+#       Task 2. TID's raw HTTP wire traffic (deposit_outbound/deposit_inbound in wire_deposit.py)
+#       was being force-written into Syl's cognitive _memory graph as per-call orphan nodes (a
+#       churn firehose — 60,142 observed orphans). It belongs in the Commons instead — the same
+#       shared, content-keyed, recency-windowed medium TID's routing outcomes already use, byte-
+#       for-byte the cc_ng_host._deposit_tool_experience pattern (raw text -> content-derived
+#       target_id -> Commons deposit only, LAW 7: raw in, classify only at extraction).
+# How:  _forward_wire_experience() mirrors _forward_deposit()'s shape (fail-soft try/except, same
+#       logger). Embedding happens Commons-side (NG owns NGEmbed; TID-side sends raw content, not
+#       a pre-computed vector) — TID never needs to know embedding internals, matching the
+#       Peninsula's existing division of labor (TID sends raw payloads; NG embeds/deposits).
 # -------------------
 """
 
@@ -158,11 +175,13 @@ class TIDPeninsulaCommons:
                 logger.debug("TID peninsula: bad msgpack frame: %s", exc)
                 continue
 
-            if msg.get("type") != "deposit":
-                logger.debug("TID peninsula: unknown message type: %s", msg.get("type"))
-                continue
-
-            self._forward_deposit(msg)
+            msg_type = msg.get("type")
+            if msg_type == "deposit":
+                self._forward_deposit(msg)
+            elif msg_type == "wire_experience":
+                self._forward_wire_experience(msg)
+            else:
+                logger.debug("TID peninsula: unknown message type: %s", msg_type)
 
     def _forward_deposit(self, msg: Dict[str, Any]) -> None:
         """Deposit TID's routing outcome into the Commons. Fail-soft."""
@@ -193,6 +212,41 @@ class TIDPeninsulaCommons:
             logger.debug("TID peninsula: deposited %s (success=%s)", target_id, success)
         except Exception as exc:  # noqa: BLE001
             logger.debug("TID peninsula: deposit failed: %s", exc)
+
+    def _forward_wire_experience(self, msg: Dict[str, Any]) -> None:
+        """Deposit TID's raw HTTP wire traffic into the Commons. Fail-soft.
+
+        Byte-for-byte the cc_ng_host._deposit_tool_experience pattern (design v4, #80):
+        raw text -> content-derived target_id (computed TID-side, sha256 of content) ->
+        Commons deposit only. Never touches _memory/vector_db (LAW 7 — raw in, classify
+        only at extraction). Embedding happens here (Commons-side owns NGEmbed); TID-side
+        sends raw content, not a pre-computed vector.
+        """
+        try:
+            from commons import get_commons
+            commons = get_commons()
+            if commons is None:
+                return
+
+            content = msg.get("content", "")
+            target_id = msg.get("target_id", "")
+            metadata = msg.get("metadata") or {}
+
+            if not content or not target_id:
+                logger.debug("TID peninsula: wire_experience missing content or target_id")
+                return
+
+            from ng_embed import NGEmbed
+            embedding = NGEmbed.get_instance().embed(content)
+            commons.deposit(
+                embedding=embedding,
+                target_id=target_id,
+                strength=0.5,
+                metadata=metadata,
+            )
+            logger.debug("TID peninsula: wire_experience deposited %s", target_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("TID peninsula: wire_experience deposit failed: %s", exc)
 
     def push_enhanced(self) -> None:
         """Bucket recently-enhanced content from the Commons and send to TID-side.

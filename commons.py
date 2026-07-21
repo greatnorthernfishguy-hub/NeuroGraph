@@ -2,6 +2,25 @@
 The Commons — shared substrate medium for peer-module communication.
 
 # ---- Changelog ----
+# [2026-07-21] Claude Code (Sonnet 5) — #80 wire → Commons: _evict_old_wire() lifecycle carve-out
+#   What: New _WIRE_KEEP_PER_DIR env-configurable window (LAW 5) + _evict_old_wire(), mirroring
+#         _evict_old_metrics/_evict_old_errors's shape and recency logic. deposit() gets a new
+#         elif branch: any target_id starting "wire:" is recency-windowed to the most-recent N
+#         synapses per wire:tid.http.{dir}: namespace. NOTE the grouping key is the first 2
+#         ':'-parts here, not 3 like metrics/errors — wire:tid.http.{dir}:{sha256hash} has only
+#         3 parts total (no 4th per-deposit-unique segment; the hash itself is that entropy),
+#         unlike metrics:<source>:<kind>:<extra> / error:<module>:<ExcType>:<extra> which have 4
+#         and window on the first 3 to drop their trailing unique id.
+#   Why:  Design `prd/2026-07-21-wire-event-commons-peninsula-design.md` (v4) §6 — TID's raw HTTP
+#         wire deposits land in Syl's SHARED Commons (unlike CC's isolated one), seeded at
+#         weight=0.5 and never reinforced — below the ~0.575 metrics/error weight that motivated
+#         #320/#330's windowing. High-volume wire would otherwise pressure NG-Lite's weight-based
+#         max_synapses bound and could evict a lower-weight genuine memory first. This is the same
+#         housekeeping metrics:*/error:* already get, applied to the new wire: namespace.
+#   How:  Task 1 of the implementation plan (additive-first strategy) — this lands before any TID
+#         wire-to-Commons emission exists, so it is inert (no wire: deposits yet) until Task 4 flips
+#         TID to send wire_experience frames. Substrate-lifecycle maintenance keyed on the target_id
+#         namespace — NOT a classification of experience (LAW 7 untouched).
 # [2026-07-15] Claude Code (Sonnet 5) — #366: reversible suppression (leg-3 retract, mesh-side)
 #   What: A per-target suppression MAP (target_id -> "hard"|"soft") the two extraction paths honor.
 #         "hard" ⇒ surfaced by NEITHER bucket() nor bucket_recent() (gone). "soft" ⇒ muted from the
@@ -83,6 +102,7 @@ restore() below are the hooks for that — not yet wired into a lifecycle (POC s
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,6 +125,16 @@ _METRICS_KEEP_PER_KIND = 200
 # error:<module_id>:<ExcType> deposits from the operational-logger. A noisy module's errors are
 # telemetry, not memory — windowed by recency so they never crowd out genuine experience/topology.
 _ERRORS_KEEP_PER_KIND = 200
+
+# Wire-stream retention window (#80, design v4 §6): same reasoning as _METRICS_KEEP_PER_KIND,
+# applied to wire:tid.http.{outbound|inbound}: deposits from TID's raw HTTP circulation. Wire is
+# seeded at weight=0.5 and never reinforced — below the ~0.575 metrics/error weight that motivated
+# the original windowing — so unwindowed wire volume would pressure the weight-based max_synapses
+# bound and could evict a lower-weight genuine memory first. Env-configurable (LAW 5); sized
+# comfortably past the leg-2 commons_enhance scoop cadence so salient wire gets read (and salted
+# back) before its raw form is reclaimed. Default 200 mirrors _METRICS_KEEP_PER_KIND's starting
+# shape (design v4 §11, open question — tune on live rate).
+_WIRE_KEEP_PER_DIR = int(os.environ.get("WIRE_KEEP_PER_DIR", "200"))
 
 
 class Commons:
@@ -157,7 +187,38 @@ class Commons:
             self._evict_old_metrics(target_id)
         elif target_id.startswith("error:"):
             self._evict_old_errors(target_id)
+        elif target_id.startswith("wire:"):
+            self._evict_old_wire(target_id)
         return result
+
+    def _evict_old_wire(self, target_id: str) -> None:
+        """Keep only the most-recent _WIRE_KEEP_PER_DIR synapses for this wire tid.http.{dir}.
+
+        Same reasoning and shape as _evict_old_metrics/_evict_old_errors (#80, design v4 §6):
+        wire:tid.http.{outbound|inbound}: deposits are TID's raw HTTP circulation — recency-
+        windowed telemetry, not memory — so high-volume wire never competes with genuine
+        experience/topology for the weight-based max_synapses bound. Housekeeping keyed on the
+        target_id namespace only; NOT a classification of the wire content (LAW 7 untouched).
+        """
+        try:
+            parts = target_id.split(":")
+            # wire:tid.http.{dir}:{sha256hash} has only 3 ':'-parts total (unlike
+            # metrics:<source>:<kind>:<extra> / error:<module>:<ExcType>:<extra>, which have 4
+            # and window on the first 3). The group key here is the first 2 parts — the hash
+            # itself is per-deposit entropy, not part of the wire:tid.http.{dir} namespace.
+            if len(parts) < 2:
+                return
+            prefix = ":".join(parts[:2]) + ":"          # wire:tid.http.{dir}:
+            syns = self._ng.synapses
+            keys = [k for k, s in syns.items()
+                    if getattr(s, "target_id", "").startswith(prefix)]
+            if len(keys) <= _WIRE_KEEP_PER_DIR:
+                return
+            keys.sort(key=lambda k: getattr(syns[k], "last_updated", 0.0), reverse=True)
+            for k in keys[_WIRE_KEEP_PER_DIR:]:
+                del syns[k]
+        except Exception as exc:  # noqa: BLE001 — retention failure never breaks a deposit
+            logger.debug("wire eviction failed for %s: %s", target_id, exc)
 
     def _evict_old_errors(self, target_id: str) -> None:
         """Keep only the most-recent _ERRORS_KEEP_PER_KIND synapses for this error module:type.
