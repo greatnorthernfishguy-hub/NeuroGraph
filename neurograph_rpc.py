@@ -5359,9 +5359,39 @@ def process_request(line: str) -> Optional[str]:
         })
 
 
+def _start_malloc_trim_timer() -> None:
+    """[2026-07-21] glibc fragmentation reclaim -- pairs with MALLOC_ARENA_MAX=2 (env).
+    The cap limits arena count; this periodically hands freed memory the arenas hoard
+    back to the OS via malloc_trim(0). Together = the Anima fragmentation fix (~75%
+    RSS-climb cut). Env NG_MALLOC_TRIM_SECS (LAW 5, default 180, 0=off). Daemon, fail-soft."""
+    try:
+        interval = int(os.environ.get("NG_MALLOC_TRIM_SECS", "180"))
+    except Exception:
+        interval = 180
+    if interval <= 0:
+        return
+    try:
+        import ctypes
+        _libc = ctypes.CDLL("libc.so.6")
+    except Exception as _exc:
+        logger.warning("malloc_trim timer: libc unavailable (%s) -- skipping", _exc)
+        return
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                _libc.malloc_trim(0)
+            except Exception:
+                pass
+    threading.Thread(target=_loop, name="malloc-trim", daemon=True).start()
+    logger.info("malloc_trim timer started (every %ds; MALLOC_ARENA_MAX=%s)",
+                interval, os.environ.get("MALLOC_ARENA_MAX", "default"))
+
+
 def main() -> None:
     """Main RPC loop — read requests from stdin, write responses to stdout."""
     logger.info("NeuroGraph RPC bridge starting")
+    _start_malloc_trim_timer()
 
     # Signal readiness to the TypeScript plugin
     ready_msg = json.dumps({
