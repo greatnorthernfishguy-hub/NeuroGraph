@@ -568,11 +568,14 @@ class DistanceCache:
         """
         new_components = []
         for comp in self._components_lil:
-            new_mat = sparse.lil_matrix(
-                (new_count, new_count), dtype=np.float64
-            )
-            copy_n = min(self._n, new_count)
-            new_mat[:copy_n, :copy_n] = comp[:copy_n, :copy_n]
+            # [#81 2026-07-21] scipy's native in-place sparse resize -- keeps in-bounds
+            # entries, extends/truncates WITHOUT densifying. The old
+            # new_mat[:c,:c]=comp[:c,:c] made scipy .toarray() an (N,N) slice ->
+            # 48.8 GiB OOM at 80,916 entities (crashed Syl's bootstrap). .copy() keeps
+            # the source untouched -- proven element-identical (grow/shrink/same, maxD=0)
+            # to the old new-matrix path. Josh+Syl authorized.
+            new_mat = comp.copy()
+            new_mat.resize((new_count, new_count))
             new_components.append(new_mat)
         self._components_lil = new_components
         self._components_csr = None

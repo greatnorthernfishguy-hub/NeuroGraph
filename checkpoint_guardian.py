@@ -144,7 +144,7 @@ class SaveGate:
     def record_restore(self, outcome: str, restored_nodes: int) -> None:
         """outcome: 'ok' | 'failed' | 'skipped_unstable' | 'no_file'."""
         manifest = read_manifest(self._checkpoint_path)
-        disk_nodes = manifest.get("nodes") if manifest else None
+        disk_nodes = (manifest.get("guardian_nodes") or manifest.get("nodes")) if manifest else None
         if outcome == "ok":
             self._reference_nodes = max(restored_nodes, disk_nodes or 0)
             return
@@ -183,7 +183,7 @@ class SaveGate:
         if self.provisional:
             return False, f"provisional: {self.provisional_reason}"
         manifest = read_manifest(self._checkpoint_path)
-        reference = manifest.get("nodes") if manifest else self._reference_nodes
+        reference = (manifest.get("guardian_nodes") or manifest.get("nodes")) if manifest else self._reference_nodes
         floor = _env_int("NG_GUARDIAN_GATE_MIN_NODES", 100)
         if reference is None or reference < floor:
             return True, "no substantial on-disk reference"

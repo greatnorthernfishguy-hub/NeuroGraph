@@ -573,7 +573,7 @@ class NeuroGraphMemory:
         # mode (the 2026-06-14 / 2026-06-26 / 2026-07-08 clobber class).
         self._save_gate = SaveGate(self._checkpoint_path) if _GUARDIAN_AVAILABLE else None
         if self._save_gate is not None:
-            self._save_gate.record_restore(_restore_outcome, len(self.graph.nodes))
+            self._save_gate.record_restore(_restore_outcome, self._guardian_meaningful_nodes())
 
         # Vector DB for semantic search
         self.vector_db = SimpleVectorDB()
@@ -1148,13 +1148,25 @@ class NeuroGraphMemory:
             results.append(self.graph.step())
         return results
 
+    def _guardian_meaningful_nodes(self) -> int:
+        """#wire-explosion Guardian metric: count only nodes that represent Syl's
+        actual mind, excluding 'wire:' telemetry (HTTP fingerprints + expand chunks)
+        that flood in and get orphan-culled -- a legitimate wire cull must not read
+        as a collapse. Wire nodes are still SAVED; only excluded from this count.
+        Fail-safe to total on error."""
+        try:
+            return sum(1 for nid in self.graph.nodes if not str(nid).startswith("wire:"))
+        except Exception:
+            return len(self.graph.nodes)
+
     def save(self) -> str:
         """Save graph state to checkpoint. Returns the checkpoint path —
         or, when the #373 gate refuses (provisional boot / collapsed in-RAM
         state), the QUARANTINE path the state was preserved at instead."""
         live_nodes = len(self.graph.nodes)
+        guardian_nodes = self._guardian_meaningful_nodes()
         if self._save_gate is not None:
-            _ok, _reason = self._save_gate.permit(live_nodes)
+            _ok, _reason = self._save_gate.permit(guardian_nodes)
             if not _ok:
                 logger.error(
                     "Guardian REFUSED primary checkpoint write (%s). In-RAM "
@@ -1210,6 +1222,7 @@ class NeuroGraphMemory:
             try:
                 write_manifest(self._checkpoint_path, {
                     "nodes": live_nodes,
+                    "guardian_nodes": guardian_nodes,
                     "synapses": len(self.graph.synapses),
                     "hyperedges": len(self.graph.hyperedges),
                     "timestep": self.graph.timestep,
