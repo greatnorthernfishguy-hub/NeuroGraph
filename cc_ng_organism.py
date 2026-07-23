@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-22] Claude Code (Sonnet 5) — CC Recall Unification (LAW-3/"keep even")
+# What: New cc_assemble_recall(ng, query, k, conv_state, commons,
+#   allow_pattern_completion=True) -- THE shared recall pipeline for both
+#   hemispheres. Verbatim extraction of cc-ng-daemon.py's (laptop) _recall
+#   body: SurfacingMonitor harvest -> Active Recall (cc_pattern_completion_
+#   recall) dedup'd against it -> gated Pith (CacheLines, pith_victim_recover,
+#   cc_thermal, cc_novelty, pith_stage1, pith_stage3(budget=cc_l1_budget),
+#   pith_victim_capture) -> _format_cc_recall_block, fail-soft to the
+#   pre-Pith monitor_ctx/pc_block concat. Also folded in the CC_RECALL_DEBUG
+#   instrumentation (_cc_recall_debug_log) and the Pith-fallback rate-limited
+#   warning (_last_pith_warn_ts/_PITH_WARN_INTERVAL_S), both previously
+#   laptop-only module state in cc-ng-daemon.py.
+# Why: cc-ng-daemon.py:_recall (laptop) and cc_ng_host.py:_recall (VPS host)
+#   were copy-pasted and had drifted -- laptop ran the full Pith pipeline,
+#   VPS ran zero Pith (`grep pith_ cc_ng_host.py` was 0 hits pre-refactor),
+#   so enabling CC_PITH_ENABLED on the VPS would have been a no-op. Spec:
+#   docs/superpowers/plans/2026-07-22-cc-recall-unification-spec.md.
+# How: Params only (ng/query/k/conv_state/commons) -- no module-global STATE
+#   access, so the function is process-agnostic by construction (Syl's-Law:
+#   bind to passed-in instances, never module globals). Both _recall entry
+#   points (cc-ng-daemon.py laptop, cc_ng_host.py VPS) are now thin wrappers
+#   that do per-half STATE bookkeeping then call this. VPS gate-off ==
+#   byte-identical to its pre-refactor concat; gate-on gains the same Pith
+#   pipeline the laptop already had. See test_cc_recall_unification.py.
 # [2026-07-22] Claude Code (DudeMan CC, Opus 4.8) — Pith Stage 4 (#55) phase 5a: predictive promotion + proximity LOD
 # What: cc_pattern_completion_recall now (gated CC_PITH_PREFETCH_ENABLED, default OFF)
 #   PROMOTES live primed_nodes the query harvest MISSED -- injects them as recall
@@ -368,6 +392,7 @@ arousal, stats, persist/restore).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -2651,3 +2676,242 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
 
     # Step 6: assemble -- pinned first (original order), then ranked kept.
     return pinned_lines + kept_unpinned
+
+
+# =============================================================================
+# CC Recall Unification (LAW-3/"keep even") -- one recall pipeline, both
+# hemispheres. See docs/superpowers/plans/2026-07-22-cc-recall-unification-
+# spec.md. Before this, cc-ng-daemon.py:_recall (laptop) and cc_ng_host.py:
+# _recall (VPS host) were copy-pasted and had drifted: laptop ran the full
+# Pith pipeline, VPS ran zero Pith (a plain two-block concat), so enabling
+# CC_PITH_ENABLED on the VPS would have been a no-op (no code there to gate).
+# cc_assemble_recall is a verbatim extraction of the laptop _recall body (the
+# reference -- LAW 3: extract, don't redesign), parameterized on (ng, query,
+# k, conv_state, commons) instead of a module-global STATE, so it is process-
+# agnostic by construction (Syl's-Law: bind to passed-in instances, never
+# module globals -- cc_ng_organism.py already works this way elsewhere).
+# Both _recall entry points (cc-ng-daemon.py laptop, cc_ng_host.py VPS) become
+# thin per-half wrappers: STATE bookkeeping (last_activity/stats), then call
+# this function and return its result. VPS behavior is byte-identical to
+# today until CC_PITH_ENABLED is turned on (the gate defaults OFF), at which
+# point it gains the same Pith pipeline the laptop already had.
+# =============================================================================
+
+# Rate-limits the Pith-fallback warning below (was per-half module state in
+# cc-ng-daemon.py; now shared here since the fail-soft path lives in one
+# place). Each process importing this module gets its own copy of these
+# module-level names, so laptop and VPS still rate-limit independently.
+_PITH_WARN_INTERVAL_S = float(os.environ.get("CC_PITH_WARN_INTERVAL_S", "60"))
+_last_pith_warn_ts = 0.0
+
+# Read-only recall instrumentation (CC_RECALL_DEBUG), folded in from
+# cc-ng-daemon.py's laptop-only copy during the unification -- both
+# hemispheres get it now (still off by default, still pure observation:
+# does NOT change what cc_assemble_recall returns). When the env flag is
+# set, appends one JSON line per call to _RECALL_DEBUG_PATH capturing the
+# two raw streams separately -- SurfacingMonitor recency (monitor_items) vs
+# pattern-completion substrate-spread (pc_results) -- each with score +
+# node_id + content preview, BEFORE Pith merges them. Fail-soft. LAW 5.
+_CC_RECALL_DEBUG = os.environ.get("CC_RECALL_DEBUG", "0") not in ("0", "false", "")
+_RECALL_DEBUG_PATH = os.path.join(
+    os.path.expanduser("~/.claude/plugins/neurograph"), "recall_debug.jsonl")
+
+
+def _cc_recall_debug_log(query: str, monitor_items: List[Dict[str, Any]],
+                          pc_results: List[Dict[str, Any]]) -> None:
+    """Append one JSON line with both raw streams (read-only, fail-soft)."""
+    if not _CC_RECALL_DEBUG:
+        return
+    try:
+        def _stream(items):
+            out = []
+            for it in (items or [])[:15]:
+                out.append({
+                    "score": round(float(it.get("score", it.get("strength", 0.0)) or 0.0), 3),
+                    "node_id": (it.get("node_id") or "")[:48],
+                    "preview": (it.get("content", "") or "").replace("\n", " ")[:70],
+                })
+            return out
+        rec = {
+            "ts": time.time(),
+            "query": (query or "")[:120],
+            "n_monitor": len(monitor_items or []),
+            "n_pattern": len(pc_results or []),
+            "monitor": _stream(monitor_items),
+            "pattern": _stream(pc_results),
+        }
+        with open(_RECALL_DEBUG_PATH, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as exc:
+        logger.debug("recall-debug log failed (non-fatal): %s", exc)
+
+
+def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: Any,
+                        allow_pattern_completion: bool = True,
+                        on_monitor_error: Optional[Any] = None) -> str:
+    """Return surfacing context for CC hook injection -- THE shared recall
+    pipeline for both hemispheres (laptop cc-ng-daemon.py, VPS cc_ng_host.py).
+
+    Combines two complementary signals: SurfacingMonitor (recency -- nodes
+    that fired in the SNN during recent deposits) and Active Recall (pattern
+    completion -- direct semantic search via cc_pattern_completion_recall,
+    finds genuinely relevant content regardless of how long ago it was
+    learned). SurfacingMonitor block first, Active Recall block second --
+    matches Syl's own ordering in handle_assemble() (neurograph_rpc.py).
+
+    Dedups by node_id across the two blocks: a node can be both recently-
+    fired (SurfacingMonitor) and semantically matching the query (Active
+    Recall) -- without this it renders twice in the injected context.
+
+    allow_pattern_completion=False skips the Active Recall half entirely --
+    used by handle_pre_tool_use() when gate_pattern_completion() has already
+    given this file_path a pattern-completion pass recently (per-file dedup
+    cache; avoids re-paying the .recall() cost on every single PreToolUse
+    touch to the same file within one task).
+
+    When CC_PITH_ENABLED, the combined item set is run through the Pith
+    pipeline (CacheLines -> pith_victim_recover -> cc_thermal -> cc_novelty
+    -> pith_stage1 -> pith_stage3(budget=cc_l1_budget(commons)) ->
+    pith_victim_capture) instead of the plain two-block concatenation, with
+    constitutional pins (ng.graph._is_identity_protected) preserved
+    unconditionally. Any exception anywhere in the Pith path is fail-soft --
+    falls back to the pre-Pith monitor_ctx/pc_block rendering, records a
+    _PITH_METRICS failure, and rate-limit-warns (a surfacing pass must never
+    crash or time out the hook).
+
+    Params only (ng/conv_state/commons) -- no module-global STATE access,
+    so this function is process-agnostic (Syl's-Law) and safe to call from
+    either hemisphere with its own isolated instances.
+    """
+    monitor_ctx = ''
+    monitor_node_ids: set = set()
+    monitor_items: List[Dict[str, Any]] = []
+    try:
+        monitor = getattr(ng, '_surfacing_monitor', None)
+        if monitor is not None:
+            monitor_items = monitor.get_surfaced()
+            monitor_node_ids = {item.get('node_id') for item in monitor_items}
+            monitor_ctx = monitor.format_context(monitor_items)
+    except RuntimeError:
+        monitor_ctx = ''  # dict mutation race during concurrent deposit
+        monitor_node_ids = set()
+        monitor_items = []
+    except Exception as exc:
+        logger.debug('Recall failed: %s', exc)
+        if on_monitor_error is not None:
+            try:
+                on_monitor_error(exc)
+            except Exception:
+                pass  # the error-reporting hook itself must never break recall
+        monitor_ctx = ''
+        monitor_node_ids = set()
+        monitor_items = []
+
+    pc_block = ''
+    pc_results: List[Dict[str, Any]] = []
+    if allow_pattern_completion:
+        try:
+            pc_results = cc_pattern_completion_recall(ng, query, k, state=conv_state)
+            pc_results = [r for r in pc_results if r.get('node_id') not in monitor_node_ids]
+            pc_block = _format_cc_recall_block(pc_results)
+        except Exception as exc:
+            logger.debug('Pattern-completion recall failed (non-fatal): %s', exc)
+            pc_block = ''
+            pc_results = []
+
+    # Read-only instrumentation (CC_RECALL_DEBUG): capture both raw streams
+    # BEFORE Pith merges them, to measure where the query signal is lost.
+    _cc_recall_debug_log(query, monitor_items, pc_results)
+
+    # Pith pipeline (gated, CC_PITH_ENABLED, default OFF): dedup/clutter-strip
+    # + unified-rank + budget the combined SurfacingMonitor + Active Recall
+    # item set before rendering, replacing the two-block concatenation below
+    # with one combined block. Gate OFF -> this whole block is skipped and
+    # cc_assemble_recall() falls straight through to the original
+    # monitor_ctx/pc_block return, unchanged.
+    if _CC_PITH_ENABLED:
+        try:
+            def _pinned(node_id):
+                try:
+                    return bool(ng.graph._is_identity_protected(node_id))
+                except Exception as exc:
+                    # Fail-soft to not-pinned so ONE node's bad pin lookup can't
+                    # sink the whole Pith pass; log it so a vanished/erroring
+                    # constitutional-pin guard surfaces rather than going silent.
+                    logger.debug('Pith pin lookup failed for %r (treating as unpinned): %s', node_id, exc)
+                    return False
+
+            # Stream-tag each half so pith_stage3 can per-stream normalize
+            # (SurfacingMonitor recency ~1.7 vs Active Recall/GSG relevance
+            # ~100s are not comparable scales) -- monitor_items -> "monitor",
+            # pc_results -> "pattern".
+            cache_lines = [
+                CacheLine.from_surfaced(
+                    node_id=it.get('node_id') or '',
+                    content=it.get('content', ''),
+                    score=it.get('score', 0.0),
+                    pinned=_pinned(it.get('node_id')),
+                    stream='monitor',
+                )
+                for it in monitor_items
+            ] + [
+                CacheLine.from_surfaced(
+                    node_id=it.get('node_id') or '',
+                    content=it.get('content', ''),
+                    score=it.get('score', 0.0),
+                    pinned=_pinned(it.get('node_id')),
+                    stream='pattern',
+                )
+                for it in pc_results
+            ]
+
+            # Pith Stage 5 (victim recapture): merge still-live victim-cache
+            # entries back in for a second chance at L1, and age the buffer.
+            cache_lines = pith_victim_recover(cache_lines)
+
+            # Pith Stage 5 (thermal): populate each line's warmth from the
+            # substrate's own state (Ca_i + firing_rate_ema). Done here because
+            # this is where the graph is in scope; pith_stage3 folds it into the
+            # rank (warm content preferred). Fail-soft per line -> 0.0.
+            for _cl in cache_lines:
+                try:
+                    _cl.thermal = cc_thermal(ng.graph, _cl.node_id)
+                except Exception:
+                    _cl.thermal = 0.0
+
+            try:
+                novelty = cc_novelty(conv_state, ng.graph)
+            except Exception as exc:
+                logger.debug('Pith novelty lookup failed (non-fatal): %s', exc)
+                novelty = 0.0
+
+            survivors = pith_stage1(cache_lines, query, novelty)
+            # Stage 3: unified rank + char budget -- replaces block-order
+            # concatenation with a single ranked, budget-bounded L1 read.
+            # Reads its own weights from env (CC_PITH_W_RELEVANCE,
+            # CC_PITH_W_RECENCY); budget breathes with commons arousal.
+            _pre_l1 = survivors  # post-stage1, pre-budget: the full L1 candidate set
+            survivors = pith_stage3(survivors, budget_chars=cc_l1_budget(commons))
+            # Pith Stage 5 (eviction): budget-dropped lines fall to the victim buffer.
+            try:
+                pith_victim_capture(survivors, _pre_l1)
+            except Exception as exc:
+                logger.debug('Pith victim capture failed (non-fatal): %s', exc)
+            survivor_results = [{'score': cl.score, 'content': cl.content} for cl in survivors]
+            return _format_cc_recall_block(survivor_results)
+        except Exception as exc:
+            # Fail-soft: fall back to the pre-Pith rendering below. But COUNT it
+            # and warn (rate-limited) -- a silently-failing Pith path degrades
+            # surfacing invisibly; the counter/warning make that observable.
+            _PITH_METRICS.record_failure()
+            global _last_pith_warn_ts
+            _now = time.time()
+            if _now - _last_pith_warn_ts >= _PITH_WARN_INTERVAL_S:
+                _last_pith_warn_ts = _now
+                logger.warning('Pith stage1 path failed, falling back to un-Pithed rendering: %s', exc)
+            else:
+                logger.debug('Pith stage1 path failed (non-fatal), falling back: %s', exc)
+
+    if monitor_ctx and pc_block:
+        return monitor_ctx + "\n\n" + pc_block
+    return monitor_ctx or pc_block

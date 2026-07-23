@@ -24,6 +24,25 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-22] Claude Code (Sonnet 5) — CC Recall Unification (LAW-3/"keep even")
+# What: _recall() is now a thin wrapper: STATE bookkeeping (recalls stat,
+#   None/empty-query guard), then delegates to the new native
+#   cc_ng_organism.cc_assemble_recall(ng, query, k, conv_state, commons,
+#   allow_pattern_completion) for the actual pipeline. Errors from the shared
+#   fn are caught here and counted into STATE.stats["errors"] (fail-soft, "").
+# Why: cc_ng_host.py's _recall and cc-ng-daemon.py (laptop)'s _recall were
+#   copy-pasted and had drifted -- laptop ran the full Pith extraction
+#   pipeline (CacheLines, pith_stage1/3, thermal, novelty, victim cache),
+#   this file ran zero Pith (plain two-block concat), so enabling
+#   CC_PITH_ENABLED here would have been a no-op with no code to gate.
+#   Spec: docs/superpowers/plans/2026-07-22-cc-recall-unification-spec.md.
+# How: cc_assemble_recall is a verbatim extraction of the laptop _recall body
+#   into cc_ng_organism.py, param-driven (ng/conv_state/commons passed in,
+#   no module-global STATE reaches into it -- Syl's-Law). Gate-off (default),
+#   this hemisphere's output is byte-identical to the pre-unification concat;
+#   gate-on, it gains the same Pith pipeline the laptop already had. The
+#   laptop's cc-ng-daemon.py:_recall becomes the equivalent thin wrapper
+#   (mirrored edit, NOT git -- docs/scripts/, edited directly on the laptop).
 # [2026-07-07] Claude Code (Fable 5) — #358 retrieval-enrichment wiring
 # What: _recall() passes _STATE.conv_state into cc_pattern_completion_recall
 #   (novelty EMA + primed-node bonus now live); init_cc_host() runs the
@@ -355,15 +374,16 @@ def _deposit_tool_experience(text: str) -> None:
 def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
     """Return surfacing context for CC hook injection.
 
-    Combines SurfacingMonitor (recency) with Active Recall (pattern
-    completion via cc_pattern_completion_recall) — see docs/prd/2026-07-06-
-    cc-surfacing-pattern-completion-tier-drop.md. allow_pattern_completion=
-    False skips the Active Recall half — used by _handle_pre_tool_use() when
-    gate_pattern_completion() has already covered this file_path recently.
-
-    Dedups by node_id across the two blocks: a node can be both recently-
-    fired (SurfacingMonitor) and semantically matching the query (Active
-    Recall) — without this it renders twice in the injected context.
+    Thin per-half wrapper (2026-07-22 CC Recall Unification, LAW-3: one
+    implementation, not two drifted copies). The actual recall pipeline —
+    SurfacingMonitor + Active Recall (pattern completion), dedup'd, plus the
+    gated Pith extraction pass (CC_PITH_ENABLED, default OFF) — lives in
+    cc_ng_organism.cc_assemble_recall(). This wrapper only does VPS-host-
+    local bookkeeping (STATE stats) and passes this hemisphere's own
+    isolated ng/conv_state/commons instances through as params (Syl's-Law:
+    no module-global STATE reaches into the shared fn). Gate-off, this is
+    byte-identical to the pre-unification two-block concat; gate-on, the
+    VPS gains the same Pith pipeline the laptop already had.
     """
     ng = _STATE.cc_ng
     if ng is None or not query:
@@ -371,38 +391,20 @@ def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
     with _STATE.stats_lock:
         _STATE.stats["recalls"] += 1
 
-    monitor_ctx = ""
-    monitor_node_ids: set = set()
+    def _bump_error(exc):
+        with _STATE.stats_lock:
+            _STATE.stats["errors"] += 1
+
     try:
-        monitor = getattr(ng, '_surfacing_monitor', None)
-        if monitor is not None:
-            monitor_items = monitor.get_surfaced()
-            monitor_node_ids = {item.get("node_id") for item in monitor_items}
-            monitor_ctx = monitor.format_context(monitor_items)
-    except RuntimeError:
-        monitor_ctx = ""  # dict mutation race during concurrent deposit
-        monitor_node_ids = set()
+        from cc_ng_organism import cc_assemble_recall
+        return cc_assemble_recall(ng, query, k, _STATE.conv_state, _STATE.commons,
+                                   allow_pattern_completion=allow_pattern_completion,
+                                   on_monitor_error=_bump_error)
     except Exception as exc:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1
         logger.debug("CC recall failed: %s", exc)
-        monitor_ctx = ""
-        monitor_node_ids = set()
-
-    pc_block = ""
-    if allow_pattern_completion:
-        try:
-            from cc_ng_organism import cc_pattern_completion_recall, _format_cc_recall_block
-            results = cc_pattern_completion_recall(ng, query, k, state=_STATE.conv_state)
-            results = [r for r in results if r.get("node_id") not in monitor_node_ids]
-            pc_block = _format_cc_recall_block(results)
-        except Exception as exc:
-            logger.debug("Pattern-completion recall failed (non-fatal): %s", exc)
-            pc_block = ""
-
-    if monitor_ctx and pc_block:
-        return monitor_ctx + "\n\n" + pc_block
-    return monitor_ctx or pc_block
+        return ""
 
 
 def _nudge(text: str) -> None:

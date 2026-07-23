@@ -43,9 +43,16 @@ class _FakeMonitor:
 @pytest.fixture
 def cc_ng_state(monkeypatch):
     import cc_ng_host
+    import cc_ng_organism
 
     monkeypatch.setattr(cc_ng_host._STATE, "cc_ng", type("NG", (), {"_surfacing_monitor": None})())
     monkeypatch.setattr(cc_ng_host._STATE, "conv_state", {})
+    # This suite exercises the pre-Pith monitor_ctx/pc_block dedup logic in
+    # cc_assemble_recall() specifically, regardless of the ambient
+    # CC_PITH_ENABLED env var (set process-wide in this environment's
+    # ~/.bashrc) -- force the gate off so these tests are deterministic.
+    # See tests/test_pith_stage5.py for the same module-constant-patch pattern.
+    monkeypatch.setattr(cc_ng_organism, "_CC_PITH_ENABLED", False)
     return cc_ng_host._STATE
 
 
