@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-22] Claude Code (DudeMan CC, Opus 4.8) — Pith Stage 4 (#55) phase 5a: predictive promotion + proximity LOD
+# What: cc_pattern_completion_recall now (gated CC_PITH_PREFETCH_ENABLED, default OFF)
+#   PROMOTES live primed_nodes the query harvest MISSED -- injects them as recall
+#   candidates (not just bonusing already-surfaced ones), then cc_gsg_rescore + rank/
+#   budget still arbitrate (pure-additive, no hard override). Promoted-but-far nodes
+#   stage as pith_stage2_keyframe summaries (proximity-keyed LOD via _cc_node_query_
+#   distance). New PithMetrics.promoted_predicted/prefetch_hits (§13.3 honest lower bound).
+#   Env (LAW 5): CC_PITH_PREFETCH_ENABLED/LOD_DIST/SUMMARY_CHARS. Byte-identical when off; fail-soft.
+# Why: primed_nodes only ever helped when the harvest ALSO independently found the node;
+#   prefetch exists for exactly the miss. Turns the #256 anticipatory signal into the
+#   real Stage-4 promotion. Spec: docs/superpowers/plans/2026-07-22-pith-stage4-spec.md.
+# How: native cc_ng_organism.py only; neurograph-law-enforcer PASS; 18/18 tests
+#   (tests/test_pith_stage4.py). DEFERRED: 5b (warm buffer + idle pulse), TID 2-bit predictor.
+#   Def-of-done still needs a MEASURED live prefetch_hits/promoted_predicted number (spec §6).
 # [2026-07-16] Claude Code (DudeMan CC, Opus 4.8) — Pith Stage 5: eviction & recapture (thermal + victim + breathing) + bootstrap_cc_modules
 # What: (Stage 5, #55) cc_thermal(graph, node) reads the substrate's own warmth
 #   (Ca_i + firing_rate_ema); the daemon populates CacheLine.thermal at
@@ -1497,19 +1511,61 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             cfg["propagation_steps"] = old_steps
 
         # Anticipatory bonus (#256 port) -- canonical rpc.py:2981-2989
+        promoted_ids: set = set()
         if state is not None:
             now = time.time()
             live = {nid: s for nid, (s, exp) in (state.get("primed_nodes") or {}).items()
                     if exp > now}
             if live:
+                surfaced_ids = {item.get("node_id") for item in surfaced}
                 for item in surfaced:
                     nid = item.get("node_id")
                     if nid and nid in live:
                         item["strength"] = item.get("strength", 0.0) + _CC_ANTICIPATE_BONUS
+
+                # Pith Stage 4 (#55) predictive promotion, phase 5a: today a
+                # primed node only ever helps if the query-driven harvest
+                # independently finds it too -- prefetch exists for exactly
+                # the opposite case, surfacing predicted content the harvest
+                # MISSED. Gated (byte-identical when off, _CC_PITH_PREFETCH_
+                # ENABLED default "0"); pure-additive candidate injection with
+                # no hard override -- cc_gsg_rescore and downstream rank/
+                # budget still decide whether a promoted node survives (a
+                # weak prediction still loses to a strong harvest hit).
+                if _CC_PITH_PREFETCH_ENABLED:
+                    for nid, primed_score in live.items():
+                        if nid in surfaced_ids:
+                            continue
+                        try:
+                            if ng.graph is None or nid not in ng.graph.nodes:
+                                continue
+                            surfaced.append({"node_id": nid, "strength": _CC_ANTICIPATE_BONUS})
+                            surfaced_ids.add(nid)
+                            promoted_ids.add(nid)
+                        except Exception as exc:
+                            logger.debug("Pith predictive promotion skipped node %r (non-fatal): %s", nid, exc)
+                    if promoted_ids:
+                        _PITH_METRICS.promoted_predicted += len(promoted_ids)
+
                 surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
 
         # GSG geodesic re-score -- canonical rpc.py:2991-3038
         surfaced = cc_gsg_rescore(surfaced, query, ng.graph)
+
+        # Pith Stage 4 (#55) proximity-keyed LOD (spec sec 4c): a promoted-
+        # but-unsurfaced line beyond the distance threshold is staged as a
+        # keyframe summary rather than full content -- near predictions are
+        # trusted at full resolution, far ones cost less if they turn out
+        # irrelevant. Query direction is only computed when there's a
+        # promoted candidate to stage (no extra embed cost otherwise).
+        query_dir = None
+        if promoted_ids:
+            try:
+                from ng_embed import embed as _embed
+                query_dir = _cc_embed_to_poincare_dir(_embed(query))
+            except Exception as exc:
+                logger.debug("Pith LOD query embed failed (non-fatal): %s", exc)
+                query_dir = None
 
         out = []
         for r in surfaced:
@@ -1518,6 +1574,13 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)
             if not text:
                 continue
+            if nid in promoted_ids and query_dir is not None:
+                try:
+                    dist = _cc_node_query_distance(node, query_dir)
+                    if dist is not None and dist > _CC_PITH_PREFETCH_LOD_DIST:
+                        text, _ = pith_stage2_keyframe(text, max_chars=_CC_PITH_PREFETCH_SUMMARY_CHARS, query=query)
+                except Exception as exc:
+                    logger.debug("Pith LOD staging failed for %r (non-fatal): %s", nid, exc)
             out.append({"node_id": nid, "score": r.get("strength", 0.0), "content": text})
 
         # Lever 2: selectivity re-rank (gated). Divide each candidate's strength
@@ -1536,7 +1599,18 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                 item["score"] = item["score"] / (fre + eps)
             out.sort(key=lambda x: x["score"], reverse=True)
 
-        return out[:k]
+        final = out[:k]
+        # Pith Stage 4 (#55) §13.3 measurement: a "hit" here is scoped to what
+        # this function can see -- a promoted-and-unsurfaced node that
+        # survived ranking into this turn's returned set. It is an honest
+        # lower bound on the true L1-survival ratio (pith_stage3's later
+        # budget cut can still drop it) -- see spec sec 6 def-of-done.
+        if promoted_ids:
+            survived = sum(1 for item in final if item.get("node_id") in promoted_ids)
+            if survived:
+                _PITH_METRICS.prefetch_hits += survived
+
+        return final
     except Exception as exc:
         logger.debug("cc_pattern_completion_recall failed (non-fatal): %s", exc)
         return []
@@ -1638,6 +1712,18 @@ _CC_NOVELTY_EMA_GAIN = 0.1
 # same cadence for CC's rebuilds as Syl's. Not a new invented value.
 _CC_LENIA_CHECKPOINT_INTERVAL_SECS: float = 300.0
 
+# --- Pith Stage 4 (#55) predictive promotion -- LAW 5 env knobs ---
+# Gated OFF by default: unset -> cc_pattern_completion_recall's promotion
+# block never fires, byte-identical to the pre-Stage-4 bonus-only behavior.
+# See docs/superpowers/plans/2026-07-22-pith-stage4-spec.md sec 4/5a.
+_CC_PITH_PREFETCH_ENABLED = os.environ.get("CC_PITH_PREFETCH_ENABLED", "0") not in ("0", "false", "False", "")
+# Poincare/angular distance (see _cc_node_query_distance) beyond which a
+# promoted-but-unsurfaced predicted node is staged as a keyframe summary
+# instead of full content (proximity-keyed LOD, spec sec 4c) -- near
+# predictions are trusted at full resolution, far ones cost less if wrong.
+_CC_PITH_PREFETCH_LOD_DIST = float(os.environ.get("CC_PITH_PREFETCH_LOD_DIST", "1.5"))
+_CC_PITH_PREFETCH_SUMMARY_CHARS = max(60, min(1000, int(os.environ.get("CC_PITH_PREFETCH_SUMMARY_CHARS", "150"))))
+
 
 def _cc_poincare_distance(x, y) -> float:
     """Geodesic distance in the Poincaré ball — verbatim port of canonical's
@@ -1652,6 +1738,38 @@ def _cc_poincare_distance(x, y) -> float:
     denom = (1.0 - nx2) * (1.0 - ny2)
     arg = 1.0 + num / max(denom, 1e-9)
     return math.acosh(max(1.0, arg))
+
+
+def _cc_node_query_distance(node, query_dir) -> Optional[float]:
+    """Geodesic (hyperbolic) or angular (spherical) distance between a node's
+    stamped GSG direction and a query direction -- MIRRORS the per-node branch
+    cc_gsg_rescore computes for its bonus (kept as a separate copy, NOT a
+    factor-out: cc_gsg_rescore is a verbatim #358 canonical port and is left
+    untouched). If the two ever need to diverge-proof, refactor both together.
+    Lets Pith Stage 4's proximity-keyed LOD staging (#55, spec sec 4c)
+    threshold on the same distance without re-deriving the manifold branch.
+
+    Returns None when the node has no 'poincare_dir' stamp (nothing to
+    compare -- caller treats that as "can't tell, don't downgrade") or on any
+    error; never raises.
+    """
+    try:
+        pdir = (node.metadata or {}).get("poincare_dir") if hasattr(node, "metadata") else None
+        if pdir is None:
+            return None
+        import numpy as _np
+        import math as _math
+        layer = max(0, min(2, getattr(node, "diffpc_layer", 0)))
+        mtype = getattr(node, "manifold_type", "hyperbolic")
+        if mtype == "spherical":
+            node_dir = _np.array(pdir, dtype=_np.float32)
+            cos = float(_np.clip(_np.dot(query_dir, node_dir), -1.0 + 1e-7, 1.0 - 1e-7))
+            return _math.acos(cos)
+        node_pt = _np.array(pdir) * _CC_GSG_LAYER_NORMS[layer]
+        query_pt = _np.array(query_dir) * _CC_GSG_LAYER_NORMS[0]
+        return _cc_poincare_distance(query_pt, node_pt)
+    except Exception:
+        return None
 
 
 def cc_novelty(state: dict, graph) -> float:
@@ -1898,6 +2016,8 @@ class PithMetrics:
     budget_chars_used: int = 0
     compressed_count: int = 0
     chars_saved: int = 0
+    promoted_predicted: int = 0
+    prefetch_hits: int = 0
 
     def reset(self) -> None:
         self.total_lines_in = 0
@@ -1910,6 +2030,8 @@ class PithMetrics:
         self.budget_chars_used = 0
         self.compressed_count = 0
         self.chars_saved = 0
+        self.promoted_predicted = 0
+        self.prefetch_hits = 0
 
     def record_failure(self) -> None:
         """Bump the fail-soft counter -- the Pith path swallows exceptions and
@@ -1930,6 +2052,8 @@ class PithMetrics:
             "budget_chars_used": self.budget_chars_used,
             "compressed_count": self.compressed_count,
             "chars_saved": self.chars_saved,
+            "promoted_predicted": self.promoted_predicted,
+            "prefetch_hits": self.prefetch_hits,
         }
 
 
