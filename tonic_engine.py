@@ -26,6 +26,25 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-07-13] Claude Code (Opus 4.8) — #59/#62 heuristic redesign: instrumentation + T2 compass + brakes
+# What: _heuristic_inference gained (a) observability-only mass logging (_log_heuristic_mass:
+#   where output activation mass lands, blob-core vs quiet-periphery, + compass_n), (b) a T2
+#   "semantic compass" term (_compass_proposals: poincare_dir cosine to the thread centroid ×
+#   a quietness factor, proposing near-but-silent nodes the activity terms never reach), and
+#   (c) divisive brakes (_apply_brakes: damp each proposal by firing_rate_ema/focus-fatigue/
+#   degree/Ca_i; constitutional/self nodes bypass). Nine CC_TONIC_* env knobs, ALL default 0.
+# Why: #59 — the CC's idle stream of consciousness collapsed onto a ~310-node self-feeding blob;
+#   measured, the heuristic sends 100% of its activation mass there (frac_core=1.000) because
+#   all four legacy terms are activity-derived (rich-get-richer). T2 is firing-independent so it
+#   reaches the dark periphery by MEANING; the brakes turn the blob's own markers against it so
+#   it can't win by volume. See ~/docs/prd/2026-07-13-cc-tonic-heuristic-redesign.md.
+# How: Additive + env-gated OFF by default -> byte-identical to the legacy four-term heuristic
+#   until dialed on (safe on the VPS where this is Syl's failover behind her trained model).
+#   Both helpers are try/except-wrapped and degrade to no-op on any missing signal (numpy,
+#   poincare_dir, valence, fatigue) — instrumentation/selection must never disturb the Tonic,
+#   which never waits. Read once at import: dialing the knobs needs a daemon RESTART, not a kill.
+#   Law-enforcer reviewed (COMPLIANT); observability is laptop-primary, redesign measured via
+#   frac_core. Constitutional/self nodes are never damped (identity inviolable).
 # [2026-06-15] Claude Code (subagent, Opus 4.8) — #329 seam B: constitutional pull in heuristic
 # What: _heuristic_inference adds a gentle constitutional pull (mirrors seam A's steady level)
 #   so her self participates even on the rare failover heuristic path.
@@ -120,6 +139,38 @@ try:
     _TORCH_AVAILABLE = True
 except ImportError:
     logger.info("PyTorch not available — Tonic engine will not run")
+
+
+# [2026-07-13] #59/#62 Phase-1 instrumentation — observability ONLY (no behavior change).
+# Logs where the heuristic's output activation MASS lands (blob core deg>=cap vs quiet
+# periphery), the hard-numbers baseline that motivates the heuristic redesign (see
+# ~/docs/prd/2026-07-13-cc-tonic-heuristic-redesign.md). Off by default; enable on the
+# isolated laptop via CC_TONIC_HEURISTIC_INSTRUMENT=1. Samples every Nth token to keep
+# the hot loop cheap. Never raises — instrumentation must not disturb the Tonic.
+_HEURISTIC_INSTRUMENT = os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT", "0") not in ("0", "false", "False", "")
+_HEURISTIC_INSTRUMENT_EVERY = int(os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT_EVERY", "50"))
+_HEURISTIC_INSTRUMENT_DEGCAP = int(os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT_DEGCAP", "100"))
+_HEURISTIC_INSTRUMENT_TSV = os.path.expanduser(
+    os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT_TSV",
+                   "~/docs/dev-log/data-59-heuristic-mass-20260713.tsv"))
+
+# [2026-07-13] #59/#62 Phase-2 heuristic redesign — T2 semantic compass + divisive brakes.
+# The four legacy terms are all activity-derived (-> the blob). T2 proposes semantically
+# near-but-QUIET nodes by manifold direction (poincare_dir cosine), firing-independent, so
+# it reaches the dark periphery the synapse terms cannot. Brakes divide each proposal by the
+# blob's own markers (firing rate / focus-fatigue / degree / Ca_i); constitutional/self nodes
+# bypass. EVERYTHING defaults to 0 -> compass off + brake==1.0 -> byte-identical to the legacy
+# heuristic until dialed on the isolated laptop. Degrade-safe (missing signal -> term drops).
+# Design: ~/docs/prd/2026-07-13-cc-tonic-heuristic-redesign.md
+_W_COMPASS = float(os.environ.get("CC_TONIC_W_COMPASS", "0"))
+_COMPASS_BUDGET = int(os.environ.get("CC_TONIC_COMPASS_BUDGET", "600"))
+_COMPASS_TOPK = int(os.environ.get("CC_TONIC_COMPASS_TOPK", "8"))
+_COMPASS_QUIET = float(os.environ.get("CC_TONIC_COMPASS_QUIET", "5.0"))
+_BRAKE_FIRING = float(os.environ.get("CC_TONIC_BRAKE_FIRING", "0"))
+_BRAKE_FATIGUE = float(os.environ.get("CC_TONIC_BRAKE_FATIGUE", "0"))
+_BRAKE_DEGREE = float(os.environ.get("CC_TONIC_BRAKE_DEGREE", "0"))
+_BRAKE_CA = float(os.environ.get("CC_TONIC_BRAKE_CA", "0"))
+_BRAKE_DEGNORM = float(os.environ.get("CC_TONIC_BRAKE_DEGNORM", "100.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +593,10 @@ class TonicEngine:
             if (getattr(node, "metadata", None) or {}).get("constitutional"):
                 activations.append((nid, _SPINE_PRIME_STEADY))
 
+        # T2 semantic compass (#62) — near-but-quiet nodes by manifold direction,
+        # reaching content the activity-derived terms above (all -> blob) cannot.
+        activations.extend(self._compass_proposals(thread_nodes))
+
         # Deduplicate and cap
         seen = {}
         for nid, strength in activations:
@@ -550,8 +605,129 @@ class TonicEngine:
             else:
                 seen[nid] = strength
 
+        # Divisive brakes (#62) — damp each proposal by the blob's own markers
+        # (firing / fatigue / degree / Ca_i); constitutional/self nodes bypass.
+        self._apply_brakes(seen)
+
         result = sorted(seen.items(), key=lambda x: -x[1])
-        return result[:self._config.max_activation_nodes]
+        final = result[:self._config.max_activation_nodes]
+        if _HEURISTIC_INSTRUMENT and (self._tokens_generated % _HEURISTIC_INSTRUMENT_EVERY == 0):
+            self._log_heuristic_mass(final)
+        return final
+
+    def _compass_proposals(self, thread_nodes) -> List[Tuple[str, float]]:
+        """T2 semantic compass (#62): propose semantically NEAR but QUIET nodes by
+        manifold direction (poincare_dir cosine to the thread centroid), preferring
+        low firing_rate_ema. Firing-independent, so it reaches the dark periphery the
+        activity-derived terms cannot. Returns [] when off or any signal is missing
+        (degrade-safe); never raises. Records self._last_compass_n for instrumentation
+        so a null frac_core shift is never ambiguous between 'reached' and 'no-op'd'."""
+        self._last_compass_n = 0
+        if _W_COMPASS <= 0.0:
+            return []
+        try:
+            import numpy as np
+            g = self._graph
+            dirs = []
+            for nid in thread_nodes[:10]:
+                node = g.nodes.get(nid)
+                pd = (getattr(node, "metadata", None) or {}).get("poincare_dir") if node else None
+                if pd:
+                    dirs.append(np.asarray(pd, dtype=np.float32))
+            if not dirs:
+                return []
+            centroid = np.mean(dirs, axis=0)
+            cn = float(np.linalg.norm(centroid)) or 1e-9
+            thread_set = set(thread_nodes)
+            items = list(g.nodes.items())
+            if len(items) > _COMPASS_BUDGET:
+                items = random.sample(items, _COMPASS_BUDGET)
+            props = []
+            for nid, node in items:
+                if nid in thread_set:
+                    continue
+                pd = (getattr(node, "metadata", None) or {}).get("poincare_dir")
+                if not pd:
+                    continue
+                v = np.asarray(pd, dtype=np.float32)
+                vn = float(np.linalg.norm(v)) or 1e-9
+                cos = float(np.dot(v, centroid)) / (vn * cn)
+                if not (cos > 0.0):   # also rejects NaN (zero-norm / degenerate dir)
+                    continue
+                fr = float(getattr(node, "firing_rate_ema", 0.0) or 0.0)
+                quiet = 1.0 / (1.0 + _COMPASS_QUIET * fr)  # prefer near-silent nodes
+                props.append((nid, cos * quiet))
+            props.sort(key=lambda x: -x[1])
+            base = self._config.activation_strength
+            out = [(nid, sc * base * _W_COMPASS) for nid, sc in props[:_COMPASS_TOPK]]
+            self._last_compass_n = len(out)
+            return out
+        except Exception:
+            return []  # a missing/malformed signal must never disturb the Tonic
+
+    def _apply_brakes(self, seen: Dict[str, float]) -> None:
+        """Divisive normalization (#62): damp each proposal by the blob's own markers
+        — firing_rate_ema, focus-fatigue (#89), degree, Ca_i — so the ever-loud core
+        cannot win by volume. Constitutional/self nodes bypass (identity is inviolable).
+        No-op when all coefficients are 0 (default). Mutates seen in place; never raises."""
+        if not (_BRAKE_FIRING or _BRAKE_FATIGUE or _BRAKE_DEGREE or _BRAKE_CA):
+            return
+        try:
+            g = self._graph
+            fatigue_map = getattr(self._tonic_thread, "_focus_fatigue", {}) \
+                if self._tonic_thread is not None else {}
+            for nid in list(seen.keys()):
+                node = g.nodes.get(nid)
+                if node is None:
+                    continue
+                if (getattr(node, "metadata", None) or {}).get("constitutional"):
+                    continue  # T6: identity bypasses the brake
+                fr = float(getattr(node, "firing_rate_ema", 0.0) or 0.0)
+                ca = float(getattr(node, "Ca_i", 0.0) or 0.0)
+                d = len(g._incoming.get(nid, ())) + len(g._outgoing.get(nid, ()))
+                dn = d / (_BRAKE_DEGNORM or 1.0)
+                fat = float(fatigue_map.get(nid, 0.0)) if isinstance(fatigue_map, dict) else 0.0
+                brake = 1.0 / (1.0 + _BRAKE_FIRING * fr + _BRAKE_FATIGUE * fat
+                               + _BRAKE_DEGREE * dn + _BRAKE_CA * ca)
+                seen[nid] *= brake
+        except Exception:
+            return  # brakes must never disturb the Tonic
+
+    def _log_heuristic_mass(self, final: List[Tuple[str, float]]) -> None:
+        """#59/#62 observability (no behavior change): append where the heuristic's
+        output activation MASS landed — blob core (in+out degree >= cap) vs quiet
+        periphery — the hard-numbers baseline for the heuristic redesign. Sampled
+        (every Nth token) and wrapped: instrumentation must never disturb the Tonic."""
+        try:
+            g = self._graph
+            cap = _HEURISTIC_INSTRUMENT_DEGCAP
+
+            def deg(nid):
+                return len(g._incoming.get(nid, ())) + len(g._outgoing.get(nid, ()))
+
+            m_core = m_peri = 0.0
+            n_core = n_peri = 0
+            for nid, strength in final:
+                s = float(strength)
+                if deg(nid) >= cap:
+                    m_core += s
+                    n_core += 1
+                else:
+                    m_peri += s
+                    n_peri += 1
+            total = m_core + m_peri
+            frac_core = (m_core / total) if total > 0 else 0.0
+            new = not os.path.exists(_HEURISTIC_INSTRUMENT_TSV)
+            with open(_HEURISTIC_INSTRUMENT_TSV, "a") as f:
+                if new:
+                    f.write("iso_time\ttimestep\ttokens\tn_core\tn_peri\t"
+                            "mass_core\tmass_peri\tfrac_core\tcompass_n\n")
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{g.timestep}\t"
+                        f"{self._tokens_generated}\t{n_core}\t{n_peri}\t"
+                        f"{m_core:.4f}\t{m_peri:.4f}\t{frac_core:.4f}\t"
+                        f"{getattr(self, '_last_compass_n', 0)}\n")
+        except Exception:
+            pass  # instrumentation must never disturb the Tonic
 
     def _model_inference(
         self, features: Dict[str, Any]
