@@ -344,6 +344,158 @@ def test_drain_ingest_tract_return_consumed_matches_what_was_truncated(cc_ng, tm
     assert replay_absorbed >= 1
 
 
+# =============================================================================
+# max_entries -- turn-granular batching (FatherGraph Finding 1).
+# Real ng_tract files and the real drain_ingest_tract byte path: these prove
+# the PARTIAL TRUNCATE actually works, which is the whole basis of the cap.
+# Before this, batch_size was enforced only per-FILE -- one drain call
+# swallowed a whole conduit file however large, so a 500-turn file merged 500
+# turns with no consolidation between them and held _concurrent_lock for all
+# 500 embeds. Stubbing the drain here would test nothing; the risk lives
+# entirely in the offset arithmetic against the real (compiled) TractReader.
+# =============================================================================
+
+def _deposit_turns(tract_path, n, tag="cap"):
+    import ng_tract
+    for i in range(n):
+        ng_tract.deposit_experience(
+            content=f"{tag} turn number {i}".encode(), source="cc_gateway",
+            tract_path=tract_path, content_type="text",
+        )
+
+
+def test_drain_ingest_tract_max_entries_caps_absorption_and_keeps_remainder(cc_ng, tmp_path):
+    """5 turns, max_entries=2 -> absorb exactly 2, and the file must still hold
+    the other 3 as VALID, PARSEABLE tract data. This is the load-bearing claim:
+    a partial truncate at a TractReader.position() offset leaves a remainder
+    that is itself a well-formed tract, not a corrupt tail."""
+    import ng_tract
+    tract_path = str(tmp_path / "turns.tract")
+    _deposit_turns(tract_path, 5)
+    full_size = os.path.getsize(tract_path)
+    state = {"last_forest_id": None}
+
+    absorbed = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state,
+                                  tract_path=tract_path, max_entries=2)
+
+    assert absorbed == 2, "cap must stop at exactly max_entries turns"
+    remaining_size = os.path.getsize(tract_path)
+    assert 0 < remaining_size < full_size, "remainder must survive, and be smaller"
+
+    with open(tract_path, "rb") as f:
+        tail = f.read()
+    tail_contents = [e.content for e in ng_tract.TractReader(tail)]
+    assert tail_contents == ["cap turn number 2", "cap turn number 3", "cap turn number 4"], (
+        "the untouched remainder must parse standalone, in order, with nothing "
+        f"dropped or duplicated -- got {tail_contents}")
+
+
+def test_drain_ingest_tract_repeated_capped_calls_drain_every_turn_exactly_once(cc_ng, tmp_path):
+    """Draining 5 turns two-at-a-time must yield 2+2+1 and then stop, with the
+    file gone to zero. No turn absorbed twice, none stranded -- the property the
+    conduit loop depends on when it comes back to a partially-drained file."""
+    tract_path = str(tmp_path / "turns.tract")
+    _deposit_turns(tract_path, 5)
+    state = {"last_forest_id": None}
+
+    counts = []
+    for _ in range(4):
+        if not os.path.exists(tract_path) or os.path.getsize(tract_path) == 0:
+            break
+        counts.append(drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state,
+                                         tract_path=tract_path, max_entries=2))
+
+    assert counts == [2, 2, 1], f"expected 2+2+1 across capped calls, got {counts}"
+    assert os.path.getsize(tract_path) == 0, "file must be fully drained at the end"
+
+
+def test_drain_ingest_tract_max_entries_zero_is_byte_identical_to_uncapped(cc_ng, tmp_path):
+    """max_entries=0 (the default) must behave EXACTLY as before the cap
+    existed: whole file drained, whole file consumed. Guards the ~dozen
+    pre-existing callers that pass no cap at all."""
+    tract_path = str(tmp_path / "turns.tract")
+    _deposit_turns(tract_path, 4)
+    with open(tract_path, "rb") as f:
+        original = f.read()
+    state = {"last_forest_id": None}
+
+    absorbed, consumed = drain_ingest_tract(
+        cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path,
+        return_consumed=True, max_entries=0)
+
+    assert absorbed == 4
+    assert consumed == original, "uncapped drain must still consume the entire file"
+    assert os.path.getsize(tract_path) == 0
+
+
+def test_drain_ingest_tract_capped_consumed_bytes_are_exactly_the_removed_prefix(cc_ng, tmp_path):
+    """A capped drain must report as `consumed` ONLY the prefix it removed --
+    never the whole file it read. Over-reporting here is the duplicate-ingestion
+    bug in reverse for Leg 1: the laptop would trickle turns to the VPS that it
+    had not actually taken out of its own file, then take them again next pulse."""
+    tract_path = str(tmp_path / "turns.tract")
+    _deposit_turns(tract_path, 5)
+    with open(tract_path, "rb") as f:
+        original = f.read()
+    state = {"last_forest_id": None}
+
+    absorbed, consumed = drain_ingest_tract(
+        cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path,
+        return_consumed=True, max_entries=2)
+
+    assert absorbed == 2
+    assert consumed == original[:len(consumed)], "consumed must be a true prefix of what was read"
+    assert len(consumed) < len(original), "a capped drain must NOT claim the whole file"
+    with open(tract_path, "rb") as f:
+        left_on_disk = f.read()
+    assert consumed + left_on_disk == original, (
+        "consumed bytes + bytes still on disk must reconstruct the original file "
+        "exactly -- nothing lost, nothing double-claimed")
+
+
+def test_drain_gateway_conduit_batches_within_one_oversized_file(tmp_path, draining_hemisphere,
+                                                                  monkeypatch):
+    """THE Finding-1 regression test: a SINGLE conduit file holding more turns
+    than batch_size must be absorbed in batch-sized bites with a consolidation
+    pass between them -- not dumped whole and slept on afterwards.
+
+    Deliberately uses turns_per_file > batch_size, the case the previous suite
+    never exercised (every test used 1 turn per file), which is exactly why the
+    per-file bulk dump went unnoticed.
+
+    Asserts on the STEP COUNT OBSERVED AT EACH DRAIN CALL, not on the total.
+    The total cannot tell the two apart: `while since_sleep >= batch_size`
+    pays down accumulated sleep debt, so a 5-turn bulk dump also ends at 15
+    steps -- it just takes them all AFTER the graph has already swallowed
+    every turn. What distinguishes real interleaving is that the 2nd and 3rd
+    absorptions each begin with consolidation already behind them."""
+    conduit_dir = _make_conduit(tmp_path, 1)
+    g = _CountingGraph()
+
+    # Local stub (not _stub_drain) so it can witness graph.steps at call time.
+    remaining = {"n": 5}
+
+    def _fake(graph, vector_db, state, tract_path=None, return_consumed=False, max_entries=0):
+        graph.step_marks.append(graph.steps)
+        n = min(remaining["n"], max_entries) if max_entries else remaining["n"]
+        remaining["n"] -= n
+        with open(tract_path, "wb") as f:
+            f.write(b"x" * remaining["n"])
+        return n
+    monkeypatch.setattr(cc_ng_organism, "drain_ingest_tract", _fake)
+
+    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
+                                      batch_size=2, idle_steps=5, load_ceiling=999.0)
+
+    assert absorbed == 5, "every turn in the oversized file must still land"
+    assert g.step_marks == [0, 5, 10], (
+        f"expected 3 capped absorptions each preceded by consolidation, got {g.step_marks} "
+        "-- a single mark ([0]) means the whole file was bulk-dumped into the graph "
+        "before any consolidation ran")
+    assert g.steps == 15, f"expected 3 consolidation passes (15 steps), got {g.steps}"
+    assert os.listdir(conduit_dir) == [], "the fully-drained file must be removed"
+
+
 def test_drain_ingest_tract_return_consumed_is_empty_on_missing_file(cc_ng, tmp_path):
     absorbed, consumed = drain_ingest_tract(
         cc_ng.graph, cc_ng.vector_db, {"last_forest_id": None},
@@ -469,11 +621,24 @@ class _CountingGraph:
 
 def _stub_drain(monkeypatch, turns_per_file):
     """Replace drain_ingest_tract with a stub that truncates the file (as the
-    real one does on success) and reports a fixed turn count."""
-    def _fake(graph, vector_db, state, tract_path=None, return_consumed=False):
+    real one does on success) and reports a fixed turn count.
+
+    Honours max_entries the way the real function does: it takes at most that
+    many turns per call and leaves a SMALLER-but-nonempty file behind when
+    turns remain, so the caller's exhausted/quarantine size check sees a
+    genuine partial drain. (Leaving the size unchanged would look like a parse
+    failure and get the file quarantined.)"""
+    remaining = {}
+
+    def _fake(graph, vector_db, state, tract_path=None, return_consumed=False,
+              max_entries=0):
+        left = remaining.get(tract_path, turns_per_file)
+        n = min(left, max_entries) if max_entries else left
+        left -= n
+        remaining[tract_path] = left
         with open(tract_path, "wb") as f:
-            f.write(b"")          # mimic truncate-after-successful-drain
-        return turns_per_file
+            f.write(b"x" * left)  # empty == fully drained; shrinking == more to come
+        return n
     monkeypatch.setattr(cc_ng_organism, "drain_ingest_tract", _fake)
 
 

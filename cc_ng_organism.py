@@ -1439,13 +1439,34 @@ def cc_gateway_tract_path() -> str:
 
 
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
-                        return_consumed: bool = False):
+                        return_consumed: bool = False, max_entries: int = 0):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
     established tract model. Truncates the file after a successful drain
     (single reader, single writer-appender; safe because miniTID only ever
     appends and this is the only drainer).
+
+    max_entries > 0 stops after that many entries have been TAKEN IN (reached
+    the embed/dual-pass attempt) and truncates ONLY the byte span up to the end
+    of the last entry taken; the remainder stays in the file for the next call.
+    0 (default) drains the whole file -- byte-identical to the previous
+    behaviour, since the stop offset then lands exactly at len(data).
+
+    Why a partial truncate is safe here: the tract format is a flat run of
+    self-describing entries with no file-level header (verified against the
+    installed ng_tract 0.1.0 -- 5 entries deposit as exactly 5*56 bytes, and
+    both data[:off] and data[off:] parse standalone at every entry boundary).
+    TractReader.position() -- a METHOD, not a property -- returns the byte
+    offset just past the entry it last yielded, so any position() value is
+    simultaneously a valid end-of-prefix and start-of-remainder.
+
+    The cap counts entries ATTEMPTED, not entries successfully absorbed. That
+    is deliberate: it is what actually bounds the work (and therefore the
+    caller's lock hold), and it guarantees forward progress. Counting only
+    successes would mean a file whose entries all fail the dual-pass never
+    reaches the cap and gets drained in one unbounded pass -- exactly the bulk
+    dump the cap exists to prevent (FatherGraph Finding 1).
 
     Returns the count of entries absorbed (int) by default. If
     return_consumed=True, returns (absorbed, consumed_bytes) instead --
@@ -1488,9 +1509,18 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
         return _ret(0)
 
     absorbed = 0
+    taken = 0
+    # Byte offset just past the last entry we advanced over. Advanced for EVERY
+    # entry, including ones the filters skip -- a skipped entry has still been
+    # looked at, and leaving it in the file would make every later call re-scan
+    # it forever. 0 means we never got past the first entry.
+    consumed_offset = 0
     try:
         reader = ng_tract.TractReader(data)
         for entry in reader:
+            # position() is a bound method on the Rust binding, not a property.
+            # Read it BEFORE the filters so `continue` still consumes the entry.
+            consumed_offset = reader.position()
             # Check entry type using ng_tract.ENTRY_EXPERIENCE (the real module constant)
             if entry.entry_type != ng_tract.ENTRY_EXPERIENCE:
                 continue
@@ -1499,12 +1529,15 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             text = entry.content
             if not text or not text.strip():
                 continue
+            taken += 1
             try:
                 emb = ng_embed_fn(text)
                 if run_conversational_dual_pass(graph, vector_db, text, emb, state):
                     absorbed += 1
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
+            if max_entries and taken >= max_entries:
+                break
     except Exception as exc:
         # Parse failure -- truncate below never runs, so nothing was actually
         # consumed from the file. Elevated to warning (was debug): silent at
@@ -1531,15 +1564,26 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     # laptop's next pulse would re-read and re-trickle the SAME bytes the VPS
     # already absorbed -- duplicate ingestion, the mirror-image of the
     # original data-loss bug this whole return_consumed path exists to fix.)
+    #
+    # The prefix we trim is the span we actually walked, which equals `data`
+    # on an uncapped drain and stops at an entry boundary on a capped one.
+    # Everything downstream (startswith check, remainder, consumed_actual)
+    # keys off THIS, never off `data` -- so a capped drain reports exactly the
+    # bytes it removed and leaves the rest both on disk and unclaimed.
+    consumed_prefix = data[:consumed_offset]
+    if not consumed_prefix:
+        # Never got past the first entry -- nothing to remove. Return without
+        # rewriting the file at all, rather than doing a no-op full rewrite.
+        return _ret(absorbed)
     consumed_actual = b""
     try:
         with open(path, "rb") as f:
             current = f.read()
-        if current.startswith(data):
-            remainder = current[len(data):]
+        if current.startswith(consumed_prefix):
+            remainder = current[len(consumed_prefix):]
             with open(path, "wb") as f:
                 f.write(remainder)
-            consumed_actual = data  # only now -- the write actually succeeded
+            consumed_actual = consumed_prefix  # only now -- the write actually succeeded
         else:
             # Someone else touched the file since our read (not the plain
             # append-only case we can safely trim a known prefix from).
@@ -1759,80 +1803,112 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
     total = 0
     since_sleep = 0
     files_done = 0
+    batches_done = 0
+    stop_for_load = False
     for path in paths:
-        # Backpressure is THROTTLING A FLOWING RIVER, not damming it before the
-        # first drop: the load gate only applies BETWEEN batches, never before
-        # the first file. Checked-first (the 2026-07-28 bug) meant that on any
-        # box above the ceiling the whole callosum was a silent no-op -- absorbed
-        # nothing, logged nothing (the `if total:` summary is skipped at 0), and
-        # let conduit files accumulate forever in a git-synced dir while looking
-        # like success. Own ceiling env, not cc_refeed's: that 0.75 is tuned for
-        # an opportunistic re-feed that can back off all day, whereas this is a
-        # once-nightly path that must make progress.
-        if files_done > 0 and _should_pause is not None:
+        # Each file is drained in BATCH-SIZED BITES, not in one gulp. Before
+        # the entry cap existed, one drain_ingest_tract call swallowed a whole
+        # conduit file regardless of batch_size, so a 500-turn file merged 500
+        # turns of foreign topology with no consolidation between them and only
+        # then slept -- the exact "bulk dump" FatherGraph Finding 1 forbids,
+        # failing hardest on the biggest files. It also pinned _concurrent_lock
+        # for all 500 embeds+dual-passes, the long-hold shape that produced the
+        # _recall() hook timeouts in cc_ng_host.py's changelog (and which
+        # _cc_callosum_consolidate already slices up for exactly that reason).
+        # Now: absorb <= batch_size, release the lock, consolidate, come back.
+        while True:
+            # Backpressure is THROTTLING A FLOWING RIVER, not damming it before the
+            # first drop: the load gate only applies BETWEEN batches, never before
+            # the first one. Checked-first (the 2026-07-28 bug) meant that on any
+            # box above the ceiling the whole callosum was a silent no-op -- absorbed
+            # nothing, logged nothing (the `if total:` summary is skipped at 0), and
+            # let conduit files accumulate forever in a git-synced dir while looking
+            # like success. Own ceiling env, not cc_refeed's: that 0.75 is tuned for
+            # an opportunistic re-feed that can back off all day, whereas this is a
+            # once-nightly path that must make progress.
+            if batches_done > 0 and _should_pause is not None:
+                try:
+                    paused = _should_pause(ceiling)
+                except Exception:
+                    paused = False
+                if paused:
+                    logger.info(
+                        "CC callosum Leg1: load above ceiling %.2f -- stopping after %d file(s), "
+                        "%d batch(es), %d turn(s); %d file(s) left on disk for the next run "
+                        "(backpressure)",
+                        ceiling, files_done, batches_done, total, len(paths) - files_done)
+                    stop_for_load = True
+                    break
             try:
-                paused = _should_pause(ceiling)
-            except Exception:
-                paused = False
-            if paused:
-                logger.info(
-                    "CC callosum Leg1: load above ceiling %.2f -- stopping after %d file(s), "
-                    "%d turn(s); %d file(s) left on disk for the next run (backpressure)",
-                    ceiling, files_done, total, len(paths) - files_done)
+                size_before = os.path.getsize(path)
+            except Exception as exc:
+                logger.debug("CC callosum Leg1 conduit stat failed for %s (non-fatal): %s", path, exc)
                 break
-        try:
-            size_before = os.path.getsize(path)
-        except Exception as exc:
-            logger.debug("CC callosum Leg1 conduit stat failed for %s (non-fatal): %s", path, exc)
-            continue
-        try:
-            # LAW 4 / two-writer safety: absorption MUTATES the graph, so it must
-            # hold _concurrent_lock -- drain_ingest_tract does not take it itself
-            # (it calls run_conversational_dual_pass directly, which also doesn't),
-            # and the autosave thread does ng.save() under this same lock every
-            # 60s. At HEAD this was covered incidentally because the call site sat
-            # inside _autosave_loop's lock block; moving it to a socket handler
-            # (one thread per connection) silently dropped that cover. Taken
-            # PER FILE and released between files, so a long run never starves
-            # hooks -- cc_ng_host.py's changelog records _recall() hook timeouts
-            # from exactly that kind of long hold.
-            _lock = getattr(graph, "_concurrent_lock", None)
-            if _lock is not None:
-                with _lock:
-                    absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path)
-            else:
-                absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path)
-        except Exception as exc:
-            logger.debug("CC callosum Leg1 conduit drain failed for %s (non-fatal): %s", path, exc)
-            continue
-        total += absorbed
-        since_sleep += absorbed
-        files_done += 1
-        try:
-            size_after = os.path.getsize(path)
-            if size_after == 0:
-                os.remove(path)
-            elif size_after == size_before:
-                # Never truncated at all -- drain_ingest_tract's parse step
-                # itself failed (the only path that skips truncate). Retrying
-                # forever would let a format-skew file pile up invisibly in a
-                # git-synced dir; quarantine it loudly instead.
-                qdir = os.path.join(conduit_dir, "quarantine")
-                os.makedirs(qdir, exist_ok=True)
-                dest = os.path.join(qdir, os.path.basename(path))
-                os.replace(path, dest)
-                logger.warning(
-                    "CC callosum Leg1: %s failed to parse (untouched, %d bytes) -- "
-                    "quarantined to %s instead of retrying forever", path, size_before, dest)
-        except Exception as exc:
-            logger.debug("CC callosum Leg1 conduit cleanup failed for %s (non-fatal): %s", path, exc)
+            try:
+                # LAW 4 / two-writer safety: absorption MUTATES the graph, so it must
+                # hold _concurrent_lock -- drain_ingest_tract does not take it itself
+                # (it calls run_conversational_dual_pass directly, which also doesn't),
+                # and the autosave thread does ng.save() under this same lock every
+                # 60s. At HEAD this was covered incidentally because the call site sat
+                # inside _autosave_loop's lock block; moving it to a socket handler
+                # (one thread per connection) silently dropped that cover. Taken
+                # PER BATCH and released between batches, so a long run never starves
+                # hooks -- cc_ng_host.py's changelog records _recall() hook timeouts
+                # from exactly that kind of long hold.
+                _lock = getattr(graph, "_concurrent_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path,
+                                                      max_entries=batch_size)
+                else:
+                    absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path,
+                                                  max_entries=batch_size)
+            except Exception as exc:
+                logger.debug("CC callosum Leg1 conduit drain failed for %s (non-fatal): %s", path, exc)
+                break
+            total += absorbed
+            since_sleep += absorbed
+            batches_done += 1
 
-        # Finding 3: sleep BEFORE accepting the next batch, not after the run.
-        while since_sleep >= batch_size:
-            if _cc_callosum_consolidate(graph, idle_steps):
-                logger.info("CC callosum Leg1: consolidation pass (%d idle steps) after "
-                            "%d-turn batch", idle_steps, batch_size)
-            since_sleep -= batch_size
+            # `exhausted` decides whether to come back to THIS file. Default True
+            # (leave) so any unexpected cleanup failure moves on rather than
+            # re-draining the same path forever.
+            exhausted = True
+            try:
+                size_after = os.path.getsize(path)
+                if size_after == 0:
+                    os.remove(path)
+                elif size_after == size_before:
+                    # Never truncated at all -- drain_ingest_tract's parse step
+                    # itself failed (the only path that skips truncate). Retrying
+                    # forever would let a format-skew file pile up invisibly in a
+                    # git-synced dir; quarantine it loudly instead.
+                    qdir = os.path.join(conduit_dir, "quarantine")
+                    os.makedirs(qdir, exist_ok=True)
+                    dest = os.path.join(qdir, os.path.basename(path))
+                    os.replace(path, dest)
+                    logger.warning(
+                        "CC callosum Leg1: %s failed to parse (untouched, %d bytes) -- "
+                        "quarantined to %s instead of retrying forever", path, size_before, dest)
+                else:
+                    # Shrank but not to empty: the cap stopped us mid-file and the
+                    # remainder is still there. Consolidate, then come back for it.
+                    exhausted = False
+            except Exception as exc:
+                logger.debug("CC callosum Leg1 conduit cleanup failed for %s (non-fatal): %s", path, exc)
+
+            # Finding 3: sleep BEFORE accepting the next batch, not after the run.
+            while since_sleep >= batch_size:
+                if _cc_callosum_consolidate(graph, idle_steps):
+                    logger.info("CC callosum Leg1: consolidation pass (%d idle steps) after "
+                                "%d-turn batch", idle_steps, batch_size)
+                since_sleep -= batch_size
+
+            if exhausted:
+                break
+        files_done += 1
+        if stop_for_load:
+            break
 
     # Trailing partial batch still needs its consolidation before the graph
     # goes back to serving recall on freshly-merged topology.
@@ -1842,8 +1918,8 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
                         "trailing %d-turn batch", idle_steps, since_sleep)
 
     if total:
-        logger.info("CC callosum Leg1: absorbed %d turn(s) from %d conduit file(s) "
-                    "(batch=%d, idle_steps=%d)", total, files_done, batch_size, idle_steps)
+        logger.info("CC callosum Leg1: absorbed %d turn(s) from %d conduit file(s) in %d batch(es) "
+                    "(batch=%d, idle_steps=%d)", total, files_done, batches_done, batch_size, idle_steps)
     return total
 
 
