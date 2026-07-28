@@ -1,5 +1,43 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70): raw-turn
+#   conduit, laptop -> VPS Arborist
+# What: New cc_gateway_conduit_dir()/trickle_gateway_conduit()/drain_gateway_
+#   conduit() in the same region as cc_gateway_tract_path()/drain_ingest_tract().
+#   trickle_gateway_conduit(data) writes a snapshot of the laptop's cc_gateway
+#   tract bytes to a uniquely-named per-batch file (laptop_cc_gateway.<ts>_
+#   <uuid8>.tract) in the git-synced ~/docs/ng_topology dir. drain_gateway_
+#   conduit(graph, vector_db, state) is the VPS-side counterpart: globs every
+#   laptop_cc_gateway.*.tract file in that dir, runs each through the existing
+#   drain_ingest_tract() (unchanged), then deletes the now-emptied file.
+# Why: Retires the lossy top-N JSONL sync (cc-ng-sync.py: content-only, capped
+#   at EXPORT_SIZE, re-embedded via on_message() with no synapses/hyperedges/
+#   tree structure). The laptop does zero embedding by design (no forest, no
+#   tree, no TID) -- the VPS is the sole Arborist for both hemispheres. This
+#   is the pipe that gets the laptop's raw BTF conversation frames onto the
+#   VPS so they hit the same run_conversational_dual_pass() the VPS already
+#   runs for its own local tract. Spec: docs/superpowers/plans/2026-07-27-
+#   cc-corpus-callosum-leg1-spec.md.
+# How: Per-batch filenames (not a shared append/truncate target) sidestep the
+#   binary-merge-conflict scenario a single conduit file would hit under
+#   repo-sync.sh's git push/pull cycle (git can't line-merge BTF) -- each
+#   trickle-copy is one immutable file, atomically materialized via write-tmp
+#   -then-rename so a mid-write crash or an in-flight repo-sync.sh push never
+#   observes a partial file. Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5, default
+#   off) on both the laptop write side and the VPS drain side independently --
+#   symmetric gate-off means neither half does anything until both are flipped
+#   on. drain_ingest_tract() itself is untouched (no signature/behavior change,
+#   no reordering of its existing local-drain call site); the snapshot read
+#   that feeds trickle_gateway_conduit() is a separate, additional read of the
+#   same tract path performed by the caller (cc-ng-daemon.py's autosave pulse)
+#   immediately before the existing drain_ingest_tract() call -- pure read, no
+#   truncate, so the local drain's own truncate-after-drain lifecycle is
+#   completely untouched. Accepted narrow race: bytes miniTID appends between
+#   that snapshot read and drain_ingest_tract()'s own (immediately following)
+#   read ride along into drain's local truncate but are NOT in the snapshot,
+#   so they reach the laptop's own forest but miss this pulse's conduit copy --
+#   caught by the next pulse's snapshot instead (miniTID only ever appends;
+#   nothing is lost, just delayed one pulse). See test_cc_callosum_leg1.py.
 # [2026-07-22] Claude Code (Sonnet 5) — CC Recall Unification (LAW-3/"keep even")
 # What: New cc_assemble_recall(ng, query, k, conv_state, commons,
 #   allow_pattern_completion=True) -- THE shared recall pipeline for both
@@ -392,12 +430,14 @@ arousal, stats, persist/restore).
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -1373,7 +1413,8 @@ def cc_gateway_tract_path() -> str:
     return os.environ.get("CC_GATEWAY_TRACT_PATH", _DEFAULT_CC_GATEWAY_TRACT_PATH)
 
 
-def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) -> int:
+def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
+                        return_consumed: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -1381,27 +1422,45 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
     (single reader, single writer-appender; safe because miniTID only ever
     appends and this is the only drainer).
 
-    Returns the count of entries absorbed. Fails soft -- an ingest-tract
-    drain failure must never break the daemon's autosave pulse.
+    Returns the count of entries absorbed (int) by default. If
+    return_consumed=True, returns (absorbed, consumed_bytes) instead --
+    consumed_bytes is EXACTLY the byte span this call truncated out of the
+    file (b'' on any early-return path, including a parse failure that never
+    reached truncate), never an independently-taken snapshot. This closes a
+    Corpus Callosum Leg 1 (#70) data-loss window a prior design had: a
+    caller taking its own separate pre-drain snapshot can miss bytes
+    miniTID appends between that snapshot and this function's OWN read --
+    those bytes still get absorbed+truncated here, but the caller's stale
+    snapshot never contained them, so they'd be silently lost to any
+    second consumer (the VPS Arborist) even though the file already
+    forgot them. Handing back the literal consumed span makes trickling
+    it elsewhere byte-exact with what was actually removed from the file,
+    with no separate read and no window between them.
+
+    Fails soft -- an ingest-tract drain failure must never break the
+    daemon's autosave pulse.
     """
+    def _ret(absorbed_n: int, consumed: bytes = b""):
+        return (absorbed_n, consumed) if return_consumed else absorbed_n
+
     path = tract_path or cc_gateway_tract_path()
     if not os.path.exists(path):
-        return 0
+        return _ret(0)
     try:
         import ng_tract
         from ng_embed import embed as ng_embed_fn
     except Exception as exc:
         logger.debug("CC ingest-tract drain unavailable (non-fatal): %s", exc)
-        return 0
+        return _ret(0)
 
     try:
         with open(path, "rb") as f:
             data = f.read()
     except Exception as exc:
         logger.debug("CC ingest-tract read failed (non-fatal): %s", exc)
-        return 0
+        return _ret(0)
     if not data:
-        return 0
+        return _ret(0)
 
     absorbed = 0
     try:
@@ -1422,8 +1481,12 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
     except Exception as exc:
-        logger.debug("CC ingest-tract parse failed (non-fatal): %s", exc)
-        return absorbed
+        # Parse failure -- truncate below never runs, so nothing was actually
+        # consumed from the file. Elevated to warning (was debug): silent at
+        # the default level, this is exactly how a laptop/VPS ng_tract format
+        # skew would look -- every file failing the same way, invisibly.
+        logger.warning("CC ingest-tract parse failed (non-fatal, file untouched): %s", exc)
+        return _ret(absorbed)  # consumed=b"" -- nothing was truncated
 
     # Truncate only the bytes we actually consumed. miniTID is a separate
     # process that only appends; if it appends between our initial read and
@@ -1432,18 +1495,163 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None) ->
     # writing back only what comes after our consumed prefix closes that
     # window down to the two file ops below, instead of spanning the whole
     # embed+dual-pass pass above.
+    #
+    # consumed_actual tracks EXACTLY what left the file, set ONLY after a
+    # confirmed successful removal -- NOT assumed from `data` unconditionally.
+    # (2026-07-27 law-enforcer re-review: the prior unconditional `return
+    # _ret(absorbed, data)` here over-reported `consumed` on three paths --
+    # the current.startswith(data) mismatch branch, an rb-reopen failure, and
+    # a wb-open failure -- each left `data` still sitting in the file while
+    # still telling the caller it was gone. For Leg 1 (#70) that meant the
+    # laptop's next pulse would re-read and re-trickle the SAME bytes the VPS
+    # already absorbed -- duplicate ingestion, the mirror-image of the
+    # original data-loss bug this whole return_consumed path exists to fix.)
+    consumed_actual = b""
     try:
         with open(path, "rb") as f:
             current = f.read()
-        remainder = current[len(data):] if current.startswith(data) else current
-        with open(path, "wb") as f:
-            f.write(remainder)
+        if current.startswith(data):
+            remainder = current[len(data):]
+            with open(path, "wb") as f:
+                f.write(remainder)
+            consumed_actual = data  # only now -- the write actually succeeded
+        else:
+            # Someone else touched the file since our read (not the plain
+            # append-only case we can safely trim a known prefix from).
+            # Write it back unchanged rather than guess -- nothing of ours
+            # was removed, so consumed_actual correctly stays b"".
+            with open(path, "wb") as f:
+                f.write(current)
     except Exception as exc:
         logger.debug("CC ingest-tract truncate failed (non-fatal): %s", exc)
 
     if absorbed:
         logger.info("CC ingest-tract: absorbed %d turn(s) into recall", absorbed)
-    return absorbed
+    return _ret(absorbed, consumed_actual)
+
+
+# ---- Corpus Callosum Leg 1 (#70): laptop -> VPS raw-turn conduit ----
+# See changelog entry above for the full design. Producer side
+# (trickle_gateway_conduit) runs on the laptop; consumer side
+# (drain_gateway_conduit) runs on the VPS, alongside its own local
+# drain_ingest_tract() call. Both gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5).
+
+_DEFAULT_CC_GATEWAY_CONDUIT_DIR = os.path.expanduser("~/docs/ng_topology")
+_CC_GATEWAY_CONDUIT_GLOB = "laptop_cc_gateway.*.tract"
+
+_CC_CALLOSUM_LEG1_ENABLED = os.environ.get("CC_CALLOSUM_LEG1_ENABLED", "0") not in ("0", "false", "False", "")
+
+
+def cc_gateway_conduit_dir() -> str:
+    """Resolve the Leg 1 conduit directory from CC_GATEWAY_CONDUIT_PATH (LAW 5,
+    default ~/docs/ng_topology -- the same dir repo-sync.sh's existing 15-min
+    git cron already syncs, so no new transport is needed). Both the laptop
+    writer (trickle_gateway_conduit) and the VPS reader (drain_gateway_conduit)
+    independently read the same env var with the same default."""
+    return os.environ.get("CC_GATEWAY_CONDUIT_PATH", _DEFAULT_CC_GATEWAY_CONDUIT_DIR)
+
+
+def trickle_gateway_conduit(data: bytes, conduit_dir: str = None) -> Optional[str]:
+    """Laptop side: write a snapshot of already-read cc_gateway tract bytes
+    to a new, uniquely-named per-batch file in the synced conduit dir.
+
+    One immutable file per call -- deliberately NOT a shared append/truncate
+    target, which would risk a binary merge conflict under repo-sync.sh's git
+    push/pull cycle (git cannot line-merge BTF). Atomic (write-tmp-then-
+    rename) so a concurrent repo-sync.sh push, or a crash mid-write, never
+    observes a partial file.
+
+    Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5), default off -- a no-op
+    (returns None immediately) when the gate is off, so this is inert dead
+    code on both hemispheres until explicitly flipped on. Fails soft --
+    a conduit-write failure must never affect the caller's local drain or
+    the daemon's autosave pulse. Returns the written path on success, else
+    None (gate off, empty data, or any failure).
+    """
+    if not _CC_CALLOSUM_LEG1_ENABLED:
+        return None
+    if not data:
+        return None
+    try:
+        conduit_dir = conduit_dir or cc_gateway_conduit_dir()
+        os.makedirs(conduit_dir, exist_ok=True)
+        fname = f"laptop_cc_gateway.{time.time_ns()}_{uuid.uuid4().hex[:8]}.tract"
+        dest = os.path.join(conduit_dir, fname)
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        return dest
+    except Exception as exc:
+        logger.debug("CC callosum Leg1 conduit write failed (non-fatal): %s", exc)
+        return None
+
+
+def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None) -> int:
+    """VPS side: drain every per-batch conduit file the laptop has trickled
+    into the synced conduit dir, absorbing each through the same
+    drain_ingest_tract() the VPS already runs for its own local tract --
+    same dual-pass, same source=="cc_gateway" filter, no new code path.
+
+    Each file is fully consumed by drain_ingest_tract() (which truncates it
+    to empty on success) and then deleted -- repo-sync.sh syncs the deletion
+    back to the laptop normally, no shared mutable file ever crosses the
+    wire twice. Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5), default off.
+
+    A file drain_ingest_tract() cannot even PARSE (a corrupt file, or a
+    laptop/VPS ng_tract format skew) never reaches its truncate step, so its
+    size is unchanged after the call -- that file is moved into
+    <conduit_dir>/quarantine/ (not deleted, not left in place to be retried
+    forever and silently pile up) and logged loudly. A per-batch file is
+    otherwise immutable/single-writer, so any OTHER outcome (partial or full
+    absorption) always empties it via drain_ingest_tract()'s own truncate,
+    and it is deleted normally. One bad/corrupt file is quarantined and
+    skipped (fails soft) rather than aborting the whole batch. Returns the
+    total count of entries absorbed across all files.
+    """
+    if not _CC_CALLOSUM_LEG1_ENABLED:
+        return 0
+    conduit_dir = conduit_dir or cc_gateway_conduit_dir()
+    try:
+        paths = sorted(glob.glob(os.path.join(conduit_dir, _CC_GATEWAY_CONDUIT_GLOB)))
+    except Exception as exc:
+        logger.debug("CC callosum Leg1 conduit listing failed (non-fatal): %s", exc)
+        return 0
+
+    total = 0
+    for path in paths:
+        try:
+            size_before = os.path.getsize(path)
+        except Exception as exc:
+            logger.debug("CC callosum Leg1 conduit stat failed for %s (non-fatal): %s", path, exc)
+            continue
+        try:
+            total += drain_ingest_tract(graph, vector_db, state, tract_path=path)
+        except Exception as exc:
+            logger.debug("CC callosum Leg1 conduit drain failed for %s (non-fatal): %s", path, exc)
+            continue
+        try:
+            size_after = os.path.getsize(path)
+            if size_after == 0:
+                os.remove(path)
+            elif size_after == size_before:
+                # Never truncated at all -- drain_ingest_tract's parse step
+                # itself failed (the only path that skips truncate). Retrying
+                # forever would let a format-skew file pile up invisibly in a
+                # git-synced dir; quarantine it loudly instead.
+                qdir = os.path.join(conduit_dir, "quarantine")
+                os.makedirs(qdir, exist_ok=True)
+                dest = os.path.join(qdir, os.path.basename(path))
+                os.replace(path, dest)
+                logger.warning(
+                    "CC callosum Leg1: %s failed to parse (untouched, %d bytes) -- "
+                    "quarantined to %s instead of retrying forever", path, size_before, dest)
+        except Exception as exc:
+            logger.debug("CC callosum Leg1 conduit cleanup failed for %s (non-fatal): %s", path, exc)
+
+    if total:
+        logger.info("CC callosum Leg1: absorbed %d turn(s) from %d conduit file(s)", total, len(paths))
+    return total
 
 
 # [2026-07-10] Recall seed floor for _harvest_associations' VDB seed-search.

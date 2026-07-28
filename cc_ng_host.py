@@ -24,6 +24,22 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70): drain the
+#   laptop's raw-turn conduit alongside the existing local ingest-tract drain
+# What: _autosave_loop's pulse now also calls the new drain_gateway_conduit()
+#   (cc_ng_organism.py) right after the existing local drain_ingest_tract()
+#   call -- absorbs every laptop_cc_gateway.*.tract file the laptop has
+#   trickled into the git-synced ~/docs/ng_topology dir, through the SAME
+#   dual-pass the local drain already uses.
+# Why: The VPS is the sole Arborist for both hemispheres (laptop does zero
+#   embedding by design) -- Leg 1 is the pipe that gets the laptop's raw BTF
+#   turns here so they get embedded at all. Retires the lossy top-N JSONL
+#   sync (cc-ng-sync.py). Spec: docs/superpowers/plans/2026-07-27-cc-
+#   corpus-callosum-leg1-spec.md.
+# How: Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5, default off) inside
+#   drain_gateway_conduit() itself -- this call site is unconditional but
+#   inert (immediate no-op, returns 0) until the gate is flipped on. See
+#   test_cc_callosum_leg1.py.
 # [2026-07-23] Claude Code (Sonnet 5) — CC Host Tonic Idle/Dream Wiring (parity gap close)
 # What: Three additions, all CC-scoped: (1) _handle_user_prompt_submit() now
 #   calls CC's own _tonic_thread.message_received() per turn (keepalive --
@@ -787,9 +803,15 @@ def _autosave_loop() -> None:
             try:
                 from cc_ng_organism import (
                     surface_wants, generate_emergent_want, drain_ingest_tract,
-                    cc_update_probation,
+                    cc_update_probation, drain_gateway_conduit,
                 )
                 drain_ingest_tract(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
+                # Corpus Callosum Leg 1 (#70, gated CC_CALLOSUM_LEG1_ENABLED,
+                # default off): absorb the laptop's raw turns trickled into
+                # the git-synced conduit dir, same dual-pass as the local
+                # drain just above -- the VPS is the sole Arborist for both
+                # hemispheres. No-op when the gate is off.
+                drain_gateway_conduit(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
                 cc_update_probation(_STATE.cc_ng.graph)
                 surface_wants(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
                 generate_emergent_want(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
