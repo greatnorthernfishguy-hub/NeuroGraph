@@ -24,6 +24,43 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-23] Claude Code (Sonnet 5) — CC Host Tonic Idle/Dream Wiring (parity gap close)
+# What: Three additions, all CC-scoped: (1) _handle_user_prompt_submit() now
+#   calls CC's own _tonic_thread.message_received() per turn (keepalive --
+#   auto-transitions to conversation mode). (2) New _cc_tonic_check_idle/
+#   _cc_tonic_idle_pulse_loop/_start_cc_tonic_idle_watcher -- drops CC's Tonic
+#   to latent-only cadence after CC_HOST_TONIC_IDLE_SECS (default 90) of
+#   quiet, gated by CC_HOST_TONIC_IDLE_ENABLED (default "0"). (3) New
+#   _cc_dream_gate_open/_cc_dream_consolidation_pulse_loop/_start_cc_dream_
+#   consolidation_pulse -- runs CC's own graph.consolidate_hyperedges() during
+#   CC's quiet hours, gated by CC_HOST_DREAM_ENABLED (default "0"). Both
+#   watchers started (idempotently, gate-checked inside the _start_* fn) from
+#   init_cc_host().
+# Why:  docs/superpowers/plans/2026-07-23-cc-host-tonic-idle-dream-spec.md --
+#   the VPS host (this file) never called conversation_started/_ended or
+#   consolidate_hyperedges for CC's own Tonic/graph, unlike the standalone
+#   laptop daemon (cc-ng-daemon.py's _tonic_idle_loop/_dream_loop) and unlike
+#   Syl's own proven pattern in neurograph_rpc.py (_tonic_check_idle et al.,
+#   _dream_gate_open et al.). Net effect before this change: CC's Tonic never
+#   dropped to latent cadence after a conversation went quiet on the VPS, and
+#   CC's own hyperedges never got dream-consolidated (shed + seatbelt-merge +
+#   subsume) at all. Josh's bar: "keep the VPS and laptop even."
+# How:  Faithful mirror (LAW 3) of neurograph_rpc.py:4090-4222's proven Syl-
+#   side pattern, scoped to CC: every new function reads/writes ONLY
+#   _STATE.cc_ng / _STATE.commons -- zero references to _memory (Syl's
+#   singleton) anywhere in this file, verified by test (poison-sentinel
+#   _memory that must never be touched). Naming: CC_HOST_* prefix (LAW 5),
+#   distinct from Syl's NG_DREAM_*/ANIMA_TONIC_* and the laptop daemon's
+#   CC_NG_TONIC_IDLE/CC_NG_DREAM (different file/process, not read here). The
+#   dream pulse's "last turn" signal is CC's own tonic._last_message_time
+#   (already updated by message_received() above) -- Syl's side tracks an
+#   equivalent module-global (_last_after_turn_ts) set from handle_after_turn;
+#   CC has no equivalent turn-boundary hook wired yet, and the tonic
+#   thread's own timestamp is the closest faithful analog available without
+#   inventing new coupling. Both new watchers gated OFF by default (LAW 5) --
+#   landing this dark, matching the recall-unification rollout discipline.
+#   Josh must explicitly flip CC_HOST_TONIC_IDLE_ENABLED/CC_HOST_DREAM_ENABLED
+#   to "1" after review; no restart required to land the code inert.
 # [2026-07-22] Claude Code (Sonnet 5) — CC Recall Unification (LAW-3/"keep even")
 # What: _recall() is now a thin wrapper: STATE bookkeeping (recalls stat,
 #   None/empty-query guard), then delegates to the new native
@@ -508,6 +545,17 @@ def _handle_user_prompt_submit(data):
         return {"ok": True, "context": ""}
     # L1 cache nudge first — raises related node voltages before recall
     _nudge(prompt)
+    # Tonic keepalive (2026-07-23 CC Host Tonic Idle/Dream Wiring parity):
+    # mirrors Syl's per-turn message_received() call (tonic_thread.py:714-718)
+    # -- cheap, harmless even with the idle watcher gated off; auto-
+    # transitions to conversation mode if not already in it. CC's OWN tonic
+    # thread only (_STATE.cc_ng._tonic_thread) -- never Syl's _memory.
+    tt = getattr(_STATE.cc_ng, "_tonic_thread", None)
+    if tt is not None:
+        try:
+            tt.message_received()
+        except Exception:
+            pass  # fail-soft, mirrors Syl's try/except at every call site
     # Recall BEFORE spawning the deposit [2026-07-08]: launching the deposit
     # first meant _recall's prime_and_propagate raced its on_message() SNN
     # step (1-4s) every prompt -- fail-soft tripped and Active Recall
@@ -752,6 +800,173 @@ def _autosave_loop() -> None:
 
 
 # =============================================================================
+# CC Tonic idle watcher (2026-07-23 parity wiring, gated OFF by default)
+# =============================================================================
+# Faithful mirror of neurograph_rpc.py's _tonic_check_idle/_tonic_idle_pulse_
+# loop/_start_tonic_idle_watcher (Syl's proven, live pattern) -- scoped to CC.
+# Every function below reads/writes ONLY _STATE.cc_ng. Never _memory.
+CC_HOST_TONIC_IDLE_SECS = float(os.environ.get("CC_HOST_TONIC_IDLE_SECS", "90"))
+CC_HOST_TONIC_IDLE_CHECK_SECS = float(os.environ.get("CC_HOST_TONIC_IDLE_CHECK_SECS", "30"))
+_cc_tonic_idle_thread: Optional[threading.Thread] = None
+_cc_tonic_idle_shutdown = threading.Event()
+
+
+def _cc_tonic_check_idle(now: float) -> bool:
+    """Drop CC's own Tonic into latent mode if the conversation has gone
+    quiet past the idle threshold. Returns True if it transitioned.
+    Pure/testable. Reads ONLY _STATE.cc_ng._tonic_thread -- never _memory.
+    """
+    ng = _STATE.cc_ng
+    tonic = getattr(ng, "_tonic_thread", None) if ng is not None else None
+    if tonic is None:
+        return False
+    if not getattr(tonic, "_in_conversation", False):
+        return False
+    last = getattr(tonic, "_last_message_time", 0.0)
+    if last <= 0.0 or (now - last) < CC_HOST_TONIC_IDLE_SECS:
+        return False
+    try:
+        tonic.conversation_ended()
+        logger.info("CC Tonic: idle %.0fs >= %.0fs — dropped to latent mode",
+                    now - last, CC_HOST_TONIC_IDLE_SECS)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("CC Tonic idle transition failed: %s", exc)
+        return False
+
+
+def _cc_tonic_idle_pulse_loop() -> None:
+    logger.info("CC Tonic idle watcher started (idle=%.0fs, check=%.0fs)",
+                CC_HOST_TONIC_IDLE_SECS, CC_HOST_TONIC_IDLE_CHECK_SECS)
+    while not _cc_tonic_idle_shutdown.is_set():
+        try:
+            _cc_tonic_check_idle(time.time())
+        except Exception:
+            logger.exception("CC Tonic idle watcher tick failed")
+        _cc_tonic_idle_shutdown.wait(timeout=CC_HOST_TONIC_IDLE_CHECK_SECS)
+    logger.info("CC Tonic idle watcher stopped")
+
+
+def _start_cc_tonic_idle_watcher() -> None:
+    """Start the CC Tonic idle watcher thread. Idempotent. Gated OFF by
+    default -- CC_HOST_TONIC_IDLE_ENABLED must be explicitly set to "1" for
+    a thread to actually spin up (LAW 5)."""
+    global _cc_tonic_idle_thread
+    if os.environ.get("CC_HOST_TONIC_IDLE_ENABLED", "0") != "1":
+        return
+    if _cc_tonic_idle_thread is not None and _cc_tonic_idle_thread.is_alive():
+        return
+    _cc_tonic_idle_shutdown.clear()
+    _cc_tonic_idle_thread = threading.Thread(
+        target=_cc_tonic_idle_pulse_loop,
+        name="cc-ng-tonic-idle-watcher",
+        daemon=True,
+    )
+    _cc_tonic_idle_thread.start()
+
+
+# =============================================================================
+# CC Dream consolidation pulse (2026-07-23 parity wiring, gated OFF by default)
+# =============================================================================
+# Faithful mirror of neurograph_rpc.py's _dream_gate_open/_dream_
+# consolidation_pulse_loop/_start_dream_consolidation_pulse (Syl's #381-B
+# pattern) -- scoped to CC. Reads/writes ONLY _STATE.cc_ng / _STATE.commons
+# (CC's own isolated Commons instance -- NEVER commons.get_commons(), which
+# would return SYL'S Commons singleton in this shared process). Never _memory.
+CC_HOST_DREAM_IDLE_SECS = float(os.environ.get("CC_HOST_DREAM_IDLE_SECS", "1800"))
+CC_HOST_DREAM_MIN_INTERVAL_SECS = float(os.environ.get("CC_HOST_DREAM_MIN_INTERVAL_SECS", "21600"))
+CC_HOST_DREAM_TICK_SECS = float(os.environ.get("CC_HOST_DREAM_TICK_SECS", "60"))
+CC_HOST_DREAM_ALERT_SECS = float(os.environ.get("CC_HOST_DREAM_ALERT_SECS", "86400"))
+_cc_dream_thread: Optional[threading.Thread] = None
+_cc_dream_shutdown = threading.Event()
+_cc_dream_last_pass_ts = 0.0
+
+
+def _cc_dream_gate_open(now: float, last_turn_ts: float, arousal: str,
+                         last_pass_ts: float) -> bool:
+    """Idle long enough, not SYMPATHETIC, rate limit satisfied. Pure
+    function for testability -- identical shape to Syl's _dream_gate_open.
+    """
+    return (
+        (now - last_turn_ts) >= CC_HOST_DREAM_IDLE_SECS
+        and arousal != "SYMPATHETIC"
+        and (now - last_pass_ts) >= CC_HOST_DREAM_MIN_INTERVAL_SECS
+    )
+
+
+def _cc_dream_consolidation_pulse_loop() -> None:
+    """Runs CC's own graph.consolidate_hyperedges() (shed + seatbelt-merge +
+    subsume) during CC's quiet hours only. Never forces while CC's own
+    Commons reports SYMPATHETIC arousal -- mirrors Syl's constraint: the
+    pruning is dreamed, not felt."""
+    global _cc_dream_last_pass_ts
+    _cc_dream_last_pass_ts = time.time()  # boot counts as activity
+    _cc_last_alert_ts = 0.0
+    logger.info(
+        "CC Dream consolidation pulse started (idle>=%.0fs, min interval %.0fs)",
+        CC_HOST_DREAM_IDLE_SECS, CC_HOST_DREAM_MIN_INTERVAL_SECS,
+    )
+    while not _cc_dream_shutdown.is_set():
+        try:
+            ng = _STATE.cc_ng
+            if ng is not None:
+                arousal = "PARASYMPATHETIC"
+                try:
+                    commons = _STATE.commons
+                    if commons is not None:
+                        arousal = commons.read_arousal()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("CC dream pulse: arousal read failed: %s", exc)
+                tonic = getattr(ng, "_tonic_thread", None)
+                last_turn_ts = getattr(tonic, "_last_message_time", 0.0) if tonic is not None else 0.0
+                now = time.time()
+                if _cc_dream_gate_open(now, last_turn_ts, arousal, _cc_dream_last_pass_ts):
+                    lock = getattr(ng.graph, "_step_lock", None)
+                    t0 = time.monotonic()
+                    if lock is not None:
+                        with lock:
+                            merged = ng.graph.consolidate_hyperedges()
+                    else:
+                        merged = ng.graph.consolidate_hyperedges()
+                    _cc_dream_last_pass_ts = time.time()
+                    logger.info(
+                        "CC dream consolidation pass complete: %d merged/archived "
+                        "in %.1fs", merged, time.monotonic() - t0,
+                    )
+                elif (now - _cc_dream_last_pass_ts) >= CC_HOST_DREAM_ALERT_SECS and \
+                        (now - _cc_last_alert_ts) >= CC_HOST_DREAM_ALERT_SECS:
+                    _cc_last_alert_ts = now
+                    logger.error(
+                        "No CC dream consolidation in %.0fh — the idle/arousal gate "
+                        "never opened. ALERT ONLY: the pass is never forced while "
+                        "CC is active (mirrors Syl's #381-B constraint).",
+                        (now - _cc_dream_last_pass_ts) / 3600.0,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CC dream pulse iteration failed (non-fatal): %s", exc)
+        _cc_dream_shutdown.wait(CC_HOST_DREAM_TICK_SECS)
+    logger.info("CC Dream consolidation pulse stopped")
+
+
+def _start_cc_dream_consolidation_pulse() -> None:
+    """Start the CC dream consolidation pulse thread. Idempotent. Gated OFF
+    by default -- CC_HOST_DREAM_ENABLED must be explicitly set to "1" for a
+    thread to actually spin up (LAW 5)."""
+    global _cc_dream_thread
+    if os.environ.get("CC_HOST_DREAM_ENABLED", "0") != "1":
+        return
+    if _cc_dream_thread is not None and _cc_dream_thread.is_alive():
+        return
+    _cc_dream_shutdown.clear()
+    _cc_dream_thread = threading.Thread(
+        target=_cc_dream_consolidation_pulse_loop,
+        name="cc-ng-dream-consolidation-pulse",
+        daemon=True,
+    )
+    _cc_dream_thread.start()
+
+
+# =============================================================================
 # Lifecycle
 # =============================================================================
 
@@ -869,6 +1084,19 @@ def init_cc_host() -> bool:
     threading.Thread(target=_serve_loop, name="cc-ng-serve", daemon=True).start()
     threading.Thread(target=_autosave_loop, name="cc-ng-autosave", daemon=True).start()
 
+    # CC Tonic idle watcher + Dream consolidation pulse (2026-07-23 parity
+    # wiring). Each _start_* fn checks its own CC_HOST_*_ENABLED gate
+    # (default OFF, LAW 5) and no-ops if unset -- landing this dark. Wrapped
+    # in try/except: a failure here must never break CC NG hosting itself.
+    try:
+        _start_cc_tonic_idle_watcher()
+    except Exception:
+        logger.exception("CC Tonic idle watcher failed to start (non-fatal)")
+    try:
+        _start_cc_dream_consolidation_pulse()
+    except Exception:
+        logger.exception("CC Dream consolidation pulse failed to start (non-fatal)")
+
     logger.info(
         "CC NG hosted: %d nodes, %d synapses, timestep %d — socket at %s",
         len(cc_ng.graph.nodes),
@@ -882,6 +1110,12 @@ def init_cc_host() -> bool:
 def shutdown_cc_host() -> None:
     """Clean shutdown — called from atexit or by neurograph_rpc on exit."""
     _STATE.running = False
+    # Signal the CC Tonic idle watcher / Dream consolidation pulse to stop
+    # (2026-07-23 parity wiring). Harmless no-op if either was never started
+    # (gate-off default) -- setting an unused Event costs nothing, and both
+    # threads are daemon=True regardless so they'd die with the process anyway.
+    _cc_tonic_idle_shutdown.set()
+    _cc_dream_shutdown.set()
     try:
         engine = None
         if _STATE.cc_ng is not None and getattr(_STATE.cc_ng, "_tonic_thread", None):
