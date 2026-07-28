@@ -1699,8 +1699,9 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
     than retried forever and silently piling up in a git-synced dir. One bad
     file is skipped, not fatal to the rest.
 
-    Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5), default off. Returns the total
-    count of turns absorbed across all files.
+    Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5), default off. Refuses to run at
+    all when MACHINE_ID is unset -- see the self-consumption guard below.
+    Returns the total count of turns absorbed across all files.
     """
     if not _CC_CALLOSUM_LEG1_ENABLED:
         return 0
@@ -1721,6 +1722,22 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
     # the drain on the producing machine would eat its own turns before they
     # ever crossed (they'd already be absorbed locally, so it would look
     # harmless while silently starving the far hemisphere).
+    # The guard defaults from THIS hemisphere's declared identity rather than
+    # trusting every caller to pass it (LAW 4 -- the invariant belongs where the
+    # identity is known, not in each consumer). trickle_gateway_conduit() already
+    # refuses to WRITE without MACHINE_ID; refuse to DRAIN without it for the
+    # same reason. An explicit exclude_prefix argument is an override, not the
+    # guard itself.
+    if exclude_prefix is None:
+        machine_id = os.environ.get("MACHINE_ID", "").strip()
+        if not machine_id:
+            logger.warning(
+                "CC callosum Leg1: MACHINE_ID unset -- refusing to drain the conduit "
+                "without a self-consumption guard (would absorb and DELETE this "
+                "hemisphere's own outgoing turns before the far half pulled them). "
+                "Set MACHINE_ID in the daemon env.")
+            return 0
+        exclude_prefix = f"{machine_id}_"
     if exclude_prefix:
         paths = [p for p in paths if not os.path.basename(p).startswith(exclude_prefix)]
 
