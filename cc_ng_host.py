@@ -24,6 +24,22 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-28] Claude Code (DudeMan CC, Opus 5) — Callosum drain OFF the autosave pulse; drain_conduit socket handler
+# What: SUPERSEDES the 2026-07-27 entry below -- the drain_gateway_conduit() call it
+#   added to _autosave_loop is REMOVED. New _handle_drain_conduit (dispatch key
+#   "drain_conduit") lets the nightly cc-ng-sync.py drive the drain against the LIVE
+#   daemon instead, passing batch_size/idle_steps/exclude_prefix through.
+# Why: a 60-second pulse is the wrong home for merge absorption. FatherGraph Finding 1
+#   (never bulk-dump; batch ~20-30) and Finding 3 (250 idle steps of sleep consolidation
+#   BETWEEN batches -- measured 47%->74% accuracy, "not optional -- it's what makes merge
+#   work") require batched ingestion with consolidation in between, and those idle steps
+#   must not block this pulse. As written it drained every queued file back-to-back; a
+#   full cron-gap backlog (~45 files) would have landed in a single tick.
+# How: socket rather than a second NeuroGraphMemory in the sync process -- the live
+#   daemon is the single legitimate writer of this graph, and opening a second instance
+#   is the torn-checkpoint hazard cc-ng-sync.py's own 2026-07-03 entry documents.
+#   Saves under _concurrent_lock after the drain. The local drain_ingest_tract() call in
+#   _autosave_loop (the VPS draining its OWN tract) is untouched -- different thing.
 # [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70): drain the
 #   laptop's raw-turn conduit alongside the existing local ingest-tract drain
 # What: _autosave_loop's pulse now also calls the new drain_gateway_conduit()
@@ -721,11 +737,51 @@ def _handle_import(data):
     return {"ok": True, "imported": total}
 
 
+def _handle_drain_conduit(data):
+    """Corpus Callosum Leg 1 (#70): drain the cross-machine BTF conduit into
+    THIS hemisphere's graph, with FatherGraph absorption discipline.
+
+    Invoked by the nightly cc-ng-sync.py over the socket -- deliberately NOT
+    from the 60s autosave pulse (that was the bulk-dump bug, fixed 2026-07-28)
+    and deliberately over the socket rather than by opening a second
+    NeuroGraphMemory: the live daemon owns the graph, so a second instance
+    would be a two-writer torn-checkpoint hazard (see cc-ng-sync.py's own
+    changelog for the incident that discipline came from).
+
+    batch_size / idle_steps come from the caller (the cron already exports
+    CC_NG_BATCH_SIZE=25 / CC_NG_IDLE_STEPS=250 -- the FatherGraph values);
+    drain_gateway_conduit falls back to those same env names if omitted.
+    Gated by CC_CALLOSUM_LEG1_ENABLED inside drain_gateway_conduit itself.
+    """
+    ng = _STATE.cc_ng
+    if ng is None:
+        return {"ok": False, "error": "NG not initialized"}
+    try:
+        from cc_ng_organism import drain_gateway_conduit
+        absorbed = drain_gateway_conduit(
+            ng.graph, ng.vector_db, _STATE.conv_state,
+            conduit_dir=data.get("conduit_dir"),
+            batch_size=data.get("batch_size"),
+            idle_steps=data.get("idle_steps"),
+            exclude_prefix=data.get("exclude_prefix"),
+        )
+    except Exception as exc:
+        logger.warning("CC conduit drain failed (non-fatal): %s", exc)
+        return {"ok": False, "error": str(exc)}
+    try:
+        with ng.graph._concurrent_lock:
+            ng.save()
+    except Exception as exc:
+        return {"ok": True, "absorbed": absorbed, "warning": "save failed: " + str(exc)}
+    return {"ok": True, "absorbed": absorbed}
+
+
 _DISPATCH = {
     "ping": _handle_ping,
     "status": _handle_status,
     "export": _handle_export,
     "import": _handle_import,
+    "drain_conduit": _handle_drain_conduit,
     "SessionStart": _handle_session_start,
     "SessionStop": _handle_session_stop,
     "UserPromptSubmit": _handle_user_prompt_submit,
@@ -803,15 +859,18 @@ def _autosave_loop() -> None:
             try:
                 from cc_ng_organism import (
                     surface_wants, generate_emergent_want, drain_ingest_tract,
-                    cc_update_probation, drain_gateway_conduit,
+                    cc_update_probation,
                 )
                 drain_ingest_tract(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
-                # Corpus Callosum Leg 1 (#70, gated CC_CALLOSUM_LEG1_ENABLED,
-                # default off): absorb the laptop's raw turns trickled into
-                # the git-synced conduit dir, same dual-pass as the local
-                # drain just above -- the VPS is the sole Arborist for both
-                # hemispheres. No-op when the gate is off.
-                drain_gateway_conduit(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
+                # Corpus Callosum Leg 1 (#70): the conduit drain USED to run here.
+                # Moved out 2026-07-28 -- a 60s pulse is the wrong home for merge
+                # absorption. FatherGraph Finding 1 (never bulk-dump; batch ~20-30)
+                # and Finding 3 (250 idle steps BETWEEN batches -- "not optional,
+                # it's what makes merge work", 47%->74% accuracy) require batched
+                # ingestion with homeostatic consolidation between batches, and
+                # those idle steps must not block this pulse. It now runs in
+                # docs/scripts/cc-ng-sync.py -- the nightly path it replaces,
+                # which already carries CC_NG_BATCH_SIZE=25/CC_NG_IDLE_STEPS=250.
                 cc_update_probation(_STATE.cc_ng.graph)
                 surface_wants(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
                 generate_emergent_want(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)

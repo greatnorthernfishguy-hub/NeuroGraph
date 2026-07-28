@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-28] Claude Code (DudeMan CC, Opus 5) — Callosum Leg 1: FatherGraph absorption discipline + move off the 60s pulse
+# What: drain_gateway_conduit() gained batch_size/idle_steps/load_ceiling/exclude_prefix
+#   and now sleeps between batches instead of draining every queued file back-to-back:
+#   after every batch_size absorbed turns it runs idle_steps of pure graph.step()
+#   (_cc_callosum_consolidate) BEFORE taking in more, plus a trailing pass. Load-aware
+#   via cc_refeed.should_pause_for_load (stops clean, leaves files on disk = backpressure).
+#   exclude_prefix stops a hemisphere eating its own outgoing files. Conduit glob
+#   laptop_cc_gateway.* -> *_cc_gateway.* and the producer now tags filenames with
+#   MACHINE_ID (the hardcoded "laptop" made VPS-produced files invisible to the drain --
+#   latent, since only the laptop produces today, but it silently broke bidirectionality).
+#   The pulse call site in cc_ng_host.py is REMOVED; cc_ng_host gained a drain_conduit
+#   socket handler so the nightly cc-ng-sync.py drives the LIVE daemon instead.
+# Why: FatherGraph Finding 1 -- "the drain can't be a bulk dump... New topology must
+#   arrive gradually enough that the receiving topology's homeostatic regulation can
+#   absorb it without displacement" (stable batch ~20-30). Finding 3 -- "After receiving
+#   a merge batch, run idle steps (~250) BEFORE accepting the next batch", measured
+#   47%->74% accuracy, "not optional -- it's what makes merge work". A 60-second autosave
+#   pulse can satisfy neither, and it would have delivered a whole cron-gap's backlog
+#   (~45 files) in one tick. Also LAW 3: the lossy cc-ng-sync.py JSONL path this replaces
+#   was still running in parallel; the callosum now takes over that nightly slot, which
+#   already exports CC_NG_BATCH_SIZE=25 / CC_NG_IDLE_STEPS=250 -- the FatherGraph values.
+# How: reuses drain_ingest_tract unchanged for per-file BTF parse + dual-pass (LAW 3);
+#   mirrors the batch+sleep loop already in _handle_import (cc_ng_host.py) and
+#   import_trickle (cc-ng-sync.py). Gate CC_CALLOSUM_LEG1_ENABLED unchanged, default off.
+#   Ref: docs/reports/Topology_Merge_Insights_from_FatherGraph_Training.md
 # [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70): raw-turn
 #   conduit, laptop -> VPS Arborist
 # What: New cc_gateway_conduit_dir()/trickle_gateway_conduit()/drain_gateway_
@@ -1537,7 +1562,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
 # drain_ingest_tract() call. Both gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5).
 
 _DEFAULT_CC_GATEWAY_CONDUIT_DIR = os.path.expanduser("~/docs/ng_topology")
-_CC_GATEWAY_CONDUIT_GLOB = "laptop_cc_gateway.*.tract"
+_CC_GATEWAY_CONDUIT_GLOB = "*_cc_gateway.*.tract"
 
 _CC_CALLOSUM_LEG1_ENABLED = os.environ.get("CC_CALLOSUM_LEG1_ENABLED", "0") not in ("0", "false", "False", "")
 
@@ -1575,7 +1600,22 @@ def trickle_gateway_conduit(data: bytes, conduit_dir: str = None) -> Optional[st
     try:
         conduit_dir = conduit_dir or cc_gateway_conduit_dir()
         os.makedirs(conduit_dir, exist_ok=True)
-        fname = f"laptop_cc_gateway.{time.time_ns()}_{uuid.uuid4().hex[:8]}.tract"
+        # Hemisphere identity must be DECLARED, never guessed. The drain's
+        # exclude_prefix guard is what stops a half from eating its own
+        # outgoing turns, and it keys on this filename prefix -- so a wrong
+        # default here silently disarms it. Defaulting to "laptop" would make
+        # a VPS-produced file look laptop-produced, and the VPS would then
+        # drain (and delete) its own turns before the laptop ever pulled them:
+        # silent one-way data loss that looks exactly like success. Refuse
+        # loudly instead; the cron already exports MACHINE_ID on both halves.
+        machine_id = os.environ.get("MACHINE_ID", "").strip()
+        if not machine_id:
+            logger.warning(
+                "CC callosum Leg1: MACHINE_ID unset -- refusing to write a conduit file "
+                "with a guessed hemisphere identity (would disarm the drain's "
+                "self-consumption guard). Set MACHINE_ID in the daemon env.")
+            return None
+        fname = f"{machine_id}_cc_gateway.{time.time_ns()}_{uuid.uuid4().hex[:8]}.tract"
         dest = os.path.join(conduit_dir, fname)
         tmp = dest + ".tmp"
         with open(tmp, "wb") as f:
@@ -1587,49 +1627,170 @@ def trickle_gateway_conduit(data: bytes, conduit_dir: str = None) -> Optional[st
         return None
 
 
-def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None) -> int:
-    """VPS side: drain every per-batch conduit file the laptop has trickled
-    into the synced conduit dir, absorbing each through the same
-    drain_ingest_tract() the VPS already runs for its own local tract --
-    same dual-pass, same source=="cc_gateway" filter, no new code path.
+def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
+    """FatherGraph Finding 3 sleep consolidation: run idle_steps of pure
+    graph.step() with NO new input, so homeostatic regulation (threshold
+    adaptation, synaptic scaling, excitability) can catch up before the next
+    batch of foreign topology arrives. Measured 47%->74% accuracy in the
+    FatherGraph training; the report calls it "not optional -- it's what
+    makes merge work". Mirrors _handle_import (cc_ng_host.py) and
+    import_trickle (cc-ng-sync.py), which already do exactly this.
+    Returns True if the steps ran. Fails soft."""
+    if idle_steps <= 0 or graph is None:
+        return False
+    # Take the lock in SLICES, not for the whole 250 steps. cc_ng_host.py's
+    # changelog records real hook timeouts caused by _recall() blocking on a
+    # long _concurrent_lock hold ("_concurrent_lock in _recall() caused hook
+    # timeouts (Tonic holds lock)"). Consolidation is exactly that shape --
+    # hundreds of graph.step() calls -- so it yields between slices, letting
+    # a waiting recall/deposit interleave. Homeostasis does not care whether
+    # the steps were contiguous; the hooks care a great deal.
+    slice_n = max(1, int(os.environ.get("CC_CALLOSUM_LOCK_SLICE_STEPS", "25")))
+    try:
+        lock = getattr(graph, "_concurrent_lock", None)
+        done = 0
+        while done < idle_steps:
+            n = min(slice_n, idle_steps - done)
+            if lock is not None:
+                with lock:
+                    for _ in range(n):
+                        graph.step()
+            else:
+                for _ in range(n):
+                    graph.step()
+            done += n
+        return True
+    except Exception as exc:
+        logger.debug("CC callosum Leg1 consolidation failed (non-fatal): %s", exc)
+        return False
 
-    Each file is fully consumed by drain_ingest_tract() (which truncates it
-    to empty on success) and then deleted -- repo-sync.sh syncs the deletion
-    back to the laptop normally, no shared mutable file ever crosses the
-    wire twice. Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5), default off.
 
-    A file drain_ingest_tract() cannot even PARSE (a corrupt file, or a
-    laptop/VPS ng_tract format skew) never reaches its truncate step, so its
-    size is unchanged after the call -- that file is moved into
-    <conduit_dir>/quarantine/ (not deleted, not left in place to be retried
-    forever and silently pile up) and logged loudly. A per-batch file is
-    otherwise immutable/single-writer, so any OTHER outcome (partial or full
-    absorption) always empties it via drain_ingest_tract()'s own truncate,
-    and it is deleted normally. One bad/corrupt file is quarantined and
-    skipped (fails soft) rather than aborting the whole batch. Returns the
-    total count of entries absorbed across all files.
+def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None,
+                           batch_size: int = None, idle_steps: int = None,
+                           load_ceiling: float = None, exclude_prefix: str = None) -> int:
+    """VPS side: drain the per-batch conduit files the laptop has trickled into
+    the synced conduit dir, absorbing each through the same drain_ingest_tract()
+    the VPS already runs for its own local tract -- same dual-pass, same
+    source=="cc_gateway" filter, no new code path (LAW 3).
+
+    ABSORPTION DISCIPLINE (FatherGraph Findings 1 + 3 -- the reason this does
+    not simply loop over every queued file):
+      * Finding 1 -- "the drain can't be a bulk dump... New topology must
+        arrive gradually enough that the receiving topology's homeostatic
+        regulation can absorb it without displacement." Stable batch ~20-30.
+      * Finding 3 -- "After receiving a merge batch, run idle steps (~250)
+        BEFORE accepting the next batch." Measured 47%->74% accuracy.
+    So: every `batch_size` absorbed turns is followed by `idle_steps` of sleep
+    consolidation before any more are taken in, plus a final pass for the
+    trailing partial batch. Defaults come from CC_NG_BATCH_SIZE (25) and
+    CC_NG_IDLE_STEPS (250) -- the SAME env names the nightly cc-ng-sync cron
+    already passes on both halves (LAW 5, no new knobs invented).
+
+    BACKPRESSURE: load is checked before each file via cc_refeed's
+    should_pause_for_load (CC_REFEED_LOAD_CEILING, default 0.75). Above the
+    ceiling this stops cleanly and leaves the remaining files on disk for the
+    next run -- they are durable, which IS the backpressure. Reused from the
+    cc_refeed discipline the corpus-callosum spec calls for.
+
+    Per-file lifecycle is unchanged: a fully-drained file (truncated to 0 by
+    drain_ingest_tract) is deleted; a file whose size is UNCHANGED never
+    reached the truncate step (its parse failed -- corrupt, or a laptop/VPS
+    ng_tract format skew) and is moved to <conduit_dir>/quarantine/ rather
+    than retried forever and silently piling up in a git-synced dir. One bad
+    file is skipped, not fatal to the rest.
+
+    Gated by CC_CALLOSUM_LEG1_ENABLED (LAW 5), default off. Returns the total
+    count of turns absorbed across all files.
     """
     if not _CC_CALLOSUM_LEG1_ENABLED:
         return 0
     conduit_dir = conduit_dir or cc_gateway_conduit_dir()
+    if batch_size is None:
+        batch_size = max(1, int(os.environ.get("CC_NG_BATCH_SIZE", "25")))
+    if idle_steps is None:
+        idle_steps = max(0, int(os.environ.get("CC_NG_IDLE_STEPS", "250")))
     try:
         paths = sorted(glob.glob(os.path.join(conduit_dir, _CC_GATEWAY_CONDUIT_GLOB)))
     except Exception as exc:
         logger.debug("CC callosum Leg1 conduit listing failed (non-fatal): %s", exc)
         return 0
 
+    # Never drain this hemisphere's OWN outgoing files -- they are addressed to
+    # the other half and must survive until it has pulled them. Mirrors the
+    # old sync's `!= f'{MACHINE_ID}_export.jsonl'` guard. Without this, running
+    # the drain on the producing machine would eat its own turns before they
+    # ever crossed (they'd already be absorbed locally, so it would look
+    # harmless while silently starving the far hemisphere).
+    if exclude_prefix:
+        paths = [p for p in paths if not os.path.basename(p).startswith(exclude_prefix)]
+
+    # Load-aware backpressure -- imported defensively; absent cc_refeed must
+    # not disable the drain, only its ability to notice load.
+    try:
+        from cc_refeed import should_pause_for_load as _should_pause
+    except Exception:
+        _should_pause = None
+    # Own ceiling (LAW 5). cc_refeed's CC_REFEED_LOAD_CEILING=0.75 governs an
+    # opportunistic re-feed that may back off indefinitely; this is a
+    # once-nightly path that has to make progress, so it gets its own knob and
+    # a more permissive default.
+    if load_ceiling is None:
+        ceiling = float(os.environ.get("CC_CALLOSUM_LOAD_CEILING", "1.5"))
+    else:
+        ceiling = float(load_ceiling)
+
     total = 0
+    since_sleep = 0
+    files_done = 0
     for path in paths:
+        # Backpressure is THROTTLING A FLOWING RIVER, not damming it before the
+        # first drop: the load gate only applies BETWEEN batches, never before
+        # the first file. Checked-first (the 2026-07-28 bug) meant that on any
+        # box above the ceiling the whole callosum was a silent no-op -- absorbed
+        # nothing, logged nothing (the `if total:` summary is skipped at 0), and
+        # let conduit files accumulate forever in a git-synced dir while looking
+        # like success. Own ceiling env, not cc_refeed's: that 0.75 is tuned for
+        # an opportunistic re-feed that can back off all day, whereas this is a
+        # once-nightly path that must make progress.
+        if files_done > 0 and _should_pause is not None:
+            try:
+                paused = _should_pause(ceiling)
+            except Exception:
+                paused = False
+            if paused:
+                logger.info(
+                    "CC callosum Leg1: load above ceiling %.2f -- stopping after %d file(s), "
+                    "%d turn(s); %d file(s) left on disk for the next run (backpressure)",
+                    ceiling, files_done, total, len(paths) - files_done)
+                break
         try:
             size_before = os.path.getsize(path)
         except Exception as exc:
             logger.debug("CC callosum Leg1 conduit stat failed for %s (non-fatal): %s", path, exc)
             continue
         try:
-            total += drain_ingest_tract(graph, vector_db, state, tract_path=path)
+            # LAW 4 / two-writer safety: absorption MUTATES the graph, so it must
+            # hold _concurrent_lock -- drain_ingest_tract does not take it itself
+            # (it calls run_conversational_dual_pass directly, which also doesn't),
+            # and the autosave thread does ng.save() under this same lock every
+            # 60s. At HEAD this was covered incidentally because the call site sat
+            # inside _autosave_loop's lock block; moving it to a socket handler
+            # (one thread per connection) silently dropped that cover. Taken
+            # PER FILE and released between files, so a long run never starves
+            # hooks -- cc_ng_host.py's changelog records _recall() hook timeouts
+            # from exactly that kind of long hold.
+            _lock = getattr(graph, "_concurrent_lock", None)
+            if _lock is not None:
+                with _lock:
+                    absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path)
+            else:
+                absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path)
         except Exception as exc:
             logger.debug("CC callosum Leg1 conduit drain failed for %s (non-fatal): %s", path, exc)
             continue
+        total += absorbed
+        since_sleep += absorbed
+        files_done += 1
         try:
             size_after = os.path.getsize(path)
             if size_after == 0:
@@ -1649,8 +1810,23 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
         except Exception as exc:
             logger.debug("CC callosum Leg1 conduit cleanup failed for %s (non-fatal): %s", path, exc)
 
+        # Finding 3: sleep BEFORE accepting the next batch, not after the run.
+        while since_sleep >= batch_size:
+            if _cc_callosum_consolidate(graph, idle_steps):
+                logger.info("CC callosum Leg1: consolidation pass (%d idle steps) after "
+                            "%d-turn batch", idle_steps, batch_size)
+            since_sleep -= batch_size
+
+    # Trailing partial batch still needs its consolidation before the graph
+    # goes back to serving recall on freshly-merged topology.
+    if since_sleep > 0:
+        if _cc_callosum_consolidate(graph, idle_steps):
+            logger.info("CC callosum Leg1: final consolidation pass (%d idle steps) after "
+                        "trailing %d-turn batch", idle_steps, since_sleep)
+
     if total:
-        logger.info("CC callosum Leg1: absorbed %d turn(s) from %d conduit file(s)", total, len(paths))
+        logger.info("CC callosum Leg1: absorbed %d turn(s) from %d conduit file(s) "
+                    "(batch=%d, idle_steps=%d)", total, files_done, batch_size, idle_steps)
     return total
 
 
