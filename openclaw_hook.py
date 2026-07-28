@@ -28,6 +28,19 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-07-28] Claude Code (Opus 5) — #83 structural save-guard wiring (Josh-approved protected-file change; CC substrate + commons backed up, sha256-verified)
+# What: save() now passes live synapse and hyperedge counts to SaveGate.permit()
+#   alongside the node count. Three lines at one call site; no other change.
+# Why: #83 — the node-only ratio could not distinguish the #59 tonic melt (an
+#   orphan sweep drops ~61% of nodes in one boot step) from a real collapse, so
+#   it refused legitimate saves. Isolated nodes have degree 0, so sweeping them
+#   cannot remove a synapse: synapses surviving PROVES the connected core is
+#   intact and the lost nodes were isolates. Without these counts the gate has
+#   no way to see that distinction.
+# How: counts read under try/except -> None on any error, which makes the gate
+#   fall back to the exact node-only ratio it used before (never weaker). All
+#   decision logic lives in non-protected checkpoint_guardian.evaluate_save_health.
+# -------------------
 # [2026-07-09] Claude Code (Fable 5 design / Haiku implementation) — #373 checkpoint guardian wiring (Josh-approved protected-file change; checkpoints backed up)
 # What: __init__ records the boot-restore outcome into checkpoint_guardian.SaveGate;
 #   save() routes through gate (refused -> quarantine, loud) -> atomic tmp+os.replace
@@ -1166,7 +1179,18 @@ class NeuroGraphMemory:
         live_nodes = len(self.graph.nodes)
         guardian_nodes = self._guardian_meaningful_nodes()
         if self._save_gate is not None:
-            _ok, _reason = self._save_gate.permit(guardian_nodes)
+            # #83: hand the gate the structural counts too. Losing isolated
+            # nodes cannot lose a synapse, so synapses surviving is what tells
+            # a legitimate orphan sweep (#59 tonic melt) from a real collapse.
+            # Fail-safe to None => the gate falls back to the node-only ratio.
+            try:
+                _live_syn = len(self.graph.synapses)
+                _live_he = len(self.graph.hyperedges)
+            except Exception:
+                _live_syn = _live_he = None
+            _ok, _reason = self._save_gate.permit(
+                guardian_nodes, live_synapses=_live_syn, live_hyperedges=_live_he,
+            )
             if not _ok:
                 logger.error(
                     "Guardian REFUSED primary checkpoint write (%s). In-RAM "
