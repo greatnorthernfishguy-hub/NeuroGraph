@@ -168,7 +168,13 @@ def test_drain_gateway_conduit_absorbs_and_deletes_conduit_files(cc_ng, tmp_path
 
     conv_nodes = [n for n in cc_ng.graph.nodes.values()
                   if n.metadata.get("creation_mode") == "conversational"]
-    assert len(conv_nodes) == 2
+    # >= 2, not == 2: on an environment with live TID reachable (e.g. the
+    # VPS), dual-pass extracts real concept/tree nodes per turn alongside
+    # the 2 forest nodes -- exactly Leg 1's actual purpose (the VPS is the
+    # sole Arborist). A forest-only environment (no TID, e.g. the laptop
+    # itself) degrades to exactly 2. Either is correct; what matters is
+    # both turns landed, which `absorbed == 2` above already proved.
+    assert len(conv_nodes) >= 2
 
     # Fully-drained (now-empty) conduit files are deleted -- repo-sync.sh
     # syncs the deletion back to the laptop, no shared mutable file crosses
