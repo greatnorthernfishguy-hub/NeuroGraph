@@ -1501,19 +1501,23 @@ def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str])
             # Deposit raw experience: this node was surfaced during this turn.
             # target_id is opaque — just marks it as a surfacing event.
             # metadata carries the raw context without classification.
-            if _ng_tract_bridge is not None:
-                _ng_tract_bridge.record_outcome(
-                    embedding=node_embedding,
-                    target_id=f"surfacing:{node_id}",
-                    success=True,
-                    module_id="neurograph",
-                    metadata={
-                        "surfacing_source": node_info.get("source", "unknown"),
-                        "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
-                        "user_text_preview": (user_text or "")[:200],
-                        "syl_response_preview": syl_text[:200],
-                    },
-                )
+            # Goes into the ONE shared Commons (medium-propagation, no addressing).
+            # The old _ng_tract_bridge.record_outcome path is a no-op stub
+            # (ng_tract_bridge.py:512) — this deposit was silently discarded.
+            # NOT throttle collateral: that bridge method was deliberately inerted
+            # 2026-06-04 (substrate-as-protocol PRD Phase 4 §5.4, "broadcast is
+            # NG-specific"). Don't "restore" it — route to the Commons instead.
+            _deposit_outcome_to_river(
+                embedding=node_embedding,
+                target_id=f"surfacing:{node_id}",
+                success=True,
+                metadata={
+                    "surfacing_source": node_info.get("source", "unknown"),
+                    "surfacing_strength": node_info.get("strength", node_info.get("score", 0)),
+                    "user_text_preview": (user_text or "")[:200],
+                    "syl_response_preview": syl_text[:200],
+                },
+            )
 
         logger.debug(
             "Surfacing outcome deposited: %d nodes, syl_response=%d chars",
@@ -3417,19 +3421,23 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # Downstream modules (Elmer, Immunis, THC, Bunyan) extract what
     # matters to their specialty at read time.  Law 7 compliant.
     try:
-        if _ng_tract_bridge is not None:
-            _stats = _memory.graph.get_stats() if hasattr(_memory.graph, 'get_stats') else {}
-            _stats["total_nodes"] = len(_memory.graph.nodes)
-            _stats_text = str(_stats)
-            from ng_embed import embed as _embed_fn
-            _stats_emb = _embed_fn(_stats_text)
-            _ng_tract_bridge.record_outcome(
-                embedding=_stats_emb,
-                target_id="substrate:self_observation",
-                success=True,
-                module_id="neurograph",
-                metadata=_stats,
-            )
+        _stats = _memory.graph.get_stats() if hasattr(_memory.graph, 'get_stats') else {}
+        _stats["total_nodes"] = len(_memory.graph.nodes)
+        _stats_text = str(_stats)
+        from ng_embed import embed as _embed_fn
+        _stats_emb = _embed_fn(_stats_text)
+        # Goes into the ONE shared Commons (medium-propagation, no addressing).
+        # The old _ng_tract_bridge.record_outcome path is a no-op stub
+        # (ng_tract_bridge.py:512) — this deposit was silently discarded.
+        # NOT throttle collateral: that bridge method was deliberately inerted
+        # 2026-06-04 (substrate-as-protocol PRD Phase 4 §5.4, "broadcast is
+        # NG-specific"). Don't "restore" it — route to the Commons instead.
+        _deposit_outcome_to_river(
+            embedding=_stats_emb,
+            target_id="substrate:self_observation",
+            success=True,
+            metadata=_stats,
+        )
     except Exception as exc:
         logger.debug("Self-observation deposit failed (non-fatal): %s", exc)
 
