@@ -19,6 +19,22 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-07-29] Claude Code (Opus 5) — create_hyperedge accepts an explicit hyperedge_id
+# What: new trailing keyword param `hyperedge_id: Optional[str] = None` on
+#   create_hyperedge. None (the default, and every existing call site) keeps the
+#   old behaviour exactly — Hyperedge mints its own uuid4. When supplied, the id is
+#   passed through to the Hyperedge and used for all four registrations
+#   (self.hyperedges, _node_hyperedges, _he_co_fire_counts, _dirty_hyperedges).
+#   Collision raises ValueError rather than clobbering the incumbent.
+# Why: the corpus callosum (cc_topology_merge) installs hyperedges transported from
+#   the VPS hemisphere by calling create_hyperedge, which REMINTED every one — the
+#   two hemispheres ended up disagreeing about which edge is which. Member-set
+#   dedupe (_hyperedge_exists) already prevented duplicate stacking, so nothing was
+#   visibly broken, but every id-referential structure (PredictionRecord.hyperedge_id,
+#   co-fire history) would dangle silently the moment it crossed. Transport is not
+#   creation; it must be able to preserve identity. Josh-approved (2026-07-29).
+# How: additive and appended LAST in the signature, so no positional call site shifts.
+#   Param is opt-in — the 5 in-repo callers are untouched and behaviourally identical.
 # [2026-07-15] Claude Code (Opus 4.8) — #59 identity-protected endpoints exempt from sprout_degree_cap
 # What: both cap enforcement sites (_sprout_synapses co-firing loop + _surprise_exploration
 #   feeder) now let an at/above-cap endpoint through when it is identity-protected
@@ -1946,11 +1962,31 @@ class Graph:
         output_weight: float = 1.0,
         metadata: Optional[Dict[str, Any]] = None,
         is_learnable: bool = True,
+        hyperedge_id: Optional[str] = None,
     ) -> Hyperedge:
-        """Create a hyperedge grouping multiple nodes (PRD §2.2.3)."""
+        """Create a hyperedge grouping multiple nodes (PRD §2.2.3).
+
+        hyperedge_id: normally None -- the Hyperedge mints its own uuid4. Pass
+            an explicit id ONLY when installing a hyperedge that already has an
+            identity elsewhere and must keep it (corpus-callosum transport
+            between two NeuroGraph instances, checkpoint restore). Without it,
+            transported hyperedges get reminted locally and the two graphs
+            disagree about which edge is which, so any cross-graph reference
+            BY id (prediction records, co-fire history) dangles silently.
+            Raises ValueError on collision rather than clobbering the
+            incumbent -- a silent overwrite would drop a live edge out of
+            self.hyperedges while leaving its id in _node_hyperedges.
+        """
         for nid in member_node_ids:
             if nid not in self.nodes:
                 raise KeyError(f"Member node {nid} not found")
+
+        if hyperedge_id is not None and hyperedge_id in self.hyperedges:
+            raise ValueError(
+                f"Hyperedge {hyperedge_id} already exists — refusing to "
+                f"overwrite. Callers transporting hyperedges must check for "
+                f"existence first (see cc_topology_merge._hyperedge_exists)."
+            )
 
         if len(member_node_ids) < 2:
             logger.warning(
@@ -1969,6 +2005,7 @@ class Graph:
             output_weight=output_weight,
             metadata=metadata or {},
             is_learnable=is_learnable,
+            **({"hyperedge_id": hyperedge_id} if hyperedge_id is not None else {}),
         )
         self.hyperedges[he.hyperedge_id] = he
         # Phase 4: stamp creation time.
