@@ -24,6 +24,17 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-07-28] Claude Code (DudeMan CC, Opus 5) — Commons persistence (#84) wired into host lifecycle
+# What: persist_cc_commons(CC_NG_WORKSPACE) is now called (a) on the autosave cadence,
+#   right after the CC checkpoint save, and (b) in shutdown_cc_host() after the final
+#   graph save. Both call sites are non-fatal (debug-logged on failure).
+# Why: the CC Commons medium was in-memory only -- every gateway restart dropped the
+#   deposited topology, so nothing bucketed across process lifetimes. #84.
+# How: import + call the persist helper in cc_ng_organism. It writes ONLY the medium
+#   get_cc_commons() built (constructed directly, never via canonical get_commons()),
+#   under CC_NG_WORKSPACE -- Syl's Commons is never touched even though this code runs
+#   inside her process. Shutdown persist sits OUTSIDE the graph-save lock so a refused
+#   or failed save-guarded checkpoint doesn't also cost us the medium.
 # [2026-07-28] Claude Code (DudeMan CC, Opus 5) — Callosum drain OFF the autosave pulse; drain_conduit socket handler
 # What: SUPERSEDES the 2026-07-27 entry below -- the drain_gateway_conduit() call it
 #   added to _autosave_loop is REMOVED. New _handle_drain_conduit (dispatch key
@@ -876,6 +887,16 @@ def _autosave_loop() -> None:
                 generate_emergent_want(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
             except Exception as exc:
                 logger.debug("ingest-tract/probation/surface_wants/emergent_want failed (non-fatal): %s", exc)
+            # Commons persist (#84) — same cadence as CC's own checkpoint above, but
+            # an independent file under CC_NG_WORKSPACE. Never touches Syl's Commons:
+            # persist_cc_commons writes only the medium get_cc_commons built, which is
+            # constructed directly (never via canonical get_commons) precisely because
+            # this code runs inside her process.
+            try:
+                from cc_ng_organism import persist_cc_commons
+                persist_cc_commons(CC_NG_WORKSPACE)
+            except Exception as exc:
+                logger.debug("CC Commons persist failed (non-fatal): %s", exc)
         except Exception as exc:
             logger.warning("CC autosave failed: %s", exc)
 
@@ -1212,6 +1233,15 @@ def shutdown_cc_host() -> None:
                 _STATE.cc_ng.save()
     except Exception as exc:
         logger.warning("CC final save failed: %s", exc)
+
+    # Commons persist (#84) — independent of the graph save above, and outside its
+    # lock: a refused/failed save-guarded graph save must not cost us the medium too.
+    try:
+        from cc_ng_organism import persist_cc_commons
+        if persist_cc_commons(CC_NG_WORKSPACE):
+            logger.info("CC Commons persisted on shutdown")
+    except Exception as exc:
+        logger.debug("CC Commons persist on shutdown failed (non-fatal): %s", exc)
 
     try:
         if _STATE.server_sock is not None:

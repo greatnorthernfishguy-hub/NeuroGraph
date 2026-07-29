@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-07-29] Claude Code (DudeMan CC, Opus 5) — #84: CC Commons persist/restore
+# What: New cc_commons_checkpoint_path() and persist_cc_commons(); get_cc_commons()
+#   now restores from <workspace>/checkpoints/commons.msgpack at create time. Both
+#   hosts (cc_ng_host.py on the VPS, cc-ng-daemon.py on the laptop) call
+#   persist_cc_commons() from their autosave pulse and shutdown path.
+# Why: CC's Commons was in-memory-only — every daemon restart dropped the whole
+#   medium. The docstring justified that as "matching Syl's own Commons today", but
+#   that stopped being true when #332 wired her side (neurograph_rpc.py: restore at
+#   handle_bootstrap, persist at autosave + clean exit), leaving CC the odd one out.
+#   Leg 2 of the Corpus Callosum (#70) moves topology through the Commons, so a
+#   restart mid-transit silently loses deposits — this is its prerequisite.
+# How: restore lives INSIDE get_cc_commons rather than in each host, because that is
+#   the single get-or-create point both hosts funnel through — it guarantees the
+#   restore-before-first-deposit ordering Syl gets from doing it inline, without
+#   duplicating path logic across two files that have already drifted once. The
+#   singleton is published only after restore completes, so the unlocked
+#   double-checked read can't hand out a half-populated medium. Checkpoint file is
+#   distinct from CC's main.msgpack/vectors.msgpack: the Commons is the shared
+#   ecosystem medium, not CC's mind, and never touches save-guarded checkpoint I/O.
+#   Restore and persist failures are both non-fatal (start fresh / skip the cycle).
 # [2026-07-28] Claude Code (DudeMan CC, Opus 5) — Callosum Leg 1: FatherGraph absorption discipline + move off the 60s pulse
 # What: drain_gateway_conduit() gained batch_size/idle_steps/load_ceiling/exclude_prefix
 #   and now sleeps between batches instead of draining every queued file back-to-back:
@@ -480,6 +500,19 @@ _cc_commons_lock = threading.Lock()
 _cc_module_instances: "Dict[str, Any]" = {}
 
 
+def cc_commons_checkpoint_path(workspace_dir: str) -> str:
+    """Where CC's Commons medium persists (#84).
+
+    Mirrors Syl's _COMMONS_CHECKPOINT_PATH (neurograph_rpc.py) one level down:
+    checkpoints/commons.msgpack, but under CC's OWN workspace so the two media
+    never share a file. Separate from CC's main.msgpack/vectors.msgpack for the
+    same reason it is on Syl's side -- the Commons is the shared ecosystem
+    medium (experience/topology/metrics/repair deposits), not CC's mind, and it
+    must never touch the save-guarded checkpoint I/O.
+    """
+    return os.path.join(os.path.expanduser(workspace_dir), "checkpoints", "commons.msgpack")
+
+
 def get_cc_commons(workspace_dir: str, config: Optional[Dict[str, Any]] = None) -> Any:
     """Get-or-create CC's own Commons medium -- CC's ecosystem-of-one (for now).
 
@@ -491,18 +524,53 @@ def get_cc_commons(workspace_dir: str, config: Optional[Dict[str, Any]] = None) 
     get-or-create-under-lock shape of the canonical function without touching
     its global.
 
-    Ephemeral (in-memory only, resets on daemon restart) -- matching Syl's own
-    Commons today (its persist()/restore() hooks are wired but not yet called
-    on any lifecycle event either; not a CC-specific gap).
+    Restores from cc_commons_checkpoint_path(workspace_dir) at create time (#84).
+    Restore-on-create, not restore-from-the-host: this IS the get-or-create point
+    both hosts funnel through, so the persisted state lands before any module hook
+    can deposit/bucket -- the same restore-before-first-deposit ordering Syl gets
+    from doing it inline in handle_bootstrap. A restore failure is non-fatal: CC
+    starts fresh, exactly as it did before this was wired.
     """
     global _cc_commons
     if _cc_commons is None:
         with _cc_commons_lock:
             if _cc_commons is None:  # double-checked under lock
                 from commons import Commons
-                _cc_commons = Commons(config=config)
+                _commons = Commons(config=config)
+                _path = cc_commons_checkpoint_path(workspace_dir)
+                try:
+                    if os.path.exists(_path):
+                        _commons.restore(_path)
+                        logger.info("CC Commons restored from %s (%s)", _path, _commons.stats())
+                    else:
+                        logger.info("No CC Commons checkpoint at %s -- starting fresh", _path)
+                except Exception as exc:
+                    logger.warning(
+                        "CC Commons restore failed (starting fresh, non-fatal): %s", exc)
+                # Publish only after restore: a concurrent get_cc_commons() must never
+                # see a half-populated medium (the double-checked read is unlocked).
+                _cc_commons = _commons
                 logger.info("CC Commons medium initialized (workspace=%s)", workspace_dir)
     return _cc_commons
+
+
+def persist_cc_commons(workspace_dir: str) -> bool:
+    """Write CC's Commons medium to disk (#84). No-op if it was never created.
+
+    Called from each host's autosave pulse and shutdown path -- same cadence as
+    CC's own checkpoint, but an independent file, so a failure here can never
+    affect the graph save that already completed. Returns True on a write.
+    """
+    if _cc_commons is None:
+        return False
+    _path = cc_commons_checkpoint_path(workspace_dir)
+    try:
+        os.makedirs(os.path.dirname(_path), exist_ok=True)
+        _cc_commons.persist(_path)
+        return True
+    except Exception as exc:
+        logger.debug("CC Commons persist failed (non-fatal): %s", exc)
+        return False
 
 
 def deposit_cc_experience(text: str, target_id: str, workspace_dir: str,
