@@ -635,6 +635,45 @@ class TestNoveltyDampening(unittest.TestCase):
         self.assertAlmostEqual(node.threshold, self.graph.config["default_threshold"])
         self.assertTrue(node.metadata.get("graduated"))
 
+    def test_unscoped_sweep_does_not_touch_conversational_nodes(self):
+        """#111 -- an unscoped update_probation() must not graduate conversation.
+
+        Called with no node_ids the registrar used to walk the whole graph and
+        stamp graduated=True on timer expiry alone, with no firing gate. On any
+        host that routes turns through on_message (CC does) that silently
+        defeats #93. Documents and conversation are separate probation domains.
+        """
+        embedded = self._make_embedded_chunks(["Test"])
+        node_ids = self.registrar.register(embedded)
+        conv = self.graph.create_node(node_id="CONV", metadata={
+            "probation_remaining": 1, "probation_total": 10,
+            "novelty_dampening": 0.3, "creation_mode": "conversational"})
+
+        graduated = self.registrar.update_probation()   # no node_ids
+
+        self.assertEqual(conv.metadata["probation_remaining"], 1,
+                         "the ingestor decremented a conversational node")
+        self.assertNotIn("CONV", graduated)
+        self.assertIsNone(conv.metadata.get("graduated"))
+        self.assertEqual(
+            self.graph.nodes[node_ids[0]].metadata["probation_remaining"], 9,
+            "the ingestor must still sweep its own ingested nodes")
+
+    def test_empty_node_ids_sweeps_nothing_rather_than_everything(self):
+        """#111 -- `node_ids or list(graph.nodes)` treated [] as falsy and swept
+        the entire graph. An explicit empty request means sweep nothing.
+        """
+        embedded = self._make_embedded_chunks(["Test"])
+        node_ids = self.registrar.register(embedded)
+
+        graduated = self.registrar.update_probation([])
+
+        self.assertEqual(graduated, [])
+        self.assertEqual(
+            self.graph.nodes[node_ids[0]].metadata["probation_remaining"], 10,
+            "an empty node_ids list swept the whole graph")
+
+
     def test_dampening_fades_during_probation(self):
         """Excitability increases during probation (linear curve)."""
         embedded = self._make_embedded_chunks(["Test"])

@@ -1454,6 +1454,25 @@ def cc_update_probation(graph) -> list:
     graduated = []
     base_threshold = graph.config.get("default_threshold", 1.0)
     for nid, node in list(graph.nodes.items()):
+        # #111 -- document nodes belong to the Ingestor's probation sweep
+        # (universal_ingestor.py, now scoped to creation_mode == "ingested").
+        # Before both sweeps were scoped they walked the same graph, so CC's
+        # ingested nodes were decremented twice -- once per prompt via
+        # on_message, once per 60s pulse via this function -- burning their
+        # window at double rate. One sweeper per probation domain.
+        #
+        # Deliberately an EXCLUSION, not `== "conversational"`: nodes with no
+        # creation_mode (older checkpoints, seeds) must still graduate here
+        # rather than be stranded in probation forever.
+        #
+        # This is where the CC mirror intentionally stops matching canonical
+        # neurograph_rpc.py::_update_probation. On Syl the Ingestor sweep is
+        # dead code (on_message has no callers there), so _update_probation is
+        # the ONLY thing graduating her document nodes and must keep sweeping
+        # them. CC-first, back-propagate later: expect these two to differ
+        # until canonical is brought over.
+        if (node.metadata or {}).get("creation_mode") == "ingested":
+            continue
         prob = node.metadata.get("probation_remaining")
         if prob is None:
             continue

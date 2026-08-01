@@ -2043,7 +2043,29 @@ class NodeRegistrar:
         Returns list of node IDs that graduated this call.
         """
         graduated: List[str] = []
-        ids = node_ids or list(self.graph.nodes.keys())
+        if node_ids is None:
+            # #111 -- sweep only what THIS registrar stamped. An unscoped
+            # whole-graph sweep also decrements and graduates CONVERSATIONAL
+            # nodes, with no firing gate, which silently defeats #93 on any
+            # host that routes turns through on_message. CC does exactly that
+            # (cc_ng_host.py:393 _deposit -> ng.on_message), and its per-prompt
+            # cadence beats the 60s pulse that runs the #93-gated sweep, so the
+            # ungated stamp usually won the race. Syl is unaffected either way:
+            # on_message has no callers in neurograph_rpc.py.
+            #
+            # Documents and conversation are separate probation domains by
+            # design; the callosum topology sync is the only join between them.
+            # Do not "fix" this by unifying the two pipelines.
+            #
+            # NOTE: an explicit empty list now means "sweep nothing" rather
+            # than "sweep everything" -- `node_ids or ...` treated [] as falsy.
+            # Sweeping the whole graph on an empty request was never intended.
+            ids = [
+                nid for nid, n in self.graph.nodes.items()
+                if (n.metadata or {}).get("creation_mode") == "ingested"
+            ]
+        else:
+            ids = node_ids
 
         for nid in ids:
             node = self.graph.nodes.get(nid)

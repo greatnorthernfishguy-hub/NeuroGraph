@@ -609,3 +609,52 @@ def test_cc_probation_rollback_drains_marker_instead_of_stranding_it(monkeypatch
     assert quiet.metadata.get("probation_expired_unfired") is None, \
         "the marker must be drained, not left behind to re-fire next sweep"
     assert "R" not in cno.cc_update_probation(g)
+
+
+def test_cc_update_probation_leaves_ingested_nodes_to_the_ingestor():
+    """#111 -- one sweeper per probation domain.
+
+    Before this, both cc_update_probation (60s pulse) and the Ingestor's
+    update_probation (per prompt, via on_message) walked the whole graph, so a
+    CC document node was decremented twice and burned its window at double
+    rate. cc_update_probation now declines document-provenance nodes.
+    """
+    from neuro_foundation import Graph
+    import cc_ng_organism as cno
+
+    g = Graph()
+    doc = g.create_node(node_id="DOC", metadata={
+        "probation_remaining": 5, "probation_total": 10,
+        "novelty_dampening": 0.3, "creation_mode": "ingested"})
+    conv = g.create_node(node_id="CONV", metadata={
+        "probation_remaining": 5, "probation_total": 10,
+        "novelty_dampening": 0.3, "creation_mode": "conversational"})
+
+    cno.cc_update_probation(g)
+
+    assert doc.metadata["probation_remaining"] == 5, \
+        "cc_update_probation decremented a document node -- that is the Ingestor's domain"
+    assert conv.metadata["probation_remaining"] == 4, \
+        "cc_update_probation must still own conversational nodes"
+
+
+def test_cc_update_probation_still_owns_nodes_with_no_creation_mode():
+    """#111 -- the skip is an EXCLUSION of "ingested", not a match on
+    "conversational". Older checkpoints and seeded nodes carry no
+    creation_mode; if the scope were an inclusion they would be stranded in
+    probation forever, never graduating and never releasing their dampening.
+    """
+    from neuro_foundation import Graph
+    import cc_ng_organism as cno
+
+    g = Graph()
+    legacy = g.create_node(node_id="LEGACY", metadata={
+        "probation_remaining": 1, "probation_total": 10, "novelty_dampening": 0.3})
+    legacy.intrinsic_excitability = 0.3
+
+    graduated = cno.cc_update_probation(g)
+
+    assert legacy.metadata["probation_remaining"] <= 0
+    assert "LEGACY" in graduated or legacy.metadata.get("probation_expired_unfired") is True, \
+        "a node with no creation_mode was skipped entirely -- stranded in probation"
+
