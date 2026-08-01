@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SEE FIRST: /home/josh/docs/CC-CALLOSUM-TRUTH.md -- consolidated, verified state of
+# the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
+# The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-07-29] Claude Code (DudeMan CC, Opus 5) — Callosum Leg 2: topology merge (laptop side)
 # What: merge_cc_topology() absorbs the length-prefixed msgpack conduit written by
@@ -23,11 +26,35 @@
 #     export. Absorbing it would re-deposit our own nodes as if foreign,
 #     double-counting structure and corrupting the trickle accounting.
 #
-#   Idempotency is two-layer: `node_id in graph.nodes` is the live guard (a
-#   re-run is a no-op), and the journal records what landed so the SENDER can
-#   pass exclude_ids and stop re-transmitting. Neither alone is sufficient --
-#   the graph guard doesn't survive a sender with no memory, and the journal
-#   doesn't survive a graph restored from an older snapshot.
+#   Idempotency is `node_id in graph.nodes` and nothing else. The journal is
+#   DELIVERY BOOKKEEPING, not a receive-side guard: it records what landed so
+#   the SENDER can pass exclude_ids and stop re-transmitting. It has no say in
+#   what the receiver admits -- see the 2026-07-31 entry below.
+#
+# [2026-07-31] Claude Code (Opus 5) — #106: remove the merge-journal poison-pill
+# What: deleted the receive-side `if nid in journal: continue` veto in Tier 1.
+#   Presence in the graph is now the sole admission guard. A journaled-but-absent
+#   node is re-absorbed and counted as `journal_stale_readmitted`.
+# Why: the journal is append-only with no invalidation path, and the graph guard
+#   above it already catches every node that is actually present. So the journal
+#   branch could only ever fire on the set (journal - graph.nodes) -- precisely
+#   the nodes that were absorbed once and then destroyed locally (#104 cull,
+#   orphan sweep, checkpoint rolled back behind the merge). That is exactly the
+#   set that needs re-delivery, and the veto made it permanently undeliverable.
+#   The damage compounds past the node: Tier 2 gates on both endpoints being in
+#   graph.nodes and Tier 3 needs every member present, so one permanently-vetoed
+#   node silently shredded every synapse and hyperedge incident to it, on every
+#   future pass, forever. A conduit is the laptop's ONLY route to tree structure
+#   (no TID here) -- a permanent veto is a permanent hole in the topology.
+# How: the branch stays, minus the `continue` -- it now logs and counts instead
+#   of dropping, so the stale-journal condition is observable rather than silent.
+#   Ruled at .claude/agent-memory/neurograph-law-enforcer/
+#   ruling_half_brain_wholeness_ring.md ("Q2 ... Delete the journal skip from the
+#   RECEIVE path ... zero new state"); additive-only governs graph CONTENT, not
+#   delivery bookkeeping. Re-absorb churn is bounded on both ends: the sender's
+#   exclude_ids stops re-sending journaled nodes, and a node re-absorbed here
+#   arrives with its own synapses and hyperedge in the same batch, so it does not
+#   land orphaned into the next sweep.
 # -------------------
 
 import json
@@ -55,9 +82,14 @@ class TopologyMergeAbort(RuntimeError):
 
 
 def _load_journal(journal_path: Optional[str]) -> Set[str]:
-    """Node IDs already absorbed. Missing/corrupt journal -> empty set; the
-    graph-membership guard still makes a re-run a no-op, so a lost journal
-    costs re-scanning, not double-deposit."""
+    """Node IDs already delivered to us, for the SENDER's exclude_ids.
+
+    This is delivery bookkeeping, NOT an admission guard -- `nid in graph.nodes`
+    decides what the receiver takes (#106). Append-only with no invalidation
+    path, so an entry outlives the node it names; treating it as authority is
+    what made journaled-but-culled nodes permanently undeliverable. Missing or
+    corrupt journal is harmless: it costs the sender a re-scan, nothing more.
+    """
     if not journal_path or not os.path.exists(journal_path):
         return set()
     seen: Set[str] = set()
@@ -164,7 +196,7 @@ def merge_cc_topology(
         "status": "ok", "path": conduit_path, "sender": sender,
         "embedding_model": wire_model,
         "absorbed_nodes": 0, "absorbed_synapses": 0, "absorbed_hyperedges": 0,
-        "skipped_present": 0, "skipped_journal": 0, "skipped_not_cc": 0,
+        "skipped_present": 0, "journal_stale_readmitted": 0, "skipped_not_cc": 0,
         "skipped_identity": 0, "bad_embedding": 0,
         "absorbed_without_embedding_DEFECT": 0,
         "skipped_synapses": 0, "skipped_hyperedges": 0,
@@ -200,8 +232,25 @@ def merge_cc_topology(
                 batch_landed.add(nid)   # present == usable as an endpoint
                 continue
             if nid in journal:
-                stats["skipped_journal"] += 1
-                continue
+                # NO `continue` HERE -- #106. Falling through is the fix.
+                #
+                # The graph check above already caught every node that is
+                # actually present, so this branch can only be reached by a node
+                # in (journal - graph.nodes): one that landed once and was then
+                # destroyed locally. Vetoing on that record made re-delivery
+                # impossible forever, and the loss did not stop at the node --
+                # Tier 2 requires both endpoints in graph.nodes and Tier 3 every
+                # member, so a single permanently-vetoed node shredded all of its
+                # incident structure on every subsequent pass. The journal is the
+                # sender's bookkeeping (exclude_ids); presence in the graph is
+                # the receiver's authority. A journaled node that arrived anyway
+                # means the sender chose to re-send it -- honour the delivery.
+                # Counted at the absorption site below, not here -- this point
+                # is only "detected", and the node can still be rejected by the
+                # provenance gates or the deposit try/except before it lands.
+                logger.info(
+                    "CC topology: %s is journaled as landed but is absent from "
+                    "the graph -- re-absorbing (stale journal entry, #106)", nid)
 
             meta = dict(rec.get("metadata") or {})
             # Defense in depth: re-run both provenance gates on receive. The
@@ -267,6 +316,12 @@ def merge_cc_topology(
                 continue
 
             stats["absorbed_nodes"] += 1
+            if nid in journal:
+                # Counted here, after the node has actually landed, so the stat
+                # reports re-admissions that happened rather than ones merely
+                # attempted. `journal` is not mutated inside this loop, so this
+                # re-test is the same predicate evaluated at the Tier-1 branch.
+                stats["journal_stale_readmitted"] += 1
             landed_ids.append(nid)
             batch_landed.add(nid)
             budget -= 1
@@ -348,7 +403,10 @@ def merge_cc_topology(
                 logger.debug("CC topology hyperedge failed: %s", exc)
                 stats["skipped_hyperedges"] += 1
 
-    _append_journal(journal_path, landed_ids)
+    # Re-admitted nodes (#106) are already journaled; appending them again would
+    # grow the file by one duplicate line per node per pass without changing the
+    # loaded set. Only record genuinely new deliveries.
+    _append_journal(journal_path, [n for n in landed_ids if n not in journal])
 
     stats["completed"] = stats["deferred_by_budget"] == 0
     logger.info(

@@ -77,6 +77,12 @@ def test_probation_graduation(cc_ng):
     initial_excitability = node.intrinsic_excitability
     assert initial_excitability < 1.0  # should be dampened
 
+    # #93 — the "graduated" stamp now requires evidence the node actually fired,
+    # so make it genuinely spike before its window closes.
+    cc_ng.graph.stimulate(node_id, 20.0)
+    cc_ng.graph.step()
+    assert len(node.spike_history) > 0, "precondition: node must have really fired"
+
     # Call cc_update_probation repeatedly until graduation
     for i in range(_CC_CONV_PROBATION_PERIOD):
         graduated = cc_update_probation(cc_ng.graph)
@@ -94,6 +100,50 @@ def test_probation_graduation(cc_ng):
     assert node.intrinsic_excitability == 1.0
     base_threshold = cc_ng.graph.config.get("default_threshold", 1.0)
     assert node.threshold == base_threshold
+
+
+def test_probation_unfired_node_sheds_dampening_but_does_not_graduate(cc_ng, monkeypatch):
+    """#93 (CC mirror of the canonical test in test_conversational_recall.py) — a node
+    that ages out of probation without ever firing must still get its novelty-dampening
+    released, but must NOT be stamped 'graduated'. Gating the dampening release too
+    would be self-reinforcing: a permanently boosted threshold makes firing less
+    likely, so the node could never earn its way out.
+    """
+    import cc_ng_organism as cc
+    from cc_ng_organism import (run_conversational_dual_pass, cc_update_probation,
+                                _CC_CONV_PROBATION_PERIOD)
+    from ng_embed import embed
+    # Pin the gate rather than inheriting CC_CONV_PROBATION_REQUIRE_SPIKE from the env.
+    monkeypatch.setattr(cc, "_CC_CONV_PROBATION_REQUIRE_SPIKE", True)
+
+    state = {"last_forest_id": None}
+    text = "quiet probation node that never fires"
+    assert run_conversational_dual_pass(
+        cc_ng.graph, cc_ng.vector_db, text, embed(text), state) is True
+    node_id = state["last_forest_id"]
+    node = cc_ng.graph.nodes[node_id]
+    assert node.metadata.get("probation_remaining") == _CC_CONV_PROBATION_PERIOD
+    assert len(node.spike_history) == 0, "precondition: node must not have fired"
+
+    # Age the whole window out without ever stimulating it.
+    for _ in range(_CC_CONV_PROBATION_PERIOD):
+        graduated = cc_update_probation(cc_ng.graph)
+
+    assert node_id not in graduated
+    assert node.metadata.get("graduated") is False
+    assert node.metadata.get("probation_expired_unfired") is True
+    # ...but the handicap is lifted on schedule regardless.
+    assert node.intrinsic_excitability == 1.0
+    assert node.threshold == cc_ng.graph.config.get("default_threshold", 1.0)
+
+    # Late graduation: fire it now and the very next sweep earns the stamp.
+    cc_ng.graph.stimulate(node_id, 20.0)
+    cc_ng.graph.step()
+    assert len(node.spike_history) > 0
+    graduated = cc_update_probation(cc_ng.graph)
+    assert node_id in graduated
+    assert node.metadata.get("graduated") is True
+    assert node.metadata.get("probation_expired_unfired") is None
 
 
 def test_kiss_redundancy_gate_reinforces_instead_of_duplicating(cc_ng):
@@ -227,6 +277,9 @@ def test_kiss_reinforcement_never_resets_a_graduated_node(cc_ng):
     run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
     node_id = state["last_forest_id"]
     node = cc_ng.graph.nodes[node_id]
+    # #93 — graduation now requires a real spike, not just an expired timer.
+    cc_ng.graph.stimulate(node_id, 20.0)
+    cc_ng.graph.step()
     for _ in range(_CC_CONV_PROBATION_PERIOD):
         cc_update_probation(cc_ng.graph)
     assert node.metadata.get("graduated") is True
@@ -521,3 +574,38 @@ def test_seed_cc_rim_creates_node_and_is_idempotent(tmp_path):
     assert node.intrinsic_excitability == 1.0
     block = render_constitutional_core(graph)
     assert block == "## Who I Am\n- " + seed_cc_rim.RIM_CHOICE_CLAUSE_TEXT
+
+
+def test_cc_probation_rollback_drains_marker_instead_of_stranding_it(monkeypatch):
+    """#93 rollback, CC side. Mirror of the canonical test in
+    test_conversational_recall.py -- cc_update_probation is a near-verbatim port,
+    so the one-way-rollback defect ports with it.
+
+    Deliberately built on a bare Graph rather than the cc_ng fixture: this
+    exercises cc_update_probation alone, which is parameterized on graph, and
+    a NeuroGraphMemory would add ~800MB and the #100 flakiness for nothing.
+    """
+    from neuro_foundation import Graph
+    import cc_ng_organism as cno
+
+    g = Graph()
+
+    # Phase 1: knob ON, node ages out without ever firing -> stamped.
+    monkeypatch.setattr(cno, "_CC_CONV_PROBATION_REQUIRE_SPIKE", True)
+    quiet = g.create_node(node_id="R", metadata={
+        "probation_remaining": 1, "probation_total": 10, "novelty_dampening": 0.3})
+    quiet.intrinsic_excitability = 0.3
+    cno.cc_update_probation(g)
+    assert quiet.metadata.get("probation_expired_unfired") is True
+    assert quiet.metadata.get("graduated") is False
+    assert len(quiet.spike_history) == 0, "precondition: it never fired"
+
+    # Phase 2: operator rolls the gate back OFF. The node still has not fired.
+    monkeypatch.setattr(cno, "_CC_CONV_PROBATION_REQUIRE_SPIKE", False)
+    graduated = cno.cc_update_probation(g)
+
+    assert "R" in graduated, "rollback stranded a node it was flipped to rescue"
+    assert quiet.metadata.get("graduated") is True
+    assert quiet.metadata.get("probation_expired_unfired") is None, \
+        "the marker must be drained, not left behind to re-fire next sweep"
+    assert "R" not in cno.cc_update_probation(g)

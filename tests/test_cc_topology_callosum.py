@@ -508,3 +508,137 @@ def test_create_hyperedge_default_still_mints():
     h2 = g.create_hyperedge(member_node_ids={"a", "b"})
     assert h1.hyperedge_id != h2.hyperedge_id
     assert len(h1.hyperedge_id) == 36          # uuid4 string
+
+
+# --- #106: the merge-journal poison-pill --------------------------------------
+
+def test_journaled_but_culled_node_is_readmitted(tmp_path):
+    """#106. A node absorbed once and then destroyed locally must be re-absorbed.
+
+    This is the whole defect. The journal is append-only with no invalidation
+    path, so the entry outlives the node; the old receive-side veto therefore
+    fired on exactly one set -- (journal - graph.nodes) -- which is precisely
+    the set that needs re-delivery. Because Tier 2 requires both endpoints in
+    graph.nodes, a permanently-vetoed node also permanently shredded every
+    synapse incident to it. The laptop has no TID, so the conduit is its only
+    route to tree structure: a permanent veto is a permanent hole.
+    """
+    sg, sv, ids = _build_sender()
+    path, _ = _export(sg, sv, tmp_path)
+
+    rg, rv = _receiver()
+    st1 = _merge(rg, rv, path, tmp_path)
+    assert st1["absorbed_nodes"] == 4
+    assert st1["absorbed_synapses"] == 2
+
+    # The #104 cull: a tree node is taken locally after it landed. Its incident
+    # synapse cascades out with it and the hyperedge shrinks (remove_node,
+    # neuro_foundation.py:1860) -- the journal entry survives all of it.
+    rg.remove_node(ids["t1"])
+    assert ids["t1"] not in rg.nodes
+    assert not tmg._synapse_exists(rg, ids["f1"], ids["t1"])
+
+    journal = (tmp_path / "journal.txt").read_text().split()
+    assert ids["t1"] in journal, "precondition: the stale entry must be present"
+
+    # Same conduit, same journal. Pre-#106 this was a no-op forever.
+    st2 = _merge(rg, rv, path, tmp_path)
+
+    assert st2["journal_stale_readmitted"] == 1
+    assert st2["absorbed_nodes"] == 1
+    assert ids["t1"] in rg.nodes
+
+    # The point of re-admitting the node is the structure that rides with it.
+    assert st2["absorbed_synapses"] == 1
+    assert tmg._synapse_exists(rg, ids["f1"], ids["t1"])
+
+    # The three other nodes were present, so the graph guard -- not the journal
+    # -- is what makes the re-run a no-op for them.
+    assert st2["skipped_present"] == 3
+
+    # Re-absorbing must not append a duplicate journal line.
+    assert (tmp_path / "journal.txt").read_text().split() == journal
+
+
+def test_readmitted_node_restores_full_hyperedge_membership(tmp_path):
+    """The culled member comes back bound, not merely present.
+
+    remove_node shrinks a surviving hyperedge to {f1, t2} rather than deleting
+    it, so the arriving {f1, t1, t2} edge is neither a member-set duplicate nor
+    id-installable -- it remints. That is the documented collision path, and it
+    is what restores the binding the cull broke.
+    """
+    sg, sv, ids = _build_sender()
+    sender_he_id = next(iter(sg.hyperedges))
+    path, _ = _export(sg, sv, tmp_path)
+
+    rg, rv = _receiver()
+    _merge(rg, rv, path, tmp_path)
+    rg.remove_node(ids["t1"])
+    assert rg.hyperedges[sender_he_id].member_nodes == {ids["f1"], ids["t2"]}
+
+    st2 = _merge(rg, rv, path, tmp_path)
+
+    assert st2["absorbed_hyperedges"] == 1
+    assert st2["hyperedge_id_reminted"] == 1
+    full = {ids["f1"], ids["t1"], ids["t2"]}
+    assert any(he.member_nodes == full for he in rg.hyperedges.values()), \
+        "the culled member was re-absorbed but left unbound"
+
+
+def test_journal_still_feeds_sender_exclude_ids(tmp_path):
+    """Removing the receive-side veto must not break the journal's real job.
+
+    Its documented purpose is sender-side: the receiver's journal becomes the
+    exporter's exclude_ids so the sender stops re-transmitting. That is also
+    what bounds re-absorb churn now that the receiver no longer self-vetoes.
+    """
+    sg, sv, ids = _build_sender()
+    path, _ = _export(sg, sv, tmp_path)
+    rg, rv = _receiver()
+    _merge(rg, rv, path, tmp_path)
+
+    landed = set((tmp_path / "journal.txt").read_text().split())
+    assert landed == set(ids.values())
+
+    _, est = _export(sg, sv, tmp_path, exclude_ids=landed)
+    assert est["exported_nodes"] == 0, \
+        "sender kept re-sending nodes the journal reported"
+
+
+def test_readmit_counter_not_incremented_when_deposit_fails(tmp_path, monkeypatch):
+    """#106 stat honesty: the counter reports re-admissions, not attempts.
+
+    It used to increment at the Tier-1 journal branch, upstream of the
+    provenance gates, the embedding validation and the deposit try/except --
+    so a node that raised on deposit and hit `continue` was still counted as
+    readmitted. That inflates the one number used to judge whether the
+    poison-pill fix is working, in the optimistic direction.
+    """
+    sg, sv, ids = _build_sender()
+    path, _ = _export(sg, sv, tmp_path)
+
+    rg, rv = _receiver()
+    _merge(rg, rv, path, tmp_path)
+    rg.remove_node(ids["t1"])
+    assert ids["t1"] in (tmp_path / "journal.txt").read_text().split()
+
+    # merge_cc_topology imports this lazily from cc_ng_organism inside the
+    # function body (cc_topology_merge.py:156), so the source module is what
+    # has to be patched -- there is no module-level name on tmg to shadow.
+    import cc_ng_organism as cno
+    real_deposit = cno._cc_deposit_memory_node
+
+    def _fail_on_t1(graph, vector_db, nid, emb, content, meta):
+        if nid == ids["t1"]:
+            raise RuntimeError("simulated deposit failure")
+        return real_deposit(graph, vector_db, nid, emb, content, meta)
+
+    monkeypatch.setattr(cno, "_cc_deposit_memory_node", _fail_on_t1)
+
+    st = _merge(rg, rv, path, tmp_path)
+
+    assert ids["t1"] not in rg.nodes, "precondition: the deposit must have failed"
+    assert st["absorbed_nodes"] == 0
+    assert st["journal_stale_readmitted"] == 0, \
+        "counted a re-admission that never landed"

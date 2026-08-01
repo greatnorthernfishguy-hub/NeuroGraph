@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SEE FIRST: /home/josh/docs/CC-CALLOSUM-TRUTH.md -- consolidated, verified state of
+# the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
+# The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-07-29] Claude Code (DudeMan CC, Opus 5) — Callosum Leg 2: topology export (VPS Arborist -> laptop)
 # What: export_cc_topology() walks the CC substrate's conversational topology

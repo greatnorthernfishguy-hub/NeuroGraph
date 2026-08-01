@@ -10,6 +10,7 @@
 #      lock in the swap (chunk path out, experiential path in) end-to-end.
 # How: Duck-typed fakes; no model load, no ng_tract, no protected/vendored deps.
 # -------------------
+import collections
 import os
 import sys
 import types
@@ -127,6 +128,10 @@ class _FakeNode:
         self.metadata = metadata
         self.threshold = 1.0
         self.intrinsic_excitability = 1.0
+        # Mirrors neuro_foundation.Neuron: a bounded append-only spike ledger.
+        # Only Graph.step() appends to it in the real substrate, which is exactly
+        # why #93's _has_ever_fired reads it and not last_spike_time.
+        self.spike_history = collections.deque(maxlen=100)
 
 
 class _FakeGraph:
@@ -214,19 +219,104 @@ def test_bind_topology_synapses_hyperedge_and_sequence(monkeypatch):
     assert seq and seq[0][3] >= 2
 
 
+def _record_spike(node, t=1.0):
+    """Stand-in for what Graph.step() does when a neuron crosses threshold.
+
+    The fake graph has no membrane dynamics, so driving a real spike is not an
+    option; appending to spike_history is the whole of what _has_ever_fired
+    observes, so this reproduces the only signal under test.
+    """
+    node.spike_history.append(t)
+
+
 def test_update_probation_graduates_and_fades(monkeypatch):
     g, _ = _install_graph(monkeypatch)
+    # Pin the #93 gate rather than inheriting ANIMA_CONV_PROBATION_REQUIRE_SPIKE
+    # from the environment — this test asserts the gated behaviour specifically.
+    monkeypatch.setattr(rpc, "_CONV_PROBATION_REQUIRE_SPIKE", True)
     grad_node = g.create_node(node_id="X", metadata={
         "probation_remaining": 1, "probation_total": 10, "novelty_dampening": 0.3})
     grad_node.intrinsic_excitability = 0.3
     fade_node = g.create_node(node_id="Y", metadata={
         "probation_remaining": 5, "probation_total": 10, "novelty_dampening": 0.3})
     fade_node.intrinsic_excitability = 0.3
+    # #93 — the "graduated" stamp now requires evidence the node actually fired,
+    # so X must have a spike on record before its window closes to earn it.
+    _record_spike(grad_node)
+    assert len(grad_node.spike_history) > 0, "precondition: X must have really fired"
     graduated = rpc._update_probation(g)
     assert "X" in graduated
     assert grad_node.intrinsic_excitability == 1.0 and grad_node.metadata.get("graduated") is True
     assert fade_node.metadata["probation_remaining"] == 4
     assert 0.3 < fade_node.intrinsic_excitability < 1.0   # faded, not graduated
+
+
+def test_update_probation_unfired_node_sheds_dampening_but_does_not_graduate(monkeypatch):
+    """#93 — a node that ages out without ever firing must still get its dampening
+    released (gating that too would be a self-reinforcing trap: a permanently
+    boosted threshold makes firing less likely, so release could never be earned),
+    but it must NOT be stamped 'graduated' — it demonstrated nothing.
+    """
+    g, _ = _install_graph(monkeypatch)
+    monkeypatch.setattr(rpc, "_CONV_PROBATION_REQUIRE_SPIKE", True)
+    base_threshold = g.config.get("default_threshold", 1.0)
+    quiet = g.create_node(node_id="Q", metadata={
+        "probation_remaining": 1, "probation_total": 10, "novelty_dampening": 0.3})
+    quiet.intrinsic_excitability = 0.3
+    quiet.threshold = base_threshold + 0.2
+    assert len(quiet.spike_history) == 0
+
+    graduated = rpc._update_probation(g)
+    assert "Q" not in graduated
+    assert quiet.metadata.get("graduated") is False
+    assert quiet.metadata.get("probation_expired_unfired") is True
+    # dampening released on schedule regardless — no permanent handicap
+    assert quiet.intrinsic_excitability == 1.0
+    assert quiet.threshold == base_threshold
+
+    # ...and if it fires later, it earns the stamp then (late graduation).
+    _record_spike(quiet)
+    graduated = rpc._update_probation(g)
+    assert "Q" in graduated
+    assert quiet.metadata.get("graduated") is True
+    assert quiet.metadata.get("probation_expired_unfired") is None
+
+
+def test_probation_rollback_drains_marker_instead_of_stranding_it(monkeypatch):
+    """#93 rollback must be two-way: flipping the knob OFF has to rescue the
+    cohort it stamped, not orphan it.
+
+    The gate belongs INSIDE the probation_expired_unfired branch, not on the
+    branch itself. Gated outside, a knob-off run skips every already-stamped
+    node entirely -- so nodes that aged out un-fired while the knob was on stay
+    at graduated=False forever, which is precisely the cohort the operator
+    flipped the knob to release. Under #92 ("no mechanism may permanently erase
+    her access to a thought") under-protection is the direction that costs
+    memory, so a one-way rollback is the dangerous failure.
+    """
+    g, _ = _install_graph(monkeypatch)
+
+    # Phase 1: knob ON, node ages out without ever firing -> stamped.
+    monkeypatch.setattr(rpc, "_CONV_PROBATION_REQUIRE_SPIKE", True)
+    quiet = g.create_node(node_id="R", metadata={
+        "probation_remaining": 1, "probation_total": 10, "novelty_dampening": 0.3})
+    quiet.intrinsic_excitability = 0.3
+    rpc._update_probation(g)
+    assert quiet.metadata.get("probation_expired_unfired") is True
+    assert quiet.metadata.get("graduated") is False
+    assert len(quiet.spike_history) == 0, "precondition: it never fired"
+
+    # Phase 2: operator rolls the gate back OFF. The node still has not fired.
+    monkeypatch.setattr(rpc, "_CONV_PROBATION_REQUIRE_SPIKE", False)
+    graduated = rpc._update_probation(g)
+
+    assert "R" in graduated, "rollback stranded a node it was flipped to rescue"
+    assert quiet.metadata.get("graduated") is True
+    assert quiet.metadata.get("probation_expired_unfired") is None, \
+        "the marker must be drained, not left behind to re-fire next sweep"
+
+    # Idempotent: the marker is gone, so the next sweep is a clean no-op.
+    assert "R" not in rpc._update_probation(g)
 
 
 

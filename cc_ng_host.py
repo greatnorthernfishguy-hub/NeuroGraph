@@ -1,3 +1,6 @@
+# SEE FIRST: /home/josh/docs/CC-CALLOSUM-TRUTH.md -- consolidated, verified state of
+# the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
+# The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 """
 cc_ng_host.py — Host CC's NeuroGraph instance inside neurograph_rpc.py process.
 

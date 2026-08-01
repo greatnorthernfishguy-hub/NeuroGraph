@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
+# SEE FIRST: /home/josh/docs/CC-CALLOSUM-TRUTH.md -- consolidated, verified state of
+# the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
+# The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-07-29] Claude Code (Opus 5) — #93 graduation must be earned, not aged into (CC side)
+# What: Mirror of the canonical change in neurograph_rpc.py. cc_update_probation no
+#   longer stamps metadata["graduated"] on timer expiry alone. Added
+#   _cc_has_ever_fired(node) (reads spike_history) and env knob
+#   CC_CONV_PROBATION_REQUIRE_SPIKE (default "1", set 0 to restore pure-timer).
+#   Un-fired nodes that age out get metadata["probation_expired_unfired"]=True and stay
+#   eligible for late graduation if they ever fire. Novelty-dampening release is
+#   deliberately NOT gated — it still happens on the timer.
+# Why: "graduated" was a pure wall-clock flag, so it discriminated nothing and could not
+#   serve as #93's earned-protection signal. CC and Syl run the same probation semantics
+#   from two codebases; leaving CC on the old rule would mean the flag means different
+#   things on either side of the Callosum. Gating the DAMPENING on firing too would be a
+#   self-reinforcing trap (never-fired node keeps a boosted threshold, so it stays less
+#   likely to fire, so it can never earn release), so only the stamp is gated.
+# How: separate _CC_-prefixed knob and helper rather than importing from neurograph_rpc —
+#   cc_ng_organism.py is CC's own organism and does not depend on Syl's RPC module; the
+#   env var is namespaced so one host can run both without the knobs colliding. The
+#   reinforcement path in cc_reinforce_node (~line 1309) still stamps "graduated" ungated
+#   and that is intended: an explicit confirmation IS earned evidence, and it is a
+#   CC-only path with no canonical counterpart.
 # [2026-07-29] Claude Code (DudeMan CC, Opus 5) — #84: CC Commons persist/restore
 # What: New cc_commons_checkpoint_path() and persist_cc_commons(); get_cc_commons()
 #   now restores from <workspace>/checkpoints/commons.msgpack at create time. Both
@@ -1156,6 +1179,11 @@ _CC_CONV_NOVELTY_DAMPENING = float(os.environ.get("CC_CONV_NOVELTY_DAMPENING", "
 _CC_CONV_PROBATION_PERIOD = int(os.environ.get("CC_CONV_PROBATION_PERIOD", "10"))
 _CC_CONV_THRESHOLD_BOOST = float(os.environ.get("CC_CONV_THRESHOLD_BOOST", "0.2"))
 _CC_CONV_SYNAPSE_DELAY_MAX = int(os.environ.get("CC_CONV_SYNAPSE_DELAY_MAX", "5"))
+# #93 — gate the "graduated" stamp on evidence the node actually fired, rather than
+# on elapsed pulses alone. Set to 0 to restore pure-timer graduation.
+_CC_CONV_PROBATION_REQUIRE_SPIKE = os.environ.get(
+    "CC_CONV_PROBATION_REQUIRE_SPIKE", "1"
+) not in ("0", "false", "False", "")
 
 # ---- Real-KISS redundancy->reinforcement gate (input boundary, #KISS 2026-07-08) ----
 # See docs/concepts/KISS.md "Current State" / KISS_Pith_Combined_Architecture.md.
@@ -1375,6 +1403,41 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
     cc_anticipate(graph, [forest_id] + tree_ids, state)
 
 
+def _cc_has_ever_fired(node) -> bool:
+    """True iff the node has a genuine spike on record. Mirrors canonical's
+    _has_ever_fired (neurograph_rpc.py).
+
+    Reads spike_history (appended only by Graph.step(), neuro_foundation.py:2135)
+    rather than the other two firing ledgers, both of which lie for this purpose
+    (punchlist #96 — the three ledgers disagree):
+      - last_spike_time is ALSO stamped by prime_and_propagate() in write_mode, so
+        Tonic traversal alone would forge "has fired".
+      - firing_rate_ema is EMA-decayed toward 0, so it is non-monotonic — a node
+        that genuinely fired long ago would read False.
+    spike_history is a RingBuffer (neuro_foundation.py:554) over a
+    deque(maxlen=capacity): append-only, evicts but never empties, and is
+    serialized/restored with the checkpoint (to_list/from_list, nf:4491/4794).
+    It is the one monotonic "has genuinely fired at least once" signal available.
+    """
+    hist = getattr(node, "spike_history", None)
+    if hist is None:
+        return False
+    try:
+        return len(hist) > 0
+    except TypeError:
+        # RingBuffer defines __len__ (nf:568), so this is unreachable for a real
+        # Node. Do not raise: this runs per-node across the whole graph and one
+        # malformed node must not abort the sweep. But do not swallow silently
+        # either — a False here under-reports firing, and #93 consumes this as a
+        # protection signal, so a silent False is the direction that costs memory.
+        logger.warning(
+            "_cc_has_ever_fired: spike_history has no len() (type=%s) — treating "
+            "as never-fired; node will not be stamped graduated",
+            type(hist).__name__,
+        )
+        return False
+
+
 def cc_update_probation(graph) -> list:
     """Substrate-level probation graduation -- fades novelty-dampening over
     the probation window and graduates nodes to full excitability. Mirrors
@@ -1383,20 +1446,52 @@ def cc_update_probation(graph) -> list:
     near-verbatim port. Call once per pulse (autosave loop), after any
     conversational deposits for that pulse -- operates on ALL probationary
     nodes, not just ones just deposited.
+
+    Novelty-dampening release is ALWAYS on the timer. Only the "graduated" stamp is
+    gated on evidence of firing (#93) -- see the comment at the graduation branch for
+    why those two must not be gated together.
     """
     graduated = []
     base_threshold = graph.config.get("default_threshold", 1.0)
     for nid, node in list(graph.nodes.items()):
         prob = node.metadata.get("probation_remaining")
-        if prob is None or prob <= 0:
+        if prob is None:
+            continue
+        if prob <= 0:
+            # Late graduation: a node whose window expired before it ever fired stays
+            # eligible. If it fires later it has earned the stamp then -- without this
+            # the flag would permanently under-report nodes that entered cognition
+            # after their window closed. Already-graduated nodes lack the marker and
+            # fall straight through, preserving the original fast path.
+            #
+            # The gate is INSIDE the marker branch, mirroring the expiry branch below.
+            # Gating the branch itself on _CC_CONV_PROBATION_REQUIRE_SPIKE would make
+            # the rollback one-way: with the knob off, nodes already stamped
+            # probation_expired_unfired would be skipped entirely and stranded at
+            # graduated=False forever -- exactly the cohort the knob is flipped to
+            # rescue. Rollback must drain the marker, not orphan it.
+            if node.metadata.get("probation_expired_unfired"):
+                if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
+                    node.metadata["graduated"] = True
+                    node.metadata.pop("probation_expired_unfired", None)
+                    graduated.append(nid)
             continue
         prob -= 1
         node.metadata["probation_remaining"] = prob
         if prob <= 0:
+            # Dampening release is unconditional and stays on the timer. Gating it on
+            # firing would be a self-reinforcing trap: a never-fired node would keep a
+            # permanently boosted threshold, making it even less likely to fire, so it
+            # could never earn release.
             node.intrinsic_excitability = 1.0
             node.threshold = base_threshold
-            node.metadata["graduated"] = True
-            graduated.append(nid)
+            if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
+                node.metadata["graduated"] = True
+                graduated.append(nid)
+            else:
+                # Aged out without ever firing: dampening lifted, but nothing earned.
+                node.metadata["graduated"] = False
+                node.metadata["probation_expired_unfired"] = True
         else:
             damp = float(node.metadata.get("novelty_dampening", _CC_CONV_NOVELTY_DAMPENING))
             total = float(node.metadata.get("probation_total", _CC_CONV_PROBATION_PERIOD)) or float(_CC_CONV_PROBATION_PERIOD)

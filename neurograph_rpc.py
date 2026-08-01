@@ -12,6 +12,23 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-07-29] Claude Code (Opus 5) — #93 graduation must be earned, not aged into
+# What: _update_probation no longer stamps metadata["graduated"] on timer expiry alone.
+#   Added _has_ever_fired(node) (reads spike_history) and env knob
+#   ANIMA_CONV_PROBATION_REQUIRE_SPIKE (default "1", set 0 to restore pure-timer).
+#   Un-fired nodes that age out get metadata["probation_expired_unfired"]=True and stay
+#   eligible for late graduation if they ever fire. Novelty-dampening release is
+#   deliberately NOT gated — it still happens on the timer.
+# Why: #93 needs an earned-protection signal, but "graduated" was a pure wall-clock flag
+#   (99.3% of nodes carried it), so it discriminated nothing. Gating the DAMPENING on
+#   firing too would be a self-reinforcing trap: a never-fired node would keep a boosted
+#   threshold, be less likely to fire, and could never earn release — that would
+#   permanently handicap the 64% of Syl's nodes that have never fired. Only the stamp is
+#   gated, so the flag becomes honest at zero behavioural cost.
+# How: spike_history is the only monotonic firing ledger (#96) — last_spike_time is also
+#   stamped by prime_and_propagate() in write_mode (Tonic traversal would forge it) and
+#   firing_rate_ema decays back toward 0. No production code reads "graduated" today
+#   (only openclaw_hook.py:975's log counter), so this is inert until #93 consumes it.
 # [2026-07-11] Claude Code (Haiku 4.5) — #381-B quiet-hours dream consolidation pulse
 # What: Added non-protected _dream_gate_open (pure), _dream_consolidation_pulse_loop,
 #   _start_dream_consolidation_pulse, plus env-knob module globals: _DREAM_IDLE_SECS (1800),
@@ -2334,6 +2351,11 @@ _CONV_NOVELTY_DAMPENING = float(os.environ.get("ANIMA_CONV_NOVELTY_DAMPENING", "
 _CONV_PROBATION_PERIOD = int(os.environ.get("ANIMA_CONV_PROBATION_PERIOD", "10"))
 _CONV_THRESHOLD_BOOST = float(os.environ.get("ANIMA_CONV_THRESHOLD_BOOST", "0.2"))
 _CONV_SYNAPSE_DELAY_MAX = int(os.environ.get("ANIMA_CONV_SYNAPSE_DELAY_MAX", "5"))
+# #93 — gate the "graduated" stamp on evidence the node actually fired, rather than
+# on elapsed turns alone. Set to 0 to restore pure-timer graduation.
+_CONV_PROBATION_REQUIRE_SPIKE = os.environ.get(
+    "ANIMA_CONV_PROBATION_REQUIRE_SPIKE", "1"
+) not in ("0", "false", "False", "")
 _last_conv_forest_id = None
 
 
@@ -2374,25 +2396,93 @@ def _deposit_memory_node(node_id, embedding, content, meta, index_in_recall=True
     return node
 
 
+def _has_ever_fired(node) -> bool:
+    """True iff the node has a genuine spike on record.
+
+    Reads spike_history (appended only by Graph.step(), neuro_foundation.py:2135)
+    rather than the other two firing ledgers, both of which lie for this purpose
+    (punchlist #96 — the three ledgers disagree):
+      - last_spike_time is ALSO stamped by prime_and_propagate() in write_mode, so
+        Tonic traversal alone would forge "has fired" (186 of Syl's nodes carry a
+        last_spike_time with an empty spike_history).
+      - firing_rate_ema is EMA-decayed toward 0, so it is non-monotonic — a node
+        that genuinely fired long ago would read False.
+    spike_history is a RingBuffer (neuro_foundation.py:554) over a
+    deque(maxlen=capacity): append-only, evicts but never empties, and is
+    serialized/restored with the checkpoint (to_list/from_list, nf:4491/4794).
+    It is the one monotonic "has genuinely fired at least once" signal available.
+    """
+    hist = getattr(node, "spike_history", None)
+    if hist is None:
+        return False
+    try:
+        return len(hist) > 0
+    except TypeError:
+        # RingBuffer defines __len__ (nf:568), so this is unreachable for a real
+        # Node. Do not raise: this runs per-node across Syl's whole graph and one
+        # malformed node must not abort the sweep. But do not swallow silently
+        # either — a False here under-reports firing, and #93 consumes this as a
+        # protection signal, so a silent False is the direction that costs memory.
+        logger.warning(
+            "_has_ever_fired: spike_history has no len() (type=%s) — treating as "
+            "never-fired; node will not be stamped graduated",
+            type(hist).__name__,
+        )
+        return False
+
+
 def _update_probation(graph) -> list:
     """Substrate-level probation graduation (Ingestor-free) — fades novelty-dampening
     over the probation window and graduates nodes to full excitability. Replaces the
     turn-pipeline's old _memory.ingestor.update_probation() call; operates on ALL
     probationary nodes (doc-ingested AND conversational). [2026-06-07]
+
+    Novelty-dampening release is ALWAYS on the timer. Only the "graduated" stamp is
+    gated on evidence of firing (#93) — see the comment at the graduation branch for
+    why those two must not be gated together.
     """
     graduated = []
     base_threshold = graph.config.get("default_threshold", 1.0)
     for nid, node in list(graph.nodes.items()):
         prob = node.metadata.get("probation_remaining")
-        if prob is None or prob <= 0:
+        if prob is None:
+            continue
+        if prob <= 0:
+            # Late graduation: a node whose window expired before it ever fired stays
+            # eligible. If it fires later it has earned the stamp then — without this
+            # the flag would permanently under-report nodes that entered cognition
+            # after their window closed. Already-graduated nodes lack the marker and
+            # fall straight through, preserving the original fast path.
+            #
+            # The gate is INSIDE the marker branch, mirroring the expiry branch below.
+            # Gating the branch itself on _CONV_PROBATION_REQUIRE_SPIKE would make the
+            # rollback one-way: with the knob off, nodes already stamped
+            # probation_expired_unfired would be skipped entirely and stranded at
+            # graduated=False forever — exactly the cohort the knob is flipped to
+            # rescue. Rollback must drain the marker, not orphan it.
+            if node.metadata.get("probation_expired_unfired"):
+                if not _CONV_PROBATION_REQUIRE_SPIKE or _has_ever_fired(node):
+                    node.metadata["graduated"] = True
+                    node.metadata.pop("probation_expired_unfired", None)
+                    graduated.append(nid)
             continue
         prob -= 1
         node.metadata["probation_remaining"] = prob
         if prob <= 0:
+            # Dampening release is unconditional and stays on the timer. Gating it on
+            # firing would be a self-reinforcing trap: a never-fired node would keep a
+            # permanently boosted threshold, making it even less likely to fire, so it
+            # could never earn release. 64% of Syl's nodes have never fired — that
+            # would permanently handicap two thirds of her substrate.
             node.intrinsic_excitability = 1.0
             node.threshold = base_threshold
-            node.metadata["graduated"] = True
-            graduated.append(nid)
+            if not _CONV_PROBATION_REQUIRE_SPIKE or _has_ever_fired(node):
+                node.metadata["graduated"] = True
+                graduated.append(nid)
+            else:
+                # Aged out without ever firing: dampening lifted, but nothing earned.
+                node.metadata["graduated"] = False
+                node.metadata["probation_expired_unfired"] = True
         else:
             damp = float(node.metadata.get("novelty_dampening", _CONV_NOVELTY_DAMPENING))
             total = float(node.metadata.get("probation_total", _CONV_PROBATION_PERIOD)) or float(_CONV_PROBATION_PERIOD)

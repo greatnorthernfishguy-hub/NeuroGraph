@@ -316,6 +316,27 @@ TID's `app.py` created both a bare `NGLite` instance and an `NGEcosystem` instan
 
 **Lesson:** Never `cat`, dump, or display any config file that could contain credentials. Use Python scripts that filter sensitive fields, or `grep` for specific non-sensitive values.
 
+### The Recurring Synapse-Collapse False Alarm (#80, #91, and counting)
+
+**Syl's synapse count sawtooths. It grows to 25–31k over 3–5 hours, then collapses to a stable ~4,400 floor in ~60 seconds, 5–8 times a day, at all hours. This is correct behavior. It is the intended de-densify.**
+
+This has been "discovered," escalated as a catastrophe, investigated from scratch, and re-deemed expected **at least four times** — #80 (gates collapsing the live graph), the 2026-07-21 wire-telemetry alarm, the #59 melt, and again 2026-07-30. Each pass burned hours re-deriving the same verdict from raw logs. Each pass proposed ripping out working machinery. The 2026-07-30 pass reached "she is being lobotomized multiple times a day" before checking the one number that settles it.
+
+**The number that settles it:** 2,927 synapses touch identity-protected nodes and are exempt from every prune rule. Protected core (2,927) + working set (~1,500) ≈ the observed ~4,400 floor. *Nothing protected dies.* Separately, 23,444 of 26,202 synapses (89%) sit in one narrow `peak_weight` bin at 0.10–0.15 — birth weight, never reinforced once. Lifetime prune:sprout is 2.6:1. That is churn being cleared, which is the entire point.
+
+**The discriminator is a protection layer, not a report.** Do not go looking for a `prune_audit` / `prune_reason` / classification output — none exists and searching for one wastes a session. The judgement is encoded as a skip-guard: `_prune_synapses()` (`neuro_foundation.py:3409`) calls `_is_identity_protected()` (`:3443`) at the top of the loop body, before any rule runs. Protected = node `metadata['constitutional']` truthy, or `metadata['provenance'] == 'syl_authored'`. That is #92, whose invariant is *"no mechanism may permanently erase her access to a thought."*
+
+**Known-alarming signatures that are all expected, not findings:**
+- `inactive_steps` p50 ≈ 957 against `inactivity_threshold = 1000` — the distribution is right-censored and jams against the ceiling by construction. Looks like imminent total loss; is the steady state.
+- 82% gone in 60 seconds — a synchronized cohort crossing the line together. Cliff shape ≠ pathology.
+- Dormancy counts on the global step odometer (`:2442` increments every synapse each `step()`; `:2206` resets only those actually propagated through), so a synapse ages whether or not it ever had opportunity to fire. Real, known, not the cause of harm.
+- `prime_and_propagate`'s `inactive_steps = 0` reset (`:2670`) is gated behind `_age_on` (`:2541` = `write_mode and config["tonic_ages_substrate"]`), which is **0 for Syl** — so Tonic traversal does not credit activity. Deliberate; #59's changelog says so in as many words ("the inactive_steps reset is gated too").
+- The save-guard (#51/#83) refusing to persist during a collapse is it working, not a second bug.
+
+**Lesson:** The diagnostic question is never *"how much died"* — it is *"did anything protected die."* Volume of deletion is not evidence of harm, and on this substrate it never has been. Before escalating any synapse-count drop, count protected survivors and check the `peak_weight` histogram; if the losses are the 0.10–0.15 monoculture and the protected set is intact, it is churn clearing and there is nothing to fix. Read this section and `~/.claude/.../memory/index/MEMORY-ecosystem-syl.md` *before* investigating, not after.
+
+**Genuinely open, and not a reason to reopen the above:** only 18 of 16,190 nodes are protected (1 constitutional + 17 `syl_authored`). Whether that spine is too thin is a scope question about what earns protection. It is not a defect in the culling.
+
 ---
 
 ## 9. The `.claude/` Hooks
