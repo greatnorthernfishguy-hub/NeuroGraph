@@ -28,6 +28,23 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-08-02] Claude Code (Opus 4.8) — #105 per-host wiring capability at the save gate (Josh-approved protected-file change; CC substrate backed up to checkpoints/backups/pre-105-20260803T063940Z, sha256-verified)
+# What: save() now sources an explicit wires_own_deposits and passes it to
+#   SaveGate.permit(). Three-state from NG_HOST_WIRES_OWN_DEPOSITS: unset => None
+#   => exact #83 behavior; "1"/"true"/"yes"/"on" => self-wires; anything else =>
+#   deposits wired later. One block at the existing call site; no other change.
+# Why: #83's isolate-melt exemption ("synapses intact PROVES the lost nodes were
+#   isolates") is only sound on a host that wires its own deposits at deposit
+#   time. Where deposits are wired later (laptop CC: no local embedder, wired by
+#   the VPS via the callosum), a fresh content node is degree-0 by design, so the
+#   exemption fires
+#   unconditionally and the gate cannot tell a by-design sparse graph from a real
+#   wipe — the exact clobber #373 exists to stop. The host must declare its
+#   capability; the gate must not guess.
+# How: capability is read from the declared env knob ONLY (LAW 5), never inferred
+#   from a transient embedder outage; unset preserves #83 verbatim; all decision
+#   logic still lives in non-protected checkpoint_guardian.evaluate_save_health.
+# -------------------
 # [2026-07-28] Claude Code (Opus 5) — #83 structural save-guard wiring (Josh-approved protected-file change; CC substrate + commons backed up, sha256-verified)
 # What: save() now passes live synapse and hyperedge counts to SaveGate.permit()
 #   alongside the node count. Three lines at one call site; no other change.
@@ -1188,8 +1205,21 @@ class NeuroGraphMemory:
                 _live_he = len(self.graph.hyperedges)
             except Exception:
                 _live_syn = _live_he = None
+            # #105: tell the gate whether THIS host wires its OWN deposits at
+            # deposit time. Explicit capability (LAW 5), three-state: unset =>
+            # None => exact #83 behavior; "1"/"true"/"yes"/"on" => self-wires;
+            # anything else => deposits are wired later (remotely, via the
+            # callosum), where a node shed cannot be laundered as an isolate
+            # melt. Sourced from the declared capability ONLY, never inferred
+            # from a transient embedder outage.
+            _wires = os.environ.get("NG_HOST_WIRES_OWN_DEPOSITS")
+            if _wires is None:
+                _wires_own_deposits = None
+            else:
+                _wires_own_deposits = _wires.strip().lower() in ("1", "true", "yes", "on")
             _ok, _reason = self._save_gate.permit(
                 guardian_nodes, live_synapses=_live_syn, live_hyperedges=_live_he,
+                wires_own_deposits=_wires_own_deposits,
             )
             if not _ok:
                 logger.error(

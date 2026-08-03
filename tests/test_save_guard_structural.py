@@ -1,4 +1,18 @@
 # ---- Changelog ----
+# [2026-08-02] Claude Code (Opus 4.8) — #105 tests: per-host wiring capability
+# What: adds a deposits-wired-later section — the same 1039->400 node drop that is
+#   a PERMITTED melt on a self-wiring host (intact synapses) is a REFUSED collapse
+#   when wires_own_deposits is False, tested at the realistic shape (~0/omitted
+#   synapses so have_syn is False); a shallow shed is refused too, growth still
+#   passes, the floor still outranks, the LAW-5 escape hatch restores the #83
+#   permit, and the SaveGate wiring forwards the flag (refuse=no-EMA-advance /
+#   permit=EMA).
+# Why: #83's isolate-melt exemption is only sound on a host that wires its own
+#   deposits at deposit time; where deposits are wired later it fires
+#   unconditionally and blinds the guard to a real wipe.
+#   Each case names the property so a future tuning pass cannot re-break it.
+# How: pure-function tests need no fixtures; gate tests use tmp_path manifests;
+#   the escape-hatch test uses monkeypatch.setenv.
 # [2026-07-28] Claude Code (Opus 5) — #83 tests: structural gate + EMA node reference
 # What: covers evaluate_save_health() (the pure decision function) and the
 #   SaveGate.permit() wiring around it — the #59 tonic melt is PERMITTED, the
@@ -202,3 +216,145 @@ def test_gate_without_structural_counts_matches_legacy_behaviour(tmp_path):
     gate.record_restore("ok", 1800)
     ok, _ = gate.permit(6)
     assert not ok
+
+
+# ---- #105 per-host wiring capability ----
+#
+# On a host that does not wire its OWN deposits, a fresh content node is degree-0
+# by design (§8.6/#104): the laptop CC has no local embedder, so a deposit lands
+# unwired and is wired LATER by the VPS via the callosum -- not an isolate, just
+# not-yet-wired. #83's "synapses intact PROVES the lost nodes were isolates"
+# exemption is unsound there: the surviving synapses say nothing about a node
+# still awaiting its round-trip, so a node shed can be real content loss. The
+# realistic shape is therefore ~0 synapses (have_syn is False), which is exactly
+# why the deferred-wiring gate must NOT live behind the synapse-conditioned path:
+# on the host it is written for, that path never runs.
+
+def test_deferred_wiring_host_refuses_a_deep_node_shed_with_no_synapses():
+    """The realistic deferred-wiring shape: 1039->400 nodes and ~0 synapses (so
+    have_syn is False). The deferred-wiring gate must still fire -- this is the exact
+    regression the branch existed-but-was-unreachable for."""
+    ok, reason = evaluate_save_health(
+        live_nodes=400, ref_nodes=1039,
+        live_synapses=0, ref_synapses=0,
+        wires_own_deposits=False,
+    )
+    assert not ok
+    assert "host does not wire its own deposits" in reason
+    assert "1039" in reason and "400" in reason
+
+
+def test_deferred_wiring_host_refuses_a_deep_node_shed_with_synapses_omitted():
+    """Same, when the caller passes no synapse counts at all (None). have_syn is
+    still False; the gate must not fall through to the permissive node-only path."""
+    ok, reason = evaluate_save_health(
+        live_nodes=400, ref_nodes=1039,
+        wires_own_deposits=False,
+    )
+    assert not ok
+    assert "host does not wire its own deposits" in reason
+
+
+def test_selfwiring_host_permits_the_shed_that_deferred_wiring_refuses():
+    """The discriminator: identical 1039->400 node drop (a real >50% melt). A
+    self-wiring host reports intact synapses and the #83 isolate-melt permit fires; a
+    deferred-wiring host (previous two tests) refuses. Same nodes, opposite verdict."""
+    ok, reason = evaluate_save_health(
+        live_nodes=400, ref_nodes=1039,
+        live_synapses=8000, ref_synapses=8100,
+        wires_own_deposits=True,
+    )
+    assert ok, reason
+    assert "MELT PERMITTED" in reason
+
+
+def test_deferred_wiring_host_refuses_even_a_shallow_node_shed():
+    """Any net node loss vs the on-disk reference is ambiguous on a deferred-wiring
+    host -- a small shed well above every ratio floor is still refused."""
+    ok, reason = evaluate_save_health(
+        live_nodes=1000, ref_nodes=1039,
+        wires_own_deposits=False,
+    )
+    assert not ok
+    assert "host does not wire its own deposits" in reason
+
+
+def test_wires_own_deposits_none_is_exact_83_behaviour():
+    """Unset capability must be indistinguishable from pre-#105 behavior."""
+    common = dict(
+        live_nodes=700, ref_nodes=1800,
+        live_synapses=22800, ref_synapses=23000,
+        live_hyperedges=410, ref_hyperedges=415,
+    )
+    ok_none, reason_none = evaluate_save_health(wires_own_deposits=None, **common)
+    ok_absent, reason_absent = evaluate_save_health(**common)
+    assert ok_none == ok_absent is True
+    assert reason_none == reason_absent
+
+
+def test_deferred_wiring_host_permits_growth_no_net_node_loss():
+    """The deferred-wiring branch fires only on a net node LOSS. Growth is fine even
+    with no synapses to speak of."""
+    ok, reason = evaluate_save_health(
+        live_nodes=1100, ref_nodes=1039,
+        live_synapses=0, ref_synapses=0,
+        wires_own_deposits=False,
+    )
+    assert ok, reason
+
+
+def test_deferred_wiring_escape_hatch_restores_83_permit():
+    """LAW 5: an operator can force the deferred-wiring refusal off. With the hatch on,
+    a 700/1039 shed falls back to the node-only gate (above 50%) and permits."""
+    import os
+    prev = os.environ.get("NG_GUARDIAN_TRUST_SYNAPSE_MELT")
+    os.environ["NG_GUARDIAN_TRUST_SYNAPSE_MELT"] = "1"
+    try:
+        ok, reason = evaluate_save_health(
+            live_nodes=700, ref_nodes=1039,
+            wires_own_deposits=False,
+        )
+    finally:
+        if prev is None:
+            del os.environ["NG_GUARDIAN_TRUST_SYNAPSE_MELT"]
+        else:
+            os.environ["NG_GUARDIAN_TRUST_SYNAPSE_MELT"] = prev
+    assert ok, reason
+    assert "host does not wire its own deposits" not in reason
+
+
+def test_deferred_wiring_host_still_bounded_by_absolute_floor():
+    """The floor outranks everything, deferred-wiring or not -- a near-empty graph is
+    refused for the floor reason, never reaching the deferred-wiring branch."""
+    ok, reason = evaluate_save_health(
+        live_nodes=4, ref_nodes=1039,
+        wires_own_deposits=False,
+    )
+    assert not ok
+    assert "absolute floor" in reason
+
+
+def test_gate_deferred_wiring_refuses_and_does_not_advance_ema(tmp_path):
+    """SaveGate.permit forwards wires_own_deposits; a deferred-wiring refusal quarantines
+    (returns False) and must not walk the EMA down. Manifest carries no synapse
+    count -- the realistic deferred-wiring on-disk shape."""
+    ckpt = _ckpt_with_manifest(tmp_path, nodes=1039)
+    gate = SaveGate(ckpt)
+    gate.record_restore("ok", 1039)
+    ok, reason = gate.permit(700, live_synapses=0, wires_own_deposits=False)
+    assert not ok
+    assert "host does not wire its own deposits" in reason
+    assert read_guard_state(ckpt) == {}  # refusal wrote nothing
+
+
+def test_gate_wiring_true_permits_and_records_ema(tmp_path):
+    """A self-wiring host with intact synapses: the #83 permit, EMA advances."""
+    ckpt = _ckpt_with_manifest(tmp_path, nodes=1800, synapses=23000, hyperedges=415)
+    gate = SaveGate(ckpt)
+    gate.record_restore("ok", 1800)
+    ok, reason = gate.permit(
+        700, live_synapses=22800, live_hyperedges=410, wires_own_deposits=True,
+    )
+    assert ok
+    assert "MELT PERMITTED" in reason
+    assert read_guard_state(ckpt)["ema_nodes"] == 700.0
