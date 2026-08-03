@@ -55,6 +55,29 @@
 #   exclude_ids stops re-sending journaled nodes, and a node re-absorbed here
 #   arrives with its own synapses and hyperedge in the same batch, so it does not
 #   land orphaned into the next sweep.
+#
+# [2026-08-02] Claude Code (Opus 5) — #108 / ruling condition (c): consolidation
+#   steps between merge batches, and the guard that makes them safe.
+# What: after each batch's Tier 3, run `idle_steps` of pure graph.step() via
+#   cc_ng_organism._cc_callosum_consolidate (LAW 3 — reuse, do not mint a second
+#   stepping loop). Env-sourced from CC_NG_IDLE_STEPS (LAW 5), default 250.
+#   Guarded: skip while ANY arrival this merge has landed is still unbound.
+# Why: grace exists so STDP-via-spreading-activation and sprouting-via-co-firing
+#   can wire an arriving node (neuro_foundation.py:3474) -- local, same-step
+#   mechanisms. Merge ran zero steps, so arrivals got the grace window and no
+#   wiring opportunity inside it. Measured consequence, CC-CALLOSUM-TRUTH.md
+#   §8.6: cc_gateway nodes that fired are 98% wired; nodes that never fired are
+#   0.4% wired. Firing is what wires; no steps means no firing.
+# Guard scope: MERGE-scoped, not batch-scoped, and that distinction is the fix.
+#   Binding structure splits across batches, so a batch-scoped predicate cannot
+#   see the node it must protect -- batch 1 lands X unbound and skips, batch 2
+#   lands whole, X is not in batch 2's set, the guard passes, and 250 steps age
+#   X from 0 to 250 against a grace of 25. That is §8.2's cohort cliff authored
+#   into the merge path in the name of fixing it. Caught in law-enforcer review
+#   2026-08-02 before commit.
+# Not #117: this advances the clock on a merge, which is part of absorbing the
+#   merge. It is NOT the missing autonomic loop and must not be read as progress
+#   on the LAW 8 violation (§0.2, §8.5). The clock is still conversation-gated.
 # -------------------
 
 import json
@@ -147,13 +170,28 @@ def merge_cc_topology(
     journal_path: Optional[str] = None,
     max_nodes_per_call: int = _DEFAULT_MAX_NODES_PER_CALL,
     expected_embedding_model: Optional[str] = None,
+    idle_steps: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Absorb a CC topology conduit into the local substrate.
 
     Returns a stats dict. Raises TopologyMergeAbort when the conduit must not
     be absorbed at all.
+
+    CONSOLIDATION BETWEEN BATCHES (FatherGraph Finding 3, ruling condition (c),
+    #108): after each batch's Tier 3 completes, `idle_steps` of pure graph.step()
+    run with no new input so homeostatic regulation can absorb the new topology
+    before the next batch arrives. The report calls this "not optional -- it's
+    what makes merge work" (47%->74%). Reuses `_cc_callosum_consolidate`
+    (cc_ng_organism.py:1856), which already slices the lock -- LAW 3, restore the
+    existing mechanism rather than write a second one. Default 250 via
+    CC_NG_IDLE_STEPS, the same env the nightly cron already exports.
     """
-    from cc_ng_organism import _cc_deposit_memory_node
+    from cc_ng_organism import _cc_deposit_memory_node, _cc_callosum_consolidate
+
+    if idle_steps is None:
+        # LAW 5, and deliberately the SAME env name the nightly cc-ng-sync cron
+        # already exports on both halves (cc_ng_organism.py:1938). No new knob.
+        idle_steps = max(0, int(os.environ.get("CC_NG_IDLE_STEPS", "250")))
 
     local_machine_id = local_machine_id or os.environ.get("MACHINE_ID")
     if not local_machine_id:
@@ -202,10 +240,19 @@ def merge_cc_topology(
         "skipped_synapses": 0, "skipped_hyperedges": 0,
         "hyperedge_id_reminted": 0,
         "batches_read": 0, "deferred_by_budget": 0,
+        "consolidation_passes": 0, "consolidation_steps": 0,
+        "consolidation_skipped_unbound_arrivals": 0,
     }
 
     budget = max_nodes_per_call
     landed_ids: List[str] = []
+    # Merge-scoped arrival set for the consolidation guard below. Deliberately
+    # NOT `batch_landed` and NOT `landed_ids`: the guard has to see every node
+    # this merge has put in play, across all batches. See the guard at the
+    # bottom of the loop for why batch scope is unsafe. `landed_ids` is the
+    # journal's ledger and excludes already-present nodes (:249), which are
+    # legitimate endpoints and can be left unbound by a split batch too.
+    merge_landed: Set[str] = set()
 
     for frame in frames[1:]:
         if frame.get("kind") != "batch":
@@ -403,6 +450,54 @@ def merge_cc_topology(
                 logger.debug("CC topology hyperedge failed: %s", exc)
                 stats["skipped_hyperedges"] += 1
 
+        # --- Consolidation: sleep on this batch before taking the next ------
+        # FatherGraph Finding 3 / ruling condition (c) / #108. Tier 3 has run,
+        # so everything this batch could bind is bound; the steps let threshold
+        # adaptation, synaptic scaling and excitability catch up before more
+        # foreign topology lands.
+        #
+        # GUARDED, and the guard is the whole reason this is not a two-line
+        # change. Consolidation advances graph.timestep, and
+        # orphan_node_grace_period is denominated in exactly that clock (default
+        # 25). idle_steps defaults to 250. So running the steps while any node
+        # that landed in THIS merge is still unbound would march it straight
+        # past grace and hand it to the orphan sweep -- authoring
+        # CC-CALLOSUM-TRUTH.md §8.2's cohort cliff into the merge path, in the
+        # name of a fix for it. A node is left unbound here when its binding
+        # structure was split across batches or skipped (skipped_synapses /
+        # skipped_hyperedges), which whole-containment permits.
+        #
+        # THE PREDICATE IS MERGE-SCOPED, NOT BATCH-SCOPED, and that is the
+        # whole point. Binding splits ACROSS batches (the comment above), so a
+        # batch-scoped check cannot see the node it needs to protect: batch 1
+        # lands X unbound and correctly skips; batch 2 lands whole, X is not in
+        # batch 2's set, the guard passes, and 250 steps age X from 0 to 250
+        # against a grace of 25. The merge kills the arrival the guard exists
+        # to protect, one batch later. `merge_landed` accumulates every arrival
+        # this call has put in play so the guard stays honest for all of them.
+        #
+        # So: consolidate only when everything this merge has landed is bound.
+        # Otherwise skip, count, and log loudly -- an unbound arrival is a real
+        # defect worth seeing, and deferring its consolidation costs only
+        # integration quality, whereas running it costs the node.
+        merge_landed |= batch_landed
+        if idle_steps > 0 and merge_landed:
+            unbound = _unbound_nodes(graph, merge_landed)
+            if unbound:
+                stats["consolidation_skipped_unbound_arrivals"] += len(unbound)
+                logger.error(
+                    "CC topology: skipping %d consolidation step(s) after batch %d -- "
+                    "%d of %d arrival(s) so far this merge are still unbound (no "
+                    "synapse, no hyperedge) and grace is denominated in the clock "
+                    "consolidation would advance. Sample: %s. This is a "
+                    "whole-containment gap upstream, not a consolidation problem "
+                    "(#108/#107).",
+                    idle_steps, stats["batches_read"], len(unbound), len(merge_landed),
+                    sorted(unbound)[:3])
+            elif _cc_callosum_consolidate(graph, idle_steps):
+                stats["consolidation_passes"] += 1
+                stats["consolidation_steps"] += idle_steps
+
     # Re-admitted nodes (#106) are already journaled; appending them again would
     # grow the file by one duplicate line per node per pass without changing the
     # loaded set. Only record genuinely new deliveries.
@@ -416,6 +511,32 @@ def merge_cc_topology(
         stats["absorbed_hyperedges"], stats["deferred_by_budget"],
     )
     return stats
+
+
+def _unbound_nodes(graph: Any, node_ids: Set[str]) -> Set[str]:
+    """Which of `node_ids` are anchored by nothing the orphan sweep respects.
+
+    Mirrors the sweep's own predicate (neuro_foundation.py:3487): a node is
+    reap-eligible only when it has no outgoing synapse, no incoming synapse AND
+    no hyperedge membership. Hyperedge membership is an independent, equally
+    sufficient anchor -- counting synapse degree alone reports catastrophic
+    false positives (CC-CALLOSUM-TRUTH.md §1.1, and note synapses key on
+    pre_node_id/post_node_id, not source_id/target_id).
+
+    Identity protection is deliberately NOT consulted: this asks "would
+    advancing the clock endanger this arrival", and a protected node is spared
+    for reasons unrelated to whether the batch bound it. Treating protection as
+    boundness would let a half-bound batch consolidate.
+    """
+    outgoing = getattr(graph, "_outgoing", {}) or {}
+    incoming = getattr(graph, "_incoming", {}) or {}
+    node_hyperedges = getattr(graph, "_node_hyperedges", {}) or {}
+    return {
+        nid for nid in node_ids
+        if not outgoing.get(nid)
+        and not incoming.get(nid)
+        and not node_hyperedges.get(nid)
+    }
 
 
 def _hyperedge_exists(graph: Any, members: Set[str]) -> bool:

@@ -642,3 +642,128 @@ def test_readmit_counter_not_incremented_when_deposit_fails(tmp_path, monkeypatc
     assert st["absorbed_nodes"] == 0
     assert st["journal_stale_readmitted"] == 0, \
         "counted a re-admission that never landed"
+
+
+# --------------------------------------------------------------------------
+# Consolidation between batches (#108) and its unbound-arrival guard
+# --------------------------------------------------------------------------
+#
+# Note the base fixture is NOT fully bound: `f2` (turn-002) has no synapse and
+# no hyperedge membership, so it is a permanently unbound arrival and every
+# merge of _build_sender() output correctly refuses to consolidate. The tests
+# below that want consolidation to happen must bind it first -- which is also
+# why they use _build_bound_sender() rather than adding a synapse to the shared
+# fixture, where it would change exported_synapses for the other 25 tests.
+
+
+def _build_bound_sender():
+    """_build_sender(), plus the one synapse that anchors the orphan f2."""
+    g, v, ids = _build_sender()
+    g.create_synapse(ids["f2"], ids["t1"], weight=0.2, delay=2)
+    return g, v, ids
+
+
+def _add_unbound(g, v, nid="cc:conv::turn-000"):
+    """A cc node with no synapse and no hyperedge -- an unbound arrival.
+
+    creation_time sorts it first so it lands in batch 1, ahead of the bound
+    topology, which is what the cross-batch test needs.
+    """
+    meta = {"cc": True, "creation_mode": "conversational",
+            "_forest_content": "content for lone"}
+    node = g.create_node(node_id=nid, metadata=meta)
+    node.creation_time = -1
+    v.insert(id=nid, embedding=_emb(99), content="content for lone", metadata=meta)
+    return nid
+
+
+def test_bound_merge_consolidates_after_the_batch(tmp_path):
+    """The #108 restoration itself: Tier 3 done, everything bound, sleep on it."""
+    sg, sv, _ = _build_bound_sender()
+    path, _ = _export(sg, sv, tmp_path)
+    rg, rv = _receiver()
+    assert rg.timestep == 0
+
+    st = _merge(rg, rv, path, tmp_path, idle_steps=5)
+
+    assert st["consolidation_passes"] == 1
+    assert st["consolidation_steps"] == 5
+    assert st["consolidation_skipped_unbound_arrivals"] == 0
+    assert rg.timestep == 5, "consolidation must actually advance the graph clock"
+
+
+def test_idle_steps_zero_disables_consolidation(tmp_path):
+    """LAW 5 escape hatch: CC_NG_IDLE_STEPS=0 buys back the old behaviour."""
+    sg, sv, _ = _build_bound_sender()
+    path, _ = _export(sg, sv, tmp_path)
+    rg, rv = _receiver()
+
+    st = _merge(rg, rv, path, tmp_path, idle_steps=0)
+
+    assert st["consolidation_passes"] == 0
+    assert st["consolidation_steps"] == 0
+    assert rg.timestep == 0
+    assert st["absorbed_nodes"] == 4, "merge itself must be unaffected"
+
+
+def test_unbound_arrival_suppresses_consolidation(tmp_path):
+    """An unbound arrival must not be aged past the orphan grace period.
+
+    idle_steps (250 in production) dwarfs orphan_node_grace_period
+    (neuro_foundation.py:1436, default 25), so consolidating over an unbound
+    arrival marches it from age 0 to well past grace and hands it to the sweep
+    -- the merge would destroy the node it just absorbed.
+    """
+    sg, sv, _ = _build_bound_sender()
+    lone = _add_unbound(sg, sv)
+    path, _ = _export(sg, sv, tmp_path)
+    rg, rv = _receiver()
+
+    st = _merge(rg, rv, path, tmp_path, idle_steps=5)
+
+    assert st["consolidation_passes"] == 0
+    assert st["consolidation_skipped_unbound_arrivals"] == 1
+    assert rg.timestep == 0, "the arrival was aged despite being unbound"
+    assert lone in rg.nodes
+
+
+def test_consolidation_guard_is_merge_scoped_not_batch_scoped(tmp_path):
+    """The guard must stay tripped for batches AFTER the one that landed unbound.
+
+    Binding structure splits across batches, so a batch-scoped check cannot see
+    the node it needs to protect: batch 1 lands the lone node and correctly
+    skips, batches 2..n are each internally whole, a batch-scoped guard passes
+    on them, and the steps age the batch-1 arrival past grace anyway. The merge
+    kills the arrival the guard exists to protect, one batch later.
+
+    The control below is what makes this discriminating: on these exact batch
+    boundaries, with no unbound arrival, consolidation genuinely does run.
+    """
+    ctl_dir, var_dir = tmp_path / "ctl", tmp_path / "var"
+    ctl_dir.mkdir(), var_dir.mkdir()
+
+    # Control: same sender, same batching, nothing unbound.
+    cg, cv, _ = _build_bound_sender()
+    ctl_path, _ = _export(cg, cv, ctl_dir, batch_size=1)
+    crg, crv = _receiver()
+    ctl = _merge(crg, crv, ctl_path, ctl_dir, idle_steps=5)
+
+    assert ctl["batches_read"] >= 2, "control must span several batches"
+    assert ctl["consolidation_passes"] >= 1, \
+        "control consolidates -- otherwise the variant below proves nothing"
+
+    # Variant: identical, except one unbound node arrives in batch 1.
+    sg, sv, _ = _build_bound_sender()
+    lone = _add_unbound(sg, sv)
+    path, _ = _export(sg, sv, var_dir, batch_size=1)
+    rg, rv = _receiver()
+
+    st = _merge(rg, rv, path, var_dir, idle_steps=5)
+
+    assert st["batches_read"] > ctl["batches_read"]
+    assert st["consolidation_passes"] == 0, \
+        "a later whole batch consolidated over an arrival still unbound from batch 1"
+    assert rg.timestep == 0
+    assert lone in rg.nodes
+    # Every batch from the first onward should have refused, not just batch 1.
+    assert st["consolidation_skipped_unbound_arrivals"] > 1
