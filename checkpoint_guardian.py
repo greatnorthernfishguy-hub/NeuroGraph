@@ -1,4 +1,30 @@
 # ---- Changelog ----
+# [2026-08-02] Claude Code (Opus 4.8) — #105 per-host wiring capability
+# What: evaluate_save_health() and SaveGate.permit() take an optional
+#   wires_own_deposits flag. None/True => exact #83 behavior. False => a host
+#   that does not wire its OWN deposits at deposit time (laptop CC: no local
+#   embedder, so a fresh deposit lands degree-0 and is wired later by the VPS via
+#   the corpus callosum). On such a host the synapse-unchanged "isolate melt"
+#   exemption is INVALID: a degree-0 node may be real content still awaiting its
+#   callosum round-trip, not an isolate, and stable synapse counts cannot tell
+#   the two apart. So a node shed past the floor is refused-and-quarantined, not
+#   permitted as an isolate melt. The caller sources the flag from the explicit
+#   NG_HOST_WIRES_OWN_DEPOSITS capability (LAW 5), never inferred from a
+#   transient embedder/wiring outage.
+# Why: #83's structural discriminator ("synapses ~unchanged PROVES the connected
+#   core survived, so the lost nodes were isolates") is only sound where nodes
+#   are wired AT DEPOSIT. Where deposits are wired later (remotely), a freshly
+#   deposited content node is degree-0 by design, so the exemption fires on real
+#   memory and the guard cannot tell a not-yet-wired deposit from a real wipe —
+#   it would permit the very clobber #373 exists to stop. The fix is a per-host
+#   capability, not a number: hosts that self-wire keep #83 verbatim; hosts whose
+#   deposits are wired later fall back to the node/EMA gate with NO synapse
+#   exemption. The flag is transitional by design (LAW 5): when the laptop gains
+#   local wiring, NG_HOST_WIRES_OWN_DEPOSITS flips and #83 returns with no code
+#   change.
+# How: additive optional param, defaults preserve #83 exactly; pure decision
+#   function still (no I/O); capability is env-sourced by the caller (LAW 5);
+#   the refusal logs like every other refusal — nothing silent (LAW 3).
 # [2026-07-28] Claude Code (Opus 5) — #83 save-guard: structural gate + EMA node reference
 # What: SaveGate.permit() now consults evaluate_save_health() instead of a raw
 #   live/on-disk node ratio. New: guard-state sidecar (<checkpoint>.guard_state.json)
@@ -167,12 +193,36 @@ def evaluate_save_health(live_nodes: int,
                          ref_synapses: Optional[int] = None,
                          live_hyperedges: Optional[int] = None,
                          ref_hyperedges: Optional[int] = None,
-                         ema_nodes: Optional[float] = None) -> Tuple[bool, str]:
+                         ema_nodes: Optional[float] = None,
+                         wires_own_deposits: Optional[bool] = None) -> Tuple[bool, str]:
     """Pure decision function: may this in-RAM state overwrite the primary?
 
     Returns (permit, reason). Ordered cheapest-and-most-certain first. Every
     permitted-but-abnormal outcome returns a reason the caller logs loudly --
     a melt is allowed through, never silently (LAW 3).
+
+    wires_own_deposits (#105): does THIS host wire its OWN deposits AT deposit
+    time (a local embedder/Arborist so co-firing sprouts synapses as content
+    arrives)? The #83 synapse-retention MELT-PERMIT rests on "an isolated node
+    has degree 0, so its loss cannot drop a synapse -> synapses surviving PROVES
+    the lost nodes were worthless isolates." That proof holds ONLY where a node
+    is wired at deposit. Where deposits are wired LATER (laptop CC: no local
+    embedder -> a fresh deposit lands degree-0 and is wired later by the VPS via
+    the corpus callosum), a freshly deposited content node is degree-0 by design
+    -- not an isolate, just not-yet-wired -- so a synapse-retained node shed can
+    be real memory loss awaiting its round-trip. There the gate must refuse-to-
+    overwrite (caller quarantines). The topology is fully alive; only the moment
+    of wiring is remote.
+      - None (default/omitted): exact #83 behavior -- Syl-safe, unchanged.
+      - True: host self-wires deposits -- exact #83 behavior.
+      - False: host does not wire its own deposits -- ANY downward node delta vs
+        the on-disk reference is refused (LAW 5 escape hatch:
+        NG_GUARDIAN_TRUST_SYNAPSE_MELT forces the #83 permit back on even here).
+    Sourced from the explicit host capability NG_HOST_WIRES_OWN_DEPOSITS by the
+    caller (a declared architectural fact, LAW 5) -- NOT inferred from a
+    transient embedder outage, which would wrongly flip a self-wiring host into
+    quarantine-mode. Transitional by design: when the laptop gains local wiring,
+    the flag flips and #83 returns with no code change.
     """
     floor = _env_int("NG_GUARDIAN_GATE_MIN_NODES", 100)
     if ref_nodes is None or ref_nodes < floor:
@@ -185,6 +235,32 @@ def evaluate_save_health(live_nodes: int,
         return False, (
             f"live graph ({live_nodes} nodes) is below the absolute floor "
             f"({abs_floor}) while {ref_nodes} nodes are on disk"
+        )
+
+    # 1b. #105 host that does not wire its own deposits: where a deposit is wired
+    #     later (remotely, via the callosum) rather than at deposit time, a fresh
+    #     content node is degree-0 by design (§8.6/#104) -- not an isolate, just
+    #     not-yet-wired -- so #83's structural exemption ("synapses intact PROVES
+    #     the shed nodes were isolates") is unsound: the surviving synapses say
+    #     nothing about a node still awaiting its round-trip. Any net node loss vs
+    #     the on-disk reference is therefore ambiguous and must not auto-overwrite.
+    #     Refuse -> caller quarantines. Checked against ref_nodes (the on-disk
+    #     floor), NOT the EMA, so a walked-down EMA cannot launder a shed into a
+    #     permit. This runs BEFORE the synapse gate on purpose: such a host has ~0
+    #     synapses, so have_syn below is False and every synapse-conditioned path
+    #     is skipped -- if this check lived inside that path it would be dead code
+    #     on the exact host it is for. LAW-5 escape hatch:
+    #     NG_GUARDIAN_TRUST_SYNAPSE_MELT forces the #83 permit back on even here.
+    if (wires_own_deposits is False and ref_nodes and live_nodes < ref_nodes
+            and not _env_flag("NG_GUARDIAN_TRUST_SYNAPSE_MELT", "0")):
+        shed = 1 - live_nodes / max(ref_nodes, 1)
+        return False, (
+            f"content collapse (host does not wire its own deposits): nodes "
+            f"{ref_nodes} -> {live_nodes} ({shed:.0%} shed) -- a fresh deposit "
+            f"here is degree-0 until the callosum round-trip wires it, so a "
+            f"degree-0 shed can be real memory loss awaiting wiring, not an "
+            f"isolate melt, and synapse counts cannot prove otherwise. "
+            f"Quarantined for review."
         )
 
     # 2. Structural gate -- the discriminator. Synapses surviving means the
@@ -338,12 +414,21 @@ class SaveGate:
 
     def permit(self, live_nodes: int,
                live_synapses: Optional[int] = None,
-               live_hyperedges: Optional[int] = None) -> Tuple[bool, str]:
+               live_hyperedges: Optional[int] = None,
+               wires_own_deposits: Optional[bool] = None) -> Tuple[bool, str]:
         """May this in-RAM state overwrite the primary checkpoint?
 
         Pass live_synapses/live_hyperedges when available: they are what lets
         the gate tell a by-design isolated-node melt from a real collapse.
         Omitting them is safe but falls back to the stricter node-only ratio.
+
+        wires_own_deposits (#105): whether THIS host wires its OWN deposits at
+        deposit time. None/omitted (or True) => exact #83 behavior; False => a
+        host whose deposits are wired later (remotely, via the callosum), where
+        any node shed vs the on-disk reference is refused-and-quarantined rather
+        than permitted as an isolate melt. Sourced by the caller from the
+        explicit NG_HOST_WIRES_OWN_DEPOSITS capability (LAW 5), never inferred
+        from a transient embedder outage. See evaluate_save_health().
 
         Side effect by design: a PERMITTED save advances the node EMA, because
         permit() is called exactly once per save attempt and only a permitted
@@ -371,6 +456,7 @@ class SaveGate:
             live_hyperedges=live_hyperedges,
             ref_hyperedges=ref_hyperedges,
             ema_nodes=ema,
+            wires_own_deposits=wires_own_deposits,
         )
 
         if ok:
