@@ -3,6 +3,27 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-08-04] Claude Code (Opus 4.8) — #131: gate the Real-KISS reinforce-path graduation
+#   (the uncovered #111 sibling)
+# What: _cc_kiss_reinforce_node no longer stamps metadata["graduated"]=True unconditionally
+#   when a reinforcement decrement drives probation_remaining<=0. It now applies the same
+#   firing gate as cc_update_probation's timer-expiry path: graduated is stamped only if
+#   (not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node)); an un-fired node
+#   instead gets graduated=False + probation_expired_unfired=True and re-earns the stamp on
+#   its first real fire via cc_update_probation's late-graduation branch (~line 1503).
+#   Novelty-dampening release (intrinsic_excitability/threshold reset) stays unconditional
+#   on the timer, exactly as the other paths. kiss_reinforcement_count is still bumped.
+# Why: #111's fix (504c2d5) gated the timer-expiry and late-graduation paths but left the
+#   reinforce path ungated. It was the last site that could produce the state
+#   CC-CALLOSUM-TRUTH.md §6 defines as un-earned: graduated=True with empty spike_history.
+#   Live proof: cc:conv::1028c3d6... graduated with 12 confirmations + empty spike_history
+#   while same-birth siblings with 17-18 confirmations did not -- the ungated stamp tracked
+#   which tick the decrement landed on (a timer-race artifact), not confirmation strength.
+#   The governing truth doc (SEE FIRST, line 2) is newer + higher-authority than the
+#   2026-07-29 note that called the ungated stamp "intended"; that note is rewritten below.
+# How: mirror of the blessed gate in cc_update_probation (same knob, same helper, same
+#   probation_expired_unfired cohort) so both paths rollback together under
+#   CC_CONV_PROBATION_REQUIRE_SPIKE=0. law-enforcer COMPLIANT (2026-08-04). See #131.
 # [2026-07-29] Claude Code (Opus 5) — #93 graduation must be earned, not aged into (CC side)
 # What: Mirror of the canonical change in neurograph_rpc.py. cc_update_probation no
 #   longer stamps metadata["graduated"] on timer expiry alone. Added
@@ -19,10 +40,14 @@
 #   likely to fire, so it can never earn release), so only the stamp is gated.
 # How: separate _CC_-prefixed knob and helper rather than importing from neurograph_rpc —
 #   cc_ng_organism.py is CC's own organism and does not depend on Syl's RPC module; the
-#   env var is namespaced so one host can run both without the knobs colliding. The
-#   reinforcement path in cc_reinforce_node (~line 1309) still stamps "graduated" ungated
-#   and that is intended: an explicit confirmation IS earned evidence, and it is a
-#   CC-only path with no canonical counterpart.
+#   env var is namespaced so one host can run both without the knobs colliding.
+#   NOTE (superseded 2026-08-04, see #131 entry above): this entry originally claimed the
+#   reinforcement path in _cc_kiss_reinforce_node (~line 1309) was "intended" to stamp
+#   "graduated" ungated because "an explicit confirmation IS earned evidence." That was
+#   wrong. A KISS reinforcement is a cosine near-duplicate match at the INPUT boundary --
+#   evidence content recurred, not evidence the node entered cognition. It also graduated
+#   by timer-race, not confirmation count (a node with 12 confirmations graduated while
+#   siblings with 17-18 did not). #131 gates it on the firing ledger like every other path.
 # [2026-07-29] Claude Code (DudeMan CC, Opus 5) — #84: CC Commons persist/restore
 # What: New cc_commons_checkpoint_path() and persist_cc_commons(); get_cc_commons()
 #   now restores from <workspace>/checkpoints/commons.msgpack at create time. Both
@@ -1327,9 +1352,24 @@ def _cc_kiss_reinforce_node(graph, node_id: str) -> bool:
         prob -= 1
         node.metadata["probation_remaining"] = prob
         if prob <= 0:
+            # Novelty-dampening release stays unconditional on the timer (same
+            # rationale as cc_update_probation): gating it on firing would trap a
+            # never-fired node with a boosted threshold it can never earn release from.
             node.intrinsic_excitability = 1.0
             node.threshold = graph.config.get("default_threshold", 1.0)
-            node.metadata["graduated"] = True
+            # #131 (#111 sibling): reinforcement ACCELERATES the probation timer but is
+            # NOT itself evidence the node entered cognition. Gate the graduated stamp on
+            # the firing ledger, exactly as the timer-expiry path does (cc_update_probation
+            # ~line 1507). An un-fired node that ages out via reinforcement lands in the
+            # probation_expired_unfired cohort and re-earns graduation the first time it
+            # truly fires. kiss_reinforcement_count is still bumped above, so the
+            # confirmation signal is preserved for a future consumer (#113) -- it is just
+            # no longer conflated with earned-by-firing.
+            if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
+                node.metadata["graduated"] = True
+            else:
+                node.metadata["graduated"] = False
+                node.metadata["probation_expired_unfired"] = True
     return True
 
 

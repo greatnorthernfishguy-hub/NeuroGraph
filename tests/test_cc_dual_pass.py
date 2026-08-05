@@ -292,6 +292,114 @@ def test_kiss_reinforcement_never_resets_a_graduated_node(cc_ng):
     assert node.threshold == base_threshold
 
 
+def test_kiss_reinforcement_unfired_node_does_not_graduate(cc_ng, monkeypatch):
+    """#131 (the uncovered #111 sibling) — when repeated reinforcement, not the
+    wall-clock timer, is what drives probation_remaining to 0, an un-fired node
+    must still NOT be stamped 'graduated'. This is the reinforce-path counterpart
+    of test_probation_unfired_node_sheds_dampening_but_does_not_graduate: before
+    #131 this path stamped graduated=True unconditionally, producing exactly the
+    un-earned state (graduated=True with an empty spike_history) that #93/#111
+    outlawed. Dampening release still rides the timer; the stamp is gated on
+    firing; the node re-earns graduation on its first real spike.
+    """
+    import cc_ng_organism as cc
+    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
+    from ng_embed import embed
+    monkeypatch.setattr(cc, "_CC_CONV_PROBATION_REQUIRE_SPIKE", True)
+
+    state = {"last_forest_id": None}
+    text = "reinforce-driven graduation gate: node that never fires"
+    emb = embed(text)
+    assert run_conversational_dual_pass(
+        cc_ng.graph, cc_ng.vector_db, text, emb, state) is True
+    node_id = state["last_forest_id"]
+    node = cc_ng.graph.nodes[node_id]
+    assert node.metadata.get("probation_remaining") == _CC_CONV_PROBATION_PERIOD
+
+    # Drive the window to 0 purely by redundant reinforcement — never stimulate it.
+    for _ in range(_CC_CONV_PROBATION_PERIOD):
+        run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+
+    assert len(node.spike_history) == 0, "precondition: node must not have fired"
+    assert node.metadata.get("probation_remaining") <= 0
+    # The stamp is withheld and the un-fired cohort is recorded...
+    assert node.metadata.get("graduated") is False
+    assert node.metadata.get("probation_expired_unfired") is True
+    # ...but the novelty handicap is lifted on schedule regardless.
+    assert node.intrinsic_excitability == 1.0
+    assert node.threshold == cc_ng.graph.config.get("default_threshold", 1.0)
+    # ...and the confirmation signal is preserved, not thrown away with the stamp.
+    assert node.metadata.get("kiss_reinforcement_count") == _CC_CONV_PROBATION_PERIOD
+
+    # Late graduation: fire it now and the very next probation sweep earns the stamp,
+    # exactly as the timer-expiry path does.
+    from cc_ng_organism import cc_update_probation
+    cc_ng.graph.stimulate(node_id, 20.0)
+    cc_ng.graph.step()
+    assert len(node.spike_history) > 0
+    graduated = cc_update_probation(cc_ng.graph)
+    assert node_id in graduated
+    assert node.metadata.get("graduated") is True
+    assert node.metadata.get("probation_expired_unfired") is None
+
+
+def test_kiss_reinforcement_fired_node_graduates(cc_ng, monkeypatch):
+    """#131 — the positive case: a node that HAS genuinely fired and is then
+    driven out of probation by reinforcement earns the graduated stamp on the
+    reinforce path, no separate probation sweep required."""
+    import cc_ng_organism as cc
+    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
+    from ng_embed import embed
+    monkeypatch.setattr(cc, "_CC_CONV_PROBATION_REQUIRE_SPIKE", True)
+
+    state = {"last_forest_id": None}
+    text = "reinforce-driven graduation gate: node that really fires"
+    emb = embed(text)
+    assert run_conversational_dual_pass(
+        cc_ng.graph, cc_ng.vector_db, text, emb, state) is True
+    node_id = state["last_forest_id"]
+    node = cc_ng.graph.nodes[node_id]
+    # Make it genuinely spike before the reinforcement window closes.
+    cc_ng.graph.stimulate(node_id, 20.0)
+    cc_ng.graph.step()
+    assert len(node.spike_history) > 0, "precondition: node must have really fired"
+
+    for _ in range(_CC_CONV_PROBATION_PERIOD):
+        run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+
+    assert node.metadata.get("probation_remaining") <= 0
+    assert node.metadata.get("graduated") is True
+    assert node.metadata.get("probation_expired_unfired") is None
+    assert node.intrinsic_excitability == 1.0
+
+
+def test_kiss_reinforcement_graduation_gate_kill_switch(cc_ng, monkeypatch):
+    """#131 / LAW-5 rollback parity — with CC_CONV_PROBATION_REQUIRE_SPIKE=0 the
+    reinforce path reverts to the old pure-timer rule: an un-fired node driven out
+    of probation by reinforcement graduates. Both graduation paths must honour the
+    same knob so the whole feature rolls back together."""
+    import cc_ng_organism as cc
+    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
+    from ng_embed import embed
+    monkeypatch.setattr(cc, "_CC_CONV_PROBATION_REQUIRE_SPIKE", False)
+
+    state = {"last_forest_id": None}
+    text = "reinforce-driven graduation gate: kill-switch restores pure timer"
+    emb = embed(text)
+    assert run_conversational_dual_pass(
+        cc_ng.graph, cc_ng.vector_db, text, emb, state) is True
+    node_id = state["last_forest_id"]
+    node = cc_ng.graph.nodes[node_id]
+
+    for _ in range(_CC_CONV_PROBATION_PERIOD):
+        run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+
+    assert len(node.spike_history) == 0, "precondition: node must not have fired"
+    assert node.metadata.get("probation_remaining") <= 0
+    assert node.metadata.get("graduated") is True
+    assert node.metadata.get("probation_expired_unfired") is None
+
+
 class _FakePred:
     def __init__(self, conf, src, tgt):
         self.confidence = conf
