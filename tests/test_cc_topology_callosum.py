@@ -69,7 +69,7 @@ def _export(g, v, tmp_path, **kw):
 def _merge(g, v, path, tmp_path, **kw):
     kw.setdefault("local_machine_id", "laptop")
     kw.setdefault("expected_embedding_model", "test-model")
-    kw.setdefault("journal_path", str(tmp_path / "journal.txt"))
+    kw.setdefault("membership_path", str(tmp_path / "membership.txt"))
     return tmg.merge_cc_topology(g, v, path, **kw)
 
 
@@ -447,7 +447,7 @@ def test_remerge_is_idempotent_with_preserved_ids(tmp_path):
 
     rg, rv = _receiver()
     _merge(rg, rv, path, tmp_path)
-    st2 = _merge(rg, rv, path, tmp_path, journal_path=str(tmp_path / "j2.txt"))
+    st2 = _merge(rg, rv, path, tmp_path, membership_path=str(tmp_path / "m2.txt"))
 
     assert st2["absorbed_hyperedges"] == 0
     assert st2["skipped_hyperedges"] == 1
@@ -533,18 +533,20 @@ def test_journaled_but_culled_node_is_readmitted(tmp_path):
 
     # The #104 cull: a tree node is taken locally after it landed. Its incident
     # synapse cascades out with it and the hyperedge shrinks (remove_node,
-    # neuro_foundation.py:1860) -- the journal entry survives all of it.
+    # neuro_foundation.py:1860). The membership snapshot was written at the end
+    # of merge1 -- BEFORE this cull -- so it still names t1 (it is refreshed on
+    # the NEXT merge, which is exactly the pass that re-admits t1).
     rg.remove_node(ids["t1"])
     assert ids["t1"] not in rg.nodes
     assert not tmg._synapse_exists(rg, ids["f1"], ids["t1"])
 
-    journal = (tmp_path / "journal.txt").read_text().split()
-    assert ids["t1"] in journal, "precondition: the stale entry must be present"
+    membership = (tmp_path / "membership.txt").read_text().split()
+    assert ids["t1"] in membership, "precondition: the stale snapshot entry must be present"
 
-    # Same conduit, same journal. Pre-#106 this was a no-op forever.
+    # Same conduit, same snapshot. Pre-#106 this was a no-op forever.
     st2 = _merge(rg, rv, path, tmp_path)
 
-    assert st2["journal_stale_readmitted"] == 1
+    assert st2["membership_stale_readmitted"] == 1
     assert st2["absorbed_nodes"] == 1
     assert ids["t1"] in rg.nodes
 
@@ -552,12 +554,14 @@ def test_journaled_but_culled_node_is_readmitted(tmp_path):
     assert st2["absorbed_synapses"] == 1
     assert tmg._synapse_exists(rg, ids["f1"], ids["t1"])
 
-    # The three other nodes were present, so the graph guard -- not the journal
+    # The three other nodes were present, so the graph guard -- not the snapshot
     # -- is what makes the re-run a no-op for them.
     assert st2["skipped_present"] == 3
 
-    # Re-absorbing must not append a duplicate journal line.
-    assert (tmp_path / "journal.txt").read_text().split() == journal
+    # #110: merge2 REWROTE the snapshot from the (now whole again) graph, so it
+    # equals current CC membership -- t1 included, because it was re-admitted.
+    assert set((tmp_path / "membership.txt").read_text().split()) == tmg.cc_current_membership(rg)
+    assert ids["t1"] in tmg.cc_current_membership(rg)
 
 
 def test_readmitted_node_restores_full_hyperedge_membership(tmp_path):
@@ -586,30 +590,62 @@ def test_readmitted_node_restores_full_hyperedge_membership(tmp_path):
         "the culled member was re-absorbed but left unbound"
 
 
-def test_journal_still_feeds_sender_exclude_ids(tmp_path):
-    """Removing the receive-side veto must not break the journal's real job.
-
-    Its documented purpose is sender-side: the receiver's journal becomes the
-    exporter's exclude_ids so the sender stops re-transmitting. That is also
-    what bounds re-absorb churn now that the receiver no longer self-vetoes.
+def test_membership_snapshot_feeds_sender_exclude_ids(tmp_path):
+    """The snapshot's real job is sender-side: the receiver's current membership
+    becomes the exporter's exclude_ids so the sender stops re-transmitting what
+    the receiver already holds. That is also what bounds re-absorb churn now that
+    the receiver no longer self-vetoes (#106).
     """
     sg, sv, ids = _build_sender()
     path, _ = _export(sg, sv, tmp_path)
     rg, rv = _receiver()
     _merge(rg, rv, path, tmp_path)
 
-    landed = set((tmp_path / "journal.txt").read_text().split())
-    assert landed == set(ids.values())
+    held = set((tmp_path / "membership.txt").read_text().split())
+    assert held == set(ids.values())
+    assert held == tmg.cc_current_membership(rg)   # the file IS the live membership
 
-    _, est = _export(sg, sv, tmp_path, exclude_ids=landed)
+    _, est = _export(sg, sv, tmp_path, exclude_ids=held)
     assert est["exported_nodes"] == 0, \
-        "sender kept re-sending nodes the journal reported"
+        "sender kept re-sending nodes the receiver already holds"
+
+
+def test_culled_node_drops_out_of_exclude_ids_and_is_resent(tmp_path):
+    """#110: the send-side counterpart of #106.
+
+    exclude_ids is the receiver's CURRENT membership, not an append-only journal,
+    so a node culled locally DROPS OUT of it and the exporter re-sends exactly
+    that node. The old append-only journal kept the id forever, so the sender
+    never re-sent it and #106's receive-side re-admission had nothing to
+    re-admit -- the §3 poison-pill, relocated to the send side.
+    """
+    sg, sv, ids = _build_sender()
+    path, _ = _export(sg, sv, tmp_path)
+    rg, rv = _receiver()
+    _merge(rg, rv, path, tmp_path)
+
+    # Before the cull: given current membership, the exporter re-sends nothing.
+    held = tmg.cc_current_membership(rg)
+    _, e0 = _export(sg, sv, tmp_path, exclude_ids=held)
+    assert e0["exported_nodes"] == 0
+
+    # The #104 cull takes t1 locally.
+    rg.remove_node(ids["t1"])
+
+    # Current membership no longer names t1, so the exporter re-sends exactly it.
+    held = tmg.cc_current_membership(rg)
+    assert ids["t1"] not in held
+    resent_path, e1 = _export(sg, sv, tmp_path, exclude_ids=held)
+    assert e1["exported_nodes"] == 1
+    resent = {rec["id"] for frame in tex.read_topology_frames(open(resent_path, "rb").read())
+              for rec in (frame.get("nodes") or ())}
+    assert resent == {ids["t1"]}, "the culled node -- and only it -- must be re-sent"
 
 
 def test_readmit_counter_not_incremented_when_deposit_fails(tmp_path, monkeypatch):
     """#106 stat honesty: the counter reports re-admissions, not attempts.
 
-    It used to increment at the Tier-1 journal branch, upstream of the
+    It used to increment at the Tier-1 membership branch, upstream of the
     provenance gates, the embedding validation and the deposit try/except --
     so a node that raised on deposit and hit `continue` was still counted as
     readmitted. That inflates the one number used to judge whether the
@@ -621,7 +657,7 @@ def test_readmit_counter_not_incremented_when_deposit_fails(tmp_path, monkeypatc
     rg, rv = _receiver()
     _merge(rg, rv, path, tmp_path)
     rg.remove_node(ids["t1"])
-    assert ids["t1"] in (tmp_path / "journal.txt").read_text().split()
+    assert ids["t1"] in (tmp_path / "membership.txt").read_text().split()
 
     # merge_cc_topology imports this lazily from cc_ng_organism inside the
     # function body (cc_topology_merge.py:156), so the source module is what
@@ -640,7 +676,7 @@ def test_readmit_counter_not_incremented_when_deposit_fails(tmp_path, monkeypatc
 
     assert ids["t1"] not in rg.nodes, "precondition: the deposit must have failed"
     assert st["absorbed_nodes"] == 0
-    assert st["journal_stale_readmitted"] == 0, \
+    assert st["membership_stale_readmitted"] == 0, \
         "counted a re-admission that never landed"
 
 

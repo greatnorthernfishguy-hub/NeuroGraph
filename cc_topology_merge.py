@@ -78,6 +78,26 @@
 # Not #117: this advances the clock on a merge, which is part of absorbing the
 #   merge. It is NOT the missing autonomic loop and must not be read as progress
 #   on the LAW 8 violation (§0.2, §8.5). The clock is still conversation-gated.
+#
+# [2026-08-04] Claude Code (Opus 4.8) — #110: exclude_ids from live membership,
+#   not the append-only journal (the §3 poison-pill, relocated to the send side).
+# What: the receiver-written file the SENDER reads as exclude_ids is now a
+#   MEMBERSHIP SNAPSHOT of current CC graph.nodes, overwritten each merge
+#   (cc_current_membership + _write_membership), replacing the append-only
+#   _append_journal. Param journal_path -> membership_path; stat
+#   journal_stale_readmitted -> membership_stale_readmitted (nothing in-tree read
+#   the old key; tests updated).
+# Why: #106 made presence-in-graph authoritative on the RECEIVE side, but the
+#   sender still built exclude_ids from an append-only record with no
+#   invalidation path. A node culled locally (#104 sweep, orphan collection,
+#   rolled-back checkpoint) stayed in that record forever, so the sender never
+#   re-sent it and #106's re-admission had nothing to re-admit -- the identical
+#   append-only-record-as-authority shape §3 warns about, moved one hop. A live
+#   snapshot SHRINKS when a node is culled, closing the loop: culled -> drops out
+#   of exclude_ids -> re-sent -> re-admitted (#106). Presence in the graph is now
+#   the single authority on BOTH sides. Doc: CC-CALLOSUM-TRUTH.md §4 caveat, §10
+#   Phase 3. Not yet load-bearing (merge_cc_topology has no production caller);
+#   wired correct now so #88's first live run inherits it.
 # -------------------
 
 import json
@@ -104,42 +124,77 @@ class TopologyMergeAbort(RuntimeError):
     counted and logged but never abort the pass."""
 
 
-def _load_journal(journal_path: Optional[str]) -> Set[str]:
-    """Node IDs already delivered to us, for the SENDER's exclude_ids.
+def cc_current_membership(graph: Any) -> Set[str]:
+    """The CC node IDs the receiver currently holds -- the authoritative source
+    for the SENDER's exclude_ids (#110).
 
-    This is delivery bookkeeping, NOT an admission guard -- `nid in graph.nodes`
-    decides what the receiver takes (#106). Append-only with no invalidation
-    path, so an entry outlives the node it names; treating it as authority is
-    what made journaled-but-culled nodes permanently undeliverable. Missing or
-    corrupt journal is harmless: it costs the sender a re-scan, nothing more.
+    It is `graph.nodes` intersected with CC provenance, read live. Because it is
+    regenerated from the graph rather than appended to, a node culled locally
+    (#104 sweep, orphan collection, a rolled-back checkpoint) DROPS OUT of it --
+    so the exporter re-sends that node and #106's receive-side re-admission has
+    something to re-admit. The append-only journal this replaces could only grow,
+    so a culled id stayed excluded forever and the node was permanently
+    un-resendable: the §3 poison-pill, merely relocated to the send side. After
+    #110, presence in the graph is the authority on BOTH sides -- receive
+    admission (#106) and send exclusion.
+
+    Uses the same predicate the exporter classifies with (is_cc_provenance, via
+    cc_topology_export._is_cc_node), so what the receiver advertises as held and
+    what the sender considers CC-exportable cannot drift apart.
     """
-    if not journal_path or not os.path.exists(journal_path):
+    return {nid for nid, node in graph.nodes.items()
+            if is_cc_provenance(nid, getattr(node, "metadata", None) or {})}
+
+
+def _load_membership(membership_path: Optional[str]) -> Set[str]:
+    """Load the receiver's last-written membership snapshot -- what the SENDER
+    reads as exclude_ids.
+
+    Delivery bookkeeping, NOT an admission guard: `nid in graph.nodes` alone
+    decides what the receiver takes (#106). Missing or corrupt is harmless -- it
+    costs the sender a re-scan (it re-sends and the receiver idempotently skips
+    what it already has), nothing more.
+    """
+    if not membership_path or not os.path.exists(membership_path):
         return set()
-    seen: Set[str] = set()
+    held: Set[str] = set()
     try:
-        with open(journal_path, "r", encoding="utf-8") as fh:
+        with open(membership_path, "r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if line:
-                    seen.add(line)
+                    held.add(line)
     except Exception as exc:
-        logger.warning("CC topology journal unreadable (%s): %s -- continuing "
-                       "with graph-membership guard only", journal_path, exc)
-    return seen
+        logger.warning("CC topology membership snapshot unreadable (%s): %s -- "
+                       "continuing with graph-membership guard only",
+                       membership_path, exc)
+    return held
 
 
-def _append_journal(journal_path: Optional[str], node_ids: List[str]) -> None:
-    if not journal_path or not node_ids:
+def _write_membership(membership_path: Optional[str], node_ids: Set[str]) -> None:
+    """Overwrite the snapshot with the receiver's CURRENT CC membership (#110).
+
+    Overwrite, never append: the file MUST be able to shrink when a node is
+    culled, or it becomes the same append-only-record-as-authority the §3
+    poison-pill was. Written via a temp file + os.replace so a crash mid-write
+    cannot leave the sender reading a half-truncated snapshot (a truncated
+    snapshot only ever over-excludes-less -> re-sends more, never corrupts, but
+    the atomic swap keeps even that from happening). Sorted output is
+    deterministic across passes.
+    """
+    if not membership_path:
         return
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(journal_path)) or ".", exist_ok=True)
-        with open(journal_path, "a", encoding="utf-8") as fh:
-            for nid in node_ids:
+        os.makedirs(os.path.dirname(os.path.abspath(membership_path)) or ".", exist_ok=True)
+        tmp = membership_path + ".partial"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for nid in sorted(node_ids):
                 fh.write(nid + "\n")
             fh.flush()
             os.fsync(fh.fileno())
+        os.replace(tmp, membership_path)
     except Exception as exc:
-        logger.warning("CC topology journal append failed (non-fatal): %s", exc)
+        logger.warning("CC topology membership snapshot write failed (non-fatal): %s", exc)
 
 
 def _local_embedding_model() -> str:
@@ -167,7 +222,7 @@ def merge_cc_topology(
     vector_db: Any,
     conduit_path: str,
     local_machine_id: Optional[str] = None,
-    journal_path: Optional[str] = None,
+    membership_path: Optional[str] = None,
     max_nodes_per_call: int = _DEFAULT_MAX_NODES_PER_CALL,
     expected_embedding_model: Optional[str] = None,
     idle_steps: Optional[int] = None,
@@ -229,12 +284,12 @@ def merge_cc_topology(
             "Cosine similarity between differently-embedded vectors is noise; "
             "refusing to absorb rather than silently corrupt recall geometry")
 
-    journal = _load_journal(journal_path)
+    held = _load_membership(membership_path)
     stats = {
         "status": "ok", "path": conduit_path, "sender": sender,
         "embedding_model": wire_model,
         "absorbed_nodes": 0, "absorbed_synapses": 0, "absorbed_hyperedges": 0,
-        "skipped_present": 0, "journal_stale_readmitted": 0, "skipped_not_cc": 0,
+        "skipped_present": 0, "membership_stale_readmitted": 0, "skipped_not_cc": 0,
         "skipped_identity": 0, "bad_embedding": 0,
         "absorbed_without_embedding_DEFECT": 0,
         "skipped_synapses": 0, "skipped_hyperedges": 0,
@@ -249,8 +304,8 @@ def merge_cc_topology(
     # Merge-scoped arrival set for the consolidation guard below. Deliberately
     # NOT `batch_landed` and NOT `landed_ids`: the guard has to see every node
     # this merge has put in play, across all batches. See the guard at the
-    # bottom of the loop for why batch scope is unsafe. `landed_ids` is the
-    # journal's ledger and excludes already-present nodes (:249), which are
+    # bottom of the loop for why batch scope is unsafe. `landed_ids` feeds the
+    # membership snapshot and excludes already-present nodes (:249), which are
     # legitimate endpoints and can be left unbound by a split batch too.
     merge_landed: Set[str] = set()
 
@@ -278,26 +333,29 @@ def merge_cc_topology(
                 stats["skipped_present"] += 1
                 batch_landed.add(nid)   # present == usable as an endpoint
                 continue
-            if nid in journal:
+            if nid in held:
                 # NO `continue` HERE -- #106. Falling through is the fix.
                 #
                 # The graph check above already caught every node that is
                 # actually present, so this branch can only be reached by a node
-                # in (journal - graph.nodes): one that landed once and was then
-                # destroyed locally. Vetoing on that record made re-delivery
-                # impossible forever, and the loss did not stop at the node --
-                # Tier 2 requires both endpoints in graph.nodes and Tier 3 every
-                # member, so a single permanently-vetoed node shredded all of its
-                # incident structure on every subsequent pass. The journal is the
-                # sender's bookkeeping (exclude_ids); presence in the graph is
-                # the receiver's authority. A journaled node that arrived anyway
+                # in (held - graph.nodes): one that was in the receiver's last
+                # membership snapshot but has since been destroyed locally.
+                # Vetoing on that record made re-delivery impossible forever, and
+                # the loss did not stop at the node -- Tier 2 requires both
+                # endpoints in graph.nodes and Tier 3 every member, so a single
+                # permanently-vetoed node shredded all of its incident structure
+                # on every subsequent pass. The snapshot is the sender's
+                # bookkeeping (exclude_ids); presence in the graph is the
+                # receiver's authority. A held-but-absent node that arrived anyway
                 # means the sender chose to re-send it -- honour the delivery.
+                # (After #110 the sender WILL re-send it: a culled node drops out
+                # of cc_current_membership, so exclude_ids no longer names it.)
                 # Counted at the absorption site below, not here -- this point
                 # is only "detected", and the node can still be rejected by the
                 # provenance gates or the deposit try/except before it lands.
                 logger.info(
-                    "CC topology: %s is journaled as landed but is absent from "
-                    "the graph -- re-absorbing (stale journal entry, #106)", nid)
+                    "CC topology: %s was in our last membership snapshot but is "
+                    "absent from the graph -- re-absorbing (culled since, #106)", nid)
 
             meta = dict(rec.get("metadata") or {})
             # Defense in depth: re-run both provenance gates on receive. The
@@ -363,12 +421,12 @@ def merge_cc_topology(
                 continue
 
             stats["absorbed_nodes"] += 1
-            if nid in journal:
+            if nid in held:
                 # Counted here, after the node has actually landed, so the stat
                 # reports re-admissions that happened rather than ones merely
-                # attempted. `journal` is not mutated inside this loop, so this
+                # attempted. `held` is not mutated inside this loop, so this
                 # re-test is the same predicate evaluated at the Tier-1 branch.
-                stats["journal_stale_readmitted"] += 1
+                stats["membership_stale_readmitted"] += 1
             landed_ids.append(nid)
             batch_landed.add(nid)
             budget -= 1
@@ -498,10 +556,13 @@ def merge_cc_topology(
                 stats["consolidation_passes"] += 1
                 stats["consolidation_steps"] += idle_steps
 
-    # Re-admitted nodes (#106) are already journaled; appending them again would
-    # grow the file by one duplicate line per node per pass without changing the
-    # loaded set. Only record genuinely new deliveries.
-    _append_journal(journal_path, [n for n in landed_ids if n not in journal])
+    # #110: overwrite the membership snapshot with the receiver's CURRENT CC
+    # membership -- what the sender reads as exclude_ids. Full overwrite, not an
+    # append of `landed_ids`: a node culled since the last pass must DROP OUT so
+    # the sender re-sends it (the send-side counterpart of #106's receive-side
+    # re-admission). Sourced from graph.nodes, so re-admitted nodes reappear and
+    # culled ones vanish without any per-pass dedup bookkeeping.
+    _write_membership(membership_path, cc_current_membership(graph))
 
     stats["completed"] = stats["deferred_by_budget"] == 0
     logger.info(
