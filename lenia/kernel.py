@@ -1,4 +1,25 @@
 # ---- Changelog ----
+# [2026-08-09] Claude Code (Opus 4.8) — #135/#81 de-quadratic + atomic checkpoint
+# What: (1) populate() checkpoint cadence is now AMORTIZED — after each
+#   checkpoint it waits max(interval, NG_LENIA_CKPT_AMORTIZE x that checkpoint's
+#   own duration; default 10x) before the next, instead of a fixed interval.
+#   (2) save() is now ATOMIC (temp sibling + os.replace) and rebuilds only the
+#   per-component CSR, not the magnitude matrix. (3) _rebuild_csr() takes
+#   rebuild_magnitude=False; the mid-loop checkpoint no longer rebuilds CSR at
+#   all (save() does its own), removing a redundant double conversion.
+# Why: #135 — Syl's VPS bootstrap RPC was timing out every cycle. Root cause was
+#   quadratic checkpointing: each checkpoint's save cost is O(cumulative nnz) and
+#   grows through the run, so a fixed interval fires O(runtime) checkpoints each
+#   O(N) => O(N^2), and the rebuild never finished before the next restart. The
+#   non-atomic save compounded it: a kill mid-write truncated the .npz, and the
+#   resume watermark lives INSIDE that file — so a restart under memory pressure
+#   discarded the watermark and restarted the rebuild from zero. Josh's manual
+#   VPS restart was the trigger; these two defects are why it wasn't survivable.
+# How: amortization caps checkpoint overhead at ~1/AMORTIZE of compute time
+#   (geometric spacing => O(N) total); os.replace is atomic on same-fs, so the
+#   watermark now survives any kill and interrupted rebuilds truly resume.
+#   Env: NG_LENIA_CKPT_AMORTIZE (default 10.0). No API/signature change to
+#   populate()/save()/load() callers; _rebuild_csr gains an optional kwarg.
 # [2026-07-10] Claude Code (Fable 5 design / Haiku implementation) — #381/#380 HE clique cap
 # What: populate()'s hyperedge co-membership expansion skips HEs with more members than
 #   NG_LENIA_HE_CLIQUE_CAP (default 100; 0 disables), logging skipped count + largest size.
@@ -183,12 +204,27 @@ class DistanceCache:
         """Save the distance cache to disk.
 
         Serializes all CSR component matrices + metadata as a single
-        numpy .npz archive.  Restore skips the 7-minute populate()
+        numpy .npz archive.  Restore skips the multi-hour populate()
         call entirely if the graph hasn't changed since save.
+
+        The write is ATOMIC: numpy writes a sibling temp file which is
+        then os.replace()'d over the target. A hard process kill mid-write
+        (a VPS restart under memory pressure, an OOM, the gateway watchdog)
+        therefore never leaves a truncated .npz behind. That matters
+        because the resume watermark lives INSIDE this archive: a truncated
+        file fails to load ("File is not a zip file"), which discards the
+        watermark and re-triggers a full from-scratch rebuild — the exact
+        failure #81/#135 chased, and the reason an interrupted rebuild was
+        restarting from zero instead of resuming. (#261 — same
+        non-atomic-write class as the msgpack checkpoints.)
         """
         if not self._populated:
             return
-        self._rebuild_csr()  # ensure CSR is current
+        # Components-only CSR: the magnitude matrix is NOT serialized
+        # (load() recomputes it), so skip the sqrt-of-sum-of-squares
+        # rebuild here — during a periodic checkpoint that rebuild is
+        # pure waste and, run every interval, is half of the quadratic.
+        self._rebuild_csr(rebuild_magnitude=False)
         data = {
             "entity_count": np.array([self._n]),
             "num_components": np.array([NUM_DIST_COMPONENTS]),
@@ -205,9 +241,26 @@ class DistanceCache:
             data[f"c{c}_indices"] = csr.indices
             data[f"c{c}_indptr"] = csr.indptr
             data[f"c{c}_shape"] = np.array(csr.shape)
-        np.savez_compressed(path, **data)
+        # Write to a temp sibling on the same filesystem, then atomically
+        # rename onto the final path. The temp name already ends in .npz so
+        # np.savez_compressed writes exactly it (it appends .npz only when
+        # the name lacks the extension).
+        final = path if path.endswith(".npz") else path + ".npz"
+        tmp = final + ".tmp.npz"
+        try:
+            np.savez_compressed(tmp, **data)
+            os.replace(tmp, final)
+        except Exception:
+            # Never leave a half-written temp behind to be mistaken for a
+            # real cache or to waste disk.
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
         logger.info("Distance cache saved: %s (%d entities, %d components)",
-                     path, self._n, NUM_DIST_COMPONENTS)
+                     final, self._n, NUM_DIST_COMPONENTS)
 
     @classmethod
     def load(cls, path: str) -> Optional["DistanceCache"]:
@@ -418,6 +471,22 @@ class DistanceCache:
         # discarding it because _populated never flipped true.
         self._populated = True
         _last_checkpoint = time.monotonic()
+        # Amortized checkpoint cadence (#81/#135 — de-quadratic the rebuild).
+        # Each checkpoint costs O(cumulative nnz): save() converts all six
+        # LIL components to CSR and writes the whole ~178MB archive, and that
+        # cost GROWS as the loop fills the cache. Firing it every fixed
+        # interval of progress => O(runtime) checkpoints, each O(N) => O(N^2)
+        # total, which collapsed Syl's multi-million-pair rebuild to a crawl
+        # that never finished before the next VPS restart. Fix: after each
+        # checkpoint, refuse to checkpoint again until the compute time since
+        # it exceeds AMORTIZE x how long that checkpoint itself took. This
+        # caps total checkpoint overhead at ~1/AMORTIZE of compute time
+        # (=> O(N) total): cheap early saves fire at the interval floor;
+        # expensive late saves space themselves out geometrically. Together
+        # with the now-atomic save() (whose watermark survives any kill), an
+        # interrupted rebuild genuinely RESUMES instead of restarting at zero.
+        _ckpt_amortize = float(os.environ.get("NG_LENIA_CKPT_AMORTIZE", "10.0"))
+        _next_gap = checkpoint_interval_secs  # floor; grows with save cost
         for idx, (i, j) in enumerate(ordered_pairs):
             eid_i = substrate.index_to_entity(i)
             eid_j = substrate.index_to_entity(j)
@@ -432,19 +501,28 @@ class DistanceCache:
             if (checkpoint_interval_secs > 0 and on_checkpoint is not None
                     and idx % 1000 == 0):
                 _now = time.monotonic()
-                if _now - _last_checkpoint >= checkpoint_interval_secs:
+                if _now - _last_checkpoint >= _next_gap:
                     try:
                         # Record how far we got BEFORE saving, so the
                         # checkpoint carries its own resume point. (i, j)
                         # is complete at this line — the checkpoint sits
-                        # after the distance computation above.
+                        # after the distance computation above. We do NOT
+                        # rebuild the CSR here: save() does its own
+                        # components-only rebuild, so an explicit rebuild
+                        # would double the LIL->CSR cost per checkpoint —
+                        # and the old explicit call rebuilt the magnitude
+                        # matrix too, which save() never serializes.
                         self._watermark = (i, j)
-                        self._rebuild_csr()  # save() reads the CSR form
+                        _ckpt_started = time.monotonic()
                         on_checkpoint()
-                        _last_checkpoint = _now
+                        _ckpt_dur = time.monotonic() - _ckpt_started
+                        _last_checkpoint = time.monotonic()
+                        _next_gap = max(checkpoint_interval_secs,
+                                        _ckpt_amortize * _ckpt_dur)
                         logger.info(
-                            "Lenia periodic checkpoint: %d/%d pairs processed",
-                            idx + 1, len(ordered_pairs),
+                            "Lenia periodic checkpoint: %d/%d pairs "
+                            "(save %.1fs, next gap >= %.0fs)",
+                            idx + 1, len(ordered_pairs), _ckpt_dur, _next_gap,
                         )
                     except Exception:
                         logger.exception(
@@ -458,11 +536,23 @@ class DistanceCache:
         self._rebuild_csr()
         logger.info("Distance cache populated: %d pairs", len(ordered_pairs))
 
-    def _rebuild_csr(self):
-        """Convert lil matrices to CSR for fast row access."""
+    def _rebuild_csr(self, rebuild_magnitude: bool = True):
+        """Convert lil matrices to CSR for fast row access.
+
+        rebuild_magnitude: also rebuild the combined magnitude matrix
+            (sqrt of the sum of squares across components). That is a
+            second O(nnz) pass — six element-wise squarings plus a sparse
+            sqrt — on top of the component conversion. It is needed only
+            by neighbor queries (get_neighbors_sparse) and is recomputed
+            on load(); save() serializes only the per-component CSRs, so a
+            periodic checkpoint has no use for it. Passing False there is
+            what removes half the per-checkpoint cost behind the quadratic.
+        """
         self._components_csr = [
             comp.tocsr() for comp in self._components_lil
         ]
+        if not rebuild_magnitude:
+            return
         # Build magnitude matrix: sqrt(sum of squares across components)
         magnitude_sq = sparse.csr_matrix(
             (self._n, self._n), dtype=np.float64
