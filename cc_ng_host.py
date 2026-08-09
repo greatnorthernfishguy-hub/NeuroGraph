@@ -27,6 +27,23 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-08-08] Claude Code (DudeMan CC, Opus 4.8) — export_topology socket handler (#88 Leg 2 sender)
+# What: _handle_export_topology added to _DISPATCH (key "export_topology"). Wraps
+#   cc_topology_export.export_cc_topology against the LIVE graph under
+#   ng.graph._concurrent_lock, writing the length-prefixed msgpack conduit the
+#   laptop hemisphere merges. READ-ONLY on the graph -- deliberately NO ng.save()
+#   (nothing in the graph changed; contrast _handle_drain_conduit, the Leg 1
+#   receiver, which does save). Accepts out_path (required), machine_id,
+#   batch_size, exclude_ids, max_nodes; returns {"ok": True, **stats}.
+# Why: #88 Leg 2 needs a SENDER driven against the live daemon so the export reads
+#   a consistent snapshot under the daemon's own lock -- never a second
+#   NeuroGraphMemory (the two-writer torn-checkpoint hazard). export_cc_topology
+#   had "no production caller" (#87); this is it. The nightly cc-ng-sync.py drives
+#   it over the socket.
+# How: import export_cc_topology inside the handler (lazy, non-fatal on ImportError);
+#   snapshot under _concurrent_lock; log + return stats. exclude_ids/max_nodes left
+#   to the caller -- the #110 live-membership handshake is a re-send optimization,
+#   not a #88 blocker.
 # [2026-07-28] Claude Code (DudeMan CC, Opus 5) — Commons persistence (#84) wired into host lifecycle
 # What: persist_cc_commons(CC_NG_WORKSPACE) is now called (a) on the autosave cadence,
 #   right after the CC checkpoint save, and (b) in shutdown_cc_host() after the final
@@ -319,6 +336,14 @@ _CC_SNN_CONFIG = {
     "threshold_ceiling": 5.0,
     "weight_threshold": 0.01,
     "grace_period": 5000,  # [2026-07-03] 500->5000, porting Syl's 2026-06-25 fix — see docs/scripts/cc-ng-daemon.py changelog
+    # [2026-08-08] #107 / enforcer ruling (a) — orphan_node_grace_period env-sourced + host-scoped (LAW 5).
+    # De-fork parity with docs/scripts/cc-ng-daemon.py:443 (the live daemon; canonical must match so #82/#118
+    # de-fork can't regress the ruling). Engine DEFAULT_CONFIG (neuro_foundation.py:1436) defaults this to 25
+    # and merges {**DEFAULT_CONFIG, **_CC_SNN_CONFIG}, so CC silently ran 25 with no env override — the LAW-5
+    # defect the ruling names. Default 25 == engine default: BEHAVIOR-PRESERVING compliance fix, NOT a value
+    # change. ❌ Do NOT raise (attempted at 500, reverted — CC-CALLOSUM-TRUTH.md §8.8: orphan grace is a local
+    # same-step bootstrap guard, not a nightly cross-machine timer). Source of truth: .bashrc CC_NG_ORPHAN_GRACE.
+    "orphan_node_grace_period": int(os.environ.get("CC_NG_ORPHAN_GRACE", "25")),
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
@@ -790,12 +815,58 @@ def _handle_drain_conduit(data):
     return {"ok": True, "absorbed": absorbed}
 
 
+def _handle_export_topology(data):
+    """Corpus Callosum Leg 2 (#88): export THIS hemisphere's CC conversational
+    topology (trees + hyperedges) to a length-prefixed msgpack conduit for the
+    OTHER hemisphere to merge.
+
+    The SENDER half of Leg 2 -- the sibling of _handle_drain_conduit (Leg 1) and
+    the production caller cc_topology_export.export_cc_topology never had ("no
+    production caller", #87). Invoked by the nightly cc-ng-sync.py over the
+    socket so the export reads a consistent snapshot of the LIVE graph under the
+    daemon's _concurrent_lock -- never a second NeuroGraphMemory (the two-writer
+    torn-checkpoint hazard documented in cc-ng-sync.py's changelog).
+
+    READ-ONLY with respect to the graph: export_cc_topology only reads
+    nodes/synapses/hyperedges + vector_db content and writes the conduit file.
+    So, unlike the drain, there is deliberately NO ng.save() here -- nothing in
+    the graph changed. batch_size falls back to the caller's CC_NG_BATCH_SIZE;
+    the embedding-model stamp (FatherGraph Finding 6) is filled by the exporter
+    from the live embedder so the receiver can assert geometry parity and abort
+    on mismatch. exclude_ids/max_nodes are left to the caller -- the #110 live-
+    membership handshake is a re-send optimization, not a #88 blocker.
+    """
+    ng = _STATE.cc_ng
+    if ng is None:
+        return {"ok": False, "error": "NG not initialized"}
+    out_path = data.get("out_path")
+    if not out_path:
+        return {"ok": False, "error": "out_path required"}
+    kwargs = {"machine_id": data.get("machine_id")}
+    if data.get("batch_size"):
+        kwargs["batch_size"] = int(data["batch_size"])
+    if data.get("exclude_ids"):
+        kwargs["exclude_ids"] = set(data["exclude_ids"])
+    if data.get("max_nodes") is not None:
+        kwargs["max_nodes"] = int(data["max_nodes"])
+    try:
+        from cc_topology_export import export_cc_topology
+        with ng.graph._concurrent_lock:
+            stats = export_cc_topology(ng.graph, ng.vector_db, out_path, **kwargs)
+    except Exception as exc:
+        logger.warning("CC topology export failed (non-fatal): %s", exc)
+        return {"ok": False, "error": str(exc)}
+    logger.info("CC topology export -> %s: %s", out_path, stats)
+    return {"ok": True, **stats}
+
+
 _DISPATCH = {
     "ping": _handle_ping,
     "status": _handle_status,
     "export": _handle_export,
     "import": _handle_import,
     "drain_conduit": _handle_drain_conduit,
+    "export_topology": _handle_export_topology,
     "SessionStart": _handle_session_start,
     "SessionStop": _handle_session_stop,
     "UserPromptSubmit": _handle_user_prompt_submit,
