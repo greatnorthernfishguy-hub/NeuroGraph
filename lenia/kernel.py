@@ -1,4 +1,24 @@
 # ---- Changelog ----
+# [2026-08-11] Claude Code (Opus 4.8) — #137 resume path also drops the ~5 GB LIL
+# What: populate()'s buffer-mode switch now treats a RESUME (resume_watermark is
+#   not None) the same as incremental growth — `_incremental = start_index > 0 or
+#   resume_watermark is not None`. Both accumulate a COO delta and fold it into
+#   the resident CSR; only a genuine full rebuild from an empty cache still uses
+#   a transient LIL (cheap over empty CSR).
+# Why: #136 removed the standing LIL at load() but NOT on the resume path. Syl's
+#   live bootstrap resumes an interrupted rebuild (neurograph_rpc.py:2136 —
+#   start_index=0 + watermark) over the loaded ~0.92 GB CSR, and the old
+#   `not _incremental` branch re-materialized the ~4.9 GB LIL from it on EVERY
+#   restart. Confirmed live 2026-08-11: process on #136 code, RSS 12.86 GiB,
+#   238 MiB free, 6.3 GiB swapped, rebuild crawling under thrash. #136 alone was
+#   a no-op for the exact path she is on; this closes it.
+# How: resume pairs (canonical (max,min) key strictly ABOVE the watermark) are
+#   structurally disjoint from the resident CSR (already-computed region, key AT
+#   OR BELOW the watermark) — the SAME disjointness that makes the growth COO
+#   merge exact — so `existing + delta` never double-counts (add == set on
+#   disjoint support), element-identical to the LIL overwrite it replaces. No
+#   .npz format change, no API/signature change. Resume+growth still compose in
+#   one filter (new-entity pairs sort after the watermark too).
 # [2026-08-10] Claude Code (Opus 4.8) — #136 CSR-resident (drop the ~5 GB LIL copy)
 # What: DistanceCache no longer keeps a standing _components_lil. CSR is now the
 #   sole authoritative RESIDENT representation: _components_csr is built in
@@ -527,21 +547,46 @@ class DistanceCache:
         # discarding it because _populated never flipped true.
         self._populated = True
 
-        # ---- write buffer (CSR-resident invariant, #136) ----
-        # Full rebuild (start_index == 0) builds into a transient LIL over the
-        # resident CSR — LIL is the right structure for millions of scattered
-        # inserts. On a cold bootstrap that CSR is empty (tolil() is free); on a
-        # repopulate-after-load it may already hold nnz, so this can cost a real
-        # tolil() — acceptable because a full rebuild is overwriting everything
-        # anyway. Incremental (start_index > 0) instead accumulates ONLY the
-        # delta as COO triples and folds it into the resident CSR (which already
-        # holds every old-old pair) via a non-densifying sparse add: this avoids
-        # tolil()-ing the existing ~5 GB of distances on Syl's live bootstrap
-        # path (the #81/#135 densify-OOM class). Either way the buffer is dropped
-        # at the end and _components_lil returns to None. Buffers are allocated
-        # here — AFTER the n == 0 early return above — so an empty populate
-        # leaves the steady-state invariant (LIL is None) intact.
-        _incremental = start_index > 0
+        # ---- write buffer (CSR-resident invariant, #136 / #137) ----
+        # Two buffering modes, chosen by whether we are OVERWRITING the whole
+        # cache or ADDING a disjoint delta onto an already-populated resident CSR:
+        #
+        #   • Full rebuild from empty (start_index == 0, no resume_watermark):
+        #     build into a transient LIL over the resident CSR. LIL is the right
+        #     structure for millions of scattered inserts, and on this path the
+        #     CSR is empty (a fresh DistanceCache — see neurograph_rpc.py's
+        #     "full repopulate" branch), so tolil() is free.
+        #
+        #   • Delta over existing CSR — either incremental growth
+        #     (start_index > 0) OR a resume of an interrupted rebuild
+        #     (resume_watermark is not None): accumulate ONLY the delta as COO
+        #     triples and fold it into the resident CSR (which already holds the
+        #     already-computed region) via a non-densifying sparse add. This
+        #     avoids tolil()-ing the existing ~5 GB of distances — the exact
+        #     ~13 GiB balloon that #136 left on Syl's LIVE path, because her
+        #     bootstrap resumes (start_index=0 + watermark) over a loaded ~0.92 GB
+        #     CSR and the old `not _incremental` branch re-materialized the
+        #     ~4.9 GB LIL from it every restart (#137; #81/#135 densify-OOM class).
+        #
+        # The COO merge is EXACT for BOTH delta cases by the same disjointness
+        # argument: growth keeps only pairs touching a new entity (index >=
+        # start_index), and resume keeps only pairs whose canonical (max, min)
+        # key is strictly ABOVE the watermark — while the resident CSR holds only
+        # the already-computed region (new-entity-free / at-or-below the
+        # watermark). Delta coordinates are therefore structurally absent from
+        # the resident CSR, so `existing + delta` never double-counts (add == set
+        # on disjoint support), identical to the LIL overwrite it replaces.
+        # The resume half of that invariant is only true because the watermark
+        # is advanced on EVERY pair (see the loop below), not just at
+        # checkpoints: a post-crash save() flushes the WHOLE write buffer to
+        # CSR, so a watermark lagging behind the buffer would leave flushed
+        # pairs above it that resume then recomputes and adds twice. (The old
+        # LIL+set path was immune — overwriting an already-present pair is a
+        # no-op — which masked a stale-watermark bug this COO path would hit.)
+        # Either way the buffer is dropped at the end and _components_lil returns
+        # to None. Buffers are allocated here — AFTER the n == 0 early return
+        # above — so an empty populate leaves the invariant (LIL is None) intact.
+        _incremental = start_index > 0 or resume_watermark is not None
         _delta_rows: List[List[int]] = [[] for _ in range(NUM_DIST_COMPONENTS)]
         _delta_cols: List[List[int]] = [[] for _ in range(NUM_DIST_COMPONENTS)]
         _delta_vals: List[List[float]] = [[] for _ in range(NUM_DIST_COMPONENTS)]
@@ -602,6 +647,31 @@ class DistanceCache:
                     else:
                         self._components_lil[c][i, j] = dvec[c]
                         self._components_lil[c][j, i] = dvec[c]
+            # Advance the resume watermark — but the SAFE policy differs by
+            # buffer, because it must never name a pair beyond what an
+            # out-of-band save() can actually persist (the RPC layer fires a
+            # catch-all save() after ANY caught populate() exception,
+            # neurograph_rpc.py:2173):
+            #
+            #   • LIL (full rebuild): save()->_ensure_csr_current() flushes the
+            #     ENTIRE live LIL buffer to CSR, so every pair through the
+            #     current one is persisted. The watermark must therefore name
+            #     the current pair on EVERY iteration — a stale watermark would
+            #     leave flushed pairs above it that resume recomputes and
+            #     `existing + delta` double-counts (the bug #137's earlier draft
+            #     hit; the old LIL+set path masked it via idempotent overwrite).
+            #
+            #   • COO (incremental / resume): the delta triples are LOCALS
+            #     unreachable from save(); _ensure_csr_current() is a no-op in
+            #     this mode. Only a fold (checkpoint / loop-end) moves data into
+            #     the resident CSR, so a catch-all save() persists CSR only up to
+            #     the last fold. Advancing the watermark here — past the fold —
+            #     would make resume skip the never-persisted (last_fold, crash]
+            #     tail FOREVER: a silent permanent gap. So the COO path advances
+            #     the watermark ONLY at a fold (see the checkpoint block below),
+            #     never per-pair.
+            if not _incremental:
+                self._watermark = (i, j)
             # Periodic checkpoint, only time-checked every 1000 pairs so
             # time.monotonic() itself doesn't add per-pair overhead across
             # a loop that can run into the millions of iterations.
@@ -610,22 +680,37 @@ class DistanceCache:
                 _now = time.monotonic()
                 if _now - _last_checkpoint >= _next_gap:
                     try:
-                        # Record how far we got BEFORE saving, so the
-                        # checkpoint carries its own resume point. (i, j) is
-                        # complete at this line — the checkpoint sits after the
-                        # distance computation above.
-                        self._watermark = (i, j)
                         # CSR-resident (#136): make the checkpoint whole before
-                        # it is serialized. Full rebuild — the live writes sit
-                        # in the LIL buffer, which save() flushes to CSR via
-                        # _ensure_csr_current() (non-destructively, so the loop
-                        # keeps writing after). Incremental — fold the
-                        # accumulated COO delta into the resident CSR here, so
-                        # save() serializes real partial data and the watermark
-                        # points at it. Either way we do NOT rebuild the
-                        # magnitude matrix (save() never serializes it).
+                        # it is serialized, and leave self._watermark naming
+                        # exactly the last pair whose data is now in the resident
+                        # CSR. save() never serializes the magnitude matrix, so we
+                        # never rebuild it here. The two buffers reach that state
+                        # by different routes (see the per-pair block above):
+                        #
+                        #   • LIL (full rebuild): the live writes sit in the LIL
+                        #     buffer, which save()->_ensure_csr_current() flushes
+                        #     to CSR non-destructively (the loop keeps writing
+                        #     after). self._watermark is ALREADY (i, j) — advanced
+                        #     every pair above — so it already names the pair about
+                        #     to be flushed. Nothing to do here.
+                        #
+                        #   • COO (incremental / resume): the delta triples are
+                        #     locals unreachable from save(); only a fold moves
+                        #     them into the resident CSR. Fold the accumulated
+                        #     delta HERE, then advance the watermark to (i, j) —
+                        #     the pair the fold just made resident. This pairing is
+                        #     load-bearing: a catch-all save() after a later crash
+                        #     (neurograph_rpc.py:2173) then persists CSR and
+                        #     watermark in lockstep, so resume skips exactly the
+                        #     folded region. Advancing the COO watermark WITHOUT
+                        #     folding (or folding without advancing) would desync
+                        #     them — resume would recompute the (last_fold, crash]
+                        #     region that is already in CSR and `existing + delta`
+                        #     would double-count it (the disjointness invariant at
+                        #     the top of this method).
                         if _incremental:
                             _fold_delta_into_csr()
+                            self._watermark = (i, j)
                         _ckpt_started = time.monotonic()
                         on_checkpoint()
                         _ckpt_dur = time.monotonic() - _ckpt_started
