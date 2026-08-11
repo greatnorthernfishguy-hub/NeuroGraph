@@ -1,4 +1,36 @@
 # ---- Changelog ----
+# [2026-08-10] Claude Code (Opus 4.8) — #136 CSR-resident (drop the ~5 GB LIL copy)
+# What: DistanceCache no longer keeps a standing _components_lil. CSR is now the
+#   sole authoritative RESIDENT representation: _components_csr is built in
+#   __init__ and is never None after it; _components_lil is None in steady state
+#   and is materialized ONLY as a transient bulk-write buffer inside populate()
+#   (full rebuild) / the legacy per-element mutators, then dropped. load() no
+#   longer tolil()s the loaded CSR (it only rebuilds the magnitude matrix);
+#   resize()/reconcile_removals()/_translate_watermark() operate on CSR directly;
+#   incremental populate(start_index>0) accumulates a COO delta and folds it into
+#   the resident CSR via a non-densifying sparse add instead of buffering in LIL.
+#   New helpers: _ensure_csr_current() (flush a live buffer; no-op in steady
+#   state), _rebuild_components_csr(), _rebuild_magnitude().
+# Why: on Syl's live VPS the cache is 26,985 entities / 76.66M nnz across the six
+#   components. The resident LIL copy cost ~4.9 GB (vs ~0.92 GB for CSR) and was
+#   re-materialized on EVERY bootstrap by load()'s csr.tolil() — ~5 GB of a
+#   ~13.2 GiB neurograph_rpc.py RSS that the hot read path (get_neighbors_sparse/
+#   get_csr) never touches. Removing the standing LIL is the single largest
+#   avoidable memory win on the bootstrap-critical path (sibling of #81/#135).
+# How: INVARIANT — _components_csr authoritative & never None post-__init__;
+#   _components_lil None except transiently. Every CSR-authoritative op calls
+#   _ensure_csr_current() first, so a checkpoint save fired mid-full-rebuild (LIL
+#   live) and the reconcile-mid-interrupt test path stay correct; the flush is
+#   NON-destructive (populate keeps writing to LIL after a checkpoint). The
+#   incremental COO merge is exact because start_index filters to pairs touching
+#   a new entity, whose coordinates are structurally disjoint from the resident
+#   CSR's old-old pairs (no double-count). csr.resize() is verified non-densifying
+#   (O(nnz) peak, not O(N^2)) — the #81 trap does not recur on the CSR path.
+#   No .npz format change, no API/signature change to any production caller.
+#   KernelComputer.compute()'s `_components_csr is None` conjunct is now vestigial
+#   (never None) but harmless — the adjacent `_magnitude_csr is None` guard
+#   returns the same all-zero result for an unpopulated cache. DO NOT "restore" a
+#   standing LIL as if it were missing shrapnel — it is the 4.9 GB this removed.
 # [2026-08-09] Claude Code (Opus 4.8) — #135/#81 de-quadratic + atomic checkpoint
 # What: (1) populate() checkpoint cadence is now AMORTIZED — after each
 #   checkpoint it waits max(interval, NG_LENIA_CKPT_AMORTIZE x that checkpoint's
@@ -167,12 +199,16 @@ class DistanceCache:
         self._entity_ids: Optional[List[str]] = (
             list(entity_ids) if entity_ids is not None else None
         )
-        # Build as lil for efficient updates, convert to CSR for fast reads
-        self._components_lil: List[sparse.lil_matrix] = [
-            sparse.lil_matrix((entity_count, entity_count), dtype=np.float64)
+        # CSR is the authoritative RESIDENT representation (6 matrices, one per
+        # distance component; present from construction, never None after this).
+        # LIL is only ever a TRANSIENT bulk-write buffer inside populate() and
+        # the legacy per-element mutators — None in steady state. See the
+        # 2026-08-10 changelog entry (CSR-resident invariant; #136 / #81/#135).
+        self._components_csr: List[sparse.csr_matrix] = [
+            sparse.csr_matrix((entity_count, entity_count), dtype=np.float64)
             for _ in range(NUM_DIST_COMPONENTS)
         ]
-        self._components_csr: Optional[List[sparse.csr_matrix]] = None
+        self._components_lil: Optional[List[sparse.lil_matrix]] = None
         # Dirty entries: set of (row, col, component_idx)
         self._dirty: Set[Tuple[int, int, int]] = set()
         self._populated = False
@@ -220,11 +256,18 @@ class DistanceCache:
         """
         if not self._populated:
             return
-        # Components-only CSR: the magnitude matrix is NOT serialized
-        # (load() recomputes it), so skip the sqrt-of-sum-of-squares
-        # rebuild here — during a periodic checkpoint that rebuild is
-        # pure waste and, run every interval, is half of the quadratic.
-        self._rebuild_csr(rebuild_magnitude=False)
+        # CSR-resident model (#136): _components_csr is already authoritative in
+        # steady state, so serialize it directly. The ONE case where it is stale
+        # is a periodic checkpoint fired MID-populate() (a full rebuild), where
+        # the live writes are sitting in the transient LIL buffer:
+        # _ensure_csr_current() flushes LIL -> components-CSR NON-destructively
+        # (it leaves the LIL buffer intact so the populate loop keeps writing to
+        # it after this save returns). The magnitude matrix is never serialized
+        # (load() recomputes it), so we never rebuild it here — during a
+        # checkpoint that rebuild was pure waste and, run every interval, was
+        # half of the #81/#135 quadratic. (Incremental populate keeps
+        # _components_csr current at each checkpoint itself; see populate().)
+        self._ensure_csr_current()
         data = {
             "entity_count": np.array([self._n]),
             "num_components": np.array([NUM_DIST_COMPONENTS]),
@@ -296,9 +339,13 @@ class DistanceCache:
                     shape=tuple(arch[f"c{c}_shape"]),
                 )
                 cache._components_csr.append(csr)
-                cache._components_lil[c] = csr.tolil()
+            # CSR-resident (#136): the loaded CSR IS the authoritative copy. Do
+            # NOT tolil() it — that transient was ~4.9 GB on Syl's 76.6M-nnz
+            # cache and is never read on the hot path. LIL stays None. Only the
+            # magnitude matrix needs (re)building, straight from the resident CSR.
+            cache._components_lil = None
             cache._populated = True
-            cache._rebuild_csr()  # rebuilds magnitude too
+            cache._rebuild_magnitude()
             logger.info("Distance cache restored: %s (%d entities)", actual, n)
             return cache
         except Exception as exc:
@@ -308,11 +355,20 @@ class DistanceCache:
     def set_distance(
         self, i: int, j: int, component: int, value: float
     ):
-        """Set a distance component for a pair."""
-        self._components_lil[component][i, j] = value
-        self._components_lil[component][j, i] = value
-        self._components_csr = None  # invalidate CSR cache
-        self._magnitude_csr = None
+        """Set a distance component for a pair.
+
+        CSR-resident model (#136): there is no standing LIL to write into, so
+        this materializes ONLY the touched component as a transient LIL, writes
+        the symmetric pair, and reconverts that one component to CSR. Not a hot
+        path (no production callers — test/compat surface only), so the per-call
+        O(nnz) reconvert of a single component is acceptable.
+        """
+        self._ensure_csr_current()
+        lil = self._components_csr[component].tolil()
+        lil[i, j] = value
+        lil[j, i] = value
+        self._components_csr[component] = lil.tocsr()
+        self._magnitude_csr = None  # invalidate derived magnitude
 
     def populate(self, substrate: LeniaSubstrate, start_index: int = 0,
                  checkpoint_interval_secs: float = 0.0,
@@ -470,6 +526,47 @@ class DistanceCache:
         # should still persist whatever was computed rather than
         # discarding it because _populated never flipped true.
         self._populated = True
+
+        # ---- write buffer (CSR-resident invariant, #136) ----
+        # Full rebuild (start_index == 0) builds into a transient LIL over the
+        # resident CSR — LIL is the right structure for millions of scattered
+        # inserts. On a cold bootstrap that CSR is empty (tolil() is free); on a
+        # repopulate-after-load it may already hold nnz, so this can cost a real
+        # tolil() — acceptable because a full rebuild is overwriting everything
+        # anyway. Incremental (start_index > 0) instead accumulates ONLY the
+        # delta as COO triples and folds it into the resident CSR (which already
+        # holds every old-old pair) via a non-densifying sparse add: this avoids
+        # tolil()-ing the existing ~5 GB of distances on Syl's live bootstrap
+        # path (the #81/#135 densify-OOM class). Either way the buffer is dropped
+        # at the end and _components_lil returns to None. Buffers are allocated
+        # here — AFTER the n == 0 early return above — so an empty populate
+        # leaves the steady-state invariant (LIL is None) intact.
+        _incremental = start_index > 0
+        _delta_rows: List[List[int]] = [[] for _ in range(NUM_DIST_COMPONENTS)]
+        _delta_cols: List[List[int]] = [[] for _ in range(NUM_DIST_COMPONENTS)]
+        _delta_vals: List[List[float]] = [[] for _ in range(NUM_DIST_COMPONENTS)]
+
+        def _fold_delta_into_csr() -> None:
+            """Merge the accumulated COO delta into the resident CSR and clear
+            it. Exact (never double-counting) because the start_index filter
+            keeps only pairs touching a new entity, whose coordinates are
+            structurally absent from the existing old-old CSR."""
+            for c in range(NUM_DIST_COMPONENTS):
+                if _delta_rows[c]:
+                    delta = sparse.coo_matrix(
+                        (_delta_vals[c], (_delta_rows[c], _delta_cols[c])),
+                        shape=(self._n, self._n),
+                    ).tocsr()
+                    self._components_csr[c] = self._components_csr[c] + delta
+                    _delta_rows[c].clear()
+                    _delta_cols[c].clear()
+                    _delta_vals[c].clear()
+
+        if not _incremental:
+            # Transient LIL buffer over the resident CSR (free when empty on a
+            # cold bootstrap; a real tolil() on a repopulate-after-load).
+            self._components_lil = [c.tolil() for c in self._components_csr]
+
         _last_checkpoint = time.monotonic()
         # Amortized checkpoint cadence (#81/#135 — de-quadratic the rebuild).
         # Each checkpoint costs O(cumulative nnz): save() converts all six
@@ -493,8 +590,18 @@ class DistanceCache:
             dvec = substrate.distance_vector(eid_i, eid_j)
             for c in range(NUM_DIST_COMPONENTS):
                 if abs(dvec[c]) > 1e-15:
-                    self._components_lil[c][i, j] = dvec[c]
-                    self._components_lil[c][j, i] = dvec[c]
+                    if _incremental:
+                        # Accumulate the symmetric pair as COO triples; folded
+                        # into the resident CSR at each checkpoint and at the end.
+                        _delta_rows[c].append(i)
+                        _delta_cols[c].append(j)
+                        _delta_vals[c].append(dvec[c])
+                        _delta_rows[c].append(j)
+                        _delta_cols[c].append(i)
+                        _delta_vals[c].append(dvec[c])
+                    else:
+                        self._components_lil[c][i, j] = dvec[c]
+                        self._components_lil[c][j, i] = dvec[c]
             # Periodic checkpoint, only time-checked every 1000 pairs so
             # time.monotonic() itself doesn't add per-pair overhead across
             # a loop that can run into the millions of iterations.
@@ -504,15 +611,21 @@ class DistanceCache:
                 if _now - _last_checkpoint >= _next_gap:
                     try:
                         # Record how far we got BEFORE saving, so the
-                        # checkpoint carries its own resume point. (i, j)
-                        # is complete at this line — the checkpoint sits
-                        # after the distance computation above. We do NOT
-                        # rebuild the CSR here: save() does its own
-                        # components-only rebuild, so an explicit rebuild
-                        # would double the LIL->CSR cost per checkpoint —
-                        # and the old explicit call rebuilt the magnitude
-                        # matrix too, which save() never serializes.
+                        # checkpoint carries its own resume point. (i, j) is
+                        # complete at this line — the checkpoint sits after the
+                        # distance computation above.
                         self._watermark = (i, j)
+                        # CSR-resident (#136): make the checkpoint whole before
+                        # it is serialized. Full rebuild — the live writes sit
+                        # in the LIL buffer, which save() flushes to CSR via
+                        # _ensure_csr_current() (non-destructively, so the loop
+                        # keeps writing after). Incremental — fold the
+                        # accumulated COO delta into the resident CSR here, so
+                        # save() serializes real partial data and the watermark
+                        # points at it. Either way we do NOT rebuild the
+                        # magnitude matrix (save() never serializes it).
+                        if _incremental:
+                            _fold_delta_into_csr()
                         _ckpt_started = time.monotonic()
                         on_checkpoint()
                         _ckpt_dur = time.monotonic() - _ckpt_started
@@ -533,27 +646,53 @@ class DistanceCache:
         # Loop completed — the cache is whole; a finished save must not
         # carry a resume point.
         self._watermark = None
-        self._rebuild_csr()
+        if _incremental:
+            _fold_delta_into_csr()
+            self._rebuild_magnitude()
+        else:
+            self._rebuild_csr()          # LIL -> resident CSR + magnitude
+        # Drop the transient write buffer — steady state holds CSR only (#136).
+        self._components_lil = None
         logger.info("Distance cache populated: %d pairs", len(ordered_pairs))
 
-    def _rebuild_csr(self, rebuild_magnitude: bool = True):
-        """Convert lil matrices to CSR for fast row access.
+    def _ensure_csr_current(self) -> None:
+        """Flush a live transient LIL write buffer into the resident CSR.
 
-        rebuild_magnitude: also rebuild the combined magnitude matrix
-            (sqrt of the sum of squares across components). That is a
-            second O(nnz) pass — six element-wise squarings plus a sparse
-            sqrt — on top of the component conversion. It is needed only
-            by neighbor queries (get_neighbors_sparse) and is recomputed
-            on load(); save() serializes only the per-component CSRs, so a
-            periodic checkpoint has no use for it. Passing False there is
-            what removes half the per-checkpoint cost behind the quadratic.
+        No-op in steady state — the CSR-resident invariant (#136) keeps
+        _components_lil None whenever we are not mid-populate()/mid-mutator.
+        Called at the top of every operation that treats _components_csr as
+        authoritative (save, reconcile_removals, _translate_watermark, get_csr,
+        get_neighbors_sparse, get_distance_vector) so those stay correct even if
+        invoked while a full-rebuild populate() is in flight — a checkpoint
+        save, or the reconcile-mid-interrupt path exercised by
+        test_reconcile_then_resume_completes_correctly. NON-destructive: the LIL
+        buffer is left intact for the populate loop to keep writing to.
+        (Incremental populate holds no LIL — it keeps _components_csr current by
+        folding its COO delta at each checkpoint — so this is a no-op there.)
         """
-        self._components_csr = [
-            comp.tocsr() for comp in self._components_lil
-        ]
-        if not rebuild_magnitude:
-            return
-        # Build magnitude matrix: sqrt(sum of squares across components)
+        if self._components_lil is not None:
+            self._rebuild_components_csr()
+
+    def _rebuild_components_csr(self) -> None:
+        """Convert the transient LIL write buffer into the resident CSR list.
+
+        Only valid while a LIL buffer is live (full-rebuild populate() / the
+        legacy mutators). Does NOT touch the magnitude matrix.
+        """
+        assert self._components_lil is not None, \
+            "_rebuild_components_csr called with no live LIL buffer"
+        self._components_csr = [comp.tocsr() for comp in self._components_lil]
+
+    def _rebuild_magnitude(self) -> None:
+        """(Re)build the combined magnitude matrix from the resident CSR.
+
+        sqrt(sum of squares across the six components) — a second O(nnz) pass
+        (six element-wise squarings plus a sparse sqrt) needed only by neighbor
+        queries (get_neighbors_sparse). Recomputed on load() and at the end of
+        populate(); never serialized (save() writes only the per-component
+        CSRs). Operates purely on _components_csr, so it needs no LIL — that is
+        what lets load() skip re-materializing the ~5 GB LIL (#136).
+        """
         magnitude_sq = sparse.csr_matrix(
             (self._n, self._n), dtype=np.float64
         )
@@ -561,10 +700,26 @@ class DistanceCache:
             magnitude_sq = magnitude_sq + csr.multiply(csr)
         self._magnitude_csr = magnitude_sq.sqrt()
 
+    def _rebuild_csr(self, rebuild_magnitude: bool = True):
+        """Flush the live LIL buffer to CSR, then optionally rebuild magnitude.
+
+        Retained for the full-rebuild populate() completion path (LIL live) and
+        sweep_dirty(). The components-only flush is _rebuild_components_csr();
+        the magnitude pass is _rebuild_magnitude() (see each for the cost split
+        behind #81/#135). Requires a live LIL buffer.
+        """
+        self._rebuild_components_csr()
+        if rebuild_magnitude:
+            self._rebuild_magnitude()
+
     def get_csr(self, component: int) -> sparse.csr_matrix:
-        """Get CSR matrix for a component. Rebuilds if dirty."""
-        if self._components_csr is None:
-            self._rebuild_csr()
+        """Get the resident CSR matrix for a component.
+
+        CSR-resident (#136): _components_csr is authoritative;
+        _ensure_csr_current() flushes a live write buffer first (no-op in
+        steady state).
+        """
+        self._ensure_csr_current()
         return self._components_csr[component]
 
     def get_neighbors_sparse(
@@ -576,8 +731,9 @@ class DistanceCache:
             (neighbor_indices, magnitudes) — both 1D numpy arrays.
             Only includes pairs within max_range.
         """
+        self._ensure_csr_current()
         if self._magnitude_csr is None:
-            self._rebuild_csr()
+            self._rebuild_magnitude()
 
         row = self._magnitude_csr.getrow(entity_idx)
         indices = row.indices
@@ -614,23 +770,29 @@ class DistanceCache:
 
     def mark_dirty_entity(self, entity_idx: int, component: int):
         """Mark all pairs involving an entity as dirty for a component."""
-        # Only mark existing connections, not all pairs
-        if self._components_csr is not None:
-            csr = self._components_csr[component]
-            row = csr.getrow(entity_idx)
-            for j in row.indices:
-                self._dirty.add((entity_idx, j, component))
-                self._dirty.add((j, entity_idx, component))
-        else:
-            for j in range(self._n):
-                if j != entity_idx:
-                    self._dirty.add((entity_idx, j, component))
-                    self._dirty.add((j, entity_idx, component))
+        # Only mark existing connections, not all pairs.
+        # #136: _components_csr is authoritative and never None after __init__,
+        # so the old "unpopulated -> mark all N pairs" else-branch was dead once
+        # the CSR-resident invariant landed. On an unpopulated cache the rows are
+        # empty CSR, so this correctly marks nothing dirty.
+        csr = self._components_csr[component]
+        row = csr.getrow(entity_idx)
+        for j in row.indices:
+            self._dirty.add((entity_idx, j, component))
+            self._dirty.add((j, entity_idx, component))
 
     def sweep_dirty(self, substrate: LeniaSubstrate):
         """Recompute all dirty entries from the substrate."""
         if not self._dirty:
             return
+
+        # CSR-resident (#136): no standing LIL — materialize a transient buffer
+        # over the resident CSR to absorb the scattered symmetric point writes,
+        # flush it back to CSR, then drop it. _ensure_csr_current() is a no-op in
+        # steady state (the only state sweep_dirty runs in) but keeps the
+        # invariant honest if ever called mid-rebuild.
+        self._ensure_csr_current()
+        self._components_lil = [c.tolil() for c in self._components_csr]
 
         entities = substrate.entities()
         for i, j, component in list(self._dirty):
@@ -643,7 +805,8 @@ class DistanceCache:
             self._components_lil[component][j, i] = dvec[component]
 
         self._dirty.clear()
-        self._rebuild_csr()
+        self._rebuild_csr()          # LIL -> resident CSR + magnitude
+        self._components_lil = None
 
     def resize(self, new_count: int, new_entity_ids: Optional[List[str]] = None):
         """Resize for entity addition/removal.
@@ -656,19 +819,22 @@ class DistanceCache:
         can safely follow this with populate(start_index=old_count) to
         fill in only the new entities instead of recomputing everything.
         """
+        self._ensure_csr_current()
         new_components = []
-        for comp in self._components_lil:
+        for comp in self._components_csr:
             # [#81 2026-07-21] scipy's native in-place sparse resize -- keeps in-bounds
             # entries, extends/truncates WITHOUT densifying. The old
             # new_mat[:c,:c]=comp[:c,:c] made scipy .toarray() an (N,N) slice ->
             # 48.8 GiB OOM at 80,916 entities (crashed Syl's bootstrap). .copy() keeps
             # the source untouched -- proven element-identical (grow/shrink/same, maxD=0)
             # to the old new-matrix path. Josh+Syl authorized.
+            # [#136 2026-08-10] Now grows the RESIDENT CSR directly (no standing LIL).
+            # csr.resize() is likewise native + non-densifying (O(nnz) peak), so the
+            # #81 trap does not recur on this path either.
             new_mat = comp.copy()
             new_mat.resize((new_count, new_count))
             new_components.append(new_mat)
-        self._components_lil = new_components
-        self._components_csr = None
+        self._components_csr = new_components
         self._magnitude_csr = None
         self._n = new_count
         if new_entity_ids is not None:
@@ -709,6 +875,11 @@ class DistanceCache:
         if not keep_idx:
             return None                     # nothing survives
 
+        # CSR-resident (#136): both the watermark translation scan and the
+        # keep-slice below read the resident CSR. Flush any live buffer first
+        # (no-op in steady state).
+        self._ensure_csr_current()
+
         keep_mask = np.zeros(n_old, dtype=bool)
         keep_mask[keep_idx] = True
         new_index = np.full(n_old, -1, dtype=np.int64)
@@ -724,11 +895,10 @@ class DistanceCache:
             self._watermark = new_wm
 
         keep = np.asarray(keep_idx, dtype=np.int64)
-        self._components_lil = [
-            comp.tocsr()[keep][:, keep].tolil()
-            for comp in self._components_lil
+        self._components_csr = [
+            comp[keep][:, keep]
+            for comp in self._components_csr
         ]
-        self._components_csr = None
         self._magnitude_csr = None
         self._dirty = {
             (int(new_index[i]), int(new_index[j]), c)
@@ -780,8 +950,8 @@ class DistanceCache:
         wm_hi, wm_lo = wj, wi   # canonical key = (max, min)
         best_key = None
         best_pair = None
-        for comp in self._components_lil:
-            coo = comp.tocsr().tocoo()
+        for comp in self._components_csr:
+            coo = comp.tocoo()
             r, c = coo.row, coo.col
             upper = r < c          # symmetric storage — visit (min, max) once
             r, c = r[upper], c[upper]
@@ -805,10 +975,16 @@ class DistanceCache:
         self.set_distance(i, j, component, value)
 
     def get_distance_vector(self, i: int, j: int) -> np.ndarray:
-        """Return the full distance vector for a pair."""
+        """Return the full distance vector for a pair.
+
+        CSR-resident (#136): reads straight from the resident CSR;
+        _ensure_csr_current() flushes a live write buffer first (no-op in
+        steady state).
+        """
+        self._ensure_csr_current()
         vec = np.zeros(NUM_DIST_COMPONENTS, dtype=np.float64)
         for c in range(NUM_DIST_COMPONENTS):
-            vec[c] = self._components_lil[c][i, j]
+            vec[c] = self._components_csr[c][i, j]
         return vec
 
     def get_neighbors(

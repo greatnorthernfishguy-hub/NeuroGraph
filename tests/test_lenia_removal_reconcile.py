@@ -131,7 +131,9 @@ def test_reconcile_preserves_surviving_distances_exactly():
     assert cache.entity_ids == survivors
     assert cache.entity_count == len(survivors)
     for c in range(NUM_DIST_COMPONENTS):
-        assert cache._components_lil[c].shape == (len(survivors), len(survivors))
+        # #136: CSR is the authoritative resident rep (LIL is None in steady
+        # state). reconcile_removals compacts the resident CSR directly.
+        assert cache._components_csr[c].shape == (len(survivors), len(survivors))
     new_idx = {e: i for i, e in enumerate(survivors)}
     for (a, b), vec in want.items():
         got = cache.get_distance_vector(new_idx[a], new_idx[b])

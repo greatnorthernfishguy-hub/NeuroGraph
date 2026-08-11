@@ -1,4 +1,18 @@
 # ---- Changelog ----
+# [2026-08-11] CC (laptop) — CSR-resident residency-invariant guard (#136)
+# What: test_csr_is_resident_and_lil_dropped_in_steady_state — asserts
+#   _components_lil is None after __init__, after a full populate(), after
+#   load(), and after an incremental resize()+populate(start_index=...), while
+#   _components_csr stays authoritative (never None, correct shape, real nnz).
+# Why: #136 makes CSR the sole RESIDENT representation and drops the ~5 GB LIL
+#   copy that load() used to re-materialize on every bootstrap. Nothing guarded
+#   the actual invariant — a future edit could silently re-introduce a standing
+#   LIL (the exact regression #136 removes) and every other test would still
+#   pass. This is the mechanism proof: the redundant rep is provably gone in
+#   every steady state, so the residency win is structural, not incidental.
+# How: real Graph/NeuroGraphSubstrate/DistanceCache (this file's no-mocks
+#   convention), exercising each entry into steady state (__init__, populate,
+#   load, incremental populate) and asserting the invariant holds after each.
 # [2026-07-06] Claude Code (Sonnet 5) — Periodic in-loop checkpointing tests
 # What: test_populate_periodic_checkpoint_saves_a_loadable_cache_before_loop_completes,
 #   test_populate_checkpoint_disabled_by_default_makes_no_checkpoint_calls.
@@ -69,6 +83,54 @@ def test_distance_cache_save_load_roundtrip_preserves_entity_ids(tmp_cache_path)
     assert loaded is not None
     assert loaded.entity_count == sub.entity_count()
     assert loaded.entity_ids == sub.entities()
+
+
+def test_csr_is_resident_and_lil_dropped_in_steady_state(tmp_cache_path):
+    """#136 residency invariant: the LIL copy exists only as a transient write
+    buffer, never in steady state. _components_lil must be None after every way
+    of reaching a settled cache (__init__, full populate, load, incremental
+    populate), while _components_csr stays authoritative — non-None, correctly
+    shaped, and holding real nonzeros. Guards against a future edit silently
+    re-introducing the standing ~5 GB LIL that #136 removed.
+    """
+    def _assert_csr_resident(c, n, *, expect_nnz):
+        assert c._components_lil is None, "steady-state cache must not hold a LIL copy"
+        assert c._components_csr is not None
+        assert len(c._components_csr) == NUM_DIST_COMPONENTS
+        for comp in c._components_csr:
+            assert comp.shape == (n, n)
+        total_nnz = sum(comp.nnz for comp in c._components_csr)
+        if expect_nnz:
+            assert total_nnz > 0, "populated cache must hold nonzeros in CSR"
+        else:
+            assert total_nnz == 0
+
+    # 1. Fresh construction: empty CSR resident, no LIL.
+    g = _build_chain_graph(10)
+    sub = NeuroGraphSubstrate(g, None)
+    cache = DistanceCache(sub.entity_count(), entity_ids=sub.entities())
+    _assert_csr_resident(cache, sub.entity_count(), expect_nnz=False)
+
+    # 2. After a full populate(): LIL buffer dropped, CSR holds the data.
+    cache.populate(sub)
+    _assert_csr_resident(cache, sub.entity_count(), expect_nnz=True)
+    cache.save(tmp_cache_path)
+
+    # 3. After load(): CSR rebuilt resident WITHOUT re-materializing the LIL
+    #    (the actual ~5 GB bootstrap win on Syl's live cache).
+    loaded = DistanceCache.load(tmp_cache_path)
+    _assert_csr_resident(loaded, sub.entity_count(), expect_nnz=True)
+
+    # 4. After an incremental resize()+populate(start_index=...): the delta is
+    #    folded into resident CSR via sparse add, no standing LIL left behind.
+    for i in range(10, 13):
+        g.create_node(node_id=f"n{i}")
+    for i in range(9, 12):
+        g.create_synapse(f"n{i}", f"n{i + 1}", weight=0.5)
+    incr_sub = NeuroGraphSubstrate(g, None, known_entity_order=loaded.entity_ids)
+    loaded.resize(incr_sub.entity_count(), new_entity_ids=incr_sub.entities())
+    loaded.populate(incr_sub, start_index=sub.entity_count())
+    _assert_csr_resident(loaded, incr_sub.entity_count(), expect_nnz=True)
 
 
 def test_distance_cache_load_missing_entity_ids_is_backward_compatible(tmp_cache_path):
