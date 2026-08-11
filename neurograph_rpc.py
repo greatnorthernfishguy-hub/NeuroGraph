@@ -2241,6 +2241,12 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # inside 60s; CC socket comes up a bit later (normal settle). Failures stay isolated.
     def _init_cc_host_bg():
         try:
+            _fh = logging.FileHandler(os.path.expanduser('~/.claude/plugins/neurograph/cc_host_init.log'))
+            _fh.setFormatter(logging.Formatter('%(asctime)s [cc-init] %(levelname)s %(message)s'))
+            logging.getLogger('neurograph').addHandler(_fh)
+        except Exception:
+            pass
+        try:
             logger.info('DIAG: [cc-bg] about to import cc_ng_host')
             import cc_ng_host
             logger.info('DIAG: [cc-bg] cc_ng_host imported, calling init_cc_host()')
