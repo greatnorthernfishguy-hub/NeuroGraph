@@ -3,6 +3,12 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-08-12] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-C: receiver budget pinned 50->25
+# What: _DEFAULT_MAX_NODES_PER_CALL default 50 -> 25 (env CC_TOPOLOGY_MERGE_MAX_NODES).
+# Why: FatherGraph Finding 1 + Finding 3 (25/250). The driver ships BATCH_SIZE=25; a
+#       50-node receiver budget would merge two sender frames before a single 250-step
+#       consolidation pass -- a silent 2x bulk-dump against the exact Finding this guards.
+# How: one-line default change + comment; no signature/behavior change beyond the floor.
 # [2026-07-29] Claude Code (DudeMan CC, Opus 5) — Callosum Leg 2: topology merge (laptop side)
 # What: merge_cc_topology() absorbs the length-prefixed msgpack conduit written by
 #   cc_topology_export.py, depositing the VPS Arborist's grown ::tree:: structure
@@ -112,10 +118,14 @@ from cc_topology_export import read_topology_frames, is_cc_provenance
 
 logger = logging.getLogger(__name__)
 
-# FatherGraph Finding 1: trickle, never bulk-dump. Patching a large block of
-# structure in after the fact displaces existing learning rather than
-# integrating with it.
-_DEFAULT_MAX_NODES_PER_CALL = int(os.environ.get("CC_TOPOLOGY_MERGE_MAX_NODES", "50"))
+# FatherGraph Finding 1 + Finding 3: trickle, never bulk-dump, and 25 nodes per
+# batch with 250 idle consolidation steps BETWEEN batches (the measured 47%->74%
+# recall gain -- "not optional"). Patching a large block of structure in after
+# the fact displaces existing learning rather than integrating with it. Pinned to
+# 25 (CC-CALLOSUM-TRUTH.md §10.4-C): the driver ships BATCH_SIZE=25, so a 50-node
+# receiver budget would merge two sender frames before a single consolidation
+# pass -- a silent 2x bulk-dump against the exact Finding this guards.
+_DEFAULT_MAX_NODES_PER_CALL = int(os.environ.get("CC_TOPOLOGY_MERGE_MAX_NODES", "25"))
 
 
 class TopologyMergeAbort(RuntimeError):

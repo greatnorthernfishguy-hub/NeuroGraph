@@ -3,6 +3,15 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-08-12] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-B: connected_only husk filter
+# What: export_cc_topology() gains connected_only=False param; when set, drops degree-0
+#       husk nodes (in no surviving synapse/hyperedge) before framing -- ~438 real nodes
+#       instead of the ~17,740-node whole-graph dump (97.6% husk). max_nodes caps AFTER
+#       the filter; incident structure re-collected when syns is None or max_nodes set.
+# Why: the Leg-2 dry run pushed the whole husk-laden topology and choked on the >100MB
+#       git-push wall. connected_only makes the trickle real connected topology.
+# How: collect_incident_structure() over the node-id set; build a connected set from syn
+#       pre/post + hyperedge members; filter nodes to that set; stats["husks_filtered"].
 # [2026-07-29] Claude Code (DudeMan CC, Opus 5) — Callosum Leg 2: topology export (VPS Arborist -> laptop)
 # What: export_cc_topology() walks the CC substrate's conversational topology
 #   (cc:conv:: forest nodes + their ::tree:: concept nodes, the forest<->tree
@@ -351,10 +360,17 @@ def export_cc_topology(
     embedding_model: Optional[str] = None,
     exclude_ids: Optional[Set[str]] = None,
     max_nodes: Optional[int] = None,
+    connected_only: bool = False,
 ) -> Dict[str, Any]:
     """Export CC conversational topology to a length-prefixed msgpack conduit.
 
     Read-only with respect to the graph. Returns a stats dict.
+
+    connected_only (#88): export ONLY nodes that sit in a surviving synapse or
+    hyperedge; drop the degree-0 husks. This is the filter that makes the first
+    live run a trickle of real topology (~438 connected CC nodes + their edges)
+    instead of the 97.6%-husk "whole shlop". max_nodes (applied after the husk
+    filter) further caps it to a few 25-node packets for a watched smoke run.
 
     The embedding-model stamp in the header is FatherGraph Finding 6: both ends
     must share the embedder or cosine similarity is noise. The receiver asserts
@@ -378,17 +394,47 @@ def export_cc_topology(
             embedding_model = "unknown"
 
     nodes, stats = collect_cc_topology(graph, vector_db, exclude_ids=exclude_ids)
-    if max_nodes is not None:
-        nodes = nodes[:max_nodes]
 
     # Structure is collected ONCE against the FULL exportable node set, never
     # per-chunk. Batching is a DELIVERY concern -- it must not decide what
     # topology exists. Collecting per-chunk (as this first did) silently drops
     # every edge whose endpoints straddle a chunk boundary; at batch_size=25
     # over a few thousand nodes that is most of the graph.
+    syns = hes = None
+    if connected_only:
+        # #88 bounded first run: drop degree-0 husks -- CC nodes that sit in no
+        # surviving synapse or hyperedge. They carry NO binding structure, so
+        # trickling them into the receiver is destructive churn, not integration
+        # (§8.2 cohort cliff; the #71/#72 forest-only signature that made the
+        # first export 97.6% husk). Collect incident structure against the FULL
+        # set first, so whole-containment is judged before the filter; the
+        # connected set is exactly the edge endpoints, so no edge is ever
+        # dropped -- only bare husks fall away.
+        syns, hes = collect_incident_structure(graph, {n["id"] for n in nodes})
+        connected: Set[str] = set()
+        for syn in syns:
+            connected.add(syn["pre"])
+            connected.add(syn["post"])
+        for he in hes:
+            connected.update(he["members"])
+        before = len(nodes)
+        nodes = [n for n in nodes if n["id"] in connected]
+        stats["husks_filtered"] = before - len(nodes)
+
+    # max_nodes caps AFTER the husk filter so a bounded smoke run ("a few
+    # 25-node packets before any scale") yields real connected packets, not the
+    # chronological husks that dominate the head of the unfiltered list.
+    if max_nodes is not None:
+        nodes = nodes[:max_nodes]
+
+    stats["collected"] = len(nodes)
     all_ids = [n["id"] for n in nodes]
+    # Whole-containment is judged against the FINAL shipped set. Re-collect when
+    # nothing was collected yet, or when a cap may have dropped an endpoint the
+    # earlier full-set collection still references.
+    if syns is None or max_nodes is not None:
+        syns, hes = collect_incident_structure(graph, set(all_ids))
     batch_of = {nid: i // batch_size for i, nid in enumerate(all_ids)}
-    syns, hes = collect_incident_structure(graph, set(all_ids))
 
     # Place each edge in the batch where its LAST endpoint lands, so the
     # receiver always already holds both ends when the edge arrives.

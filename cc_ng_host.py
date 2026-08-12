@@ -27,6 +27,12 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-08-12] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-B: forward connected_only
+# What: _handle_export_topology forwards data["connected_only"] into export_cc_topology
+#       kwargs when the caller opts in. Off by default -- explicit opt-in, never implicit.
+# Why: lets the Leg-2 sender request husk-dropped connected topology (~438 nodes) instead
+#       of the 97.6%-husk whole-graph dump the dry run choked on (>100MB git-push wall).
+# How: after the max_nodes block, if data.get("connected_only"): kwargs["connected_only"]=True.
 # [2026-08-08] Claude Code (DudeMan CC, Opus 4.8) — export_topology socket handler (#88 Leg 2 sender)
 # What: _handle_export_topology added to _DISPATCH (key "export_topology"). Wraps
 #   cc_topology_export.export_cc_topology against the LIVE graph under
@@ -849,6 +855,11 @@ def _handle_export_topology(data):
         kwargs["exclude_ids"] = set(data["exclude_ids"])
     if data.get("max_nodes") is not None:
         kwargs["max_nodes"] = int(data["max_nodes"])
+    if data.get("connected_only"):
+        # #88 / §10.4-B: drop degree-0 husks so the trickle is real connected
+        # topology (~438 nodes), not the 97.6%-husk whole-graph dump the dry run
+        # choked on. Off by default -- an explicit caller opt-in, never implicit.
+        kwargs["connected_only"] = True
     try:
         from cc_topology_export import export_cc_topology
         with ng.graph._concurrent_lock:
