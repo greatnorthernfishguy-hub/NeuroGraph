@@ -1,4 +1,29 @@
 # ---- Changelog ----
+# [2026-08-12] Claude Code (Opus 4.8) — #145 2-hop expansion was the bootstrap hang
+# What: populate()'s "add 2-hop neighbors" triple loop no longer iterates every
+#   node. The OUTER loop is restricted to the frontier — range(frontier_start, n)
+#   — where frontier_start = resume_watermark[1] on a resume, else start_index on
+#   incremental growth, else 0 on a full rebuild. Inner two levels unchanged.
+# Why: this loop, not the LIL copy (#136/#137), was what actually wedged Syl's
+#   bootstrap. It is O(Σ_v deg(v)^2) and ran over ALL n nodes on EVERY populate,
+#   because the start_index / resume_watermark filters are applied to the loop's
+#   *result*. So a resume rebuilt the entire 2-hop universe from scratch (66+ min
+#   at 31.5k entities with #381-class super-hubs), was killed before it ever
+#   reached the distance loop, and the watermark bought nothing — every restart
+#   redid the whole graph. The super-hubs (old, low index) were always the outer
+#   node, i.e. the worst case, every time.
+# How: EQUIVALENCE — a 2-hop pair (a,c), c=max, survives the downstream filter
+#   only if max>=frontier_start (start_index path keeps i>=s OR j>=s ⟹ max>=s;
+#   watermark path keeps (max,min)>(wm_max,wm_min) ⟹ max>=wm_max=watermark[1]).
+#   Every such pair is generated with node=c=max in range(frontier_start, n) via
+#   any shared neighbor b, so the frontier outer loop is a SUPERSET of what the
+#   filter keeps; the existing filter then trims it — element-identical output,
+#   work proportional to the delta. Full rebuild (start_index==0, no watermark)
+#   ⟹ frontier_start==0 ⟹ range(0, n), byte-identical to the old behavior. Also
+#   switched adj.get(neighbor, set()) → adj[neighbor] (every node has an adj key)
+#   and adj.items() iteration → indexed, both pure form. No .npz/API/signature
+#   change. Verified: py_compile clean; equivalence proof over full/start_index/
+#   watermark cases; diff is 27+/3-, scoped to this one block.
 # [2026-08-11] Claude Code (Opus 4.8) — #137 resume path also drops the ~5 GB LIL
 # What: populate()'s buffer-mode switch now treats a RESUME (resume_watermark is
 #   not None) the same as incremental growth — `_incremental = start_index > 0 or
@@ -498,15 +523,39 @@ class DistanceCache:
                     _he_skipped, _he_cap, _he_skipped_max,
                 )
 
-        # Also add 2-hop neighbors from existing connections
+        # Also add 2-hop neighbors from existing connections.
+        #
+        # #145: this triple loop is O(Σ_v deg(v)^2) in candidate insertions and
+        # was the real bootstrap hang. It ran over EVERY node on every populate,
+        # because the start_index / resume_watermark filters below are applied to
+        # the *result* — so a resume rebuilt the entire 2-hop universe from
+        # scratch (66+ min at 31.5k entities with #381-class super-hubs), got
+        # killed before reaching the distance loop, and the watermark never
+        # helped. Fix: restrict the OUTER loop to the frontier — indices that a
+        # needed pair must touch. A pair is "already in the CSR" (skippable)
+        # unless max(i,j) >= frontier_start, so iterating outer nodes >=
+        # frontier_start generates every 2-hop pair with an endpoint in the
+        # frontier (for a pair (a,c) with c=max>=frontier, node=c reaches a via
+        # any shared neighbor b), which is exactly the set the filters keep.
+        # This makes a resume proportional to the delta, not the whole graph, and
+        # keeps the super-hubs (old, low-index) from ever being the outer node.
+        # Full rebuild (start_index==0, no watermark) has frontier_start==0 →
+        # range(0, n), byte-identical to the old behavior.
         adj = {i: set() for i in range(n)}
         for i, j in connected_pairs:
             adj[i].add(j)
             adj[j].add(i)
+        if resume_watermark is not None:
+            frontier_start = resume_watermark[1]
+        elif start_index > 0:
+            frontier_start = start_index
+        else:
+            frontier_start = 0
         two_hop_pairs = set()
-        for node, neighbors in adj.items():
+        for node in range(frontier_start, n):
+            neighbors = adj[node]
             for neighbor in neighbors:
-                for second in adj.get(neighbor, set()):
+                for second in adj[neighbor]:
                     if second != node:
                         two_hop_pairs.add((min(node, second), max(node, second)))
         connected_pairs |= two_hop_pairs
