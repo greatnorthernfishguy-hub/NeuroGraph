@@ -313,6 +313,14 @@ def collect_incident_structure(
 
     hyperedges: List[Dict[str, Any]] = []
     for he_id, he in list(getattr(graph, "hyperedges", {}).items()):
+        # #147 Tier-1: archived edges (consolidation seatbelt-merge, or the dream
+        # seam-split) stay in graph.hyperedges + _archived_hyperedges for
+        # reversibility (LAW 7) but are retired -- they must NOT ride the wire, or
+        # the receiver's member-set dedupe (which can't collapse near-dups) would
+        # reinstate the very blobs the split retired. Shared collect_incident_structure
+        # => this guard covers both Leg-2 (VPS send) and Leg-3 (#86 laptop send).
+        if getattr(he, "is_archived", False):
+            continue
         # NB: create_hyperedge()'s PARAMETER is `member_node_ids`, but the
         # Hyperedge ATTRIBUTE is `member_nodes` (neuro_foundation.py:1965).
         # Reading the parameter name here silently yielded empty sets and

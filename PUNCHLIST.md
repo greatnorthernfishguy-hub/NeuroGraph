@@ -493,7 +493,7 @@ The Stormfather monolith (`E-T-StormFather` repo) and the Notion workspace conta
 
 ## #106 — Heterogeneous Synaptic Delays + Polychrony
 
-**Status:** OPEN — design session required before touching code
+**Status:** OPEN — design session required before touching code. **WANTED (elevated 2026-08-13, Josh: "HD-SNN is important. I mean, polychrony!").** Partial-shipped: scalar heterogeneous `Synapse.delay` is LIVE (#257, `neuro_foundation.py:664`, `_delay_buffer` + GSG-grounded geodesic scaling `:206-208`); HD-SNN-**proper** — the per-delay weight vector `W[i,j,d]` below — is the part still unbuilt. The dream-time seam-split (task #147) **holds a seam slot** for HD-SNN-proper's polychronous-motif boundaries but does NOT block on it. See `docs/CC-CALLOSUM-TRUTH.md` §8.15 (full seam-signal inventory).
 **Priority:** Medium
 **Added:** 2026-05-25 (SNN research review)
 **MASTER:** `/home/josh/docs/MASTER-NG-SNN-Upgrades.md`

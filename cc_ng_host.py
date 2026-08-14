@@ -371,6 +371,15 @@ _CC_SNN_CONFIG = {
     "he_discovery_min_nodes": 3,
     "he_consolidation_overlap": 0.8,
     "he_experience_threshold": 100,
+    # [2026-08-14] #147 seam-split — env-sourced per LAW 5 (enforcer ruling on the #147 diff),
+    # mirroring CC_NG_ORPHAN_GRACE above. Source of truth: .bashrc (CC_NG_HE_SPLIT_*). ALL
+    # defaults == neuro_foundation.py DEFAULT_CONFIG, and the enable gate defaults OFF, so
+    # with no env set this is byte-identical to the engine default: the dream-loop caller
+    # (_cc_dream_consolidation_pulse_loop) self-gates to a no-op until CC_NG_HE_SPLIT_ENABLED=1.
+    "he_split_oversized_enabled": os.environ.get("CC_NG_HE_SPLIT_ENABLED", "0") not in ("0", "false", "False", ""),
+    "he_split_dedup_overlap": float(os.environ.get("CC_NG_HE_SPLIT_DEDUP_OVERLAP", "0.9")),
+    "he_split_sim_threshold": float(os.environ.get("CC_NG_HE_SPLIT_SIM_THRESHOLD", "0.6")),
+    "he_split_seam_primary_weight": float(os.environ.get("CC_NG_HE_SPLIT_SEAM_PRIMARY", "0.4")),
     "peer_bridge": {"enabled": False},  # CC is not a peer module
     "ces": {"enabled": False},          # No real-time attention stream needed
     # Heuristic only -- never attempt CC's own Qwen load (was silently hanging,
@@ -1083,9 +1092,11 @@ def _cc_dream_gate_open(now: float, last_turn_ts: float, arousal: str,
 
 def _cc_dream_consolidation_pulse_loop() -> None:
     """Runs CC's own graph.consolidate_hyperedges() (shed + seatbelt-merge +
-    subsume) during CC's quiet hours only. Never forces while CC's own
-    Commons reports SYMPATHETIC arousal -- mirrors Syl's constraint: the
-    pruning is dreamed, not felt."""
+    subsume + dedup) then dedup_and_split_oversized_hyperedges() (#147 seam-split of any
+    survivor still over he_max_members) during CC's quiet hours only. Never
+    forces while CC's own Commons reports SYMPATHETIC arousal -- mirrors Syl's
+    constraint: the pruning is dreamed, not felt. The seam-split is gated OFF by
+    default (he_split_oversized_enabled, LAW 5) -- a no-op until flipped."""
     global _cc_dream_last_pass_ts
     _cc_dream_last_pass_ts = time.time()  # boot counts as activity
     _cc_last_alert_ts = 0.0
@@ -1110,15 +1121,23 @@ def _cc_dream_consolidation_pulse_loop() -> None:
                 if _cc_dream_gate_open(now, last_turn_ts, arousal, _cc_dream_last_pass_ts):
                     lock = getattr(ng.graph, "_step_lock", None)
                     t0 = time.monotonic()
+                    # Forced order (#147): consolidate (shed + seatbelt-merge +
+                    # subsume + dedup) FIRST, then seam-split any survivor still
+                    # over he_max_members. dedup_and_split_oversized_hyperedges is gated OFF
+                    # by default (he_split_oversized_enabled, LAW 5) -> a
+                    # guaranteed no-op returning 0 until the knob is flipped.
                     if lock is not None:
                         with lock:
                             merged = ng.graph.consolidate_hyperedges()
+                            split = ng.graph.dedup_and_split_oversized_hyperedges(ng.vector_db)
                     else:
                         merged = ng.graph.consolidate_hyperedges()
+                        split = ng.graph.dedup_and_split_oversized_hyperedges(ng.vector_db)
                     _cc_dream_last_pass_ts = time.time()
                     logger.info(
-                        "CC dream consolidation pass complete: %d merged/archived "
-                        "in %.1fs", merged, time.monotonic() - t0,
+                        "CC dream consolidation pass complete: %d merged/archived, "
+                        "%d oversized seam-split in %.1fs",
+                        merged, split, time.monotonic() - t0,
                     )
                 elif (now - _cc_dream_last_pass_ts) >= CC_HOST_DREAM_ALERT_SECS and \
                         (now - _cc_last_alert_ts) >= CC_HOST_DREAM_ALERT_SECS:
