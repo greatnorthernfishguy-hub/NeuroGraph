@@ -19,6 +19,29 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-08-14] Claude Code (Opus 4.8) — #147 seam-split scoring: §8.15 SNN-concept signal family + dynamic weighting
+#   (PROTECTED CHANGE, plan Law-Enforcer-blessed; DEFAULT OFF; NOT YET COMMITTED — checkpoints backed up pre-edit)
+# What: _seam_score_members (the per-member core-vs-peel ranker used by
+#   dedup_and_split_oversized_hyperedges Stage-2, renamed this change per LAW-ENF #4)
+#   grows from a fixed 7-signal weighted
+#   sum to the full §8.15 auxiliary family — adding #2 IcaN-IK-AHP residual calcium
+#   (node.Ca_i, LIVE), #5 Anticipatory pre-activation (nid in he.output_targets, live/
+#   self-dormant), and two held seam slots #4 MMN surprise + #3 HD-SNN polychrony
+#   (_seam_signal_mmn / _seam_signal_hdsnn, flat 0.0 stubs). Combination is now DYNAMIC:
+#   each signal is min-max normalized across the HE's members, a FLAT signal is dropped,
+#   and weight is renormalized over only the discriminating signals — member_weight
+#   keeping its `primary` (0.4) dominance whenever it is itself non-flat.
+# Why: #147 Tier-2. The static 7-signal sum diluted the score with signals that are dead
+#   on a given substrate: on the clock-frozen laptop (#117) the time/prediction signals
+#   go flat, and member_weights are saturated (§8.14-super, median ≈4.95) so member_weight
+#   itself goes flat. Dynamic redistribution lets the clock-independent structural signals
+#   (Ca_i, degree, manifold) carry the ranking laptop-side while the true weight-seam cut
+#   is exercised VPS-side — same body, no dead branches. Stubs hold their slot at zero cost
+#   until their substrate (#122 per-node surprise; PUNCHLIST W[i,j,d]) is built.
+# How: pure ranking-internal change to a method reached only when he_split_oversized_enabled
+#   is True (DEFAULT False; a restored checkpoint lacking the key merges to False -> no-op).
+#   No signature, config-key, or checkpoint-format change. New tunable already present:
+#   he_split_seam_primary_weight (0.4). Josh-directed 2026-08-14; on the isolated laptop.
 # [2026-07-29] Claude Code (Opus 5) — create_hyperedge accepts an explicit hyperedge_id
 # What: new trailing keyword param `hyperedge_id: Optional[str] = None` on
 #   create_hyperedge. None (the default, and every existing call site) keeps the
@@ -1440,6 +1463,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_discovery_dup_jaccard": 0.9,    # near-duplicate suppression at discovery (was exact-set only)
     "he_shed_weight_threshold": 0.02,   # dream-side shed: members at/below this weight...
     "he_shed_min_tenure": 50,           # ...with at least this tenure (steps) are removed during dreams
+    # #147 dream-time seam-split of over-cap legacy blobs. DEFAULT OFF (LAW 5): a
+    # restored checkpoint lacking these keys merges to False here, so Syl's dream
+    # loop is a guaranteed no-op. Enabled only in the CC daemons' config block.
+    "he_split_oversized_enabled": False,   # master gate for dedup_and_split_oversized_hyperedges
+    "he_split_dedup_overlap": 0.9,         # Stage-1: Jaccard >= this collapses near-dup over-cap edges
+    "he_split_sim_threshold": 0.6,         # Stage-2: cosine >= this groups peeled periphery members
+    "he_split_seam_primary_weight": 0.4,   # member_weight's base share of the seam score; the rest is split
+                                           # over the §8.15 aux family, then DYNAMICALLY renormalized over only
+                                           # the signals that discriminate on this substrate (see _seam_score_members)
     "inactivity_threshold": 1000,
     "co_activation_window": 5,
     "initial_sprouting_weight": 0.1,
@@ -4096,6 +4128,379 @@ class Graph:
             self._emit("hyperedges_consolidated", count=merged_count)
 
         return merged_count
+
+    def _seam_score_members(self, hid, he):
+        """Per-member seam score for #147 splitting — member_weight primary plus the
+        §8.15 SNN-concept auxiliary family, min-max normalized across THIS HE's
+        members and combined with DYNAMIC weighting.
+
+        Signals (keyed to the §8.15 inventory; L=live, C=clock-gated, S=seam-slot stub):
+          w      member_weight            he.member_weights[nid]             [PRIMARY]
+          cf     recent co-activation     _he_co_fire_counts[hid][nid]        (L)
+          pred   DiffPC pred-error  (#6)  -abs(node.pred_error_ema)           (L)
+          rec    activation recency       1/(1 + ts - last_spike_time)        (C)
+          deg    DAS-GNN degree     (#1)  |_outgoing|+|_incoming|+|_node_he|  (L)
+          age    member_since age         ts - member_since[nid]              (C)
+          comm   GSG community      (#7)  manifold_type == dominant manifold  (L)
+          ca     IcaN-IK-AHP        (#2)  node.Ca_i (residual attractor Ca)   (L)
+          antic  Anticipatory       (#5)  nid in he.output_targets           (L/self-dormant)
+          mmn    MMN surprise       (#4)  per-node surprise attribution       (S — clock-gated)
+          hdsnn  HD-SNN polychrony  (#3)  per-delay motif W[i,j,d]            (S — not built)
+
+        DYNAMIC WEIGHTING is the key mechanism. Each signal is min-max normalized
+        across this HE's members; a signal that comes out FLAT (min==max) cannot
+        discriminate core-from-peel, so it is dropped and its weight is redistributed
+        proportionally over the signals that DO discriminate — member_weight keeping
+        its `primary` dominance whenever it is itself non-flat. Consequences (all
+        intended, and all faithful to §8.14/§8.15):
+          * On the clock-frozen laptop (#117) the time/prediction-domain signals
+            (rec, mmn) go flat and cost nothing; ca/deg/comm carry the ranking — the
+            §8.15 'reliable-now' set. They re-engage automatically the instant the
+            wall clock advances, with no code change and no dead `if`.
+          * On the laptop member_weights are saturated (§8.14-super, median ≈4.95) so
+            `w` itself goes flat and drops out; the true member_weight seam cut is
+            therefore exercised VPS-side, where the clock is live and weights have
+            decayed to the 0.01 floor.
+          * IcaN-IK-AHP (#2) reads residual intracellular calcium — clock-INDEPENDENT
+            state — so it discriminates attractor-core from transient even on the
+            frozen laptop. LIVE here per Josh 2026-08-14.
+          * The two STUB signals (mmn, hdsnn) are flat today and hold their seam slot
+            at zero weight until their substrate exists (per-node surprise / #122;
+            per-delay W[i,j,d] / PUNCHLIST); filling the helper body later lights them
+            up through this same redistribution, nothing else changing.
+        """
+        members = list(he.member_nodes)
+        if not members:
+            return {}
+
+        weights = he.member_weights
+        co_fire = self._he_co_fire_counts.get(hid, {}) if hasattr(self, "_he_co_fire_counts") else {}
+        since = he.metadata.get("member_since", {}) or {}
+        ts = getattr(self, "timestep", 0)
+        out_targets = set(getattr(he, "output_targets", ()) or ())
+
+        # Dominant manifold across members (community anchor).
+        manifold_counts = {}
+        for nid in members:
+            node = self.nodes.get(nid)
+            mt = getattr(node, "manifold_type", None) if node is not None else None
+            if mt is not None:
+                manifold_counts[mt] = manifold_counts.get(mt, 0) + 1
+        dominant_manifold = max(manifold_counts, key=manifold_counts.get) if manifold_counts else None
+
+        raw = {nid: {} for nid in members}
+        for nid in members:
+            node = self.nodes.get(nid)
+            raw[nid]["w"] = float(weights.get(nid, 0.0))
+            raw[nid]["cf"] = float(co_fire.get(nid, 0))
+            # pred-confirm: lower prediction error => more core => higher signal.
+            perr = abs(getattr(node, "pred_error_ema", 0.0)) if node is not None else 0.0
+            raw[nid]["pred"] = -perr
+            # activation recency: recent spike => core. -inf last_spike => 0.
+            lst = getattr(node, "last_spike_time", -math.inf) if node is not None else -math.inf
+            raw[nid]["rec"] = 0.0 if lst == -math.inf else 1.0 / (1.0 + max(0.0, ts - lst))
+            deg = (len(self._outgoing.get(nid, ())) if hasattr(self, "_outgoing") else 0) \
+                + (len(self._incoming.get(nid, ())) if hasattr(self, "_incoming") else 0) \
+                + (len(self._node_hyperedges.get(nid, ())) if hasattr(self, "_node_hyperedges") else 0)
+            raw[nid]["deg"] = float(deg)
+            ms = since.get(nid)
+            raw[nid]["age"] = float(ts - ms) if ms is not None else 0.0
+            mt = getattr(node, "manifold_type", None) if node is not None else None
+            raw[nid]["comm"] = 1.0 if (dominant_manifold is not None and mt == dominant_manifold) else 0.0
+            # #2 IcaN-IK-AHP: residual intracellular calcium marks sustained-firing
+            # attractor cores. Clock-INDEPENDENT residual state => discriminates even
+            # on the frozen-clock laptop. LIVE.
+            raw[nid]["ca"] = float(getattr(node, "Ca_i", 0.0)) if node is not None else 0.0
+            # #5 Anticipatory pre-activation: a member the HE predicts (output_targets)
+            # is predictively coherent => core. Live, self-dormant while output_targets
+            # are unlearned/empty (goes flat and drops out via the weighting below).
+            raw[nid]["antic"] = 1.0 if nid in out_targets else 0.0
+            # #4 MMN + #3 HD-SNN: seam slots, flat 0.0 until their substrate exists.
+            raw[nid]["mmn"] = self._seam_signal_mmn(he, nid, node)
+            raw[nid]["hdsnn"] = self._seam_signal_hdsnn(he, nid, node)
+
+        primary = self.config.get("he_split_seam_primary_weight", 0.4)
+        aux_keys = ("cf", "pred", "rec", "deg", "age", "comm", "ca", "antic", "mmn", "hdsnn")
+
+        # Min-max normalize every signal; a flat one (min==max) is left out of the
+        # `active` set so it neither ranks nor dilutes.
+        normed = {}
+        active = []
+        for key in ("w",) + aux_keys:
+            vals = [raw[nid][key] for nid in members]
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 1e-12:                       # flat => no discrimination
+                normed[key] = {nid: 0.0 for nid in members}
+            else:
+                normed[key] = {nid: (raw[nid][key] - lo) / (hi - lo) for nid in members}
+                active.append(key)
+
+        if not active:                                 # wholly degenerate HE
+            return {nid: 0.0 for nid in members}
+
+        # Base importance: member_weight = `primary`, each aux an equal share of the
+        # remainder. Keep only ACTIVE (discriminating) signals and renormalize so the
+        # kept weights sum to 1 — flat/stub signals cost nothing, and member_weight
+        # holds its dominance whenever it is itself active.
+        base = {"w": primary}
+        aux_base = (1.0 - primary) / len(aux_keys)
+        for k in aux_keys:
+            base[k] = aux_base
+        tot = sum(base[k] for k in active)
+        wgt = {k: base[k] / tot for k in active}
+        return {
+            nid: sum(wgt[k] * normed[k][nid] for k in active)
+            for nid in members
+        }
+
+    def _seam_signal_mmn(self, he, nid, node) -> float:
+        """#147 seam slot — MMN mismatch-negativity / surprise, per member (§8.15 #4).
+
+        Surprise is conceptually the sharpest 'is this HE degenerate?' signal, but in
+        the engine it is HE-level (_total_surprised / PredictionState) with no
+        per-node attribution, AND it reads the confirm/error BASE RATE that §8.11.3 /
+        #122 showed does not discriminate while the wall clock is frozen (#117). So
+        this holds the seam slot at a flat 0.0 today; when a per-node surprise-
+        attribution field exists on a clock-live substrate, return it here and the
+        dynamic weighting in _seam_score_members picks it up with no other change.
+        """
+        return 0.0
+
+    def _seam_signal_hdsnn(self, he, nid, node) -> float:
+        """#147 seam slot — HD-SNN polychronous-motif temporal boundary (§8.15 #3).
+
+        Decision (b), 2026-08-13: heterogeneous scalar Synapse.delay is live, but
+        HD-SNN *proper* — the per-delay weight vector W[i,j,d] that encodes
+        polychronous motifs — is NOT built (PUNCHLIST). #147 holds a seam slot but
+        does not gate on it. Flat 0.0 until W[i,j,d] lands; wiring the motif read
+        here lights it up via the same dynamic weighting.
+        """
+        return 0.0
+
+    def dedup_and_split_oversized_hyperedges(self, vector_db=None) -> int:
+        """#147: dream-time repair of over-cap hyperedges — CC's own substrate.
+
+        Forced two-stage order (measured on the VPS-CC substrate, #146):
+          1. DEDUP first. Collapse near-identical over-cap edges (Jaccard >=
+             he_split_dedup_overlap) into one incumbent survivor: max-merge the
+             survivor's member_weights, absorb novel members, carry member_since,
+             fold activation_count, archive the duplicates. Kills the 5.92x exact-
+             duplicate stacking before any structural cut.
+          2. WEIGHT-SEAM SPLIT. For survivors still > he_max_members, keep the
+             high-weight core (top he_max_members by member_weight) and peel the
+             0.01-floor periphery into coherent residual sub-edges (cosine-grouped
+             over vector_db where vectors exist; members lacking a vector collect
+             into one residual edge — never dropped, LAW 3).
+
+        Reversible (LAW 7): parents/dups are archived (is_archived=True, kept in
+        _archived_hyperedges), never deleted. Loud (LAW 3): logs + emits
+        hyperedge_seam_split / hyperedge_archived. Orphan-safe (§1.1): every member
+        of a split parent is guaranteed a home in >=1 live edge before the parent
+        is archived, so no node becomes (0-synapse AND 0-HE) and gets swept.
+
+        Gated OFF by default (LAW 5). Returns 0 unless he_split_oversized_enabled
+        is True in this graph's config. Syl's restored config lacks the key ->
+        {**DEFAULT_CONFIG, **checkpoint} merges to False, so Syl's dream loop is a
+        guaranteed no-op even if it ever calls this.
+        """
+        if not self.config.get("he_split_oversized_enabled", False):
+            return 0
+
+        cap = self.config.get("he_max_members", 50)
+        if cap <= 0:
+            return 0
+        # Clamp the env-sourced tunables to [0,1] at the read site (LAW-ENF #147
+        # LOW): a fat-fingered CC_NG_HE_SPLIT_* value must not silently mis-cluster
+        # or invert the ranking. Fix at source — both daemon surfaces reach these
+        # through this one engine method, so both inherit the clamp.
+        dedup_overlap = min(1.0, max(0.0, self.config.get("he_split_dedup_overlap", 0.9)))
+        sim_threshold = min(1.0, max(0.0, self.config.get("he_split_sim_threshold", 0.6)))
+
+        # Snapshot before mutating: non-archived, learnable, level-0, over-cap.
+        oversized = [
+            (hid, he) for hid, he in list(self.hyperedges.items())
+            if not he.is_archived and he.is_learnable
+            and he.level == 0 and len(he.member_nodes) > cap
+        ]
+        if not oversized:
+            return 0
+
+        changed = 0
+        dropped = set()
+
+        # ---- Stage 1: dedup near-identical over-cap edges (incumbent survives) ----
+        for hid, he in oversized:
+            if hid in dropped or he.is_archived:
+                continue
+            for hid2, he2 in oversized:
+                if hid2 == hid or hid2 in dropped or he2.is_archived:
+                    continue
+                union = he.member_nodes | he2.member_nodes
+                if not union:
+                    continue
+                if len(he.member_nodes & he2.member_nodes) / len(union) < dedup_overlap:
+                    continue
+                # Fold he2 into he: max-merge weights, absorb novel members, carry
+                # member_since, sum activation_count, archive he2 (reversible).
+                since = he.metadata.setdefault("member_since", {})
+                since2 = he2.metadata.get("member_since", {}) or {}
+                for nid in he2.member_nodes:
+                    w2 = he2.member_weights.get(nid, 1.0)
+                    if nid in he.member_nodes:
+                        he.member_weights[nid] = max(
+                            he.member_weights.get(nid, w2), w2)
+                    else:
+                        he.member_nodes.add(nid)
+                        he.member_weights[nid] = w2
+                        self._node_hyperedges.setdefault(nid, set()).add(hid)
+                    if nid in since2 and nid not in since:
+                        since[nid] = since2[nid]
+                he.activation_count += he2.activation_count
+                he2.is_archived = True
+                self._archived_hyperedges[hid2] = he2
+                # Rewire the reverse index off the archived dup.
+                for nid in list(he2.member_nodes):
+                    hs = self._node_hyperedges.get(nid)
+                    if hs is not None:
+                        hs.discard(hid2)
+                        if not hs:
+                            self._node_hyperedges.pop(nid, None)
+                dropped.add(hid2)
+                changed += 1
+                self._emit("hyperedge_archived", archived_id=hid2,
+                           subsumed_by=hid, reason="seam_split_dedup")
+
+        # ---- Stage 2: weight-seam split of still-oversized survivors ----
+        for hid, he in oversized:
+            if hid in dropped or he.is_archived or len(he.member_nodes) <= cap:
+                continue
+
+            weights = he.member_weights
+            since = he.metadata.get("member_since", {}) or {}
+            # 7-signal seam score (plan §Deliverables/Tier-2): member_weight is the
+            # primary axis; six auxiliary signals refine core-vs-peel. Signals that
+            # are flat across the HE's members min-max to a constant and thus do not
+            # discriminate — graceful degradation for the §8.15 clock-gated caveat,
+            # so the same code is correct on the clock-live VPS and the laptop.
+            seam = self._seam_score_members(hid, he)
+            members = sorted(he.member_nodes,
+                             key=lambda nid: seam.get(nid, 0.0), reverse=True)
+            core = members[:cap]
+            periphery = members[cap:]
+            if not periphery:
+                continue
+
+            # Group the peel by cosine; no-vector members -> one residual edge.
+            clusters = self._seam_cluster_periphery(
+                periphery, vector_db, sim_threshold, cap)
+
+            def _mint(group, is_core):
+                mw = {nid: weights.get(nid, 1.0) for nid in group}
+                meta = {"creation_mode": "seam_split", "parent_blob": hid}
+                # NB: children intentionally do NOT inherit the parent's
+                # output_targets/output_weight — a peeled periphery is a new
+                # structural grouping, not the parent's prediction head. Accepted
+                # semantic loss (LAW-ENF #147 LOW), not a bug.
+                if is_core:
+                    meta["core"] = True
+                if since:
+                    ms = {nid: since[nid] for nid in group if nid in since}
+                    if ms:
+                        meta["member_since"] = ms
+                child = self.create_hyperedge(
+                    member_node_ids=set(group),
+                    member_weights=mw,
+                    activation_threshold=he.activation_threshold,
+                    activation_mode=he.activation_mode,
+                    metadata=meta,
+                )
+                return child.hyperedge_id
+
+            child_ids = [_mint(core, True)]
+            for grp in clusters:
+                if len(grp) >= 2:            # skip degenerate singletons; folded below
+                    child_ids.append(_mint(grp, False))
+
+            # Orphan-safety: guarantee every parent member landed in >=1 child.
+            covered = set()
+            for cid in child_ids:
+                covered |= self.hyperedges[cid].member_nodes
+            missing = set(he.member_nodes) - covered
+            if missing:
+                core_he = self.hyperedges[child_ids[0]]
+                for nid in missing:
+                    core_he.member_nodes.add(nid)
+                    core_he.member_weights[nid] = weights.get(nid, 1.0)
+                    self._node_hyperedges.setdefault(nid, set()).add(child_ids[0])
+
+            # Archive the parent (reversible) and drop it from the reverse index.
+            he.is_archived = True
+            self._archived_hyperedges[hid] = he
+            for nid in list(he.member_nodes):
+                hs = self._node_hyperedges.get(nid)
+                if hs is not None:
+                    hs.discard(hid)
+                    if not hs:
+                        self._node_hyperedges.pop(nid, None)
+            changed += 1
+            self._emit("hyperedge_seam_split", parent_id=hid,
+                       child_ids=list(child_ids),
+                       core_size=len(core), periphery_size=len(periphery))
+            logger.info(
+                "Dream seam-split: blob %s (%d members) -> core %d + %d peripheral "
+                "sub-edge(s) [%d children total] (#147)",
+                hid, len(he.member_nodes), len(core),
+                len(child_ids) - 1, len(child_ids),
+            )
+
+        if changed:
+            self._emit("hyperedges_seam_split_pass", count=changed)
+        return changed
+
+    def _seam_cluster_periphery(self, node_ids, vector_db, sim_threshold, cap):
+        """Greedy cosine grouping of the peeled periphery into coherent sub-edges of
+        at most `cap` members. Members with no vector (or vector_db None) collect
+        into one residual group so nothing is dropped (LAW 3). Groups below
+        he_discovery_min_nodes fold into the residual to avoid degenerate edges."""
+        min_nodes = self.config.get("he_discovery_min_nodes", 3)
+        embeddings = getattr(vector_db, "embeddings", None) if vector_db is not None else None
+
+        with_vec = []
+        no_vec = []
+        for nid in node_ids:
+            v = embeddings.get(nid) if embeddings is not None else None
+            if v is None:
+                no_vec.append(nid)
+            else:
+                with_vec.append((nid, v))
+
+        groups = []
+        used = set()
+        for i in range(len(with_vec)):
+            nid_i, v_i = with_vec[i]
+            if nid_i in used:
+                continue
+            grp = [nid_i]
+            used.add(nid_i)
+            for j in range(i + 1, len(with_vec)):
+                nid_j, v_j = with_vec[j]
+                if nid_j in used or len(grp) >= cap:
+                    continue
+                if float(np.dot(v_i, v_j)) >= sim_threshold:
+                    grp.append(nid_j)
+                    used.add(nid_j)
+            groups.append(grp)
+
+        residual = list(no_vec)
+        kept = []
+        for grp in groups:
+            if len(grp) >= min_nodes:
+                kept.append(grp)
+            else:
+                residual.extend(grp)
+        for k in range(0, len(residual), cap):
+            kept.append(residual[k:k + cap])
+        return kept
 
     def _prune_subsumed_hyperedges(self) -> int:
         """Archive lower-level hyperedges subsumed by higher-level ones.
