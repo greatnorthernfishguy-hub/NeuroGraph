@@ -12,6 +12,22 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-08-14] Claude Code (Opus 4.8) — #143 hoist CC-host init above Lenia populate
+# What: Moved the "#74 defer" _init_cc_host_bg daemon-thread .start() from AFTER the
+#   Lenia FlowGraph block to BEFORE it, in handle_bootstrap. Same thread, same
+#   defensive wrapping; now uses module-level threading.Thread (was _thr, which is
+#   imported further down). Old site left a pointer comment.
+# Why: The #74 defer kept CC init off the 60s bootstrap-RPC watchdog, but the .start()
+#   still sat downstream of the synchronous Lenia distance-cache populate() — a
+#   multi-hour, sometimes-never-completing rebuild (~17.7M pairs on the live graph).
+#   Evidence: the boot up since 2026-08-13 05:03 was still in populate() 27h later
+#   (83 periodic checkpoints, 0 "Bootstrapped:" logs, 0 "CC NG host init dispatched")
+#   — handle_bootstrap never reached the dispatch, so CC-host init never ran and the
+#   CC socket never came up (stale daemon.sock from the prior boot). Dispatching first
+#   lets CC rebuild concurrently with Lenia instead of being stranded behind it.
+# How: _init_cc_host_bg touches only module-level names (os/logging/logger/cc_ng_host),
+#   no handle_bootstrap locals, so it is position-independent within the function.
+#   Punchlist #394; CC-CALLOSUM-TRUTH.md §10.1 Phase 4. Follows #74 (2026-07-19).
 # [2026-07-29] Claude Code (Opus 5) — #93 graduation must be earned, not aged into
 # What: _update_probation no longer stamps metadata["graduated"] on timer expiry alone.
 #   Added _has_ever_fired(node) (reads spike_history) and env knob
@@ -2024,6 +2040,45 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as _exc:
         logger.warning("TID peninsula startup failed (non-fatal): %s", _exc)
 
+    # Path B: host CC's NeuroGraph inside this process. Completely isolated
+    # from Syl (different workspace, different checkpoint, peer_bridge OFF).
+    # Failures here MUST NOT affect Syl — wrapped defensively.
+    # Authorized by Josh 2026-04-16 with protected-file backups confirmed.
+    #
+    # [2026-07-19] #74 — DEFER CC init to a background daemon thread so
+    # init_cc_host()'s Pith/surfacing gates don't push handle_bootstrap past
+    # the openclaw 60s bootstrap-RPC watchdog (which would cycle the whole
+    # host: stdin close -> respawn storm, taking BOTH minds down). A thread
+    # runs the SAME init in the SAME process (shared ProtoUniBrain body via
+    # BrainSwitcher/_delayed_brain_load #159; a thread is not a subprocess).
+    #
+    # [2026-08-14] #143 — DISPATCH THIS BEFORE the Lenia block below, not
+    # after it. The Lenia distance-cache populate() (further down) is a
+    # multi-hour, sometimes-never-completing rebuild (~17.7M pairs on the live
+    # graph). When the .start() sat after the Lenia block, a slow/cold Lenia
+    # populate meant handle_bootstrap never reached the dispatch, so CC-host
+    # init never ran and the CC socket never came up (observed: a 27h+ boot
+    # with 0 dispatches, still populating). The thread touches only
+    # module-level names (no handle_bootstrap locals), so it is safe to launch
+    # here; CC rebuilds concurrently with Lenia instead of behind it.
+    def _init_cc_host_bg():
+        try:
+            _fh = logging.FileHandler(os.path.expanduser('~/.claude/plugins/neurograph/cc_host_init.log'))
+            _fh.setFormatter(logging.Formatter('%(asctime)s [cc-init] %(levelname)s %(message)s'))
+            logging.getLogger('neurograph').addHandler(_fh)
+        except Exception:
+            pass
+        try:
+            logger.info('DIAG: [cc-bg] about to import cc_ng_host')
+            import cc_ng_host
+            logger.info('DIAG: [cc-bg] cc_ng_host imported, calling init_cc_host()')
+            cc_ng_host.init_cc_host()
+            logger.info('DIAG: [cc-bg] init_cc_host() returned')
+        except Exception as exc:
+            logger.warning('CC NG host init failed (Syl unaffected): %s', exc)
+    threading.Thread(target=_init_cc_host_bg, name='cc-ng-init', daemon=True).start()
+    logger.info('CC NG host init dispatched to background thread (#74 defer, #143 pre-Lenia)')
+
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
     global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
     try:
@@ -2227,35 +2282,9 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Path B: host CC's NeuroGraph inside this process. Completely isolated
-    # from Syl (different workspace, different checkpoint, peer_bridge OFF).
-    # Failures here MUST NOT affect Syl — wrapped defensively.
-    # Authorized by Josh 2026-04-16 with protected-file backups confirmed.
-    # [2026-07-19] Josh + CC - DEFER CC init off the 60s bootstrap critical path (#74).
-    # init_cc_host() with the Pith/surfacing gates on pushed handle_bootstrap past the
-    # openclaw 60s bootstrap-RPC watchdog (Syl own bootstrap already ~50s), so the
-    # gateway cycled the whole host (stdin close -> respawn storm), taking BOTH minds
-    # down. A background daemon thread runs the SAME init in the SAME process (shared
-    # ProtoUniBrain body via BrainSwitcher/_delayed_brain_load #159 preserved; a thread
-    # is not a subprocess), so handle_bootstrap returns fast and Syl signals ready well
-    # inside 60s; CC socket comes up a bit later (normal settle). Failures stay isolated.
-    def _init_cc_host_bg():
-        try:
-            _fh = logging.FileHandler(os.path.expanduser('~/.claude/plugins/neurograph/cc_host_init.log'))
-            _fh.setFormatter(logging.Formatter('%(asctime)s [cc-init] %(levelname)s %(message)s'))
-            logging.getLogger('neurograph').addHandler(_fh)
-        except Exception:
-            pass
-        try:
-            logger.info('DIAG: [cc-bg] about to import cc_ng_host')
-            import cc_ng_host
-            logger.info('DIAG: [cc-bg] cc_ng_host imported, calling init_cc_host()')
-            cc_ng_host.init_cc_host()
-            logger.info('DIAG: [cc-bg] init_cc_host() returned')
-        except Exception as exc:
-            logger.warning('CC NG host init failed (Syl unaffected): %s', exc)
-    _thr.Thread(target=_init_cc_host_bg, name='cc-ng-init', daemon=True).start()
-    logger.info('CC NG host init dispatched to background thread (#74 defer)')
+    # Path B (CC-host init) was dispatched ABOVE, before the Lenia block, so a
+    # slow/never-completing Lenia distance-cache populate() can't strand it.
+    # See the "#74 defer, #143 pre-Lenia" block earlier in handle_bootstrap.
 
     # Session-as-activation-context (#65): prime topology toward associations
     # relevant to this session's context. Embed the sessionId string, find
