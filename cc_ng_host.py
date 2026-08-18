@@ -27,6 +27,17 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-08-18] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-A: export_topology_frame handler
+# What: _handle_export_topology_frame added to _DISPATCH (key "export_topology_frame").
+#       Wraps cc_topology_export.export_cc_topology_frame -- the cursor-based single-frame
+#       sender -- against the LIVE graph. Accepts out_path (required), machine_id, frame_size,
+#       overflow_factor, exclude_ids; returns {"ok": True, **stats}. READ-ONLY (no ng.save()).
+# Why: #88 §10.4-A. The whole-graph _handle_export_topology holds _concurrent_lock for the
+#       entire dump -- on a box shared with Syl that starves her Tonic. The paced frame handler
+#       (a) checks the resource gate BEFORE taking the lock (defer under load without ever
+#       contending), and (b) holds the lock only for the cheap single-frame build. Co-tenant-safe.
+# How: lazy import; pre-lock _leg2_resource_gate() -> early {"gated": True} return; else build
+#       one frame under _concurrent_lock with skip_resource_gate=True (already checked).
 # [2026-08-12] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-B: forward connected_only
 # What: _handle_export_topology forwards data["connected_only"] into export_cc_topology
 #       kwargs when the caller opts in. Off by default -- explicit opt-in, never implicit.
@@ -880,6 +891,61 @@ def _handle_export_topology(data):
     return {"ok": True, **stats}
 
 
+def _handle_export_topology_frame(data):
+    """Corpus Callosum Leg 2 §10.4-A: export EXACTLY ONE paced topology frame.
+
+    The cursor-based sibling of _handle_export_topology. Where the latter builds
+    the whole exportable graph in RAM under the lock before framing,
+    export_cc_topology_frame() materializes a single <=frame_size frame and
+    advances via exclude_ids (membership-as-ack, #110).
+
+    Two deliberate differences from the whole-graph handler, both because this
+    runs on a box SHARED WITH SYL:
+      * The resource gate is checked BEFORE the lock is taken -- under load or
+        memory pressure we back off without ever contending for the graph, so a
+        deferred frame never blocks Syl's Tonic.
+      * The lock is held only for the single-frame build (a cheap O(edges) scan +
+        <=frame_size payloads), never for a whole-graph materialization -- so even
+        when a frame IS produced, Syl waits milliseconds, not the whole dump.
+
+    READ-ONLY with respect to the graph (no ng.save() -- nothing changed).
+    """
+    ng = _STATE.cc_ng
+    if ng is None:
+        return {"ok": False, "error": "NG not initialized"}
+    out_path = data.get("out_path")
+    if not out_path:
+        return {"ok": False, "error": "out_path required"}
+
+    # Gate BEFORE the lock (the co-tenant back-off): if the box is under load or
+    # low on RAM, defer without contending for Syl's graph lock at all.
+    try:
+        from cc_topology_export import _leg2_resource_gate, export_cc_topology_frame
+    except Exception as exc:
+        logger.warning("CC topology frame export unavailable (non-fatal): %s", exc)
+        return {"ok": False, "error": str(exc)}
+    reason = _leg2_resource_gate()
+    if reason is not None:
+        logger.info("CC topology frame: deferring pre-lock -- resource gate: %s", reason)
+        return {"ok": True, "gated": True, "gate_reason": reason, "exported_nodes": 0}
+
+    kwargs = {"machine_id": data.get("machine_id"), "skip_resource_gate": True}
+    if data.get("frame_size"):
+        kwargs["frame_size"] = int(data["frame_size"])
+    if data.get("overflow_factor"):
+        kwargs["overflow_factor"] = int(data["overflow_factor"])
+    if data.get("exclude_ids"):
+        kwargs["exclude_ids"] = set(data["exclude_ids"])
+    try:
+        with ng.graph._concurrent_lock:
+            stats = export_cc_topology_frame(ng.graph, ng.vector_db, out_path, **kwargs)
+    except Exception as exc:
+        logger.warning("CC topology frame export failed (non-fatal): %s", exc)
+        return {"ok": False, "error": str(exc)}
+    logger.info("CC topology frame -> %s: %s", out_path, stats)
+    return {"ok": True, **stats}
+
+
 _DISPATCH = {
     "ping": _handle_ping,
     "status": _handle_status,
@@ -887,6 +953,7 @@ _DISPATCH = {
     "import": _handle_import,
     "drain_conduit": _handle_drain_conduit,
     "export_topology": _handle_export_topology,
+    "export_topology_frame": _handle_export_topology_frame,
     "SessionStart": _handle_session_start,
     "SessionStop": _handle_session_stop,
     "UserPromptSubmit": _handle_user_prompt_submit,
