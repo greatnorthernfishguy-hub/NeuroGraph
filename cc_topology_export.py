@@ -3,6 +3,30 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-08-18] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-A: cursor-based single-frame export
+# What: export_cc_topology_frame() materializes EXACTLY ONE <=frame_size conduit frame per call
+#       and advances via exclude_ids (membership-as-ack, #110) -- the paced sender that replaces
+#       collect_cc_topology()'s whole-graph RAM build for the live trickle. A cheap O(edges) scan
+#       (synapse adjacency + node->hyperedge map, NO payloads) picks the next chronological
+#       connected CC nodes; content/embedding/metadata payloads are built ONLY for the chosen
+#       frame. Enforces the structural-survival invariant (every shipped node is incident to a
+#       SHIPPED edge -- a synapse to an already-acked/in-frame node, or membership in a whole HE
+#       closed within exclude_ids|frame; a node whose only edges reach not-yet-sent nodes is
+#       deferred, never shipped as a husk) and NEVER splits a hyperedge across frames (whole-HE
+#       closure may overflow to frame_size*CC_LEG2_OVERFLOW_FACTOR; a single HE past that hard cap
+#       raises the oversized_he_at_source alarm and is skipped -- proof Leg S hasn't run yet).
+#       Resource-gated before any work: per-core loadavg ceiling (mirrors
+#       cc_refeed.should_pause_for_load) + free-MB floor (mirrors the neurograph_rpc.py:858 boot
+#       gate), all env-tunable via CC_LEG2_*; a co-tenant VPS sender (Syl shares the box) backs
+#       OFF under pressure rather than blocking.
+# Why: #88 §10.4-A. The first live Leg-2 run must be a bounded, paced trickle. collect_cc_topology
+#       builds the ENTIRE exportable graph (~17k husk-laden nodes, then payloads) in RAM before
+#       framing -- it neither paces nor bounds memory on a box shared with Syl. A per-call cursor
+#       frame does both.
+# How: plan /home/josh/.claude/plans/callosum-leg2-sender-rebuild-A-D.md (Leg A). Reuses
+#       collect_incident_structure() for the whole-containment edge cut (archived-HE guard, delay
+#       on the wire) and the same header+batch _frame() format, so an A-frame is just a 1-batch
+#       conduit the existing receiver already reads. Read-only w.r.t. the graph.
 # [2026-08-12] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-B: connected_only husk filter
 # What: export_cc_topology() gains connected_only=False param; when set, drops degree-0
 #       husk nodes (in no surviving synapse/hyperedge) before framing -- ~438 real nodes
@@ -72,6 +96,21 @@ _DEFAULT_BATCH_SIZE = int(os.environ.get("CC_TOPOLOGY_BATCH_SIZE", "25"))
 _CC_ID_PREFIXES = ("cc:conv::",)
 _CC_ID_MARKERS = ("::tree::",)
 _CC_PROVENANCE = ("cc_authored",)
+
+# Leg-2 §10.4-A pacing + resource envelope. The cursor-based frame sender runs on
+# the co-tenant VPS (Syl shares the box), so it must bound its OWN footprint and
+# back off under pressure rather than block.
+_DEFAULT_FRAME_SIZE = int(os.environ.get("CC_LEG2_FRAME_SIZE", "25"))
+# A whole-hyperedge closure may push a frame past frame_size, but never split an
+# HE across frames -- allow overflow only up to this multiple of frame_size. A
+# single HE larger than that is an oversized source-side blob (§8.14) that Leg S
+# (the VPS dream split) must repair before it can cross.
+_OVERFLOW_FACTOR = int(os.environ.get("CC_LEG2_OVERFLOW_FACTOR", "3"))
+# Load gate: 1-min loadavg per core, same shape/default as cc_refeed.should_pause_for_load.
+_LEG2_LOAD_CEILING = float(os.environ.get("CC_LEG2_LOAD_CEILING", "0.75"))
+# Memory floor (MB free): refuse a frame below this, mirroring the neurograph_rpc.py:858
+# module boot gate's 500 MB threshold.
+_LEG2_MIN_FREE_MB = int(os.environ.get("CC_LEG2_MIN_FREE_MB", "500"))
 
 
 def is_cc_provenance(node_id: str, meta: Optional[Dict[str, Any]]) -> bool:
@@ -503,6 +542,344 @@ def export_cc_topology(
         "CC topology export: %d node(s), %d synapse(s), %d hyperedge(s) in %d batch(es) -> %s",
         len(nodes), total_syn, total_he, batches, out_path,
     )
+    return stats
+
+
+def _leg2_resource_gate() -> Optional[str]:
+    """Return a human-readable reason to DEFER this frame, or None if clear.
+
+    Mirrors the two envelopes the rest of the substrate already respects: the
+    per-core loadavg ceiling of cc_refeed.should_pause_for_load() and the
+    free-RAM floor of the neurograph_rpc module boot gate (py:858). A co-tenant
+    sender (Syl shares this VPS) backs OFF under pressure rather than blocking or
+    spinning -- the frame is simply not written, and the next tick tries again.
+    """
+    try:
+        per_core = os.getloadavg()[0] / max(1, os.cpu_count() or 1)
+        if per_core > _LEG2_LOAD_CEILING:
+            return "loadavg/core %.2f > %.2f" % (per_core, _LEG2_LOAD_CEILING)
+    except OSError:
+        pass
+    try:
+        import psutil
+        avail_mb = psutil.virtual_memory().available >> 20
+        if avail_mb < _LEG2_MIN_FREE_MB:
+            return "free RAM %dMB < %dMB" % (avail_mb, _LEG2_MIN_FREE_MB)
+    except ImportError:
+        pass  # psutil absent -- proceed without the memory gate (rpc precedent)
+    return None
+
+
+def export_cc_topology_frame(
+    graph: Any,
+    vector_db: Any,
+    out_path: str,
+    machine_id: Optional[str] = None,
+    frame_size: int = _DEFAULT_FRAME_SIZE,
+    exclude_ids: Optional[Set[str]] = None,
+    embedding_model: Optional[str] = None,
+    overflow_factor: int = _OVERFLOW_FACTOR,
+    skip_resource_gate: bool = False,
+) -> Dict[str, Any]:
+    """Materialize EXACTLY ONE conduit frame of CC topology and advance the cursor.
+
+    This is the §10.4-A paced sender. Unlike export_cc_topology(), which builds
+    the whole exportable graph in RAM before framing, this call:
+      * does a cheap O(edges) scan (synapse adjacency + node->hyperedge map, NO
+        payloads),
+      * picks the next <=frame_size chronological connected CC nodes not already
+        acked (exclude_ids = membership-as-ack, #110),
+      * builds content/embedding/metadata payloads ONLY for that frame,
+      * writes a single-batch length-prefixed msgpack conduit atomically.
+
+    Structural-survival invariant: every node written is incident to at least one
+    SHIPPED edge -- a synapse to an already-acked or in-frame node, or membership
+    in a whole hyperedge closed within (exclude_ids | frame). A node whose only
+    edges reach not-yet-sent nodes is DEFERRED to a later frame (once its anchor
+    has been acked) rather than shipped as a husk.
+
+    Hyperedges are NEVER split across frames. Closing a whole HE may push the
+    frame past frame_size, but only up to frame_size*overflow_factor. A single HE
+    larger than that hard cap is an oversized source-side blob (§8.14) that Leg S
+    (the VPS dream split) must repair first: it raises the oversized_he_at_source
+    alarm and is skipped, never truncated.
+
+    Read-only with respect to the graph. Returns a stats dict; the caller writes
+    stats["frame_node_ids"] into its membership/ack ledger to advance the cursor.
+    """
+    exclude_ids = set(exclude_ids or ())
+
+    machine_id = machine_id or os.environ.get("MACHINE_ID")
+    if not machine_id:
+        # Same refusal export_cc_topology()/Leg 1 make: a wrong/absent hemisphere
+        # id produces silent one-way data loss that looks exactly like success.
+        raise ValueError(
+            "MACHINE_ID unset -- refusing to write a topology conduit rather "
+            "than guess which hemisphere authored it"
+        )
+
+    stats: Dict[str, Any] = {
+        "frame_size": frame_size,
+        "exported_nodes": 0,
+        "exported_synapses": 0,
+        "exported_hyperedges": 0,
+        "deferred_no_anchor": 0,
+        "oversized_he_at_source": 0,
+        "missing_embedding_DEFECT": 0,
+        "candidates": 0,
+        "exhausted": False,
+        "gated": False,
+        "path": out_path,
+        "machine_id": machine_id,
+    }
+
+    if not skip_resource_gate:
+        reason = _leg2_resource_gate()
+        if reason is not None:
+            stats["gated"] = True
+            stats["gate_reason"] = reason
+            logger.info("CC topology frame: deferring -- resource gate: %s", reason)
+            return stats
+
+    if embedding_model is None:
+        try:
+            import ng_embed
+            embedding_model = getattr(ng_embed, "MODEL_NAME", None) or getattr(
+                ng_embed, "_MODEL_NAME", None) or "unknown"
+        except Exception:
+            embedding_model = "unknown"
+    stats["embedding_model"] = embedding_model
+
+    hard_cap = max(frame_size, frame_size * max(1, overflow_factor))
+
+    # ---- cheap O(edges) scan: adjacency + node->HE map, NO payloads ----
+    he_members: Dict[str, frozenset] = {}
+    node_hes: Dict[str, List[str]] = {}
+    for he_id, he in list(getattr(graph, "hyperedges", {}).items()):
+        # #147 Tier-1: archived edges never ride the wire (see
+        # collect_incident_structure) -- keep them out of the anchor map too, or a
+        # node whose only HE is a retired blob would look anchorable and never be.
+        if getattr(he, "is_archived", False):
+            continue
+        members = getattr(he, "member_nodes", None)
+        if members is None:
+            members = getattr(he, "member_node_ids", None)
+        if not members:
+            continue
+        members = frozenset(members)
+        he_members[he_id] = members
+        for m in members:
+            node_hes.setdefault(m, []).append(he_id)
+
+    syn_partners: Dict[str, Set[str]] = {}
+    for syn in list(getattr(graph, "synapses", {}).values()):
+        pre = getattr(syn, "pre_node_id", None)
+        post = getattr(syn, "post_node_id", None)
+        if pre is None or post is None:
+            continue
+        syn_partners.setdefault(pre, set()).add(post)
+        syn_partners.setdefault(post, set()).add(pre)
+
+    nodes_map = getattr(graph, "nodes", {})
+    _elig: Dict[str, bool] = {}
+
+    def eligible(nid: str) -> bool:
+        cached = _elig.get(nid)
+        if cached is not None:
+            return cached
+        node = nodes_map.get(nid)
+        ok = bool(
+            node is not None
+            and _is_cc_node(nid, node)
+            and not _is_identity_protected(graph, nid, node)
+        )
+        _elig[nid] = ok
+        return ok
+
+    # ---- candidates: connected, CC, not identity-protected, not yet acked ----
+    connected = set(syn_partners) | set(node_hes)
+    candidates = [
+        nid for nid in connected
+        if nid not in exclude_ids and eligible(nid)
+    ]
+    candidates.sort(
+        key=lambda nid: float(getattr(nodes_map.get(nid), "creation_time", 0) or 0)
+    )
+    stats["candidates"] = len(candidates)
+    if not candidates:
+        stats["exhausted"] = True
+        logger.info("CC topology frame: nothing left to send (0 candidates)")
+        return stats
+
+    # ---- greedy chronological fill under the survival invariant ----
+    present: Set[str] = set(exclude_ids)  # what the receiver has / will have
+    frame: List[str] = []
+    frame_set: Set[str] = set()
+    _oversized_seen: Set[str] = set()  # alarm once per HE per call, not per member
+
+    def _place(nid: str) -> None:
+        if nid in frame_set:
+            return
+        frame.append(nid)
+        frame_set.add(nid)
+        present.add(nid)
+
+    def _closeable_he(nid: str, budget: int) -> Optional[List[str]]:
+        """Smallest hyperedge containing nid whose not-yet-present members are all
+        eligible to cross and fit within `budget`. Returns the members to ADD (may
+        be empty if all are already present), or None if no such HE."""
+        best: Optional[List[str]] = None
+        for he_id in node_hes.get(nid, ()):
+            new = [m for m in he_members[he_id] if m not in present]
+            if any(not eligible(m) for m in new):
+                continue  # a member can't cross -> HE unshippable, not an anchor
+            if len(new) <= budget and (best is None or len(new) < len(best)):
+                best = new
+        return best
+
+    for nid in candidates:
+        if len(frame) >= frame_size:
+            break
+        if nid in frame_set:
+            continue  # already pulled in by an earlier HE closure
+        budget = frame_size - len(frame)
+
+        # (a) synapse anchor to something already acked or already in this frame.
+        if any(p in present for p in syn_partners.get(nid, ())):
+            _place(nid)
+            continue
+
+        # (b) whole-HE closure within the normal frame budget.
+        new = _closeable_he(nid, budget)
+        if new is not None:
+            for m in new:
+                _place(m)
+            continue
+
+        # (c) whole-HE closure into the overflow region -- one HE too big for the
+        #     remaining budget but within the hard cap. Never split; closes frame.
+        new = _closeable_he(nid, hard_cap - len(frame))
+        if new is not None:
+            for m in new:
+                _place(m)
+            break
+
+        # (d) co-add a synapse partner that is itself a shippable candidate: the
+        #     shared synapse anchors BOTH. Seeds a synapse-only component and the
+        #     very first frame's origin (which has nothing already-acked to lean on).
+        partnered = False
+        for p in syn_partners.get(nid, ()):
+            if p in present or p in frame_set:
+                continue
+            if p in exclude_ids or not eligible(p):
+                continue
+            if len(frame) + 2 <= frame_size:
+                _place(nid)
+                _place(p)
+                partnered = True
+            break
+        if partnered:
+            continue
+
+        # (e) unshippable this pass. Distinguish an oversized source blob (Leg S
+        #     owes a split) from a node whose only anchors are still in the future
+        #     (it becomes placeable once this/earlier frames are acked).
+        oversized = [h for h in node_hes.get(nid, ()) if len(he_members[h]) > hard_cap]
+        if oversized:
+            for h in oversized:
+                if h in _oversized_seen:
+                    continue
+                _oversized_seen.add(h)
+                stats["oversized_he_at_source"] += 1
+                logger.error(
+                    "CC topology frame: hyperedge %s has %d members > hard cap "
+                    "(%d) -- oversized source-side blob (§8.14). Skipping; Leg S "
+                    "(VPS dream split) must repair it before it can cross.",
+                    h, len(he_members[h]), hard_cap)
+        else:
+            stats["deferred_no_anchor"] += 1
+
+    if not frame:
+        # Candidates exist but none were placeable this pass (all deferred /
+        # oversized). NOT exhausted -- surface it so the driver doesn't spin.
+        logger.warning(
+            "CC topology frame: %d candidate(s) but none placeable this pass "
+            "(deferred=%d, oversized=%d)",
+            len(candidates), stats["deferred_no_anchor"],
+            stats["oversized_he_at_source"])
+        return stats
+
+    # ---- build payloads ONLY for the chosen frame ----
+    node_payloads: List[Dict[str, Any]] = []
+    for nid in frame:
+        node = nodes_map[nid]
+        meta = dict(getattr(node, "metadata", None) or {})
+        payload: Dict[str, Any] = {
+            "id": nid,
+            "content": _content_for(vector_db, nid, meta),
+            "metadata": _portable_metadata(meta),
+        }
+        # An unembedded CC node is a defect upstream (see collect_cc_topology's
+        # note), not a tolerable mode -- but it still crosses so its binding
+        # structure is not shredded; the gap is ALARMED, to be driven to zero by
+        # re-embedding, never absorbed.
+        emb = _embedding_for(vector_db, nid)
+        if emb is None:
+            stats["missing_embedding_DEFECT"] += 1
+            logger.error(
+                "CC topology frame: node %s has NO embedding -- exporting its "
+                "topology anyway, but it will be inert to the Tonic and to recall "
+                "until re-embedded. Defect, not a mode.", nid)
+        else:
+            payload["embedding"] = emb.astype(np.float32).tobytes()
+            payload["embedding_dim"] = int(emb.shape[0])
+        node_payloads.append(payload)
+
+    # ---- edges wholly contained in (frame | acked), touching >=1 frame node ----
+    # collect_incident_structure carries the archived-HE guard and the synapse
+    # `delay` field; we drop edges lying entirely within exclude_ids (already
+    # delivered on an earlier frame) so nothing is re-sent.
+    member_set = frame_set | exclude_ids
+    syns, hes = collect_incident_structure(graph, member_set)
+    syns = [s for s in syns if s["pre"] in frame_set or s["post"] in frame_set]
+    hes = [h for h in hes if any(m in frame_set for m in h["members"])]
+
+    # ---- write a single-batch conduit atomically (existing header+batch shape) ----
+    tmp_path = out_path + ".partial"
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    with open(tmp_path, "wb") as fh:
+        fh.write(_frame({
+            "kind": "header",
+            "version": _WIRE_VERSION,
+            "machine_id": machine_id,
+            "embedding_model": embedding_model,
+            "created": time.time(),
+            "node_count": len(frame),
+        }))
+        fh.write(_frame({
+            "kind": "batch",
+            "seq": 1,
+            "nodes": node_payloads,
+            "synapses": syns,
+            "hyperedges": hes,
+        }))
+    # Atomic publish: a reader must never observe a partial conduit (Leg 1 hit
+    # exactly this -- a drain that read mid-write).
+    os.replace(tmp_path, out_path)
+
+    stats.update({
+        "exported_nodes": len(frame),
+        "exported_synapses": len(syns),
+        "exported_hyperedges": len(hes),
+        "frame_node_ids": list(frame),
+        "embedding_model": embedding_model,
+    })
+    logger.info(
+        "CC topology frame: %d node(s), %d synapse(s), %d hyperedge(s) -> %s "
+        "(candidates=%d, deferred=%d, oversized=%d)",
+        len(frame), len(syns), len(hes), out_path,
+        len(candidates), stats["deferred_no_anchor"],
+        stats["oversized_he_at_source"])
     return stats
 
 
