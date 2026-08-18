@@ -474,6 +474,19 @@ def _deposit(text: str) -> None:
     except Exception as exc:
         logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
 
+    # Cricket want-bucket: extract [WANT]...[/WANT] markers from conversational
+    # nodes and materialize them as want nodes in CC's graph. Mirrors Syl's
+    # _surface_wants() in neurograph_rpc.py. Fails soft; never breaks the hook.
+    if ng is not None:
+        try:
+            from cc_ng_organism import surface_wants_for_graph
+            vdb = getattr(ng, "vector_db", None)
+            wants = surface_wants_for_graph(ng.graph, vdb)
+            if wants:
+                logger.debug("CC surfaced %d want nodes", len(wants))
+        except Exception as exc:
+            logger.debug("CC want surfacing failed (non-fatal): %s", exc)
+
 
 def _deposit_tool_experience(text: str) -> None:
     """Tool-call experience -> CC's own Commons medium ONLY, never the main substrate.

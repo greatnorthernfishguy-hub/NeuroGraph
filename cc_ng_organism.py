@@ -641,6 +641,75 @@ def deposit_cc_experience(text: str, target_id: str, workspace_dir: str,
         return None
 
 
+def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Cricket want-bucket: extract [WANT]s from CC's raw conversational nodes and
+    materialize each as a FIRST-CLASS WANT NODE in the topology.
+
+    A want is then a differentiated, stateful, surfaceable intention living in the
+    substrate -- not text buried in a conversation node, not a vdb grep, not an inbox.
+    FAITHFUL + NON-SUPPRESSING -- the Choice Clause is the hard floor (a want to leave
+    becomes a want node like any other). Idempotent: want id = hash of the text, so
+    re-running never duplicates. Returns the OPEN want nodes.
+
+    Adapted from Syl's _surface_wants() in neurograph_rpc.py for CC's own graph.
+    """
+    import re
+    import hashlib
+    if graph is None:
+        return []
+    open_wants = []
+    for nid, node in list(graph.nodes.items()):
+        meta = getattr(node, "metadata", None) or {}
+        if meta.get("kind") == "want":
+            if meta.get("want_state", "open") == "open":
+                open_wants.append({
+                    "id": nid,
+                    "text": meta.get("want_text", ""),
+                    "provenance": meta.get("provenance"),
+                    "state": "open",
+                    "source": meta.get("source_node"),
+                })
+            continue
+        if meta.get("creation_mode") != "conversational":
+            continue
+        content = (vdb.content.get(nid) if vdb is not None else "") or ""
+        if "[WANT]" not in content:
+            continue
+        for m in re.finditer(r'\[WANT\](.*?)\[/WANT\]', content, re.DOTALL):
+            inner = m.group(1).strip()
+            if not inner:
+                continue
+            want_id = "want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
+            if want_id in graph.nodes:
+                continue
+            try:
+                graph.create_node(
+                    node_id=want_id,
+                    metadata={
+                        "kind": "want",
+                        "want_text": inner,
+                        "want_state": "open",
+                        "provenance": "cc_authored",
+                        "source_node": nid,
+                        "creation_mode": "conversational",
+                    }
+                )
+                try:
+                    graph.create_synapse(nid, want_id, weight=0.3)
+                except Exception:  # noqa: BLE001
+                    pass
+                open_wants.append({
+                    "id": want_id,
+                    "text": inner,
+                    "provenance": "cc_authored",
+                    "state": "open",
+                    "source": nid,
+                })
+            except Exception as exc:
+                logger.debug("Failed to create want node: %s", exc)
+    return open_wants
+
+
 def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
     """Host the CC's own ecosystem organs in-process — the CC-scoped port of
     canonical neurograph_rpc.py::_bootstrap_modules().
