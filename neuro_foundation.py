@@ -1977,6 +1977,7 @@ class Graph:
         self._outgoing.get(syn.pre_node_id, set()).discard(synapse_id)
         self._incoming.get(syn.post_node_id, set()).discard(synapse_id)
         self._dirty_synapses.discard(synapse_id)
+        self._synapse_confirmation_history.pop(synapse_id, None)
 
     def remove_synapse(self, synapse_id: str) -> None:
         """Remove a synapse (public API)."""
