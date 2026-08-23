@@ -2433,8 +2433,9 @@ def _deposit_memory_node(node_id, embedding, content, meta, index_in_recall=True
     node.metadata["novelty_dampening"] = _CONV_NOVELTY_DAMPENING
     try:
         import numpy as _np
+        from neuro_foundation import pack_poincare_dir  # #119: compact bytes storage
         _dir = _embed_to_poincare_dir(_np.asarray(embedding, dtype=_np.float32))
-        node.metadata["poincare_dir"] = _dir.tolist()
+        node.metadata["poincare_dir"] = pack_poincare_dir(_dir)
     except Exception as exc:  # noqa: BLE001
         logger.debug("poincare_dir stamp failed (non-fatal): %s", exc)
     if index_in_recall:
@@ -2809,7 +2810,8 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
         _dt = _memory.graph.config["default_threshold"]
         _birth_t = _dt * (0.7 + 0.6 * (1.0 - _novelty))
         _birth_t = max(0.5 * _dt, min(1.2 * _dt, _birth_t))
-        _poincare_dir = _embed_to_poincare_dir(_ingest_embedding)
+        from neuro_foundation import pack_poincare_dir  # #119: compact bytes storage
+        _poincare_packed = pack_poincare_dir(_embed_to_poincare_dir(_ingest_embedding))
         for _nid in result.nodes_created:
             _nd = _memory.graph.nodes.get(_nid)
             if _nd is not None:
@@ -2817,7 +2819,7 @@ def handle_ingest(params: Dict[str, Any]) -> Dict[str, Any]:
                 # GSG: store Poincaré direction; layer norm applied dynamically at assemble
                 if not hasattr(_nd, "metadata") or _nd.metadata is None:
                     _nd.metadata = {}
-                _nd.metadata["poincare_dir"] = _poincare_dir.tolist()
+                _nd.metadata["poincare_dir"] = _poincare_packed
 
     # [2026-04-23] CC (#208) — TrollGuard sidecar: perimeter defense sees every ingest.
     # scan_text() = Layer 4 VectorSentry (real-time live I/O protection). Targeted
@@ -2905,36 +2907,48 @@ def _poincare_distance(x: Any, y: Any) -> float:
 
 
 def _gsg_backfill_existing_nodes() -> None:
-    """Stamp poincare_dir on all existing nodes that lack it, using stored vector DB embeddings.
+    """Stamp/compact poincare_dir on existing nodes, using stored vector DB embeddings.
 
     SimpleVectorDB.insert() L2-normalizes embeddings on storage, so
     vector_db.embeddings[node_id] is already the unit direction vector — no
     re-embedding or model calls needed.  Runs once at bootstrap; subsequent
     restarts skip in O(n) with zero writes.  Force-saves the checkpoint so
     the stamped metadata survives the next restart.
+
+    #119: also performs the one-time migration of any legacy Python-list
+    poincare_dir to the compact float32 byte-buffer form (pack_poincare_dir),
+    reclaiming ~8× the per-node metadata footprint.  After this pass re-saves,
+    no list-form directions remain in the checkpoint.
     """
     if _memory is None:
         return
     import numpy as _np
+    from neuro_foundation import pack_poincare_dir  # #119: compact bytes storage
     stamped = 0
+    converted = 0
     for node_id, node in _memory.graph.nodes.items():
-        if (node.metadata or {}).get("poincare_dir"):
+        _existing = (node.metadata or {}).get("poincare_dir")
+        if _existing:  # present and non-empty
+            if not isinstance(_existing, (bytes, bytearray)):  # #119: legacy list -> bytes
+                node.metadata["poincare_dir"] = pack_poincare_dir(_existing)
+                converted += 1
             continue
         emb = _memory.vector_db.embeddings.get(node_id)
         if emb is None:
             continue
         if node.metadata is None:
             node.metadata = {}
-        node.metadata["poincare_dir"] = emb.tolist()
+        node.metadata["poincare_dir"] = pack_poincare_dir(emb)
         stamped += 1
-    if stamped:
-        logger.info("GSG backfill: stamped poincare_dir on %d existing nodes — saving checkpoint", stamped)
+    if stamped or converted:
+        logger.info("GSG backfill: stamped %d, migrated %d poincare_dir to bytes — saving checkpoint",
+                    stamped, converted)
         try:
             _memory.save()
         except Exception as exc:
             logger.warning("GSG backfill save failed: %s", exc)
     else:
-        logger.debug("GSG backfill: all nodes already have poincare_dir — skipping")
+        logger.debug("GSG backfill: all nodes already have compact poincare_dir — skipping")
 
 
 def _anticipate(fired_node_ids: List[str]) -> None:
@@ -3235,7 +3249,8 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
                 _nd = _memory.graph.nodes.get(_nid)
                 if _nd is None:
                     continue
-                _pdir = (_nd.metadata or {}).get("poincare_dir") if hasattr(_nd, "metadata") else None
+                from neuro_foundation import poincare_dir_array as _pda  # #119: bytes-aware
+                _pdir = _pda(_nd.metadata) if hasattr(_nd, "metadata") else None
                 if _pdir is None:
                     continue
                 _layer = getattr(_nd, "diffpc_layer", 0)

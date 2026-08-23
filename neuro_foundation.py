@@ -1024,6 +1024,36 @@ _GSG_MSG_DECAY: float = 0.15  # geodesic decay rate; 0.0=Euclidean, 0.15=gentle;
 _GSG_MSG_DECAY_SPHER: float = 0.15  # great circle decay for sphere+sphere synapses
 
 
+# --- GSG poincare_dir compact storage (#119 footprint increment 1) ------------
+# A node's poincare_dir is a unit-direction vector (768 × float32) redundant with
+# its vdb embedding. Stored per-node in metadata as a Python *list*, it cost
+# ~24 KB/node (768 boxed floats + list overhead) × ~40K nodes ≈ 960 MB resident.
+# We store the raw float32 byte-buffer instead (3072 bytes, one bytes object):
+# msgpack-native (bin type, use_bin_type=True) in BOTH the SNN checkpoint and the
+# vector-DB store, ~8× smaller. All readers go through poincare_dir_array(), which
+# also decodes the legacy list form so pre-#119 checkpoints keep working until the
+# one-time backfill pass (neurograph_rpc._gsg_backfill_existing_nodes) re-saves.
+def pack_poincare_dir(direction: Any) -> bytes:
+    """Compact a unit-direction vector into its stored float32 byte-buffer form."""
+    return np.asarray(direction, dtype=np.float32).tobytes()
+
+
+def poincare_dir_array(metadata: Optional[Dict[str, Any]]) -> Optional["np.ndarray"]:
+    """Return a node's poincare_dir as a float32 ndarray, or None if absent.
+
+    Accepts the compact bytes form (current) and the legacy Python-list form
+    (pre-#119 checkpoints). frombuffer is zero-copy; the returned array is
+    read-only, which every GSG read-path respects (dot / norm / scale only)."""
+    if not metadata:
+        return None
+    pd = metadata.get("poincare_dir")
+    if pd is None:
+        return None
+    if isinstance(pd, (bytes, bytearray)):
+        return np.frombuffer(pd, dtype=np.float32)
+    return np.asarray(pd, dtype=np.float32)
+
+
 class STDPRule(PlasticityRule):
     """Spike-Timing-Dependent Plasticity (PRD §3.1).
 
@@ -2181,11 +2211,10 @@ class Graph:
             def _gsg_resolve(nid_: str, nd_: Any) -> None:
                 if nid_ in _gsg_cache:
                     return
-                _pd = (nd_.metadata or {}).get("poincare_dir")
-                if _pd is None:
+                _arr = poincare_dir_array(nd_.metadata)  # #119: compact bytes-aware read
+                if _arr is None:
                     _gsg_cache[nid_] = None
                     return
-                _arr = np.array(_pd, dtype=np.float32)
                 _mt = getattr(nd_, "manifold_type", "hyperbolic")
                 if _mt == "spherical":
                     _gsg_cache[nid_] = (_arr, "spherical")  # unit dir IS sphere pos
@@ -3614,11 +3643,9 @@ class Graph:
                 _pn = self.nodes.get(nid)
                 _on = self.nodes.get(other_id)
                 if _pn and _on:
-                    _pd1 = (_pn.metadata or {}).get("poincare_dir")
-                    _pd2 = (_on.metadata or {}).get("poincare_dir")
-                    if _pd1 and _pd2:
-                        _a = np.array(_pd1, dtype=np.float32)
-                        _b = np.array(_pd2, dtype=np.float32)
+                    _a = poincare_dir_array(_pn.metadata)  # #119: compact bytes-aware read
+                    _b = poincare_dir_array(_on.metadata)
+                    if _a is not None and _b is not None:
                         _mt1 = getattr(_pn, "manifold_type", "hyperbolic")
                         _mt2 = getattr(_on, "manifold_type", "hyperbolic")
                         _gdist = None

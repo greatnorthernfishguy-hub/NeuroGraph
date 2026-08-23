@@ -627,13 +627,14 @@ class TonicEngine:
             return []
         try:
             import numpy as np
+            from neuro_foundation import poincare_dir_array  # #119: compact bytes-aware read
             g = self._graph
             dirs = []
             for nid in thread_nodes[:10]:
                 node = g.nodes.get(nid)
-                pd = (getattr(node, "metadata", None) or {}).get("poincare_dir") if node else None
-                if pd:
-                    dirs.append(np.asarray(pd, dtype=np.float32))
+                pd = poincare_dir_array(getattr(node, "metadata", None)) if node else None
+                if pd is not None:
+                    dirs.append(pd)
             if not dirs:
                 return []
             centroid = np.mean(dirs, axis=0)
@@ -646,10 +647,9 @@ class TonicEngine:
             for nid, node in items:
                 if nid in thread_set:
                     continue
-                pd = (getattr(node, "metadata", None) or {}).get("poincare_dir")
-                if not pd:
+                v = poincare_dir_array(getattr(node, "metadata", None))
+                if v is None:
                     continue
-                v = np.asarray(pd, dtype=np.float32)
                 vn = float(np.linalg.norm(v)) or 1e-9
                 cos = float(np.dot(v, centroid)) / (vn * cn)
                 if not (cos > 0.0):   # also rejects NaN (zero-norm / degenerate dir)
