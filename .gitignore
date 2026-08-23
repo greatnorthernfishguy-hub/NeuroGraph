@@ -11,6 +11,9 @@ data/
 *.bak
 *.bak-*
 *.bak.*
+# Pre-edit safety snapshots (e.g. neuro_foundation.py.pre-confhist-leakfix.20260821-110911).
+# Same class as *.bak-* above; the existing globs don't match the "pre-<tag>.<date>" suffix.
+*.pre-*
 *.msgpack
 *.msgpack.*
 

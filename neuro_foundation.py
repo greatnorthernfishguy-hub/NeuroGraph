@@ -618,7 +618,7 @@ class RingBuffer:
 # Core Data Structures (PRD §2.2)
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class Node:
     """Atomic unit of the graph wrapping neural state (PRD §2.2.1, Table 2.2.1).
 
@@ -660,7 +660,7 @@ class Node:
     creation_time: int = 0                          # Timestep when node was created (#258 orphan grace)
 
 
-@dataclass
+@dataclass(slots=True)
 class Synapse:
     """Directed, weighted connection between two nodes (PRD §2.2.2, Table 2.2.2).
 
@@ -705,7 +705,7 @@ class Synapse:
     salience: float = 1.0
 
 
-@dataclass
+@dataclass(slots=True)
 class Hyperedge:
     """Set-valued relationship connecting arbitrary nodes (PRD §2.2.3, Table 2.2.3).
 
@@ -1977,6 +1977,7 @@ class Graph:
         self._outgoing.get(syn.pre_node_id, set()).discard(synapse_id)
         self._incoming.get(syn.post_node_id, set()).discard(synapse_id)
         self._dirty_synapses.discard(synapse_id)
+        self._synapse_confirmation_history.pop(synapse_id, None)
 
     def remove_synapse(self, synapse_id: str) -> None:
         """Remove a synapse (public API)."""

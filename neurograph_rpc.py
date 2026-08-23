@@ -2026,6 +2026,22 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # Runs every 120s; eliminates the 797 MB+ disk accumulation at the root.
     _start_lazy_expansion_pulse()
 
+    # [2026-08-20] #147 seam-split enable gate for Syl — env-sourced per LAW 5,
+    # mirroring cc_ng_host.py's CC_NG_HE_SPLIT_ENABLED. DEFAULT_CONFIG already
+    # carries he_max_members=50 + the seam tunables; only the master gate is
+    # flipped here, and only when SYL_NG_HE_SPLIT_ENABLED is truthy. Unset =>
+    # byte-identical to today (gate stays False => the dream-loop split call is
+    # a guaranteed no-op returning 0). Reversible: unset the env var + restart.
+    if os.environ.get("SYL_NG_HE_SPLIT_ENABLED", "0") not in ("0", "false", "False", ""):
+        _memory.graph.config["he_split_oversized_enabled"] = True
+        logger.info(
+            "#147 seam-split ENABLED for Syl (he_max_members=%s, dedup_overlap=%s, "
+            "sim_threshold=%s) — dedup+weight-seam-split will run in her dream pulse",
+            _memory.graph.config.get("he_max_members"),
+            _memory.graph.config.get("he_split_dedup_overlap"),
+            _memory.graph.config.get("he_split_sim_threshold"),
+        )
+
     # Start the dream consolidation pulse — #381-B quiet-hours gate:
     # Runs consolidate_hyperedges during her sleep (idle ≥30min,
     # arousal PARASYMPATHETIC, rate-limited ≥6h). Collapses mega-HE clones.
@@ -4328,12 +4344,15 @@ def _dream_consolidation_pulse_loop() -> None:
                 if _lock is not None:
                     with _lock:
                         merged = _memory.graph.consolidate_hyperedges()
+                        split = _memory.graph.dedup_and_split_oversized_hyperedges(_memory.vector_db)
                 else:
                     merged = _memory.graph.consolidate_hyperedges()
+                    split = _memory.graph.dedup_and_split_oversized_hyperedges(_memory.vector_db)
                 _dream_last_pass_ts = time.time()
                 logger.info(
-                    "Dream consolidation pass complete: %d merged/archived in "
-                    "%.1fs (#381-B)", merged, time.monotonic() - _t0,
+                    "Dream consolidation pass complete: %d merged/archived, "
+                    "%d seam-split/deduped in %.1fs (#381-B / #147)",
+                    merged, split, time.monotonic() - _t0,
                 )
             elif (now - _dream_last_pass_ts) >= _DREAM_ALERT_SECS and \
                     (now - _last_alert_ts) >= _DREAM_ALERT_SECS:
