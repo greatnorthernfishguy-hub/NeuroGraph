@@ -525,6 +525,19 @@ try:
 except ImportError:
     msgpack = None
 
+# #119 increment 3 — columnar synapse substrate. SynapseMapping/AdjacencyView are
+# Dict-compatible shims backed by structure-of-arrays numpy columns, replacing the
+# boxed-Synapse dict and the dict-of-sets-of-UUID adjacency indices to reclaim the
+# ~8-12 GB those duplicate UUID strings + per-object overhead cost. ng_columnar
+# imports SynapseType lazily (function-level), so there is no import cycle here.
+from ng_columnar import (
+    IdInterner,
+    SynapseStore,
+    SynapseMapping,
+    CSRAdjacency,
+    AdjacencyView,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1599,13 +1612,30 @@ class Graph:
 
         # --- Core collections (sparse) ---
         self.nodes: Dict[str, Node] = {}
-        self.synapses: Dict[str, Synapse] = {}
+        # #119 increment 3 — synapses live in a structure-of-arrays store, not a
+        # dict of boxed Synapse objects. `self.synapses` is a SynapseMapping shim
+        # presenting the exact Dict[str, Synapse] surface (values are write-through
+        # SynapseView handles), so every call site is unchanged. The shared node
+        # IdInterner is the single canonical copy of each node-id string; the store
+        # decodes synapse endpoints through it, and both adjacency views iterate it
+        # for node presence.
+        self._node_interner: IdInterner = IdInterner()
+        self._synapse_store: SynapseStore = SynapseStore(self._node_interner)
+        self.synapses = SynapseMapping(self._synapse_store)
         self.hyperedges: Dict[str, Hyperedge] = {}
 
         # --- Sparse adjacency indices ---
-        # node_id → set of synapse_ids
-        self._outgoing: Dict[str, Set[str]] = {}
-        self._incoming: Dict[str, Set[str]] = {}
+        # #119 increment 3 — `_outgoing`/`_incoming` are no longer dict-of-sets of
+        # duplicate UUID strings; they are AdjacencyView shims over a single CSR
+        # grouping of the store's endpoint columns. `_outgoing[node_id]` still
+        # yields {synapse_id, ...} (materialised fresh per lookup), but the edges
+        # are derived from the store — the store is the sole source of truth, so
+        # every edge mutation must route through `self.synapses` (it always does).
+        self._csr_adjacency: CSRAdjacency = CSRAdjacency(self._synapse_store)
+        self._outgoing = AdjacencyView(
+            self._csr_adjacency, self._node_interner, self._synapse_store, "out")
+        self._incoming = AdjacencyView(
+            self._csr_adjacency, self._node_interner, self._synapse_store, "in")
         # node_id → set of hyperedge_ids the node belongs to
         self._node_hyperedges: Dict[str, Set[str]] = {}
 
@@ -1994,18 +2024,30 @@ class Graph:
             peak_weight=weight,
         )
         self.synapses[syn.synapse_id] = syn
-        self._outgoing[pre_node_id].add(syn.synapse_id)
-        self._incoming[post_node_id].add(syn.synapse_id)
+        # #119 increment 3 — no explicit _outgoing/_incoming write: adjacency is
+        # derived from the store's endpoint columns, and the store.add above is
+        # the real change. The old `_outgoing[pre].add(sid)` materialised the
+        # node's whole neighbour set just to mutate a throwaway copy — O(degree)
+        # per insert, i.e. an O(degree^2) build. Dropping it restores linear build.
         self._dirty_synapses.add(syn.synapse_id)
-        return syn
+        # Return the live write-through handle from the store, not the boxed
+        # `syn` that was just fanned into columns. Under the columnar store
+        # `self.synapses[sid]` is a write-through SynapseView; callers that hold
+        # the return value and later read plasticity updates or mutate fields
+        # (salience/metadata on sprouting, eligibility traces, etc.) must see
+        # and reach the store. Under a plain-dict store this returns `syn`.
+        return self.synapses[syn.synapse_id]
 
     def _remove_synapse_internal(self, synapse_id: str) -> None:
         """Remove a synapse and clean up indices (no KeyError on missing)."""
         syn = self.synapses.pop(synapse_id, None)
         if syn is None:
             return
-        self._outgoing.get(syn.pre_node_id, set()).discard(synapse_id)
-        self._incoming.get(syn.post_node_id, set()).discard(synapse_id)
+        # #119 increment 3 — no explicit _outgoing/_incoming discard: the pop
+        # above removed the edge from the store, adjacency's sole source of
+        # truth. The old `.get(node, set()).discard(sid)` materialised the
+        # endpoint's whole neighbour set to mutate a throwaway — O(degree) per
+        # removal (quadratic pruning). The derived views re-read the store.
         self._dirty_synapses.discard(synapse_id)
         self._synapse_confirmation_history.pop(synapse_id, None)
 
@@ -4950,7 +4992,11 @@ class Graph:
             "peak_weight": syn.peak_weight,
             "low_weight_steps": syn.low_weight_steps,
             "inactive_steps": syn.inactive_steps,
-            "metadata": syn.metadata,
+            # peek_metadata() reads without persisting an empty dict into the
+            # store's sparse map (#119 increment 3); serializing every synapse
+            # via the plain `.metadata` property would make that map dense.
+            # _DetachedSynapse has no peek — its `.metadata` is already a copy.
+            "metadata": syn.peek_metadata() if hasattr(syn, "peek_metadata") else syn.metadata,
             "salience": syn.salience,
         }
 
@@ -5012,7 +5058,12 @@ class Graph:
         # can add nodes/synapses between iterations — list() gives us a
         # stable view without pausing the latent thread.
         _nodes      = list(self.nodes.items())
-        _synapses   = list(self.synapses.items())
+        # #119 increment 3 — synapses live in a columnar store, so items()
+        # values are live (store, row) views that a concurrent Tonic mutator
+        # can tombstone/recycle before we read them. snapshot_items() returns
+        # immutable detached copies, restoring the old dict-of-boxed-Synapse
+        # guarantee that this lock-free snapshot relied on.
+        _synapses   = self.synapses.snapshot_items()
         _hyperedges = list(self.hyperedges.items())
         _archived   = list(self._archived_hyperedges.items())
         _act_preds  = list(self.active_predictions.items())
@@ -5200,12 +5251,25 @@ class Graph:
         self.config = {**DEFAULT_CONFIG, **data.get("config", {})}
         self.timestep = data.get("timestep", 0)
 
-        # Clear existing state
+        # Clear existing state.
         self.nodes.clear()
-        self.synapses.clear()
         self.hyperedges.clear()
-        self._outgoing.clear()
-        self._incoming.clear()
+        # #119 increment 3 — the columnar substrate cannot be emptied by
+        # `.clear()`: AdjacencyView.clear() is a deliberate no-op and nothing
+        # resets the shared node IdInterner, so a restore()-into-a-reused-Graph
+        # would leave every previously-loaded node-id interned. The CSR
+        # adjacency then over-reports len/membership/iteration with phantom
+        # nodes absent from self.nodes, and the interner grows across restores.
+        # Rebuild the interner + store + mapping + CSR + views fresh (mirroring
+        # __init__) so no ghost endpoint survives the swap.
+        self._node_interner = IdInterner()
+        self._synapse_store = SynapseStore(self._node_interner)
+        self.synapses = SynapseMapping(self._synapse_store)
+        self._csr_adjacency = CSRAdjacency(self._synapse_store)
+        self._outgoing = AdjacencyView(
+            self._csr_adjacency, self._node_interner, self._synapse_store, "out")
+        self._incoming = AdjacencyView(
+            self._csr_adjacency, self._node_interner, self._synapse_store, "in")
         self._node_hyperedges.clear()
         self._recent_spikes.clear()
         self._delay_buffer.clear()
@@ -5284,8 +5348,11 @@ class Graph:
                 salience=sd.get("salience", 1.0),          # Phase 4
             )
             self.synapses[sid] = syn
-            self._outgoing.setdefault(syn.pre_node_id, set()).add(sid)
-            self._incoming.setdefault(syn.post_node_id, set()).add(sid)
+            # #119 increment 3 — adjacency is derived from the store; the
+            # assignment above is the real change. The old setdefault().add()
+            # materialised each endpoint's neighbour set per synapse — an
+            # O(edges^2) restore. Nodes were already registered above (edgeless
+            # `_outgoing[nid] = set()`), so endpoints resolve without it.
 
         # Restore hyperedges
         for hid, hd in data.get("hyperedges", {}).items():
