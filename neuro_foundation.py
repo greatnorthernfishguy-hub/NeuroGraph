@@ -520,6 +520,8 @@ from typing import (
 
 import numpy as np
 
+import ng_tract  # native (Rust) SynapseStore — columnar synapse storage (#RAM footprint)
+
 try:
     import msgpack
 except ImportError:
@@ -1599,7 +1601,14 @@ class Graph:
 
         # --- Core collections (sparse) ---
         self.nodes: Dict[str, Node] = {}
-        self.synapses: Dict[str, Synapse] = {}
+        # Native (Rust) columnar synapse store — replaces the former
+        # Dict[str, Synapse].  Drops per-synapse Python object inflation; the
+        # engine reads/writes via the Mapping facade (SynapseRef live proxies).
+        # The class registrations let SynapseRef hydrate synapse_type back into
+        # the Python SynapseType enum and materialize Synapse-shaped views.
+        self.synapses = ng_tract.SynapseStore()
+        self.synapses.set_synapse_type_class(SynapseType)
+        self.synapses.set_synapse_class(Synapse)
         self.hyperedges: Dict[str, Hyperedge] = {}
 
         # --- Sparse adjacency indices ---
@@ -1997,7 +2006,12 @@ class Graph:
         self._outgoing[pre_node_id].add(syn.synapse_id)
         self._incoming[post_node_id].add(syn.synapse_id)
         self._dirty_synapses.add(syn.synapse_id)
-        return syn
+        # Return the LIVE store view, not the detached dataclass above: callers
+        # (and the STDP/reward paths) hold this and expect in-place mutations
+        # through the store to be visible on it — the former Dict[str,Synapse]
+        # stored the very object it returned, so returning a fresh SynapseRef
+        # preserves that write-through identity contract.
+        return self.synapses[syn.synapse_id]
 
     def _remove_synapse_internal(self, synapse_id: str) -> None:
         """Remove a synapse and clean up indices (no KeyError on missing)."""
@@ -2459,9 +2473,8 @@ class Graph:
             if self.config.get("three_factor_enabled", False):
                 trace_tau = self.config["eligibility_trace_tau"]
                 trace_decay = math.exp(-1.0 / trace_tau) if trace_tau > 0 else 0.0
-                for syn in self.synapses.values():
-                    if abs(syn.eligibility_trace) > 1e-12:
-                        syn.eligibility_trace *= trace_decay
+                # Native columnar decay — no Python per-synapse iteration (#RAM/CPU).
+                self.synapses.decay_eligibility(trace_decay)
 
             # 6f. Clean up expired Phase 3 predictions
             self._cleanup_predictions()
@@ -2500,12 +2513,10 @@ class Graph:
 
             # 10. Track synapse inactivity + decay salience armor (Phase 4).
             salience_decay = self.config["he_salience_decay_rate"]
-            for syn in self.synapses.values():
-                syn.inactive_steps += 1
-                # Salience decays proportionally toward 1.0 — high salience fades
-                # faster than low.  Never drops below 1.0.
-                if syn.salience > 1.0:
-                    syn.salience = 1.0 + (syn.salience - 1.0) * (1.0 - salience_decay)
+            # Native columnar aging: inactive_steps++ for all, salience decays
+            # toward 1.0 (never below).  Semantics verified identical to the prior
+            # Python loop.  No per-synapse iteration (#RAM/CPU).
+            self.synapses.age_and_decay_salience(salience_decay)
 
             # Emit spike events (enriched with trace state for Lenia bridge)
             if fired_ids:
@@ -2838,10 +2849,11 @@ class Graph:
                 self._tonic_age_counter = 0
                 with self._step_lock:
                     _sal_decay = self.config.get("he_salience_decay_rate", 0.0)
-                    for _syn in self.synapses.values():
-                        _syn.inactive_steps += 1
-                        if _sal_decay and _syn.salience > 1.0:
-                            _syn.salience = 1.0 + (_syn.salience - 1.0) * (1.0 - _sal_decay)
+                    # Native whole-population aging (§12 item 4) — same op step()
+                    # uses (nf.py:2519). Numerically identical to the old Python
+                    # sweep: inactive_steps += 1 for every row, and salience > 1.0
+                    # relaxes by 1 + (s-1)*(1-decay) (a no-op when decay == 0).
+                    self.synapses.age_and_decay_salience(_sal_decay)
                     self._prune_synapses()
                     self._collect_orphan_nodes()
 
@@ -4935,25 +4947,6 @@ class Graph:
             "creation_time": node.creation_time,
         }
 
-    def _serialize_synapse(self, syn: Synapse) -> Dict[str, Any]:
-        return {
-            "synapse_id": syn.synapse_id,
-            "pre_node_id": syn.pre_node_id,
-            "post_node_id": syn.post_node_id,
-            "weight": syn.weight,
-            "max_weight": syn.max_weight,
-            "delay": syn.delay,
-            "last_update_time": syn.last_update_time,
-            "eligibility_trace": syn.eligibility_trace,
-            "creation_time": syn.creation_time,
-            "synapse_type": syn.synapse_type.name,
-            "peak_weight": syn.peak_weight,
-            "low_weight_steps": syn.low_weight_steps,
-            "inactive_steps": syn.inactive_steps,
-            "metadata": syn.metadata,
-            "salience": syn.salience,
-        }
-
     def _serialize_hyperedge(self, he: Hyperedge) -> Dict[str, Any]:
         return {
             "hyperedge_id": he.hyperedge_id,
@@ -5012,7 +5005,6 @@ class Graph:
         # can add nodes/synapses between iterations — list() gives us a
         # stable view without pausing the latent thread.
         _nodes      = list(self.nodes.items())
-        _synapses   = list(self.synapses.items())
         _hyperedges = list(self.hyperedges.items())
         _archived   = list(self._archived_hyperedges.items())
         _act_preds  = list(self.active_predictions.items())
@@ -5027,7 +5019,7 @@ class Graph:
             "timestep": self.timestep,
             "config": self.config,
             "nodes": {nid: self._serialize_node(n) for nid, n in _nodes},
-            "synapses": {sid: self._serialize_synapse(s) for sid, s in _synapses},
+            "synapses": self.synapses.to_checkpoint_dict(),
             "hyperedges": {hid: self._serialize_hyperedge(h) for hid, h in _hyperedges},
             "archived_hyperedges": {
                 hid: self._serialize_hyperedge(h)
@@ -5126,7 +5118,7 @@ class Graph:
                 if nid in self.nodes
             },
             "synapses": {
-                sid: self._serialize_synapse(self.synapses[sid])
+                sid: self.synapses.serialize_one(sid)
                 for sid in self._dirty_synapses
                 if sid in self.synapses
             },
@@ -5170,7 +5162,7 @@ class Graph:
         extracted_synapses = {}
         for sid, syn in self.synapses.items():
             if syn.pre_node_id in node_ids and syn.post_node_id in node_ids:
-                extracted_synapses[sid] = self._serialize_synapse(syn)
+                extracted_synapses[sid] = self.synapses.serialize_one(sid)
 
         # Filter hyperedges — all members must be in the extracted set
         extracted_hyperedges = {}
@@ -5264,28 +5256,17 @@ class Graph:
             if valid:
                 self._delay_buffer[ts] = valid
 
-        # Restore synapses
-        for sid, sd in data.get("synapses", {}).items():
-            syn = Synapse(
-                synapse_id=sid,
-                pre_node_id=sd["pre_node_id"],
-                post_node_id=sd["post_node_id"],
-                weight=sd["weight"],
-                max_weight=sd.get("max_weight", 5.0),
-                delay=sd.get("delay", 1),
-                last_update_time=sd.get("last_update_time", 0.0),
-                eligibility_trace=sd.get("eligibility_trace", 0.0),
-                creation_time=sd.get("creation_time", 0.0),
-                synapse_type=SynapseType[sd.get("synapse_type", "EXCITATORY")],
-                peak_weight=sd.get("peak_weight", sd["weight"]),
-                low_weight_steps=sd.get("low_weight_steps", 0),
-                inactive_steps=sd.get("inactive_steps", 0),
-                metadata=sd.get("metadata", {}),
-                salience=sd.get("salience", 1.0),          # Phase 4
-            )
-            self.synapses[sid] = syn
-            self._outgoing.setdefault(syn.pre_node_id, set()).add(sid)
-            self._incoming.setdefault(syn.post_node_id, set()).add(sid)
+        # Restore synapses — native bulk load, no per-synapse Python object
+        # inflation.  bulk_load applies the same field defaults the Synapse
+        # constructor did (max_weight=5.0, delay=1, synapse_type=EXCITATORY,
+        # peak_weight=weight, low_weight_steps=0, inactive_steps=0, metadata={},
+        # salience=1.0), verified identical.  Adjacency indices are rebuilt in a
+        # single pass over the store's live proxies.
+        self.synapses.bulk_load(data.get("synapses", {}))
+        for sid in self.synapses.keys():
+            ref = self.synapses[sid]
+            self._outgoing.setdefault(ref.pre_node_id, set()).add(sid)
+            self._incoming.setdefault(ref.post_node_id, set()).add(sid)
 
         # Restore hyperedges
         for hid, hd in data.get("hyperedges", {}).items():
