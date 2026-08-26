@@ -4899,16 +4899,49 @@ class Graph:
             )
         if msgpack is None:
             raise ImportError("msgpack required for topology serialization")
+        # #RAM footprint — stream the outer checkpoint map, splicing the native
+        # pre-packed synapses bytes VERBATIM instead of packing a 644K-entry dict.
+        # For FULL/FORK, data["synapses"] is the raw msgpack bytes from
+        # to_checkpoint_msgpack() (byte-identical to packing the dict, per the
+        # crate's round-trip tests); for INCREMENTAL it is a normal (small) dict,
+        # which packs the ordinary way. The result is byte-identical to
+        # msgpack.pack(data, ...) either way.
+        packer = msgpack.Packer(use_bin_type=True)
         with open(path, "wb") as f:
-            msgpack.pack(data, f, use_bin_type=True)
+            f.write(packer.pack_map_header(len(data)))
+            for key, value in data.items():
+                f.write(packer.pack(key))
+                if key == "synapses" and isinstance(value, (bytes, bytearray)):
+                    f.write(value)  # verbatim pre-packed {sid: {15-key}} map
+                else:
+                    f.write(packer.pack(value))
 
     def restore(self, path: str) -> None:
         """Load state from checkpoint (PRD §8 restore, §6)."""
         if path.endswith(".msgpack"):
             if msgpack is None:
                 raise ImportError("msgpack required for .msgpack deserialization")
+            # #RAM footprint — stream the outer map and SKIP the synapses value
+            # (slicing its raw bytes) instead of unpacking it into ~644K transient
+            # Python dicts. Every other key decodes normally. The sliced bytes are
+            # handed to the native bulk_load_msgpack in _deserialize. Robust to key
+            # order and works on checkpoints written before this change (the synapses
+            # sub-map's wire format is unchanged — see the crate round-trip tests).
             with open(path, "rb") as f:
-                data = msgpack.unpack(f, raw=False)
+                raw = f.read()
+            unpacker = msgpack.Unpacker(raw=False, max_buffer_size=len(raw) + 1)
+            unpacker.feed(raw)
+            data = {}
+            n_pairs = unpacker.read_map_header()
+            for _ in range(n_pairs):
+                key = unpacker.unpack()
+                if key == "synapses":
+                    start = unpacker.tell()
+                    unpacker.skip()  # advance past the value WITHOUT inflating it
+                    data[key] = raw[start:unpacker.tell()]  # raw sub-map bytes
+                else:
+                    data[key] = unpacker.unpack()
+            del raw
         else:
             # #325 — legacy LOSSY JSON topology (pre-enforcer). Tolerated for ONE-TIME migration
             # only; this state was already degraded at write time (json.dump default=str).
@@ -5019,7 +5052,12 @@ class Graph:
             "timestep": self.timestep,
             "config": self.config,
             "nodes": {nid: self._serialize_node(n) for nid, n in _nodes},
-            "synapses": self.synapses.to_checkpoint_dict(),
+            # Native pre-packed synapses map (#RAM footprint): to_checkpoint_msgpack
+            # emits the {synapse_id: {15-key}} MessagePack bytes directly from the Rust
+            # columns — byte-identical to packb(to_checkpoint_dict()) but WITHOUT
+            # materializing ~644K transient Python dicts. checkpoint() splices these
+            # bytes verbatim into the outer map (see the streaming write below).
+            "synapses": self.synapses.to_checkpoint_msgpack(),
             "hyperedges": {hid: self._serialize_hyperedge(h) for hid, h in _hyperedges},
             "archived_hyperedges": {
                 hid: self._serialize_hyperedge(h)
@@ -5262,7 +5300,17 @@ class Graph:
         # peak_weight=weight, low_weight_steps=0, inactive_steps=0, metadata={},
         # salience=1.0), verified identical.  Adjacency indices are rebuilt in a
         # single pass over the store's live proxies.
-        self.synapses.bulk_load(data.get("synapses", {}))
+        #
+        # #RAM footprint — restore() slices the synapses value as raw msgpack
+        # bytes (never inflated to dicts); feed them straight to the native
+        # bulk_load_msgpack. Legacy paths (JSON restore, or a dict-shaped value)
+        # still arrive as a dict and take the original bulk_load. Both are the
+        # crate's two deserialization authorities and converge on the same store.
+        _syn = data.get("synapses", {})
+        if isinstance(_syn, (bytes, bytearray)):
+            self.synapses.bulk_load_msgpack(bytes(_syn))
+        else:
+            self.synapses.bulk_load(_syn)
         for sid in self.synapses.keys():
             ref = self.synapses[sid]
             self._outgoing.setdefault(ref.pre_node_id, set()).add(sid)
