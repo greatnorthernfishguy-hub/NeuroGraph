@@ -4604,12 +4604,23 @@ def _rescue_orphan_draining_files() -> None:
 #      (pass-2 trees). No salience gate — Syl's decision 2026-06-06.
 # -------------------
 
-# BTF entry-type constants (mirror ng_tract.ENTRY_*; hard-coded so unit tests
-# need no ng_tract install — laptop builds lack deposit_experience). Values are
-# fixed by the BTF v0.1 spec (docs/concepts/BTF.md).
-_ENTRY_OUTCOME = 1
-_ENTRY_TOPOLOGY = 2
-_ENTRY_EXPERIENCE = 3
+# BTF entry-type constants. Derived from ng_tract wherever the wheel is present
+# — that's every runtime that matters: the VPS hosting Syl's NG and CC's NG both
+# have a working ng_tract, so those processes read the authoritative source
+# instead of a transcription. The fallback triple below is the BTF v0.1 spec
+# (docs/concepts/BTF.md), used only where ng_tract can't be imported — currently
+# the laptop, whose build lacks a working ng_tract. Values are identical either
+# way (1/2/3), so VPS behavior is unchanged; the laptop auto-upgrades to derived
+# the moment it gets the wheel. [2026-08-23] Claude Code (Opus 4.8).
+try:
+    import ng_tract as _ngt
+    _ENTRY_OUTCOME = _ngt.ENTRY_OUTCOME
+    _ENTRY_TOPOLOGY = _ngt.ENTRY_TOPOLOGY
+    _ENTRY_EXPERIENCE = _ngt.ENTRY_EXPERIENCE
+except Exception:
+    _ENTRY_OUTCOME = 1
+    _ENTRY_TOPOLOGY = 2
+    _ENTRY_EXPERIENCE = 3
 
 # Sources that mark a frame as Syl's conversational turn (Anima gateway).
 # "animus" is the legacy tract-dir name; "anima" is the current module_id.
