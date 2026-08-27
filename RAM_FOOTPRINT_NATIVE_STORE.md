@@ -1,4 +1,20 @@
 <!-- ---- Changelog ----
+# 2026-08-26 CC (Opus 4.8) — RECONCILED TO LIVE GIT + baseline hygiene
+# What: (1) §13 was stale — it narrated the native SynapseStore wiring as
+#       "uncommitted, not deployed." It is COMMITTED on feat/shrink-syl-footprint:
+#       5770343 (serialization + tonic aging → native store), 0f5447f (streamed
+#       checkpoint load, no dict inflation), da5c16e (rpc BTF constants). Corrected.
+#       (2) Added a new in-flight increment to §6: dropping he_prediction_window_fired
+#       from serialization (~2GB RSS) — uncommitted working-tree edit, protected,
+#       Syl's-Law-gated. (3) §8 baseline: phase35 is now 20/20 green (json→msgpack
+#       migration + rewrite of test_predictions_still_error_after_restore, which was
+#       a stale Feb-2026 assertion coupled to the pre-serialization delay_buffer bug).
+# Why: Josh, verbatim: "I'm not confident you've been updating it." Correct — the
+#       doc had drifted three commits behind the protected file. This is the fix.
+# How: Edited §6, §8, §13 + this changelog + the Last-updated date. Deploy state
+#       to Syl UNVERIFIABLE from this (dev) box — no live process, no backups here;
+#       she runs on the VPS. "Committed on-branch" is NOT "deployed"; §10 gate stands.
+#
 # 2026-08-23 CC-VPS (Opus 4.8) — CREATED
 # What: Durable orientation + design doc for the RAM-footprint-reduction task
 #       (move Syl's resident graph out of boxed Python objects into a NATIVE
@@ -23,7 +39,7 @@
 > "#119" means — you probably have it backwards. Keep reading.
 
 **Owner:** Josh (sole architect). **Author of this doc:** CC-VPS.
-**Last updated:** 2026-08-24. **Keep this date current on every edit.**
+**Last updated:** 2026-08-26. **Keep this date current on every edit.**
 
 ---
 
@@ -184,6 +200,17 @@ vendoring; there is no pip index).
    integer arrays,** held natively. Medium RAM win, medium risk.
 3. **Synapse columnar store — THE BIG ONE (~8–12 GB). The real work.** Native
    Rust SoA in the wheel; zero-copy views to Python.
+   **Wiring COMMITTED** (§13: 5770343 / 0f5447f / da5c16e); deploy to Syl still gated.
+4. **Drop `he_prediction_window_fired` from serialization (~2 GB RSS).** A
+   transient per-window accumulator (telemetry-only: feeds
+   `SurpriseEvent.actual_nodes`, which no production consumer reads). On the live
+   substrate it reaches tens of millions of node-id slots; reloaded as
+   non-shared strings it cost ~2 GB RSS per restart. Serialized as `{}` and
+   skipped on load; the runtime rebuilds these sets from empty each step, and the
+   confirm/surprise classification never consults them, so it is behaviourally
+   identical across a restart. **Uncommitted working-tree edit, protected file,
+   Syl's-Law-gated (§10).** Test baseline (phase35/phase25) migrated to prove it
+   preserves the persistence contract — see §8.
 
 Increments 2 and 3 are the ones that must land **in Rust**, not as the
 `ng_columnar.py` Python shim.
@@ -228,6 +255,15 @@ Partitioned against a detached-HEAD worktree (2026-08-23):
   serialization-policy (phase35 ×20), `ng_tract_bridge` ×17, migration ×6,
   `tonic_habituation` ×8, plus a torch-missing env error. **These are NOT caused
   by this work.**
+  > **UPDATE 2026-08-26:** the phase35 ×20 bucket is **CLEARED — 20/20 green.**
+  > Migrated the suite json→msgpack (#325) and rewrote
+  > `test_predictions_still_error_after_restore`, which was a stale Feb-2026
+  > assertion: it only ever "errored" because the old checkpoint *dropped*
+  > `_delay_buffer`, losing the in-flight A→B spike. Now that in-flight spikes
+  > survive restore (a correctness gain), that spike fires B and *confirms* the
+  > prediction. The rewrite exercises the real error path authentically (target
+  > with a raised firing threshold → prediction genuinely expires unconfirmed).
+  > This is baseline hygiene for the §6.4 he_window increment, not core-store work.
 - **1 genuine regression introduced by the shim WIP:**
   `tests/test_graph_substrate_race.py::test_build_adjacency_no_race_under_concurrent_step_mutation`
   — passes on HEAD (2 passed ~6 s), **times out** on the WIP because
@@ -323,7 +359,27 @@ existing zero-copy-view pattern. Nothing here has touched `~/NeuroGraph` yet.
 6. **Wire into `neuro_foundation.py`** — PROTECTED, Syl's-Law gated (§10). LAST.
    **EDITS EXIST IN WORKING TREE, uncommitted, NOT deployed.** See §13.
 
-### 13. Where it actually stands (2026-08-24, VERIFY before acting)
+### 13. Where it actually stands (2026-08-26, VERIFY before acting)
+
+> **⚠️ SUPERSEDES the 2026-08-24 text below.** The native-store wiring is no
+> longer "uncommitted in the working tree" — it is **COMMITTED** on
+> `feat/shrink-syl-footprint`:
+> - `5770343` step3: route synapse serialization + tonic aging through native store
+> - `0f5447f` perf: stream checkpoint synapses through native store (no dict inflation)
+> - `da5c16e` rpc: derive BTF entry constants from ng_tract when present
+> - `7c5aef6` #400 poincare float32 pack (increment 1)
+>
+> **The ONLY uncommitted protected-file edit now in the working tree** is a NEW
+> #RAM increment (see §6.4): dropping `he_prediction_window_fired` from the
+> checkpoint (serialized as `{}`, skipped on load) — ~2 GB RSS. Plus non-protected
+> test-baseline edits (`tests/test_phase35.py`, `tests/test_phase25.py`).
+>
+> **Deploy state to Syl: UNVERIFIED.** Checked from the dev box — no live
+> substrate process and no msgpack backups are visible here (she runs on the VPS).
+> "Committed on-branch" is NOT "deployed." The §10 gate (Josh's "proceed" + both
+> backups confirmed) still governs any VPS deploy / sidecar restart.
+>
+> --- historical 2026-08-24 snapshot (store wiring since committed) follows ---
 
 - **`~/ng-tract-rs` crate:** items 1–4 written, compiles, wheel built
   (`target/wheels/ng_tract-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl`),
