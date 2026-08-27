@@ -4939,6 +4939,15 @@ class Graph:
                     start = unpacker.tell()
                     unpacker.skip()  # advance past the value WITHOUT inflating it
                     data[key] = raw[start:unpacker.tell()]  # raw sub-map bytes
+                elif key == "he_prediction_window_fired":
+                    # #RAM — transient per-window accumulator (telemetry-only, feeds
+                    # SurpriseEvent.actual_nodes which nothing in production reads).
+                    # On the live substrate this map balloons to tens of millions of
+                    # node-id slots; reloaded as non-shared strings it cost ~2GB RSS.
+                    # SKIP the value without inflating it and DON'T store it — the
+                    # runtime rebuilds these sets from empty as new steps accumulate,
+                    # and the confirm/surprise classification never consults them.
+                    unpacker.skip()
                 else:
                     data[key] = unpacker.unpack()
             del raw
@@ -5043,7 +5052,6 @@ class Graph:
         _act_preds  = list(self.active_predictions.items())
         _syn_hist   = list(self._synapse_confirmation_history.items())
         _he_preds   = list(self._active_predictions.items())
-        _he_window  = list(self._prediction_window_fired.items())
         _delay_buf  = list(self._delay_buffer.items())
         _recent_spk = [(nid, spikes) for nid, spikes
                        in self._recent_spikes.items() if spikes]
@@ -5091,11 +5099,16 @@ class Graph:
                 pid: self._serialize_prediction_state(ps)
                 for pid, ps in _he_preds
             },
-            # Phase 2.5: Window-fired tracking
-            "he_prediction_window_fired": {
-                pid: list(nodes)
-                for pid, nodes in _he_window
-            },
+            # Phase 2.5: Window-fired tracking — NOT persisted (#RAM). This is a
+            # transient per-window accumulator (telemetry-only: feeds
+            # SurpriseEvent.actual_nodes, which no production consumer reads). On the
+            # live substrate it reaches tens of millions of node-id slots and, reloaded
+            # as non-shared strings, cost ~2GB RSS on every restart. The runtime rebuilds
+            # these sets from empty (see step(): _prediction_window_fired.get(pid, set()))
+            # and the confirm/surprise classification never consults them, so persisting
+            # an empty map is behaviourally identical across a restart. restore() also
+            # skips this key on load for checkpoints written before this change.
+            "he_prediction_window_fired": {},
             # Phase 2.5: Counter for unique HE prediction IDs
             "he_prediction_counter": self._prediction_counter,
             "telemetry": {
