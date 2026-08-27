@@ -63,7 +63,7 @@ def build_predictive_graph(**extra_config) -> Graph:
 
 def checkpoint_and_restore(g: Graph) -> Graph:
     """Serialize and deserialize a Graph through a temp file."""
-    path = tempfile.mktemp(suffix=".json")
+    path = tempfile.mktemp(suffix=".msgpack")
     try:
         g.checkpoint(path)
         g2 = Graph()
@@ -147,10 +147,21 @@ class TestPhase3PredictionPersistence:
         assert len(confirmed_events) >= 1
 
     def test_predictions_still_error_after_restore(self):
-        """Restored predictions can still expire and trigger error events."""
+        """A restored prediction whose target never fires expires into an error.
+
+        The A->B link is strong enough to generate a prediction (weight >=
+        prediction_threshold), but B's firing threshold is raised so the
+        arriving spike can never fire it. With no confirming activation the
+        prediction must expire unconfirmed after its window, exercising the
+        live _cleanup_predictions -> _on_prediction_error path across a
+        checkpoint/restore boundary.
+        """
         g = build_predictive_graph(prediction_window=3)
         g.create_node(node_id="A")
         g.create_node(node_id="B")
+        # B receives A's spike but cannot fire, so the prediction has no way to
+        # be confirmed and must resolve as an error when the window expires.
+        g.nodes["B"].threshold = 100.0
         g.create_synapse("A", "B", weight=4.0)
 
         g.stimulate("A", 2.0)
@@ -162,7 +173,7 @@ class TestPhase3PredictionPersistence:
         error_events = []
         g2.register_event_handler("prediction_error",
                                   lambda **kw: error_events.append(kw))
-        # Let the window expire without firing B
+        # Step past the prediction window; B never fires.
         g2.step_n(5)
 
         assert len(error_events) >= 1
@@ -250,8 +261,16 @@ class TestPhase25PredictionPersistence:
         g2 = checkpoint_and_restore(g)
         assert g2._prediction_counter == counter_before
 
-    def test_he_prediction_window_fired_restored(self):
-        """Window-fired tracking should survive serialization."""
+    def test_he_prediction_window_fired_not_persisted(self):
+        """Window-fired tracking is intentionally NOT persisted (#RAM).
+
+        It is a transient per-window accumulator (telemetry-only: feeds
+        SurpriseEvent.actual_nodes, which no production consumer reads). On the
+        live substrate it reached tens of millions of node-id slots and cost
+        ~2GB RSS on reload. The runtime rebuilds these sets from empty and the
+        confirm/surprise classification never consults them, so restore() drops
+        the key. The predictions themselves must still survive.
+        """
         g = build_predictive_graph(prediction_window=10)
         ids = [g.create_node(f"m{i}").node_id for i in range(3)]
         out = g.create_node("out")
@@ -265,11 +284,16 @@ class TestPhase25PredictionPersistence:
             g.stimulate(nid, 2.0)
         g.step()
 
-        # Prediction exists but out hasn't fired → window_fired is tracked
+        # In-process, window_fired is tracked normally (runtime accumulation intact)
         assert len(g._prediction_window_fired) > 0
+        preds_before = len(g._active_predictions)
+        assert preds_before > 0
 
         g2 = checkpoint_and_restore(g)
-        assert len(g2._prediction_window_fired) == len(g._prediction_window_fired)
+        # The predictions themselves survive...
+        assert len(g2._active_predictions) == preds_before
+        # ...but window_fired is deliberately dropped (rebuilt from empty at runtime).
+        assert len(g2._prediction_window_fired) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +412,13 @@ class TestPredictionValidation:
         assert len(g.get_predictions()) > 0
 
         # Save checkpoint data manually, then modify it to remove node B
-        path = tempfile.mktemp(suffix=".json")
+        path = tempfile.mktemp(suffix=".msgpack")
         try:
             g.checkpoint(path)
 
-            import json
-            with open(path, "r") as f:
-                data = json.load(f)
+            import msgpack
+            with open(path, "rb") as f:
+                data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
 
             # Remove node B
             data["nodes"].pop("B", None)
@@ -404,8 +428,8 @@ class TestPredictionValidation:
                 if v.get("post_node_id") != "B" and v.get("pre_node_id") != "B"
             }
 
-            with open(path, "w") as f:
-                json.dump(data, f)
+            with open(path, "wb") as f:
+                f.write(msgpack.packb(data, use_bin_type=True))
 
             g2 = Graph()
             g2.restore(path)
@@ -452,19 +476,19 @@ class TestPredictionValidation:
         g.step()
         assert len(g.get_active_predictions()) > 0
 
-        path = tempfile.mktemp(suffix=".json")
+        path = tempfile.mktemp(suffix=".msgpack")
         try:
             g.checkpoint(path)
 
-            import json
-            with open(path, "r") as f:
-                data = json.load(f)
+            import msgpack
+            with open(path, "rb") as f:
+                data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
 
             # Remove the hyperedge
             data["hyperedges"] = {}
 
-            with open(path, "w") as f:
-                json.dump(data, f)
+            with open(path, "wb") as f:
+                f.write(msgpack.packb(data, use_bin_type=True))
 
             g2 = Graph()
             g2.restore(path)
@@ -486,19 +510,19 @@ class TestPredictionValidation:
         g.step()
         assert len(g._synapse_confirmation_history) > 0
 
-        path = tempfile.mktemp(suffix=".json")
+        path = tempfile.mktemp(suffix=".msgpack")
         try:
             g.checkpoint(path)
 
-            import json
-            with open(path, "r") as f:
-                data = json.load(f)
+            import msgpack
+            with open(path, "rb") as f:
+                data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
 
             # Remove the synapse
             data["synapses"] = {}
 
-            with open(path, "w") as f:
-                json.dump(data, f)
+            with open(path, "wb") as f:
+                f.write(msgpack.packb(data, use_bin_type=True))
 
             g2 = Graph()
             g2.restore(path)
@@ -516,11 +540,11 @@ class TestVersionAndIntegration:
     """Checkpoint version and end-to-end roundtrip tests."""
 
     def test_version_bump(self):
-        """Checkpoint version should be 0.4.1."""
+        """Checkpoint version should be 0.4.2."""
         g = build_predictive_graph()
         g.create_node(node_id="A")
         data = g._serialize_full()
-        assert data["version"] == "0.4.1"
+        assert data["version"] == "0.4.2"
 
     def test_full_roundtrip_with_active_state(self):
         """Full scenario: generate predictions, save mid-flight, restore, continue."""
@@ -579,13 +603,13 @@ class TestVersionAndIntegration:
         g.create_synapse("A", "B", weight=4.0)
 
         # Manually create a v0.2.5-style checkpoint (no prediction fields)
-        path = tempfile.mktemp(suffix=".json")
+        path = tempfile.mktemp(suffix=".msgpack")
         try:
             g.checkpoint(path)
 
-            import json
-            with open(path, "r") as f:
-                data = json.load(f)
+            import msgpack
+            with open(path, "rb") as f:
+                data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
 
             # Strip all Phase 3.5 keys
             for key in [
@@ -597,8 +621,8 @@ class TestVersionAndIntegration:
                 data.pop(key, None)
             data["version"] = "0.2.5"
 
-            with open(path, "w") as f:
-                json.dump(data, f)
+            with open(path, "wb") as f:
+                f.write(msgpack.packb(data, use_bin_type=True))
 
             g2 = Graph()
             g2.restore(path)

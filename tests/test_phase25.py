@@ -580,7 +580,7 @@ class TestPhase25Serialization:
         g.step()
         g.step_n(5)
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:
             path = f.name
 
         try:
@@ -601,7 +601,7 @@ class TestPhase25Serialization:
         he_l1 = g.create_hierarchical_hyperedge({he_l0.hyperedge_id})
         g.consolidate_hyperedges()
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:
             path = f.name
 
         try:
@@ -625,7 +625,7 @@ class TestPhase25Serialization:
         he.recent_activation_ema = 0.42
         he.is_archived = False
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:
             path = f.name
 
         try:
