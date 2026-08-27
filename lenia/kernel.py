@@ -1,4 +1,20 @@
 # ---- Changelog ----
+# [2026-08-27] Claude Code (Opus 4.8) — #147 borrow-safe DistanceCache.populate()
+# What: populate()'s synapse-endpoint loop and hyperedge-member loop now
+#   snapshot proxy PRIMITIVES (pre/post ids; member-id lists) INSIDE the
+#   graph's `_step_lock`, then iterate the plain-Python copies. No live
+#   ng_tract (Rust) proxy escapes the lock.
+# Why: these two loops read syn.pre_node_id / he.member_nodes UNLOCKED while
+#   the autonomic scan-drain pulse ran graph.step() under the SAME _step_lock
+#   (step() mutates syn.inactive_steps). Concurrent read+mutable-borrow of the
+#   same PyCell -> pyo3_runtime.PanicException 'Already borrowed:
+#   PyBorrowMutError'. Being a BaseException it escaped the pulse loop's
+#   `except Exception` and permanently killed the autonomic thread at boot
+#   (populate() is the multi-hour bootstrap rebuild). LAW 4: fixed at source,
+#   not papered over with a consumer-side BaseException catch. Mirrors the
+#   graph_substrate._build_adjacency #147 idiom already in this tree.
+# How: getattr(graph,'_step_lock'); `with _lock:` around the primitive-copy
+#   comprehension, unlocked fallback if absent (Tier-1 / no-lock graphs).
 # [2026-08-12] Claude Code (Opus 4.8) — #145 2-hop expansion was the bootstrap hang
 # What: populate()'s "add 2-hop neighbors" triple loop no longer iterates every
 #   node. The OUTER loop is restricted to the frontier — range(frontier_start, n)
@@ -476,10 +492,34 @@ class DistanceCache:
         # Synaptic connections (direct)
         graph = getattr(substrate, '_graph', None)
         if graph is not None:
-            for syn in graph.synapses.values():
+            # #147 borrow-safe snapshot: extract synapse endpoint PRIMITIVES
+            # under the graph's step lock, mirroring
+            # graph_substrate._build_adjacency. list() copies the container but
+            # each element stays a live ng_tract (Rust) proxy — reading syn.*
+            # AFTER the lock releases re-borrows the store and races
+            # graph.step()'s mutating tail (step() sets syn.inactive_steps under
+            # the SAME _step_lock) -> pyo3_runtime.PanicException: Already
+            # borrowed: PyBorrowMutError, which (being a BaseException) escapes
+            # the pulse loop's `except Exception` and kills the autonomic thread.
+            # Copy pre/post ids INSIDE the lock so no proxy escapes it; the lock
+            # is held only for the brief primitive copy, never across the
+            # multi-hour distance loop below.
+            _lock = getattr(graph, "_step_lock", None)
+            if _lock is not None:
+                with _lock:
+                    _syn_endpoints = [
+                        (s.pre_node_id, s.post_node_id)
+                        for s in graph.synapses.values()
+                    ]
+            else:
+                _syn_endpoints = [
+                    (s.pre_node_id, s.post_node_id)
+                    for s in graph.synapses.values()
+                ]
+            for _pre_id, _post_id in _syn_endpoints:
                 try:
-                    i = substrate.entity_index(syn.pre_node_id)
-                    j = substrate.entity_index(syn.post_node_id)
+                    i = substrate.entity_index(_pre_id)
+                    j = substrate.entity_index(_post_id)
                     connected_pairs.add((min(i, j), max(i, j)))
                 except (KeyError, ValueError):
                     continue
@@ -495,10 +535,27 @@ class DistanceCache:
             _he_cap = int(os.environ.get("NG_LENIA_HE_CLIQUE_CAP", "100"))
             _he_skipped = 0
             _he_skipped_max = 0
-            for he in graph.hyperedges.values():
-                member_ids = getattr(he, 'node_ids', [])
-                if hasattr(he, 'member_nodes') and he.member_nodes is not None:
-                    member_ids = he.member_nodes
+            # #147 borrow-safe snapshot: copy each hyperedge's member-id list to
+            # a plain list under the step lock — same borrow-race reasoning as the
+            # synapse loop above (he.member_nodes / he.node_ids read the ng_tract
+            # proxy). member_nodes takes precedence when present-and-not-None,
+            # else node_ids (original semantics preserved). Lock held only for the
+            # copy; the clique expansion below touches no proxy.
+            _he_lock = getattr(graph, "_step_lock", None)
+            def _snapshot_he_members():
+                out = []
+                for he in graph.hyperedges.values():
+                    if getattr(he, 'member_nodes', None) is not None:
+                        out.append(list(he.member_nodes))
+                    else:
+                        out.append(list(getattr(he, 'node_ids', []) or []))
+                return out
+            if _he_lock is not None:
+                with _he_lock:
+                    _he_member_lists = _snapshot_he_members()
+            else:
+                _he_member_lists = _snapshot_he_members()
+            for member_ids in _he_member_lists:
                 if not member_ids:
                     continue
                 if _he_cap > 0 and len(member_ids) > _he_cap:
@@ -551,13 +608,41 @@ class DistanceCache:
             frontier_start = start_index
         else:
             frontier_start = 0
+        # Bound the 2-hop expansion by PIVOT degree — the per-node analogue of
+        # #381's per-clique cap. The inner two loops emit a pair for every
+        # (node, second) sharing a waypoint `neighbor`; a mega-connector waypoint
+        # (a node in hundreds of small hyperedges, so high aggregate adj-degree
+        # even after #381 caps each clique) contributes deg² pairs. That is the
+        # surviving runaway #145's outer-loop frontier never bounded: it
+        # detonated `two_hop_pairs` into multi-GB and stalled populate before it
+        # reached the distance loop or cleared the resume watermark, so bootstrap
+        # looped on the resume branch forever and the incremental path (which
+        # only engages once watermark is None) was permanently unreachable.
+        # Skipping 2-hop routing THROUGH a hub is the same call #381 makes:
+        # everything is ~2 hops from a hub, so those pairs are low-signal and not
+        # worth an OOM. Env-gated (default 100, matching the clique cap; 0 off).
+        _2hop_cap = int(os.environ.get("NG_LENIA_2HOP_DEGREE_CAP", "100"))
+        _2hop_skipped = 0
+        _2hop_skipped_max = 0
         two_hop_pairs = set()
         for node in range(frontier_start, n):
             neighbors = adj[node]
             for neighbor in neighbors:
-                for second in adj[neighbor]:
+                second_hop = adj[neighbor]
+                if _2hop_cap > 0 and len(second_hop) > _2hop_cap:
+                    _2hop_skipped += 1
+                    _2hop_skipped_max = max(_2hop_skipped_max, len(second_hop))
+                    continue
+                for second in second_hop:
                     if second != node:
                         two_hop_pairs.add((min(node, second), max(node, second)))
+        if _2hop_skipped:
+            logger.info(
+                "Distance cache: skipped %d high-degree 2-hop pivot pass(es) "
+                "above NG_LENIA_2HOP_DEGREE_CAP=%d (largest: %d neighbors) — "
+                "per-node analogue of #381 (2-hop deg² runaway)",
+                _2hop_skipped, _2hop_cap, _2hop_skipped_max,
+            )
         connected_pairs |= two_hop_pairs
 
         if start_index > 0:

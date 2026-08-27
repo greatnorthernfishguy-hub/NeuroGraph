@@ -146,6 +146,8 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         self._topo_cache: Dict[Tuple[str, str], int] = {}
         # Adjacency list cache
         self._adj: Optional[Dict[str, List[str]]] = None
+        # #147: per-pair synapse weights, materialized alongside _adj under _step_lock
+        self._edge_weight: Optional[Dict[Tuple[str, str], float]] = None
         # Hyperedge membership cache (entity_id -> set of hyperedge_ids)
         self._he_membership: Optional[Dict[str, Set[str]]] = None
         # Co-fire tracking
@@ -157,18 +159,33 @@ class NeuroGraphSubstrate(LeniaSubstrate):
     def _build_adjacency(self):
         """Build adjacency list from synapses (cached)."""
         self._adj = defaultdict(list)
-        # #88: snapshot synapses under the Graph's step lock so a concurrent graph.step()
-        # (prune/sprout mutates graph.synapses under _step_lock) can't change the dict
-        # mid-iteration ("dictionary keys changed during iteration").
+        self._edge_weight = {}
+        # #88/#147: snapshot synapse PRIMITIVES under the Graph's step lock. list() copies the
+        # container but each element stays a live ng_tract (Rust) proxy — reading syn.* AFTER the
+        # lock releases re-borrows the store and races graph.step()'s mutating tail (step() sets
+        # syn.inactive_steps under the SAME _step_lock) -> pyo3_runtime.PanicException: Already
+        # borrowed: PyBorrowMutError. Extract every field we need (pre/post ids + weight) INSIDE
+        # the lock so no proxy escapes it. Also lets _synaptic_distance be an O(1) dict lookup
+        # instead of a per-pair full-synapse scan.
         _lock = getattr(self._graph, "_step_lock", None)
         if _lock is not None:
             with _lock:
-                _syns = list(self._graph.synapses.values())
+                _edges = [
+                    (s.pre_node_id, s.post_node_id, float(s.weight))
+                    for s in self._graph.synapses.values()
+                ]
         else:
-            _syns = list(self._graph.synapses.values())
-        for syn in _syns:
-            self._adj[syn.pre_node_id].append(syn.post_node_id)
-            self._adj[syn.post_node_id].append(syn.pre_node_id)
+            _edges = [
+                (s.pre_node_id, s.post_node_id, float(s.weight))
+                for s in self._graph.synapses.values()
+            ]
+        for pre, post, weight in _edges:
+            self._adj[pre].append(post)
+            self._adj[post].append(pre)
+            # first-seen weight per unordered pair mirrors the old first-match return
+            key = (pre, post) if pre <= post else (post, pre)
+            if key not in self._edge_weight:
+                self._edge_weight[key] = weight
 
     def _cache_embeddings(self):
         """Build embedding matrix from vector DB for fast cosine similarity.
@@ -336,16 +353,12 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         if self._adj is None:
             self._build_adjacency()
 
-        # Fast check: are they even neighbors?
-        if b not in self._adj.get(a, []):
-            return 0.0
-
-        for syn in list(self._graph.synapses.values()):   # #341: snapshot — pulse thread mutates concurrently
-            if (syn.pre_node_id == a and syn.post_node_id == b) or (
-                syn.pre_node_id == b and syn.post_node_id == a
-            ):
-                return float(syn.weight)
-        return 0.0
+        # #147: weights were materialized in _build_adjacency INSIDE _step_lock
+        # (self._edge_weight), so this is a lock-free O(1) lookup that never touches a
+        # live ng_tract proxy — closes the PyBorrowMutError race the old per-pair
+        # `for syn in graph.synapses.values()` scan opened.
+        key = (a, b) if a <= b else (b, a)
+        return self._edge_weight.get(key, 0.0)
 
     def _build_hyperedge_membership(self):
         """Build entity_id -> {hyperedge_id, ...} membership (cached).
