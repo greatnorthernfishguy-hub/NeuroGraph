@@ -3,6 +3,27 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-08-28] Claude Code (DudeMan CC, Opus 4.8) — #147 amendment (receiving half): identity crosses the callosum
+# What: removed the merge-time identity-rejection gate (was: skip any node with
+#       metadata['constitutional'] or provenance ending '_authored'). Identity CC
+#       nodes now absorb like any other CC node. Sender+receiver share ONE admission
+#       predicate, is_cc_provenance; protection moves to the correct layer.
+# Why: the sender half (#147 amendment in cc_topology_export) stopped withholding
+#       identity because the callosum is white matter between two hemispheres of one
+#       mind, not a foreign donation. Leaving this receiver gate in place would have
+#       made the change not just inert but HARMFUL: identity nodes would ship, be
+#       dropped here, and any hyperedge binding them would then fail the Tier-3
+#       members.issubset(graph.nodes) check and be dropped whole -- silently
+#       shredding identity-touching binding structure. Both ends must move together.
+# How: identity, once absorbed, is protected at prune/orphan time by
+#       neuro_foundation._is_identity_protected (3517), whose own docstring names
+#       this case ("a want arrives synapse-poor via corpus-callosum consolidation,
+#       #70"); the constitutional/provenance flags ride _portable_metadata and land
+#       in node.metadata, which is exactly what that protector keys on. is_cc_provenance
+#       at the top of the node loop still scopes admission to CC's own mind (no Syl
+#       node, no foreign path). Josh-directed (identity crosses the callosum);
+#       reviewed by neurograph-law-enforcer, which caught the missing receiver half.
+#       merge_cc_topology has no production caller yet (Phase 3), so blast radius is 0.
 # [2026-08-12] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-C: receiver budget pinned 50->25
 # What: _DEFAULT_MAX_NODES_PER_CALL default 50 -> 25 (env CC_TOPOLOGY_MERGE_MAX_NODES).
 # Why: FatherGraph Finding 1 + Finding 3 (25/250). The driver ships BATCH_SIZE=25; a
@@ -375,9 +396,20 @@ def merge_cc_topology(
             if not is_cc_provenance(nid, meta):
                 stats["skipped_not_cc"] += 1
                 continue
-            if meta.get("constitutional") or str(meta.get("provenance") or "").endswith("_authored"):
-                stats["skipped_identity"] += 1
-                continue
+            # #147 amendment (2026-08-28): identity CROSSES the callosum. The gate
+            # that used to reject constitutional / *_authored nodes here has been
+            # removed -- walling identity out of the callosum is a split-brain
+            # lesion (the sender stopped withholding it in cc_topology_export; this
+            # is its receiving half). Sender and receiver now share ONE admission
+            # predicate: is_cc_provenance above. Protection is applied at the
+            # CORRECT layer -- prune/orphan time, by neuro_foundation
+            # _is_identity_protected (3517), which keys on the very metadata flags
+            # (constitutional / provenance) that ride the wire via _portable_metadata
+            # and land in node.metadata below. That protector's own docstring names
+            # this exact case: "a want arrives synapse-poor via corpus-callosum
+            # consolidation (#70)". The stats["skipped_identity"] counter (init at
+            # the top of this fn) now stays 0 by design -- a nonzero value would
+            # mean the split-brain lesion was re-introduced.
 
             # An embedding is an attribute of the node, not a precondition for
             # it. Absent or corrupt, the node still installs with its metadata

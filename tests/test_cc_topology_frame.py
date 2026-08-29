@@ -199,6 +199,37 @@ def test_synapse_to_an_acked_node_anchors_and_ships(tmp_path):
 # Whole-hyperedge invariant: overflow keeps it whole; oversized alarms
 # --------------------------------------------------------------------------
 
+def test_hyperedge_with_acked_member_reincludes_it_and_ships_whole(tmp_path):
+    """#147 amendment -- the reaping fix. An HE whose only anchor is an
+    already-acked member must RE-INCLUDE that member so the HE closes WHOLE within
+    this frame. Pre-amendment, HE closure trusted the ack ledger and shipped the HE
+    referencing the acked member WITHOUT sending it -- on the two prior merges the
+    receiver then raised KeyError / reaped nodes. The shipped HE must never
+    reference a node absent from the frame it rides in."""
+    g, v = Graph(), SimpleVectorDB()
+    _cc(g, v, "cc:conv::a", 0)
+    _cc(g, v, "cc:conv::b", 1)
+    _cc(g, v, "cc:conv::c", 2)
+    # The ONLY structure is a hyperedge over all three -- no synapses. So the only
+    # way b and c can ship is by closing this HE whole.
+    g.create_hyperedge(member_node_ids={"cc:conv::a", "cc:conv::b", "cc:conv::c"},
+                       activation_threshold=0.55, metadata={"cc": True})
+
+    out, stats = _run_frame(g, v, tmp_path, frame_size=25,
+                            exclude_ids={"cc:conv::a"})   # a is already acked
+
+    # a is re-included even though acked -- the HE closes whole in-frame.
+    assert set(stats["frame_node_ids"]) == {"cc:conv::a", "cc:conv::b", "cc:conv::c"}
+    _, nodes, _, hes = _decode(out)
+    frame_ids = {n["id"] for n in nodes}
+    assert frame_ids == {"cc:conv::a", "cc:conv::b", "cc:conv::c"}
+    assert len(hes) == 1
+    assert set(hes[0]["members"]) == {"cc:conv::a", "cc:conv::b", "cc:conv::c"}
+    # The load-bearing guarantee: no shipped HE member is absent from the frame.
+    for he in hes:
+        assert set(he["members"]).issubset(frame_ids)
+
+
 def test_whole_hyperedge_ships_whole_past_frame_size(tmp_path):
     """A 5-member HE with frame_size=3 (hard cap 3*3=9): the HE crosses WHOLE in
     one frame rather than being split at the frame boundary (§8.14 forbids

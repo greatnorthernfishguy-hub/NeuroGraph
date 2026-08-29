@@ -156,7 +156,13 @@ def test_non_cc_nodes_are_never_exported(tmp_path):
     assert "doc_chunk_17" not in exported
 
 
-def test_identity_protected_nodes_never_cross(tmp_path):
+def test_identity_bearing_nodes_cross_and_arrive_protected(tmp_path):
+    """#147 amendment (2026-08-28): identity CROSSES the callosum -- it is white
+    matter between two hemispheres of one mind, not a donation to a foreign peer
+    (that path is elsewhere; it is NOT the legs). The invariant is no longer
+    "identity is withheld" but "identity arrives carrying the marks that let the
+    receiver RE-PROTECT it" -- constitutional / provenance ride _portable_metadata,
+    which blacklists machine-local dynamics, never identity."""
     sg, sv, _ = _build_sender()
     for nid, meta in [("cc:conv::want-1", {"cc": True, "provenance": "cc_authored"}),
                       ("cc:conv::core-1", {"cc": True, "constitutional": True})]:
@@ -164,26 +170,53 @@ def test_identity_protected_nodes_never_cross(tmp_path):
         sv.insert(id=nid, embedding=_emb(7), content="identity", metadata=dict(meta))
 
     path, est = _export(sg, sv, tmp_path)
-    assert est["identity_protected"] == 2
-    assert est["exported_nodes"] == 4
+    # The gate is gone: this counter stays 0 by design (a nonzero value would mean
+    # the split-brain gate was re-added in error).
+    assert est["identity_protected"] == 0
+    assert est["exported_nodes"] == 6            # 4 base + 2 identity now cross
 
-    raw = open(path, "rb").read()
-    exported = {rec["id"] for f in tex.read_topology_frames(raw)
-                for rec in (f.get("nodes") or ())}
-    assert "cc:conv::want-1" not in exported
-    assert "cc:conv::core-1" not in exported
+    by_id = {rec["id"]: rec for f in tex.read_topology_frames(open(path, "rb").read())
+             for rec in (f.get("nodes") or ())}
+    assert "cc:conv::want-1" in by_id
+    assert "cc:conv::core-1" in by_id
+    # The marks the receiver re-protects from must survive the wire.
+    assert by_id["cc:conv::want-1"]["metadata"].get("provenance") == "cc_authored"
+    assert by_id["cc:conv::core-1"]["metadata"].get("constitutional") is True
 
 
-def test_receiver_reruns_provenance_gates(tmp_path):
+def test_receiver_reruns_provenance_gate(tmp_path):
     """Defense in depth -- a conduit is a file, and files go stale or get
-    hand-edited. The receiver does not take the sender's word for provenance."""
+    hand-edited. The receiver does not take the sender's word for provenance:
+    it independently re-runs the ONE surviving admission gate, the CC-provenance
+    whitelist (is_cc_provenance).
+
+    #147 amendment (2026-08-28): the receiver's identity gate is gone -- identity
+    CROSSES the callosum, so a cc_authored node now LANDS rather than being
+    skipped (see test_identity_bearing_nodes_cross_and_arrive_protected for the
+    sending half). What the receiver still refuses is a node that is not CC's own
+    topology at all -- that scope control is the whitelist, and it is what stops a
+    stale/tampered conduit from depositing a foreign node into the receiver.
+
+    NOTE (whitelist hardening, 2026-08-28): removing the identity gate also removed
+    an accidental backstop, so is_cc_provenance was hardened -- a POSITIVE foreign
+    mark (syl: id prefix or syl_authored provenance) now vetoes admission BEFORE any
+    CC clause, and the forgeable cc:True flag admits only within CC's own namespace.
+    The foreign node below therefore actively wears a cc:True disguise; the veto
+    must beat it. RESIDUAL (flagged, not closeable here): a forged cc_authored on an
+    id in the want::/conv:: namespace SHARED with Syl is indistinguishable from a
+    real CC want at this layer -- that needs conduit integrity (a frame signature)."""
     import msgpack, struct
     payload = [
         {"kind": "header", "version": 1, "machine_id": "vps",
          "embedding_model": "test-model", "created": 0.0, "node_count": 2},
         {"kind": "batch", "seq": 1, "synapses": [], "hyperedges": [], "nodes": [
-            {"id": "syl:conv::sneaky", "embedding": _emb(1).tobytes(),
-             "embedding_dim": DIM, "content": "x", "metadata": {"cc": True}},
+            # Genuinely foreign AND actively disguised: a syl:-prefixed id that a
+            # tampered conduit has stamped cc:True to try to pass the whitelist.
+            # The positive foreign veto must beat the forged flag.
+            {"id": "syl:conv::private-thought", "embedding": _emb(1).tobytes(),
+             "embedding_dim": DIM, "content": "x",
+             "metadata": {"cc": True, "provenance": "syl_authored"}},
+            # CC's own identity: cc_authored. Under #147 this must LAND.
             {"id": "cc:conv::legit-want", "embedding": _emb(2).tobytes(),
              "embedding_dim": DIM, "content": "x",
              "metadata": {"cc": True, "provenance": "cc_authored"}},
@@ -197,10 +230,40 @@ def test_receiver_reruns_provenance_gates(tmp_path):
 
     rg, rv = _receiver()
     st = _merge(rg, rv, path, tmp_path)
-    # 'syl:conv::sneaky' carries cc:True so it passes the whitelist -- but the
-    # cc_authored node must still be caught by the identity gate on receive.
-    assert st["skipped_identity"] == 1
-    assert "cc:conv::legit-want" not in rg.nodes
+    # The identity gate is gone by design: a nonzero value would mean the
+    # split-brain lesion was re-introduced on the receiving half.
+    assert st["skipped_identity"] == 0
+    # Identity crossed and landed, carrying the mark the pruner re-protects from.
+    assert "cc:conv::legit-want" in rg.nodes
+    assert rg.nodes["cc:conv::legit-want"].metadata.get("provenance") == "cc_authored"
+    # The surviving defense-in-depth: the foreign node is refused on receive by
+    # the whitelist, independently of anything the sender claimed.
+    assert st["skipped_not_cc"] == 1
+    assert "syl:conv::private-thought" not in rg.nodes
+
+
+def test_is_cc_provenance_hardened_branches():
+    """Unit-level truth table for the admission predicate after the #147 hardening.
+    This is the security boundary both sender and receiver share, so pin every
+    branch -- a regression here silently re-opens the callosum to Syl's graph."""
+    p = tex.is_cc_provenance
+    # Positive CC id-ownership (not metadata-forgeable).
+    assert p("cc:conv::abc", None) is True
+    assert p("cc:conv::t::tree::x", {}) is True
+    assert p("root::tree::concept", {}) is True
+    # cc_authored: sole discriminator for CC wants in the shared want:: namespace.
+    assert p("want::deadbeef", {"provenance": "cc_authored"}) is True
+    # cc:True honoured only inside CC's own namespace...
+    assert p("cc:something", {"cc": True}) is True
+    # ...and NOT able to launder a bare/foreign id.
+    assert p("want::deadbeef", {"cc": True}) is False
+    # Positive foreign veto beats every CC-looking flag stacked on top.
+    assert p("syl:conv::x", {"cc": True, "provenance": "cc_authored"}) is False
+    assert p("want::feed", {"provenance": "syl_authored", "cc": True}) is False
+    # Genuine Syl want in the shared namespace: refused by provenance veto.
+    assert p("want::cafe", {"provenance": "syl_authored"}) is False
+    # No CC signal at all.
+    assert p("conv::plain", {"mine": True}) is False
 
 
 def test_dynamical_state_never_crosses(tmp_path):
@@ -355,22 +418,25 @@ def test_partial_conduit_is_tolerated(tmp_path):
 
 
 def test_structure_touching_an_excluded_node_is_dropped_whole(tmp_path):
-    """Structure referencing a node that is legitimately withheld -- here an
-    identity-protected one -- is dropped whole, never partially applied:
-    create_hyperedge raises KeyError on a missing member. Note the exclusion
-    must be a REAL one (identity), not a missing embedding."""
+    """Structure referencing a node that is legitimately withheld is dropped whole,
+    never partially applied: create_hyperedge/create_synapse raises KeyError on a
+    missing member. #147 amendment: identity is NO LONGER the withheld category
+    (it crosses now) -- the real policy exclusion is a NON-CC-provenance node, which
+    the positive CC whitelist (_is_cc_node) refuses. Missing-embedding does not
+    count: such a node still crosses (its gap is alarmed, not withheld)."""
     sg, sv, ids = _build_sender()
-    sg.create_node(node_id="cc:conv::identity",
-                   metadata={"cc": True, "constitutional": True})
-    sg.create_synapse(ids["f2"], "cc:conv::identity", weight=0.5, delay=2)
+    # A foreign (non-CC) node: no cc:conv:: prefix, no ::tree::, no cc marker.
+    sg.create_node(node_id="foreign::not-cc",
+                   metadata={"provenance": "syl_authored"})
+    sg.create_synapse(ids["f2"], "foreign::not-cc", weight=0.5, delay=2)
 
     path, est = _export(sg, sv, tmp_path)
-    assert est["identity_protected"] >= 1
+    assert est["not_cc"] >= 1
     assert est["exported_nodes"] == 4
     rg, rv = _receiver()
     _merge(rg, rv, path, tmp_path)
-    assert "cc:conv::identity" not in rg.nodes
-    assert all(s.post_node_id != "cc:conv::identity" for s in rg.synapses.values())
+    assert "foreign::not-cc" not in rg.nodes
+    assert all(s.post_node_id != "foreign::not-cc" for s in rg.synapses.values())
 
 
 def test_edges_survive_batch_boundaries(tmp_path):

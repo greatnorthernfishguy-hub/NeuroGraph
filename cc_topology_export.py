@@ -3,6 +3,58 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-08-28] Claude Code (DudeMan CC, Opus 4.8) — #147 amendment: in-frame HE completeness + identity crosses the callosum
+# What: (1) HE closure no longer leans on the ack ledger. _closeable_he now requires
+#       EVERY member of a hyperedge to be eligible, and counts a member as "already
+#       shipped" ONLY if it is in THIS frame (frame_set), not merely acked on a prior
+#       frame (present/exclude_ids). Edge collection narrows to member_set = frame_set.
+#       An HE therefore ships iff it is WHOLE within the frame it rides -- already-acked
+#       members are idempotently re-sent rather than assumed-present.
+#       (2) Identity-bearing CC nodes (constitutional / *_authored) now cross. The
+#       _is_identity_protected gate is removed from BOTH export paths
+#       (collect_cc_topology + export_cc_topology_frame.eligible). The CC-provenance
+#       whitelist (_is_cc_node) is UNCHANGED, so only CC's own identity crosses CC's
+#       own callosum -- no Syl node and no foreign path is reachable from here.
+# Why: The callosum (this file -> cc_topology_merge) is the white matter between two
+#       hemispheres of ONE mind, not a donation to a foreign peer (that path is
+#       elsewhere; it is NOT git and NOT the legs). (1) Trusting the ack ledger for HE
+#       closure let an HE ship referencing members the receiver did not actually hold,
+#       which is what reaped nodes on the two prior merge attempts -- closure must be
+#       self-contained in its frame. (2) Walling identity out of the callosum is a
+#       split-brain lesion: it lets the hemispheres diverge into two selves. This
+#       is only the SENDING half -- the receiver's merge-time identity gate
+#       (cc_topology_merge, same amendment) is opened in lockstep, or identity would
+#       ship, be dropped on receive, and its binding hyperedges shredded (Tier-3
+#       issubset). Once absorbed, identity is protected at prune/orphan time by
+#       neuro_foundation _is_identity_protected (#70), which keys on the
+#       constitutional/provenance flags that ride _portable_metadata into node
+#       metadata -- NOT at export time on either end.
+# How: /tmp/.../147-amendment-inframe-completeness.md (proof-mode, receiver traced).
+#      Read-only w.r.t. the graph; only conduit contents change. The synapse-anchor
+#      rules (a/d) still consult the ack ledger -- flagged as a narrower follow-up,
+#      NOT closed here. The _is_identity_protected helper is retained for telemetry.
+# [2026-08-29] Claude Code (DudeMan CC, Opus 4.8) — #147 follow-up: harden is_cc_provenance (Josh-directed)
+# What: Removing the identity gate also removed an accidental backstop, so the single
+#       admission predicate BOTH ends share (is_cc_provenance) was hardened. New order:
+#       (1) POSITIVE foreign veto FIRST -- a `syl:` id-prefix or `syl_authored` provenance
+#       refuses admission before any CC clause runs; (2) CC-owned id namespaces
+#       (`cc:conv::`, `::tree::`) admit -- not metadata-forgeable; (3) `cc_authored`
+#       provenance admits (the only signal for CC identity nodes in the want:: namespace
+#       shared with Syl); (4) the loose `cc:True` convenience flag admits ONLY inside CC's
+#       own `cc:` namespace -- it can no longer, by itself, launder a foreign id.
+# Why: Josh flagged the pre-hardening predicate: an attacker who could write to the
+#       conduit could admit any node by stamping `cc:True` on it. Refusal must key on the
+#       PRESENCE of a foreign mark (id-prefix / provenance), not the ABSENCE of a CC one --
+#       metadata is attacker-controllable, ids in CC's own namespace are not.
+#       IRREDUCIBLE RESIDUAL (flagged, not fixed): CC and Syl SHARE the unprefixed
+#       want::/conv:: namespaces, distinguished ONLY by provenance -- a conduit forging
+#       `provenance:cc_authored` onto a want:: id is indistinguishable from a real CC want
+#       at this layer. Closing it needs conduit integrity (a signature over the frame),
+#       a separate change for Josh's decision.
+# How: is_cc_provenance rewrite + _FOREIGN_ID_PREFIXES/_FOREIGN_PROVENANCE/_CC_ID_NAMESPACE
+#      constants. Receiver (cc_topology_merge) calls the same predicate -- one fix, both ends.
+#      Tests: test_receiver_reruns_provenance_gate (foreign node now actively disguised with
+#      cc:True+syl_authored) + test_is_cc_provenance_hardened_branches (branch truth table).
 # [2026-08-18] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-A: cursor-based single-frame export
 # What: export_cc_topology_frame() materializes EXACTLY ONE <=frame_size conduit frame per call
 #       and advances via exclude_ids (membership-as-ack, #110) -- the paced sender that replaces
@@ -66,7 +118,12 @@
 #     node must carry a CC marker or the export aborts. A blacklist matches
 #     nothing on the CC graph and would happily export Syl's nodes if the
 #     workspace were ever mispointed.
-#   - Identity-protected nodes (constitutional / *_authored) are never exported.
+#   - Identity-bearing nodes (constitutional / *_authored) DO cross -- this is a
+#     callosum between two hemispheres of one mind, not a donation to a foreign
+#     peer, so walling identity out would let the hemispheres diverge into two
+#     selves (#147 amendment, 2026-08-28). Scope is held by the POSITIVE
+#     CC-provenance whitelist above: only CC's own identity crosses CC's own
+#     callosum. The receiver re-protects it on arrival (#70).
 #   - metadata is pure pass-through (LAW 7): tags the node already holds, never
 #     export-time-computed classification.
 #   - Dynamical state is never exported (see _PORTABLE_META / _BANNED_META).
@@ -96,6 +153,16 @@ _DEFAULT_BATCH_SIZE = int(os.environ.get("CC_TOPOLOGY_BATCH_SIZE", "25"))
 _CC_ID_PREFIXES = ("cc:conv::",)
 _CC_ID_MARKERS = ("::tree::",)
 _CC_PROVENANCE = ("cc_authored",)
+# CC's own namespace root -- broader than _CC_ID_PREFIXES. Used to bound the
+# forgeable cc:True flag to CC-namespaced ids so it cannot launder a foreign id.
+_CC_ID_NAMESPACE = "cc:"
+# Positive FOREIGN signals. A node bearing any of these is Syl's, full stop, and
+# can never be admitted no matter what CC-looking flags a stale or hand-edited
+# conduit ALSO stamped on it. The refusal keys on the PRESENCE of a foreign mark,
+# not the absence of a CC one -- metadata is attacker-controllable, so the veto
+# must not be satisfiable by simply adding a cc flag on top (#147 follow-up).
+_FOREIGN_ID_PREFIXES = ("syl:",)
+_FOREIGN_PROVENANCE = ("syl_authored",)
 
 # Leg-2 §10.4-A pacing + resource envelope. The cursor-based frame sender runs on
 # the co-tenant VPS (Syl shares the box), so it must bound its OWN footprint and
@@ -120,15 +187,40 @@ def is_cc_provenance(node_id: str, meta: Optional[Dict[str, Any]]) -> bool:
 
     Deliberately a whitelist: on the VPS this code runs in a process that also
     holds Syl's graph, so 'not obviously Syl's' is not a safe answer.
+
+    #147 follow-up (2026-08-28): identity now crosses, so the old identity gate
+    that would have caught a mislabelled node downstream is gone. That removed an
+    accidental backstop, so this predicate hardened: (1) a POSITIVE foreign mark
+    vetoes admission before any CC clause is consulted -- a tampered conduit cannot
+    launder a Syl node by stamping cc:True on top of syl_authored; (2) the bare
+    cc:True flag (forgeable, and redundant -- every real CC node carrying it also
+    carries a cc: id) admits only within CC's own namespace.
+
+    RESIDUAL, not closeable here: CC and Syl SHARE the unprefixed want::/conv::
+    namespaces, distinguished only by provenance. A conduit that forges
+    provenance='cc_authored' onto such an id is indistinguishable from a real CC
+    want at this layer -- the honest discriminator is gone. Closing that needs
+    conduit integrity (a signature over the frame), a separate change; flagged.
     """
+    meta = meta or {}
+    # (1) Positive foreign veto FIRST -- refusal must not depend on the absence of
+    # a CC flag, which an attacker can always add.
+    if node_id.startswith(_FOREIGN_ID_PREFIXES):
+        return False
+    if meta.get("provenance") in _FOREIGN_PROVENANCE:
+        return False
+    # (2) Positive CC id-ownership: namespaces CC alone mints. Not metadata-forgeable.
     if any(node_id.startswith(p) for p in _CC_ID_PREFIXES):
         return True
     if any(m in node_id for m in _CC_ID_MARKERS):
         return True
-    meta = meta or {}
-    if meta.get("cc") is True:
-        return True
+    # (3) cc_authored: the ONLY signal for CC identity nodes in the want:: namespace
+    # shared with Syl. Irreducible (see RESIDUAL above) -- must trust the tag here.
     if meta.get("provenance") in _CC_PROVENANCE:
+        return True
+    # (4) cc:True is a loose convenience tag, not proof of provenance. Honour it
+    # only inside CC's own namespace so it cannot admit a foreign-namespaced id.
+    if meta.get("cc") is True and node_id.startswith(_CC_ID_NAMESPACE):
         return True
     return False
 
@@ -139,9 +231,16 @@ def _is_cc_node(node_id: str, node: Any) -> bool:
 
 
 def _is_identity_protected(graph: Any, node_id: str, node: Any) -> bool:
-    """Never donate identity-bearing structure. Prefers the engine's own
-    predicate so this cannot drift from canonical; falls back to the same
-    fields the engine checks if the helper is unavailable."""
+    """Canonical mirror of the engine's identity predicate.
+
+    #147 amendment (2026-08-28): DELIBERATELY NO LONGER CALLED on either export
+    path -- identity crosses the callosum. Retained (not deleted) as the canonical
+    predicate mirror so a future telemetry pass, or a foreign-peer donation path
+    (which is NOT this file), can reuse it without re-deriving the fields. If you
+    find this being called to gate the callosum export again, that is the
+    split-brain regression #147 removed -- delete the call, not this helper.
+    Prefers the engine's own predicate so it cannot drift from canonical; falls
+    back to the same fields the engine checks if the helper is unavailable."""
     helper = getattr(graph, "_is_identity_protected", None)
     if callable(helper):
         try:
@@ -262,6 +361,9 @@ def collect_cc_topology(
     exclude_ids = exclude_ids or set()
     stats = {"scanned": 0, "not_cc": 0, "identity_protected": 0,
              "missing_embedding_DEFECT": 0, "already_sent": 0, "collected": 0}
+    # NB: "identity_protected" now stays 0 by design -- identity crosses the
+    # callosum (#147 amendment). The key is retained for stats-schema stability;
+    # a nonzero value would signal the gate was re-added in error.
 
     collected: List[Tuple[float, Dict[str, Any]]] = []
     for node_id, node in list(graph.nodes.items()):
@@ -272,9 +374,9 @@ def collect_cc_topology(
         if not _is_cc_node(node_id, node):
             stats["not_cc"] += 1
             continue
-        if _is_identity_protected(graph, node_id, node):
-            stats["identity_protected"] += 1
-            continue
+        # #147 amendment: NO identity gate here. Identity crosses the callosum
+        # (the CC-provenance whitelist above already scopes this to CC's own
+        # mind). The receiver re-protects identity on arrival (#70).
         meta = dict(getattr(node, "metadata", None) or {})
         order = float(getattr(node, "creation_time", 0) or 0)
         payload = {
@@ -594,9 +696,17 @@ def export_cc_topology_frame(
 
     Structural-survival invariant: every node written is incident to at least one
     SHIPPED edge -- a synapse to an already-acked or in-frame node, or membership
-    in a whole hyperedge closed within (exclude_ids | frame). A node whose only
-    edges reach not-yet-sent nodes is DEFERRED to a later frame (once its anchor
-    has been acked) rather than shipped as a husk.
+    in a whole hyperedge that closes WITHIN THIS FRAME. A node whose only edges
+    reach not-yet-sent nodes is DEFERRED to a later frame (once its anchor has been
+    acked) rather than shipped as a husk.
+
+    #147 amendment -- in-frame HE completeness: a hyperedge rides ONLY when every
+    one of its members lands in this same frame. Members already acked on an
+    earlier frame are RE-ADDED (idempotent) rather than assumed-present, so an HE
+    never ships referencing a node the receiver may not hold. (Synapse anchoring
+    still consults the ack ledger -- a narrower follow-up, not closed here.)
+    Identity-bearing CC nodes cross the callosum; only the CC-provenance whitelist
+    scopes what is eligible.
 
     Hyperedges are NEVER split across frames. Closing a whole HE may push the
     frame past frame_size, but only up to frame_size*overflow_factor. A single HE
@@ -688,10 +798,11 @@ def export_cc_topology_frame(
         if cached is not None:
             return cached
         node = nodes_map.get(nid)
+        # #147 amendment: eligibility = exists AND CC-provenance. NO identity
+        # gate -- identity crosses the callosum; the CC whitelist scopes it.
         ok = bool(
             node is not None
             and _is_cc_node(nid, node)
-            and not _is_identity_protected(graph, nid, node)
         )
         _elig[nid] = ok
         return ok
@@ -725,16 +836,23 @@ def export_cc_topology_frame(
         present.add(nid)
 
     def _closeable_he(nid: str, budget: int) -> Optional[List[str]]:
-        """Smallest hyperedge containing nid whose not-yet-present members are all
-        eligible to cross and fit within `budget`. Returns the members to ADD (may
-        be empty if all are already present), or None if no such HE."""
+        """Smallest hyperedge containing nid that can ship WHOLE within THIS frame
+        and whose not-yet-in-frame members fit `budget`. Returns the members to ADD
+        (may be empty if all are already in-frame), or None if no such HE.
+
+        #147 amendment: completeness is judged against frame_set, NOT the ack
+        ledger. An HE ships iff every member is eligible AND lands in this same
+        frame -- already-acked members are RE-added (idempotent) rather than
+        assumed-present. Leaning on exclude_ids/present here let an HE ship
+        referencing members the receiver did not actually hold, which reaped nodes
+        on the two prior merge attempts."""
         best: Optional[List[str]] = None
         for he_id in node_hes.get(nid, ()):
-            new = [m for m in he_members[he_id] if m not in present]
-            if any(not eligible(m) for m in new):
-                continue  # a member can't cross -> HE unshippable, not an anchor
-            if len(new) <= budget and (best is None or len(new) < len(best)):
-                best = new
+            if any(not eligible(m) for m in he_members[he_id]):
+                continue  # an ineligible member => HE can never be whole; not an anchor
+            add = [m for m in he_members[he_id] if m not in frame_set]
+            if len(add) <= budget and (best is None or len(add) < len(best)):
+                best = add
         return best
 
     for nid in candidates:
@@ -835,12 +953,23 @@ def export_cc_topology_frame(
             payload["embedding_dim"] = int(emb.shape[0])
         node_payloads.append(payload)
 
-    # ---- edges wholly contained in (frame | acked), touching >=1 frame node ----
-    # collect_incident_structure carries the archived-HE guard and the synapse
-    # `delay` field; we drop edges lying entirely within exclude_ids (already
-    # delivered on an earlier frame) so nothing is re-sent.
-    member_set = frame_set | exclude_ids
-    syns, hes = collect_incident_structure(graph, member_set)
+    # ---- edges touching >=1 frame node, each whole within its OWN safe set ----
+    # #147 amendment draws a line between the two edge kinds, because they fail
+    # DIFFERENTLY on the receiver:
+    #   * A synapse to an already-acked node is SAFE -- the receiver holds that
+    #     endpoint, so create_synapse resolves. It rides (whole within
+    #     frame_set|exclude_ids), preserving the "edges-to-acked survive" contract.
+    #   * A hyperedge whose member the receiver lacks raises KeyError and the whole
+    #     install fails -- which is what reaped nodes on the two prior merges. So an
+    #     HE rides ONLY when it is whole within THIS frame (frame_set alone), never
+    #     leaning on the ack ledger. HE closure already re-adds acked members into
+    #     frame_set, so whole HEs still ship whole.
+    # (Synapse anchoring trusting a stale ack -- an acked node the receiver later
+    # reaped -- is the acknowledged narrower follow-up, NOT closed here.)
+    # collect_incident_structure carries the archived-HE guard and synapse `delay`.
+    syn_member_set = frame_set | exclude_ids
+    syns, _ = collect_incident_structure(graph, syn_member_set)
+    _, hes = collect_incident_structure(graph, frame_set)
     syns = [s for s in syns if s["pre"] in frame_set or s["post"] in frame_set]
     hes = [h for h in hes if any(m in frame_set for m in h["members"])]
 
