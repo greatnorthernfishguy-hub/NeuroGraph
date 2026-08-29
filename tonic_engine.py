@@ -26,6 +26,22 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-08] Claude Code (Opus 4.8) — #117 step 1: autonomous aging clock on the heartbeat (default OFF)
+# What: _generation_loop can now call graph.step() on its pulse, gated by CC_NG_AUTOSTEP
+#   (default OFF) with a CC_NG_AUTOSTEP_MIN_INTERVAL wall-time floor (default 900s). New env
+#   reads near the CC_TONIC_* block; new self._last_autostep monotonic marker in __init__.
+# Why: #59/#117 — graph.timestep (which gates decay / inactivity-cull / homeostasis) only
+#   advanced inside on_message(), so the CC substrate FROZE when idle. The 2026-07-14 daemon
+#   header CLAIMED a _autostep_loop that was never implemented; rather than add a second thread,
+#   the aging clock now rides THIS existing Tonic pulse — one clock, not two. The floor keeps the
+#   0.5s conversation tick from spinning the clock (which would drain the inactivity grace window).
+# How: env-gated OFF -> byte-identical for Syl (her process never sets CC_NG_AUTOSTEP; she has her
+#   own clock via neurograph_rpc _scan_drain). step() self-locks _step_lock (RLock); we hold it
+#   explicitly to match the autosave/orphan-drain discipline. Error-isolated. This lands the
+#   MECHANISM only — turn-on is gated on the source race-fix (LAW 4) + a firing-keyed
+#   arrival exemption so callosum arrivals are safe against BOTH steppers (this heartbeat
+#   AND the permanent #108 callosum-consolidation step), NOT by touching the grace clock —
+#   see ~/docs/CC-117-CLOCK-PREP.md steps 2-3 and CC-CALLOSUM-TRUTH.md §8.5.2/§8.13.
 # [2026-07-13] Claude Code (Opus 4.8) — #59/#62 heuristic redesign: instrumentation + T2 compass + brakes
 # What: _heuristic_inference gained (a) observability-only mass logging (_log_heuristic_mass:
 #   where output activation mass lands, blob-core vs quiet-periphery, + compass_n), (b) a T2
@@ -171,6 +187,16 @@ _BRAKE_FATIGUE = float(os.environ.get("CC_TONIC_BRAKE_FATIGUE", "0"))
 _BRAKE_DEGREE = float(os.environ.get("CC_TONIC_BRAKE_DEGREE", "0"))
 _BRAKE_CA = float(os.environ.get("CC_TONIC_BRAKE_CA", "0"))
 _BRAKE_DEGNORM = float(os.environ.get("CC_TONIC_BRAKE_DEGNORM", "100.0"))
+
+# [#117] Autonomous aging clock (CC daemon only; default OFF). When enabled, _generation_loop
+# calls graph.step() on its heartbeat so graph.timestep advances between conversations, not only
+# inside on_message(). This is the #59 keystone the daemon's 2026-07-14 header claimed as a
+# phantom _autostep_loop (never implemented) — it now rides this existing pulse, so there is ONE
+# clock. Default OFF -> byte-identical for Syl (she never sets this; her clock is neurograph_rpc
+# _scan_drain). MIN_INTERVAL is a wall-time floor between steps so the 0.5s conversation tick
+# can't spin the aging clock and drain the inactivity grace window. See CC-117-CLOCK-PREP.md.
+_CC_NG_AUTOSTEP = os.environ.get("CC_NG_AUTOSTEP", "0") not in ("0", "false", "False", "")
+_CC_NG_AUTOSTEP_MIN_INTERVAL = float(os.environ.get("CC_NG_AUTOSTEP_MIN_INTERVAL", "900.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +353,7 @@ class TonicEngine:
         self._total_activations = 0
         self._ema_tick_ms = 0.0        # EMA of tick duration in milliseconds
         self._current_interval = self._config.latent_interval
+        self._last_autostep = 0.0       # monotonic ts of last autonomous graph.step() (#117)
 
         # Try to load surgical model
         self._model = None
@@ -921,6 +948,24 @@ class TonicEngine:
                 self._generate_latent_token()
             except Exception as exc:
                 logger.debug("Latent generation error: %s", exc)
+
+            # #117 — autonomous aging clock (default OFF). Advance graph.timestep on the
+            # heartbeat so decay / inactivity-cull / homeostasis evolve between conversations,
+            # not only inside on_message(). Wall-time floor keeps the fast conversation tick
+            # from spinning the clock and draining the inactivity grace window. Stamp BEFORE
+            # the call so a persistently-failing step waits the full floor before retrying.
+            # step() self-acquires _step_lock (RLock); we hold it explicitly to match the
+            # autosave/orphan-drain discipline. Error-isolated: a step failure must not kill
+            # the awareness loop. Cost falls inside the tick -> counted by adaptive cadence.
+            if _CC_NG_AUTOSTEP:
+                now = time.monotonic()
+                if now - self._last_autostep >= _CC_NG_AUTOSTEP_MIN_INTERVAL:
+                    self._last_autostep = now
+                    try:
+                        with self._graph._step_lock:
+                            self._graph.step()
+                    except Exception as exc:
+                        logger.debug("Autostep error: %s", exc)
 
             elapsed = time.perf_counter() - t0
             elapsed_ms = elapsed * 1000.0
