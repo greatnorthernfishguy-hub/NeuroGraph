@@ -7,7 +7,8 @@ into fully integrated knowledge within the NeuroGraph Foundation.
 Pipeline stages (PRD Addendum §2):
     1. Extract  — Convert raw input to structured text
     2. Chunk    — Segment into semantically meaningful units
-    3. Embed    — Vector representations via sentence-transformers
+    3. Embed    — Vector representations via ng_embed (ONNX Runtime,
+                  Snowflake/snowflake-arctic-embed-m-v1.5, 768-dim)
     4. Register — Insert into Vector DB, create SNN nodes with novelty dampening
     5. Associate — Create synapses/hyperedges via similarity and structure
 
@@ -38,6 +39,30 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-09-03] DudeMan CC (Fable 5.1) — Correct stale embedder references (docs only)
+#   What: Comment/docstring-only corrections. No behavior change, no logic touched.
+#         (a) Module docstring stage 3 said "via sentence-transformers" — that backend
+#             was removed 2026-03-19; now names ng_embed / arctic-embed-m-v1.5 / 768-dim.
+#         (b) Two comments called BAAI/bge-base-en-v1.5 "384-dim". It is 768-dim; the
+#             384-dim model was all-MiniLM-L6-v2. Corrected both, and attributed the
+#             384-dim deposit incident to MiniLM where it belongs.
+#         (c) EmbeddingEngine class docstring still described sentence-transformers and
+#             documented `device` as live device control. ng_embed is CPU/ONNX and
+#             ignores it; marked vestigial and explained why _resolve_device() remains.
+#         (d) Trailing note claimed "fastembed (ONNX Runtime) is now the sole embedding
+#             backend" three lines after stating fastembed was removed. Now names ng_embed.
+#         (e) Documented that `model_name` is a reporting label, not a model selector.
+#   Why:  Found while sizing punchlist #82 (multimodal perceptual embedding), which needs
+#         the substrate's true node width. The comments disagreed with each other and with
+#         the code, so the 768-dim contract could not be trusted from reading this file —
+#         it had to be cross-checked against ng_embed.py. ng_lite.py:105-108 records a real
+#         past incident from exactly this confusion (a 384-dim default depositing
+#         wrong-dimension vectors), which is why the wrong dimension in a comment matters.
+#   How:  Text edits only. NOT changed: the live `model_name` default at EmbeddingEngine
+#         .__init__ and the three ingest-profile configs still read "BAAI/bge-base-en-v1.5".
+#         Those are live values, not comments — changing them is a separate decision and is
+#         tracked as punchlist #405. `_try_load_ng_embed()` overwrites model_name on
+#         success, so the stale default surfaces only on the hash-fallback path.
 # [2026-06-05] CC (Opus 4.8 subagent) — #295: index_in_recall gate on NodeRegistrar.register
 #   What: Added index_in_recall: bool = True parameter to NodeRegistrar.register(). When False,
 #         the substrate node (graph.create_node) is still created but self.vector_db.insert() is
@@ -52,7 +77,7 @@ Grok Review Changelog (v0.7.1):
 # [2026-04-13] Claude (Sonnet 4.6) — Migrate embedding backend from fastembed to ng_embed
 #   What: Replaced _try_load_fastembed() with _try_load_ng_embed(). EmbeddingEngine
 #         now uses ng_embed.NGEmbed singleton (ONNX Runtime, Snowflake arctic-embed-m-v1.5,
-#         768-dim) instead of fastembed (BAAI/bge-base-en-v1.5, 384-dim, not installed).
+#         768-dim) instead of fastembed (BAAI/bge-base-en-v1.5, 768-dim, not installed).
 #   Why:  fastembed is not installed on the laptop CC instance; ng_embed.py is the
 #         ecosystem-wide ONNX embedding engine built specifically so no external
 #         embedding service (Ollama, HF Inference) is needed. Also unifies the
@@ -1595,24 +1620,32 @@ class AdaptiveChunker:
 class EmbeddingEngine:
     """Converts chunks into vector representations.
 
-    Uses sentence-transformers/all-MiniLM-L6-v2 when available.
-    Falls back to a deterministic hash-based embedding for environments
-    without the model installed (testing, lightweight deployments).
+    Uses ng_embed (NGEmbed ONNX singleton — Snowflake/snowflake-arctic-embed-m-v1.5,
+    768-dim) when available. Falls back to a deterministic hash-based embedding
+    for environments without ng_embed (testing, lightweight deployments). The
+    hash fallback is also 768-dim, so the substrate never receives a
+    wrong-dimension vector from either path.
 
-    Supports explicit device control via the ``device`` config key:
-    - ``"auto"`` (default): let sentence-transformers pick the best device
-    - ``"cpu"``: force CPU inference (safe for CUDA-less environments)
-    - ``"cuda"``: request GPU; falls back to CPU if CUDA is unavailable
+    The ``device`` config key is VESTIGIAL. It dates from the
+    sentence-transformers backend (removed 2026-03-19); ng_embed runs ONNX
+    Runtime on CPU and ignores it. ``_resolve_device()`` is retained only
+    because other call sites still read ``_active_device``, which
+    ``_try_load_ng_embed()`` sets to "cpu/onnx".
 
     Caching avoids recomputation of identical text.
 
     Args:
         config: Embedding configuration with keys:
-            - model_name: Model identifier (default "BAAI/bge-base-en-v1.5")
-            - dimension: Embedding dimension (default 768)
+            - model_name: Reporting label only, NOT a model selector (default
+              "BAAI/bge-base-en-v1.5"). Nothing loads by this value —
+              ``_try_load_ng_embed()`` overwrites it with the real model id on
+              success, so the default is visible only when ng_embed failed and
+              the engine is actually running the hash fallback. Stale default
+              tracked as punchlist #405.
+            - dimension: Embedding dimension (default 768; forced to 768 on load)
             - cache_size: Max cache entries (default 10000)
             - use_model: Force model loading (default True, falls back if unavailable)
-            - device: Device selection — "auto", "cpu", or "cuda" (default "auto")
+            - device: Vestigial, ignored by the ng_embed backend (default "auto")
     """
 
     _logger = logging.getLogger("neurograph.embedding")
@@ -1751,13 +1784,15 @@ class EmbeddingEngine:
             return False
 
     # _try_load_fastembed removed 2026-04-13 — replaced by _try_load_ng_embed.
-    # fastembed (BAAI/bge-base-en-v1.5, 384-dim) was not installed on all instances
+    # fastembed (BAAI/bge-base-en-v1.5, 768-dim) was not installed on all instances
     # and was always an intermediate solution after sentence-transformers was removed
     # 2026-03-19. ng_embed.py is the canonical ecosystem embedding engine.
     # _try_load_sentence_transformers removed 2026-03-19.
     # sentence-transformers (torch) broke and degraded ecosystem to hash
-    # fallbacks, then deposited 384-dim vectors into the 768-dim substrate.
-    # fastembed (ONNX Runtime) is now the sole embedding backend.
+    # fallbacks, then deposited 384-dim vectors (all-MiniLM-L6-v2) into the
+    # 768-dim substrate.
+    # ng_embed (ONNX Runtime, Snowflake arctic-embed-m-v1.5) is now the sole
+    # embedding backend — see _try_load_ng_embed above.
 
     def embed(self, chunks: List[Chunk]) -> List[EmbeddedChunk]:
         """Embed a list of chunks, using cache where possible.
