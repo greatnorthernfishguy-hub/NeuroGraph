@@ -42,6 +42,23 @@ Laws observed:
 #   arrival exemption so callosum arrivals are safe against BOTH steppers (this heartbeat
 #   AND the permanent #108 callosum-consolidation step), NOT by touching the grace clock —
 #   see ~/docs/CC-117-CLOCK-PREP.md steps 2-3 and CC-CALLOSUM-TRUTH.md §8.5.2/§8.13.
+# [2026-09-05] Claude Code (DudeMan CC, Fable 5.1) — Pith Stage 4 (#55) phase 5b: Markov prefetch on the tick
+# What: set_prefetch_seed(fn) + _merge_prefetch_seeds(); each _generate_latent_token_inner tick
+#   folds the host's live primed_nodes into the write-mode prime (capped, score-scaled current).
+#   status gains prefetch_seeded. Env (LAW 5): CC_PITH_PREFETCH_WARM_ENABLED (default OFF),
+#   CC_PITH_PREFETCH_MAX, CC_PITH_PREFETCH_CURRENT_SCALE. Byte-identical when off or unseeded.
+# Why: PRD §5.4.1 -- "the substrate topology IS the table"; prefetch is spreading activation,
+#   not a content cache (a dict-cache take was reverted 2026-09-05). A separate read-mode
+#   prime is a NO-OP because read mode restores voltages and the harvest is itself a read-
+#   mode prime; only the Tonic's persisting write tick can leave the neighbourhood warm.
+#   CONSEQUENCE (deviation from the signed design's write_mode=False): prediction-seeded
+#   activity now undergoes STDP, sprouting and age-on-write like every other Tonic tick --
+#   prefetch SHAPES topology. Gate stays OFF until Josh signs that off explicitly.
+# How: rides the existing heartbeat exactly like #117 autostep -- one clock, no new thread,
+#   cost inside the tick so adaptive cadence counts it. Merge happens INSIDE the proposal
+#   set before _apply_brakes and the max_activation_nodes slice (law-enforcer 2026-09-05:
+#   a post-hoc append bypassed both). One seed set primes at most REPEATS ticks. Seed source is host-injected so this
+#   file knows nothing about conv_state; laptop daemon + cc_ng_host each pass their own.
 # [2026-07-13] Claude Code (Opus 4.8) — #59/#62 heuristic redesign: instrumentation + T2 compass + brakes
 # What: _heuristic_inference gained (a) observability-only mass logging (_log_heuristic_mass:
 #   where output activation mass lands, blob-core vs quiet-periphery, + compass_n), (b) a T2
@@ -197,6 +214,29 @@ _BRAKE_DEGNORM = float(os.environ.get("CC_TONIC_BRAKE_DEGNORM", "100.0"))
 # can't spin the aging clock and drain the inactivity grace window. See CC-117-CLOCK-PREP.md.
 _CC_NG_AUTOSTEP = os.environ.get("CC_NG_AUTOSTEP", "0") not in ("0", "false", "False", "")
 _CC_NG_AUTOSTEP_MIN_INTERVAL = float(os.environ.get("CC_NG_AUTOSTEP_MIN_INTERVAL", "900.0"))
+
+# Pith Stage 4 phase 5b (#55) -- Markov prefetch rides THIS tick. The host hands the
+# engine a seed callable (set_prefetch_seed) returning the live primed_nodes that
+# cc_anticipate wrote at deposit; each tick merges them into the write-mode prime
+# so the predicted neighbourhood is already warm when the next query's read-mode
+# harvest runs. Read-mode restores voltages, so a separate read-mode prefetch would
+# be a no-op -- the Tonic's own persisting tick is the only place warming sticks.
+# Default OFF -> byte-identical for Syl and for any host that never sets a seed.
+_CC_PITH_PREFETCH_WARM_ENABLED = os.environ.get("CC_PITH_PREFETCH_WARM_ENABLED", "0") not in ("0", "false", "False", "")
+# NOTE: this gate is a module constant in a file Syl's process shares. Her engine is
+# unaffected only because nothing ever calls set_prefetch_seed on it -- isolation
+# rests on seed injection, not on the gate. Do not "helpfully" seed her engine.
+# MAX default 15 == cc_ng_organism._CC_ANTICIPATE_TOP_K (canonical, do-not-tune);
+# if canonical moves, this should move with it or the cap silently stops binding.
+_CC_PITH_PREFETCH_MAX = max(0, min(64, int(os.environ.get("CC_PITH_PREFETCH_MAX", "15"))))
+# How many ticks one seed set (one deposit's prediction) may be primed. primed_nodes
+# live 120s and the tick is 2-10s, so unbounded = 12-60 write-mode re-primes of the
+# same prediction, each carrying STDP/sprout/melt. Default 1: warm once per prediction.
+_CC_PITH_PREFETCH_REPEATS = max(1, int(os.environ.get("CC_PITH_PREFETCH_REPEATS", "1")))
+# Fraction of activation_strength given to a prefetched seed (scaled by its primed
+# score, capped at 1.0). 0.5 sits with the heuristic's recency seeds and below its
+# synapse-follow (0.8): a prediction warms, it does not out-shout a real association.
+_CC_PITH_PREFETCH_CURRENT_SCALE = max(0.0, min(1.0, float(os.environ.get("CC_PITH_PREFETCH_CURRENT_SCALE", "0.5"))))
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +394,11 @@ class TonicEngine:
         self._ema_tick_ms = 0.0        # EMA of tick duration in milliseconds
         self._current_interval = self._config.latent_interval
         self._last_autostep = 0.0       # monotonic ts of last autonomous graph.step() (#117)
+        self._prefetch_seed = None      # host-injected callable -> {node_id: primed_score} (#55 5b)
+        self._prefetch_seeded = 0       # seeds merged into ticks so far (#55 5b)
+        self._prefetch_gen_key = None   # last seed set primed (repeat bound, #55 5b)
+        self._prefetch_gen_uses = 0     # ticks the current seed set has been primed
+        self._prefetch_fail_logged = False
 
         # Try to load surgical model
         self._model = None
@@ -450,6 +495,59 @@ class TonicEngine:
             "Tonic shed shared body -> heuristic (memory-cheap); will re-join on proto reload"
         )
         return True
+
+    def set_prefetch_seed(self, fn) -> None:
+        """Accept the host's Markov-prefetch seed source (#55 Stage 4 phase 5b).
+
+        `fn()` returns {node_id: primed_score} for the currently live predictions
+        (the host owns TTL filtering). The engine folds them into each tick's
+        write-mode prime when CC_PITH_PREFETCH_WARM_ENABLED is set. Idempotent.
+        """
+        self._prefetch_seed = fn
+
+    def _merge_prefetch_seeds(self, seen: Dict[str, float]) -> None:
+        """Fold live predicted nodes into a tick's proposal dict, IN PLACE.
+
+        Called BEFORE _apply_brakes and before the max_activation_nodes slice,
+        so predictions compete for the same budget as real associations and are
+        damped by the same markers (#62) -- a hub-biased prediction set must not
+        skip the brakes that exist to damp hubs. Max-dedup: a node the model or
+        heuristic already proposed keeps its own current. One seed set is primed
+        at most _CC_PITH_PREFETCH_REPEATS ticks. Never raises; on any failure the
+        dict is left as it was.
+        """
+        if not _CC_PITH_PREFETCH_WARM_ENABLED or self._prefetch_seed is None or _CC_PITH_PREFETCH_MAX <= 0:
+            return
+        try:
+            seeds = self._prefetch_seed() or {}
+            if not seeds:
+                return
+            key = tuple(sorted(seeds.items()))
+            if key == self._prefetch_gen_key:
+                self._prefetch_gen_uses += 1
+                if self._prefetch_gen_uses > _CC_PITH_PREFETCH_REPEATS:
+                    return
+            else:
+                self._prefetch_gen_key, self._prefetch_gen_uses = key, 1
+            nodes = self._graph.nodes
+            base = self._config.activation_strength * _CC_PITH_PREFETCH_CURRENT_SCALE
+            added = 0
+            for nid, score in sorted(seeds.items(), key=lambda kv: kv[1], reverse=True):
+                if added >= _CC_PITH_PREFETCH_MAX:
+                    break
+                if nid not in nodes:
+                    continue
+                cur = base * min(1.0, max(0.0, float(score)))
+                if nid in seen:
+                    seen[nid] = max(seen[nid], cur)
+                    continue
+                seen[nid] = cur
+                added += 1
+            self._prefetch_seeded += added
+        except Exception as exc:
+            if not self._prefetch_fail_logged:
+                self._prefetch_fail_logged = True
+                logger.warning("Prefetch seed merge failing (non-fatal, logged once): %s", exc)
 
     def set_body_lock(self, lock) -> None:
         """Accept the shared body access lock from BrainSwitcher."""
@@ -634,6 +732,9 @@ class TonicEngine:
 
         # Divisive brakes (#62) — damp each proposal by the blob's own markers
         # (firing / fatigue / degree / Ca_i); constitutional/self nodes bypass.
+        # #55 5b: predictions join the proposal set HERE -- before brakes and budget.
+        self._merge_prefetch_seeds(seen)
+
         self._apply_brakes(seen)
 
         result = sorted(seen.items(), key=lambda x: -x[1])
@@ -799,7 +900,11 @@ class TonicEngine:
             if strength > 0.05:  # noise floor
                 activations.append((nid, strength))
 
-        return activations
+        # #55 5b: same merge as the heuristic path (this path has no brakes or
+        # cap for anyone, so there is nothing to bypass).
+        seen = dict(activations)
+        self._merge_prefetch_seeds(seen)
+        return list(seen.items())
 
     def _identity_embedding_tensor(self):
         """#329 seam C: her constitutional self as the identity-conditioning vector.
@@ -1032,4 +1137,5 @@ class TonicEngine:
             "ema_tick_ms": round(self._ema_tick_ms, 2),
             "current_interval_s": round(self._current_interval, 2),
             "node_sample_budget": self._config.node_sample_budget,
+            "prefetch_seeded": self._prefetch_seeded,
         }

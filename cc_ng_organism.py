@@ -155,6 +155,15 @@
 #   that do per-half STATE bookkeeping then call this. VPS gate-off ==
 #   byte-identical to its pre-refactor concat; gate-on gains the same Pith
 #   pipeline the laptop already had. See test_cc_recall_unification.py.
+# [2026-09-05] Claude Code (DudeMan CC, Fable 5.1) — Pith Stage 4 (#55) phase 5b: prefetch seed + surfaced counter
+# What: pith_prefetch_seed(state) -> live primed_nodes as {id: score}, the one seed
+#   implementation both hosts hand to TonicEngine.set_prefetch_seed. New
+#   PithMetrics.prefetch_surfaced: a live primed node the harvest found on its own.
+# Why: 5b is Markov prefetch as spreading activation on the Tonic tick (PRD §5.4.1),
+#   not a content cache. When it works, the harvest surfaces predictions itself and
+#   5a has nothing left to promote -- so the honest hit-rate is prefetch_surfaced,
+#   not prefetch_hits. Both stay visible via the daemon's pith_metrics RPC.
+# How: pure helpers; no new thread, no new state. Gate lives in tonic_engine.py.
 # [2026-07-22] Claude Code (DudeMan CC, Opus 4.8) — Pith Stage 4 (#55) phase 5a: predictive promotion + proximity LOD
 # What: cc_pattern_completion_recall now (gated CC_PITH_PREFETCH_ENABLED, default OFF)
 #   PROMOTES live primed_nodes the query harvest MISSED -- injects them as recall
@@ -2315,6 +2324,10 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                     nid = item.get("node_id")
                     if nid and nid in live:
                         item["strength"] = item.get("strength", 0.0) + _CC_ANTICIPATE_BONUS
+                        # #55 5b: a predicted node the harvest surfaced BY ITSELF is
+                        # the true Markov-prefetch hit (5a's promotion only counts
+                        # the ones it had to inject). Read via the pith_metrics RPC.
+                        _PITH_METRICS.prefetch_surfaced += 1
 
                 # Pith Stage 4 (#55) predictive promotion, phase 5a: today a
                 # primed node only ever helps if the query-driven harvest
@@ -2516,6 +2529,30 @@ _CC_PITH_PREFETCH_ENABLED = os.environ.get("CC_PITH_PREFETCH_ENABLED", "0") not 
 # predictions are trusted at full resolution, far ones cost less if wrong.
 _CC_PITH_PREFETCH_LOD_DIST = float(os.environ.get("CC_PITH_PREFETCH_LOD_DIST", "1.5"))
 _CC_PITH_PREFETCH_SUMMARY_CHARS = max(60, min(1000, int(os.environ.get("CC_PITH_PREFETCH_SUMMARY_CHARS", "150"))))
+
+
+def pith_prefetch_seed(state) -> Dict[str, float]:
+    """Stage 4 phase 5b (#55): the Markov-prefetch seed for the Tonic tick.
+
+    Returns {node_id: primed_score} for the still-live entries of
+    ``state["primed_nodes"]`` (written by cc_anticipate at deposit, TTL'd).
+    Hosts wrap this over their own conv_state and hand it to
+    TonicEngine.set_prefetch_seed; the engine folds it into its write-mode
+    prime so the predicted neighbourhood is warm before the next harvest.
+    Scores are normalised to [0,1] by the set's max. Pure read; never raises
+    (a failure is counted via PithMetrics.record_failure).
+    """
+    try:
+        now = time.time()
+        live = {nid: float(s) for nid, (s, exp) in ((state or {}).get("primed_nodes") or {}).items()
+                if exp > now}
+        # cc_anticipate scores are unbounded synapse-weight sums, not [0,1]; normalise
+        # by the set's max so the engine's score-scaled current actually differentiates.
+        top = max(live.values()) if live else 0.0
+        return {nid: (s / top if top > 0 else 0.0) for nid, s in live.items()}
+    except Exception:
+        _PITH_METRICS.record_failure()
+        return {}
 
 
 def _cc_poincare_distance(x, y) -> float:
@@ -2811,6 +2848,8 @@ class PithMetrics:
     chars_saved: int = 0
     promoted_predicted: int = 0
     prefetch_hits: int = 0
+    # 5b: live primed nodes the harvest surfaced on its own (warm topology).
+    prefetch_surfaced: int = 0
 
     def reset(self) -> None:
         self.total_lines_in = 0
@@ -2825,6 +2864,7 @@ class PithMetrics:
         self.chars_saved = 0
         self.promoted_predicted = 0
         self.prefetch_hits = 0
+        self.prefetch_surfaced = 0
 
     def record_failure(self) -> None:
         """Bump the fail-soft counter -- the Pith path swallows exceptions and
@@ -2847,6 +2887,7 @@ class PithMetrics:
             "chars_saved": self.chars_saved,
             "promoted_predicted": self.promoted_predicted,
             "prefetch_hits": self.prefetch_hits,
+            "prefetch_surfaced": self.prefetch_surfaced,
         }
 
 

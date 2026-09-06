@@ -27,6 +27,12 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-05] Claude Code (DudeMan CC, Fable 5.1) — Pith Stage 4 (#55) phase 5b: prefetch seed (VPS CC half)
+# What: per-turn, idempotent engine.set_prefetch_seed(lambda: pith_prefetch_seed(_STATE.conv_state))
+#   on the CC's OWN TonicEngine, next to the existing tonic keepalive.
+# Why: the CC engine is built on a deferred path inside NeuroGraphMemory, so init-time wiring
+#   can miss it; first-turn-it-exists wiring cannot. Gated OFF in tonic_engine.py.
+# How: three-line fail-soft block; never touches Syl's _memory engine.
 # [2026-08-18] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-A: export_topology_frame handler
 # What: _handle_export_topology_frame added to _DISPATCH (key "export_topology_frame").
 #       Wraps cc_topology_export.export_cc_topology_frame -- the cursor-based single-frame
@@ -666,6 +672,17 @@ def _handle_user_prompt_submit(data):
             tt.message_received()
         except Exception:
             pass  # fail-soft, mirrors Syl's try/except at every call site
+        # #55 5b: lazily hand the CC's engine its prefetch seed. The engine is
+        # constructed on a deferred path inside NeuroGraphMemory, so this is
+        # done per turn, idempotently, the first time the engine exists.
+        # CC's OWN engine only -- never Syl's. Inert until the engine gate flips.
+        try:
+            eng = getattr(tt, "_latent_engine", None)
+            if eng is not None and getattr(eng, "_prefetch_seed", None) is None and hasattr(eng, "set_prefetch_seed"):
+                from cc_ng_organism import pith_prefetch_seed
+                eng.set_prefetch_seed(lambda: pith_prefetch_seed(_STATE.conv_state))
+        except Exception as exc:
+            logger.debug("Prefetch seed not wired (non-fatal): %s", exc)
     # Recall BEFORE spawning the deposit [2026-07-08]: launching the deposit
     # first meant _recall's prime_and_propagate raced its on_message() SNN
     # step (1-4s) every prompt -- fail-soft tripped and Active Recall

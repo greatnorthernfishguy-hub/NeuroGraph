@@ -268,3 +268,31 @@ def test_recall_still_fails_soft_with_promotion_enabled(monkeypatch):
     class BrokenNg:
         graph = None
     assert cc_pattern_completion_recall(BrokenNg(), "anything", state={"primed_nodes": {}}) == []
+
+
+# ---- phase 5b (2026-09-05): seed helper + prefetch_surfaced counter ----
+
+def test_prefetch_seed_filters_expired_and_never_raises():
+    now = time.time()
+    st = {"primed_nodes": {"live": (0.7, now + 60), "dead": (0.9, now - 1), "half": (0.35, now + 60)}}
+    seed = cc.pith_prefetch_seed(st)
+    assert seed == {"live": 1.0, "half": 0.5}      # normalised by the live max; expired dropped
+    assert cc.pith_prefetch_seed(None) == {}
+    assert cc.pith_prefetch_seed({"primed_nodes": "garbage"}) == {}
+
+
+def test_prefetch_surfaced_counts_harvest_found_primed_node(cc_ng, monkeypatch):
+    """A live primed node the harvest surfaces on its own is the true prefetch hit."""
+    monkeypatch.setattr(cc, "_CC_PITH_PREFETCH_ENABLED", False)  # no injection help
+    g = cc_ng.graph
+    nid = "seedme"
+    g.create_node(node_id=nid)
+    g.nodes[nid].metadata["_forest_content"] = "seedme content the query matches"
+    state = {"primed_nodes": {nid: (1.0, time.time() + 60)}}
+    # Force the harvest to surface it by stubbing the association harvest.
+    monkeypatch.setattr(cc_ng, "_harvest_associations",
+                        lambda q, novelty=None: [{"node_id": nid, "strength": 0.5}])
+    cc_pattern_completion_recall(cc_ng, "seedme content", k=5, threshold=0.0, state=state)
+    assert cc._PITH_METRICS.prefetch_surfaced == 1
+    assert cc._PITH_METRICS.promoted_predicted == 0
+    assert "prefetch_surfaced" in cc._PITH_METRICS.snapshot()
