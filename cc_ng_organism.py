@@ -155,6 +155,17 @@
 #   that do per-half STATE bookkeeping then call this. VPS gate-off ==
 #   byte-identical to its pre-refactor concat; gate-on gains the same Pith
 #   pipeline the laptop already had. See test_cc_recall_unification.py.
+# [2026-09-06] Claude Code (DudeMan CC, Opus 5) — #400: pack poincare_dir on the CC half
+# What: writers store compact float32 bytes via pack_poincare_dir (fresh stamp at the
+#   conversational-node path, and cc_gsg_backfill); readers decode via poincare_dir_array;
+#   cc_gsg_backfill gains the one-time legacy-list -> bytes migration and reports it.
+# Why: #400 landed the helpers and canonical's _gsg_backfill_existing_nodes migration, but
+#   the CC half never got either -- cc_gsg_backfill skipped any node that already had a
+#   poincare_dir regardless of form, and stamped new ones with .tolist(). Laptop checkpoint
+#   verified still 100% boxed lists: 5,991 nodes x ~24 KB = ~147 MB that should be ~18 MB.
+#   Feeds #412 (daemon RSS -> earlyoom -> #411).
+# How: mirrors neurograph_rpc._gsg_backfill_existing_nodes exactly (isinstance bytes check,
+#   pack in place, continue). neuro_foundation.py is PROTECTED and untouched -- import only.
 # [2026-09-05] Claude Code (DudeMan CC, Fable 5.1) — Pith Stage 4 (#55) phase 5b: prefetch seed + surfaced counter
 # What: pith_prefetch_seed(state) -> live primed_nodes as {id: score}, the one seed
 #   implementation both hosts hand to TonicEngine.set_prefetch_seed. New
@@ -1347,7 +1358,10 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
     node.metadata["probation_total"] = _CC_CONV_PROBATION_PERIOD
     node.metadata["novelty_dampening"] = _CC_CONV_NOVELTY_DAMPENING
     try:
-        node.metadata["poincare_dir"] = _cc_embed_to_poincare_dir(embedding).tolist()
+        # #400: compact float32 bytes, not a boxed 768-float list (~24 KB -> 3 KB
+        # per node). Every reader below goes through poincare_dir_array().
+        from neuro_foundation import pack_poincare_dir as _pack_pd
+        node.metadata["poincare_dir"] = _pack_pd(_cc_embed_to_poincare_dir(embedding))
     except Exception as exc:
         logger.debug("CC poincare_dir stamp failed (non-fatal): %s", exc)
     if index_in_recall:
@@ -2584,7 +2598,10 @@ def _cc_node_query_distance(node, query_dir) -> Optional[float]:
     error; never raises.
     """
     try:
-        pdir = (node.metadata or {}).get("poincare_dir") if hasattr(node, "metadata") else None
+        # #400: metadata holds packed float32 bytes now, or a legacy list on an
+        # un-backfilled checkpoint; poincare_dir_array() normalises both.
+        from neuro_foundation import poincare_dir_array as _pda
+        pdir = _pda(node.metadata) if hasattr(node, "metadata") else None
         if pdir is None:
             return None
         import numpy as _np
@@ -2672,7 +2689,8 @@ def cc_gsg_rescore(surfaced, query_text: str, graph):
             node = graph.nodes.get(nid)
             if node is None:
                 continue
-            pdir = (node.metadata or {}).get("poincare_dir") if hasattr(node, "metadata") else None
+            from neuro_foundation import poincare_dir_array as _pda  # #400 bytes-or-list
+            pdir = _pda(node.metadata) if hasattr(node, "metadata") else None
             if pdir is None:
                 continue
             layer = max(0, min(2, getattr(node, "diffpc_layer", 0)))
@@ -2712,21 +2730,36 @@ def cc_gsg_backfill(graph, vector_db) -> int:
     try:
         if graph is None or vector_db is None:
             return 0
+        from neuro_foundation import pack_poincare_dir as _pack  # #400
         stamped = 0
+        packed = 0
         for node_id, node in list(graph.nodes.items()):
-            if (node.metadata or {}).get("poincare_dir"):
+            _existing = (node.metadata or {}).get("poincare_dir")
+            if _existing is not None:
+                # #400 one-time migration, mirroring canonical
+                # neurograph_rpc._gsg_backfill_existing_nodes: a legacy boxed list
+                # becomes compact float32 bytes in place. Without this the CC half
+                # keeps ~24 KB/node forever -- the old stamp-only guard skipped
+                # every already-stamped node regardless of its storage form.
+                if not isinstance(_existing, (bytes, bytearray)):
+                    try:
+                        node.metadata["poincare_dir"] = _pack(_existing)
+                        packed += 1
+                    except Exception:
+                        pass
                 continue
             emb = vector_db.embeddings.get(node_id)
             if emb is None:
                 continue
             if node.metadata is None:
                 node.metadata = {}
-            node.metadata["poincare_dir"] = emb.tolist()
+            node.metadata["poincare_dir"] = _pack(emb)  # #400 packed, not a list
             stamped += 1
-        if stamped:
-            logger.info("CC GSG backfill: stamped poincare_dir on %d nodes (stamp-only; "
-                        "persists via normal autosave)", stamped)
-        return stamped
+        if stamped or packed:
+            logger.info("CC GSG backfill: stamped %d node(s), migrated %d legacy list(s) -> "
+                        "packed float32 bytes (#400; stamp-only, persists via normal autosave)",
+                        stamped, packed)
+        return stamped + packed
     except Exception as exc:
         logger.debug("cc_gsg_backfill failed (non-fatal): %s", exc)
         return 0
