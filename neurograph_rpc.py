@@ -12,6 +12,19 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 1: route portal.vision frames to vision_absorption
+# What: In the scan-dir drain, BTF OUTCOME entries with module_id "portal.vision*" are split
+#       out before the wire/non-wire split and passed to vision_absorption.absorb_entries().
+#       Every other OUTCOME entry remains excluded from the drain exactly as before; EXPERIENCE
+#       routing is untouched.
+# Why:  Sight. Frames are encoded on the phone (SigLIP 2, 768-d) and arrive on the experience
+#       tract as outcomes carrying the embedding. They are experience, not documentation — they
+#       must reach the SNN through the sensory door and must NEVER take the non-wire fallthrough
+#       into the Universal Ingestor (OOM loop, 2026-04-15). Design: ~/docs/concepts/Multimodal
+#       Perceptual Embedding.md. Plan: superpowers/plans/2026-09-06-82-vision-build-plan.md.
+# How:  ~20 lines in the drain loop; lazy import; non-fatal on any exception. No vdb, no
+#       ingestor, no embedding model on this path. Not a protected file; no protected file
+#       touched. Tests: tests/test_vision_absorption.py (7 green).
 # [2026-08-14] Claude Code (Opus 4.8) — #143 hoist CC-host init above Lenia populate
 # What: Moved the "#74 defer" _init_cc_host_bg daemon-thread .start() from AFTER the
 #   Lenia FlowGraph block to BEFORE it, in handle_bootstrap. Same thread, same
@@ -3848,11 +3861,31 @@ def _drain_scan_dir() -> None:
             if not raw:
                 continue
             reader = ng_tract.TractReader(raw)
-            all_entries = [
-                e for e in reader
-                if not isinstance(e, bytes)
-                and getattr(e, "entry_type", None) == ng_tract.ENTRY_EXPERIENCE
-            ]
+            # #82 vision: OUTCOME entries whose module_id is the vision prefix carry
+            # phone-encoded 768-d frames. Split them out FIRST — before the wire/
+            # non-wire split below reads `.source` (an EXPERIENCE field) — so a
+            # frame can never take the non-wire fallthrough into the ingestor
+            # (that fallthrough OOM-looped on 2026-04-15 for wire bytes). All
+            # other OUTCOME entries stay excluded exactly as before.
+            _raw_entries = [e for e in reader if not isinstance(e, bytes)]
+            vision_entries = []
+            all_entries = []
+            for e in _raw_entries:
+                _et = getattr(e, "entry_type", None)
+                if _et == ng_tract.ENTRY_OUTCOME and str(getattr(e, "module_id", "") or "").startswith("portal.vision"):
+                    vision_entries.append(e)
+                elif _et == ng_tract.ENTRY_EXPERIENCE:
+                    all_entries.append(e)
+            if vision_entries and _memory is not None:
+                try:
+                    from vision_absorption import absorb_entries as _vision_absorb
+                    _vres = _vision_absorb(_memory.graph, vision_entries)
+                    if _vres:
+                        logger.info("Scan-dir drain: %d vision frame(s) absorbed from %s (%d nodes)",
+                                    len(_vres), tract_path.name,
+                                    sum(1 + len(r["tree_ids"]) for r in _vres))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Vision absorb failed (non-fatal, %s): %s", tract_path.name, exc)
 
             # Separate wire vs non-wire entries
             wire_entries = []
