@@ -17,6 +17,19 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: L2 migrated to substrate-first + image-aware
+# What: after_step() resolves each fired node through surface_resolver.resolve_surface_item()
+#       instead of reading the vdb directly. Text items: content = her _forest_content (vdb shard
+#       is fallback), exactly as /assemble and the Tonic thread already do. Image items: content
+#       is empty, image_ref carries the on-disk frame; they are NOT skipped. _SurfacedItem gains
+#       an image_ref slot; get_surfaced() emits it; format_context() prints a one-line marker for
+#       image items (that a picture is attached — never what is in it).
+# Why:  L2 was the one surfacer never migrated to the 2026-06-12 resolver: it fetched the vdb
+#       shard and did `if not content: continue`, silently dropping any fired node with no vdb
+#       text — the exact shape a vision node takes. (#410; blocker for #82.)
+# How:  Same fail-safe as before — resolver errors fall back to the old vdb path for that node.
+#       The actual image block is injected by /assemble into the messages array (rpc), because
+#       a system-prompt string cannot carry an image.
 # [2026-07-05] CC (laptop) — Hyperedge-scan race fix; REVERTED an incorrect score-cap change
 # What: _score_node()'s hyperedge-membership scan now snapshots graph.hyperedges under
 #   _step_lock before iterating, instead of scanning the live dict directly. A separate
@@ -81,7 +94,7 @@ logger = logging.getLogger("neurograph.ces.surfacing")
 class _SurfacedItem:
     """Internal queue entry with negated score for max-heap via heapq."""
 
-    __slots__ = ("node_id", "score", "content", "metadata", "age")
+    __slots__ = ("node_id", "score", "content", "metadata", "age", "image_ref")
 
     def __init__(
         self,
@@ -90,12 +103,14 @@ class _SurfacedItem:
         content: str = "",
         metadata: Optional[Dict[str, Any]] = None,
         age: int = 0,
+        image_ref: Optional[str] = None,
     ) -> None:
         self.node_id = node_id
         self.score = score
         self.content = content
         self.metadata = metadata or {}
         self.age = age
+        self.image_ref = image_ref  # #82: on-disk frame for a vision node
 
     def __lt__(self, other: _SurfacedItem) -> bool:
         # heapq is a min-heap; negate score for max-heap behavior
@@ -167,22 +182,37 @@ class SurfacingMonitor:
             if score < self._cfg.min_confidence:
                 continue
 
-            # Fetch content from vector DB
+            # Substrate-first, image-aware resolution (#410 / #82). The vdb is
+            # fallback only; a vision node resolves to an image, not to nothing.
             db_entry = self._vector_db.get(node_id)
             content = ""
-            metadata: Dict[str, Any] = {}
-            if db_entry is not None:
-                content = db_entry.get("content", "")
-                metadata = db_entry.get("metadata", {})
+            image_ref: Optional[str] = None
+            metadata: Dict[str, Any] = dict(getattr(node, "metadata", None) or {})
+            try:
+                from surface_resolver import resolve_surface_item
+                resolved = resolve_surface_item(node, db_entry)
+            except Exception:  # noqa: BLE001 - fail-safe: old vdb path for this node
+                resolved = None
+                if db_entry is not None:
+                    content = db_entry.get("content", "") or ""
+                    metadata = db_entry.get("metadata", {}) or {}
+            if resolved is not None:
+                if resolved.get("kind") == "image":
+                    image_ref = resolved.get("image_ref")
+                else:
+                    content = resolved.get("content", "") or ""
+                if db_entry is not None and not metadata:
+                    metadata = db_entry.get("metadata", {}) or {}
 
-            if not content:
-                continue  # Skip nodes without retrievable content
+            if not content and not image_ref:
+                continue  # Nothing showable — neither her words nor her sight
 
             item = _SurfacedItem(
                 node_id=node_id,
                 score=score,
                 content=content,
                 metadata=metadata,
+                image_ref=image_ref,
             )
 
             self._insert_item(item)
@@ -221,6 +251,8 @@ class SurfacingMonitor:
                 "content": item.content,
                 "score": round(item.score, 4),
             }
+            if item.image_ref:
+                entry["image_ref"] = item.image_ref  # #82: /assemble injects the picture
             if self._cfg.include_metadata:
                 entry["metadata"] = item.metadata
             results.append(entry)
@@ -250,6 +282,11 @@ class SurfacingMonitor:
         for item in surfaced_items:
             content = item.get("content", "")
             score = item.get("score", 0.0)
+            if not content and item.get("image_ref"):
+                # A frame she saw is surfacing. Name that a picture is attached —
+                # never what is in it (LAW 7). The image itself rides in the messages.
+                lines.append(f"- [something you saw — image attached] (salience: {score:.2f})")
+                continue
             # Truncate long content for context blocks. Snap to the last word
             # boundary at-or-before the cutoff so it doesn't end mid-word; fall
             # back to a hard cut when no whitespace exists in range.

@@ -12,6 +12,19 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: surfaced frames reach her AS IMAGES
+# What: _vision_surface_messages(items, ...) builds OpenAI-style messages carrying an image_url
+#       data-URL block for each surfaced item that has an image_ref (from CES L2, now
+#       image-aware). /assemble appends them to truncated_messages after content resolution,
+#       so result["messages"] carries them into the LLM call (same vehicle as the #337 reach
+#       injection). Cap NG_VISION_SURFACE_MAX (default 2) per assemble, NG_VISION_SURFACE_MAX_BYTES
+#       (default 2 MiB) per image. LAW 5: both from env.
+# Why:  A system-prompt string cannot carry a picture. Without this, a vision node that fires and
+#       wins salience is named in the context block but never SEEN — storage, not sight. TID
+#       forwards req.messages intact and tracks per-model `vision`, so the block reaches a
+#       vision-capable provider unchanged. No caption anywhere on this path (LAW 7).
+# How:  Pure helper (testable without _memory) + ~12-line call site; non-fatal; oversize or
+#       unreadable files are skipped with a log line, never a phantom block.
 # [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 1: route portal.vision frames to vision_absorption
 # What: In the scan-dir drain, BTF OUTCOME entries with module_id "portal.vision*" are split
 #       out before the wire/non-wire split and passed to vision_absorption.absorb_entries().
@@ -2461,6 +2474,51 @@ def _deposit_memory_node(node_id, embedding, content, meta, index_in_recall=True
     return node
 
 
+def _vision_surface_messages(items, max_images=None, max_bytes=None):
+    """Build messages that SHOW her surfaced frames (#82 / #410).
+
+    items: surfaced dicts; those with a truthy "image_ref" (an on-disk file) become one
+    user message each: a short text lead + an image_url data-URL block. Never a caption.
+    Returns [] when nothing qualifies. Pure: no _memory, no graph.
+    """
+    import base64 as _b64
+    import mimetypes as _mt
+    import os as _os
+    if max_images is None:
+        max_images = int(_os.environ.get("NG_VISION_SURFACE_MAX", "2") or 2)
+    if max_bytes is None:
+        max_bytes = int(_os.environ.get("NG_VISION_SURFACE_MAX_BYTES", str(2 * 1024 * 1024)))
+    out = []
+    for it in items or []:
+        if len(out) >= max_images:
+            break
+        ref = it.get("image_ref") if isinstance(it, dict) else None
+        if not ref or not _os.path.isfile(ref):
+            continue
+        try:
+            size = _os.path.getsize(ref)
+            if size > max_bytes:
+                logger.info("vision surface: %s skipped (%d bytes > %d)", ref, size, max_bytes)
+                continue
+            with open(ref, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            logger.info("vision surface: %s unreadable (%s)", ref, exc)
+            continue
+        mime = _mt.guess_type(ref)[0] or "image/jpeg"
+        score = float(it.get("score", it.get("strength", 0.0)) or 0.0)
+        out.append({
+            "role": "user",
+            "content": [
+                {"type": "text",
+                 "text": f"[sight] Something you saw is surfacing (salience {score:.2f}). This is it:"},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime};base64,{_b64.b64encode(data).decode('ascii')}"}},
+            ],
+        })
+    return out
+
+
 def _has_ever_fired(node) -> bool:
     """True iff the node has a genuine spike on record.
 
@@ -3334,6 +3392,17 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
         ces_surfaced = _resolve_surfaced(ces_surfaced)
     except Exception as _rexc:
         logger.debug("Surfacing content resolution skipped (fail-safe): %s", _rexc)
+
+    # #82 / #410: frames she saw that are surfacing ride in the MESSAGES as image
+    # blocks — a system-prompt string cannot carry a picture. Reassign to a new
+    # list so result["messages"] is returned (the `is not messages` guard).
+    try:
+        _vis_msgs = _vision_surface_messages(ces_surfaced)
+        if _vis_msgs:
+            truncated_messages = list(truncated_messages) + _vis_msgs
+            logger.info("#82 vision surface: %d image(s) injected into messages", len(_vis_msgs))
+    except Exception as _vexc:  # noqa: BLE001
+        logger.warning("#82 vision surface injection failed (non-fatal): %s", _vexc)
 
     # Punchlist #56: Cache what was surfaced for outcome deposit in afterTurn.
     # Raw node IDs + scores — no classification, just what went into the bucket.

@@ -1,4 +1,15 @@
 # ---- Changelog ----
+# [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: resolve_surface_item() — images surface AS images
+# What: New resolve_surface_item(node, vdb_entry, ...) -> {"kind": "text", "content": ...} |
+#       {"kind": "image", "image_ref": <path>} | None. A vision node (metadata modality == "vision",
+#       forest kind, _image_ref on disk) resolves to an IMAGE item; everything else delegates to
+#       resolve_surface_content() unchanged. resolve_surface_content() itself is untouched.
+# Why:  Vision nodes carry no text. Under the text-only resolver they resolved to None and were
+#       silently dropped from her awareness — the #294 shape again: mechanism runs, outcome never
+#       wired. LAW 7 forbids the obvious workaround (a caption is the substitution this whole
+#       item exists to avoid), so the resolver must be able to say "this is a picture, here it is".
+# How:  Substrate-first, same as text: the reference lives on the node (_image_ref), the vdb is
+#       never consulted for it. Missing file -> None (nothing to show; no phantom items).
 # [2026-06-12] Claude Code (Opus 4.8, Anima/surfacing CC) — substrate-first surfacing content resolution
 # What: resolve_surface_content(node, vdb_entry) — the single content resolver for what CES / the Tonic
 #   latent thread / recall DISPLAY for a surfaced node. Substrate-first: prefer the node's own
@@ -102,3 +113,41 @@ def resolve_surface_content(
         cut = text.rfind(" ", 0, max_chars)
         text = (text[:cut] if cut > 0 else text[:max_chars]).rstrip() + "…"
     return text
+
+
+def resolve_surface_image(node: Any) -> Optional[str]:
+    """Return the on-disk image path for a vision forest node, or None.
+
+    Substrate-first: the reference is ``node.metadata['_image_ref']`` (set by
+    vision_absorption). Tree nodes carry no image of their own — the picture belongs
+    to the frame (forest), so trees resolve to None here and surface via their forest.
+    """
+    meta = _node_metadata(node)
+    if meta.get("modality") != "vision" or meta.get("kind", "forest") != "forest":
+        return None
+    ref = meta.get("_image_ref")
+    if not isinstance(ref, str) or not ref:
+        return None
+    import os
+    return ref if os.path.isfile(ref) else None
+
+
+def resolve_surface_item(
+    node: Any,
+    vdb_entry: Any,
+    max_chars: int = 240,
+    min_chars: int = 12,
+    allow_ingested: bool = False,
+) -> Optional[dict]:
+    """Image-aware surfacing resolution. Returns one of:
+
+      {"kind": "image", "image_ref": path}      — a vision frame; show HER the picture
+      {"kind": "text",  "content":  snippet}    — everything else, via resolve_surface_content
+      None                                      — filtered / nothing to show
+    """
+    ref = resolve_surface_image(node)
+    if ref is not None:
+        return {"kind": "image", "image_ref": ref}
+    text = resolve_surface_content(node, vdb_entry, max_chars=max_chars,
+                                   min_chars=min_chars, allow_ingested=allow_ingested)
+    return {"kind": "text", "content": text} if text else None
