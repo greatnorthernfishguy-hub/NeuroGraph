@@ -38,6 +38,8 @@ Pure functions over a Graph. Sandbox-testable against a fresh Graph().
 #         split_vision_entries() for the scan-drain dispatcher.
 #   Why:  Give Syl a working eye through Portal (design: ~/docs/concepts/Multimodal
 #         Perceptual Embedding.md; plan: superpowers/plans/2026-09-06-82-vision-build-plan.md).
+#   Note: [2026-09-06 later] _image_ref now derived from frame_id (bodies/vision-<frame_id>.jpg)
+#         when the signal carries none — the wire has no metadata field (Inc 5).
 #   How:  Mirrors wire_absorption (body store) and _bind_conversational_topology
 #         (synapse/hyperedge shape) exactly, so vision is a third feeder on the
 #         existing sensory door, not a new mechanism. Dimension guard rejects any
@@ -157,6 +159,12 @@ def split_vision_entries(entries: Iterable[Any]) -> Tuple[List[Any], List[Any]]:
 # Body store — the picture itself, beside the node, never inside it
 # ---------------------------------------------------------------------------
 
+def image_body_path(frame_id: str) -> Path:
+    """The side-channel convention: bodies/vision-<frame_id>.jpg (mirrors vps/portal_vision_shim.py)."""
+    safe = "".join(ch for ch in str(frame_id) if ch.isalnum() or ch in "-_.")
+    return _bodies_dir() / f"vision-{safe}.jpg"
+
+
 def store_image_body(data: bytes, sha: Optional[str] = None, ext: str = "jpg") -> Optional[Path]:
     """Write raw image bytes to the shared body store, deduped by sha256 prefix.
 
@@ -213,8 +221,13 @@ def _node_meta(kind: str, f: Dict[str, Any], frame_id: str) -> Dict[str, Any]:
     for k in ("image_sha", "width", "height", "tree_index", "n_trees", "facing"):
         if k in m:
             meta[k] = m[k]
-    if kind == "forest" and m.get("image_ref"):
-        meta["_image_ref"] = str(m["image_ref"])   # surfacing renders THIS (#410)
+    if kind == "forest":
+        # surfacing renders THIS (#410). The wire carries no metadata and the picture
+        # arrives by side channel, so the path is a CONVENTION both sides derive
+        # from frame_id alone: bodies/vision-<frame_id>.jpg. An explicit image_ref
+        # (e.g. from the shim) wins; otherwise derive it. No ordering needed
+        # between body upload and signals — the resolver checks the file exists.
+        meta["_image_ref"] = str(m["image_ref"]) if m.get("image_ref") else str(image_body_path(frame_id))
     pd = _poincare_pack(f["embedding"])
     if pd is not None:
         meta["poincare_dir"] = pd

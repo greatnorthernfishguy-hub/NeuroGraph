@@ -60,6 +60,16 @@ class TestVisionAbsorption(unittest.TestCase):
         self.assertGreater(forest.voltage, 0.0)
         self.assertEqual(g.nodes[r["tree_ids"][0]].voltage, 0.0)
 
+    def test_image_ref_derived_from_frame_id_when_absent(self):
+        g = Graph()
+        entries = _frame("abc-123", n_trees=0)          # no image_ref in metadata
+        r = va.absorb_entries(g, entries)[0]
+        ref = g.nodes[r["forest_id"]].metadata["_image_ref"]
+        self.assertTrue(ref.endswith("/vision-abc-123.jpg"), ref)
+        self.assertEqual(str(va.image_body_path("abc-123")), ref)
+        # explicit wins
+        r2 = va.absorb_entries(Graph(), _frame("x", n_trees=0, image_ref="/explicit.jpg"))[0]
+
     def test_wrong_dimension_is_a_hard_reject(self):
         g = Graph()
         res = va.absorb_entries(g, _frame("bad", n_trees=1, dim=512))
