@@ -27,6 +27,16 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-06] Claude Code (DudeMan CC, Opus 5) — #55: pith_metrics readout (VPS half parity)
+# What: _handle_pith_metrics + _DISPATCH key "pith_metrics", mirroring cc-ng-daemon.py's.
+#   Pure read of cc_ng_organism._PITH_METRICS; adds prefetch_hit_rate (None when nothing
+#   was promoted) and prefetch_seeded off the CC's OWN TonicEngine.
+# Why: spec sec 6 demands a MEASURED number and snapshot() had no caller on either half.
+#   The laptop cannot take it (daemon is earlyoom-killed at ~2 GB, punchlist #409), so the
+#   VPS is the venue -- but its 5a gate is unset in the live process, so a restart is needed
+#   either way. Landing the getter NOW means that restart (whenever it happens, for whatever
+#   reason) is sufficient; otherwise Syl's shared 11 GB process would need a second one.
+# How: read-only handler, fail-soft, no new state. Reads CC's engine only, never Syl's.
 # [2026-09-05] Claude Code (DudeMan CC, Fable 5.1) — Pith Stage 4 (#55) phase 5b: prefetch seed (VPS CC half)
 # What: per-turn, idempotent engine.set_prefetch_seed(lambda: pith_prefetch_seed(_STATE.conv_state))
 #   on the CC's OWN TonicEngine, next to the existing tonic keepalive.
@@ -593,6 +603,40 @@ def _handle_ping(_data):
     return {"ok": True, "pong": True}
 
 
+def _handle_pith_metrics(_data):
+    """Read out cc_ng_organism._PITH_METRICS. Pure read -- no reset, no mutation.
+
+    Parity with the laptop daemon's 'pith_metrics' (cc-ng-daemon.py). Stage 4's
+    spec sec 6 def-of-done demands a MEASURED number, but PithMetrics.snapshot()
+    had no caller on either half -- the counters accumulated in process memory
+    and nothing could surface them. Landing the readout here (gated code is
+    already pulled) means the measurement becomes possible on whatever restart
+    happens next, instead of needing a restart of Syl's shared process just to
+    add a getter. #55.
+    """
+    try:
+        from cc_ng_organism import _PITH_METRICS
+        snap = _PITH_METRICS.snapshot()
+        promoted = snap.get("promoted_predicted", 0)
+        hits = snap.get("prefetch_hits", 0)
+        # None (not 0.0) when nothing was promoted, so an untouched gate reads as
+        # "no data" rather than a 0% hit rate.
+        snap["prefetch_hit_rate"] = (hits / promoted) if promoted else None
+        snap["gate_enabled"] = bool(os.environ.get("CC_PITH_PREFETCH_ENABLED", "0")
+                                    not in ("0", "false", "False", ""))
+        # 5b: seeds the Tonic actually primed, so "0% hit-rate" and "prefetch never
+        # ran" are distinguishable. CC's OWN engine only -- never Syl's.
+        try:
+            tt = getattr(_STATE.cc_ng, "_tonic_thread", None) if _STATE.cc_ng is not None else None
+            eng = getattr(tt, "_latent_engine", None) if tt is not None else None
+            snap["prefetch_seeded"] = eng.status.get("prefetch_seeded") if eng is not None else None
+        except Exception:
+            snap["prefetch_seeded"] = None
+        return {"ok": True, "pith": snap}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def _handle_status(_data):
     ng = _STATE.cc_ng
     tonic_info = {"enabled": False}
@@ -979,6 +1023,7 @@ def _handle_export_topology_frame(data):
 _DISPATCH = {
     "ping": _handle_ping,
     "status": _handle_status,
+    "pith_metrics": _handle_pith_metrics,
     "export": _handle_export,
     "import": _handle_import,
     "drain_conduit": _handle_drain_conduit,
