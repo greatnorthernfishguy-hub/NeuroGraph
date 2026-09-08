@@ -165,7 +165,9 @@
 #   is wrong! Has always been wrong, was never asked for." Fixing at the source (LAW 4).
 # How: the content is already on the node; embed it there. Costs a model call per unstamped
 #   node -- the old "zero model calls" property was bought with the wrong source.
-#   Also widens the text source: _forest_content OR want_text OR core_text. Looking only at
+#   Also widens the text source: a tree's own _concept first (trees share the parent's
+#   _forest_content -- sourcing that would collapse a whole forest's trees onto one
+#   identical direction), then _forest_content OR want_text OR core_text. Looking only at
 #   _forest_content meant 216 of the 217 unstamped nodes (182 cc:want:: + the Choice Clause)
 #   were skipped on every boot forever -- wants and the constitutional rim had NO geometry
 #   and were invisible to GSG proximity. A sweep that cannot converge is a repair loop, not
@@ -2778,7 +2780,16 @@ def cc_gsg_backfill(graph, vector_db=None) -> int:
             # skipped every boot forever, so wants and the rim had no geometry
             # and could not participate in GSG proximity at all.
             _md = node.metadata or {}
-            content = _md.get("_forest_content") or _md.get("want_text") or _md.get("core_text")
+            # ORDER MATTERS. A tree node carries BOTH its own `_concept` and the
+            # parent turn's `_forest_content` -- every tree under one forest shares
+            # the latter. Reading _forest_content first would embed the parent turn
+            # for all of them and collapse an entire forest's trees onto one
+            # identical direction, destroying the geometry the live deposit path
+            # builds correctly (verified on the VPS: sibling trees share
+            # _forest_content but have DIFFERENT poincare_dir). The tree's own
+            # concept is its own meaning, so it wins.
+            content = (_md.get("_concept") if _md.get("_tree_concept") else None) \
+                or _md.get("_forest_content") or _md.get("want_text") or _md.get("core_text")
             if not content:
                 continue
             try:
