@@ -164,8 +164,12 @@
 #   stamped nothing for any node the vdb had no row for. Josh, 2026-09-07: "Poincare via VDB
 #   is wrong! Has always been wrong, was never asked for." Fixing at the source (LAW 4).
 # How: the content is already on the node; embed it there. Costs a model call per unstamped
-#   node (217 on the laptop) -- the old "zero model calls" property was bought with the wrong
-#   source. Content-less nodes are skipped, as before.
+#   node -- the old "zero model calls" property was bought with the wrong source.
+#   Also widens the text source: _forest_content OR want_text OR core_text. Looking only at
+#   _forest_content meant 216 of the 217 unstamped nodes (182 cc:want:: + the Choice Clause)
+#   were skipped on every boot forever -- wants and the constitutional rim had NO geometry
+#   and were invisible to GSG proximity. A sweep that cannot converge is a repair loop, not
+#   a backfill (Josh, 2026-09-07, on the word doing quiet work in the wrong direction).
 # [2026-09-06] Claude Code (DudeMan CC, Opus 5) — #400: pack poincare_dir on the CC half
 # What: writers store compact float32 bytes via pack_poincare_dir (fresh stamp at the
 #   conversational-node path, and cc_gsg_backfill); readers decode via poincare_dir_array;
@@ -2766,8 +2770,15 @@ def cc_gsg_backfill(graph, vector_db=None) -> int:
                     except Exception:
                         pass
                 continue
-            # SNN-native source: the node's own content, embedded here. No vdb.
-            content = (node.metadata or {}).get("_forest_content")
+            # SNN-native source: the node's own text, embedded here. No vdb.
+            # A node's text does not always live in _forest_content -- a want
+            # carries want_text, a constitutional rim node carries core_text.
+            # Looking only at _forest_content is why this never converged: 216
+            # of the 217 unstamped nodes (182 wants + the Choice Clause) were
+            # skipped every boot forever, so wants and the rim had no geometry
+            # and could not participate in GSG proximity at all.
+            _md = node.metadata or {}
+            content = _md.get("_forest_content") or _md.get("want_text") or _md.get("core_text")
             if not content:
                 continue
             try:
