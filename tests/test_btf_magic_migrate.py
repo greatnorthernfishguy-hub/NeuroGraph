@@ -244,5 +244,43 @@ class TestStreamingPath(unittest.TestCase):
             self.assertEqual(p.read_bytes(), tb, "original restored byte-for-byte")
 
 
+class TestVerifierIsWheelIndependent(unittest.TestCase):
+    """The verifier must not report correctly-converted files as broken just
+    because the LOCAL wheel cannot read canonical BT. That is the exact blind
+    spot this migration exists to fix, and it bit the verifier on the VPS:
+    14 good files were reported 'corrected buffer yields 2454 items, expected
+    576 entries' purely because the TB-lineage reader chunked BT into raw bytes."""
+
+    def setUp(self):
+        M._BT_READER = None
+
+    def tearDown(self):
+        M._BT_READER = None
+
+    def test_verify_passes_when_local_reader_cannot_read_bt(self):
+        orig = b"".join(_bt_entry(target=f"t{i}", seed=i) for i in range(4))
+        tb = _to_tb(orig)
+        fixed, _, conv = M.correct(tb)
+        self.assertEqual(conv, 4)
+        M._BT_READER = False                       # simulate a pre-fix wheel
+        self.assertIsNone(M.verify(tb, fixed), "must not fail on a wheel that cannot read BT")
+
+    def test_structural_checks_still_bite_with_a_blind_reader(self):
+        orig = _bt_entry()
+        tb = _to_tb(orig)
+        M._BT_READER = False
+        tampered = bytearray(M.correct(tb)[0])
+        tampered[100] ^= 0xFF                      # a byte outside any magic field
+        self.assertIsNotNone(M.verify(tb, bytes(tampered)), "payload tampering must still fail")
+        self.assertIsNotNone(M.verify(tb, bytes(tampered)[:-1]), "length change must still fail")
+
+    def test_decode_check_still_runs_on_a_capable_reader(self):
+        orig = _bt_entry()
+        tb = _to_tb(orig)
+        fixed, _, _ = M.correct(tb)
+        M._BT_READER = True
+        self.assertIsNone(M.verify(tb, fixed))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

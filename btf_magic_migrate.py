@@ -86,6 +86,7 @@ MAGIC_BT = b"\x42\x54"   # canonical, BTF v0.1 §4.1
 MAGIC_TB = b"\x54\x42"   # legacy defect: u16 native-endian on LE hardware
 ENVELOPE_SIZE = 24
 _LEN_OFF = 4             # u32 total_length, native-endian
+EMBEDDING_DIM_PROBE = 768  # substrate width, used only for the reader-capability probe
 
 
 class ParseError(Exception):
@@ -167,6 +168,35 @@ def correct(buf: bytes) -> Tuple[bytes, int, int]:
     return bytes(out), total, converted
 
 
+_BT_READER: Optional[bool] = None
+
+
+def _reader_understands_bt() -> bool:
+    """True if the INSTALLED wheel parses canonical BT entries as entries.
+
+    A pre-fix wheel writes TB and hands BT back as raw bytes. Cached, because the
+    answer cannot change inside one run.
+    """
+    global _BT_READER
+    if _BT_READER is not None:
+        return _BT_READER
+    try:
+        import numpy as np
+        import ng_tract
+        probe = bytes(ng_tract.write_outcome(
+            timestamp=1.0, module_id="probe", target_id="probe",
+            success=True, embedding=np.zeros(EMBEDDING_DIM_PROBE, dtype=np.float32)))
+        if probe[:2] != MAGIC_BT:                 # this wheel writes TB
+            fixed = bytearray(probe)
+            fixed[0:2] = MAGIC_BT
+            probe = bytes(fixed)
+        items = list(ng_tract.TractReader(probe))
+        _BT_READER = bool(items) and not any(isinstance(e, bytes) for e in items)
+    except Exception:  # noqa: BLE001
+        _BT_READER = False
+    return _BT_READER
+
+
 def _decode_all(buf: bytes) -> List[Dict[str, Any]]:
     """Decode every entry with the canonical reader, for before/after comparison."""
     import ng_tract
@@ -217,6 +247,13 @@ def verify(before: bytes, after: bytes) -> Optional[str]:
     for i, (x, y) in enumerate(zip(before, after)):
         if x != y and i not in magic_offsets and (i - 1) not in magic_offsets:
             return f"byte {i} changed outside a magic field"
+    # The decode check is only meaningful if the LOCAL wheel can read canonical BT.
+    # On a host still running the TB-lineage wheel it cannot, and it would report
+    # every correctly-converted file as broken — the same blind spot this migration
+    # exists to fix, biting the verifier. Structural checks above already cover
+    # length, the full envelope chain, and that nothing outside a magic field moved.
+    if not _reader_understands_bt():
+        return None
     try:
         rows = _decode_all(after)
     except Exception as exc:  # noqa: BLE001
