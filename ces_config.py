@@ -14,12 +14,19 @@ Usage::
     cfg = load_ces_config()
 
     # With overrides
-    cfg = load_ces_config({"streaming": {"ollama_model": "mxbai-embed-large"}})
+    cfg = load_ces_config({"streaming": {"chunk_size": 100}})
 
     # From JSON file
     cfg = load_ces_config(config_path="~/.neurograph/ces.json")
 
 # ---- Changelog ----
+# [2026-09-08] Cursor Agent — Drop dead Ollama streaming fields and unused SurfacingConfig.format
+#   What: Removed StreamingConfig.ollama_model / ollama_url / ollama_check_interval
+#         (StreamParser embeds via ng_embed only since 2026-04-21) and SurfacingConfig.format
+#         (nothing reads it; format_context() is the only formatter). Usage example now
+#         overrides a live field (chunk_size).
+#   Why:  Nightly audit area 1 — confirmed-dead leftovers. Subtraction only.
+#   How:  Field deletion + docstring example fix. load_ces_config() still ignores unknown keys.
 # [2026-03-25] Claude (Opus 4.6) — Salience weights in SurfacingConfig (SVG Phase 3)
 #   What: Added weight_voltage, weight_excitability, weight_he_membership to
 #         SurfacingConfig. Bootstrap defaults match original hardcoded 0.5/0.3/0.2.
@@ -53,14 +60,11 @@ logger = logging.getLogger("neurograph.ces")
 class StreamingConfig:
     """Configuration for the StreamParser module."""
 
-    ollama_model: str = "nomic-embed-text"
-    ollama_url: str = "http://localhost:11434"
     chunk_size: int = 50
     overlap: int = 10
     nudge_strength: float = 0.15
     similarity_threshold: float = 0.6
     max_queue: int = 1000
-    ollama_check_interval: float = 60.0
 
 
 @dataclass
@@ -71,7 +75,6 @@ class SurfacingConfig:
     min_confidence: float = 0.3
     max_surfaced: int = 5
     decay_rate: float = 0.95
-    format: str = "context_block"
     include_metadata: bool = True
     queue_capacity: int = 50
 

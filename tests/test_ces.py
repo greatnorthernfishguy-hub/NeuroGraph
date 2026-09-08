@@ -17,6 +17,13 @@ Covers:
 #   word-snap / hard cut now pin the new contract (long content renders WHOLE, no ellipsis),
 #   and are renamed to say so. No other test in this file changes.
 # Why:  Exec P468 / Josh: surfaced items render whole at the source.
+# [2026-09-08] Cursor Agent — Drop Ollama-only CES tests and config assertions
+#   What: Removed _check_ollama / _ollama_available probes. Rewrote embedder tests
+#         to match StreamParser's ng_embed-only path. Config defaults no longer
+#         assert deleted ollama_* fields.
+#   Why:  Nightly audit area 1 — those methods were removed from stream_parser.py
+#         on 2026-04-21. Keep real CES tests green.
+#   How:  Delete one test; rewrite two; swap two default-field assertions.
 # [2026-03-26] Claude Code Opus — Punchlist #102: Fix stale tests from embedding migration
 # What: Updated test dimensions from 384→768 to match current embedding pipeline
 # Why: Punchlist #102 — tests obsoleted by snowflake-arctic-embed-m-v1.5 migration
@@ -167,7 +174,6 @@ def vector_db(graph):
 class TestCESConfigDefaults:
     def test_default_streaming(self):
         cfg = load_ces_config()
-        assert cfg.streaming.ollama_model == "nomic-embed-text"
         assert cfg.streaming.chunk_size == 50
         assert cfg.streaming.overlap == 10
         assert cfg.streaming.nudge_strength == 0.15
@@ -197,7 +203,7 @@ class TestCESConfigOverrides:
         assert cfg.streaming.chunk_size == 100
         assert cfg.streaming.overlap == 20
         # Other defaults preserved
-        assert cfg.streaming.ollama_model == "nomic-embed-text"
+        assert cfg.streaming.nudge_strength == 0.15
 
     def test_override_surfacing(self):
         cfg = load_ces_config({"surfacing": {"max_surfaced": 20}})
@@ -388,7 +394,7 @@ class TestStreamParserLifecycle:
 
         ces_config.streaming.chunk_size = 3
         ces_config.streaming.overlap = 0
-        # Use fallback embedder since Ollama won't be available
+        # ng_embed is passed via fallback_embedder (parameter name is historical)
         def fake_embed(text):
             np.random.seed(hash(text) % 2**31)
             return np.random.randn(64).astype(np.float32)
@@ -406,24 +412,7 @@ class TestStreamParserLifecycle:
 
 
 class TestStreamParserEmbedding:
-    def test_ollama_check_caches_result(self, graph, vector_db, ces_config):
-        from stream_parser import StreamParser
-
-        parser = StreamParser(graph, vector_db, ces_config)
-        try:
-            # First check (will fail since no Ollama)
-            result1 = parser._check_ollama()
-            parser._ollama_last_check = time.time()
-
-            # Second check should use cache
-            result2 = parser._check_ollama()
-            assert result1 == result2
-        finally:
-            parser.stop()
-
-    def test_fallback_embedder_used_when_ollama_unavailable(
-        self, graph, vector_db, ces_config
-    ):
+    def test_embedder_is_used(self, graph, vector_db, ces_config):
         from stream_parser import StreamParser
 
         called = {"count": 0}
@@ -436,23 +425,19 @@ class TestStreamParserEmbedding:
             graph, vector_db, ces_config, fallback_embedder=fake_embed
         )
         try:
-            parser._ollama_available = False
             result = parser._embed_chunk("test text")
             assert result is not None
             assert called["count"] == 1
         finally:
             parser.stop()
 
-    def test_no_embedding_when_no_fallback(self, graph, vector_db, ces_config):
+    def test_no_embedding_when_no_embedder(self, graph, vector_db, ces_config):
         from stream_parser import StreamParser
 
         parser = StreamParser(graph, vector_db, ces_config, fallback_embedder=None)
         try:
-            parser._ollama_available = False
             result = parser._embed_chunk("test text")
-            # After embedding migration, ng_embed provides a 768-dim fallback
-            assert result is not None
-            assert len(result) == 768
+            assert result is None
         finally:
             parser.stop()
 

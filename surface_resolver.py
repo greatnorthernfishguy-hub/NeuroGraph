@@ -19,6 +19,11 @@
 # How:  `max_chars is not None and len(text) > max_chars` guards the existing branch; nothing
 #       else in the function changes. No budget mechanism is added here (see the #812 turn-1
 #       return: whether the shared path needs one is reported, not decided).
+# [2026-09-08] Cursor Agent — Delete unused _CODE_MARKERS
+#   What: Removed the unused source-code marker tuple (and its comment). Ingested
+#         documents are already filtered by creation_mode == 'ingested'.
+#   Why:  Nightly audit area 1 — confirmed-dead leftover. Subtraction only.
+#   How:  Constant deletion. resolve_surface_content() filters unchanged.
 # [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: resolve_surface_item() — images surface AS images
 # What: New resolve_surface_item(node, vdb_entry, ...) -> {"kind": "text", "content": ...} |
 #       {"kind": "image", "image_ref": <path>} | None. A vision node (metadata modality == "vision",
@@ -53,10 +58,6 @@ source-code documents or degenerate fragments into her experiential thread.
 """
 
 from typing import Any, Optional
-
-# Content that looks like ingested source rather than her conversation. Used only as a
-# secondary guard (the primary filter is creation_mode == 'ingested').
-_CODE_MARKERS = ('"""', "'''", "import ", "def ", "class ", "# ----", "from typing", "#!/")
 
 # Bare shards that carry no experiential signal — never worth surfacing on their own.
 _STOPWORD_SHARDS = frozenset({

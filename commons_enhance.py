@@ -2,6 +2,12 @@
 Commons enhance-loop (leg 2) — NG salience-gated scoop → SNN-enhance → return.
 
 # ---- Changelog ----
+# [2026-09-08] Cursor Agent — Delete unused _related_existing / _extract_enhancement_nodes
+#   What: Removed two leftover helpers from the pre-perception enhance path.
+#         Seeds now come from _seed_fn / _seeds_from_knowledge; salt is harvested
+#         from prime_and_propagate fired_entries, not 1-hop/hyperedge extraction.
+#   Why:  Nightly audit area 1 — confirmed-dead leftovers. Subtraction only.
+#   How:  Method deletion. Live injectables and sandbox defaults unchanged.
 # [2026-06-24] Claude Code (Opus 4.8) — leg-2 go-live (part b): seed/assoc resolvers injectable
 # What: Added seed_fn + assoc_fn injectables (alongside the existing novelty_fn). _enhance_one now
 #       resolves seeds and content-addresses through them. Defaults reproduce the sandbox _knowledge
@@ -140,13 +146,6 @@ class CommonsEnhancer:
         emb = np.asarray(embedding, dtype=np.float32)
         return max(0.0, 1.0 - max(_cos(emb, k) for k, _, _ in self._knowledge))
 
-    def _related_existing(self, embedding: np.ndarray, top: int = 3) -> List[Tuple[np.ndarray, str]]:
-        """Existing knowledge the content should bind with — (embedding, content_id), most-similar first."""
-        emb = np.asarray(embedding, dtype=np.float32)
-        scored = [(_cos(emb, k), k, cid) for k, _, cid in self._knowledge]
-        scored.sort(key=lambda t: t[0], reverse=True)
-        return [(k, cid) for s, k, cid in scored if s >= _RELATED_SIM][:top]
-
     # ---- default seed/assoc resolvers (sandbox _knowledge map; live overrides via injectables) ----
     def _seeds_from_knowledge(self, embedding: np.ndarray) -> List[Tuple[str, str]]:
         """Seeds = the ≤3 existing-knowledge nodes most similar (≥_RELATED_SIM) to the deposit.
@@ -162,23 +161,6 @@ class CommonsEnhancer:
         """A fired SNN node → its content-address. Sandbox: node.metadata['cid']; live = vector_db."""
         node = self.graph.nodes.get(node_id)
         return node.metadata.get("cid") if (node is not None and node.metadata) else None
-
-    # ---- §4 return scope: 1-hop synapse neighbors + direct hyperedge co-members (SNN node ids) ----
-    def _extract_enhancement_nodes(self, content_nid: str) -> Tuple[set, set]:
-        one_hop = set()
-        for sid in self.graph._outgoing.get(content_nid, set()):
-            syn = self.graph.synapses.get(sid)
-            if syn is not None:
-                one_hop.add(syn.post_node_id)
-        for sid in self.graph._incoming.get(content_nid, set()):
-            syn = self.graph.synapses.get(sid)
-            if syn is not None:
-                one_hop.add(syn.pre_node_id)
-        co_members = set()
-        for he in self.graph.get_hyperedges(content_nid):
-            co_members |= set(he.member_nodes)
-        co_members.discard(content_nid)
-        return one_hop, co_members
 
     # ---- the per-cycle PERCEPTION enhance (§3 (A) realized as read-only spreading activation) ----
     def _enhance_one(self, embedding: np.ndarray, content_id: str) -> Dict[str, Any]:
