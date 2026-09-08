@@ -23,6 +23,11 @@ Intentional divergences from NuWave source:
     is referenced in the source)
 
 # ---- Changelog ----
+# [2026-09-08] Cursor Agent — Remove unread KISSConfig.skip_unchanged_system
+#   What: Deleted skip_unchanged_system and the comment that only documented it.
+#         The delta gate in filter_context() is always on — the flag was never read.
+#   Why:  Nightly audit area 1 — confirmed-dead leftover. Subtraction only.
+#   How:  Field deletion. System-hash skip behavior unchanged.
 # [2026-04-16] Claude Code (Sonnet 4.6) — Port from NuWave
 #   What: Faithful port of KISSFilter, KISSConfig, KISSStats from
 #         /home/josh/NuWave/nuwave/kiss/filter.py.
@@ -60,9 +65,6 @@ class KISSConfig:
 
     # Force full context refresh every N turns (GOP boundary)
     force_full_every: int = 20
-
-    # System context: skip if unchanged from last turn
-    skip_unchanged_system: bool = True
 
 
 @dataclass

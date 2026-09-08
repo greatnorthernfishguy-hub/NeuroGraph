@@ -2,6 +2,13 @@
 The Commons — shared substrate medium for peer-module communication.
 
 # ---- Changelog ----
+# [2026-09-08] Cursor Agent — Docstrings match live persist/restore wiring
+#   What: Module docstring no longer claims persist()/restore() are unwired POC
+#         hooks. Suppression-map comment no longer implies process-lifetime is
+#         sandbox-only. No persist wiring added — callers already exist.
+#   Why:  Nightly audit area 1 — lying docs. persist()/restore() have been wired
+#         into neurograph_rpc.py bootstrap / auto-save / shutdown since #332.
+#   How:  Docstring-only. Durable suppression persist remains #368 (out of scope).
 # [2026-07-21] Claude Code (Sonnet 5) — #80 wire → Commons: _evict_old_wire() lifecycle carve-out
 #   What: New _WIRE_KEEP_PER_DIR env-configurable window (LAW 5) + _evict_old_wire(), mirroring
 #         _evict_old_metrics/_evict_old_errors's shape and recency logic. deposit() gets a new
@@ -94,9 +101,10 @@ Tiers:
     Tier 3 (NeuroGraph present):   NeuroGraph is the ocean; the Commons mechanism is the
                                    Tier-2 stand-in. (Tier-3 wiring is a separate step.)
 
-Reference-counted survival (Tier 2, future): the Commons lives while >=1 member holds it;
+Reference-counted survival (Tier 2): the Commons lives while >=1 member holds it;
 disk-persisted for full-herd-death recovery; first member creates, rest attach. persist()/
-restore() below are the hooks for that — not yet wired into a lifecycle (POC scope).
+restore() are wired into neurograph_rpc.py bootstrap (restore) plus auto-save and
+shutdown (persist). The suppression map is still process-lifetime (#368).
 """
 
 from __future__ import annotations
@@ -152,7 +160,7 @@ class Commons:
         # #366: reversible suppression map — target_id -> "hard" | "soft". The reversible counterpart
         # to Cricket's frozen Rim, honored at the extraction boundary (see changelog). "hard" = gone
         # from both buckets; "soft" = muted from proactive bucket_recent but still semantically
-        # reachable via bucket(). Process-lifetime only in the sandbox; durable persistence is #368.
+        # reachable via bucket(). Process-lifetime only (live and sandbox); durable persistence is #368.
         self._suppressed: Dict[str, str] = {}
         logger.info("Commons medium initialized (bare NG-Lite)")
 
