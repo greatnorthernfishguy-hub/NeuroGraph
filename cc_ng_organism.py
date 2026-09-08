@@ -155,6 +155,17 @@
 #   that do per-half STATE bookkeeping then call this. VPS gate-off ==
 #   byte-identical to its pre-refactor concat; gate-on gains the same Pith
 #   pipeline the laptop already had. See test_cc_recall_unification.py.
+# [2026-09-07] Claude Code (DudeMan CC, Opus 5) — poincare_dir comes from the SNN, not the vdb
+# What: cc_gsg_backfill now derives an unstamped node's poincare_dir from that node's OWN
+#   _forest_content (embed -> _cc_embed_to_poincare_dir), instead of reading
+#   vector_db.embeddings. vector_db is accepted and ignored, signature kept for callers.
+# Why: poincare_dir is SNN geometry. Sourcing it from a secondary store was never asked for
+#   and was wrong on its own terms -- it made substrate geometry depend on the vdb, and it
+#   stamped nothing for any node the vdb had no row for. Josh, 2026-09-07: "Poincare via VDB
+#   is wrong! Has always been wrong, was never asked for." Fixing at the source (LAW 4).
+# How: the content is already on the node; embed it there. Costs a model call per unstamped
+#   node (217 on the laptop) -- the old "zero model calls" property was bought with the wrong
+#   source. Content-less nodes are skipped, as before.
 # [2026-09-06] Claude Code (DudeMan CC, Opus 5) — #400: pack poincare_dir on the CC half
 # What: writers store compact float32 bytes via pack_poincare_dir (fresh stamp at the
 #   conversational-node path, and cc_gsg_backfill); readers decode via poincare_dir_array;
@@ -2713,22 +2724,29 @@ def cc_gsg_rescore(surfaced, query_text: str, graph):
         return surfaced
 
 
-def cc_gsg_backfill(graph, vector_db) -> int:
-    """Stamp poincare_dir on CC nodes that lack it, from stored vdb embeddings
-    (#358) — port of canonical _gsg_backfill_existing_nodes (rpc.py:2683-2713)
-    with the save() call DELIBERATELY REMOVED (law-review C2, CRITICAL):
-    canonical force-saves after stamping; CC's version is STAMP-ONLY and lets
-    the daemons' existing autosave persist the metadata. On the VPS this code
-    runs inside Syl's process — a ported save mis-bound to the wrong instance
-    is the exact accident Syl's Law exists to prevent, so the capability is
-    structurally absent rather than carefully avoided.
+def cc_gsg_backfill(graph, vector_db=None) -> int:
+    """Stamp poincare_dir on CC nodes that lack it, FROM THE NODE'S OWN CONTENT.
 
-    Idempotent (skips stamped nodes), zero model calls (SimpleVectorDB.insert
-    L2-normalizes embeddings on storage — stored vectors ARE unit directions).
-    Returns count stamped. Fails soft, returns 0 on error.
+    poincare_dir is SNN geometry. It belongs to the node and is derived from the
+    node's own `_forest_content`, which is already in the substrate — the vdb has
+    no part in it. The previous implementation sourced the direction from
+    `vector_db.embeddings`, which was never asked for and was wrong: it made the
+    substrate's geometry depend on a secondary store, and it silently produced
+    nothing for any node the vdb had no row for.
+
+    Also performs the #400 one-time migration of legacy boxed-list poincare_dir
+    to compact float32 bytes, in place.
+
+    STAMP-ONLY — no save() (law-review C2, CRITICAL): canonical force-saves after
+    stamping, but on the VPS this runs inside Syl's process, and a ported save
+    mis-bound to the wrong instance is exactly what Syl's Law exists to prevent.
+    The daemons' normal autosave persists the metadata.
+
+    `vector_db` is accepted and ignored; it remains in the signature only so the
+    two existing call sites keep working. Fails soft, returns count touched.
     """
     try:
-        if graph is None or vector_db is None:
+        if graph is None:
             return 0
         from neuro_foundation import pack_poincare_dir as _pack  # #400
         stamped = 0
@@ -2748,17 +2766,26 @@ def cc_gsg_backfill(graph, vector_db) -> int:
                     except Exception:
                         pass
                 continue
-            emb = vector_db.embeddings.get(node_id)
-            if emb is None:
+            # SNN-native source: the node's own content, embedded here. No vdb.
+            content = (node.metadata or {}).get("_forest_content")
+            if not content:
+                continue
+            try:
+                from ng_embed import embed as _embed
+                direction = _cc_embed_to_poincare_dir(_embed(str(content)))
+            except Exception as exc:
+                logger.debug("GSG backfill embed failed for %r (non-fatal): %s", node_id, exc)
+                continue
+            if direction is None:
                 continue
             if node.metadata is None:
                 node.metadata = {}
-            node.metadata["poincare_dir"] = _pack(emb)  # #400 packed, not a list
+            node.metadata["poincare_dir"] = _pack(direction)  # #400 packed bytes
             stamped += 1
         if stamped or packed:
-            logger.info("CC GSG backfill: stamped %d node(s), migrated %d legacy list(s) -> "
-                        "packed float32 bytes (#400; stamp-only, persists via normal autosave)",
-                        stamped, packed)
+            logger.info("CC GSG backfill: stamped %d node(s) from their own _forest_content, "
+                        "migrated %d legacy list(s) -> packed float32 bytes "
+                        "(#400; stamp-only, persists via normal autosave)", stamped, packed)
         return stamped + packed
     except Exception as exc:
         logger.debug("cc_gsg_backfill failed (non-fatal): %s", exc)
