@@ -155,8 +155,16 @@
 #   that do per-half STATE bookkeeping then call this. VPS gate-off ==
 #   byte-identical to its pre-refactor concat; gate-on gains the same Pith
 #   pipeline the laptop already had. See test_cc_recall_unification.py.
+# [2026-09-07] Claude Code (DudeMan CC, Opus 5) — rename: cc_gsg_backfill -> cc_stamp_missing_geometry
+# What: renamed at the def and both call sites (cc_ng_host, cc-ng-daemon).
+# Why: "backfill" presupposes a settled forward path being retro-applied, which is why
+#   nobody audited where it got its values -- it read as janitorial. It was backfilling the
+#   SNN (target correct), but the #400 list->bytes migration is the only part that is
+#   actually a backfill; stamping geometry that never existed is origination, and this
+#   sweep runs at every daemon init forever without converging. A repair loop is not a
+#   backfill. Josh's observation, 2026-09-07.
 # [2026-09-07] Claude Code (DudeMan CC, Opus 5) — poincare_dir comes from the SNN, not the vdb
-# What: cc_gsg_backfill now derives an unstamped node's poincare_dir from that node's OWN
+# What: cc_stamp_missing_geometry now derives an unstamped node's poincare_dir from that node's OWN
 #   _forest_content (embed -> _cc_embed_to_poincare_dir), instead of reading
 #   vector_db.embeddings. vector_db is accepted and ignored, signature kept for callers.
 # Why: poincare_dir is SNN geometry. Sourcing it from a secondary store was never asked for
@@ -174,10 +182,10 @@
 #   a backfill (Josh, 2026-09-07, on the word doing quiet work in the wrong direction).
 # [2026-09-06] Claude Code (DudeMan CC, Opus 5) — #400: pack poincare_dir on the CC half
 # What: writers store compact float32 bytes via pack_poincare_dir (fresh stamp at the
-#   conversational-node path, and cc_gsg_backfill); readers decode via poincare_dir_array;
-#   cc_gsg_backfill gains the one-time legacy-list -> bytes migration and reports it.
+#   conversational-node path, and cc_stamp_missing_geometry); readers decode via poincare_dir_array;
+#   cc_stamp_missing_geometry gains the one-time legacy-list -> bytes migration and reports it.
 # Why: #400 landed the helpers and canonical's _gsg_backfill_existing_nodes migration, but
-#   the CC half never got either -- cc_gsg_backfill skipped any node that already had a
+#   the CC half never got either -- cc_stamp_missing_geometry skipped any node that already had a
 #   poincare_dir regardless of form, and stamped new ones with .tolist(). Laptop checkpoint
 #   verified still 100% boxed lists: 5,991 nodes x ~24 KB = ~147 MB that should be ~18 MB.
 #   Feeds #412 (daemon RSS -> earlyoom -> #411).
@@ -401,7 +409,7 @@
 #   must resume, not plain-extend).
 # [2026-07-07] Claude Code (Fable 5) — Retrieval-enrichment extraction (#358)
 # What: cc_novelty (pull-based MMN EMA), cc_anticipate (#256 port),
-#   cc_gsg_rescore + _cc_poincare_distance + cc_gsg_backfill (GSG surfacing
+#   cc_gsg_rescore + _cc_poincare_distance + cc_stamp_missing_geometry (GSG surfacing
 #   port, stamp-only backfill), cc_pattern_completion_recall rebuilt on
 #   _harvest_associations spreading activation. Constants copied verbatim
 #   from neurograph_rpc.py (C5 — test-pinned in test_cc_retrieval_enrichment).
@@ -2730,7 +2738,7 @@ def cc_gsg_rescore(surfaced, query_text: str, graph):
         return surfaced
 
 
-def cc_gsg_backfill(graph, vector_db=None) -> int:
+def cc_stamp_missing_geometry(graph, vector_db=None) -> int:
     """Stamp poincare_dir on CC nodes that lack it, FROM THE NODE'S OWN CONTENT.
 
     poincare_dir is SNN geometry. It belongs to the node and is derived from the
@@ -2810,7 +2818,7 @@ def cc_gsg_backfill(graph, vector_db=None) -> int:
                         "(#400; stamp-only, persists via normal autosave)", stamped, packed)
         return stamped + packed
     except Exception as exc:
-        logger.debug("cc_gsg_backfill failed (non-fatal): %s", exc)
+        logger.debug("cc_stamp_missing_geometry failed (non-fatal): %s", exc)
         return 0
 
 

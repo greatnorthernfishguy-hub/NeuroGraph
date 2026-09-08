@@ -27,6 +27,16 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-07] Claude Code (DudeMan CC, Opus 5) — #413: close the Ingestor door in _deposit()
+# What: _deposit() calls cc_ng_organism.run_conversational_dual_pass() instead of
+#   ng.on_message(). Parity with the laptop daemon's same-day fix. The _recent_spikes read
+#   and discover_hyperedges() below are untouched -- the dual-pass fires nodes the same way.
+# Why: on_message() IS the Universal Ingestor ("Stage 1-5: Extract -> Chunk -> Embed ->
+#   Register"), so every turn through _deposit was chunked as a document. #294 Task A
+#   (78a76ea) built the ingestor-free path and the tract drain uses it; this was the old
+#   door nobody closed. Laptop evidence: 6,141 chunked entries / 252 MB of subagent payloads.
+# How: LAW 3 repair in place, same lock discipline. Touches the CC half only -- Syl's
+#   _memory and neurograph_rpc deposit path are not in this file and are unchanged.
 # [2026-09-06] Claude Code (DudeMan CC, Opus 5) — #55: pith_metrics readout (VPS half parity)
 # What: _handle_pith_metrics + _DISPATCH key "pith_metrics", mirroring cc-ng-daemon.py's.
 #   Pure read of cc_ng_organism._PITH_METRICS; adds prefetch_hit_rate (None when nothing
@@ -179,7 +189,7 @@ were confirmed before this module was enabled.
 # [2026-07-07] Claude Code (Fable 5) — #358 retrieval-enrichment wiring
 # What: _recall() passes _STATE.conv_state into cc_pattern_completion_recall
 #   (novelty EMA + primed-node bonus now live); init_cc_host() runs the
-#   stamp-only cc_gsg_backfill after organism bootstrap.
+#   stamp-only cc_stamp_missing_geometry after organism bootstrap.
 # Why: #358 — CC recall rebuilt substrate-native in cc_ng_organism.py; the
 #   daemons carry only state plumbing. Spec: docs/superpowers/specs/
 #   2026-07-07-cc-retrieval-enrichment-design.md (law-review C1/C2/C4).
@@ -463,9 +473,19 @@ def _deposit(text: str) -> None:
         return
     with _STATE.stats_lock:
         _STATE.stats["deposits"] += 1
+    # #413 / #294 Task A: the CONVERSATIONAL path, not the Universal Ingestor.
+    # ng.on_message() is the document pipeline (its own docstring: "Stage 1-5:
+    # Extract -> Chunk -> Embed -> Register") and chunked every turn as if it
+    # were a document. #294 Task A built the ingestor-free path in June and the
+    # tract drain uses it; this call site was the old door left standing. The
+    # dual-pass fires nodes the same way, so the _recent_spikes read and the
+    # hyperedge discovery below are unchanged.
     try:
+        from cc_ng_organism import run_conversational_dual_pass
+        from ng_embed import embed as _embed
         with ng.graph._concurrent_lock:
-            ng.on_message(text)
+            run_conversational_dual_pass(
+                ng.graph, getattr(ng, "vector_db", None), text, _embed(text), _STATE.conv_state)
             fired = [
                 nid for nid, spikes in ng.graph._recent_spikes.items()
                 if spikes and spikes[-1] == ng.graph.timestep
@@ -1404,8 +1424,8 @@ def init_cc_host() -> bool:
         _STATE.trisyn_manager = bootstrap_trisynaptic(
             cc_ng, _STATE.concept_queue, instance_tag="cc-vps")
         _STATE.commons = get_cc_commons(CC_NG_WORKSPACE)
-        from cc_ng_organism import cc_gsg_backfill
-        _stamped = cc_gsg_backfill(cc_ng.graph, cc_ng.vector_db)
+        from cc_ng_organism import cc_stamp_missing_geometry
+        _stamped = cc_stamp_missing_geometry(cc_ng.graph, cc_ng.vector_db)
         if _stamped:
             logger.info("CC GSG backfill at init: %d nodes stamped (persists via autosave)", _stamped)
     except Exception:
