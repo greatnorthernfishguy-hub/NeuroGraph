@@ -23,6 +23,15 @@ Environment:
 
 from __future__ import annotations
 
+# ---- Changelog ----
+# [2026-09-08] Cursor Grok — Nightly audit area 2: drop deleted ng_peer_bridge.py
+# What: Replaced MANIFEST entry ng_peer_bridge.py with ng_tract_bridge.py + ng_embed.py.
+# Why: ng_peer_bridge.py is gone; skill deploy still listed it. GUI fallback already
+#   copies tract_bridge + embed. commons_eco / salience_gate belong in the updater
+#   vendored set (other modules), not this OpenClaw skill MANIFEST.
+# How: One MANIFEST swap. Matching test_patch fixture updated.
+# -------------------
+
 import argparse
 import hashlib
 import json
@@ -53,8 +62,10 @@ MANIFEST = [
     # Phase 6: NG-Lite lightweight learning substrate + bridge
     ("ng_lite.py",             ["skill:ng_lite.py"], False),
     ("ng_bridge.py",           ["skill:ng_bridge.py"], False),
-    # Phase 7: Peer bridge + ET Module Manager
-    ("ng_peer_bridge.py",      ["skill:ng_peer_bridge.py"], False),
+    # Phase 7: Tract bridge + embed + ET Module Manager
+    # (ng_peer_bridge.py deleted 2026-06-03 — do not restore)
+    ("ng_tract_bridge.py",     ["skill:ng_tract_bridge.py"], False),
+    ("ng_embed.py",            ["skill:ng_embed.py"], False),
     ("et_modules/__init__.py", ["skill:et_modules/__init__.py"], False),
     ("et_modules/manager.py",  ["skill:et_modules/manager.py"], False),
     ("et_module.json",         ["skill:et_module.json"], False),

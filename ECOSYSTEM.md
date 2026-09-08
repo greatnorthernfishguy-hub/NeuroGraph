@@ -154,7 +154,7 @@ Write-mode spreading activation means her exploration strengthens pathways — t
 leaves traces. The ouroboros loop (graph → CES → context window → ingestor → graph)
 is self-sustaining. PRD: `~/docs/prd/The_Tonic_PRD_v0.1.md`.
 
-NeuroGraph is also the **canonical source** for the six vendored files that every
+NeuroGraph is also the **canonical source** for the vendored files that every
 other module copies. It is the DNA of the organism — when it changes, every cell
 receives the update.
 
@@ -460,8 +460,8 @@ tract files. Other modules drain their incoming tracts and absorb relevant event
 scored by cosine similarity. Relevance is determined by the *receiving* module's
 substrate — not by the sender's intent.
 
-**Implementation:** `ng_tract_bridge.py` (v0.3, per-pair directional tracts).
-Legacy `ng_peer_bridge.py` (JSONL broadcast) retained as fallback until v1.0.
+**Implementation:** `ng_tract_bridge.py` (v0.3+, per-pair directional tracts).
+`ng_peer_bridge.py` (JSONL broadcast) was deleted 2026-06-03 — do not restore.
 Tract files live at `~/.et_modules/tracts/<module>/<peer>.tract`.
 
 The River does not carry messages. It carries topology changes. Nobody sends
@@ -551,17 +551,23 @@ causal chains, forms predictions, and experiences surprise when predictions fail
 
 ## The Vendored Files
 
-Six files are copied verbatim from NeuroGraph canonical into every module. They are
+These files are copied verbatim from NeuroGraph canonical into every module. They are
 the shared nervous tissue — the substrate must be identical across the organism.
 
 | File | What It Is |
 |------|-----------|
 | `ng_lite.py` | The substrate. Hebbian learning, nodes, synapses, step cycle. |
 | `ng_tract_bridge.py` | The River. Per-pair directional tracts (v0.3+). |
-| `ng_peer_bridge.py` | Legacy River. JSONL broadcast. Retained until v1.0. |
 | `ng_ecosystem.py` | Tier management. Handles Tier 1→2→3 progression. |
 | `ng_autonomic.py` | The hormonal system. Organism-wide arousal state. |
 | `openclaw_adapter.py` | OpenClaw skill interface. Base class for all module hooks. |
+| `ng_embed.py` | Centralized embedding + dual-pass. |
+| `ng_commons_eco.py` | Commons-backed get_context/record_outcome adapter. |
+| `ng_salience_gate.py` | Salience-gated telemetry deposit. |
+| `ng_updater.py` | Auto-update + re-sync of the above from canonical. |
+
+`ng_bridge.py` (`NGSaaSBridge`) is NeuroGraph-only (Tier 3 SaaS) and is **not** vendored.
+`ng_peer_bridge.py` was deleted 2026-06-03 — do not restore.
 
 **These are sacred.** Changes happen at the canonical source (NeuroGraph) and
 re-vendor to all modules simultaneously. A module running a different version of
@@ -682,7 +688,7 @@ The River's transport mechanism is evolving:
 | v0.3 | Per-pair directional tracts, NGBridge interface, vendored | **Done** (2026-03-20) |
 | v0.4 | Myelination — use-dependent transport upgrade (file→mmap) | Planned |
 | v0.5 | Vagus nerve — dedicated autonomic tract, permanently myelinated | Planned |
-| v1.0 | Full cutover — ng_peer_bridge.py deprecated | Planned |
+| v1.0 | JSONL peer bridge deleted (`ng_peer_bridge.py` gone 2026-06-03) | **Done** (file removed; tract-only) |
 
 ### What Myelination Actually Means
 
