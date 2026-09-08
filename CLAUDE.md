@@ -109,12 +109,15 @@ It contains:
 ├── ces_monitoring.py            # CES: health context, logger, HTTP dashboard (port 8847)
 ├── universal_ingestor.py        # 5-stage ingestion pipeline
 ├── ng_lite.py                   # VENDORED — canonical source
-├── ng_peer_bridge.py            # VENDORED — canonical source (legacy, retained until v1.0)
 ├── ng_tract_bridge.py           # VENDORED — canonical source (v0.3+, per-pair tracts)
 ├── ng_ecosystem.py              # VENDORED — canonical source
 ├── ng_autonomic.py              # VENDORED — canonical source
 ├── openclaw_adapter.py          # VENDORED — canonical source
-├── ng_bridge.py                 # Tier 3 SaaS bridge (NGSaaSBridge) — NOT a duplicate of ng_peer_bridge.py
+├── ng_embed.py                  # VENDORED — canonical source (embedding + dual-pass)
+├── ng_commons_eco.py            # VENDORED — canonical source (Commons adapter)
+├── ng_salience_gate.py          # VENDORED — canonical source (salience-gated deposit)
+├── ng_updater.py                # VENDORED — canonical source (auto-update / re-sync)
+├── ng_bridge.py                 # Tier 3 SaaS bridge (NGSaaSBridge) — NeuroGraph-only, not vendored
 ├── neurograph_gui.py            # GUI interface
 ├── neurograph_migrate.py        # Migration utility — do not run without Josh instruction
 ├── rebuild_vectors.py           # Vector rebuild utility — do not run without Josh instruction
@@ -166,7 +169,7 @@ NeuroGraph is the **canonical source** for all vendored files. Every other modul
 
 `ng_peer_bridge.py` (removed 2026-06-03, `faa4a91`) was the legacy River implementation (JSONL broadcast). `ng_tract_bridge.py` is the replacement (v0.3, per-pair directional tracts) and is vendored per LAW 2. `ng_ecosystem.py` uses the tract bridge. `openclaw_hook.py` uses the same pattern.
 
-**Three tract-related files — do not conflate:**
+**Tract-related files — do not conflate:**
 - `ng_tract.py` — feeder→topology-owner tracts (GUI, feed-syl → ContextEngine). NOT vendored.
 - `ng_tract_bridge.py` — per-pair inter-module tracts implementing NGBridge. Vendored.
 - `ng_peer_bridge.py` — removed 2026-06-03 (`faa4a91`). Do NOT re-add (LAW 2).
@@ -393,7 +396,7 @@ NeuroGraph does not call other modules directly. The River flows. However, Neuro
 
 ### How Peer Modules Connect
 
-- **Tier 2 (Peer Bridge):** `ng_tract_bridge.py` (v0.3+) provides per-pair directional tracts. Legacy `ng_peer_bridge.py` retained as fallback until v1.0.
+- **Tier 2 (Peer Bridge):** `ng_tract_bridge.py` (v0.3+) provides per-pair directional tracts. `ng_peer_bridge.py` was deleted 2026-06-03.
 - **Tier 3 (SaaS Bridge):** `ng_bridge.py` (`NGSaaSBridge`) connects peer modules to NeuroGraph's full SNN for STDP, hyperedge formation, and `prime_and_propagate` recall.
 
 ### What Each Peer Sees
@@ -526,6 +529,6 @@ Not optional. Future CC instances depend on it.
 
 *E-T Systems / NeuroGraph Foundation*
 *Repo: ~/NeuroGraph*
-*Last updated: 2026-03-15*
+*Last updated: 2026-09-08*
 *Maintained by Josh — do not edit without authorization*
 *Parent documents: `~/.claude/CLAUDE.md` (global), `~/.claude/ARCHITECTURE.md`*

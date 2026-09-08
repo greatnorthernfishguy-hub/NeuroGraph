@@ -37,6 +37,14 @@ Grok Review Changelog (v0.7.1):
 #   ng_lite_state.json) via _fetch_ng_lite_state instead of json-loading the .json.
 # Why: NG-Lite saves are msgpack only (Josh 2026-10-13); the .json is retired to .json.legacy-json on first load.
 # How: msgpack.unpackb, read-only; same dict shape as before.
+# [2026-09-08] Cursor Grok — Nightly audit area 2: drop deleted ng_peer_bridge.py
+# What: Removed ng_peer_bridge.py from skill-copy fallback and _VENDORED_FILES.
+#   [2026-11-22 DudeMan CC, landing this branch (#1249)] the branch also ADDED ng_commons_eco.py,
+#   ng_salience_gate.py, ng_updater.py to _VENDORED_FILES; that part is NOT landed here: widening the vendored
+#   lists waits for the re-vendor stage (Josh 2026-11-22: laptop working first, then re-vendor).
+# Why: File is gone; GUI was still hashing/copying a ghost. Inventory now matches
+#   live vendored modules. ng_bridge.py stays off the list (NeuroGraph-only SaaS).
+# How: List edits only. No new packaging.
 # -------------------
 """
 
@@ -677,8 +685,9 @@ class GitUpdater:
             "openclaw_hook.py", "neurograph_migrate.py", "neurograph_gui.py",
             # Phase 6: NG-Lite + bridge
             "ng_lite.py", "ng_bridge.py",
-            # Phase 7: Peer bridge + ET Module Manager
-            "ng_peer_bridge.py", "ng_tract_bridge.py", "ng_embed.py", "et_module.json",
+            # Phase 7: Tract bridge + ET Module Manager
+            # (ng_peer_bridge.py deleted 2026-06-03 — do not restore)
+            "ng_tract_bridge.py", "ng_embed.py", "et_module.json",
             "et_modules/__init__.py", "et_modules/manager.py",
         ]
         patched = 0
@@ -715,10 +724,11 @@ class GitUpdater:
 # 4. ModuleRegistry, VendoredFileStalenessChecker, VendoredFileSyncer, EcosystemRestarter
 # ---------------------------------------------------------------------------
 
+# Canonical vendored set. ng_peer_bridge.py deleted 2026-06-03 — do not restore.
+# ng_bridge.py is NeuroGraph-only (Tier 3 SaaS) and is intentionally not vendored.
 _VENDORED_FILES: List[str] = [
     "ng_lite.py",
     "ng_tract_bridge.py",
-    "ng_peer_bridge.py",
     "ng_ecosystem.py",
     "openclaw_adapter.py",
     "ng_autonomic.py",

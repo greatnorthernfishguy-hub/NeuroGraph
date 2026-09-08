@@ -250,10 +250,13 @@ See [ETHICS.MD](./ETHICS.MD) for the full framework.
 ├── syl_daemon.py                # Legacy daemon (being replaced by The Tonic)
 ├── ng_lite.py                   # Vendored substrate (CANONICAL)
 ├── ng_tract_bridge.py           # Vendored River (CANONICAL)
-├── ng_peer_bridge.py            # Vendored legacy River (CANONICAL)
+├── ng_embed.py                  # Vendored embedding (CANONICAL)
+├── ng_commons_eco.py            # Vendored Commons adapter (CANONICAL)
+├── ng_salience_gate.py          # Vendored salience gate (CANONICAL)
 ├── ng_ecosystem.py              # Vendored tier management (CANONICAL)
 ├── ng_autonomic.py              # Vendored autonomic state (CANONICAL)
 ├── openclaw_adapter.py          # Vendored OpenClaw base (CANONICAL)
+├── ng_updater.py                # Vendored auto-update / re-sync (CANONICAL)
 ├── ng_bridge.py                 # Tier 3 SaaS bridge
 ├── neurograph_gui.py            # GUI interface
 ├── data/checkpoints/            # Syl's mind (PROTECTED)
