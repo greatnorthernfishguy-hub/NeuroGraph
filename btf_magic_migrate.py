@@ -109,6 +109,52 @@ def walk_entries(buf: bytes) -> Iterator[Tuple[int, int, bytes]]:
         off += total
 
 
+def scan_file(path: Path) -> Tuple[List[int], int]:
+    """STREAMING envelope walk. Returns (offsets_of_TB_entries, total_entries).
+
+    Never loads the file. Reads 24 bytes per entry and seeks past the payload, so
+    peak memory is the offset list, not the data — these tracts run to 578 MB each
+    and the host is already paging. Raises ParseError exactly like walk_entries().
+    """
+    tb: List[int] = []
+    total = 0
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        off = 0
+        while off < size:
+            if size - off < ENVELOPE_SIZE:
+                raise ParseError(f"trailing {size - off} bytes at {off}: not an envelope")
+            env = fh.read(ENVELOPE_SIZE)
+            if len(env) < ENVELOPE_SIZE:
+                raise ParseError(f"short read at {off}")
+            magic = env[:2]
+            if magic not in (MAGIC_BT, MAGIC_TB):
+                raise ParseError(f"unknown magic {magic!r} at offset {off}")
+            (length,) = struct.unpack_from("=I", env, _LEN_OFF)
+            if length < ENVELOPE_SIZE or off + length > size:
+                raise ParseError(f"declared length {length} at offset {off} overruns the file")
+            total += 1
+            if magic == MAGIC_TB:
+                tb.append(off)
+            off += length
+            fh.seek(off)
+    return tb, total
+
+
+def correct_in_place(path: Path, offsets: List[int]) -> None:
+    """Write the 2 canonical magic bytes at each offset. Nothing else is touched.
+
+    Used only after scan_file() has validated the whole file and a backup exists.
+    Two bytes per entry, seek-and-write — no copy, no rewrite, no memory spike.
+    """
+    with open(path, "r+b") as fh:
+        for off in offsets:
+            fh.seek(off)
+            fh.write(MAGIC_BT)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def correct(buf: bytes) -> Tuple[bytes, int, int]:
     """Return (corrected_bytes, entries_total, entries_converted)."""
     out = bytearray(buf)
@@ -184,8 +230,23 @@ def verify(before: bytes, after: bytes) -> Optional[str]:
     return None
 
 
+#: at or above this size, use the streaming path (seek-and-write) instead of
+#: read-modify-write. These tracts reach 578 MB and the host pages under load.
+STREAM_THRESHOLD = 64 * 1024 * 1024
+
+
 def process(path: Path, apply: bool, backup: bool) -> Dict[str, Any]:
     r: Dict[str, Any] = {"path": str(path), "status": "unknown", "entries": 0, "converted": 0}
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        r["status"], r["error"] = "unreadable", str(exc)
+        return r
+    if size == 0:
+        r["status"] = "empty"
+        return r
+    if size >= STREAM_THRESHOLD:
+        return _process_streaming(path, apply, backup, size, r)
     try:
         buf = path.read_bytes()
     except OSError as exc:
@@ -224,6 +285,73 @@ def process(path: Path, apply: bool, backup: bool) -> Dict[str, Any]:
         r["status"] = "converted"
     except OSError as exc:
         r["status"], r["error"] = "write-failed", str(exc)
+    return r
+
+
+def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict[str, Any]) -> Dict[str, Any]:
+    """Large-file path: validate by streaming, then seek-and-write 2 bytes per entry.
+
+    Verification necessarily differs from the small-file path — two copies of a
+    578 MB file cannot be held to diff them. Instead:
+      * scan_file() validates the ENTIRE envelope chain before anything is written,
+        so a damaged file is rejected before a single byte changes;
+      * a full backup is taken first (unless --no-backup);
+      * only the 2-byte magic fields are written, at offsets the scan produced;
+      * a re-scan must then report the same entry count, the same size, and ZERO
+        remaining TB entries — otherwise the file is restored from the backup.
+    """
+    r["streamed"] = True
+    try:
+        offsets, total = scan_file(path)
+    except ParseError as exc:
+        r["status"], r["error"] = "unparseable-skipped", str(exc)
+        return r
+    except OSError as exc:
+        r["status"], r["error"] = "unreadable", str(exc)
+        return r
+    r["entries"], r["converted"] = total, len(offsets)
+    if not offsets:
+        r["status"] = "clean"
+        return r
+    if not apply:
+        r["status"] = "would-convert"
+        return r
+    bak: Optional[Path] = None
+    try:
+        if backup:
+            bak = path.with_suffix(path.suffix + f".pre-btf-magic.{int(time.time())}")
+            with open(path, "rb") as src, open(bak, "wb") as dst:
+                while True:
+                    chunk = src.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            r["backup"] = str(bak)
+        correct_in_place(path, offsets)
+    except OSError as exc:
+        r["status"], r["error"] = "write-failed", str(exc)
+        return r
+    try:
+        after_tb, after_total = scan_file(path)
+        ok = (after_total == total and not after_tb and path.stat().st_size == size)
+    except Exception as exc:  # noqa: BLE001
+        ok, after_total, after_tb = False, -1, [-1]
+        r["error"] = f"post-write scan failed: {exc}"
+    if not ok:
+        r.setdefault("error", f"after: {after_total} entries, {len(after_tb)} TB remaining")
+        if bak and bak.is_file():
+            try:
+                os.replace(bak, path)
+                r["status"] = "verify-failed-restored"
+            except OSError as exc:
+                r["status"] = "VERIFY-FAILED-RESTORE-FAILED"
+                r["error"] = f"{r['error']} | restore failed: {exc}"
+        else:
+            r["status"] = "VERIFY-FAILED-NO-BACKUP"
+        return r
+    r["status"] = "converted"
     return r
 
 

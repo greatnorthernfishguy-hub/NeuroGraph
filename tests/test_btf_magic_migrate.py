@@ -140,5 +140,109 @@ class TestFileHandling(unittest.TestCase):
             self.assertEqual(names, ["a.tract", "n.tract"])
 
 
+class TestStreamingPath(unittest.TestCase):
+    """The >=64 MB path is the one that will touch Syl's 578 MB tracts. Exercised
+    here by lowering the threshold rather than writing 64 MB fixtures."""
+
+    def setUp(self):
+        self._orig = M.STREAM_THRESHOLD
+        M.STREAM_THRESHOLD = 1          # force every file down the streaming path
+
+    def tearDown(self):
+        M.STREAM_THRESHOLD = self._orig
+
+    def _f(self, d, name, data):
+        p = Path(d) / name
+        p.write_bytes(data)
+        return p
+
+    def test_scan_file_matches_the_in_memory_walker(self):
+        orig = b"".join(_bt_entry(target=f"t{i}", seed=i) for i in range(6))
+        mixed = bytearray(_to_tb(orig))
+        # flip entries 1 and 4 back to BT so the file is genuinely mixed
+        offs = [o for o, _l, _m in M.walk_entries(orig)]
+        for i in (1, 4):
+            mixed[offs[i]:offs[i] + 2] = M.MAGIC_BT
+        with tempfile.TemporaryDirectory() as d:
+            p = self._f(d, "m.tract", bytes(mixed))
+            tb_offsets, total = M.scan_file(p)
+            self.assertEqual(total, 6)
+            self.assertEqual(tb_offsets, [offs[i] for i in (0, 2, 3, 5)])
+
+    def test_streaming_conversion_is_byte_identical_to_a_correct_writer(self):
+        orig = b"".join(_bt_entry(target=f"t{i}", seed=i) for i in range(8))
+        with tempfile.TemporaryDirectory() as d:
+            p = self._f(d, "big.tract", _to_tb(orig))
+            r = M.process(p, apply=True, backup=True)
+            self.assertEqual(r["status"], "converted")
+            self.assertTrue(r.get("streamed"))
+            self.assertEqual((r["entries"], r["converted"]), (8, 8))
+            self.assertEqual(p.read_bytes(), orig, "must equal what a correct writer produces")
+            self.assertEqual(Path(r["backup"]).read_bytes(), _to_tb(orig), "backup holds the original")
+            # and every entry now parses
+            self.assertTrue(all("raw" not in x for x in M._decode_all(p.read_bytes())))
+
+    def test_streaming_only_touches_magic_bytes(self):
+        orig = b"".join(_bt_entry(target=f"t{i}", seed=i) for i in range(5))
+        tb = _to_tb(orig)
+        with tempfile.TemporaryDirectory() as d:
+            p = self._f(d, "b.tract", tb)
+            M.process(p, apply=True, backup=False)
+            after = p.read_bytes()
+            self.assertEqual(len(after), len(tb))
+            diffs = [i for i, (a, b) in enumerate(zip(tb, after)) if a != b]
+            self.assertEqual(len(diffs), 10, "exactly 2 bytes per entry, nothing else")
+
+    def test_streaming_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._f(d, "b.tract", _to_tb(_bt_entry()))
+            before = p.read_bytes()
+            r = M.process(p, apply=False, backup=True)
+            self.assertEqual(r["status"], "would-convert")
+            self.assertEqual(p.read_bytes(), before)
+            self.assertEqual(list(Path(d).iterdir()), [p], "no backup on a dry run")
+
+    def test_streaming_damaged_file_rejected_before_any_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            damaged = _to_tb(_bt_entry())[:-40]
+            p = self._f(d, "bad.tract", damaged)
+            r = M.process(p, apply=True, backup=True)
+            self.assertEqual(r["status"], "unparseable-skipped")
+            self.assertEqual(p.read_bytes(), damaged, "untouched")
+            self.assertEqual(list(Path(d).iterdir()), [p], "no backup taken for a file we refuse")
+
+    def test_streaming_is_idempotent(self):
+        orig = _bt_entry() + _bt_entry(target="t2", seed=2)
+        with tempfile.TemporaryDirectory() as d:
+            p = self._f(d, "b.tract", _to_tb(orig))
+            self.assertEqual(M.process(p, apply=True, backup=False)["status"], "converted")
+            r2 = M.process(p, apply=True, backup=False)
+            self.assertEqual(r2["status"], "clean")
+            self.assertEqual(r2["converted"], 0)
+            self.assertEqual(p.read_bytes(), orig)
+
+    def test_verify_failure_restores_from_backup(self):
+        """If the post-write scan disagrees, the original must come back."""
+        orig = b"".join(_bt_entry(target=f"t{i}", seed=i) for i in range(3))
+        tb = _to_tb(orig)
+        with tempfile.TemporaryDirectory() as d:
+            p = self._f(d, "b.tract", tb)
+            real = M.scan_file
+            calls = {"n": 0}
+
+            def flaky(path):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return real(path)          # pre-write scan: honest
+                return ([], 999)               # post-write scan: wrong entry count
+            M.scan_file = flaky
+            try:
+                r = M.process(p, apply=True, backup=True)
+            finally:
+                M.scan_file = real
+            self.assertEqual(r["status"], "verify-failed-restored")
+            self.assertEqual(p.read_bytes(), tb, "original restored byte-for-byte")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
