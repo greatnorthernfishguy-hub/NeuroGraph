@@ -165,7 +165,8 @@ class TestStreamingPath(unittest.TestCase):
             mixed[offs[i]:offs[i] + 2] = M.MAGIC_BT
         with tempfile.TemporaryDirectory() as d:
             p = self._f(d, "m.tract", bytes(mixed))
-            tb_offsets, total = M.scan_file(p)
+            tb_offsets, total, wounds = M.scan_file(p)
+            self.assertEqual(wounds, [])
             self.assertEqual(total, 6)
             self.assertEqual(tb_offsets, [offs[i] for i in (0, 2, 3, 5)])
 
@@ -230,11 +231,11 @@ class TestStreamingPath(unittest.TestCase):
             real = M.scan_file
             calls = {"n": 0}
 
-            def flaky(path):
+            def flaky(path, resync=False):
                 calls["n"] += 1
                 if calls["n"] == 1:
-                    return real(path)          # pre-write scan: honest
-                return ([], 999)               # post-write scan: wrong entry count
+                    return real(path, resync)  # pre-write scan: honest
+                return ([], 999, [])           # post-write scan: wrong entry count
             M.scan_file = flaky
             try:
                 r = M.process(p, apply=True, backup=True)
@@ -320,9 +321,9 @@ class TestReapBackup(unittest.TestCase):
         real = M.scan_file
         calls = {"n": 0}
 
-        def flaky(path):
+        def flaky(path, resync=False):
             calls["n"] += 1
-            return real(path) if calls["n"] == 1 else ([], 999)
+            return real(path, resync) if calls["n"] == 1 else ([], 999, [])
         try:
             orig = _bt_entry() + _bt_entry(target="t2", seed=2)
             tb = _to_tb(orig)
@@ -336,6 +337,84 @@ class TestReapBackup(unittest.TestCase):
         finally:
             M.scan_file = real
             M.STREAM_THRESHOLD = self._orig
+
+
+class TestResync(unittest.TestCase):
+    """Syl's condensate/neurograph.tract carries a 452-byte torn record at offset
+    32,656,000 with 1.58 GB of healthy entries after it. Refusing the whole file
+    for one wound was the wrong trade."""
+
+    def setUp(self):
+        self._orig, M.STREAM_THRESHOLD = M.STREAM_THRESHOLD, 1
+
+    def tearDown(self):
+        M.STREAM_THRESHOLD = self._orig
+
+    def _wounded(self, n_before=3, gap=452, n_after=4):
+        head = b"".join(_bt_entry(target=f"h{i}", seed=i) for i in range(n_before))
+        tail = b"".join(_bt_entry(target=f"t{i}", seed=100 + i) for i in range(n_after))
+        return _to_tb(head) + b"\x00" * gap + _to_tb(tail), len(head), gap
+
+    def test_without_resync_the_file_is_refused_untouched(self):
+        data, _, _ = self._wounded()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "w.tract"
+            p.write_bytes(data)
+            r = M.process(p, apply=True, backup=True, resync=False)
+            self.assertEqual(r["status"], "unparseable-skipped")
+            self.assertEqual(p.read_bytes(), data, "untouched")
+
+    def test_resync_converts_both_sides_and_leaves_the_wound_alone(self):
+        data, head_len, gap = self._wounded()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "w.tract"
+            p.write_bytes(data)
+            r = M.process(p, apply=True, backup=True, resync=True)
+            self.assertEqual(r["status"], "converted")
+            self.assertEqual(r["entries"], 7, "3 before + 4 after")
+            self.assertEqual(r["converted"], 7)
+            self.assertEqual(r["wounds"], [{"start": head_len, "bytes": gap}])
+            after = p.read_bytes()
+            self.assertEqual(len(after), len(data))
+            self.assertEqual(after[head_len:head_len + gap], b"\x00" * gap,
+                             "the wound must be bit-for-bit untouched")
+            self.assertEqual(after[:head_len].count(M.MAGIC_TB), 0)
+            tb_left, total, wounds = M.scan_file(p, resync=True)
+            self.assertEqual((tb_left, total), ([], 7))
+
+    def test_resync_only_changes_magic_bytes(self):
+        data, _, _ = self._wounded()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "w.tract"
+            p.write_bytes(data)
+            M.process(p, apply=True, backup=False, resync=True)
+            after = p.read_bytes()
+            diffs = [i for i, (a, b) in enumerate(zip(data, after)) if a != b]
+            self.assertEqual(len(diffs), 14, "2 bytes x 7 entries, nothing else")
+
+    def test_a_stray_magic_inside_a_payload_is_not_mistaken_for_a_boundary(self):
+        """The confirm-by-chaining rule is what makes resync safe."""
+        head = _bt_entry(target="h", seed=1)
+        # a payload containing the literal bytes 'BT' followed by junk
+        poison = _bt_entry(target="p", seed=2)
+        tail = _bt_entry(target="t", seed=3)
+        data = _to_tb(head) + b"\x00" * 300 + _to_tb(poison + tail)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "w.tract"
+            p.write_bytes(data)
+            r = M.process(p, apply=True, backup=False, resync=True)
+            self.assertEqual(r["status"], "converted")
+            self.assertEqual(r["entries"], 3)
+            self.assertEqual(r["wounds"], [{"start": len(head), "bytes": 300}])
+
+    def test_dry_run_with_resync_writes_nothing(self):
+        data, _, _ = self._wounded()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "w.tract"
+            p.write_bytes(data)
+            r = M.process(p, apply=False, backup=True, resync=True)
+            self.assertEqual(r["status"], "would-convert")
+            self.assertEqual(p.read_bytes(), data)
 
 
 if __name__ == "__main__":

@@ -110,36 +110,97 @@ def walk_entries(buf: bytes) -> Iterator[Tuple[int, int, bytes]]:
         off += total
 
 
-def scan_file(path: Path) -> Tuple[List[int], int]:
-    """STREAMING envelope walk. Returns (offsets_of_TB_entries, total_entries).
+#: an entry is ~3 KB; this bounds what we will believe a length field says
+MAX_ENTRY = 64 << 20
+
+
+def _envelope_at(fh, off: int, size: int) -> Optional[int]:
+    """Return the entry length if a well-formed envelope starts at `off`, else None."""
+    if size - off < ENVELOPE_SIZE:
+        return None
+    fh.seek(off)
+    env = fh.read(ENVELOPE_SIZE)
+    if len(env) < ENVELOPE_SIZE or env[:2] not in (MAGIC_BT, MAGIC_TB):
+        return None
+    (length,) = struct.unpack_from("=I", env, _LEN_OFF)
+    if length < ENVELOPE_SIZE or length > MAX_ENTRY or off + length > size:
+        return None
+    return length
+
+
+def _find_next_entry(fh, start: int, size: int) -> Optional[Tuple[int, int]]:
+    """Scan forward from `start` for the next CONFIRMED entry boundary.
+
+    A candidate counts only if its envelope is well-formed AND it chains — either
+    it ends exactly at EOF, or another well-formed envelope begins where it ends.
+    That two-step rule is what stops a stray 'BT' inside a payload from being
+    mistaken for a record boundary. Returns (offset, length) or None.
+    """
+    CH = 1 << 20
+    off = start
+    while off < size:
+        fh.seek(off)
+        blk = fh.read(CH + 1)
+        if not blk:
+            return None
+        i = 0
+        while True:
+            j = min((k for k in (blk.find(MAGIC_BT, i), blk.find(MAGIC_TB, i)) if k >= 0), default=-1)
+            if j < 0:
+                break
+            cand = off + j
+            length = _envelope_at(fh, cand, size)
+            if length is not None:
+                nxt = cand + length
+                if nxt == size or _envelope_at(fh, nxt, size) is not None:
+                    return cand, length
+            i = j + 1
+        off += CH
+
+
+def scan_file(path: Path, resync: bool = False) -> Tuple[List[int], int, List[Tuple[int, int]]]:
+    """STREAMING envelope walk. Returns (TB offsets, total entries, wounds).
 
     Never loads the file. Reads 24 bytes per entry and seeks past the payload, so
     peak memory is the offset list, not the data — these tracts run to 578 MB each
-    and the host is already paging. Raises ParseError exactly like walk_entries().
+    and the host is already paging.
+
+    With resync=False this raises ParseError on the first malformed envelope, as
+    before. With resync=True a malformed region is skipped to the next CONFIRMED
+    entry boundary and recorded as a wound (start, end). Wounds are never read,
+    written, or moved — they are reported and stepped over, so one torn record
+    costs one record instead of the whole file.
     """
     tb: List[int] = []
+    wounds: List[Tuple[int, int]] = []
     total = 0
     size = path.stat().st_size
     with open(path, "rb") as fh:
         off = 0
         while off < size:
-            if size - off < ENVELOPE_SIZE:
-                raise ParseError(f"trailing {size - off} bytes at {off}: not an envelope")
-            env = fh.read(ENVELOPE_SIZE)
-            if len(env) < ENVELOPE_SIZE:
-                raise ParseError(f"short read at {off}")
-            magic = env[:2]
-            if magic not in (MAGIC_BT, MAGIC_TB):
-                raise ParseError(f"unknown magic {magic!r} at offset {off}")
-            (length,) = struct.unpack_from("=I", env, _LEN_OFF)
-            if length < ENVELOPE_SIZE or off + length > size:
-                raise ParseError(f"declared length {length} at offset {off} overruns the file")
+            length = _envelope_at(fh, off, size)
+            if length is None:
+                if not resync:
+                    if size - off < ENVELOPE_SIZE:
+                        raise ParseError(f"trailing {size - off} bytes at {off}: not an envelope")
+                    fh.seek(off)
+                    magic = fh.read(2)
+                    if magic not in (MAGIC_BT, MAGIC_TB):
+                        raise ParseError(f"unknown magic {magic!r} at offset {off}")
+                    raise ParseError(f"bad entry length at offset {off}")
+                nxt = _find_next_entry(fh, off + 1, size)
+                if nxt is None:
+                    wounds.append((off, size))
+                    break
+                wounds.append((off, nxt[0]))
+                off, length = nxt
+            fh.seek(off)
+            magic = fh.read(2)
             total += 1
             if magic == MAGIC_TB:
                 tb.append(off)
             off += length
-            fh.seek(off)
-    return tb, total
+    return tb, total, wounds
 
 
 def correct_in_place(path: Path, offsets: List[int]) -> None:
@@ -272,7 +333,7 @@ def verify(before: bytes, after: bytes) -> Optional[str]:
 STREAM_THRESHOLD = 64 * 1024 * 1024
 
 
-def process(path: Path, apply: bool, backup: bool, reap: bool = False) -> Dict[str, Any]:
+def process(path: Path, apply: bool, backup: bool, reap: bool = False, resync: bool = False) -> Dict[str, Any]:
     r: Dict[str, Any] = {"path": str(path), "status": "unknown", "entries": 0, "converted": 0}
     try:
         size = path.stat().st_size
@@ -283,7 +344,7 @@ def process(path: Path, apply: bool, backup: bool, reap: bool = False) -> Dict[s
         r["status"] = "empty"
         return r
     if size >= STREAM_THRESHOLD:
-        return _process_streaming(path, apply, backup, size, r, reap)
+        return _process_streaming(path, apply, backup, size, r, reap, resync)
     try:
         buf = path.read_bytes()
     except OSError as exc:
@@ -333,7 +394,7 @@ def process(path: Path, apply: bool, backup: bool, reap: bool = False) -> Dict[s
     return r
 
 
-def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict[str, Any], reap: bool = False) -> Dict[str, Any]:
+def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict[str, Any], reap: bool = False, resync: bool = False) -> Dict[str, Any]:
     """Large-file path: validate by streaming, then seek-and-write 2 bytes per entry.
 
     Verification necessarily differs from the small-file path — two copies of a
@@ -347,7 +408,7 @@ def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict
     """
     r["streamed"] = True
     try:
-        offsets, total = scan_file(path)
+        offsets, total, wounds = scan_file(path, resync)
     except ParseError as exc:
         r["status"], r["error"] = "unparseable-skipped", str(exc)
         return r
@@ -355,6 +416,8 @@ def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict
         r["status"], r["error"] = "unreadable", str(exc)
         return r
     r["entries"], r["converted"] = total, len(offsets)
+    if wounds:
+        r["wounds"] = [{"start": a, "bytes": b - a} for a, b in wounds]
     if not offsets:
         r["status"] = "clean"
         return r
@@ -379,8 +442,9 @@ def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict
         r["status"], r["error"] = "write-failed", str(exc)
         return r
     try:
-        after_tb, after_total = scan_file(path)
-        ok = (after_total == total and not after_tb and path.stat().st_size == size)
+        after_tb, after_total, after_wounds = scan_file(path, resync)
+        ok = (after_total == total and not after_tb
+              and path.stat().st_size == size and after_wounds == wounds)
     except Exception as exc:  # noqa: BLE001
         ok, after_total, after_tb = False, -1, [-1]
         r["error"] = f"post-write scan failed: {exc}"
@@ -425,12 +489,15 @@ def main(argv=None) -> int:
     ap.add_argument("--apply", action="store_true", help="actually write (default is a dry run)")
     ap.add_argument("--no-backup", action="store_true", help="skip .pre-btf-magic backups")
     ap.add_argument("--json", action="store_true", help="machine-readable report")
+    ap.add_argument("--resync", action="store_true",
+                    help="step over a torn/zeroed region to the next confirmed entry instead of "
+                         "refusing the file; wounds are reported and never modified")
     ap.add_argument("--reap-backup", action="store_true",
                     help="delete each backup once that file has verified — bounds peak disk to one file")
     a = ap.parse_args(argv)
 
     files = gather(a.paths)
-    results = [process(f, a.apply, not a.no_backup, a.reap_backup) for f in files]
+    results = [process(f, a.apply, not a.no_backup, a.reap_backup, a.resync) for f in files]
 
     if a.json:
         print(json.dumps({"apply": a.apply, "files": results}, indent=2))
