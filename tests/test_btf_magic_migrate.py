@@ -282,5 +282,61 @@ class TestVerifierIsWheelIndependent(unittest.TestCase):
         self.assertIsNone(M.verify(tb, fixed))
 
 
+class TestReapBackup(unittest.TestCase):
+    """--reap-backup bounds peak disk to one file. The host is at 96%; 27 files
+    of backups would need 5.94 GB against 8 GB free."""
+
+    def _f(self, d, name, data):
+        p = Path(d) / name
+        p.write_bytes(data)
+        return p
+
+    def test_small_file_backup_reaped_only_after_success(self):
+        orig = _bt_entry()
+        with tempfile.TemporaryDirectory() as d:
+            p = self._f(d, "a.tract", _to_tb(orig))
+            r = M.process(p, apply=True, backup=True, reap=True)
+            self.assertEqual(r["status"], "converted")
+            self.assertTrue(r.get("backup_reaped"))
+            self.assertEqual(p.read_bytes(), orig)
+            self.assertEqual([x.name for x in Path(d).iterdir()], ["a.tract"], "no backup left behind")
+
+    def test_streaming_backup_reaped_only_after_verify(self):
+        self._orig, M.STREAM_THRESHOLD = M.STREAM_THRESHOLD, 1
+        try:
+            orig = b"".join(_bt_entry(target=f"t{i}", seed=i) for i in range(4))
+            with tempfile.TemporaryDirectory() as d:
+                p = self._f(d, "b.tract", _to_tb(orig))
+                r = M.process(p, apply=True, backup=True, reap=True)
+                self.assertEqual(r["status"], "converted")
+                self.assertTrue(r.get("backup_reaped"))
+                self.assertEqual(p.read_bytes(), orig)
+                self.assertEqual([x.name for x in Path(d).iterdir()], ["b.tract"])
+        finally:
+            M.STREAM_THRESHOLD = self._orig
+
+    def test_backup_is_KEPT_when_verification_fails(self):
+        self._orig, M.STREAM_THRESHOLD = M.STREAM_THRESHOLD, 1
+        real = M.scan_file
+        calls = {"n": 0}
+
+        def flaky(path):
+            calls["n"] += 1
+            return real(path) if calls["n"] == 1 else ([], 999)
+        try:
+            orig = _bt_entry() + _bt_entry(target="t2", seed=2)
+            tb = _to_tb(orig)
+            with tempfile.TemporaryDirectory() as d:
+                p = self._f(d, "c.tract", tb)
+                M.scan_file = flaky
+                r = M.process(p, apply=True, backup=True, reap=True)
+                self.assertEqual(r["status"], "verify-failed-restored")
+                self.assertFalse(r.get("backup_reaped"), "must NOT reap when verification failed")
+                self.assertEqual(p.read_bytes(), tb, "original restored")
+        finally:
+            M.scan_file = real
+            M.STREAM_THRESHOLD = self._orig
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -272,7 +272,7 @@ def verify(before: bytes, after: bytes) -> Optional[str]:
 STREAM_THRESHOLD = 64 * 1024 * 1024
 
 
-def process(path: Path, apply: bool, backup: bool) -> Dict[str, Any]:
+def process(path: Path, apply: bool, backup: bool, reap: bool = False) -> Dict[str, Any]:
     r: Dict[str, Any] = {"path": str(path), "status": "unknown", "entries": 0, "converted": 0}
     try:
         size = path.stat().st_size
@@ -283,7 +283,7 @@ def process(path: Path, apply: bool, backup: bool) -> Dict[str, Any]:
         r["status"] = "empty"
         return r
     if size >= STREAM_THRESHOLD:
-        return _process_streaming(path, apply, backup, size, r)
+        return _process_streaming(path, apply, backup, size, r, reap)
     try:
         buf = path.read_bytes()
     except OSError as exc:
@@ -320,12 +320,20 @@ def process(path: Path, apply: bool, backup: bool) -> Dict[str, Any]:
             os.fsync(fh.fileno())
         os.replace(tmp, path)
         r["status"] = "converted"
+        if reap and backup and r.get("backup"):
+            # Verified above before the write; the backup has done its job. Reaping
+            # bounds peak disk to one file, which matters when the host is at 96%.
+            try:
+                Path(r["backup"]).unlink()
+                r["backup_reaped"] = True
+            except OSError:
+                pass
     except OSError as exc:
         r["status"], r["error"] = "write-failed", str(exc)
     return r
 
 
-def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict[str, Any]) -> Dict[str, Any]:
+def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict[str, Any], reap: bool = False) -> Dict[str, Any]:
     """Large-file path: validate by streaming, then seek-and-write 2 bytes per entry.
 
     Verification necessarily differs from the small-file path — two copies of a
@@ -389,6 +397,13 @@ def _process_streaming(path: Path, apply: bool, backup: bool, size: int, r: Dict
             r["status"] = "VERIFY-FAILED-NO-BACKUP"
         return r
     r["status"] = "converted"
+    if reap and bak and bak.is_file():
+        # Only after the post-write re-scan agreed. Bounds peak disk to one file.
+        try:
+            bak.unlink()
+            r["backup_reaped"] = True
+        except OSError:
+            pass
     return r
 
 
@@ -410,10 +425,12 @@ def main(argv=None) -> int:
     ap.add_argument("--apply", action="store_true", help="actually write (default is a dry run)")
     ap.add_argument("--no-backup", action="store_true", help="skip .pre-btf-magic backups")
     ap.add_argument("--json", action="store_true", help="machine-readable report")
+    ap.add_argument("--reap-backup", action="store_true",
+                    help="delete each backup once that file has verified — bounds peak disk to one file")
     a = ap.parse_args(argv)
 
     files = gather(a.paths)
-    results = [process(f, a.apply, not a.no_backup) for f in files]
+    results = [process(f, a.apply, not a.no_backup, a.reap_backup) for f in files]
 
     if a.json:
         print(json.dumps({"apply": a.apply, "files": results}, indent=2))
