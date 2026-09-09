@@ -20,6 +20,12 @@ Usage::
     cfg = load_ces_config(config_path="~/.neurograph/ces.json")
 
 # ---- Changelog ----
+# [2026-09-09] Cursor Agent — Drop unread SurfacingConfig.voltage_threshold
+#   What: Removed voltage_threshold (default 0.6). SurfacingMonitor scores
+#         fired nodes and gates on min_confidence; after_step() does not
+#         re-check current voltage (fired_node_ids already means threshold).
+#   Why:  Nightly 2026-09-09 area 1 — CES hygiene. Field was config-only.
+#   How:  Dataclass field deletion. load_ces_config() still ignores unknown keys.
 # [2026-03-25] Claude (Opus 4.6) — Salience weights in SurfacingConfig (SVG Phase 3)
 #   What: Added weight_voltage, weight_excitability, weight_he_membership to
 #         SurfacingConfig. Bootstrap defaults match original hardcoded 0.5/0.3/0.2.
@@ -67,7 +73,6 @@ class StreamingConfig:
 class SurfacingConfig:
     """Configuration for the SurfacingMonitor module."""
 
-    voltage_threshold: float = 0.6
     min_confidence: float = 0.3
     max_surfaced: int = 5
     decay_rate: float = 0.95

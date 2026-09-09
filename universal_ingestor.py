@@ -39,6 +39,13 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-09-09] Cursor Agent — Delete uncalled EmbeddingEngine helpers
+#   What: Removed _resolve_device() and _suppress_provider_warnings(). Neither
+#         had a call site after sentence-transformers was dropped (2026-03-19).
+#         _active_device is still set to "cpu/onnx" by _try_load_ng_embed().
+#   Why:  Nightly 2026-09-09 area 1 — confirmed-dead helpers. Subtraction only.
+#   How:  Method deletion + class docstring no longer claims _resolve_device
+#         is retained. Hash fallback and ng_embed load path unchanged.
 # [2026-09-03] DudeMan CC (Fable 5.1) — Correct stale embedder references (docs only)
 #   What: Comment/docstring-only corrections. No behavior change, no logic touched.
 #         (a) Module docstring stage 3 said "via sentence-transformers" — that backend
@@ -1628,9 +1635,8 @@ class EmbeddingEngine:
 
     The ``device`` config key is VESTIGIAL. It dates from the
     sentence-transformers backend (removed 2026-03-19); ng_embed runs ONNX
-    Runtime on CPU and ignores it. ``_resolve_device()`` is retained only
-    because other call sites still read ``_active_device``, which
-    ``_try_load_ng_embed()`` sets to "cpu/onnx".
+    Runtime on CPU and ignores it. ``_active_device`` is set to "cpu/onnx"
+    by ``_try_load_ng_embed()``.
 
     Caching avoids recomputation of identical text.
 
@@ -1666,86 +1672,6 @@ class EmbeddingEngine:
 
         if self.use_model:
             self._try_load_model()
-
-    def _resolve_device(self) -> str:
-        """Resolve the requested device to an actual device string.
-
-        Handles graceful degradation: if 'cuda' is requested but unavailable,
-        falls back to 'cpu' with a warning rather than hard-failing.
-
-        When device is 'auto', performs explicit CUDA availability detection
-        rather than delegating to sentence-transformers' auto-detect, which
-        can hit meta-tensor errors on CUDA-built torch without a GPU.
-
-        Returns:
-            Device string for SentenceTransformer — always explicit, never None.
-        """
-        try:
-            import torch
-            cuda_available = torch.cuda.is_available()
-        except ImportError:
-            cuda_available = False
-
-        if self.device == "auto":
-            if cuda_available:
-                self._logger.info("Auto-detected CUDA device.")
-                return "cuda"
-            return "cpu"
-        if self.device == "cuda":
-            if cuda_available:
-                return "cuda"
-            self._logger.warning(
-                "CUDA requested but not available (torch.cuda.is_available()=False). "
-                "Falling back to CPU."
-            )
-            return "cpu"
-        return self.device  # "cpu" or any explicit device string
-
-    @staticmethod
-    def _suppress_provider_warnings() -> None:
-        """Suppress API key warnings from HuggingFace inference providers.
-
-        sentence-transformers v5+ and transformers v5+ added inference provider
-        backends (OpenAI, Google, Voyage, etc.) that emit noisy warnings when
-        their API keys aren't set — even when we only use local torch models.
-        NeuroGraph uses ONLY local torch-based embeddings; TID controls all
-        external API calls.  No provider API keys are needed or used.
-
-        This sets environment variables and warning filters BEFORE import to
-        prevent those warnings from reaching the user.
-
-        Grok review v0.7.1: Broadened filters to catch all warning categories
-        (not just UserWarning) and plural "KEYS" patterns that were escaping.
-        """
-        import os
-        import warnings
-
-        # Tell transformers to only log errors, not provider-related warnings
-        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-        os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-        # Disable HuggingFace Hub telemetry and inference provider checks
-        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-        os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-        os.environ.setdefault("HF_HUB_DISABLE_EXPERIMENTAL_WARNING", "1")
-        # Prevent tokenizers parallelism warning
-        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-        # Filter out API key warnings that slip through from provider packages
-        # (openai, google-generativeai, voyageai) if they happen to be installed.
-        # Use no category restriction to catch UserWarning, FutureWarning,
-        # DeprecationWarning, RuntimeWarning — providers use various types.
-        # Use re.IGNORECASE-equivalent patterns for case-insensitive matching.
-        for pattern in [
-            r"(?i).*api.?keys?.*",
-            r"(?i).*set up your.*api.*",
-            r"(?i).*openai.*",
-            r"(?i).*google.*api.*",
-            r"(?i).*voyage.*",
-            r"(?i).*inference.?provider.*",
-            r"(?i).*provider.*backend.*",
-            r"(?i).*api.?key.*not.?set.*",
-        ]:
-            warnings.filterwarnings("ignore", message=pattern)
 
     def _try_load_model(self) -> None:
         """Load the embedding backend (ng_embed ONNX singleton).
