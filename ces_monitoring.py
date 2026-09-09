@@ -18,6 +18,14 @@ Usage::
     monitor.stop()
 
 # ---- Changelog ----
+# [2026-09-09] Cursor Agent — Bind dashboard to localhost; drop unused handler attr
+#   What: MonitoringDashboard listens on 127.0.0.1 (port unchanged). Removed
+#         unused _DashboardHandler.ng_memory (handlers serve stats_cache /
+#         ces_monitor only) and the constructor arg that only set it.
+#   Why:  Nightly 2026-09-09 area 1 — CES hygiene. Dashboard must not bind all
+#         interfaces (CLAUDE.md: do not expose 8847 externally).
+#   How:  HTTPServer(("127.0.0.1", port)). CESMonitor still holds ng_memory
+#         for get_health() / health_context(); those stay live.
 # [2026-05-05] Claude (Sonnet 4.6) — #237 Async stats cache for MonitoringDashboard
 # What: Added _StatsCache (write-behind cache, refreshed every health_interval by
 #       CESMonitor._health_check_tick). HTTP handlers in _DashboardHandler now serve
@@ -175,7 +183,6 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the monitoring dashboard."""
 
     # Set by MonitoringDashboard before server starts
-    ng_memory: Any = None
     ces_monitor: Any = None
     stats_cache: Optional["_StatsCache"] = None
 
@@ -242,14 +249,12 @@ class MonitoringDashboard:
 
     Args:
         ces_config: ``CESConfig`` with monitoring parameters.
-        ng_memory: ``NeuroGraphMemory`` instance for stats.
         ces_monitor: ``CESMonitor`` parent for surfacing access.
     """
 
     def __init__(
         self,
         ces_config: CESConfig,
-        ng_memory: Any = None,
         ces_monitor: Any = None,
         stats_cache: Optional[_StatsCache] = None,
     ) -> None:
@@ -258,7 +263,6 @@ class MonitoringDashboard:
         self._thread: Optional[threading.Thread] = None
 
         # Share refs with the handler class
-        _DashboardHandler.ng_memory = ng_memory
         _DashboardHandler.ces_monitor = ces_monitor
         _DashboardHandler.stats_cache = stats_cache
 
@@ -270,7 +274,7 @@ class MonitoringDashboard:
 
         try:
             self._server = HTTPServer(
-                ("0.0.0.0", self._cfg.http_port), _DashboardHandler
+                ("127.0.0.1", self._cfg.http_port), _DashboardHandler
             )
             self._thread = threading.Thread(
                 target=self._server.serve_forever,
@@ -278,7 +282,9 @@ class MonitoringDashboard:
                 name="ces-dashboard",
             )
             self._thread.start()
-            logger.info("CES dashboard started on port %d", self._cfg.http_port)
+            logger.info(
+                "CES dashboard started on 127.0.0.1:%d", self._cfg.http_port
+            )
         except Exception as exc:
             logger.warning("Failed to start CES dashboard: %s", exc)
             self._server = None
@@ -316,7 +322,7 @@ class CESMonitor:
         self._ces_logger = CESLogger(ces_config)
         self._stats_cache = _StatsCache()
         self._dashboard = MonitoringDashboard(
-            ces_config, ng_memory=ng_memory, ces_monitor=self,
+            ces_config, ces_monitor=self,
             stats_cache=self._stats_cache,
         )
 

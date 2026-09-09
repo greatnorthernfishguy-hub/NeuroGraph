@@ -24,6 +24,16 @@ Covers:
 #   Why:  Nightly audit area 1 — those methods were removed from stream_parser.py
 #         on 2026-04-21. Keep real CES tests green.
 #   How:  Delete one test; rewrite two; swap two default-field assertions.
+# [2026-09-09] Cursor Agent — CES hygiene test repairs
+#   What: Dropped unread voltage_threshold probes. Rewrote StreamParser embedder
+#         tests to match ng_embed-only _embed_chunk() (no _check_ollama).
+#         test_decay_removes_weak_items now advances graph.timestep so decay
+#         is not skipped by the same-step idempotency guard. test_get_health
+#         fixtures graph/vector_db because get_health() reads those directly
+#         (does not call ng_memory.stats()). Dashboard start asserts 127.0.0.1.
+#   Why:  Nightly 2026-09-09 area 1 — keep CES tests green after ollama path
+#         removal and localhost bind. Do not restore ollama.
+#   How:  Assertion/fixture repair only. No production ollama restore.
 # [2026-03-26] Claude Code Opus — Punchlist #102: Fix stale tests from embedding migration
 # What: Updated test dimensions from 384→768 to match current embedding pipeline
 # Why: Punchlist #102 — tests obsoleted by snowflake-arctic-embed-m-v1.5 migration
@@ -180,7 +190,7 @@ class TestCESConfigDefaults:
 
     def test_default_surfacing(self):
         cfg = load_ces_config()
-        assert cfg.surfacing.voltage_threshold == 0.6
+        assert cfg.surfacing.min_confidence == 0.3
         assert cfg.surfacing.max_surfaced == 5
         assert cfg.surfacing.decay_rate == 0.95
 
@@ -651,7 +661,6 @@ class TestSurfacingAfterStep:
     def test_fired_node_above_threshold_surfaced(self, graph, vector_db, ces_config):
         from surfacing import SurfacingMonitor
 
-        ces_config.surfacing.voltage_threshold = 0.5
         ces_config.surfacing.min_confidence = 0.1
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
@@ -684,7 +693,6 @@ class TestSurfacingAfterStep:
         from surfacing import SurfacingMonitor
 
         empty_db = MockVectorDB()  # No content stored
-        ces_config.surfacing.voltage_threshold = 0.1
         ces_config.surfacing.min_confidence = 0.1
         monitor = SurfacingMonitor(graph, empty_db, ces_config)
 
@@ -736,7 +744,6 @@ class TestSurfacingQueue:
         from surfacing import SurfacingMonitor
 
         ces_config.surfacing.queue_capacity = 3
-        ces_config.surfacing.voltage_threshold = 0.1
         ces_config.surfacing.min_confidence = 0.1
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
@@ -758,7 +765,6 @@ class TestSurfacingQueue:
 
         ces_config.surfacing.decay_rate = 0.1  # Aggressive decay
         ces_config.surfacing.min_confidence = 0.5
-        ces_config.surfacing.voltage_threshold = 0.1
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
         graph.nodes["node_3"].voltage = 2.0
@@ -770,6 +776,7 @@ class TestSurfacingQueue:
         # after_step() may both call it in one step without double-penalising). So with the clock standing still,
         # further calls change nothing ...
         for _ in range(20):
+            graph.timestep += 1
             monitor.after_step(MockStepResult())
         assert len(monitor._queue) == 1
 
@@ -781,7 +788,6 @@ class TestSurfacingQueue:
     def test_clear_empties_queue(self, graph, vector_db, ces_config):
         from surfacing import SurfacingMonitor
 
-        ces_config.surfacing.voltage_threshold = 0.1
         ces_config.surfacing.min_confidence = 0.1
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
@@ -797,7 +803,6 @@ class TestSurfacingFormatting:
     def test_format_context_block(self, graph, vector_db, ces_config):
         from surfacing import SurfacingMonitor
 
-        ces_config.surfacing.voltage_threshold = 0.1
         ces_config.surfacing.min_confidence = 0.1
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
@@ -827,7 +832,6 @@ class TestSurfacingFormatting:
         (Was test_format_context_truncates_at_word_boundary, which pinned the removed cut.)"""
         from surfacing import SurfacingMonitor
 
-        ces_config.surfacing.voltage_threshold = 0.1
         ces_config.surfacing.min_confidence = 0.1
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
@@ -848,7 +852,6 @@ class TestSurfacingFormatting:
         the removed hard cut.)"""
         from surfacing import SurfacingMonitor
 
-        ces_config.surfacing.voltage_threshold = 0.1
         ces_config.surfacing.min_confidence = 0.1
         monitor = SurfacingMonitor(graph, vector_db, ces_config)
 
@@ -932,12 +935,14 @@ class TestCESMonitorCoordinator:
         from ces_monitoring import CESMonitor
 
         mock_memory = MagicMock()
-        mock_memory.stats.return_value = {
-            "nodes": 100,
-            "synapses": 200,
-            "prediction_accuracy": 0.5,
-            "vector_db_count": 50,
-        }
+        mock_graph = MagicMock()
+        mock_graph.nodes = {f"n{i}": object() for i in range(100)}
+        mock_graph.synapses = {f"s{i}": object() for i in range(200)}
+        tel = MagicMock()
+        tel.prediction_accuracy = 0.5
+        mock_graph.get_telemetry.return_value = tel
+        mock_memory.graph = mock_graph
+        mock_memory.vector_db.count.return_value = 50
         ces_config.monitoring.http_enabled = False
 
         monitor = CESMonitor(mock_memory, ces_config)
@@ -991,13 +996,12 @@ class TestMonitoringDashboard:
 
         ces_config.monitoring.http_enabled = True
         ces_config.monitoring.http_port = 0  # OS-assigned port
-        mock_memory = MagicMock()
-        mock_memory.stats.return_value = {"nodes": 0}
-
-        dashboard = MonitoringDashboard(ces_config, ng_memory=mock_memory)
+        dashboard = MonitoringDashboard(ces_config)
         try:
             dashboard.start()
-            # Port 0 may or may not work depending on OS, so just check it didn't crash
+            assert dashboard.is_running
+            assert dashboard._server is not None
+            assert dashboard._server.server_address[0] == "127.0.0.1"
         finally:
             dashboard.stop()
 
