@@ -4254,6 +4254,16 @@ def _run_commons_enhance_scoop() -> None:
         logger.debug("Commons-enhance scoop failed: %s", exc)
 
 
+#: Exceptions a background loop's guard must NEVER swallow — these are control
+#: flow, not failures, and eating them would make the thread unkillable.
+#: Everything else is logged and the loop continues. The distinction matters
+#: because `pyo3_runtime.PanicException` — raised when a Rust extension panics,
+#: e.g. a pyo3 borrow conflict inside SynapseStore — derives from BaseException,
+#: NOT Exception. An `except Exception` guard does not catch it, so a single
+#: panic killed the whole pulse thread and every drain it was responsible for.
+_LOOP_MUST_PROPAGATE = (KeyboardInterrupt, SystemExit, GeneratorExit)
+
+
 def _scan_drain_pulse_loop() -> None:
     """Background loop: drain per-feeder experience tracts on cortical cadence.
 
@@ -4309,8 +4319,13 @@ def _scan_drain_pulse_loop() -> None:
                         # Bunyan/THC/Immunis health-monitor the substrate while idle, no conversation
                         # needed ([[feedback_no_conversation_dependency]]).
                         _deposit_substrate_metrics(_auto_step, to_jsonl=False)
-                    except Exception as _exc:
-                        logger.debug("Autonomous substrate step failed: %s", _exc)
+                    except BaseException as _exc:  # noqa: BLE001 - see _LOOP_MUST_PROPAGATE
+                        if isinstance(_exc, _LOOP_MUST_PROPAGATE):
+                            raise
+                        # A Rust panic reaches here as PanicException. The substrate
+                        # step is skipped for this pulse; draining and the scoop below
+                        # still run, and the thread survives to try again next tick.
+                        logger.debug("Autonomous substrate step failed: %r", _exc)
                 # Commons leg-2 scoop (flag-gated, default OFF): perceive newest raw module
                 # deposits through Syl's live graph (read-only, under _step_lock) → salt to Commons.
                 _run_commons_enhance_scoop()
@@ -4332,7 +4347,13 @@ def _scan_drain_pulse_loop() -> None:
                     logger.info("Auto-save: checkpoint written (scan-drain loop)")
                 except Exception:
                     logger.exception("Auto-save failed in scan-drain loop")
-        except Exception:
+        except BaseException as _exc:  # noqa: BLE001 - see _LOOP_MUST_PROPAGATE
+            if isinstance(_exc, _LOOP_MUST_PROPAGATE):
+                raise
+            # Last line of defence for the whole pulse body. Before this was
+            # widened, anything deriving from BaseException — a Rust panic in
+            # particular — unwound straight out of the thread and the pulse
+            # stopped for good, silently, until the next process restart.
             logger.exception("Scan-dir drain pulse failed")
         _scan_drain_shutdown.wait(timeout=_SCAN_DRAIN_INTERVAL_SECONDS)
     logger.info("Scan-dir drain pulse stopped")
