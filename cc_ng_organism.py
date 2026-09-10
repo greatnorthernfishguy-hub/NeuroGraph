@@ -3087,6 +3087,12 @@ class PithMetrics:
     # off, or with l1_assemblies == 0, is an INVALID SAMPLE for the sec 13.3 claim --
     # it is not a 0% prefetch rate. This is the denominator-of-record for the
     # acceptance bar's sample size; a ratio published without it cannot be judged.
+    #
+    # [D5d] Committed in the SAME lock hold as the four result counters, at the end
+    # of the assembly. So l1_assemblies == 0 with any result counter > 0 is not a
+    # state this code can produce: a reset always lands between assemblies, never
+    # inside one, and results are never orphaned from the assembly that produced
+    # them. Counting it early made exactly that state reachable.
     l1_assemblies: int = 0
 
     # [D5b] Guards snapshot()/reset() and the sec 13.3 counting block against each
@@ -3753,15 +3759,15 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
     Never raises on empty input (returns []) or degenerate scores.
     """
     _PITH_METRICS.ranked_in += len(cache_lines)
-    # [D5b] One invocation == one GATED L1 assembly, counted BEFORE the empty-input
-    # early return: an assembly that surfaced nothing still happened, and dropping
-    # those would silently inflate every per-assembly rate from this counter.
-    # Gate off -> this function is never called -> 0, which reads as "invalid
-    # sample", never as "0% prefetch". See PithMetrics.l1_assemblies.
-    with _PITH_METRICS._lock:
-        _PITH_METRICS.l1_assemblies += 1
-
     if not cache_lines:
+        # [D5d] An assembly that surfaced nothing still happened, so it is counted --
+        # dropping these would inflate every per-assembly rate. Its four result
+        # counters advance by zero, and they advance in the SAME lock hold as the
+        # assembly count, so this exit obeys the same all-or-nothing rule as the
+        # main one below. Gate off -> this function is never called -> 0, which
+        # reads as "invalid sample", never "0% prefetch". See l1_assemblies.
+        with _PITH_METRICS._lock:
+            _PITH_METRICS.l1_assemblies += 1
         return []
 
     if budget_chars is None:
@@ -3866,14 +3872,28 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
             if _is_pf:
                 _n_pf_prom += 1
 
-    # [D5b] Commit atomically: `+=` on an attribute is load-add-store, so concurrent
-    # recalls can otherwise lose an update, and a snapshot mid-commit could see a
-    # numerator already raised against a denominator not yet raised.
+    # [D5d] Commit the assembly count and its four result counters in ONE lock hold,
+    # at the END of the assembly. Two reasons, and the second was a real defect:
+    #
+    # 1. `+=` on an attribute is load-add-store, so concurrent recalls would
+    #    otherwise lose updates.
+    # 2. Counting the assembly EARLY (as D5b did, above the empty-input return) let
+    #    a reset land between the two commits: the assembly count was zeroed while
+    #    this assembly's results were still in flight, and the next snapshot showed
+    #    results against zero assemblies -- kept=1, prefetch=1, assemblies=0. A rate
+    #    computed from that window divides by nothing. Reproduced by pausing inside
+    #    `weights.get` and resetting mid-flight; regression test in
+    #    tests/test_pith_metrics_concurrency.py.
+    #
+    # Committing at the end means an assembly interrupted by an exception records
+    # NEITHER its count nor its results, which is the consistent outcome: a reset
+    # now always lands cleanly between assemblies, never inside one.
     with _PITH_METRICS._lock:
         _PITH_METRICS.l1_kept_distinct += _n_kept
         _PITH_METRICS.l1_prefetch_distinct += _n_pf
         _PITH_METRICS.l1_kept_distinct_promotable += _n_kept_prom
         _PITH_METRICS.l1_prefetch_distinct_promotable += _n_pf_prom
+        _PITH_METRICS.l1_assemblies += 1
 
     _PITH_METRICS.ranked_kept += len(pinned_lines) + len(kept_unpinned)
     _PITH_METRICS.ranked_dropped += dropped
