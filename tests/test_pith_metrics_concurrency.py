@@ -131,14 +131,22 @@ def test_snapshot_is_coherent_across_a_concurrent_reset():
     def reader():
         while not stop.is_set():
             s = cc._PITH_METRICS.snapshot()
-            # Post-reset, every sec 13.3 term is zero together. A mixture -- some
-            # zeroed, some not, with turns already counted -- means a torn view.
             terms = (s["l1_kept_distinct"], s["l1_prefetch_distinct"],
                      s["l1_kept_distinct_promotable"], s["l1_prefetch_distinct_promotable"])
             if s["l1_prefetch_distinct"] > s["l1_kept_distinct"]:
-                mixtures.append(s)
+                mixtures.append(("broad numerator exceeds denominator", s))
+            if s["l1_prefetch_distinct_promotable"] > s["l1_kept_distinct_promotable"]:
+                mixtures.append(("narrow numerator exceeds denominator", s))
             if any(t < 0 for t in terms):
-                mixtures.append(s)
+                mixtures.append(("negative term", s))
+            # A reset zeroes every sec 13.3 term together. Seeing some zeroed while
+            # others are not is a torn view of the reset itself -- the specific
+            # mixture this test is named for, and the one the earlier version of it
+            # never actually checked.
+            zeroed = [t == 0 for t in terms]
+            if any(zeroed) and not all(zeroed) and s["l1_prefetch_distinct"] == 0 \
+                    and s["l1_kept_distinct"] == 0 and s["l1_kept_distinct_promotable"] != 0:
+                mixtures.append(("partially-applied reset", s))
 
     ts = [threading.Thread(target=writer) for _ in range(3)]
     ts += [threading.Thread(target=resetter), threading.Thread(target=reader),
@@ -222,3 +230,58 @@ def test_config_never_raises_without_tonic(monkeypatch):
     c = cc.pith_effective_config()          # must not raise
     assert c["resolved"]["CC_PITH_PREFETCH_MAX"] is None
     assert "unavailable" in c["authority"]["CC_PITH_PREFETCH_MAX"]
+
+
+# ------------------------------------------------------------ deterministic mutual exclusion
+# The racing tests above are PROBABILISTIC: against a de-locked build,
+# test_snapshot_is_coherent_across_a_concurrent_reset catches the defect on roughly
+# two runs in three, and test_no_lost_updates_under_concurrent_recalls does not catch
+# it at all (CPython's GIL usually retires a short `+=` sequence intact at this
+# contention). Racing tests can only ever say "not seen"; the three below prove
+# mutual exclusion directly and fail deterministically without a real lock.
+
+def _blocks_while_lock_held(call, hold=0.35, slack=1.5):
+    """True if `call` cannot complete while another thread holds the metrics lock."""
+    done = threading.Event()
+    started = threading.Event()
+
+    def runner():
+        started.set()
+        call()
+        done.set()
+
+    with cc._PITH_METRICS._lock:
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        started.wait(timeout=5)
+        blocked = not done.wait(timeout=hold)
+    finished = done.wait(timeout=slack)
+    t.join(timeout=slack)
+    return blocked, finished
+
+
+def test_snapshot_actually_acquires_the_lock():
+    """Deterministic: snapshot() must block while the lock is held elsewhere."""
+    blocked, finished = _blocks_while_lock_held(lambda: cc._PITH_METRICS.snapshot())
+    assert blocked, "snapshot() did not take the lock -- coherence is unenforced"
+    assert finished, "snapshot() never completed after the lock was released"
+
+
+def test_reset_actually_acquires_the_lock():
+    """Deterministic: reset() must block while the lock is held elsewhere."""
+    blocked, finished = _blocks_while_lock_held(lambda: cc._PITH_METRICS.reset())
+    assert blocked, "reset() did not take the lock -- it can tear a snapshot"
+    assert finished, "reset() never completed after the lock was released"
+
+
+def test_counting_commit_actually_acquires_the_lock():
+    """Deterministic: the sec 13.3 commit must block while the lock is held.
+
+    This is the write side of the invariant. If the commit does not take the lock,
+    a reader can observe the numerator raised and the denominator not yet raised.
+    """
+    lines = [_line("a", 30.0, prefetch=True), _line("b", 20.0)]
+    blocked, finished = _blocks_while_lock_held(
+        lambda: pith_stage3(list(lines), budget_chars=100000))
+    assert blocked, "the sec 13.3 commit did not take the lock"
+    assert finished, "pith_stage3 never completed after the lock was released"
