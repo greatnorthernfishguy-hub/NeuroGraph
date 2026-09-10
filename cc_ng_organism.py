@@ -3076,8 +3076,28 @@ class PithMetrics:
     l1_prefetch_distinct: int = 0              # broad numerator
     l1_kept_distinct_promotable: int = 0       # narrow denominator: excludes monitor + victim
     l1_prefetch_distinct_promotable: int = 0   # narrow numerator
+    # [D5b] Recall turns: one increment per pith_stage3 invocation, which is one L1
+    # assembly (single live call site, in cc_assemble_recall's gated Pith block).
+    # This is the denominator-of-record for the acceptance bar's "recall turns" -- a
+    # ratio without it cannot be judged for sample size.
+    l1_assemblies: int = 0
+
+    # [D5b] Guards snapshot()/reset() and the sec 13.3 counting block against each
+    # other. Without it a snapshot concurrent with a reset can return a MIX of
+    # pre- and post-reset fields (a torn read), which for a ratio means a numerator
+    # from one instant over a denominator from another -- silently out of range
+    # rather than obviously broken. RLock so a future nested use cannot self-deadlock.
+    # NOT part of equality/repr: it is machinery, not measured state.
+    _lock: "threading.RLock" = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def reset(self) -> None:
+        """[D5b] Atomic with respect to snapshot() -- a snapshot concurrent with a
+        reset returns either the whole pre-reset view or the whole post-reset one,
+        never a mixture of the two."""
+        with self._lock:
+            self._reset_locked()
+
+    def _reset_locked(self) -> None:
         self.total_lines_in = 0
         self.clutter_stripped = 0
         self.combined = 0
@@ -3092,6 +3112,7 @@ class PithMetrics:
         self.prefetch_hits = 0
         self.prefetch_surfaced = 0
         self.l1_kept_distinct = 0
+        self.l1_assemblies = 0
         self.l1_prefetch_distinct = 0
         self.l1_kept_distinct_promotable = 0
         self.l1_prefetch_distinct_promotable = 0
@@ -3104,6 +3125,16 @@ class PithMetrics:
         self.pith_failures += 1
 
     def snapshot(self) -> Dict[str, int]:
+        """A coherent point-in-time view: every field read under one lock hold.
+
+        [D5b] Taken atomically with respect to reset() and the sec 13.3 counting
+        block, so a caller can never observe a numerator and denominator from two
+        different instants.
+        """
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> Dict[str, int]:
         return {
             "total_lines_in": self.total_lines_in,
             "clutter_stripped": self.clutter_stripped,
@@ -3122,10 +3153,79 @@ class PithMetrics:
             "l1_prefetch_distinct": self.l1_prefetch_distinct,
             "l1_kept_distinct_promotable": self.l1_kept_distinct_promotable,
             "l1_prefetch_distinct_promotable": self.l1_prefetch_distinct_promotable,
+            "l1_assemblies": self.l1_assemblies,
         }
 
 
 _PITH_METRICS = PithMetrics()
+
+
+# [D5b] Keys reported by pith_effective_config(). Explicit ALLOW-LIST: telemetry
+# must never carry the whole environment, which holds tokens and paths.
+_PITH_CONFIG_KEYS = (
+    "CC_PITH_ENABLED", "CC_PITH_L1_BUDGET", "CC_PITH_L1_BREATHE",
+    "CC_PITH_PREFETCH_ENABLED", "CC_PITH_PREFETCH_WARM_ENABLED",
+    "CC_PITH_PREFETCH_MAX", "CC_PITH_PREFETCH_REPEATS",
+    "CC_PITH_PREFETCH_CURRENT_SCALE", "CC_PITH_PREFETCH_LOD_DIST",
+)
+
+
+def pith_effective_config() -> Dict[str, Dict]:
+    """The configuration this process is ACTUALLY running under.
+
+    Returns {"env": {...}, "resolved": {...}, "authority": {...}} where:
+
+    * ``env``      -- the raw allow-listed environment strings, ``None`` where a
+                      variable is unset. What the shell handed this process.
+    * ``resolved`` -- the module-level constants the code branches on, after
+                      defaulting, type coercion and CLAMPING. What actually runs.
+    * ``authority`` -- which module resolved each setting, so a reader can go
+                      check the source rather than trust this dict.
+
+    The distinction is not cosmetic. ``CC_PITH_PREFETCH_MAX=999`` resolves to 64
+    (clamped), an unset ``CC_PITH_PREFETCH_ENABLED`` resolves to False, and a
+    stale-shell launch shows ``env=None`` against a ``resolved`` default -- so a
+    window recorded with raw env alone cannot distinguish "gate off" from "gate
+    on by default", which is exactly the degraded-daemon trap this exists to
+    close (the hook passes only ET_TRACTS_DIR and setdefaults CC_PITH_ENABLED).
+
+    Values are read at import time by their owning module, so this reports what
+    THIS process resolved -- editing .bashrc does not change a running daemon.
+    Never raises: a missing tonic_engine yields None for its four settings rather
+    than sinking a snapshot.
+    """
+    env = {k: os.environ.get(k) for k in _PITH_CONFIG_KEYS}
+
+    resolved = {
+        "CC_PITH_ENABLED": _CC_PITH_ENABLED,
+        "CC_PITH_L1_BUDGET": _CC_PITH_L1_BUDGET,
+        "CC_PITH_L1_BREATHE": _CC_PITH_L1_BREATHE,
+        "CC_PITH_PREFETCH_ENABLED": _CC_PITH_PREFETCH_ENABLED,
+        "CC_PITH_PREFETCH_LOD_DIST": _CC_PITH_PREFETCH_LOD_DIST,
+    }
+    authority = {k: "cc_ng_organism" for k in resolved}
+
+    # The four warm-prefetch knobs are resolved by tonic_engine, not here -- read
+    # them from their owner rather than re-deriving (LAW 4: one source per value).
+    try:
+        import tonic_engine as _te
+        resolved.update({
+            "CC_PITH_PREFETCH_WARM_ENABLED": _te._CC_PITH_PREFETCH_WARM_ENABLED,
+            "CC_PITH_PREFETCH_MAX": _te._CC_PITH_PREFETCH_MAX,
+            "CC_PITH_PREFETCH_REPEATS": _te._CC_PITH_PREFETCH_REPEATS,
+            "CC_PITH_PREFETCH_CURRENT_SCALE": _te._CC_PITH_PREFETCH_CURRENT_SCALE,
+        })
+        for k in ("CC_PITH_PREFETCH_WARM_ENABLED", "CC_PITH_PREFETCH_MAX",
+                  "CC_PITH_PREFETCH_REPEATS", "CC_PITH_PREFETCH_CURRENT_SCALE"):
+            authority[k] = "tonic_engine"
+    except Exception as _exc:                      # pragma: no cover - import guard
+        logger.debug("pith_effective_config: tonic_engine unavailable (%s)", _exc)
+        for k in ("CC_PITH_PREFETCH_WARM_ENABLED", "CC_PITH_PREFETCH_MAX",
+                  "CC_PITH_PREFETCH_REPEATS", "CC_PITH_PREFETCH_CURRENT_SCALE"):
+            resolved[k] = None
+            authority[k] = "tonic_engine (unavailable)"
+
+    return {"env": env, "resolved": resolved, "authority": authority}
 
 
 def _pith_normalize(text: str) -> str:
@@ -3634,6 +3734,11 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
     Never raises on empty input (returns []) or degenerate scores.
     """
     _PITH_METRICS.ranked_in += len(cache_lines)
+    # [D5b] One invocation == one recall turn, counted BEFORE the empty-input early
+    # return: a turn that surfaced nothing is still a turn, and dropping those would
+    # silently inflate every per-turn rate computed from this counter.
+    with _PITH_METRICS._lock:
+        _PITH_METRICS.l1_assemblies += 1
 
     if not cache_lines:
         return []
@@ -3719,25 +3824,35 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
     # neither mixes pipeline stages. Deduplicated by node_id within THIS
     # invocation (labelled as such wherever reported) -- counting-only: the
     # emitted list below is untouched, and nothing here feeds ranking.
+    # Tally outside the lock (pure local work), then commit under it, so the lock
+    # is held for four additions rather than for a walk of the whole L1 set.
     _l1_final = pinned_lines + kept_unpinned
     _seen_l1: set = set()
-    _seen_promotable: set = set()
+    _n_kept = _n_pf = _n_kept_prom = _n_pf_prom = 0
     for _cl in _l1_final:
         _nid = getattr(_cl, "node_id", None)
         if not _nid or _nid in _seen_l1:
             continue                      # first-wins on provenance, as documented
         _seen_l1.add(_nid)
         _is_pf = bool(getattr(_cl, "prefetch_origin", False))
-        _PITH_METRICS.l1_kept_distinct += 1
+        _n_kept += 1
         if _is_pf:
-            _PITH_METRICS.l1_prefetch_distinct += 1
+            _n_pf += 1
         # Narrow reading of PRD "L1 promotions": promotion-eligible streams only.
         # Same eligibility applied to BOTH terms, so the numerator stays a subset.
         if getattr(_cl, "stream", "recall") not in ("monitor", "victim"):
-            _seen_promotable.add(_nid)
-            _PITH_METRICS.l1_kept_distinct_promotable += 1
+            _n_kept_prom += 1
             if _is_pf:
-                _PITH_METRICS.l1_prefetch_distinct_promotable += 1
+                _n_pf_prom += 1
+
+    # [D5b] Commit atomically: `+=` on an attribute is load-add-store, so concurrent
+    # recalls can otherwise lose an update, and a snapshot mid-commit could see a
+    # numerator already raised against a denominator not yet raised.
+    with _PITH_METRICS._lock:
+        _PITH_METRICS.l1_kept_distinct += _n_kept
+        _PITH_METRICS.l1_prefetch_distinct += _n_pf
+        _PITH_METRICS.l1_kept_distinct_promotable += _n_kept_prom
+        _PITH_METRICS.l1_prefetch_distinct_promotable += _n_pf_prom
 
     _PITH_METRICS.ranked_kept += len(pinned_lines) + len(kept_unpinned)
     _PITH_METRICS.ranked_dropped += dropped
