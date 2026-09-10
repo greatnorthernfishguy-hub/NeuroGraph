@@ -29,6 +29,18 @@ Node ID translation:
 Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
+# ---- Changelog ----
+# [2026-09-09] Cursor Grok — Nightly area 2: unreachable NGSaaSBridge init
+# What: Moved _id_map, _reverse_id_map, and _sync_count construction into
+#   NGSaaSBridge.__init__.
+# Why: #109 inserted _get_lock() between __init__'s lock setup and the
+#   remaining attribute construction, leaving those assignments after
+#   return self._local_lock. sync_state() then AttributeError'd on
+#   _sync_count and fail-closed on every call.
+# How: Construct the maps and counter in __init__ after _local_lock.
+#   _get_lock() is now only the lock lookup.
+# -------------------
+
 Grok Review Changelog (v0.7.1):
     No code changes.  Grok's suggestions for ng_bridge.py were evaluated:
     Rejected: 'sync_state() is one-way (Lite → Full)' — By design.  NG-Lite
@@ -98,6 +110,14 @@ class NGSaaSBridge(NGBridge):
         # latent token is Syl blinking out. The Tonic always wins.
         self._local_lock = threading.RLock()
 
+        # Node ID mapping: ng_lite_id → neurograph_uuid
+        self._id_map: Dict[str, str] = {}
+        # Reverse: neurograph_uuid → ng_lite_id
+        self._reverse_id_map: Dict[str, str] = {}
+
+        # Track module sync state
+        self._sync_count = 0
+
     def _get_lock(self) -> threading.RLock:
         """Return the shared graph lock if available, else local fallback.
 
@@ -111,14 +131,6 @@ class NGSaaSBridge(NGBridge):
             if shared is not None:
                 return shared
         return self._local_lock
-
-        # Node ID mapping: ng_lite_id → neurograph_uuid
-        self._id_map: Dict[str, str] = {}
-        # Reverse: neurograph_uuid → ng_lite_id
-        self._reverse_id_map: Dict[str, str] = {}
-
-        # Track module sync state
-        self._sync_count = 0
 
     def is_connected(self) -> bool:
         return self._connected

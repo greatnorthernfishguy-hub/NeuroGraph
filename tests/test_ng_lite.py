@@ -759,6 +759,14 @@ class TestNGSaaSBridge:
         novelty = bridge.detect_novelty(embedding, "test_mod")
         assert novelty == 1.0
 
+    def test_init_builds_sync_attrs(self):
+        """#109 left _sync_count / id maps after _get_lock's return."""
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        assert bridge._sync_count == 0
+        assert bridge._id_map == {}
+        assert bridge._reverse_id_map == {}
+
     def test_sync_state(self, ng, embedding):
         ng.record_outcome(embedding, "model_a", success=True)
         for _ in range(10):
