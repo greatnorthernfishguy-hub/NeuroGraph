@@ -170,9 +170,11 @@
 #   budget -- deliberately not folded into `stream`, whose per-stream min-max would give a
 #   singleton "prefetch" population a normalized 1.0 (top-of-stream) and promote exactly the
 #   lines being counted. Dedup is counting-only; the emitted list is byte-identical.
-#   KNOWN PROVENANCE LOSS: pith_victim_recover rebuilds a fresh CacheLine(stream="victim")
-#   from the victim dict, so prefetch_origin does NOT survive eviction -> recapture. Such a
-#   line counts in the denominator, not the numerator -> the ratio is biased DOWN
+#   KNOWN PROVENANCE LOSS (precise): pith_victim_capture does not persist prefetch_origin
+#   into the victim dict at all, and pith_victim_recover rebuilds a fresh
+#   CacheLine(stream="victim") from that dict -- so provenance dies at CAPTURE, not merely
+#   at recover, and does NOT survive eviction -> recapture. Such a line counts in the
+#   denominator, not the numerator -> the ratio is biased DOWN
 #   (conservative, which is the direction sec 6.2's "lower bound" wants). Not "fixed" here:
 #   whether a recaptured line is still "pre-staged" is a separate semantic decision.
 #   Existing counters (ranked_kept, prefetch_hits, promoted_predicted, prefetch_surfaced)
@@ -3076,10 +3078,15 @@ class PithMetrics:
     l1_prefetch_distinct: int = 0              # broad numerator
     l1_kept_distinct_promotable: int = 0       # narrow denominator: excludes monitor + victim
     l1_prefetch_distinct_promotable: int = 0   # narrow numerator
-    # [D5b] Recall turns: one increment per pith_stage3 invocation, which is one L1
-    # assembly (single live call site, in cc_assemble_recall's gated Pith block).
-    # This is the denominator-of-record for the acceptance bar's "recall turns" -- a
-    # ratio without it cannot be judged for sample size.
+    # [D5b] GATED L1 ASSEMBLIES -- one increment per pith_stage3 invocation. The
+    # single live call site is inside cc_assemble_recall's CC_PITH_ENABLED block, so
+    # this counts L1 assemblies that actually happened, NOT daemon recalls: with the
+    # gate off the block is never entered and this stays 0.
+    #
+    # That distinction decides how a window is read. A window with the gate resolved
+    # off, or with l1_assemblies == 0, is an INVALID SAMPLE for the sec 13.3 claim --
+    # it is not a 0% prefetch rate. This is the denominator-of-record for the
+    # acceptance bar's sample size; a ratio published without it cannot be judged.
     l1_assemblies: int = 0
 
     # [D5b] Guards snapshot()/reset() and the sec 13.3 counting block against each
@@ -3125,11 +3132,23 @@ class PithMetrics:
         self.pith_failures += 1
 
     def snapshot(self) -> Dict[str, int]:
-        """A coherent point-in-time view: every field read under one lock hold.
+        """A point-in-time view. Read the guarantee carefully -- it is NARROW.
 
-        [D5b] Taken atomically with respect to reset() and the sec 13.3 counting
-        block, so a caller can never observe a numerator and denominator from two
-        different instants.
+        COHERENT: the sec 13.3 terms (l1_kept_distinct, l1_prefetch_distinct, and
+        their _promotable pair) and l1_assemblies. Those are written only under
+        this lock, so they are consistent with each other and with reset() -- a
+        reader can never pair a numerator from one instant with a denominator from
+        another, which is the failure that would silently produce a ratio above
+        1.0 while looking well-formed.
+
+        BEST-EFFORT: every legacy counter (ranked_in, ranked_kept, ranked_dropped,
+        prefetch_hits, promoted_predicted, prefetch_surfaced, ...). Their writers
+        do NOT take this lock, so holding it here does not make them atomic. Do not
+        treat them as consistent with the sec 13.3 terms or with each other.
+
+        They are deliberately left unlocked: they are hot-path `+=` on counters no
+        acceptance figure is computed from, and widening the lock to cover them
+        would add contention to every recall to make this docstring shorter.
         """
         with self._lock:
             return self._snapshot_locked()
@@ -3734,9 +3753,11 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
     Never raises on empty input (returns []) or degenerate scores.
     """
     _PITH_METRICS.ranked_in += len(cache_lines)
-    # [D5b] One invocation == one recall turn, counted BEFORE the empty-input early
-    # return: a turn that surfaced nothing is still a turn, and dropping those would
-    # silently inflate every per-turn rate computed from this counter.
+    # [D5b] One invocation == one GATED L1 assembly, counted BEFORE the empty-input
+    # early return: an assembly that surfaced nothing still happened, and dropping
+    # those would silently inflate every per-assembly rate from this counter.
+    # Gate off -> this function is never called -> 0, which reads as "invalid
+    # sample", never as "0% prefetch". See PithMetrics.l1_assemblies.
     with _PITH_METRICS._lock:
         _PITH_METRICS.l1_assemblies += 1
 
