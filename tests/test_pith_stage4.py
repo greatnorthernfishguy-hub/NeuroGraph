@@ -66,8 +66,17 @@ class FakeNode:
 
 # ---- gate default / byte-identical off ----
 
-def test_prefetch_gate_defaults_off():
-    assert cc._CC_PITH_PREFETCH_ENABLED is False
+def test_prefetch_gate_defaults_off(monkeypatch):
+    """The CODE default, not the process env. Written this way because satisfying
+    LAW 5 -- registering CC_PITH_PREFETCH_ENABLED in ~/.bashrc so the sec 6
+    measurement can run -- otherwise turns this test red for a config reason."""
+    import importlib
+    monkeypatch.delenv("CC_PITH_PREFETCH_ENABLED", raising=False)
+    importlib.reload(cc)
+    try:
+        assert cc._CC_PITH_PREFETCH_ENABLED is False
+    finally:
+        importlib.reload(cc)
 
 
 def test_promotion_noop_when_gated_off(cc_ng, monkeypatch):
