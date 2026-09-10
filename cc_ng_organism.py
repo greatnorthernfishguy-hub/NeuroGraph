@@ -155,6 +155,28 @@
 #   that do per-half STATE bookkeeping then call this. VPS gate-off ==
 #   byte-identical to its pre-refactor concat; gate-on gains the same Pith
 #   pipeline the laptop already had. See test_cc_recall_unification.py.
+# [2026-09-10] Claude Code (DudeMan CC, Opus 5) — D5: same-stage sec 13.3 instrumentation
+# What: CacheLine.prefetch_origin (provenance ONLY) + four PithMetrics counters counted at
+#   final L1 assembly in pith_stage3: l1_kept_distinct / l1_prefetch_distinct (primary,
+#   broad) and *_promotable (narrow, excludes monitor+victim). Deduplicated by node_id
+#   within each invocation; both terms use identical eligibility so the numerator is a
+#   subset of the denominator by construction. Provenance flows
+#   cc_pattern_completion_recall (promoted_ids -> dict key) -> cc_assemble_recall -> CacheLine.
+# Why: pith_metrics reported prefetch_hits/promoted_predicted -- a prefetch SURVIVAL rate,
+#   not spec sec 13.3's "what fraction of L1 was pre-staged". Worse, prefetch_hits is counted
+#   in cc_pattern_completion_recall (pre-budget) while ranked_kept is counted in pith_stage3
+#   (post-budget), so no existing pair shares a stage. These four do.
+# How: prefetch_origin takes NO part in scoring, normalization, weighting, sorting, dedup or
+#   budget -- deliberately not folded into `stream`, whose per-stream min-max would give a
+#   singleton "prefetch" population a normalized 1.0 (top-of-stream) and promote exactly the
+#   lines being counted. Dedup is counting-only; the emitted list is byte-identical.
+#   KNOWN PROVENANCE LOSS: pith_victim_recover rebuilds a fresh CacheLine(stream="victim")
+#   from the victim dict, so prefetch_origin does NOT survive eviction -> recapture. Such a
+#   line counts in the denominator, not the numerator -> the ratio is biased DOWN
+#   (conservative, which is the direction sec 6.2's "lower bound" wants). Not "fixed" here:
+#   whether a recaptured line is still "pre-staged" is a separate semantic decision.
+#   Existing counters (ranked_kept, prefetch_hits, promoted_predicted, prefetch_surfaced)
+#   keep their meanings unchanged.
 # [2026-09-07] Claude Code (DudeMan CC, Opus 5) — cc_reground_synapse_delays()
 # What: recomputes synaptic delay from geodesic distance for synapses whose delay was
 #   assigned by the random fallback because an endpoint had no poincare_dir at sprout.
@@ -2440,7 +2462,11 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                         text, _ = pith_stage2_keyframe(text, max_chars=_CC_PITH_PREFETCH_SUMMARY_CHARS, query=query)
                 except Exception as exc:
                     logger.debug("Pith LOD staging failed for %r (non-fatal): %s", nid, exc)
-            out.append({"node_id": nid, "score": r.get("strength", 0.0), "content": text})
+            # [D5] Carry Stage-4 promotion provenance out of this function so the
+            # assembler can stamp it on the CacheLine. Additive key; every existing
+            # consumer reads by name and is unaffected.
+            out.append({"node_id": nid, "score": r.get("strength", 0.0), "content": text,
+                        "prefetch_origin": nid in promoted_ids})
 
         # Lever 2: selectivity re-rank (gated). Divide each candidate's strength
         # by its baseline firing rate so hubs (fire for everything) sink and
@@ -3003,13 +3029,22 @@ class CacheLine:
     keyframe: bool = False
     deltas: list = field(default_factory=list)
     stream: str = "recall"
+    # [D5] Provenance ONLY. Set when a line originates from Stage-4 predictive
+    # promotion. It takes no part in scoring, normalization, weighting, sorting,
+    # dedup or budget arithmetic -- deliberately NOT folded into `stream`, whose
+    # per-stream min-max in pith_stage3 would give a singleton "prefetch"
+    # population a normalized 1.0 (top-of-stream) and thereby promote exactly the
+    # lines it is meant to count. Read at one counting site only.
+    prefetch_origin: bool = False
 
     @classmethod
     def from_surfaced(cls, node_id: str, content: str, score: float = 0.0,
                        pinned: bool = False, manifold_type: str = "hyperbolic",
-                       stream: str = "recall") -> "CacheLine":
+                       stream: str = "recall",
+                       prefetch_origin: bool = False) -> "CacheLine":
         return cls(node_id=node_id, content=content, score=score, pinned=pinned,
-                    manifold_type=manifold_type, stream=stream)
+                    manifold_type=manifold_type, stream=stream,
+                    prefetch_origin=prefetch_origin)
 
 
 @dataclass
@@ -3032,6 +3067,15 @@ class PithMetrics:
     prefetch_hits: int = 0
     # 5b: live primed nodes the harvest surfaced on its own (warm topology).
     prefetch_surfaced: int = 0
+    # [D5] Spec sec 13.3 terms, both counted at the SAME point (final L1 assembly
+    # in pith_stage3) over the SAME set, deduplicated by node_id within each
+    # invocation. Dedup is counting-only: it never touches the emitted lines.
+    # Numerator is a subset of denominator by construction (same filter, plus
+    # prefetch_origin). PRIMARY metric = l1_prefetch_distinct / l1_kept_distinct.
+    l1_kept_distinct: int = 0                  # broad denominator: all distinct nodes in L1
+    l1_prefetch_distinct: int = 0              # broad numerator
+    l1_kept_distinct_promotable: int = 0       # narrow denominator: excludes monitor + victim
+    l1_prefetch_distinct_promotable: int = 0   # narrow numerator
 
     def reset(self) -> None:
         self.total_lines_in = 0
@@ -3047,6 +3091,10 @@ class PithMetrics:
         self.promoted_predicted = 0
         self.prefetch_hits = 0
         self.prefetch_surfaced = 0
+        self.l1_kept_distinct = 0
+        self.l1_prefetch_distinct = 0
+        self.l1_kept_distinct_promotable = 0
+        self.l1_prefetch_distinct_promotable = 0
 
     def record_failure(self) -> None:
         """Bump the fail-soft counter -- the Pith path swallows exceptions and
@@ -3070,6 +3118,10 @@ class PithMetrics:
             "promoted_predicted": self.promoted_predicted,
             "prefetch_hits": self.prefetch_hits,
             "prefetch_surfaced": self.prefetch_surfaced,
+            "l1_kept_distinct": self.l1_kept_distinct,
+            "l1_prefetch_distinct": self.l1_prefetch_distinct,
+            "l1_kept_distinct_promotable": self.l1_kept_distinct_promotable,
+            "l1_prefetch_distinct_promotable": self.l1_prefetch_distinct_promotable,
         }
 
 
@@ -3661,6 +3713,32 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
         break
     dropped = len(scored) - len(kept_unpinned)
 
+    # [D5] Spec sec 13.3 terms, counted here because this is where the final L1
+    # set exists: `pinned_lines + kept_unpinned` is exactly what this function
+    # returns. Both terms come from the same set, after the same budget cut, so
+    # neither mixes pipeline stages. Deduplicated by node_id within THIS
+    # invocation (labelled as such wherever reported) -- counting-only: the
+    # emitted list below is untouched, and nothing here feeds ranking.
+    _l1_final = pinned_lines + kept_unpinned
+    _seen_l1: set = set()
+    _seen_promotable: set = set()
+    for _cl in _l1_final:
+        _nid = getattr(_cl, "node_id", None)
+        if not _nid or _nid in _seen_l1:
+            continue                      # first-wins on provenance, as documented
+        _seen_l1.add(_nid)
+        _is_pf = bool(getattr(_cl, "prefetch_origin", False))
+        _PITH_METRICS.l1_kept_distinct += 1
+        if _is_pf:
+            _PITH_METRICS.l1_prefetch_distinct += 1
+        # Narrow reading of PRD "L1 promotions": promotion-eligible streams only.
+        # Same eligibility applied to BOTH terms, so the numerator stays a subset.
+        if getattr(_cl, "stream", "recall") not in ("monitor", "victim"):
+            _seen_promotable.add(_nid)
+            _PITH_METRICS.l1_kept_distinct_promotable += 1
+            if _is_pf:
+                _PITH_METRICS.l1_prefetch_distinct_promotable += 1
+
     _PITH_METRICS.ranked_kept += len(pinned_lines) + len(kept_unpinned)
     _PITH_METRICS.ranked_dropped += dropped
     _PITH_METRICS.budget_chars_used += running_total
@@ -3852,6 +3930,8 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                     score=it.get('score', 0.0),
                     pinned=_pinned(it.get('node_id')),
                     stream='pattern',
+                    # [D5] provenance only -- see CacheLine.prefetch_origin
+                    prefetch_origin=bool(it.get('prefetch_origin', False)),
                 )
                 for it in pc_results
             ]
