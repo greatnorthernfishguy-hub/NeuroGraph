@@ -155,6 +155,20 @@
 #   that do per-half STATE bookkeeping then call this. VPS gate-off ==
 #   byte-identical to its pre-refactor concat; gate-on gains the same Pith
 #   pipeline the laptop already had. See test_cc_recall_unification.py.
+# [2026-09-07] Claude Code (DudeMan CC, Opus 5) — cc_reground_synapse_delays()
+# What: recomputes synaptic delay from geodesic distance for synapses whose delay was
+#   assigned by the random fallback because an endpoint had no poincare_dir at sprout.
+#   dry_run by default; only_nodes scopes it (the Rim + WANTs are the reason it exists).
+# Why: delay is stamped ONCE at sprout. The 183 Rim/WANT nodes had no geometry until
+#   2026-09-07 19:28, so every synapse ever sprouted to them took random.randint(1,5) --
+#   ~120k edges, on the two most important node classes in the substrate. Since delay IS
+#   the temporal structure (polychrony), those groups encode noise. Regrounding is not a
+#   change to earned structure; it puts the delay where correct computation would have
+#   put it. Josh, 2026-09-07: "Wouldn't it only put it in the place it would already be
+#   if it was computed correctly in the first place?" Yes.
+# How: mirrors the _sprout_synapses formula verbatim (same decay, same clamp, same
+#   manifold branches, cross-manifold left alone). Weights untouched; STDP re-shapes them
+#   against correct arrival times. neuro_foundation.py is PROTECTED -- not edited.
 # [2026-09-07] Claude Code (DudeMan CC, Opus 5) — rename: cc_gsg_backfill -> cc_stamp_missing_geometry
 # What: renamed at the def and both call sites (cc_ng_host, cc-ng-daemon).
 # Why: "backfill" presupposes a settled forward path being retro-applied, which is why
@@ -2607,6 +2621,84 @@ def _cc_poincare_distance(x, y) -> float:
     denom = (1.0 - nx2) * (1.0 - ny2)
     arg = 1.0 + num / max(denom, 1e-9)
     return math.acosh(max(1.0, arg))
+
+
+_CC_GSG_MSG_DECAY = 0.15   # matches neuro_foundation._GSG_MSG_DECAY
+
+
+def cc_reground_synapse_delays(graph, only_nodes=None, dry_run=True) -> dict:
+    """Recompute synaptic delay from geodesic distance for synapses that took
+    the random fallback because an endpoint had no geometry at sprout time.
+
+    Delay is assigned ONCE, at sprout, from whatever geometry the endpoints had
+    then (neuro_foundation._sprout_synapses). Nodes stamped later keep whatever
+    random.randint() gave them. That is not preserved temporal structure -- it
+    is noise that never meant anything -- so regrounding it puts the delay where
+    it would already have been had the geometry been there, which is the whole
+    point. Weights are untouched; STDP re-shapes them against correct arrival
+    times from here.
+
+    Mirrors the sprout-site formula exactly:
+        t     = 1 - exp(-_GSG_MSG_DECAY * geodesic)
+        delay = clamp(d_min + (d_max - d_min) * t, d_min, d_max)
+    Cross-manifold pairs have no shared geodesic and are left alone, as at sprout.
+
+    only_nodes: restrict to synapses touching these node ids (e.g. the Rim and
+    the WANTs). None = every eligible synapse.
+    dry_run=True reports without mutating. Returns a stats dict.
+    """
+    import math
+    from neuro_foundation import poincare_dir_array
+    stats = {"examined": 0, "eligible": 0, "changed": 0, "skipped_no_geometry": 0,
+             "skipped_cross_manifold": 0, "unchanged": 0, "delta_histogram": {}}
+    try:
+        d_min = int(graph.config.get("d_min", 1))
+        d_max = int(graph.config.get("d_max", 5))
+        for syn in list(getattr(graph, "synapses", {}).values()):
+            stats["examined"] += 1
+            pre_id = getattr(syn, "pre_node_id", None)
+            post_id = getattr(syn, "post_node_id", None)
+            if only_nodes is not None and pre_id not in only_nodes and post_id not in only_nodes:
+                continue
+            pre, post = graph.nodes.get(pre_id), graph.nodes.get(post_id)
+            if pre is None or post is None:
+                continue
+            a = poincare_dir_array(getattr(pre, "metadata", None))
+            b = poincare_dir_array(getattr(post, "metadata", None))
+            if a is None or b is None:
+                stats["skipped_no_geometry"] += 1
+                continue
+            mt1 = getattr(pre, "manifold_type", "hyperbolic")
+            mt2 = getattr(post, "manifold_type", "hyperbolic")
+            if mt1 != mt2:
+                stats["skipped_cross_manifold"] += 1
+                continue
+            import numpy as _np
+            if mt1 == "spherical":
+                cos = max(-1.0 + 1e-7, min(1.0 - 1e-7, float(_np.dot(a, b))))
+                gdist = math.acos(cos)
+            else:
+                l1 = max(0, min(2, getattr(pre, "diffpc_layer", 2)))
+                l2 = max(0, min(2, getattr(post, "diffpc_layer", 2)))
+                gdist = _cc_poincare_distance(a * _CC_GSG_LAYER_NORMS[l1],
+                                              b * _CC_GSG_LAYER_NORMS[l2])
+            stats["eligible"] += 1
+            t = 1.0 - math.exp(-_CC_GSG_MSG_DECAY * gdist)
+            new_delay = max(d_min, min(d_max, round(d_min + (d_max - d_min) * t)))
+            old_delay = getattr(syn, "delay", None)
+            if old_delay == new_delay:
+                stats["unchanged"] += 1
+                continue
+            key = f"{old_delay}->{new_delay}"
+            stats["delta_histogram"][key] = stats["delta_histogram"].get(key, 0) + 1
+            stats["changed"] += 1
+            if not dry_run:
+                syn.delay = new_delay
+        return stats
+    except Exception as exc:
+        logger.debug("cc_reground_synapse_delays failed (non-fatal): %s", exc)
+        stats["error"] = str(exc)
+        return stats
 
 
 def _cc_node_query_distance(node, query_dir) -> Optional[float]:
