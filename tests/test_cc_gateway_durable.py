@@ -116,10 +116,45 @@ def test_restart_or_different_graph_never_trusts_prior_applied(rig):
     assert rig.seen == ['same words'] and path.exists()
 
 
-def test_restart_cannot_authorize_prior_accepted_against_arbitrary_bootstrap(rig):
-    rig.add(); rig.drain(); rig.state.clear()
+def test_restart_accepted_receipt_and_new_file_do_not_repeat_learning(rig):
+    first = rig.add(texts=('first',)); first_raw = first.read_bytes()
+    rig.drain(); rig.state.clear()
+    second = rig.add(name='laptop_cc_gateway.2.tract', texts=('second',))
+    second_raw = second.read_bytes()
     result = rig.drain()
-    assert result['uncertain'] == 1 and result['accepted_files'] == []
+    assert result['accepted'] and result['all_done'] and result['uncertain'] == 0
+    assert rig.seen == ['first', 'second']
+    assert result['accepted_files'] == [
+        dict(name=first.name, sha256=hashlib.sha256(first_raw).hexdigest()),
+        dict(name=second.name, sha256=hashlib.sha256(second_raw).hexdigest())]
+
+
+def test_restart_finishes_terminal_receipt_cleanup_without_relearning(rig, monkeypatch):
+    path = rig.add()
+    unlink = os.unlink
+    with monkeypatch.context() as scoped:
+        def fail(target, *args, **kwargs):
+            if str(target) == str(path): raise OSError('cleanup interrupted')
+            return unlink(target, *args, **kwargs)
+        scoped.setattr(os, 'unlink', fail)
+        assert not rig.drain()['ok']
+    rig.state.clear()
+    result = rig.drain()
+    assert result['accepted'] and result['uncertain'] == 0
+    assert not path.exists() and rig.seen == ['same words']
+
+
+def test_same_filename_two_accepted_digests_remain_exact_receipt_identities(rig):
+    path = rig.add(texts=('first',)); first_raw = path.read_bytes()
+    rig.drain()
+    path = rig.add(texts=('second',)); second_raw = path.read_bytes()
+    rig.drain(); rig.state.clear()
+    result = rig.drain()
+    assert result['accepted'] and result['all_done']
+    assert {r['sha256'] for r in result['accepted_files']} == {
+        hashlib.sha256(first_raw).hexdigest(), hashlib.sha256(second_raw).hexdigest()}
+    assert {r['name'] for r in result['accepted_files']} == {path.name}
+    assert rig.seen == ['first', 'second']
 
 
 def test_corrupt_suffix_is_parsed_before_any_learning(rig):

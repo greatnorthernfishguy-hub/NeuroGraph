@@ -3,6 +3,8 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-11] Codex — terminal accepted deliveries survive normal restarts;
+#   ownership fences unresolved attempts, not verified completed delivery.
 # [2026-09-11] Codex — #423 retain raw delivery and journal attempts before learning.
 # What: receipt-gated gateway acceptance; restart ambiguity retained for reconciliation.
 # Why: refused checkpoint saves must not delete conversational experience.
@@ -2113,11 +2115,16 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
     every mutation. A filesystem lock serializes deliveries, while graph locking
     remains one record (or save) at a time. No synthetic graph steps.
 
-    Interrupted attempts, partial learning and any previous graph incarnation
-    require reconciliation; this journal cannot prove exactly-once learning or
-    that an arbitrary restored checkpoint contains an earlier accepted delivery.
+    Interrupted attempts, partial learning and unresolved prior-incarnation
+    deliveries require reconciliation. Terminal accepted receipts survive normal
+    restarts without relearning. The checkpoint and journal must be preserved
+    together: arbitrary rollback or mixing a newer journal with an older graph
+    is unsupported without reconciliation, not detected by process ownership.
     Same live graph may retry a refused save without repeating applied records.
     Raw journal copies are retained even after acceptance (no automatic GC).
+    Producer filenames are unique and immutable; transport participants must
+    cooperate with delivery serialization. The digest recheck before unlink is
+    not an atomic compare-and-unlink against an unrelated same-name writer.
     Legacy batch/idle arguments remain inert for 1/0 socket compatibility.
     """
     import contextlib
@@ -2208,9 +2215,9 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
                     if name.startswith(exclude_prefix):
                         continue
                     key = (conduit_dir, name, digest)
-                    if prior_owner != owner:
-                        # Even an old accepted receipt is insufficient evidence
-                        # about this bootstrap's chosen checkpoint.
+                    if status != 'accepted' and prior_owner != owner:
+                        # Unresolved attempts belong to their original graph.
+                        # Terminal acceptance is durable across normal restarts.
                         result['uncertain'] += 1
                         result['retained'] += 1
                         continue
