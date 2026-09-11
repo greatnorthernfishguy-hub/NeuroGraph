@@ -27,6 +27,11 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-11] Codex — #426 restore CC Tonic without a private transformer load.
+# What: construct the existing engine in shared-body-only mode at host startup.
+# Why: disabling eager model load had disabled the engine BrainSwitcher expected.
+# How: engine starts independently of sessions and waits without heuristic execution; Elmer attaches the shared body.
+# Ref: docs/handoffs/cc-shared-tonic-repair-20260911.md.
 # [2026-09-07] Claude Code (DudeMan CC, Opus 5) — #413: close the Ingestor door in _deposit()
 # What: _deposit() calls cc_ng_organism.run_conversational_dual_pass() instead of
 #   ng.on_message(). Parity with the laptop daemon's same-day fix. The _recent_spikes read
@@ -362,8 +367,8 @@ RECALL_K_BRIEF = 3
 # peer_bridge disabled: CC is not a peer module (would collide with Syl's
 # module_id="neurograph" in the tract directory).
 # ces disabled: CC doesn't need real-time attention stream.
-# tonic enabled (own Qwen loaded at init; BrainSwitcher hot-swaps to shared
-# ProtoUniBrain body 60s post-startup via Elmer's _delayed_brain_load (#159)).
+# TonicThread is enabled; automatic latent-engine construction stays disabled.
+# The host starts a shared-body-only engine; BrainSwitcher supplies the body (#426).
 _CC_SNN_CONFIG = {
     "learning_rate": 0.03,
     "tau_plus": 10.0,
@@ -1350,6 +1355,38 @@ def _cleanup_stale_socket() -> None:
     )
 
 
+def _start_cc_tonic_engine(ng) -> bool:
+    """Start CC's existing Tonic mechanism without allocating a transformer.
+
+    BrainSwitcher owns shared-body attachment. This engine belongs only to CC's
+    graph, vector store and TonicThread; no session or step-clock gate is changed.
+    """
+    tt = getattr(ng, "_tonic_thread", None)
+    if tt is None:
+        logger.warning("CC Tonic startup: TonicThread unavailable")
+        return False
+    if getattr(tt, "_latent_engine", None) is not None:
+        return True
+    engine = None
+    try:
+        from tonic_engine import TonicEngine
+        from cc_ng_organism import pith_prefetch_seed
+        engine = TonicEngine(ng.graph, ng.vector_db, tt, require_shared_body=True)
+        engine.set_prefetch_seed(lambda: pith_prefetch_seed(_STATE.conv_state))
+        engine.start()
+        tt.set_latent_engine(engine)
+        logger.info("CC Tonic started in shared-body-only mode; BrainSwitcher owns attachment")
+        return True
+    except Exception:
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception:
+                logger.warning("CC Tonic partial-start cleanup failed", exc_info=True)
+        logger.exception("CC Tonic startup failed; no private transformer was requested")
+        return False
+
+
 def init_cc_host() -> bool:
     """Initialize CC's NG and start the hook socket server.
 
@@ -1436,6 +1473,8 @@ def init_cc_host() -> bool:
     # Start background threads
     threading.Thread(target=_serve_loop, name="cc-ng-serve", daemon=True).start()
     threading.Thread(target=_autosave_loop, name="cc-ng-autosave", daemon=True).start()
+
+    _start_cc_tonic_engine(cc_ng)
 
     # CC Tonic idle watcher + Dream consolidation pulse (2026-07-23 parity
     # wiring). Each _start_* fn checks its own CC_HOST_*_ENABLED gate
