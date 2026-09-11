@@ -305,3 +305,35 @@ def test_journal_cannot_live_in_git_conduit(rig):
     path = rig.add()
     result = rig.drain(journal_path=str(rig.conduit / 'journal.sqlite3'))
     assert not result['ok'] and not rig.seen and path.exists()
+
+
+
+def test_restart_adopts_unattempted_file_after_load_gate(rig, monkeypatch):
+    first = rig.add(texts=('first',))
+    second = rig.add(name='laptop_cc_gateway.2.tract', texts=('second',))
+    monkeypatch.setitem(sys.modules, 'cc_refeed', SimpleNamespace(should_pause_for_load=lambda c: True))
+    initial = rig.drain()
+    assert initial['accepted'] and initial['retained'] == 1
+    assert not first.exists() and second.exists() and rig.seen == ['first']
+    rig.state.clear()
+    result = rig.drain()
+    assert result['accepted'] and result['all_done'] and not result['uncertain']
+    assert rig.seen == ['first', 'second'] and not second.exists()
+    assert len(result['accepted_files']) == 2
+
+
+def test_restart_adopts_raw_retained_before_first_attempt(rig, monkeypatch):
+    path = rig.add()
+    class InterruptedReader:
+        def __init__(self, raw):
+            raise KeyboardInterrupt()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(ng_tract, 'TractReader', InterruptedReader)
+        with pytest.raises(KeyboardInterrupt):
+            rig.drain()
+    with sqlite3.connect(rig.journal) as db:
+        assert db.execute('SELECT count(*) FROM files').fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM records').fetchone()[0] == 0
+    rig.state.clear()
+    assert rig.drain()['accepted']
+    assert rig.seen == ['same words'] and not path.exists()
