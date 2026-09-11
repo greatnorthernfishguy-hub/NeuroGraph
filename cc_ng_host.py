@@ -1120,15 +1120,9 @@ def _autosave_loop() -> None:
                     cc_update_probation,
                 )
                 drain_ingest_tract(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
-                # Corpus Callosum Leg 1 (#70): the conduit drain USED to run here.
-                # Moved out 2026-07-28 -- a 60s pulse is the wrong home for merge
-                # absorption. FatherGraph Finding 1 (never bulk-dump; batch ~20-30)
-                # and Finding 3 (250 idle steps BETWEEN batches -- "not optional,
-                # it's what makes merge work", 47%->74% accuracy) require batched
-                # ingestion with homeostatic consolidation between batches, and
-                # those idle steps must not block this pulse. It now runs in
-                # docs/scripts/cc-ng-sync.py -- the nightly path it replaces,
-                # which already carries CC_NG_BATCH_SIZE=25/CC_NG_IDLE_STEPS=250.
+                # Leg1 raw conduit delivery runs through the socket sync job.
+                # The July28 topology/sleep rationale was superseded Sep11:
+                # raw experience has no synthetic consolidation cadence.
                 cc_update_probation(_STATE.cc_ng.graph)
                 surface_wants(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)
                 generate_emergent_want(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db)

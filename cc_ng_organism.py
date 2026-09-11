@@ -73,9 +73,10 @@
 #   distinct from CC's main.msgpack/vectors.msgpack: the Commons is the shared
 #   ecosystem medium, not CC's mind, and never touches save-guarded checkpoint I/O.
 #   Restore and persist failures are both non-fatal (start fresh / skip the cycle).
+# Historical policy below was superseded 2026-09-11: Leg1 is raw experience; no sleep.
 # [2026-07-28] Claude Code (DudeMan CC, Opus 5) — Callosum Leg 1: FatherGraph absorption discipline + move off the 60s pulse
 # What: drain_gateway_conduit() gained batch_size/idle_steps/load_ceiling/exclude_prefix
-#   and now sleeps between batches instead of draining every queued file back-to-back:
+#   and at that time slept between batches instead of draining every queued file back-to-back:
 #   after every batch_size absorbed turns it runs idle_steps of pure graph.step()
 #   (_cc_callosum_consolidate) BEFORE taking in more, plus a trailing pass. Load-aware
 #   via cc_refeed.should_pause_for_load (stops clean, leaves files on disk = backpressure).
@@ -2103,7 +2104,9 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
 
     batch_size/idle_steps are accepted only for older socket callers. They are
     intentionally inert: even a stale caller passing 25/250 cannot recreate the
-    category error. Source-owned load backpressure still yields between records;
+    category error. Retire these arguments only after all socket callers stop
+    sending them and all receivers have the source correction.
+    Source-owned load backpressure still yields between records;
     the unprocessed tract suffix remains durable for the next call. A malformed
     file is quarantined; own-hemisphere files are never consumed.
     """
