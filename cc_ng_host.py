@@ -27,6 +27,10 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-11] Codex — #423 acknowledge only durable gateway save receipts.
+# What: canonical receiver owns retained input and receipt-gated cleanup.
+# Why: quarantine and component failures must never acknowledge consumption.
+# How: opt-in save receipt callback, local workspace transport journal.
 # [2026-09-07] Claude Code (DudeMan CC, Opus 5) — #413: close the Ingestor door in _deposit()
 # What: _deposit() calls cc_ng_organism.run_conversational_dual_pass() instead of
 #   ng.on_message(). Parity with the laptop daemon's same-day fix. The _recent_spikes read
@@ -908,22 +912,19 @@ def _handle_drain_conduit(data):
         return {"ok": False, "error": "NG not initialized"}
     try:
         from cc_ng_organism import drain_gateway_conduit
-        absorbed = drain_gateway_conduit(
+        result = drain_gateway_conduit(
             ng.graph, ng.vector_db, _STATE.conv_state,
             conduit_dir=data.get("conduit_dir"),
             batch_size=data.get("batch_size"),
             idle_steps=data.get("idle_steps"),
             exclude_prefix=data.get("exclude_prefix"),
+            save_callback=lambda: ng.save(with_receipt=True),
+            journal_path=os.path.join(CC_NG_WORKSPACE, "delivery", "gateway.sqlite3"),
         )
     except Exception as exc:
         logger.warning("CC conduit drain failed (non-fatal): %s", exc)
         return {"ok": False, "error": str(exc)}
-    try:
-        with ng.graph._concurrent_lock:
-            ng.save()
-    except Exception as exc:
-        return {"ok": True, "absorbed": absorbed, "warning": "save failed: " + str(exc)}
-    return {"ok": True, "absorbed": absorbed}
+    return result
 
 
 def _handle_export_topology(data):
@@ -1038,6 +1039,8 @@ _DISPATCH = {
     "export": _handle_export,
     "import": _handle_import,
     "drain_conduit": _handle_drain_conduit,
+    # Old hosts reject this event before any legacy destructive drain runs.
+    "drain_conduit_durable": _handle_drain_conduit,
     "export_topology": _handle_export_topology,
     "export_topology_frame": _handle_export_topology_frame,
     "SessionStart": _handle_session_start,

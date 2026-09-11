@@ -3,6 +3,10 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-11] Codex — #423 retain raw delivery and journal attempts before learning.
+# What: receipt-gated gateway acceptance; restart ambiguity retained for reconciliation.
+# Why: refused checkpoint saves must not delete conversational experience.
+# How: local SQLite transport journal, per-record graph locks, canonical dual-pass.
 # [2026-09-11] Codex + native CC review — raw Leg1 experience is not topology merge.
 # What: one experience record per lock slice; no synthetic consolidation/graph.step.
 # Why: Josh confines FatherGraph 25/250 to topology. Raw text uses conversational dual-pass.
@@ -1821,6 +1825,13 @@ def cc_gateway_tract_path() -> str:
     return os.environ.get("CC_GATEWAY_TRACT_PATH", _DEFAULT_CC_GATEWAY_TRACT_PATH)
 
 
+def _apply_gateway_experience(graph, vector_db, state, entry):
+    """Canonical raw conversation embedding/dual-pass, shared by both drains."""
+    from ng_embed import embed
+    return run_conversational_dual_pass(
+        graph, vector_db, entry.content, embed(entry.content), state)
+
+
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         return_consumed: bool = False, max_entries: int = 0):
     """Drain miniTID's turn-deposit tract file, running each raw experience
@@ -1914,8 +1925,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 continue
             taken += 1
             try:
-                emb = ng_embed_fn(text)
-                if run_conversational_dual_pass(graph, vector_db, text, emb, state):
+                if _apply_gateway_experience(graph, vector_db, state, entry):
                     absorbed += 1
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
@@ -2094,156 +2104,229 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
 
 def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None,
                            batch_size: int = None, idle_steps: int = None,
-                           load_ceiling: float = None, exclude_prefix: str = None) -> int:
-    """Receive literal CC conversation records through conversational dual-pass.
+                           load_ceiling: float = None, exclude_prefix: str = None,
+                           *, save_callback=None, journal_path=None) -> dict:
+    """Receive immutable raw Leg1 input, acknowledge only a complete save receipt.
 
-    Leg1 carries experience text, not learned topology. Each record uses the
-    ordinary embedding/deposit path, with one record per graph-lock slice.
-    This function never synthesizes idle steps or invokes topology consolidation.
-    FatherGraph's merge discipline remains in Leg2's topology merger.
+    SQLite stores transport identities, exact raw BTF bytes and attempt states,
+    never embeddings or derived cognition. FULL synchronous transactions precede
+    every mutation. A filesystem lock serializes deliveries, while graph locking
+    remains one record (or save) at a time. No synthetic graph steps.
 
-    batch_size/idle_steps are accepted only for older socket callers. They are
-    intentionally inert: even a stale caller passing 25/250 cannot recreate the
-    category error. Retire these arguments only after all socket callers stop
-    sending them and all receivers have the source correction.
-    Source-owned load backpressure still yields between records;
-    the unprocessed tract suffix remains durable for the next call. A malformed
-    file is quarantined; own-hemisphere files are never consumed.
+    Interrupted attempts, partial learning and any previous graph incarnation
+    require reconciliation; this journal cannot prove exactly-once learning or
+    that an arbitrary restored checkpoint contains an earlier accepted delivery.
+    Same live graph may retry a refused save without repeating applied records.
+    Raw journal copies are retained even after acceptance (no automatic GC).
+    Legacy batch/idle arguments remain inert for 1/0 socket compatibility.
     """
+    import contextlib
+    import fcntl
+    import hashlib
+    import json
+    import sqlite3
+
+    result = dict(ok=False, accepted=False, absorbed=0, applied=0,
+                  retained=0, uncertain=0, accepted_files=[], errors=[])
     if not _CC_CALLOSUM_LEG1_ENABLED:
-        return 0
-    if batch_size not in (None, 1) or idle_steps not in (None, 0):
-        logger.warning("CC Leg1 ignores legacy topology batch/idle settings; "
-                       "raw experience receives no synthetic consolidation")
-    conduit_dir = conduit_dir or cc_gateway_conduit_dir()
-    try:
-        paths = sorted(glob.glob(os.path.join(conduit_dir, _CC_GATEWAY_CONDUIT_GLOB)))
-    except Exception as exc:
-        logger.debug("CC callosum Leg1 conduit listing failed (non-fatal): %s", exc)
-        return 0
-
-    # Never drain this hemisphere's OWN outgoing files -- they are addressed to
-    # the other half and must survive until it has pulled them. Mirrors the
-    # old sync's `!= f'{MACHINE_ID}_export.jsonl'` guard. Without this, running
-    # the drain on the producing machine would eat its own turns before they
-    # ever crossed (they'd already be absorbed locally, so it would look
-    # harmless while silently starving the far hemisphere).
-    # The guard defaults from THIS hemisphere's declared identity rather than
-    # trusting every caller to pass it (LAW 4 -- the invariant belongs where the
-    # identity is known, not in each consumer). trickle_gateway_conduit() already
-    # refuses to WRITE without MACHINE_ID; refuse to DRAIN without it for the
-    # same reason. An explicit exclude_prefix argument is an override, not the
-    # guard itself.
+        result['disabled'] = True
+        return result
+    if save_callback is None or not journal_path:
+        result['errors'].append('durable save callback and local journal required')
+        return result
+    if getattr(graph, '_concurrent_lock', None) is None:
+        result['errors'].append('graph mutation lock required')
+        return result
     if exclude_prefix is None:
-        machine_id = os.environ.get("MACHINE_ID", "").strip()
+        machine_id = os.environ.get('MACHINE_ID', '').strip()
         if not machine_id:
-            logger.warning(
-                "CC callosum Leg1: MACHINE_ID unset -- refusing to drain the conduit "
-                "without a self-consumption guard (would absorb and DELETE this "
-                "hemisphere's own outgoing turns before the far half pulled them). "
-                "Set MACHINE_ID in the daemon env.")
-            return 0
-        exclude_prefix = f"{machine_id}_"
-    if exclude_prefix:
-        paths = [p for p in paths if not os.path.basename(p).startswith(exclude_prefix)]
-
-    # Load-aware backpressure -- imported defensively; absent cc_refeed must
-    # not disable the drain, only its ability to notice load.
+            result['errors'].append('MACHINE_ID required for self-consumption guard')
+            return result
+        exclude_prefix = machine_id + '_'
+    if not exclude_prefix:
+        result['errors'].append('empty self-consumption guard refused')
+        return result
+    if batch_size not in (None, 1) or idle_steps not in (None, 0):
+        logger.warning('CC Leg1 ignores topology batch/idle arguments')
+    conduit_dir = os.path.realpath(conduit_dir or cc_gateway_conduit_dir())
+    journal_path = os.path.abspath(journal_path)
+    if os.path.commonpath([conduit_dir, journal_path]) == conduit_dir:
+        result['errors'].append('local journal must be outside synced conduit')
+        return result
     try:
-        from cc_refeed import should_pause_for_load as _should_pause
-    except Exception:
-        _should_pause = None
-    # Own ceiling (LAW 5). cc_refeed's CC_REFEED_LOAD_CEILING=0.75 governs an
-    # opportunistic re-feed that may back off indefinitely; this is a
-    # once-nightly path that has to make progress, so it gets its own knob and
-    # a more permissive default.
-    if load_ceiling is None:
-        ceiling = float(os.environ.get("CC_CALLOSUM_LOAD_CEILING", "1.5"))
-    else:
-        ceiling = float(load_ceiling)
-
-    total = 0
-    files_done = 0
-    slices_done = 0
-    stop_for_load = False
-    for path in paths:
-        # One raw experience is the lock unit. No topology batch or idle steps.
-        # The existing partial drain retains the unprocessed byte suffix.
-        while True:
-            # Yield under load between experience records. The first record can
-            # still make progress; this is resource backpressure, not learning cadence.
-            if slices_done > 0 and _should_pause is not None:
+        from cc_refeed import should_pause_for_load
+    except ImportError:
+        should_pause_for_load = lambda ceiling: False
+    ceiling = float(load_ceiling if load_ceiling is not None else
+                    os.environ.get('CC_CALLOSUM_LOAD_CEILING', '1.5'))
+    try:
+        os.makedirs(os.path.dirname(journal_path), mode=0o700, exist_ok=True)
+        # Persist the new delivery-directory entry before trusting its journal.
+        parent_fd = os.open(os.path.dirname(os.path.dirname(journal_path)),
+                            os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        with open(journal_path + '.lock', 'a+b') as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            # Keep a strong graph reference: neither PID reuse nor id() reuse can make
+            # another graph look like the one whose applied records can retry saving.
+            binding = state.get('_gateway_delivery_binding')
+            if not binding or binding[0] is not graph or binding[1] != os.getpid():
+                binding = (graph, os.getpid(), uuid.uuid4().hex)
+                state['_gateway_delivery_binding'] = binding
+            owner = binding[2]
+            with contextlib.closing(sqlite3.connect(journal_path)) as db:
+                db.execute('PRAGMA journal_mode=WAL')
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute('CREATE TABLE IF NOT EXISTS files (\n                    conduit TEXT, name TEXT, digest TEXT, raw BLOB NOT NULL,\n                    owner TEXT NOT NULL, status TEXT NOT NULL, receipt TEXT,\n                    PRIMARY KEY(conduit, name, digest))')
+                db.execute('CREATE TABLE IF NOT EXISTS records (\n                    conduit TEXT, name TEXT, digest TEXT, start INTEGER, end INTEGER,\n                    status TEXT NOT NULL,\n                    PRIMARY KEY(conduit, name, digest, start, end))')
+                db.commit()
+                directory_fd = os.open(os.path.dirname(journal_path), os.O_RDONLY | os.O_DIRECTORY)
                 try:
-                    paused = _should_pause(ceiling)
-                except Exception:
-                    paused = False
-                if paused:
-                    logger.info(
-                        "CC callosum Leg1: load above ceiling %.2f -- stopping after %d file(s), "
-                        "%d record slice(s), %d turn(s); %d file(s) left on disk for the next run "
-                        "(backpressure)",
-                        ceiling, files_done, slices_done, total, len(paths) - files_done)
-                    stop_for_load = True
-                    break
-            try:
-                size_before = os.path.getsize(path)
-            except Exception as exc:
-                logger.debug("CC callosum Leg1 conduit stat failed for %s (non-fatal): %s", path, exc)
-                break
-            try:
-                # The live graph owns all mutation. Release its lock between
-                # ordinary records, so other conversation work can interleave.
-                _lock = getattr(graph, "_concurrent_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path,
-                                                      max_entries=1)
-                else:
-                    absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path,
-                                                  max_entries=1)
-            except Exception as exc:
-                logger.debug("CC callosum Leg1 conduit drain failed for %s (non-fatal): %s", path, exc)
-                break
-            total += absorbed
-            slices_done += 1
-
-            # `exhausted` decides whether to come back to THIS file. Default True
-            # (leave) so any unexpected cleanup failure moves on rather than
-            # re-draining the same path forever.
-            exhausted = True
-            try:
-                size_after = os.path.getsize(path)
-                if size_after == 0:
-                    os.remove(path)
-                elif size_after == size_before:
-                    # Never truncated at all -- drain_ingest_tract's parse step
-                    # itself failed (the only path that skips truncate). Retrying
-                    # forever would let a format-skew file pile up invisibly in a
-                    # git-synced dir; quarantine it loudly instead.
-                    qdir = os.path.join(conduit_dir, "quarantine")
-                    os.makedirs(qdir, exist_ok=True)
-                    dest = os.path.join(qdir, os.path.basename(path))
-                    os.replace(path, dest)
-                    logger.warning(
-                        "CC callosum Leg1: %s failed to parse (untouched, %d bytes) -- "
-                        "quarantined to %s instead of retrying forever", path, size_before, dest)
-                else:
-                    # Shrank but not to empty: the cap stopped us mid-file and the
-                    # remainder is still there. Yield the lock, then return to it.
-                    exhausted = False
-            except Exception as exc:
-                logger.debug("CC callosum Leg1 conduit cleanup failed for %s (non-fatal): %s", path, exc)
-
-            if exhausted:
-                break
-        files_done += 1
-        if stop_for_load:
-            break
-
-    if total:
-        logger.info("CC callosum Leg1: absorbed %d turn(s) from %d conduit file(s) in %d record slice(s) "
-                    "(raw experience; no topology consolidation)", total, files_done, slices_done)
-    return total
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                # Retain each full immutable file BEFORE parsing or any learning.
+                for path in sorted(glob.glob(os.path.join(conduit_dir, _CC_GATEWAY_CONDUIT_GLOB))):
+                    name = os.path.basename(path)
+                    if name.startswith(exclude_prefix):
+                        continue
+                    with open(path, 'rb') as stream:
+                        raw = stream.read()
+                    digest = hashlib.sha256(raw).hexdigest()
+                    with db:
+                        db.execute('INSERT OR IGNORE INTO files VALUES (?,?,?,?,?,?,NULL)',
+                                   (conduit_dir, name, digest, raw, owner, 'retained'))
+                rows = db.execute('SELECT name,digest,owner,status FROM files WHERE conduit=? ORDER BY name,digest',
+                                  (conduit_dir,)).fetchall()
+                slices = 0
+                pending = []
+                accepted = []
+                for name, digest, prior_owner, status in rows:
+                    if name.startswith(exclude_prefix):
+                        continue
+                    key = (conduit_dir, name, digest)
+                    if prior_owner != owner:
+                        # Even an old accepted receipt is insufficient evidence
+                        # about this bootstrap's chosen checkpoint.
+                        result['uncertain'] += 1
+                        result['retained'] += 1
+                        continue
+                    if status in ('uncertain', 'invalid'):
+                        result['retained'] += 1
+                        result['uncertain'] += status == 'uncertain'
+                        continue
+                    if status != 'accepted':
+                        raw = db.execute('SELECT raw FROM files WHERE conduit=? AND name=? AND digest=?', key).fetchone()[0]
+                        if hashlib.sha256(raw).hexdigest() != digest:
+                            result['errors'].append(name + ': retained raw digest mismatch')
+                            result['retained'] += 1
+                            continue
+                        try:
+                            import ng_tract
+                            reader = ng_tract.TractReader(raw)
+                            records = []
+                            start = 0
+                            for entry in reader:
+                                end = reader.position()
+                                if not start < end <= len(raw):
+                                    raise ValueError('invalid tract byte interval')
+                                if (entry.entry_type != ng_tract.ENTRY_EXPERIENCE or
+                                        entry.source != 'cc_gateway' or not entry.content.strip()):
+                                    raise ValueError('unexpected or empty gateway record')
+                                records.append((start, end, entry))
+                                start = end
+                            if start != len(raw) or not records:
+                                raise ValueError('incomplete or empty tract')
+                        except Exception as exc:
+                            with db:
+                                db.execute('UPDATE files SET status=? WHERE conduit=? AND name=? AND digest=?',
+                                           ('invalid',) + key)
+                            result['errors'].append(name + ': ' + str(exc))
+                            result['retained'] += 1
+                            continue
+                        complete = True
+                        for start, end, entry in records:
+                            rkey = key + (start, end)
+                            record = db.execute('SELECT status FROM records WHERE conduit=? AND name=? AND digest=? AND start=? AND end=?', rkey).fetchone()
+                            if record and record[0] == 'applied':
+                                continue
+                            if record:
+                                complete = False
+                                with db:
+                                    db.execute('UPDATE files SET status=? WHERE conduit=? AND name=? AND digest=?', ('uncertain',) + key)
+                                result['uncertain'] += 1
+                                break
+                            if slices and should_pause_for_load(ceiling):
+                                complete = False
+                                break
+                            with db:
+                                db.execute('INSERT INTO records VALUES (?,?,?,?,?,?)', rkey + ('attempting',))
+                            try:
+                                with graph._concurrent_lock:
+                                    applied = _apply_gateway_experience(graph, vector_db, state, entry)
+                                if not applied:
+                                    raise RuntimeError('dual-pass did not confirm full application')
+                                with db:
+                                    db.execute('UPDATE records SET status=? WHERE conduit=? AND name=? AND digest=? AND start=? AND end=?', ('applied',) + rkey)
+                                result['applied'] += 1
+                                result['absorbed'] += 1
+                                slices += 1
+                            except Exception as exc:
+                                with db:
+                                    db.execute('UPDATE files SET status=? WHERE conduit=? AND name=? AND digest=?', ('uncertain',) + key)
+                                result['errors'].append(name + ': ' + str(exc))
+                                result['uncertain'] += 1
+                                complete = False
+                                break
+                        if not complete:
+                            result['retained'] += 1
+                            continue
+                        pending.append(key)
+                    else:
+                        accepted.append(key)
+                if pending:
+                    try:
+                        with graph._concurrent_lock:
+                            receipt = save_callback()
+                        if (not isinstance(receipt, dict) or receipt.get('accepted') is not True
+                                or receipt.get('outcome') != 'primary'):
+                            raise RuntimeError('checkpoint not accepted: ' + str(receipt))
+                        # One save covers all completely applied input files.
+                        # Journal acceptance commits before deletion or response.
+                        with db:
+                            for key in pending:
+                                db.execute('UPDATE files SET status=?,receipt=? WHERE conduit=? AND name=? AND digest=?',
+                                           ('accepted', json.dumps(receipt)) + key)
+                        accepted.extend(pending)
+                    except Exception as exc:
+                        result['errors'].append(str(exc))
+                        result['retained'] += len(pending)
+                for _, name, digest in accepted:
+                    path = os.path.join(conduit_dir, name)
+                    if os.path.exists(path):
+                        with open(path, 'rb') as stream:
+                            current = stream.read()
+                        if hashlib.sha256(current).hexdigest() != digest:
+                            # Same name, different bytes: no deletion authority.
+                            result['retained'] += 1
+                            continue
+                        os.unlink(path)
+                        fd = os.open(conduit_dir, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                    result['accepted_files'].append(dict(name=name, sha256=digest))
+                result['accepted'] = bool(result['accepted_files'])
+                result['all_done'] = not result['retained'] and not result['errors']
+                result['ok'] = not result['retained'] and not result['errors']
+    except Exception as exc:
+        result['errors'].append(str(exc))
+        result['ok'] = result['accepted'] = False
+    return result
 
 
 # [2026-07-10] Recall seed floor for _harvest_associations' VDB seed-search.

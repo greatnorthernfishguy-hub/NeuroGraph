@@ -1,6 +1,8 @@
 # tests/test_cc_callosum_leg1.py
 #
 # ---- Changelog ----
+# [2026-09-11] Codex — isolate local/trickle tests; receipt gateway cases moved
+#   to test_cc_gateway_durable.py. No real NG/model fixture.
 # [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70) tests
 # What: Coverage for cc_ng_organism.trickle_gateway_conduit() (laptop-side
 #   per-batch conduit write) and drain_gateway_conduit() (VPS-side drain +
@@ -10,9 +12,8 @@
 #   rather than a shared append target -- see spec §2b race note), collision-
 #   free filenames under rapid calls, VPS drain-and-delete, gate-off no-op on
 #   both sides, and fail-soft on a missing/corrupt conduit dir.
-# How: Real ng_tract.deposit_experience()/TractReader round-trips and a real
-#   NeuroGraphMemory instance (same cc_ng fixture pattern as
-#   test_cc_dual_pass.py/test_cc_refeed.py) for the end-to-end drain proof;
+# How: Real ng_tract.deposit_experience()/TractReader round-trips and fake
+#   conversational learning (no graph/model construction) for the end-to-end drain proof;
 #   the gate (_CC_CALLOSUM_LEG1_ENABLED, computed once at import like
 #   _CC_PITH_ENABLED) is toggled via monkeypatch.setattr on the module
 #   object, the established pattern in this suite (see test_cc_recall_dedup.py,
@@ -53,25 +54,17 @@ def leg1_enabled(monkeypatch):
     monkeypatch.setenv("MACHINE_ID", "laptop")
 
 
-@pytest.fixture
-def draining_hemisphere(monkeypatch, leg1_enabled):
-    """Run the test AS the receiving half. The conduit files under test are all
-    laptop-produced, so the drain's self-consumption guard -- which now defaults
-    from MACHINE_ID rather than trusting the caller to pass exclude_prefix -- must
-    see a DIFFERENT identity or it will (correctly) skip every one of them.
-    A drain test declaring MACHINE_ID=laptop while draining laptop_* files was
-    describing a hemisphere eating its own outgoing turns."""
-    monkeypatch.setenv("MACHINE_ID", "vps")
 
 
 @pytest.fixture
-def cc_ng():
-    from openclaw_hook import NeuroGraphMemory
-    workspace = tempfile.mkdtemp(prefix='cc_callosum_leg1_test_')
-    ng = NeuroGraphMemory(workspace_dir=workspace,
-                          config={"tonic": {"enabled": False}, "peer_bridge": {"enabled": False}})
-    yield ng
-    shutil.rmtree(workspace, ignore_errors=True)
+def cc_ng(monkeypatch):
+    """Transport tests use fake learning, never construct a live NG/model."""
+    from types import SimpleNamespace
+    import ng_embed
+    monkeypatch.setattr(ng_embed, 'embed', lambda text: None)
+    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', lambda *args: True)
+    return SimpleNamespace(graph=SimpleNamespace(_concurrent_lock=threading.RLock()),
+                           vector_db=None)
 
 
 # =============================================================================
@@ -86,23 +79,6 @@ def test_trickle_gateway_conduit_is_noop_when_gate_off(tmp_path, monkeypatch):
     assert not os.path.exists(conduit_dir)
 
 
-def test_drain_gateway_conduit_is_noop_when_gate_off(tmp_path, monkeypatch, cc_ng):
-    monkeypatch.setattr(cc_ng_organism, "_CC_CALLOSUM_LEG1_ENABLED", False)
-    conduit_dir = str(tmp_path / "conduit")
-    os.makedirs(conduit_dir)
-    # A leftover conduit file must survive untouched -- gate-off means
-    # drain_gateway_conduit doesn't even list the directory.
-    leftover = os.path.join(conduit_dir, "laptop_cc_gateway.123_deadbeef.tract")
-    with open(leftover, "wb") as f:
-        f.write(b"untouched")
-
-    state = {"last_forest_id": None}
-    absorbed = drain_gateway_conduit(cc_ng.graph, cc_ng.vector_db, state, conduit_dir=conduit_dir,
-                                    idle_steps=0, load_ceiling=999.0)
-    assert absorbed == 0
-    assert os.path.exists(leftover)
-    with open(leftover, "rb") as f:
-        assert f.read() == b"untouched"
 
 
 # =============================================================================
@@ -162,108 +138,12 @@ def test_trickle_gateway_conduit_fails_soft_on_unwritable_dir(leg1_enabled):
 # VPS side: drain_gateway_conduit
 # =============================================================================
 
-def test_drain_gateway_conduit_absorbs_and_deletes_conduit_files(cc_ng, tmp_path, draining_hemisphere):
-    """The golden end-to-end: real BTF frames trickled into per-batch conduit
-    files -> drain_gateway_conduit absorbs each via the real drain_ingest_
-    tract -> conversational nodes exist -> each fully-drained file is deleted."""
-    import ng_tract
-
-    conduit_dir = str(tmp_path / "conduit")
-    os.makedirs(conduit_dir)
-
-    for i, text in enumerate([
-        "the laptop turn about the corpus callosum spec",
-        "the laptop turn about retiring the lossy jsonl sync",
-    ]):
-        path = os.path.join(conduit_dir, f"laptop_cc_gateway.{1000 + i}_batch{i}.tract")
-        ng_tract.deposit_experience(
-            raw=text.encode(),
-            source="cc_gateway",
-            tract_paths=[path],
-        )
-
-    state = {"last_forest_id": None}
-    absorbed = drain_gateway_conduit(cc_ng.graph, cc_ng.vector_db, state, conduit_dir=conduit_dir,
-                                    load_ceiling=999.0)
-    assert absorbed == 2
-
-    conv_nodes = [n for n in cc_ng.graph.nodes.values()
-                  if n.metadata.get("creation_mode") == "conversational"]
-    # >= 2, not == 2: on an environment with live TID reachable (e.g. the
-    # VPS), dual-pass extracts real concept/tree nodes per turn alongside
-    # the 2 forest nodes -- exactly Leg 1's actual purpose (the VPS is the
-    # sole Arborist). A forest-only environment (no TID, e.g. the laptop
-    # itself) degrades to exactly 2. Either is correct; what matters is
-    # both turns landed, which `absorbed == 2` above already proved.
-    assert len(conv_nodes) >= 2
-
-    # Fully-drained (now-empty) conduit files are deleted -- repo-sync.sh
-    # syncs the deletion back to the laptop, no shared mutable file crosses
-    # the wire twice.
-    assert glob.glob(os.path.join(conduit_dir, "laptop_cc_gateway.*.tract")) == []
 
 
-def test_drain_gateway_conduit_missing_dir_is_noop(cc_ng, tmp_path, draining_hemisphere):
-    conduit_dir = str(tmp_path / "does_not_exist")
-    state = {"last_forest_id": None}
-    absorbed = drain_gateway_conduit(cc_ng.graph, cc_ng.vector_db, state, conduit_dir=conduit_dir,
-                                    idle_steps=0, load_ceiling=999.0)
-    assert absorbed == 0
 
 
-def test_drain_gateway_conduit_skips_corrupt_file_absorbs_rest(cc_ng, tmp_path, draining_hemisphere):
-    """One corrupt/garbage conduit file must not abort the whole batch --
-    fails soft on that file, keeps draining the others."""
-    import ng_tract
-
-    conduit_dir = str(tmp_path / "conduit")
-    os.makedirs(conduit_dir)
-
-    good_path = os.path.join(conduit_dir, "laptop_cc_gateway.1_good.tract")
-    ng_tract.deposit_experience(
-        raw=b"a genuine turn that must still be absorbed",
-        source="cc_gateway",
-        tract_paths=[good_path],
-    )
-    bad_path = os.path.join(conduit_dir, "laptop_cc_gateway.2_bad.tract")
-    with open(bad_path, "wb") as f:
-        f.write(b"not a valid BTF tract at all")
-
-    state = {"last_forest_id": None}
-    absorbed = drain_gateway_conduit(cc_ng.graph, cc_ng.vector_db, state, conduit_dir=conduit_dir,
-                                    idle_steps=0, load_ceiling=999.0)
-    assert absorbed >= 1
-    conv_nodes = [n for n in cc_ng.graph.nodes.values()
-                  if n.metadata.get("creation_mode") == "conversational"]
-    assert len(conv_nodes) >= 1
 
 
-def test_drain_gateway_conduit_quarantines_unparseable_file_instead_of_retrying_forever(
-        cc_ng, tmp_path, draining_hemisphere):
-    """Finding 2 (law-enforcer review): a file that fails to even PARSE never
-    reaches drain_ingest_tract's truncate step, so it would otherwise sit in
-    the conduit dir unchanged forever, retried every pulse. It must instead
-    be moved to <conduit_dir>/quarantine/ (not deleted -- the bytes are
-    preserved for inspection) and removed from the conduit dir proper, so a
-    laptop/VPS format skew can't silently pile up garbage in a git-synced
-    directory."""
-    conduit_dir = str(tmp_path / "conduit")
-    os.makedirs(conduit_dir)
-    bad_path = os.path.join(conduit_dir, "laptop_cc_gateway.1_bad.tract")
-    garbage = b"not a valid BTF tract at all, and never will be"
-    with open(bad_path, "wb") as f:
-        f.write(garbage)
-
-    state = {"last_forest_id": None}
-    absorbed = drain_gateway_conduit(cc_ng.graph, cc_ng.vector_db, state, conduit_dir=conduit_dir,
-                                    idle_steps=0, load_ceiling=999.0)
-
-    assert absorbed == 0
-    assert not os.path.exists(bad_path)  # gone from the conduit dir proper
-    quarantined = os.path.join(conduit_dir, "quarantine", "laptop_cc_gateway.1_bad.tract")
-    assert os.path.exists(quarantined)
-    with open(quarantined, "rb") as f:
-        assert f.read() == garbage  # bytes preserved, not truncated or lost
 
 
 # =============================================================================
@@ -441,23 +321,6 @@ def test_drain_ingest_tract_capped_consumed_bytes_are_exactly_the_removed_prefix
         "exactly -- nothing lost, nothing double-claimed")
 
 
-def test_drain_gateway_conduit_yields_between_raw_records_without_stepping(tmp_path, draining_hemisphere, monkeypatch):
-    conduit_dir = _make_conduit(tmp_path, 1)
-    g = _CountingGraph()
-    remaining = {"n": 5}
-    def fake(graph, vector_db, state, tract_path=None, return_consumed=False, max_entries=0):
-        assert max_entries == 1
-        graph.step_marks.append(graph.steps)
-        remaining["n"] -= 1
-        with open(tract_path, "wb") as f:
-            f.write(b"x" * remaining["n"])
-        return 1
-    monkeypatch.setattr(cc_ng_organism, "drain_ingest_tract", fake)
-    assert drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                 batch_size=25, idle_steps=250, load_ceiling=999.0) == 5
-    assert g.step_marks == [0] * 5
-    assert g.steps == 0
-    assert os.listdir(conduit_dir) == []
 
 
 
@@ -559,219 +422,3 @@ def test_drain_ingest_tract_return_consumed_empty_when_truncate_write_fails(
 
 
 # =============================================================================
-# Raw experience delivery, bounded lock use and load backpressure.
-# FatherGraph consolidation belongs to topology tests, not this path.
-# =============================================================================
-
-class _CountingGraph:
-    """Records every graph.step() so consolidation can be asserted, not assumed."""
-    def __init__(self):
-        self.steps = 0
-        self.step_marks = []          # steps-so-far at each consolidation boundary
-        self._concurrent_lock = threading.RLock()
-
-    def step(self):
-        self.steps += 1
-
-
-def _stub_drain(monkeypatch, turns_per_file):
-    """Replace drain_ingest_tract with a stub that truncates the file (as the
-    real one does on success) and reports a fixed turn count.
-
-    Honours max_entries the way the real function does: it takes at most that
-    many turns per call and leaves a SMALLER-but-nonempty file behind when
-    turns remain, so the caller's exhausted/quarantine size check sees a
-    genuine partial drain. (Leaving the size unchanged would look like a parse
-    failure and get the file quarantined.)"""
-    remaining = {}
-
-    def _fake(graph, vector_db, state, tract_path=None, return_consumed=False,
-              max_entries=0):
-        left = remaining.get(tract_path, turns_per_file)
-        n = min(left, max_entries) if max_entries else left
-        left -= n
-        remaining[tract_path] = left
-        with open(tract_path, "wb") as f:
-            f.write(b"x" * left)  # empty == fully drained; shrinking == more to come
-        return n
-    monkeypatch.setattr(cc_ng_organism, "drain_ingest_tract", _fake)
-
-
-def _make_conduit(tmp_path, n_files, prefix="laptop_cc_gateway"):
-    conduit_dir = str(tmp_path / "conduit")
-    os.makedirs(conduit_dir, exist_ok=True)
-    for i in range(n_files):
-        with open(os.path.join(conduit_dir, f"{prefix}.{1000+i}_b{i}.tract"), "wb") as f:
-            f.write(b"payload")
-    return conduit_dir
-
-
-def test_legacy_topology_arguments_cannot_make_raw_experience_sleep(tmp_path, draining_hemisphere, monkeypatch):
-    conduit_dir = _make_conduit(tmp_path, 6)
-    _stub_drain(monkeypatch, turns_per_file=1)
-    g = _CountingGraph()
-    def forbidden(*a, **kw):
-        pytest.fail("Leg1 invoked topology consolidation")
-    monkeypatch.setattr(cc_ng_organism, "_cc_callosum_consolidate", forbidden)
-    assert drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                 batch_size=25, idle_steps=250, load_ceiling=999.0) == 6
-    assert g.steps == 0
-
-
-
-def test_ambient_topology_environment_cannot_add_leg1_steps(tmp_path, draining_hemisphere, monkeypatch):
-    conduit_dir = _make_conduit(tmp_path, 5)
-    _stub_drain(monkeypatch, turns_per_file=1)
-    monkeypatch.setenv("CC_NG_BATCH_SIZE", "25")
-    monkeypatch.setenv("CC_NG_IDLE_STEPS", "250")
-    g = _CountingGraph()
-    assert drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir, load_ceiling=999.0) == 5
-    assert g.steps == 0
-
-
-
-def test_drain_no_consolidation_when_nothing_absorbed(tmp_path, draining_hemisphere, monkeypatch):
-    """An empty conduit must not spin the graph for no reason."""
-    conduit_dir = _make_conduit(tmp_path, 0)
-    _stub_drain(monkeypatch, turns_per_file=0)
-    g = _CountingGraph()
-
-    assert drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                  batch_size=2, idle_steps=5) == 0
-    assert g.steps == 0
-
-
-def test_drain_stops_and_leaves_files_when_load_is_high(tmp_path, draining_hemisphere, monkeypatch):
-    """Backpressure (cc_refeed discipline): above the load ceiling the drain
-    stops cleanly and leaves the remaining conduit files ON DISK for the next
-    run -- durability IS the backpressure. Nothing may be lost or eaten."""
-    conduit_dir = _make_conduit(tmp_path, 4)
-    _stub_drain(monkeypatch, turns_per_file=1)
-    g = _CountingGraph()
-
-    import cc_refeed
-    monkeypatch.setattr(cc_refeed, "should_pause_for_load", lambda *a, **k: True)
-
-    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                      batch_size=2, idle_steps=5)
-
-    # Throttle a flowing river, don't dam it before the first drop: the gate
-    # applies BETWEEN batches, so file 1 always lands and files 2..N are held.
-    # (Checked-BEFORE-the-first-file was the 2026-07-28 bug -- on any box above
-    # the ceiling the whole callosum silently absorbed nothing and logged
-    # nothing, letting the conduit grow forever while looking like success.)
-    assert absorbed == 1, "first file must land; the gate throttles, not dams"
-    remaining = glob.glob(os.path.join(conduit_dir, "laptop_cc_gateway.*.tract"))
-    assert len(remaining) == 3, "the rest must survive for the next run"
-
-
-def test_drain_skips_own_hemispheres_outgoing_files(tmp_path, leg1_enabled, monkeypatch):
-    """exclude_prefix guard: a hemisphere must never eat its OWN outgoing
-    files -- they're addressed to the far half and must survive until it has
-    pulled them. Without this, running the drain on the producing machine
-    would silently starve the other hemisphere (the turns are already absorbed
-    locally, so it would look harmless)."""
-    conduit_dir = _make_conduit(tmp_path, 2, prefix="laptop_cc_gateway")
-    for i in range(3):
-        with open(os.path.join(conduit_dir, f"vps_cc_gateway.{2000+i}_b{i}.tract"), "wb") as f:
-            f.write(b"payload")
-    _stub_drain(monkeypatch, turns_per_file=1)
-    g = _CountingGraph()
-
-    # Running ON the laptop: must drain vps_* and leave laptop_* alone.
-    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                      batch_size=10, idle_steps=1,
-                                      load_ceiling=999.0, exclude_prefix="laptop_")
-
-    assert absorbed == 3, "should absorb only the far hemisphere's 3 files"
-    assert len(glob.glob(os.path.join(conduit_dir, "laptop_cc_gateway.*.tract"))) == 2
-    assert len(glob.glob(os.path.join(conduit_dir, "vps_cc_gateway.*.tract"))) == 0
-
-
-def test_drain_guard_defaults_from_machine_id_without_being_passed(
-        tmp_path, leg1_enabled, monkeypatch):
-    """The self-consumption guard must NOT depend on every caller remembering
-    to pass exclude_prefix. It is an invariant of the drain, so it defaults
-    from this hemisphere's declared MACHINE_ID (LAW 4 -- enforce where the
-    identity is known). Same scenario as the test above, with the argument
-    omitted entirely: the outcome must be identical."""
-    conduit_dir = _make_conduit(tmp_path, 2, prefix="laptop_cc_gateway")
-    for i in range(3):
-        with open(os.path.join(conduit_dir, f"vps_cc_gateway.{2000+i}_b{i}.tract"), "wb") as f:
-            f.write(b"payload")
-    _stub_drain(monkeypatch, turns_per_file=1)
-    g = _CountingGraph()
-
-    # MACHINE_ID=laptop from the fixture; NO exclude_prefix argument.
-    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                      batch_size=10, idle_steps=1, load_ceiling=999.0)
-
-    assert absorbed == 3
-    assert len(glob.glob(os.path.join(conduit_dir, "laptop_cc_gateway.*.tract"))) == 2
-    assert len(glob.glob(os.path.join(conduit_dir, "vps_cc_gateway.*.tract"))) == 0
-
-
-def test_drain_refuses_entirely_when_machine_id_is_unset(tmp_path, leg1_enabled, monkeypatch):
-    """With no declared identity the guard cannot be built, so the drain must
-    refuse rather than run unguarded. Draining unguarded would absorb AND
-    DELETE this hemisphere's own outgoing files before the far half pulled
-    them -- silent one-way data loss that looks exactly like success. Mirrors
-    trickle_gateway_conduit()'s refusal to write without MACHINE_ID."""
-    monkeypatch.delenv("MACHINE_ID", raising=False)
-    conduit_dir = _make_conduit(tmp_path, 3, prefix="laptop_cc_gateway")
-    _stub_drain(monkeypatch, turns_per_file=1)
-    g = _CountingGraph()
-
-    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                      batch_size=10, idle_steps=1, load_ceiling=999.0)
-
-    assert absorbed == 0
-    # Nothing consumed, nothing deleted -- the files stay durable on disk.
-    assert len(glob.glob(os.path.join(conduit_dir, "laptop_cc_gateway.*.tract"))) == 3
-
-
-def test_drain_explicit_exclude_prefix_overrides_machine_id_default(
-        tmp_path, leg1_enabled, monkeypatch):
-    """An explicit argument is an override, not the guard -- a caller that does
-    pass one still wins, so the existing cc-ng-sync.py call site is unaffected."""
-    conduit_dir = _make_conduit(tmp_path, 2, prefix="laptop_cc_gateway")
-    _stub_drain(monkeypatch, turns_per_file=1)
-    g = _CountingGraph()
-
-    # MACHINE_ID=laptop would skip these; an explicit non-matching prefix drains them.
-    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                      batch_size=10, idle_steps=1,
-                                      load_ceiling=999.0, exclude_prefix="vps_")
-
-    assert absorbed == 2
-
-
-def test_real_frames_preserve_text_order_and_suffix_under_backpressure(tmp_path, draining_hemisphere, monkeypatch):
-    import ng_tract
-    import ng_embed
-    import cc_refeed
-    conduit_dir = tmp_path / "conduit"
-    conduit_dir.mkdir()
-    path = conduit_dir / "laptop_cc_gateway.1000_original.tract"
-    texts = ["  first\nline — literal  ", "second\n\nparagraph", "third text"]
-    for text in texts:
-        ng_tract.deposit_experience(raw=text.encode(), source="cc_gateway",
-                                    tract_paths=[str(path)])
-    original = path.read_bytes()
-    reader = ng_tract.TractReader(original)
-    next(iter(reader))
-    suffix = original[reader.position():]
-    seen = []
-    monkeypatch.setattr(ng_embed, "embed", lambda text: None)
-    monkeypatch.setattr(cc_ng_organism, "run_conversational_dual_pass",
-                        lambda graph, vdb, text, emb, state: seen.append(text) or True)
-    monkeypatch.setattr(cc_refeed, "should_pause_for_load", lambda *a: True)
-    g = _CountingGraph()
-    assert drain_gateway_conduit(g, None, {}, conduit_dir=str(conduit_dir)) == 1
-    assert seen == texts[:1]
-    assert path.read_bytes() == suffix
-    monkeypatch.setattr(cc_refeed, "should_pause_for_load", lambda *a: False)
-    assert drain_gateway_conduit(g, None, {}, conduit_dir=str(conduit_dir), idle_steps=250) == 2
-    assert seen == texts
-    assert g.steps == 0
-    assert not path.exists()
