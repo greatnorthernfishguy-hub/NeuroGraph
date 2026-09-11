@@ -26,6 +26,13 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-09-11] Claude Code + Codex — #426 shared-body-only Tonic attachment.
+# What: optional require_shared_body prevents private model loading; late offers build
+#   only the encoder/decoder wrapper around the supplied body. Failed offers retry.
+# Why: VPS CC and Syl share one transformer while retaining separate substrates.
+# How: body offer/revoke/forward serialize on the existing lock; shared weights and
+#   training state are untouched. No step-clock changes or new lifecycle thread.
+# Ref: docs/handoffs/cc-shared-tonic-repair-20260911.md.
 # [2026-08] Claude Code (Opus 4.8) — #117 step 1: autonomous aging clock on the heartbeat (default OFF)
 # What: _generation_loop can now call graph.step() on its pulse, gated by CC_NG_AUTOSTEP
 #   (default OFF) with a CC_NG_AUTOSTEP_MIN_INTERVAL wall-time floor (default 900s). New env
@@ -360,7 +367,8 @@ class TonicEngine:
     The transformer IS the awareness. The output IS the next state.
     The ouroboros closes through actual inference, not a timer.
 
-    If the surgical model is not available (weights not trained yet),
+    Shared-body-required consumers prohibit heuristic execution and wait for attachment.
+    For ordinary consumers, if the surgical model is not available (weights not trained yet),
     falls back to a heuristic that still provides genuine forward
     compression — it reads the graph topology and produces activation
     decisions based on attractor analysis. Not as rich as the transformer,
@@ -374,6 +382,7 @@ class TonicEngine:
         tonic_thread,
         config: Optional[EngineConfig] = None,
         transformer_body=None,
+        require_shared_body: bool = False,
     ):
         self._graph = graph
         self._vector_db = vector_db
@@ -382,6 +391,10 @@ class TonicEngine:
         self._shared_body = transformer_body  # from ProtoUniBrain if available
         self._body_lock = None  # shared with ProtoUniBrain — set via set_body_lock()
         self._lock_file_path = None  # cross-process flock path — set via set_lock_file()
+        # [2026-09-11] Shared-body-only mode: this engine may NEVER allocate a transformer
+        # of its own or execute heuristic inference. It waits until a real body is offered.
+        self._require_shared_body = bool(require_shared_body)
+        self._wrapper_fail_logged = False
 
         self._running = False
         self._in_conversation = False
@@ -403,8 +416,21 @@ class TonicEngine:
         # Try to load surgical model
         self._model = None
         self._use_heuristic = True
-        if _TORCH_AVAILABLE:
+        if self._require_shared_body:
+            # No loader call, ever, on this path — not even with a body in hand at
+            # construction; the wrapper build is the attach path and nothing else.
+            # An engine built with a body still has to go through offer_shared_body()
+            # so that installation is lock-serialized and identity-verified like any
+            # other attach.
+            body, self._shared_body = self._shared_body, None
+            if body is not None:
+                self.offer_shared_body(body)
+        elif _TORCH_AVAILABLE:
             self._try_load_model()
+
+    def _weights_path(self) -> str:
+        """Absolute path to the TonicBrain checkpoint (encoder/decoder weights)."""
+        return os.path.join(os.path.dirname(__file__), self._config.weights_path)
 
     def _try_load_model(self) -> None:
         """Attempt to load trained TonicBrain.
@@ -412,12 +438,13 @@ class TonicEngine:
         If a shared transformer_body was provided (from ProtoUniBrain),
         pass it through to avoid loading a second copy (~2GB savings).
         Falls back to loading its own copy if sharing fails.
+
+        NOT reachable in require_shared_body mode — see __init__ and
+        _build_shared_wrapper(), which is the only attach path there.
         """
-        import os
-        weights_path = os.path.join(
-            os.path.dirname(__file__),
-            self._config.weights_path,
-        )
+        if self._require_shared_body:
+            return  # This loader can allocate a private body; shared-only never uses it.
+        weights_path = self._weights_path()
         if os.path.exists(weights_path):
             try:
                 from surgery.tonic_brain import load_tonic_brain
@@ -447,52 +474,123 @@ class TonicEngine:
             else:
                 logger.info("No TonicBrain or Elmer weights — using heuristic engine")
 
+    def _build_shared_wrapper(self, transformer_body):
+        """Build the lightweight encoder/decoder wrapper AROUND A BORROWED BODY.
+
+        Returns the new TonicBrain, or None on any failure (missing checkpoint,
+        torch absent, load error) — a None return is RETRYABLE: _model is left
+        untouched so the next offer_shared_body() tries again.
+
+        Structural guarantee (not a comment-level one): a None body returns None
+        before the loader is reached, so no call from this method can ever fall
+        into load_tonic_brain's `from_pretrained` branch. That branch is the
+        ~2GB own-copy allocation this mode exists to prevent.
+
+        Called OUTSIDE _body_lock_context(): torch.load of the checkpoint is slow
+        and must not block in-flight inference on the shared body.
+        """
+        if transformer_body is None:
+            return None
+        if not _TORCH_AVAILABLE:
+            return None
+        weights_path = self._weights_path()
+        if not os.path.exists(weights_path):
+            if not self._wrapper_fail_logged:
+                self._wrapper_fail_logged = True
+                logger.info(
+                    "Tonic shared-body attach: no checkpoint at %s — waiting for shared transformer "
+                    "(will retry on next offer)", weights_path,
+                )
+            return None
+        try:
+            from surgery.tonic_brain import load_tonic_brain
+            model = load_tonic_brain(weights_path, transformer_body=transformer_body)
+        except Exception as exc:
+            if not self._wrapper_fail_logged:
+                self._wrapper_fail_logged = True
+                logger.warning(
+                    "Tonic shared-body wrapper build failed: %s — waiting for shared transformer "
+                    "(will retry on next offer)", exc,
+                )
+            return None
+        # eval() the OUR-SIDE halves only. self._model.eval() would recurse into the
+        # borrowed body and flip proto's training flag — that module is not ours to
+        # mutate. The forward is under torch.no_grad() regardless.
+        for part in ("encoder", "decoder"):
+            try:
+                getattr(model, part).eval()
+            except Exception:
+                pass
+        self._wrapper_fail_logged = False
+        return model
+
     # -----------------------------------------------------------------
     # Body Hot-Swap (called by BrainSwitcher)
     # -----------------------------------------------------------------
 
-    def offer_shared_body(self, transformer_body) -> bool:
-        """Hot-swap: ProtoUniBrain loaded, share its transformer body.
+    def offer_shared_body(self, transformer_body, *, blocking=True) -> bool:
+        """Attach the exact supplied body; shared-only engines build their wrapper late.
 
-        Replaces the Tonic's own copy with ProtoUniBrain's living one.
-        The old copy gets garbage collected, freeing ~2GB.
-        Encoder and decoder stay — only the body swaps.
+        BrainSwitcher uses blocking=False so a busy inference defers an offer to
+        its next monitor cycle. Body installation still serializes with revocation.
         """
+        if transformer_body is None:
+            return False
+        new_model = None
         if self._model is None:
-            return False
+            if not self._require_shared_body:
+                return False
+            new_model = self._build_shared_wrapper(transformer_body)
+            if new_model is None:
+                return False
         try:
-            import gc
-            old_body = self._model.body
-            self._model.body = transformer_body
-            self._shared_body = transformer_body
-            self._use_heuristic = False   # re-join the share — transformer mode restored
-                                          # (also the re-join path after a heuristic shed)
-            del old_body
-            gc.collect()
-            logger.info("Tonic hot-swapped to shared ProtoUniBrain body (~2GB freed)")
-            return True
+            with self._body_lock_context(blocking=blocking):
+                try:
+                    if self._model is None:
+                        self._model = new_model
+                    else:
+                        self._model.body = transformer_body
+                    if getattr(self._model, "body", None) is not transformer_body:
+                        raise ValueError("wrapper did not retain the offered body")
+                    self._shared_body = transformer_body
+                    self._use_heuristic = False
+                except Exception:
+                    self._shared_body = None
+                    self._model = None
+                    self._use_heuristic = True
+                    raise
+        except BlockingIOError:
+            return False  # no attachment change; monitor retries when inference yields
         except Exception as exc:
-            logger.warning("Tonic body hot-swap failed: %s", exc)
+            logger.warning("Tonic body attachment failed: %s", exc)
             return False
+        logger.info("Tonic attached to shared ProtoUniBrain body (no private body loaded)")
+        return True
 
     def revoke_shared_body(self) -> bool:
-        """ProtoUniBrain shed (memory pressure) -> degrade STRAIGHT to heuristic.
+        """Release the borrowed body; required-sharing consumers wait without inference.
 
         Memory-cheap by design (Syl/Josh, 2026-06-10): a pressure-driven shed must
         RELIEVE memory, not load a fresh ~2GB own-transformer at the worst possible
         moment — two models resident under the very pressure that triggered the shed
         (the OOM-'n'-load trap). So we drop the now-dangling shared-body reference and
-        fall to the heuristic decoder, KEEPING the lightweight encoder/decoder wrapper
+        wait (or use the default consumer fallback), KEEPING the lightweight encoder/decoder wrapper
         so offer_shared_body() can re-join the share the instant proto reloads.
+
+        Runs under the body lock so a forward in flight finishes first, and so the
+        _use_heuristic flip and the body drop are seen together by _model_inference's
+        in-lock recheck — never a live wrapper with body=None.
         """
         if self._model is None and self._shared_body is None:
             return False  # already heuristic — nothing to shed
-        if self._model is not None:
-            self._model.body = None      # drop the ref to proto's shed body (proto frees the ~2GB)
-        self._shared_body = None
-        self._use_heuristic = True
+        with self._body_lock_context():
+            self._use_heuristic = True       # flip FIRST: in-lock readers see heuristic
+            if self._model is not None:
+                self._model.body = None      # drop the ref to proto's shed body (proto frees the ~2GB)
+            self._shared_body = None
         logger.info(
-            "Tonic shed shared body -> heuristic (memory-cheap); will re-join on proto reload"
+            "Tonic shed shared body -> %s; will re-join on proto reload",
+            "waiting (heuristic prohibited)" if self._require_shared_body else "heuristic"
         )
         return True
 
@@ -565,7 +663,7 @@ class TonicEngine:
         self._lock_file_path = path
 
     @contextlib.contextmanager
-    def _body_lock_context(self):
+    def _body_lock_context(self, *, blocking=True):
         """Composite body access lock: threading lock + fcntl shared read lock.
 
         Acquires in order:
@@ -579,15 +677,23 @@ class TonicEngine:
         stack = contextlib.ExitStack()
         with stack:
             if self._body_lock is not None:
-                stack.enter_context(self._body_lock)
+                if blocking:
+                    stack.enter_context(self._body_lock)
+                elif self._body_lock.acquire(blocking=False):
+                    stack.callback(self._body_lock.release)
+                else:
+                    raise BlockingIOError("shared transformer is in use")
             if self._lock_file_path is not None:
                 try:
                     import fcntl as _fcntl
                     _lf = stack.enter_context(open(self._lock_file_path, 'r'))
-                    _fcntl.flock(_lf.fileno(), _fcntl.LOCK_SH)
+                    flags = _fcntl.LOCK_SH | (0 if blocking else _fcntl.LOCK_NB)
+                    _fcntl.flock(_lf.fileno(), flags)
                     stack.callback(_fcntl.flock, _lf.fileno(), _fcntl.LOCK_UN)
                 except Exception as _exc:
-                    logger.debug("flock unavailable — cross-process lock skipped: %s", _exc)
+                    if not blocking or self._require_shared_body:
+                        raise  # never use the shared-only body without its declared lock
+                    logger.warning("flock unavailable — cross-process lock skipped: %s", _exc)
             yield
 
     # -----------------------------------------------------------------
@@ -620,6 +726,11 @@ class TonicEngine:
 
     def _generate_latent_token_inner(self) -> Dict[str, Any]:
         """Inner implementation — actual latent token generation."""
+        if self._require_shared_body and (
+            self._use_heuristic or self._model is None
+            or self._shared_body is None
+        ):
+            return {"fired": 0, "activated": 0, "waiting_for_shared_body": True}
         features = _extract_tonic_features(
             self._graph, self._tonic_thread,
             node_budget=self._config.node_sample_budget,
@@ -631,7 +742,7 @@ class TonicEngine:
         if self._model is not None and not self._use_heuristic:
             activations = self._model_inference(features)
         else:
-            activations = self._heuristic_inference(features)
+            activations = self._fallback_inference(features)
 
         if not activations:
             return {"fired": 0, "activated": 0}
@@ -659,6 +770,12 @@ class TonicEngine:
             "activated": len(activations),
         }
 
+    def _fallback_inference(self, features: Dict[str, Any]) -> List[Tuple[str, float]]:
+        # VPS embedded topology must never receive heuristic-generated activations.
+        if self._require_shared_body:
+            return []
+        return self._heuristic_inference(features)
+
     def _heuristic_inference(
         self, features: Dict[str, Any]
     ) -> List[Tuple[str, float]]:
@@ -674,6 +791,8 @@ class TonicEngine:
         This is real graph reasoning, just without a transformer.
         It will be replaced by the surgical model when trained.
         """
+        if self._require_shared_body:
+            return []  # Guard direct callers as well as normal inference dispatch.
         activations: List[Tuple[str, float]] = []
         base_strength = self._config.activation_strength
 
@@ -873,17 +992,33 @@ class TonicEngine:
             import torch
             from surgery.tonic_brain import GraphFeatures
         except ImportError:
-            return self._heuristic_inference(features)
+            return self._fallback_inference(features)
 
         # Extract graph features into GraphFeatures struct
         graph_features = self._extract_graph_features_for_model()
         if graph_features is None:
-            return self._heuristic_inference(features)
+            return self._fallback_inference(features)
 
-        # Forward through TonicBrain — the actual push
+        # Forward through TonicBrain — the actual push.
+        # The caller's `self._model is not None and not self._use_heuristic` test happened
+        # OUTSIDE this lock, so a revoke can have landed in between. Re-check model, body
+        # and mode INSIDE the lock: revoke_shared_body() mutates them under this same lock,
+        # so what we read here cannot change until the forward completes. Without this, a
+        # shed mid-tick calls the wrapper with body=None. Apply the fallback policy
+        # OUTSIDE the lock; required-sharing consumers return no activations.
+        output = None
         with self._body_lock_context():
-            with torch.no_grad():
-                output = self._model(graph_features)
+            model = self._model
+            if (
+                model is not None
+                and getattr(model, "body", None) is not None
+                and self._shared_body is not None
+                and not self._use_heuristic
+            ):
+                with torch.no_grad():
+                    output = model(graph_features)
+        if output is None:
+            return self._fallback_inference(features)
 
         # Map activation strengths to actual nodes
         activation_strengths = output["activations"]
@@ -892,7 +1027,7 @@ class TonicEngine:
         # Get the top active/recent nodes to map activations onto
         candidates = self._get_activation_candidates(features)
         if not candidates:
-            return self._heuristic_inference(features)
+            return self._fallback_inference(features)
 
         activations: List[Tuple[str, float]] = []
         for i, (nid, _) in enumerate(candidates[:len(activation_strengths)]):
@@ -1132,8 +1267,14 @@ class TonicEngine:
             "tokens_generated": self._tokens_generated,
             "total_activations": self._total_activations,
             "mode": "conversation" if self._in_conversation else "latent",
-            "using_heuristic": self._use_heuristic,
+            "using_heuristic": self._use_heuristic and not self._require_shared_body,
+            "heuristic_allowed": not self._require_shared_body,
+            "waiting_for_shared_body": self._require_shared_body and (
+                self._use_heuristic or self._model is None or self._shared_body is None
+            ),
             "model_loaded": self._model is not None,
+            "require_shared_body": self._require_shared_body,
+            "shared_body_attached": self._shared_body is not None,
             "ema_tick_ms": round(self._ema_tick_ms, 2),
             "current_interval_s": round(self._current_interval, 2),
             "node_sample_budget": self._config.node_sample_budget,
