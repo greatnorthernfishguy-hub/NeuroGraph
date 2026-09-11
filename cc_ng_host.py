@@ -897,20 +897,11 @@ def _handle_import(data):
 
 
 def _handle_drain_conduit(data):
-    """Corpus Callosum Leg 1 (#70): drain the cross-machine BTF conduit into
-    THIS hemisphere's graph, with FatherGraph absorption discipline.
+    """Receive raw CC conversation through the existing dual-pass tract path.
 
-    Invoked by the nightly cc-ng-sync.py over the socket -- deliberately NOT
-    from the 60s autosave pulse (that was the bulk-dump bug, fixed 2026-07-28)
-    and deliberately over the socket rather than by opening a second
-    NeuroGraphMemory: the live daemon owns the graph, so a second instance
-    would be a two-writer torn-checkpoint hazard (see cc-ng-sync.py's own
-    changelog for the incident that discipline came from).
-
-    batch_size / idle_steps come from the caller (the cron already exports
-    CC_NG_BATCH_SIZE=25 / CC_NG_IDLE_STEPS=250 -- the FatherGraph values);
-    drain_gateway_conduit falls back to those same env names if omitted.
-    Gated by CC_CALLOSUM_LEG1_ENABLED inside drain_gateway_conduit itself.
+    Leg1 is experience, not topology. Source drain never synthesizes idle steps;
+    the client sends 1/0 for compatibility with older running hosts. Leg2 retains
+    its separate topology consolidation policy. Only the live graph owns writes.
     """
     ng = _STATE.cc_ng
     if ng is None:

@@ -37,14 +37,9 @@ from cc_ng_organism import (
 )
 
 
-# NOTE on idle_steps=0 in the file-lifecycle tests below: consolidation is
-# REAL homeostatic regulation (graph.step() x N), and on a 2-node toy graph
-# 250 steps trips the zero-fire breaker and culls the very nodes the test
-# just absorbed -- an artifact of the toy scale, not of the drain. Those
-# tests pin idle_steps=0 to isolate what they actually assert (per-file
-# delete/quarantine lifecycle). The consolidation discipline itself is
-# tested separately, with a counting fake graph, further down.
-
+# Leg1 is raw conversational experience: no synthetic topology consolidation.
+# Old tests forced idle_steps=0 because 250 culled fresh toy-graph deposits;
+# Josh's Sep11 correction identifies that behavior as the wrong path, not a toy artifact.
 
 @pytest.fixture
 def leg1_enabled(monkeypatch):
@@ -182,15 +177,14 @@ def test_drain_gateway_conduit_absorbs_and_deletes_conduit_files(cc_ng, tmp_path
     ]):
         path = os.path.join(conduit_dir, f"laptop_cc_gateway.{1000 + i}_batch{i}.tract")
         ng_tract.deposit_experience(
-            content=text.encode(),
+            raw=text.encode(),
             source="cc_gateway",
-            tract_path=path,
-            content_type="text",
+            tract_paths=[path],
         )
 
     state = {"last_forest_id": None}
     absorbed = drain_gateway_conduit(cc_ng.graph, cc_ng.vector_db, state, conduit_dir=conduit_dir,
-                                    idle_steps=0, load_ceiling=999.0)
+                                    load_ceiling=999.0)
     assert absorbed == 2
 
     conv_nodes = [n for n in cc_ng.graph.nodes.values()
@@ -227,10 +221,9 @@ def test_drain_gateway_conduit_skips_corrupt_file_absorbs_rest(cc_ng, tmp_path, 
 
     good_path = os.path.join(conduit_dir, "laptop_cc_gateway.1_good.tract")
     ng_tract.deposit_experience(
-        content=b"a genuine turn that must still be absorbed",
+        raw=b"a genuine turn that must still be absorbed",
         source="cc_gateway",
-        tract_path=good_path,
-        content_type="text",
+        tract_paths=[good_path],
     )
     bad_path = os.path.join(conduit_dir, "laptop_cc_gateway.2_bad.tract")
     with open(bad_path, "wb") as f:
@@ -305,7 +298,7 @@ def test_drain_ingest_tract_default_return_is_unchanged_int(cc_ng, tmp_path):
     import ng_tract
     tract_path = str(tmp_path / "turns.tract")
     ng_tract.deposit_experience(
-        content=b"a turn", source="cc_gateway", tract_path=tract_path, content_type="text",
+        raw=b"a turn", source="cc_gateway", tract_paths=[tract_path],
     )
     state = {"last_forest_id": None}
     result = drain_ingest_tract(cc_ng.graph, cc_ng.vector_db, state, tract_path=tract_path)
@@ -321,8 +314,8 @@ def test_drain_ingest_tract_return_consumed_matches_what_was_truncated(cc_ng, tm
     import ng_tract
     tract_path = str(tmp_path / "turns.tract")
     ng_tract.deposit_experience(
-        content=b"a genuinely distinct turn for consumed-bytes fidelity",
-        source="cc_gateway", tract_path=tract_path, content_type="text",
+        raw=b"a genuinely distinct turn for consumed-bytes fidelity",
+        source="cc_gateway", tract_paths=[tract_path],
     )
     with open(tract_path, "rb") as f:
         original_bytes = f.read()
@@ -345,22 +338,17 @@ def test_drain_ingest_tract_return_consumed_matches_what_was_truncated(cc_ng, tm
 
 
 # =============================================================================
-# max_entries -- turn-granular batching (FatherGraph Finding 1).
-# Real ng_tract files and the real drain_ingest_tract byte path: these prove
-# the PARTIAL TRUNCATE actually works, which is the whole basis of the cap.
-# Before this, batch_size was enforced only per-FILE -- one drain call
-# swallowed a whole conduit file however large, so a 500-turn file merged 500
-# turns with no consolidation between them and held _concurrent_lock for all
-# 500 embeds. Stubbing the drain here would test nothing; the risk lives
-# entirely in the offset arithmetic against the real (compiled) TractReader.
+# max_entries -- resource bounding and durable partial consumption.
+# Real BTF files exercise byte offsets against the compiled TractReader.
+# A bounded call must retain all unprocessed records for the next slice.
 # =============================================================================
 
 def _deposit_turns(tract_path, n, tag="cap"):
     import ng_tract
     for i in range(n):
         ng_tract.deposit_experience(
-            content=f"{tag} turn number {i}".encode(), source="cc_gateway",
-            tract_path=tract_path, content_type="text",
+            raw=f"{tag} turn number {i}".encode(), source="cc_gateway",
+            tract_paths=[tract_path],
         )
 
 
@@ -453,47 +441,24 @@ def test_drain_ingest_tract_capped_consumed_bytes_are_exactly_the_removed_prefix
         "exactly -- nothing lost, nothing double-claimed")
 
 
-def test_drain_gateway_conduit_batches_within_one_oversized_file(tmp_path, draining_hemisphere,
-                                                                  monkeypatch):
-    """THE Finding-1 regression test: a SINGLE conduit file holding more turns
-    than batch_size must be absorbed in batch-sized bites with a consolidation
-    pass between them -- not dumped whole and slept on afterwards.
-
-    Deliberately uses turns_per_file > batch_size, the case the previous suite
-    never exercised (every test used 1 turn per file), which is exactly why the
-    per-file bulk dump went unnoticed.
-
-    Asserts on the STEP COUNT OBSERVED AT EACH DRAIN CALL, not on the total.
-    The total cannot tell the two apart: `while since_sleep >= batch_size`
-    pays down accumulated sleep debt, so a 5-turn bulk dump also ends at 15
-    steps -- it just takes them all AFTER the graph has already swallowed
-    every turn. What distinguishes real interleaving is that the 2nd and 3rd
-    absorptions each begin with consolidation already behind them."""
+def test_drain_gateway_conduit_yields_between_raw_records_without_stepping(tmp_path, draining_hemisphere, monkeypatch):
     conduit_dir = _make_conduit(tmp_path, 1)
     g = _CountingGraph()
-
-    # Local stub (not _stub_drain) so it can witness graph.steps at call time.
     remaining = {"n": 5}
-
-    def _fake(graph, vector_db, state, tract_path=None, return_consumed=False, max_entries=0):
+    def fake(graph, vector_db, state, tract_path=None, return_consumed=False, max_entries=0):
+        assert max_entries == 1
         graph.step_marks.append(graph.steps)
-        n = min(remaining["n"], max_entries) if max_entries else remaining["n"]
-        remaining["n"] -= n
+        remaining["n"] -= 1
         with open(tract_path, "wb") as f:
             f.write(b"x" * remaining["n"])
-        return n
-    monkeypatch.setattr(cc_ng_organism, "drain_ingest_tract", _fake)
+        return 1
+    monkeypatch.setattr(cc_ng_organism, "drain_ingest_tract", fake)
+    assert drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
+                                 batch_size=25, idle_steps=250, load_ceiling=999.0) == 5
+    assert g.step_marks == [0] * 5
+    assert g.steps == 0
+    assert os.listdir(conduit_dir) == []
 
-    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                      batch_size=2, idle_steps=5, load_ceiling=999.0)
-
-    assert absorbed == 5, "every turn in the oversized file must still land"
-    assert g.step_marks == [0, 5, 10], (
-        f"expected 3 capped absorptions each preceded by consolidation, got {g.step_marks} "
-        "-- a single mark ([0]) means the whole file was bulk-dumped into the graph "
-        "before any consolidation ran")
-    assert g.steps == 15, f"expected 3 consolidation passes (15 steps), got {g.steps}"
-    assert os.listdir(conduit_dir) == [], "the fully-drained file must be removed"
 
 
 def test_drain_ingest_tract_return_consumed_is_empty_on_missing_file(cc_ng, tmp_path):
@@ -537,8 +502,8 @@ def test_drain_ingest_tract_return_consumed_empty_when_file_changed_underneath(
     import ng_tract
     tract_path = str(tmp_path / "turns.tract")
     ng_tract.deposit_experience(
-        content=b"a turn whose file gets rewritten mid-drain",
-        source="cc_gateway", tract_path=tract_path, content_type="text",
+        raw=b"a turn whose file gets rewritten mid-drain",
+        source="cc_gateway", tract_paths=[tract_path],
     )
 
     other_content = b"something else wrote this while we were mid-drain"
@@ -571,8 +536,8 @@ def test_drain_ingest_tract_return_consumed_empty_when_truncate_write_fails(
     import ng_tract
     tract_path = str(tmp_path / "turns.tract")
     ng_tract.deposit_experience(
-        content=b"a turn whose truncate write fails",
-        source="cc_gateway", tract_path=tract_path, content_type="text",
+        raw=b"a turn whose truncate write fails",
+        source="cc_gateway", tract_paths=[tract_path],
     )
 
     real_open = builtins.open
@@ -594,18 +559,8 @@ def test_drain_ingest_tract_return_consumed_empty_when_truncate_write_fails(
 
 
 # =============================================================================
-# FatherGraph absorption discipline (Findings 1 + 3)
-#
-# The drain must NOT bulk-dump. Finding 1: "the drain can't be a bulk dump...
-# New topology must arrive gradually enough that the receiving topology's
-# homeostatic regulation can absorb it without displacement." Finding 3:
-# "After receiving a merge batch, run idle steps (~250) BEFORE accepting the
-# next batch" -- measured 47%->74% accuracy, "not optional -- it's what makes
-# merge work."
-#
-# These drive the REAL drain_gateway_conduit batching/sleep logic, stubbing
-# only drain_ingest_tract (the per-file BTF parse + dual-pass, covered
-# elsewhere) so the discipline itself is what's under test.
+# Raw experience delivery, bounded lock use and load backpressure.
+# FatherGraph consolidation belongs to topology tests, not this path.
 # =============================================================================
 
 class _CountingGraph:
@@ -651,35 +606,28 @@ def _make_conduit(tmp_path, n_files, prefix="laptop_cc_gateway"):
     return conduit_dir
 
 
-def test_drain_sleeps_between_batches_not_after_bulk_dump(tmp_path, draining_hemisphere, monkeypatch):
-    """6 files x 1 turn, batch_size=2, idle_steps=5 -> consolidation must run
-    after every 2nd turn (3 times), NOT once at the end. Proves the sleep is
-    interleaved (Finding 3), not tacked on after a bulk dump (Finding 1)."""
+def test_legacy_topology_arguments_cannot_make_raw_experience_sleep(tmp_path, draining_hemisphere, monkeypatch):
     conduit_dir = _make_conduit(tmp_path, 6)
     _stub_drain(monkeypatch, turns_per_file=1)
     g = _CountingGraph()
+    def forbidden(*a, **kw):
+        pytest.fail("Leg1 invoked topology consolidation")
+    monkeypatch.setattr(cc_ng_organism, "_cc_callosum_consolidate", forbidden)
+    assert drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
+                                 batch_size=25, idle_steps=250, load_ceiling=999.0) == 6
+    assert g.steps == 0
 
-    absorbed = drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir,
-                                      batch_size=2, idle_steps=5, load_ceiling=999.0)
-
-    assert absorbed == 6
-    # 6 turns / batch 2 = 3 consolidation passes x 5 steps each
-    assert g.steps == 15, f"expected 3 interleaved sleeps (15 steps), got {g.steps}"
 
 
-def test_drain_consolidates_trailing_partial_batch(tmp_path, draining_hemisphere, monkeypatch):
-    """5 turns with batch_size=2 -> two full-batch sleeps plus one trailing
-    sleep for the remaining turn, so freshly-merged topology is never left
-    unconsolidated when the run ends."""
+def test_ambient_topology_environment_cannot_add_leg1_steps(tmp_path, draining_hemisphere, monkeypatch):
     conduit_dir = _make_conduit(tmp_path, 5)
     _stub_drain(monkeypatch, turns_per_file=1)
+    monkeypatch.setenv("CC_NG_BATCH_SIZE", "25")
+    monkeypatch.setenv("CC_NG_IDLE_STEPS", "250")
     g = _CountingGraph()
+    assert drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir, load_ceiling=999.0) == 5
+    assert g.steps == 0
 
-    drain_gateway_conduit(g, None, {}, conduit_dir=conduit_dir, batch_size=2, idle_steps=5,
-                            load_ceiling=999.0)
-
-    # 2 full batches (2 sleeps) + 1 trailing turn (1 sleep) = 3 x 5 steps
-    assert g.steps == 15
 
 
 def test_drain_no_consolidation_when_nothing_absorbed(tmp_path, draining_hemisphere, monkeypatch):
@@ -796,3 +744,34 @@ def test_drain_explicit_exclude_prefix_overrides_machine_id_default(
                                       load_ceiling=999.0, exclude_prefix="vps_")
 
     assert absorbed == 2
+
+
+def test_real_frames_preserve_text_order_and_suffix_under_backpressure(tmp_path, draining_hemisphere, monkeypatch):
+    import ng_tract
+    import ng_embed
+    import cc_refeed
+    conduit_dir = tmp_path / "conduit"
+    conduit_dir.mkdir()
+    path = conduit_dir / "laptop_cc_gateway.1000_original.tract"
+    texts = ["  first\nline — literal  ", "second\n\nparagraph", "third text"]
+    for text in texts:
+        ng_tract.deposit_experience(raw=text.encode(), source="cc_gateway",
+                                    tract_paths=[str(path)])
+    original = path.read_bytes()
+    reader = ng_tract.TractReader(original)
+    next(iter(reader))
+    suffix = original[reader.position():]
+    seen = []
+    monkeypatch.setattr(ng_embed, "embed", lambda text: None)
+    monkeypatch.setattr(cc_ng_organism, "run_conversational_dual_pass",
+                        lambda graph, vdb, text, emb, state: seen.append(text) or True)
+    monkeypatch.setattr(cc_refeed, "should_pause_for_load", lambda *a: True)
+    g = _CountingGraph()
+    assert drain_gateway_conduit(g, None, {}, conduit_dir=str(conduit_dir)) == 1
+    assert seen == texts[:1]
+    assert path.read_bytes() == suffix
+    monkeypatch.setattr(cc_refeed, "should_pause_for_load", lambda *a: False)
+    assert drain_gateway_conduit(g, None, {}, conduit_dir=str(conduit_dir), idle_steps=250) == 2
+    assert seen == texts
+    assert g.steps == 0
+    assert not path.exists()
