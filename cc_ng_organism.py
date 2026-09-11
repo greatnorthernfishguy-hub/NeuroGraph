@@ -3,6 +3,8 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-11] Codex — re-adopt retained raw input across restart only when
+#   its durable journal has no attempt records; any attempted input stays fenced.
 # [2026-09-11] Codex — terminal accepted deliveries survive normal restarts;
 #   ownership fences unresolved attempts, not verified completed delivery.
 # [2026-09-11] Codex — #423 retain raw delivery and journal attempts before learning.
@@ -2216,11 +2218,19 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
                         continue
                     key = (conduit_dir, name, digest)
                     if status != 'accepted' and prior_owner != owner:
-                        # Unresolved attempts belong to their original graph.
-                        # Terminal acceptance is durable across normal restarts.
-                        result['uncertain'] += 1
-                        result['retained'] += 1
-                        continue
+                        # Every mutation has a committed record marker first.
+                        # Retained bytes with NO record rows have never been
+                        # attempted, so a new incarnation may safely adopt them.
+                        attempted = db.execute(
+                            'SELECT 1 FROM records WHERE conduit=? AND name=? AND digest=? LIMIT 1',
+                            key).fetchone()
+                        if attempted:
+                            result['uncertain'] += 1
+                            result['retained'] += 1
+                            continue
+                        with db:
+                            db.execute('UPDATE files SET owner=? WHERE conduit=? AND name=? AND digest=?',
+                                       (owner,) + key)
                     if status in ('uncertain', 'invalid'):
                         result['retained'] += 1
                         result['uncertain'] += status == 'uncertain'
