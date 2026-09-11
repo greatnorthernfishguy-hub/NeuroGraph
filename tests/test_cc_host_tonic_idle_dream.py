@@ -1,4 +1,6 @@
 # tests/test_cc_host_tonic_idle_dream.py
+# [2026-09-11] Codex — isolate poison-sentinel conversation I/O; ONNX daemon
+# escaped this unit fixture and aborted during interpreter finalization (core144623).
 #
 # ---- Changelog ----
 # [2026-07-23] Claude Code (Sonnet 5) — CC Host Tonic Idle/Dream Wiring tests
@@ -240,8 +242,14 @@ def test_new_code_never_touches_syl_memory_singleton(monkeypatch):
         "PARASYMPATHETIC", now - cc_ng_host.CC_HOST_DREAM_MIN_INTERVAL_SECS - 1.0,
     ) is True
 
-    # message_received wiring path too.
+    # This test owns Tonic wiring, not conversation I/O. The real deposit
+    # launches an unjoined daemon that can load ONNX and the Commons even
+    # with _STATE.cc_ng replaced by a fake; never cross that boundary here.
+    monkeypatch.setattr(cc_ng_host, "_recall", lambda *a, **k: "")
+    monkeypatch.setattr(cc_ng_host, "_nudge", lambda *a, **k: None)
+    monkeypatch.setattr(cc_ng_host, "_deposit", lambda *a, **k: None)
     cc_ng_host._handle_user_prompt_submit({"prompt": "hello"})
+    assert tonic.received_calls == 1
 
     # neurograph_rpc._memory itself was never touched -- if it had been,
     # one of the calls above would already have raised AssertionError.
