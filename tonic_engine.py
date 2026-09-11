@@ -27,6 +27,7 @@ Laws observed:
 
 # ---- Changelog ----
 # [2026-09-11] Claude Code + Codex — #426 shared-body-only Tonic attachment.
+# [2026-09-11] Codex — preserve existing wrappers on failed swaps (Grok review).
 # What: optional require_shared_body prevents private model loading; late offers build
 #   only the encoder/decoder wrapper around the supplied body. Failed offers retry.
 # Why: VPS CC and Syl share one transformer while retaining separate substrates.
@@ -545,6 +546,10 @@ class TonicEngine:
                 return False
         try:
             with self._body_lock_context(blocking=blocking):
+                previous_model = self._model
+                previous_body = getattr(previous_model, "body", None)
+                previous_shared = self._shared_body
+                previous_heuristic = self._use_heuristic
                 try:
                     if self._model is None:
                         self._model = new_model
@@ -555,9 +560,23 @@ class TonicEngine:
                     self._shared_body = transformer_body
                     self._use_heuristic = False
                 except Exception:
+                    # Keep existing wrappers retryable, including default consumers
+                    # which deliberately do not build a wrapper on a later offer.
                     self._shared_body = None
-                    self._model = None
+                    self._model = previous_model
                     self._use_heuristic = True
+                    if previous_model is not None:
+                        try:
+                            previous_model.body = previous_body
+                            if getattr(previous_model, "body", None) is not previous_body:
+                                raise ValueError("wrapper did not restore its previous body")
+                            self._shared_body = previous_shared
+                            self._use_heuristic = previous_heuristic
+                        except Exception:
+                            # A failed rollback must not forward through a partial
+                            # body. Retain the wrapper so a future offer can retry.
+                            logger.warning("Tonic body rollback failed; attachment inactive",
+                                           exc_info=True)
                     raise
         except BlockingIOError:
             return False  # no attachment change; monitor retries when inference yields

@@ -342,10 +342,12 @@ def test_success_requires_the_exact_offered_body(loader, monkeypatch):
     wrapper = eng._model
     wrapper.__class__ = _Stubborn
     wrapper._locked = True
+    previous_body = wrapper.body
     assert eng.offer_shared_body(_FakeBody("second")) is False
-    assert eng._use_heuristic is True
-    assert eng._shared_body is None
-    assert eng._model is None
+    assert eng._use_heuristic is False
+    assert eng._shared_body is previous_body
+    assert eng._model is wrapper
+    wrapper._locked = False
     replacement = _FakeBody("retry")
     assert eng.offer_shared_body(replacement) is True
     assert eng._shared_body is replacement
@@ -467,3 +469,60 @@ def test_forward_does_not_reenter_the_body_lock(loader, monkeypatch):
     t.join(timeout=5.0)
     assert not t.is_alive(), "forward path deadlocked on the body lock"
     assert done == [[]]
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_failed_swap_preserves_existing_wrapper_and_can_retry(loader, required):
+    old_body, rejected, next_body = _FakeBody("old"), _FakeBody("reject"), _FakeBody("next")
+    engine = _engine(require_shared_body=required, transformer_body=old_body)
+
+    class FailingSwap(_FakeBrain):
+        def __setattr__(self, name, value):
+            super().__setattr__(name, value)
+            if name == "body" and value is rejected:
+                raise RuntimeError("swap failed after changing body")
+
+    wrapper = FailingSwap(old_body)
+    engine._model = wrapper
+    calls_before = len(loader.calls)
+    assert engine.offer_shared_body(rejected) is False
+    assert engine._model is wrapper
+    assert wrapper.body is old_body
+    assert engine._shared_body is old_body
+    assert engine._use_heuristic is False
+    assert engine.offer_shared_body(next_body) is True
+    assert engine._model is wrapper
+    assert wrapper.body is next_body
+    assert loader.calls[calls_before:] == []
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_failed_rollback_disables_forward_but_keeps_retryable_wrapper(loader, required):
+    old_body, rejected, next_body = _FakeBody("old"), _FakeBody("reject"), _FakeBody("next")
+    engine = _engine(require_shared_body=required, transformer_body=old_body)
+
+    class FailingRollback(_FakeBrain):
+        def __setattr__(self, name, value):
+            if name == "body" and getattr(self, "faulty", False):
+                if value is old_body:
+                    raise RuntimeError("rollback failed")
+                if value is rejected:
+                    super().__setattr__(name, value)
+                    raise RuntimeError("partial swap")
+            super().__setattr__(name, value)
+
+    wrapper = FailingRollback(old_body)
+    wrapper.faulty = True
+    engine._model = wrapper
+    assert engine.offer_shared_body(rejected) is False
+    assert engine._model is wrapper
+    assert engine._shared_body is None
+    assert engine._use_heuristic is True
+    if required:
+        assert engine._generate_latent_token_inner()["waiting_for_shared_body"]
+        assert engine.status["using_heuristic"] is False
+    assert wrapper.forward_calls == 0
+    assert engine.offer_shared_body(next_body) is True
+    assert engine._model is wrapper
+    assert engine._shared_body is next_body
+    assert engine._use_heuristic is False
