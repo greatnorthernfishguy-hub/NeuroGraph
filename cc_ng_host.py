@@ -27,6 +27,12 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-12] Codex — expose the shared Pith history compressor to miniTID.
+# What: add the missing compress_history socket handler to the hosted VPS CC path.
+# Why: miniTID's enabled Pith peninsula otherwise received an unknown event and
+#   silently fell back to fixed-length truncation despite both services being healthy.
+# How: mirror the laptop daemon's fail-soft wrapper around the one canonical
+#   cc_ng_organism.pith_compress_history implementation, reading under CC's graph lock.
 # [2026-09-12] Codex — #430 serialize CC initialization and retain graph on bind failure.
 # What: One complete init at a time; only attempt-owned failed sockets close.
 # Why: Concurrent bootstrap could erase the graph behind a live listener.
@@ -670,6 +676,38 @@ def _handle_pith_metrics(_data):
         return {"ok": False, "error": str(exc)}
 
 
+def _handle_compress_history(data):
+    """Compress miniTID's older turns through the shared Pith implementation.
+
+    miniTID owns message ordering and splices this positionally aligned result
+    back into the provider request. This boundary is read-only over CC's graph.
+    Fail soft to the original turns so a compressor problem cannot discard
+    conversation history.
+    """
+    turns = data.get("turns") or []
+    if not isinstance(turns, list) or not turns:
+        return {"ok": True, "compressed": turns}
+    try:
+        from cc_ng_organism import pith_compress_history
+        ng = _STATE.cc_ng
+        graph = getattr(ng, "graph", None) if ng is not None else None
+        per_turn_chars = data.get("per_turn_chars")
+        lock = getattr(graph, "_concurrent_lock", None) if graph is not None else None
+        if lock is not None:
+            with lock:
+                compressed = pith_compress_history(
+                    turns, graph, per_turn_chars=per_turn_chars
+                )
+        else:
+            compressed = pith_compress_history(
+                turns, graph, per_turn_chars=per_turn_chars
+            )
+        return {"ok": True, "compressed": compressed}
+    except Exception as exc:
+        logger.warning("compress_history failed (returning turns unchanged): %s", exc)
+        return {"ok": True, "compressed": turns}
+
+
 def _handle_status(_data):
     ng = _STATE.cc_ng
     tonic_info = {"enabled": False}
@@ -1045,6 +1083,7 @@ _DISPATCH = {
     "ping": _handle_ping,
     "status": _handle_status,
     "pith_metrics": _handle_pith_metrics,
+    "compress_history": _handle_compress_history,
     "export": _handle_export,
     "import": _handle_import,
     "drain_conduit": _handle_drain_conduit,
