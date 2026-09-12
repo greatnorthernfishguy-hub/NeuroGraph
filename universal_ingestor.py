@@ -119,6 +119,7 @@ Grok Review Changelog (v0.7.1):
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -353,8 +354,101 @@ class SimpleVectorDB:
         """Return all stored IDs."""
         return list(self.embeddings.keys())
 
+    # ---- Changelog ----
+    # [2026-09-11] Claude (Sonnet 5) — #423: capture/write split
+    # What: save() factored into capture_state([detach]) -> dict and
+    #       write_state(path, captured) -> int. save() delegates; bytes unchanged.
+    # Why:  Coherent multi-component checkpoints need the in-RAM capture of graph,
+    #       vectors and activations to finish at one coordination boundary, with disk
+    #       I/O after live mutation resumes. Fused save() made that inexpressible.
+    # How:  Entry construction moved into capture_state (iterating a list() snapshot of
+    #       the id set so a concurrent add/delete cannot mutate it mid-traversal);
+    #       format dispatch + file write moved into write_state.
+    # -------------------
+    def capture_state(self, detach: bool = True) -> Dict[str, Any]:
+        """Capture vector DB state in RAM — performs NO disk I/O.
+
+        Embeddings are copied out as float32 ``bytes`` (already detached from the live
+        arrays). ``content`` values are immutable strings. ``metadata`` dicts are the
+        LIVE objects unless ``detach=True``.
+
+        Args:
+            detach: When True, deep-copy each entry's metadata so no live mutable dict
+                remains aliased into the capture. Cheap relative to the embeddings, but
+                enabled by default; callers can explicitly request the legacy aliased form.
+
+        Returns:
+            Mapping suitable for :meth:`write_state`.
+        """
+        import numpy as np
+
+        entries: Dict[str, Any] = {}
+        # list() the ids first: a concurrent add/delete during the traversal would
+        # otherwise raise "dictionary changed size during iteration" mid-capture.
+        for id in list(self.embeddings.keys()):
+            # Disappearing entries indicate an uncoordinated mutation. Refuse
+            # the capture rather than silently publishing a smaller vector set.
+            emb = self.embeddings[id]
+            meta = self.metadata.get(id, {})
+            entries[id] = {
+                "embedding": emb.astype(np.float32).tobytes(),
+                "content": self.content.get(id, ""),
+                "metadata": copy.deepcopy(meta) if detach else meta,
+            }
+        # Key order matches the pre-split save() exactly, so the packed bytes are
+        # byte-identical for an unchanged DB.
+        return {
+            "version": "1.0.0",
+            "count": len(entries),
+            "entries": entries,
+        }
+
+    def write_state(self, path: str, captured: Dict[str, Any]) -> int:
+        """Write a previously captured vector DB mapping to disk.
+
+        Pure I/O: reads no live state, so it may run after mutation resumes.
+
+        Args:
+            path: File path. Extension determines format (.msgpack or .json).
+            captured: Mapping returned by :meth:`capture_state`.
+
+        Returns:
+            Number of entries written.
+        """
+        if path.endswith(".msgpack"):
+            try:
+                import msgpack
+            except ImportError:
+                raise ImportError("msgpack required for .msgpack serialization")
+            with open(path, "wb") as f:
+                msgpack.pack(captured, f, use_bin_type=True)
+        else:
+            import json
+            import base64
+            # JSON fallback: base64-encode the binary embeddings
+            json_data = {
+                "version": captured["version"],
+                "count": captured["count"],
+                "entries": {},
+            }
+            for id, entry in captured["entries"].items():
+                json_data["entries"][id] = {
+                    "embedding_b64": base64.b64encode(entry["embedding"]).decode("ascii"),
+                    "content": entry["content"],
+                    "metadata": entry["metadata"],
+                }
+            with open(path, "w") as f:
+                json.dump(json_data, f, indent=2, default=str)
+
+        return int(captured["count"])
+
     def save(self, path: str) -> int:
         """Persist vector DB state to disk (msgpack or JSON).
+
+        Capture-then-write, fused: equivalent to
+        ``write_state(path, capture_state())``. Use the two primitives directly when
+        the capture must complete at a coordination boundary and the write must happen
+        after live mutation resumes (#423).
 
         Stores embeddings as raw bytes (float32), plus content and metadata
         dicts. Format mirrors Graph checkpoint conventions.
@@ -365,46 +459,7 @@ class SimpleVectorDB:
         Returns:
             Number of entries saved.
         """
-        import numpy as np
-
-        data = {
-            "version": "1.0.0",
-            "count": len(self.embeddings),
-            "entries": {},
-        }
-        for id in self.embeddings:
-            data["entries"][id] = {
-                "embedding": self.embeddings[id].astype(np.float32).tobytes(),
-                "content": self.content.get(id, ""),
-                "metadata": self.metadata.get(id, {}),
-            }
-
-        if path.endswith(".msgpack"):
-            try:
-                import msgpack
-            except ImportError:
-                raise ImportError("msgpack required for .msgpack serialization")
-            with open(path, "wb") as f:
-                msgpack.pack(data, f, use_bin_type=True)
-        else:
-            import json
-            import base64
-            # JSON fallback: base64-encode the binary embeddings
-            json_data = {
-                "version": data["version"],
-                "count": data["count"],
-                "entries": {},
-            }
-            for id, entry in data["entries"].items():
-                json_data["entries"][id] = {
-                    "embedding_b64": base64.b64encode(entry["embedding"]).decode("ascii"),
-                    "content": entry["content"],
-                    "metadata": entry["metadata"],
-                }
-            with open(path, "w") as f:
-                json.dump(json_data, f, indent=2, default=str)
-
-        return len(self.embeddings)
+        return self.write_state(path, self.capture_state())
 
     def load(self, path: str) -> int:
         """Restore vector DB state from disk.
@@ -1965,6 +2020,12 @@ class NodeRegistrar:
             "initial_threshold_boost", 0.2
         )
 
+    # ---- Changelog ----
+    # [2026-09-11] Codex — #423 pair document graph/vector writes with capture.
+    # What: registration, document probation and pure association share _step_lock.
+    # Why: these direct metadata/vector mutations must participate in coherent capture.
+    # How: guard only post-embedding application; extraction and embeddings stay outside.
+    # -------------------
     def register(
         self,
         embedded_chunks: List[EmbeddedChunk],
@@ -1983,51 +2044,52 @@ class NodeRegistrar:
 
         Returns list of created node IDs.
         """
-        created_ids: List[str] = []
-        src_meta = source_metadata or {}
+        with self.graph._step_lock:
+            created_ids: List[str] = []
+            src_meta = source_metadata or {}
 
-        for ec in embedded_chunks:
-            node_id = ec.chunk.chunk_id
+            for ec in embedded_chunks:
+                node_id = ec.chunk.chunk_id
 
-            # Create node with novelty dampening
-            node_meta = {
-                **ec.chunk.metadata,
-                **src_meta,
-                "chunk_text_preview": ec.chunk.text[:200],
-                "token_count": ec.chunk.token_count,
-                "position": ec.chunk.position,
-                "creation_mode": "ingested",
-                "probation_remaining": self.probation_period,
-                "novelty_dampening": self.novelty_dampening,
-                "dampening_curve": self.dampening_curve.name,
-            }
-            if ec.chunk.parent_chunk_id:
-                node_meta["parent_chunk_id"] = ec.chunk.parent_chunk_id
+                # Create node with novelty dampening
+                node_meta = {
+                    **ec.chunk.metadata,
+                    **src_meta,
+                    "chunk_text_preview": ec.chunk.text[:200],
+                    "token_count": ec.chunk.token_count,
+                    "position": ec.chunk.position,
+                    "creation_mode": "ingested",
+                    "probation_remaining": self.probation_period,
+                    "novelty_dampening": self.novelty_dampening,
+                    "dampening_curve": self.dampening_curve.name,
+                }
+                if ec.chunk.parent_chunk_id:
+                    node_meta["parent_chunk_id"] = ec.chunk.parent_chunk_id
 
-            node = self.graph.create_node(node_id=node_id, metadata=node_meta)
+                node = self.graph.create_node(node_id=node_id, metadata=node_meta)
 
-            # Apply novelty dampening: higher threshold for new nodes
-            base_threshold = self.graph.config.get("default_threshold", 1.0)
-            node.threshold = base_threshold + self.initial_threshold_boost
+                # Apply novelty dampening: higher threshold for new nodes
+                base_threshold = self.graph.config.get("default_threshold", 1.0)
+                node.threshold = base_threshold + self.initial_threshold_boost
 
-            # Reduce intrinsic excitability by dampening factor
-            # dampening=0.3 means node starts at 30% effectiveness
-            node.intrinsic_excitability = self.novelty_dampening
+                # Reduce intrinsic excitability by dampening factor
+                # dampening=0.3 means node starts at 30% effectiveness
+                node.intrinsic_excitability = self.novelty_dampening
 
-            # Store in vector DB — ONLY for lived experience (recall store).
-            # Telemetry (index_in_recall=False) still becomes a substrate node
-            # above, but must NOT enter Syl's recall store (#295, Decision 1).
-            if index_in_recall:
-                self.vector_db.insert(
-                    id=node_id,
-                    embedding=ec.vector,
-                    content=ec.chunk.text,
-                    metadata=node_meta,
-                )
+                # Store in vector DB — ONLY for lived experience (recall store).
+                # Telemetry (index_in_recall=False) still becomes a substrate node
+                # above, but must NOT enter Syl's recall store (#295, Decision 1).
+                if index_in_recall:
+                    self.vector_db.insert(
+                        id=node_id,
+                        embedding=ec.vector,
+                        content=ec.chunk.text,
+                        metadata=node_meta,
+                    )
 
-            created_ids.append(node_id)
+                created_ids.append(node_id)
 
-        return created_ids
+            return created_ids
 
     def get_dampening_factor(self, node: Node) -> float:
         """Compute current dampening factor for a node based on probation progress.
@@ -2077,55 +2139,56 @@ class NodeRegistrar:
         Call this each simulation step (or periodically) to fade dampening.
         Returns list of node IDs that graduated this call.
         """
-        graduated: List[str] = []
-        if node_ids is None:
-            # #111 -- sweep only what THIS registrar stamped. An unscoped
-            # whole-graph sweep also decrements and graduates CONVERSATIONAL
-            # nodes, with no firing gate, which silently defeats #93 on any
-            # host that routes turns through on_message. CC does exactly that
-            # (cc_ng_host.py:393 _deposit -> ng.on_message), and its per-prompt
-            # cadence beats the 60s pulse that runs the #93-gated sweep, so the
-            # ungated stamp usually won the race. Syl is unaffected either way:
-            # on_message has no callers in neurograph_rpc.py.
-            #
-            # Documents and conversation are separate probation domains by
-            # design; the callosum topology sync is the only join between them.
-            # Do not "fix" this by unifying the two pipelines.
-            #
-            # NOTE: an explicit empty list now means "sweep nothing" rather
-            # than "sweep everything" -- `node_ids or ...` treated [] as falsy.
-            # Sweeping the whole graph on an empty request was never intended.
-            ids = [
-                nid for nid, n in self.graph.nodes.items()
-                if (n.metadata or {}).get("creation_mode") == "ingested"
-            ]
-        else:
-            ids = node_ids
-
-        for nid in ids:
-            node = self.graph.nodes.get(nid)
-            if node is None:
-                continue
-
-            prob = node.metadata.get("probation_remaining")
-            if prob is None or prob <= 0:
-                continue
-
-            # Decrement probation
-            node.metadata["probation_remaining"] = prob - 1
-
-            if node.metadata["probation_remaining"] <= 0:
-                # Graduate: restore full excitability and threshold
-                node.intrinsic_excitability = 1.0
-                node.threshold = self.graph.config.get("default_threshold", 1.0)
-                node.metadata["graduated"] = True
-                graduated.append(nid)
+        with self.graph._step_lock:
+            graduated: List[str] = []
+            if node_ids is None:
+                # #111 -- sweep only what THIS registrar stamped. An unscoped
+                # whole-graph sweep also decrements and graduates CONVERSATIONAL
+                # nodes, with no firing gate, which silently defeats #93 on any
+                # host that routes turns through on_message. CC does exactly that
+                # (cc_ng_host.py:393 _deposit -> ng.on_message), and its per-prompt
+                # cadence beats the 60s pulse that runs the #93-gated sweep, so the
+                # ungated stamp usually won the race. Syl is unaffected either way:
+                # on_message has no callers in neurograph_rpc.py.
+                #
+                # Documents and conversation are separate probation domains by
+                # design; the callosum topology sync is the only join between them.
+                # Do not "fix" this by unifying the two pipelines.
+                #
+                # NOTE: an explicit empty list now means "sweep nothing" rather
+                # than "sweep everything" -- `node_ids or ...` treated [] as falsy.
+                # Sweeping the whole graph on an empty request was never intended.
+                ids = [
+                    nid for nid, n in self.graph.nodes.items()
+                    if (n.metadata or {}).get("creation_mode") == "ingested"
+                ]
             else:
-                # Update excitability based on dampening curve
-                factor = self.get_dampening_factor(node)
-                node.intrinsic_excitability = factor
+                ids = node_ids
 
-        return graduated
+            for nid in ids:
+                node = self.graph.nodes.get(nid)
+                if node is None:
+                    continue
+
+                prob = node.metadata.get("probation_remaining")
+                if prob is None or prob <= 0:
+                    continue
+
+                # Decrement probation
+                node.metadata["probation_remaining"] = prob - 1
+
+                if node.metadata["probation_remaining"] <= 0:
+                    # Graduate: restore full excitability and threshold
+                    node.intrinsic_excitability = 1.0
+                    node.threshold = self.graph.config.get("default_threshold", 1.0)
+                    node.metadata["graduated"] = True
+                    graduated.append(nid)
+                else:
+                    # Update excitability based on dampening curve
+                    factor = self.get_dampening_factor(node)
+                    node.intrinsic_excitability = factor
+
+            return graduated
 
 
 # ---------------------------------------------------------------------------
@@ -2180,22 +2243,23 @@ class HypergraphAssociator:
         Returns:
             Tuple of (synapse_ids, hyperedge_ids) created.
         """
-        synapse_ids: List[str] = []
-        hyperedge_ids: List[str] = []
+        with self.graph._step_lock:
+            synapse_ids: List[str] = []
+            hyperedge_ids: List[str] = []
 
-        # 1. Similarity-based synapses
-        sim_synapses = self._create_similarity_synapses(embedded_chunks, node_ids)
-        synapse_ids.extend(sim_synapses)
+            # 1. Similarity-based synapses
+            sim_synapses = self._create_similarity_synapses(embedded_chunks, node_ids)
+            synapse_ids.extend(sim_synapses)
 
-        # 2. Structural synapses
-        struct_synapses = self._create_structural_synapses(embedded_chunks, node_ids)
-        synapse_ids.extend(struct_synapses)
+            # 2. Structural synapses
+            struct_synapses = self._create_structural_synapses(embedded_chunks, node_ids)
+            synapse_ids.extend(struct_synapses)
 
-        # 3. Hypergraph clustering
-        he_ids = self._create_clusters(embedded_chunks, node_ids)
-        hyperedge_ids.extend(he_ids)
+            # 3. Hypergraph clustering
+            he_ids = self._create_clusters(embedded_chunks, node_ids)
+            hyperedge_ids.extend(he_ids)
 
-        return synapse_ids, hyperedge_ids
+            return synapse_ids, hyperedge_ids
 
     def _create_similarity_synapses(
         self,

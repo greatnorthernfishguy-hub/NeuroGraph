@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-09-11] Codex — #423 durability before generation retention.
+# What: flush source artifacts, generation members and directories before pruning;
+# optional pre-prune verification callback; copy failures now prevent eviction.
+# Why: a written but unflushed replacement must not evict the last durable set.
+# How: shared file/directory barrier for legacy and receipt callers, no graph lock.
+# -------------------
+# ---- Changelog ----
 # [2026-08-02] Claude Code (Opus 4.8) — #105 per-host wiring capability
 # What: evaluate_save_health() and SaveGate.permit() take an optional
 #   wires_own_deposits flag. None/True => exact #83 behavior. False => a host
@@ -552,19 +559,38 @@ def _parse_stamp(name: str) -> Optional[datetime]:
         return None
 
 
+def _flush_checkpoint_paths(files, directories):
+    """Durability barrier before a new generation may evict its predecessor."""
+    for path in files:
+        with open(path, "rb") as stream:
+            os.fsync(stream.fileno())
+    for path in sorted(set(map(str, directories)), key=lambda p: len(Path(p).parts), reverse=True):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def rotate_generations(checkpoint_dir, files: List[str],
                        recent: Optional[int] = None,
                        hourly: Optional[int] = None,
                        daily: Optional[int] = None,
-                       now: Optional[datetime] = None) -> Optional[str]:
+                       now: Optional[datetime] = None,
+                       before_prune: Optional[Callable[[str], Any]] = None) -> Optional[str]:
     """Hardlink the consistent SET of checkpoint files into generations/<stamp>/.
 
     Hardlinks are frozen snapshots at zero copy cost: the atomic-save path
     replaces the primary's inode (os.replace), so the generation keeps the
     old bytes. Falls back to copy2 where hardlinks aren't possible (EXDEV).
-    Generations are SETS — main + vectors + sidecars together, never mixed
-    across saves (mixed-generation restores breed vdb orphans).
+    Generations are SETS — main + vectors + sidecars together. Callers must
+    supply a completed set. Flush current files before linking, then flush
+    generation members/directories before the optional verification callback
+    and retention. Any flush/copy/verification failure preserves predecessors.
     """
+    # Flush current artifacts before creating any replacement generation.
+    sources = [Path(f) for f in files if Path(f).exists()]
+    _flush_checkpoint_paths(sources, [Path(checkpoint_dir)])
     gen_root = Path(checkpoint_dir) / "generations"
     gen_root.mkdir(parents=True, exist_ok=True)
     if now is None:
@@ -576,10 +602,7 @@ def rotate_generations(checkpoint_dir, files: List[str],
         n += 1
         gen_dir = gen_root / f"{stamp}-{n}"
     gen_dir.mkdir()
-    for f in files:
-        src = Path(f)
-        if not src.exists():
-            continue
+    for src in sources:
         dst = gen_dir / src.name
         # Hardlink only .msgpack members: their writers replace the inode
         # atomically (tmp + os.replace), so a linked generation is frozen.
@@ -597,6 +620,11 @@ def rotate_generations(checkpoint_dir, files: List[str],
                 shutil.copy2(src, dst)
             except OSError as exc:
                 logger.warning("Guardian: generation copy failed for %s (%s)", src, exc)
+                raise  # Incomplete replacement must never evict prior generations.
+    _flush_checkpoint_paths([gen_dir / src.name for src in sources],
+                            [gen_dir, gen_root, Path(checkpoint_dir)])
+    if before_prune is not None:
+        before_prune(str(gen_dir))
     _prune_generations(gen_root, gen_dir.name,
                        recent if recent is not None else _env_int("NG_GUARDIAN_GEN_RECENT", 3),
                        hourly if hourly is not None else _env_int("NG_GUARDIAN_GEN_HOURLY", 6),

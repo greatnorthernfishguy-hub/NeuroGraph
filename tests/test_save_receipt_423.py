@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import time
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -72,6 +73,8 @@ def _build_namespace():
             for sub in node.body:
                 if isinstance(sub, ast.FunctionDef) and sub.name == "save":
                     save_fn = sub
+                elif isinstance(sub, ast.FunctionDef) and sub.name == "_capture_checkpoint_state":
+                    wanted.append(sub)
 
     assert save_fn is not None, "save() not found in NeuroGraphMemory"
     missing = {h for h in _HELPERS} - {
@@ -117,6 +120,7 @@ save = NS["save"]
 
 class FakeGraph:
     def __init__(self, nodes=12, fail=False):
+        self._step_lock = threading.RLock()
         self.nodes = {f"n{i}": i for i in range(nodes)}
         self.synapses = {"s0": 1, "s1": 2}
         self.hyperedges = {"h0": 1}
@@ -124,11 +128,16 @@ class FakeGraph:
         self.fail = fail
         self.payload = b"graph-bytes-v1"
 
-    def checkpoint(self, path, mode=None):
+    def capture_checkpoint(self, mode=None, detach=False):
+        assert detach and self._step_lock._is_owned()
+        return {"payload": bytes(self.payload)}
+
+    def write_checkpoint(self, path, captured, mode=None):
+        assert not self._step_lock._is_owned()
         if self.fail:
             raise IOError("graph checkpoint write exploded")
         with open(path, "wb") as f:
-            f.write(self.payload)
+            f.write(captured["payload"])
         return path
 
 
@@ -138,12 +147,16 @@ class FakeVectorDB:
         self.entries = entries
         self.payload = b"vector-bytes-v1"
 
-    def save(self, path):
+    def capture_state(self, detach=False):
+        assert detach
+        return {"count": self.entries, "payload": bytes(self.payload)}
+
+    def write_state(self, path, captured):
         if self.fail:
             raise IOError("vector DB write exploded")
         with open(path, "wb") as f:
-            f.write(self.payload)
-        return self.entries
+            f.write(captured["payload"])
+        return captured["count"]
 
     def count(self):
         return self.entries
@@ -162,24 +175,21 @@ class FakeGate:
 
 
 class FakeActivation:
-    """Mirrors ActivationPersistence.save()'s real contract.
-
-    It writes IN PLACE, swallows its own write exceptions, returns the path
-    either way, and assigns ``_last_save_time`` ONLY after the write context
-    exits cleanly. ``capture`` failures are raised from OUTSIDE that try, so
-    they propagate — same as the real writer.
-    """
+    """Explicit writer receipts plus injected old swallowed-error regressions."""
 
     def __init__(self, mode="ok"):
         self.mode = mode
         self._last_save_time = None
 
-    def save(self, graph, checkpoint_path):
-        path = str(checkpoint_path) + ".activations.json"
+    def capture_state(self, graph):
+        assert graph._step_lock._is_owned()
         if self.mode == "raise_capture":
             raise RuntimeError("capture() exploded before the writer's try")
-        data = {"version": "1.0", "saved_at": time.time(),
+        return {"version": "1.0", "saved_at": time.time(),
                 "timestep": graph.timestep, "entries": {"n0": 0.5}}
+
+    def write_state(self, checkpoint_path, data, *, with_receipt=False):
+        path = str(checkpoint_path) + ".activations.json"
         try:
             if self.mode != "noop":
                 with open(path, "w") as f:
@@ -195,12 +205,13 @@ class FakeActivation:
                 raise IOError("never opened the file")
             self._last_save_time = data["saved_at"]
         except Exception:
-            pass  # exactly what the real writer does: log and carry on
-        return path
+            return path  # injected old regression: no explicit success evidence
+        return {"path": path, "saved_at": data["saved_at"]} if with_receipt else path
 
 
 class FakeSelf:
     def __init__(self, tmp, graph=None, vdb=None, gate=None, activation="ok"):
+        self._save_publication_lock = threading.RLock()
         self._checkpoint_dir = Path(tmp)
         self._checkpoint_path = Path(tmp) / "main.msgpack"
         self._vector_db_path = Path(tmp) / "vectors.msgpack"
@@ -210,6 +221,8 @@ class FakeSelf:
         self._activation_persistence = (
             FakeActivation(activation) if isinstance(activation, str)
             else activation)
+
+    _capture_checkpoint_state = NS["_capture_checkpoint_state"]
 
     def _guardian_meaningful_nodes(self):
         return len(self.graph.nodes)
@@ -442,8 +455,7 @@ class TestComponentFailures(ReceiptTestCase):
 
 class TestGenerationEvidence(ReceiptTestCase):
     def test_stale_vectors_in_ring_cannot_count_as_accepted(self):
-        """The partial-ring trap: vectors fail, but a previous vectors.msgpack
-        is still on disk, so rotate_generations hardlinks the STALE one."""
+        """Failed vectors leave older primary bytes; never rotate that mixed set."""
         me = self.sut()
         save(me, with_receipt=True)                 # generation 1: good
         self.assertTrue(me._vector_db_path.exists())
@@ -452,11 +464,9 @@ class TestGenerationEvidence(ReceiptTestCase):
         r = save(me, with_receipt=True)
 
         self.assertEqual(r["components"]["vectors"]["status"], "failed")
-        self.assertEqual(r["components"]["generation"]["status"], "failed")
-        members = r["components"]["generation"]["members"]
-        self.assertEqual(members["vectors"]["state"], "stale")
-        # the stale file really is sitting in the ring, looking healthy
-        self.assertIsNotNone(members["vectors"]["identity"])
+        self.assertEqual(r["components"]["generation"]["status"], "not_attempted")
+        self.assertNotIn("members", r["components"]["generation"])
+        self.assertIn("prior generation retained", r["components"]["generation"]["error"])
         self.assertFalse(r["accepted"])
 
     def test_missing_member_is_detected(self):
@@ -568,8 +578,8 @@ class TestAcceptanceFlush(ReceiptTestCase):
         self.assertEqual(result['components']['generation']['durability'], 'fsynced')
         self.assertIn(False, calls)
         self.assertIn(True, calls)
-        first_directory = calls.index(True)
-        self.assertTrue(all(calls[first_directory:]))
+        # Source and generation barriers each finish with directory flushes.
+        self.assertTrue(calls[-1])
 
     def test_file_flush_failure_refuses_acceptance(self):
         from unittest.mock import patch
@@ -590,7 +600,83 @@ class TestAcceptanceFlush(ReceiptTestCase):
             result = save(self.sut(), with_receipt=True)
         self.assertFalse(result['accepted'])
 
-    def test_legacy_save_does_not_gain_receipt_flushes(self):
+    def test_legacy_save_flushes_before_retention_too(self):
         from unittest.mock import patch
-        with patch.object(os, 'fsync', side_effect=AssertionError('receipt-only operation')):
+        with patch.object(os, "fsync", wraps=os.fsync) as flush:
             self.assertIsInstance(save(self.sut()), str)
+        self.assertGreater(flush.call_count, 0)
+
+class TestRetentionDurabilityOrder(ReceiptTestCase):
+    def test_source_and_generation_flush_failures_never_prune_previous(self):
+        from unittest.mock import patch
+        for receipt in (False, True):
+            for failure_phase in (1, 2):
+                with self.subTest(receipt=receipt, failure_phase=failure_phase):
+                    me = self.sut()
+                    self.assertTrue(save(me, with_receipt=True)['accepted'])
+                    ring = Path(self.tmp) / 'generations'
+                    before = {str(p): p.read_bytes() for p in ring.rglob('*') if p.is_file()}
+                    barrier = checkpoint_guardian._flush_checkpoint_paths
+                    calls = []
+                    def fail_phase(files, directories):
+                        calls.append(tuple(map(str, files)))
+                        if len(calls) == failure_phase:
+                            raise OSError('injected durability failure')
+                        return barrier(files, directories)
+                    with patch.object(checkpoint_guardian, '_flush_checkpoint_paths', side_effect=fail_phase), \
+                         patch.object(checkpoint_guardian, '_prune_generations') as prune:
+                        result = save(me, with_receipt=receipt)
+                    prune.assert_not_called()
+                    for path, content in before.items():
+                        self.assertEqual(Path(path).read_bytes(), content)
+                    if receipt:
+                        self.assertFalse(result['accepted'])
+                        self.assertEqual(result['components']['generation']['status'], 'failed')
+                    if failure_phase == 1:
+                        after = {str(p): p.read_bytes() for p in ring.rglob('*') if p.is_file()}
+                        self.assertEqual(after, before)
+
+    def test_receipt_verification_flush_failure_happens_before_pruning(self):
+        from unittest.mock import patch
+        me = self.sut()
+        self.assertTrue(save(me, with_receipt=True)['accepted'])
+        with patch.dict(NS, {'_sync_receipt_artifacts': lambda components: (_ for _ in ()).throw(OSError('flush failed'))}), \
+             patch.object(checkpoint_guardian, '_prune_generations') as prune:
+            result = save(me, with_receipt=True)
+        prune.assert_not_called()
+        self.assertFalse(result['accepted'])
+
+    def test_retention_runs_only_after_both_durability_barriers_and_verification(self):
+        from unittest.mock import patch
+        events = []
+        barrier = checkpoint_guardian._flush_checkpoint_paths
+        verify_flush = NS['_sync_receipt_artifacts']
+        def flush(files, directories):
+            barrier(files, directories)
+            events.append('barrier')
+        def verify(components):
+            verify_flush(components)
+            events.append('verified')
+        def prune(*a, **kw):
+            self.assertEqual(events, ['barrier', 'barrier', 'verified'])
+            events.append('pruned')
+        with patch.object(checkpoint_guardian, '_flush_checkpoint_paths', side_effect=flush), \
+             patch.object(checkpoint_guardian, '_prune_generations', side_effect=prune), \
+             patch.dict(NS, {'_sync_receipt_artifacts': verify}):
+            result = save(self.sut(), with_receipt=True)
+        self.assertTrue(result['accepted'])
+        self.assertEqual(events[-1], 'pruned')
+
+    def test_failed_generation_copy_preserves_predecessor(self):
+        from unittest.mock import patch
+        me = self.sut()
+        self.assertTrue(save(me, with_receipt=True)['accepted'])
+        ring = Path(self.tmp) / 'generations'
+        before = {str(p): p.read_bytes() for p in ring.rglob('*') if p.is_file()}
+        with patch.object(checkpoint_guardian.shutil, 'copy2', side_effect=OSError('copy failure')), \
+             patch.object(checkpoint_guardian, '_prune_generations') as prune:
+            result = save(me, with_receipt=True)
+        prune.assert_not_called()
+        self.assertFalse(result['accepted'])
+        for path, content in before.items():
+            self.assertEqual(Path(path).read_bytes(), content)
