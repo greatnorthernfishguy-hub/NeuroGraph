@@ -19,6 +19,14 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-09-11] Codex — #423 detach borrowed checkpoint state during serialization
+# (PROTECTED CHANGE; Josh authorized offline source repair; no live checkpoint operation)
+# What: Full/fork/incremental capture copies borrowed mutable subtrees once; an
+#       incremental copy failure now preserves dirty flags for a later retry.
+# Why: Synthetic-shape profiling found the second whole-tree deepcopy dominated
+#      its mutation pause. Live-substrate footprint qualification remains open.
+# How: One capture-local deepcopy memo; fresh rows/lists and immutable scalars are
+#      retained. Same canonical lock, schema, and explicit detach=False semantics.
 # [2026-08-14] Claude Code (Opus 4.8) — #147 seam-split scoring: §8.15 SNN-concept signal family + dynamic weighting
 #   (PROTECTED CHANGE, plan Law-Enforcer-blessed; DEFAULT OFF; NOT YET COMMITTED — checkpoints backed up pre-edit)
 # What: _seam_score_members (the per-member core-vs-peel ranker used by
@@ -4899,10 +4907,10 @@ class Graph:
     #       mutation resumes. That is impossible while capture and write are fused in one
     #       method. The coordination boundary itself is the CALLER's (openclaw_hook)
     #       responsibility — these primitives only make the split expressible.
-    # How:  Mode dispatch + serialization moved verbatim into capture_checkpoint; msgpack
+    # How:  Mode dispatch + serialization moved into capture_checkpoint; msgpack
     #       enforcement + streaming write moved verbatim into write_checkpoint. Optional
-    #       detach= deep-copies the captured tree (minus the already-immutable pre-packed
-    #       synapse bytes) to break aliasing into live mutable state. Default detach=True
+    #       detach= copies borrowed mutable subtrees during serialization and excludes
+    #       the newly packed native synapse bytes. Default detach=True
     #       makes standalone capture detached too — the detached footprint is UNMEASURED on
     #       live-substrate sizes and must be measured before live use (#423).
     # -------------------
@@ -4921,10 +4929,10 @@ class Graph:
 
         Args:
             mode: FULL, INCREMENTAL, or FORK.
-            detach: When True, deep-copy the captured tree so no live mutable object
-                (``config``, per-node/hyperedge ``metadata``, delay buffers, …) remains
-                aliased into it. The pre-packed native synapse ``bytes`` are already an
-                immutable copy and are excluded from the deep-copy. When explicitly False
+            detach: When True, deep-copy borrowed mutable subtrees so no live mutable object
+                (``config``, per-node/hyperedge ``metadata``, histories, …) remains
+                aliased into it. Delay buffers and similar scalar collections are rebuilt.
+                The newly packed native synapse payload is excluded from the deep-copy. When explicitly False
                 the capture aliases live mutable state exactly as before this split —
                 cheaper, but not a point-in-time snapshot of those fields.
 
@@ -4932,36 +4940,24 @@ class Graph:
             The checkpoint mapping, suitable for :meth:`write_checkpoint`.
 
         Note:
-            INCREMENTAL clears the dirty-flag sets, so the captured mapping is the only
-            remaining record of those changes — a discarded INCREMENTAL capture loses
-            them, identically to the pre-split behaviour.
+            INCREMENTAL clears the dirty-flag sets only after successful serialization.
+            A copy failure therefore leaves them available for a later capture retry.
         """
         with self._step_lock:
+            memo = {} if detach else None
             if mode == CheckpointMode.FULL:
-                data = self._serialize_full()
+                data = self._serialize_full(_memo=memo)
             elif mode == CheckpointMode.INCREMENTAL:
-                data = self._serialize_incremental()
+                data = self._serialize_incremental(_memo=memo)
                 # Clear dirty flags after incremental save
                 self._dirty_nodes.clear()
                 self._dirty_synapses.clear()
                 self._dirty_hyperedges.clear()
             elif mode == CheckpointMode.FORK:
-                data = self._serialize_full()
+                data = self._serialize_full(_memo=memo)
                 data["_fork"] = True
             else:
                 raise ValueError(f"Unknown checkpoint mode: {mode}")
-
-            if detach:
-                # Deep-copy everything EXCEPT the pre-packed synapse bytes, which are
-                # already an immutable snapshot produced by the native layer (copying
-                # them would double the largest allocation for no gain).
-                _syn = data.get("synapses")
-                if isinstance(_syn, bytes):
-                    data["synapses"] = None
-                    data = copy.deepcopy(data)
-                    data["synapses"] = _syn
-                else:
-                    data = copy.deepcopy(data)
 
             return data
 
@@ -5082,7 +5078,7 @@ class Graph:
 
         self._deserialize(data)
 
-    def _serialize_node(self, node: Node) -> Dict[str, Any]:
+    def _serialize_node(self, node: Node, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
         return {
             "node_id": node.node_id,
             "voltage": node.voltage,
@@ -5095,27 +5091,27 @@ class Graph:
             "spike_history_capacity": node.spike_history.capacity,
             "firing_rate_ema": node.firing_rate_ema,
             "intrinsic_excitability": node.intrinsic_excitability,
-            "metadata": node.metadata,
+            "metadata": copy.deepcopy(node.metadata, _memo) if _memo is not None else node.metadata,
             "is_inhibitory": node.is_inhibitory,
             "Ca_i": node.Ca_i,
             "diffpc_layer": node.diffpc_layer,
-            "pred_weights": node.pred_weights,
+            "pred_weights": copy.deepcopy(node.pred_weights, _memo) if _memo is not None else node.pred_weights,
             "pred_error_ema": node.pred_error_ema,
             "manifold_type": node.manifold_type,
             "creation_time": node.creation_time,
         }
 
-    def _serialize_hyperedge(self, he: Hyperedge) -> Dict[str, Any]:
+    def _serialize_hyperedge(self, he: Hyperedge, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
         return {
             "hyperedge_id": he.hyperedge_id,
             "member_nodes": list(he.member_nodes),
-            "member_weights": he.member_weights,
+            "member_weights": copy.deepcopy(he.member_weights, _memo) if _memo is not None else he.member_weights,
             "activation_threshold": he.activation_threshold,
             "activation_mode": he.activation_mode.name,
             "current_activation": he.current_activation,
-            "output_targets": he.output_targets,
+            "output_targets": copy.deepcopy(he.output_targets, _memo) if _memo is not None else he.output_targets,
             "output_weight": he.output_weight,
-            "metadata": he.metadata,
+            "metadata": copy.deepcopy(he.metadata, _memo) if _memo is not None else he.metadata,
             "is_learnable": he.is_learnable,
             "refractory_period": he.refractory_period,
             "refractory_remaining": he.refractory_remaining,
@@ -5157,11 +5153,13 @@ class Graph:
             "confirmed_targets": list(ps.confirmed_targets),
         }
 
-    def _serialize_full(self) -> Dict[str, Any]:
-        # Snapshot all mutable dicts before building the return value.
-        # Tonic runs prime_and_propagate(write_mode=True) concurrently and
-        # can add nodes/synapses between iterations — list() gives us a
-        # stable view without pausing the latent thread.
+    def _serialize_full(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
+        # Row containers and scalar-only history lists are freshly allocated here.
+        # Only borrowed mutable subtrees need recursive copying. A capture-local
+        # memo preserves aliases/cycles across those subtrees without traversing
+        # every new row a second time. None preserves the legacy serializer's
+        # aliasing contract. capture_checkpoint holds _step_lock throughout;
+        # list(items()) alone would not provide a coherent mutation boundary.
         _nodes      = list(self.nodes.items())
         _hyperedges = list(self.hyperedges.items())
         _archived   = list(self._archived_hyperedges.items())
@@ -5171,20 +5169,24 @@ class Graph:
         _delay_buf  = list(self._delay_buffer.items())
         _recent_spk = [(nid, spikes) for nid, spikes
                        in self._recent_spikes.items() if spikes]
+        # The native backend creates this packed payload for the capture. It does
+        # not borrow live state, and bytearray is intentionally not deep-copied:
+        # that would duplicate the largest capture allocation inside _step_lock.
+        _packed_synapses = self.synapses.to_checkpoint_msgpack()
         return {
             "version": "0.4.2",
             "timestep": self.timestep,
-            "config": self.config,
-            "nodes": {nid: self._serialize_node(n) for nid, n in _nodes},
+            "config": copy.deepcopy(self.config, _memo) if _memo is not None else self.config,
+            "nodes": {nid: self._serialize_node(n, _memo=_memo) for nid, n in _nodes},
             # Native pre-packed synapses map (#RAM footprint): to_checkpoint_msgpack
             # emits the {synapse_id: {15-key}} MessagePack bytes directly from the Rust
             # columns — byte-identical to packb(to_checkpoint_dict()) but WITHOUT
             # materializing ~644K transient Python dicts. checkpoint() splices these
             # bytes verbatim into the outer map (see the streaming write below).
-            "synapses": self.synapses.to_checkpoint_msgpack(),
-            "hyperedges": {hid: self._serialize_hyperedge(h) for hid, h in _hyperedges},
+            "synapses": _packed_synapses,
+            "hyperedges": {hid: self._serialize_hyperedge(h, _memo=_memo) for hid, h in _hyperedges},
             "archived_hyperedges": {
-                hid: self._serialize_hyperedge(h)
+                hid: self._serialize_hyperedge(h, _memo=_memo)
                 for hid, h in _archived
             },
             # Phase 3: Active synapse-level predictions
@@ -5198,7 +5200,7 @@ class Graph:
                     "prediction": self._serialize_prediction(po.prediction),
                     "confirmed": po.confirmed,
                     "resolved_at": po.resolved_at,
-                    "actual_firing_nodes": po.actual_firing_nodes,
+                    "actual_firing_nodes": copy.deepcopy(po.actual_firing_nodes, _memo) if _memo is not None else po.actual_firing_nodes,
                 }
                 for po in self._prediction_outcomes
             ],
@@ -5208,8 +5210,8 @@ class Graph:
                 for syn_id, history in _syn_hist
             },
             # Phase 3: Logs
-            "novel_sequence_log": list(self._novel_sequence_log),
-            "reward_history": list(self._reward_history),
+            "novel_sequence_log": copy.deepcopy(list(self._novel_sequence_log), _memo) if _memo is not None else list(self._novel_sequence_log),
+            "reward_history": copy.deepcopy(list(self._reward_history), _memo) if _memo is not None else list(self._reward_history),
             # Phase 2.5: Active HE-level predictions
             "he_active_predictions": {
                 pid: self._serialize_prediction_state(ps)
@@ -5251,8 +5253,8 @@ class Graph:
             "total_he_state_transitions":  self._total_he_state_transitions,
             "total_he_substrate_culled":   self._total_he_substrate_culled,
             # Phase 2.5b: Output target learning state
-            "he_last_fired_step":  self._he_last_fired_step,
-            "he_output_candidates": self._he_output_candidates,
+            "he_last_fired_step": copy.deepcopy(self._he_last_fired_step, _memo) if _memo is not None else self._he_last_fired_step,
+            "he_output_candidates": copy.deepcopy(self._he_output_candidates, _memo) if _memo is not None else self._he_output_candidates,
             # v0.4.2 Hibernation state — ephemeral process counters serialized so
             # subprocess loads (CC hook, Codemine worker) believe the process never
             # stopped. Without these, homeostatic scaling never fires, in-flight spikes
@@ -5274,23 +5276,24 @@ class Graph:
             ),
         }
 
-    def _serialize_incremental(self) -> Dict[str, Any]:
+    def _serialize_incremental(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
         return {
             "version": "0.1.0",
             "incremental": True,
             "timestep": self.timestep,
             "nodes": {
-                nid: self._serialize_node(self.nodes[nid])
+                nid: self._serialize_node(self.nodes[nid], _memo=_memo)
                 for nid in self._dirty_nodes
                 if nid in self.nodes
             },
             "synapses": {
-                sid: self.synapses.serialize_one(sid)
+                sid: (copy.deepcopy(self.synapses.serialize_one(sid), _memo)
+                      if _memo is not None else self.synapses.serialize_one(sid))
                 for sid in self._dirty_synapses
                 if sid in self.synapses
             },
             "hyperedges": {
-                hid: self._serialize_hyperedge(self.hyperedges[hid])
+                hid: self._serialize_hyperedge(self.hyperedges[hid], _memo=_memo)
                 for hid in self._dirty_hyperedges
                 if hid in self.hyperedges
             },
