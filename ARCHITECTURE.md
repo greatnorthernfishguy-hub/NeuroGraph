@@ -217,10 +217,10 @@ differently, but because the neural activation hasn't fully decayed.
 ### SurfacingMonitor — Associative Remembering
 `surfacing.py`
 
-A bounded priority queue (max 5 items) of concepts whose nodes fired above
-threshold (`voltage_threshold: 0.6`). After each `graph.step()`, the monitor
-scores fired nodes by a composite of voltage, recency, and relevance. Scores
-decay each step (`decay_rate: 0.95`) so stale concepts fade.
+A bounded priority queue (max 5 items) of concepts whose salience score
+exceeds `min_confidence` (0.3). After each `graph.step()`, the monitor
+scores fired nodes by a composite of voltage, excitability, and hyperedge
+membership. Scores decay each step (`decay_rate: 0.95`) so stale concepts fade.
 
 The queue formats as a context block injected into the conversation prompt.
 This is associative remembering — knowledge surfaces because the topology
@@ -237,7 +237,7 @@ Three layers:
 1. **Health context** — natural language string for prompt injection describing
    CES state ("StreamParser processing 3.2 chunks/sec, 47 nodes nudged")
 2. **Rotating file logger** — `~/.neurograph/logs/ces.log`
-3. **HTTP dashboard** — JSON endpoints on port 8847 (not 8080, despite what
+3. **HTTP dashboard** — JSON endpoints on 127.0.0.1:8847 (not 8080, despite what
    older docs may say)
 
 ### CES Configuration
