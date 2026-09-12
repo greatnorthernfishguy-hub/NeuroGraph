@@ -27,6 +27,10 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-12] Codex — #430 serialize CC initialization and retain graph on bind failure.
+# What: One complete init at a time; only attempt-owned failed sockets close.
+# Why: Concurrent bootstrap could erase the graph behind a live listener.
+# How: Caller-level mutex and failed-readiness latch; no live restart or new model.
 # [2026-09-11] Codex — #423 acknowledge only durable gateway save receipts.
 # What: canonical receiver owns retained input and receipt-gated cleanup.
 # Why: quarantine and component failures must never acknowledge consumption.
@@ -1390,7 +1394,28 @@ def _start_cc_tonic_engine(ng) -> bool:
         return False
 
 
+_cc_init_lock = threading.Lock()
+_cc_init_attempted = False
+_cc_init_failed = False
+
+
 def init_cc_host() -> bool:
+    """Serialize CC construction and publication across bootstrap callers."""
+    global _cc_init_failed
+    with _cc_init_lock:
+        if _cc_init_failed:
+            return False
+        try:
+            result = _init_cc_host_once()
+        except BaseException:
+            _cc_init_failed = _cc_init_attempted
+            raise
+        if not result and _cc_init_attempted:
+            _cc_init_failed = True
+        return result
+
+
+def _init_cc_host_once() -> bool:
     """Initialize CC's NG and start the hook socket server.
 
     Called from neurograph_rpc.py's handle_bootstrap. Any failure here must
@@ -1403,11 +1428,13 @@ def init_cc_host() -> bool:
     # the VPS across multiple restarts tonight -- no success line, no
     # failure line, socket never created. This traces exactly how far
     # execution gets before whatever is stopping it.
+    global _cc_init_attempted
     logger.info("DIAG: init_cc_host() ENTRY")
 
     if _STATE.cc_ng is not None:
-        logger.info("CC NG already initialized")
-        return True
+        ready = _STATE.running and _STATE.server_sock is not None
+        logger.info("CC NG already constructed (hosting ready=%s)", ready)
+        return bool(ready)
 
     Path(CC_NG_WORKSPACE).mkdir(parents=True, exist_ok=True)
     logger.info("DIAG: init_cc_host() workspace dir ready, constructing NeuroGraphMemory...")
@@ -1415,6 +1442,7 @@ def init_cc_host() -> bool:
     # Construct CC's NG directly (not via get_instance) — Syl already owns
     # the class-level _instance singleton. CC gets its own standalone object.
     from openclaw_hook import NeuroGraphMemory
+    _cc_init_attempted = True
     try:
         cc_ng = NeuroGraphMemory(
             workspace_dir=CC_NG_WORKSPACE,
@@ -1457,7 +1485,9 @@ def init_cc_host() -> bool:
         logger.exception("CC organism-layer bootstrap failed (non-fatal)")
     logger.info("DIAG: init_cc_host() organism-layer bootstrap done, binding socket...")
 
-    # Bind socket
+    # Retain the graph on failure. The wrapper then reports failed readiness;
+    # it never replays initialization over a possibly active partial instance.
+    sock = None
     try:
         _cleanup_stale_socket()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1467,7 +1497,8 @@ def init_cc_host() -> bool:
         _STATE.server_sock = sock
     except Exception:
         logger.exception("CC socket bind failed")
-        _STATE.cc_ng = None
+        if sock is not None:
+            sock.close()
         return False
 
     _STATE.running = True

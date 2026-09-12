@@ -12,6 +12,10 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-09-12] Codex — #430 serialize self-start and RPC bootstrap.
+# What: Overlapping bootstrap reports initializing without a second construction.
+# Why: Self-bootstrap and stdin RPC previously raced into duplicate Syl/CC setup.
+# How: Nonblocking caller-level lock; existing bootstrap body and ownership intact.
 # [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: surfaced frames reach her AS IMAGES
 # What: _vision_surface_messages(items, ...) builds OpenAI-style messages carrying an image_url
 #       data-URL block for each surfaced item that has an image_ref (from CES L2, now
@@ -1936,9 +1940,33 @@ class TonicBridge:
 # ── RPC Dispatch ──────────────────────────────────────────────────────
 
 
+_bootstrap_lock = threading.Lock()
+_bootstrap_incomplete = False
+_bootstrap_construction_attempted = False
+
+
 def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Claim one bootstrap; overlapping RPCs return without watchdog blocking."""
+    global _bootstrap_incomplete
+    if not _bootstrap_lock.acquire(blocking=False):
+        raise RuntimeError("NeuroGraph bootstrap initializing")
+    try:
+        if _bootstrap_incomplete:
+            raise RuntimeError("NeuroGraph bootstrap initialization_failed; retained state requires review")
+        try:
+            return _handle_bootstrap_once(params)
+        except BaseException:
+            # Preserve a partially initialized mind; do not report it ready
+            # or replay module initialization over it on the next RPC.
+            _bootstrap_incomplete = _bootstrap_construction_attempted or _memory is not None
+            raise
+    finally:
+        _bootstrap_lock.release()
+
+
+def _handle_bootstrap_once(params: Dict[str, Any]) -> Dict[str, Any]:
     """Create NeuroGraphMemory singleton and restore from checkpoint."""
-    global _memory, _tract
+    global _memory, _tract, _bootstrap_construction_attempted
 
     if _memory is not None:
         return {"bootstrapped": True, "reason": "already_initialized"}
@@ -1973,6 +2001,7 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # the endpoint responds rather than refusing connections).
     _start_http_sidecar(8850)
 
+    _bootstrap_construction_attempted = True
     _memory = NeuroGraphMemory.get_instance()
 
     # Initialize NeuroGraph's outbound River tract — topology deltas flow from here
@@ -2114,8 +2143,10 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
             logger.info('DIAG: [cc-bg] about to import cc_ng_host')
             import cc_ng_host
             logger.info('DIAG: [cc-bg] cc_ng_host imported, calling init_cc_host()')
-            cc_ng_host.init_cc_host()
-            logger.info('DIAG: [cc-bg] init_cc_host() returned')
+            if cc_ng_host.init_cc_host():
+                logger.info('DIAG: [cc-bg] init_cc_host() ready')
+            else:
+                logger.error('CC NG host initialization incomplete; retained state requires review')
         except Exception as exc:
             logger.warning('CC NG host init failed (Syl unaffected): %s', exc)
     threading.Thread(target=_init_cc_host_bg, name='cc-ng-init', daemon=True).start()
