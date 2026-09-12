@@ -27,6 +27,10 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-12] Codex — report the outbound Pith history budget in telemetry.
+# What: include history budget and label the general Pith/prefetch gates separately.
+# Why: history results lacked their budget and `gate_enabled` meant only prefetch.
+# How: align allow-lists; preserve gate_enabled as the compatibility alias.
 # [2026-09-12] Codex — persist VPS Pith acceptance telemetry across restarts.
 # What: port D4's bounded, fsynced lifetime snapshots to the hosted CC process.
 # Why: live RPC counters vanished on restart, so unattended genuine-work evidence
@@ -394,6 +398,7 @@ PITH_SNAPSHOT_GATE_KEYS = (
     "CC_PITH_ENABLED",
     "CC_PITH_L1_BUDGET",
     "CC_PITH_L1_BREATHE",
+    "CC_PITH_KEYFRAME_CHARS",
     "CC_PITH_PREFETCH_ENABLED",
     "CC_PITH_PREFETCH_WARM_ENABLED",
     "CC_PITH_PREFETCH_MAX",
@@ -813,8 +818,14 @@ def _handle_pith_metrics(_data):
         # None (not 0.0) when nothing was promoted, so an untouched gate reads as
         # "no data" rather than a 0% hit rate.
         snap["prefetch_hit_rate"] = (hits / promoted) if promoted else None
-        snap["gate_enabled"] = bool(os.environ.get("CC_PITH_PREFETCH_ENABLED", "0")
+        snap["pith_enabled"] = bool(os.environ.get("CC_PITH_ENABLED", "0")
                                     not in ("0", "false", "False", ""))
+        snap["prefetch_enabled"] = bool(
+            os.environ.get("CC_PITH_PREFETCH_ENABLED", "0")
+            not in ("0", "false", "False", "")
+        )
+        # Backward-compatible alias for the pre-D4c prefetch-specific field.
+        snap["gate_enabled"] = snap["prefetch_enabled"]
         # 5b: seeds the Tonic actually primed, so "0% hit-rate" and "prefetch never
         # ran" are distinguishable. CC's OWN engine only -- never Syl's.
         try:

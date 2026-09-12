@@ -95,6 +95,17 @@ def test_unset_gate_remains_visible(host, monkeypatch):
     assert host._pith_gate_values()["CC_PITH_PREFETCH_WARM_ENABLED"] is None
 
 
+def test_metrics_names_pith_and_prefetch_gates_separately(host, monkeypatch):
+    monkeypatch.setenv("CC_PITH_ENABLED", "1")
+    monkeypatch.setenv("CC_PITH_PREFETCH_ENABLED", "0")
+
+    snap = host._handle_pith_metrics({})["pith"]
+
+    assert snap["pith_enabled"] is True
+    assert snap["prefetch_enabled"] is False
+    assert snap["gate_enabled"] is False
+
+
 def test_snapshot_is_complete_append_only_and_differenceable(host):
     host._STATE.stats["started_at"] = 123.5
     for reason in ("start", "interval", "shutdown"):
