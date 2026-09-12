@@ -669,24 +669,13 @@ def _stream_sha256(path) -> Optional[str]:
 
 
 def _sidecar_defect(path: str, token: Any) -> Optional[str]:
-    """Why the activation sidecar at `path` is not this save's, or None if it is.
+    """Verify the explicit writer receipt against the sidecar's captured token.
 
-    ActivationPersistence.save() writes the sidecar IN PLACE, catches its own
-    exceptions, and returns the path either way — so neither its return value
-    nor a fresh mtime is evidence. A json.dump that dies on flush or close
-    leaves a complete-LOOKING file behind with a brand-new mtime.
-
-    Its one real success signal is `_last_save_time`, assigned only AFTER the
-    write context exits cleanly. We require that signal to have advanced AND
-    the sidecar on disk to carry exactly that value in its own `saved_at`.
-    Token EQUALITY, not a timestamp range: these hosts have documented clock
-    problems, so no ordering assumption is made anywhere in this check.
-
-    `token` is the writer's post-save signal, or None when it did not advance.
+    Token equality makes no wall-clock ordering assumption. Missing evidence
+    fails closed; write_state supplies the token only after a successful close.
     """
     if token is None:
-        return ("activation writer reported no successful-write signal "
-                "(_last_save_time did not advance) — its write was swallowed")
+        return "activation writer reported no successful-write token"
     try:
         with open(path) as f:
             data = json.load(f)
@@ -837,6 +826,9 @@ class NeuroGraphMemory:
         workspace_dir: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
     ) -> None:
+        # Serialize capture-to-publication without holding the graph mutation lock.
+        import threading
+        self._save_publication_lock = threading.RLock()
         self._workspace_dir = Path(
             workspace_dir
             or os.environ.get("NEUROGRAPH_WORKSPACE_DIR", "~/NeuroGraph/data")
@@ -1289,6 +1281,9 @@ class NeuroGraphMemory:
         text: str,
         exclude_node_ids: Optional[set] = None,
         novelty: float = 0.5,
+        *,
+        max_surfaced_override: Optional[int] = None,
+        propagation_steps_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic priming + spreading activation harvest.
 
@@ -1307,8 +1302,10 @@ class NeuroGraphMemory:
         prime_k = snn_config.get("prime_k", 10)
         prime_threshold = snn_config.get("prime_threshold", 0.4)
         prime_strength = snn_config.get("prime_strength", 1.0)
-        propagation_steps = snn_config.get("propagation_steps", 3)
-        max_surfaced = snn_config.get("max_surfaced", 10)
+        propagation_steps = (snn_config.get("propagation_steps", 3)
+                             if propagation_steps_override is None else propagation_steps_override)
+        max_surfaced = (snn_config.get("max_surfaced", 10)
+                        if max_surfaced_override is None else max_surfaced_override)
 
         # Surprise-weighted surfacing (#255): scale retrieval aggressiveness by MMN novelty.
         # novelty ∈ [0,1]; novelty_scale ∈ [-1,+1]. High novelty → cast wider/deeper.
@@ -1440,16 +1437,9 @@ class NeuroGraphMemory:
         if not text or not text.strip():
             return []
 
-        # Temporarily override config for this call
-        old_max = self.graph.config.get("max_surfaced", 10)
-        old_steps = self.graph.config.get("propagation_steps", 3)
-        self.graph.config["max_surfaced"] = k
-        self.graph.config["propagation_steps"] = steps
-        try:
-            return self._harvest_associations(text)
-        finally:
-            self.graph.config["max_surfaced"] = old_max
-            self.graph.config["propagation_steps"] = old_steps
+        # Query-local options must never appear in a concurrent checkpoint's config.
+        return self._harvest_associations(
+            text, max_surfaced_override=k, propagation_steps_override=steps)
 
     def step(self, n: int = 1) -> List[Any]:
         """Run N SNN learning steps without ingestion."""
@@ -1469,14 +1459,54 @@ class NeuroGraphMemory:
         except Exception:
             return len(self.graph.nodes)
 
+    # ---- Changelog ----
+    # [2026-09-11] Codex — #423 capture a common detached checkpoint state.
+    # What: canonical producer coordinates graph, vectors, activation and counts.
+    # Why: durable files alone cannot prove a common capture instant.
+    # How: existing step lock covers in-memory capture only; writer APIs take payloads.
+    # -------------------
+    def _capture_checkpoint_state(self):
+        """Capture one detached set; callers serialize save publication separately.
+
+        All participating writers must use the canonical step lock. This helper
+        does not establish that host-wide invariant by itself. No disk I/O or
+        model inference belongs inside this boundary.
+        """
+        stage = "graph"
+        try:
+            with self.graph._step_lock:
+                captured = {}
+                captured["graph"] = self.graph.capture_checkpoint(
+                    mode=CheckpointMode.FULL, detach=True)
+                stage = "vectors"
+                captured["vectors"] = self.vector_db.capture_state(detach=True)
+                stage = "activations"
+                captured["activations"] = (
+                    self._activation_persistence.capture_state(self.graph)
+                    if self._activation_persistence is not None else None)
+                stage = "graph"
+                captured["counts"] = {
+                    "nodes": len(self.graph.nodes),
+                    "guardian_nodes": self._guardian_meaningful_nodes(),
+                    "synapses": len(self.graph.synapses),
+                    "hyperedges": len(self.graph.hyperedges),
+                    "timestep": self.graph.timestep,
+                    "vdb_count": captured["vectors"]["count"],
+                }
+            return captured
+        except Exception as exc:
+            failure = RuntimeError(f"{stage} checkpoint capture failed: {exc}")
+            failure.checkpoint_component = stage
+            raise failure from exc
+
     def save(self, *, with_receipt: bool = False) -> "str | Dict[str, Any]":
         """Save graph state to checkpoint.
 
-        Legacy contract (``with_receipt=False``, the default) is UNCHANGED:
+        Legacy return contract (``with_receipt=False``, the default):
         returns the checkpoint path — or, when the #373 gate refuses
         (provisional boot / collapsed in-RAM state), the QUARANTINE path the
-        state was preserved at instead. Exceptions propagate exactly as they
-        always did, and no verification work of any kind is performed.
+        state was preserved at instead. Capture failures raise before any writes.
+        Receipt-specific disk verification remains opt-in.
 
         ``with_receipt=True`` (#423) returns a structured receipt instead::
 
@@ -1494,10 +1524,15 @@ class NeuroGraphMemory:
         Components are ``graph``, ``vectors``, ``activations``, ``manifest``
         and ``generation``.
 
-        INVARIANT: ``with_receipt`` changes only what is REPORTED, never what
-        is written. Both modes perform the same writes in the same order and
-        stop at the same points. The one behavioural difference is that where
-        legacy would raise, receipt mode returns ``outcome="failed"`` with the
+        Both modes first capture one detached graph/vector/activation set, then
+        release the mutation lock before writing. This intentionally adds capture
+        memory and pause cost to legacy saves too. Payloads are released after
+        each writer finishes; all three still coexist at peak capture. Writes run
+        graph -> vectors -> activations. An incomplete artifact set never rotates
+        into the generation ring; activation errors then raise in legacy mode
+        and refuse acceptance in receipt mode.
+        Receipt mode additionally
+        verifies disk artifacts and returns ``outcome="failed"`` with the
         offending component marked — a durable-delivery caller asking "may I
         commit this consumption?" must always get an answer, not a traceback.
         The exception is still logged via ``logger.exception``.
@@ -1534,297 +1569,338 @@ class NeuroGraphMemory:
         receipt also does not provide multi-file power-loss transactionality;
         it reports what reached disk, it does not make the set atomic.
 
-        Caller holds the graph lock; no clock advancement happens here.
+        Caller must NOT hold the graph mutation lock. Capture acquires it briefly;
+        a separate per-instance lock serializes publication. No clock advances.
         """
         # #423: every line of receipt bookkeeping below is guarded by
-        # `with_receipt`, so the legacy path does exactly the work it always
-        # did — no stats, no reads, no hashing.
-        components = _new_receipt_components() if with_receipt else None
+        # `with_receipt`; detached capture is common to both return modes.
+        from contextlib import nullcontext
+        ownership = getattr(self.graph._step_lock, "_is_owned", None)
+        # Never wait for publication while already holding the mutation lock.
+        publication = (self._save_publication_lock if callable(ownership) and not ownership()
+                       else nullcontext())
+        with publication:
+            components = _new_receipt_components() if with_receipt else None
 
-        def _mark(name: str, status: str, **extra: Any) -> None:
-            if components is not None:
-                components[name]["status"] = status
-                components[name].update(extra)
+            def _mark(name: str, status: str, **extra: Any) -> None:
+                if components is not None:
+                    components[name]["status"] = status
+                    components[name].update(extra)
 
-        def _err(name: str, exc: BaseException) -> None:
-            if components is not None:
-                components[name]["status"] = "failed"
-                components[name]["error"] = f"{type(exc).__name__}: {exc}"
+            def _err(name: str, exc: BaseException) -> None:
+                if components is not None:
+                    components[name]["status"] = "failed"
+                    components[name]["error"] = f"{type(exc).__name__}: {exc}"
 
-        def _receipt(outcome: str, path: Optional[str] = None) -> Dict[str, Any]:
-            blocking: List[str] = []
-            for _n in _RECEIPT_COMPONENTS:
-                _c = components[_n]
-                # activations is the sole component whose not_applicable is
-                # survivable — see the docstring.
-                if _c["status"] == "saved":
-                    continue
-                if _n == "activations" and _c["status"] == "not_applicable":
-                    continue
-                blocking.append(
-                    f"{_n}={_c['status']}"
-                    + (f" ({_c['error']})" if _c["error"] else "")
-                )
-            return {
-                "outcome": outcome,
-                "accepted": outcome == "primary" and not blocking,
-                "components": components,
-                "not_accepted_because": blocking,
-                "path": path,
-                "guardian_available": self._save_gate is not None,
-            }
-
-        live_nodes = len(self.graph.nodes)
-        guardian_nodes = self._guardian_meaningful_nodes()
-        if self._save_gate is not None:
-            # #83: hand the gate the structural counts too. Losing isolated
-            # nodes cannot lose a synapse, so synapses surviving is what tells
-            # a legitimate orphan sweep (#59 tonic melt) from a real collapse.
-            # Fail-safe to None => the gate falls back to the node-only ratio.
-            try:
-                _live_syn = len(self.graph.synapses)
-                _live_he = len(self.graph.hyperedges)
-            except Exception:
-                _live_syn = _live_he = None
-            # #105: tell the gate whether THIS host wires its OWN deposits at
-            # deposit time. Explicit capability (LAW 5), three-state: unset =>
-            # None => exact #83 behavior; "1"/"true"/"yes"/"on" => self-wires;
-            # anything else => deposits are wired later (remotely, via the
-            # callosum), where a node shed cannot be laundered as an isolate
-            # melt. Sourced from the declared capability ONLY, never inferred
-            # from a transient embedder outage.
-            _wires = os.environ.get("NG_HOST_WIRES_OWN_DEPOSITS")
-            if _wires is None:
-                _wires_own_deposits = None
-            else:
-                _wires_own_deposits = _wires.strip().lower() in ("1", "true", "yes", "on")
-            _ok, _reason = self._save_gate.permit(
-                guardian_nodes, live_synapses=_live_syn, live_hyperedges=_live_he,
-                wires_own_deposits=_wires_own_deposits,
-            )
-            if not _ok:
-                logger.error(
-                    "Guardian REFUSED primary checkpoint write (%s). In-RAM "
-                    "state (%d nodes) quarantined; primary %s left untouched.",
-                    _reason, live_nodes, self._checkpoint_path,
-                )
-                try:
-                    qpath = quarantine_save(
-                        str(self._checkpoint_dir), "main",
-                        lambda p: self.graph.checkpoint(p, mode=CheckpointMode.FULL),
+            def _receipt(outcome: str, path: Optional[str] = None) -> Dict[str, Any]:
+                blocking: List[str] = []
+                for _n in _RECEIPT_COMPONENTS:
+                    _c = components[_n]
+                    # activations is the sole component whose not_applicable is
+                    # survivable — see the docstring.
+                    if _c["status"] == "saved":
+                        continue
+                    if _n == "activations" and _c["status"] == "not_applicable":
+                        continue
+                    blocking.append(
+                        f"{_n}={_c['status']}"
+                        + (f" ({_c['error']})" if _c["error"] else "")
                     )
-                except Exception as exc:
-                    if not with_receipt:
-                        raise
-                    logger.exception("Guardian: graph quarantine write failed")
-                    _err("graph", exc)
-                    return _receipt("failed")
-                if with_receipt:
-                    _mark("graph", "saved", path=qpath,
-                          identity=_file_identity(qpath))
-                try:
-                    _vqpath = quarantine_save(
-                        str(self._checkpoint_dir), "vectors",
-                        lambda p: self.vector_db.save(p),
-                    )
-                    if with_receipt:
-                        _mark("vectors", "saved", path=_vqpath,
-                              identity=_file_identity(_vqpath))
-                except Exception as exc:
-                    logger.warning("Guardian: vector DB quarantine failed: %s", exc)
-                    _err("vectors", exc)
-                if with_receipt:
-                    # Quarantine writes no sidecar, manifest or generation at
-                    # all — report that as not_attempted rather than implying
-                    # they were considered. Never accepted.
-                    for _n in ("activations", "manifest", "generation"):
-                        _mark(_n, "not_attempted",
-                              error="quarantine path does not write this artifact")
-                    return _receipt("quarantine", qpath)
-                return qpath
+                return {
+                    "outcome": outcome,
+                    "accepted": outcome == "primary" and not blocking,
+                    "components": components,
+                    "not_accepted_because": blocking,
+                    "path": path,
+                    "guardian_available": self._save_gate is not None,
+                }
 
-        graph_identity = None
-        vectors_identity = None
-        act_identity = None
-        manifest_identity = None
-
-        try:
-            if self._save_gate is not None:
-                # #373: atomic — a mid-write process death can no longer tear the
-                # only copy. Tmp name preserves .msgpack (both writers dispatch on
-                # the extension — see checkpoint_guardian.atomic_file_write).
-                atomic_file_write(
-                    str(self._checkpoint_path),
-                    lambda p: self.graph.checkpoint(p, mode=CheckpointMode.FULL),
-                )
-            else:
-                self.graph.checkpoint(str(self._checkpoint_path), mode=CheckpointMode.FULL)
-        except Exception as exc:
-            if not with_receipt:
-                raise
-            logger.exception("Primary checkpoint write failed")
-            _err("graph", exc)
-            return _receipt("failed")
-        if with_receipt:
-            graph_identity = _file_identity(self._checkpoint_path)
-            if graph_identity is None:
-                _mark("graph", "failed", path=str(self._checkpoint_path),
-                      error="checkpoint absent immediately after a successful write")
-                return _receipt("failed", str(self._checkpoint_path))
-            _mark("graph", "saved", path=str(self._checkpoint_path),
-                  identity=graph_identity)
-
-        # CES: Save activation sidecar alongside checkpoint
-        if self._activation_persistence is not None:
-            _act_path = (str(self._checkpoint_path) + ".activations.json"
-                         if with_receipt else None)
-            # The writer's own successful-write signal, sampled before and
-            # after. It advances only when its write context exited cleanly.
-            _token_pre = (getattr(self._activation_persistence,
-                                  "_last_save_time", None)
-                          if with_receipt else None)
             try:
-                _act_reported = self._activation_persistence.save(
-                    self.graph, str(self._checkpoint_path)
-                )
+                owns_mutation_lock = getattr(self.graph._step_lock, "_is_owned", None)
+                if not callable(owns_mutation_lock):
+                    raise RuntimeError("checkpoint requires an ownership-aware canonical RLock")
+                if owns_mutation_lock():
+                    raise RuntimeError("save called while holding graph mutation lock; release it before publication")
+                captured = self._capture_checkpoint_state()
             except Exception as exc:
                 if not with_receipt:
                     raise
-                logger.exception("Activation sidecar capture failed")
-                _err("activations", exc)
-                return _receipt("failed", str(self._checkpoint_path))
-            if with_receipt:
-                # save() catches and logs its OWN write errors and returns the
-                # sidecar path either way, so its return value proves nothing.
-                _token_post = getattr(self._activation_persistence,
-                                      "_last_save_time", None)
-                _token = _token_post if _token_post != _token_pre else None
-                _mark("activations", "failed", path=_act_path,
-                      identity=_file_identity(_act_path))
-                if str(_act_reported) != _act_path:
-                    components["activations"]["error"] = (
-                        f"sidecar reported at {str(_act_reported)!r} but the "
-                        f"generation ring captures {_act_path!r}")
-                elif components["activations"]["identity"] is None:
-                    components["activations"]["error"] = (
-                        "sidecar absent after save (writer swallowed its error)")
-                else:
-                    _defect = _sidecar_defect(_act_path, _token)
-                    if _defect:
-                        components["activations"]["error"] = _defect
-                    else:
-                        _mark("activations", "saved")
-                        act_identity = components["activations"]["identity"]
-        elif with_receipt:
-            _mark("activations", "not_applicable",
-                  error="CES activation persistence not installed")
-        logger.info("Checkpoint saved to %s", self._checkpoint_path)
-
-        # Save vector DB alongside graph checkpoint
-        _vec_pre = _file_identity(self._vector_db_path) if with_receipt else None
-        try:
+                logger.exception("Checkpoint capture refused or failed")
+                _err(getattr(exc, "checkpoint_component", "graph"), exc)
+                return _receipt("failed")
+            counts = captured["counts"]
+            live_nodes = counts["nodes"]
+            guardian_nodes = counts["guardian_nodes"]
             if self._save_gate is not None:
-                vdb_count = atomic_file_write(
-                    str(self._vector_db_path),
-                    lambda p: self.vector_db.save(p),
-                )
-            else:
-                vdb_count = self.vector_db.save(str(self._vector_db_path))
-            logger.info("Vector DB saved to %s (%d entries)", self._vector_db_path, vdb_count)
-            if with_receipt:
-                _mark("vectors", "failed", path=str(self._vector_db_path),
-                      identity=_file_identity(self._vector_db_path),
-                      entries=vdb_count)
-                _post = components["vectors"]["identity"]
-                if _post is None:
-                    components["vectors"]["error"] = "vector DB absent after write"
-                elif _identity_unchanged(_vec_pre, _post):
-                    components["vectors"]["error"] = (
-                        "vector DB unchanged on disk after a reportedly "
-                        "successful write")
-                else:
-                    _mark("vectors", "saved")
-                    vectors_identity = _post
-        except Exception as exc:
-            logger.warning("Failed to save vector DB: %s", exc)
-            _err("vectors", exc)
-
-        if self._save_gate is not None:
-            # #373: manifest describes what is now on disk; generation ring
-            # hardlinks the consistent SET (never mixed across saves).
-            _stage = "manifest"
-            try:
-                _mpath = write_manifest(self._checkpoint_path, {
-                    "nodes": live_nodes,
-                    "guardian_nodes": guardian_nodes,
-                    "synapses": len(self.graph.synapses),
-                    "hyperedges": len(self.graph.hyperedges),
-                    "timestep": self.graph.timestep,
-                    "vdb_count": self.vector_db.count(),
-                    "git": best_effort_git_hash(os.path.dirname(os.path.abspath(__file__))),
-                })
-                if with_receipt:
-                    manifest_identity = _file_identity(_mpath)
-                    _mark("manifest",
-                          "saved" if manifest_identity is not None else "failed",
-                          path=str(_mpath), identity=manifest_identity,
-                          error=(None if manifest_identity is not None
-                                 else "manifest absent after write"))
-                _stage = "generation"
-                _gen_dir = rotate_generations(str(self._checkpoint_dir), [
-                    str(self._checkpoint_path),
-                    str(self._checkpoint_path) + ".activations.json",
-                    str(self._vector_db_path),
-                    str(self._checkpoint_path) + ".manifest.json",
-                ])
-                if with_receipt:
-                    _base = os.path.basename(str(self._checkpoint_path))
-                    _gen = _verify_generation(_gen_dir, [
-                        ("graph", _base, str(self._checkpoint_path),
-                         graph_identity),
-                        ("vectors", os.path.basename(str(self._vector_db_path)),
-                         str(self._vector_db_path), vectors_identity),
-                        ("activations", _base + ".activations.json",
-                         str(self._checkpoint_path) + ".activations.json",
-                         act_identity),
-                        ("manifest", _base + ".manifest.json",
-                         str(self._checkpoint_path) + ".manifest.json",
-                         manifest_identity),
-                    ])
-                    _mark("generation", "saved" if _gen["ok"] else "failed",
-                          path=str(_gen_dir) if _gen_dir else None,
-                          members=_gen["members"],
-                          error=_gen["error"] or (None if _gen["ok"] else
-                                "generation ring does not hold this save's exact "
-                                "artifact set: " + ", ".join(
-                                    f"{_k}={_v['state']}"
-                                    for _k, _v in _gen["members"].items()
-                                    if _v["state"] != "match")))
-            except Exception as exc:
-                logger.warning("Guardian: manifest/rotation failed (primary save "
-                               "itself succeeded): %s", exc)
-                _err(_stage, exc)
-        elif with_receipt:
-            # No guardian => no manifest and no generation ring, so the exact
-            # retained set cannot be verified. Fail acceptance closed rather
-            # than infer the legacy path succeeded.
-            for _n in ("manifest", "generation"):
-                _mark(_n, "not_applicable",
-                      error="checkpoint guardian unavailable — manifest and "
-                            "generation ring can be neither written nor verified")
-
-        if with_receipt:
-            receipt = _receipt("primary", str(self._checkpoint_path))
-            if receipt['accepted']:
+                # #83: hand the gate the structural counts too. Losing isolated
+                # nodes cannot lose a synapse, so synapses surviving is what tells
+                # a legitimate orphan sweep (#59 tonic melt) from a real collapse.
+                # Fail-safe to None => the gate falls back to the node-only ratio.
                 try:
-                    _sync_receipt_artifacts(components)
-                    components['generation']['durability'] = 'fsynced'
+                    _live_syn = counts["synapses"]
+                    _live_he = counts["hyperedges"]
+                except Exception:
+                    _live_syn = _live_he = None
+                # #105: tell the gate whether THIS host wires its OWN deposits at
+                # deposit time. Explicit capability (LAW 5), three-state: unset =>
+                # None => exact #83 behavior; "1"/"true"/"yes"/"on" => self-wires;
+                # anything else => deposits are wired later (remotely, via the
+                # callosum), where a node shed cannot be laundered as an isolate
+                # melt. Sourced from the declared capability ONLY, never inferred
+                # from a transient embedder outage.
+                _wires = os.environ.get("NG_HOST_WIRES_OWN_DEPOSITS")
+                if _wires is None:
+                    _wires_own_deposits = None
+                else:
+                    _wires_own_deposits = _wires.strip().lower() in ("1", "true", "yes", "on")
+                _ok, _reason = self._save_gate.permit(
+                    guardian_nodes, live_synapses=_live_syn, live_hyperedges=_live_he,
+                    wires_own_deposits=_wires_own_deposits,
+                )
+                if not _ok:
+                    captured.pop("activations", None)
+                    logger.error(
+                        "Guardian REFUSED primary checkpoint write (%s). In-RAM "
+                        "state (%d nodes) quarantined; primary %s left untouched.",
+                        _reason, live_nodes, self._checkpoint_path,
+                    )
+                    try:
+                        qpath = quarantine_save(
+                            str(self._checkpoint_dir), "main",
+                            lambda p: self.graph.write_checkpoint(p, captured["graph"], mode=CheckpointMode.FULL),
+                        )
+                    except Exception as exc:
+                        if not with_receipt:
+                            raise
+                        logger.exception("Guardian: graph quarantine write failed")
+                        _err("graph", exc)
+                        return _receipt("failed")
+                    finally:
+                        captured.pop("graph", None)
+                    if with_receipt:
+                        _mark("graph", "saved", path=qpath,
+                              identity=_file_identity(qpath))
+                    try:
+                        _vqpath = quarantine_save(
+                            str(self._checkpoint_dir), "vectors",
+                            lambda p: self.vector_db.write_state(p, captured["vectors"]),
+                        )
+                        if with_receipt:
+                            _mark("vectors", "saved", path=_vqpath,
+                                  identity=_file_identity(_vqpath))
+                    except Exception as exc:
+                        logger.warning("Guardian: vector DB quarantine failed: %s", exc)
+                        _err("vectors", exc)
+                    finally:
+                        captured.pop("vectors", None)
+                    if with_receipt:
+                        # Quarantine writes no sidecar, manifest or generation at
+                        # all — report that as not_attempted rather than implying
+                        # they were considered. Never accepted.
+                        for _n in ("activations", "manifest", "generation"):
+                            _mark(_n, "not_attempted",
+                                  error="quarantine path does not write this artifact")
+                        return _receipt("quarantine", qpath)
+                    return qpath
+
+            _artifact_write_failed = False
+            graph_identity = None
+            vectors_identity = None
+            act_identity = None
+            manifest_identity = None
+
+            try:
+                if self._save_gate is not None:
+                    # #373: atomic — a mid-write process death can no longer tear the
+                    # only copy. Tmp name preserves .msgpack (both writers dispatch on
+                    # the extension — see checkpoint_guardian.atomic_file_write).
+                    atomic_file_write(
+                        str(self._checkpoint_path),
+                        lambda p: self.graph.write_checkpoint(p, captured["graph"], mode=CheckpointMode.FULL),
+                    )
+                else:
+                    self.graph.write_checkpoint(str(self._checkpoint_path), captured["graph"], mode=CheckpointMode.FULL)
+            except Exception as exc:
+                if not with_receipt:
+                    raise
+                logger.exception("Primary checkpoint write failed")
+                _err("graph", exc)
+                return _receipt("failed")
+            finally:
+                captured.pop("graph", None)
+            if with_receipt:
+                graph_identity = _file_identity(self._checkpoint_path)
+                if graph_identity is None:
+                    _mark("graph", "failed", path=str(self._checkpoint_path),
+                          error="checkpoint absent immediately after a successful write")
+                    return _receipt("failed", str(self._checkpoint_path))
+                _mark("graph", "saved", path=str(self._checkpoint_path),
+                      identity=graph_identity)
+
+            # Save vector DB alongside graph checkpoint
+            _vec_pre = _file_identity(self._vector_db_path) if with_receipt else None
+            try:
+                if self._save_gate is not None:
+                    vdb_count = atomic_file_write(
+                        str(self._vector_db_path),
+                        lambda p: self.vector_db.write_state(p, captured["vectors"]),
+                    )
+                else:
+                    vdb_count = self.vector_db.write_state(str(self._vector_db_path), captured["vectors"])
+                logger.info("Vector DB saved to %s (%d entries)", self._vector_db_path, vdb_count)
+                if with_receipt:
+                    _mark("vectors", "failed", path=str(self._vector_db_path),
+                          identity=_file_identity(self._vector_db_path),
+                          entries=vdb_count)
+                    _post = components["vectors"]["identity"]
+                    if _post is None:
+                        components["vectors"]["error"] = "vector DB absent after write"
+                    elif _identity_unchanged(_vec_pre, _post):
+                        components["vectors"]["error"] = (
+                            "vector DB unchanged on disk after a reportedly "
+                            "successful write")
+                    else:
+                        _mark("vectors", "saved")
+                        vectors_identity = _post
+            except Exception as exc:
+                logger.warning("Failed to save vector DB: %s", exc)
+                _artifact_write_failed = True
+                _err("vectors", exc)
+            finally:
+                captured.pop("vectors", None)
+
+            # Sidecar failure must not strand a current graph with old vectors.
+            _activation_write_error = None
+            if self._activation_persistence is not None:
+                _act_path = (str(self._checkpoint_path) + ".activations.json"
+                             if with_receipt else None)
+                try:
+                    _act_reported = self._activation_persistence.write_state(
+                        str(self._checkpoint_path), captured["activations"],
+                        with_receipt=with_receipt
+                    )
                 except Exception as exc:
-                    _err('generation', exc)
-                    logger.warning('Checkpoint acceptance flush failed: %s', exc)
-                    receipt = _receipt('primary', str(self._checkpoint_path))
-            return receipt
-        return str(self._checkpoint_path)
+                    _activation_write_error = exc
+                    _artifact_write_failed = True
+                    logger.exception("Activation sidecar write failed")
+                    _err("activations", exc)
+                finally:
+                    captured.pop("activations", None)
+                if with_receipt and _activation_write_error is None:
+                    # Verify artifact and successful-write token even if a future
+                    # writer regression returns a path without persisting the payload.
+                    _token = (_act_reported.get("saved_at")
+                              if isinstance(_act_reported, dict) else None)
+                    _reported_path = (_act_reported.get("path")
+                                      if isinstance(_act_reported, dict) else None)
+                    _mark("activations", "failed", path=_act_path,
+                          identity=_file_identity(_act_path))
+                    if _reported_path != _act_path:
+                        components["activations"]["error"] = (
+                            f"sidecar reported at {_reported_path!r} but the "
+                            f"generation ring captures {_act_path!r}")
+                    elif components["activations"]["identity"] is None:
+                        components["activations"]["error"] = (
+                            "sidecar absent after save (writer swallowed its error)")
+                    else:
+                        _defect = _sidecar_defect(_act_path, _token)
+                        if _defect:
+                            components["activations"]["error"] = _defect
+                        else:
+                            _mark("activations", "saved")
+                            act_identity = components["activations"]["identity"]
+            elif with_receipt:
+                _mark("activations", "not_applicable",
+                      error="CES activation persistence not installed")
+            captured.pop("activations", None)
+            logger.info("Checkpoint saved to %s", self._checkpoint_path)
+
+            # Do not rotate an incomplete set over the last good generation.
+            # Primary paths can still be mixed after failure: this is not a
+            # multi-file crash transaction. Keep recovery generations intact.
+            if with_receipt:
+                _artifact_write_failed = _artifact_write_failed or any(
+                    components[name]["status"] != "saved"
+                    and not (name == "activations"
+                             and components[name]["status"] == "not_applicable")
+                    for name in ("graph", "vectors", "activations"))
+            if _artifact_write_failed:
+                for _name in ("manifest", "generation"):
+                    _mark(_name, "not_attempted", error="artifact write incomplete; prior generation retained")
+            elif self._save_gate is not None:
+                # #373: manifest describes what is now on disk; generation ring
+                # hardlinks the consistent SET (never mixed across saves).
+                _stage = "manifest"
+                try:
+                    _mpath = write_manifest(self._checkpoint_path, {
+                        "nodes": live_nodes,
+                        "guardian_nodes": guardian_nodes,
+                        "synapses": counts["synapses"],
+                        "hyperedges": counts["hyperedges"],
+                        "timestep": counts["timestep"],
+                        "vdb_count": counts["vdb_count"],
+                        "git": best_effort_git_hash(os.path.dirname(os.path.abspath(__file__))),
+                    })
+                    if with_receipt:
+                        manifest_identity = _file_identity(_mpath)
+                        _mark("manifest",
+                              "saved" if manifest_identity is not None else "failed",
+                              path=str(_mpath), identity=manifest_identity,
+                              error=(None if manifest_identity is not None
+                                     else "manifest absent after write"))
+                    _stage = "generation"
+                    def _verify_before_prune(_gen_dir):
+                        _base = os.path.basename(str(self._checkpoint_path))
+                        _gen = _verify_generation(_gen_dir, [
+                            ("graph", _base, str(self._checkpoint_path),
+                             graph_identity),
+                            ("vectors", os.path.basename(str(self._vector_db_path)),
+                             str(self._vector_db_path), vectors_identity),
+                            ("activations", _base + ".activations.json",
+                             str(self._checkpoint_path) + ".activations.json",
+                             act_identity),
+                            ("manifest", _base + ".manifest.json",
+                             str(self._checkpoint_path) + ".manifest.json",
+                             manifest_identity),
+                        ])
+                        _mark("generation", "saved" if _gen["ok"] else "failed",
+                              path=str(_gen_dir) if _gen_dir else None,
+                              members=_gen["members"],
+                              error=_gen["error"] or (None if _gen["ok"] else
+                                    "generation ring does not hold this save's exact "
+                                    "artifact set: " + ", ".join(
+                                        f"{_k}={_v['state']}"
+                                        for _k, _v in _gen["members"].items()
+                                        if _v["state"] != "match")))
+                        if not _gen["ok"]:
+                            raise OSError("generation verification failed before retention")
+                        _sync_receipt_artifacts(components)
+                        components["generation"]["durability"] = "fsynced"
+                    _gen_dir = rotate_generations(str(self._checkpoint_dir), [
+                        str(self._checkpoint_path),
+                        str(self._checkpoint_path) + ".activations.json",
+                        str(self._vector_db_path),
+                        str(self._checkpoint_path) + ".manifest.json",
+                    ], before_prune=_verify_before_prune if with_receipt else None)
+                except Exception as exc:
+                    logger.warning("Guardian: manifest/rotation failed (primary save "
+                                   "itself succeeded): %s", exc)
+                    _err(_stage, exc)
+            elif with_receipt:
+                # No guardian => no manifest and no generation ring, so the exact
+                # retained set cannot be verified. Fail acceptance closed rather
+                # than infer the legacy path succeeded.
+                for _n in ("manifest", "generation"):
+                    _mark(_n, "not_applicable",
+                          error="checkpoint guardian unavailable — manifest and "
+                                "generation ring can be neither written nor verified")
+
+            if with_receipt:
+                receipt = _receipt("primary", str(self._checkpoint_path))
+                return receipt
+            if _activation_write_error is not None:
+                raise _activation_write_error
+            return str(self._checkpoint_path)
 
     def stats(self) -> Dict[str, Any]:
         """Return current graph statistics and telemetry."""
