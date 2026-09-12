@@ -1103,10 +1103,18 @@ def _handle_connection(conn: socket.socket) -> None:
 
 
 def _serve_loop() -> None:
-    _STATE.server_sock.settimeout(1.0)
+    # Autosave thread startup can fail before this worker gets scheduled.
+    # Keep our socket reference; the init failure path may clear publication.
+    sock = _STATE.server_sock
+    if sock is None:
+        return
+    try:
+        sock.settimeout(1.0)
+    except OSError:
+        return
     while _STATE.running:
         try:
-            conn, _ = _STATE.server_sock.accept()
+            conn, _ = sock.accept()
         except socket.timeout:
             continue
         except OSError:
@@ -1395,6 +1403,8 @@ def _start_cc_tonic_engine(ng) -> bool:
 
 
 _cc_init_lock = threading.Lock()
+# Process-lifetime construction history: clearing a reference is not permission
+# to create another instance with potentially surviving background activity.
 _cc_init_attempted = False
 _cc_init_failed = False
 
@@ -1404,6 +1414,10 @@ def init_cc_host() -> bool:
     global _cc_init_failed
     with _cc_init_lock:
         if _cc_init_failed:
+            return False
+        if _cc_init_attempted and _STATE.cc_ng is None:
+            _cc_init_failed = True
+            logger.error("CC graph reference missing after construction; refusing reconstruction")
             return False
         try:
             result = _init_cc_host_once()
@@ -1463,6 +1477,35 @@ def _init_cc_host_once() -> bool:
     _STATE.cc_ng = cc_ng
     _STATE.stats["started_at"] = time.time()
 
+    # Retain the graph on failure. The wrapper then reports failed readiness;
+    # it never replays initialization over a possibly active partial instance.
+    sock = None
+    try:
+        _cleanup_stale_socket()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(SOCKET_PATH)
+        sock.listen(16)
+        os.chmod(SOCKET_PATH, 0o600)
+        _STATE.server_sock = sock
+    except Exception:
+        logger.exception("CC socket bind failed")
+        if sock is not None:
+            sock.close()
+        return False
+
+    _STATE.running = True
+    try:
+        _write_refcount(0)
+        # Start persistence before serving clients, then optional organisms.
+        threading.Thread(target=_autosave_loop, name="cc-ng-autosave", daemon=True).start()
+        threading.Thread(target=_serve_loop, name="cc-ng-serve", daemon=True).start()
+    except BaseException:
+        _STATE.running = False
+        if _STATE.server_sock is sock:
+            _STATE.server_sock = None
+        sock.close()
+        raise
+
     # Full-parity organism layer (Josh 2026-07-04: "ANYTHING Syl's NeuroGraph
     # can do, I want your NeuroGraph to be able to do, as well.") -- Lenia
     # continuous field dynamics + TriSynaptic concept-extraction manager,
@@ -1483,30 +1526,7 @@ def _init_cc_host_once() -> bool:
             logger.info("CC GSG backfill at init: %d nodes stamped (persists via autosave)", _stamped)
     except Exception:
         logger.exception("CC organism-layer bootstrap failed (non-fatal)")
-    logger.info("DIAG: init_cc_host() organism-layer bootstrap done, binding socket...")
-
-    # Retain the graph on failure. The wrapper then reports failed readiness;
-    # it never replays initialization over a possibly active partial instance.
-    sock = None
-    try:
-        _cleanup_stale_socket()
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(SOCKET_PATH)
-        sock.listen(16)
-        os.chmod(SOCKET_PATH, 0o600)
-        _STATE.server_sock = sock
-    except Exception:
-        logger.exception("CC socket bind failed")
-        if sock is not None:
-            sock.close()
-        return False
-
-    _STATE.running = True
-    _write_refcount(0)
-
-    # Start background threads
-    threading.Thread(target=_serve_loop, name="cc-ng-serve", daemon=True).start()
-    threading.Thread(target=_autosave_loop, name="cc-ng-autosave", daemon=True).start()
+    logger.info("DIAG: init_cc_host() organism-layer bootstrap done")
 
     _start_cc_tonic_engine(cc_ng)
 

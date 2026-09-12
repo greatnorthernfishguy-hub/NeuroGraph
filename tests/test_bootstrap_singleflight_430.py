@@ -28,7 +28,7 @@ def functions(file, names, ns):
 def cc(tmp_path, monkeypatch):
     import sys
     state = NS(cc_ng=None, stats={}, concept_queue=[], running=False, server_sock=None)
-    counts = {'construct': 0, 'organism': 0, 'worker': 0, 'closed': 0}
+    counts = {'construct': 0, 'organism': 0, 'worker': 0, 'closed': 0, 'tonic': 0}
     control = NS(entered=threading.Event(), release=threading.Event(), pause=False,
                  fail=None)
 
@@ -54,14 +54,16 @@ def cc(tmp_path, monkeypatch):
 
     class Worker:
         def __init__(self, **kw):
-            pass
+            self.name = kw['name']
         def start(self):
             counts['worker'] += 1
-            if control.fail == 'worker':
+            if control.fail == self.name:
                 raise RuntimeError('worker failed')
 
     def organism(*a, **kw):
         counts['organism'] += 1
+        if control.fail == 'organism':
+            raise RuntimeError('optional organism failed')
 
     monkeypatch.setitem(sys.modules, 'openclaw_hook', NS(NeuroGraphMemory=Memory))
     monkeypatch.setitem(sys.modules, 'cc_ng_organism', NS(
@@ -75,7 +77,9 @@ def cc(tmp_path, monkeypatch):
               socket=NS(socket=lambda *a: Socket(), AF_UNIX=1, SOCK_STREAM=1),
               SOCKET_PATH=str(tmp_path / 'fake'), os=NS(chmod=lambda *a: None),
               _write_refcount=lambda *a: None, _serve_loop=lambda: None,
-              _autosave_loop=lambda: None, _start_cc_tonic_idle_watcher=lambda: None,
+              _autosave_loop=lambda: None,
+              _start_cc_tonic_engine=lambda ng: counts.update(tonic=counts['tonic']+1),
+              _start_cc_tonic_idle_watcher=lambda: None,
               _start_cc_dream_consolidation_pulse=lambda: None)
     functions('cc_ng_host.py', {'init_cc_host', '_init_cc_host_once'}, ns)
     return ns, state, counts, control
@@ -102,14 +106,14 @@ def test_cc_overlap_constructs_once_and_preserves_graph(cc):
     assert results == [True, True]
     graph = state.cc_ng
     assert ns['init_cc_host']() is True and state.cc_ng is graph
-    assert counts == {'construct': 1, 'organism': 1, 'worker': 2, 'closed': 0}
+    assert counts == {'construct': 1, 'organism': 1, 'worker': 2, 'closed': 0, 'tonic': 1}
 
 
-@pytest.mark.parametrize('failure', ['constructor', 'bind', 'worker'])
+@pytest.mark.parametrize('failure', ['constructor', 'bind', 'cc-ng-serve', 'cc-ng-autosave'])
 def test_cc_partial_failure_never_reconstructs_or_claims_ready(cc, failure):
     ns, state, counts, ctl = cc
     ctl.fail = failure
-    if failure == 'worker':
+    if failure.startswith('cc-ng-'):
         with pytest.raises(RuntimeError):
             ns['init_cc_host']()
     else:
@@ -121,7 +125,11 @@ def test_cc_partial_failure_never_reconstructs_or_claims_ready(cc, failure):
     assert counts['construct'] == 1
     if failure != 'constructor':
         assert graph is not None
-    if failure == 'bind':
+    assert state.running is False and state.server_sock is None
+    assert counts['organism'] == 0 and counts['tonic'] == 0
+    if failure == 'cc-ng-autosave':
+        assert counts['worker'] == 1  # Never start serving without persistence.
+    if failure != 'constructor':
         assert counts['closed'] == 1
 
 
@@ -263,3 +271,26 @@ def test_actual_rpc_envelope_rejects_incomplete_bootstrap(condition):
         assert response['error']['code'] == -32000
         assert condition in response['error']['message']
         assert 'result' not in response
+
+
+def test_optional_organism_failure_remains_nonfatal(cc):
+    ns, state, counts, ctl = cc
+    ctl.fail = 'organism'
+    assert ns['init_cc_host']() is True
+    assert state.running and state.server_sock is not None
+    assert counts['worker'] == 2 and counts['tonic'] == 1
+
+
+def test_serve_worker_after_failed_startup_has_no_published_socket():
+    ns = {'_STATE': NS(server_sock=None, running=False)}
+    functions('cc_ng_host.py', {'_serve_loop'}, ns)
+    ns['_serve_loop']()
+
+
+def test_lost_graph_reference_does_not_authorize_second_construction(cc):
+    ns, state, counts, ctl = cc
+    assert ns['init_cc_host']() is True
+    state.cc_ng = None  # Accidental reference loss, not a teardown/restart contract.
+    assert ns['init_cc_host']() is False
+    assert counts['construct'] == 1 and counts['worker'] == 2
+    assert ns['_cc_init_failed'] is True
