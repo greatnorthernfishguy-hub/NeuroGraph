@@ -24,9 +24,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from neuro_foundation import Graph
-import tonic_engine as te
-from tonic_engine import TonicEngine, EngineConfig
+# [2026-09-11] Codex — isolate the combined capture/attachment suite from real
+# Graph and torch imports too; these tests exercise body ownership, not SNN math.
+from unittest.mock import patch
+_import_torch = types.ModuleType("torch")
+_import_torch.nn = types.ModuleType("torch.nn")
+_import_torch.no_grad = contextlib.nullcontext
+with patch.dict(sys.modules, {"torch": _import_torch, "torch.nn": _import_torch.nn}):
+    import tonic_engine as te
+TonicEngine, EngineConfig = te.TonicEngine, te.EngineConfig
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +131,13 @@ def loader(monkeypatch):
 
 
 def _graph():
-    g = Graph()
-    for nid in ("A", "B", "C"):
-        g.create_node(node_id=nid)
-    return g
+    return types.SimpleNamespace(
+        nodes={nid: types.SimpleNamespace(voltage=0.0, resting_potential=0.0,
+                                          last_spike_time=-float("inf"), metadata={})
+               for nid in ("A", "B", "C")},
+        timestep=0, synapses={}, hyperedges={}, config={},
+        prime_and_propagate=lambda **kw: None,
+    )
 
 
 def _engine(**kw):
