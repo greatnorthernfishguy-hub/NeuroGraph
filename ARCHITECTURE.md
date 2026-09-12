@@ -388,11 +388,14 @@ NeuroGraph is the source. Every other module copies from here:
 | File | What It Is |
 |------|-----------|
 | `ng_lite.py` | Tier 1/2 substrate — Hebbian learning, nodes, synapses, step cycle, Cricket constitutional nodes |
-| `ng_tract_bridge.py` | The River — per-pair directional tracts (v0.3+, preferred) |
-| `ng_peer_bridge.py` | Legacy River — JSONL broadcast (retained until v1.0) |
+| `ng_tract_bridge.py` | The River — per-pair directional tracts (v0.3+) |
 | `ng_ecosystem.py` | Tier lifecycle — manages Tier 1→2→3 progression |
 | `ng_autonomic.py` | Autonomic state — organism-wide PARASYMPATHETIC/SYMPATHETIC |
 | `openclaw_adapter.py` | OpenClaw skill base class |
+| `ng_embed.py` | Centralized embedding + dual-pass |
+| `ng_commons_eco.py` | Commons-backed get_context/record_outcome adapter |
+| `ng_salience_gate.py` | Salience-gated telemetry deposit |
+| `ng_updater.py` | Auto-update + re-sync of the above from canonical |
 
 When a vendored file changes here, **every module in the ecosystem must
 re-vendor simultaneously.** A module running a different version of ng_lite.py

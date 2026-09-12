@@ -1,5 +1,10 @@
 # ET Module Manager Integration — Prompt Primer for Claude Code Instances
 
+> **Stale on `ng_peer_bridge.py` (deleted 2026-06-03).** Cross-module learning
+> uses vendored `ng_tract_bridge.py`, not JSONL broadcast. Do not copy or restore
+> `ng_peer_bridge.py`. Sections below that name that file are historical.
+
+
 ## Context
 
 You are working on an **E-T Systems module** that is part of a modular AI
