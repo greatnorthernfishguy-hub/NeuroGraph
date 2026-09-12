@@ -1,6 +1,6 @@
 # SEE FIRST: /home/josh/docs/CC-CALLOSUM-TRUTH.md -- consolidated, verified state of
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
-# The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
+# The wholeness ring ALREADY EXISTS here (Leg 2).
 """
 cc_ng_host.py — Host CC's NeuroGraph instance inside neurograph_rpc.py process.
 
@@ -27,6 +27,13 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-10] Claude Code (Grok 4.6) — nightly area 1: drop TEMP DIAG noise
+# What: Removed the four temporary DIAG logger.info lines in init_cc_host()
+#   plus the 2026-07-05 comment that said to remove them once the silent hang
+#   was resolved. Dropped the stale "Open defect: merge-journal poison-pill"
+#   clause from the file header (fixed by #106 on 2026-07-31).
+# Why: The hang was diagnosed and resolved; the breadcrumbs were leftover noise.
+# How: Subtraction only. Permanent exception/success logs are unchanged.
 # [2026-09-07] Claude Code (DudeMan CC, Opus 5) — #413: close the Ingestor door in _deposit()
 # What: _deposit() calls cc_ng_organism.run_conversational_dual_pass() instead of
 #   ng.on_message(). Parity with the laptop daemon's same-day fix. The _recent_spikes read
@@ -1358,19 +1365,11 @@ def init_cc_host() -> bool:
 
     Returns True on success, False on failure.
     """
-    # TEMP DIAGNOSTIC (2026-07-05, remove once the silent-hang mystery is
-    # resolved): init_cc_host() has produced zero observable log output on
-    # the VPS across multiple restarts tonight -- no success line, no
-    # failure line, socket never created. This traces exactly how far
-    # execution gets before whatever is stopping it.
-    logger.info("DIAG: init_cc_host() ENTRY")
-
     if _STATE.cc_ng is not None:
         logger.info("CC NG already initialized")
         return True
 
     Path(CC_NG_WORKSPACE).mkdir(parents=True, exist_ok=True)
-    logger.info("DIAG: init_cc_host() workspace dir ready, constructing NeuroGraphMemory...")
 
     # Construct CC's NG directly (not via get_instance) — Syl already owns
     # the class-level _instance singleton. CC gets its own standalone object.
@@ -1383,7 +1382,6 @@ def init_cc_host() -> bool:
     except Exception:
         logger.exception("CC NG construction failed")
         return False
-    logger.info("DIAG: init_cc_host() NeuroGraphMemory constructed OK")
 
     # Disable NG-internal auto-save; we manage saves via our autosave thread
     cc_ng.auto_save_interval = 999999
@@ -1415,7 +1413,6 @@ def init_cc_host() -> bool:
             logger.info("CC GSG backfill at init: %d nodes stamped (persists via autosave)", _stamped)
     except Exception:
         logger.exception("CC organism-layer bootstrap failed (non-fatal)")
-    logger.info("DIAG: init_cc_host() organism-layer bootstrap done, binding socket...")
 
     # Bind socket
     try:
