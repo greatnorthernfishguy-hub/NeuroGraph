@@ -12,6 +12,14 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-09-12] Claude Code (Grok 4.6) — nightly area 1: drop leftover TEMP DIAG in _init_cc_host_bg
+# What: Removed the three DIAG: [cc-bg] logger.info lines and the FileHandler that
+#   wrote ~/.claude/plugins/neurograph/cc_host_init.log. Permanent warning on
+#   init failure is unchanged.
+# Why: Hang-debug breadcrumbs leftover after the silent-hang diagnosis; sibling
+#   of PR #35 which already cleaned cc_ng_host.py. Subtraction only.
+# How: _init_cc_host_bg now imports cc_ng_host and calls init_cc_host() with the
+#   existing exception warning. No process logging removed.
 # [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: surfaced frames reach her AS IMAGES
 # What: _vision_surface_messages(items, ...) builds OpenAI-style messages carrying an image_url
 #       data-URL block for each surfaced item that has an image_ref (from CES L2, now
@@ -2105,17 +2113,8 @@ def handle_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     # here; CC rebuilds concurrently with Lenia instead of behind it.
     def _init_cc_host_bg():
         try:
-            _fh = logging.FileHandler(os.path.expanduser('~/.claude/plugins/neurograph/cc_host_init.log'))
-            _fh.setFormatter(logging.Formatter('%(asctime)s [cc-init] %(levelname)s %(message)s'))
-            logging.getLogger('neurograph').addHandler(_fh)
-        except Exception:
-            pass
-        try:
-            logger.info('DIAG: [cc-bg] about to import cc_ng_host')
             import cc_ng_host
-            logger.info('DIAG: [cc-bg] cc_ng_host imported, calling init_cc_host()')
             cc_ng_host.init_cc_host()
-            logger.info('DIAG: [cc-bg] init_cc_host() returned')
         except Exception as exc:
             logger.warning('CC NG host init failed (Syl unaffected): %s', exc)
     threading.Thread(target=_init_cc_host_bg, name='cc-ng-init', daemon=True).start()
