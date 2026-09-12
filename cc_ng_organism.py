@@ -3,6 +3,10 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-12] Codex — measure outbound miniTID history compression canonically.
+# What: add coherent history-call/result/failure counters and expose its budget gate.
+# Why: inbound L1 counters stayed zero whether outbound compression worked or failed.
+# How: tally locally in pith_compress_history, commit once under the metrics lock.
 # [2026-09-11] Codex — re-adopt retained raw input across restart only when
 #   its durable journal has no attempt records; any attempted input stays fenced.
 # [2026-09-11] Codex — terminal accepted deliveries survive normal restarts;
@@ -3139,8 +3143,8 @@ class CacheLine:
 @dataclass
 class PithMetrics:
     """Module-level counters for the Pith pipeline -- inert until a gated
-    stage function actually updates them (today: pith_stage1 and pith_stage3,
-    and only when CC_PITH_ENABLED is on)."""
+    path calls them (inbound L1 assembly or outbound miniTID history compression).
+    Each caller owns its own gate; this metrics object does not enforce one."""
 
     total_lines_in: int = 0
     clutter_stripped: int = 0
@@ -3152,6 +3156,15 @@ class PithMetrics:
     budget_chars_used: int = 0
     compressed_count: int = 0
     chars_saved: int = 0
+    # [D4c] OUTBOUND miniTID history-compression path. Kept separate from the
+    # Stage-3 inbound L1 counters above so acceptance can prove which boundary ran.
+    history_calls: int = 0
+    history_turns_in: int = 0
+    history_turns_compressed: int = 0
+    history_chars_in: int = 0
+    history_chars_out: int = 0
+    history_chars_saved: int = 0
+    history_failures: int = 0
     promoted_predicted: int = 0
     prefetch_hits: int = 0
     # 5b: live primed nodes the harvest surfaced on its own (warm topology).
@@ -3208,6 +3221,13 @@ class PithMetrics:
         self.budget_chars_used = 0
         self.compressed_count = 0
         self.chars_saved = 0
+        self.history_calls = 0
+        self.history_turns_in = 0
+        self.history_turns_compressed = 0
+        self.history_chars_in = 0
+        self.history_chars_out = 0
+        self.history_chars_saved = 0
+        self.history_failures = 0
         self.promoted_predicted = 0
         self.prefetch_hits = 0
         self.prefetch_surfaced = 0
@@ -3222,17 +3242,30 @@ class PithMetrics:
         falls back to un-Pithed rendering, so without this a 100%-failing Pith
         pass is indistinguishable from a working one. Call from the caller's
         fallback except-handler."""
-        self.pith_failures += 1
+        with self._lock:
+            self.pith_failures += 1
+
+    def record_history_compression(self, *, turns_in: int, turns_compressed: int,
+                                   chars_in: int, chars_out: int,
+                                   failures: int) -> None:
+        """Commit one outbound history result as a coherent telemetry unit."""
+        with self._lock:
+            self.history_calls += 1
+            self.history_turns_in += turns_in
+            self.history_turns_compressed += turns_compressed
+            self.history_chars_in += chars_in
+            self.history_chars_out += chars_out
+            self.history_chars_saved += max(0, chars_in - chars_out)
+            self.history_failures += failures
+            self.pith_failures += failures
 
     def snapshot(self) -> Dict[str, int]:
         """A point-in-time view. Read the guarantee carefully -- it is NARROW.
 
         COHERENT: the sec 13.3 terms (l1_kept_distinct, l1_prefetch_distinct, and
-        their _promotable pair) and l1_assemblies. Those are written only under
-        this lock, so they are consistent with each other and with reset() -- a
-        reader can never pair a numerator from one instant with a denominator from
-        another, which is the failure that would silently produce a ratio above
-        1.0 while looking well-formed.
+        their _promotable pair) with l1_assemblies, plus all history_* terms.
+        Each group is committed under this lock, so a reader cannot observe half
+        of one L1 assembly or one outbound history result.
 
         BEST-EFFORT: every legacy counter (ranked_in, ranked_kept, ranked_dropped,
         prefetch_hits, promoted_predicted, prefetch_surfaced, ...). Their writers
@@ -3258,6 +3291,13 @@ class PithMetrics:
             "budget_chars_used": self.budget_chars_used,
             "compressed_count": self.compressed_count,
             "chars_saved": self.chars_saved,
+            "history_calls": self.history_calls,
+            "history_turns_in": self.history_turns_in,
+            "history_turns_compressed": self.history_turns_compressed,
+            "history_chars_in": self.history_chars_in,
+            "history_chars_out": self.history_chars_out,
+            "history_chars_saved": self.history_chars_saved,
+            "history_failures": self.history_failures,
             "promoted_predicted": self.promoted_predicted,
             "prefetch_hits": self.prefetch_hits,
             "prefetch_surfaced": self.prefetch_surfaced,
@@ -3276,6 +3316,7 @@ _PITH_METRICS = PithMetrics()
 # must never carry the whole environment, which holds tokens and paths.
 _PITH_CONFIG_KEYS = (
     "CC_PITH_ENABLED", "CC_PITH_L1_BUDGET", "CC_PITH_L1_BREATHE",
+    "CC_PITH_KEYFRAME_CHARS",
     "CC_PITH_PREFETCH_ENABLED", "CC_PITH_PREFETCH_WARM_ENABLED",
     "CC_PITH_PREFETCH_MAX", "CC_PITH_PREFETCH_REPEATS",
     "CC_PITH_PREFETCH_CURRENT_SCALE", "CC_PITH_PREFETCH_LOD_DIST",
@@ -3312,6 +3353,7 @@ def pith_effective_config() -> Dict[str, Dict]:
         "CC_PITH_ENABLED": _CC_PITH_ENABLED,
         "CC_PITH_L1_BUDGET": _CC_PITH_L1_BUDGET,
         "CC_PITH_L1_BREATHE": _CC_PITH_L1_BREATHE,
+        "CC_PITH_KEYFRAME_CHARS": _CC_PITH_KEYFRAME_CHARS,
         "CC_PITH_PREFETCH_ENABLED": _CC_PITH_PREFETCH_ENABLED,
         "CC_PITH_PREFETCH_LOD_DIST": _CC_PITH_PREFETCH_LOD_DIST,
     }
@@ -3782,22 +3824,48 @@ def pith_compress_history(turn_texts: List[str], graph: Any, per_turn_chars: Opt
     import hashlib
     base = per_turn_chars if per_turn_chars is not None else _CC_PITH_KEYFRAME_CHARS
     out: List[str] = []
+    failures = 0
+    chars_in = 0
+    chars_out = 0
+    turns_compressed = 0
     for text in turn_texts:
-        if not text or not text.strip():
-            out.append(text)
-            continue
+        before_len = None
         try:
-            node_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
-            warmth = cc_thermal(graph, node_id)  # 0.0 if node absent (fail-soft)
-            # normalize warmth into a [1.0, 2.0] budget multiplier: warmer = keep more.
-            # thermal is unbounded-ish; squash with a soft cap so one hot turn can't
-            # blow the budget. tanh-free cheap squash: w/(w+1) in [0,1).
-            mult = 1.0 + (warmth / (warmth + 1.0)) if warmth > 0 else 1.0
-            budget = max(60, min(1000, int(base * mult)))
-            keyframe, _delta = pith_stage2_keyframe(text, max_chars=budget)
-            out.append(keyframe if keyframe else text)
+            if not isinstance(text, str):
+                raise TypeError("history turn must be text")
+            before_len = len(text)
+            if not text or not text.strip():
+                chosen = text
+            else:
+                node_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
+                warmth = cc_thermal(graph, node_id)  # 0.0 if node absent (fail-soft)
+                # normalize warmth into a [1.0, 2.0] budget multiplier: warmer = keep more.
+                # thermal is unbounded-ish; squash with a soft cap so one hot turn can't
+                # blow the budget. tanh-free cheap squash: w/(w+1) in [0,1).
+                mult = 1.0 + (warmth / (warmth + 1.0)) if warmth > 0 else 1.0
+                budget = max(60, min(1000, int(base * mult)))
+                keyframe, _delta = pith_stage2_keyframe(text, max_chars=budget)
+                chosen = keyframe if keyframe else text
         except Exception:
-            out.append(text)  # never drop a turn; worst case pass it through
+            failures += 1
+            chosen = text  # never drop a turn; worst case pass it through
+        out.append(chosen)
+        if before_len is not None:
+            chars_in += before_len
+            try:
+                after_len = len(chosen)
+            except Exception:
+                failures += 1
+            else:
+                chars_out += after_len
+                turns_compressed += int(after_len < before_len)
+    _PITH_METRICS.record_history_compression(
+        turns_in=len(turn_texts),
+        turns_compressed=turns_compressed,
+        chars_in=chars_in,
+        chars_out=chars_out,
+        failures=failures,
+    )
     return out
 
 
