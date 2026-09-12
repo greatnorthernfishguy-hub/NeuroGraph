@@ -27,6 +27,12 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-12] Codex — persist VPS Pith acceptance telemetry across restarts.
+# What: port D4's bounded, fsynced lifetime snapshots to the hosted CC process.
+# Why: live RPC counters vanished on restart, so unattended genuine-work evidence
+#   could be lost before either coordinator or operator sampled it.
+# How: one error-isolated wall-clock observer records allow-listed raw/resolved
+#   configuration and monotonic counters; it never reads or mutates graph state.
 # [2026-09-12] Codex — expose the shared Pith history compressor to miniTID.
 # What: add the missing compress_history socket handler to the hosted VPS CC path.
 # Why: miniTID's enabled Pith peninsula otherwise received an unknown event and
@@ -355,11 +361,13 @@ were confirmed before this module was enabled.
 from __future__ import annotations
 
 import json
+import datetime
 import logging
 import os
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -372,6 +380,31 @@ REFCOUNT_PATH = os.path.join(CC_NG_WORKSPACE, "refcount")
 
 # --- Cadence ---
 AUTOSAVE_INTERVAL = 60.0  # seconds
+
+# --- Pith acceptance telemetry (D4 parity with the laptop daemon) ---
+PITH_SNAPSHOT_INTERVAL_SECS = max(
+    30.0, float(os.environ.get("CC_PITH_SNAPSHOT_INTERVAL_SECS", "300"))
+)
+PITH_SNAPSHOT_PATH = os.path.join(CC_NG_WORKSPACE, "pith_metrics.jsonl")
+PITH_SNAPSHOT_MAX_BYTES = max(
+    64 * 1024,
+    int(os.environ.get("CC_PITH_SNAPSHOT_MAX_BYTES", str(4 * 1024 * 1024))),
+)
+PITH_SNAPSHOT_GATE_KEYS = (
+    "CC_PITH_ENABLED",
+    "CC_PITH_L1_BUDGET",
+    "CC_PITH_L1_BREATHE",
+    "CC_PITH_PREFETCH_ENABLED",
+    "CC_PITH_PREFETCH_WARM_ENABLED",
+    "CC_PITH_PREFETCH_MAX",
+    "CC_PITH_PREFETCH_REPEATS",
+    "CC_PITH_PREFETCH_CURRENT_SCALE",
+    "CC_PITH_PREFETCH_LOD_DIST",
+)
+# One import of this host module corresponds to one gateway/Python lifetime.
+PITH_WINDOW_ID = uuid.uuid4().hex[:16]
+_PITH_CONFIG_WARNED = set()
+_PITH_SNAPSHOT_LOCK = threading.Lock()
 
 # --- Recall ---
 RECALL_K = 5
@@ -637,6 +670,125 @@ def _write_refcount(n: int) -> None:
 # Request handlers — mirror cc-ng-daemon.py protocol exactly so the existing
 # cc-ng-hook.py client works unchanged.
 # =============================================================================
+
+def _pith_gate_values():
+    """Return only the Pith environment keys approved for telemetry."""
+    return {key: os.environ.get(key) for key in PITH_SNAPSHOT_GATE_KEYS}
+
+
+def _pith_config_unavailable(code):
+    """Warn once per closed-vocabulary cause and return it for the record."""
+    if code not in _PITH_CONFIG_WARNED:
+        _PITH_CONFIG_WARNED.add(code)
+        logger.warning(
+            "CC Pith: resolved config UNAVAILABLE (%s) -- snapshots record "
+            "config=null. Windows taken now cannot prove resolved settings.",
+            code,
+        )
+    return code
+
+
+def _pith_effective_config():
+    """Resolve Pith's actual settings without leaking exception text."""
+    try:
+        from cc_ng_organism import pith_effective_config
+    except ModuleNotFoundError:
+        return None, _pith_config_unavailable("organism_unavailable")
+    except ImportError:
+        return None, _pith_config_unavailable("symbol_unavailable")
+    except Exception:
+        return None, _pith_config_unavailable("import_failed")
+    try:
+        return pith_effective_config(), None
+    except Exception:
+        return None, _pith_config_unavailable("resolve_failed")
+
+
+def _pith_snapshot(reason):
+    """Append one durable, bounded snapshot of monotonic Pith counters."""
+    try:
+        from cc_ng_organism import _PITH_METRICS
+
+        config, config_error = _pith_effective_config()
+        record = {
+            "ts": time.time(),
+            "iso": datetime.datetime.now().isoformat(timespec="seconds"),
+            "reason": reason,
+            "pid": os.getpid(),
+            "window_id": PITH_WINDOW_ID,
+            "window_started_ts": _STATE.stats.get("started_at"),
+            "gates": _pith_gate_values(),
+            "config": config,
+            "config_error": config_error,
+            "counters": _PITH_METRICS.snapshot(),
+        }
+        if not _PITH_SNAPSHOT_LOCK.acquire(timeout=2.0):
+            logger.debug("CC Pith snapshot skipped: telemetry writer busy")
+            return False
+        try:
+            try:
+                if (
+                    os.path.exists(PITH_SNAPSHOT_PATH)
+                    and os.path.getsize(PITH_SNAPSHOT_PATH) > PITH_SNAPSHOT_MAX_BYTES
+                ):
+                    os.replace(PITH_SNAPSHOT_PATH, PITH_SNAPSHOT_PATH + ".1")
+            except Exception:
+                pass
+            with open(PITH_SNAPSHOT_PATH, "a") as stream:
+                stream.write(json.dumps(record) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            _PITH_SNAPSHOT_LOCK.release()
+        return True
+    except Exception as exc:
+        logger.debug("CC Pith snapshot failed (non-fatal): %s", exc)
+        return False
+
+
+def _pith_snapshot_loop():
+    """Persist telemetry on its own wall clock while the hosted CC is alive."""
+    logger.info(
+        "CC Pith telemetry: snapshots every %.0fs -> %s",
+        PITH_SNAPSHOT_INTERVAL_SECS,
+        PITH_SNAPSHOT_PATH,
+    )
+    _pith_snapshot("start")
+    while _STATE.running:
+        time.sleep(PITH_SNAPSHOT_INTERVAL_SECS)
+        if not _STATE.running:
+            break
+        _pith_snapshot("interval")
+    logger.info("CC Pith telemetry: loop stopped")
+
+
+def _log_pith_startup_config():
+    """Make this measurement window and its resolved gates operator-visible."""
+    logger.info("CC Pith window %s (pid %d)", PITH_WINDOW_ID, os.getpid())
+    logger.info(
+        "CC Pith gates at startup (raw env): %s",
+        " ".join(
+            "%s=%s" % (key, value if value is not None else "<unset>")
+            for key, value in _pith_gate_values().items()
+        ),
+    )
+    config, config_error = _pith_effective_config()
+    if config:
+        logger.info(
+            "CC Pith config RESOLVED: %s",
+            " ".join(
+                "%s=%s" % (key, value)
+                for key, value in sorted(config["resolved"].items())
+            ),
+        )
+    else:
+        logger.warning(
+            "CC Pith config NOT RESOLVED (%s) -- raw gates above are the only "
+            "configuration record for window %s",
+            config_error,
+            PITH_WINDOW_ID,
+        )
+
 
 def _handle_ping(_data):
     return {"ok": True, "pong": True}
@@ -1545,6 +1697,18 @@ def _init_cc_host_once() -> bool:
         sock.close()
         raise
 
+    # D4 telemetry observes in-memory counters only. It never touches CC's graph
+    # and cannot prevent the host from serving if logging is unavailable.
+    try:
+        _log_pith_startup_config()
+        threading.Thread(
+            target=_pith_snapshot_loop,
+            name="cc-pith-telemetry",
+            daemon=True,
+        ).start()
+    except Exception:
+        logger.exception("CC Pith telemetry failed to start (non-fatal)")
+
     # Full-parity organism layer (Josh 2026-07-04: "ANYTHING Syl's NeuroGraph
     # can do, I want your NeuroGraph to be able to do, as well.") -- Lenia
     # continuous field dynamics + TriSynaptic concept-extraction manager,
@@ -1625,6 +1789,11 @@ def shutdown_cc_host() -> None:
             logger.info("CC Commons persisted on shutdown")
     except Exception as exc:
         logger.debug("CC Commons persist on shutdown failed (non-fatal): %s", exc)
+
+    # The periodic samples are the durable path; this is an additional final
+    # point for clean exits. It remains fail-soft and does not read graph state.
+    if _STATE.stats.get("started_at", 0.0) > 0.0:
+        _pith_snapshot("shutdown")
 
     try:
         if _STATE.server_sock is not None:
