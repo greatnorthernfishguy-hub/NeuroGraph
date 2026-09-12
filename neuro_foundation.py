@@ -19,6 +19,14 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-09-11] Codex — #423 detach borrowed checkpoint state during serialization
+# (PROTECTED CHANGE; Josh authorized offline source repair; no live checkpoint operation)
+# What: Full/fork/incremental capture copies borrowed mutable subtrees once; an
+#       incremental copy failure now preserves dirty flags for a later retry.
+# Why: Synthetic-shape profiling found the second whole-tree deepcopy dominated
+#      its mutation pause. Live-substrate footprint qualification remains open.
+# How: One capture-local deepcopy memo; fresh rows/lists and immutable scalars are
+#      retained. Same canonical lock, schema, and explicit detach=False semantics.
 # [2026-08-14] Claude Code (Opus 4.8) — #147 seam-split scoring: §8.15 SNN-concept signal family + dynamic weighting
 #   (PROTECTED CHANGE, plan Law-Enforcer-blessed; DEFAULT OFF; NOT YET COMMITTED — checkpoints backed up pre-edit)
 # What: _seam_score_members (the per-member core-vs-peel ranker used by
@@ -1890,6 +1898,15 @@ class Graph:
         }
 
     # -----------------------------------------------------------------------
+    # ---- Changelog ----
+    # [2026-09-11] Codex — #423 canonical mutation/capture exclusion.
+    # What: topology mutations, both propagation modes, reward and consolidation
+    #       use the existing reentrant _step_lock, also held by capture_checkpoint.
+    # Why: Tonic's advisory _concurrent_lock does not exclude checkpoint capture.
+    # How: outer guards only; all 19 Graph/registrar/association operation bodies
+    #      verified AST-identical apart from their new guard. Model inference stays
+    #      at callers, outside these mutation operations. No clock/prune changes.
+    # -------------------
     # Topology Management (PRD §2.2.4)
     # -----------------------------------------------------------------------
 
@@ -1909,57 +1926,59 @@ class Graph:
         Returns:
             The created Node.
         """
-        nid = node_id or str(uuid.uuid4())
-        if nid in self.nodes:
-            raise ValueError(f"Node {nid} already exists")
-        node = Node(
-            node_id=nid,
-            threshold=self.config["default_threshold"],
-            refractory_period=self.config["refractory_period"],
-            metadata=metadata or {},
-            is_inhibitory=is_inhibitory,
-            creation_time=int(self.timestep),
-        )
-        self.nodes[nid] = node
-        self._outgoing[nid] = set()
-        self._incoming[nid] = set()
-        self._node_hyperedges[nid] = set()
-        self._recent_spikes[nid] = deque(maxlen=self.config["co_activation_window"] * 2)
-        self._dirty_nodes.add(nid)
-        return node
+        with self._step_lock:
+            nid = node_id or str(uuid.uuid4())
+            if nid in self.nodes:
+                raise ValueError(f"Node {nid} already exists")
+            node = Node(
+                node_id=nid,
+                threshold=self.config["default_threshold"],
+                refractory_period=self.config["refractory_period"],
+                metadata=metadata or {},
+                is_inhibitory=is_inhibitory,
+                creation_time=int(self.timestep),
+            )
+            self.nodes[nid] = node
+            self._outgoing[nid] = set()
+            self._incoming[nid] = set()
+            self._node_hyperedges[nid] = set()
+            self._recent_spikes[nid] = deque(maxlen=self.config["co_activation_window"] * 2)
+            self._dirty_nodes.add(nid)
+            return node
 
     def remove_node(self, node_id: str) -> None:
         """Remove node and all connected synapses; update hyperedges (PRD §8 remove_node)."""
-        if node_id not in self.nodes:
-            raise KeyError(f"Node {node_id} not found")
+        with self._step_lock:
+            if node_id not in self.nodes:
+                raise KeyError(f"Node {node_id} not found")
 
-        # Remove connected synapses (cascading deletion)
-        syn_ids_to_remove = set()
-        syn_ids_to_remove.update(self._outgoing.get(node_id, set()))
-        syn_ids_to_remove.update(self._incoming.get(node_id, set()))
-        for sid in syn_ids_to_remove:
-            self._remove_synapse_internal(sid)
+            # Remove connected synapses (cascading deletion)
+            syn_ids_to_remove = set()
+            syn_ids_to_remove.update(self._outgoing.get(node_id, set()))
+            syn_ids_to_remove.update(self._incoming.get(node_id, set()))
+            for sid in syn_ids_to_remove:
+                self._remove_synapse_internal(sid)
 
-        # Remove from hyperedges
-        for hid in list(self._node_hyperedges.get(node_id, set())):
-            he = self.hyperedges.get(hid)
-            if he:
-                he.member_nodes.discard(node_id)
-                he.member_weights.pop(node_id, None)
-                if node_id in he.output_targets:
-                    he.output_targets.remove(node_id)
-                if len(he.member_nodes) == 0:
-                    self._remove_hyperedge_internal(hid)
-                else:
-                    self._dirty_hyperedges.add(hid)
+            # Remove from hyperedges
+            for hid in list(self._node_hyperedges.get(node_id, set())):
+                he = self.hyperedges.get(hid)
+                if he:
+                    he.member_nodes.discard(node_id)
+                    he.member_weights.pop(node_id, None)
+                    if node_id in he.output_targets:
+                        he.output_targets.remove(node_id)
+                    if len(he.member_nodes) == 0:
+                        self._remove_hyperedge_internal(hid)
+                    else:
+                        self._dirty_hyperedges.add(hid)
 
-        # Clean up indices
-        self._outgoing.pop(node_id, None)
-        self._incoming.pop(node_id, None)
-        self._node_hyperedges.pop(node_id, None)
-        self._recent_spikes.pop(node_id, None)
-        del self.nodes[node_id]
-        self._dirty_nodes.discard(node_id)
+            # Clean up indices
+            self._outgoing.pop(node_id, None)
+            self._incoming.pop(node_id, None)
+            self._node_hyperedges.pop(node_id, None)
+            self._recent_spikes.pop(node_id, None)
+            del self.nodes[node_id]
+            self._dirty_nodes.discard(node_id)
 
     def create_synapse(
         self,
@@ -1983,35 +2002,36 @@ class Graph:
         Returns:
             The created Synapse.
         """
-        if pre_node_id not in self.nodes:
-            raise KeyError(f"Pre node {pre_node_id} not found")
-        if post_node_id not in self.nodes:
-            raise KeyError(f"Post node {post_node_id} not found")
-        if pre_node_id == post_node_id:
-            raise ValueError("Self-connections not allowed")
+        with self._step_lock:
+            if pre_node_id not in self.nodes:
+                raise KeyError(f"Pre node {pre_node_id} not found")
+            if post_node_id not in self.nodes:
+                raise KeyError(f"Post node {post_node_id} not found")
+            if pre_node_id == post_node_id:
+                raise ValueError("Self-connections not allowed")
 
-        mw = max_weight if max_weight is not None else self.config["max_weight"]
-        syn = Synapse(
-            pre_node_id=pre_node_id,
-            post_node_id=post_node_id,
-            weight=max(0.0, min(weight, mw)),
-            max_weight=mw,
-            delay=max(1, delay),
-            synapse_type=synapse_type,
-            creation_time=float(self.timestep),
-            last_update_time=float(self.timestep),
-            peak_weight=weight,
-        )
-        self.synapses[syn.synapse_id] = syn
-        self._outgoing[pre_node_id].add(syn.synapse_id)
-        self._incoming[post_node_id].add(syn.synapse_id)
-        self._dirty_synapses.add(syn.synapse_id)
-        # Return the LIVE store view, not the detached dataclass above: callers
-        # (and the STDP/reward paths) hold this and expect in-place mutations
-        # through the store to be visible on it — the former Dict[str,Synapse]
-        # stored the very object it returned, so returning a fresh SynapseRef
-        # preserves that write-through identity contract.
-        return self.synapses[syn.synapse_id]
+            mw = max_weight if max_weight is not None else self.config["max_weight"]
+            syn = Synapse(
+                pre_node_id=pre_node_id,
+                post_node_id=post_node_id,
+                weight=max(0.0, min(weight, mw)),
+                max_weight=mw,
+                delay=max(1, delay),
+                synapse_type=synapse_type,
+                creation_time=float(self.timestep),
+                last_update_time=float(self.timestep),
+                peak_weight=weight,
+            )
+            self.synapses[syn.synapse_id] = syn
+            self._outgoing[pre_node_id].add(syn.synapse_id)
+            self._incoming[post_node_id].add(syn.synapse_id)
+            self._dirty_synapses.add(syn.synapse_id)
+            # Return the LIVE store view, not the detached dataclass above: callers
+            # (and the STDP/reward paths) hold this and expect in-place mutations
+            # through the store to be visible on it — the former Dict[str,Synapse]
+            # stored the very object it returned, so returning a fresh SynapseRef
+            # preserves that write-through identity contract.
+            return self.synapses[syn.synapse_id]
 
     def _remove_synapse_internal(self, synapse_id: str) -> None:
         """Remove a synapse and clean up indices (no KeyError on missing)."""
@@ -2025,9 +2045,10 @@ class Graph:
 
     def remove_synapse(self, synapse_id: str) -> None:
         """Remove a synapse (public API)."""
-        if synapse_id not in self.synapses:
-            raise KeyError(f"Synapse {synapse_id} not found")
-        self._remove_synapse_internal(synapse_id)
+        with self._step_lock:
+            if synapse_id not in self.synapses:
+                raise KeyError(f"Synapse {synapse_id} not found")
+            self._remove_synapse_internal(synapse_id)
 
     def create_hyperedge(
         self,
@@ -2054,44 +2075,45 @@ class Graph:
             incumbent -- a silent overwrite would drop a live edge out of
             self.hyperedges while leaving its id in _node_hyperedges.
         """
-        for nid in member_node_ids:
-            if nid not in self.nodes:
-                raise KeyError(f"Member node {nid} not found")
+        with self._step_lock:
+            for nid in member_node_ids:
+                if nid not in self.nodes:
+                    raise KeyError(f"Member node {nid} not found")
 
-        if hyperedge_id is not None and hyperedge_id in self.hyperedges:
-            raise ValueError(
-                f"Hyperedge {hyperedge_id} already exists — refusing to "
-                f"overwrite. Callers transporting hyperedges must check for "
-                f"existence first (see cc_topology_merge._hyperedge_exists)."
+            if hyperedge_id is not None and hyperedge_id in self.hyperedges:
+                raise ValueError(
+                    f"Hyperedge {hyperedge_id} already exists — refusing to "
+                    f"overwrite. Callers transporting hyperedges must check for "
+                    f"existence first (see cc_topology_merge._hyperedge_exists)."
+                )
+
+            if len(member_node_ids) < 2:
+                logger.warning(
+                    "Creating hyperedge with %d member(s) — hyperedges with fewer "
+                    "than 2 members are structurally degenerate",
+                    len(member_node_ids),
+                )
+
+            mw = member_weights or {nid: 1.0 for nid in member_node_ids}
+            he = Hyperedge(
+                member_nodes=set(member_node_ids),
+                member_weights=mw,
+                activation_threshold=activation_threshold,
+                activation_mode=activation_mode,
+                output_targets=output_targets or [],
+                output_weight=output_weight,
+                metadata=metadata or {},
+                is_learnable=is_learnable,
+                **({"hyperedge_id": hyperedge_id} if hyperedge_id is not None else {}),
             )
-
-        if len(member_node_ids) < 2:
-            logger.warning(
-                "Creating hyperedge with %d member(s) — hyperedges with fewer "
-                "than 2 members are structurally degenerate",
-                len(member_node_ids),
-            )
-
-        mw = member_weights or {nid: 1.0 for nid in member_node_ids}
-        he = Hyperedge(
-            member_nodes=set(member_node_ids),
-            member_weights=mw,
-            activation_threshold=activation_threshold,
-            activation_mode=activation_mode,
-            output_targets=output_targets or [],
-            output_weight=output_weight,
-            metadata=metadata or {},
-            is_learnable=is_learnable,
-            **({"hyperedge_id": hyperedge_id} if hyperedge_id is not None else {}),
-        )
-        self.hyperedges[he.hyperedge_id] = he
-        # Phase 4: stamp creation time.
-        he.creation_time = self.timestep
-        for nid in member_node_ids:
-            self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
-        self._he_co_fire_counts[he.hyperedge_id] = {}
-        self._dirty_hyperedges.add(he.hyperedge_id)
-        return he
+            self.hyperedges[he.hyperedge_id] = he
+            # Phase 4: stamp creation time.
+            he.creation_time = self.timestep
+            for nid in member_node_ids:
+                self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
+            self._he_co_fire_counts[he.hyperedge_id] = {}
+            self._dirty_hyperedges.add(he.hyperedge_id)
+            return he
 
     def _remove_hyperedge_internal(self, hyperedge_id: str) -> None:
         he = self.hyperedges.pop(hyperedge_id, None)
@@ -2105,9 +2127,10 @@ class Graph:
         self._dirty_hyperedges.discard(hyperedge_id)
 
     def remove_hyperedge(self, hyperedge_id: str) -> None:
-        if hyperedge_id not in self.hyperedges:
-            raise KeyError(f"Hyperedge {hyperedge_id} not found")
-        self._remove_hyperedge_internal(hyperedge_id)
+        with self._step_lock:
+            if hyperedge_id not in self.hyperedges:
+                raise KeyError(f"Hyperedge {hyperedge_id} not found")
+            self._remove_hyperedge_internal(hyperedge_id)
 
     # -----------------------------------------------------------------------
     # Stimulation (PRD §8 stimulate / stimulate_batch)
@@ -2115,15 +2138,17 @@ class Graph:
 
     def stimulate(self, node_id: str, current: float) -> None:
         """Inject input current into a node (PRD §8 stimulate)."""
-        node = self.nodes.get(node_id)
-        if node is None:
-            raise KeyError(f"Node {node_id} not found")
-        node.voltage += current * node.intrinsic_excitability
+        with self._step_lock:
+            node = self.nodes.get(node_id)
+            if node is None:
+                raise KeyError(f"Node {node_id} not found")
+            node.voltage += current * node.intrinsic_excitability
 
     def stimulate_batch(self, stimuli: List[Tuple[str, float]]) -> None:
         """Batch stimulus for search results (PRD §8 stimulate_batch)."""
-        for node_id, current in stimuli:
-            self.stimulate(node_id, current)
+        with self._step_lock:
+            for node_id, current in stimuli:
+                self.stimulate(node_id, current)
 
     # -----------------------------------------------------------------------
     # Simulation Loop (PRD §2.2.4, §8 step)
@@ -2605,259 +2630,260 @@ class Graph:
         Returns:
             PropagationResult with all nodes that fired, ranked by latency.
         """
-        if not node_ids:
-            return PropagationResult(steps_run=steps, nodes_primed=0)
+        with self._step_lock:
+            if not node_ids:
+                return PropagationResult(steps_run=steps, nodes_primed=0)
 
-        # #59 age-on-write gate — computed once. When on, the Tonic's write cycle keeps
-        # exercised synapses fresh (inactive_steps=0 on use) AND ages the rest toward the
-        # inactivity prune. Off -> neither happens -> byte-identical to the legacy path.
-        _age_on = write_mode and bool(self.config.get("tonic_ages_substrate"))
+            # #59 age-on-write gate — computed once. When on, the Tonic's write cycle keeps
+            # exercised synapses fresh (inactive_steps=0 on use) AND ages the rest toward the
+            # inactivity prune. Off -> neither happens -> byte-identical to the legacy path.
+            _age_on = write_mode and bool(self.config.get("tonic_ages_substrate"))
 
-        # In read mode: save state for non-destructive propagation
-        # In write mode: skip save — voltages and spikes persist
-        saved_voltages: Dict[str, float] = {}
-        saved_refractory: Dict[str, int] = {}
-        saved_he_refractory: Dict[str, int] = {}
+            # In read mode: save state for non-destructive propagation
+            # In write mode: skip save — voltages and spikes persist
+            saved_voltages: Dict[str, float] = {}
+            saved_refractory: Dict[str, int] = {}
+            saved_he_refractory: Dict[str, int] = {}
 
-        if not write_mode:
-            for nid, node in self.nodes.items():
-                saved_voltages[nid] = node.voltage
-                saved_refractory[nid] = node.refractory_remaining
+            if not write_mode:
+                for nid, node in self.nodes.items():
+                    saved_voltages[nid] = node.voltage
+                    saved_refractory[nid] = node.refractory_remaining
 
-            for hid, he in self.hyperedges.items():
-                saved_he_refractory[hid] = he.refractory_remaining
-
-        # Compute approximate distances from primed nodes
-        primed_set = set(node_ids)
-        distances: Dict[str, int] = {nid: 0 for nid in node_ids}
-        # BFS to compute distances
-        frontier = set(node_ids)
-        for dist in range(1, steps + 1):
-            next_frontier: Set[str] = set()
-            for nid in frontier:
-                for syn_id in self._outgoing.get(nid, set()):
-                    syn = self.synapses.get(syn_id)
-                    if syn and syn.post_node_id not in distances:
-                        distances[syn.post_node_id] = dist
-                        next_frontier.add(syn.post_node_id)
-            frontier = next_frontier
-
-        # Collect current prediction targets for was_predicted tagging
-        predicted_targets: Set[str] = set()
-        for pred in self.active_predictions.values():
-            predicted_targets.add(pred.target_node_id)
-        for pred_state in self._active_predictions.values():
-            predicted_targets.update(pred_state.predicted_targets)
-
-        # Build working set — nodes needing per-step processing. O(n) once here;
-        # step-level loops below run O(working_set) << O(n). (#164 Phase B)
-        # Includes: nodes with non-resting voltage, active refractory, or primed.
-        _ACTIVE_EPS = 1e-5
-        working_set: Set[str] = set(node_ids)
-        for nid, node in self.nodes.items():
-            if (abs(node.voltage - node.resting_potential) > _ACTIVE_EPS
-                    or node.refractory_remaining > 0):
-                working_set.add(nid)
-
-        # --- PRIME: inject current into specified nodes ---
-        for nid, current in zip(node_ids, currents):
-            node = self.nodes.get(nid)
-            if node is not None:
-                node.voltage += current * node.intrinsic_excitability
-
-        # --- PROPAGATE: run N read-only SNN steps ---
-        result = PropagationResult(
-            steps_run=steps,
-            nodes_primed=len(node_ids),
-        )
-        # Local delay buffer separate from the graph's real one
-        prop_delay_buffer: Dict[int, List[Tuple[str, float]]] = {}
-        prop_timestep = self.timestep
-
-        decay = self.config["decay_rate"]
-        experience_threshold = self.config["he_experience_threshold"]
-
-        for step_idx in range(steps):
-            prop_timestep += 1
-
-            # 1. Voltage decay — O(working_set) not O(n) (#164)
-            _to_deactivate: List[str] = []
-            for nid in working_set:
-                node = self.nodes[nid]
-                node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
-                if (abs(node.voltage - node.resting_potential) <= _ACTIVE_EPS
-                        and node.refractory_remaining == 0):
-                    _to_deactivate.append(nid)
-            for nid in _to_deactivate:
-                working_set.discard(nid)
-
-            # 2. Deliver delayed spikes from propagation buffer
-            arrivals = prop_delay_buffer.pop(prop_timestep, [])
-            for target_id, current in arrivals:
-                target = self.nodes.get(target_id)
-                if target is not None:
-                    target.voltage += current * target.intrinsic_excitability
-                    working_set.add(target_id)  # now active (#164)
-
-            # 3. Detect firing nodes — O(working_set) not O(n) (#164)
-            fired_ids: List[str] = []
-            for nid in working_set:
-                node = self.nodes[nid]
-                if node.refractory_remaining > 0:
-                    continue
-                if node.voltage >= node.threshold:
-                    fired_ids.append(nid)
-
-            # 4. Reset fired nodes and set refractory
-            for nid in fired_ids:
-                node = self.nodes[nid]
-                voltage_at_fire = node.voltage
-                node.voltage = node.resting_potential
-                node.refractory_remaining = node.refractory_period
-
-                # Write mode: record spike time so STDP can see it
-                if write_mode:
-                    node.last_spike_time = float(prop_timestep)
-
-                entry = FiredEntry(
-                    node_id=nid,
-                    firing_step=step_idx,
-                    voltage_at_fire=voltage_at_fire,
-                    was_predicted=nid in predicted_targets,
-                    source_distance=distances.get(nid, steps + 1),
-                )
-                result.fired_entries.append(entry)
-
-            # 5. Propagate spikes through outgoing synapses
-            fired_set = set(fired_ids)
-            for nid in fired_ids:
-                node = self.nodes[nid]
-                sign = -1.0 if node.is_inhibitory else 1.0
-                for syn_id in self._outgoing.get(nid, set()):
-                    syn = self.synapses.get(syn_id)
-                    if syn is None:
-                        continue
-                    if _age_on:
-                        # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
-                        # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
-                        syn.inactive_steps = 0
-                    effective_type_sign = sign
-                    if syn.synapse_type == SynapseType.INHIBITORY:
-                        effective_type_sign = -1.0
-                    current = syn.weight * effective_type_sign
-                    arrival = prop_timestep + syn.delay
-                    prop_delay_buffer.setdefault(arrival, []).append(
-                        (syn.post_node_id, current)
-                    )
-
-            # 6. Evaluate hyperedges (pattern completion, output injection)
-            max_level = max((he.level for he in self.hyperedges.values()), default=0)
-            for level in range(max_level + 1):
                 for hid, he in self.hyperedges.items():
-                    if he.level != level or he.is_archived:
-                        continue
-                    activation = self._compute_hyperedge_activation(he, fired_set)
-                    if he.refractory_remaining > 0:
-                        continue
-                    if activation >= he.activation_threshold:
-                        he.refractory_remaining = he.refractory_period
+                    saved_he_refractory[hid] = he.refractory_remaining
 
-                        # Output injection
-                        effective_weight = he.output_weight
-                        if he.activation_mode == ActivationMode.GRADED:
-                            effective_weight *= activation
-                        for target_id in he.output_targets:
-                            target = self.nodes.get(target_id)
-                            if target is not None:
-                                target.voltage += effective_weight * target.intrinsic_excitability
-                                working_set.add(target_id)  # now active (#164)
+            # Compute approximate distances from primed nodes
+            primed_set = set(node_ids)
+            distances: Dict[str, int] = {nid: 0 for nid in node_ids}
+            # BFS to compute distances
+            frontier = set(node_ids)
+            for dist in range(1, steps + 1):
+                next_frontier: Set[str] = set()
+                for nid in frontier:
+                    for syn_id in self._outgoing.get(nid, set()):
+                        syn = self.synapses.get(syn_id)
+                        if syn and syn.post_node_id not in distances:
+                            distances[syn.post_node_id] = dist
+                            next_frontier.add(syn.post_node_id)
+                frontier = next_frontier
 
-                        # Pattern completion (pre-charge inactive members)
-                        if he.pattern_completion_strength > 0:
-                            learning_factor = min(
-                                1.0, he.activation_count / max(experience_threshold, 1)
-                            )
-                            eff_completion = he.pattern_completion_strength * learning_factor
-                            if eff_completion > 0:
-                                for mnid in he.member_nodes:
-                                    if mnid not in fired_set:
-                                        mnode = self.nodes.get(mnid)
-                                        if mnode and mnode.refractory_remaining == 0:
-                                            mnode.voltage += (
-                                                eff_completion
-                                                * he.member_weights.get(mnid, 1.0)
-                                                * mnode.intrinsic_excitability
-                                            )
-                                            working_set.add(mnid)  # now active (#164)
+            # Collect current prediction targets for was_predicted tagging
+            predicted_targets: Set[str] = set()
+            for pred in self.active_predictions.values():
+                predicted_targets.add(pred.target_node_id)
+            for pred_state in self._active_predictions.values():
+                predicted_targets.update(pred_state.predicted_targets)
 
-            # Decrement refractory counters — O(working_set) not O(n) (#164)
-            for nid in working_set:
-                node = self.nodes[nid]
-                if node.refractory_remaining > 0 and nid not in fired_set:
-                    node.refractory_remaining -= 1
-            for hid, he in self.hyperedges.items():
-                if he.refractory_remaining > 0 and hid not in set(fired_ids):
-                    he.refractory_remaining -= 1
-
-            # Write mode: apply STDP plasticity on fired nodes
-            if write_mode and fired_ids:
-                for rule in self._plasticity_rules:
-                    if isinstance(rule, STDPRule):
-                        rule.apply(self, fired_ids, prop_timestep)
-
-        # --- RESTORE (read mode only) ---
-        # In write mode: voltages, spike times, and weight changes persist.
-        # The exploration shaped the topology. That's the point.
-        if not write_mode:
+            # Build working set — nodes needing per-step processing. O(n) once here;
+            # step-level loops below run O(working_set) << O(n). (#164 Phase B)
+            # Includes: nodes with non-resting voltage, active refractory, or primed.
+            _ACTIVE_EPS = 1e-5
+            working_set: Set[str] = set(node_ids)
             for nid, node in self.nodes.items():
-                node.voltage = saved_voltages.get(nid, node.resting_potential)
-                node.refractory_remaining = saved_refractory.get(nid, 0)
-            for hid, he in self.hyperedges.items():
-                he.refractory_remaining = saved_he_refractory.get(hid, 0)
+                if (abs(node.voltage - node.resting_potential) > _ACTIVE_EPS
+                        or node.refractory_remaining > 0):
+                    working_set.add(nid)
 
-        # --- WRITE MODE: synapse sprouting for Tonic co-activations (#163) ---
-        # prime_and_propagate bypasses step()'s _recent_spikes tracking, so
-        # Tonic firings are invisible to _sprout_synapses. Fix: record all
-        # p&p-fired nodes at self.timestep-1 (past → window check passes),
-        # then call _sprout_synapses so co-activating nodes wire together.
-        if write_mode:
-            all_fired = list({e.node_id for e in result.fired_entries})
-            if all_fired:
-                _record_ts = self.timestep - 1 if self.timestep > 0 else 0
-                _window_cap = self.config["co_activation_window"] * 2
-                for _nid in all_fired:
-                    self._recent_spikes.setdefault(
-                        _nid, deque(maxlen=_window_cap)
-                    ).append(_record_ts)
-                self._sprout_synapses(all_fired)
+            # --- PRIME: inject current into specified nodes ---
+            for nid, current in zip(node_ids, currents):
+                node = self.nodes.get(nid)
+                if node is not None:
+                    node.voltage += current * node.intrinsic_excitability
 
-        # #59 age-on-write: the Tonic living IS the passage of time for the substrate.
-        # Age the substrate HERE, in the Tonic's own write cycle (one thread) — so idle
-        # thinking finally ages under-used edges (the melt): the reset above keeps Tonic-
-        # exercised synapses fresh, so only what the Tonic ISN'T touching climbs toward the
-        # inactivity threshold and culls. No rival stepping thread -> #109 stays intact;
-        # only the brief mutating tail holds _step_lock (serialize vs deposit step()).
-        # IMPORTANT: does NOT advance self.timestep — that clock is shared with step()'s
-        # delayed-spike delivery (_delay_buffer, drained by exact-tick match), so stealing
-        # ticks here would strand conversational spikes permanently. The melt is driven by
-        # the per-synapse inactive_steps counter (incremented below, reset on use above),
-        # which needs no global clock. Gated (default off) + interval-bounded.
-        if _age_on:
-            self._tonic_age_counter += 1
-            _interval = max(1, int(self.config.get("tonic_age_interval", 1)))
-            if self._tonic_age_counter >= _interval:
-                self._tonic_age_counter = 0
-                with self._step_lock:
-                    _sal_decay = self.config.get("he_salience_decay_rate", 0.0)
-                    # Native whole-population aging (§12 item 4) — same op step()
-                    # uses (nf.py:2519). Numerically identical to the old Python
-                    # sweep: inactive_steps += 1 for every row, and salience > 1.0
-                    # relaxes by 1 + (s-1)*(1-decay) (a no-op when decay == 0).
-                    self.synapses.age_and_decay_salience(_sal_decay)
-                    self._prune_synapses()
-                    self._collect_orphan_nodes()
+            # --- PROPAGATE: run N read-only SNN steps ---
+            result = PropagationResult(
+                steps_run=steps,
+                nodes_primed=len(node_ids),
+            )
+            # Local delay buffer separate from the graph's real one
+            prop_delay_buffer: Dict[int, List[Tuple[str, float]]] = {}
+            prop_timestep = self.timestep
 
-        return result
+            decay = self.config["decay_rate"]
+            experience_threshold = self.config["he_experience_threshold"]
+
+            for step_idx in range(steps):
+                prop_timestep += 1
+
+                # 1. Voltage decay — O(working_set) not O(n) (#164)
+                _to_deactivate: List[str] = []
+                for nid in working_set:
+                    node = self.nodes[nid]
+                    node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
+                    if (abs(node.voltage - node.resting_potential) <= _ACTIVE_EPS
+                            and node.refractory_remaining == 0):
+                        _to_deactivate.append(nid)
+                for nid in _to_deactivate:
+                    working_set.discard(nid)
+
+                # 2. Deliver delayed spikes from propagation buffer
+                arrivals = prop_delay_buffer.pop(prop_timestep, [])
+                for target_id, current in arrivals:
+                    target = self.nodes.get(target_id)
+                    if target is not None:
+                        target.voltage += current * target.intrinsic_excitability
+                        working_set.add(target_id)  # now active (#164)
+
+                # 3. Detect firing nodes — O(working_set) not O(n) (#164)
+                fired_ids: List[str] = []
+                for nid in working_set:
+                    node = self.nodes[nid]
+                    if node.refractory_remaining > 0:
+                        continue
+                    if node.voltage >= node.threshold:
+                        fired_ids.append(nid)
+
+                # 4. Reset fired nodes and set refractory
+                for nid in fired_ids:
+                    node = self.nodes[nid]
+                    voltage_at_fire = node.voltage
+                    node.voltage = node.resting_potential
+                    node.refractory_remaining = node.refractory_period
+
+                    # Write mode: record spike time so STDP can see it
+                    if write_mode:
+                        node.last_spike_time = float(prop_timestep)
+
+                    entry = FiredEntry(
+                        node_id=nid,
+                        firing_step=step_idx,
+                        voltage_at_fire=voltage_at_fire,
+                        was_predicted=nid in predicted_targets,
+                        source_distance=distances.get(nid, steps + 1),
+                    )
+                    result.fired_entries.append(entry)
+
+                # 5. Propagate spikes through outgoing synapses
+                fired_set = set(fired_ids)
+                for nid in fired_ids:
+                    node = self.nodes[nid]
+                    sign = -1.0 if node.is_inhibitory else 1.0
+                    for syn_id in self._outgoing.get(nid, set()):
+                        syn = self.synapses.get(syn_id)
+                        if syn is None:
+                            continue
+                        if _age_on:
+                            # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
+                            # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
+                            syn.inactive_steps = 0
+                        effective_type_sign = sign
+                        if syn.synapse_type == SynapseType.INHIBITORY:
+                            effective_type_sign = -1.0
+                        current = syn.weight * effective_type_sign
+                        arrival = prop_timestep + syn.delay
+                        prop_delay_buffer.setdefault(arrival, []).append(
+                            (syn.post_node_id, current)
+                        )
+
+                # 6. Evaluate hyperedges (pattern completion, output injection)
+                max_level = max((he.level for he in self.hyperedges.values()), default=0)
+                for level in range(max_level + 1):
+                    for hid, he in self.hyperedges.items():
+                        if he.level != level or he.is_archived:
+                            continue
+                        activation = self._compute_hyperedge_activation(he, fired_set)
+                        if he.refractory_remaining > 0:
+                            continue
+                        if activation >= he.activation_threshold:
+                            he.refractory_remaining = he.refractory_period
+
+                            # Output injection
+                            effective_weight = he.output_weight
+                            if he.activation_mode == ActivationMode.GRADED:
+                                effective_weight *= activation
+                            for target_id in he.output_targets:
+                                target = self.nodes.get(target_id)
+                                if target is not None:
+                                    target.voltage += effective_weight * target.intrinsic_excitability
+                                    working_set.add(target_id)  # now active (#164)
+
+                            # Pattern completion (pre-charge inactive members)
+                            if he.pattern_completion_strength > 0:
+                                learning_factor = min(
+                                    1.0, he.activation_count / max(experience_threshold, 1)
+                                )
+                                eff_completion = he.pattern_completion_strength * learning_factor
+                                if eff_completion > 0:
+                                    for mnid in he.member_nodes:
+                                        if mnid not in fired_set:
+                                            mnode = self.nodes.get(mnid)
+                                            if mnode and mnode.refractory_remaining == 0:
+                                                mnode.voltage += (
+                                                    eff_completion
+                                                    * he.member_weights.get(mnid, 1.0)
+                                                    * mnode.intrinsic_excitability
+                                                )
+                                                working_set.add(mnid)  # now active (#164)
+
+                # Decrement refractory counters — O(working_set) not O(n) (#164)
+                for nid in working_set:
+                    node = self.nodes[nid]
+                    if node.refractory_remaining > 0 and nid not in fired_set:
+                        node.refractory_remaining -= 1
+                for hid, he in self.hyperedges.items():
+                    if he.refractory_remaining > 0 and hid not in set(fired_ids):
+                        he.refractory_remaining -= 1
+
+                # Write mode: apply STDP plasticity on fired nodes
+                if write_mode and fired_ids:
+                    for rule in self._plasticity_rules:
+                        if isinstance(rule, STDPRule):
+                            rule.apply(self, fired_ids, prop_timestep)
+
+            # --- RESTORE (read mode only) ---
+            # In write mode: voltages, spike times, and weight changes persist.
+            # The exploration shaped the topology. That's the point.
+            if not write_mode:
+                for nid, node in self.nodes.items():
+                    node.voltage = saved_voltages.get(nid, node.resting_potential)
+                    node.refractory_remaining = saved_refractory.get(nid, 0)
+                for hid, he in self.hyperedges.items():
+                    he.refractory_remaining = saved_he_refractory.get(hid, 0)
+
+            # --- WRITE MODE: synapse sprouting for Tonic co-activations (#163) ---
+            # prime_and_propagate bypasses step()'s _recent_spikes tracking, so
+            # Tonic firings are invisible to _sprout_synapses. Fix: record all
+            # p&p-fired nodes at self.timestep-1 (past → window check passes),
+            # then call _sprout_synapses so co-activating nodes wire together.
+            if write_mode:
+                all_fired = list({e.node_id for e in result.fired_entries})
+                if all_fired:
+                    _record_ts = self.timestep - 1 if self.timestep > 0 else 0
+                    _window_cap = self.config["co_activation_window"] * 2
+                    for _nid in all_fired:
+                        self._recent_spikes.setdefault(
+                            _nid, deque(maxlen=_window_cap)
+                        ).append(_record_ts)
+                    self._sprout_synapses(all_fired)
+
+            # #59 age-on-write: the Tonic living IS the passage of time for the substrate.
+            # Age the substrate HERE, in the Tonic's own write cycle (one thread) — so idle
+            # thinking finally ages under-used edges (the melt): the reset above keeps Tonic-
+            # exercised synapses fresh, so only what the Tonic ISN'T touching climbs toward the
+            # inactivity threshold and culls. No rival stepping thread -> #109 stays intact;
+            # the full propagation now shares _step_lock with coherent capture (#423).
+            # IMPORTANT: does NOT advance self.timestep — that clock is shared with step()'s
+            # delayed-spike delivery (_delay_buffer, drained by exact-tick match), so stealing
+            # ticks here would strand conversational spikes permanently. The melt is driven by
+            # the per-synapse inactive_steps counter (incremented below, reset on use above),
+            # which needs no global clock. Gated (default off) + interval-bounded.
+            if _age_on:
+                self._tonic_age_counter += 1
+                _interval = max(1, int(self.config.get("tonic_age_interval", 1)))
+                if self._tonic_age_counter >= _interval:
+                    self._tonic_age_counter = 0
+                    with self._step_lock:
+                        _sal_decay = self.config.get("he_salience_decay_rate", 0.0)
+                        # Native whole-population aging (§12 item 4) — same op step()
+                        # uses (nf.py:2519). Numerically identical to the old Python
+                        # sweep: inactive_steps += 1 for every row, and salience > 1.0
+                        # relaxes by 1 + (s-1)*(1-decay) (a no-op when decay == 0).
+                        self.synapses.age_and_decay_salience(_sal_decay)
+                        self._prune_synapses()
+                        self._collect_orphan_nodes()
+
+            return result
 
     # -----------------------------------------------------------------------
     # Hyperedge Activation (PRD §4.2)
@@ -3829,7 +3855,8 @@ class Graph:
 
     def set_plasticity_rules(self, rules: List[PlasticityRule]) -> None:
         """Configure active plasticity rules (PRD §8 set_plasticity_rules)."""
-        self._plasticity_rules = list(rules)
+        with self._step_lock:
+            self._plasticity_rules = list(rules)
 
     def inject_reward(
         self,
@@ -3850,53 +3877,54 @@ class Graph:
             scope: Optional set of node IDs to limit reward scope.
                 If None, reward applies globally to all synapses with traces.
         """
-        lr = self.config["he_threshold_lr"]
-        self._total_rewards_injected += 1
-        self._reward_history.append({
-            "strength": strength,
-            "timestep": self.timestep,
-            "scope_size": len(scope) if scope else None,
-        })
-        # Cap reward history
-        if len(self._reward_history) > 1000:
-            self._reward_history = self._reward_history[-500:]
+        with self._step_lock:
+            lr = self.config["he_threshold_lr"]
+            self._total_rewards_injected += 1
+            self._reward_history.append({
+                "strength": strength,
+                "timestep": self.timestep,
+                "scope_size": len(scope) if scope else None,
+            })
+            # Cap reward history
+            if len(self._reward_history) > 1000:
+                self._reward_history = self._reward_history[-500:]
 
-        for syn in self.synapses.values():
-            if abs(syn.eligibility_trace) < 1e-9:
-                continue
-
-            # Apply scope filter
-            if scope is not None:
-                if syn.pre_node_id not in scope and syn.post_node_id not in scope:
+            for syn in self.synapses.values():
+                if abs(syn.eligibility_trace) < 1e-9:
                     continue
 
-            dw = syn.eligibility_trace * strength * self.config["learning_rate"]
-            syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
-            syn.eligibility_trace *= 0.9  # Decay trace after use
-            if syn.weight > syn.peak_weight:
-                syn.peak_weight = syn.weight
+                # Apply scope filter
+                if scope is not None:
+                    if syn.pre_node_id not in scope and syn.post_node_id not in scope:
+                        continue
 
-        # Hyperedge threshold learning (PRD §4.3)
-        for he in self.hyperedges.values():
-            if not he.is_learnable:
-                continue
-            # Scope check for hyperedges
-            if scope is not None:
-                if not he.member_nodes.intersection(scope):
+                dw = syn.eligibility_trace * strength * self.config["learning_rate"]
+                syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
+                syn.eligibility_trace *= 0.9  # Decay trace after use
+                if syn.weight > syn.peak_weight:
+                    syn.peak_weight = syn.weight
+
+            # Hyperedge threshold learning (PRD §4.3)
+            for he in self.hyperedges.values():
+                if not he.is_learnable:
                     continue
-            # Threshold adapts for recently-fired hyperedges
-            if he.refractory_remaining > 0:
-                if strength > 0:
-                    he.activation_threshold = max(0.1, he.activation_threshold - lr * strength)
-                else:
-                    he.activation_threshold = min(1.0, he.activation_threshold - lr * strength)
+                # Scope check for hyperedges
+                if scope is not None:
+                    if not he.member_nodes.intersection(scope):
+                        continue
+                # Threshold adapts for recently-fired hyperedges
+                if he.refractory_remaining > 0:
+                    if strength > 0:
+                        he.activation_threshold = max(0.1, he.activation_threshold - lr * strength)
+                    else:
+                        he.activation_threshold = min(1.0, he.activation_threshold - lr * strength)
 
-        self._emit(
-            "reward_injected",
-            strength=strength,
-            scope_size=len(scope) if scope else None,
-            timestep=self.timestep,
-        )
+            self._emit(
+                "reward_injected",
+                strength=strength,
+                scope_size=len(scope) if scope else None,
+                timestep=self.timestep,
+            )
 
     # -----------------------------------------------------------------------
     # Phase 2: Hierarchical Hyperedges (PRD §4.4)
@@ -3928,37 +3956,38 @@ class Graph:
         Returns:
             The new hierarchical Hyperedge (level = max(child levels) + 1).
         """
-        all_member_nodes: Set[str] = set()
-        max_child_level = 0
-        for chid in child_hyperedge_ids:
-            child = self.hyperedges.get(chid)
-            if child is None:
-                raise KeyError(f"Child hyperedge {chid} not found")
-            all_member_nodes.update(child.member_nodes)
-            max_child_level = max(max_child_level, child.level)
+        with self._step_lock:
+            all_member_nodes: Set[str] = set()
+            max_child_level = 0
+            for chid in child_hyperedge_ids:
+                child = self.hyperedges.get(chid)
+                if child is None:
+                    raise KeyError(f"Child hyperedge {chid} not found")
+                all_member_nodes.update(child.member_nodes)
+                max_child_level = max(max_child_level, child.level)
 
-        for nid in all_member_nodes:
-            if nid not in self.nodes:
-                raise KeyError(f"Member node {nid} not found")
+            for nid in all_member_nodes:
+                if nid not in self.nodes:
+                    raise KeyError(f"Member node {nid} not found")
 
-        he = Hyperedge(
-            member_nodes=all_member_nodes,
-            member_weights={nid: 1.0 for nid in all_member_nodes},
-            activation_threshold=activation_threshold,
-            activation_mode=activation_mode,
-            output_targets=output_targets or [],
-            output_weight=output_weight,
-            metadata=metadata or {},
-            is_learnable=True,
-            child_hyperedges=set(child_hyperedge_ids),
-            level=max_child_level + 1,
-        )
-        self.hyperedges[he.hyperedge_id] = he
-        for nid in all_member_nodes:
-            self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
-        self._he_co_fire_counts[he.hyperedge_id] = {}
-        self._dirty_hyperedges.add(he.hyperedge_id)
-        return he
+            he = Hyperedge(
+                member_nodes=all_member_nodes,
+                member_weights={nid: 1.0 for nid in all_member_nodes},
+                activation_threshold=activation_threshold,
+                activation_mode=activation_mode,
+                output_targets=output_targets or [],
+                output_weight=output_weight,
+                metadata=metadata or {},
+                is_learnable=True,
+                child_hyperedges=set(child_hyperedge_ids),
+                level=max_child_level + 1,
+            )
+            self.hyperedges[he.hyperedge_id] = he
+            for nid in all_member_nodes:
+                self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
+            self._he_co_fire_counts[he.hyperedge_id] = {}
+            self._dirty_hyperedges.add(he.hyperedge_id)
+            return he
 
     # -----------------------------------------------------------------------
     # Phase 2: Hyperedge Discovery (PRD §3.3.2 extended)
@@ -3977,98 +4006,99 @@ class Graph:
         Returns:
             List of newly discovered Hyperedges (may be empty).
         """
-        if len(fired_node_ids) < self.config["he_discovery_min_nodes"]:
-            return []
-
-        # #381-D (Syl: "lock discovery guards now"): an avalanche is an event,
-        # not a concept. A graph-scale co-firing set must not become a
-        # hyperedge — that is how a 3,790-member blob was born.
-        _max_frac = self.config.get("he_discovery_max_fraction", 0.05)
-        _max_set = max(self.config["he_discovery_min_nodes"],
-                       int(_max_frac * max(1, len(self.nodes))))
-        if len(fired_node_ids) > _max_set:
-            logger.info(
-                "HE discovery skipped: fired set of %d exceeds %.0f%% of the "
-                "graph (limit %d) — avalanche, not a concept (#381-D)",
-                len(fired_node_ids), _max_frac * 100, _max_set,
-            )
-            return []
-
-        window = self.config["he_discovery_window"]
-        min_fires = self.config["he_discovery_min_co_fires"]
-        min_nodes = self.config["he_discovery_min_nodes"]
-        overlap_threshold = self.config["he_discovery_overlap_threshold"]
-
-        # Reset discovery counts periodically
-        if self.timestep - self._he_discovery_last_reset > window * 2:
-            self._he_discovery_counts.clear()
-            self._he_discovery_last_reset = self.timestep
-
-        fired_set = set(fired_node_ids)
-
-        # Find the existing candidate with the best Jaccard overlap.
-        # Refining to the intersection on each match converges the candidate
-        # toward the reliable co-activation core, discarding peripheral nodes
-        # that don't fire consistently together.
-        best_key: Optional[Tuple[str, ...]] = None
-        best_jaccard = 0.0
-        for candidate_key in list(self._he_discovery_counts.keys()):
-            candidate_set = set(candidate_key)
-            union_size = len(fired_set | candidate_set)
-            if not union_size:
-                continue
-            jaccard = len(fired_set & candidate_set) / union_size
-            if jaccard >= overlap_threshold and jaccard > best_jaccard:
-                best_jaccard = jaccard
-                best_key = candidate_key
-
-        if best_key is not None:
-            # Refine candidate to intersection — drop nodes not in this firing
-            refined = tuple(sorted(fired_set & set(best_key)))
-            count = self._he_discovery_counts.pop(best_key)
-            if len(refined) < min_nodes:
-                # Intersection shrank below minimum — discard candidate
+        with self._step_lock:
+            if len(fired_node_ids) < self.config["he_discovery_min_nodes"]:
                 return []
-            self._he_discovery_counts[refined] = count + 1
-            active_key = refined
-        else:
-            # No overlapping candidate — start a new one from the full fired set
-            fired_sorted = tuple(sorted(fired_node_ids))
-            self._he_discovery_counts[fired_sorted] = (
-                self._he_discovery_counts.get(fired_sorted, 0) + 1
-            )
-            active_key = fired_sorted
 
-        discovered: List[Hyperedge] = []
+            # #381-D (Syl: "lock discovery guards now"): an avalanche is an event,
+            # not a concept. A graph-scale co-firing set must not become a
+            # hyperedge — that is how a 3,790-member blob was born.
+            _max_frac = self.config.get("he_discovery_max_fraction", 0.05)
+            _max_set = max(self.config["he_discovery_min_nodes"],
+                           int(_max_frac * max(1, len(self.nodes))))
+            if len(fired_node_ids) > _max_set:
+                logger.info(
+                    "HE discovery skipped: fired set of %d exceeds %.0f%% of the "
+                    "graph (limit %d) — avalanche, not a concept (#381-D)",
+                    len(fired_node_ids), _max_frac * 100, _max_set,
+                )
+                return []
 
-        if self._he_discovery_counts.get(active_key, 0) >= min_fires:
-            active_set = set(active_key)
-            _dup_j = self.config.get("he_discovery_dup_jaccard", 0.9)
-            already_exists = False
-            for _he in self.hyperedges.values():
-                if _he.is_archived or not _he.member_nodes:
+            window = self.config["he_discovery_window"]
+            min_fires = self.config["he_discovery_min_co_fires"]
+            min_nodes = self.config["he_discovery_min_nodes"]
+            overlap_threshold = self.config["he_discovery_overlap_threshold"]
+
+            # Reset discovery counts periodically
+            if self.timestep - self._he_discovery_last_reset > window * 2:
+                self._he_discovery_counts.clear()
+                self._he_discovery_last_reset = self.timestep
+
+            fired_set = set(fired_node_ids)
+
+            # Find the existing candidate with the best Jaccard overlap.
+            # Refining to the intersection on each match converges the candidate
+            # toward the reliable co-activation core, discarding peripheral nodes
+            # that don't fire consistently together.
+            best_key: Optional[Tuple[str, ...]] = None
+            best_jaccard = 0.0
+            for candidate_key in list(self._he_discovery_counts.keys()):
+                candidate_set = set(candidate_key)
+                union_size = len(fired_set | candidate_set)
+                if not union_size:
                     continue
-                _inter = len(active_set & _he.member_nodes)
-                if _inter and _inter / len(active_set | _he.member_nodes) >= _dup_j:
-                    already_exists = True
-                    break
-            if not already_exists and len(active_set) >= min_nodes:
-                valid_nodes = {nid for nid in active_set if nid in self.nodes}
-                if len(valid_nodes) >= min_nodes:
-                    he = self.create_hyperedge(
-                        valid_nodes,
-                        activation_threshold=0.6,
-                        metadata={"creation_mode": "discovered", "timestep": self.timestep},
-                    )
-                    # Phase 4: stamp creation_time for age-based promotion.
-                    he.creation_time = self.timestep
-                    discovered.append(he)
-                    self._total_he_discovered += 1
-                    self._emit("hyperedge_discovered", hid=he.hyperedge_id)
-            # Reset this pattern's counter
-            del self._he_discovery_counts[active_key]
+                jaccard = len(fired_set & candidate_set) / union_size
+                if jaccard >= overlap_threshold and jaccard > best_jaccard:
+                    best_jaccard = jaccard
+                    best_key = candidate_key
 
-        return discovered
+            if best_key is not None:
+                # Refine candidate to intersection — drop nodes not in this firing
+                refined = tuple(sorted(fired_set & set(best_key)))
+                count = self._he_discovery_counts.pop(best_key)
+                if len(refined) < min_nodes:
+                    # Intersection shrank below minimum — discard candidate
+                    return []
+                self._he_discovery_counts[refined] = count + 1
+                active_key = refined
+            else:
+                # No overlapping candidate — start a new one from the full fired set
+                fired_sorted = tuple(sorted(fired_node_ids))
+                self._he_discovery_counts[fired_sorted] = (
+                    self._he_discovery_counts.get(fired_sorted, 0) + 1
+                )
+                active_key = fired_sorted
+
+            discovered: List[Hyperedge] = []
+
+            if self._he_discovery_counts.get(active_key, 0) >= min_fires:
+                active_set = set(active_key)
+                _dup_j = self.config.get("he_discovery_dup_jaccard", 0.9)
+                already_exists = False
+                for _he in self.hyperedges.values():
+                    if _he.is_archived or not _he.member_nodes:
+                        continue
+                    _inter = len(active_set & _he.member_nodes)
+                    if _inter and _inter / len(active_set | _he.member_nodes) >= _dup_j:
+                        already_exists = True
+                        break
+                if not already_exists and len(active_set) >= min_nodes:
+                    valid_nodes = {nid for nid in active_set if nid in self.nodes}
+                    if len(valid_nodes) >= min_nodes:
+                        he = self.create_hyperedge(
+                            valid_nodes,
+                            activation_threshold=0.6,
+                            metadata={"creation_mode": "discovered", "timestep": self.timestep},
+                        )
+                        # Phase 4: stamp creation_time for age-based promotion.
+                        he.creation_time = self.timestep
+                        discovered.append(he)
+                        self._total_he_discovered += 1
+                        self._emit("hyperedge_discovered", hid=he.hyperedge_id)
+                # Reset this pattern's counter
+                del self._he_discovery_counts[active_key]
+
+            return discovered
 
     # -----------------------------------------------------------------------
     # Phase 2: Hyperedge Consolidation (PRD §4.3 extended)
@@ -4091,83 +4121,84 @@ class Graph:
             Number of hyperedges removed or archived by consolidation.
         """
         # #381-B: dream-side shedding runs first — lighter members, honester merges.
-        self.shed_floor_members()
+        with self._step_lock:
+            self.shed_floor_members()
 
-        overlap_threshold = self.config["he_consolidation_overlap"]
-        he_list = [(hid, he) for hid, he in self.hyperedges.items()
-                   if he.level == 0 and not he.is_archived]
-        to_remove: Set[str] = set()
-        merged_count = 0
+            overlap_threshold = self.config["he_consolidation_overlap"]
+            he_list = [(hid, he) for hid, he in self.hyperedges.items()
+                       if he.level == 0 and not he.is_archived]
+            to_remove: Set[str] = set()
+            merged_count = 0
 
-        for i in range(len(he_list)):
-            hid_a, he_a = he_list[i]
-            if hid_a in to_remove or he_a.is_archived:
-                continue
-            for j in range(i + 1, len(he_list)):
-                hid_b, he_b = he_list[j]
-                if hid_b in to_remove or he_b.is_archived:
+            for i in range(len(he_list)):
+                hid_a, he_a = he_list[i]
+                if hid_a in to_remove or he_a.is_archived:
                     continue
-
-                # Jaccard similarity
-                intersection = he_a.member_nodes & he_b.member_nodes
-                union = he_a.member_nodes | he_b.member_nodes
-                if not union:
-                    continue
-                jaccard = len(intersection) / len(union)
-
-                if jaccard >= overlap_threshold:
-                    _he_max = self.config.get("he_max_members", 50)
-                    _union = he_a.member_nodes | he_b.member_nodes
-                    if _he_max > 0 and len(_union) > _he_max:
-                        # #381-B seatbelt: union would exceed the bound —
-                        # growth-by-consolidation is how mega-HEs metastasize.
-                        # Archive the newer edge (dict order: he_a is older),
-                        # fold its firing history into the survivor. Archived
-                        # = preserved and reversible, never deleted.
-                        he_b.is_archived = True
-                        self._archived_hyperedges[hid_b] = he_b
-                        he_a.activation_count += he_b.activation_count
-                        if he_b.consolidation_state == ConsolidationState.SPECULATIVE:
-                            adapt_rate = self.config["he_consolidation_adapt_rate"]
-                            self._he_survival_ema = (
-                                (1.0 - adapt_rate) * self._he_survival_ema
-                            )
-                        merged_count += 1
-                        self._emit("hyperedge_archived", archived_id=hid_b,
-                                   subsumed_by=hid_a, reason="merge_seatbelt")
+                for j in range(i + 1, len(he_list)):
+                    hid_b, he_b = he_list[j]
+                    if hid_b in to_remove or he_b.is_archived:
                         continue
-                    # Merge B into A: expand A's members, keep lower threshold
-                    for nid in he_b.member_nodes - he_a.member_nodes:
-                        he_a.member_nodes.add(nid)
-                        he_a.member_weights[nid] = he_b.member_weights.get(nid, 1.0)
-                        self._node_hyperedges.setdefault(nid, set()).add(hid_a)
-                    he_a.activation_threshold = min(
-                        he_a.activation_threshold,
-                        he_b.activation_threshold,
+
+                    # Jaccard similarity
+                    intersection = he_a.member_nodes & he_b.member_nodes
+                    union = he_a.member_nodes | he_b.member_nodes
+                    if not union:
+                        continue
+                    jaccard = len(intersection) / len(union)
+
+                    if jaccard >= overlap_threshold:
+                        _he_max = self.config.get("he_max_members", 50)
+                        _union = he_a.member_nodes | he_b.member_nodes
+                        if _he_max > 0 and len(_union) > _he_max:
+                            # #381-B seatbelt: union would exceed the bound —
+                            # growth-by-consolidation is how mega-HEs metastasize.
+                            # Archive the newer edge (dict order: he_a is older),
+                            # fold its firing history into the survivor. Archived
+                            # = preserved and reversible, never deleted.
+                            he_b.is_archived = True
+                            self._archived_hyperedges[hid_b] = he_b
+                            he_a.activation_count += he_b.activation_count
+                            if he_b.consolidation_state == ConsolidationState.SPECULATIVE:
+                                adapt_rate = self.config["he_consolidation_adapt_rate"]
+                                self._he_survival_ema = (
+                                    (1.0 - adapt_rate) * self._he_survival_ema
+                                )
+                            merged_count += 1
+                            self._emit("hyperedge_archived", archived_id=hid_b,
+                                       subsumed_by=hid_a, reason="merge_seatbelt")
+                            continue
+                        # Merge B into A: expand A's members, keep lower threshold
+                        for nid in he_b.member_nodes - he_a.member_nodes:
+                            he_a.member_nodes.add(nid)
+                            he_a.member_weights[nid] = he_b.member_weights.get(nid, 1.0)
+                            self._node_hyperedges.setdefault(nid, set()).add(hid_a)
+                        he_a.activation_threshold = min(
+                            he_a.activation_threshold,
+                            he_b.activation_threshold,
+                        )
+                        he_a.activation_count += he_b.activation_count
+                        to_remove.add(hid_b)
+                        merged_count += 1
+
+            for hid in to_remove:
+                he = self.hyperedges.get(hid)
+                # Phase 4: penalize survival EMA for hyperedges pruned before graduating.
+                if he and he.consolidation_state == ConsolidationState.SPECULATIVE:
+                    adapt_rate = self.config["he_consolidation_adapt_rate"]
+                    self._he_survival_ema = (
+                        (1.0 - adapt_rate) * self._he_survival_ema + adapt_rate * 0.0
                     )
-                    he_a.activation_count += he_b.activation_count
-                    to_remove.add(hid_b)
-                    merged_count += 1
+                self._remove_hyperedge_internal(hid)
 
-        for hid in to_remove:
-            he = self.hyperedges.get(hid)
-            # Phase 4: penalize survival EMA for hyperedges pruned before graduating.
-            if he and he.consolidation_state == ConsolidationState.SPECULATIVE:
-                adapt_rate = self.config["he_consolidation_adapt_rate"]
-                self._he_survival_ema = (
-                    (1.0 - adapt_rate) * self._he_survival_ema + adapt_rate * 0.0
-                )
-            self._remove_hyperedge_internal(hid)
+            # --- Phase 2.5: Cross-level consistency pruning (subsumption) ---
+            archived_count = self._prune_subsumed_hyperedges()
+            merged_count += archived_count
 
-        # --- Phase 2.5: Cross-level consistency pruning (subsumption) ---
-        archived_count = self._prune_subsumed_hyperedges()
-        merged_count += archived_count
+            self._total_he_consolidated += merged_count
+            if merged_count > 0:
+                self._emit("hyperedges_consolidated", count=merged_count)
 
-        self._total_he_consolidated += merged_count
-        if merged_count > 0:
-            self._emit("hyperedges_consolidated", count=merged_count)
-
-        return merged_count
+            return merged_count
 
     def _seam_score_members(self, hid, he):
         """Per-member seam score for #147 splitting — member_weight primary plus the
@@ -4343,159 +4374,160 @@ class Graph:
         {**DEFAULT_CONFIG, **checkpoint} merges to False, so Syl's dream loop is a
         guaranteed no-op even if it ever calls this.
         """
-        if not self.config.get("he_split_oversized_enabled", False):
-            return 0
+        with self._step_lock:
+            if not self.config.get("he_split_oversized_enabled", False):
+                return 0
 
-        cap = self.config.get("he_max_members", 50)
-        if cap <= 0:
-            return 0
-        # Clamp the env-sourced tunables to [0,1] at the read site (LAW-ENF #147
-        # LOW): a fat-fingered CC_NG_HE_SPLIT_* value must not silently mis-cluster
-        # or invert the ranking. Fix at source — both daemon surfaces reach these
-        # through this one engine method, so both inherit the clamp.
-        dedup_overlap = min(1.0, max(0.0, self.config.get("he_split_dedup_overlap", 0.9)))
-        sim_threshold = min(1.0, max(0.0, self.config.get("he_split_sim_threshold", 0.6)))
+            cap = self.config.get("he_max_members", 50)
+            if cap <= 0:
+                return 0
+            # Clamp the env-sourced tunables to [0,1] at the read site (LAW-ENF #147
+            # LOW): a fat-fingered CC_NG_HE_SPLIT_* value must not silently mis-cluster
+            # or invert the ranking. Fix at source — both daemon surfaces reach these
+            # through this one engine method, so both inherit the clamp.
+            dedup_overlap = min(1.0, max(0.0, self.config.get("he_split_dedup_overlap", 0.9)))
+            sim_threshold = min(1.0, max(0.0, self.config.get("he_split_sim_threshold", 0.6)))
 
-        # Snapshot before mutating: non-archived, learnable, level-0, over-cap.
-        oversized = [
-            (hid, he) for hid, he in list(self.hyperedges.items())
-            if not he.is_archived and he.is_learnable
-            and he.level == 0 and len(he.member_nodes) > cap
-        ]
-        if not oversized:
-            return 0
+            # Snapshot before mutating: non-archived, learnable, level-0, over-cap.
+            oversized = [
+                (hid, he) for hid, he in list(self.hyperedges.items())
+                if not he.is_archived and he.is_learnable
+                and he.level == 0 and len(he.member_nodes) > cap
+            ]
+            if not oversized:
+                return 0
 
-        changed = 0
-        dropped = set()
+            changed = 0
+            dropped = set()
 
-        # ---- Stage 1: dedup near-identical over-cap edges (incumbent survives) ----
-        for hid, he in oversized:
-            if hid in dropped or he.is_archived:
-                continue
-            for hid2, he2 in oversized:
-                if hid2 == hid or hid2 in dropped or he2.is_archived:
+            # ---- Stage 1: dedup near-identical over-cap edges (incumbent survives) ----
+            for hid, he in oversized:
+                if hid in dropped or he.is_archived:
                     continue
-                union = he.member_nodes | he2.member_nodes
-                if not union:
+                for hid2, he2 in oversized:
+                    if hid2 == hid or hid2 in dropped or he2.is_archived:
+                        continue
+                    union = he.member_nodes | he2.member_nodes
+                    if not union:
+                        continue
+                    if len(he.member_nodes & he2.member_nodes) / len(union) < dedup_overlap:
+                        continue
+                    # Fold he2 into he: max-merge weights, absorb novel members, carry
+                    # member_since, sum activation_count, archive he2 (reversible).
+                    since = he.metadata.setdefault("member_since", {})
+                    since2 = he2.metadata.get("member_since", {}) or {}
+                    for nid in he2.member_nodes:
+                        w2 = he2.member_weights.get(nid, 1.0)
+                        if nid in he.member_nodes:
+                            he.member_weights[nid] = max(
+                                he.member_weights.get(nid, w2), w2)
+                        else:
+                            he.member_nodes.add(nid)
+                            he.member_weights[nid] = w2
+                            self._node_hyperedges.setdefault(nid, set()).add(hid)
+                        if nid in since2 and nid not in since:
+                            since[nid] = since2[nid]
+                    he.activation_count += he2.activation_count
+                    he2.is_archived = True
+                    self._archived_hyperedges[hid2] = he2
+                    # Rewire the reverse index off the archived dup.
+                    for nid in list(he2.member_nodes):
+                        hs = self._node_hyperedges.get(nid)
+                        if hs is not None:
+                            hs.discard(hid2)
+                            if not hs:
+                                self._node_hyperedges.pop(nid, None)
+                    dropped.add(hid2)
+                    changed += 1
+                    self._emit("hyperedge_archived", archived_id=hid2,
+                               subsumed_by=hid, reason="seam_split_dedup")
+
+            # ---- Stage 2: weight-seam split of still-oversized survivors ----
+            for hid, he in oversized:
+                if hid in dropped or he.is_archived or len(he.member_nodes) <= cap:
                     continue
-                if len(he.member_nodes & he2.member_nodes) / len(union) < dedup_overlap:
+
+                weights = he.member_weights
+                since = he.metadata.get("member_since", {}) or {}
+                # 7-signal seam score (plan §Deliverables/Tier-2): member_weight is the
+                # primary axis; six auxiliary signals refine core-vs-peel. Signals that
+                # are flat across the HE's members min-max to a constant and thus do not
+                # discriminate — graceful degradation for the §8.15 clock-gated caveat,
+                # so the same code is correct on the clock-live VPS and the laptop.
+                seam = self._seam_score_members(hid, he)
+                members = sorted(he.member_nodes,
+                                 key=lambda nid: seam.get(nid, 0.0), reverse=True)
+                core = members[:cap]
+                periphery = members[cap:]
+                if not periphery:
                     continue
-                # Fold he2 into he: max-merge weights, absorb novel members, carry
-                # member_since, sum activation_count, archive he2 (reversible).
-                since = he.metadata.setdefault("member_since", {})
-                since2 = he2.metadata.get("member_since", {}) or {}
-                for nid in he2.member_nodes:
-                    w2 = he2.member_weights.get(nid, 1.0)
-                    if nid in he.member_nodes:
-                        he.member_weights[nid] = max(
-                            he.member_weights.get(nid, w2), w2)
-                    else:
-                        he.member_nodes.add(nid)
-                        he.member_weights[nid] = w2
-                        self._node_hyperedges.setdefault(nid, set()).add(hid)
-                    if nid in since2 and nid not in since:
-                        since[nid] = since2[nid]
-                he.activation_count += he2.activation_count
-                he2.is_archived = True
-                self._archived_hyperedges[hid2] = he2
-                # Rewire the reverse index off the archived dup.
-                for nid in list(he2.member_nodes):
+
+                # Group the peel by cosine; no-vector members -> one residual edge.
+                clusters = self._seam_cluster_periphery(
+                    periphery, vector_db, sim_threshold, cap)
+
+                def _mint(group, is_core):
+                    mw = {nid: weights.get(nid, 1.0) for nid in group}
+                    meta = {"creation_mode": "seam_split", "parent_blob": hid}
+                    # NB: children intentionally do NOT inherit the parent's
+                    # output_targets/output_weight — a peeled periphery is a new
+                    # structural grouping, not the parent's prediction head. Accepted
+                    # semantic loss (LAW-ENF #147 LOW), not a bug.
+                    if is_core:
+                        meta["core"] = True
+                    if since:
+                        ms = {nid: since[nid] for nid in group if nid in since}
+                        if ms:
+                            meta["member_since"] = ms
+                    child = self.create_hyperedge(
+                        member_node_ids=set(group),
+                        member_weights=mw,
+                        activation_threshold=he.activation_threshold,
+                        activation_mode=he.activation_mode,
+                        metadata=meta,
+                    )
+                    return child.hyperedge_id
+
+                child_ids = [_mint(core, True)]
+                for grp in clusters:
+                    if len(grp) >= 2:            # skip degenerate singletons; folded below
+                        child_ids.append(_mint(grp, False))
+
+                # Orphan-safety: guarantee every parent member landed in >=1 child.
+                covered = set()
+                for cid in child_ids:
+                    covered |= self.hyperedges[cid].member_nodes
+                missing = set(he.member_nodes) - covered
+                if missing:
+                    core_he = self.hyperedges[child_ids[0]]
+                    for nid in missing:
+                        core_he.member_nodes.add(nid)
+                        core_he.member_weights[nid] = weights.get(nid, 1.0)
+                        self._node_hyperedges.setdefault(nid, set()).add(child_ids[0])
+
+                # Archive the parent (reversible) and drop it from the reverse index.
+                he.is_archived = True
+                self._archived_hyperedges[hid] = he
+                for nid in list(he.member_nodes):
                     hs = self._node_hyperedges.get(nid)
                     if hs is not None:
-                        hs.discard(hid2)
+                        hs.discard(hid)
                         if not hs:
                             self._node_hyperedges.pop(nid, None)
-                dropped.add(hid2)
                 changed += 1
-                self._emit("hyperedge_archived", archived_id=hid2,
-                           subsumed_by=hid, reason="seam_split_dedup")
-
-        # ---- Stage 2: weight-seam split of still-oversized survivors ----
-        for hid, he in oversized:
-            if hid in dropped or he.is_archived or len(he.member_nodes) <= cap:
-                continue
-
-            weights = he.member_weights
-            since = he.metadata.get("member_since", {}) or {}
-            # 7-signal seam score (plan §Deliverables/Tier-2): member_weight is the
-            # primary axis; six auxiliary signals refine core-vs-peel. Signals that
-            # are flat across the HE's members min-max to a constant and thus do not
-            # discriminate — graceful degradation for the §8.15 clock-gated caveat,
-            # so the same code is correct on the clock-live VPS and the laptop.
-            seam = self._seam_score_members(hid, he)
-            members = sorted(he.member_nodes,
-                             key=lambda nid: seam.get(nid, 0.0), reverse=True)
-            core = members[:cap]
-            periphery = members[cap:]
-            if not periphery:
-                continue
-
-            # Group the peel by cosine; no-vector members -> one residual edge.
-            clusters = self._seam_cluster_periphery(
-                periphery, vector_db, sim_threshold, cap)
-
-            def _mint(group, is_core):
-                mw = {nid: weights.get(nid, 1.0) for nid in group}
-                meta = {"creation_mode": "seam_split", "parent_blob": hid}
-                # NB: children intentionally do NOT inherit the parent's
-                # output_targets/output_weight — a peeled periphery is a new
-                # structural grouping, not the parent's prediction head. Accepted
-                # semantic loss (LAW-ENF #147 LOW), not a bug.
-                if is_core:
-                    meta["core"] = True
-                if since:
-                    ms = {nid: since[nid] for nid in group if nid in since}
-                    if ms:
-                        meta["member_since"] = ms
-                child = self.create_hyperedge(
-                    member_node_ids=set(group),
-                    member_weights=mw,
-                    activation_threshold=he.activation_threshold,
-                    activation_mode=he.activation_mode,
-                    metadata=meta,
+                self._emit("hyperedge_seam_split", parent_id=hid,
+                           child_ids=list(child_ids),
+                           core_size=len(core), periphery_size=len(periphery))
+                logger.info(
+                    "Dream seam-split: blob %s (%d members) -> core %d + %d peripheral "
+                    "sub-edge(s) [%d children total] (#147)",
+                    hid, len(he.member_nodes), len(core),
+                    len(child_ids) - 1, len(child_ids),
                 )
-                return child.hyperedge_id
 
-            child_ids = [_mint(core, True)]
-            for grp in clusters:
-                if len(grp) >= 2:            # skip degenerate singletons; folded below
-                    child_ids.append(_mint(grp, False))
-
-            # Orphan-safety: guarantee every parent member landed in >=1 child.
-            covered = set()
-            for cid in child_ids:
-                covered |= self.hyperedges[cid].member_nodes
-            missing = set(he.member_nodes) - covered
-            if missing:
-                core_he = self.hyperedges[child_ids[0]]
-                for nid in missing:
-                    core_he.member_nodes.add(nid)
-                    core_he.member_weights[nid] = weights.get(nid, 1.0)
-                    self._node_hyperedges.setdefault(nid, set()).add(child_ids[0])
-
-            # Archive the parent (reversible) and drop it from the reverse index.
-            he.is_archived = True
-            self._archived_hyperedges[hid] = he
-            for nid in list(he.member_nodes):
-                hs = self._node_hyperedges.get(nid)
-                if hs is not None:
-                    hs.discard(hid)
-                    if not hs:
-                        self._node_hyperedges.pop(nid, None)
-            changed += 1
-            self._emit("hyperedge_seam_split", parent_id=hid,
-                       child_ids=list(child_ids),
-                       core_size=len(core), periphery_size=len(periphery))
-            logger.info(
-                "Dream seam-split: blob %s (%d members) -> core %d + %d peripheral "
-                "sub-edge(s) [%d children total] (#147)",
-                hid, len(he.member_nodes), len(core),
-                len(child_ids) - 1, len(child_ids),
-            )
-
-        if changed:
-            self._emit("hyperedges_seam_split_pass", count=changed)
-        return changed
+            if changed:
+                self._emit("hyperedges_seam_split_pass", count=changed)
+            return changed
 
     def _seam_cluster_periphery(self, node_ids, vector_db, sim_threshold, cap):
         """Greedy cosine grouping of the peeled periphery into coherent sub-edges of
@@ -4625,38 +4657,39 @@ class Graph:
         structural (LAW 7); loud (LAW 3); wake path never calls this — it
         runs only from consolidate_hyperedges (the dream pass).
         """
-        shed_thresh = self.config.get("he_shed_weight_threshold", 0.02)
-        min_keep = self.config["he_discovery_min_nodes"]
-        min_tenure = self.config.get("he_shed_min_tenure", 50)
-        total = 0
-        for hid, he in self.hyperedges.items():
-            if he.is_archived or not he.is_learnable:
-                continue
-            since = he.metadata.get("member_since", {})
-            candidates = [
-                nid for nid in list(he.member_nodes)
-                if he.member_weights.get(nid, 1.0) <= shed_thresh
-                and (self.timestep - since.get(nid, 0)) >= min_tenure
-            ]
-            allowed = max(0, len(he.member_nodes) - min_keep)
-            for nid in candidates[:allowed]:
-                he.member_nodes.discard(nid)
-                he.member_weights.pop(nid, None)
-                if isinstance(since, dict):
-                    since.pop(nid, None)
-                hset = self._node_hyperedges.get(nid)
-                if hset is not None:
-                    hset.discard(hid)
-                    if not hset:
-                        self._node_hyperedges.pop(nid, None)
-                total += 1
-        if total:
-            logger.info(
-                "Dream shed: removed %d floor-weight member(s) across "
-                "hyperedges (#381-B)", total,
-            )
-            self._emit("hyperedge_members_shed", count=total)
-        return total
+        with self._step_lock:
+            shed_thresh = self.config.get("he_shed_weight_threshold", 0.02)
+            min_keep = self.config["he_discovery_min_nodes"]
+            min_tenure = self.config.get("he_shed_min_tenure", 50)
+            total = 0
+            for hid, he in self.hyperedges.items():
+                if he.is_archived or not he.is_learnable:
+                    continue
+                since = he.metadata.get("member_since", {})
+                candidates = [
+                    nid for nid in list(he.member_nodes)
+                    if he.member_weights.get(nid, 1.0) <= shed_thresh
+                    and (self.timestep - since.get(nid, 0)) >= min_tenure
+                ]
+                allowed = max(0, len(he.member_nodes) - min_keep)
+                for nid in candidates[:allowed]:
+                    he.member_nodes.discard(nid)
+                    he.member_weights.pop(nid, None)
+                    if isinstance(since, dict):
+                        since.pop(nid, None)
+                    hset = self._node_hyperedges.get(nid)
+                    if hset is not None:
+                        hset.discard(hid)
+                        if not hset:
+                            self._node_hyperedges.pop(nid, None)
+                    total += 1
+            if total:
+                logger.info(
+                    "Dream shed: removed %d floor-weight member(s) across "
+                    "hyperedges (#381-B)", total,
+                )
+                self._emit("hyperedge_members_shed", count=total)
+            return total
 
     # -----------------------------------------------------------------------
     # Phase 4: Consolidation Lifecycle
@@ -4864,27 +4897,87 @@ class Graph:
     # Persistence (PRD §6)
     # -----------------------------------------------------------------------
 
-    def checkpoint(self, path: str, mode: CheckpointMode = CheckpointMode.FULL) -> None:
-        """Save state (PRD §8 checkpoint, §6).
+    # ---- Changelog ----
+    # [2026-09-11] Claude Code + Codex — #423: capture/write split and mutation guards
+    # What: checkpoint() factored into capture_checkpoint(mode[, detach]) -> dict and
+    #       write_checkpoint(path, captured[, mode]). checkpoint() now delegates to both
+    #       and is byte-for-byte identical to the previous implementation.
+    # Why:  A coherent checkpoint needs the in-RAM capture to finish at a coordinated
+    #       boundary between completed mutations, with all disk I/O performed AFTER live
+    #       mutation resumes. That is impossible while capture and write are fused in one
+    #       method. The coordination boundary itself is the CALLER's (openclaw_hook)
+    #       responsibility — these primitives only make the split expressible.
+    # How:  Mode dispatch + serialization moved into capture_checkpoint; msgpack
+    #       enforcement + streaming write moved verbatim into write_checkpoint. Optional
+    #       detach= copies borrowed mutable subtrees during serialization and excludes
+    #       the newly packed native synapse bytes. Default detach=True
+    #       makes standalone capture detached too — the detached footprint is UNMEASURED on
+    #       live-substrate sizes and must be measured before live use (#423).
+    # -------------------
+    def capture_checkpoint(
+        self,
+        mode: CheckpointMode = CheckpointMode.FULL,
+        detach: bool = True,
+    ) -> Dict[str, Any]:
+        """Capture serializable checkpoint state in RAM — performs NO disk I/O.
+
+        Intended to be called at a coordinated boundary between completed mutations;
+        the returned mapping is then handed to :meth:`write_checkpoint` after live
+        mutation has resumed. This method acquires the canonical ``_step_lock``. The producer holds
+        that same reentrant lock across all component captures so that graph,
+        vectors and activations share one boundary.
 
         Args:
-            path: File path (extension determines format: .json or .msgpack).
             mode: FULL, INCREMENTAL, or FORK.
-        """
-        if mode == CheckpointMode.FULL:
-            data = self._serialize_full()
-        elif mode == CheckpointMode.INCREMENTAL:
-            data = self._serialize_incremental()
-            # Clear dirty flags after incremental save
-            self._dirty_nodes.clear()
-            self._dirty_synapses.clear()
-            self._dirty_hyperedges.clear()
-        elif mode == CheckpointMode.FORK:
-            data = self._serialize_full()
-            data["_fork"] = True
-        else:
-            raise ValueError(f"Unknown checkpoint mode: {mode}")
+            detach: When True, deep-copy borrowed mutable subtrees so no live mutable object
+                (``config``, per-node/hyperedge ``metadata``, histories, …) remains
+                aliased into it. Delay buffers and similar scalar collections are rebuilt.
+                The newly packed native synapse payload is excluded from the deep-copy. When explicitly False
+                the capture aliases live mutable state exactly as before this split —
+                cheaper, but not a point-in-time snapshot of those fields.
 
+        Returns:
+            The checkpoint mapping, suitable for :meth:`write_checkpoint`.
+
+        Note:
+            INCREMENTAL clears the dirty-flag sets only after successful serialization.
+            A copy failure therefore leaves them available for a later capture retry.
+        """
+        with self._step_lock:
+            memo = {} if detach else None
+            if mode == CheckpointMode.FULL:
+                data = self._serialize_full(_memo=memo)
+            elif mode == CheckpointMode.INCREMENTAL:
+                data = self._serialize_incremental(_memo=memo)
+                # Clear dirty flags after incremental save
+                self._dirty_nodes.clear()
+                self._dirty_synapses.clear()
+                self._dirty_hyperedges.clear()
+            elif mode == CheckpointMode.FORK:
+                data = self._serialize_full(_memo=memo)
+                data["_fork"] = True
+            else:
+                raise ValueError(f"Unknown checkpoint mode: {mode}")
+
+            return data
+
+    def write_checkpoint(
+        self,
+        path: str,
+        captured: Dict[str, Any],
+        mode: Optional[CheckpointMode] = None,
+    ) -> None:
+        """Write a previously captured checkpoint mapping to disk.
+
+        Pure I/O: no live graph state is read here, so this may run after live
+        mutation has resumed.
+
+        Args:
+            path: Destination path. Must end in ``.msgpack`` (see #325).
+            captured: Mapping returned by :meth:`capture_checkpoint`.
+            mode: Originating mode, used only to make the format-refusal message
+                name the mode that produced the capture.
+        """
         # #325 — topology persistence is msgpack-ONLY. JSON is LOSSY here: json.dump(default=str)
         # stringifies numpy/bytes/float32 fields (pred_weights, delay buffers, etc.) into reprs
         # that cannot round-trip. All CheckpointMode values (FULL/INCREMENTAL/FORK) serialize
@@ -4892,29 +4985,48 @@ class Graph:
         # extension. A non-.msgpack path is refused LOUDLY at the source rather than silently
         # corrupting state. (Was: else-branch silently wrote lossy JSON for any non-.msgpack path.)
         if not path.endswith(".msgpack"):
+            _mode_note = (
+                f" (CheckpointMode.{mode.name} enforces msgpack)" if mode is not None else ""
+            )
             raise ValueError(
                 f"Topology checkpoint requires a '.msgpack' path; got {path!r}. JSON serialization "
-                f"is lossy for full-fidelity SNN state and is not supported "
-                f"(CheckpointMode.{mode.name} enforces msgpack). See punchlist #325."
+                f"is lossy for full-fidelity SNN state and is not supported"
+                f"{_mode_note}. See punchlist #325."
             )
         if msgpack is None:
             raise ImportError("msgpack required for topology serialization")
         # #RAM footprint — stream the outer checkpoint map, splicing the native
         # pre-packed synapses bytes VERBATIM instead of packing a 644K-entry dict.
-        # For FULL/FORK, data["synapses"] is the raw msgpack bytes from
+        # For FULL/FORK, captured["synapses"] is the raw msgpack bytes from
         # to_checkpoint_msgpack() (byte-identical to packing the dict, per the
         # crate's round-trip tests); for INCREMENTAL it is a normal (small) dict,
         # which packs the ordinary way. The result is byte-identical to
-        # msgpack.pack(data, ...) either way.
+        # msgpack.pack(captured, ...) either way.
         packer = msgpack.Packer(use_bin_type=True)
         with open(path, "wb") as f:
-            f.write(packer.pack_map_header(len(data)))
-            for key, value in data.items():
+            f.write(packer.pack_map_header(len(captured)))
+            for key, value in captured.items():
                 f.write(packer.pack(key))
                 if key == "synapses" and isinstance(value, (bytes, bytearray)):
                     f.write(value)  # verbatim pre-packed {sid: {15-key}} map
                 else:
                     f.write(packer.pack(value))
+
+    def checkpoint(self, path: str, mode: CheckpointMode = CheckpointMode.FULL) -> None:
+        """Save state (PRD §8 checkpoint, §6).
+
+        Capture-then-write, fused: equivalent to ``write_checkpoint(path,
+        capture_checkpoint(mode), mode)``. Use the two primitives directly when the
+        capture must complete at a coordination boundary and the write must happen
+        after live mutation resumes (#423).
+
+        Args:
+            path: File path (must be .msgpack — see #325).
+            mode: FULL, INCREMENTAL, or FORK.
+        """
+        if not path.endswith(".msgpack"):
+            raise ValueError("Topology checkpoint requires a '.msgpack' path")
+        self.write_checkpoint(path, self.capture_checkpoint(mode), mode)
 
     def restore(self, path: str) -> None:
         """Load state from checkpoint (PRD §8 restore, §6)."""
@@ -4966,7 +5078,7 @@ class Graph:
 
         self._deserialize(data)
 
-    def _serialize_node(self, node: Node) -> Dict[str, Any]:
+    def _serialize_node(self, node: Node, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
         return {
             "node_id": node.node_id,
             "voltage": node.voltage,
@@ -4979,27 +5091,27 @@ class Graph:
             "spike_history_capacity": node.spike_history.capacity,
             "firing_rate_ema": node.firing_rate_ema,
             "intrinsic_excitability": node.intrinsic_excitability,
-            "metadata": node.metadata,
+            "metadata": copy.deepcopy(node.metadata, _memo) if _memo is not None else node.metadata,
             "is_inhibitory": node.is_inhibitory,
             "Ca_i": node.Ca_i,
             "diffpc_layer": node.diffpc_layer,
-            "pred_weights": node.pred_weights,
+            "pred_weights": copy.deepcopy(node.pred_weights, _memo) if _memo is not None else node.pred_weights,
             "pred_error_ema": node.pred_error_ema,
             "manifold_type": node.manifold_type,
             "creation_time": node.creation_time,
         }
 
-    def _serialize_hyperedge(self, he: Hyperedge) -> Dict[str, Any]:
+    def _serialize_hyperedge(self, he: Hyperedge, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
         return {
             "hyperedge_id": he.hyperedge_id,
             "member_nodes": list(he.member_nodes),
-            "member_weights": he.member_weights,
+            "member_weights": copy.deepcopy(he.member_weights, _memo) if _memo is not None else he.member_weights,
             "activation_threshold": he.activation_threshold,
             "activation_mode": he.activation_mode.name,
             "current_activation": he.current_activation,
-            "output_targets": he.output_targets,
+            "output_targets": copy.deepcopy(he.output_targets, _memo) if _memo is not None else he.output_targets,
             "output_weight": he.output_weight,
-            "metadata": he.metadata,
+            "metadata": copy.deepcopy(he.metadata, _memo) if _memo is not None else he.metadata,
             "is_learnable": he.is_learnable,
             "refractory_period": he.refractory_period,
             "refractory_remaining": he.refractory_remaining,
@@ -5041,11 +5153,13 @@ class Graph:
             "confirmed_targets": list(ps.confirmed_targets),
         }
 
-    def _serialize_full(self) -> Dict[str, Any]:
-        # Snapshot all mutable dicts before building the return value.
-        # Tonic runs prime_and_propagate(write_mode=True) concurrently and
-        # can add nodes/synapses between iterations — list() gives us a
-        # stable view without pausing the latent thread.
+    def _serialize_full(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
+        # Row containers and scalar-only history lists are freshly allocated here.
+        # Only borrowed mutable subtrees need recursive copying. A capture-local
+        # memo preserves aliases/cycles across those subtrees without traversing
+        # every new row a second time. None preserves the legacy serializer's
+        # aliasing contract. capture_checkpoint holds _step_lock throughout;
+        # list(items()) alone would not provide a coherent mutation boundary.
         _nodes      = list(self.nodes.items())
         _hyperedges = list(self.hyperedges.items())
         _archived   = list(self._archived_hyperedges.items())
@@ -5055,20 +5169,24 @@ class Graph:
         _delay_buf  = list(self._delay_buffer.items())
         _recent_spk = [(nid, spikes) for nid, spikes
                        in self._recent_spikes.items() if spikes]
+        # The native backend creates this packed payload for the capture. It does
+        # not borrow live state, and bytearray is intentionally not deep-copied:
+        # that would duplicate the largest capture allocation inside _step_lock.
+        _packed_synapses = self.synapses.to_checkpoint_msgpack()
         return {
             "version": "0.4.2",
             "timestep": self.timestep,
-            "config": self.config,
-            "nodes": {nid: self._serialize_node(n) for nid, n in _nodes},
+            "config": copy.deepcopy(self.config, _memo) if _memo is not None else self.config,
+            "nodes": {nid: self._serialize_node(n, _memo=_memo) for nid, n in _nodes},
             # Native pre-packed synapses map (#RAM footprint): to_checkpoint_msgpack
             # emits the {synapse_id: {15-key}} MessagePack bytes directly from the Rust
             # columns — byte-identical to packb(to_checkpoint_dict()) but WITHOUT
             # materializing ~644K transient Python dicts. checkpoint() splices these
             # bytes verbatim into the outer map (see the streaming write below).
-            "synapses": self.synapses.to_checkpoint_msgpack(),
-            "hyperedges": {hid: self._serialize_hyperedge(h) for hid, h in _hyperedges},
+            "synapses": _packed_synapses,
+            "hyperedges": {hid: self._serialize_hyperedge(h, _memo=_memo) for hid, h in _hyperedges},
             "archived_hyperedges": {
-                hid: self._serialize_hyperedge(h)
+                hid: self._serialize_hyperedge(h, _memo=_memo)
                 for hid, h in _archived
             },
             # Phase 3: Active synapse-level predictions
@@ -5082,7 +5200,7 @@ class Graph:
                     "prediction": self._serialize_prediction(po.prediction),
                     "confirmed": po.confirmed,
                     "resolved_at": po.resolved_at,
-                    "actual_firing_nodes": po.actual_firing_nodes,
+                    "actual_firing_nodes": copy.deepcopy(po.actual_firing_nodes, _memo) if _memo is not None else po.actual_firing_nodes,
                 }
                 for po in self._prediction_outcomes
             ],
@@ -5092,8 +5210,8 @@ class Graph:
                 for syn_id, history in _syn_hist
             },
             # Phase 3: Logs
-            "novel_sequence_log": list(self._novel_sequence_log),
-            "reward_history": list(self._reward_history),
+            "novel_sequence_log": copy.deepcopy(list(self._novel_sequence_log), _memo) if _memo is not None else list(self._novel_sequence_log),
+            "reward_history": copy.deepcopy(list(self._reward_history), _memo) if _memo is not None else list(self._reward_history),
             # Phase 2.5: Active HE-level predictions
             "he_active_predictions": {
                 pid: self._serialize_prediction_state(ps)
@@ -5135,8 +5253,8 @@ class Graph:
             "total_he_state_transitions":  self._total_he_state_transitions,
             "total_he_substrate_culled":   self._total_he_substrate_culled,
             # Phase 2.5b: Output target learning state
-            "he_last_fired_step":  self._he_last_fired_step,
-            "he_output_candidates": self._he_output_candidates,
+            "he_last_fired_step": copy.deepcopy(self._he_last_fired_step, _memo) if _memo is not None else self._he_last_fired_step,
+            "he_output_candidates": copy.deepcopy(self._he_output_candidates, _memo) if _memo is not None else self._he_output_candidates,
             # v0.4.2 Hibernation state — ephemeral process counters serialized so
             # subprocess loads (CC hook, Codemine worker) believe the process never
             # stopped. Without these, homeostatic scaling never fires, in-flight spikes
@@ -5158,23 +5276,24 @@ class Graph:
             ),
         }
 
-    def _serialize_incremental(self) -> Dict[str, Any]:
+    def _serialize_incremental(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
         return {
             "version": "0.1.0",
             "incremental": True,
             "timestep": self.timestep,
             "nodes": {
-                nid: self._serialize_node(self.nodes[nid])
+                nid: self._serialize_node(self.nodes[nid], _memo=_memo)
                 for nid in self._dirty_nodes
                 if nid in self.nodes
             },
             "synapses": {
-                sid: self.synapses.serialize_one(sid)
+                sid: (copy.deepcopy(self.synapses.serialize_one(sid), _memo)
+                      if _memo is not None else self.synapses.serialize_one(sid))
                 for sid in self._dirty_synapses
                 if sid in self.synapses
             },
             "hyperedges": {
-                hid: self._serialize_hyperedge(self.hyperedges[hid])
+                hid: self._serialize_hyperedge(self.hyperedges[hid], _memo=_memo)
                 for hid in self._dirty_hyperedges
                 if hid in self.hyperedges
             },

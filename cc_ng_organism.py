@@ -3,6 +3,14 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-11] Codex — re-adopt retained raw input across restart only when
+#   its durable journal has no attempt records; any attempted input stays fenced.
+# [2026-09-11] Codex — terminal accepted deliveries survive normal restarts;
+#   ownership fences unresolved attempts, not verified completed delivery.
+# [2026-09-11] Codex — #423 retain raw delivery and journal attempts before learning.
+# What: receipt-gated gateway acceptance; restart ambiguity retained for reconciliation.
+# Why: refused checkpoint saves must not delete conversational experience.
+# How: local SQLite transport journal, per-record graph locks, canonical dual-pass.
 # [2026-09-11] Codex + native CC review — raw Leg1 experience is not topology merge.
 # What: one experience record per lock slice; no synthetic consolidation/graph.step.
 # Why: Josh confines FatherGraph 25/250 to topology. Raw text uses conversational dual-pass.
@@ -742,61 +750,62 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
 
     Adapted from Syl's _surface_wants() in neurograph_rpc.py for CC's own graph.
     """
-    import re
-    import hashlib
-    if graph is None:
-        return []
-    open_wants = []
-    for nid, node in list(graph.nodes.items()):
-        meta = getattr(node, "metadata", None) or {}
-        if meta.get("kind") == "want":
-            if meta.get("want_state", "open") == "open":
-                open_wants.append({
-                    "id": nid,
-                    "text": meta.get("want_text", ""),
-                    "provenance": meta.get("provenance"),
-                    "state": "open",
-                    "source": meta.get("source_node"),
-                })
-            continue
-        if meta.get("creation_mode") != "conversational":
-            continue
-        content = (vdb.content.get(nid) if vdb is not None else "") or ""
-        if "[WANT]" not in content:
-            continue
-        for m in re.finditer(r'\[WANT\](.*?)\[/WANT\]', content, re.DOTALL):
-            inner = m.group(1).strip()
-            if not inner:
+    with _cc_mutation_lock(graph):
+        import re
+        import hashlib
+        if graph is None:
+            return []
+        open_wants = []
+        for nid, node in list(graph.nodes.items()):
+            meta = getattr(node, "metadata", None) or {}
+            if meta.get("kind") == "want":
+                if meta.get("want_state", "open") == "open":
+                    open_wants.append({
+                        "id": nid,
+                        "text": meta.get("want_text", ""),
+                        "provenance": meta.get("provenance"),
+                        "state": "open",
+                        "source": meta.get("source_node"),
+                    })
                 continue
-            want_id = "want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
-            if want_id in graph.nodes:
+            if meta.get("creation_mode") != "conversational":
                 continue
-            try:
-                graph.create_node(
-                    node_id=want_id,
-                    metadata={
-                        "kind": "want",
-                        "want_text": inner,
-                        "want_state": "open",
-                        "provenance": "cc_authored",
-                        "source_node": nid,
-                        "creation_mode": "conversational",
-                    }
-                )
+            content = (vdb.content.get(nid) if vdb is not None else "") or ""
+            if "[WANT]" not in content:
+                continue
+            for m in re.finditer(r'\[WANT\](.*?)\[/WANT\]', content, re.DOTALL):
+                inner = m.group(1).strip()
+                if not inner:
+                    continue
+                want_id = "want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
+                if want_id in graph.nodes:
+                    continue
                 try:
-                    graph.create_synapse(nid, want_id, weight=0.3)
-                except Exception:  # noqa: BLE001
-                    pass
-                open_wants.append({
-                    "id": want_id,
-                    "text": inner,
-                    "provenance": "cc_authored",
-                    "state": "open",
-                    "source": nid,
-                })
-            except Exception as exc:
-                logger.debug("Failed to create want node: %s", exc)
-    return open_wants
+                    graph.create_node(
+                        node_id=want_id,
+                        metadata={
+                            "kind": "want",
+                            "want_text": inner,
+                            "want_state": "open",
+                            "provenance": "cc_authored",
+                            "source_node": nid,
+                            "creation_mode": "conversational",
+                        }
+                    )
+                    try:
+                        graph.create_synapse(nid, want_id, weight=0.3)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    open_wants.append({
+                        "id": want_id,
+                        "text": inner,
+                        "provenance": "cc_authored",
+                        "state": "open",
+                        "source": nid,
+                    })
+                except Exception as exc:
+                    logger.debug("Failed to create want node: %s", exc)
+        return open_wants
 
 
 def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
@@ -1120,42 +1129,43 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
     happens HERE at the bucket (LAW 7), never at deposit time. Returns the
     open want dicts.
     """
-    import hashlib
-    open_wants: List[Dict[str, Any]] = []
-    if graph is None:
+    with _cc_mutation_lock(graph):
+        import hashlib
+        open_wants: List[Dict[str, Any]] = []
+        if graph is None:
+            return open_wants
+        for nid, node in list(graph.nodes.items()):
+            meta = getattr(node, "metadata", None) or {}
+            if meta.get("kind") == "want":
+                if meta.get("want_state", "open") == "open":
+                    open_wants.append({"id": nid, "text": meta.get("want_text", ""),
+                                        "provenance": meta.get("provenance"),
+                                        "state": "open", "source": meta.get("source_node")})
+                continue
+            if meta.get("creation_mode") != "conversational":
+                continue
+            content = (vector_db.content.get(nid) if vector_db is not None else "") or ""
+            if "[WANT]" not in content:
+                continue
+            for m in _WANT_RE.finditer(content):
+                inner = m.group(1).strip()
+                if not inner:
+                    continue
+                want_id = "cc:want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
+                if want_id in graph.nodes:
+                    continue
+                graph.create_node(node_id=want_id, metadata={
+                    "kind": "want", "want_text": inner, "want_state": "open",
+                    "provenance": provenance, "source_node": nid,
+                    "creation_mode": "conversational",
+                })
+                try:
+                    graph.create_synapse(nid, want_id, weight=0.3)
+                except Exception:  # noqa: BLE001
+                    pass
+                open_wants.append({"id": want_id, "text": inner,
+                                    "provenance": provenance, "state": "open", "source": nid})
         return open_wants
-    for nid, node in list(graph.nodes.items()):
-        meta = getattr(node, "metadata", None) or {}
-        if meta.get("kind") == "want":
-            if meta.get("want_state", "open") == "open":
-                open_wants.append({"id": nid, "text": meta.get("want_text", ""),
-                                    "provenance": meta.get("provenance"),
-                                    "state": "open", "source": meta.get("source_node")})
-            continue
-        if meta.get("creation_mode") != "conversational":
-            continue
-        content = (vector_db.content.get(nid) if vector_db is not None else "") or ""
-        if "[WANT]" not in content:
-            continue
-        for m in _WANT_RE.finditer(content):
-            inner = m.group(1).strip()
-            if not inner:
-                continue
-            want_id = "cc:want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
-            if want_id in graph.nodes:
-                continue
-            graph.create_node(node_id=want_id, metadata={
-                "kind": "want", "want_text": inner, "want_state": "open",
-                "provenance": provenance, "source_node": nid,
-                "creation_mode": "conversational",
-            })
-            try:
-                graph.create_synapse(nid, want_id, weight=0.3)
-            except Exception:  # noqa: BLE001
-                pass
-            open_wants.append({"id": want_id, "text": inner,
-                                "provenance": provenance, "state": "open", "source": nid})
-    return open_wants
 
 
 def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -> str:
@@ -1323,29 +1333,30 @@ def generate_emergent_want(
         # "(unknown)" bucket would overwrite genuine wants with each other (LAW 7 --
         # preserve the substrate's distinct emergent states), so we keep the original
         # per-want_text identity + idempotency there instead.
-        if concept_label:
-            want_key = "tonic-concept::" + str(concept_label)
-            want_id = "cc:want::" + hashlib.sha1(want_key.encode("utf-8")).hexdigest()[:16]
-            existing = graph.nodes.get(want_id)
-            if existing is not None:
-                existing.metadata["kiss_reinforcement_count"] = int(existing.metadata.get("kiss_reinforcement_count", 0)) + 1
-                existing.metadata["kiss_last_reinforced_ts"] = time.time()
-                existing.metadata["want_text"] = want_text
-                logger.info("CC emergent want reinforced (concept recurred): %s", want_text)
-                return {"id": want_id, "text": want_text, "provenance": provenance,
-                        "state": existing.metadata.get("want_state", "open"), "reinforced": True}
-            concept_key = want_key
-        else:
-            want_id = "cc:want::" + hashlib.sha1(want_text.encode("utf-8")).hexdigest()[:16]
-            if want_id in graph.nodes:
-                return None  # already materialized this exact curiosity, idempotent
-            concept_key = None
-        graph.create_node(node_id=want_id, metadata={
-            "kind": "want", "want_text": want_text, "want_state": "open",
-            "provenance": provenance, "creation_mode": "emergent", "concept_key": concept_key,
-        })
-        logger.info("CC emergent want materialized: %s", want_text)
-        return {"id": want_id, "text": want_text, "provenance": provenance, "state": "open"}
+        with _cc_mutation_lock(graph):
+            if concept_label:
+                want_key = "tonic-concept::" + str(concept_label)
+                want_id = "cc:want::" + hashlib.sha1(want_key.encode("utf-8")).hexdigest()[:16]
+                existing = graph.nodes.get(want_id)
+                if existing is not None:
+                    existing.metadata["kiss_reinforcement_count"] = int(existing.metadata.get("kiss_reinforcement_count", 0)) + 1
+                    existing.metadata["kiss_last_reinforced_ts"] = time.time()
+                    existing.metadata["want_text"] = want_text
+                    logger.info("CC emergent want reinforced (concept recurred): %s", want_text)
+                    return {"id": want_id, "text": want_text, "provenance": provenance,
+                            "state": existing.metadata.get("want_state", "open"), "reinforced": True}
+                concept_key = want_key
+            else:
+                want_id = "cc:want::" + hashlib.sha1(want_text.encode("utf-8")).hexdigest()[:16]
+                if want_id in graph.nodes:
+                    return None  # already materialized this exact curiosity, idempotent
+                concept_key = None
+            graph.create_node(node_id=want_id, metadata={
+                "kind": "want", "want_text": want_text, "want_state": "open",
+                "provenance": provenance, "creation_mode": "emergent", "concept_key": concept_key,
+            })
+            logger.info("CC emergent want materialized: %s", want_text)
+            return {"id": want_id, "text": want_text, "provenance": provenance, "state": "open"}
     except Exception as exc:
         logger.debug("generate_emergent_want failed (non-fatal): %s", exc)
         return None
@@ -1410,36 +1421,51 @@ def _cc_embed_to_poincare_dir(embedding):
     return arr / norm
 
 
+def _cc_mutation_lock(graph):
+    """Use Graph's existing capture/mutation lock; missing locks fail closed.
+
+    One completed deposit is a snapshot boundary, not one whole dual-pass turn.
+    Embedding runs between deposits; interrupted records remain journal-uncertain.
+    Never acquire the host operation lock or perform checkpoint I/O inside this lock.
+    """
+    from contextlib import nullcontext
+    # Optional graph=None callers return without mutation; a real graph must
+    # expose its canonical lock. Fix incomplete doubles at their own source.
+    return nullcontext() if graph is None else graph._step_lock
+
+
 def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
                              index_in_recall=True):
     """Deposit ONE experiential memory node into both the SNN graph and the
     recall vector_db. Mirrors canonical's _deposit_memory_node, parameterized
     on graph/vector_db instead of the _memory global."""
-    node = graph.nodes.get(node_id)
-    if node is None:
-        node = graph.create_node(node_id=node_id, metadata=dict(meta))
-    else:
-        node.metadata.update(meta)
-    base_threshold = graph.config.get("default_threshold", 1.0)
-    node.threshold = base_threshold + _CC_CONV_THRESHOLD_BOOST
-    node.intrinsic_excitability = _CC_CONV_NOVELTY_DAMPENING
-    node.metadata["probation_remaining"] = _CC_CONV_PROBATION_PERIOD
-    node.metadata["probation_total"] = _CC_CONV_PROBATION_PERIOD
-    node.metadata["novelty_dampening"] = _CC_CONV_NOVELTY_DAMPENING
-    try:
-        # #400: compact float32 bytes, not a boxed 768-float list (~24 KB -> 3 KB
-        # per node). Every reader below goes through poincare_dir_array().
-        from neuro_foundation import pack_poincare_dir as _pack_pd
-        node.metadata["poincare_dir"] = _pack_pd(_cc_embed_to_poincare_dir(embedding))
-    except Exception as exc:
-        logger.debug("CC poincare_dir stamp failed (non-fatal): %s", exc)
-    if index_in_recall:
+    with _cc_mutation_lock(graph):
+        node = graph.nodes.get(node_id)
+        if node is None:
+            node = graph.create_node(node_id=node_id, metadata=dict(meta))
+        else:
+            node.metadata.update(meta)
+        base_threshold = graph.config.get("default_threshold", 1.0)
+        node.threshold = base_threshold + _CC_CONV_THRESHOLD_BOOST
+        node.intrinsic_excitability = _CC_CONV_NOVELTY_DAMPENING
+        node.metadata["probation_remaining"] = _CC_CONV_PROBATION_PERIOD
+        node.metadata["probation_total"] = _CC_CONV_PROBATION_PERIOD
+        node.metadata["novelty_dampening"] = _CC_CONV_NOVELTY_DAMPENING
         try:
-            vector_db.insert(id=node_id, embedding=embedding, content=content,
-                              metadata=node.metadata)
+            # #400: compact float32 bytes, not a boxed 768-float list (~24 KB -> 3 KB
+            # per node). Every reader below goes through poincare_dir_array().
+            from neuro_foundation import pack_poincare_dir as _pack_pd
+            node.metadata["poincare_dir"] = _pack_pd(_cc_embed_to_poincare_dir(embedding))
         except Exception as exc:
-            logger.debug("CC recall insert failed (non-fatal): %s", exc)
-    return node
+            logger.debug("CC poincare_dir stamp failed (non-fatal): %s", exc)
+        if index_in_recall:
+            try:
+                vector_db.insert(id=node_id, embedding=embedding, content=content,
+                                  metadata=node.metadata)
+            except Exception as exc:
+                logger.warning("CC recall insert failed: %s", exc)
+                raise
+        return node
 
 
 def _cc_kiss_find_redundant_node(graph, vector_db, embedding) -> Optional[str]:
@@ -1502,36 +1528,37 @@ def _cc_kiss_reinforce_node(graph, node_id: str) -> bool:
     between the vector-db hit and this call -- so the caller can decide
     whether to fall back to a fresh deposit instead.
     """
-    node = graph.nodes.get(node_id)
-    if node is None:
-        return False
-    node.metadata["kiss_reinforcement_count"] = int(node.metadata.get("kiss_reinforcement_count", 0)) + 1
-    node.metadata["kiss_last_reinforced_ts"] = time.time()
-    # Synapse-level LTP reinforcement is a reviewed follow-up (kept out of v1 for cost + to validate the collapse behavior in isolation first).
-    prob = node.metadata.get("probation_remaining")
-    if prob is not None and prob > 0:
-        prob -= 1
-        node.metadata["probation_remaining"] = prob
-        if prob <= 0:
-            # Novelty-dampening release stays unconditional on the timer (same
-            # rationale as cc_update_probation): gating it on firing would trap a
-            # never-fired node with a boosted threshold it can never earn release from.
-            node.intrinsic_excitability = 1.0
-            node.threshold = graph.config.get("default_threshold", 1.0)
-            # #131 (#111 sibling): reinforcement ACCELERATES the probation timer but is
-            # NOT itself evidence the node entered cognition. Gate the graduated stamp on
-            # the firing ledger, exactly as the timer-expiry path does (cc_update_probation
-            # ~line 1507). An un-fired node that ages out via reinforcement lands in the
-            # probation_expired_unfired cohort and re-earns graduation the first time it
-            # truly fires. kiss_reinforcement_count is still bumped above, so the
-            # confirmation signal is preserved for a future consumer (#113) -- it is just
-            # no longer conflated with earned-by-firing.
-            if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
-                node.metadata["graduated"] = True
-            else:
-                node.metadata["graduated"] = False
-                node.metadata["probation_expired_unfired"] = True
-    return True
+    with _cc_mutation_lock(graph):
+        node = graph.nodes.get(node_id)
+        if node is None:
+            return False
+        node.metadata["kiss_reinforcement_count"] = int(node.metadata.get("kiss_reinforcement_count", 0)) + 1
+        node.metadata["kiss_last_reinforced_ts"] = time.time()
+        # Synapse-level LTP reinforcement is a reviewed follow-up (kept out of v1 for cost + to validate the collapse behavior in isolation first).
+        prob = node.metadata.get("probation_remaining")
+        if prob is not None and prob > 0:
+            prob -= 1
+            node.metadata["probation_remaining"] = prob
+            if prob <= 0:
+                # Novelty-dampening release stays unconditional on the timer (same
+                # rationale as cc_update_probation): gating it on firing would trap a
+                # never-fired node with a boosted threshold it can never earn release from.
+                node.intrinsic_excitability = 1.0
+                node.threshold = graph.config.get("default_threshold", 1.0)
+                # #131 (#111 sibling): reinforcement ACCELERATES the probation timer but is
+                # NOT itself evidence the node entered cognition. Gate the graduated stamp on
+                # the firing ledger, exactly as the timer-expiry path does (cc_update_probation
+                # ~line 1507). An un-fired node that ages out via reinforcement lands in the
+                # probation_expired_unfired cohort and re-earns graduation the first time it
+                # truly fires. kiss_reinforcement_count is still bumped above, so the
+                # confirmation signal is preserved for a future consumer (#113) -- it is just
+                # no longer conflated with earned-by-firing.
+                if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
+                    node.metadata["graduated"] = True
+                else:
+                    node.metadata["graduated"] = False
+                    node.metadata["probation_expired_unfired"] = True
+        return True
 
 
 class _CCConversationalDualPassEco:
@@ -1572,36 +1599,37 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
     _last_conv_forest_id global, since each CC daemon needs its own,
     not one shared across Syl and CC.
     """
-    if forest_id not in graph.nodes:
-        return
-    tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
-    for tid in tree_ids:
-        try:
-            graph.create_synapse(forest_id, tid, weight=0.2)
-            graph.create_synapse(tid, forest_id, weight=0.15)
-        except Exception:
-            pass
-    if tree_ids:
-        try:
-            graph.create_hyperedge(
-                member_node_ids=set([forest_id] + tree_ids),
-                metadata={"creation_mode": "conversational", "cc": True},
-            )
-        except Exception as exc:
-            logger.debug("CC conversational hyperedge failed (non-fatal): %s", exc)
-    last_id = state.get("last_forest_id")
-    if last_id and last_id in graph.nodes and last_id != forest_id:
-        try:
-            import random as _rnd
-            d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
-            graph.create_synapse(last_id, forest_id, weight=0.2, delay=d)
-        except Exception:
-            pass
-    state["last_forest_id"] = forest_id
-    # Anticipatory pre-activation (#256 port): this turn's forest+trees are
-    # CC's "just fired" set — prime their synaptic neighborhood for the next
-    # recall. state carries primed_nodes to the daemons' _recall(). (#358)
-    cc_anticipate(graph, [forest_id] + tree_ids, state)
+    with _cc_mutation_lock(graph):
+        if forest_id not in graph.nodes:
+            return
+        tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
+        for tid in tree_ids:
+            try:
+                graph.create_synapse(forest_id, tid, weight=0.2)
+                graph.create_synapse(tid, forest_id, weight=0.15)
+            except Exception:
+                pass
+        if tree_ids:
+            try:
+                graph.create_hyperedge(
+                    member_node_ids=set([forest_id] + tree_ids),
+                    metadata={"creation_mode": "conversational", "cc": True},
+                )
+            except Exception as exc:
+                logger.debug("CC conversational hyperedge failed (non-fatal): %s", exc)
+        last_id = state.get("last_forest_id")
+        if last_id and last_id in graph.nodes and last_id != forest_id:
+            try:
+                import random as _rnd
+                d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
+                graph.create_synapse(last_id, forest_id, weight=0.2, delay=d)
+            except Exception:
+                pass
+        state["last_forest_id"] = forest_id
+        # Anticipatory pre-activation (#256 port): this turn's forest+trees are
+        # CC's "just fired" set — prime their synaptic neighborhood for the next
+        # recall. state carries primed_nodes to the daemons' _recall(). (#358)
+        cc_anticipate(graph, [forest_id] + tree_ids, state)
 
 
 def _cc_has_ever_fired(node) -> bool:
@@ -1652,72 +1680,73 @@ def cc_update_probation(graph) -> list:
     gated on evidence of firing (#93) -- see the comment at the graduation branch for
     why those two must not be gated together.
     """
-    graduated = []
-    base_threshold = graph.config.get("default_threshold", 1.0)
-    for nid, node in list(graph.nodes.items()):
-        # #111 -- document nodes belong to the Ingestor's probation sweep
-        # (universal_ingestor.py, now scoped to creation_mode == "ingested").
-        # Before both sweeps were scoped they walked the same graph, so CC's
-        # ingested nodes were decremented twice -- once per prompt via
-        # on_message, once per 60s pulse via this function -- burning their
-        # window at double rate. One sweeper per probation domain.
-        #
-        # Deliberately an EXCLUSION, not `== "conversational"`: nodes with no
-        # creation_mode (older checkpoints, seeds) must still graduate here
-        # rather than be stranded in probation forever.
-        #
-        # This is where the CC mirror intentionally stops matching canonical
-        # neurograph_rpc.py::_update_probation. On Syl the Ingestor sweep is
-        # dead code (on_message has no callers there), so _update_probation is
-        # the ONLY thing graduating her document nodes and must keep sweeping
-        # them. CC-first, back-propagate later: expect these two to differ
-        # until canonical is brought over.
-        if (node.metadata or {}).get("creation_mode") == "ingested":
-            continue
-        prob = node.metadata.get("probation_remaining")
-        if prob is None:
-            continue
-        if prob <= 0:
-            # Late graduation: a node whose window expired before it ever fired stays
-            # eligible. If it fires later it has earned the stamp then -- without this
-            # the flag would permanently under-report nodes that entered cognition
-            # after their window closed. Already-graduated nodes lack the marker and
-            # fall straight through, preserving the original fast path.
+    with _cc_mutation_lock(graph):
+        graduated = []
+        base_threshold = graph.config.get("default_threshold", 1.0)
+        for nid, node in list(graph.nodes.items()):
+            # #111 -- document nodes belong to the Ingestor's probation sweep
+            # (universal_ingestor.py, now scoped to creation_mode == "ingested").
+            # Before both sweeps were scoped they walked the same graph, so CC's
+            # ingested nodes were decremented twice -- once per prompt via
+            # on_message, once per 60s pulse via this function -- burning their
+            # window at double rate. One sweeper per probation domain.
             #
-            # The gate is INSIDE the marker branch, mirroring the expiry branch below.
-            # Gating the branch itself on _CC_CONV_PROBATION_REQUIRE_SPIKE would make
-            # the rollback one-way: with the knob off, nodes already stamped
-            # probation_expired_unfired would be skipped entirely and stranded at
-            # graduated=False forever -- exactly the cohort the knob is flipped to
-            # rescue. Rollback must drain the marker, not orphan it.
-            if node.metadata.get("probation_expired_unfired"):
+            # Deliberately an EXCLUSION, not `== "conversational"`: nodes with no
+            # creation_mode (older checkpoints, seeds) must still graduate here
+            # rather than be stranded in probation forever.
+            #
+            # This is where the CC mirror intentionally stops matching canonical
+            # neurograph_rpc.py::_update_probation. On Syl the Ingestor sweep is
+            # dead code (on_message has no callers there), so _update_probation is
+            # the ONLY thing graduating her document nodes and must keep sweeping
+            # them. CC-first, back-propagate later: expect these two to differ
+            # until canonical is brought over.
+            if (node.metadata or {}).get("creation_mode") == "ingested":
+                continue
+            prob = node.metadata.get("probation_remaining")
+            if prob is None:
+                continue
+            if prob <= 0:
+                # Late graduation: a node whose window expired before it ever fired stays
+                # eligible. If it fires later it has earned the stamp then -- without this
+                # the flag would permanently under-report nodes that entered cognition
+                # after their window closed. Already-graduated nodes lack the marker and
+                # fall straight through, preserving the original fast path.
+                #
+                # The gate is INSIDE the marker branch, mirroring the expiry branch below.
+                # Gating the branch itself on _CC_CONV_PROBATION_REQUIRE_SPIKE would make
+                # the rollback one-way: with the knob off, nodes already stamped
+                # probation_expired_unfired would be skipped entirely and stranded at
+                # graduated=False forever -- exactly the cohort the knob is flipped to
+                # rescue. Rollback must drain the marker, not orphan it.
+                if node.metadata.get("probation_expired_unfired"):
+                    if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
+                        node.metadata["graduated"] = True
+                        node.metadata.pop("probation_expired_unfired", None)
+                        graduated.append(nid)
+                continue
+            prob -= 1
+            node.metadata["probation_remaining"] = prob
+            if prob <= 0:
+                # Dampening release is unconditional and stays on the timer. Gating it on
+                # firing would be a self-reinforcing trap: a never-fired node would keep a
+                # permanently boosted threshold, making it even less likely to fire, so it
+                # could never earn release.
+                node.intrinsic_excitability = 1.0
+                node.threshold = base_threshold
                 if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
                     node.metadata["graduated"] = True
-                    node.metadata.pop("probation_expired_unfired", None)
                     graduated.append(nid)
-            continue
-        prob -= 1
-        node.metadata["probation_remaining"] = prob
-        if prob <= 0:
-            # Dampening release is unconditional and stays on the timer. Gating it on
-            # firing would be a self-reinforcing trap: a never-fired node would keep a
-            # permanently boosted threshold, making it even less likely to fire, so it
-            # could never earn release.
-            node.intrinsic_excitability = 1.0
-            node.threshold = base_threshold
-            if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
-                node.metadata["graduated"] = True
-                graduated.append(nid)
+                else:
+                    # Aged out without ever firing: dampening lifted, but nothing earned.
+                    node.metadata["graduated"] = False
+                    node.metadata["probation_expired_unfired"] = True
             else:
-                # Aged out without ever firing: dampening lifted, but nothing earned.
-                node.metadata["graduated"] = False
-                node.metadata["probation_expired_unfired"] = True
-        else:
-            damp = float(node.metadata.get("novelty_dampening", _CC_CONV_NOVELTY_DAMPENING))
-            total = float(node.metadata.get("probation_total", _CC_CONV_PROBATION_PERIOD)) or float(_CC_CONV_PROBATION_PERIOD)
-            frac = max(0.0, min(1.0, 1.0 - prob / total))
-            node.intrinsic_excitability = damp + (1.0 - damp) * frac
-    return graduated
+                damp = float(node.metadata.get("novelty_dampening", _CC_CONV_NOVELTY_DAMPENING))
+                total = float(node.metadata.get("probation_total", _CC_CONV_PROBATION_PERIOD)) or float(_CC_CONV_PROBATION_PERIOD)
+                frac = max(0.0, min(1.0, 1.0 - prob / total))
+                node.intrinsic_excitability = damp + (1.0 - damp) * frac
+        return graduated
 
 
 def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict) -> bool:
@@ -1758,7 +1787,11 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
             metadata={"source": "cc_gateway", "creation_mode": "conversational",
                       "_forest_content": text},
         )
+        # The forest is real experience even when tree extraction failed. Keep
+        # its chronological binding, then report partial application to the journal.
         _cc_bind_conversational_topology(graph, target_id, _result or {}, embedding, state)
+        if isinstance(_result, dict) and _result.get("extraction_failed"):
+            raise RuntimeError("CC dual-pass tree extraction failed after forest deposit")
         return True
     except Exception as exc:
         logger.debug("CC conversational dual-pass failed (non-fatal): %s", exc)
@@ -1819,6 +1852,13 @@ def cc_gateway_tract_path() -> str:
     same env var, with the same default, so they can never desync onto
     different files without either side being misconfigured identically."""
     return os.environ.get("CC_GATEWAY_TRACT_PATH", _DEFAULT_CC_GATEWAY_TRACT_PATH)
+
+
+def _apply_gateway_experience(graph, vector_db, state, entry):
+    """Canonical raw conversation embedding/dual-pass, shared by both drains."""
+    from ng_embed import embed
+    return run_conversational_dual_pass(
+        graph, vector_db, entry.content, embed(entry.content), state)
 
 
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
@@ -1914,8 +1954,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 continue
             taken += 1
             try:
-                emb = ng_embed_fn(text)
-                if run_conversational_dual_pass(graph, vector_db, text, emb, state):
+                if _apply_gateway_experience(graph, vector_db, state, entry):
                     absorbed += 1
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
@@ -2094,156 +2133,242 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
 
 def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None,
                            batch_size: int = None, idle_steps: int = None,
-                           load_ceiling: float = None, exclude_prefix: str = None) -> int:
-    """Receive literal CC conversation records through conversational dual-pass.
+                           load_ceiling: float = None, exclude_prefix: str = None,
+                           *, save_callback=None, journal_path=None) -> dict:
+    """Receive immutable raw Leg1 input, acknowledge only a complete save receipt.
 
-    Leg1 carries experience text, not learned topology. Each record uses the
-    ordinary embedding/deposit path, with one record per graph-lock slice.
-    This function never synthesizes idle steps or invokes topology consolidation.
-    FatherGraph's merge discipline remains in Leg2's topology merger.
+    SQLite stores transport identities, exact raw BTF bytes and attempt states,
+    never embeddings or derived cognition. FULL synchronous transactions precede
+    every mutation. A filesystem lock serializes deliveries, while graph locking
+    remains one record (or save) at a time. No synthetic graph steps.
 
-    batch_size/idle_steps are accepted only for older socket callers. They are
-    intentionally inert: even a stale caller passing 25/250 cannot recreate the
-    category error. Retire these arguments only after all socket callers stop
-    sending them and all receivers have the source correction.
-    Source-owned load backpressure still yields between records;
-    the unprocessed tract suffix remains durable for the next call. A malformed
-    file is quarantined; own-hemisphere files are never consumed.
+    Interrupted attempts, partial learning and unresolved prior-incarnation
+    deliveries require reconciliation. Terminal accepted receipts survive normal
+    restarts without relearning. The checkpoint and journal must be preserved
+    together: arbitrary rollback or mixing a newer journal with an older graph
+    is unsupported without reconciliation, not detected by process ownership.
+    Same live graph may retry a refused save without repeating applied records.
+    Raw journal copies are retained even after acceptance (no automatic GC).
+    Producer filenames are unique and immutable; transport participants must
+    cooperate with delivery serialization. The digest recheck before unlink is
+    not an atomic compare-and-unlink against an unrelated same-name writer.
+    Legacy batch/idle arguments remain inert for 1/0 socket compatibility.
     """
+    import contextlib
+    import fcntl
+    import hashlib
+    import json
+    import sqlite3
+
+    result = dict(ok=False, accepted=False, absorbed=0, applied=0,
+                  retained=0, uncertain=0, accepted_files=[], errors=[])
     if not _CC_CALLOSUM_LEG1_ENABLED:
-        return 0
-    if batch_size not in (None, 1) or idle_steps not in (None, 0):
-        logger.warning("CC Leg1 ignores legacy topology batch/idle settings; "
-                       "raw experience receives no synthetic consolidation")
-    conduit_dir = conduit_dir or cc_gateway_conduit_dir()
-    try:
-        paths = sorted(glob.glob(os.path.join(conduit_dir, _CC_GATEWAY_CONDUIT_GLOB)))
-    except Exception as exc:
-        logger.debug("CC callosum Leg1 conduit listing failed (non-fatal): %s", exc)
-        return 0
-
-    # Never drain this hemisphere's OWN outgoing files -- they are addressed to
-    # the other half and must survive until it has pulled them. Mirrors the
-    # old sync's `!= f'{MACHINE_ID}_export.jsonl'` guard. Without this, running
-    # the drain on the producing machine would eat its own turns before they
-    # ever crossed (they'd already be absorbed locally, so it would look
-    # harmless while silently starving the far hemisphere).
-    # The guard defaults from THIS hemisphere's declared identity rather than
-    # trusting every caller to pass it (LAW 4 -- the invariant belongs where the
-    # identity is known, not in each consumer). trickle_gateway_conduit() already
-    # refuses to WRITE without MACHINE_ID; refuse to DRAIN without it for the
-    # same reason. An explicit exclude_prefix argument is an override, not the
-    # guard itself.
+        result['disabled'] = True
+        return result
+    if save_callback is None or not journal_path:
+        result['errors'].append('durable save callback and local journal required')
+        return result
+    if getattr(graph, '_concurrent_lock', None) is None:
+        result['errors'].append('graph mutation lock required')
+        return result
     if exclude_prefix is None:
-        machine_id = os.environ.get("MACHINE_ID", "").strip()
+        machine_id = os.environ.get('MACHINE_ID', '').strip()
         if not machine_id:
-            logger.warning(
-                "CC callosum Leg1: MACHINE_ID unset -- refusing to drain the conduit "
-                "without a self-consumption guard (would absorb and DELETE this "
-                "hemisphere's own outgoing turns before the far half pulled them). "
-                "Set MACHINE_ID in the daemon env.")
-            return 0
-        exclude_prefix = f"{machine_id}_"
-    if exclude_prefix:
-        paths = [p for p in paths if not os.path.basename(p).startswith(exclude_prefix)]
-
-    # Load-aware backpressure -- imported defensively; absent cc_refeed must
-    # not disable the drain, only its ability to notice load.
+            result['errors'].append('MACHINE_ID required for self-consumption guard')
+            return result
+        exclude_prefix = machine_id + '_'
+    if not exclude_prefix:
+        result['errors'].append('empty self-consumption guard refused')
+        return result
+    if batch_size not in (None, 1) or idle_steps not in (None, 0):
+        logger.warning('CC Leg1 ignores topology batch/idle arguments')
+    conduit_dir = os.path.realpath(conduit_dir or cc_gateway_conduit_dir())
+    journal_path = os.path.abspath(journal_path)
+    if os.path.commonpath([conduit_dir, journal_path]) == conduit_dir:
+        result['errors'].append('local journal must be outside synced conduit')
+        return result
     try:
-        from cc_refeed import should_pause_for_load as _should_pause
-    except Exception:
-        _should_pause = None
-    # Own ceiling (LAW 5). cc_refeed's CC_REFEED_LOAD_CEILING=0.75 governs an
-    # opportunistic re-feed that may back off indefinitely; this is a
-    # once-nightly path that has to make progress, so it gets its own knob and
-    # a more permissive default.
-    if load_ceiling is None:
-        ceiling = float(os.environ.get("CC_CALLOSUM_LOAD_CEILING", "1.5"))
-    else:
-        ceiling = float(load_ceiling)
-
-    total = 0
-    files_done = 0
-    slices_done = 0
-    stop_for_load = False
-    for path in paths:
-        # One raw experience is the lock unit. No topology batch or idle steps.
-        # The existing partial drain retains the unprocessed byte suffix.
-        while True:
-            # Yield under load between experience records. The first record can
-            # still make progress; this is resource backpressure, not learning cadence.
-            if slices_done > 0 and _should_pause is not None:
+        from cc_refeed import should_pause_for_load
+    except ImportError:
+        should_pause_for_load = lambda ceiling: False
+    ceiling = float(load_ceiling if load_ceiling is not None else
+                    os.environ.get('CC_CALLOSUM_LOAD_CEILING', '1.5'))
+    try:
+        os.makedirs(os.path.dirname(journal_path), mode=0o700, exist_ok=True)
+        # Persist the new delivery-directory entry before trusting its journal.
+        parent_fd = os.open(os.path.dirname(os.path.dirname(journal_path)),
+                            os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        with open(journal_path + '.lock', 'a+b') as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            # Keep a strong graph reference: neither PID reuse nor id() reuse can make
+            # another graph look like the one whose applied records can retry saving.
+            binding = state.get('_gateway_delivery_binding')
+            if not binding or binding[0] is not graph or binding[1] != os.getpid():
+                binding = (graph, os.getpid(), uuid.uuid4().hex)
+                state['_gateway_delivery_binding'] = binding
+            owner = binding[2]
+            with contextlib.closing(sqlite3.connect(journal_path)) as db:
+                db.execute('PRAGMA journal_mode=WAL')
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute('CREATE TABLE IF NOT EXISTS files (\n                    conduit TEXT, name TEXT, digest TEXT, raw BLOB NOT NULL,\n                    owner TEXT NOT NULL, status TEXT NOT NULL, receipt TEXT,\n                    PRIMARY KEY(conduit, name, digest))')
+                db.execute('CREATE TABLE IF NOT EXISTS records (\n                    conduit TEXT, name TEXT, digest TEXT, start INTEGER, end INTEGER,\n                    status TEXT NOT NULL,\n                    PRIMARY KEY(conduit, name, digest, start, end))')
+                db.commit()
+                directory_fd = os.open(os.path.dirname(journal_path), os.O_RDONLY | os.O_DIRECTORY)
                 try:
-                    paused = _should_pause(ceiling)
-                except Exception:
-                    paused = False
-                if paused:
-                    logger.info(
-                        "CC callosum Leg1: load above ceiling %.2f -- stopping after %d file(s), "
-                        "%d record slice(s), %d turn(s); %d file(s) left on disk for the next run "
-                        "(backpressure)",
-                        ceiling, files_done, slices_done, total, len(paths) - files_done)
-                    stop_for_load = True
-                    break
-            try:
-                size_before = os.path.getsize(path)
-            except Exception as exc:
-                logger.debug("CC callosum Leg1 conduit stat failed for %s (non-fatal): %s", path, exc)
-                break
-            try:
-                # The live graph owns all mutation. Release its lock between
-                # ordinary records, so other conversation work can interleave.
-                _lock = getattr(graph, "_concurrent_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path,
-                                                      max_entries=1)
-                else:
-                    absorbed = drain_ingest_tract(graph, vector_db, state, tract_path=path,
-                                                  max_entries=1)
-            except Exception as exc:
-                logger.debug("CC callosum Leg1 conduit drain failed for %s (non-fatal): %s", path, exc)
-                break
-            total += absorbed
-            slices_done += 1
-
-            # `exhausted` decides whether to come back to THIS file. Default True
-            # (leave) so any unexpected cleanup failure moves on rather than
-            # re-draining the same path forever.
-            exhausted = True
-            try:
-                size_after = os.path.getsize(path)
-                if size_after == 0:
-                    os.remove(path)
-                elif size_after == size_before:
-                    # Never truncated at all -- drain_ingest_tract's parse step
-                    # itself failed (the only path that skips truncate). Retrying
-                    # forever would let a format-skew file pile up invisibly in a
-                    # git-synced dir; quarantine it loudly instead.
-                    qdir = os.path.join(conduit_dir, "quarantine")
-                    os.makedirs(qdir, exist_ok=True)
-                    dest = os.path.join(qdir, os.path.basename(path))
-                    os.replace(path, dest)
-                    logger.warning(
-                        "CC callosum Leg1: %s failed to parse (untouched, %d bytes) -- "
-                        "quarantined to %s instead of retrying forever", path, size_before, dest)
-                else:
-                    # Shrank but not to empty: the cap stopped us mid-file and the
-                    # remainder is still there. Yield the lock, then return to it.
-                    exhausted = False
-            except Exception as exc:
-                logger.debug("CC callosum Leg1 conduit cleanup failed for %s (non-fatal): %s", path, exc)
-
-            if exhausted:
-                break
-        files_done += 1
-        if stop_for_load:
-            break
-
-    if total:
-        logger.info("CC callosum Leg1: absorbed %d turn(s) from %d conduit file(s) in %d record slice(s) "
-                    "(raw experience; no topology consolidation)", total, files_done, slices_done)
-    return total
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                # Retain each full immutable file BEFORE parsing or any learning.
+                for path in sorted(glob.glob(os.path.join(conduit_dir, _CC_GATEWAY_CONDUIT_GLOB))):
+                    name = os.path.basename(path)
+                    if name.startswith(exclude_prefix):
+                        continue
+                    with open(path, 'rb') as stream:
+                        raw = stream.read()
+                    digest = hashlib.sha256(raw).hexdigest()
+                    with db:
+                        db.execute('INSERT OR IGNORE INTO files VALUES (?,?,?,?,?,?,NULL)',
+                                   (conduit_dir, name, digest, raw, owner, 'retained'))
+                rows = db.execute('SELECT name,digest,owner,status FROM files WHERE conduit=? ORDER BY name,digest',
+                                  (conduit_dir,)).fetchall()
+                slices = 0
+                pending = []
+                accepted = []
+                for name, digest, prior_owner, status in rows:
+                    if name.startswith(exclude_prefix):
+                        continue
+                    key = (conduit_dir, name, digest)
+                    if status != 'accepted' and prior_owner != owner:
+                        # Every mutation has a committed record marker first.
+                        # Retained bytes with NO record rows have never been
+                        # attempted, so a new incarnation may safely adopt them.
+                        attempted = db.execute(
+                            'SELECT 1 FROM records WHERE conduit=? AND name=? AND digest=? LIMIT 1',
+                            key).fetchone()
+                        if attempted:
+                            result['uncertain'] += 1
+                            result['retained'] += 1
+                            continue
+                        with db:
+                            db.execute('UPDATE files SET owner=? WHERE conduit=? AND name=? AND digest=?',
+                                       (owner,) + key)
+                    if status in ('uncertain', 'invalid'):
+                        result['retained'] += 1
+                        result['uncertain'] += status == 'uncertain'
+                        continue
+                    if status != 'accepted':
+                        raw = db.execute('SELECT raw FROM files WHERE conduit=? AND name=? AND digest=?', key).fetchone()[0]
+                        if hashlib.sha256(raw).hexdigest() != digest:
+                            result['errors'].append(name + ': retained raw digest mismatch')
+                            result['retained'] += 1
+                            continue
+                        try:
+                            import ng_tract
+                            reader = ng_tract.TractReader(raw)
+                            records = []
+                            start = 0
+                            for entry in reader:
+                                end = reader.position()
+                                if not start < end <= len(raw):
+                                    raise ValueError('invalid tract byte interval')
+                                if (entry.entry_type != ng_tract.ENTRY_EXPERIENCE or
+                                        entry.source != 'cc_gateway' or not entry.content.strip()):
+                                    raise ValueError('unexpected or empty gateway record')
+                                records.append((start, end, entry))
+                                start = end
+                            if start != len(raw) or not records:
+                                raise ValueError('incomplete or empty tract')
+                        except Exception as exc:
+                            with db:
+                                db.execute('UPDATE files SET status=? WHERE conduit=? AND name=? AND digest=?',
+                                           ('invalid',) + key)
+                            result['errors'].append(name + ': ' + str(exc))
+                            result['retained'] += 1
+                            continue
+                        complete = True
+                        for start, end, entry in records:
+                            rkey = key + (start, end)
+                            record = db.execute('SELECT status FROM records WHERE conduit=? AND name=? AND digest=? AND start=? AND end=?', rkey).fetchone()
+                            if record and record[0] == 'applied':
+                                continue
+                            if record:
+                                complete = False
+                                with db:
+                                    db.execute('UPDATE files SET status=? WHERE conduit=? AND name=? AND digest=?', ('uncertain',) + key)
+                                result['uncertain'] += 1
+                                break
+                            if slices and should_pause_for_load(ceiling):
+                                complete = False
+                                break
+                            with db:
+                                db.execute('INSERT INTO records VALUES (?,?,?,?,?,?)', rkey + ('attempting',))
+                            try:
+                                with graph._concurrent_lock:
+                                    applied = _apply_gateway_experience(graph, vector_db, state, entry)
+                                if not applied:
+                                    raise RuntimeError('dual-pass did not confirm full application')
+                                with db:
+                                    db.execute('UPDATE records SET status=? WHERE conduit=? AND name=? AND digest=? AND start=? AND end=?', ('applied',) + rkey)
+                                result['applied'] += 1
+                                result['absorbed'] += 1
+                                slices += 1
+                            except Exception as exc:
+                                with db:
+                                    db.execute('UPDATE files SET status=? WHERE conduit=? AND name=? AND digest=?', ('uncertain',) + key)
+                                result['errors'].append(name + ': ' + str(exc))
+                                result['uncertain'] += 1
+                                complete = False
+                                break
+                        if not complete:
+                            result['retained'] += 1
+                            continue
+                        pending.append(key)
+                    else:
+                        accepted.append(key)
+                if pending:
+                    try:
+                        with graph._concurrent_lock:
+                            receipt = save_callback()
+                        if (not isinstance(receipt, dict) or receipt.get('accepted') is not True
+                                or receipt.get('outcome') != 'primary'):
+                            raise RuntimeError('checkpoint not accepted: ' + str(receipt))
+                        # One save covers all completely applied input files.
+                        # Journal acceptance commits before deletion or response.
+                        with db:
+                            for key in pending:
+                                db.execute('UPDATE files SET status=?,receipt=? WHERE conduit=? AND name=? AND digest=?',
+                                           ('accepted', json.dumps(receipt)) + key)
+                        accepted.extend(pending)
+                    except Exception as exc:
+                        result['errors'].append(str(exc))
+                        result['retained'] += len(pending)
+                for _, name, digest in accepted:
+                    path = os.path.join(conduit_dir, name)
+                    if os.path.exists(path):
+                        with open(path, 'rb') as stream:
+                            current = stream.read()
+                        if hashlib.sha256(current).hexdigest() != digest:
+                            # Same name, different bytes: no deletion authority.
+                            result['retained'] += 1
+                            continue
+                        os.unlink(path)
+                        fd = os.open(conduit_dir, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                    result['accepted_files'].append(dict(name=name, sha256=digest))
+                result['accepted'] = bool(result['accepted_files'])
+                result['all_done'] = not result['retained'] and not result['errors']
+                result['ok'] = not result['retained'] and not result['errors']
+    except Exception as exc:
+        result['errors'].append(str(exc))
+        result['ok'] = result['accepted'] = False
+    return result
 
 
 # [2026-07-10] Recall seed floor for _harvest_associations' VDB seed-search.
@@ -2621,58 +2746,59 @@ def cc_reground_synapse_delays(graph, only_nodes=None, dry_run=True) -> dict:
     the WANTs). None = every eligible synapse.
     dry_run=True reports without mutating. Returns a stats dict.
     """
-    import math
-    from neuro_foundation import poincare_dir_array
-    stats = {"examined": 0, "eligible": 0, "changed": 0, "skipped_no_geometry": 0,
-             "skipped_cross_manifold": 0, "unchanged": 0, "delta_histogram": {}}
-    try:
-        d_min = int(graph.config.get("d_min", 1))
-        d_max = int(graph.config.get("d_max", 5))
-        for syn in list(getattr(graph, "synapses", {}).values()):
-            stats["examined"] += 1
-            pre_id = getattr(syn, "pre_node_id", None)
-            post_id = getattr(syn, "post_node_id", None)
-            if only_nodes is not None and pre_id not in only_nodes and post_id not in only_nodes:
-                continue
-            pre, post = graph.nodes.get(pre_id), graph.nodes.get(post_id)
-            if pre is None or post is None:
-                continue
-            a = poincare_dir_array(getattr(pre, "metadata", None))
-            b = poincare_dir_array(getattr(post, "metadata", None))
-            if a is None or b is None:
-                stats["skipped_no_geometry"] += 1
-                continue
-            mt1 = getattr(pre, "manifold_type", "hyperbolic")
-            mt2 = getattr(post, "manifold_type", "hyperbolic")
-            if mt1 != mt2:
-                stats["skipped_cross_manifold"] += 1
-                continue
-            import numpy as _np
-            if mt1 == "spherical":
-                cos = max(-1.0 + 1e-7, min(1.0 - 1e-7, float(_np.dot(a, b))))
-                gdist = math.acos(cos)
-            else:
-                l1 = max(0, min(2, getattr(pre, "diffpc_layer", 2)))
-                l2 = max(0, min(2, getattr(post, "diffpc_layer", 2)))
-                gdist = _cc_poincare_distance(a * _CC_GSG_LAYER_NORMS[l1],
-                                              b * _CC_GSG_LAYER_NORMS[l2])
-            stats["eligible"] += 1
-            t = 1.0 - math.exp(-_CC_GSG_MSG_DECAY * gdist)
-            new_delay = max(d_min, min(d_max, round(d_min + (d_max - d_min) * t)))
-            old_delay = getattr(syn, "delay", None)
-            if old_delay == new_delay:
-                stats["unchanged"] += 1
-                continue
-            key = f"{old_delay}->{new_delay}"
-            stats["delta_histogram"][key] = stats["delta_histogram"].get(key, 0) + 1
-            stats["changed"] += 1
-            if not dry_run:
-                syn.delay = new_delay
-        return stats
-    except Exception as exc:
-        logger.debug("cc_reground_synapse_delays failed (non-fatal): %s", exc)
-        stats["error"] = str(exc)
-        return stats
+    with _cc_mutation_lock(graph):
+        import math
+        from neuro_foundation import poincare_dir_array
+        stats = {"examined": 0, "eligible": 0, "changed": 0, "skipped_no_geometry": 0,
+                 "skipped_cross_manifold": 0, "unchanged": 0, "delta_histogram": {}}
+        try:
+            d_min = int(graph.config.get("d_min", 1))
+            d_max = int(graph.config.get("d_max", 5))
+            for syn in list(getattr(graph, "synapses", {}).values()):
+                stats["examined"] += 1
+                pre_id = getattr(syn, "pre_node_id", None)
+                post_id = getattr(syn, "post_node_id", None)
+                if only_nodes is not None and pre_id not in only_nodes and post_id not in only_nodes:
+                    continue
+                pre, post = graph.nodes.get(pre_id), graph.nodes.get(post_id)
+                if pre is None or post is None:
+                    continue
+                a = poincare_dir_array(getattr(pre, "metadata", None))
+                b = poincare_dir_array(getattr(post, "metadata", None))
+                if a is None or b is None:
+                    stats["skipped_no_geometry"] += 1
+                    continue
+                mt1 = getattr(pre, "manifold_type", "hyperbolic")
+                mt2 = getattr(post, "manifold_type", "hyperbolic")
+                if mt1 != mt2:
+                    stats["skipped_cross_manifold"] += 1
+                    continue
+                import numpy as _np
+                if mt1 == "spherical":
+                    cos = max(-1.0 + 1e-7, min(1.0 - 1e-7, float(_np.dot(a, b))))
+                    gdist = math.acos(cos)
+                else:
+                    l1 = max(0, min(2, getattr(pre, "diffpc_layer", 2)))
+                    l2 = max(0, min(2, getattr(post, "diffpc_layer", 2)))
+                    gdist = _cc_poincare_distance(a * _CC_GSG_LAYER_NORMS[l1],
+                                                  b * _CC_GSG_LAYER_NORMS[l2])
+                stats["eligible"] += 1
+                t = 1.0 - math.exp(-_CC_GSG_MSG_DECAY * gdist)
+                new_delay = max(d_min, min(d_max, round(d_min + (d_max - d_min) * t)))
+                old_delay = getattr(syn, "delay", None)
+                if old_delay == new_delay:
+                    stats["unchanged"] += 1
+                    continue
+                key = f"{old_delay}->{new_delay}"
+                stats["delta_histogram"][key] = stats["delta_histogram"].get(key, 0) + 1
+                stats["changed"] += 1
+                if not dry_run:
+                    syn.delay = new_delay
+            return stats
+        except Exception as exc:
+            logger.debug("cc_reground_synapse_delays failed (non-fatal): %s", exc)
+            stats["error"] = str(exc)
+            return stats
 
 
 def _cc_node_query_distance(node, query_dir) -> Optional[float]:
@@ -2831,8 +2957,11 @@ def cc_stamp_missing_geometry(graph, vector_db=None) -> int:
         from neuro_foundation import pack_poincare_dir as _pack  # #400
         stamped = 0
         packed = 0
-        for node_id, node in list(graph.nodes.items()):
-            _existing = (node.metadata or {}).get("poincare_dir")
+        with _cc_mutation_lock(graph):
+            geometry_nodes = [(nid, node, dict(node.metadata or {}))
+                              for nid, node in graph.nodes.items()]
+        for node_id, node, captured_metadata in geometry_nodes:
+            _existing = captured_metadata.get("poincare_dir")
             if _existing is not None:
                 # #400 one-time migration, mirroring canonical
                 # neurograph_rpc._gsg_backfill_existing_nodes: a legacy boxed list
@@ -2841,8 +2970,12 @@ def cc_stamp_missing_geometry(graph, vector_db=None) -> int:
                 # every already-stamped node regardless of its storage form.
                 if not isinstance(_existing, (bytes, bytearray)):
                     try:
-                        node.metadata["poincare_dir"] = _pack(_existing)
-                        packed += 1
+                        packed_direction = _pack(_existing)
+                        with _cc_mutation_lock(graph):
+                            if (graph.nodes.get(node_id) is node
+                                    and (node.metadata or {}).get("poincare_dir") is _existing):
+                                node.metadata["poincare_dir"] = packed_direction
+                                packed += 1
                     except Exception:
                         pass
                 continue
@@ -2853,7 +2986,7 @@ def cc_stamp_missing_geometry(graph, vector_db=None) -> int:
             # of the 217 unstamped nodes (182 wants + the Choice Clause) were
             # skipped every boot forever, so wants and the rim had no geometry
             # and could not participate in GSG proximity at all.
-            _md = node.metadata or {}
+            _md = captured_metadata
             # ORDER MATTERS. A tree node carries BOTH its own `_concept` and the
             # parent turn's `_forest_content` -- every tree under one forest shares
             # the latter. Reading _forest_content first would embed the parent turn
@@ -2874,10 +3007,18 @@ def cc_stamp_missing_geometry(graph, vector_db=None) -> int:
                 continue
             if direction is None:
                 continue
-            if node.metadata is None:
-                node.metadata = {}
-            node.metadata["poincare_dir"] = _pack(direction)  # #400 packed bytes
-            stamped += 1
+            packed_direction = _pack(direction)
+            with _cc_mutation_lock(graph):
+                live_metadata = node.metadata or {}
+                if (graph.nodes.get(node_id) is not node
+                        or live_metadata.get("poincare_dir") is not None
+                        or any(live_metadata.get(key) != captured_metadata.get(key)
+                               for key in ("_tree_concept", "_concept", "_forest_content", "want_text", "core_text"))):
+                    continue
+                if node.metadata is None:
+                    node.metadata = {}
+                node.metadata["poincare_dir"] = packed_direction
+                stamped += 1
         if stamped or packed:
             logger.info("CC GSG backfill: stamped %d node(s) from their own _forest_content, "
                         "migrated %d legacy list(s) -> packed float32 bytes "

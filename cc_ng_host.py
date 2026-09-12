@@ -27,6 +27,19 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-12] Codex — #430 serialize CC initialization and retain graph on bind failure.
+# What: One complete init at a time; only attempt-owned failed sockets close.
+# Why: Concurrent bootstrap could erase the graph behind a live listener.
+# How: Caller-level mutex and failed-readiness latch; no live restart or new model.
+# [2026-09-11] Codex — #423 acknowledge only durable gateway save receipts.
+# What: canonical receiver owns retained input and receipt-gated cleanup.
+# Why: quarantine and component failures must never acknowledge consumption.
+# How: opt-in save receipt callback, local workspace transport journal.
+# [2026-09-11] Codex — #426 restore CC Tonic without a private transformer load.
+# What: construct the existing engine in shared-body-only mode at host startup.
+# Why: disabling eager model load had disabled the engine BrainSwitcher expected.
+# How: engine starts independently of sessions and waits without heuristic execution; Elmer attaches the shared body.
+# Ref: docs/handoffs/cc-shared-tonic-repair-20260911.md.
 # [2026-09-07] Claude Code (DudeMan CC, Opus 5) — #413: close the Ingestor door in _deposit()
 # What: _deposit() calls cc_ng_organism.run_conversational_dual_pass() instead of
 #   ng.on_message(). Parity with the laptop daemon's same-day fix. The _recent_spikes read
@@ -362,8 +375,8 @@ RECALL_K_BRIEF = 3
 # peer_bridge disabled: CC is not a peer module (would collide with Syl's
 # module_id="neurograph" in the tract directory).
 # ces disabled: CC doesn't need real-time attention stream.
-# tonic enabled (own Qwen loaded at init; BrainSwitcher hot-swaps to shared
-# ProtoUniBrain body 60s post-startup via Elmer's _delayed_brain_load (#159)).
+# TonicThread is enabled; automatic latent-engine construction stays disabled.
+# The host starts a shared-body-only engine; BrainSwitcher supplies the body (#426).
 _CC_SNN_CONFIG = {
     "learning_rate": 0.03,
     "tau_plus": 10.0,
@@ -908,22 +921,19 @@ def _handle_drain_conduit(data):
         return {"ok": False, "error": "NG not initialized"}
     try:
         from cc_ng_organism import drain_gateway_conduit
-        absorbed = drain_gateway_conduit(
+        result = drain_gateway_conduit(
             ng.graph, ng.vector_db, _STATE.conv_state,
             conduit_dir=data.get("conduit_dir"),
             batch_size=data.get("batch_size"),
             idle_steps=data.get("idle_steps"),
             exclude_prefix=data.get("exclude_prefix"),
+            save_callback=lambda: ng.save(with_receipt=True),
+            journal_path=os.path.join(CC_NG_WORKSPACE, "delivery", "gateway.sqlite3"),
         )
     except Exception as exc:
         logger.warning("CC conduit drain failed (non-fatal): %s", exc)
         return {"ok": False, "error": str(exc)}
-    try:
-        with ng.graph._concurrent_lock:
-            ng.save()
-    except Exception as exc:
-        return {"ok": True, "absorbed": absorbed, "warning": "save failed: " + str(exc)}
-    return {"ok": True, "absorbed": absorbed}
+    return result
 
 
 def _handle_export_topology(data):
@@ -1038,6 +1048,8 @@ _DISPATCH = {
     "export": _handle_export,
     "import": _handle_import,
     "drain_conduit": _handle_drain_conduit,
+    # Old hosts reject this event before any legacy destructive drain runs.
+    "drain_conduit_durable": _handle_drain_conduit,
     "export_topology": _handle_export_topology,
     "export_topology_frame": _handle_export_topology_frame,
     "SessionStart": _handle_session_start,
@@ -1091,10 +1103,18 @@ def _handle_connection(conn: socket.socket) -> None:
 
 
 def _serve_loop() -> None:
-    _STATE.server_sock.settimeout(1.0)
+    # Autosave thread startup can fail before this worker gets scheduled.
+    # Keep our socket reference; the init failure path may clear publication.
+    sock = _STATE.server_sock
+    if sock is None:
+        return
+    try:
+        sock.settimeout(1.0)
+    except OSError:
+        return
     while _STATE.running:
         try:
-            conn, _ = _STATE.server_sock.accept()
+            conn, _ = sock.accept()
         except socket.timeout:
             continue
         except OSError:
@@ -1350,7 +1370,66 @@ def _cleanup_stale_socket() -> None:
     )
 
 
+def _start_cc_tonic_engine(ng) -> bool:
+    """Start CC's existing Tonic mechanism without allocating a transformer.
+
+    BrainSwitcher owns shared-body attachment. This engine belongs only to CC's
+    graph, vector store and TonicThread; no session or step-clock gate is changed.
+    """
+    tt = getattr(ng, "_tonic_thread", None)
+    if tt is None:
+        logger.warning("CC Tonic startup: TonicThread unavailable")
+        return False
+    if getattr(tt, "_latent_engine", None) is not None:
+        return True
+    engine = None
+    try:
+        from tonic_engine import TonicEngine
+        from cc_ng_organism import pith_prefetch_seed
+        engine = TonicEngine(ng.graph, ng.vector_db, tt, require_shared_body=True)
+        engine.set_prefetch_seed(lambda: pith_prefetch_seed(_STATE.conv_state))
+        engine.start()
+        tt.set_latent_engine(engine)
+        logger.info("CC Tonic started in shared-body-only mode; BrainSwitcher owns attachment")
+        return True
+    except Exception:
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception:
+                logger.warning("CC Tonic partial-start cleanup failed", exc_info=True)
+        logger.exception("CC Tonic startup failed; no private transformer was requested")
+        return False
+
+
+_cc_init_lock = threading.Lock()
+# Process-lifetime construction history: clearing a reference is not permission
+# to create another instance with potentially surviving background activity.
+_cc_init_attempted = False
+_cc_init_failed = False
+
+
 def init_cc_host() -> bool:
+    """Serialize CC construction and publication across bootstrap callers."""
+    global _cc_init_failed
+    with _cc_init_lock:
+        if _cc_init_failed:
+            return False
+        if _cc_init_attempted and _STATE.cc_ng is None:
+            _cc_init_failed = True
+            logger.error("CC graph reference missing after construction; refusing reconstruction")
+            return False
+        try:
+            result = _init_cc_host_once()
+        except BaseException:
+            _cc_init_failed = _cc_init_attempted
+            raise
+        if not result and _cc_init_attempted:
+            _cc_init_failed = True
+        return result
+
+
+def _init_cc_host_once() -> bool:
     """Initialize CC's NG and start the hook socket server.
 
     Called from neurograph_rpc.py's handle_bootstrap. Any failure here must
@@ -1363,11 +1442,13 @@ def init_cc_host() -> bool:
     # the VPS across multiple restarts tonight -- no success line, no
     # failure line, socket never created. This traces exactly how far
     # execution gets before whatever is stopping it.
+    global _cc_init_attempted
     logger.info("DIAG: init_cc_host() ENTRY")
 
     if _STATE.cc_ng is not None:
-        logger.info("CC NG already initialized")
-        return True
+        ready = _STATE.running and _STATE.server_sock is not None
+        logger.info("CC NG already constructed (hosting ready=%s)", ready)
+        return bool(ready)
 
     Path(CC_NG_WORKSPACE).mkdir(parents=True, exist_ok=True)
     logger.info("DIAG: init_cc_host() workspace dir ready, constructing NeuroGraphMemory...")
@@ -1375,6 +1456,7 @@ def init_cc_host() -> bool:
     # Construct CC's NG directly (not via get_instance) — Syl already owns
     # the class-level _instance singleton. CC gets its own standalone object.
     from openclaw_hook import NeuroGraphMemory
+    _cc_init_attempted = True
     try:
         cc_ng = NeuroGraphMemory(
             workspace_dir=CC_NG_WORKSPACE,
@@ -1394,6 +1476,35 @@ def init_cc_host() -> bool:
 
     _STATE.cc_ng = cc_ng
     _STATE.stats["started_at"] = time.time()
+
+    # Retain the graph on failure. The wrapper then reports failed readiness;
+    # it never replays initialization over a possibly active partial instance.
+    sock = None
+    try:
+        _cleanup_stale_socket()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(SOCKET_PATH)
+        sock.listen(16)
+        os.chmod(SOCKET_PATH, 0o600)
+        _STATE.server_sock = sock
+    except Exception:
+        logger.exception("CC socket bind failed")
+        if sock is not None:
+            sock.close()
+        return False
+
+    _STATE.running = True
+    try:
+        _write_refcount(0)
+        # Start persistence before serving clients, then optional organisms.
+        threading.Thread(target=_autosave_loop, name="cc-ng-autosave", daemon=True).start()
+        threading.Thread(target=_serve_loop, name="cc-ng-serve", daemon=True).start()
+    except BaseException:
+        _STATE.running = False
+        if _STATE.server_sock is sock:
+            _STATE.server_sock = None
+        sock.close()
+        raise
 
     # Full-parity organism layer (Josh 2026-07-04: "ANYTHING Syl's NeuroGraph
     # can do, I want your NeuroGraph to be able to do, as well.") -- Lenia
@@ -1415,27 +1526,9 @@ def init_cc_host() -> bool:
             logger.info("CC GSG backfill at init: %d nodes stamped (persists via autosave)", _stamped)
     except Exception:
         logger.exception("CC organism-layer bootstrap failed (non-fatal)")
-    logger.info("DIAG: init_cc_host() organism-layer bootstrap done, binding socket...")
+    logger.info("DIAG: init_cc_host() organism-layer bootstrap done")
 
-    # Bind socket
-    try:
-        _cleanup_stale_socket()
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(SOCKET_PATH)
-        sock.listen(16)
-        os.chmod(SOCKET_PATH, 0o600)
-        _STATE.server_sock = sock
-    except Exception:
-        logger.exception("CC socket bind failed")
-        _STATE.cc_ng = None
-        return False
-
-    _STATE.running = True
-    _write_refcount(0)
-
-    # Start background threads
-    threading.Thread(target=_serve_loop, name="cc-ng-serve", daemon=True).start()
-    threading.Thread(target=_autosave_loop, name="cc-ng-autosave", daemon=True).start()
+    _start_cc_tonic_engine(cc_ng)
 
     # CC Tonic idle watcher + Dream consolidation pulse (2026-07-23 parity
     # wiring). Each _start_* fn checks its own CC_HOST_*_ENABLED gate

@@ -68,11 +68,16 @@ class ActivationPersistence:
 
         Only includes nodes with non-zero voltage to keep the sidecar
         compact.  Bounded to ``max_entries`` by voltage magnitude.
+
+        Every captured value is a plain float, so the result is inherently
+        detached from live node objects — no aliasing to break (#423).
         """
         now = time.time()
         entries: Dict[str, Dict[str, Any]] = {}
 
-        for node_id, node in graph.nodes.items():
+        # list() the items first: node creation by a concurrent writer would
+        # otherwise raise "dictionary changed size during iteration" mid-capture.
+        for node_id, node in list(graph.nodes.items()):
             if node.voltage == 0.0 or node.voltage == node.resting_potential:
                 continue
             entries[node_id] = {
@@ -94,8 +99,94 @@ class ActivationPersistence:
 
         return entries
 
+    # ---- Changelog ----
+    # [2026-09-11] Claude (Sonnet 5) — #423: capture/write split + surfaced errors
+    # What: save() factored into capture_state(graph) -> envelope dict and
+    #       write_state(checkpoint_path, captured) -> path. write_state RAISES on write
+    #       failure instead of logging a warning and returning the path anyway; save()
+    #       propagates that. capture() now iterates a list() snapshot of graph.nodes.
+    # Why:  (a) A coherent checkpoint needs capture at a coordination boundary and disk
+    #       I/O after live mutation resumes. (b) The old except-and-return made a failed
+    #       sidecar indistinguishable from a written one at the call site — the hook had
+    #       to infer "writer swallowed its error" from the absent file. A partial capture
+    #       must never be able to produce an accepted receipt.
+    # How:  Envelope construction in capture_state; json.dump in write_state with the
+    #       success bookkeeping only after the write returns, and the exception logged
+    #       then re-raised. _auto_save_tick already guards with try/except, so the
+    #       timer chain is unaffected.
+    # [2026-09-11] Codex — explicit optional write receipt; consumers no longer
+    # infer successful publication by inspecting private timer bookkeeping.
+    # -------------------
+    def capture_state(self, graph: Any) -> Dict[str, Any]:
+        """Capture the full activation sidecar payload in RAM — NO disk I/O.
+
+        Args:
+            graph: The ``Graph`` instance to capture from.
+
+        Returns:
+            The sidecar envelope (version, saved_at, timestep, entries), suitable
+            for :meth:`write_state`.
+        """
+        entries = self.capture(graph)
+        return {
+            "version": "1.0",
+            "saved_at": time.time(),
+            "timestep": graph.timestep,
+            "entries": entries,
+        }
+
+    def write_state(self, checkpoint_path: str, captured: Dict[str, Any],
+                    *, with_receipt: bool = False) -> str | Dict[str, Any]:
+        """Write a previously captured activation payload next to the checkpoint.
+
+        Pure I/O: reads no live graph state, so it may run after mutation resumes.
+
+        Args:
+            checkpoint_path: Path to the main checkpoint file.
+            captured: Envelope returned by :meth:`capture_state`.
+
+        Returns:
+            Path to the written sidecar file, or with ``with_receipt=True`` a
+            mapping containing that path and the captured ``saved_at`` token.
+            The receipt is returned only after the write closes successfully.
+
+        Raises:
+            Exception: Whatever the write failed with. The error is surfaced, NOT
+                swallowed — a caller must never treat a failed sidecar as saved
+                (#423). Save-time bookkeeping (``get_stats``) is updated only after
+                the write succeeds.
+        """
+        sidecar_path = self._sidecar_path_for(checkpoint_path)
+        entries = captured.get("entries", {})
+
+        try:
+            with open(sidecar_path, "w") as f:
+                json.dump(captured, f)
+        except Exception as exc:
+            logger.error(
+                "Failed to save activation sidecar to %s: %s", sidecar_path, exc,
+            )
+            raise
+
+        self._last_save_time = captured.get("saved_at")
+        self._entries_saved = len(entries)
+        self._sidecar_path = sidecar_path
+        logger.info(
+            "Activation sidecar saved: %d entries to %s",
+            len(entries),
+            sidecar_path,
+        )
+        if with_receipt:
+            return {"path": sidecar_path, "saved_at": captured["saved_at"]}
+        return sidecar_path
+
     def save(self, graph: Any, checkpoint_path: str) -> str:
         """Capture and write activation sidecar next to the checkpoint.
+
+        Capture-then-write, fused: equivalent to
+        ``write_state(checkpoint_path, capture_state(graph))``. Use the two
+        primitives directly when the capture must complete at a coordination
+        boundary and the write must happen after live mutation resumes (#423).
 
         Args:
             graph: The ``Graph`` instance to capture from.
@@ -103,32 +194,12 @@ class ActivationPersistence:
 
         Returns:
             Path to the written sidecar file.
+
+        Raises:
+            Exception: Propagated from :meth:`write_state` if the write fails.
+                (Before #423 this was swallowed and the path returned regardless.)
         """
-        entries = self.capture(graph)
-        sidecar_path = self._sidecar_path_for(checkpoint_path)
-
-        data = {
-            "version": "1.0",
-            "saved_at": time.time(),
-            "timestep": graph.timestep,
-            "entries": entries,
-        }
-
-        try:
-            with open(sidecar_path, "w") as f:
-                json.dump(data, f)
-            self._last_save_time = data["saved_at"]
-            self._entries_saved = len(entries)
-            self._sidecar_path = sidecar_path
-            logger.info(
-                "Activation sidecar saved: %d entries to %s",
-                len(entries),
-                sidecar_path,
-            )
-        except Exception as exc:
-            logger.warning("Failed to save activation sidecar: %s", exc)
-
-        return sidecar_path
+        return self.write_state(checkpoint_path, self.capture_state(graph))
 
     def restore(self, graph: Any, checkpoint_path: str) -> int:
         """Restore activation state from sidecar with temporal decay.

@@ -3,6 +3,11 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-11] Codex — #423 completed topology batches are capture boundaries
+# What: serialize in-memory Tier 1/2/3 apply and membership reads on _step_lock.
+# Why: graph/vector capture must not observe nodes before their binding arrives.
+# How: release before consolidation (concurrent -> step order) and membership I/O;
+#      retain the existing budget, grace, admission and 25/250 stepping behavior.
 # [2026-08-28] Claude Code (DudeMan CC, Opus 4.8) — #147 amendment (receiving half): identity crosses the callosum
 # What: removed the merge-time identity-rejection gate (was: skip any node with
 #       metadata['constitutional'] or provenance ending '_authored'). Identity CC
@@ -173,8 +178,9 @@ def cc_current_membership(graph: Any) -> Set[str]:
     cc_topology_export._is_cc_node), so what the receiver advertises as held and
     what the sender considers CC-exportable cannot drift apart.
     """
-    return {nid for nid, node in graph.nodes.items()
-            if is_cc_provenance(nid, getattr(node, "metadata", None) or {})}
+    with graph._step_lock:
+        return {nid for nid, node in graph.nodes.items()
+                if is_cc_provenance(nid, getattr(node, "metadata", None) or {})}
 
 
 def _load_membership(membership_path: Optional[str]) -> Set[str]:
@@ -351,204 +357,212 @@ def merge_cc_topology(
             stats["deferred_by_budget"] += len(frame.get("nodes") or ())
             continue
 
-        # --- Tier 1: nodes -------------------------------------------------
-        batch_landed: Set[str] = set()
-        for rec in frame.get("nodes") or ():
-            if budget <= 0:
-                stats["deferred_by_budget"] += 1
-                continue
-            nid = rec.get("id")
-            if not nid:
-                continue
-            if nid in graph.nodes:
-                stats["skipped_present"] += 1
-                batch_landed.add(nid)   # present == usable as an endpoint
-                continue
-            if nid in held:
-                # NO `continue` HERE -- #106. Falling through is the fix.
-                #
-                # The graph check above already caught every node that is
-                # actually present, so this branch can only be reached by a node
-                # in (held - graph.nodes): one that was in the receiver's last
-                # membership snapshot but has since been destroyed locally.
-                # Vetoing on that record made re-delivery impossible forever, and
-                # the loss did not stop at the node -- Tier 2 requires both
-                # endpoints in graph.nodes and Tier 3 every member, so a single
-                # permanently-vetoed node shredded all of its incident structure
-                # on every subsequent pass. The snapshot is the sender's
-                # bookkeeping (exclude_ids); presence in the graph is the
-                # receiver's authority. A held-but-absent node that arrived anyway
-                # means the sender chose to re-send it -- honour the delivery.
-                # (After #110 the sender WILL re-send it: a culled node drops out
-                # of cc_current_membership, so exclude_ids no longer names it.)
-                # Counted at the absorption site below, not here -- this point
-                # is only "detected", and the node can still be rejected by the
-                # provenance gates or the deposit try/except before it lands.
-                logger.info(
-                    "CC topology: %s was in our last membership snapshot but is "
-                    "absent from the graph -- re-absorbing (culled since, #106)", nid)
-
-            meta = dict(rec.get("metadata") or {})
-            # Defense in depth: re-run both provenance gates on receive. The
-            # sender is trusted but not authoritative -- a conduit is a file,
-            # and a file can be stale, hand-edited, or from a mispointed
-            # workspace. Cheap check, catastrophic miss.
-            if not is_cc_provenance(nid, meta):
-                stats["skipped_not_cc"] += 1
-                continue
-            # #147 amendment (2026-08-28): identity CROSSES the callosum. The gate
-            # that used to reject constitutional / *_authored nodes here has been
-            # removed -- walling identity out of the callosum is a split-brain
-            # lesion (the sender stopped withholding it in cc_topology_export; this
-            # is its receiving half). Sender and receiver now share ONE admission
-            # predicate: is_cc_provenance above. Protection is applied at the
-            # CORRECT layer -- prune/orphan time, by neuro_foundation
-            # _is_identity_protected (3517), which keys on the very metadata flags
-            # (constitutional / provenance) that ride the wire via _portable_metadata
-            # and land in node.metadata below. That protector's own docstring names
-            # this exact case: "a want arrives synapse-poor via corpus-callosum
-            # consolidation (#70)". The stats["skipped_identity"] counter (init at
-            # the top of this fn) now stays 0 by design -- a nonzero value would
-            # mean the split-brain lesion was re-introduced.
-
-            # An embedding is an attribute of the node, not a precondition for
-            # it. Absent or corrupt, the node still installs with its metadata
-            # and stays a full participant in synapses and hyperedges -- which
-            # are the payload. What is lost is recall-store indexing and the
-            # poincare_dir stamp, both recoverable later by re-embedding.
-            # Dropping the node instead would also drop every edge touching it.
-            emb = None
-            dim = int(rec.get("embedding_dim") or 0)
-            blob = rec.get("embedding")
-            if blob and dim > 0:
-                candidate = np.frombuffer(blob, dtype=np.float32)
-                if candidate.shape[0] == dim and np.all(np.isfinite(candidate)):
-                    emb = candidate
-                else:
-                    # Corrupt numbers are worse than none: a malformed vector
-                    # would be indexed for recall and stamped as a position.
-                    stats["bad_embedding"] += 1
-                    logger.warning(
-                        "CC topology: discarding malformed embedding for %s "
-                        "(installing node structurally)", nid)
-
-            try:
-                if emb is not None:
-                    # Deposits into graph + recall AND re-derives poincare_dir
-                    # locally from the embedding (cc_ng_organism.py:1219),
-                    # which is why the wire never carries it.
-                    _cc_deposit_memory_node(graph, vector_db, nid, emb,
-                                            rec.get("content") or "", meta)
-                else:
-                    # Structural install. Deliberately NOT stamping a zero
-                    # poincare_dir -- absent is honest, whereas zeros asserts a
-                    # false position at the origin that delay derivation would
-                    # then treat as real.
+        # Existing Graph RLock: one bounded topology batch is indivisible to
+        # checkpoint capture. Conduit read/msgpack decode already completed.
+        # Never hold it through consolidation, which acquires _concurrent_lock.
+        with graph._step_lock:
+            # --- Tier 1: nodes -------------------------------------------------
+            batch_landed: Set[str] = set()
+            for rec in frame.get("nodes") or ():
+                if budget <= 0:
+                    stats["deferred_by_budget"] += 1
+                    continue
+                nid = rec.get("id")
+                if not nid:
+                    continue
+                if nid in graph.nodes:
+                    stats["skipped_present"] += 1
+                    batch_landed.add(nid)   # present == usable as an endpoint
+                    continue
+                if nid in held:
+                    # NO `continue` HERE -- #106. Falling through is the fix.
                     #
-                    # Reaching here means the sender exported a node with no
-                    # usable vector. That is a DEFECT on the far side (see the
-                    # matching alarm in cc_topology_export.collect_cc_nodes),
-                    # not a supported wire mode -- the node lands structurally
-                    # so its synapses and hyperedges survive, but it is inert
-                    # to recall and to the Tonic until re-embedded. Drive this
-                    # count to zero; do not learn to live with it.
-                    graph.create_node(node_id=nid, metadata=dict(meta))
-                    stats["absorbed_without_embedding_DEFECT"] += 1
-                    logger.error(
-                        "CC topology merge: node %s arrived with NO embedding -- "
-                        "installed structurally, but it is inert to recall and "
-                        "the Tonic. Upstream export defect.", nid)
-            except Exception as exc:
-                logger.warning("CC topology deposit failed for %s: %s", nid, exc)
-                continue
+                    # The graph check above already caught every node that is
+                    # actually present, so this branch can only be reached by a node
+                    # in (held - graph.nodes): one that was in the receiver's last
+                    # membership snapshot but has since been destroyed locally.
+                    # Vetoing on that record made re-delivery impossible forever, and
+                    # the loss did not stop at the node -- Tier 2 requires both
+                    # endpoints in graph.nodes and Tier 3 every member, so a single
+                    # permanently-vetoed node shredded all of its incident structure
+                    # on every subsequent pass. The snapshot is the sender's
+                    # bookkeeping (exclude_ids); presence in the graph is the
+                    # receiver's authority. A held-but-absent node that arrived anyway
+                    # means the sender chose to re-send it -- honour the delivery.
+                    # (After #110 the sender WILL re-send it: a culled node drops out
+                    # of cc_current_membership, so exclude_ids no longer names it.)
+                    # Counted at the absorption site below, not here -- this point
+                    # is only "detected", and the node can still be rejected by the
+                    # provenance gates or the deposit try/except before it lands.
+                    logger.info(
+                        "CC topology: %s was in our last membership snapshot but is "
+                        "absent from the graph -- re-absorbing (culled since, #106)", nid)
 
-            stats["absorbed_nodes"] += 1
-            if nid in held:
-                # Counted here, after the node has actually landed, so the stat
-                # reports re-admissions that happened rather than ones merely
-                # attempted. `held` is not mutated inside this loop, so this
-                # re-test is the same predicate evaluated at the Tier-1 branch.
-                stats["membership_stale_readmitted"] += 1
-            landed_ids.append(nid)
-            batch_landed.add(nid)
-            budget -= 1
+                meta = dict(rec.get("metadata") or {})
+                # Defense in depth: re-run both provenance gates on receive. The
+                # sender is trusted but not authoritative -- a conduit is a file,
+                # and a file can be stale, hand-edited, or from a mispointed
+                # workspace. Cheap check, catastrophic miss.
+                if not is_cc_provenance(nid, meta):
+                    stats["skipped_not_cc"] += 1
+                    continue
+                # #147 amendment (2026-08-28): identity CROSSES the callosum. The gate
+                # that used to reject constitutional / *_authored nodes here has been
+                # removed -- walling identity out of the callosum is a split-brain
+                # lesion (the sender stopped withholding it in cc_topology_export; this
+                # is its receiving half). Sender and receiver now share ONE admission
+                # predicate: is_cc_provenance above. Protection is applied at the
+                # CORRECT layer -- prune/orphan time, by neuro_foundation
+                # _is_identity_protected (3517), which keys on the very metadata flags
+                # (constitutional / provenance) that ride the wire via _portable_metadata
+                # and land in node.metadata below. That protector's own docstring names
+                # this exact case: "a want arrives synapse-poor via corpus-callosum
+                # consolidation (#70)". The stats["skipped_identity"] counter (init at
+                # the top of this fn) now stays 0 by design -- a nonzero value would
+                # mean the split-brain lesion was re-introduced.
 
-        # --- Tier 2: synapses (both endpoints must exist) -------------------
-        for syn in frame.get("synapses") or ():
-            pre, post = syn.get("pre"), syn.get("post")
-            if pre not in graph.nodes or post not in graph.nodes:
-                stats["skipped_synapses"] += 1
-                continue
-            if _synapse_exists(graph, pre, post):
-                stats["skipped_synapses"] += 1
-                continue
-            try:
-                graph.create_synapse(
-                    pre_node_id=pre,
-                    post_node_id=post,
-                    weight=float(syn.get("weight", 0.1)),
-                    # The reason this is msgpack and not a BTF frame: delay is
-                    # functional (polychronous motifs, STDP ordering), and BTF
-                    # has no field for it.
-                    delay=int(syn.get("delay", 1)),
-                    synapse_type=_synapse_type(syn.get("synapse_type")),
-                    max_weight=float(syn.get("max_weight", 5.0)),
-                )
-                stats["absorbed_synapses"] += 1
-            except Exception as exc:
-                logger.debug("CC topology synapse %s->%s failed: %s", pre, post, exc)
-                stats["skipped_synapses"] += 1
+                # An embedding is an attribute of the node, not a precondition for
+                # it. Absent or corrupt, the node still installs with its metadata
+                # and stays a full participant in synapses and hyperedges -- which
+                # are the payload. What is lost is recall-store indexing and the
+                # poincare_dir stamp, both recoverable later by re-embedding.
+                # Dropping the node instead would also drop every edge touching it.
+                emb = None
+                dim = int(rec.get("embedding_dim") or 0)
+                blob = rec.get("embedding")
+                if blob and dim > 0:
+                    candidate = np.frombuffer(blob, dtype=np.float32)
+                    if candidate.shape[0] == dim and np.all(np.isfinite(candidate)):
+                        emb = candidate
+                    else:
+                        # Corrupt numbers are worse than none: a malformed vector
+                        # would be indexed for recall and stamped as a position.
+                        stats["bad_embedding"] += 1
+                        logger.warning(
+                            "CC topology: discarding malformed embedding for %s "
+                            "(installing node structurally)", nid)
 
-        # --- Tier 3: hyperedges (all members must exist) --------------------
-        for he in frame.get("hyperedges") or ():
-            members = set(he.get("members") or ())
-            if not members or not members.issubset(graph.nodes):
-                # create_hyperedge raises KeyError here (neuro_foundation.py:1951);
-                # skipping keeps the pass alive for the rest of the batch.
-                stats["skipped_hyperedges"] += 1
-                continue
-            if _hyperedge_exists(graph, members):
-                # Re-merge must not stack a second binding edge over the same
-                # members -- that double-counts the turn's activation. This
-                # member-set check is kept as the PRIMARY guard even though the
-                # sender's id now rides the wire, because it also catches the
-                # case id-matching cannot: an edge the two hemispheres grew
-                # INDEPENDENTLY over the same members, which has two legitimate
-                # but different ids. Id-preservation and member-set dedupe
-                # cover different halves of convergence; we want both.
-                stats["skipped_hyperedges"] += 1
-                continue
-            try:
-                # Preserve the sender's identity when it supplied one. Frames
-                # written before the id was added to the wire simply omit it,
-                # and .get() -> None restores the old mint-locally behaviour --
-                # so an in-flight older frame still merges cleanly.
-                wire_id = he.get("id") or None
-                if wire_id is not None and wire_id in getattr(graph, "hyperedges", {}):
-                    # Same id, different member set (member-set dedupe above
-                    # already cleared identical ones). create_hyperedge would
-                    # raise ValueError; mint locally instead of losing the edge.
-                    logger.warning(
-                        "CC topology: hyperedge id %s already present with "
-                        "different members -- installing under a fresh local id",
-                        wire_id)
-                    wire_id = None
-                edge = graph.create_hyperedge(
-                    member_node_ids=members,
-                    activation_threshold=float(he.get("activation_threshold", 0.6)),
-                    metadata=dict(he.get("metadata") or {}),
-                    hyperedge_id=wire_id,
-                )
-                lvl = he.get("level")
-                if lvl is not None and hasattr(edge, "level"):
-                    # No `level` param on create_hyperedge -- set post-hoc.
-                    edge.level = int(lvl)
-                stats["absorbed_hyperedges"] += 1
-                if wire_id is None and he.get("id"):
-                    stats["hyperedge_id_reminted"] += 1
-            except Exception as exc:
-                logger.debug("CC topology hyperedge failed: %s", exc)
-                stats["skipped_hyperedges"] += 1
+                try:
+                    if emb is not None:
+                        # Deposits into graph + recall AND re-derives poincare_dir
+                        # locally from the embedding (cc_ng_organism.py:1219),
+                        # which is why the wire never carries it.
+                        _cc_deposit_memory_node(graph, vector_db, nid, emb,
+                                                rec.get("content") or "", meta)
+                    else:
+                        # Structural install. Deliberately NOT stamping a zero
+                        # poincare_dir -- absent is honest, whereas zeros asserts a
+                        # false position at the origin that delay derivation would
+                        # then treat as real.
+                        #
+                        # Reaching here means the sender exported a node with no
+                        # usable vector. That is a DEFECT on the far side (see the
+                        # matching alarm in cc_topology_export.collect_cc_nodes),
+                        # not a supported wire mode -- the node lands structurally
+                        # so its synapses and hyperedges survive, but it is inert
+                        # to recall and to the Tonic until re-embedded. Drive this
+                        # count to zero; do not learn to live with it.
+                        graph.create_node(node_id=nid, metadata=dict(meta))
+                        stats["absorbed_without_embedding_DEFECT"] += 1
+                        logger.error(
+                            "CC topology merge: node %s arrived with NO embedding -- "
+                            "installed structurally, but it is inert to recall and "
+                            "the Tonic. Upstream export defect.", nid)
+                except Exception as exc:
+                    logger.warning("CC topology deposit failed for %s: %s", nid, exc)
+                    continue
+
+                stats["absorbed_nodes"] += 1
+                if nid in held:
+                    # Counted here, after the node has actually landed, so the stat
+                    # reports re-admissions that happened rather than ones merely
+                    # attempted. `held` is not mutated inside this loop, so this
+                    # re-test is the same predicate evaluated at the Tier-1 branch.
+                    stats["membership_stale_readmitted"] += 1
+                landed_ids.append(nid)
+                batch_landed.add(nid)
+                budget -= 1
+
+            # --- Tier 2: synapses (both endpoints must exist) -------------------
+            for syn in frame.get("synapses") or ():
+                pre, post = syn.get("pre"), syn.get("post")
+                if pre not in graph.nodes or post not in graph.nodes:
+                    stats["skipped_synapses"] += 1
+                    continue
+                if _synapse_exists(graph, pre, post):
+                    stats["skipped_synapses"] += 1
+                    continue
+                try:
+                    graph.create_synapse(
+                        pre_node_id=pre,
+                        post_node_id=post,
+                        weight=float(syn.get("weight", 0.1)),
+                        # The reason this is msgpack and not a BTF frame: delay is
+                        # functional (polychronous motifs, STDP ordering), and BTF
+                        # has no field for it.
+                        delay=int(syn.get("delay", 1)),
+                        synapse_type=_synapse_type(syn.get("synapse_type")),
+                        max_weight=float(syn.get("max_weight", 5.0)),
+                    )
+                    stats["absorbed_synapses"] += 1
+                except Exception as exc:
+                    logger.debug("CC topology synapse %s->%s failed: %s", pre, post, exc)
+                    stats["skipped_synapses"] += 1
+
+            # --- Tier 3: hyperedges (all members must exist) --------------------
+            for he in frame.get("hyperedges") or ():
+                members = set(he.get("members") or ())
+                if not members or not members.issubset(graph.nodes):
+                    # create_hyperedge raises KeyError here (neuro_foundation.py:1951);
+                    # skipping keeps the pass alive for the rest of the batch.
+                    stats["skipped_hyperedges"] += 1
+                    continue
+                if _hyperedge_exists(graph, members):
+                    # Re-merge must not stack a second binding edge over the same
+                    # members -- that double-counts the turn's activation. This
+                    # member-set check is kept as the PRIMARY guard even though the
+                    # sender's id now rides the wire, because it also catches the
+                    # case id-matching cannot: an edge the two hemispheres grew
+                    # INDEPENDENTLY over the same members, which has two legitimate
+                    # but different ids. Id-preservation and member-set dedupe
+                    # cover different halves of convergence; we want both.
+                    stats["skipped_hyperedges"] += 1
+                    continue
+                try:
+                    # Preserve the sender's identity when it supplied one. Frames
+                    # written before the id was added to the wire simply omit it,
+                    # and .get() -> None restores the old mint-locally behaviour --
+                    # so an in-flight older frame still merges cleanly.
+                    wire_id = he.get("id") or None
+                    if wire_id is not None and wire_id in getattr(graph, "hyperedges", {}):
+                        # Same id, different member set (member-set dedupe above
+                        # already cleared identical ones). create_hyperedge would
+                        # raise ValueError; mint locally instead of losing the edge.
+                        logger.warning(
+                            "CC topology: hyperedge id %s already present with "
+                            "different members -- installing under a fresh local id",
+                            wire_id)
+                        wire_id = None
+                    edge = graph.create_hyperedge(
+                        member_node_ids=members,
+                        activation_threshold=float(he.get("activation_threshold", 0.6)),
+                        metadata=dict(he.get("metadata") or {}),
+                        hyperedge_id=wire_id,
+                    )
+                    lvl = he.get("level")
+                    if lvl is not None and hasattr(edge, "level"):
+                        # No `level` param on create_hyperedge -- set post-hoc.
+                        edge.level = int(lvl)
+                    stats["absorbed_hyperedges"] += 1
+                    if wire_id is None and he.get("id"):
+                        stats["hyperedge_id_reminted"] += 1
+                except Exception as exc:
+                    logger.debug("CC topology hyperedge failed: %s", exc)
+                    stats["skipped_hyperedges"] += 1
+
+            merge_landed |= batch_landed
+            unbound = (_unbound_nodes(graph, merge_landed)
+                       if idle_steps > 0 and merge_landed else set())
 
         # --- Consolidation: sleep on this batch before taking the next ------
         # FatherGraph Finding 3 / ruling condition (c) / #108. Tier 3 has run,
@@ -580,9 +594,7 @@ def merge_cc_topology(
         # Otherwise skip, count, and log loudly -- an unbound arrival is a real
         # defect worth seeing, and deferring its consolidation costs only
         # integration quality, whereas running it costs the node.
-        merge_landed |= batch_landed
         if idle_steps > 0 and merge_landed:
-            unbound = _unbound_nodes(graph, merge_landed)
             if unbound:
                 stats["consolidation_skipped_unbound_arrivals"] += len(unbound)
                 logger.error(
