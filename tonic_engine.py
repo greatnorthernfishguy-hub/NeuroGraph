@@ -26,6 +26,18 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-09-13] Grok Build (grok-4.6) — bounded per-stage latent-token timing.
+# What: time candidate feature extraction, model-tensor feature materialization,
+#   shared-body lock wait, transformer forward while holding the existing body
+#   lock, prime_and_propagate, ouroboros_cycle, the latent-token total, and
+#   autostep when it actually runs. status() exposes
+#   last-sample + EMA scalars; over-budget logs include the same split.
+# Why: VPS observation needs lock-wait vs forward vs propagate vs extract so
+#   starvation can be distinguished from shared-body serialization. Measurement
+#   only — cadence, locks, heuristic policy, and outputs stay unchanged.
+# How: perf_counter around existing call sites; wait is __enter__ of the current
+#   _body_lock_context(), forward is the held-lock body. Constant-size dicts.
+#   Fail-soft: timing/logging exceptions cannot stop a tick or change activations.
 # [2026-09-11] Claude Code + Codex — #426 shared-body-only Tonic attachment.
 # [2026-09-11] Codex — preserve existing wrappers on failed swaps (Grok review).
 # What: optional require_shared_body prevents private model loading; late offers build
@@ -246,6 +258,20 @@ _CC_PITH_PREFETCH_REPEATS = max(1, int(os.environ.get("CC_PITH_PREFETCH_REPEATS"
 # synapse-follow (0.8): a prediction warms, it does not out-shout a real association.
 _CC_PITH_PREFETCH_CURRENT_SCALE = max(0.0, min(1.0, float(os.environ.get("CC_PITH_PREFETCH_CURRENT_SCALE", "0.5"))))
 
+# Bounded per-stage tick timing. Always on, constant-size, no extra env knob.
+# EMA α matches the existing cadence EMA in _generation_loop.
+_STAGE_EMA_ALPHA = 0.2
+_STAGE_NAMES = (
+    "feature_extract",
+    "model_feature_extract",
+    "body_lock_wait",
+    "transformer_forward",
+    "propagate",
+    "ouroboros",
+    "latent",
+    "autostep",
+)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -413,6 +439,9 @@ class TonicEngine:
         self._prefetch_gen_key = None   # last seed set primed (repeat bound, #55 5b)
         self._prefetch_gen_uses = 0     # ticks the current seed set has been primed
         self._prefetch_fail_logged = False
+        # Per-stage last-sample + EMA (milliseconds). Fixed keys; never a history.
+        self._stage_last_ms = {name: 0.0 for name in _STAGE_NAMES}
+        self._stage_ema_ms = {name: 0.0 for name in _STAGE_NAMES}
 
         # Try to load surgical model
         self._model = None
@@ -719,6 +748,50 @@ class TonicEngine:
     # Latent Token Generation
     # -----------------------------------------------------------------
 
+    def _reset_stage_samples(self) -> None:
+        """Zero this tick's last-sample values. EMAs of stages that ran stay."""
+        try:
+            for name in self._stage_last_ms:
+                self._stage_last_ms[name] = 0.0
+        except Exception:
+            pass
+
+    def _record_stage_ms(self, name: str, elapsed_ms: float) -> None:
+        """Store one stage sample. Never raises; never grows storage."""
+        try:
+            elapsed_ms = max(0.0, float(elapsed_ms))
+            self._stage_last_ms[name] = elapsed_ms
+            prev = self._stage_ema_ms[name]
+            if prev == 0.0:
+                self._stage_ema_ms[name] = elapsed_ms
+            else:
+                self._stage_ema_ms[name] = (
+                    _STAGE_EMA_ALPHA * elapsed_ms
+                    + (1.0 - _STAGE_EMA_ALPHA) * prev
+                )
+        except Exception:
+            pass
+
+    def _record_stage(self, name: str, t0: float) -> None:
+        try:
+            self._record_stage_ms(name, (time.perf_counter() - t0) * 1000.0)
+        except Exception:
+            pass
+
+    def _stage_status(self) -> Dict[str, Any]:
+        try:
+            return {
+                f"{kind}_{name}_ms": round(float(store[name]), 2)
+                for name in _STAGE_NAMES
+                for kind, store in (("last", self._stage_last_ms), ("ema", self._stage_ema_ms))
+            }
+        except Exception:
+            return {
+                f"{kind}_{name}_ms": 0.0
+                for name in _STAGE_NAMES
+                for kind in ("last", "ema")
+            }
+
     def _generate_latent_token(self) -> Dict[str, Any]:
         """Generate one latent token — one step of the push.
 
@@ -733,6 +806,8 @@ class TonicEngine:
         The Tonic acquires the lock to signal "I'm working" so bridges
         know to skip, but it never blocks waiting for anyone.
         """
+        self._reset_stage_samples()
+        t_latent = time.perf_counter()
         lock = getattr(self._graph, '_concurrent_lock', None)
         acquired = False
         if lock is not None:
@@ -742,18 +817,24 @@ class TonicEngine:
         finally:
             if acquired:
                 lock.release()
+            self._record_stage("latent", t_latent)
 
     def _generate_latent_token_inner(self) -> Dict[str, Any]:
         """Inner implementation — actual latent token generation."""
+        self._reset_stage_samples()
         if self._require_shared_body and (
             self._use_heuristic or self._model is None
             or self._shared_body is None
         ):
             return {"fired": 0, "activated": 0, "waiting_for_shared_body": True}
-        features = _extract_tonic_features(
-            self._graph, self._tonic_thread,
-            node_budget=self._config.node_sample_budget,
-        )
+        t_feat = time.perf_counter()
+        try:
+            features = _extract_tonic_features(
+                self._graph, self._tonic_thread,
+                node_budget=self._config.node_sample_budget,
+            )
+        finally:
+            self._record_stage("feature_extract", t_feat)
         if features is None:
             return {"fired": 0, "activated": 0}
 
@@ -770,16 +851,24 @@ class TonicEngine:
         node_ids = [nid for nid, _ in activations]
         currents = [strength for _, strength in activations]
 
-        result = self._graph.prime_and_propagate(
-            node_ids=node_ids,
-            currents=currents,
-            steps=self._config.propagation_steps,
-            write_mode=True,
-        )
+        t_prop = time.perf_counter()
+        try:
+            result = self._graph.prime_and_propagate(
+                node_ids=node_ids,
+                currents=currents,
+                steps=self._config.propagation_steps,
+                write_mode=True,
+            )
+        finally:
+            self._record_stage("propagate", t_prop)
 
         # Update the tonic thread with the result
         if self._tonic_thread is not None:
-            self._tonic_thread.ouroboros_cycle()
+            t_ou = time.perf_counter()
+            try:
+                self._tonic_thread.ouroboros_cycle()
+            finally:
+                self._record_stage("ouroboros", t_ou)
 
         self._tokens_generated += 1
         self._total_activations += len(activations)
@@ -1013,8 +1102,14 @@ class TonicEngine:
         except ImportError:
             return self._fallback_inference(features)
 
-        # Extract graph features into GraphFeatures struct
-        graph_features = self._extract_graph_features_for_model()
+        # Materialize graph features for the model outside the body lock. This
+        # walks graph collections independently of the bounded candidate scan,
+        # so keep its cost distinct from both lock wait and transformer work.
+        t_model_feat = time.perf_counter()
+        try:
+            graph_features = self._extract_graph_features_for_model()
+        finally:
+            self._record_stage("model_feature_extract", t_model_feat)
         if graph_features is None:
             return self._fallback_inference(features)
 
@@ -1025,17 +1120,32 @@ class TonicEngine:
         # so what we read here cannot change until the forward completes. Without this, a
         # shed mid-tick calls the wrapper with body=None. Apply the fallback policy
         # OUTSIDE the lock; required-sharing consumers return no activations.
+        # Wait vs forward: time __enter__ of the existing context manager separately
+        # from the held-lock body. Do not acquire the lock twice.
         output = None
-        with self._body_lock_context():
-            model = self._model
-            if (
-                model is not None
-                and getattr(model, "body", None) is not None
-                and self._shared_body is not None
-                and not self._use_heuristic
-            ):
-                with torch.no_grad():
-                    output = model(graph_features)
+        t_wait = time.perf_counter()
+        t_held = None
+        t_fwd_end = None
+        try:
+            with self._body_lock_context():
+                t_held = time.perf_counter()
+                model = self._model
+                if (
+                    model is not None
+                    and getattr(model, "body", None) is not None
+                    and self._shared_body is not None
+                    and not self._use_heuristic
+                ):
+                    try:
+                        with torch.no_grad():
+                            output = model(graph_features)
+                    finally:
+                        t_fwd_end = time.perf_counter()
+        finally:
+            if t_held is not None:
+                self._record_stage_ms("body_lock_wait", (t_held - t_wait) * 1000.0)
+                if t_fwd_end is not None:
+                    self._record_stage_ms("transformer_forward", (t_fwd_end - t_held) * 1000.0)
         if output is None:
             return self._fallback_inference(features)
 
@@ -1220,11 +1330,13 @@ class TonicEngine:
                 now = time.monotonic()
                 if now - self._last_autostep >= _CC_NG_AUTOSTEP_MIN_INTERVAL:
                     self._last_autostep = now
+                    t_auto = time.perf_counter()
                     try:
                         with self._graph._step_lock:
                             self._graph.step()
                     except Exception as exc:
                         logger.debug("Autostep error: %s", exc)
+                    self._record_stage("autostep", t_auto)
 
             elapsed = time.perf_counter() - t0
             elapsed_ms = elapsed * 1000.0
@@ -1239,11 +1351,32 @@ class TonicEngine:
                 )
 
             if elapsed > self._config.tick_budget_seconds:
-                logger.warning(
-                    "Tonic tick over budget: %.3fs (budget %.1fs, nodes=%d, ema=%.1fms)",
-                    elapsed, self._config.tick_budget_seconds,
-                    len(self._graph.nodes), self._ema_tick_ms,
-                )
+                try:
+                    logger.warning(
+                        "Tonic tick over budget: %.3fs (budget %.1fs, nodes=%d, ema=%.1fms, "
+                        "feature_extract=%.1fms model_feature_extract=%.1fms "
+                        "body_lock_wait=%.1fms transformer_forward=%.1fms "
+                        "propagate=%.1fms ouroboros=%.1fms latent=%.1fms autostep=%.1fms)",
+                        elapsed, self._config.tick_budget_seconds,
+                        len(self._graph.nodes), self._ema_tick_ms,
+                        self._stage_last_ms.get("feature_extract", 0.0),
+                        self._stage_last_ms.get("model_feature_extract", 0.0),
+                        self._stage_last_ms.get("body_lock_wait", 0.0),
+                        self._stage_last_ms.get("transformer_forward", 0.0),
+                        self._stage_last_ms.get("propagate", 0.0),
+                        self._stage_last_ms.get("ouroboros", 0.0),
+                        self._stage_last_ms.get("latent", 0.0),
+                        self._stage_last_ms.get("autostep", 0.0),
+                    )
+                except Exception:
+                    try:
+                        logger.warning(
+                            "Tonic tick over budget: %.3fs (budget %.1fs, nodes=%d, ema=%.1fms)",
+                            elapsed, self._config.tick_budget_seconds,
+                            len(self._graph.nodes), self._ema_tick_ms,
+                        )
+                    except Exception:
+                        pass
 
             base_interval = (
                 self._config.conversation_interval
@@ -1298,4 +1431,5 @@ class TonicEngine:
             "current_interval_s": round(self._current_interval, 2),
             "node_sample_budget": self._config.node_sample_budget,
             "prefetch_seeded": self._prefetch_seeded,
+            **self._stage_status(),
         }
