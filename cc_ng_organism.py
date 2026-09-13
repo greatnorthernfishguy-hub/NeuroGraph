@@ -3,6 +3,10 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-13] Codex — construct provider context from connected CC topology.
+# What: add a bounded, read-only provider-context assembler over activation basins.
+# Why: individually ranked snippets lose causal relationships, exact anchors, and continuity.
+# How: existing SNN pattern completion supplies roots; synapses and hyperedges keep assemblies whole.
 # [2026-09-12] Codex — measure outbound miniTID history compression canonically.
 # What: add coherent history-call/result/failure counters and expose its budget gate.
 # Why: inbound L1 counters stayed zero whether outbound compression worked or failed.
@@ -2412,7 +2416,8 @@ _CC_RECALL_PROP_STEPS = int(os.environ.get("CC_RECALL_PROP_STEPS", "0"))
 
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                                     threshold: float = _CC_RECALL_PRIME_THRESHOLD,
-                                    state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                                    state: Optional[Dict[str, Any]] = None,
+                                    preserve_graph_config: bool = False) -> List[Dict[str, Any]]:
     """Substrate-native pattern-completion recall for CC's hook surfacing
     (#358 rebuild -- replaces the bare ng.recall() cosine search this
     function originally wrapped; LAW 3 rebuild-in-place, same contract).
@@ -2447,22 +2452,37 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         old_max = cfg.get("max_surfaced", 10)
         old_thresh = cfg.get("prime_threshold", 0.4)
         old_steps = cfg.get("propagation_steps", 3)
-        # Oversample the harvest when selectivity is on, so query-relevant but
-        # lower-strength nodes are IN the pool for selectivity to promote past
-        # the hubs (re-ranking only the top-k hubs the spread returns can't help).
-        cfg["max_surfaced"] = k * _CC_RECALL_SELECTIVITY_OVERSAMPLE if _CC_RECALL_SELECTIVITY else k
-        cfg["prime_threshold"] = threshold
-        # Experimental (measured): fewer propagation steps keeps activation near
-        # the query-specific SEEDS instead of flowing to the convergent hub
-        # attractor basin that erases the query signal. 0 = engine default.
-        if _CC_RECALL_PROP_STEPS > 0:
-            cfg["propagation_steps"] = _CC_RECALL_PROP_STEPS
-        try:
-            surfaced = ng._harvest_associations(query, novelty=novelty)
-        finally:
-            cfg["max_surfaced"] = old_max
-            cfg["prime_threshold"] = old_thresh
-            cfg["propagation_steps"] = old_steps
+        harvest_max = k * _CC_RECALL_SELECTIVITY_OVERSAMPLE if _CC_RECALL_SELECTIVITY else k
+        if preserve_graph_config:
+            # provider_context is a read-only observation boundary.  The host
+            # must not temporarily rewrite graph.config; use the canonical
+            # harvest overrides instead.  The graph-owned prime threshold stays
+            # authoritative on this observation path.  The underlying
+            # prime_and_propagate read mode disables plasticity and restores
+            # transient voltages/refractory state after observational ignition;
+            # it exposes current learned topology without teaching the graph.
+            surfaced = ng._harvest_associations(
+                query,
+                novelty=novelty,
+                max_surfaced_override=harvest_max,
+                propagation_steps_override=(
+                    _CC_RECALL_PROP_STEPS if _CC_RECALL_PROP_STEPS > 0 else None
+                ),
+            )
+        else:
+            # Existing hook recall temporarily overrides the graph's harvest
+            # controls and restores them around the call.  Kept unchanged for
+            # compatibility; provider_context takes the branch above.
+            cfg["max_surfaced"] = harvest_max
+            cfg["prime_threshold"] = threshold
+            if _CC_RECALL_PROP_STEPS > 0:
+                cfg["propagation_steps"] = _CC_RECALL_PROP_STEPS
+            try:
+                surfaced = ng._harvest_associations(query, novelty=novelty)
+            finally:
+                cfg["max_surfaced"] = old_max
+                cfg["prime_threshold"] = old_thresh
+                cfg["propagation_steps"] = old_steps
 
         # Anticipatory bonus (#256 port) -- canonical rpc.py:2981-2989
         promoted_ids: set = set()
@@ -3053,6 +3073,17 @@ _CC_PITH_W_RECENCY = float(os.environ.get("CC_PITH_W_RECENCY", "0.6"))
 _CC_PITH_L1_BUDGET = int(os.environ.get("CC_PITH_L1_BUDGET", "4000"))
 _CC_PITH_L1_BUDGET = max(500, min(40000, _CC_PITH_L1_BUDGET))
 
+# Provider-context Slice A.  These are extraction-boundary attention limits,
+# not deposit schemas.  Raw experience still enters the substrate unchanged.
+_CC_PITH_PROVIDER_ROOTS = max(1, min(24, int(os.environ.get("CC_PITH_PROVIDER_ROOTS", "8"))))
+_CC_PITH_PROVIDER_MEMBERS = max(2, min(16, int(os.environ.get("CC_PITH_PROVIDER_MEMBERS", "6"))))
+_CC_PITH_PROVIDER_DEPTH = max(1, min(3, int(os.environ.get("CC_PITH_PROVIDER_DEPTH", "2"))))
+_CC_PITH_PROVIDER_NODE_CHARS = max(120, min(2000, int(os.environ.get("CC_PITH_PROVIDER_NODE_CHARS", "700"))))
+_CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS = max(
+    500, min(16000, int(os.environ.get("CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS", "8000"))))
+_CC_PITH_PROVIDER_MAX_QUEST_CHARS = max(
+    0, min(16000, int(os.environ.get("CC_PITH_PROVIDER_MAX_QUEST_CHARS", "8000"))))
+
 # Stage 2 (keyframe / LOD compression) config -- default keyframe size in
 # chars, clamped [60, 1000]. See pith_stage2_keyframe().
 _CC_PITH_KEYFRAME_CHARS = max(60, min(1000, int(os.environ.get("CC_PITH_KEYFRAME_CHARS", "220"))))
@@ -3129,6 +3160,14 @@ class CacheLine:
     # population a normalized 1.0 (top-of-stream) and thereby promote exactly the
     # lines it is meant to count. Read at one counting site only.
     prefetch_origin: bool = False
+    # Slice A: one provider-facing line is a connected activation basin.  The
+    # root is the keyframe; related observations remain attached as deltas so
+    # action -> outcome -> correction cannot be admitted as orphan fragments.
+    member_node_ids: list = field(default_factory=list)
+    relations: list = field(default_factory=list)
+    sources: list = field(default_factory=list)
+    anchors: list = field(default_factory=list)
+    epistemic: str = "learned"
 
     @classmethod
     def from_surfaced(cls, node_id: str, content: str, score: float = 0.0,
@@ -3317,6 +3356,9 @@ _PITH_METRICS = PithMetrics()
 _PITH_CONFIG_KEYS = (
     "CC_PITH_ENABLED", "CC_PITH_L1_BUDGET", "CC_PITH_L1_BREATHE",
     "CC_PITH_KEYFRAME_CHARS",
+    "CC_PITH_PROVIDER_ROOTS", "CC_PITH_PROVIDER_MEMBERS",
+    "CC_PITH_PROVIDER_DEPTH", "CC_PITH_PROVIDER_NODE_CHARS",
+    "CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS", "CC_PITH_PROVIDER_MAX_QUEST_CHARS",
     "CC_PITH_PREFETCH_ENABLED", "CC_PITH_PREFETCH_WARM_ENABLED",
     "CC_PITH_PREFETCH_MAX", "CC_PITH_PREFETCH_REPEATS",
     "CC_PITH_PREFETCH_CURRENT_SCALE", "CC_PITH_PREFETCH_LOD_DIST",
@@ -3354,6 +3396,12 @@ def pith_effective_config() -> Dict[str, Dict]:
         "CC_PITH_L1_BUDGET": _CC_PITH_L1_BUDGET,
         "CC_PITH_L1_BREATHE": _CC_PITH_L1_BREATHE,
         "CC_PITH_KEYFRAME_CHARS": _CC_PITH_KEYFRAME_CHARS,
+        "CC_PITH_PROVIDER_ROOTS": _CC_PITH_PROVIDER_ROOTS,
+        "CC_PITH_PROVIDER_MEMBERS": _CC_PITH_PROVIDER_MEMBERS,
+        "CC_PITH_PROVIDER_DEPTH": _CC_PITH_PROVIDER_DEPTH,
+        "CC_PITH_PROVIDER_NODE_CHARS": _CC_PITH_PROVIDER_NODE_CHARS,
+        "CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS": _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS,
+        "CC_PITH_PROVIDER_MAX_QUEST_CHARS": _CC_PITH_PROVIDER_MAX_QUEST_CHARS,
         "CC_PITH_PREFETCH_ENABLED": _CC_PITH_PREFETCH_ENABLED,
         "CC_PITH_PREFETCH_LOD_DIST": _CC_PITH_PREFETCH_LOD_DIST,
     }
@@ -4056,6 +4104,661 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
 
     # Step 6: assemble -- pinned first (original order), then ranked kept.
     return pinned_lines + kept_unpinned
+
+
+# ---------------------------------------------------------------------------
+# Provider-context Slice A: topology-connected situational assembly
+# ---------------------------------------------------------------------------
+
+_PITH_ANCHOR_PATTERNS = (
+    re.compile(r"https?://[^\s)>\]]+"),
+    re.compile(r"(?<![A-Za-z0-9_])/[A-Za-z0-9._~+()\-]+(?:/[A-Za-z0-9._~+()\-]+)+"),
+    re.compile(r"\b(?:branch|worktree|repo(?:sitory)?)\s+([A-Za-z0-9._/\-]+)", re.I),
+    re.compile(r"(?<![0-9a-f-])[0-9a-f]{7,40}(?![0-9a-f-])", re.I),
+    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I),
+    re.compile(r"(?<!\w)#\d+\b"),
+)
+
+def _pith_unique(values) -> list:
+    out = []
+    seen = set()
+    for value in values:
+        if value is None:
+            continue
+        item = str(value).strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _pith_exact_anchors(text: str, metadata: Optional[Dict[str, Any]] = None) -> list:
+    """Extract exact operational references without treating them as knowledge.
+
+    Anchors remain attached to their activation basin.  This is intentionally a
+    conservative recognizer: paths, URLs, issue ids, UUIDs, commits, and explicit
+    metadata fields only.  It does not emit arbitrary token-like strings.
+    """
+    found = []
+    # Backticks and quotes are the only reliable boundary for paths containing
+    # spaces; preserve the enclosed value exactly rather than guessing where a
+    # prose path ends.
+    for quoted in re.findall(r"[`\"']([^`\"'\n]*[/\\][^`\"'\n]+)[`\"']", text or ""):
+        found.append(quoted)
+    for pattern in _PITH_ANCHOR_PATTERNS:
+        found.extend(pattern.findall(text or ""))
+    meta = metadata if isinstance(metadata, dict) else {}
+    for key in ("path", "file", "repo", "repository", "branch", "commit", "sha",
+                "worktree", "session_id", "thread_id", "url"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            found.append(value.strip())
+    return _pith_unique(found)
+
+
+def _pith_node_raw_text(node: Any, fallback: str = "") -> str:
+    """Resolve one node's unshortened meaning for assembly + anchor reads."""
+    meta = getattr(node, "metadata", None) or {}
+    choices = []
+    if meta.get("_tree_concept"):
+        choices.append(meta.get("_concept"))
+    choices.extend((meta.get("_forest_content"), meta.get("want_text"),
+                    meta.get("core_text"), meta.get("content"), meta.get("text"),
+                    meta.get("_label"), meta.get("label"), fallback))
+    for value in choices:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _pith_node_text(node: Any, fallback: str = "") -> str:
+    """Resolve and bound one node's own meaning for a connected assembly.
+
+    Tree nodes keep their own concept while a forest keeps the lived turn.  This
+    differs deliberately from standalone snippet display: an assembly already
+    carries the forest keyframe, so repeating that forest for every tree would
+    erase the relationships the cache line exists to preserve.
+    """
+    text = _pith_node_raw_text(node, fallback)
+    if len(text) <= _CC_PITH_PROVIDER_NODE_CHARS:
+        return text
+    keyframe, _delta = pith_stage2_keyframe(
+        text, max_chars=_CC_PITH_PROVIDER_NODE_CHARS)
+    return keyframe or _pith_cut_at_word_boundary(
+        text, _CC_PITH_PROVIDER_NODE_CHARS)
+
+
+def _pith_node_sources(node: Any) -> list:
+    meta = getattr(node, "metadata", None) or {}
+    values = []
+    for key in ("source", "provenance", "creation_mode"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip()[:80])
+    return _pith_unique(values) or ["substrate topology"]
+
+
+def _pith_node_coherence(node: Any) -> str:
+    meta = getattr(node, "metadata", None) or {}
+    explicit = str(meta.get("coherence") or "").strip().lower()
+    if meta.get("conflict") or meta.get("contested") or explicit == "conflict":
+        return "conflict"
+    if (meta.get("stale") or meta.get("invalid") or meta.get("superseded")
+            or explicit in ("invalid", "stale")):
+        return "stale"
+    if meta.get("uncertain") or explicit == "uncertain":
+        return "uncertain"
+    if explicit in ("modified", "exclusive", "shared"):
+        return explicit
+    # Absence of a coherence record is unknown, not evidence that this process
+    # exclusively owns a current/verified view.
+    return "unknown"
+
+
+def _pith_role(node: Any) -> str:
+    """Return only an explicitly recorded experiential role.
+
+    Free-text keyword inference would invent causality at extraction time.  The
+    topology supplies the relationship; role labels refine it only when the
+    node's own metadata names the role.
+    """
+    meta = getattr(node, "metadata", None) or {}
+    for key in ("role", "kind", "event_type", "type"):
+        value = str(meta.get(key) or "").lower()
+        if value in ("action", "outcome", "correction", "failure", "decision"):
+            return value
+    return ""
+
+
+def _pith_relation_label(parent_text: str, parent_node: Any,
+                         child_text: str, child_node: Any, edge_kind: str) -> str:
+    parent_role = _pith_role(parent_node)
+    child_role = _pith_role(child_node)
+    if parent_role == "action" and child_role in ("outcome", "failure"):
+        return f"action -> {child_role}"
+    if parent_role in ("outcome", "failure") and child_role == "correction":
+        return f"{parent_role} -> correction"
+    if parent_role == "correction" and child_role == "outcome":
+        return "correction -> outcome"
+    if edge_kind == "hyperedge":
+        return "learned co-member"
+    if edge_kind == "incoming":
+        return "learned predecessor"
+    return "learned successor"
+
+
+def _pith_graph_neighbors(graph: Any, node_id: str,
+                          active_node_ids: Optional[set] = None) -> list:
+    """Return direct synaptic and hyperedge companions, strongest first.
+
+    The graph's own learned topology defines membership.  Numeric strength is
+    used only to make traversal deterministic and bounded; it never creates a
+    relationship or substitutes cosine-selected snippets for a basin.
+    """
+    candidates: Dict[str, tuple] = {}
+
+    def _offer(other_id, kind, strength):
+        if not other_id or other_id == node_id or other_id not in graph.nodes:
+            return
+        prior = candidates.get(other_id)
+        item = (kind, max(0.0, float(strength or 0.0)))
+        if prior is None or item[1] > prior[1]:
+            candidates[other_id] = item
+
+    for sid in tuple(getattr(graph, "_outgoing", {}).get(node_id, ())):
+        syn = graph.synapses.get(sid)
+        if syn is not None:
+            _offer(getattr(syn, "post_node_id", None), "outgoing", getattr(syn, "weight", 0.0))
+    for sid in tuple(getattr(graph, "_incoming", {}).get(node_id, ())):
+        syn = graph.synapses.get(sid)
+        if syn is not None:
+            _offer(getattr(syn, "pre_node_id", None), "incoming", getattr(syn, "weight", 0.0))
+    for hid in tuple(getattr(graph, "_node_hyperedges", {}).get(node_id, ())):
+        he = getattr(graph, "hyperedges", {}).get(hid)
+        if he is None or getattr(he, "is_archived", False):
+            continue
+        member_weights = getattr(he, "member_weights", {}) or {}
+        he_strength = max(float(getattr(he, "current_activation", 0.0) or 0.0),
+                          float(getattr(he, "pattern_completion_strength", 0.0) or 0.0))
+        for other_id in tuple(getattr(he, "member_nodes", ())):
+            _offer(other_id, "hyperedge",
+                   max(float(member_weights.get(other_id, 0.0) or 0.0), he_strength))
+    active = active_node_ids or set()
+    order = {"outgoing": 0, "incoming": 1, "hyperedge": 2}
+    return [(nid, kind, strength) for nid, (kind, strength) in sorted(
+        candidates.items(),
+        key=lambda item: (-(item[0] in active), -item[1][1],
+                          order.get(item[1][0], 9), item[0]))]
+
+
+def _pith_is_constitutional(graph: Any, node_id: str) -> bool:
+    """Identify only nodes already rendered by constitutional-core ownership.
+
+    The graph's broader identity-protection predicate also covers deliberate
+    authored wants.  Those are valid learned situation members and must not be
+    suppressed merely because pruning protects them.
+    """
+    node = graph.nodes.get(node_id)
+    meta = getattr(node, "metadata", None) or {}
+    return bool(meta.get("constitutional"))
+
+
+def _pith_copy_cache_line(line: CacheLine, stream: Optional[str] = None) -> CacheLine:
+    return CacheLine(
+        node_id=line.node_id, content=line.content, score=line.score,
+        pinned=line.pinned, thermal=line.thermal, lod=line.lod,
+        coherence=line.coherence, manifold_type=line.manifold_type,
+        keyframe=line.keyframe, deltas=list(line.deltas),
+        stream=stream or line.stream, prefetch_origin=line.prefetch_origin,
+        member_node_ids=list(line.member_node_ids), relations=[dict(r) for r in line.relations],
+        sources=list(line.sources), anchors=list(line.anchors), epistemic=line.epistemic,
+    )
+
+
+def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
+                                      max_members: Optional[int] = None,
+                                      max_depth: Optional[int] = None,
+                                      live_rails: Optional[Dict[str, str]] = None) -> List[CacheLine]:
+    """Build relationship-preserving cache lines from SNN-surfaced roots.
+
+    Every returned CacheLine is a connected basin: one fired root plus direct
+    synaptic/hyperedge companions and, when available, one further causal hop.
+    VDB ranking chooses no members here.  The learned graph does.  Constitutional
+    nodes are excluded because provider_context renders the constitutional core
+    once, independently and non-evictably.
+    """
+    if graph is None or not surfaced:
+        return []
+    member_limit = max_members or _CC_PITH_PROVIDER_MEMBERS
+    depth_limit = max_depth or _CC_PITH_PROVIDER_DEPTH
+    raw_basins = []
+    rail_labels = {
+        _pith_normalize(text): label
+        for text, label in (live_rails or {}).items()
+        if isinstance(text, str) and text.strip()
+    }
+
+    def _display_text(node, fallback=""):
+        raw = _pith_node_raw_text(node, fallback)
+        rail_label = rail_labels.get(_pith_normalize(raw))
+        if rail_label:
+            return raw, f"[{rail_label} is present exactly once in the live tail]", True
+        return raw, _pith_node_text(node, fallback), False
+
+    active_node_ids = {item.get("node_id") for item in surfaced if item.get("node_id")}
+    root_scores = [float(item.get("score", 0.0) or 0.0) for item in surfaced]
+    score_lo = min(root_scores) if root_scores else 0.0
+    score_hi = max(root_scores) if root_scores else 0.0
+
+    for root_item in surfaced:
+        root_id = root_item.get("node_id")
+        root = graph.nodes.get(root_id) if root_id else None
+        if root is None or _pith_is_constitutional(graph, root_id):
+            continue
+        root_raw, root_text, root_is_live = _display_text(
+            root, root_item.get("content", ""))
+        if not root_text:
+            continue
+
+        members = [root_id]
+        relations = []
+        deltas = []
+        sources = _pith_node_sources(root)
+        anchors = ([] if root_is_live else
+                   _pith_exact_anchors(root_raw, getattr(root, "metadata", None)))
+        coherence_states = [_pith_node_coherence(root)]
+        frontier = [(root_id, root_text, root, 0)]
+        visited = {root_id}
+        internal_support = 0.0
+        total_support = 0.0
+
+        while frontier and len(members) < member_limit:
+            parent_id, parent_text, parent_node, depth = frontier.pop(0)
+            neighbors = _pith_graph_neighbors(graph, parent_id, active_node_ids)
+            total_support += sum(strength for _nid, _kind, strength in neighbors)
+            if depth >= depth_limit:
+                continue
+            for child_id, edge_kind, strength in neighbors:
+                if child_id in visited or _pith_is_constitutional(graph, child_id):
+                    continue
+                child = graph.nodes.get(child_id)
+                child_raw, child_text, child_is_live = _display_text(child)
+                if not child_text:
+                    continue
+                visited.add(child_id)
+                members.append(child_id)
+                internal_support += strength
+                label = _pith_relation_label(
+                    parent_text, parent_node, child_text, child, edge_kind)
+                relation = {
+                    "from": parent_id,
+                    "to": child_id,
+                    "kind": label,
+                    "content": child_text,
+                }
+                relations.append(relation)
+                deltas.append(f"{label}: {child_text}")
+                sources.extend(_pith_node_sources(child))
+                if not child_is_live:
+                    anchors.extend(_pith_exact_anchors(
+                        child_raw, getattr(child, "metadata", None)))
+                coherence_states.append(_pith_node_coherence(child))
+                frontier.append((child_id, child_text, child, depth + 1))
+                if len(members) >= member_limit:
+                    break
+
+        if "conflict" in coherence_states:
+            coherence = "conflict"
+        elif "stale" in coherence_states:
+            coherence = "stale"
+        elif "uncertain" in coherence_states:
+            coherence = "uncertain"
+        elif "modified" in coherence_states:
+            coherence = "modified"
+        elif "shared" in coherence_states:
+            coherence = "shared"
+        elif coherence_states and all(value == "exclusive" for value in coherence_states):
+            coherence = "exclusive"
+        else:
+            coherence = "unknown"
+
+        activation = float(root_item.get("score", 0.0) or 0.0)
+        activation_norm = 1.0 if score_hi <= score_lo else (activation - score_lo) / (score_hi - score_lo)
+        cohesion = internal_support / total_support if total_support > 0 else 0.0
+        relation_depth = min(1.0, len(relations) / 3.0)
+        causal = 1.0 if any("action ->" in r["kind"] or "-> correction" in r["kind"]
+                            for r in relations) else 0.0
+        # Structure gets the deciding vote; root activation remains a strong
+        # attention signal but cannot let one unrelated high-score hub tear a
+        # coherent action/outcome/correction assembly apart.
+        structural = 0.5 * cohesion + 0.3 * relation_depth + 0.2 * causal
+        basin_score = 0.35 * activation_norm + 0.65 * structural
+        raw_basins.append(CacheLine(
+            node_id=root_id,
+            content=root_text,
+            score=basin_score,
+            pinned=False,
+            thermal=cc_thermal(graph, root_id),
+            coherence=coherence,
+            manifold_type=getattr(root, "manifold_type", "hyperbolic"),
+            keyframe=True,
+            deltas=deltas,
+            stream="connected",
+            prefetch_origin=bool(root_item.get("prefetch_origin", False)),
+            member_node_ids=members,
+            relations=relations,
+            sources=_pith_unique(sources),
+            anchors=_pith_unique(anchors),
+            epistemic="learned",
+        ))
+
+    # Competition includes the organism's existing warmth and coherence state
+    # without letting either erase topology.  Learned structure + activation
+    # remain 85% of the decision; warmth and coherence are bounded tie-breaks.
+    thermal_values = [line.thermal for line in raw_basins]
+    thermal_lo = min(thermal_values) if thermal_values else 0.0
+    thermal_hi = max(thermal_values) if thermal_values else 0.0
+    coherence_support = {
+        "exclusive": 1.0, "shared": 0.9, "modified": 0.75,
+        "uncertain": 0.55, "stale": 0.35, "conflict": 0.25,
+        "unknown": 0.5,
+    }
+    for line in raw_basins:
+        thermal_norm = (0.0 if thermal_hi <= thermal_lo else
+                        (line.thermal - thermal_lo) / (thermal_hi - thermal_lo))
+        line.score = (0.85 * line.score + 0.10 * thermal_norm
+                      + 0.05 * coherence_support.get(line.coherence, 0.5))
+
+    raw_basins.sort(key=lambda line: (-line.score, line.node_id))
+    selected = []
+    covered = set()
+    for line in raw_basins:
+        members = set(line.member_node_ids)
+        if members and len(members & covered) / len(members) >= 0.6:
+            continue
+        selected.append(line)
+        covered.update(members)
+    return selected
+
+
+def _pith_render_connected_line(line: CacheLine) -> str:
+    """Model-facing Markdown for one whole cache line; never renders scores/ids."""
+    label = "learned from substrate"
+    lines = [f"### Connected assembly [{label}; coherence: {line.coherence}]",
+             f"- Keyframe: {line.content}"]
+    for relation in line.relations:
+        lines.append(f"- {relation['kind']}: {relation['content']}")
+    if line.sources:
+        lines.append("- Sources: " + ", ".join(line.sources))
+    if line.anchors:
+        lines.append("- Exact anchors: " + ", ".join(f"`{a}`" for a in line.anchors))
+    return "\n".join(lines)
+
+
+def _pith_fit_statement(text: str, limit: int) -> Optional[str]:
+    """Bound one statement while keeping it visibly extractive.
+
+    Relationship membership is carried by the CacheLine, not inferred from a
+    shortened sentence.  This helper therefore shortens only the prose payload;
+    it never removes a relation, source, anchor, or coherence label.
+    """
+    value = (text or "").strip()
+    if not value or limit < 1:
+        return None
+    if len(value) <= limit:
+        return value
+    if limit <= 2:
+        return "…"[:limit]
+    if limit < 18:
+        return _pith_cut_at_word_boundary(value, limit - 2) + " …"
+    keyframe, _delta = pith_stage2_keyframe(value, max_chars=limit)
+    if keyframe and len(keyframe) <= limit:
+        return keyframe
+    shortened = _pith_cut_at_word_boundary(value, limit - 2)
+    return (shortened + " …")[:limit]
+
+
+def _pith_fit_connected_line(line: CacheLine, max_chars: int) -> Optional[CacheLine]:
+    """Fit one relationship CacheLine by shortening prose, never structure.
+
+    All member relationships, exact anchors, sources, and epistemic/coherence
+    labels travel together.  If even that fixed structure cannot fit, the
+    entire line is rejected rather than emitting an orphaned fragment.
+    """
+    if max_chars <= 0:
+        return None
+    if len(_pith_render_connected_line(line)) <= max_chars:
+        return _pith_copy_cache_line(line)
+
+    fitted = _pith_copy_cache_line(line)
+    fields = [line.content] + [str(r.get("content") or "") for r in line.relations]
+    # Render with one visible character per statement to measure structure that
+    # cannot be removed (relation labels, sources, anchors, headings).
+    fitted.content = "…"
+    for relation in fitted.relations:
+        relation["content"] = "…"
+    fixed_cost = len(_pith_render_connected_line(fitted))
+    if fixed_cost > max_chars:
+        return None
+
+    payload_budget = max_chars - fixed_cost + len(fields)  # replace each "…"
+    allocations = [1] * len(fields)
+    remaining = payload_budget - len(fields)
+    active = {i for i, value in enumerate(fields) if len(value) > 1}
+    # Deterministic water-filling preserves every statement while allowing short
+    # statements to finish and donate their unused share to longer ones.
+    while remaining > 0 and active:
+        share = max(1, remaining // len(active))
+        progressed = False
+        for index in tuple(sorted(active)):
+            want = len(fields[index]) - allocations[index]
+            add = min(want, share, remaining)
+            if add > 0:
+                allocations[index] += add
+                remaining -= add
+                progressed = True
+            if allocations[index] >= len(fields[index]):
+                active.discard(index)
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+
+    rendered_fields = [_pith_fit_statement(value, allowance)
+                       for value, allowance in zip(fields, allocations)]
+    if any(value is None for value in rendered_fields):
+        return None
+    fitted.content = rendered_fields[0]
+    for relation, value in zip(fitted.relations, rendered_fields[1:]):
+        relation["content"] = value
+    # Arithmetic above is exact for the renderer, but retain a closed guard if
+    # future formatting changes add overhead.
+    if len(_pith_render_connected_line(fitted)) > max_chars:
+        return None
+    return fitted
+
+
+def _pith_provider_admit(lines: List[CacheLine], budget_chars: int) -> tuple:
+    """Admit a strict ranked prefix as whole relationship cache lines.
+
+    An oversized line may compress its member prose to the remaining envelope,
+    but no relation, source, anchor, or coherence label is removed.  A line
+    whose fixed structure cannot fit stops prefix admission.
+    """
+    ordered = sorted(lines, key=lambda line: (-line.score, line.node_id))
+    kept = []
+    rendered = []
+    used = 0
+    for line in ordered:
+        separator = 2 if rendered else 0
+        fitted = _pith_fit_connected_line(line, budget_chars - used - separator)
+        if fitted is None:
+            break
+        block = _pith_render_connected_line(fitted)
+        cost = len(block) + separator
+        kept.append(fitted)
+        rendered.append(block)
+        used += cost
+    return kept, rendered
+
+
+def _pith_line_is_correction(line: CacheLine) -> bool:
+    return any("correction" in relation["kind"] or "failure" in relation["kind"]
+               for relation in line.relations)
+
+
+def _pith_provider_sections(core: str, lines: List[CacheLine],
+                            blocks: List[str]) -> tuple:
+    """Render complete provider context and its learned-state warnings."""
+    situation = []
+    corrections = []
+    warnings = []
+    alert_states = []
+    for line, block in zip(lines, blocks):
+        (corrections if _pith_line_is_correction(line) else situation).append(block)
+        if line.coherence in ("conflict", "stale", "uncertain", "unknown"):
+            alert_states.append(line.coherence)
+            warnings.append(f"{line.coherence}_material")
+
+    sections = [core]
+    if situation:
+        sections.append("## Learned Situation\n" + "\n\n".join(situation))
+    if corrections:
+        sections.append("## Learned Corrections and Failures\n" + "\n\n".join(corrections))
+    if alert_states:
+        alerts = []
+        for state in _pith_unique(alert_states):
+            if state == "unknown":
+                alerts.append(
+                    "- A connected learned assembly has no explicit coherence record; "
+                    "treat currentness as unknown until live evidence confirms it.")
+            else:
+                alerts.append(
+                    f"- A connected learned assembly is marked {state}; "
+                    "treat it as unresolved until live evidence confirms it.")
+        sections.append("## Uncertainty and Conflicts\n" + "\n".join(alerts))
+    return "\n\n".join(sections), _pith_unique(warnings)
+
+
+def _pith_provider_unavailable(reason: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "state": "unavailable",
+        "context": f"## NeuroGraph Context Status\n- Fresh substrate context unavailable ({reason}).",
+        "source": "cc_neurograph_topology",
+        "coherence": "unavailable",
+        "anchors": [],
+        "warnings": [reason],
+        "assemblies": 0,
+    }
+
+
+def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = "",
+                          conv_state: Optional[Dict[str, Any]] = None,
+                          commons: Any = None,
+                          budget_chars: Optional[int] = None,
+                          root_count: Optional[int] = None) -> Dict[str, Any]:
+    """Construct a fresh provider-ready situational model from CC's live SNN.
+
+    `current_instruction` and the already-rendered `quest_focus` orient attention
+    but are not echoed: miniTID owns their one exact occurrence in the live
+    message tail.  They are never deposited, classified, or fetched from Quest
+    storage here.  Learned material comes only from the current
+    topology/activation path: pattern completion provides roots and the graph's
+    synapses/hyperedges provide connected assemblies.
+
+    Closed result states are ``ok``, ``empty``, and ``unavailable``.  There is no
+    heuristic, faux, transcript-replay, or raw-history fallback.
+    """
+    if not isinstance(current_instruction, str) or not current_instruction.strip():
+        return _pith_provider_unavailable("invalid_instruction")
+    if len(current_instruction) > _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS:
+        return _pith_provider_unavailable("instruction_too_large")
+    if quest_focus is None:
+        quest_focus = ""
+    if not isinstance(quest_focus, str) or len(quest_focus) > _CC_PITH_PROVIDER_MAX_QUEST_CHARS:
+        return _pith_provider_unavailable("invalid_quest_focus")
+    graph = getattr(ng, "graph", None) if ng is not None else None
+    if graph is None:
+        return _pith_provider_unavailable("ng_unavailable")
+    if budget_chars is None:
+        budget = cc_l1_budget(commons)
+    elif (isinstance(budget_chars, int) and not isinstance(budget_chars, bool)
+          and 500 <= budget_chars <= 40000):
+        budget = budget_chars
+    else:
+        return _pith_provider_unavailable("invalid_budget")
+    roots = root_count if root_count is not None else _CC_PITH_PROVIDER_ROOTS
+    if (not isinstance(roots, int) or isinstance(roots, bool)
+            or not 1 <= roots <= 24):
+        return _pith_provider_unavailable("invalid_root_count")
+
+    cue = current_instruction.strip()
+    if quest_focus.strip():
+        cue += "\n\n" + quest_focus.strip()
+    try:
+        core = render_constitutional_core(graph)
+        if not core:
+            # Constitutional identity is a non-evictable prerequisite, not a
+            # best-effort memory.  Refuse to present a partial mind as healthy.
+            return _pith_provider_unavailable("constitutional_core_missing")
+        if len(core) > budget:
+            # Identity is indivisible and non-evictable.  Never abbreviate it
+            # merely to make a context envelope look healthy.
+            return _pith_provider_unavailable("constitutional_core_exceeds_budget")
+        # cc_novelty updates its caller-owned bookkeeping.  A shallow copy keeps
+        # provider_context observational even at that non-graph boundary.
+        recall_state = dict(conv_state or {})
+        # Provider context must describe what this cue actually ignited now.
+        # Stage-4 speculative priming remains useful elsewhere, but an un-fired
+        # prediction cannot become a situational root merely because it was in
+        # the conversation state's prefetch set.
+        recall_state["primed_nodes"] = {}
+        surfaced = cc_pattern_completion_recall(
+            ng, cue, roots, state=recall_state, preserve_graph_config=True)
+        live_rails = {current_instruction.strip(): "current instruction"}
+        if quest_focus.strip():
+            quest_text = quest_focus.strip()
+            prior = live_rails.get(quest_text)
+            live_rails[quest_text] = (
+                "current instruction and Quest focus" if prior else "Quest focus")
+        fresh = pith_connected_activation_basins(
+            graph, surfaced, live_rails=live_rails)
+        candidates = fresh
+        # Reserve every possible section/alert delimiter before admitting prose.
+        # Empty placeholder blocks let the real renderer calculate that fixed
+        # overhead without a second, drifting budget formula.
+        envelope_shell, _shell_warnings = _pith_provider_sections(
+            core, candidates, [""] * len(candidates))
+        learned_budget = max(0, budget - len(envelope_shell))
+        kept, learned_blocks = _pith_provider_admit(candidates, learned_budget)
+        context, warnings = _pith_provider_sections(core, kept, learned_blocks)
+        # The shell is conservative, but this is the explicit total-envelope
+        # invariant.  A formatter regression fails closed rather than silently
+        # overfilling a provider prompt.
+        if len(context) > budget:
+            return _pith_provider_unavailable("context_bound_failed")
+        state = "ok" if kept else "empty"
+        if not kept:
+            warnings.append("topology_empty" if not candidates else "capacity_empty")
+        coherence_order = (
+            "conflict", "stale", "uncertain", "unknown", "modified", "shared", "exclusive")
+        coherence = next((value for value in coherence_order
+                          if any(line.coherence == value for line in kept)), "empty")
+        anchors = _pith_unique(anchor for line in kept for anchor in line.anchors)
+        return {
+            "ok": True,
+            "state": state,
+            "context": context,
+            "source": "cc_neurograph_topology",
+            "coherence": coherence,
+            "anchors": anchors,
+            "warnings": _pith_unique(warnings),
+            "assemblies": len(kept),
+        }
+    except Exception as exc:
+        logger.warning("provider_context assembly unavailable: %s", exc)
+        return _pith_provider_unavailable("assembly_failed")
 
 
 # =============================================================================

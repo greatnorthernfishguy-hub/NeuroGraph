@@ -27,6 +27,10 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-13] Codex — expose read-only topology-built provider context.
+# What: add the provider_context socket verb through the shared Pith assembler.
+# Why: miniTID needs a fresh situational model rather than ranked memory snippets.
+# How: bind only this CC hemisphere's graph/state/Commons under its consistency lock.
 # [2026-09-12] Codex — report the outbound Pith history budget in telemetry.
 # What: include history budget and label the general Pith/prefetch gates separately.
 # Why: history results lacked their budget and `gate_enabled` meant only prefetch.
@@ -399,6 +403,12 @@ PITH_SNAPSHOT_GATE_KEYS = (
     "CC_PITH_L1_BUDGET",
     "CC_PITH_L1_BREATHE",
     "CC_PITH_KEYFRAME_CHARS",
+    "CC_PITH_PROVIDER_ROOTS",
+    "CC_PITH_PROVIDER_MEMBERS",
+    "CC_PITH_PROVIDER_DEPTH",
+    "CC_PITH_PROVIDER_NODE_CHARS",
+    "CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS",
+    "CC_PITH_PROVIDER_MAX_QUEST_CHARS",
     "CC_PITH_PREFETCH_ENABLED",
     "CC_PITH_PREFETCH_WARM_ENABLED",
     "CC_PITH_PREFETCH_MAX",
@@ -871,6 +881,40 @@ def _handle_compress_history(data):
         return {"ok": True, "compressed": turns}
 
 
+def _handle_provider_context(data):
+    """Return fresh, bounded context assembled from this CC topology.
+
+    This wrapper owns only hemisphere binding and lock consistency.  Validation,
+    assembly, Markdown, and the closed result vocabulary live in the shared
+    organism function so laptop and VPS cannot drift.  No nudge, deposit, save,
+    Quest read, or heuristic fallback occurs here.
+    """
+    try:
+        from cc_ng_organism import pith_provider_context
+    except Exception:
+        return {
+            "ok": False, "state": "unavailable",
+            "context": "## NeuroGraph Context Status\n- Fresh substrate context unavailable (symbol_unavailable).",
+            "source": "cc_neurograph_topology", "coherence": "unavailable",
+            "anchors": [], "warnings": ["symbol_unavailable"], "assemblies": 0,
+        }
+    ng = _STATE.cc_ng
+    graph = getattr(ng, "graph", None) if ng is not None else None
+    kwargs = {
+        "current_instruction": data.get("current_instruction"),
+        "quest_focus": data.get("quest_focus", ""),
+        "conv_state": _STATE.conv_state,
+        "commons": _STATE.commons,
+        "budget_chars": data.get("budget_chars"),
+        "root_count": data.get("root_count"),
+    }
+    lock = getattr(graph, "_concurrent_lock", None) if graph is not None else None
+    if lock is not None:
+        with lock:
+            return pith_provider_context(ng, **kwargs)
+    return pith_provider_context(ng, **kwargs)
+
+
 def _handle_status(_data):
     ng = _STATE.cc_ng
     tonic_info = {"enabled": False}
@@ -1247,6 +1291,7 @@ _DISPATCH = {
     "status": _handle_status,
     "pith_metrics": _handle_pith_metrics,
     "compress_history": _handle_compress_history,
+    "provider_context": _handle_provider_context,
     "export": _handle_export,
     "import": _handle_import,
     "drain_conduit": _handle_drain_conduit,
