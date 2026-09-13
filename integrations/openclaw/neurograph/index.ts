@@ -127,6 +127,43 @@
  *         the VPS, which this workstream may not SSH into or inspect live.
  *         The frozen "type-checks against the installed SDK" gate remains
  *         explicitly open, pending a later controlled VPS validation pass.
+ * [2026-09-13] Claude Sonnet 5 — second corrective follow-up (Grok second-pass review, PASS WITH OPEN ACTIVATION GATE)
+ *   What: (1) Extracted trackedSpawn(rpc) — publishes GLOBAL_KEY spawning:true,
+ *         runs rpc.start(), then publishes the live rpc/engine, all under one
+ *         SPAWN_KEY-tracked promise. Both register()'s eager spawn and the
+ *         registerContextEngine() factory's fallback spawn (previously an
+ *         untracked `await rpc.start()` outside any SPAWN_KEY) now call this
+ *         one function, so a stop() during *either* spawn path converges on
+ *         the child produced. (2) index.test.ts beforeEach now also clears
+ *         SPAWN_KEY, matching GLOBAL_KEY/SHUTDOWN_KEY, so a spawn promise
+ *         from one test can never leak into the next. (3) The hung-call env
+ *         var test now restores NEUROGRAPH_SHUTDOWN_WARN_MS with `delete`
+ *         when it was originally unset, instead of assigning `undefined`
+ *         (which coerced to the literal string "undefined" and produced a
+ *         NaN setTimeout warning); the test now also asserts the read-back
+ *         warnMs is finite. (4) types/openclaw-stub.d.ts's changelog no
+ *         longer claims the ambient stub satisfies "installed OpenClaw SDK"
+ *         validation — corrected to match the already-accurate 2026-09-13
+ *         follow-up entry beneath it.
+ *   Why:  Grok's second-pass review found the previously "fixed" SPAWN_KEY
+ *         tracking only covered the eager-spawn path; the factory's own
+ *         fallback spawn (taken whenever the eager spawn is slow or fails)
+ *         still called `await rpc.start()` untracked, so a stop() during
+ *         that narrower window could still hit `!state.rpc` and orphan the
+ *         child. It also flagged: SPAWN_KEY wasn't reset between tests,
+ *         risking cross-test leakage as more spawn-path tests were added;
+ *         the env-var test's `undefined`-assignment restore pattern was
+ *         itself producing a NaN warning instead of actually restoring
+ *         "unset"; and the stub file's first changelog paragraph still made
+ *         the installed-SDK claim the previous follow-up's own second
+ *         paragraph had already contradicted.
+ *   How:  trackedSpawn() is a plain function (no class state) so both call
+ *         sites share it directly; a new forced-interleaving test exercises
+ *         it standalone with a fake spawnFn (no real process). No change to
+ *         the doStop()/admission semantics from the previous follow-up.
+ *   Note: The real-SDK/activation gate remains explicitly open — this is a
+ *         contingency-hygiene pass only, not an SDK validation or Anima
+ *         change. No SSH, deploy, push, or Python/systemd/Anima edits.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -933,6 +970,27 @@ function setSpawnPromise(p: Promise<void>): void {
 }
 
 /**
+ * Spawns `rpc` and publishes it to GLOBAL_KEY, tracking the in-flight spawn
+ * via SPAWN_KEY (Law Review second-pass follow-up, 2026-09-13). Both
+ * register()'s eager spawn and the registerContextEngine() factory's
+ * fallback spawn (used when the eager spawn hasn't finished or failed) call
+ * this same function, so a stop() landing during *either* spawn path
+ * converges on the child it produces via stopNeurographService()'s
+ * getSpawnPromise() await — neither path can return early on `!state.rpc`
+ * and orphan a still-spawning child behind a resolved SHUTDOWN_KEY.
+ */
+function trackedSpawn(rpc: NeurographRpcClient): Promise<NeurographContextEngine> {
+  setGlobalState({ rpc: null as any, engine: null as any, spawning: true });
+  const settle = (async () => {
+    await rpc.start();
+    const engine = new NeurographContextEngine(rpc);
+    setGlobalState({ rpc, engine, spawning: false });
+  })();
+  setSpawnPromise(settle);
+  return settle.then(() => getGlobalState()!.engine);
+}
+
+/**
  * Resolves the current GLOBAL_KEY state and joins the one global shutdown
  * promise (register() → registerService("neurograph-rpc-host").stop()).
  * Safe to call zero, one, or many times: the first call performs the
@@ -1058,42 +1116,29 @@ const neurographPlugin = {
         return current.engine;
       }
 
-      // Eager spawn failed or hasn't run — start now
+      // Eager spawn failed or hasn't run — start now, on the same tracked
+      // SPAWN_KEY path (trackedSpawn()) as the eager spawn below, so a
+      // stop() arriving during this narrower spawn converges on the child
+      // it produces instead of racing ahead of it.
       const rpc = new NeurographRpcClient(logger);
-      await rpc.start();
-      const engine = new NeurographContextEngine(rpc);
-      setGlobalState({ rpc, engine, spawning: false });
-      return engine;
+      return trackedSpawn(rpc);
     });
 
     // Eager spawn — start Python process immediately.
     // The factory callback above waits for this if called during startup.
-    setGlobalState({ rpc: null as any, engine: null as any, spawning: true });
-
-    setSpawnPromise(
-      (async () => {
-        try {
-          const rpc = new NeurographRpcClient(logger);
-          await rpc.start();
-          // A stop() may have arrived while this spawn was in flight (see
-          // stopNeurographService()) — it awaits this same promise before
-          // deciding there's nothing to stop, but it can only stop what it
-          // finds in GLOBAL_KEY, so this spawn must publish the live rpc
-          // unconditionally and then let the already-waiting stop() (or the
-          // watchdog) converge on it, rather than deciding for itself
-          // whether to keep or discard a child nobody else can reach yet.
-          const engine = new NeurographContextEngine(rpc);
-          setGlobalState({ rpc, engine, spawning: false });
-          rpc.startWatchdog();
-          logger.info("NeuroGraph: eager spawn complete — organism alive (watchdog started)");
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.error(`NeuroGraph eager spawn failed (will retry on first use): ${msg}`);
-          // Clear the spawning flag so the factory can try
-          (globalThis as any)[GLOBAL_KEY] = undefined;
-        }
-      })()
-    );
+    (async () => {
+      try {
+        const rpc = new NeurographRpcClient(logger);
+        await trackedSpawn(rpc);
+        rpc.startWatchdog();
+        logger.info("NeuroGraph: eager spawn complete — organism alive (watchdog started)");
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`NeuroGraph eager spawn failed (will retry on first use): ${msg}`);
+        // Clear the spawning flag so the factory can try
+        (globalThis as any)[GLOBAL_KEY] = undefined;
+      }
+    })();
 
     logger.info("NeuroGraph ContextEngine plugin registered");
   },
@@ -1115,6 +1160,7 @@ export {
   getGlobalShutdownPromise,
   getSpawnPromise,
   setSpawnPromise,
+  trackedSpawn,
   GLOBAL_KEY,
   SHUTDOWN_KEY,
   SPAWN_KEY,

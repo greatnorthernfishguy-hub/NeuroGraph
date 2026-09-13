@@ -9,12 +9,15 @@
  *         integrations/openclaw/neurograph/index.ts imports and uses.
  *   Why:  `openclaw` is an optional peerDependency (see package.json) and is
  *         not installed in this dev/test environment — there is no VPS
- *         OpenClaw checkout available to typecheck against here. The spec's
- *         "type-checks against the installed OpenClaw SDK" test requirement
- *         is satisfied against this stub's shape; a real OpenClaw install at
- *         deploy time supersedes this stub via normal module resolution
- *         (this file only declares ambient modules, it does not shadow a
- *         real `openclaw` package if one is present in node_modules).
+ *         OpenClaw checkout available to typecheck against here. This stub
+ *         lets `tsc --noEmit` run at all in that environment; a real
+ *         OpenClaw install at deploy time supersedes this stub via normal
+ *         module resolution (this file only declares ambient modules, it
+ *         does not shadow a real `openclaw` package if one is present in
+ *         node_modules). See the 2026-09-13 follow-up entry below: a clean
+ *         run here does NOT by itself satisfy the spec's "type-checks
+ *         against the installed OpenClaw SDK" requirement — that gate is
+ *         separately tracked as open.
  *   How:  Ambient `declare module` blocks matching the exact import sites in
  *         index.ts (verified via grep — no other openclaw import path or
  *         API-surface member is referenced by this chunk's code).
@@ -31,6 +34,17 @@
  *         later controlled VPS validation pass against the real package.
  *         Do not treat a pass here as SDK compatibility proof.
  *   How:  Header comment only; no declared shapes changed.
+ *
+ * [2026-09-13] Claude Sonnet 5 — second corrective follow-up (Grok second-pass review)
+ *   What: Corrected the first (chunk-1) paragraph above, which still claimed
+ *         a clean run here "satisfies" the installed-SDK test requirement —
+ *         that claim was already superseded by the entry directly below it
+ *         but the original wording was never fixed, leaving the file
+ *         self-contradictory.
+ *   Why:  Independent second-pass review flagged the stale claim. The real-
+ *         SDK/activation gate stays explicitly open; this stub proves only
+ *         internal type-consistency against its own declared shapes.
+ *   How:  Wording fix only; no declared shapes changed.
  */
 
 declare module "openclaw/plugin-sdk/plugins/types.js" {

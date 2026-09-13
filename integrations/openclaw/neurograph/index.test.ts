@@ -40,6 +40,22 @@
  *         accepted-persistence-only definition of a closed shutdown.
  *   How:  All 14 pre-existing required tests are preserved; only the one
  *         factually-wrong expectation was corrected in place.
+ * [2026-09-13] Claude Sonnet 5 — second corrective follow-up (Grok second-pass review)
+ *   What: (1) Added a forced-interleaving test for trackedSpawn() (the
+ *         factory's fallback spawn path) racing a concurrent stop() call.
+ *         (2) beforeEach now also clears SPAWN_KEY, alongside GLOBAL_KEY/
+ *         SHUTDOWN_KEY, so a spawn promise from one test can't leak into
+ *         the next. (3) The hung-call env-var test now restores
+ *         NEUROGRAPH_SHUTDOWN_WARN_MS/_INTERVAL_MS with `delete` when they
+ *         were originally unset, instead of assigning `undefined` (which
+ *         coerces to the string "undefined" and produced a NaN setTimeout
+ *         warning on the *next* test run to touch that code path); also
+ *         asserts the parsed warnMs is finite.
+ *   Why:  Second-pass review found SPAWN_KEY untouched by beforeEach (a
+ *         leak risk once more spawn-path tests exist), and the env-var
+ *         restore pattern silently producing `process.env.X = "undefined"`
+ *         rather than actually deleting the key.
+ *   How:  No changes to the 18 previously-committed test expectations.
  */
 
 import { test, describe, beforeEach } from "node:test";
@@ -54,9 +70,12 @@ import {
   setGlobalState,
   stopNeurographService,
   getGlobalShutdownPromise,
+  getSpawnPromise,
   setSpawnPromise,
+  trackedSpawn,
   GLOBAL_KEY,
   SHUTDOWN_KEY,
+  SPAWN_KEY,
 } from "./index.js";
 
 // ── Fake child process ──────────────────────────────────────────────
@@ -145,6 +164,7 @@ async function startedClient() {
 beforeEach(() => {
   (globalThis as any)[GLOBAL_KEY] = undefined;
   (globalThis as any)[SHUTDOWN_KEY] = undefined;
+  (globalThis as any)[SPAWN_KEY] = undefined;
 });
 
 // ── start() is a no-op re: substrate spawning (service-level) ───────
@@ -339,6 +359,11 @@ describe("NeurographRpcClient stop() lifecycle", () => {
     const originalIntervalMs = process.env.NEUROGRAPH_SHUTDOWN_WARN_INTERVAL_MS;
     process.env.NEUROGRAPH_SHUTDOWN_WARN_MS = "10";
     process.env.NEUROGRAPH_SHUTDOWN_WARN_INTERVAL_MS = "10";
+    assert.ok(
+      Number.isFinite(Number(process.env.NEUROGRAPH_SHUTDOWN_WARN_MS)),
+      "the warn-threshold env var must parse to a finite number, not the NaN that an "
+        + "`undefined`-string assignment would eventually restore this to"
+    );
     try {
       const { client, proc, lines } = await startedClient();
 
@@ -385,8 +410,20 @@ describe("NeurographRpcClient stop() lifecycle", () => {
       proc.simulateExit(0);
       await stopPromise;
     } finally {
-      process.env.NEUROGRAPH_SHUTDOWN_WARN_MS = originalWarnMs;
-      process.env.NEUROGRAPH_SHUTDOWN_WARN_INTERVAL_MS = originalIntervalMs;
+      // `process.env.X = undefined` would coerce to the literal string
+      // "undefined" (Number("undefined") is NaN) rather than actually
+      // unsetting the var — delete when the var was originally absent so a
+      // later test/run reads the real default, not a NaN-parsing string.
+      if (originalWarnMs === undefined) {
+        delete process.env.NEUROGRAPH_SHUTDOWN_WARN_MS;
+      } else {
+        process.env.NEUROGRAPH_SHUTDOWN_WARN_MS = originalWarnMs;
+      }
+      if (originalIntervalMs === undefined) {
+        delete process.env.NEUROGRAPH_SHUTDOWN_WARN_INTERVAL_MS;
+      } else {
+        process.env.NEUROGRAPH_SHUTDOWN_WARN_INTERVAL_MS = originalIntervalMs;
+      }
     }
   });
 
@@ -599,6 +636,50 @@ describe("NeurographRpcClient stop() lifecycle", () => {
     await new Promise((r) => setImmediate(r));
     const disposeWrite = proc.stdin.writes.find((w) => w.request.method === "dispose");
     assert.ok(disposeWrite, "stop() must converge on and dispose the child the spawn produced, not orphan it");
+
+    proc.emitLine({ jsonrpc: "2.0", id: disposeWrite!.request.id, result: { safe_to_terminate: true } });
+    await new Promise((r) => setImmediate(r));
+    proc.simulateExit(0);
+
+    await stopPromise;
+    assert.equal(getGlobalState(), undefined, "global state cleared once the converged stop actually closed");
+  });
+
+  test("trackedSpawn() (factory fallback spawn path) also converges with a concurrent stop() (Fix 1, second pass)", async () => {
+    const { spawnFn, getLastProc } = makeSpawnFn();
+    const { logger } = makeLogger();
+    const rpc = new NeurographRpcClient(logger, spawnFn);
+
+    // This is the exact call the registerContextEngine() factory's fallback
+    // branch makes — a spawn path distinct from register()'s eager-spawn
+    // IIFE, but which must share the same SPAWN_KEY tracking so stop()
+    // cannot race ahead of it either.
+    const enginePromise = trackedSpawn(rpc);
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(getGlobalState()?.spawning, true, "trackedSpawn must publish spawning:true synchronously");
+    assert.ok(getSpawnPromise(), "trackedSpawn must register its promise on SPAWN_KEY");
+
+    const stopPromise = stopNeurographService();
+    let stopSettled = false;
+    stopPromise.then(() => {
+      stopSettled = true;
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(
+      stopSettled,
+      false,
+      "stop() must await the tracked factory-path spawn rather than returning early on !state.rpc"
+    );
+
+    const proc = getLastProc();
+    proc.emitLine({ jsonrpc: "2.0", method: "ready" });
+    const engine = await enginePromise;
+    assert.ok(engine instanceof NeurographContextEngine, "trackedSpawn must resolve with the live engine");
+
+    await new Promise((r) => setImmediate(r));
+    const disposeWrite = proc.stdin.writes.find((w: Written) => w.request.method === "dispose");
+    assert.ok(disposeWrite, "stop() must dispose the child the factory-path spawn produced, not orphan it");
 
     proc.emitLine({ jsonrpc: "2.0", id: disposeWrite!.request.id, result: { safe_to_terminate: true } });
     await new Promise((r) => setImmediate(r));
