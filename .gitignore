@@ -32,3 +32,6 @@ node_modules/
 # Machine-local Claude Code permissions (accumulated per-session grants) — not shared.
 # Only settings.local.json is local; settings.json and hooks/ stay tracked.
 .claude/settings.local.json
+# Subagent persistent memory (per-session accumulated notes) — same class as
+# settings.local.json above: machine-local working state, not shared.
+.claude/agent-memory/
