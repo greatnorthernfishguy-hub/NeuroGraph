@@ -94,6 +94,39 @@
  *         safe_to_terminate), systemd, Commons, and deploy.sh are explicitly
  *         out of scope for this chunk per Josh's instruction — later chunks
  *         of the same spec.
+ * [2026-09-13] Claude Sonnet 5 — corrective follow-up to chunk 1 (Grok family review of 0ac8826)
+ *   What: (1) call()/ensureRunning() re-check `stopping` after every await
+ *         gap via new admitOrReject()/assertNotStoppingMidFlight() helpers,
+ *         instead of checking once before the first await. (2) A new
+ *         SPAWN_KEY singleton tracks the eager-spawn promise;
+ *         stopNeurographService() now awaits it before concluding there's
+ *         nothing to stop,
+ *         so a stop() landing mid-spawn converges on the child once it
+ *         finishes spawning instead of latching a resolved no-op onto
+ *         SHUTDOWN_KEY. (3) doStop() no longer reports closed:true for "no
+ *         live process to dispose" (covers both: never spawned, and child
+ *         exited during drain) or for a child that exits between an
+ *         accepted safe_to_terminate:true response and the stdin close —
+ *         both now return closed:false and leave GLOBAL_KEY intact.
+ *   Why:  Independent family review found the committed tests didn't
+ *         exercise the actual races: call()/ensureRunning() only checked
+ *         `stopping` before their await, so stop()/watchdog could interleave
+ *         in the gap; a stop() during eager spawn hit the `!state.rpc`
+ *         branch and orphaned the spawning child behind a resolved
+ *         SHUTDOWN_KEY; and "nothing to dispose" was reported as a
+ *         successful close even when no dispose was ever accepted.
+ *   How:  See admitOrReject/assertNotStoppingMidFlight on
+ *         NeurographRpcClient, SPAWN_KEY/getSpawnPromise/setSpawnPromise,
+ *         and the rewritten doStop()/stopNeurographService(). New
+ *         index.test.ts cases cover the await-gap race, the watchdog-vs-stop
+ *         race, the eager-spawn-orphan sequence, and live-child-exit during
+ *         an in-flight call.
+ *   Note: `npm run typecheck:stub-harness` (renamed from `typecheck`) checks
+ *         index.ts against an ambient stub, not the real installed OpenClaw
+ *         SDK — this laptop has none installed, and the real SDK lives on
+ *         the VPS, which this workstream may not SSH into or inspect live.
+ *         The frozen "type-checks against the installed SDK" gate remains
+ *         explicitly open, pending a later controlled VPS validation pass.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -312,27 +345,82 @@ class NeurographRpcClient {
     }
   }
 
-  async ensureRunning(): Promise<void> {
-    // Step 2: prohibit ensureRunning() (respawn) while stopping.
+  /**
+   * Client-owned admission queue/mutex (Law Review follow-up, 2026-09-13):
+   * `this.stopping` is only ever set `true` synchronously (in `doStop()`,
+   * before its first `await`), so any admission check that runs
+   * synchronously (no pending await) is race-free by construction. The
+   * hazard is an await *gap*: a call/ensureRunning already past its
+   * check, sitting inside `await this.start()` or the like, when
+   * `stopping` flips true. `admitOrReject()` closes that gap two ways:
+   * (1) the whole operation — including any internal spawn — is added to
+   * `this.admitted` *synchronously*, before returning to the caller, so
+   * `drainAdmittedCalls()` actually waits for it rather than missing it;
+   * (2) `assertNotStoppingMidFlight()` is called again after every await
+   * inside the wrapped operation, so a shutdown that begins mid-spawn
+   * aborts the operation before it reaches the stdin write instead of
+   * writing after admission has closed.
+   */
+  private admitOrReject<T>(label: string, fn: () => Promise<T>): Promise<T> {
     if (this.stopping) {
-      throw new Error("NeuroGraph RPC client is stopping — ensureRunning() is prohibited");
+      return Promise.reject(
+        new Error(`NeuroGraph RPC client is stopping — ${label} is closed`)
+      );
     }
+    const promise = fn();
+    this.admitted.add(promise as Promise<unknown>);
+    (promise as Promise<unknown>)
+      .finally(() => this.admitted.delete(promise as Promise<unknown>))
+      .catch(() => {
+        // Swallow here only to avoid an unhandled-rejection warning on the
+        // *tracking* chain; the original `promise` returned to the caller
+        // still rejects normally.
+      });
+    return promise;
+  }
+
+  /** Throws if shutdown began during an await gap inside an admitted op. */
+  private assertNotStoppingMidFlight(label: string): void {
+    if (this.stopping) {
+      throw new Error(`NeuroGraph RPC client is stopping — ${label} aborted after an in-flight await`);
+    }
+  }
+
+  ensureRunning(): Promise<void> {
+    // Step 2: prohibit ensureRunning() (respawn) while stopping. Checked
+    // synchronously here (admitOrReject) so a watchdog callback that has
+    // not yet reached this point when stop() begins is refused outright —
+    // it never calls start() at all.
+    return this.admitOrReject("ensureRunning()", () => this.performEnsureRunning());
+  }
+
+  private async performEnsureRunning(): Promise<void> {
     if (this.proc && this.proc.exitCode === null) return;
     this.proc = null;
     this.ready = false;
     this.logger.warn("Python process not running — restarting");
     await this.start();
+    // Re-check: shutdown may have begun while start() was in flight. If so,
+    // do not proceed to bootstrap the newly-spawned child — never write a
+    // normal RPC after admission has closed.
+    this.assertNotStoppingMidFlight("ensureRunning() bootstrap");
     await this.call("bootstrap", {}, 60000);
   }
 
-  async call(method: string, params: Record<string, unknown> = {}, timeoutMs = 30000): Promise<unknown> {
+  call(method: string, params: Record<string, unknown> = {}, timeoutMs = 30000): Promise<unknown> {
     // Step 1: atomically mark normal calls closed once shutdown begins.
-    if (this.stopping) {
-      throw new Error(`NeuroGraph RPC client is stopping — normal calls are closed (method=${method})`);
-    }
+    // Admission (and re-check after the ensureRunning await gap, inside
+    // performCall) is centralized in admitOrReject/assertNotStoppingMidFlight.
+    return this.admitOrReject(`call(${method})`, () => this.performCall(method, params, timeoutMs));
+  }
+
+  private async performCall(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
     if (!this.proc || !this.proc.stdin || this.proc.exitCode !== null) {
       await this.ensureRunning();
     }
+    // Re-check: shutdown may have begun while ensureRunning() (a spawn) was
+    // in flight. If so, never write the request — admission has closed.
+    this.assertNotStoppingMidFlight(`call(${method})`);
 
     const id = this.nextId++;
     const request = JSON.stringify({
@@ -342,7 +430,7 @@ class NeurographRpcClient {
       params,
     });
 
-    const promise = new Promise<unknown>((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`RPC timeout: ${method} (${timeoutMs}ms)`));
@@ -351,19 +439,6 @@ class NeurographRpcClient {
       this.pending.set(id, { resolve, reject, timer });
       this.proc!.stdin!.write(request + "\n");
     });
-
-    // Track this call as "admitted" so shutdown can drain it (step 3)
-    // before issuing the privileged dispose (step 4). The tracking chain
-    // is separate from the promise returned to the caller so caller-side
-    // rejection semantics are unaffected.
-    this.admitted.add(promise);
-    promise.finally(() => this.admitted.delete(promise)).catch(() => {
-      // Swallow here only to avoid an unhandled-rejection warning on the
-      // *tracking* chain; the original `promise` returned above still
-      // rejects normally for the caller.
-    });
-
-    return promise;
   }
 
   /**
@@ -455,12 +530,16 @@ class NeurographRpcClient {
    * appended one) converges on the same in-flight/settled promise, one
    * child, and one dispose write.
    *
-   * Never sends SIGTERM/SIGKILL. Never closes stdin unless Python's
-   * dispose response reports `safe_to_terminate: true`. On any failure
-   * (no live process, dispose rejects, or safe_to_terminate is not true)
-   * this resolves `{ closed: false }` and leaves the process, stdin, and
-   * global state untouched — per spec step 8 and the "never permitted"
-   * list, an unaccepted/failed shutdown must never signal the child.
+   * `closed: true` is reported *only* when Python actually accepted the
+   * privileged dispose (`safe_to_terminate: true`) and the child then
+   * exited naturally. Every other path — no live process, a dispose that
+   * never got sent, a rejected dispose, an unaccepted `safe_to_terminate`,
+   * or the child dying before we can act on an acceptance — is an
+   * unaccepted shutdown and reports `closed: false` without touching
+   * stdin, without signaling, and without clearing global state. A
+   * process that is simply absent (never spawned, or already dead) is not
+   * treated as a successful shutdown: no persistence was ever accepted for
+   * it, so there is nothing this stop() can claim credit for.
    */
   async stop(): Promise<{ closed: boolean }> {
     if (this.stopPromise) return this.stopPromise;
@@ -478,12 +557,19 @@ class NeurographRpcClient {
     await this.drainAdmittedCalls();
 
     if (!this.proc || this.proc.exitCode !== null) {
-      // Nothing to dispose — process already gone.
+      // No live process to dispose — either it was never running, or it
+      // exited (naturally or otherwise) before or during the drain, prior
+      // to any dispose request being sent. No persistence was accepted on
+      // this call, so this is an unaccepted shutdown, not a success.
+      this.logger.warn(
+        "NeuroGraph shutdown: no live process to dispose (absent before drain, or exited during drain) — " +
+          "no dispose was accepted; reporting unaccepted shutdown."
+      );
       if (this.rl) {
         this.rl.close();
         this.rl = null;
       }
-      return { closed: true };
+      return { closed: false };
     }
 
     let disposeResult: DisposeResult | undefined;
@@ -505,6 +591,19 @@ class NeurographRpcClient {
       this.logger.warn(
         "NeuroGraph shutdown: dispose response did not report safe_to_terminate=true — " +
           "leaving stdin open and process running; no signal sent."
+      );
+      return { closed: false };
+    }
+
+    // The child may have exited on its own between the dispose response
+    // arriving and this check (e.g. a crash immediately after writing its
+    // response). If so, treat this as unaccepted too: we never got to act
+    // on the acceptance by closing stdin ourselves, so there is no proven
+    // Node-owned quiescence boundary to claim.
+    if (!this.proc || this.proc.exitCode !== null) {
+      this.logger.warn(
+        "NeuroGraph shutdown: child exited before stdin could be closed following an accepted dispose — " +
+          "reporting unaccepted shutdown."
       );
       return { closed: false };
     }
@@ -811,6 +910,28 @@ function setGlobalShutdownPromise(p: Promise<void>): void {
   (globalThis as any)[SHUTDOWN_KEY] = p;
 }
 
+// ── Global eager-spawn-promise key ──────────────────────────────────
+// register()'s eager spawn (below) runs detached — nothing awaits it at
+// the call site. Without tracking it, a stop() that arrives while
+// GLOBAL_KEY is still `{ rpc: null, spawning: true }` (Law Review
+// follow-up, 2026-09-13: previously this hit the "!state.rpc" branch and
+// immediately latched a resolved no-op onto SHUTDOWN_KEY) would report
+// "nothing to stop" and then the spawn would go on to produce a live,
+// unowned child a moment later — an orphan that no future stop() call can
+// ever reach, because SHUTDOWN_KEY is already settled. Tracking the
+// in-flight spawn promise here lets stopNeurographService() wait for it to
+// settle (success or failure) before deciding there is nothing to stop.
+
+const SPAWN_KEY = Symbol.for("neurograph.spawnPromise");
+
+function getSpawnPromise(): Promise<void> | undefined {
+  return (globalThis as any)[SPAWN_KEY];
+}
+
+function setSpawnPromise(p: Promise<void>): void {
+  (globalThis as any)[SPAWN_KEY] = p;
+}
+
 /**
  * Resolves the current GLOBAL_KEY state and joins the one global shutdown
  * promise (register() → registerService("neurograph-rpc-host").stop()).
@@ -821,23 +942,37 @@ function setGlobalShutdownPromise(p: Promise<void>): void {
  * actually closed (natural exit after an accepted safe_to_terminate);
  * a failed/unaccepted shutdown leaves global state intact so the
  * substrate keeps running rather than being silently orphaned.
+ *
+ * If an eager spawn is still in flight (GLOBAL_KEY holds
+ * `{ rpc: null, spawning: true }`), this waits for that spawn to settle
+ * before evaluating global state, so a stop() that lands mid-spawn stops
+ * the child that finishes spawning rather than orphaning it.
  */
 function stopNeurographService(): Promise<void> {
   const existingShutdown = getGlobalShutdownPromise();
   if (existingShutdown) return existingShutdown;
 
-  const state = getGlobalState();
-  if (!state || !state.rpc) {
-    const noop = Promise.resolve();
-    setGlobalShutdownPromise(noop);
-    return noop;
-  }
+  const shutdown = (async () => {
+    const spawnPromise = getSpawnPromise();
+    if (spawnPromise) {
+      // The eager-spawn IIFE never rejects outward (it catches its own
+      // errors and clears GLOBAL_KEY on failure) — this catch is defense
+      // in depth only.
+      await spawnPromise.catch(() => {});
+    }
 
-  const shutdown = state.rpc.stop().then((result) => {
+    const state = getGlobalState();
+    if (!state || !state.rpc) {
+      // Genuinely nothing running (spawn never started, or it failed and
+      // already cleared its own state) — there is nothing to stop.
+      return;
+    }
+
+    const result = await state.rpc.stop();
     if (result.closed) {
       (globalThis as any)[GLOBAL_KEY] = undefined;
     }
-  });
+  })();
 
   setGlobalShutdownPromise(shutdown);
   return shutdown;
@@ -935,21 +1070,30 @@ const neurographPlugin = {
     // The factory callback above waits for this if called during startup.
     setGlobalState({ rpc: null as any, engine: null as any, spawning: true });
 
-    (async () => {
-      try {
-        const rpc = new NeurographRpcClient(logger);
-        await rpc.start();
-        const engine = new NeurographContextEngine(rpc);
-        setGlobalState({ rpc, engine, spawning: false });
-        rpc.startWatchdog();
-        logger.info("NeuroGraph: eager spawn complete — organism alive (watchdog started)");
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(`NeuroGraph eager spawn failed (will retry on first use): ${msg}`);
-        // Clear the spawning flag so the factory can try
-        (globalThis as any)[GLOBAL_KEY] = undefined;
-      }
-    })();
+    setSpawnPromise(
+      (async () => {
+        try {
+          const rpc = new NeurographRpcClient(logger);
+          await rpc.start();
+          // A stop() may have arrived while this spawn was in flight (see
+          // stopNeurographService()) — it awaits this same promise before
+          // deciding there's nothing to stop, but it can only stop what it
+          // finds in GLOBAL_KEY, so this spawn must publish the live rpc
+          // unconditionally and then let the already-waiting stop() (or the
+          // watchdog) converge on it, rather than deciding for itself
+          // whether to keep or discard a child nobody else can reach yet.
+          const engine = new NeurographContextEngine(rpc);
+          setGlobalState({ rpc, engine, spawning: false });
+          rpc.startWatchdog();
+          logger.info("NeuroGraph: eager spawn complete — organism alive (watchdog started)");
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error(`NeuroGraph eager spawn failed (will retry on first use): ${msg}`);
+          // Clear the spawning flag so the factory can try
+          (globalThis as any)[GLOBAL_KEY] = undefined;
+        }
+      })()
+    );
 
     logger.info("NeuroGraph ContextEngine plugin registered");
   },
@@ -969,7 +1113,9 @@ export {
   setGlobalState,
   stopNeurographService,
   getGlobalShutdownPromise,
+  getSpawnPromise,
+  setSpawnPromise,
   GLOBAL_KEY,
   SHUTDOWN_KEY,
+  SPAWN_KEY,
 };
-

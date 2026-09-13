@@ -18,6 +18,19 @@
  *   How:  Ambient `declare module` blocks matching the exact import sites in
  *         index.ts (verified via grep — no other openclaw import path or
  *         API-surface member is referenced by this chunk's code).
+ *
+ * [2026-09-13] Claude Sonnet 5 — corrective follow-up (Grok family review of 0ac8826)
+ *   What: Clarified scope: this stub is an isolated compile harness only.
+ *   Why:  A clean `npm run typecheck:stub-harness` against this file proves
+ *         index.ts is internally type-consistent with these declared shapes —
+ *         it does NOT satisfy the frozen "type-checks against the installed
+ *         OpenClaw SDK" gate. This laptop has no installed `openclaw`
+ *         package to check against, and the real runtime SDK lives on the
+ *         VPS, which this workstream is forbidden from reaching (no SSH or
+ *         live inspection). That gate is explicitly left open, pending a
+ *         later controlled VPS validation pass against the real package.
+ *         Do not treat a pass here as SDK compatibility proof.
+ *   How:  Header comment only; no declared shapes changed.
  */
 
 declare module "openclaw/plugin-sdk/plugins/types.js" {

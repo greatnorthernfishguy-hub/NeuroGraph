@@ -22,6 +22,24 @@
  *         ChildProcess; stdin.write is captured to an array so tests can
  *         assert exactly one dispose write regardless of how many
  *         stop()/registerService.stop() callers there are.
+ * [2026-09-13] Claude Sonnet 5 — corrective follow-up (Grok family review of 0ac8826)
+ *   What: (1) Changed the "no live process to dispose" case from expecting
+ *         closed:true to closed:false — no dispose was ever accepted, so it
+ *         is not a success. (2) Added an await-gap race test that forces
+ *         call() to abort a respawn already in flight when stop() begins.
+ *         (3) Added a dedicated watchdog/ensureRunning()-vs-stop() race test.
+ *         (4) Added a live-child-exit-during-an-in-flight-call test asserting
+ *         closed:false and no dispose write. (5) Added a stop-during-eager-
+ *         spawn test against the new SPAWN_KEY plumbing, asserting stop()
+ *         converges on the spawned child instead of latching a no-op.
+ *   Why:  Independent family review found the 14 tests in 0ac8826 exercised
+ *         the happy paths of the admission/drain state machine but never
+ *         the actual await-gap races or the eager-spawn-orphan sequence the
+ *         source fixes address, and one existing expectation (closed:true
+ *         for "nothing to dispose") was itself wrong per the spec's
+ *         accepted-persistence-only definition of a closed shutdown.
+ *   How:  All 14 pre-existing required tests are preserved; only the one
+ *         factually-wrong expectation was corrected in place.
  */
 
 import { test, describe, beforeEach } from "node:test";
@@ -36,6 +54,7 @@ import {
   setGlobalState,
   stopNeurographService,
   getGlobalShutdownPromise,
+  setSpawnPromise,
   GLOBAL_KEY,
   SHUTDOWN_KEY,
 } from "./index.js";
@@ -427,14 +446,166 @@ describe("NeurographRpcClient stop() lifecycle", () => {
     assert.notEqual(getGlobalState(), undefined, "global state must be left intact on failed shutdown");
   });
 
-  test("dispose rejection (no live process) never closes stdin/signals/clears state", async () => {
+  test("no live process to dispose is an unaccepted shutdown, not a success", async () => {
     const { logger } = makeLogger();
     const client = new NeurographRpcClient(logger, makeSpawnFn().spawnFn);
     // Never started — no live process at all.
     setGlobalState({ rpc: client, engine: null as any, spawning: false });
 
     const result = await client.stop();
-    assert.equal(result.closed, true, "nothing to dispose is treated as already-closed, not a failure");
+    assert.equal(
+      result.closed,
+      false,
+      "no persistence was ever accepted for a process that was never live — reporting closed:true here would " +
+        "claim credit for a dispose that never happened"
+    );
+  });
+
+  test("await-gap race: call() aborts a mid-flight ensureRunning() respawn once stop() begins (Fix 1)", async () => {
+    const { spawnFn, getLastProc } = makeSpawnFn();
+    const { logger } = makeLogger();
+    const client = new NeurographRpcClient(logger, spawnFn);
+
+    // Bring up proc1, then kill it so the next call() must respawn.
+    const startPromise = client.start();
+    await new Promise((r) => setImmediate(r));
+    getLastProc().emitLine({ jsonrpc: "2.0", method: "ready" });
+    await startPromise;
+    const proc1 = getLastProc();
+    proc1.simulateExit(1);
+
+    // call() → performCall sees a dead proc → awaits ensureRunning() → performEnsureRunning()
+    // → awaits start(), which synchronously spawns proc2 before its own await gap.
+    const callPromise = client.call("assemble", {});
+    await new Promise((r) => setImmediate(r));
+    const proc2 = getLastProc();
+    assert.notEqual(proc2, proc1, "call() must have triggered a respawn onto a second fake child");
+
+    // stop() begins while call() is still sitting inside the awaited respawn
+    // (proc2 has not emitted "ready" yet) — this is the exact await gap Fix 1 closes.
+    const stopPromise = client.stop();
+
+    // Let proc2 finish spawning now.
+    proc2.emitLine({ jsonrpc: "2.0", method: "ready" });
+
+    // The racing call() must reject — it must never reach the stdin write for
+    // "assemble" on proc2, because assertNotStoppingMidFlight() aborts it
+    // immediately after the ensureRunning() await settles.
+    await assert.rejects(() => callPromise, /aborted after an in-flight await|stopping/);
+    assert.equal(
+      proc2.stdin.writes.some((w) => w.request.method === "assemble"),
+      false,
+      "the racing call must never write its request after stop() began"
+    );
+
+    // stop() still needs to converge on and dispose the now-live proc2.
+    await new Promise((r) => setImmediate(r));
+    const disposeWrite = proc2.stdin.writes.find((w) => w.request.method === "dispose");
+    assert.ok(disposeWrite, "stop() must dispose the child the aborted call ended up spawning");
+    proc2.emitLine({ jsonrpc: "2.0", id: disposeWrite!.request.id, result: { safe_to_terminate: true } });
+    await new Promise((r) => setImmediate(r));
+    proc2.simulateExit(0);
+    await stopPromise;
+  });
+
+  test("watchdog-vs-stop race: an in-flight watchdog respawn is aborted by a concurrent stop() (Fix 4)", async () => {
+    const { client, proc: proc1 } = await startedClient();
+    proc1.simulateExit(1);
+
+    // Simulate the watchdog's own call path: it invokes ensureRunning() directly
+    // (see startWatchdog()'s interval callback), not through call().
+    const respawnPromise = client.ensureRunning();
+    await new Promise((r) => setImmediate(r));
+
+    const stopPromise = client.stop();
+
+    // Let the in-flight respawn's start() settle.
+    const proc2 = (client as any).proc as FakeChildProcess | undefined;
+    assert.ok(proc2, "ensureRunning() must have synchronously spawned a second fake child");
+    proc2!.emitLine({ jsonrpc: "2.0", method: "ready" });
+
+    await assert.rejects(() => respawnPromise, /aborted after an in-flight await|stopping/);
+    assert.equal(
+      proc2!.stdin.writes.some((w: Written) => w.request.method === "bootstrap"),
+      false,
+      "an aborted watchdog respawn must never reach the bootstrap call"
+    );
+
+    await new Promise((r) => setImmediate(r));
+    const disposeWrite = proc2!.stdin.writes.find((w: Written) => w.request.method === "dispose");
+    assert.ok(disposeWrite, "stop() must still converge on and dispose the child the watchdog respawn produced");
+    proc2!.emitLine({ jsonrpc: "2.0", id: disposeWrite!.request.id, result: { safe_to_terminate: true } });
+    await new Promise((r) => setImmediate(r));
+    proc2!.simulateExit(0);
+    await stopPromise;
+  });
+
+  test("child exit during drain (in-flight call) before an accepted dispose is unaccepted shutdown (Fix 3)", async () => {
+    const { client, proc } = await startedClient();
+    setGlobalState({ rpc: client, engine: null as any, spawning: false });
+
+    const callPromise = client.call("assemble", { messages: [] }).catch(() => {});
+    await new Promise((r) => setImmediate(r));
+
+    const stopPromise = stopNeurographService();
+    await new Promise((r) => setImmediate(r));
+
+    // The child dies mid-drain — before any dispose request was ever sent.
+    proc.simulateExit(1);
+
+    await callPromise;
+    await stopPromise;
+
+    assert.equal(
+      proc.stdin.writes.some((w) => w.request.method === "dispose"),
+      false,
+      "dispose must never be sent to an already-dead child"
+    );
+    assert.notEqual(
+      getGlobalState(),
+      undefined,
+      "global state must be left intact — no dispose was ever accepted for this child"
+    );
+  });
+
+  test("stop() arriving during an eager spawn converges on the spawned child (Fix 2)", async () => {
+    const { client, proc } = await startedClient();
+
+    // Simulate register()'s eager-spawn window: GLOBAL_KEY says "spawning",
+    // and the in-flight spawn promise is tracked via SPAWN_KEY.
+    setGlobalState({ rpc: null as any, engine: null as any, spawning: true });
+    let resolveSpawn: () => void = () => {};
+    const spawnPromise = new Promise<void>((r) => {
+      resolveSpawn = r;
+    });
+    setSpawnPromise(spawnPromise);
+
+    const stopPromise = stopNeurographService();
+    let settled = false;
+    stopPromise.then(() => {
+      settled = true;
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(
+      settled,
+      false,
+      "stop() must await the in-flight spawn instead of latching a resolved no-op while spawning:true"
+    );
+
+    // The spawn "finishes": it publishes the live rpc, then its promise settles.
+    setGlobalState({ rpc: client, engine: {} as any, spawning: false });
+    resolveSpawn();
+
+    await new Promise((r) => setImmediate(r));
+    const disposeWrite = proc.stdin.writes.find((w) => w.request.method === "dispose");
+    assert.ok(disposeWrite, "stop() must converge on and dispose the child the spawn produced, not orphan it");
+
+    proc.emitLine({ jsonrpc: "2.0", id: disposeWrite!.request.id, result: { safe_to_terminate: true } });
+    await new Promise((r) => setImmediate(r));
+    proc.simulateExit(0);
+
+    await stopPromise;
+    assert.equal(getGlobalState(), undefined, "global state cleared once the converged stop actually closed");
   });
 
   test("two simultaneous stop() calls converge on one dispose write and one outcome", async () => {

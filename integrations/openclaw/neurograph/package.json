@@ -6,6 +6,13 @@
       "what": "Minimal package.json for tsc typecheck + tsx --test, scoped to Source Lifecycle Repair chunk 1 (extension only).",
       "why": "SOURCE-LIFECYCLE-REPAIR-SPEC.md tests require a type-check + test runner for integrations/openclaw/neurograph/; none existed yet. The full canonical package.json/openclaw.plugin.json/README packaging is a later spec chunk.",
       "how": "Seeded from the preserved VPS package.json shape (evidence/vps-neurograph-package.json), added devDependencies/scripts for tsc + tsx --test (precedent: jink-mcp/package.json, portal-v2/package.json use the same tsx --test pattern — no vitest introduced)."
+    },
+    {
+      "date": "2026-09-13",
+      "author": "Claude Sonnet 5",
+      "what": "Corrective follow-up (Grok family review of 0ac8826): renamed the `typecheck` script to `typecheck:stub-harness`.",
+      "why": "This laptop has no installed `openclaw` package — the peerDependency below is declared, not satisfied. `tsc --noEmit` here only checks index.ts against the ambient types/openclaw-stub.d.ts stand-in, which is an isolated compile harness, not proof of compatibility with the real installed SDK. Naming it plain `typecheck` overstated that. The frozen 'type-checks against the installed OpenClaw SDK' gate is unmet and stays explicitly open pending controlled VPS validation against the real openclaw package.",
+      "how": "Renamed script only; no compiler behavior changed."
     }
   ],
   "name": "@et-systems/neurograph",
@@ -14,7 +21,7 @@
   "type": "module",
   "description": "NeuroGraph ContextEngine plugin for OpenClaw — SNN cognitive substrate",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck:stub-harness": "tsc --noEmit",
     "test": "tsx --test index.test.ts"
   },
   "peerDependencies": {

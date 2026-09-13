@@ -6,6 +6,13 @@
       "what": "tsconfig for the neurograph OpenClaw extension, scoped to typecheck index.ts and index.test.ts against ambient stub SDK types.",
       "why": "SOURCE-LIFECYCLE-REPAIR-SPEC.md Extension tests require the extension to type-check against the installed OpenClaw SDK; no real openclaw npm package is installed in this dev environment, so this project resolves the SDK's type surface from types/openclaw-stub.d.ts instead (see that file's header for the exact scope of the stand-in).",
       "how": "Modeled on jink-mcp/tsconfig.json (Node16 module/resolution, strict, skipLibCheck)."
+    },
+    {
+      "date": "2026-09-13",
+      "author": "Claude Sonnet 5",
+      "what": "Corrective follow-up (Grok family review of 0ac8826): clarified that this config is an isolated compile harness against a stub, not the frozen 'installed SDK' typecheck gate.",
+      "why": "The stub lets tsc run at all with no openclaw package installed, but a clean `tsc --noEmit` here proves index.ts is internally type-consistent with the stub's declared shapes — it does NOT prove compatibility with the real openclaw runtime SDK on the VPS, which this workstream is forbidden from reaching (no SSH/live inspection). That gate stays open for controlled VPS validation.",
+      "how": "Comment-only clarification; no compiler option changes."
     }
   ],
   "compilerOptions": {
