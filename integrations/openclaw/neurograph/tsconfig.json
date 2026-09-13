@@ -1,0 +1,23 @@
+{
+  "_changelog": [
+    {
+      "date": "2026-09-13",
+      "author": "Claude Sonnet 5",
+      "what": "tsconfig for the neurograph OpenClaw extension, scoped to typecheck index.ts and index.test.ts against ambient stub SDK types.",
+      "why": "SOURCE-LIFECYCLE-REPAIR-SPEC.md Extension tests require the extension to type-check against the installed OpenClaw SDK; no real openclaw npm package is installed in this dev environment, so this project resolves the SDK's type surface from types/openclaw-stub.d.ts instead (see that file's header for the exact scope of the stand-in).",
+      "how": "Modeled on jink-mcp/tsconfig.json (Node16 module/resolution, strict, skipLibCheck)."
+    }
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  },
+  "include": ["index.ts", "index.test.ts", "types/**/*.d.ts"]
+}

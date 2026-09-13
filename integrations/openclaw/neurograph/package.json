@@ -1,0 +1,38 @@
+{
+  "_changelog": [
+    {
+      "date": "2026-09-13",
+      "author": "Claude Sonnet 5",
+      "what": "Minimal package.json for tsc typecheck + tsx --test, scoped to Source Lifecycle Repair chunk 1 (extension only).",
+      "why": "SOURCE-LIFECYCLE-REPAIR-SPEC.md tests require a type-check + test runner for integrations/openclaw/neurograph/; none existed yet. The full canonical package.json/openclaw.plugin.json/README packaging is a later spec chunk.",
+      "how": "Seeded from the preserved VPS package.json shape (evidence/vps-neurograph-package.json), added devDependencies/scripts for tsc + tsx --test (precedent: jink-mcp/package.json, portal-v2/package.json use the same tsx --test pattern — no vitest introduced)."
+    }
+  ],
+  "name": "@et-systems/neurograph",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NeuroGraph ContextEngine plugin for OpenClaw — SNN cognitive substrate",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test index.test.ts"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.7"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.12.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}

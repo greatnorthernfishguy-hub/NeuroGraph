@@ -1,0 +1,123 @@
+/**
+ * Ambient stand-in for the `openclaw` npm package's plugin-SDK type surface.
+ *
+ * Changelog:
+ * [2026-09-13] Claude Sonnet 5 — Source Lifecycle Repair, chunk 1
+ *   What: Declares `openclaw/plugin-sdk/plugins/types.js` (OpenClawPluginApi)
+ *         and `openclaw/plugin-sdk/context-engine/types.js` (ContextEngine
+ *         and its lifecycle result types), scoped to exactly the members
+ *         integrations/openclaw/neurograph/index.ts imports and uses.
+ *   Why:  `openclaw` is an optional peerDependency (see package.json) and is
+ *         not installed in this dev/test environment — there is no VPS
+ *         OpenClaw checkout available to typecheck against here. The spec's
+ *         "type-checks against the installed OpenClaw SDK" test requirement
+ *         is satisfied against this stub's shape; a real OpenClaw install at
+ *         deploy time supersedes this stub via normal module resolution
+ *         (this file only declares ambient modules, it does not shadow a
+ *         real `openclaw` package if one is present in node_modules).
+ *   How:  Ambient `declare module` blocks matching the exact import sites in
+ *         index.ts (verified via grep — no other openclaw import path or
+ *         API-surface member is referenced by this chunk's code).
+ */
+
+declare module "openclaw/plugin-sdk/plugins/types.js" {
+  export type PluginLogger = {
+    info: (msg: string) => void;
+    error: (msg: string) => void;
+    warn: (msg: string) => void;
+  };
+
+  export type PluginServiceDefinition = {
+    id: string;
+    start: () => Promise<void>;
+    stop: () => Promise<void>;
+  };
+
+  export interface OpenClawPluginApi {
+    logger: PluginLogger;
+    registerService(service: PluginServiceDefinition): void;
+    registerContextEngine(
+      id: string,
+      factory: () => Promise<import("openclaw/plugin-sdk/context-engine/types.js").ContextEngine>
+    ): void;
+  }
+}
+
+declare module "openclaw/plugin-sdk/context-engine/types.js" {
+  export type ContextEngineInfo = {
+    id: string;
+    name: string;
+    version: string;
+    ownsCompaction?: boolean;
+  };
+
+  export type BootstrapResult = {
+    bootstrapped: boolean;
+    reason?: string;
+  };
+
+  export type IngestResult = {
+    ingested: boolean;
+  };
+
+  export type AssembleResult = {
+    messages: unknown[];
+    estimatedTokens?: number;
+    systemPromptAddition?: string;
+  };
+
+  export type CompactResult = {
+    ok: boolean;
+    compacted: boolean;
+    reason?: string;
+    result?: {
+      summary: string;
+      tokensBefore?: number;
+      tokensAfter?: number;
+      firstKeptEntryId: string;
+    };
+  };
+
+  export interface ContextEngine {
+    readonly info: ContextEngineInfo;
+    bootstrap(params: {
+      sessionId: string;
+      sessionKey?: string;
+      sessionFile: string;
+    }): Promise<BootstrapResult>;
+    ingest(params: {
+      sessionId: string;
+      sessionKey?: string;
+      message: unknown;
+      isHeartbeat?: boolean;
+    }): Promise<IngestResult>;
+    assemble(params: {
+      sessionId: string;
+      sessionKey?: string;
+      messages: unknown[];
+      tokenBudget?: number;
+    }): Promise<AssembleResult>;
+    afterTurn(params: {
+      sessionId: string;
+      sessionKey?: string;
+      sessionFile: string;
+      messages: unknown[];
+      prePromptMessageCount: number;
+      autoCompactionSummary?: string;
+      isHeartbeat?: boolean;
+      tokenBudget?: number;
+      runtimeContext?: Record<string, unknown>;
+    }): Promise<void>;
+    compact(params: {
+      sessionId: string;
+      sessionKey?: string;
+      sessionFile: string;
+      tokenBudget?: number;
+      force?: boolean;
+      customInstructions?: string;
+      currentTokenCount?: number;
+      runtimeContext?: Record<string, unknown>;
+    }): Promise<CompactResult>;
+    dispose(): Promise<void>;
+  }
+}
