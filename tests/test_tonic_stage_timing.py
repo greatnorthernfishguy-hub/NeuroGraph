@@ -1,7 +1,8 @@
 # ---- Changelog ----
 # [2026-09-13] Grok Build (grok-4.6) — bounded per-stage Tonic timing tests
-# What: Isolated fakes prove status last/EMA schema stays constant-size; lock wait
-#   vs transformer forward are measured separately without body-lock re-entry;
+# What: Isolated fakes prove status last/EMA schema stays constant-size; candidate
+#   and model-tensor feature extraction, lock wait, and transformer forward are
+#   measured separately without body-lock re-entry;
 #   waiting-for-shared-body / empty-graph early returns zero last-samples; adaptive
 #   cadence still uses total tick work; timing/logging failures cannot stop a tick
 #   or change activations.
@@ -36,6 +37,7 @@ TonicEngine, EngineConfig = te.TonicEngine, te.EngineConfig
 
 STAGE_NAMES = (
     "feature_extract",
+    "model_feature_extract",
     "body_lock_wait",
     "transformer_forward",
     "propagate",
@@ -213,6 +215,12 @@ def test_status_exposes_bounded_stage_telemetry(loader, monkeypatch):
         return orig(*a, **k)
 
     monkeypatch.setattr(te, "_extract_tonic_features", slow_extract)
+
+    def slow_model_extract():
+        time.sleep(0.02)
+        return object()
+
+    monkeypatch.setattr(engine, "_extract_graph_features_for_model", slow_model_extract)
     engine._graph.prime_and_propagate = _graph(prime_s=0.02).prime_and_propagate
     engine._tonic_thread.cycle_s = 0.02
 
@@ -236,11 +244,13 @@ def test_status_exposes_bounded_stage_telemetry(loader, monkeypatch):
 
     st = engine.status
     assert st["last_feature_extract_ms"] >= 15
+    assert st["last_model_feature_extract_ms"] >= 15
     assert st["last_transformer_forward_ms"] >= 15
     assert st["last_propagate_ms"] >= 15
     assert st["last_ouroboros_ms"] >= 15
     assert st["last_latent_ms"] >= st["last_feature_extract_ms"]
     assert st["ema_feature_extract_ms"] > 0
+    assert st["ema_model_feature_extract_ms"] > 0
     assert st["ema_transformer_forward_ms"] > 0
     assert engine._tonic_thread.cycles == 5
 
@@ -310,6 +320,7 @@ def test_waiting_for_shared_body_clears_prior_stage_samples(loader, monkeypatch)
     assert waiting["waiting_for_shared_body"] is True
     st = engine.status
     assert st["last_feature_extract_ms"] == 0.0
+    assert st["last_model_feature_extract_ms"] == 0.0
     assert st["last_body_lock_wait_ms"] == 0.0
     assert st["last_transformer_forward_ms"] == 0.0
     assert st["last_propagate_ms"] == 0.0
@@ -333,6 +344,7 @@ def test_empty_graph_early_return_zeros_unrun_stages(loader, monkeypatch):
     assert out == {"fired": 0, "activated": 0}
     st = engine.status
     assert st["last_body_lock_wait_ms"] == 0.0
+    assert st["last_model_feature_extract_ms"] == 0.0
     assert st["last_transformer_forward_ms"] == 0.0
     assert st["last_propagate_ms"] == 0.0
     assert st["last_ouroboros_ms"] == 0.0
@@ -458,6 +470,7 @@ def test_over_budget_log_includes_stages_only_when_over(loader, monkeypatch, cap
     msg = over[0]
     for name in (
         "feature_extract",
+        "model_feature_extract",
         "body_lock_wait",
         "transformer_forward",
         "propagate",

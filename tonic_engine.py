@@ -27,9 +27,10 @@ Laws observed:
 
 # ---- Changelog ----
 # [2026-09-13] Grok Build (grok-4.6) — bounded per-stage latent-token timing.
-# What: time feature extract, shared-body lock wait, transformer forward while
-#   holding the existing body lock, prime_and_propagate, ouroboros_cycle, the
-#   latent-token total, and autostep when it actually runs. status() exposes
+# What: time candidate feature extraction, model-tensor feature materialization,
+#   shared-body lock wait, transformer forward while holding the existing body
+#   lock, prime_and_propagate, ouroboros_cycle, the latent-token total, and
+#   autostep when it actually runs. status() exposes
 #   last-sample + EMA scalars; over-budget logs include the same split.
 # Why: VPS observation needs lock-wait vs forward vs propagate vs extract so
 #   starvation can be distinguished from shared-body serialization. Measurement
@@ -262,6 +263,7 @@ _CC_PITH_PREFETCH_CURRENT_SCALE = max(0.0, min(1.0, float(os.environ.get("CC_PIT
 _STAGE_EMA_ALPHA = 0.2
 _STAGE_NAMES = (
     "feature_extract",
+    "model_feature_extract",
     "body_lock_wait",
     "transformer_forward",
     "propagate",
@@ -1100,8 +1102,14 @@ class TonicEngine:
         except ImportError:
             return self._fallback_inference(features)
 
-        # Extract graph features into GraphFeatures struct
-        graph_features = self._extract_graph_features_for_model()
+        # Materialize graph features for the model outside the body lock. This
+        # walks graph collections independently of the bounded candidate scan,
+        # so keep its cost distinct from both lock wait and transformer work.
+        t_model_feat = time.perf_counter()
+        try:
+            graph_features = self._extract_graph_features_for_model()
+        finally:
+            self._record_stage("model_feature_extract", t_model_feat)
         if graph_features is None:
             return self._fallback_inference(features)
 
@@ -1346,11 +1354,13 @@ class TonicEngine:
                 try:
                     logger.warning(
                         "Tonic tick over budget: %.3fs (budget %.1fs, nodes=%d, ema=%.1fms, "
-                        "feature_extract=%.1fms body_lock_wait=%.1fms transformer_forward=%.1fms "
+                        "feature_extract=%.1fms model_feature_extract=%.1fms "
+                        "body_lock_wait=%.1fms transformer_forward=%.1fms "
                         "propagate=%.1fms ouroboros=%.1fms latent=%.1fms autostep=%.1fms)",
                         elapsed, self._config.tick_budget_seconds,
                         len(self._graph.nodes), self._ema_tick_ms,
                         self._stage_last_ms.get("feature_extract", 0.0),
+                        self._stage_last_ms.get("model_feature_extract", 0.0),
                         self._stage_last_ms.get("body_lock_wait", 0.0),
                         self._stage_last_ms.get("transformer_forward", 0.0),
                         self._stage_last_ms.get("propagate", 0.0),
