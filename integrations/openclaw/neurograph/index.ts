@@ -164,6 +164,42 @@
  *   Note: The real-SDK/activation gate remains explicitly open — this is a
  *         contingency-hygiene pass only, not an SDK validation or Anima
  *         change. No SSH, deploy, push, or Python/systemd/Anima edits.
+ * [2026-09-13] Claude Sonnet 5 — third corrective follow-up (Grok final delta review, CHANGES REQUIRED on 35f649f)
+ *   What: trackedSpawn(rpc) is now ownership-safe. It returns the existing
+ *         engine immediately if a child is already live, and joins (returns
+ *         the same enginePromise, spawns nothing new, never touches
+ *         SPAWN_KEY) if a spawn is already in flight. A new internal-only
+ *         SPAWN_ATTEMPT_KEY holds `{token, enginePromise}` for the currently
+ *         owning attempt, giving each attempt explicit identity. On
+ *         rpc.start() failure, the attempt clears the GLOBAL_KEY spawning
+ *         placeholder only if it can prove it still owns it (its token is
+ *         still the current SPAWN_ATTEMPT_KEY holder AND GLOBAL_KEY is still
+ *         the untouched `{rpc:null, spawning:true}` placeholder it set) —
+ *         never an ambiguous `!state.rpc` check. The eager-spawn IIFE's
+ *         catch block in register() no longer blindly blanks GLOBAL_KEY on
+ *         any failure; trackedSpawn() already owns that cleanup, and this
+ *         catch could otherwise destroy state belonging to a different,
+ *         successful attempt.
+ *   Why:  Grok's final delta review on 35f649f found trackedSpawn had no
+ *         join/ownership logic at all — every call unconditionally
+ *         overwrote GLOBAL_KEY/SPAWN_KEY, so a second trackedSpawn() call
+ *         while one was already in flight would spawn a second process and
+ *         replace the promise stop() was tracking. It also found the
+ *         failure-cleanup path used a loose `rpc:null` check that could
+ *         clear state belonging to a live child or a different attempt, and
+ *         the eager-spawn catch unconditionally cleared GLOBAL_KEY even when
+ *         the failure came from something unrelated to spawn ownership
+ *         (e.g. startWatchdog() after a successful spawn).
+ *   How:  Added SPAWN_ATTEMPT_KEY/SpawnAttempt/getSpawnAttempt/
+ *         setSpawnAttempt as an internal ownership token, exported only for
+ *         tests. Two new forced tests verify: a start rejection leaves no
+ *         stuck spawning state and permits a clean retry; a second
+ *         trackedSpawn() call while the first is in flight joins it,
+ *         creates no second process, preserves SPAWN_KEY identity, and
+ *         stop() converges on the one child. All 19 previously-passing
+ *         tests preserved.
+ *   Note: The real-SDK/activation gate remains explicitly open. No SSH,
+ *         deploy, push, or Python/systemd/Anima/live-state edits.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -969,25 +1005,105 @@ function setSpawnPromise(p: Promise<void>): void {
   (globalThis as any)[SPAWN_KEY] = p;
 }
 
+// ── Global spawn-attempt-ownership key ──────────────────────────────
+// Law Review third-pass follow-up (Grok final delta, 2026-09-13): SPAWN_KEY
+// alone cannot answer "does the in-flight spawn already belong to someone,
+// and is a given cleanup allowed to touch it?" — a plain `Promise<void>` has
+// no identity. SPAWN_ATTEMPT_KEY holds the currently-owning trackedSpawn()
+// call's token plus its engine-producing promise, so:
+//   (a) a second trackedSpawn() call while one is in flight can *join* it
+//       (return the same enginePromise) instead of constructing a second
+//       rpc/process or replacing the SPAWN_KEY promise stop() is tracking;
+//   (b) a failed attempt can tell, unambiguously, whether the placeholder
+//       it's about to clear is still *its own* (nobody else published a
+//       live child or started a new attempt in the meantime) before
+//       touching GLOBAL_KEY/SPAWN_KEY at all.
+// Not part of the public two-key pattern (GLOBAL_KEY/SHUTDOWN_KEY/SPAWN_KEY)
+// documented above — internal to trackedSpawn(), exported only for tests.
+
+const SPAWN_ATTEMPT_KEY = Symbol.for("neurograph.spawnAttempt");
+
+type SpawnAttempt = { token: symbol; enginePromise: Promise<NeurographContextEngine> };
+
+function getSpawnAttempt(): SpawnAttempt | undefined {
+  return (globalThis as any)[SPAWN_ATTEMPT_KEY];
+}
+
+function setSpawnAttempt(attempt: SpawnAttempt | undefined): void {
+  (globalThis as any)[SPAWN_ATTEMPT_KEY] = attempt;
+}
+
 /**
- * Spawns `rpc` and publishes it to GLOBAL_KEY, tracking the in-flight spawn
- * via SPAWN_KEY (Law Review second-pass follow-up, 2026-09-13). Both
- * register()'s eager spawn and the registerContextEngine() factory's
- * fallback spawn (used when the eager spawn hasn't finished or failed) call
- * this same function, so a stop() landing during *either* spawn path
- * converges on the child it produces via stopNeurographService()'s
- * getSpawnPromise() await — neither path can return early on `!state.rpc`
- * and orphan a still-spawning child behind a resolved SHUTDOWN_KEY.
+ * Ownership-safe spawn: publishes `rpc` to GLOBAL_KEY and tracks the
+ * in-flight attempt via SPAWN_KEY/SPAWN_ATTEMPT_KEY. Both register()'s
+ * eager spawn and the registerContextEngine() factory's fallback spawn call
+ * this one function, so every spawn path shares the same join/ownership
+ * rules:
+ *
+ * - If a child is already live (GLOBAL_KEY.rpc.isAlive()), returns its
+ *   existing engine immediately. The `rpc` argument passed in is discarded
+ *   unstarted — never overwrite a live child with a second one.
+ * - If a spawn is already in flight (SPAWN_ATTEMPT_KEY set), joins it —
+ *   returns the *same* enginePromise, spawns no second process, and never
+ *   touches SPAWN_KEY (the promise stop() is already awaiting is left
+ *   alone).
+ * - Otherwise starts a genuinely new attempt under a fresh token. On
+ *   success, publishes the live rpc/engine. On failure, clears the global
+ *   spawning placeholder *only if it is still this exact attempt's token* —
+ *   i.e. only if GLOBAL_KEY still holds this attempt's untouched
+ *   `{ rpc: null, spawning: true }` placeholder. If anything else (a live
+ *   child, a different attempt) has since taken ownership, this attempt
+ *   leaves it alone and merely rethrows. This is what makes a later retry
+ *   safe: a fresh trackedSpawn() call after a failure sees no lingering
+ *   attempt/placeholder and starts cleanly.
  */
 function trackedSpawn(rpc: NeurographRpcClient): Promise<NeurographContextEngine> {
+  const state = getGlobalState();
+  if (state?.rpc?.isAlive?.()) {
+    return Promise.resolve(state.engine);
+  }
+
+  const inFlight = getSpawnAttempt();
+  if (inFlight) {
+    return inFlight.enginePromise;
+  }
+
+  const token = Symbol("neurograph.spawnAttempt");
   setGlobalState({ rpc: null as any, engine: null as any, spawning: true });
-  const settle = (async () => {
-    await rpc.start();
-    const engine = new NeurographContextEngine(rpc);
-    setGlobalState({ rpc, engine, spawning: false });
+
+  const enginePromise: Promise<NeurographContextEngine> = (async () => {
+    try {
+      await rpc.start();
+      const engine = new NeurographContextEngine(rpc);
+      setGlobalState({ rpc, engine, spawning: false });
+      return engine;
+    } catch (err: unknown) {
+      // Ownership check: only clear the spawning placeholder if it is
+      // unambiguously still ours — nobody else (another attempt, a live
+      // child published through some other path) has touched GLOBAL_KEY
+      // since we set it above.
+      const owns = getSpawnAttempt()?.token === token;
+      if (owns) {
+        const current = getGlobalState();
+        if (current && current.spawning === true && !current.rpc) {
+          (globalThis as any)[GLOBAL_KEY] = undefined;
+        }
+      }
+      throw err;
+    } finally {
+      if (getSpawnAttempt()?.token === token) {
+        setSpawnAttempt(undefined);
+      }
+    }
   })();
-  setSpawnPromise(settle);
-  return settle.then(() => getGlobalState()!.engine);
+
+  setSpawnAttempt({ token, enginePromise });
+  // SPAWN_KEY keeps its existing Promise<void> contract (stopNeurographService()
+  // and the tests that simulate races directly against it depend on that
+  // shape) — always settles once this attempt does, fulfilled either way,
+  // since stop() only needs to know the attempt is over, not its outcome.
+  setSpawnPromise(enginePromise.then(() => undefined, () => undefined));
+  return enginePromise;
 }
 
 /**
@@ -1135,8 +1251,13 @@ const neurographPlugin = {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error(`NeuroGraph eager spawn failed (will retry on first use): ${msg}`);
-        // Clear the spawning flag so the factory can try
-        (globalThis as any)[GLOBAL_KEY] = undefined;
+        // trackedSpawn() already performs ownership-safe cleanup of its own
+        // spawning placeholder on failure. This catch must not blank
+        // GLOBAL_KEY itself: by the time we're here, trackedSpawn may have
+        // already joined an in-flight attempt or published a live child
+        // (e.g. this rejection came from rpc.startWatchdog() after a
+        // successful spawn) — state this attempt does not own and must
+        // never clear out from under whoever does.
       }
     })();
 
@@ -1161,7 +1282,10 @@ export {
   getSpawnPromise,
   setSpawnPromise,
   trackedSpawn,
+  getSpawnAttempt,
+  setSpawnAttempt,
   GLOBAL_KEY,
   SHUTDOWN_KEY,
   SPAWN_KEY,
+  SPAWN_ATTEMPT_KEY,
 };

@@ -56,6 +56,20 @@
  *         restore pattern silently producing `process.env.X = "undefined"`
  *         rather than actually deleting the key.
  *   How:  No changes to the 18 previously-committed test expectations.
+ * [2026-09-13] Claude Sonnet 5 — third corrective follow-up (Grok final delta review)
+ *   What: Imports SPAWN_ATTEMPT_KEY/getSpawnAttempt/setSpawnAttempt; beforeEach
+ *         now also clears SPAWN_ATTEMPT_KEY. Two new forced tests: (1) a
+ *         trackedSpawn() start() rejection leaves no stuck spawning/attempt
+ *         state and a later trackedSpawn() call succeeds cleanly; (2) a
+ *         second trackedSpawn() call while the first is awaiting "ready"
+ *         joins the first instead of spawning a second process, preserves
+ *         SPAWN_KEY identity, resolves to the same engine, and stop()
+ *         converges on the one child.
+ *   Why:  Grok's final delta review on 35f649f found trackedSpawn had no
+ *         join/ownership semantics — every call re-spawned and overwrote
+ *         global state, and failure cleanup could clobber state it didn't
+ *         own.
+ *   How:  All 19 previously-committed test expectations preserved.
  */
 
 import { test, describe, beforeEach } from "node:test";
@@ -73,9 +87,12 @@ import {
   getSpawnPromise,
   setSpawnPromise,
   trackedSpawn,
+  getSpawnAttempt,
+  setSpawnAttempt,
   GLOBAL_KEY,
   SHUTDOWN_KEY,
   SPAWN_KEY,
+  SPAWN_ATTEMPT_KEY,
 } from "./index.js";
 
 // ── Fake child process ──────────────────────────────────────────────
@@ -165,6 +182,7 @@ beforeEach(() => {
   (globalThis as any)[GLOBAL_KEY] = undefined;
   (globalThis as any)[SHUTDOWN_KEY] = undefined;
   (globalThis as any)[SPAWN_KEY] = undefined;
+  (globalThis as any)[SPAWN_ATTEMPT_KEY] = undefined;
 });
 
 // ── start() is a no-op re: substrate spawning (service-level) ───────
@@ -687,6 +705,74 @@ describe("NeurographRpcClient stop() lifecycle", () => {
 
     await stopPromise;
     assert.equal(getGlobalState(), undefined, "global state cleared once the converged stop actually closed");
+  });
+
+  test("trackedSpawn() start() rejection leaves no stuck spawning state and permits a later retry (Grok final delta)", async () => {
+    const { logger } = makeLogger();
+
+    // A "flaky" rpc whose start() rejects exactly once, simulating the
+    // Python process failing to launch on the first attempt.
+    const flakyRpc = {
+      isAlive: () => false,
+      start: () => Promise.reject(new Error("simulated spawn failure")),
+    } as unknown as NeurographRpcClient;
+
+    await assert.rejects(() => trackedSpawn(flakyRpc), /simulated spawn failure/);
+
+    assert.equal(getGlobalState(), undefined, "a failed attempt must not leave a stuck spawning placeholder");
+    assert.equal(getSpawnAttempt(), undefined, "a failed attempt must clear its own ownership token");
+
+    // A fresh trackedSpawn() call after the failure must start cleanly —
+    // no lingering attempt/placeholder from the rejected one should block it.
+    const { spawnFn, getLastProc } = makeSpawnFn();
+    const rpc2 = new NeurographRpcClient(logger, spawnFn);
+    const enginePromise = trackedSpawn(rpc2);
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(getGlobalState()?.spawning, true, "the retry must publish its own spawning:true placeholder");
+
+    const proc = getLastProc();
+    proc.emitLine({ jsonrpc: "2.0", method: "ready" });
+    const engine = await enginePromise;
+
+    assert.ok(engine instanceof NeurographContextEngine, "the retry must resolve to a live engine");
+    assert.equal(getGlobalState()?.rpc?.isAlive?.(), true, "the retry's child must be published as live");
+  });
+
+  test("a second trackedSpawn() while the first awaits ready joins the first (Grok final delta)", async () => {
+    const { spawnFn, getLastProc } = makeSpawnFn();
+    const { logger } = makeLogger();
+    const rpc1 = new NeurographRpcClient(logger, spawnFn);
+    const rpc2 = new NeurographRpcClient(logger, makeSpawnFn().spawnFn);
+
+    const enginePromise1 = trackedSpawn(rpc1);
+    await new Promise((r) => setImmediate(r));
+    const spawnPromiseBefore = getSpawnPromise();
+
+    const enginePromise2 = trackedSpawn(rpc2);
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(getSpawnPromise(), spawnPromiseBefore, "joining a second call must never replace the SPAWN_KEY promise stop() is tracking");
+    assert.equal(rpc2.isAlive(), false, "the joining call's own rpc must never be started");
+
+    const proc = getLastProc();
+    proc.emitLine({ jsonrpc: "2.0", method: "ready" });
+
+    const [engine1, engine2] = await Promise.all([enginePromise1, enginePromise2]);
+    assert.equal(engine1, engine2, "both trackedSpawn() calls must resolve to the identical engine");
+
+    await new Promise((r) => setImmediate(r));
+    const stopPromise = stopNeurographService();
+    await new Promise((r) => setImmediate(r));
+    const disposeWrite = proc.stdin.writes.find((w: Written) => w.request.method === "dispose");
+    assert.ok(disposeWrite, "stop() must dispose the one shared child");
+
+    proc.emitLine({ jsonrpc: "2.0", id: disposeWrite!.request.id, result: { safe_to_terminate: true } });
+    await new Promise((r) => setImmediate(r));
+    proc.simulateExit(0);
+
+    await stopPromise;
+    assert.equal(getGlobalState(), undefined, "stop() converges on the single joined child and clears global state");
   });
 
   test("two simultaneous stop() calls converge on one dispose write and one outcome", async () => {
