@@ -89,10 +89,10 @@ This is observational ignition, not teaching. On its normal path, the
 underlying `prime_and_propagate` read mode disables plasticity and restores
 transient voltages and refractory state. The wrapper also leaves graph
 configuration, conversation bookkeeping, topology, and deposits unchanged.
-Known adjacent canonical debt: that restoration is not yet protected by a
-`finally`, so a mid-propagation exception can leave transient state changed
-before `_harvest_associations` degrades to an empty result. Fix belongs in
-canonical `neuro_foundation.py`; Slice A does not compensate beside it.
+Canonical `Graph.prime_and_propagate` now performs read-mode restoration in a
+`finally` while `_step_lock` is still held (PR #45). A mid-propagation exception
+therefore cannot leak borrowed voltage or refractory state. Pith continues to
+use that canonical behavior rather than compensating beside it.
 
 ### Request
 
