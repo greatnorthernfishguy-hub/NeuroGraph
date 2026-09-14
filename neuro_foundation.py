@@ -19,6 +19,12 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-09-13] Codex — Make observational propagation exception-safe
+# (PROTECTED CHANGE; Josh authorized offline source repair; no live checkpoint operation)
+# What: Read-mode prime_and_propagate restores node voltage/refractory and hyperedge
+#       refractory state even when propagation raises before completing.
+# Why: An observational recall failure must not become an unearned cognitive-state write.
+# How: The existing read simulation is enclosed by try/finally; write mode is unchanged.
 # [2026-09-11] Codex — #423 detach borrowed checkpoint state during serialization
 # (PROTECTED CHANGE; Josh authorized offline source repair; no live checkpoint operation)
 # What: Full/fork/incremental capture copies borrowed mutable subtrees once; an
@@ -2653,193 +2659,195 @@ class Graph:
                 for hid, he in self.hyperedges.items():
                     saved_he_refractory[hid] = he.refractory_remaining
 
-            # Compute approximate distances from primed nodes
-            primed_set = set(node_ids)
-            distances: Dict[str, int] = {nid: 0 for nid in node_ids}
-            # BFS to compute distances
-            frontier = set(node_ids)
-            for dist in range(1, steps + 1):
-                next_frontier: Set[str] = set()
-                for nid in frontier:
-                    for syn_id in self._outgoing.get(nid, set()):
-                        syn = self.synapses.get(syn_id)
-                        if syn and syn.post_node_id not in distances:
-                            distances[syn.post_node_id] = dist
-                            next_frontier.add(syn.post_node_id)
-                frontier = next_frontier
+            try:
+                # Compute approximate distances from primed nodes
+                primed_set = set(node_ids)
+                distances: Dict[str, int] = {nid: 0 for nid in node_ids}
+                # BFS to compute distances
+                frontier = set(node_ids)
+                for dist in range(1, steps + 1):
+                    next_frontier: Set[str] = set()
+                    for nid in frontier:
+                        for syn_id in self._outgoing.get(nid, set()):
+                            syn = self.synapses.get(syn_id)
+                            if syn and syn.post_node_id not in distances:
+                                distances[syn.post_node_id] = dist
+                                next_frontier.add(syn.post_node_id)
+                    frontier = next_frontier
 
-            # Collect current prediction targets for was_predicted tagging
-            predicted_targets: Set[str] = set()
-            for pred in self.active_predictions.values():
-                predicted_targets.add(pred.target_node_id)
-            for pred_state in self._active_predictions.values():
-                predicted_targets.update(pred_state.predicted_targets)
+                # Collect current prediction targets for was_predicted tagging
+                predicted_targets: Set[str] = set()
+                for pred in self.active_predictions.values():
+                    predicted_targets.add(pred.target_node_id)
+                for pred_state in self._active_predictions.values():
+                    predicted_targets.update(pred_state.predicted_targets)
 
-            # Build working set — nodes needing per-step processing. O(n) once here;
-            # step-level loops below run O(working_set) << O(n). (#164 Phase B)
-            # Includes: nodes with non-resting voltage, active refractory, or primed.
-            _ACTIVE_EPS = 1e-5
-            working_set: Set[str] = set(node_ids)
-            for nid, node in self.nodes.items():
-                if (abs(node.voltage - node.resting_potential) > _ACTIVE_EPS
-                        or node.refractory_remaining > 0):
-                    working_set.add(nid)
-
-            # --- PRIME: inject current into specified nodes ---
-            for nid, current in zip(node_ids, currents):
-                node = self.nodes.get(nid)
-                if node is not None:
-                    node.voltage += current * node.intrinsic_excitability
-
-            # --- PROPAGATE: run N read-only SNN steps ---
-            result = PropagationResult(
-                steps_run=steps,
-                nodes_primed=len(node_ids),
-            )
-            # Local delay buffer separate from the graph's real one
-            prop_delay_buffer: Dict[int, List[Tuple[str, float]]] = {}
-            prop_timestep = self.timestep
-
-            decay = self.config["decay_rate"]
-            experience_threshold = self.config["he_experience_threshold"]
-
-            for step_idx in range(steps):
-                prop_timestep += 1
-
-                # 1. Voltage decay — O(working_set) not O(n) (#164)
-                _to_deactivate: List[str] = []
-                for nid in working_set:
-                    node = self.nodes[nid]
-                    node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
-                    if (abs(node.voltage - node.resting_potential) <= _ACTIVE_EPS
-                            and node.refractory_remaining == 0):
-                        _to_deactivate.append(nid)
-                for nid in _to_deactivate:
-                    working_set.discard(nid)
-
-                # 2. Deliver delayed spikes from propagation buffer
-                arrivals = prop_delay_buffer.pop(prop_timestep, [])
-                for target_id, current in arrivals:
-                    target = self.nodes.get(target_id)
-                    if target is not None:
-                        target.voltage += current * target.intrinsic_excitability
-                        working_set.add(target_id)  # now active (#164)
-
-                # 3. Detect firing nodes — O(working_set) not O(n) (#164)
-                fired_ids: List[str] = []
-                for nid in working_set:
-                    node = self.nodes[nid]
-                    if node.refractory_remaining > 0:
-                        continue
-                    if node.voltage >= node.threshold:
-                        fired_ids.append(nid)
-
-                # 4. Reset fired nodes and set refractory
-                for nid in fired_ids:
-                    node = self.nodes[nid]
-                    voltage_at_fire = node.voltage
-                    node.voltage = node.resting_potential
-                    node.refractory_remaining = node.refractory_period
-
-                    # Write mode: record spike time so STDP can see it
-                    if write_mode:
-                        node.last_spike_time = float(prop_timestep)
-
-                    entry = FiredEntry(
-                        node_id=nid,
-                        firing_step=step_idx,
-                        voltage_at_fire=voltage_at_fire,
-                        was_predicted=nid in predicted_targets,
-                        source_distance=distances.get(nid, steps + 1),
-                    )
-                    result.fired_entries.append(entry)
-
-                # 5. Propagate spikes through outgoing synapses
-                fired_set = set(fired_ids)
-                for nid in fired_ids:
-                    node = self.nodes[nid]
-                    sign = -1.0 if node.is_inhibitory else 1.0
-                    for syn_id in self._outgoing.get(nid, set()):
-                        syn = self.synapses.get(syn_id)
-                        if syn is None:
-                            continue
-                        if _age_on:
-                            # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
-                            # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
-                            syn.inactive_steps = 0
-                        effective_type_sign = sign
-                        if syn.synapse_type == SynapseType.INHIBITORY:
-                            effective_type_sign = -1.0
-                        current = syn.weight * effective_type_sign
-                        arrival = prop_timestep + syn.delay
-                        prop_delay_buffer.setdefault(arrival, []).append(
-                            (syn.post_node_id, current)
-                        )
-
-                # 6. Evaluate hyperedges (pattern completion, output injection)
-                max_level = max((he.level for he in self.hyperedges.values()), default=0)
-                for level in range(max_level + 1):
-                    for hid, he in self.hyperedges.items():
-                        if he.level != level or he.is_archived:
-                            continue
-                        activation = self._compute_hyperedge_activation(he, fired_set)
-                        if he.refractory_remaining > 0:
-                            continue
-                        if activation >= he.activation_threshold:
-                            he.refractory_remaining = he.refractory_period
-
-                            # Output injection
-                            effective_weight = he.output_weight
-                            if he.activation_mode == ActivationMode.GRADED:
-                                effective_weight *= activation
-                            for target_id in he.output_targets:
-                                target = self.nodes.get(target_id)
-                                if target is not None:
-                                    target.voltage += effective_weight * target.intrinsic_excitability
-                                    working_set.add(target_id)  # now active (#164)
-
-                            # Pattern completion (pre-charge inactive members)
-                            if he.pattern_completion_strength > 0:
-                                learning_factor = min(
-                                    1.0, he.activation_count / max(experience_threshold, 1)
-                                )
-                                eff_completion = he.pattern_completion_strength * learning_factor
-                                if eff_completion > 0:
-                                    for mnid in he.member_nodes:
-                                        if mnid not in fired_set:
-                                            mnode = self.nodes.get(mnid)
-                                            if mnode and mnode.refractory_remaining == 0:
-                                                mnode.voltage += (
-                                                    eff_completion
-                                                    * he.member_weights.get(mnid, 1.0)
-                                                    * mnode.intrinsic_excitability
-                                                )
-                                                working_set.add(mnid)  # now active (#164)
-
-                # Decrement refractory counters — O(working_set) not O(n) (#164)
-                for nid in working_set:
-                    node = self.nodes[nid]
-                    if node.refractory_remaining > 0 and nid not in fired_set:
-                        node.refractory_remaining -= 1
-                for hid, he in self.hyperedges.items():
-                    if he.refractory_remaining > 0 and hid not in set(fired_ids):
-                        he.refractory_remaining -= 1
-
-                # Write mode: apply STDP plasticity on fired nodes
-                if write_mode and fired_ids:
-                    for rule in self._plasticity_rules:
-                        if isinstance(rule, STDPRule):
-                            rule.apply(self, fired_ids, prop_timestep)
-
-            # --- RESTORE (read mode only) ---
-            # In write mode: voltages, spike times, and weight changes persist.
-            # The exploration shaped the topology. That's the point.
-            if not write_mode:
+                # Build working set — nodes needing per-step processing. O(n) once here;
+                # step-level loops below run O(working_set) << O(n). (#164 Phase B)
+                # Includes: nodes with non-resting voltage, active refractory, or primed.
+                _ACTIVE_EPS = 1e-5
+                working_set: Set[str] = set(node_ids)
                 for nid, node in self.nodes.items():
-                    node.voltage = saved_voltages.get(nid, node.resting_potential)
-                    node.refractory_remaining = saved_refractory.get(nid, 0)
-                for hid, he in self.hyperedges.items():
-                    he.refractory_remaining = saved_he_refractory.get(hid, 0)
+                    if (abs(node.voltage - node.resting_potential) > _ACTIVE_EPS
+                            or node.refractory_remaining > 0):
+                        working_set.add(nid)
+
+                # --- PRIME: inject current into specified nodes ---
+                for nid, current in zip(node_ids, currents):
+                    node = self.nodes.get(nid)
+                    if node is not None:
+                        node.voltage += current * node.intrinsic_excitability
+
+                # --- PROPAGATE: run N read-only SNN steps ---
+                result = PropagationResult(
+                    steps_run=steps,
+                    nodes_primed=len(node_ids),
+                )
+                # Local delay buffer separate from the graph's real one
+                prop_delay_buffer: Dict[int, List[Tuple[str, float]]] = {}
+                prop_timestep = self.timestep
+
+                decay = self.config["decay_rate"]
+                experience_threshold = self.config["he_experience_threshold"]
+
+                for step_idx in range(steps):
+                    prop_timestep += 1
+
+                    # 1. Voltage decay — O(working_set) not O(n) (#164)
+                    _to_deactivate: List[str] = []
+                    for nid in working_set:
+                        node = self.nodes[nid]
+                        node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
+                        if (abs(node.voltage - node.resting_potential) <= _ACTIVE_EPS
+                                and node.refractory_remaining == 0):
+                            _to_deactivate.append(nid)
+                    for nid in _to_deactivate:
+                        working_set.discard(nid)
+
+                    # 2. Deliver delayed spikes from propagation buffer
+                    arrivals = prop_delay_buffer.pop(prop_timestep, [])
+                    for target_id, current in arrivals:
+                        target = self.nodes.get(target_id)
+                        if target is not None:
+                            target.voltage += current * target.intrinsic_excitability
+                            working_set.add(target_id)  # now active (#164)
+
+                    # 3. Detect firing nodes — O(working_set) not O(n) (#164)
+                    fired_ids: List[str] = []
+                    for nid in working_set:
+                        node = self.nodes[nid]
+                        if node.refractory_remaining > 0:
+                            continue
+                        if node.voltage >= node.threshold:
+                            fired_ids.append(nid)
+
+                    # 4. Reset fired nodes and set refractory
+                    for nid in fired_ids:
+                        node = self.nodes[nid]
+                        voltage_at_fire = node.voltage
+                        node.voltage = node.resting_potential
+                        node.refractory_remaining = node.refractory_period
+
+                        # Write mode: record spike time so STDP can see it
+                        if write_mode:
+                            node.last_spike_time = float(prop_timestep)
+
+                        entry = FiredEntry(
+                            node_id=nid,
+                            firing_step=step_idx,
+                            voltage_at_fire=voltage_at_fire,
+                            was_predicted=nid in predicted_targets,
+                            source_distance=distances.get(nid, steps + 1),
+                        )
+                        result.fired_entries.append(entry)
+
+                    # 5. Propagate spikes through outgoing synapses
+                    fired_set = set(fired_ids)
+                    for nid in fired_ids:
+                        node = self.nodes[nid]
+                        sign = -1.0 if node.is_inhibitory else 1.0
+                        for syn_id in self._outgoing.get(nid, set()):
+                            syn = self.synapses.get(syn_id)
+                            if syn is None:
+                                continue
+                            if _age_on:
+                                # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
+                                # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
+                                syn.inactive_steps = 0
+                            effective_type_sign = sign
+                            if syn.synapse_type == SynapseType.INHIBITORY:
+                                effective_type_sign = -1.0
+                            current = syn.weight * effective_type_sign
+                            arrival = prop_timestep + syn.delay
+                            prop_delay_buffer.setdefault(arrival, []).append(
+                                (syn.post_node_id, current)
+                            )
+
+                    # 6. Evaluate hyperedges (pattern completion, output injection)
+                    max_level = max((he.level for he in self.hyperedges.values()), default=0)
+                    for level in range(max_level + 1):
+                        for hid, he in self.hyperedges.items():
+                            if he.level != level or he.is_archived:
+                                continue
+                            activation = self._compute_hyperedge_activation(he, fired_set)
+                            if he.refractory_remaining > 0:
+                                continue
+                            if activation >= he.activation_threshold:
+                                he.refractory_remaining = he.refractory_period
+
+                                # Output injection
+                                effective_weight = he.output_weight
+                                if he.activation_mode == ActivationMode.GRADED:
+                                    effective_weight *= activation
+                                for target_id in he.output_targets:
+                                    target = self.nodes.get(target_id)
+                                    if target is not None:
+                                        target.voltage += effective_weight * target.intrinsic_excitability
+                                        working_set.add(target_id)  # now active (#164)
+
+                                # Pattern completion (pre-charge inactive members)
+                                if he.pattern_completion_strength > 0:
+                                    learning_factor = min(
+                                        1.0, he.activation_count / max(experience_threshold, 1)
+                                    )
+                                    eff_completion = he.pattern_completion_strength * learning_factor
+                                    if eff_completion > 0:
+                                        for mnid in he.member_nodes:
+                                            if mnid not in fired_set:
+                                                mnode = self.nodes.get(mnid)
+                                                if mnode and mnode.refractory_remaining == 0:
+                                                    mnode.voltage += (
+                                                        eff_completion
+                                                        * he.member_weights.get(mnid, 1.0)
+                                                        * mnode.intrinsic_excitability
+                                                    )
+                                                    working_set.add(mnid)  # now active (#164)
+
+                    # Decrement refractory counters — O(working_set) not O(n) (#164)
+                    for nid in working_set:
+                        node = self.nodes[nid]
+                        if node.refractory_remaining > 0 and nid not in fired_set:
+                            node.refractory_remaining -= 1
+                    for hid, he in self.hyperedges.items():
+                        if he.refractory_remaining > 0 and hid not in set(fired_ids):
+                            he.refractory_remaining -= 1
+
+                    # Write mode: apply STDP plasticity on fired nodes
+                    if write_mode and fired_ids:
+                        for rule in self._plasticity_rules:
+                            if isinstance(rule, STDPRule):
+                                rule.apply(self, fired_ids, prop_timestep)
+
+            finally:
+                # Observational propagation borrows activation state. A failure must
+                # return every borrowed transient field before releasing _step_lock.
+                # Write mode is living activity, so its state intentionally persists.
+                if not write_mode:
+                    for nid, node in self.nodes.items():
+                        node.voltage = saved_voltages.get(nid, node.resting_potential)
+                        node.refractory_remaining = saved_refractory.get(nid, 0)
+                    for hid, he in self.hyperedges.items():
+                        he.refractory_remaining = saved_he_refractory.get(hid, 0)
 
             # --- WRITE MODE: synapse sprouting for Tonic co-activations (#163) ---
             # prime_and_propagate bypasses step()'s _recent_spikes tracking, so

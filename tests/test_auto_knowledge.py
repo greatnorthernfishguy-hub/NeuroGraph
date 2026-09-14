@@ -5,6 +5,13 @@ auto-knowledge integration in NeuroGraphMemory (on_message
 surfacing and standalone associate()).
 """
 
+# ---- Changelog ----
+# [2026-09-13] Codex — Verify observational propagation restores state on failure
+# What: Added fault injection covering read-mode voltage and refractory restoration.
+# Why: A failed associative read must not leave transient activation in the living substrate.
+# How: Raise during hyperedge evaluation after priming/firing, then compare exact pre-call state.
+# -------------------
+
 import math
 import os
 import tempfile
@@ -97,6 +104,49 @@ class TestPrimeAndPropagate(unittest.TestCase):
 
         g.prime_and_propagate(["A"], [2.0], steps=2)
         self.assertEqual(g.nodes["A"].refractory_remaining, 1)
+
+    def test_read_mode_restores_transient_state_when_propagation_raises(self):
+        """A failed observational read must restore exact pre-call activation state."""
+        g = Graph()
+        node_a = g.create_node(node_id="A")
+        node_b = g.create_node(node_id="B")
+        node_a.voltage = 0.41
+        node_b.voltage = -0.2
+        node_b.refractory_remaining = 1
+        hyperedge = g.create_hyperedge(
+            member_node_ids={"A", "B"},
+            activation_threshold=0.5,
+        )
+        hyperedge.refractory_remaining = 2
+
+        voltages_before = {nid: node.voltage for nid, node in g.nodes.items()}
+        refractory_before = {
+            nid: node.refractory_remaining for nid, node in g.nodes.items()
+        }
+        he_refractory_before = {
+            hid: he.refractory_remaining for hid, he in g.hyperedges.items()
+        }
+
+        with patch.object(
+            g,
+            "_compute_hyperedge_activation",
+            side_effect=RuntimeError("fault injected during propagation"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fault injected"):
+                g.prime_and_propagate(["A"], [2.0], steps=2, write_mode=False)
+
+        self.assertEqual(
+            {nid: node.voltage for nid, node in g.nodes.items()},
+            voltages_before,
+        )
+        self.assertEqual(
+            {nid: node.refractory_remaining for nid, node in g.nodes.items()},
+            refractory_before,
+        )
+        self.assertEqual(
+            {hid: he.refractory_remaining for hid, he in g.hyperedges.items()},
+            he_refractory_before,
+        )
 
     def test_empty_graph(self):
         """Empty graph returns empty result, no crash."""
