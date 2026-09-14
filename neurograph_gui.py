@@ -30,6 +30,16 @@ Grok Review Changelog (v0.7.1):
         extension against SUPPORTED_EXTENSIONS.  PyPDF2's text extraction
         does not execute embedded content.  PDF sandboxing would require
         process isolation infrastructure beyond the scope of a desktop GUI.
+
+# ---- Changelog ----
+# [2026-09-08] Cursor Grok — Nightly audit area 2: drop deleted ng_peer_bridge.py
+# What: Removed ng_peer_bridge.py from skill-copy fallback and _VENDORED_FILES.
+#   Added ng_commons_eco.py, ng_salience_gate.py, ng_updater.py to _VENDORED_FILES
+#   (tract_bridge + embed were already listed).
+# Why: File is gone; GUI was still hashing/copying a ghost. Inventory now matches
+#   live vendored modules. ng_bridge.py stays off the list (NeuroGraph-only SaaS).
+# How: List edits only. No new packaging.
+# -------------------
 """
 
 from __future__ import annotations
@@ -669,8 +679,9 @@ class GitUpdater:
             "openclaw_hook.py", "neurograph_migrate.py", "neurograph_gui.py",
             # Phase 6: NG-Lite + bridge
             "ng_lite.py", "ng_bridge.py",
-            # Phase 7: Peer bridge + ET Module Manager
-            "ng_peer_bridge.py", "ng_tract_bridge.py", "ng_embed.py", "et_module.json",
+            # Phase 7: Tract bridge + ET Module Manager
+            # (ng_peer_bridge.py deleted 2026-06-03 — do not restore)
+            "ng_tract_bridge.py", "ng_embed.py", "et_module.json",
             "et_modules/__init__.py", "et_modules/manager.py",
         ]
         patched = 0
@@ -707,14 +718,18 @@ class GitUpdater:
 # 4. ModuleRegistry, VendoredFileStalenessChecker, VendoredFileSyncer, EcosystemRestarter
 # ---------------------------------------------------------------------------
 
+# Canonical vendored set. ng_peer_bridge.py deleted 2026-06-03 — do not restore.
+# ng_bridge.py is NeuroGraph-only (Tier 3 SaaS) and is intentionally not vendored.
 _VENDORED_FILES: List[str] = [
     "ng_lite.py",
     "ng_tract_bridge.py",
-    "ng_peer_bridge.py",
     "ng_ecosystem.py",
     "openclaw_adapter.py",
     "ng_autonomic.py",
     "ng_embed.py",
+    "ng_commons_eco.py",
+    "ng_salience_gate.py",
+    "ng_updater.py",
 ]
 
 _CANONICAL_ROOT = Path.home() / "NeuroGraph"

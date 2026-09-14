@@ -48,6 +48,13 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 # How: Single-line deletion from VENDORED_FILES list. List now reflects
 #   the actual 4 vendored files post-deletion + ng_updater self.
 # -------------------
+# [2026-09-08] Cursor Grok — Nightly audit area 2: align VENDORED_FILES with live files
+# What: Added ng_tract_bridge.py, ng_embed.py, ng_commons_eco.py, ng_salience_gate.py.
+# Why: These are live vendored modules. The 2026-06-03 note that tract/embed
+#   "are not historically tracked here" left auto-sync of them broken.
+#   ng_peer_bridge.py stays off the list (deleted 2026-06-03; do not restore).
+# How: Extended VENDORED_FILES. Comment updated. No new packaging.
+# -------------------
 """
 
 from __future__ import annotations
@@ -64,16 +71,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ng_updater")
 
-# Vendored files that must be synced from NeuroGraph canonical
-# Note: ng_peer_bridge.py removed 2026-06-03 (substrate-as-protocol PRD Phase 3
-# Step 5) — see changelog header. ng_tract_bridge.py + ng_embed.py are also
-# vendored ecosystem-wide but not historically tracked here; auto-sync of
-# those still relies on the canonical-source pattern elsewhere.
+# Vendored files that must be synced from NeuroGraph canonical.
+# ng_peer_bridge.py was deleted 2026-06-03 — do not re-add.
 VENDORED_FILES = [
     "ng_lite.py",
+    "ng_tract_bridge.py",
     "ng_ecosystem.py",
     "ng_autonomic.py",
     "openclaw_adapter.py",
+    "ng_embed.py",
+    "ng_commons_eco.py",
+    "ng_salience_gate.py",
     "ng_updater.py",  # Keep ourselves current too
 ]
 

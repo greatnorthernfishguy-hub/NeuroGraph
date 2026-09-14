@@ -95,7 +95,7 @@
       },
       "peer_bridge_enabled": {
         "type": "boolean",
-        "description": "Enable NGPeerBridge for cross-module learning (Tier 2)",
+        "description": "Enable NGTractBridge for cross-module learning (Tier 2). Config key remains peer_bridge.enabled in NeuroGraphMemory.",
         "default": true
       },
       "ces_enabled": {

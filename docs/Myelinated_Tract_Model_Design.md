@@ -257,7 +257,7 @@ For reference, here is what exists today in the E-T Systems module ecosystem:
 | Phase | What | Status |
 |-------|------|--------|
 | v0.5 | Vagus nerve — dedicated autonomic tract, permanently myelinated | Planned |
-| v1.0 | Full cutover — `ng_peer_bridge.py` deprecated, legacy JSONL retired | Planned |
+| v1.0 | JSONL peer bridge deleted (`ng_peer_bridge.py` gone 2026-06-03) | **Done** (file removed; tract-only) |
 
 ---
 
