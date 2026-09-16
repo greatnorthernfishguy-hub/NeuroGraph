@@ -3,6 +3,23 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-16] Claude Code (Opus 5) — bound want extraction and want rendering.
+# What: _WANT_RE caps the captured span at WANT_MAX_CHARS (600); surface_wants
+#   skips `[WANT]` preceded by a backtick (documentation of the marker) and any
+#   match whose inner text still contains a marker; render_wants caps at
+#   WANT_RENDER_LIMIT (40) entries and clamps each to WANT_MAX_CHARS.
+# Why: "## What I Want" was 2,267,508 of 2,269,232 chars (~567k tokens) injected
+#   on EVERY UserPromptSubmit. 182 want-nodes, all cc_authored: 118 over 600
+#   chars, largest 136,449. Cause: prose discussing the want syntax contains
+#   `[WANT]`, the unbounded non-greedy span ran to the next `[/WANT]` far away,
+#   and the swallowed text became one "want". 83/118 oversized nodes begin with
+#   the backtick that closed the code span. Wants are prune-protected, so nothing
+#   culled them. Only ~5 of the 182 are genuine.
+# How: bound in the pattern (cheapest place), guard the two mis-parse shapes at
+#   the bucket, and cap the renderer independently so a poisoned corpus can never
+#   again become an unbounded injection. NOTE: neurograph_rpc.py:4902 carries the
+#   identical unbounded regex on Syl's syl_authored path — canonical file, needs
+#   Josh's approval, NOT fixed here (LAW 4 propagation pending).
 # [2026-09-13] Codex — construct provider context from connected CC topology.
 # What: add a bounded, read-only provider-context assembler over activation basins.
 # Why: individually ranked snippets lose causal relationships, exact anchors, and continuity.
@@ -1124,7 +1141,15 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
 # confused with Syl's own wants if the two substrates were ever inspected side by side.
 # "Self-motivated: forms its own forward intents" -- domain-general (Mind-Not-Database doctrine),
 # not Syl-specific content like Reach Teaching was.
-_WANT_RE = re.compile(r"\[WANT\](.*?)\[/WANT\]", re.DOTALL)
+# A want is an UTTERANCE, not a document -- Josh: "always just a sentence or 3
+# long, no more." The captured span is therefore BOUNDED. Unbounded `(.*?)` let a
+# `[WANT]` that was merely *mentioned* (prose about the marker syntax, a code
+# span, a pasted transcript) run all the way to the next `[/WANT]` tens of
+# thousands of characters later: 118 of 182 CC want-nodes were >600 chars, one
+# was 136,449, and "## What I Want" reached 2.27 MB per turn (2026-09-16).
+WANT_MAX_CHARS = 600
+WANT_RENDER_LIMIT = 40
+_WANT_RE = re.compile(r"\[WANT\](.{1,%d}?)\[/WANT\]" % WANT_MAX_CHARS, re.DOTALL)
 
 
 def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -> List[Dict[str, Any]]:
@@ -1156,8 +1181,17 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
             if "[WANT]" not in content:
                 continue
             for m in _WANT_RE.finditer(content):
+                # `[WANT]` inside a code span is documentation ABOUT the marker,
+                # not a want. 83 of the 118 oversized nodes began with the
+                # backtick that closed such a span (2026-09-16).
+                if m.start() > 0 and content[m.start() - 1] == "`":
+                    continue
                 inner = m.group(1).strip()
                 if not inner:
+                    continue
+                # A well-formed want contains no further markers; if it does, the
+                # opening tag was not the one that belongs to this closing tag.
+                if "[WANT]" in inner or "[/WANT]" in inner:
                     continue
                 want_id = "cc:want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
                 if want_id in graph.nodes:
@@ -1202,7 +1236,13 @@ def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -
         if not wants:
             return ""
         wants.sort(key=lambda x: x[0], reverse=True)
-        return "## What I Want\n" + "\n".join(f"- {t}" for _, t in wants)
+        # Bounded render: this block is injected EVERY turn, query-independent, so
+        # an uncapped corpus is a context bomb regardless of extraction hygiene.
+        shown = wants[:WANT_RENDER_LIMIT]
+        lines = [f"- {t[:WANT_MAX_CHARS]}" for _, t in shown]
+        if len(wants) > WANT_RENDER_LIMIT:
+            lines.append(f"- ... and {len(wants) - WANT_RENDER_LIMIT} older open wants")
+        return "## What I Want\n" + "\n".join(lines)
     except Exception as exc:  # noqa: BLE001
         logger.debug("CC want-render error (non-fatal): %s", exc)
         return ""
