@@ -1,4 +1,7 @@
 # tests/test_ng_embed_fail_closed.py
+import json
+import os
+
 import numpy as np
 import pytest
 import ng_embed
@@ -75,3 +78,59 @@ def test_unset_remote_falls_through_to_local(monkeypatch):
     # On a machine without the model this returns False (local branch ran); remote mode never set.
     assert emb._remote_mode is False
     assert ok in (True, False)
+
+
+def test_get_hf_token_prefers_env(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "env-token-xyz")
+    emb = NGEmbed()
+    assert emb._get_hf_token() == "env-token-xyz"
+
+
+def test_get_hf_token_raises_when_unresolvable(monkeypatch, tmp_path):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    emb = NGEmbed()
+    monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path / "no-token-here"))
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._get_hf_token()
+
+
+def test_hf_post_builds_router_url_and_auth(monkeypatch):
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_get_hf_token", lambda: "tok")
+    captured = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps([0.0] * 768).encode()
+
+    def _fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        captured["body"] = json.loads(req.data)
+        return _Resp()
+
+    monkeypatch.setattr(ng_embed.urllib.request, "urlopen", _fake_urlopen)
+    emb._hf_post("hello")
+    assert captured["url"] == (
+        "https://router.huggingface.co/hf-inference/models/"
+        "Snowflake/snowflake-arctic-embed-m-v1.5/pipeline/feature-extraction"
+    )
+    assert captured["auth"] == "Bearer tok"
+    assert captured["body"] == {"inputs": "hello"}
+    assert "normalize" not in captured["body"]  # HF's own normalize option never sent
+
+
+def test_log_failed_embed_appends_ordered(monkeypatch, tmp_path):
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    emb._log_failed_embed("first", Exception("boom1"))
+    emb._log_failed_embed("second", Exception("boom2"))
+    lines = (tmp_path / "failed_embeds.jsonl").read_text().strip().splitlines()
+    assert [json.loads(l)["inputs"] for l in lines] == ["first", "second"]
+
+
+def test_log_failed_embed_write_failure_does_not_raise(monkeypatch):
+    emb = NGEmbed()
+    emb._config["cache_dir"] = "/proc/nonexistent-cannot-mkdir/xyz"  # os.makedirs will fail
+    emb._log_failed_embed("x", Exception("boom"))  # must swallow, not raise

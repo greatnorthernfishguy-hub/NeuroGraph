@@ -42,6 +42,8 @@ import logging
 import os
 import threading
 import time
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -410,6 +412,71 @@ class NGEmbed:
             results.append(vec)
 
         return results
+
+    # -- Remote HF fallback (canonical; opt-in via NG_EMBED_REMOTE=hf) --------
+
+    def _get_hf_token(self) -> str:
+        """Read the HF token via the ecosystem convention: HF_TOKEN env var, else the
+        huggingface_hub CLI's token cache file. Never hardcoded, never duplicated into
+        .bashrc, never logged. Raises EmbeddingUnavailableError (loud, fast) if unresolvable."""
+        token = os.environ.get("HF_TOKEN")
+        if token:
+            return token
+        token_path = os.path.expanduser("~/.cache/huggingface/token")
+        try:
+            with open(token_path, "r") as f:
+                token = f.read().strip()
+        except Exception as exc:
+            raise EmbeddingUnavailableError(
+                "NG_EMBED_REMOTE=hf but no HF token resolvable (set HF_TOKEN or populate "
+                "~/.cache/huggingface/token)"
+            ) from exc
+        if not token:
+            raise EmbeddingUnavailableError("HF token file present but empty")
+        return token
+
+    def _hf_post(self, inputs) -> Any:
+        """One raw HTTP POST to HF's hf-inference feature-extraction endpoint. No retry, no
+        quarantine -- callers needing those wrap this in _hf_remote_call(). `inputs` is a str
+        (single) or List[str] (batch), passed through as the "inputs" body field exactly as
+        HF expects. Returns parsed JSON (list[768] single, list[N][768] batch)."""
+        model_id = self._config["model_id"]
+        url = (
+            f"https://router.huggingface.co/hf-inference/models/{model_id}"
+            "/pipeline/feature-extraction"
+        )
+        token = self._get_hf_token()
+        body = json.dumps({"inputs": inputs}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+
+    def _log_failed_embed(self, inputs, exc: Exception) -> None:
+        """Append one ordered quarantine record for a remote embed that exhausted retries.
+        Ordered (arrival order preserved) so the consumer's recovery queue can replay in order.
+        A write failure here is logged but MUST NOT mask the original embed error."""
+        try:
+            cache_dir = self._config["cache_dir"]
+            os.makedirs(cache_dir, exist_ok=True)
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "inputs": inputs,
+                "error": str(exc),
+                "attempts": 3,
+            }
+            path = os.path.join(cache_dir, "failed_embeds.jsonl")
+            with open(path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as log_exc:
+            logger.warning("ng_embed: failed to write quarantine log: %s", log_exc)
 
     def _hash_embed(
         self,
