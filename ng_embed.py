@@ -23,6 +23,15 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — Overlapping token windows + length-weighted pool.
+#   What: Drop tokenizer truncation. Window at 512 / overlap 64. Pool
+#         length-weighted, then L2-normalize the pooled long path only.
+#         Short path (≤512) is byte-identical to the single-window primitive.
+#   Why:  LAW 7 / spec R2 — truncation alters experience on the way in.
+#         GSG poincare_dir needs a unit pooled forest vector (criterion 4).
+#   How:  embed_windows + _window_token_ids + _pool_windows; embed()
+#         returns .pooled; embed_batch windows then flattens ONNX batch.
+# -------------------
 # [2026-09-21] Grok 4.6 — Fail-closed embed: no hash fallback.
 #   What: Raise EmbeddingUnavailableError when the model cannot load.
 #         Remove the SHA-based fallback. DualPassIncompleteError declared
@@ -51,8 +60,9 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 import numpy as np
 
@@ -78,9 +88,27 @@ class DualPassIncompleteError(Exception):
     """
 
 
+@dataclass(frozen=True)
+class EmbedWindow:
+    text: str
+    embedding: np.ndarray  # shape (768,) float32, same contract as today's single embed
+    token_count: int
+
+
+@dataclass(frozen=True)
+class WindowedEmbedding:
+    pooled: np.ndarray     # short path: byte-identical to today's single embed
+                           # long path: length-weighted mean of window vectors, then L2-normalized
+    windows: tuple         # () if the input fit in one window; else one EmbedWindow per window
+    token_count: int       # total tokenizer tokens of the (prefixed) input
+
+
 # ---------------------------------------------------------------------------
 # Configuration defaults — all values are bootstrap scaffolding
 # ---------------------------------------------------------------------------
+
+_WINDOW_TOKENS = 512
+_WINDOW_OVERLAP = 64
 
 _DEFAULT_CONFIG = {
     # Model
@@ -238,7 +266,6 @@ class NGEmbed:
                 self._tokenizer.enable_padding(
                     pad_id=0, pad_token="[PAD]",
                 )
-                self._tokenizer.enable_truncation(max_length=512)
 
                 self._model_loaded = True
                 logger.info(
@@ -270,9 +297,9 @@ class NGEmbed:
         Returns:
             768-dim float32 numpy array.
         """
-        if self._ensure_model():
-            return self._onnx_embed(text, normalize=normalize, is_query=is_query)
-        raise EmbeddingUnavailableError("embedding model unavailable")
+        if not self._ensure_model():
+            raise EmbeddingUnavailableError("embedding model unavailable")
+        return self.embed_windows(text, normalize=normalize, is_query=is_query).pooled
 
     def embed_batch(
         self,
@@ -292,31 +319,177 @@ class NGEmbed:
         """
         if not texts:
             return []
-        if self._ensure_model():
-            return self._onnx_embed_batch(texts, normalize=normalize, is_query=is_query)
-        raise EmbeddingUnavailableError("embedding model unavailable")
+        if not self._ensure_model():
+            raise EmbeddingUnavailableError("embedding model unavailable")
+
+        prefixed = [self._apply_prefix(t, is_query) for t in texts]
+        encodings = self._tokenizer.encode_batch(prefixed)
+        results: List[Optional[np.ndarray]] = [None] * len(texts)
+        short_idx = [i for i, enc in enumerate(encodings) if len(enc.ids) <= _WINDOW_TOKENS]
+        long_idx = [i for i, enc in enumerate(encodings) if len(enc.ids) > _WINDOW_TOKENS]
+
+        if short_idx:
+            short_texts = [texts[i] for i in short_idx]
+            short_vecs = self._onnx_embed_batch(
+                short_texts, normalize=normalize, is_query=is_query,
+            )
+            for i, vec in zip(short_idx, short_vecs):
+                results[i] = vec
+
+        if long_idx:
+            window_jobs: List[tuple] = []
+            for i in long_idx:
+                ids = list(encodings[i].ids)
+                for w_ids, weight, _start, _end in self._window_token_ids(ids):
+                    w_text = self._tokenizer.decode(w_ids, skip_special_tokens=True)
+                    window_jobs.append((i, weight, w_ids, w_text))
+            all_ids = [job[2] for job in window_jobs]
+            vecs = self._onnx_embed_ids_batch(all_ids, normalize=False)
+            grouped: Dict[int, List[tuple]] = {}
+            for (i, weight, _w_ids, _w_text), vec in zip(window_jobs, vecs):
+                grouped.setdefault(i, []).append((weight, vec))
+            for i, parts in grouped.items():
+                results[i] = self._pool_windows(
+                    [p[1] for p in parts],
+                    [p[0] for p in parts],
+                )
+
+        return [vec for vec in results]  # type: ignore[misc]
+
+    def embed_windows(
+        self,
+        text: str,
+        normalize: bool = False,
+        is_query: bool = False,
+    ) -> WindowedEmbedding:
+        """Windowed embed: one call if ≤512 tokens, else overlapping windows.
+
+        Short path pooled vector is byte-identical to today's single-window
+        primitive (including default normalize=False). Long path length-weighted
+        mean-pools window vectors, then L2-normalizes the pooled result.
+        """
+        if not self._ensure_model():
+            raise EmbeddingUnavailableError("embedding model unavailable")
+
+        prefixed = self._apply_prefix(text, is_query)
+        encoding = self._tokenizer.encode(prefixed)
+        ids = list(encoding.ids)
+        n = len(ids)
+
+        if n <= _WINDOW_TOKENS:
+            vec = self._onnx_embed(text, normalize=normalize, is_query=is_query)
+            return WindowedEmbedding(pooled=vec, windows=(), token_count=n)
+
+        windows: List[EmbedWindow] = []
+        embeddings: List[np.ndarray] = []
+        weights: List[int] = []
+        for w_ids, weight, _start, _end in self._window_token_ids(ids):
+            w_text = self._tokenizer.decode(w_ids, skip_special_tokens=True)
+            vec = self._onnx_embed(
+                w_text, normalize=False, is_query=False, _ids=w_ids,
+            )
+            windows.append(EmbedWindow(text=w_text, embedding=vec, token_count=weight))
+            embeddings.append(vec)
+            weights.append(weight)
+
+        pooled = self._pool_windows(embeddings, weights)
+        return WindowedEmbedding(
+            pooled=pooled,
+            windows=tuple(windows),
+            token_count=n,
+        )
+
+    def _apply_prefix(self, text: str, is_query: bool) -> str:
+        if is_query:
+            return self._config["query_prefix"] + text
+        prefix = self._config["document_prefix"]
+        return (prefix + text) if prefix else text
+
+    def _window_token_ids(self, ids: Sequence[int]) -> List[tuple]:
+        """Overlapping windows to EOF. Nothing discarded. Each slice ≤512."""
+        n = len(ids)
+        out: List[tuple] = []
+        start = 0
+        while start < n:
+            end = min(start + _WINDOW_TOKENS, n)
+            slice_ids = list(ids[start:end])
+            out.append((slice_ids, end - start, start, end))
+            if end >= n:
+                break
+            start += _WINDOW_TOKENS - _WINDOW_OVERLAP
+        return out
+
+    def _pool_windows(
+        self,
+        vecs: Sequence[np.ndarray],
+        weights: Sequence[int],
+    ) -> np.ndarray:
+        """Length-weighted mean, then L2-normalize (long path, unconditional)."""
+        w = np.asarray(weights, dtype=np.float64)
+        stacked = np.stack([np.asarray(v, dtype=np.float64) for v in vecs], axis=0)
+        pooled = (stacked * w[:, None]).sum(axis=0) / w.sum()
+        pooled32 = pooled.astype(np.float32)
+        norm = float(np.linalg.norm(pooled32))
+        if norm > 0:
+            pooled32 = pooled32 / norm
+        return pooled32
 
     def _onnx_embed(
         self,
         text: str,
         normalize: bool = False,
         is_query: bool = False,
+        _ids: Optional[Sequence[int]] = None,
     ) -> np.ndarray:
-        """Single text embedding via ONNX Runtime."""
-        # Apply prefix
-        if is_query:
-            text = self._config["query_prefix"] + text
-        else:
-            prefix = self._config["document_prefix"]
-            if prefix:
-                text = prefix + text
+        """Single-window embedding via ONNX Runtime. Raises if >512 tokens."""
+        if _ids is not None:
+            ids = list(_ids)
+            attn = [1] * len(ids)
+            return self._onnx_embed_ids(ids, attn, normalize=normalize)
 
-        # Tokenize
+        text = self._apply_prefix(text, is_query)
         encoding = self._tokenizer.encode(text)
-        input_ids = np.array([encoding.ids], dtype=np.int64)
-        attention_mask = np.array([encoding.attention_mask], dtype=np.int64)
+        ids = list(encoding.ids)
+        attn = list(encoding.attention_mask)
+        return self._onnx_embed_ids(ids, attn, normalize=normalize)
 
-        # Infer
+    def _onnx_embed_ids(
+        self,
+        ids: Sequence[int],
+        attention: Sequence[int],
+        normalize: bool = False,
+    ) -> np.ndarray:
+        if len(ids) > _WINDOW_TOKENS:
+            raise EmbeddingUnavailableError(
+                "embedding window exceeds 512 tokens"
+            )
+        results = self._onnx_embed_ids_batch([list(ids)], normalize=normalize)
+        return results[0]
+
+    def _onnx_embed_ids_batch(
+        self,
+        ids_list: List[List[int]],
+        normalize: bool = False,
+        attention_list: Optional[List[List[int]]] = None,
+    ) -> List[np.ndarray]:
+        if not ids_list:
+            return []
+        if attention_list is None:
+            attention_list = [[1] * len(ids) for ids in ids_list]
+        for ids in ids_list:
+            if len(ids) > _WINDOW_TOKENS:
+                raise EmbeddingUnavailableError(
+                    "embedding window exceeds 512 tokens"
+                )
+        max_len = max(len(ids) for ids in ids_list)
+        input_ids = np.zeros((len(ids_list), max_len), dtype=np.int64)
+        attention_mask = np.zeros((len(ids_list), max_len), dtype=np.int64)
+        for i, ids in enumerate(ids_list):
+            length = len(ids)
+            input_ids[i, :length] = ids
+            attn = attention_list[i]
+            attention_mask[i, :length] = attn[:length]
+
         outputs = self._session.run(
             None,
             {
@@ -325,15 +498,15 @@ class NGEmbed:
             },
         )
 
-        # sentence_embedding output (index 1) — pre-pooled by model
-        vec = outputs[1][0, :].astype(np.float32)
-
-        if normalize:
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-
-        return vec
+        results = []
+        for i in range(len(ids_list)):
+            vec = outputs[1][i, :].astype(np.float32)
+            if normalize:
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+            results.append(vec)
+        return results
 
     def _onnx_embed_batch(
         self,
@@ -341,48 +514,16 @@ class NGEmbed:
         normalize: bool = False,
         is_query: bool = False,
     ) -> List[np.ndarray]:
-        """Batch embedding via ONNX Runtime with padding."""
-        # Apply prefixes
-        prefixed = []
-        for text in texts:
-            if is_query:
-                prefixed.append(self._config["query_prefix"] + text)
-            else:
-                prefix = self._config["document_prefix"]
-                prefixed.append((prefix + text) if prefix else text)
-
-        # Batch tokenize
+        """Batch embedding via ONNX Runtime with padding. Short texts only."""
+        if not texts:
+            return []
+        prefixed = [self._apply_prefix(t, is_query) for t in texts]
         encodings = self._tokenizer.encode_batch(prefixed)
-        max_len = max(len(e.ids) for e in encodings)
-
-        input_ids = np.zeros((len(encodings), max_len), dtype=np.int64)
-        attention_mask = np.zeros((len(encodings), max_len), dtype=np.int64)
-
-        for i, enc in enumerate(encodings):
-            length = len(enc.ids)
-            input_ids[i, :length] = enc.ids
-            attention_mask[i, :length] = enc.attention_mask
-
-        # Infer
-        outputs = self._session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            },
+        ids_list = [list(enc.ids) for enc in encodings]
+        attn_list = [list(enc.attention_mask) for enc in encodings]
+        return self._onnx_embed_ids_batch(
+            ids_list, normalize=normalize, attention_list=attn_list,
         )
-
-        # sentence_embedding output (index 1) — pre-pooled by model
-        results = []
-        for i in range(len(texts)):
-            vec = outputs[1][i, :].astype(np.float32)
-            if normalize:
-                norm = np.linalg.norm(vec)
-                if norm > 0:
-                    vec = vec / norm
-            results.append(vec)
-
-        return results
 
     # -- Dual-pass (Punchlist #81) -------------------------------------------
 
