@@ -265,8 +265,17 @@ class NGEmbed:
             768-dim float32 numpy array.
         """
         if self._ensure_model():
+            if self._remote_mode:
+                return self._hf_remote_embed(text, normalize=normalize, is_query=is_query)
             return self._onnx_embed(text, normalize=normalize, is_query=is_query)
-        return self._hash_embed(text, normalize=normalize)
+        # Local model unavailable. Fail closed unless the operator explicitly opted into hash.
+        if self._allow_hash_fallback():
+            return self._hash_embed(text, normalize=normalize)
+        raise EmbeddingUnavailableError(
+            "local ONNX embedding model unavailable and hash fallback disabled "
+            "(set NG_EMBED_REMOTE=hf for API fallback, or NG_EMBED_ALLOW_HASH_FALLBACK=1 "
+            "to knowingly accept non-semantic hash vectors)"
+        )
 
     def embed_batch(
         self,
@@ -287,8 +296,15 @@ class NGEmbed:
         if not texts:
             return []
         if self._ensure_model():
+            if self._remote_mode:
+                return self._hf_remote_embed_batch(texts, normalize=normalize, is_query=is_query)
             return self._onnx_embed_batch(texts, normalize=normalize, is_query=is_query)
-        return [self._hash_embed(t, normalize=normalize) for t in texts]
+        if self._allow_hash_fallback():
+            return [self._hash_embed(t, normalize=normalize) for t in texts]
+        raise EmbeddingUnavailableError(
+            "local ONNX embedding model unavailable and hash fallback disabled "
+            "(batch of %d); set NG_EMBED_REMOTE=hf or NG_EMBED_ALLOW_HASH_FALLBACK=1" % len(texts)
+        )
 
     def _onnx_embed(
         self,
