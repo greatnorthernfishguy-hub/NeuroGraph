@@ -52,6 +52,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("ng_embed")
 
+
+class EmbeddingUnavailableError(Exception):
+    """Raised when a real embedding cannot be produced and no deliberate fallback is enabled.
+
+    The public failure contract of embed()/embed_batch(). Replaces the old silent
+    degrade-to-hash behavior: a failed embed is now a loud, catchable, fail-closed error.
+    Every raise site chains its cause via `raise EmbeddingUnavailableError(...) from e`.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Configuration defaults — all values are bootstrap scaffolding
 # ---------------------------------------------------------------------------
@@ -130,6 +140,7 @@ class NGEmbed:
         self._tokenizer = None        # tokenizers.Tokenizer (lazy)
         self._model_loaded = False
         self._model_failed = False
+        self._remote_mode = False     # True when NG_EMBED_REMOTE=hf selected the remote path
         self._model_lock = threading.Lock()
 
         # Dual-pass stats
@@ -165,6 +176,15 @@ class NGEmbed:
             cls._instance = None
 
     # -- Model loading -------------------------------------------------------
+
+    @staticmethod
+    def _allow_hash_fallback() -> bool:
+        """Hash fallback is an emergency escape hatch, OFF by default (LAW 5).
+
+        Only NG_EMBED_ALLOW_HASH_FALLBACK=1 re-enables the SHA-384 hash path. With it
+        unset, an unrecoverable local-model failure raises EmbeddingUnavailableError.
+        """
+        return os.environ.get("NG_EMBED_ALLOW_HASH_FALLBACK") == "1"
 
     def _ensure_model(self) -> bool:
         """Lazy-load ONNX model + tokenizer on first use."""
