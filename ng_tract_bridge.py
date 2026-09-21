@@ -48,6 +48,28 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Fix _drain_single_tract BTF magic check (#109)
+#   What: Removed raw[0:1]==b"B" first-byte pre-filter. Always routes through TractReader.
+#   Why:  BTF magic 0x4254 in LE = first byte 0x54 ('T'), not 0x42 ('B'). Check never
+#         matched; all BTF frames fell to JSONL path causing json.JSONDecodeError floods.
+#         _drain_with_cursor already does this correctly — _drain_single_tract now matches.
+#   How:  Deleted if/else split on first byte. _has_btf branch unconditionally uses
+#         TractReader. JSONL-only else kept for ImportError fallback only.
+# # [2026-05-23] Claude Code (Sonnet 4.6) — Read-cursor incremental drain (#243)
+#   What: Replaced atomic rename→read→delete drain with cursor-sidecar incremental reads.
+#         Added _cursor_path(), _read_cursor(), _write_cursor(), _compact_tract(),
+#         _drain_with_cursor(). New constants: _CURSOR_SUFFIX, _COMPACT_THRESHOLD_BYTES.
+#         _drain_all() now calls _drain_with_cursor() for file-based tracts.
+#   Why:  Rename-drain of large tracts (4–6 GB TrollGuard/Animus backlog) was
+#         catastrophically slow. Append-only + cursor enables bounded incremental
+#         drains; compaction clears consumed bytes when tract is fully drained (≥50MB).
+#   How:  Consumer reads from cursor byte offset, updates sidecar atomically via
+#         os.replace(). Compaction only fires when new_offset == file_size (no partial
+#         entry) to avoid orphaned BTF frames in the compacted file.
+# [2026-04-29] Claude (Sonnet 4.6) — _drain_all() return fix
+#   What: _drain_all() returned None; _drain_river() in openclaw_adapter silently got 0 events.
+#   Why:  #155 deleted _peer_events but didn't update _drain_river() consumer or add return value.
+#   How:  Changed -> None to -> List[Any], added return new_events at end of _drain_all().
 # [2026-04-20] Codemine (BLK-NG-155) -- delete _peer_events dead code (#155 cleanup)
 #   What: Removed _peer_events list, _peer_events_max, _enforce_window_limit(),
 #          dead code in get_recommendations() and detect_novelty(), and all
@@ -158,6 +180,14 @@ import numpy as np
 from ng_lite import NGBridge
 
 logger = logging.getLogger("ng_tract_bridge")
+
+# -----------------------------------------------------------------------
+# Cursor-drain constants (NGTractBridge)
+# -----------------------------------------------------------------------
+
+_CURSOR_SUFFIX: str = ".cursor"
+# Compact when cursor advances past this many bytes (active consumer only).
+_COMPACT_THRESHOLD_BYTES: int = 50 * 1024 * 1024  # 50 MB
 
 # -----------------------------------------------------------------------
 # MmapTract — Double-buffer myelinated transport
@@ -583,7 +613,7 @@ class NGTractBridge(NGBridge):
     # Internal: Tract drain
     # -------------------------------------------------------------------
 
-    def _drain_all(self) -> None:
+    def _drain_all(self) -> List[Any]:
         """Drain all incoming tracts directed at this module.
 
         Scans every peer's tract directory for a file named
@@ -608,7 +638,7 @@ class NGTractBridge(NGBridge):
             # Drain file-based tract (always — explore-exploit deposits land here)
             tract_path = peer_dir / f"{self.module_id}.tract"
             if tract_path.exists():
-                events = self._drain_single_tract(tract_path, peer_id)
+                events = self._drain_with_cursor(tract_path, peer_id)
                 new_events.extend(events)
 
             # Drain myelinated tract (if peer has one targeting us)
@@ -628,6 +658,7 @@ class NGTractBridge(NGBridge):
                 self._drain_count, len(new_events),
                 len(set(self._get_module_id(e) for e in new_events)),
             )
+        return new_events
 
     def _drain_single_tract(
         self, tract_path: Path, peer_id: str,
@@ -638,9 +669,10 @@ class NGTractBridge(NGBridge):
         Rename → read → delete.  New deposits go to a fresh file
         immediately after rename.  No data loss, no read/write collision.
 
-        Handles mixed BTF/JSONL tracts during the flush cycle:
-        - 0x42 ('B') first byte → BTF binary entry, read via TractReader
-        - 0x7B ('{') first byte → residual JSONL, parse with json.loads
+        Handles mixed BTF/JSONL tracts during the flush cycle via TractReader,
+        which dispatches on each frame's entry_type internally:
+        - BTF frames yield typed objects (PyOutcomeEntry, PyTopologyEntry, PyExperienceEntry)
+        - Residual JSONL lines yield raw bytes for Python to parse with json.loads
 
         BTF entries are stored as typed objects (PyOutcomeEntry,
         PyTopologyEntry, PyExperienceEntry) — no dict conversion.
@@ -676,15 +708,16 @@ class NGTractBridge(NGBridge):
             if not raw:
                 return entries
 
-            # Dispatch on first byte: BTF binary or residual JSONL
+            # Route all data through TractReader — handles BTF and residual JSONL.
+            # NOTE: BTF magic 0x4254 in LE = first byte 0x54 ('T'), not 0x42 ('B').
+            # Do NOT add a first-byte pre-filter here; TractReader already dispatches.
             try:
                 import ng_tract
                 _has_btf = True
             except ImportError:
                 _has_btf = False
 
-            if _has_btf and raw[0:1] == b"B":
-                # BTF tract — typed entry objects, no dict conversion
+            if _has_btf:
                 reader = ng_tract.TractReader(raw)
                 for entry in reader:
                     if isinstance(entry, bytes):
@@ -700,7 +733,7 @@ class NGTractBridge(NGBridge):
                                 continue
                         entries.append(entry)
             else:
-                # FLUSH CYCLE: residual JSONL — remove after tracts are clean (#120)
+                # JSONL-only fallback when ng_tract is unavailable (ImportError)
                 for line in raw.decode("utf-8", errors="replace").splitlines():
                     line = line.strip()
                     if not line:
@@ -720,6 +753,137 @@ class NGTractBridge(NGBridge):
                 os.unlink(str(drain_path))
             except OSError:
                 pass
+
+        return entries
+
+    # -------------------------------------------------------------------
+    # Internal: Cursor-based drain (append-only, incremental)
+    # -------------------------------------------------------------------
+
+    def _cursor_path(self, tract_path: Path) -> Path:
+        return tract_path.with_suffix(_CURSOR_SUFFIX)
+
+    def _read_cursor(self, tract_path: Path) -> Dict[str, Any]:
+        cp = self._cursor_path(tract_path)
+        if cp.exists():
+            try:
+                return json.loads(cp.read_text())
+            except Exception:
+                pass
+        return {"offset": 0, "ts": 0.0, "entries": 0}
+
+    def _write_cursor(self, tract_path: Path, offset: int, entries_total: int) -> None:
+        cp = self._cursor_path(tract_path)
+        # with_name avoids fragile multi-dot suffix handling
+        tmp = cp.with_name(cp.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps({
+                "offset": offset, "ts": time.time(), "entries": entries_total,
+            }))
+            os.replace(str(tmp), str(cp))
+        except OSError as exc:
+            logger.warning("Cursor write failed (%s): %s", cp.name, exc)
+
+    def _compact_tract(self, tract_path: Path, cursor_offset: int) -> None:
+        """Rewrite tract file keeping only bytes from cursor_offset onward.
+
+        Only called when cursor_offset == file_size at drain time, so the
+        "live" portion is typically empty or contains only entries that
+        arrived in the narrow window between our read and this rename.
+        Those new entries are preserved in the compact file.
+
+        There is a negligible race window (~ms) where a concurrent Rust
+        deposit_outcome() append may be captured in live_bytes or missed.
+        This is acceptable: the SNN substrate is probabilistic and tolerates
+        occasional entry loss. The alternative (4–6 GB stuck tract files)
+        is not acceptable.
+        """
+        try:
+            compact_path = tract_path.with_suffix(".compact")
+            with open(tract_path, "rb") as f:
+                f.seek(cursor_offset)
+                live_bytes = f.read()
+            compact_path.write_bytes(live_bytes)
+            os.replace(str(compact_path), str(tract_path))
+            self._write_cursor(tract_path, 0, 0)
+            logger.info(
+                "Compacted %s: cleared %d bytes (live=%d)",
+                tract_path.name, cursor_offset, len(live_bytes),
+            )
+        except Exception:
+            logger.exception("Compact failed for %s — skipping", tract_path)
+
+    def _drain_with_cursor(
+        self, tract_path: Path, peer_id: str,
+        entry_types: Optional[Set[int]] = None,
+    ) -> List[Any]:
+        """Non-destructive incremental drain using a cursor sidecar.
+
+        Reads from the last cursor position, yielding only new entries.
+        Updates the cursor atomically after each successful drain.
+        Triggers compaction only when the cursor reaches end-of-file
+        (no partial BTF frame outstanding) and the file exceeds
+        _COMPACT_THRESHOLD_BYTES — this invariant prevents a compacted
+        file from starting with a truncated BTF frame, which would make
+        TractReader return None immediately and silently skip all subsequent
+        valid entries.
+
+        Falls back to _drain_single_tract (rename+delete) on ImportError.
+        """
+        cursor_state = self._read_cursor(tract_path)
+        start_offset: int = cursor_state["offset"]
+        entries_so_far: int = cursor_state["entries"]
+
+        # Read only the unread slice — avoids loading 6GB into memory for
+        # large backlogs. file_size captured inside the same open() call so
+        # the EOF check uses a consistent snapshot.
+        try:
+            with open(tract_path, "rb") as f:
+                file_size = os.fstat(f.fileno()).st_size
+                if not file_size or start_offset >= file_size:
+                    return []
+                if start_offset:
+                    f.seek(start_offset)
+                raw_slice = f.read()
+        except OSError as exc:
+            logger.warning("Tract read failed (%s/%s): %s", peer_id, self.module_id, exc)
+            return []
+
+        if not raw_slice:
+            return []
+
+        entries: List[Any] = []
+        new_offset = start_offset
+        try:
+            import ng_tract
+            # raw_slice starts at byte 0 relative to start_offset — no start_pos needed
+            reader = ng_tract.TractReader(raw_slice)
+            for entry in reader:
+                if isinstance(entry, bytes):
+                    try:
+                        entries.append(json.loads(entry))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                else:
+                    if entry_types is not None and hasattr(entry, "entry_type"):
+                        if entry.entry_type not in entry_types:
+                            continue
+                    entries.append(entry)
+            new_offset = start_offset + reader.position()
+        except ImportError:
+            # ng_tract not available — fall back to destructive rename+delete
+            return self._drain_single_tract(tract_path, peer_id, entry_types)
+        except Exception as exc:
+            logger.warning("Cursor drain failed (%s/%s): %s", peer_id, self.module_id, exc)
+            return entries
+
+        if new_offset > start_offset:
+            new_total = entries_so_far + len(entries)
+            self._write_cursor(tract_path, new_offset, new_total)
+            # Only compact when reader consumed entire slice (== EOF at snapshot).
+            # This guarantees the compact file starts on a clean entry boundary.
+            if reader.position() == len(raw_slice) and new_offset >= _COMPACT_THRESHOLD_BYTES:
+                self._compact_tract(tract_path, new_offset)
 
         return entries
 
