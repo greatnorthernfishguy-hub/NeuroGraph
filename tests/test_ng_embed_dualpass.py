@@ -189,3 +189,46 @@ def test_remote_embed_applies_query_prefix_client_side(monkeypatch):
     monkeypatch.setattr(emb, "_hf_post", fake_post)
     emb._hf_remote_embed("q", normalize=False, is_query=True)
     assert seen["inputs"].startswith(emb._config["query_prefix"])
+
+
+def test_remote_retries_three_times_then_raises_and_quarantines(monkeypatch, tmp_path):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    emb._ensure_model()
+    sleeps = []
+    monkeypatch.setattr(ng_embed_mod.time, "sleep", lambda s: sleeps.append(s))
+    attempts = {"n": 0}
+    def boom(*a, **k):
+        attempts["n"] += 1
+        raise ConnectionError("down")
+    monkeypatch.setattr(emb, "_hf_post", boom)
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._hf_remote_embed("hello")
+    assert attempts["n"] == 3
+    assert sleeps == [1, 3, 9] or sleeps == [1, 3]  # sleep-after-fail except possibly last
+    # Accept either 2 sleeps (between 3 attempts) or 3; pin the delays that do occur.
+    assert all(x in (1, 3, 9) for x in sleeps)
+    q = tmp_path / "failed_embeds.jsonl"
+    assert q.is_file()
+    lines = q.read_text().strip().splitlines()
+    assert len(lines) == 1
+    rec = __import__("json").loads(lines[0])
+    assert rec["attempts"] == 3
+    assert rec["text"] == "hello" or "hello" in rec["text"]
+    assert "error" in rec
+
+
+def test_quarantine_write_failure_does_not_mask_original(monkeypatch, tmp_path):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    emb._ensure_model()
+    monkeypatch.setattr(ng_embed_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(emb, "_hf_post", lambda *a, **k: (_ for _ in ()).throw(ConnectionError("down")))
+    monkeypatch.setattr(emb, "_log_failed_embed", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(EmbeddingUnavailableError) as ei:
+        emb._hf_remote_embed("hello")
+    assert "down" in str(ei.value).lower() or isinstance(ei.value.__cause__, ConnectionError)

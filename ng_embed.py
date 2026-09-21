@@ -23,6 +23,14 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — Remote retry-3-then-raise + failed_embeds.jsonl.
+#   What: 3 attempts, backoff 1s/3s/9s including after the last fail,
+#         then one JSONL quarantine line, then raise. Quarantine write
+#         failure must not mask the original error.
+#   Why:  2026-07-07 remote shape; spec acceptance 6. Never hash.
+#   How:  _hf_remote_call wraps _hf_post; _log_failed_embed appends
+#         {cache_dir}/failed_embeds.jsonl.
+# -------------------
 # [2026-09-21] Grok 4.6 — NG_EMBED_REMOTE=hf gate + HF router primitive.
 #   What: Opt-in remote feature-extraction via router.huggingface.co.
 #         Invalid NG_EMBED_REMOTE values raise. Token from HF_TOKEN or
@@ -644,6 +652,62 @@ class NGEmbed:
         except urllib.error.URLError as exc:
             raise ConnectionError(str(exc.reason) if exc.reason else "url error") from exc
 
+    def _log_failed_embed(
+        self,
+        text: str,
+        is_query: bool,
+        normalize: bool,
+        error: BaseException,
+        attempts: int,
+    ) -> None:
+        rec = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "text": text,
+            "is_query": is_query,
+            "normalize": normalize,
+            "error": str(error),
+            "attempts": attempts,
+        }
+        path = Path(self._config["cache_dir"]) / "failed_embeds.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def _hf_remote_call(
+        self,
+        payload: Dict[str, Any],
+        *,
+        text: str,
+        is_query: bool,
+        normalize: bool,
+        parse: Callable[[Any], Any],
+    ) -> Any:
+        token = self._get_hf_token()
+        url = self._hf_feature_extraction_url()
+        last_exc: Optional[BaseException] = None
+        for delay in (1, 3, 9):
+            try:
+                raw = self._hf_post(url, token, payload, timeout=30)
+                return parse(raw)
+            except EmbeddingUnavailableError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(delay)
+        try:
+            self._log_failed_embed(
+                text=text,
+                is_query=is_query,
+                normalize=normalize,
+                error=last_exc if last_exc is not None else RuntimeError("remote embed failed"),
+                attempts=3,
+            )
+        except Exception:
+            logger.debug("ng_embed: quarantine write failed")
+        raise EmbeddingUnavailableError(
+            f"remote embed failed: {last_exc}"
+        ) from last_exc
+
     def _parse_hf_vector(self, raw: Any) -> np.ndarray:
         dim = int(self._config["embedding_dim"])
         if not isinstance(raw, list) or not raw:
@@ -673,15 +737,13 @@ class NGEmbed:
         _ids: Optional[Sequence[int]] = None,
     ) -> np.ndarray:
         payload_text = text if _ids is not None else self._apply_prefix(text, is_query)
-        token = self._get_hf_token()
-        url = self._hf_feature_extraction_url()
-        try:
-            raw = self._hf_post(url, token, {"inputs": payload_text}, timeout=30)
-            vec = self._parse_hf_vector(raw)
-        except EmbeddingUnavailableError:
-            raise
-        except Exception as exc:
-            raise EmbeddingUnavailableError(f"remote embed failed: {exc}") from exc
+        vec = self._hf_remote_call(
+            {"inputs": payload_text},
+            text=payload_text,
+            is_query=is_query,
+            normalize=normalize,
+            parse=self._parse_hf_vector,
+        )
         return self._maybe_l2(vec, normalize)
 
     def _hf_remote_embed_batch(
@@ -694,17 +756,19 @@ class NGEmbed:
         if not texts:
             return []
         payload = texts if skip_prefix else [self._apply_prefix(t, is_query) for t in texts]
-        token = self._get_hf_token()
-        url = self._hf_feature_extraction_url()
-        try:
-            raw = self._hf_post(url, token, {"inputs": payload}, timeout=30)
+
+        def _parse_batch(raw: Any) -> List[np.ndarray]:
             if not isinstance(raw, list) or len(raw) != len(texts):
                 raise ValueError("malformed embedding batch")
-            vecs = [self._parse_hf_vector(item) for item in raw]
-        except EmbeddingUnavailableError:
-            raise
-        except Exception as exc:
-            raise EmbeddingUnavailableError(f"remote embed failed: {exc}") from exc
+            return [self._parse_hf_vector(item) for item in raw]
+
+        vecs = self._hf_remote_call(
+            {"inputs": payload},
+            text=payload[0] if len(payload) == 1 else json.dumps(payload),
+            is_query=is_query,
+            normalize=normalize,
+            parse=_parse_batch,
+        )
         return [self._maybe_l2(v, normalize) for v in vecs]
 
     # -- Dual-pass (Punchlist #81) -------------------------------------------
