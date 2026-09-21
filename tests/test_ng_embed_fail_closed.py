@@ -191,3 +191,50 @@ def test_remote_call_batch_count_mismatch_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(emb, "_hf_post", lambda i: [[0.0] * 768])  # 1 row for 2 inputs
     with pytest.raises(EmbeddingUnavailableError):
         emb._hf_remote_call(["a", "b"], 2)
+
+
+def test_remote_embed_applies_query_prefix_client_side(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_get_hf_token", lambda: "tok")
+    seen = {}
+    def _capture(i):
+        seen["inputs"] = i
+        return [0.1] * 768
+
+    monkeypatch.setattr(emb, "_hf_post", _capture)
+    emb.embed("weather", is_query=True)
+    assert seen["inputs"].startswith(emb._config["query_prefix"])
+
+
+def test_remote_embed_normalizes_client_side(monkeypatch):
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_hf_post", lambda i: [3.0] + [0.0] * 767)
+    vec = emb._hf_remote_embed("x", normalize=True)
+    assert abs(np.linalg.norm(vec) - 1.0) < 1e-5
+
+
+def test_remote_embed_batch_returns_all_vectors(monkeypatch):
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_hf_post", lambda i: [[0.1] * 768, [0.2] * 768])
+    vecs = emb._hf_remote_embed_batch(["a", "b"])
+    assert len(vecs) == 2 and all(v.shape == (768,) for v in vecs)
+
+
+def test_remote_embed_batch_is_all_or_nothing(monkeypatch, tmp_path):
+    monkeypatch.setattr(ng_embed.time, "sleep", lambda *_: None)
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    # One row short for a 2-input batch -> whole batch raises, nothing returned.
+    monkeypatch.setattr(emb, "_hf_post", lambda i: [[0.1] * 768])
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._hf_remote_embed_batch(["a", "b"])
+
+
+def test_embed_dispatches_to_remote_when_gated(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_get_hf_token", lambda: "tok")
+    monkeypatch.setattr(emb, "_hf_post", lambda i: [0.5] * 768)
+    vec = emb.embed("hello")
+    assert vec.shape == (768,)

@@ -502,6 +502,58 @@ class NGEmbed:
             "HF remote embedding failed after 3 attempts"
         ) from last_exc
 
+    def _hf_remote_embed(
+        self,
+        text: str,
+        normalize: bool = False,
+        is_query: bool = False,
+    ) -> np.ndarray:
+        """Single text embedding via HF's hf-inference remote API. Mirrors _onnx_embed
+        exactly: same client-side prefix before the call, same client-side normalize after,
+        so callers get byte-for-byte consistent treatment regardless of path. Never sends
+        HF's own normalize body option."""
+        if is_query:
+            text = self._config["query_prefix"] + text
+        else:
+            prefix = self._config["document_prefix"]
+            if prefix:
+                text = prefix + text
+
+        rows = self._hf_remote_call(text, 1)
+        vec = np.asarray(rows[0], dtype=np.float32)
+        if normalize:
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+        return vec
+
+    def _hf_remote_embed_batch(
+        self,
+        texts: List[str],
+        normalize: bool = False,
+        is_query: bool = False,
+    ) -> List[np.ndarray]:
+        """Batch embedding via HF's hf-inference remote API. All-or-nothing: one validated
+        call for the whole batch; any failure raises for the entire batch (never partial)."""
+        prefixed = []
+        for text in texts:
+            if is_query:
+                prefixed.append(self._config["query_prefix"] + text)
+            else:
+                prefix = self._config["document_prefix"]
+                prefixed.append((prefix + text) if prefix else text)
+
+        rows = self._hf_remote_call(prefixed, len(prefixed))
+        vecs = []
+        for row in rows:
+            vec = np.asarray(row, dtype=np.float32)
+            if normalize:
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+            vecs.append(vec)
+        return vecs
+
     def _log_failed_embed(self, inputs, exc: Exception) -> None:
         """Append one ordered quarantine record for a remote embed that exhausted retries.
         Ordered (arrival order preserved) so the consumer's recovery queue can replay in order.
