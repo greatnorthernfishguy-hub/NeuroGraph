@@ -23,6 +23,13 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — Ref-counted keep-warm pinger.
+#   What: start_keepalive/stop_keepalive reference-counted; daemon thread
+#         pings every 20s. No-op when not remote. Ping failures stay debug.
+#   Why:  HF idle-eviction window is 30-60s; acceptance 8 requires a
+#         concurrency test on the counter.
+#   How:  Lock around the counter; 0→1 starts the thread; 1→0 signals stop.
+# -------------------
 # [2026-09-21] Grok 4.6 — Remote retry-3-then-raise + failed_embeds.jsonl.
 #   What: 3 attempts, backoff 1s/3s/9s including after the last fail,
 #         then one JSONL quarantine line, then raise. Quarantine write
@@ -202,6 +209,11 @@ class NGEmbed:
         self._model_failed = False
         self._remote_mode = False
         self._model_lock = threading.Lock()
+        self._keepalive_lock = threading.Lock()
+        self._keepalive_refs = 0
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._keepalive_stop = threading.Event()
+        self._keepalive_interval = 20.0
 
         # Dual-pass stats
         self._extractions = 0
@@ -770,6 +782,38 @@ class NGEmbed:
             parse=_parse_batch,
         )
         return [self._maybe_l2(v, normalize) for v in vecs]
+
+    def start_keepalive(self) -> None:
+        """Increment keepalive refcount; start the pinger on 0→1 if remote."""
+        if not self._remote_mode:
+            return
+        with self._keepalive_lock:
+            self._keepalive_refs += 1
+            if self._keepalive_refs == 1:
+                self._keepalive_stop.clear()
+                thread = threading.Thread(
+                    target=self._keepalive_loop,
+                    name="ng_embed_keepalive",
+                    daemon=True,
+                )
+                self._keepalive_thread = thread
+                thread.start()
+
+    def stop_keepalive(self) -> None:
+        """Decrement keepalive refcount; signal stop on 1→0."""
+        with self._keepalive_lock:
+            if self._keepalive_refs <= 0:
+                return
+            self._keepalive_refs -= 1
+            if self._keepalive_refs == 0:
+                self._keepalive_stop.set()
+
+    def _keepalive_loop(self) -> None:
+        while not self._keepalive_stop.wait(self._keepalive_interval):
+            try:
+                self._hf_remote_embed("ping", normalize=False, is_query=False)
+            except Exception:
+                logger.debug("ng_embed: keepalive ping failed")
 
     # -- Dual-pass (Punchlist #81) -------------------------------------------
 

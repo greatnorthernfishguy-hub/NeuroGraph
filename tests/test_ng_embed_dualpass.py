@@ -232,3 +232,57 @@ def test_quarantine_write_failure_does_not_mask_original(monkeypatch, tmp_path):
     with pytest.raises(EmbeddingUnavailableError) as ei:
         emb._hf_remote_embed("hello")
     assert "down" in str(ei.value).lower() or isinstance(ei.value.__cause__, ConnectionError)
+
+
+def test_keepalive_noop_when_not_remote():
+    emb = NGEmbed()
+    emb._remote_mode = False
+    emb.start_keepalive()
+    assert getattr(emb, "_keepalive_thread", None) in (None, ) or not (emb._keepalive_thread and emb._keepalive_thread.is_alive())
+    emb.stop_keepalive()
+
+
+def test_keepalive_reference_count_and_daemon(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    emb._ensure_model()
+    # Do not actually ping: stub the ping call and shrink the wait.
+    monkeypatch.setattr(emb, "_hf_remote_embed", lambda *a, **k: np.zeros(768, np.float32))
+    monkeypatch.setattr(emb, "_keepalive_interval", 0.05)
+    emb.start_keepalive()
+    emb.start_keepalive()
+    th = emb._keepalive_thread
+    assert th is not None and th.is_alive() and th.daemon is True
+    emb.stop_keepalive()
+    assert th.is_alive(), "one stop must not kill a double-start"
+    emb.stop_keepalive()
+    th.join(timeout=2)
+    assert not th.is_alive()
+
+
+def test_keepalive_refcount_concurrent_starts(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    emb._ensure_model()
+    monkeypatch.setattr(emb, "_hf_remote_embed", lambda *a, **k: np.zeros(768, np.float32))
+    monkeypatch.setattr(emb, "_keepalive_interval", 0.05)
+    errors = []
+    def boom_start():
+        try:
+            emb.start_keepalive()
+        except Exception as e:
+            errors.append(e)
+    threads = [threading.Thread(target=boom_start) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert emb._keepalive_refs == 8
+    for _ in range(8):
+        emb.stop_keepalive()
+    if emb._keepalive_thread is not None:
+        emb._keepalive_thread.join(timeout=2)
+        assert not emb._keepalive_thread.is_alive()
