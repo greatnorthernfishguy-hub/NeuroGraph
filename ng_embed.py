@@ -23,6 +23,14 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — dual_record_outcome extract-first (R3 atomicity).
+#   What: Extract (and embed_batch) before any forest write. concepts is
+#         None → best-effort signal_error, then DualPassIncompleteError;
+#         no forest. Legitimate [] writes forest. Tree ids un-sliced.
+#         Optional windows= echoed into result, not deposited.
+#   Why:  Spec R3 — dual-pass is atomic or there is no deposit.
+#   How:  Reorder dual_record_outcome; tree id f"{target_id}::tree::{concept}".
+# -------------------
 # [2026-09-21] Grok 4.6 — Ref-counted keep-warm pinger.
 #   What: start_keepalive/stop_keepalive reference-counted; daemon thread
 #         pings every 20s. No-op when not remote. Ping failures stay debug.
@@ -826,15 +834,16 @@ class NGEmbed:
         success: bool,
         strength: float = 1.0,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        windows: Optional[Sequence[EmbedWindow]] = None,
     ) -> Dict[str, Any]:
         """Dual-pass learning: forest embedding + tree concept extraction.
 
-        Pass 1: Record the forest (gestalt) embedding via ecosystem.record_outcome().
-        Pass 2: Extract concepts via TID → embed each → record_outcome()
-                 per tree → create forest→tree synapses in the substrate.
-
-        If TID is unavailable or extraction fails, gracefully falls back
-        to single-pass (forest only). Pass 2 failure is never fatal.
+        Extract-first. `_extract_concepts` returning None is a pass-2
+        failure: best-effort `signal_error`, then DualPassIncompleteError,
+        with no forest write. Legitimate empty `[]` writes the forest
+        only. Concepts are `embed_batch`'d before any write so an embed
+        failure also leaves no deposit.
 
         Args:
             ecosystem: The module's NGEcosystem instance.
@@ -844,6 +853,8 @@ class NGEmbed:
             success: Whether the outcome was successful.
             strength: Caller-reported significance [0.0, 1.0].
             metadata: Additional metadata dict.
+            windows: Optional precomputed EmbedWindow sequence. Echoed
+                into result["windows"] when non-empty; not deposited here.
 
         Returns:
             {
@@ -851,50 +862,21 @@ class NGEmbed:
                 "tree_ids": [str],           # Target IDs for tree nodes
                 "concepts": [str],           # Extracted concept strings
                 "pass2_attempted": bool,
+                "extraction_failed": bool,   # always False on the return path
             }
         """
-        # Pass 1: Forest — broadcast outcome to peers AND deposit locally.
-        # Workstream 2 (#274, 2026-05-31): use record_outcome_broadcast when
-        # the ecosystem supports it (NGEcosystem does post-Workstream-2 re-vendor);
-        # fall back to record_outcome for backward compat with consumers that
-        # pass a custom ecosystem-shape object that pre-dates the broadcast method.
-        if hasattr(ecosystem, "record_outcome_broadcast"):
-            forest_result = ecosystem.record_outcome_broadcast(
-                embedding, target_id, success,
-                strength=strength, metadata=metadata,
-            )
-        else:
-            forest_result = ecosystem.record_outcome(
-                embedding, target_id, success,
-                strength=strength, metadata=metadata,
-            )
-
-        result = {
-            "forest_result": forest_result,
-            "tree_ids": [],
-            "concepts": [],
-            "pass2_attempted": False,
-            "extraction_failed": False,
-        }
-
-        # Pass 2: Trees — concept extraction via TID
+        # Extract before any write. None = TID broke (raise, no deposit).
+        # [] = completed dual-pass with zero trees (write forest).
         concepts = self._extract_concepts(content)
-        result["pass2_attempted"] = True
-        # No silent failures (Josh, 2026-07-15): distinguish "TID extraction BROKE" (None) from
-        # "legitimately no concepts" ([]). A broken extraction silently losing the tree half of a
-        # foundational dual-pass is exactly the kind of invisible degradation we do not tolerate.
-        result["extraction_failed"] = concepts is None
         if concepts is None:
-            # Forest-only degradation (trees + forest↔tree links lost). Warn + signal
-            # RATE-LIMITED (see _extraction_warn_due): when TID is permanently absent
-            # every deposit fails, so per-deposit warning floods the log. self._failures
-            # is the cumulative truth (surfaced in status); we warn periodically with a
-            # suppressed-count so the signal survives without the flood.
+            # Warn + signal RATE-LIMITED (see _extraction_warn_due): when
+            # TID is permanently absent every deposit fails, so per-deposit
+            # warning floods the log. The raise is never rate-limited.
             _since = self._extraction_warn_due()
             if _since:
                 logger.warning(
-                    "dual_record_outcome[%s]: concept extraction FAILED → forest-only degradation "
-                    "(trees + forest↔tree links lost); cumulative TID extraction failures=%d "
+                    "dual_record_outcome[%s]: concept extraction FAILED — no deposit "
+                    "(R3 atomicity); cumulative TID extraction failures=%d "
                     "(+%d since last warn — TID absent/unreachable)",
                     target_id, self._failures, _since,
                 )
@@ -902,41 +884,62 @@ class NGEmbed:
                 if callable(_signal):
                     try:
                         _signal(
-                            RuntimeError("dual-pass concept extraction failed (forest-only degradation)"),
+                            RuntimeError("dual-pass concept extraction failed (no deposit)"),
                             {"target_id": target_id, "stage": "pass2_trees",
                              "extraction_failures": self._failures},
                         )
-                    except Exception:  # noqa: BLE001 — signalling must never break the deposit
+                    except Exception:  # noqa: BLE001 — signalling must never mask the raise
                         pass
-            return result
+            raise DualPassIncompleteError(
+                f"pass-2 concept extraction failed for {target_id}; no deposit"
+            )
+
+        # Embed trees before any write so embed failure leaves no forest.
+        tree_embeddings = self.embed_batch(concepts) if concepts else []
+
+        # Workstream 2 (#274, 2026-05-31): use record_outcome_broadcast when
+        # the ecosystem supports it; fall back to record_outcome for
+        # consumers that pre-date the broadcast method (CommonsEco).
+        if hasattr(ecosystem, "record_outcome_broadcast"):
+            _record = ecosystem.record_outcome_broadcast
+        else:
+            _record = ecosystem.record_outcome
+
+        forest_result = _record(
+            embedding, target_id, success,
+            strength=strength, metadata=metadata,
+        )
+
+        result = {
+            "forest_result": forest_result,
+            "tree_ids": [],
+            "concepts": [],
+            "pass2_attempted": True,
+            "extraction_failed": False,
+        }
+        if windows:
+            result["windows"] = [
+                {"text": w.text, "embedding": w.embedding, "token_count": w.token_count}
+                for w in windows
+            ]
 
         if not concepts:
-            return result  # legitimate empty — nothing to extract, not a failure
+            return result  # legitimate empty — forest written, zero trees
 
         result["concepts"] = concepts
 
-        # Embed and record each concept
-        tree_embeddings = self.embed_batch(concepts)
         for concept, tree_emb in zip(concepts, tree_embeddings):
             tree_meta = dict(metadata or {})
             tree_meta["_tree_concept"] = True
             tree_meta["_forest_target_id"] = target_id
             tree_meta["_concept"] = concept
 
-            tree_target = f"{target_id}::tree::{concept[:64]}"
-            # Workstream 2 (#274, 2026-05-31): use broadcast variant when available.
-            if hasattr(ecosystem, "record_outcome_broadcast"):
-                tree_result = ecosystem.record_outcome_broadcast(
-                    tree_emb, tree_target, success,
-                    strength=strength * 0.8,  # Trees slightly softer than forest
-                    metadata=tree_meta,
-                )
-            else:
-                tree_result = ecosystem.record_outcome(
-                    tree_emb, tree_target, success,
-                    strength=strength * 0.8,  # Trees slightly softer than forest
-                    metadata=tree_meta,
-                )
+            tree_target = f"{target_id}::tree::{concept}"
+            tree_result = _record(
+                tree_emb, tree_target, success,
+                strength=strength * 0.8,  # Trees slightly softer than forest
+                metadata=tree_meta,
+            )
 
             if tree_result:
                 result["tree_ids"].append(tree_target)
