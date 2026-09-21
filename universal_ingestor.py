@@ -19,6 +19,9 @@ Grok Review Changelog (v0.7.1):
         _encode_batch() — if something unexpected bypasses the inner catch,
         the batch falls back to per-chunk hash embeddings rather than
         propagating up to the caller.
+        *** SUPERSEDED 2026-09-21 (Josh's fail-closed ruling). Hash fallback
+        is removed entirely; there is no longer anything to fall back TO.
+        See the 2026-09-21 entry in the Changelog block below. ***
     Rejected: 'PDF extraction loses images/tables' — PyPDF2 is a text
         extraction library by design. Image/table extraction would require
         pdfplumber or similar, which is a feature request (not a bug).
@@ -27,6 +30,10 @@ Grok Review Changelog (v0.7.1):
         already catches ImportError AND broad Exception, sets _model_available
         = False, and falls back to hash. _encode_batch() additionally wraps
         runtime model errors. Both paths were implemented since Phase 4.
+        *** SUPERSEDED 2026-09-21. The rejection's premise — that degrading to
+        a hash vector is a graceful degrade — was wrong. Graceful degrade for
+        an embedding path is NO vector, not a fake one. Both paths named here
+        are gone. ***
     Rejected: 'Cache uses SHA256 on vectors — why?' — Cache key is SHA256 of
         the TEXT, not the vector (_cache_key hashes text.encode("utf-8")).
         Text is the correct key: same text always maps to the same embedding
@@ -39,6 +46,29 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-09-21] CC (Claude Opus 5, chief manager) — Fail closed: delete the hash-embedding fallback
+#   What: EmbeddingEngine no longer manufactures a vector when no embedding backend is
+#         available. Removed `_hash_embed` outright (LAW 3 — no dead implementation left
+#         behind), removed the try/except hash wrapper in `embed_chunks`, and rewrote
+#         `_encode_batch` to call the canonical NGEmbed singleton or raise RuntimeError.
+#         The loader's "using deterministic hash-based fallback" warning is now an error
+#         stating that ingestion fails closed. Two stale docstring items above marked
+#         SUPERSEDED rather than deleted — they are the record of the rejected premise.
+#   Why:  Josh's ruling, 2026-09-21: "Universal ingestor is the documentation only path.
+#         It has nothing to do with the experience path. Yeah, hashing here would also be
+#         worse than useless. Same embedding-only rules." A SHA-256 vector is uniformly
+#         random with respect to meaning: it does not degrade retrieval, it makes retrieval
+#         confidently wrong. Absent results are recoverable; poisoned ones are not. Surfaced
+#         as Finding 2 of the ng_embed cross-family review (docs:
+#         handoffs/ng-embed-failclosed-20260920/returns/ng-embed-exec-003-claude-review.md).
+#   How:  This file only. NOT a vendored file, so no re-vendor is implied. NOT wired to the
+#         experience path. Known consequence, deliberately not papered over: 45 of 109 tests
+#         in tests/test_ingestor.py now fail. They assert similarity thresholds and synapse
+#         formation against hash vectors, which means the suite has been green on noise.
+#         Repairing them is the universal_ingestor zone's work (Josh: "this will be its own
+#         zone... for now, just make it safe, and record that we need to get back to it"),
+#         not this change's. Three `"hash_fallback"` reporting labels remain at the
+#         model_name sites and are now unreachable; left for that zone with the rest.
 # [2026-09-03] DudeMan CC (Fable 5.1) — Correct stale embedder references (docs only)
 #   What: Comment/docstring-only corrections. No behavior change, no logic touched.
 #         (a) Module docstring stage 3 said "via sentence-transformers" — that backend
