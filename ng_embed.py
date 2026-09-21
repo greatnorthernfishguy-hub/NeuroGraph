@@ -5,7 +5,7 @@ Singleton embedding engine used by every module. Provides:
   1. Unified embedding via Snowflake/snowflake-arctic-embed-m-v1.5 (ONNX)
   2. Dual-pass embedding (forest + trees) via TID concept extraction
   3. Thread-safe singleton — one model instance per process
-  4. Hash fallback when ONNX model unavailable
+  4. Fail-closed: raise EmbeddingUnavailableError when the model is unavailable
 
 This is a VENDORED file. Canonical source: ~/NeuroGraph/ng_embed.py
 Do NOT modify vendored copies. Changes made here, re-vendored everywhere.
@@ -23,6 +23,16 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — Fail-closed embed: no hash fallback.
+#   What: Raise EmbeddingUnavailableError when the model cannot load.
+#         Remove the SHA-based fallback. DualPassIncompleteError declared
+#         (unwired until Lane 2).
+#   Why:  Spec R1 — no hash embedding anywhere; a failed embed is a
+#         real failure. Plan Task 1.
+#   How:  Public exception types; embed()/embed_batch() raise instead
+#         of synthesizing a vector; empty batch still returns [] before
+#         model load.
+# -------------------
 # [2026-03-22] Claude (Opus 4.6) — Initial creation.
 #   What: Centralized embedding + dual-pass for entire ecosystem.
 #   Why:  PRD §5 (Dual_Pass_Embedding_Implementation.md). Replaces 7+
@@ -36,7 +46,6 @@ Dual-pass (Punchlist #81 — Josh's invention):
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -51,6 +60,23 @@ if TYPE_CHECKING:
     from ng_ecosystem import NGEcosystem
 
 logger = logging.getLogger("ng_embed")
+
+
+class EmbeddingUnavailableError(Exception):
+    """Raised when a real embedding cannot be produced.
+
+    Public failure contract of embed()/embed_batch(). There is no hash
+    fallback and no env var that re-enables one.
+    """
+
+
+class DualPassIncompleteError(Exception):
+    """Raised when dual-pass cannot complete both forest and trees.
+
+    Pass-2 extraction failure (TID down / timeout / malformed) must not
+    leave a forest-only deposit. Distinct from EmbeddingUnavailableError.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Configuration defaults — all values are bootstrap scaffolding
@@ -222,7 +248,7 @@ class NGEmbed:
                 return True
 
             except Exception as exc:
-                logger.warning("ng_embed: model load failed, using hash fallback: %s", exc)
+                logger.warning("ng_embed: model load failed: %s", exc)
                 self._model_failed = True
                 return False
 
@@ -246,7 +272,7 @@ class NGEmbed:
         """
         if self._ensure_model():
             return self._onnx_embed(text, normalize=normalize, is_query=is_query)
-        return self._hash_embed(text, normalize=normalize)
+        raise EmbeddingUnavailableError("embedding model unavailable")
 
     def embed_batch(
         self,
@@ -268,7 +294,7 @@ class NGEmbed:
             return []
         if self._ensure_model():
             return self._onnx_embed_batch(texts, normalize=normalize, is_query=is_query)
-        return [self._hash_embed(t, normalize=normalize) for t in texts]
+        raise EmbeddingUnavailableError("embedding model unavailable")
 
     def _onnx_embed(
         self,
@@ -357,30 +383,6 @@ class NGEmbed:
             results.append(vec)
 
         return results
-
-    def _hash_embed(
-        self,
-        text: str,
-        normalize: bool = False,
-    ) -> np.ndarray:
-        """Deterministic hash-based fallback embedding.
-
-        Produces a stable 768-dim vector from text via SHA-384.
-        Not semantically meaningful — ensures modules can operate
-        when the ONNX model is unavailable.
-        """
-        dim = self._config["embedding_dim"]
-        h = hashlib.sha384(text.encode("utf-8")).digest()
-        # Expand hash to fill dim via seeded RNG
-        rng = np.random.RandomState(
-            int.from_bytes(h[:4], "little")
-        )
-        vec = rng.randn(dim).astype(np.float32)
-        if normalize:
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-        return vec
 
     # -- Dual-pass (Punchlist #81) -------------------------------------------
 
