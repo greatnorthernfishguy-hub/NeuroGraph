@@ -17,6 +17,12 @@ def _reset_singleton_and_env(monkeypatch):
     NGEmbed.reset_instance()
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    # Retry backoffs are widened for cold starts; never actually sleep in CI.
+    monkeypatch.setattr(ng_embed.time, "sleep", lambda *_: None)
+
+
 def test_embed_raises_when_model_unavailable_and_hash_disabled(monkeypatch):
     emb = NGEmbed()
     monkeypatch.setattr(emb, "_ensure_model", lambda: False)
@@ -134,3 +140,54 @@ def test_log_failed_embed_write_failure_does_not_raise(monkeypatch):
     emb = NGEmbed()
     emb._config["cache_dir"] = "/proc/nonexistent-cannot-mkdir/xyz"  # os.makedirs will fail
     emb._log_failed_embed("x", Exception("boom"))  # must swallow, not raise
+
+
+def test_remote_call_retries_three_then_raises_and_quarantines(monkeypatch, tmp_path):
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    calls = {"n": 0}
+
+    def _always_fail(inputs):
+        calls["n"] += 1
+        raise OSError("network down")
+
+    monkeypatch.setattr(emb, "_hf_post", _always_fail)
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._hf_remote_call("hello", 1)
+    assert calls["n"] == 3  # exactly 3 attempts
+    assert (tmp_path / "failed_embeds.jsonl").exists()  # quarantined
+
+
+def test_remote_call_validates_dim_counts_as_failed_attempt(monkeypatch, tmp_path):
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    calls = {"n": 0}
+    monkeypatch.setattr(emb, "_hf_post", lambda i: (calls.__setitem__("n", calls["n"] + 1) or [0.0] * 100))
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._hf_remote_call("hello", 1)  # 100 dims != 768
+    assert calls["n"] == 3
+
+
+def test_remote_call_rejects_nan(monkeypatch, tmp_path):
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    bad = [float("nan")] + [0.0] * 767
+    monkeypatch.setattr(emb, "_hf_post", lambda i: bad)
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._hf_remote_call("hello", 1)
+
+
+def test_remote_call_returns_validated_rows(monkeypatch):
+    emb = NGEmbed()
+    good = [0.1] * 768
+    monkeypatch.setattr(emb, "_hf_post", lambda i: good)
+    rows = emb._hf_remote_call("hello", 1)
+    assert len(rows) == 1 and len(rows[0]) == 768
+
+
+def test_remote_call_batch_count_mismatch_fails(monkeypatch, tmp_path):
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    monkeypatch.setattr(emb, "_hf_post", lambda i: [[0.0] * 768])  # 1 row for 2 inputs
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._hf_remote_call(["a", "b"], 2)

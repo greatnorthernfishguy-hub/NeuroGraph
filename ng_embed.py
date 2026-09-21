@@ -459,6 +459,49 @@ class NGEmbed:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read())
 
+    def _validate_remote_response(self, result, expected_count: int):
+        """Validate a remote response before use: exactly `expected_count` vectors, each
+        exactly embedding_dim finite floats, non-empty. Raises ValueError on any violation
+        (caller treats that as a failed attempt). Prevents a changed serverless response
+        shape from silently reintroducing garbage vectors."""
+        dim = self._config["embedding_dim"]
+        rows = [result] if expected_count == 1 else result
+        if not isinstance(rows, list) or len(rows) != expected_count:
+            raise ValueError(
+                "expected %d embedding row(s), got %r"
+                % (expected_count, type(result).__name__)
+            )
+        for row in rows:
+            arr = np.asarray(row, dtype=np.float32)
+            if arr.shape != (dim,):
+                raise ValueError("expected %d-dim vector, got shape %s" % (dim, arr.shape))
+            if not np.all(np.isfinite(arr)):
+                raise ValueError("non-finite values in remote embedding")
+        return rows
+
+    def _hf_remote_call(self, inputs, expected_count: int):
+        """POST to HF with retry (3 attempts; backoff 5s then 10s -- widened over Morpho's
+        1/3s so a serverless cold start is not misclassified as an outage). Validates each
+        response inside the loop, so a malformed/short/NaN body counts as a failed attempt.
+        On exhausted retries: quarantine then raise EmbeddingUnavailableError -- never hash."""
+        backoffs = [5, 10]
+        last_exc = None
+        for attempt in range(3):
+            try:
+                result = self._hf_post(inputs)
+                return self._validate_remote_response(result, expected_count)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "ng_embed: HF remote call failed (attempt %d/3): %s", attempt + 1, exc
+                )
+                if attempt < 2:
+                    time.sleep(backoffs[attempt])
+        self._log_failed_embed(inputs, last_exc)
+        raise EmbeddingUnavailableError(
+            "HF remote embedding failed after 3 attempts"
+        ) from last_exc
+
     def _log_failed_embed(self, inputs, exc: Exception) -> None:
         """Append one ordered quarantine record for a remote embed that exhausted retries.
         Ordered (arrival order preserved) so the consumer's recovery queue can replay in order.
