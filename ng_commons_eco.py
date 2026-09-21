@@ -2,6 +2,11 @@
 ng_commons_eco.py — VENDORED Commons-backed substrate adapter (the dead-ecosystem → Commons bridge).
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — dual_record_outcome no forest-only fallback (R3).
+# What: Exceptions from NGEmbed.dual_record_outcome propagate. embedding is
+#       None still returns None. 2026-06-22 fail-soft sentence revoked.
+# Why:  Josh: NOTHING in the ecosystem is single-pass. Spec R3.
+# How:  Drop the except Exception that called record_outcome as fallback.
 # [2026-07-05] Claude Code (Sonnet 5) — signal_error() — the #330 operational-logger (Josh-approved)
 # What: New CommonsEco.signal_error(exc, context) — a one-line swap for `except: pass` sites.
 #       Embeds the exception's string form via ng_embed, deposits raw to the Commons under
@@ -177,6 +182,13 @@ class CommonsEco:
         """Faithful ng_ecosystem.dual_record_outcome drop-in — forest+tree dual-pass into the Commons.
 
         # ---- Changelog ----
+        # [2026-09-21] Grok 4.6 — R3: dual-pass is atomic or there is no deposit.
+        # What: Remove the except Exception that degraded to a single forest deposit.
+        #       NGEmbed.dual_record_outcome exceptions propagate. embedding is None
+        #       still returns None.
+        # Why: Josh's directive — NOTHING in the ecosystem is single-pass; forest+tree
+        #       is the point. Forest-only is not a degraded mode. Spec R3.
+        # How: Lazy NGEmbed import + get_instance().dual_record_outcome(...). No catch.
         # [2026-06-22] Claude Code (Opus 4.8) — #328/dual-pass: CommonsEco gains dual_record_outcome
         # What: Mirror NGEcosystem.dual_record_outcome so CommonsEco is a faithful drop-in for the
         #       FULL ecosystem surface, not just record_outcome. Delegates to NGEmbed with
@@ -187,20 +199,15 @@ class CommonsEco:
         #       Modules migrating off ng_ecosystem (Immunis/THC/Elmer) must keep dual-pass when they
         #       deposit to the Commons. One uniform path: eco.dual_record_outcome(...).
         # How: import NGEmbed lazily; NGEmbed.dual_record_outcome(self, content, embedding, ...).
-        #       Fail-soft: if NGEmbed/engine is unavailable, degrade to a single forest deposit so a
-        #       deposit is NEVER lost (same graceful TID-down fallback ng_embed itself documents).
+        #       [REVOKED 2026-09-21] Fail-soft: if NGEmbed/engine is unavailable, degrade to a
+        #       single forest deposit so a deposit is NEVER lost (same graceful TID-down fallback
+        #       ng_embed itself documents).
         # -------------------
         """
         if embedding is None:
             return None
-        try:
-            from ng_embed import NGEmbed
-            return NGEmbed.get_instance().dual_record_outcome(
-                self, content, embedding, target_id, success,
-                strength=strength, metadata=metadata,
-            )
-        except Exception as exc:  # noqa: BLE001 — never lose the deposit; degrade to forest-only
-            logger.debug("[%s] CommonsEco dual_record_outcome → single-pass fallback: %s",
-                         self._source, exc)
-            return self.record_outcome(embedding, target_id, success,
-                                       strength=strength, metadata=metadata)
+        from ng_embed import NGEmbed
+        return NGEmbed.get_instance().dual_record_outcome(
+            self, content, embedding, target_id, success,
+            strength=strength, metadata=metadata,
+        )

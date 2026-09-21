@@ -2,6 +2,9 @@
 ng_commons_eco.py (VENDORED) — standalone tests for the Commons-backed eco adapter.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — R3: dual_record_outcome must not degrade to forest.
+#       Mock ng_embed.embed in signal_error tests (768-vector) so they
+#       test deposits, not a live model / NG_EMBED_REMOTE=hf.
 # [2026-06-22] Claude Code (Fable 5) — vendored CommonsEco tests (#335)
 # What: Proves CommonsEco independent of any module: faithful ng_ecosystem.get_context return shape
 #       (tier/tier_name/recommendations/novelty/ng_context), namespace filtering, novelty derivation,
@@ -13,11 +16,17 @@ ng_commons_eco.py (VENDORED) — standalone tests for the Commons-backed eco ada
 import os
 import sys
 import numpy as np
+import pytest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import commons as commons_mod
 from ng_commons_eco import CommonsEco
+
+
+def _embed_768(*_a, **_k):
+    return np.ones(768, dtype=np.float32)
 
 
 def _emb(seed, dim=768):
@@ -108,8 +117,8 @@ def _tid_up():
         return False
 
 
-def test_dual_record_outcome_failsoft_to_forest():
-    """If dual-pass can't run (no embed engine), fall back to a single forest deposit — never lose it."""
+def test_dual_record_outcome_does_not_degrade_to_forest():
+    """R3: engine failure must not leave a forest-only Commons deposit."""
     import ng_embed
     c = commons_mod.Commons()
     eco = _eco(c, namespaces=("threat:",))
@@ -118,11 +127,12 @@ def test_dual_record_outcome_failsoft_to_forest():
         raise RuntimeError("no engine")
     ng_embed.NGEmbed.get_instance = staticmethod(_boom)
     try:
-        eco.dual_record_outcome(content="x", embedding=_emb(1), target_id="threat:fb", success=True)
+        with pytest.raises(RuntimeError):
+            eco.dual_record_outcome(content="x", embedding=_emb(1), target_id="threat:fb", success=True)
     finally:
         ng_embed.NGEmbed.get_instance = orig
     targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
-    assert "threat:fb" in targets, "forest deposited on single-pass fallback"
+    assert "threat:fb" not in targets, "no forest on dual-pass failure (R3)"
 
 
 def test_dual_record_outcome_none_embedding_safe():
@@ -137,7 +147,8 @@ def test_signal_error_deposits_raw():
     try:
         raise ValueError("bad thing happened")
     except ValueError as exc:
-        eco.signal_error(exc, {"where": "test"})
+        with patch("ng_embed.embed", side_effect=_embed_768):
+            eco.signal_error(exc, {"where": "test"})
     matches = [(s.target_id, s.metadata.get("last_context", {})) for s in c._ng.synapses.values()
                if getattr(s, "target_id", "").startswith("error:")]
     assert len(matches) == 1
@@ -156,7 +167,8 @@ def test_signal_error_target_id_shape_matches_retention():
     try:
         raise RuntimeError("x")
     except RuntimeError as exc:
-        eco.signal_error(exc)
+        with patch("ng_embed.embed", side_effect=_embed_768):
+            eco.signal_error(exc)
     targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
     assert "error:immunis:RuntimeError" in targets
 
@@ -175,7 +187,8 @@ def test_signal_error_no_context_defaults_empty():
     try:
         raise TypeError("y")
     except TypeError as exc:
-        eco.signal_error(exc)  # no context passed
+        with patch("ng_embed.embed", side_effect=_embed_768):
+            eco.signal_error(exc)  # no context passed
     matches = [s.metadata.get("last_context", {}) for s in c._ng.synapses.values()
                if getattr(s, "target_id", "").startswith("error:")]
     assert matches[0]["context"] == {}
@@ -202,7 +215,7 @@ if __name__ == "__main__":
     test_signal_error_target_id_shape_matches_retention(); print("PASS signal_error target_id matches retention shape")
     test_signal_error_failsoft_no_commons(); print("PASS signal_error fail-soft when no Commons")
     test_signal_error_no_context_defaults_empty(); print("PASS signal_error context defaults to {}")
-    test_dual_record_outcome_failsoft_to_forest(); print("PASS dual_record_outcome fail-soft → single forest deposit")
+    test_dual_record_outcome_does_not_degrade_to_forest(); print("PASS dual_record_outcome does not degrade to forest")
     test_dual_record_outcome_none_embedding_safe(); print("PASS dual_record_outcome None embedding safe")
     test_dual_record_outcome_forest_and_trees_live(); print("PASS dual_record_outcome live forest+trees (or SKIP if no TID)")
     test_string_namespace_coerced_not_charsplit(); print("PASS string namespace coerced (footgun guarded)")
