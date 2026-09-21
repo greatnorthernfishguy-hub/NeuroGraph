@@ -1813,9 +1813,11 @@ class EmbeddingEngine:
             return
         self._model_available = False
         self._fallback_reason = "ng_embed not available or failed to load"
-        self._logger.warning(
-            "No embedding backend available. "
-            "Using deterministic hash-based fallback embeddings."
+        self._logger.error(
+            "No embedding backend available. Ingestion will FAIL CLOSED — "
+            "embedding calls raise rather than substituting hash vectors. "
+            "Reason: %s",
+            self._fallback_reason,
         )
 
     def _try_load_ng_embed(self) -> bool:
@@ -1823,7 +1825,9 @@ class EmbeddingEngine:
         try:
             from ng_embed import NGEmbed
             self._ng_embed = NGEmbed.get_instance()
-            # Dimension is always 768 — ng_embed produces 768-dim in both ONNX and hash-fallback paths
+            # Dimension is always 768 (ng_embed ONNX + HF remote both produce 768-dim).
+            # NOTE: ng_embed's hash fallback is opt-in and OFF by default as of the
+            # 2026-09-21 fail-closed change — it is no longer a path we rely on.
             self.dimension = 768
             self.model_name = "Snowflake/snowflake-arctic-embed-m-v1.5"
             self._model_available = True
@@ -1877,13 +1881,10 @@ class EmbeddingEngine:
 
         if uncached:
             texts = [c.text for _, c in uncached]
-            try:
-                vectors = self._encode_batch(texts)
-            except Exception as exc:
-                self._logger.warning(
-                    "Batch embed failed (%s), falling back to per-chunk hash", exc,
-                )
-                vectors = [self._hash_embed(t) for t in texts]
+            # FAIL CLOSED (2026-09-21): no hash substitution. A hash vector in a
+            # documentation index produces retrieval that is confidently wrong
+            # rather than honestly absent. Let the error propagate.
+            vectors = self._encode_batch(texts)
             for (idx, chunk), vec in zip(uncached, vectors):
                 # Normalize
                 norm = np.linalg.norm(vec)
@@ -1915,37 +1916,26 @@ class EmbeddingEngine:
         return vec
 
     def _encode_batch(self, texts: List[str]) -> List[np.ndarray]:
-        """Encode a batch of texts into vectors.
+        """Encode a batch of texts into vectors. FAIL CLOSED.
 
-        If the model is loaded but encoding fails at runtime (e.g. CUDA
-        out-of-memory, driver error), falls back to hash embeddings for this
-        batch rather than crashing the entire pipeline.
+        There is no hash fallback. If the backend is unavailable or encoding
+        fails, this raises. Josh, 2026-09-21: the documentation path gets the
+        "same embedding only rules" as the experience path — a hash vector
+        here would be "worse than useless", because it asserts a semantic
+        relationship that does not exist and the index cannot tell the
+        difference between it and a real one.
+
+        Raises:
+            ng_embed.EmbeddingUnavailableError: propagated from the backend.
+            RuntimeError: if no embedding backend loaded at all.
         """
         if self._model_available and self._ng_embed is not None:
-            try:
-                return self._ng_embed.embed_batch(texts)
-            except Exception as exc:
-                self._logger.warning(
-                    "ng_embed encode failed (%s). Falling back to hash embeddings "
-                    "for this batch of %d texts.",
-                    exc, len(texts),
-                )
-        return [self._hash_embed(t) for t in texts]
-
-    def _hash_embed(self, text: str) -> np.ndarray:
-        """Deterministic hash-based embedding fallback.
-
-        Produces consistent vectors from text content using SHA-256 seeding.
-        Useful for testing without model dependencies.
-        """
-        h = hashlib.sha256(text.encode("utf-8")).digest()
-        seed = int.from_bytes(h[:4], "big")
-        rng = np.random.RandomState(seed)
-        vec = rng.randn(self.dimension).astype(np.float32)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec
+            return self._ng_embed.embed_batch(texts)
+        raise RuntimeError(
+            "universal_ingestor: no embedding backend available "
+            f"({self._fallback_reason or 'unknown reason'}); refusing to "
+            "substitute hash vectors. Ingestion fails closed."
+        )
 
     def _cache_key(self, text: str) -> str:
         """Create cache key from text content."""
