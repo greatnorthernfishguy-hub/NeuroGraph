@@ -34,6 +34,24 @@ Dual-pass (Punchlist #81 — Josh's invention):
 # -------------------
 """
 
+# ---- Changelog ----
+# 2026-09-20 Claude Code (DudeMan CC) — Fail-closed + opt-in HF API fallback
+# What: embed()/embed_batch() now raise EmbeddingUnavailableError on unrecoverable failure
+#       instead of silently returning SHA-384 hash vectors; _hash_embed demoted to
+#       NG_EMBED_ALLOW_HASH_FALLBACK=1 opt-in only. Added env-gated (NG_EMBED_REMOTE=hf)
+#       same-model HF remote path (validated retry-3-then-raise, ordered quarantine, keepalive).
+# Why: The hash fallback returns an isotropic-Gaussian vector cosine-orthogonal to the real
+#       Snowflake manifold; silently substituting it poisons any substrate that ingests it
+#       (poisoned the laptop CC NG). Spec: docs/superpowers/specs/2026-09-20-ng-embed-canonical-
+#       fail-closed-api-fallback-design.md. LAW 3 (restore not rebuild), LAW 4 (fail at source),
+#       LAW 5 (env vars), LAW 7 (raw embeddings unchanged).
+# How: Three-path _ensure_model (local ONNX / hf remote / hash-opt-in); named module-level
+#       exception at every raise site; client-side prefix+normalize on both paths; runtime
+#       768-dim/finite response validation inside the retry loop.
+# NOTE: Canonical vendored file (LAW 2). NOT yet re-vendored — re-vendor is a separate,
+#       Josh-gated re-embed thread. This change touches nothing live.
+# -------------------
+
 from __future__ import annotations
 
 import hashlib
