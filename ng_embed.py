@@ -23,6 +23,17 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — CLS/SEP wrap every ONNX window (R-3).
+#   What: Window the interior (between leading CLS and trailing SEP)
+#         at 510 / overlap 64; wrap each slice as [CLS]+slice+[SEP]
+#         before ONNX. Decode interior for window text. Missing
+#         specials raise EmbeddingUnavailableError. Short path
+#         (full encoding ≤512) unchanged — no double wrap.
+#   Why:  Arctic is CLS-pooling; mid-sentence slices pooled from
+#         position 0 are degenerate. Law-enforcer R-3.
+#   How:  _cls_sep_ids from tokenizer.encode(""); _window_token_ids
+#         strips specials, windows interior, returns wrapped ids.
+# -------------------
 # [2026-09-21] Grok 4.6 — dual_record_outcome extract-first (R3 atomicity).
 #   What: Extract (and embed_batch) before any forest write. concepts is
 #         None → best-effort signal_error, then DualPassIncompleteError;
@@ -140,6 +151,7 @@ class WindowedEmbedding:
 
 _WINDOW_TOKENS = 512
 _WINDOW_OVERLAP = 64
+_WINDOW_INTERIOR = _WINDOW_TOKENS - 2  # room for [CLS] + [SEP] wrap
 
 _DEFAULT_CONFIG = {
     # Model
@@ -397,9 +409,11 @@ class NGEmbed:
             window_jobs: List[tuple] = []
             for i in long_idx:
                 ids = list(encodings[i].ids)
-                for w_ids, weight, _start, _end in self._window_token_ids(ids):
-                    w_text = self._tokenizer.decode(w_ids, skip_special_tokens=True)
-                    window_jobs.append((i, weight, w_ids, w_text))
+                for wrapped, interior_slice, weight, _start, _end in self._window_token_ids(ids):
+                    w_text = self._tokenizer.decode(
+                        interior_slice, skip_special_tokens=True,
+                    )
+                    window_jobs.append((i, weight, wrapped, w_text))
             if self._remote_mode:
                 vecs = self._hf_remote_embed_batch(
                     [job[3] for job in window_jobs],
@@ -456,9 +470,11 @@ class NGEmbed:
         embeddings: List[np.ndarray] = []
         weights: List[int] = []
         jobs = []
-        for w_ids, weight, _start, _end in self._window_token_ids(ids):
-            w_text = self._tokenizer.decode(w_ids, skip_special_tokens=True)
-            jobs.append((w_text, w_ids, weight))
+        for wrapped, interior_slice, weight, _start, _end in self._window_token_ids(ids):
+            w_text = self._tokenizer.decode(
+                interior_slice, skip_special_tokens=True,
+            )
+            jobs.append((w_text, wrapped, weight))
 
         if self._remote_mode:
             vecs = self._hf_remote_embed_batch(
@@ -503,18 +519,39 @@ class NGEmbed:
         prefix = self._config["document_prefix"]
         return (prefix + text) if prefix else text
 
+    def _cls_sep_ids(self) -> tuple:
+        """Read CLS/SEP from the tokenizer. Do not hardcode 101/102."""
+        encoding = self._tokenizer.encode("")
+        specials = list(encoding.ids)
+        if len(specials) < 2:
+            raise EmbeddingUnavailableError(
+                "tokenizer missing CLS/SEP specials"
+            )
+        return specials[0], specials[-1]
+
     def _window_token_ids(self, ids: Sequence[int]) -> List[tuple]:
-        """Overlapping windows to EOF. Nothing discarded. Each slice ≤512."""
-        n = len(ids)
+        """Overlapping interior windows, each wrapped as [CLS]+slice+[SEP].
+
+        Interior window length ≤ 510 so the wrapped sequence stays ≤ 512.
+        Raises if the full encoding is missing a leading CLS or trailing SEP.
+        """
+        cls_id, sep_id = self._cls_sep_ids()
+        if not ids or ids[0] != cls_id or ids[-1] != sep_id:
+            raise EmbeddingUnavailableError(
+                "encoding missing leading CLS or trailing SEP"
+            )
+        interior = list(ids[1:-1])
+        n = len(interior)
         out: List[tuple] = []
         start = 0
         while start < n:
-            end = min(start + _WINDOW_TOKENS, n)
-            slice_ids = list(ids[start:end])
-            out.append((slice_ids, end - start, start, end))
+            end = min(start + _WINDOW_INTERIOR, n)
+            slice_ids = interior[start:end]
+            wrapped = [cls_id] + slice_ids + [sep_id]
+            out.append((wrapped, slice_ids, end - start, start, end))
             if end >= n:
                 break
-            start += _WINDOW_TOKENS - _WINDOW_OVERLAP
+            start += _WINDOW_INTERIOR - _WINDOW_OVERLAP
         return out
 
     def _pool_windows(

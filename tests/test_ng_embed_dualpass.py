@@ -69,6 +69,31 @@ class _FakeTok:
         return None
 
 
+class _ClsSepTok:
+    """Arctic-shaped fake: encode returns [CLS] + one-id-per-char + [SEP].
+
+    CLS/SEP are not 101/102 — production must read them from the tokenizer.
+    """
+    CLS = 11
+    SEP = 22
+
+    def encode(self, text):
+        interior = [100 + i for i in range(len(text))]
+        return _Enc([self.CLS] + interior + [self.SEP])
+
+    def decode(self, ids, skip_special_tokens=True):
+        seq = list(ids)
+        if skip_special_tokens:
+            seq = [i for i in seq if i not in (self.CLS, self.SEP)]
+        return "x" * len(seq)
+
+    def encode_batch(self, texts):
+        return [self.encode(t) for t in texts]
+
+    def enable_padding(self, **k):
+        return None
+
+
 def _one_hot(dim, idx):
     v = np.zeros(dim, dtype=np.float32)
     v[idx % dim] = 1.0
@@ -107,24 +132,24 @@ def test_short_input_matches_single_window_primitive(monkeypatch):
 def test_long_input_pooled_differs_from_first_window_and_is_unit(monkeypatch):
     emb = NGEmbed()
     monkeypatch.setattr(emb, "_ensure_model", lambda: True)
-    emb._tokenizer = _FakeTok()
+    emb._tokenizer = _ClsSepTok()
     emb._model_loaded = True
     dim = 768
     def fake_onnx(text, normalize=False, is_query=False, _ids=None):
         n = len(text)
         return _one_hot(dim, n)
     monkeypatch.setattr(emb, "_onnx_embed", fake_onnx)
-    # 600-char input → 600 tokens → windows 512 and 152 (start 448)
+    # 600-char interior + CLS + SEP = 602 tokens; interior windows 510 / 154.
     text = "a" * 600
     we = emb.embed_windows(text)
-    assert we.token_count == 600
+    assert we.token_count == 602
     assert len(we.windows) >= 2
     pooled = we.pooled
     first = we.windows[0].embedding
     assert pooled.shape == (768,)
     assert not np.allclose(pooled, first), "pooling must not equal the first window (truncation)"
     assert abs(float(np.linalg.norm(pooled)) - 1.0) < 1e-5
-    # Tail window influences the pool: a 512-token prefix must differ.
+    # Tail window influences the pool: a 512-char prefix must differ.
     prefix = emb.embed_windows("a" * 512).pooled
     assert not np.allclose(pooled, prefix), "tokens past 512 must influence the forest vector"
 
@@ -137,6 +162,42 @@ def test_embed_windows_empty_on_short_input(monkeypatch):
     monkeypatch.setattr(emb, "_onnx_embed", lambda *a, **k: np.ones(768, dtype=np.float32))
     we = emb.embed_windows("hello")
     assert we.windows == ()
+
+
+def test_long_windows_are_complete_cls_sep_encoder_sequences(monkeypatch):
+    """Every ONNX window must be a complete [CLS] + interior + [SEP] sequence."""
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_ensure_model", lambda: True)
+    emb._tokenizer = _ClsSepTok()
+    emb._model_loaded = True
+    seen = []
+
+    def fake_onnx_ids(ids, attention, normalize=False):
+        seen.append(list(ids))
+        return _one_hot(768, len(ids))
+
+    monkeypatch.setattr(emb, "_onnx_embed_ids", fake_onnx_ids)
+    we = emb.embed_windows("a" * 600)
+    assert we.token_count == 602
+    assert len(we.windows) >= 2
+    assert seen, "long path must call the ONNX id primitive per window"
+    for ids in seen:
+        assert ids[0] == _ClsSepTok.CLS
+        assert ids[-1] == _ClsSepTok.SEP
+        assert len(ids) <= 512
+    for w in we.windows:
+        assert w.token_count <= 510
+        assert len(w.text) == w.token_count
+
+
+def test_windowing_raises_when_encoding_missing_cls_sep(monkeypatch):
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_ensure_model", lambda: True)
+    emb._tokenizer = _FakeTok()
+    emb._model_loaded = True
+    monkeypatch.setattr(emb, "_onnx_embed", lambda *a, **k: np.ones(768, dtype=np.float32))
+    with pytest.raises(EmbeddingUnavailableError):
+        emb.embed_windows("a" * 600)
 
 
 def test_remote_gate_selects_remote_without_onnx(monkeypatch):
