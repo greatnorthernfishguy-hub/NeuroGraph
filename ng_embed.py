@@ -199,6 +199,23 @@ class NGEmbed:
             if self._model_failed:
                 return False
 
+            remote_val = os.environ.get("NG_EMBED_REMOTE") or ""
+            if remote_val not in ("", "hf"):
+                # Misconfigured provider must fail loud, not silently fall through to local ONNX.
+                raise EmbeddingUnavailableError(
+                    "invalid NG_EMBED_REMOTE=%r; expected unset or 'hf'" % remote_val
+                )
+            if remote_val == "hf":
+                # Remote mode: no local ONNX load at all. Resolve the token now so a missing/
+                # unresolvable token fails fast and loud at first use, not mid-run.
+                self._get_hf_token()
+                self._remote_mode = True
+                self._model_loaded = True
+                logger.info(
+                    "ng_embed: NG_EMBED_REMOTE=hf -- HF remote inference, no local ONNX load"
+                )
+                return True
+
             try:
                 import onnxruntime as ort
                 from huggingface_hub import hf_hub_download

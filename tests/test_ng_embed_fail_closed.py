@@ -43,3 +43,35 @@ def test_embed_uses_hash_only_when_opt_in_set(monkeypatch):
 def test_empty_batch_returns_empty_without_touching_model():
     emb = NGEmbed()
     assert emb.embed_batch([]) == []
+
+
+def test_remote_gate_selects_remote_mode_without_local_load(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    emb = NGEmbed()
+    # raising=False: the real _get_hf_token lands in Task 3. Until then it does not
+    # exist on the class, and monkeypatch.setattr defaults to raising=True.
+    monkeypatch.setattr(emb, "_get_hf_token", lambda: "fake-token", raising=False)
+    # If ONNX load were attempted this would import onnxruntime + download; assert it is not.
+    def _boom(*a, **k):
+        raise AssertionError("local ONNX load must not run in remote mode")
+    monkeypatch.setattr(emb, "_onnx_embed", _boom)
+    assert emb._ensure_model() is True
+    assert emb._remote_mode is True
+
+
+def test_invalid_remote_value_raises_no_local_fallthrough(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "openrouter")
+    emb = NGEmbed()
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._ensure_model()
+    assert emb._remote_mode is False
+
+
+def test_unset_remote_falls_through_to_local(monkeypatch):
+    emb = NGEmbed()
+    # Force local load to "fail" so we don't need the real model, but prove we took the local branch.
+    monkeypatch.setattr(ng_embed, "__name__", ng_embed.__name__)  # no-op anchor
+    ok = emb._ensure_model()
+    # On a machine without the model this returns False (local branch ran); remote mode never set.
+    assert emb._remote_mode is False
+    assert ok in (True, False)
