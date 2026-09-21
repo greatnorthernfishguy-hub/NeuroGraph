@@ -23,6 +23,14 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — NG_EMBED_REMOTE=hf gate + HF router primitive.
+#   What: Opt-in remote feature-extraction via router.huggingface.co.
+#         Invalid NG_EMBED_REMOTE values raise. Token from HF_TOKEN or
+#         ~/.cache/huggingface/token. Body is {"inputs": ...} only.
+#   Why:  Spec R4 + 2026-07-07 remote API shape. Canonical keeps the name.
+#   How:  _ensure_model selects remote before any ONNX import; _hf_post
+#         uses stdlib urllib.request; client-side prefix and optional L2.
+# -------------------
 # [2026-09-21] Grok 4.6 — Overlapping token windows + length-weighted pool.
 #   What: Drop tokenizer truncation. Window at 512 / overlap 64. Pool
 #         length-weighted, then L2-normalize the pooled long path only.
@@ -184,6 +192,7 @@ class NGEmbed:
         self._tokenizer = None        # tokenizers.Tokenizer (lazy)
         self._model_loaded = False
         self._model_failed = False
+        self._remote_mode = False
         self._model_lock = threading.Lock()
 
         # Dual-pass stats
@@ -232,6 +241,20 @@ class NGEmbed:
                 return True
             if self._model_failed:
                 return False
+
+            remote = os.environ.get("NG_EMBED_REMOTE")
+            if remote is not None:
+                if remote != "hf":
+                    raise EmbeddingUnavailableError(
+                        f"unsupported NG_EMBED_REMOTE={remote!r}"
+                    )
+                self._remote_mode = True
+                self._model_loaded = True
+                logger.info(
+                    "ng_embed: NG_EMBED_REMOTE=hf — using HF remote inference, "
+                    "no local ONNX load"
+                )
+                return True
 
             try:
                 import onnxruntime as ort
@@ -321,6 +344,7 @@ class NGEmbed:
             return []
         if not self._ensure_model():
             raise EmbeddingUnavailableError("embedding model unavailable")
+        self._ensure_tokenizer()
 
         prefixed = [self._apply_prefix(t, is_query) for t in texts]
         encodings = self._tokenizer.encode_batch(prefixed)
@@ -330,9 +354,14 @@ class NGEmbed:
 
         if short_idx:
             short_texts = [texts[i] for i in short_idx]
-            short_vecs = self._onnx_embed_batch(
-                short_texts, normalize=normalize, is_query=is_query,
-            )
+            if self._remote_mode:
+                short_vecs = self._hf_remote_embed_batch(
+                    short_texts, normalize=normalize, is_query=is_query,
+                )
+            else:
+                short_vecs = self._onnx_embed_batch(
+                    short_texts, normalize=normalize, is_query=is_query,
+                )
             for i, vec in zip(short_idx, short_vecs):
                 results[i] = vec
 
@@ -343,8 +372,17 @@ class NGEmbed:
                 for w_ids, weight, _start, _end in self._window_token_ids(ids):
                     w_text = self._tokenizer.decode(w_ids, skip_special_tokens=True)
                     window_jobs.append((i, weight, w_ids, w_text))
-            all_ids = [job[2] for job in window_jobs]
-            vecs = self._onnx_embed_ids_batch(all_ids, normalize=False)
+            if self._remote_mode:
+                vecs = self._hf_remote_embed_batch(
+                    [job[3] for job in window_jobs],
+                    normalize=False,
+                    is_query=False,
+                    skip_prefix=True,
+                )
+            else:
+                vecs = self._onnx_embed_ids_batch(
+                    [job[2] for job in window_jobs], normalize=False,
+                )
             grouped: Dict[int, List[tuple]] = {}
             for (i, weight, _w_ids, _w_text), vec in zip(window_jobs, vecs):
                 grouped.setdefault(i, []).append((weight, vec))
@@ -370,6 +408,7 @@ class NGEmbed:
         """
         if not self._ensure_model():
             raise EmbeddingUnavailableError("embedding model unavailable")
+        self._ensure_tokenizer()
 
         prefixed = self._apply_prefix(text, is_query)
         encoding = self._tokenizer.encode(prefixed)
@@ -377,17 +416,38 @@ class NGEmbed:
         n = len(ids)
 
         if n <= _WINDOW_TOKENS:
-            vec = self._onnx_embed(text, normalize=normalize, is_query=is_query)
+            if self._remote_mode:
+                vec = self._hf_remote_embed(
+                    text, normalize=normalize, is_query=is_query,
+                )
+            else:
+                vec = self._onnx_embed(text, normalize=normalize, is_query=is_query)
             return WindowedEmbedding(pooled=vec, windows=(), token_count=n)
 
         windows: List[EmbedWindow] = []
         embeddings: List[np.ndarray] = []
         weights: List[int] = []
+        jobs = []
         for w_ids, weight, _start, _end in self._window_token_ids(ids):
             w_text = self._tokenizer.decode(w_ids, skip_special_tokens=True)
-            vec = self._onnx_embed(
-                w_text, normalize=False, is_query=False, _ids=w_ids,
+            jobs.append((w_text, w_ids, weight))
+
+        if self._remote_mode:
+            vecs = self._hf_remote_embed_batch(
+                [j[0] for j in jobs],
+                normalize=False,
+                is_query=False,
+                skip_prefix=True,
             )
+        else:
+            vecs = [
+                self._onnx_embed(
+                    w_text, normalize=False, is_query=False, _ids=w_ids,
+                )
+                for w_text, w_ids, _weight in jobs
+            ]
+
+        for (w_text, _w_ids, weight), vec in zip(jobs, vecs):
             windows.append(EmbedWindow(text=w_text, embedding=vec, token_count=weight))
             embeddings.append(vec)
             weights.append(weight)
@@ -397,6 +457,16 @@ class NGEmbed:
             pooled=pooled,
             windows=tuple(windows),
             token_count=n,
+        )
+
+    def _ensure_tokenizer(self) -> None:
+        """Load tokenizer without ONNX (needed to window in remote mode)."""
+        if self._tokenizer is not None:
+            return
+        from tokenizers import Tokenizer
+        self._tokenizer = Tokenizer.from_pretrained(self._config["model_id"])
+        self._tokenizer.enable_padding(
+            pad_id=0, pad_token="[PAD]",
         )
 
     def _apply_prefix(self, text: str, is_query: bool) -> str:
@@ -524,6 +594,118 @@ class NGEmbed:
         return self._onnx_embed_ids_batch(
             ids_list, normalize=normalize, attention_list=attn_list,
         )
+
+    def _hf_feature_extraction_url(self) -> str:
+        model_id = self._config["model_id"]
+        return (
+            "https://router.huggingface.co/hf-inference/models/"
+            f"{model_id}/pipeline/feature-extraction"
+        )
+
+    def _get_hf_token(self) -> str:
+        env_tok = os.environ.get("HF_TOKEN")
+        if env_tok:
+            return env_tok.strip()
+        path = Path.home() / ".cache" / "huggingface" / "token"
+        try:
+            file_tok = path.read_text().strip()
+        except OSError:
+            file_tok = ""
+        if not file_tok:
+            raise EmbeddingUnavailableError("HF token unavailable")
+        return file_tok
+
+    def _hf_post(
+        self,
+        url: str,
+        token: str,
+        payload: Dict[str, Any],
+        timeout: int = 30,
+    ) -> Any:
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise ConnectionError(f"HF HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise ConnectionError(str(exc.reason) if exc.reason else "url error") from exc
+
+    def _parse_hf_vector(self, raw: Any) -> np.ndarray:
+        dim = int(self._config["embedding_dim"])
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("malformed embedding response")
+        if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in raw):
+            raise ValueError("malformed embedding response")
+        if len(raw) != dim:
+            raise ValueError("malformed embedding dimension")
+        arr = np.asarray(raw, dtype=np.float32)
+        if arr.shape != (dim,) or not np.all(np.isfinite(arr)):
+            raise ValueError("malformed embedding response")
+        return arr
+
+    def _maybe_l2(self, vec: np.ndarray, normalize: bool) -> np.ndarray:
+        if not normalize:
+            return vec
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
+
+    def _hf_remote_embed(
+        self,
+        text: str,
+        normalize: bool = False,
+        is_query: bool = False,
+        _ids: Optional[Sequence[int]] = None,
+    ) -> np.ndarray:
+        payload_text = text if _ids is not None else self._apply_prefix(text, is_query)
+        token = self._get_hf_token()
+        url = self._hf_feature_extraction_url()
+        try:
+            raw = self._hf_post(url, token, {"inputs": payload_text}, timeout=30)
+            vec = self._parse_hf_vector(raw)
+        except EmbeddingUnavailableError:
+            raise
+        except Exception as exc:
+            raise EmbeddingUnavailableError(f"remote embed failed: {exc}") from exc
+        return self._maybe_l2(vec, normalize)
+
+    def _hf_remote_embed_batch(
+        self,
+        texts: List[str],
+        normalize: bool = False,
+        is_query: bool = False,
+        skip_prefix: bool = False,
+    ) -> List[np.ndarray]:
+        if not texts:
+            return []
+        payload = texts if skip_prefix else [self._apply_prefix(t, is_query) for t in texts]
+        token = self._get_hf_token()
+        url = self._hf_feature_extraction_url()
+        try:
+            raw = self._hf_post(url, token, {"inputs": payload}, timeout=30)
+            if not isinstance(raw, list) or len(raw) != len(texts):
+                raise ValueError("malformed embedding batch")
+            vecs = [self._parse_hf_vector(item) for item in raw]
+        except EmbeddingUnavailableError:
+            raise
+        except Exception as exc:
+            raise EmbeddingUnavailableError(f"remote embed failed: {exc}") from exc
+        return [self._maybe_l2(v, normalize) for v in vecs]
 
     # -- Dual-pass (Punchlist #81) -------------------------------------------
 

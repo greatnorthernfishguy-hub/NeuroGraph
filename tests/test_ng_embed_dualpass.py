@@ -137,3 +137,55 @@ def test_embed_windows_empty_on_short_input(monkeypatch):
     monkeypatch.setattr(emb, "_onnx_embed", lambda *a, **k: np.ones(768, dtype=np.float32))
     we = emb.embed_windows("hello")
     assert we.windows == ()
+
+
+def test_remote_gate_selects_remote_without_onnx(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    assert emb._ensure_model() is True
+    assert emb._remote_mode is True
+    assert emb._session is None
+
+
+def test_invalid_ng_embed_remote_raises(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "openai")
+    emb = NGEmbed()
+    with pytest.raises(EmbeddingUnavailableError):
+        emb._ensure_model()
+
+
+def test_remote_embed_uses_router_host_and_no_normalize_body(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    assert emb._ensure_model()
+    seen = {}
+    raw = [0.1] * 768
+    def fake_post(url, token, payload, timeout=30):
+        seen["url"] = url
+        seen["payload"] = payload
+        seen["token"] = token
+        return raw
+    monkeypatch.setattr(emb, "_hf_post", fake_post)
+    vec = emb._hf_remote_embed("hello", normalize=False, is_query=False)
+    assert "router.huggingface.co" in seen["url"]
+    assert "api-inference.huggingface.co" not in seen["url"]
+    assert "normalize" not in seen["payload"]
+    assert seen["payload"]["inputs"].endswith("hello") or seen["payload"]["inputs"] == "hello"
+    assert seen["token"] == "tok-test"
+    assert vec.shape == (768,)
+
+
+def test_remote_embed_applies_query_prefix_client_side(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    emb._ensure_model()
+    seen = {}
+    def fake_post(url, token, payload, timeout=30):
+        seen["inputs"] = payload["inputs"]
+        return [0.2] * 768
+    monkeypatch.setattr(emb, "_hf_post", fake_post)
+    emb._hf_remote_embed("q", normalize=False, is_query=True)
+    assert seen["inputs"].startswith(emb._config["query_prefix"])
