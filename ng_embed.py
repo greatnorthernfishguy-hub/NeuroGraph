@@ -143,6 +143,12 @@ class NGEmbed:
         self._model_loaded = False
         self._model_failed = False
         self._remote_mode = False     # True when NG_EMBED_REMOTE=hf selected the remote path
+        # Keep-warm pinger (remote mode only) -- ref-counted so overlapping callers don't
+        # fight over when the pinger stops.
+        self._keepalive_refcount = 0
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._keepalive_stop_event = threading.Event()
+        self._keepalive_lock = threading.Lock()
         self._model_lock = threading.Lock()
 
         # Dual-pass stats
@@ -173,6 +179,9 @@ class NGEmbed:
         """Destroy singleton (testing only)."""
         with cls._lock:
             if cls._instance is not None:
+                cls._instance._keepalive_stop_event.set()
+                cls._instance._keepalive_thread = None
+                cls._instance._keepalive_refcount = 0
                 cls._instance._session = None
                 cls._instance._tokenizer = None
             cls._instance = None
@@ -553,6 +562,51 @@ class NGEmbed:
                     vec = vec / norm
             vecs.append(vec)
         return vecs
+
+    def start_keepalive(self) -> None:
+        """Start (or increment refcount on) the background keep-warm pinger. No-op unless
+        NG_EMBED_REMOTE=hf. Resolves remote mode from the env var directly (NOT the lazy
+        self._remote_mode, which is only set once _ensure_model runs on the first embed) so
+        a campaign that calls this before any embed still pings. Resolves the token now so a
+        missing token fails loud here, not silently later. Never calls _ensure_model (that
+        would trigger a local ONNX load on a non-remote host, which remote mode exists to avoid)."""
+        if os.environ.get("NG_EMBED_REMOTE") != "hf":
+            return
+        self._get_hf_token()  # loud fast failure on missing token
+        self._remote_mode = True
+        with self._keepalive_lock:
+            self._keepalive_refcount += 1
+            if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
+                self._keepalive_stop_event.clear()
+                self._keepalive_thread = threading.Thread(
+                    target=self._keepalive_loop, name="ng-embed-keepalive", daemon=True,
+                )
+                self._keepalive_thread.start()
+
+    def stop_keepalive(self) -> None:
+        """Decrement the keepalive refcount; stop the pinger once it reaches zero. No-op
+        unless NG_EMBED_REMOTE=hf."""
+        if os.environ.get("NG_EMBED_REMOTE") != "hf":
+            return
+        with self._keepalive_lock:
+            self._keepalive_refcount = max(0, self._keepalive_refcount - 1)
+            if self._keepalive_refcount == 0 and self._keepalive_thread is not None:
+                self._keepalive_stop_event.set()
+                self._keepalive_thread = None
+
+    def _keepalive_loop(self) -> None:
+        """Ping every 20s to stay inside the empirically-measured 30-60s idle-eviction window."""
+        while not self._keepalive_stop_event.wait(timeout=20):
+            self._keepalive_ping_once()
+
+    def _keepalive_ping_once(self) -> None:
+        """One keep-warm ping via _hf_post directly (NOT _hf_remote_call -- a missed ping just
+        waits for the next 20s cycle rather than retrying or polluting the quarantine log).
+        Non-fatal on failure."""
+        try:
+            self._hf_post("ping")
+        except Exception as exc:
+            logger.debug("ng_embed: keepalive ping failed (non-fatal): %s", exc)
 
     def _log_failed_embed(self, inputs, exc: Exception) -> None:
         """Append one ordered quarantine record for a remote embed that exhausted retries.

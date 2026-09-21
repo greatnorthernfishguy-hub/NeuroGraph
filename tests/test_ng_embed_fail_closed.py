@@ -238,3 +238,35 @@ def test_embed_dispatches_to_remote_when_gated(monkeypatch):
     monkeypatch.setattr(emb, "_hf_post", lambda i: [0.5] * 768)
     vec = emb.embed("hello")
     assert vec.shape == (768,)
+
+
+def test_keepalive_noop_outside_remote_mode(monkeypatch):
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    emb = NGEmbed()
+    emb.start_keepalive()
+    assert emb._keepalive_refcount == 0
+    assert emb._keepalive_thread is None
+
+
+def test_keepalive_refcount_start_stop(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_get_hf_token", lambda: "tok")
+    emb.start_keepalive()
+    emb.start_keepalive()
+    assert emb._keepalive_refcount == 2
+    assert emb._keepalive_thread is not None and emb._keepalive_thread.daemon
+    emb.stop_keepalive()
+    assert emb._keepalive_refcount == 1
+    emb.stop_keepalive()
+    assert emb._keepalive_refcount == 0
+    assert emb._keepalive_thread is None
+
+
+def test_keepalive_raises_on_missing_token(monkeypatch):
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_get_hf_token",
+                        lambda: (_ for _ in ()).throw(EmbeddingUnavailableError("no token")))
+    with pytest.raises(EmbeddingUnavailableError):
+        emb.start_keepalive()
