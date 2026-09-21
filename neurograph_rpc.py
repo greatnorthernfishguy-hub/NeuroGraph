@@ -12,6 +12,16 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — §7 intra-turn window chains, graph-only
+# What: After a successful conversational dual_record_outcome, long turns deposit
+#       window nodes via _deposit_memory_node(..., index_in_recall=False), delay-chain
+#       them with the #257 sampler, and link each window to the forest both ways
+#       (0.2 / 0.15). Short turns (windows == ()) keep today's topology.
+# Why:  Josh: "We have polychrony, we use polychrony." Window order is substrate
+#       structure; mid-sentence fragments must not compete in cosine recall.
+# How:  NGEmbed.embed_windows(text); passed embedding stays the forest vector.
+#       Window ids flow into _bind_conversational_topology. embed_windows failure
+#       is isolated so forest deposit still lands.
 # [2026-09-12] Codex — #430 serialize self-start and RPC bootstrap.
 # What: Overlapping bootstrap reports initializing without a second construction.
 # Why: Self-bootstrap and stdin RPC previously raced into duplicate Syl/CC setup.
@@ -2645,11 +2655,12 @@ def _update_probation(graph) -> list:
     return graduated
 
 
-def _bind_conversational_topology(forest_id, result, forest_embedding) -> None:
+def _bind_conversational_topology(forest_id, result, forest_embedding, window_ids=None) -> None:
     """Wire the turn's experiential topology in the SNN (Ingestor-free): forest<->tree
-    synapses, a binding hyperedge for the whole turn (hypergraph engine), and a delayed
-    prev->current forest link (#257 polychrony — conversational temporal structure as
-    first-class topology). step() (STDP/calcium/DiffPC/GSG/homeostasis) refines it.
+    synapses, intra-turn window delay-chains (#257 polychrony), a binding hyperedge for
+    the whole turn (hypergraph engine), and a delayed prev->current forest link
+    (conversational temporal structure as first-class topology). step()
+    (STDP/calcium/DiffPC/GSG/homeostasis) refines it.
     """
     global _last_conv_forest_id
     if _memory is None:
@@ -2658,20 +2669,35 @@ def _bind_conversational_topology(forest_id, result, forest_embedding) -> None:
     if forest_id not in graph.nodes:
         return
     tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
+    window_ids = [w for w in (window_ids or []) if w in graph.nodes and w != forest_id]
     for tid in tree_ids:
         try:
             graph.create_synapse(forest_id, tid, weight=0.2)
             graph.create_synapse(tid, forest_id, weight=0.15)
         except Exception:  # noqa: BLE001 - synapse may already exist; non-fatal
             pass
-    if tree_ids:
+    for wid in window_ids:
+        try:
+            graph.create_synapse(forest_id, wid, weight=0.2)
+            graph.create_synapse(wid, forest_id, weight=0.15)
+        except Exception:  # noqa: BLE001 - synapse may already exist; non-fatal
+            pass
+    if tree_ids or window_ids:
         try:
             graph.create_hyperedge(
-                member_node_ids=set([forest_id] + tree_ids),
+                member_node_ids=set([forest_id] + tree_ids + window_ids),
                 metadata={"creation_mode": "conversational", "syl": True},
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("conversational hyperedge failed (non-fatal): %s", exc)
+    if len(window_ids) >= 2:
+        try:
+            import random as _rnd
+            for i in range(len(window_ids) - 1):
+                d = _rnd.randint(2, max(2, _CONV_SYNAPSE_DELAY_MAX))
+                graph.create_synapse(window_ids[i], window_ids[i + 1], weight=0.2, delay=d)
+        except Exception:  # noqa: BLE001
+            pass
     if _last_conv_forest_id and _last_conv_forest_id in graph.nodes and _last_conv_forest_id != forest_id:
         try:
             import random as _rnd
@@ -2773,19 +2799,36 @@ def _run_conversational_dual_pass(text: str, embedding: Any) -> bool:
         from ng_embed import NGEmbed
         import hashlib
         target_id = "conv::" + hashlib.sha1(text.encode()).hexdigest()
-        _result = NGEmbed.get_instance().dual_record_outcome(
+        embedder = NGEmbed.get_instance()
+        windows = ()
+        try:
+            windows = embedder.embed_windows(text).windows  # () on short turns
+        except Exception as win_exc:  # noqa: BLE001 — windows are extra topology
+            logger.debug("embed_windows failed (non-fatal, no window nodes): %s", win_exc)
+        meta = {"source": "conversation", "creation_mode": "conversational",
+                "_forest_content": text}
+        _result = embedder.dual_record_outcome(
             ecosystem=_ConversationalDualPassEco(_memory),
             content=text,
             embedding=embedding,
             target_id=target_id,
             success=True,
             strength=1.0,
-            metadata={"source": "conversation", "creation_mode": "conversational",
-                      "_forest_content": text},
+            metadata=meta,
         )
-        # Wire forest<->tree synapses, the binding hyperedge, and the #257 delayed
-        # prev->current forest link — the SNN side of the experiential memory.
-        _bind_conversational_topology(target_id, _result or {}, embedding)
+        window_ids = []
+        if windows:
+            for i, w in enumerate(windows):
+                wid = f"{target_id}::window::{i}"
+                _deposit_memory_node(
+                    wid, w.embedding, w.text,
+                    {**meta, "_window": True, "_window_index": i, "_forest_id": target_id},
+                    index_in_recall=False,
+                )
+                window_ids.append(wid)
+        # Wire forest<->tree synapses, intra-turn window chains, the binding
+        # hyperedge, and the #257 delayed prev->current forest link.
+        _bind_conversational_topology(target_id, _result or {}, embedding, window_ids=window_ids)
         return True
     except Exception as exc:
         logger.debug("Conversational dual-pass failed (non-fatal): %s", exc)
