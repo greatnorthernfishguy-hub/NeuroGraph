@@ -221,20 +221,39 @@ def test_remote_embed_uses_router_host_and_no_normalize_body(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "tok-test")
     emb = NGEmbed()
     assert emb._ensure_model()
+    assert "token" not in inspect.signature(NGEmbed._hf_post).parameters
+
+    import json
+    import urllib.request
+
     seen = {}
     raw = [0.1] * 768
-    def fake_post(url, token, payload, timeout=30):
-        seen["url"] = url
-        seen["payload"] = payload
-        seen["token"] = token
-        return raw
-    monkeypatch.setattr(emb, "_hf_post", fake_post)
+
+    class _Resp:
+        def read(self):
+            return json.dumps(raw).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=30):
+        seen["url"] = req.full_url
+        seen["payload"] = json.loads(req.data.decode("utf-8"))
+        seen["authorization"] = req.get_header("Authorization")
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     vec = emb._hf_remote_embed("hello", normalize=False, is_query=False)
     assert "router.huggingface.co" in seen["url"]
     assert "api-inference.huggingface.co" not in seen["url"]
     assert "normalize" not in seen["payload"]
     assert seen["payload"]["inputs"].endswith("hello") or seen["payload"]["inputs"] == "hello"
-    assert seen["token"] == "tok-test"
+    auth = seen["authorization"]
+    assert auth is not None and auth.startswith("Bearer ")
+    assert auth[len("Bearer "):] == os.environ["HF_TOKEN"]
     assert vec.shape == (768,)
 
 
@@ -244,7 +263,7 @@ def test_remote_embed_applies_query_prefix_client_side(monkeypatch):
     emb = NGEmbed()
     emb._ensure_model()
     seen = {}
-    def fake_post(url, token, payload, timeout=30):
+    def fake_post(url, payload, timeout=30):
         seen["inputs"] = payload["inputs"]
         return [0.2] * 768
     monkeypatch.setattr(emb, "_hf_post", fake_post)

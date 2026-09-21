@@ -23,6 +23,13 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-21] Grok 4.6 — HF token is not a _hf_post parameter (R-2).
+#   What: _hf_post reads the bearer via _get_hf_token() internally.
+#         Token is no longer a function argument (traceback locals).
+#   Why:  Lane 3 dumped a live HF token from pytest locals.
+#         Law-enforcer R-2.
+#   How:  Drop token arg; _hf_remote_call no longer threads it through.
+# -------------------
 # [2026-09-21] Grok 4.6 — CLS/SEP wrap every ONNX window (R-3).
 #   What: Window the interior (between leading CLS and trailing SEP)
 #         at 510 / overlap 64; wrap each slice as [CLS]+slice+[SEP]
@@ -683,7 +690,6 @@ class NGEmbed:
     def _hf_post(
         self,
         url: str,
-        token: str,
         payload: Dict[str, Any],
         timeout: int = 30,
     ) -> Any:
@@ -696,7 +702,7 @@ class NGEmbed:
             data=body,
             method="POST",
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {self._get_hf_token()}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
@@ -739,12 +745,11 @@ class NGEmbed:
         normalize: bool,
         parse: Callable[[Any], Any],
     ) -> Any:
-        token = self._get_hf_token()
         url = self._hf_feature_extraction_url()
         last_exc: Optional[BaseException] = None
         for delay in (1, 3, 9):
             try:
-                raw = self._hf_post(url, token, payload, timeout=30)
+                raw = self._hf_post(url, payload, timeout=30)
                 return parse(raw)
             except EmbeddingUnavailableError:
                 raise
