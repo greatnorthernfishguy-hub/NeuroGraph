@@ -1,4 +1,12 @@
 # tests/test_ng_embed_dualpass.py
+# ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B2: overlapping TID extraction windows
+# What: Assert short text is one TID call; long text windows cover the tail;
+#       union then max_concepts; any window None fails the extraction;
+#       legitimate [] still returns [].
+# Why:  text[:2000] dropped the rest of the turn from Pass 2.
+# How:  Fake requests.post; NGEmbed.__new__ so no ONNX/HF load.
+# -------------------
 import os
 import sys
 import inspect
@@ -366,3 +374,125 @@ def test_keepalive_refcount_concurrent_starts(monkeypatch):
     if emb._keepalive_thread is not None:
         emb._keepalive_thread.join(timeout=2)
         assert not emb._keepalive_thread.is_alive()
+
+
+def _extract_instance(**cfg_over):
+    emb = NGEmbed.__new__(NGEmbed)
+    cfg = dict(ng_embed_mod._DEFAULT_CONFIG)
+    cfg.update(cfg_over)
+    emb._config = cfg
+    emb._failures = 0
+    return emb
+
+
+class _TidResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._payload}}]}
+
+
+def test_extract_windows_short_is_single_window():
+    emb = _extract_instance()
+    text = "short turn"
+    assert emb._char_extract_windows(text) == [text]
+
+
+def test_extract_windows_cover_full_text_with_overlap():
+    emb = _extract_instance(max_content_for_extraction=2000, extract_window_overlap=256)
+    text = "H" * 2000 + "TAIL_MARKER_XYZ"
+    windows = emb._char_extract_windows(text)
+    assert len(windows) >= 2
+    assert windows[0] == text[:2000]
+    assert "TAIL_MARKER_XYZ" in windows[-1]
+    reconstructed = windows[0]
+    for w in windows[1:]:
+        assert w[:256] == reconstructed[-256:]
+        reconstructed = reconstructed[:-256] + w
+    assert reconstructed == text
+
+
+def test_extract_concepts_short_text_one_tid_call(monkeypatch):
+    import requests
+    emb = _extract_instance()
+    calls = []
+
+    def fake_post(url, json=None, timeout=None, **k):
+        calls.append((json["messages"][1]["content"], timeout))
+        return _TidResp('["alpha"]')
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts("hello concepts")
+    assert out == ["alpha"]
+    assert len(calls) == 1
+    assert "hello concepts" in calls[0][0]
+    assert calls[0][1] == emb._config["tid_timeout"]
+
+
+def test_extract_concepts_long_text_covers_tail(monkeypatch):
+    import requests
+    emb = _extract_instance()
+    text = "A" * 2000 + "UNIQUE_TAIL_MARKER"
+    seen_contents = []
+
+    def fake_post(url, json=None, timeout=None, **k):
+        body = json["messages"][1]["content"]
+        seen_contents.append(body)
+        return _TidResp('[]')
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out == []
+    assert len(seen_contents) >= 2
+    assert any("UNIQUE_TAIL_MARKER" in body for body in seen_contents)
+
+
+def test_extract_concepts_unions_then_caps_max_concepts(monkeypatch):
+    import requests
+    emb = _extract_instance(max_concepts=3)
+    text = "X" * 2500
+    payloads = ['["alpha", "beta"]', '["beta", "gamma", "delta"]']
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        payload = payloads[min(calls["n"], len(payloads) - 1)]
+        calls["n"] += 1
+        return _TidResp(payload)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out == ["alpha", "beta", "gamma"]
+    assert calls["n"] >= 2
+
+
+def test_extract_concepts_window_failure_returns_none(monkeypatch):
+    import requests
+    emb = _extract_instance()
+    text = "Y" * 2500
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _TidResp('["kept"]')
+        raise RuntimeError("TID down")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out is None
+    assert emb._failures >= 1
+
+
+def test_extract_concepts_all_empty_returns_empty_list(monkeypatch):
+    import requests
+    emb = _extract_instance()
+
+    def fake_post(url, json=None, timeout=None, **k):
+        return _TidResp("[]")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    assert emb._extract_concepts("Z" * 2500) == []

@@ -23,6 +23,16 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B2: overlapping TID extraction windows
+#   What: _extract_concepts no longer slices text[:2000]. Overlapping
+#         max_content_for_extraction (2000) char windows cover the full
+#         text; each window is one TID call (same per-call timeout);
+#         results are unioned then capped at max_concepts. Any window
+#         returning None fails the whole extraction (no deposit).
+#   Why:  The 2000-char slice dropped the rest of the turn from Pass 2.
+#         Forest embed()/embed_windows() path is unchanged.
+#   How:  _char_extract_windows + per-window _tid_extract_window; overlap
+#         extract_window_overlap (256). Short text (≤2000) is one call.
 # [2026-09-21] Grok 4.6 — HF token is not a _hf_post parameter (R-2).
 #   What: _hf_post reads the bearer via _get_hf_token() internally.
 #         Token is no longer a function argument (traceback locals).
@@ -172,7 +182,8 @@ _DEFAULT_CONFIG = {
 
     # Dual-pass (Punchlist #81)
     "tid_endpoint": "http://127.0.0.1:7437/v1/chat/completions",
-    "max_content_for_extraction": 2000,     # Chars sent to TID
+    "max_content_for_extraction": 2000,     # Chars per TID extraction window
+    "extract_window_overlap": 256,          # Char overlap between TID windows
     "max_concepts": 20,                     # Cap extracted concepts
     "forest_to_tree_weight": 0.4,           # Bootstrap synapse weight
     "tree_to_forest_ratio": 0.7,            # tree→forest = forest_weight * ratio
@@ -1042,20 +1053,30 @@ class NGEmbed:
         except Exception:
             pass
 
-    def _extract_concepts(self, text: str) -> Optional[List[str]]:
-        """Extract concepts from text via TID LLM call.
+    def _char_extract_windows(self, text: str) -> List[str]:
+        """Overlapping char windows covering the full text. Short text is one window."""
+        size = int(self._config["max_content_for_extraction"])
+        overlap = int(self._config.get("extract_window_overlap", 256))
+        if size <= 0 or len(text) <= size:
+            return [text]
+        overlap = max(0, min(overlap, size - 1))
+        step = max(1, size - overlap)
+        windows: List[str] = []
+        start = 0
+        n = len(text)
+        while start < n:
+            end = min(start + size, n)
+            windows.append(text[start:end])
+            if end >= n:
+                break
+            start += step
+        return windows
 
-        One LLM call per ingestion. Returns the list of concept strings (possibly empty `[]`
-        when TID legitimately found none), or **`None`** when the call itself FAILED (TID down /
-        timeout / malformed response). The None-vs-[] distinction lets the caller surface a real
-        failure instead of silently treating a broken extraction as "no concepts" (no silent
-        failures).
-        """
+    def _tid_extract_window(self, content: str) -> Optional[List[str]]:
+        """One TID call for one extraction window. None = this call failed."""
         import requests
 
-        content = text[:self._config["max_content_for_extraction"]]
         prompt = _EXTRACTION_PROMPT.format(content=content)
-
         try:
             resp = requests.post(
                 self._config["tid_endpoint"],
@@ -1078,10 +1099,7 @@ class NGEmbed:
             response_text = (
                 resp.json()["choices"][0]["message"]["content"].strip()
             )
-
-            concepts = self._parse_concepts(response_text)
-            return concepts[:self._config["max_concepts"]]
-
+            return self._parse_concepts(response_text)
         except Exception as exc:
             # Count every failure (self._failures is the cumulative truth, surfaced
             # in status). The user-facing WARNING is emitted rate-limited by the
@@ -1090,6 +1108,32 @@ class NGEmbed:
             self._failures += 1
             logger.debug("Concept extraction failed (TID): %s", exc)
             return None
+
+    def _extract_concepts(self, text: str) -> Optional[List[str]]:
+        """Extract concepts from text via TID LLM call.
+
+        Overlapping windows of `max_content_for_extraction` chars cover the
+        full text. Each window is one TID call (same per-call timeout).
+        Window results are unioned in first-seen order, then capped at
+        `max_concepts`.
+
+        Returns the list of concept strings (possibly empty `[]` when TID
+        legitimately found none), or **`None`** when any window call FAILED
+        (TID down / timeout / malformed response). The None-vs-[] distinction
+        lets the caller surface a real failure instead of silently treating a
+        broken extraction as "no concepts" (no silent failures).
+        """
+        union: List[str] = []
+        seen = set()
+        for window in self._char_extract_windows(text):
+            concepts = self._tid_extract_window(window)
+            if concepts is None:
+                return None
+            for concept in concepts:
+                if concept not in seen:
+                    seen.add(concept)
+                    union.append(concept)
+        return union[: self._config["max_concepts"]]
 
     def _extraction_warn_due(self) -> int:
         """Rate-limit the forest-only degradation warning. Returns the number of
