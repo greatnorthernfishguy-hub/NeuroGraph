@@ -56,6 +56,12 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B4: drop forest-only fallback sentence
+#   What: dual_record_outcome docstring no longer says it falls back to
+#         single-pass (forest only) if TID is unavailable.
+#   Why:  Dual-pass is atomic or there is no deposit. Forest-only is not
+#         a degraded mode. This method stays a thin delegator.
+#   How:  Delete that sentence. No behavior change.
 # [2026-02-22] Claude (Sonnet 4.6) — Initial creation.
 #   What: NGEcosystem class — singleton wrapper implementing the
 #         standardized E-T Systems optional integration protocol.
@@ -498,8 +504,6 @@ class NGEcosystem:
         Pass 1: record_outcome() with the forest embedding (standard).
         Pass 2: Extract concepts via TID → embed each → record_outcome()
                  per tree → create forest→tree substrate links.
-
-        Falls back to single-pass (forest only) if TID unavailable.
 
         Args:
             content: Raw text (for concept extraction in Pass 2).
