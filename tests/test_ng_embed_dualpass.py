@@ -1,5 +1,9 @@
 # tests/test_ng_embed_dualpass.py
 # ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B6: repo-required changelog header
+# What: This file now carries the changelog header the repo requires.
+# Why:  It previously started at imports.
+# How:  Header opened with B2/B3 test landings; this entry closes B6.
 # [2026-09-22] Grok 4.6 — punchlist-001 B3: openclaw_adapter has no _hash_embed
 # What: Assert OpenClawAdapter has no _hash_embed method and the source
 #       contains no def _hash_embed / self._hash_embed call.
