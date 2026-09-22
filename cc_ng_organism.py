@@ -3,6 +3,16 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-22] Claude Code — correct stale Leg1 rationale comment (source, LAW 4).
+# What: Update the 2026-07-27 Leg1 changelog entry's "Why" (and its header) to
+#   reflect the current laptop/VPS embedding and Tonic responsibilities.
+# Why: Josh ruled on 2026-09-22 that the laptop's RAM upgrade removes the constraint
+#   that kept it from running the Tonic. The old comment ("laptop does zero embedding
+#   by design ... VPS is the sole Arborist for both hemispheres") had become false and
+#   was misdirecting architecture decisions. LAW 4: fix the stale claim at its source
+#   in this file, not in downstream consumers.
+# How: Reword the Leg1 header and "Why" paragraph only; no code or behavior change.
+# [2026-09-16] Claude Code (Opus 5) — bound want extraction and want rendering.
 # [2026-09-16] Claude Code (Opus 5) — bound want extraction and want rendering.
 # What: _WANT_RE caps the captured span at WANT_MAX_CHARS (600); surface_wants
 #   skips `[WANT]` preceded by a backtick (documentation of the marker) and any
@@ -133,7 +143,7 @@
 #   import_trickle (cc-ng-sync.py). Gate CC_CALLOSUM_LEG1_ENABLED unchanged, default off.
 #   Ref: docs/reports/Topology_Merge_Insights_from_FatherGraph_Training.md
 # [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70): raw-turn
-#   conduit, laptop -> VPS Arborist
+#   conduit between hemispheres
 # What: New cc_gateway_conduit_dir()/trickle_gateway_conduit()/drain_gateway_
 #   conduit() in the same region as cc_gateway_tract_path()/drain_ingest_tract().
 #   trickle_gateway_conduit(data) writes a snapshot of the laptop's cc_gateway
@@ -144,12 +154,13 @@
 #   drain_ingest_tract() (unchanged), then deletes the now-emptied file.
 # Why: Retires the lossy top-N JSONL sync (cc-ng-sync.py: content-only, capped
 #   at EXPORT_SIZE, re-embedded via on_message() with no synapses/hyperedges/
-#   tree structure). The laptop does zero embedding by design (no forest, no
-#   tree, no TID) -- the VPS is the sole Arborist for both hemispheres. This
-#   is the pipe that gets the laptop's raw BTF conversation frames onto the
-#   VPS so they hit the same run_conversational_dual_pass() the VPS already
-#   runs for its own local tract. Spec: docs/superpowers/plans/2026-07-27-
-#   cc-corpus-callosum-leg1-spec.md.
+#   tree structure). After the laptop's RAM upgrade (Josh, 2026-09-22), the
+#   laptop is no longer constrained from running the Tonic; each hemisphere can
+#   run its own Arborist (forest/tree/TID embedding). Leg 1 remains the pipe
+#   that carries raw BTF conversation frames between hemispheres when enabled,
+#   but it is no longer justified by "the laptop cannot embed." Spec:
+#   docs/superpowers/plans/2026-07-27-cc-corpus-callosum-leg1-spec.md
+#   (superseded in part by CC-CALLOSUM-TRUTH.md and Josh's 2026-09-22 ruling).
 # How: Per-batch filenames (not a shared append/truncate target) sidestep the
 #   binary-merge-conflict scenario a single conduit file would hit under
 #   repo-sync.sh's git push/pull cycle (git can't line-merge BTF) -- each
