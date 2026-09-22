@@ -1,6 +1,16 @@
 """
 Wire Absorption — sensory-deposit path for raw HTTP wire events.
 # ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B5: sentinel is a skip, not forest-only dual-pass
+#   What: Recursion guard on _CONCEPT_SENTINEL still skips tree extraction.
+#         Comments no longer describe that skip as a successful forest-only
+#         dual-pass. absorb_trees_for_entry still returns empty trees.
+#         Meta-deposit still uses the existing BTF River path; no second
+#         deposit path and no dual_record_outcome on sentinel content.
+#   Why:  Forest-only is not a degraded dual-pass outcome. Sentinel content
+#         is a loop-break, not a completed Pass-1-only dual-pass.
+#   How:  Restore comments at absorb_trees_for_entry and the inner
+#         is_meta_deposit branch. Behavior of the skip is unchanged.
 # [2026-06-04] Claude Code (Sonnet 4.6) — #264: stop inserting wire/wire_expansion into vector_db
 #   What: Removed vector_db.insert() from batch_absorb_forests (wire event nodes) and
 #         expand_body_file (wire_expansion chunk nodes). SNN graph.create_node() and
@@ -385,7 +395,8 @@ def batch_absorb_forests(
 # Sentinel for recursion detection — concept-extraction TID calls
 # produce wire deposits that get re-absorbed.  If the wire body
 # contains this prompt fragment, it's a meta-deposit from our own
-# concept extraction — skip trees, record forest only.
+# concept extraction — skip tree extraction (loop-break, not a
+# completed dual-pass).
 _CONCEPT_SENTINEL = "You extract concepts from text"
 
 
@@ -407,7 +418,7 @@ def absorb_trees_for_entry(
     result = {"tree_ids": [], "concepts": [], "trees_created": 0}
 
     if _CONCEPT_SENTINEL in content_preview:
-        return result  # recursion guard — meta-deposit, no trees
+        return result  # recursion guard: skip trees; not a dual-pass completion
 
     peer_bridge = getattr(memory, "_peer_bridge", None)
     if peer_bridge is None:
@@ -711,7 +722,8 @@ def absorb_wire_deposit(
     # captures outbound → scan-drain absorbs → dual_record_outcome again.
     # Break: if the wire body contains the concept-extraction system prompt
     # ("You extract concepts from text"), this IS a meta-deposit from our
-    # own tree-extraction path. Forest-only for those, no TID call.
+    # own tree-extraction path. Skip dual_record_outcome (no TID call).
+    # That skip is a loop-break, not a completed forest-only dual-pass.
     _CONCEPT_SENTINEL = "You extract concepts from text"
 
     # Workstream 2 (#274, 2026-05-31): peer_bridge dependency removed. Meta-deposit
@@ -725,7 +737,9 @@ def absorb_wire_deposit(
     is_meta_deposit = _CONCEPT_SENTINEL in content[:2000]
 
     if is_meta_deposit:
-        # Forest only — no tree extraction, breaks recursion. BTF River deposit per PRD §4.13.
+        # Skip tree extraction / dual_record_outcome — recursion guard.
+        # Existing event node stands. BTF River deposit is that event's
+        # backflow (PRD §4.13), not a forest-only dual-pass.
         try:
             from neurograph_rpc import _deposit_outcome_to_river
             _deposit_outcome_to_river(fingerprint_emb, event_node_id, True, event_meta)
