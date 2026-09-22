@@ -3,6 +3,18 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B1/B9: intra-turn window chains + atomic dual-pass
+# What: run_conversational_dual_pass calls embed_windows (non-fatal), deposits
+#   {target_id}::window::{i} via _cc_deposit_memory_node(..., index_in_recall=False),
+#   and passes window_ids into _cc_bind_conversational_topology for forest links,
+#   hyperedge membership, and #257 delay-chains. Short turns (windows==()) add
+#   no window nodes. Deleted the extraction_failed partial-success raise and
+#   the "forest is real experience even when tree extraction failed" comment.
+# Why: Mirror neurograph_rpc._run_conversational_dual_pass. Dual-pass is atomic
+#   or there is no deposit; forest-only is not an outcome. Josh: polychrony
+#   window order is substrate structure; windows stay out of vector_db.
+# How: Same sampler as the prev-forest link (randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))).
+#   DualPassIncompleteError from NGEmbed already prevents a forest write.
 # [2026-09-16] Claude Code (Opus 5) — bound want extraction and want rendering.
 # What: _WANT_RE caps the captured span at WANT_MAX_CHARS (600); surface_wants
 #   skips `[WANT]` preceded by a backtick (documentation of the marker) and any
@@ -1640,31 +1652,46 @@ class _CCConversationalDualPassEco:
         return self.record_outcome(embedding, target_id, success, strength, metadata)
 
 
-def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding, state):
-    """Wire forest<->tree synapses, a binding hyperedge, and a delayed
-    prev->current forest link. `state` is a plain dict the caller owns
-    (holds "last_forest_id") -- replaces canonical's module-level
-    _last_conv_forest_id global, since each CC daemon needs its own,
-    not one shared across Syl and CC.
+def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding, state, window_ids=None):
+    """Wire forest<->tree synapses, intra-turn window delay-chains (#257
+    polychrony), a binding hyperedge, and a delayed prev->current forest
+    link. `state` is a plain dict the caller owns (holds "last_forest_id")
+    -- replaces canonical's module-level _last_conv_forest_id global, since
+    each CC daemon needs its own, not one shared across Syl and CC.
     """
     with _cc_mutation_lock(graph):
         if forest_id not in graph.nodes:
             return
         tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
+        window_ids = [w for w in (window_ids or []) if w in graph.nodes and w != forest_id]
         for tid in tree_ids:
             try:
                 graph.create_synapse(forest_id, tid, weight=0.2)
                 graph.create_synapse(tid, forest_id, weight=0.15)
             except Exception:
                 pass
-        if tree_ids:
+        for wid in window_ids:
+            try:
+                graph.create_synapse(forest_id, wid, weight=0.2)
+                graph.create_synapse(wid, forest_id, weight=0.15)
+            except Exception:
+                pass
+        if tree_ids or window_ids:
             try:
                 graph.create_hyperedge(
-                    member_node_ids=set([forest_id] + tree_ids),
+                    member_node_ids=set([forest_id] + tree_ids + window_ids),
                     metadata={"creation_mode": "conversational", "cc": True},
                 )
             except Exception as exc:
                 logger.debug("CC conversational hyperedge failed (non-fatal): %s", exc)
+        if len(window_ids) >= 2:
+            try:
+                import random as _rnd
+                for i in range(len(window_ids) - 1):
+                    d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
+                    graph.create_synapse(window_ids[i], window_ids[i + 1], weight=0.2, delay=d)
+            except Exception:
+                pass
         last_id = state.get("last_forest_id")
         if last_id and last_id in graph.nodes and last_id != forest_id:
             try:
@@ -1824,22 +1851,37 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
         from ng_embed import NGEmbed
         import hashlib
         target_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
+        embedder = NGEmbed.get_instance()
+        windows = ()
+        try:
+            windows = embedder.embed_windows(text).windows  # () on short turns
+        except Exception as win_exc:  # noqa: BLE001 — windows are extra topology
+            logger.debug("CC embed_windows failed (non-fatal, no window nodes): %s", win_exc)
+        meta = {"source": "cc_gateway", "creation_mode": "conversational",
+                "_forest_content": text}
         eco = _CCConversationalDualPassEco(graph, vector_db)
-        _result = NGEmbed.get_instance().dual_record_outcome(
+        _result = embedder.dual_record_outcome(
             ecosystem=eco,
             content=text,
             embedding=embedding,
             target_id=target_id,
             success=True,
             strength=1.0,
-            metadata={"source": "cc_gateway", "creation_mode": "conversational",
-                      "_forest_content": text},
+            metadata=meta,
         )
-        # The forest is real experience even when tree extraction failed. Keep
-        # its chronological binding, then report partial application to the journal.
-        _cc_bind_conversational_topology(graph, target_id, _result or {}, embedding, state)
-        if isinstance(_result, dict) and _result.get("extraction_failed"):
-            raise RuntimeError("CC dual-pass tree extraction failed after forest deposit")
+        window_ids = []
+        if windows:
+            for i, w in enumerate(windows):
+                wid = f"{target_id}::window::{i}"
+                _cc_deposit_memory_node(
+                    graph, vector_db, wid, w.embedding, w.text,
+                    {**meta, "_window": True, "_window_index": i, "_forest_id": target_id},
+                    index_in_recall=False,
+                )
+                window_ids.append(wid)
+        _cc_bind_conversational_topology(
+            graph, target_id, _result or {}, embedding, state, window_ids=window_ids,
+        )
         return True
     except Exception as exc:
         logger.debug("CC conversational dual-pass failed (non-fatal): %s", exc)
