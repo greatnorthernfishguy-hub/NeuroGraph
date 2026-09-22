@@ -1,5 +1,10 @@
 # tests/test_ng_embed_dualpass.py
 # ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B3: openclaw_adapter has no _hash_embed
+# What: Assert OpenClawAdapter has no _hash_embed method and the source
+#       contains no def _hash_embed / self._hash_embed call.
+# Why:  384-dim hash vectors are forbidden; modules call ng_embed or raise.
+# How:  inspect.getsource(openclaw_adapter).
 # [2026-09-22] Grok 4.6 — punchlist-001 B2: overlapping TID extraction windows
 # What: Assert short text is one TID call; long text windows cover the tail;
 #       union then max_concepts; any window None fails the extraction;
@@ -36,6 +41,14 @@ def test_hash_embed_symbol_does_not_exist():
     assert "_hash_embed" not in src
     assert "sha384" not in src.lower()
     assert "NG_EMBED_ALLOW_HASH_FALLBACK" not in src
+
+
+def test_openclaw_adapter_has_no_hash_embed():
+    import openclaw_adapter as oc
+    assert not hasattr(oc.OpenClawAdapter, "_hash_embed")
+    src = inspect.getsource(oc)
+    assert "def _hash_embed" not in src
+    assert "self._hash_embed" not in src
 
 
 def test_embed_raises_when_model_unavailable(monkeypatch):
