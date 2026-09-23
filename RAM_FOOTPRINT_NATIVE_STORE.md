@@ -1,4 +1,21 @@
 <!-- ---- Changelog ----
+# 2026-09-23 Z8 zone manager (Claude Sonnet 5) — CORRECTED: deploy state was stale, not "unverified"
+# What: §13's "Deploy state to Syl: UNVERIFIED" / "committed on-branch is NOT deployed" framing
+#       was 27 days stale. It is superseded by §14 below: the native store IS deployed and
+#       live on Syl's VPS production sidecar, confirmed two independent ways.
+# Why: Executive Packet 050's VPS-gate audit line ("native store: zero deployed") was read
+#      as current by a zone brief without re-verification, contradicting zone-return-003
+#      (syl-ram-footprint-20260921, 2026-09-22) which already had the live-since-2026-08-25 /
+#      approved-2026-09-07 evidence. Chief-003 ruled the contradiction resolves via live-state
+#      verification, not by picking a document (Zone Manager Standing Charter §2 item 7). This
+#      is that verification, done fresh rather than inherited from either source.
+# How: (1) confirmed the 4 store-wiring commits (7c5aef6/5770343/0f5447f/da5c16e) are ancestors
+#      of `main`, and `main` HEAD is 71f5d53 — the exact commit health-report-002.md (VPS
+#      health observation, 2026-09-23) cites as the VPS sidecar's running git commit for BOTH
+#      live checkpoint paths; (2) `git show main:neuro_foundation.py` at that commit contains
+#      `import ng_tract` and `self.synapses = ng_tract.SynapseStore()` — not reverted, not
+#      still-uncommitted. See §14 for the full note; §13 text is left in place as history.
+#
 # 2026-08-26 CC (Opus 4.8) — RECONCILED TO LIVE GIT + baseline hygiene
 # What: (1) §13 was stale — it narrated the native SynapseStore wiring as
 #       "uncommitted, not deployed." It is COMMITTED on feat/shrink-syl-footprint:
@@ -39,7 +56,7 @@
 > "#119" means — you probably have it backwards. Keep reading.
 
 **Owner:** Josh (sole architect). **Author of this doc:** CC-VPS.
-**Last updated:** 2026-08-26. **Keep this date current on every edit.**
+**Last updated:** 2026-09-23 (§14 added — deploy state corrected from "unverified" to confirmed live). **Keep this date current on every edit.**
 
 ---
 
@@ -445,6 +462,23 @@ eligibility_trace=0.0, creation_time=0.0, synapse_type=SynapseType[name]
 (default "EXCITATORY"), peak_weight=**weight** (NOT 0.1 — defaults to the
 synapse's own weight), low_weight_steps=0, inactive_steps=0, metadata={},
 salience=1.0`. Dataclass field order (nf.py:682-705) equals the column order.
+
+---
+
+## 14. VERIFIED LIVE — 2026-09-23 (supersedes §13's "UNVERIFIED" deploy-state line)
+
+**§13 is stale, not current.** It correctly recorded the 2026-08-26 state — wiring committed, deploy unverified from a dev box with no visibility into the VPS. That is no longer the state. Two independent checks confirm the native store is deployed and live on Syl's actual production sidecar:
+
+1. **Commit-hash cross-reference.** `health-report-002.md` (VPS NeuroGraph health observation, `handoffs/vps-neurograph-health-20260922/returns/`, 2026-09-23) reports the VPS sidecar's running git commit as `71f5d53` for both live checkpoint paths (`.claude/plugins/neurograph/checkpoints/` and `data/checkpoints/`). That is this repo's current `main` HEAD. All four store-wiring commits (`7c5aef6`, `5770343`, `0f5447f`, `da5c16e`) are ancestors of it (`git merge-base --is-ancestor`, verified clean).
+2. **Source inspection at that exact commit.** `git show main:neuro_foundation.py` contains `import ng_tract  # native (Rust) SynapseStore` (line 537) and `self.synapses = ng_tract.SynapseStore()` (line 1623) — not reverted, not still sitting uncommitted in a working tree.
+
+**This settles the question §9/§13 left open for Josh only in the sense that the deploy already happened** — it does not retroactively grant the §10 gate for anything not yet done. Nothing here authorizes skipping Syl's Law on any *future* protected-file edit; it only corrects the record on what is *already* running.
+
+**What this does NOT verify (still open, not yet confirmed):**
+- Whether the RSS reduction promised in §2 (~18GB → ~1× the ~3.2GB logical size) is actually realized at runtime. The one RSS reading taken this cycle (`~8.8GB`, health-report-002 §7/§8) is **struck as a data point** (Executive Packet 062 item 2) — it was taken from a sidecar PID only ~4h old after a mass OOM-kill, against a 12.6h-uptime baseline, an apples-to-oranges comparison. A genuine two-cycle, comparable-uptime RSS confirmation is still outstanding — this is the Z8 zone's next concrete step (`z8-syl-ram-vps-20260923`), not yet done as of this edit.
+- Whether increment 4 (§6.4, `he_prediction_window_fired` drop, ~2GB RSS) is also on `main` — not checked as part of this pass; grep `neuro_foundation.py` for it before assuming.
+
+---
 
 <!-- Related memory files (agent memory, machine-local):
      project_rust_substrate_layer  (#119 = the CORRECT native-Rust meaning)
