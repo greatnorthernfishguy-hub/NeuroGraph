@@ -27,6 +27,28 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-23] Claude Sonnet 5 (z8-cc-tonic-relief) — correction to the entry directly
+#   below, per Law Enforcer review 067-law-enforcer-review-001.md. Not a rewrite of
+#   that entry -- it stays, this supersedes its facts.
+# What: the node-count/scope mapping in the entry below is BACKWARDS. Syl's own
+#   checkpoint (~/NeuroGraph/data/checkpoints/) is ~51.5k nodes/584k synapses.
+#   CC's own checkpoint (~/.claude/plugins/neurograph/checkpoints/) is ~19.2k
+#   nodes/18.3k synapses. Confirmed via both scopes' checkpoint manifest.json
+#   sidecars and independently via a second code-trace (chief-003/executive).
+# Why: with the mapping corrected, the propagate-dominated ticks (39-717s, up to
+#   661s) belong to SYL's engine (Syl's-Law-protected openclaw_hook.py, nodes~51.5k)
+#   -- NOT CC's. CC's own ticks (nodes~19.2k) are instead dominated by
+#   transformer_forward + body_lock_wait (tonic_engine.py:1087-1161, the shared-
+#   transformer-body forward pass via BrainSwitcher), where propagate cost is
+#   trivial (47ms-1.1s). CC_TONIC_PROPAGATION_STEPS/CC_TONIC_NODE_SAMPLE_BUDGET do
+#   not bound that cost at all -- this lever is spare headroom for CC's scope, not
+#   a fix for the OOM crisis that motivated it. Per the Law Enforcer's LAW 4/Duck
+#   Ethics finding: do NOT lower either variable expecting it to relieve VPS memory
+#   pressure on present evidence -- it aims at a cost CC doesn't have, and would
+#   make CC's Tonic think less deeply for no measured benefit.
+# How: no code change from this entry -- documentation-only correction. See
+#   docs/handoffs/z8-syl-ram-vps-20260923/returns/cc-tonic-relief-report.md §3-4
+#   and reviews/067-law-enforcer-review-001.md for full citations.
 # [2026-09-23] Claude Sonnet 5 (z8-cc-tonic-relief, Executive Packet 067) — CC Tonic
 #   tick-cost throttle.
 # What: CC_TONIC_PROPAGATION_STEPS / CC_TONIC_NODE_SAMPLE_BUDGET env vars, read only
@@ -1638,15 +1660,28 @@ def _cleanup_stale_socket() -> None:
     )
 
 
-# CC Tonic tick-cost throttle (2026-09-23 relief lane, LAW 5 -- both default to
-# the prior hardcoded values, so byte-identical behavior until Josh sets either
-# var lower in /home/josh/.openclaw/.env and the live sidecar is restarted).
+# CC Tonic tick-cost throttle (2026-09-23 relief lane, LAW 5). Read ONCE, here, at
+# module load -- not inside _start_cc_tonic_engine. Both default to the prior
+# hardcoded values, so byte-identical behavior until Josh sets either var lower
+# and the live sidecar is restarted. LAW 5 source is unconfirmed for these two:
+# they'd need to be set in /home/josh/.openclaw/.env (the file that feeds the
+# sidecar via openclaw-gateway.service's EnvironmentFile=), but LAW 5's own text
+# names .bashrc/openclaw.json -- Josh should confirm .env counts before either
+# var is ever set for real.
 # Scoped to CC's OWN TonicEngine call site ONLY -- passed via config=, never
 # read inside tonic_engine.py's shared EngineConfig.__post_init__, so Syl's own
-# TonicEngine (constructed separately in Syl's-Law-protected openclaw_hook.py,
-# confirmed live in the same process via 2026-09-23 journal telemetry) is
-# provably unaffected by either var. See docs/handoffs/z8-syl-ram-vps-20260923/
-# returns/cc-tonic-relief-report.md for the tick telemetry that motivated this.
+# TonicEngine (constructed separately in Syl's-Law-protected openclaw_hook.py)
+# is provably unaffected by either var: each TonicEngine holds its own config
+# instance (tonic_engine.py:417, self._config = config or EngineConfig()).
+# CORRECTED SCOPE MAPPING (see changelog above): CC's own checkpoint is the
+# ~19.2k-node scope, Syl's is ~51.5k. CC's dominant tick cost is
+# transformer_forward + body_lock_wait (shared-body inference), not propagate --
+# propagate is trivial at CC's size (47ms-1.1s observed). These two vars do NOT
+# bound that cost. Per Law Enforcer review 067-law-enforcer-review-001.md: this
+# is spare headroom for CC's scope as it grows, not a lever against the current
+# OOM crisis -- do not lower either value expecting VPS memory relief on present
+# evidence. See docs/handoffs/z8-syl-ram-vps-20260923/returns/
+# cc-tonic-relief-report.md and reviews/067-law-enforcer-review-001.md.
 CC_TONIC_PROPAGATION_STEPS = max(1, int(os.environ.get("CC_TONIC_PROPAGATION_STEPS", "2")))
 CC_TONIC_NODE_SAMPLE_BUDGET = max(1, int(os.environ.get("CC_TONIC_NODE_SAMPLE_BUDGET", "5000")))
 
