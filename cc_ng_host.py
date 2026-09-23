@@ -27,6 +27,27 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-23] Claude Sonnet 5 (z8-cc-tonic-relief, Executive Packet 067) — CC Tonic
+#   tick-cost throttle.
+# What: CC_TONIC_PROPAGATION_STEPS / CC_TONIC_NODE_SAMPLE_BUDGET env vars, read only
+#   inside _start_cc_tonic_engine, passed to CC's TonicEngine via config= (never
+#   through tonic_engine.py's shared EngineConfig.__post_init__). Both default to
+#   the previously hardcoded values (2, 5000) — no behavior change until Josh sets
+#   either lower in the live .env and the sidecar is restarted.
+# Why: VPS OOM sweep (03:03 UTC 2026-09-23, swap peaked 9.0 GiB, 9 procs killed).
+#   Live journal telemetry (this cycle) shows CC-scope Tonic ticks (nodes~51.5k)
+#   running 39-717s against a 30s budget, dominated by the propagate stage
+#   (up to 661s) — prime_and_propagate's O(n) inner loop over CC's graph size at
+#   propagation_steps=2. Syl's own scope (nodes~19k, separate TonicEngine instance
+#   in openclaw_hook.py, confirmed live in the same journal) is also over budget but
+#   dominated by transformer_forward/body_lock_wait, not propagate — a different
+#   problem, out of this lane's CC-only scope.
+# How: node_sample_budget's O(n) list(graph.nodes.items()) dict-copy is cheap even
+#   at 51.5k nodes (60-380ms observed) so it wasn't the active bottleneck, but it's
+#   wired identically for parity/headroom as CC's scope keeps growing. Neither var
+#   touches neuro_foundation.py (Syl's-Law protected) or reduces tick frequency —
+#   throttle, never stop. Full report: docs/handoffs/z8-syl-ram-vps-20260923/
+#   returns/cc-tonic-relief-report.md.
 # [2026-09-13] Codex — expose read-only topology-built provider context.
 # What: add the provider_context socket verb through the shared Pith assembler.
 # Why: miniTID needs a fresh situational model rather than ranked memory snippets.
@@ -1617,6 +1638,19 @@ def _cleanup_stale_socket() -> None:
     )
 
 
+# CC Tonic tick-cost throttle (2026-09-23 relief lane, LAW 5 -- both default to
+# the prior hardcoded values, so byte-identical behavior until Josh sets either
+# var lower in /home/josh/.openclaw/.env and the live sidecar is restarted).
+# Scoped to CC's OWN TonicEngine call site ONLY -- passed via config=, never
+# read inside tonic_engine.py's shared EngineConfig.__post_init__, so Syl's own
+# TonicEngine (constructed separately in Syl's-Law-protected openclaw_hook.py,
+# confirmed live in the same process via 2026-09-23 journal telemetry) is
+# provably unaffected by either var. See docs/handoffs/z8-syl-ram-vps-20260923/
+# returns/cc-tonic-relief-report.md for the tick telemetry that motivated this.
+CC_TONIC_PROPAGATION_STEPS = max(1, int(os.environ.get("CC_TONIC_PROPAGATION_STEPS", "2")))
+CC_TONIC_NODE_SAMPLE_BUDGET = max(1, int(os.environ.get("CC_TONIC_NODE_SAMPLE_BUDGET", "5000")))
+
+
 def _start_cc_tonic_engine(ng) -> bool:
     """Start CC's existing Tonic mechanism without allocating a transformer.
 
@@ -1631,9 +1665,13 @@ def _start_cc_tonic_engine(ng) -> bool:
         return True
     engine = None
     try:
-        from tonic_engine import TonicEngine
+        from tonic_engine import TonicEngine, EngineConfig
         from cc_ng_organism import pith_prefetch_seed
-        engine = TonicEngine(ng.graph, ng.vector_db, tt, require_shared_body=True)
+        config = EngineConfig(
+            propagation_steps=CC_TONIC_PROPAGATION_STEPS,
+            node_sample_budget=CC_TONIC_NODE_SAMPLE_BUDGET,
+        )
+        engine = TonicEngine(ng.graph, ng.vector_db, tt, config=config, require_shared_body=True)
         engine.set_prefetch_seed(lambda: pith_prefetch_seed(_STATE.conv_state))
         engine.start()
         tt.set_latent_engine(engine)
