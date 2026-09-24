@@ -58,8 +58,8 @@ class MockVectorDB:
         self.hits = hits or []
         
     def search(self, *args, **kwargs):
-        # Returns list of (node_id, score, index)
-        return [(hit[0], hit[1], i) for i, hit in enumerate(self.hits)]
+        # Returns list of (node_id, score)
+        return [(hit[0], hit[1]) for hit in self.hits]
         
     def get(self, node_id, *args, **kwargs):
         return {"metadata": {}, "source": "", "text": ""}
@@ -387,26 +387,36 @@ def test_env_vars_custom():
 
 
 def test_region_confidence_basic():
-    mock_graph = MockGraph()
-    mock_vector_db = MockVectorDB(hits=[('n1', 0.9), ('n2', 0.8)])
-    
-    # Create some mock synapses
-    s1 = MockSynapse('s1', 'n1', 't1', weight=0.9, max_weight=1.0)
-    s2 = MockSynapse('s2', 'n1', 't2', weight=0.4, max_weight=1.0)
-    s3 = MockSynapse('s3', 'n2', 't3', weight=0.7, max_weight=1.0)
-    
-    mock_graph.synapses = {'s1': s1, 's2': s2, 's3': s3}
-    mock_graph._outgoing = {'n1': ['s1', 's2'], 'n2': ['s3']}
-    mock_graph._synapse_confirmation_history = {}
-    
-    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-    
-    # Expected confidences: 
-    # s1: 0.9/1.0*0.6 + 0.5*0.4 = 0.54 + 0.2 = 0.74
-    # s2: 0.4/1.0*0.6 + 0.5*0.4 = 0.24 + 0.2 = 0.44
-    # s3: 0.7/1.0*0.6 + 0.5*0.4 = 0.42 + 0.2 = 0.62
-    # All >= 0.3 threshold, so average = (0.74 + 0.44 + 0.62) / 3 = 0.6
-    assert 0.59 <= conf <= 0.61
+    # Patch all region confidence constants
+    with patch.multiple(cc,
+                       _CC_PITH_REGION_CONFIDENCE_ENABLED=True,
+                       _CC_PITH_REGION_CONFIDENCE_K=10,
+                       _CC_PITH_REGION_CONFIDENCE_THRESHOLD=0.3,
+                       _CC_PITH_REGION_CONFIDENCE_NEUTRAL=0.5):
+        mock_graph = MockGraph()
+        # Three hit nodes that will have synapses between them
+        mock_vector_db = MockVectorDB(hits=[('n1', 0.9), ('n2', 0.8), ('n3', 0.7)])
+        
+        # Create synapses BETWEEN hit nodes (Scope 1: synapses among nearest nodes)
+        s1 = MockSynapse('s1', 'n1', 'n2', weight=0.9, max_weight=1.0)
+        s2 = MockSynapse('s2', 'n1', 'n3', weight=0.4, max_weight=1.0)
+        s3 = MockSynapse('s3', 'n2', 'n3', weight=0.7, max_weight=1.0)
+        
+        mock_graph.synapses = {'s1': s1, 's2': s2, 's3': s3}
+        mock_graph._outgoing = {'n1': ['s1', 's2'], 'n2': ['s3']}  # n2→n3
+        mock_graph._synapse_confirmation_history = {}
+        
+        conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+        
+        # Compute expected confidences using MockGraph._compute_prediction_confidence formula:
+        # weight/max_weight * 0.6 + confirmation_rate * 0.4
+        # confirmation_rate defaults to 0.5 when no history
+        
+        # s1: 0.9/1.0*0.6 + 0.5*0.4 = 0.54 + 0.2 = 0.74
+        # s2: 0.4/1.0*0.6 + 0.5*0.4 = 0.24 + 0.2 = 0.44  
+        # s3: 0.7/1.0*0.6 + 0.5*0.4 = 0.42 + 0.2 = 0.62
+        # All >= 0.3 threshold, so average = (0.74 + 0.44 + 0.62) / 3 = 0.6
+        assert 0.59 <= conf <= 0.61
 
 
 def test_region_confidence_empty():
@@ -537,17 +547,19 @@ def test_cc_l1_budget_min_max_clamp():
 
 
 def test_cc_l1_budget_sympathetic_scales_down():
-    """Test that SYMPATHETIC arousal scales down by 0.5x."""
+    """Test that SYMPATHETIC arousal scales down by _CC_PITH_BREATHE_SYMPATHETIC factor."""
     with patch.multiple(cc,
                        _CC_PITH_L1_BUDGET=4000,
-                       _CC_PITH_L1_BREATHE=False,
+                       _CC_PITH_L1_BREATHE=True,  # Breathing must be ON for scaling
+                       _CC_PITH_BREATHE_SYMPATHETIC=0.6,  # Default is 0.6, not 0.5
                        _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
         
         mock_commons = Mock()
         mock_commons.read_arousal.return_value = "SYMPATHETIC"
         
         budget = cc.cc_l1_budget(mock_commons)
-        assert budget == 2000  # 4000 * 0.5
+        # 4000 * 0.6 = 2400 (not 2000)
+        assert budget == 2400
 
 
 def test_cc_l1_budget_parasympathetic_scales_up():
