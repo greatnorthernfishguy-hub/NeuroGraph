@@ -3,6 +3,13 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-24] Grok (groupb-pith-cacheline-unknown-default-001) — honest CacheLine coherence default.
+# What: CacheLine.coherence defaults to "unknown" instead of "exclusive".
+# Why: Pith PRD — missing coherence evidence is unknown, never an inferred
+#   exclusive state. from_surfaced never set the field, so inbound recall and
+#   victim re-injection carried "exclusive" with no evidence (LAW 4, at source).
+# How: one dataclass default. No consumer override, no vocabulary change.
+#   pith_victim_capture still drops the field; recover therefore returns unknown.
 # [2026-09-16] Claude Code (Opus 5) — bound want extraction and want rendering.
 # What: _WANT_RE caps the captured span at WANT_MAX_CHARS (600); surface_wants
 #   skips `[WANT]` preceded by a backtick (documentation of the marker) and any
@@ -3188,7 +3195,8 @@ class CacheLine:
     pinned: bool = False
     thermal: float = 0.0
     lod: float = 1.0
-    coherence: str = "exclusive"
+    # Missing coherence evidence is unknown, never an inferred exclusive state.
+    coherence: str = "unknown"
     manifold_type: str = "hyperbolic"
     keyframe: bool = False
     deltas: list = field(default_factory=list)
