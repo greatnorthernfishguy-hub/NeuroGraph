@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-09-24] Grok (groupb-pith-cacheline-unknown-default-001) — coherence default tests.
+# What: CacheLine and from_surfaced default to unknown; an explicit exclusive
+#   is preserved; a victim-recovered line is not labelled exclusive.
+# Why: the dataclass default was exclusive with no evidence (Pith PRD).
+# How: construct, capture, recover against the isolated victim buffer.
 # [2026-07-22] DudeMan CC (Opus 4.8) — Pith Stage 5 unit tests (#55)
 # What: first tests for the recently-built Stage 5 — cc_thermal (Ca_i+firing blend,
 #   fail-soft), the victim buffer (capture/recover, TTL aging, FIFO bound, pin/victim
@@ -64,6 +69,26 @@ def test_thermal_none_graph_is_zero():
 def test_thermal_node_without_attrs_is_zero():
     class Bare: pass
     assert cc_thermal(FakeGraph({"n": Bare()}), "n") == 0.0
+
+
+# ---- coherence default (missing evidence is unknown) ----
+
+def test_cacheline_and_from_surfaced_default_coherence_to_unknown():
+    assert CacheLine("n", "content").coherence == "unknown"
+    assert CacheLine.from_surfaced("n", "content").coherence == "unknown"
+
+def test_explicit_exclusive_coherence_is_preserved():
+    line = CacheLine("n", "content", coherence="exclusive")
+    assert line.coherence == "exclusive"
+
+def test_victim_recovered_line_is_not_labelled_exclusive():
+    # Capture stores no coherence; recover rebuilds via from_surfaced.
+    dropped = CacheLine("n", "had a record", coherence="exclusive")
+    pith_victim_capture(kept=[], all_lines=[dropped])
+    merged = pith_victim_recover([])
+    recovered = next(cl for cl in merged if cl.node_id == "n")
+    assert recovered.coherence != "exclusive"
+    assert recovered.coherence == "unknown"
 
 
 # ---- victim buffer: capture + recover ----
