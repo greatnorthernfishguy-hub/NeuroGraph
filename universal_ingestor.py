@@ -46,6 +46,14 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-09-24b] Z12 CC (Sonnet 5) — Fix two stale hash-fallback docstring/changelog leftovers
+#   What: EmbeddingEngine's model_name config docstring and the Grok Review Changelog (v0.7.1)
+#         block below still described the now-deleted hash fallback as current behavior.
+#   Why:  Found by the fresh cross-family review dispatched on commit 2075662 (the [2026-09-24]
+#         entry directly below) — real leftovers from that same edit, not new scope.
+#   How:  Reworded the model_name docstring bullet; added a dated note above the Grok changelog
+#         block rather than rewriting its historical entries (LAW 3).
+# -------------------
 # [2026-09-24] Z12 CC (Sonnet 5) — Reconcile to Josh's literal ruling: drop the test-mode hash carve-out
 #   What: EmbeddingEngine._hash_embed() is deleted outright (LAW 3 — no dead implementation
 #         left for someone to re-wire). _encode_batch() no longer branches on `use_model`; it
