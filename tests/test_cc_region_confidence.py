@@ -415,7 +415,7 @@ def test_region_confidence_basic():
         # s1: 0.9/1.0*0.6 + 0.5*0.4 = 0.54 + 0.2 = 0.74
         # s2: 0.4/1.0*0.6 + 0.5*0.4 = 0.24 + 0.2 = 0.44  
         # s3: 0.7/1.0*0.6 + 0.5*0.4 = 0.42 + 0.2 = 0.62
-        # All >= 0.3 threshold, so average = (0.74 + 0.44 + 0.62) / 3 = 0.6
+        # Average over all synapses among hit nodes: (0.74 + 0.44 + 0.62) / 3 = 0.6
         assert 0.59 <= conf <= 0.61
 
 
@@ -427,18 +427,21 @@ def test_region_confidence_empty():
     assert conf == 0.5  # Returns neutral when no hits
 
 
-def test_region_confidence_all_below_threshold():
+def test_region_confidence_synapse_target_outside_hits_is_neutral():
+    """Test that synapses whose target node is not in the hit set are ignored."""
     mock_graph = MockGraph()
     mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])  # Hit found
     
-    # Create synapse with low confidence
+    # Create synapse n1→t1 where t1 is NOT in hits
     s1 = MockSynapse('s1', 'n1', 't1', weight=0.1, max_weight=1.0)
     mock_graph.synapses = {'s1': s1}
     mock_graph._outgoing = {'n1': ['s1']}
     mock_graph._synapse_confirmation_history = {}
     
     conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-    assert conf == 0.5  # Returns neutral when no predictions meet threshold (0.1*0.6 + 0.5*0.4 = 0.26 < 0.3)
+    # Returns neutral because syn.post_node_id ('t1') not in node_ids (['n1'])
+    # No synapses among hit nodes to consider
+    assert conf == 0.5
 
 
 def test_region_confidence_read_only():
