@@ -49,6 +49,7 @@ from universal_ingestor import (
     AdaptiveChunker,
     # Embedder
     EmbeddingEngine,
+    EmbeddingFailedError,
     # Registrar
     NodeRegistrar,
     # Associator
@@ -548,20 +549,55 @@ class TestEmbeddingDeviceControl(unittest.TestCase):
             self.assertIsNotNone(engine.status["fallback_reason"])
 
     def test_encode_batch_runtime_fallback(self):
-        """If model encode raises at runtime, falls back to hash."""
-        engine = EmbeddingEngine({"use_model": False, "dimension": 64})
+        """[2026-09-23, Packet 091] If a real model was requested and encode
+        raises at runtime, _encode_batch() now raises EmbeddingFailedError —
+        it must NOT silently substitute a hash vector for a production
+        failure. use_model=True here (not False) because that's what this
+        test actually simulates: a model that loaded successfully and then
+        failed at call time, not the explicit no-model test mode.
+        """
+        engine = EmbeddingEngine({"use_model": True, "dimension": 64})
         # Simulate a loaded model that fails at encode time
         engine._model_available = True
 
-        class FaultyModel:
-            def encode(self, texts, **kwargs):
+        class FaultyNGEmbed:
+            def embed_batch(self, texts, **kwargs):
                 raise RuntimeError("CUDA out of memory")
 
-        engine._model = FaultyModel()
-        # Should not raise — falls back to hash embeddings
+        engine._ng_embed = FaultyNGEmbed()
+        with self.assertRaises(EmbeddingFailedError):
+            engine._encode_batch(["hello", "world"])
+
+    def test_encode_batch_explicit_hash_mode_unaffected(self):
+        """use_model=False (explicit, e.g. tests/lightweight deployments)
+        still returns honest hash vectors — never raises, never pretends to
+        be a real model."""
+        engine = EmbeddingEngine({"use_model": False, "dimension": 64})
         vecs = engine._encode_batch(["hello", "world"])
         self.assertEqual(len(vecs), 2)
         self.assertEqual(vecs[0].shape[0], 64)
+
+    def test_ingest_skips_deposit_on_embedding_failure(self):
+        """UniversalIngestor.ingest() must not deposit anything when
+        embedding fails closed — no nodes/synapses/hyperedges created, and
+        the failure is visible in the returned IngestionResult's metadata."""
+        graph = Graph()
+        vector_db = SimpleVectorDB()
+        config = IngestorConfig({"embedding": {"use_model": True, "dimension": 64}})
+        ingestor = UniversalIngestor(graph, vector_db, config)
+        ingestor.embedder._model_available = True
+
+        class FaultyNGEmbed:
+            def embed_batch(self, texts, **kwargs):
+                raise RuntimeError("HF HTTP 401")
+
+        ingestor.embedder._ng_embed = FaultyNGEmbed()
+
+        result = ingestor.ingest("Some real content to embed.", source_type=SourceType.TEXT)
+        self.assertEqual(result.nodes_created, [])
+        self.assertEqual(result.synapses_created, [])
+        self.assertEqual(result.hyperedges_created, [])
+        self.assertTrue(result.metadata.get("embedding_failed"))
 
 
 # ---------------------------------------------------------------------------
