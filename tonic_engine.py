@@ -26,6 +26,64 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — silent-zero coverage for G1 + G2,
+#   fix misleading log text, update class docstring (chief-003 follow-up to Packet 086(2)).
+#   Two additional silent-zero shapes the initial collapse left un-logged:
+#     G1 — caller passed transformer_body=<body> but the checkpoint failed to load
+#          (or was absent). _model stays None, _shared_body is the body. offer_shared_body
+#          CANNOT recover (default-mode init does not route bodies through offer, and the
+#          offer path only attaches under require_shared_body=True). start() must warn
+#          plainly that the BrainSwitcher must rebuild.
+#     G2 — torch + checkpoint present, no body passed. _try_load_model's own-copy branch
+#          loaded a wrapper with its private body; _model is set, _shared_body is None.
+#          Dispatch gate refuses forward; ticks are zero. offer_shared_body CAN recover
+#          (swap body + set _shared_body). start() must warn ADVISORILY (no rebuild).
+#   start() now logs four shapes: N1 (no torch, no body), N2 (torch, no body), G1 (body in
+#   hand, no model), G2 (model loaded, no body). The "TonicBrain loaded ... — surgical
+#   inference active" log is split: own-copy with no shared body now logs "wrapper is
+#   resident but inference is NOT active; the dispatch gate will refuse forward". The
+#   "will run as no-op until a shared body is offered" message is split: when a body is
+#   in hand it says "cannot self-recover" plainly (because offer_shared_body cannot
+#   recover). The no-torch advice no longer tells default-mode consumers to call
+#   offer_shared_body() — that path only attaches under require_shared_body=True.
+#   Class docstring at :380 updated to drop "heuristic fallback" language and describe
+#   the new contract.
+# Why: the law-enforcer review (genuine, commissioned by chief-003) named G1 and G2 as
+#   silent-zero shapes the initial fix missed, and called out the misleading "active"
+#   log text. Both reviews are required gates per Packet 077; this lands before the
+#   cross-family re-dispatch.
+# How: start() gains a four-branch dispatcher keyed on (_model is None, _shared_body is
+#   None). _try_load_model's load-outcome log is split on whether _shared_body is set.
+#   No structural change to the dispatch gate or the offer/revoke paths. Existing tests
+#   untouched; new tests test_g1_*, test_g2_* in tests/test_tonic_no_heuristic.py.
+# [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — collapse heuristic path; no-torch
+#   defined-state log (chief-003 Packet 086(2)). REQUIRE_SHARED_BODY OR shared-body
+#   attached: real model inference. Otherwise: zero activations, defined state, one-shot
+#   log, no crash, no silent zero masquerading as running. Drop _heuristic_inference,
+#   _compass_proposals, _apply_brakes, _log_heuristic_mass, _use_heuristic, and the
+#   CC_TONIC_HEURISTIC_INSTRUMENT/CC_TONIC_W_COMPASS/CC_TONIC_BRAKE_* module
+#   constants. _fallback_inference always returns []. _model_inference returns []
+#   instead of falling back. start() logs once if no inference path is reachable.
+#   Syl's openclaw_hook.py:1073 construction (require_shared_body default False,
+#   transformer_body=shared_body) gains a clear signal when no body lands; matches
+#   the shared-body-required wait state for every other construction path.
+# Why: laptop daemon PID 35833 runs under /usr/bin/python3.12 (no torch); the
+#   heuristic was the only thing producing activations there. With it gone, a
+#   torch-less host with no shared body would produce a SILENT ZERO every tick
+#   while reporting running=True — exactly the "silent zero-output" Packet 086(2)
+#   names as non-compliant. The start()-time log + status['inference_path_ready']
+#   key make the state observable, logged, and explicit. See the cc-laptop-
+#   tonic-no-heuristic-20260923 return artifact and the cross-family + law-
+#   enforcer reviews for the torch-less-host behavior specifically.
+# How: surgical removal of heuristic surface; _generate_latent_token_inner's
+#   dispatch is now `if self._model is not None and self._shared_body is not None:
+#   activations = self._model_inference(features); else: activations = []`. The
+#   require_shared_body wait check at the top of _generate_latent_token_inner is
+#   preserved (it is the shared-body-required mode's correct behavior). Existing
+#   tests that patched _heuristic_inference or asserted _fallback_inference returned
+#   heuristic output are rewritten to assert the new contract: _fallback_inference
+#   returns [] unconditionally; no construction path produces heuristic-derived
+#   activations. Shared-body-present tests are untouched.
 # [2026-09-13] Grok Build (grok-4.6) — bounded per-stage latent-token timing.
 # What: time candidate feature extraction, model-tensor feature materialization,
 #   shared-body lock wait, transformer forward while holding the existing body
@@ -194,37 +252,6 @@ except ImportError:
     logger.info("PyTorch not available — Tonic engine will not run")
 
 
-# [2026-07-13] #59/#62 Phase-1 instrumentation — observability ONLY (no behavior change).
-# Logs where the heuristic's output activation MASS lands (blob core deg>=cap vs quiet
-# periphery), the hard-numbers baseline that motivates the heuristic redesign (see
-# ~/docs/prd/2026-07-13-cc-tonic-heuristic-redesign.md). Off by default; enable on the
-# isolated laptop via CC_TONIC_HEURISTIC_INSTRUMENT=1. Samples every Nth token to keep
-# the hot loop cheap. Never raises — instrumentation must not disturb the Tonic.
-_HEURISTIC_INSTRUMENT = os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT", "0") not in ("0", "false", "False", "")
-_HEURISTIC_INSTRUMENT_EVERY = int(os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT_EVERY", "50"))
-_HEURISTIC_INSTRUMENT_DEGCAP = int(os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT_DEGCAP", "100"))
-_HEURISTIC_INSTRUMENT_TSV = os.path.expanduser(
-    os.environ.get("CC_TONIC_HEURISTIC_INSTRUMENT_TSV",
-                   "~/docs/dev-log/data-59-heuristic-mass-20260713.tsv"))
-
-# [2026-07-13] #59/#62 Phase-2 heuristic redesign — T2 semantic compass + divisive brakes.
-# The four legacy terms are all activity-derived (-> the blob). T2 proposes semantically
-# near-but-QUIET nodes by manifold direction (poincare_dir cosine), firing-independent, so
-# it reaches the dark periphery the synapse terms cannot. Brakes divide each proposal by the
-# blob's own markers (firing rate / focus-fatigue / degree / Ca_i); constitutional/self nodes
-# bypass. EVERYTHING defaults to 0 -> compass off + brake==1.0 -> byte-identical to the legacy
-# heuristic until dialed on the isolated laptop. Degrade-safe (missing signal -> term drops).
-# Design: ~/docs/prd/2026-07-13-cc-tonic-heuristic-redesign.md
-_W_COMPASS = float(os.environ.get("CC_TONIC_W_COMPASS", "0"))
-_COMPASS_BUDGET = int(os.environ.get("CC_TONIC_COMPASS_BUDGET", "600"))
-_COMPASS_TOPK = int(os.environ.get("CC_TONIC_COMPASS_TOPK", "8"))
-_COMPASS_QUIET = float(os.environ.get("CC_TONIC_COMPASS_QUIET", "5.0"))
-_BRAKE_FIRING = float(os.environ.get("CC_TONIC_BRAKE_FIRING", "0"))
-_BRAKE_FATIGUE = float(os.environ.get("CC_TONIC_BRAKE_FATIGUE", "0"))
-_BRAKE_DEGREE = float(os.environ.get("CC_TONIC_BRAKE_DEGREE", "0"))
-_BRAKE_CA = float(os.environ.get("CC_TONIC_BRAKE_CA", "0"))
-_BRAKE_DEGNORM = float(os.environ.get("CC_TONIC_BRAKE_DEGNORM", "100.0"))
-
 # [#117] Autonomous aging clock (CC daemon only; default OFF). When enabled, _generation_loop
 # calls graph.step() on its heartbeat so graph.timestep advances between conversations, not only
 # inside on_message(). This is the #59 keystone the daemon's 2026-07-14 header claimed as a
@@ -383,8 +410,8 @@ def _extract_tonic_features(
 class TonicEngine:
     """Latent token generation engine — the real push between conversations.
 
-    Runs a surgical transformer (or heuristic fallback) that generates
-    latent tokens continuously. Each token:
+    Runs a surgical transformer that generates latent tokens continuously.
+    Each token:
     1. Encode current graph state (where attention is)
     2. Forward through transformer (the push — what comes next?)
     3. Decode to node activations (where attention should go)
@@ -394,12 +421,14 @@ class TonicEngine:
     The transformer IS the awareness. The output IS the next state.
     The ouroboros closes through actual inference, not a timer.
 
-    Shared-body-required consumers prohibit heuristic execution and wait for attachment.
-    For ordinary consumers, if the surgical model is not available (weights not trained yet),
-    falls back to a heuristic that still provides genuine forward
-    compression — it reads the graph topology and produces activation
-    decisions based on attractor analysis. Not as rich as the transformer,
-    but real graph reasoning, not a timer.
+    Shared-body-required consumers prohibit a private model load and wait
+    for attachment via offer_shared_body(). Ordinary consumers (Syl's
+    openclaw_hook.py:1073 construction) load their own copy when a
+    checkpoint is available AND they have access to a transformer body,
+    and run as a no-op otherwise. There is no heuristic fallback (Packet
+    086(2)): if the surgical model can't run, the engine mints zero
+    activations and surfaces the no-inference-path state via start()'s
+    one-shot warning and status['inference_path_ready'] / ['torch_available'].
     """
 
     def __init__(
@@ -443,9 +472,13 @@ class TonicEngine:
         self._stage_last_ms = {name: 0.0 for name in _STAGE_NAMES}
         self._stage_ema_ms = {name: 0.0 for name in _STAGE_NAMES}
 
-        # Try to load surgical model
+        # Try to load surgical model. The heuristic fallback path was removed 2026-09-23
+        # (chief-003 Packet 086(2)): VPS embedded topology must never receive heuristic-
+        # derived activations. If the model can't be loaded AND no shared body lands, the
+        # engine runs as a no-op (zero activations) — see start() for the defined-state log
+        # and status['inference_path_ready'] for the observable signal. Required-sharing
+        # consumers wait for offer_shared_body as before.
         self._model = None
-        self._use_heuristic = True
         if self._require_shared_body:
             # No loader call, ever, on this path — not even with a body in hand at
             # construction; the wrapper build is the attach path and nothing else.
@@ -471,6 +504,13 @@ class TonicEngine:
 
         NOT reachable in require_shared_body mode — see __init__ and
         _build_shared_wrapper(), which is the only attach path there.
+
+        No heuristic fallback exists anymore (Packet 086(2)). A failed or
+        missing load leaves _model=None; the engine then runs as a no-op
+        (zero activations). Whether a later offer_shared_body can recover
+        depends on the construction shape (see start() for the per-shape
+        warning). This method logs the load outcome accurately; start()
+        adds the user-actionable warning.
         """
         if self._require_shared_body:
             return  # This loader can allocate a private body; shared-only never uses it.
@@ -483,26 +523,43 @@ class TonicEngine:
                     transformer_body=self._shared_body,
                 )
                 self._model.eval()
-                # Seam A (2026-06-12): only enter transformer mode if the loaded body is
-                # PROTO's (shared). With no shared body at init, the own-copy body is loaded
-                # for the wrapper but NOT used — ride heuristic (reads her graph -> her-
-                # flavored, never the rogue own-copy output) until BrainSwitcher offers
-                # proto's body (offer_shared_body sets this False + swaps the body in).
-                self._use_heuristic = (self._shared_body is None)
-                shared = "shared body" if self._shared_body is not None else "own copy"
-                logger.info("TonicBrain loaded from %s (%s) — surgical inference active",
-                            weights_path, shared)
+                # The "surgical inference active" wording is misleading when the
+                # wrapper loaded with a private body but no shared body is in
+                # _shared_body — in that case the dispatch gate refuses the
+                # forward and ticks produce zero. Be precise.
+                if self._shared_body is not None:
+                    logger.info("TonicBrain loaded from %s (shared body) — "
+                                "surgical inference active", weights_path)
+                else:
+                    logger.info("TonicBrain loaded from %s (own copy, "
+                                "transformer_body=<none>) — wrapper is resident "
+                                "but inference is NOT active; the dispatch gate "
+                                "will refuse forward until a shared body lands "
+                                "(no heuristic fallback).", weights_path)
             except Exception as exc:
-                logger.info("TonicBrain load error: %s — using heuristic", exc)
+                logger.info(
+                    "TonicBrain load error: %s — engine will run as no-op "
+                    "(zero activations). %s", exc,
+                    self._shared_body is not None
+                    and "A later offer_shared_body() call cannot recover this "
+                         "state — _model is None, and offer_shared_body only "
+                         "attaches when require_shared_body=True. The "
+                         "BrainSwitcher must rebuild the engine."
+                    or "A later offer_shared_body() call from the "
+                       "BrainSwitcher can attach a body.",
+                )
         else:
-            # Check if we can create from Elmer's weights (untrained decoder)
-            elmer_path = os.path.expanduser("~/Elmer/surgery/elmer_brain_v0.1.pt")
-            if os.path.exists(elmer_path):
-                logger.info("Elmer encoder available at %s — "
-                            "TonicBrain decoder needs training. "
-                            "Using heuristic until trained.", elmer_path)
-            else:
-                logger.info("No TonicBrain or Elmer weights — using heuristic engine")
+            logger.info(
+                "No TonicBrain checkpoint at %s — engine will run as no-op "
+                "(zero activations). %s", weights_path,
+                self._shared_body is not None
+                and "A later offer_shared_body() call cannot recover this "
+                     "state — _model is None, and offer_shared_body only "
+                     "attaches when require_shared_body=True. The "
+                     "BrainSwitcher must rebuild the engine."
+                or "A later offer_shared_body() call from the BrainSwitcher "
+                   "can attach a body.",
+            )
 
     def _build_shared_wrapper(self, transformer_body):
         """Build the lightweight encoder/decoder wrapper AROUND A BORROWED BODY.
@@ -578,7 +635,6 @@ class TonicEngine:
                 previous_model = self._model
                 previous_body = getattr(previous_model, "body", None)
                 previous_shared = self._shared_body
-                previous_heuristic = self._use_heuristic
                 try:
                     if self._model is None:
                         self._model = new_model
@@ -587,20 +643,17 @@ class TonicEngine:
                     if getattr(self._model, "body", None) is not transformer_body:
                         raise ValueError("wrapper did not retain the offered body")
                     self._shared_body = transformer_body
-                    self._use_heuristic = False
                 except Exception:
                     # Keep existing wrappers retryable, including default consumers
                     # which deliberately do not build a wrapper on a later offer.
                     self._shared_body = None
                     self._model = previous_model
-                    self._use_heuristic = True
                     if previous_model is not None:
                         try:
                             previous_model.body = previous_body
                             if getattr(previous_model, "body", None) is not previous_body:
                                 raise ValueError("wrapper did not restore its previous body")
                             self._shared_body = previous_shared
-                            self._use_heuristic = previous_heuristic
                         except Exception:
                             # A failed rollback must not forward through a partial
                             # body. Retain the wrapper so a future offer can retry.
@@ -626,19 +679,18 @@ class TonicEngine:
         so offer_shared_body() can re-join the share the instant proto reloads.
 
         Runs under the body lock so a forward in flight finishes first, and so the
-        _use_heuristic flip and the body drop are seen together by _model_inference's
-        in-lock recheck — never a live wrapper with body=None.
+        body drop is seen together by _model_inference's in-lock recheck — never a
+        live wrapper with body=None.
         """
         if self._model is None and self._shared_body is None:
-            return False  # already heuristic — nothing to shed
+            return False  # already detached — nothing to shed
         with self._body_lock_context():
-            self._use_heuristic = True       # flip FIRST: in-lock readers see heuristic
             if self._model is not None:
                 self._model.body = None      # drop the ref to proto's shed body (proto frees the ~2GB)
             self._shared_body = None
         logger.info(
             "Tonic shed shared body -> %s; will re-join on proto reload",
-            "waiting (heuristic prohibited)" if self._require_shared_body else "heuristic"
+            "waiting (no inference path)" if self._require_shared_body else "no-op mode"
         )
         return True
 
@@ -654,12 +706,11 @@ class TonicEngine:
     def _merge_prefetch_seeds(self, seen: Dict[str, float]) -> None:
         """Fold live predicted nodes into a tick's proposal dict, IN PLACE.
 
-        Called BEFORE _apply_brakes and before the max_activation_nodes slice,
-        so predictions compete for the same budget as real associations and are
-        damped by the same markers (#62) -- a hub-biased prediction set must not
-        skip the brakes that exist to damp hubs. Max-dedup: a node the model or
-        heuristic already proposed keeps its own current. One seed set is primed
-        at most _CC_PITH_PREFETCH_REPEATS ticks. Never raises; on any failure the
+        Called on the model's output dict in _model_inference, so predictions
+        are merged into the real-inference activations (no heuristic path
+        remains -- Packet 086(2)). Max-dedup: a node the model already proposed
+        keeps its own current. One seed set is primed at most
+        _CC_PITH_PREFETCH_REPEATS ticks. Never raises; on any failure the
         dict is left as it was.
         """
         if not _CC_PITH_PREFETCH_WARM_ENABLED or self._prefetch_seed is None or _CC_PITH_PREFETCH_MAX <= 0:
@@ -822,9 +873,11 @@ class TonicEngine:
     def _generate_latent_token_inner(self) -> Dict[str, Any]:
         """Inner implementation — actual latent token generation."""
         self._reset_stage_samples()
+        # Required-sharing consumers wait without inference — this matches the original
+        # "no model AND no shared body" condition that drives the wait state, plus the
+        # post-revoke shed state where the wrapper still exists but body is gone.
         if self._require_shared_body and (
-            self._use_heuristic or self._model is None
-            or self._shared_body is None
+            self._model is None or self._shared_body is None
         ):
             return {"fired": 0, "activated": 0, "waiting_for_shared_body": True}
         t_feat = time.perf_counter()
@@ -838,8 +891,10 @@ class TonicEngine:
         if features is None:
             return {"fired": 0, "activated": 0}
 
-        # Generate activation decisions
-        if self._model is not None and not self._use_heuristic:
+        # Generate activation decisions. Without a loaded model and a shared body,
+        # the engine runs as a no-op — see start() and status['inference_path_ready'].
+        # _fallback_inference() unconditionally returns [] (Packet 086(2)).
+        if self._model is not None and self._shared_body is not None:
             activations = self._model_inference(features)
         else:
             activations = self._fallback_inference(features)
@@ -879,210 +934,15 @@ class TonicEngine:
         }
 
     def _fallback_inference(self, features: Dict[str, Any]) -> List[Tuple[str, float]]:
-        # VPS embedded topology must never receive heuristic-generated activations.
-        if self._require_shared_body:
-            return []
-        return self._heuristic_inference(features)
-
-    def _heuristic_inference(
-        self, features: Dict[str, Any]
-    ) -> List[Tuple[str, float]]:
-        """Heuristic forward compression — genuine graph reasoning.
-
-        Not a timer. Not random. Analyzes the topology neighborhood
-        and produces activation decisions based on:
-        1. Thread continuity — where was attention? Continue that direction.
-        2. Attractor pull — which connected nodes have the strongest pull?
-        3. Exploration pressure — occasionally activate less-visited nodes.
-        4. Prediction tension — nodes with unresolved predictions pull harder.
-
-        This is real graph reasoning, just without a transformer.
-        It will be replaced by the surgical model when trained.
-        """
-        if self._require_shared_body:
-            return []  # Guard direct callers as well as normal inference dispatch.
-        activations: List[Tuple[str, float]] = []
-        base_strength = self._config.activation_strength
-
-        # 1. Thread continuity — follow outgoing synapses from thread nodes
-        thread_nodes = features.get("thread_nodes", [])
-        for nid in thread_nodes[:5]:
-            outgoing = self._graph._outgoing.get(nid, set())
-            for syn_id in outgoing:
-                syn = self._graph.synapses.get(syn_id)
-                if syn is not None:
-                    target = syn.post_node_id
-                    # Strength proportional to synapse weight
-                    strength = syn.weight * base_strength * 0.8
-                    activations.append((target, strength))
-
-        # 2. Attractor pull — recently spiked nodes with strong connections
-        recent = features.get("recent_spikes", [])
-        for nid, steps_since in recent[:5]:
-            recency_factor = 1.0 / (1.0 + steps_since * 0.1)
-            activations.append((nid, base_strength * recency_factor * 0.5))
-
-        # 3. Prediction tension — unresolved predictions pull attention
-        for pred in self._graph.active_predictions.values():
-            target = pred.target_node_id
-            if target in self._graph.nodes:
-                activations.append((target, pred.confidence * base_strength * 0.6))
-
-        # 4. Exploration — hash-based noise to prevent fixation
-        if features.get("active_nodes"):
-            import hashlib
-            seed = hashlib.md5(
-                f"{self._tokens_generated}".encode()
-            ).hexdigest()
-            explore_idx = int(seed[:4], 16) % len(self._graph.nodes)
-            explore_nid = list(self._graph.nodes.keys())[explore_idx]
-            activations.append((explore_nid, base_strength * 0.3))
-
-        # #329 seam B (failover only) — mirror seam A: a gentle constitutional pull so even
-        # on the heuristic path her self participates. Same steady level as seam A.
-        from tonic_thread import _SPINE_PRIME_STEADY
-        for nid, node in self._graph.nodes.items():
-            if (getattr(node, "metadata", None) or {}).get("constitutional"):
-                activations.append((nid, _SPINE_PRIME_STEADY))
-
-        # T2 semantic compass (#62) — near-but-quiet nodes by manifold direction,
-        # reaching content the activity-derived terms above (all -> blob) cannot.
-        activations.extend(self._compass_proposals(thread_nodes))
-
-        # Deduplicate and cap
-        seen = {}
-        for nid, strength in activations:
-            if nid in seen:
-                seen[nid] = max(seen[nid], strength)
-            else:
-                seen[nid] = strength
-
-        # Divisive brakes (#62) — damp each proposal by the blob's own markers
-        # (firing / fatigue / degree / Ca_i); constitutional/self nodes bypass.
-        # #55 5b: predictions join the proposal set HERE -- before brakes and budget.
-        self._merge_prefetch_seeds(seen)
-
-        self._apply_brakes(seen)
-
-        result = sorted(seen.items(), key=lambda x: -x[1])
-        final = result[:self._config.max_activation_nodes]
-        if _HEURISTIC_INSTRUMENT and (self._tokens_generated % _HEURISTIC_INSTRUMENT_EVERY == 0):
-            self._log_heuristic_mass(final)
-        return final
-
-    def _compass_proposals(self, thread_nodes) -> List[Tuple[str, float]]:
-        """T2 semantic compass (#62): propose semantically NEAR but QUIET nodes by
-        manifold direction (poincare_dir cosine to the thread centroid), preferring
-        low firing_rate_ema. Firing-independent, so it reaches the dark periphery the
-        activity-derived terms cannot. Returns [] when off or any signal is missing
-        (degrade-safe); never raises. Records self._last_compass_n for instrumentation
-        so a null frac_core shift is never ambiguous between 'reached' and 'no-op'd'."""
-        self._last_compass_n = 0
-        if _W_COMPASS <= 0.0:
-            return []
-        try:
-            import numpy as np
-            from neuro_foundation import poincare_dir_array  # #119: compact bytes-aware read
-            g = self._graph
-            dirs = []
-            for nid in thread_nodes[:10]:
-                node = g.nodes.get(nid)
-                pd = poincare_dir_array(getattr(node, "metadata", None)) if node else None
-                if pd is not None:
-                    dirs.append(pd)
-            if not dirs:
-                return []
-            centroid = np.mean(dirs, axis=0)
-            cn = float(np.linalg.norm(centroid)) or 1e-9
-            thread_set = set(thread_nodes)
-            items = list(g.nodes.items())
-            if len(items) > _COMPASS_BUDGET:
-                items = random.sample(items, _COMPASS_BUDGET)
-            props = []
-            for nid, node in items:
-                if nid in thread_set:
-                    continue
-                v = poincare_dir_array(getattr(node, "metadata", None))
-                if v is None:
-                    continue
-                vn = float(np.linalg.norm(v)) or 1e-9
-                cos = float(np.dot(v, centroid)) / (vn * cn)
-                if not (cos > 0.0):   # also rejects NaN (zero-norm / degenerate dir)
-                    continue
-                fr = float(getattr(node, "firing_rate_ema", 0.0) or 0.0)
-                quiet = 1.0 / (1.0 + _COMPASS_QUIET * fr)  # prefer near-silent nodes
-                props.append((nid, cos * quiet))
-            props.sort(key=lambda x: -x[1])
-            base = self._config.activation_strength
-            out = [(nid, sc * base * _W_COMPASS) for nid, sc in props[:_COMPASS_TOPK]]
-            self._last_compass_n = len(out)
-            return out
-        except Exception:
-            return []  # a missing/malformed signal must never disturb the Tonic
-
-    def _apply_brakes(self, seen: Dict[str, float]) -> None:
-        """Divisive normalization (#62): damp each proposal by the blob's own markers
-        — firing_rate_ema, focus-fatigue (#89), degree, Ca_i — so the ever-loud core
-        cannot win by volume. Constitutional/self nodes bypass (identity is inviolable).
-        No-op when all coefficients are 0 (default). Mutates seen in place; never raises."""
-        if not (_BRAKE_FIRING or _BRAKE_FATIGUE or _BRAKE_DEGREE or _BRAKE_CA):
-            return
-        try:
-            g = self._graph
-            fatigue_map = getattr(self._tonic_thread, "_focus_fatigue", {}) \
-                if self._tonic_thread is not None else {}
-            for nid in list(seen.keys()):
-                node = g.nodes.get(nid)
-                if node is None:
-                    continue
-                if (getattr(node, "metadata", None) or {}).get("constitutional"):
-                    continue  # T6: identity bypasses the brake
-                fr = float(getattr(node, "firing_rate_ema", 0.0) or 0.0)
-                ca = float(getattr(node, "Ca_i", 0.0) or 0.0)
-                d = len(g._incoming.get(nid, ())) + len(g._outgoing.get(nid, ()))
-                dn = d / (_BRAKE_DEGNORM or 1.0)
-                fat = float(fatigue_map.get(nid, 0.0)) if isinstance(fatigue_map, dict) else 0.0
-                brake = 1.0 / (1.0 + _BRAKE_FIRING * fr + _BRAKE_FATIGUE * fat
-                               + _BRAKE_DEGREE * dn + _BRAKE_CA * ca)
-                seen[nid] *= brake
-        except Exception:
-            return  # brakes must never disturb the Tonic
-
-    def _log_heuristic_mass(self, final: List[Tuple[str, float]]) -> None:
-        """#59/#62 observability (no behavior change): append where the heuristic's
-        output activation MASS landed — blob core (in+out degree >= cap) vs quiet
-        periphery — the hard-numbers baseline for the heuristic redesign. Sampled
-        (every Nth token) and wrapped: instrumentation must never disturb the Tonic."""
-        try:
-            g = self._graph
-            cap = _HEURISTIC_INSTRUMENT_DEGCAP
-
-            def deg(nid):
-                return len(g._incoming.get(nid, ())) + len(g._outgoing.get(nid, ()))
-
-            m_core = m_peri = 0.0
-            n_core = n_peri = 0
-            for nid, strength in final:
-                s = float(strength)
-                if deg(nid) >= cap:
-                    m_core += s
-                    n_core += 1
-                else:
-                    m_peri += s
-                    n_peri += 1
-            total = m_core + m_peri
-            frac_core = (m_core / total) if total > 0 else 0.0
-            new = not os.path.exists(_HEURISTIC_INSTRUMENT_TSV)
-            with open(_HEURISTIC_INSTRUMENT_TSV, "a") as f:
-                if new:
-                    f.write("iso_time\ttimestep\ttokens\tn_core\tn_peri\t"
-                            "mass_core\tmass_peri\tfrac_core\tcompass_n\n")
-                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{g.timestep}\t"
-                        f"{self._tokens_generated}\t{n_core}\t{n_peri}\t"
-                        f"{m_core:.4f}\t{m_peri:.4f}\t{frac_core:.4f}\t"
-                        f"{getattr(self, '_last_compass_n', 0)}\n")
-        except Exception:
-            pass  # instrumentation must never disturb the Tonic
+        # VPS embedded topology must never receive heuristic-derived activations
+        # (Packet 086(2), 2026-09-23). The heuristic was deleted; this method is now
+        # a structural no-op that always returns []. It exists only so the dispatch
+        # site at _generate_latent_token_inner and the historic reference at
+        # _model_inference remain valid call sites; nothing reaches it on the
+        # correct path (real model inference, or no-ops via the _model / _shared_body
+        # gate at the dispatch site). Required-sharing consumers are gated by the
+        # wait check above this point and never reach here either.
+        return []
 
     def _model_inference(
         self, features: Dict[str, Any]
@@ -1100,7 +960,7 @@ class TonicEngine:
             import torch
             from surgery.tonic_brain import GraphFeatures
         except ImportError:
-            return self._fallback_inference(features)
+            return []
 
         # Materialize graph features for the model outside the body lock. This
         # walks graph collections independently of the bounded candidate scan,
@@ -1111,15 +971,17 @@ class TonicEngine:
         finally:
             self._record_stage("model_feature_extract", t_model_feat)
         if graph_features is None:
-            return self._fallback_inference(features)
+            return []
 
         # Forward through TonicBrain — the actual push.
-        # The caller's `self._model is not None and not self._use_heuristic` test happened
-        # OUTSIDE this lock, so a revoke can have landed in between. Re-check model, body
-        # and mode INSIDE the lock: revoke_shared_body() mutates them under this same lock,
-        # so what we read here cannot change until the forward completes. Without this, a
-        # shed mid-tick calls the wrapper with body=None. Apply the fallback policy
-        # OUTSIDE the lock; required-sharing consumers return no activations.
+        # The dispatcher's `self._model is not None and self._shared_body is not None`
+        # test happened OUTSIDE this lock, so a revoke can have landed in between.
+        # Re-check model and body INSIDE the lock: revoke_shared_body() mutates them
+        # under this same lock, so what we read here cannot change until the forward
+        # completes. Without this, a shed mid-tick calls the wrapper with body=None.
+        # Apply the fallback policy OUTSIDE the lock; required-sharing consumers are
+        # gated by the wait check at the top of _generate_latent_token_inner and
+        # never reach this path with a missing body.
         # Wait vs forward: time __enter__ of the existing context manager separately
         # from the held-lock body. Do not acquire the lock twice.
         output = None
@@ -1134,7 +996,6 @@ class TonicEngine:
                     model is not None
                     and getattr(model, "body", None) is not None
                     and self._shared_body is not None
-                    and not self._use_heuristic
                 ):
                     try:
                         with torch.no_grad():
@@ -1147,7 +1008,7 @@ class TonicEngine:
                 if t_fwd_end is not None:
                     self._record_stage_ms("transformer_forward", (t_fwd_end - t_held) * 1000.0)
         if output is None:
-            return self._fallback_inference(features)
+            return []
 
         # Map activation strengths to actual nodes
         activation_strengths = output["activations"]
@@ -1156,7 +1017,7 @@ class TonicEngine:
         # Get the top active/recent nodes to map activations onto
         candidates = self._get_activation_candidates(features)
         if not candidates:
-            return self._fallback_inference(features)
+            return []
 
         activations: List[Tuple[str, float]] = []
         for i, (nid, _) in enumerate(candidates[:len(activation_strengths)]):
@@ -1270,6 +1131,88 @@ class TonicEngine:
 
         self._running = True
         self._shutdown_event.clear()
+
+        # Packet 086(2): the laptop daemon PID 35833 runs under /usr/bin/python3.12
+        # with no torch. Before this commit, the heuristic path produced activations
+        # on that host silently. With heuristic gone, every shape that can't reach
+        # a real forward would otherwise be a silent zero — every tick
+        # {"fired": 0, "activated": 0}, no signal to the daemon that nothing real
+        # is happening. Log ONCE here (start-time is the right moment: before the
+        # loop thread begins) so the state is defined and observable in `journalctl`
+        # / the daemon's own logs. The status dict adds inference_path_ready +
+        # torch_available keys for the same reason (machine-readable signal).
+        # The log is one-shot per process; the daemon should not see it repeat on
+        # restart / reload.
+        #
+        # Four silent-zero shapes, each with its own actionable warning:
+        #   N1 — _model is None AND _shared_body is None, no torch.
+        #        Original Packet 086(2) case. Daemon can recover if torch
+        #        is installed OR if a shared body lands via offer_shared_body
+        #        (require_shared_body path only).
+        #   N2 — _model is None AND _shared_body is None, torch available.
+        #        Same as N1 minus the torch-install advice.
+        #   G1 — _model is None AND _shared_body is not None (caller passed a
+        #        body at construction but _try_load_model failed or there was
+        #        no checkpoint). Ticks are zero; offer_shared_body cannot
+        #        recover this because require_shared_body is False (Syl-shape)
+        #        and the default-mode init does not route a body through
+        #        offer_shared_body. The BrainSwitcher must rebuild.
+        #   G2 — _model is not None AND _shared_body is None (a wrapper
+        #        loaded its own body successfully but no shared body is
+        #        attached). The dispatch gate refuses forward; ticks are
+        #        zero. offer_shared_body CAN recover this (it sets
+        #        _model.body to the supplied transformer and re-flips
+        #        _shared_body), so the warning is advisory.
+        inference_path_ready = (
+            self._model is not None and self._shared_body is not None
+        )
+        if not inference_path_ready:
+            model_is_loaded = self._model is not None
+            body_was_offered = self._shared_body is not None
+            if not model_is_loaded and not body_was_offered:
+                # N1 / N2
+                if not _TORCH_AVAILABLE:
+                    logger.warning(
+                        "Tonic started with no torch AND no shared body — "
+                        "every tick will produce zero activations (defined no-op "
+                        "state, not a crash). Install torch to enable a private "
+                        "model load; OR rebuild the engine with "
+                        "require_shared_body=True so the BrainSwitcher can "
+                        "attach a body via offer_shared_body()."
+                    )
+                else:
+                    logger.warning(
+                        "Tonic started with torch available but no shared body "
+                        "— every tick will produce zero activations until a "
+                        "shared body lands (no heuristic fallback, Packet 086(2))."
+                    )
+            elif not model_is_loaded and body_was_offered:
+                # G1 — caller passed transformer_body=<body> at construction,
+                # but the private load failed (or no checkpoint exists). The
+                # body sits in _shared_body unused; offer_shared_body cannot
+                # recover because it only attaches in require_shared_body=True
+                # mode and that path also requires a checkpoint. The
+                # BrainSwitcher must rebuild this engine.
+                logger.warning(
+                    "Tonic started with a shared body in hand but no model "
+                    "could be loaded (checkpoint missing or load error). "
+                    "Every tick will produce zero activations. THIS STATE "
+                    "CANNOT SELF-RECOVER: the default-mode init path does not "
+                    "route a body through offer_shared_body, and "
+                    "offer_shared_body only attaches when require_shared_body=True. "
+                    "The BrainSwitcher must rebuild the engine."
+                )
+            else:
+                # G2 — wrapper loaded successfully but no shared body in
+                # _shared_body. Dispatch gate refuses forward; ticks are zero.
+                # offer_shared_body CAN recover this; the warning is advisory.
+                logger.warning(
+                    "Tonic loaded a private-copy TonicBrain wrapper but no "
+                    "shared body is attached — the dispatch gate refuses forward, "
+                    "so every tick produces zero activations. Have the "
+                    "BrainSwitcher call offer_shared_body() with the shared "
+                    "body to enable inference."
+                )
 
         self._engine_thread = threading.Thread(
             target=self._generation_loop,
@@ -1419,14 +1362,26 @@ class TonicEngine:
             "tokens_generated": self._tokens_generated,
             "total_activations": self._total_activations,
             "mode": "conversation" if self._in_conversation else "latent",
-            "using_heuristic": self._use_heuristic and not self._require_shared_body,
-            "heuristic_allowed": not self._require_shared_body,
+            # Heuristic surface was removed 2026-09-23 (Packet 086(2)). These two
+            # keys remain in the public API as a literal False so existing status
+            # readers see the same shape; they no longer describe a live mode.
+            "using_heuristic": False,
+            "heuristic_allowed": False,
             "waiting_for_shared_body": self._require_shared_body and (
-                self._use_heuristic or self._model is None or self._shared_body is None
+                self._model is None or self._shared_body is None
+            ),
+            # The defined, observable signal that Packet 086(2) requires: a torch-less
+            # host with no shared body lands here as False, distinguishable from the
+            # "running with body" case (True) and from a stopped engine (also False).
+            # The daemon can read this to surface the no-inference-path state rather
+            # than reporting running=True with silent zero-output tokens.
+            "inference_path_ready": (
+                self._model is not None and self._shared_body is not None
             ),
             "model_loaded": self._model is not None,
             "require_shared_body": self._require_shared_body,
             "shared_body_attached": self._shared_body is not None,
+            "torch_available": _TORCH_AVAILABLE,
             "ema_tick_ms": round(self._ema_tick_ms, 2),
             "current_interval_s": round(self._current_interval, 2),
             "node_sample_budget": self._config.node_sample_budget,

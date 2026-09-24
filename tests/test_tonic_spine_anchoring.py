@@ -3,6 +3,17 @@ from types import SimpleNamespace
 import tonic_engine
 import tonic_thread
 
+# ---- Changelog ----
+# [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — Packet 086(2) heuristic-collapse updates.
+# What: dropped test_heuristic_includes_constitutional_pull — it tested seam B's
+#   constitutional pull inside _heuristic_inference, which was the failover-only path
+#   removed in the Packet 086(2) collapse. The constitutional spine is still exercised
+#   by test_constitutional_nodes_get_primed_into_ouroboros (via tonic_thread's
+#   _prime_constitutional and the ouroboros_cycle), so the seam-A inviolable-identity
+#   invariant is covered. Tests for the real-inference identity_embedding path
+#   (test_identity_embedding_is_nonzero_when_spine_present, etc.) are unaffected.
+# -------------------
+
 def _spine_graph():
     nodes = {}
     for i in range(1, 7):
@@ -70,22 +81,6 @@ def test_unwired_node_gets_more_charge_than_wired():
     t._prime_constitutional()
     assert seen["constitutional::spine::01"] > seen["constitutional::spine::02"]
     assert abs(seen["constitutional::spine::02"] - tonic_thread._SPINE_PRIME_STEADY) < 0.02
-
-def test_heuristic_includes_constitutional_pull():
-    eng = tonic_engine.TonicEngine.__new__(tonic_engine.TonicEngine)
-    g = _spine_graph()
-    # add a NON-constitutional node so a constitutional result can ONLY come from seam B
-    g.nodes["plain"] = SimpleNamespace(metadata={}, voltage=0.0, resting_potential=0.0,
-        last_spike_time=float("-inf"), firing_rate_ema=0.0, intrinsic_excitability=1.0)
-    eng._graph = g
-    eng._config = tonic_engine.EngineConfig()
-    eng._tokens_generated = 0
-    # empty active_nodes -> exploration branch skipped; thread/recent/predictions empty ->
-    # the ONLY possible source of a constitutional id is seam B (true TDD red without it).
-    feats = {"thread_nodes": [], "recent_spikes": [], "active_nodes": []}
-    acts = eng._heuristic_inference(feats)
-    ids = [nid for nid, _ in acts]
-    assert any(i.startswith("constitutional::spine::") for i in ids)
 
 def test_self_presence_is_descriptive_only():
     g = _spine_graph()

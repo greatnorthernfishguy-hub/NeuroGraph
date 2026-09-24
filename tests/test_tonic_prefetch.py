@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — Packet 086(2) heuristic-collapse updates.
+# What: dropped test_merge_runs_before_brakes_and_budget, which used inspect.getsource
+#   on TonicEngine._heuristic_inference to assert structural ordering against the
+#   removed `_apply_brakes` and the deleted heuristic body. The prefetch merge is
+#   unchanged: it is still called from _model_inference and still lives on the real-
+#   inference path. Other tests in this file are untouched — they exercise the
+#   _merge_prefetch_seeds method itself, which is unaffected by the heuristic deletion.
 # [2026-09-05] Claude Code (DudeMan CC, Fable 5.1) — Pith Stage 4 phase 5b unit tests (#55)
 # What: TonicEngine._merge_prefetch_seeds — gate-off byte-identical, no-seed no-op,
 #   score-scaled current, cap, dedup against model/heuristic picks, missing-node
@@ -128,12 +135,12 @@ def test_same_seed_set_primed_at_most_repeats_ticks(engine, monkeypatch):
     assert "P2" in _merge(engine, {})
 
 
-def test_merge_runs_before_brakes_and_budget(engine, monkeypatch):
-    """Structural: the heuristic path must see prefetch seeds in `seen` BEFORE
-    _apply_brakes and before the max_activation_nodes slice."""
-    import inspect
-    src = inspect.getsource(te.TonicEngine._heuristic_inference)
-    i_merge, i_brake = src.index("_merge_prefetch_seeds(seen)"), src.index("_apply_brakes(seen)")
-    i_slice = src.index("max_activation_nodes]")
-    assert i_merge < i_brake < i_slice
-    assert "_merge_prefetch_seeds" not in inspect.getsource(te.TonicEngine._generate_latent_token_inner)
+def test_predicted_node_dedup_keeps_higher_current(engine, monkeypatch):
+    """If the model and the prefetch seed both pick the same node, the max-current rule
+    keeps the existing entry -- and the entry never appears twice in the output dict."""
+    monkeypatch.setattr(te, "_CC_PITH_PREFETCH_WARM_ENABLED", True)
+    engine.set_prefetch_seed(lambda: {"A": 1.0})  # "A" already has 0.9 from BASE
+    out = _merge(engine, BASE)
+    assert out["A"] == 0.9  # model pick wins (higher than seed)
+    assert sum(1 for _ in out) == len(out)  # no double-keyed entries
+    assert len(out) == 2  # BASE keys only; the seed merged into existing "A"
