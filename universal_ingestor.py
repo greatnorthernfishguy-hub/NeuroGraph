@@ -15,6 +15,13 @@ Pipeline stages (PRD Addendum §2):
 Reference: NeuroGraph Foundation PRD Addendum v1.1-1.2 (Universal Ingestor).
 
 Grok Review Changelog (v0.7.1):
+    [2026-09-24 STALE — see the [2026-09-24] Changelog entry below] The two
+    "Accepted"/"Rejected" items just below describe an outer try/except and a
+    hash fallback that both existed at v0.7.1 and no longer do: embed()'s
+    outer try/except was removed 2026-09-23, and _hash_embed() itself was
+    deleted 2026-09-24 (Josh's ruling, PUNCHLIST-chief-20260921.md:95-99).
+    Left as-is below for the historical record of what Grok reviewed, per
+    LAW 3 (mark superseded, don't silently rewrite) — not current behavior.
     Accepted: Added outer try/except in embed() as defense-in-depth around
         _encode_batch() — if something unexpected bypasses the inner catch,
         the batch falls back to per-chunk hash embeddings rather than
@@ -1777,9 +1784,10 @@ class EmbeddingEngine:
             - model_name: Reporting label only, NOT a model selector (default
               "BAAI/bge-base-en-v1.5"). Nothing loads by this value —
               ``_try_load_ng_embed()`` overwrites it with the real model id on
-              success, so the default is visible only when ng_embed failed and
-              the engine is actually running the hash fallback. Stale default
-              tracked as punchlist #405.
+              success, so the default is visible only when no model ever
+              loaded (``status["model_name"] == "unavailable"``; see the
+              [2026-09-24] changelog entry — there is no hash fallback left
+              to run). Stale default tracked as punchlist #405.
             - dimension: Embedding dimension (default 768; forced to 768 on load)
             - cache_size: Max cache entries (default 10000)
             - use_model: Whether to attempt loading the real model at construction
