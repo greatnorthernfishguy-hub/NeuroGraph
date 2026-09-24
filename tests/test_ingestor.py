@@ -14,6 +14,35 @@ Tests cover:
     - Edge cases (empty input, single chunk, etc.)
 """
 
+# ---- Changelog ----
+# [2026-09-24] Z12 CC (Sonnet 5) — #495: rewrite 24 infrastructure tests off use_model=False scaffolding
+#   What: TestNoveltyDampening (10), TestHypergraphAssociator (6), TestUniversalIngestor (6),
+#         TestEdgeCases::test_very_long_input (1), and TestZipExtractor::test_end_to_end_zip_ingestion (1)
+#         all constructed EmbeddingEngine/UniversalIngestor with use_model=False and relied on the (now
+#         deleted, 2026-09-24) hash fallback to make embed() succeed as construction scaffolding for tests
+#         that are actually about dampening, association, pipeline plumbing, or chunking -- not embedding
+#         fallback behavior. After the fail-closed change (2075662) these 24 all raised EmbeddingFailedError.
+#   Why:  Chief-003 ruling on punchlist #495: 24 red infrastructure tests gate the main-merge ("reviewed +
+#         GREEN + met" bar). Dispatched as a Tier M mechanical fast-follow, explicitly "same pattern as the
+#         16 already rewritten" (TestEmbeddingEngine/TestEmbeddingDeviceControl, see _DeterministicFakeNGEmbed
+#         above). The 2 pre-existing ZipExtractor extension-detection bugs (test_empty_zip,
+#         test_skips_unsupported_files) are punchlist #494 -- confirmed via individual -v runs to be
+#         unrelated to the fail-closed change (no embedding call in their failure path) -- and are
+#         deliberately NOT touched by this commit.
+#   How:  Injected the same in-test _DeterministicFakeNGEmbed double already used by
+#         TestEmbeddingEngine/TestEmbeddingDeviceControl: `<engine>._model_available = True`,
+#         `<engine>.model_name = "fake-test-model"`, `<engine>._ng_embed = _DeterministicFakeNGEmbed(dimension=N)`,
+#         matching each site's own configured embedding dimension exactly (32 for the three
+#         dimension=32-configured classes; 16 for test_very_long_input; 768 for the ZipExtractor
+#         end-to-end test, whose config carries no explicit dimension key and therefore defaults to 768 per
+#         universal_ingestor.py:1812 -- confirmed the use_model=False path never reaches the
+#         self.dimension = 768 reassignment at :1933, which lives inside _try_load_ng_embed() and is only
+#         called when use_model=True). UniversalIngestor-wrapped sites reach the engine via
+#         `<ingestor>.embedder` (UniversalIngestor.__init__ sets self.embedder = EmbeddingEngine(...)).
+#         Full suite verified green after: 109 passed, 2 failed (the #494 ZipExtractor bugs only) --
+#         matching parent commit bd740ae5's pre-fail-closed baseline exactly.
+# -------------------
+
 import hashlib
 import math
 import os
@@ -700,7 +729,15 @@ class TestNoveltyDampening(unittest.TestCase):
                 "initial_threshold_boost": 0.2,
             },
         )
+        # [2026-09-24 #495] Real hash-fallback is gone; inject the in-test
+        # fake model double (see _DeterministicFakeNGEmbed above) rather than
+        # relying on EmbeddingEngine's own now-deleted fallback -- these tests
+        # are about novelty dampening / probation mechanics, not embedding
+        # fallback behavior itself.
         self.embedder = EmbeddingEngine({"use_model": False, "dimension": 32})
+        self.embedder._model_available = True
+        self.embedder.model_name = "fake-test-model"
+        self.embedder._ng_embed = _DeterministicFakeNGEmbed(dimension=32)
 
     def _make_embedded_chunks(self, texts):
         chunks = [Chunk(text=t, chunk_id=f"chunk_{i}") for i, t in enumerate(texts)]
@@ -847,7 +884,13 @@ class TestHypergraphAssociator(unittest.TestCase):
     def setUp(self):
         self.graph = Graph()
         self.vector_db = SimpleVectorDB()
+        # [2026-09-24 #495] Same in-test fake model double injection as
+        # TestNoveltyDampening/TestEmbeddingEngine -- these tests are about
+        # association/structural mechanics, not embedding fallback behavior.
         self.embedder = EmbeddingEngine({"use_model": False, "dimension": 32})
+        self.embedder._model_available = True
+        self.embedder.model_name = "fake-test-model"
+        self.embedder._ng_embed = _DeterministicFakeNGEmbed(dimension=32)
 
     def _setup_nodes_and_embeddings(self, texts):
         """Helper: create nodes and embeddings."""
@@ -995,6 +1038,15 @@ class TestUniversalIngestor(unittest.TestCase):
                 },
             },
         )
+        # [2026-09-24 #495] Same in-test fake model double injection as the
+        # EmbeddingEngine-level fixtures above, reached via
+        # UniversalIngestor.embedder (UniversalIngestor.__init__ sets
+        # self.embedder = EmbeddingEngine(self.config.embedding)) -- these
+        # are end-to-end pipeline tests, not tests of embedding fallback
+        # behavior itself.
+        self.ingestor.embedder._model_available = True
+        self.ingestor.embedder.model_name = "fake-test-model"
+        self.ingestor.embedder._ng_embed = _DeterministicFakeNGEmbed(dimension=32)
 
     def test_ingest_text(self):
         """Ingest plain text end-to-end."""
@@ -1111,6 +1163,11 @@ class TestUniversalIngestor(unittest.TestCase):
                 },
             },
         )
+        # [2026-09-24 #495] This test constructs its own local ingestor
+        # (separate from setUp's self.ingestor) -- needs its own injection.
+        ingestor.embedder._model_available = True
+        ingestor.embedder.model_name = "fake-test-model"
+        ingestor.embedder._ng_embed = _DeterministicFakeNGEmbed(dimension=32)
         text = "First topic about AI.\n\nSecond topic about ML.\n\nThird topic about DL."
         result = ingestor.ingest(text)
         if result.chunks_created >= 2:
@@ -1302,6 +1359,11 @@ class TestEdgeCases(unittest.TestCase):
                 },
             },
         )
+        # [2026-09-24 #495] This test is about chunking a long input, not
+        # embedding fallback behavior -- inject the fake model double.
+        ingestor.embedder._model_available = True
+        ingestor.embedder.model_name = "fake-test-model"
+        ingestor.embedder._ng_embed = _DeterministicFakeNGEmbed(dimension=16)
         text = "Word " * 5000  # ~5000 words
         result = ingestor.ingest(text)
         self.assertGreater(result.chunks_created, 1)
@@ -1495,6 +1557,19 @@ class TestZipExtractor(unittest.TestCase):
             graph = Graph()
             db = SimpleVectorDB()
             ingestor = UniversalIngestor(graph, db, {"embedding": {"use_model": False}})
+            # [2026-09-24 #495] No explicit "dimension" key here -- config
+            # default is 768 (universal_ingestor.py:1812), and use_model=False
+            # skips the real-model load path that would otherwise force
+            # self.dimension = 768 anyway (universal_ingestor.py:1933, inside
+            # _try_load_ng_embed(), never reached here) -- so 768 is correct
+            # either way. This test is about ZIP extraction + pipeline
+            # plumbing, not embedding fallback behavior; the 2 genuine
+            # ZipExtractor extension-detection bugs in this class
+            # (test_empty_zip, test_skips_unsupported_files) are #494,
+            # untouched here.
+            ingestor.embedder._model_available = True
+            ingestor.embedder.model_name = "fake-test-model"
+            ingestor.embedder._ng_embed = _DeterministicFakeNGEmbed(dimension=768)
             result = ingestor.ingest(path, source_type=SourceType.ZIP)
             self.assertGreater(result.chunks_created, 0)
             self.assertGreater(len(result.nodes_created), 0)
