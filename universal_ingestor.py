@@ -15,6 +15,13 @@ Pipeline stages (PRD Addendum §2):
 Reference: NeuroGraph Foundation PRD Addendum v1.1-1.2 (Universal Ingestor).
 
 Grok Review Changelog (v0.7.1):
+    [2026-09-24 STALE — see the [2026-09-24] Changelog entry below] The two
+    "Accepted"/"Rejected" items just below describe an outer try/except and a
+    hash fallback that both existed at v0.7.1 and no longer do: embed()'s
+    outer try/except was removed 2026-09-23, and _hash_embed() itself was
+    deleted 2026-09-24 (Josh's ruling, PUNCHLIST-chief-20260921.md:95-99).
+    Left as-is below for the historical record of what Grok reviewed, per
+    LAW 3 (mark superseded, don't silently rewrite) — not current behavior.
     Accepted: Added outer try/except in embed() as defense-in-depth around
         _encode_batch() — if something unexpected bypasses the inner catch,
         the batch falls back to per-chunk hash embeddings rather than
@@ -39,6 +46,83 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-09-24b] Z12 CC (Sonnet 5) — Fix two stale hash-fallback docstring/changelog leftovers
+#   What: EmbeddingEngine's model_name config docstring and the Grok Review Changelog (v0.7.1)
+#         block below still described the now-deleted hash fallback as current behavior.
+#   Why:  Found by the fresh cross-family review dispatched on commit 2075662 (the [2026-09-24]
+#         entry directly below) — real leftovers from that same edit, not new scope.
+#   How:  Reworded the model_name docstring bullet; added a dated note above the Grok changelog
+#         block rather than rewriting its historical entries (LAW 3).
+# -------------------
+# [2026-09-24] Z12 CC (Sonnet 5) — Reconcile to Josh's literal ruling: drop the test-mode hash carve-out
+#   What: EmbeddingEngine._hash_embed() is deleted outright (LAW 3 — no dead implementation
+#         left for someone to re-wire). _encode_batch() no longer branches on `use_model`; it
+#         unconditionally raises EmbeddingFailedError when no backend is available or encoding
+#         fails, full stop. `use_model=False` now only skips the initial model *load* attempt
+#         in __init__ — it no longer changes what an actual embed call does.
+#   Why:  The [2026-09-23] entry below (bd740ae5) kept an explicit use_model=False hash path,
+#         reasoned as distinguishable from the banned silent production fallback because it was
+#         opt-in and honestly labeled. That reasoning had no primary grounding. Josh's own
+#         verbatim ruling (handoffs/PUNCHLIST-chief-20260921.md:95-99, 2026-09-21): "Universal
+#         ingestor is the documentation only path. It has nothing to do with the experience
+#         path. Yeah, hashing here would also be worse than useless. Same embedding only
+#         rules." That entry's own prescribed action (line 99): "Delete EmbeddingEngine.
+#         _hash_embed and the bare-except fallback; let EmbeddingUnavailableError propagate" —
+#         unconditional, no test-mode exception. Packet 092 independently reinforces "no
+#         heuristic path, no hash anywhere" for this exact module. Chief-003 ruling
+#         (2026-09-24, executive-confirmed): amend to the literal reading. LAW 3: a prior,
+#         unmerged attempt at this exact defect (47094b9, 2026-09-20, branch
+#         cc-laptop-ingestor-failclosed-20260921) already implemented this literal reading —
+#         deleted _hash_embed, left resulting test breakage (45 of 109) as triaged follow-up
+#         rather than paper over it. That branch is superseded by this work, not duplicated:
+#         this commit is the reconciled superset (two-site scope + ripple audit + the test
+#         rewrite 47094b9 explicitly deferred).
+#   How:  See EmbeddingEngine._encode_batch()'s [2026-09-24 reconciliation] docstring note.
+#         tests/test_ingestor.py: tests that asserted hash-fallback AS A FEATURE (model_name
+#         reporting, the "explicit hash mode unaffected" case) rewritten to assert
+#         EmbeddingFailedError instead. Tests that merely used use_model=False as
+#         infrastructure to avoid a real model dependency (chunking/pipeline/association
+#         tests unrelated to embedding behavior itself) are the "ingestor zone's work" 47094b9
+#         named — triaged and punchlisted, not fixed in this commit; see commit message for
+#         the count. Full 077 gate re-runs fresh on this commit.
+# -------------------
+# [2026-09-23] Z12 CC (Sonnet 5) — Stop silently substituting hash vectors for failed real embeds
+#   *** SUPERSEDED 2026-09-24 — see the entry above. What follows is the record of the first,
+#   incomplete pass: it fixed the silent-substitution defect but introduced an ungrounded
+#   test-mode carve-out that the entry above removes. ***
+#   What: embed() and _encode_batch() no longer catch a production embed failure and fall
+#         back to _hash_embed(). New EmbeddingFailedError is raised instead (embed() lost its
+#         own redundant outer try/except entirely; _encode_batch() raises on both total
+#         unavailability and a runtime encode exception, but ONLY when use_model=True — the
+#         explicit use_model=False test/dev mode is untouched and still returns honest hash
+#         vectors, never silently). UniversalIngestor.ingest() now catches EmbeddingFailedError
+#         at Stage 3, logs it loudly, and returns an IngestionResult with zero nodes/synapses/
+#         hyperedges and metadata={"embedding_failed": True, ...} — nothing is deposited for
+#         that source, but ingest_batch()'s loop over other sources is unaffected.
+#   Why:  Packet 091 (Chief-003, 2026-09-23): _encode_batch() (then 1917-1933) caught EVERY
+#         ng_embed exception — including the correctly fail-closed EmbeddingUnavailableError
+#         ng_embed.py raises after its own 3x retry + quarantine — and substituted a SHA-256-
+#         seeded random vector tagged model_name="hash_fallback", a tag nothing upstream
+#         checks. Confirmed via daemon.log: 812 "Falling back to hash embeddings" events,
+#         2026-09-23 02:43:43-19:23:54 AKDT (the full HF-token-dead window) — the CC substrate
+#         was depositing fabricated vectors, not skipping deposits, for ~17h. Verification
+#         during this fix found a SECOND site the packet didn't cite: embed()'s own outer
+#         try/except (added 2026-03, Grok review v0.7.1, "Accepted: ...falls back to per-chunk
+#         hash embeddings rather than propagating up to the caller") independently caught and
+#         hash-substituted on ANY exception from _encode_batch() — fixing only the cited site
+#         would have left this second layer re-poisoning one level up. LAW 4: the contract
+#         violation is fixed at its source (the consumer that defeats ng_embed's fail-closed
+#         design), not papered over. The prior "batch resilience" goal (Grok v0.7.1) was real
+#         but wrongly placed — it now lives at ingest()'s orchestration layer (skip one failed
+#         source, keep processing the batch) instead of inside the embedder fabricating data.
+#   How:  See EmbeddingFailedError, EmbeddingEngine._encode_batch(), EmbeddingEngine.embed(),
+#         and UniversalIngestor.ingest()'s Stage 3 block. tests/test_ingestor.py's
+#         test_encode_batch_runtime_fallback updated to assert the new raise-not-hash behavior
+#         (construction changed use_model=False -> True to match what it actually simulates:
+#         a model that loaded, then failed at call time). Pending 077 dual review (Law Enforcer
+#         + cross-family) before merge; no deploy/restart without separate explicit go — the
+#         daemon this file serves is currently stopped and disabled (Packet 092).
+# -------------------
 # [2026-09-03] DudeMan CC (Fable 5.1) — Correct stale embedder references (docs only)
 #   What: Comment/docstring-only corrections. No behavior change, no logic touched.
 #         (a) Module docstring stage 3 said "via sentence-transformers" — that backend
@@ -1672,14 +1756,28 @@ class AdaptiveChunker:
 # Stage 3: Embedding Engine (PRD Addendum §2, Stage 3)
 # ---------------------------------------------------------------------------
 
+class EmbeddingFailedError(RuntimeError):
+    """Raised when a production embedding attempt fails and must not be
+    silently replaced by a fake vector. See EmbeddingEngine._encode_batch()
+    changelog entry [2026-09-23] for why this exists.
+    """
+
+
 class EmbeddingEngine:
     """Converts chunks into vector representations.
 
     Uses ng_embed (NGEmbed ONNX singleton — Snowflake/snowflake-arctic-embed-m-v1.5,
-    768-dim) when available. Falls back to a deterministic hash-based embedding
-    for environments without ng_embed (testing, lightweight deployments). The
-    hash fallback is also 768-dim, so the substrate never receives a
-    wrong-dimension vector from either path.
+    768-dim). FAIL CLOSED, unconditionally (2026-09-24 reconciliation — see
+    _encode_batch()'s changelog entry): there is no hash-based fallback
+    embedding anywhere in this class, including for ``use_model=False``. Josh,
+    2026-09-21 (handoffs/PUNCHLIST-chief-20260921.md:95-99, verbatim): "Universal
+    ingestor is the documentation only path. It has nothing to do with the
+    experience path. Yeah, hashing here would also be worse than useless. Same
+    embedding only rules." His prescribed action was unconditional: delete
+    ``_hash_embed`` and let the unavailable-backend error propagate — no
+    test-mode exception. ``use_model=False`` now only skips the initial model
+    *load* attempt (still useful to avoid a network/model dependency at
+    construction time); any actual embed call still raises.
 
     The ``device`` config key is VESTIGIAL. It dates from the
     sentence-transformers backend (removed 2026-03-19); ng_embed runs ONNX
@@ -1694,12 +1792,15 @@ class EmbeddingEngine:
             - model_name: Reporting label only, NOT a model selector (default
               "BAAI/bge-base-en-v1.5"). Nothing loads by this value —
               ``_try_load_ng_embed()`` overwrites it with the real model id on
-              success, so the default is visible only when ng_embed failed and
-              the engine is actually running the hash fallback. Stale default
-              tracked as punchlist #405.
+              success, so the default is visible only when no model ever
+              loaded (``status["model_name"] == "unavailable"``; see the
+              [2026-09-24] changelog entry — there is no hash fallback left
+              to run). Stale default tracked as punchlist #405.
             - dimension: Embedding dimension (default 768; forced to 768 on load)
             - cache_size: Max cache entries (default 10000)
-            - use_model: Force model loading (default True, falls back if unavailable)
+            - use_model: Whether to attempt loading the real model at construction
+              (default True). False skips the load attempt only — it does NOT enable
+              a fallback; any embed call still raises if no model is available.
             - device: Vestigial, ignored by the ng_embed backend (default "auto")
     """
 
@@ -1813,9 +1914,11 @@ class EmbeddingEngine:
             return
         self._model_available = False
         self._fallback_reason = "ng_embed not available or failed to load"
-        self._logger.warning(
-            "No embedding backend available. "
-            "Using deterministic hash-based fallback embeddings."
+        self._logger.error(
+            "No embedding backend available. Ingestion will FAIL CLOSED — "
+            "embedding calls raise rather than substituting hash vectors. "
+            "Reason: %s",
+            self._fallback_reason,
         )
 
     def _try_load_ng_embed(self) -> bool:
@@ -1823,7 +1926,10 @@ class EmbeddingEngine:
         try:
             from ng_embed import NGEmbed
             self._ng_embed = NGEmbed.get_instance()
-            # Dimension is always 768 — ng_embed produces 768-dim in both ONNX and hash-fallback paths
+            # Dimension is always 768 (ng_embed ONNX + HF remote both produce
+            # 768-dim). NOTE: ng_embed's own hash fallback is opt-in and OFF by
+            # default as of the 2026-09-21 fail-closed change — not a path we
+            # rely on here either.
             self.dimension = 768
             self.model_name = "Snowflake/snowflake-arctic-embed-m-v1.5"
             self._model_available = True
@@ -1853,8 +1959,12 @@ class EmbeddingEngine:
         """Embed a list of chunks, using cache where possible.
 
         Returns list of EmbeddedChunk with normalized vectors.
-        Individual chunk failures fall back to hash embedding rather than
-        failing the entire batch (Grok review: batch resilience).
+
+        Does NOT fall back to hash embedding on a production encode failure —
+        see _encode_batch()'s changelog entry [2026-09-23]. Raises
+        EmbeddingFailedError (or lets an unexpected exception propagate) so the
+        caller (UniversalIngestor.ingest()) can skip the deposit for this batch
+        rather than the substrate silently receiving fabricated vectors.
         """
         results: List[EmbeddedChunk] = []
         uncached: List[Tuple[int, Chunk]] = []
@@ -1869,7 +1979,7 @@ class EmbeddingEngine:
                 results.append(EmbeddedChunk(
                     chunk=chunk,
                     vector=vec,
-                    model_name=self.model_name if self._model_available else "hash_fallback",
+                    model_name=self.model_name if self._model_available else "unavailable",
                 ))
             else:
                 results.append(None)  # type: ignore[arg-type]
@@ -1877,13 +1987,7 @@ class EmbeddingEngine:
 
         if uncached:
             texts = [c.text for _, c in uncached]
-            try:
-                vectors = self._encode_batch(texts)
-            except Exception as exc:
-                self._logger.warning(
-                    "Batch embed failed (%s), falling back to per-chunk hash", exc,
-                )
-                vectors = [self._hash_embed(t) for t in texts]
+            vectors = self._encode_batch(texts)
             for (idx, chunk), vec in zip(uncached, vectors):
                 # Normalize
                 norm = np.linalg.norm(vec)
@@ -1894,7 +1998,7 @@ class EmbeddingEngine:
                 results[idx] = EmbeddedChunk(
                     chunk=chunk,
                     vector=vec,
-                    model_name=self.model_name if self._model_available else "hash_fallback",
+                    model_name=self.model_name if self._model_available else "unavailable",
                 )
 
         return results
@@ -1915,37 +2019,58 @@ class EmbeddingEngine:
         return vec
 
     def _encode_batch(self, texts: List[str]) -> List[np.ndarray]:
-        """Encode a batch of texts into vectors.
+        """Encode a batch of texts into vectors. FAIL CLOSED, unconditionally.
 
-        If the model is loaded but encoding fails at runtime (e.g. CUDA
-        out-of-memory, driver error), falls back to hash embeddings for this
-        batch rather than crashing the entire pipeline.
+        [2026-09-23] No longer falls back to hash embeddings on a production
+        encode failure. Prior behavior (Grok review v0.7.1, "Accepted: ...
+        falls back to per-chunk hash embeddings rather than propagating up to
+        the caller") optimized for batch resilience but meant a real model's
+        load or runtime failure (e.g. ng_embed's HF-401 after its own 3x
+        retry + quarantine + raise) was silently replaced by a SHA-256-seeded
+        random vector tagged model_name="hash_fallback" — a tag nothing
+        upstream checks. Confirmed live impact: 812 "Falling back to hash
+        embeddings" events, 2026-09-23 02:43:43-19:23:54 AKDT, ~17h of the CC
+        substrate receiving fabricated vectors, not absent ones (Packet 091).
+
+        [2026-09-24 reconciliation] The first pass of this fix (bd740ae5)
+        kept an honest hash path behind an explicit use_model=False flag,
+        reasoning that opt-in hash embedding for tests/lightweight
+        deployments was distinguishable from the banned silent production
+        fallback. That carve-out had no primary grounding: Josh's own
+        verbatim ruling (handoffs/PUNCHLIST-chief-20260921.md:95-99,
+        2026-09-21) prescribes, unconditionally, "Delete
+        EmbeddingEngine._hash_embed and the bare-except fallback; let
+        EmbeddingUnavailableError propagate" — and Packet 092 independently
+        reinforces "no heuristic path, no hash anywhere" for this exact
+        module. A prior, unmerged attempt at this same defect (47094b9,
+        2026-09-20, branch cc-laptop-ingestor-failclosed-20260921) already
+        implemented the literal reading — deleted _hash_embed outright,
+        left the resulting test breakage as triaged follow-up work rather
+        than paper over it. This revision reconciles bd740ae5 to match:
+        the carve-out is gone, _hash_embed is deleted, and there is no
+        longer any path in this class that returns a fabricated vector.
+        use_model=False now only skips the initial model *load* attempt
+        (__init__ won't call _try_load_model()) — any actual embed call
+        still raises, exactly like a load failure would. Batch resilience
+        for a real production failure lives at the caller
+        (UniversalIngestor.ingest() skips the deposit and logs loudly)
+        rather than being faked here — LAW 4: fix at the source, don't
+        paper over a contract violation with fabricated data.
         """
-        if self._model_available and self._ng_embed is not None:
-            try:
-                return self._ng_embed.embed_batch(texts)
-            except Exception as exc:
-                self._logger.warning(
-                    "ng_embed encode failed (%s). Falling back to hash embeddings "
-                    "for this batch of %d texts.",
-                    exc, len(texts),
-                )
-        return [self._hash_embed(t) for t in texts]
+        if not self._model_available or self._ng_embed is None:
+            raise EmbeddingFailedError(
+                f"No embedding model available "
+                f"(_model_available={self._model_available}; "
+                f"fallback_reason={self._fallback_reason!r}). Refusing to "
+                f"substitute hash embeddings. Ingestion fails closed."
+            )
 
-    def _hash_embed(self, text: str) -> np.ndarray:
-        """Deterministic hash-based embedding fallback.
-
-        Produces consistent vectors from text content using SHA-256 seeding.
-        Useful for testing without model dependencies.
-        """
-        h = hashlib.sha256(text.encode("utf-8")).digest()
-        seed = int.from_bytes(h[:4], "big")
-        rng = np.random.RandomState(seed)
-        vec = rng.randn(self.dimension).astype(np.float32)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec
+        try:
+            return self._ng_embed.embed_batch(texts)
+        except Exception as exc:
+            raise EmbeddingFailedError(
+                f"ng_embed encode failed for a batch of {len(texts)} texts: {exc}"
+            ) from exc
 
     def _cache_key(self, text: str) -> str:
         """Create cache key from text content."""
@@ -1971,7 +2096,7 @@ class EmbeddingEngine:
         """
         return {
             "model_available": self._model_available,
-            "model_name": self.model_name if self._model_available else "hash_fallback",
+            "model_name": self.model_name if self._model_available else "unavailable",
             "device_requested": self.device,
             "device_active": self._active_device,
             "dimension": self.dimension,
@@ -2691,7 +2816,31 @@ class UniversalIngestor:
 
         # Stage 3: Embed
         cache_before = self.embedder.cache_hits
-        embedded_chunks = self.embedder.embed(chunks)
+        try:
+            embedded_chunks = self.embedder.embed(chunks)
+        except EmbeddingFailedError as exc:
+            # [2026-09-23] Packet 091 fix: a failed embed means nothing is
+            # deposited for this source — never a fabricated hash vector.
+            # Batch resilience (one bad source doesn't kill ingest_batch())
+            # lives here, at the orchestration layer, not inside the
+            # embedder faking data. Logged loudly, not silently.
+            logging.getLogger("neurograph.ingestor").error(
+                "Embedding failed for source %r (%d chunks) — skipping "
+                "deposit, nothing written to the substrate. %s",
+                source[:200], len(chunks), exc,
+            )
+            result = IngestionResult(
+                source=source[:200],
+                source_type=extracted.source_type,
+                chunks_created=len(chunks),
+                metadata={
+                    "embedding_failed": True,
+                    "error": str(exc),
+                    "extraction_metadata": extracted.metadata,
+                },
+            )
+            self.ingestion_log.append(result)
+            return result
         cache_hits = max(0, self.embedder.cache_hits - cache_before - len(chunks))
 
         # Stage 4: Register
