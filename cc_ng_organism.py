@@ -1437,6 +1437,11 @@ _CC_KISS_REDUNDANCY_THRESHOLD = float(os.environ.get("CC_KISS_REDUNDANCY_THRESHO
 # (turns deposit fresh, pre-KISS behavior) without a code change or restart-to-old.
 _CC_KISS_GATE_ENABLED = os.environ.get("CC_KISS_GATE_ENABLED", "1") not in ("0", "false", "False", "")
 
+# ---- Shared Graduation confidence signal (COMB-04) ----
+# Gated confidence signal for KISS/Pith shared graduation per the "Shared Graduation"
+# spec (docs/concepts/KISS_Pith_Combined_Architecture.md).
+_CC_CONFIDENCE_GATE_ENABLED = os.environ.get("CC_CONFIDENCE_GATE_ENABLED", "0") not in ("0", "false", "False", "")
+
 _CC_CONCEPT_FLOOR_MIN_CHARS = 5
 _CC_CONCEPT_FLOOR_STOPWORDS = frozenset(
     "a an and are as at be but by for from has have i if in is it its let me my not of on "
@@ -1456,6 +1461,74 @@ def _cc_concept_passes_floor(concept: str) -> bool:
     if words and all(w in _CC_CONCEPT_FLOOR_STOPWORDS for w in words):
         return False
     return True
+
+
+def _cc_substrate_confidence(graph, embedding):
+    """Compute substrate confidence for a topological region (embedding).
+    
+    Returns confidence score 0.0 (novel/uncertain) to 1.0 (known/confident).
+    Derived from ng_lite.py public API: detect_novelty() is inverse confidence.
+    
+    This is a read-only helper against vendored ng_lite.py -- does NOT modify
+    the substrate, only queries its existing methods.
+    """
+    try:
+        # detect_novelty returns 0.0 (routine) to 1.0 (novel)
+        novelty = graph.detect_novelty(embedding)
+        # confidence = 1.0 - novelty (inverse relationship)
+        confidence = 1.0 - novelty
+        # Clamp to valid range
+        return max(0.0, min(1.0, confidence))
+    except Exception as exc:
+        # Fail-soft: return 0.0 (novel) on any error
+        logger.debug("substrate confidence derivation failed: %s", exc)
+        return 0.0
+
+
+def _cc_region_hash(embedding):
+    """Compute a stable hash for a topological region from its embedding.
+    
+    Used as part of the target_id for confidence deposits in Commons.
+    Simple SHA256 of embedding bytes for now.
+    """
+    import hashlib
+    import numpy as np
+    # Convert to bytes: flatten, float32, little-endian
+    arr = np.asarray(embedding, dtype=np.float32).flatten()
+    return hashlib.sha256(arr.tobytes()).hexdigest()[:16]  # first 16 chars
+
+
+def _cc_deposit_confidence(commons, graph, embedding):
+    """Deposit substrate confidence for a region to Commons.
+    
+    Mirroring arousal deposit pattern: target_id = "confidence:<region_hash>"
+    with metadata containing confidence value and timestamp.
+    
+    Only deposits when confidence gate is enabled.
+    Returns confidence value (float) or None on failure.
+    """
+    if not _CC_CONFIDENCE_GATE_ENABLED or commons is None:
+        return None
+    
+    try:
+        confidence = _cc_substrate_confidence(graph, embedding)
+        region_hash = _cc_region_hash(embedding)
+        target_id = f"confidence:{region_hash}"
+        
+        # Deposit to Commons with metadata
+        commons.deposit(
+            embedding,  # Using the region embedding as the deposit embedding
+            target_id,
+            metadata={
+                "confidence": confidence,
+                "region_hash": region_hash,
+                "ts": time.time()
+            }
+        )
+        return confidence
+    except Exception as exc:
+        logger.debug("confidence deposit failed: %s", exc)
+        return None
 
 
 def _cc_embed_to_poincare_dir(embedding):
@@ -1516,7 +1589,7 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
         return node
 
 
-def _cc_kiss_find_redundant_node(graph, vector_db, embedding) -> Optional[str]:
+def _cc_kiss_find_redundant_node(graph, vector_db, embedding, commons=None) -> Optional[str]:
     """Delta Gate (KISS op 1), applied at CC's own deposit boundary: is this
     turn's embedding a near-duplicate of an existing conversational
     (forest-level) memory already in `vector_db`? Pure cosine-similarity
@@ -1535,9 +1608,37 @@ def _cc_kiss_find_redundant_node(graph, vector_db, embedding) -> Optional[str]:
     returned as a collapse target -- a redundant turn must not fold into a
     pinned node. Such matches are skipped; if only pinned nodes match, returns
     None so the turn deposits fresh.
+
+    Confidence-gated adjustment (COMB-04): when CC_CONFIDENCE_GATE_ENABLED is on,
+    the redundancy threshold is adjusted by substrate confidence for this region.
+    High confidence → tighter threshold (more aggressive filtering).
+    Low confidence → looser threshold (less filtering, more learning).
     """
+    # Compute base threshold
+    base_threshold = _CC_KISS_REDUNDANCY_THRESHOLD
+    
+    # Apply confidence adjustment if enabled
+    if _CC_CONFIDENCE_GATE_ENABLED and commons is not None:
+        try:
+            # Get confidence for this region
+            region_hash = _cc_region_hash(embedding)
+            confidence = commons.read_confidence(region_hash, default=0.0)
+            
+            # Adjust threshold: high confidence -> tighter (higher threshold)
+            # Low confidence -> looser (lower threshold)
+            # confidence in [0.0, 1.0], adjustment in [-0.1, +0.1]
+            adjustment = confidence * 0.2 - 0.1  # Maps 0.0 -> -0.1, 1.0 -> +0.1
+            adjusted_threshold = base_threshold + adjustment
+            # Clamp to reasonable bounds
+            threshold = max(0.5, min(0.99, adjusted_threshold))
+        except Exception as exc:
+            logger.debug("KISS confidence adjustment failed: %s", exc)
+            threshold = base_threshold
+    else:
+        threshold = base_threshold
+    
     try:
-        hits = vector_db.search(embedding, k=5, threshold=_CC_KISS_REDUNDANCY_THRESHOLD)
+        hits = vector_db.search(embedding, k=5, threshold=threshold)
     except Exception as exc:
         logger.debug("CC KISS redundancy search failed (non-fatal): %s", exc)
         return None
@@ -4722,7 +4823,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
     if graph is None:
         return _pith_provider_unavailable("ng_unavailable")
     if budget_chars is None:
-        budget = cc_l1_budget(commons)
+        budget = cc_l1_budget(commons, region_hash=current_region_hash)
     elif (isinstance(budget_chars, int) and not isinstance(budget_chars, bool)
           and 500 <= budget_chars <= 40000):
         budget = budget_chars
@@ -4894,7 +4995,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
 
     When CC_PITH_ENABLED, the combined item set is run through the Pith
     pipeline (CacheLines -> pith_victim_recover -> cc_thermal -> cc_novelty
-    -> pith_stage1 -> pith_stage3(budget=cc_l1_budget(commons)) ->
+    -> pith_stage1 -> pith_stage3(budget=cc_l1_budget(commons, region_hash=current_region_hash)) ->
     pith_victim_capture) instead of the plain two-block concatenation, with
     constitutional pins (ng.graph._is_identity_protected) preserved
     unconditionally. Any exception anywhere in the Pith path is fail-soft --
@@ -5016,7 +5117,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # Reads its own weights from env (CC_PITH_W_RELEVANCE,
             # CC_PITH_W_RECENCY); budget breathes with commons arousal.
             _pre_l1 = survivors  # post-stage1, pre-budget: the full L1 candidate set
-            survivors = pith_stage3(survivors, budget_chars=cc_l1_budget(commons))
+            survivors = pith_stage3(survivors, budget_chars=cc_l1_budget(commons, region_hash=current_region_hash))
             # Pith Stage 5 (eviction): budget-dropped lines fall to the victim buffer.
             try:
                 pith_victim_capture(survivors, _pre_l1)

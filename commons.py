@@ -417,6 +417,32 @@ class Commons:
         """The vagus-nerve bucket — latest autonomic arousal STATE string (convenience over arousal())."""
         return self.arousal().get("state", default)
 
+    def read_confidence(self, region_hash: str, default: float = 0.0) -> float:
+        """Read substrate confidence for a topological region from Commons.
+        
+        Looks for the latest deposit with target_id "confidence:<region_hash>".
+        Returns confidence value from metadata (0.0 to 1.0), or default if not found.
+        Follows same fail-soft pattern as read_arousal().
+        """
+        try:
+            latest = None
+            latest_ts = -1.0
+            target_prefix = f"confidence:{region_hash}"
+            for syn in list(self._ng.synapses.values()):   # snapshot before iterate
+                if getattr(syn, "target_id", "").startswith(target_prefix):
+                    ts = getattr(syn, "last_updated", 0.0)
+                    if ts >= latest_ts:
+                        latest_ts = ts
+                        latest = syn
+            if latest is not None:
+                meta = getattr(latest, "metadata", {}).get("last_context", {}) or {}
+                conf = meta.get("confidence")
+                if conf is not None:
+                    return float(conf)
+        except Exception as exc:  # noqa: BLE001 — a read failure never breaks the caller's pulse
+            logger.debug("confidence read failed for region %s: %s", region_hash, exc)
+        return default
+
     # ---- Reversible hard suppression (#366) — the reversible counterpart to Cricket's Rim ----
     # NOT a third substrate-protocol verb: like persist/restore/stats/arousal, these shape/inspect the
     # medium's extraction, they don't add a way to send/route. deposit/bucket remain the only two verbs.
