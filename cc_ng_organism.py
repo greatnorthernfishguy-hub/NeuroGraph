@@ -4,6 +4,25 @@
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-09-24] Claude Sonnet 5 (Claude Code, groupb-kiss-shared-graduation-001) —
+#   Revision 1 (ZM review): pin the threshold shift's magnitude, cap the floor
+#   at base, and share one "neutral" definition with Pith.
+# What: in _cc_kiss_find_redundant_node, the clamp floor is now
+#   min(_CC_KISS_REGION_CONFIDENCE_FLOOR, _CC_KISS_REDUNDANCY_THRESHOLD) instead
+#   of the raw env value, and the formula's literal 0.5 is replaced by
+#   _CC_PITH_REGION_CONFIDENCE_NEUTRAL (the same constant cc_region_confidence
+#   itself fails soft to). New tests: test_effective_threshold_magnitude_at_
+#   extremes (pins base-span/base+span, not just direction) and test_floor_
+#   above_base_does_not_break_neutral_equals_base.
+# Why: ZM Revision 1 (T3 seq 250721) -- a mutation halving the span factor
+#   passed all 8 prior tests (nothing pinned the magnitude, charter §3); a
+#   FLOOR set above base would have silently broken "neutral == base"; two
+#   independent 0.5 literals (here and in cc_region_confidence) is a second
+#   definition of neutral where the spec wants one.
+# How: no change to the formula's shape or to cc_region_confidence itself --
+#   _CC_PITH_REGION_CONFIDENCE_NEUTRAL is a module-level constant read at call
+#   time (defined ~l.3335, safe regardless of file order in Python). LAW 3/4/7
+#   and the LE's four conditions are unaffected; see prior entry below.
+# [2026-09-24] Claude Sonnet 5 (Claude Code, groupb-kiss-shared-graduation-001) —
 #   COMB-04 Shared Graduation, KISS half: region confidence shifts the KISS
 #   redundancy threshold too.
 # What: _cc_kiss_find_redundant_node now computes an effective search threshold
@@ -1606,20 +1625,27 @@ def _cc_kiss_find_redundant_node(graph, vector_db, embedding) -> Optional[str]:
     it is shifted by cc_region_confidence(graph, vector_db, embedding), the same
     live, uncached confidence query Pith reads for cc_l1_budget (LAW 7: nothing
     from that call is deposited, cached, or stored -- it is used once, here, and
-    discarded). Confidence above neutral (0.5) lowers the effective threshold
-    (collapses more readily); confidence below neutral raises it (collapses less);
-    at neutral -- also cc_region_confidence's own fail-soft value -- the effective
-    threshold equals _CC_KISS_REDUNDANCY_THRESHOLD exactly. Clamped to
-    [_CC_KISS_REGION_CONFIDENCE_FLOOR, 1.0] so "redundant" still means
-    near-duplicate even at confidence 1.0. With the flag off, this block is
-    skipped entirely -- no confidence call, same threshold, same search call as
-    before this feature existed.
+    discarded). Confidence above neutral lowers the effective threshold (collapses
+    more readily); confidence below neutral raises it (collapses less); at neutral
+    -- _CC_PITH_REGION_CONFIDENCE_NEUTRAL, the same constant cc_region_confidence
+    itself returns on fail-soft, so both ends of Shared Graduation share one
+    definition of "neutral" -- the effective threshold equals
+    _CC_KISS_REDUNDANCY_THRESHOLD exactly. Clamped to
+    [min(_CC_KISS_REGION_CONFIDENCE_FLOOR, _CC_KISS_REDUNDANCY_THRESHOLD), 1.0]:
+    the floor is capped at base so a misconfigured floor (set above base) can
+    never make the neutral-confidence threshold silently diverge from today's
+    fixed value -- "redundant" still means near-duplicate even at confidence 1.0.
+    With the flag off, this block is skipped entirely -- no confidence call, same
+    threshold, same search call as before this feature existed.
     """
     threshold = _CC_KISS_REDUNDANCY_THRESHOLD
     if _CC_KISS_REGION_CONFIDENCE_ENABLED:
         confidence = cc_region_confidence(graph, vector_db, embedding)
-        threshold = _CC_KISS_REDUNDANCY_THRESHOLD - (confidence - 0.5) * 2.0 * _CC_KISS_REGION_CONFIDENCE_SPAN
-        threshold = max(_CC_KISS_REGION_CONFIDENCE_FLOOR, min(1.0, threshold))
+        threshold = _CC_KISS_REDUNDANCY_THRESHOLD - (
+            confidence - _CC_PITH_REGION_CONFIDENCE_NEUTRAL
+        ) * 2.0 * _CC_KISS_REGION_CONFIDENCE_SPAN
+        floor = min(_CC_KISS_REGION_CONFIDENCE_FLOOR, _CC_KISS_REDUNDANCY_THRESHOLD)
+        threshold = max(floor, min(1.0, threshold))
     try:
         hits = vector_db.search(embedding, k=5, threshold=threshold)
     except Exception as exc:

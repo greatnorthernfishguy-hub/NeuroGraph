@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-09-24] Claude Sonnet 5 (Claude Code, groupb-kiss-shared-graduation-001) — Revision 1
+# What: add test_effective_threshold_magnitude_at_extremes (pins the shift's
+#   magnitude, not just direction) and test_floor_above_base_does_not_break_
+#   neutral_equals_base (FLOOR > base still yields base at neutral).
+# Why: ZM Revision 1 review, charter §3 -- a mutation halving the span factor
+#   (`* 2.0` -> `* 1.0`) passed all 8 existing tests; nothing pinned the
+#   magnitude. A FLOOR set above base was also an unguarded edge.
+# How: same style as the existing (a)/(f) tests -- _CapturingVectorDB plus a
+#   monkeypatched cc_region_confidence, asserting the exact numeric threshold.
 # [2026-09-24] Claude Sonnet 5 (Claude Code, groupb-kiss-shared-graduation-001) — new file
 # What: tests for the KISS half of Shared Graduation (COMB-04) -- the region-
 #   confidence-shifted redundancy threshold in _cc_kiss_find_redundant_node.
@@ -118,6 +127,28 @@ def test_effective_threshold_monotonic_and_equals_base_at_neutral(monkeypatch):
     # (more permissive) threshold -> collapses more readily. One function,
     # no jumps, no categories.
     assert all(thresholds[i] > thresholds[i + 1] for i in range(len(thresholds) - 1))
+
+
+def test_effective_threshold_magnitude_at_extremes(monkeypatch):
+    """Revision 1, item 1 (ZM): pins the *magnitude* of the shift, not just its
+    direction/monotonicity -- a mutation that scales the span factor (e.g.
+    `* 1.0` instead of `* 2.0`) changes these exact values and must fail this
+    test. Floor is set low enough (0.0) that it never binds, isolating the
+    raw formula from the clamp (the clamp itself is (f)'s job)."""
+    monkeypatch.setattr(cc, "_CC_KISS_REGION_CONFIDENCE_ENABLED", True)
+    monkeypatch.setattr(cc, "_CC_KISS_REGION_CONFIDENCE_SPAN", 0.1)
+    monkeypatch.setattr(cc, "_CC_KISS_REGION_CONFIDENCE_FLOOR", 0.0)
+    base = cc._CC_KISS_REDUNDANCY_THRESHOLD
+
+    monkeypatch.setattr(cc, "cc_region_confidence", lambda g, v, e: 1.0)
+    vdb = _CapturingVectorDB()
+    cc._cc_kiss_find_redundant_node(_MiniGraph(), vdb, np.array([1.0, 0.0]))
+    assert vdb.calls[0]["threshold"] == pytest.approx(base - 0.1)
+
+    monkeypatch.setattr(cc, "cc_region_confidence", lambda g, v, e: 0.0)
+    vdb = _CapturingVectorDB()
+    cc._cc_kiss_find_redundant_node(_MiniGraph(), vdb, np.array([1.0, 0.0]))
+    assert vdb.calls[0]["threshold"] == pytest.approx(min(1.0, base + 0.1))
 
 
 def test_kiss_flag_on_but_pith_flag_off_yields_neutral_confidence_and_base_threshold(monkeypatch):
@@ -284,6 +315,22 @@ def test_threshold_computation_is_read_only(monkeypatch):
 # ============================================================================
 # (f) The clamp holds at confidence 0.0 and 1.0.
 # ============================================================================
+
+def test_floor_above_base_does_not_break_neutral_equals_base(monkeypatch):
+    """Revision 1, item 2 (ZM): CC_KISS_REGION_CONFIDENCE_FLOOR set above
+    _CC_KISS_REDUNDANCY_THRESHOLD must not make the neutral-confidence
+    threshold silently diverge from base -- the clamp caps the floor it uses
+    at base, so 'effective == base at neutral' holds for any FLOOR setting,
+    not just the sane ones."""
+    monkeypatch.setattr(cc, "_CC_KISS_REGION_CONFIDENCE_ENABLED", True)
+    monkeypatch.setattr(cc, "_CC_KISS_REGION_CONFIDENCE_FLOOR", 1.0)  # > base (0.95)
+    monkeypatch.setattr(cc, "cc_region_confidence",
+                         lambda g, v, e: cc._CC_PITH_REGION_CONFIDENCE_NEUTRAL)
+
+    vdb = _CapturingVectorDB()
+    cc._cc_kiss_find_redundant_node(_MiniGraph(), vdb, np.array([1.0, 0.0]))
+    assert vdb.calls[0]["threshold"] == pytest.approx(cc._CC_KISS_REDUNDANCY_THRESHOLD)
+
 
 def test_clamp_holds_at_confidence_extremes(monkeypatch):
     monkeypatch.setattr(cc, "_CC_KISS_REGION_CONFIDENCE_ENABLED", True)
