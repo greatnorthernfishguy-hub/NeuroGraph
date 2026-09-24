@@ -27,6 +27,12 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-24] Grok — #513: embedding-unavailable is its own deposit skip.
+# What: _embed(text) sits outside the dual-pass fault barrier. EmbeddingUnavailableError
+#   logs a warning that the deposit was skipped because embedding is unavailable, then returns.
+# Why: _deposit() runs on a daemon thread. The broad debug catch hid a fail-closed embed
+#   failure as a generic "CC deposit failed" line (LAW 4/7, punchlist #513).
+# How: narrow except around _embed only. dual_pass/discovery keep the existing Exception handler.
 # [2026-09-13] Codex — expose read-only topology-built provider context.
 # What: add the provider_context socket verb through the shared Pith assembler.
 # Why: miniTID needs a fresh situational model rather than ranked memory snippets.
@@ -547,12 +553,19 @@ def _deposit(text: str) -> None:
     # tract drain uses it; this call site was the old door left standing. The
     # dual-pass fires nodes the same way, so the _recent_spikes read and the
     # hyperedge discovery below are unchanged.
+    from ng_embed import EmbeddingUnavailableError, embed as _embed
+    try:
+        embedding = _embed(text)
+    except EmbeddingUnavailableError as exc:
+        logger.warning(
+            "CC deposit skipped because embedding is unavailable: %s", exc,
+        )
+        return
     try:
         from cc_ng_organism import run_conversational_dual_pass
-        from ng_embed import embed as _embed
         with ng.graph._concurrent_lock:
             run_conversational_dual_pass(
-                ng.graph, getattr(ng, "vector_db", None), text, _embed(text), _STATE.conv_state)
+                ng.graph, getattr(ng, "vector_db", None), text, embedding, _STATE.conv_state)
             fired = [
                 nid for nid, spikes in ng.graph._recent_spikes.items()
                 if spikes and spikes[-1] == ng.graph.timestep
