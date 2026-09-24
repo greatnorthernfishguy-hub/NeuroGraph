@@ -10,6 +10,7 @@ Tests:
 import pytest
 import os
 from unittest.mock import Mock, patch, MagicMock
+from types import SimpleNamespace
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -255,70 +256,214 @@ def test_cc_l1_budget_region_confidence_disabled():
 def test_flag_off_no_embed_call_in_cc_assemble_recall():
     """Test that ng_embed.embed() is NOT called when flag is OFF in cc_assemble_recall."""
     import cc_ng_organism as cc_module
+    from types import SimpleNamespace
     
-    # Mock ng with graph and vector_db
-    mock_ng = Mock()
-    mock_ng.graph = MockGraph()
-    mock_ng.vector_db = MockVectorDB()
+    # Create a minimal mock graph
+    mock_graph = MockGraph()
+    mock_graph.nodes = {"core": MockNode("core")}
+    mock_graph.nodes["core"].metadata = {"constitutional": True}
     
+    # Mock vector_db (needed for the embed path)
+    mock_vector_db = MockVectorDB()
+    
+    # Create ng with graph and vector_db
+    ng = SimpleNamespace(
+        graph=mock_graph,
+        vector_db=mock_vector_db,
+        _surfacing_monitor=None  # No monitor items to simplify
+    )
+    
+    # Mock commons
     mock_commons = Mock()
     mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
     
-    # Instead of testing the actual call sites, test that cc_l1_budget doesn't call embed
-    # when flag is OFF, which is what matters for byte-for-byte behavior
-    with patch.multiple(cc_module,
-                       _CC_PITH_L1_BUDGET=4000,
-                       _CC_PITH_L1_BREATHE=True,
-                       _CC_PITH_BREATHE_PARASYMPATHETIC=1.4,
-                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
+    # Patch ng_embed.embed to track calls
+    # The call site does: "from ng_embed import embed as ng_embed_fn"
+    # So we need to patch ng_embed.embed at the module level
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
         
-        # The key test: when flag is OFF, cc_l1_budget should ignore graph/vector_db/embedding
-        # and just compute budget based on commons
-        budget_with_params = cc_module.cc_l1_budget(mock_commons, mock_ng.graph, mock_ng.vector_db, [0.1]*768)
-        budget_without_params = cc_module.cc_l1_budget(mock_commons)
-        
-        # Both should be the same (no region confidence modulation)
-        assert budget_with_params == budget_without_params == 5600  # 4000 * 1.4
+        # Patch the flag to OFF
+        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False):
+            # Also need to patch other flags to bypass Pith pipeline
+            with patch.object(cc_module, '_CC_PITH_ENABLED', False):
+                # Mock pattern completion to return empty (simplify)
+                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
+                    # Call cc_assemble_recall
+                    result = cc_module.cc_assemble_recall(
+                        ng=ng,
+                        query="test query",
+                        k=5,
+                        conv_state={},
+                        commons=mock_commons,
+                        on_monitor_error=None,
+                        allow_pattern_completion=True
+                    )
+                    
+                    # ng_embed.embed should NOT be called because flag is OFF
+                    mock_embed.assert_not_called()
+                    
+                    # Result should be empty string (no monitor items, no pattern completion)
+                    assert result == ""
 
 
 def test_flag_off_no_embed_call_in_pith_provider_context():
-    """Test that ng_embed.embed() is NOT called when flag is OFF in pith_provider_context context."""
+    """Test that ng_embed.embed() is NOT called when flag is OFF in pith_provider_context."""
     import cc_ng_organism as cc_module
+    from types import SimpleNamespace
     
-    # The actual check is that when flag is OFF, cc_l1_budget returns the same
-    # regardless of extra parameters. The embedding call happens in the caller
-    # (pith_provider_context) before calling cc_l1_budget.
+    # Create a minimal mock graph with constitutional core
+    mock_graph = MockGraph()
+    mock_graph.nodes = {"core": MockNode("core")}
+    mock_graph.nodes["core"].metadata = {"constitutional": True, "core_text": "Honor agency."}
     
-    # So we need to test that pith_provider_context doesn't call embed when flag is OFF.
-    # But pith_provider_context is a complex function. Instead, we can test the logic:
-    # when flag is OFF, cc_l1_budget should behave as if extra params weren't passed.
+    # Mock vector_db (needed for the embed path)
+    mock_vector_db = MockVectorDB()
     
-    with patch.multiple(cc_module,
-                       _CC_PITH_L1_BUDGET=4000,
-                       _CC_PITH_L1_BREATHE=True,
-                       _CC_PITH_BREATHE_PARASYMPATHETIC=1.4,
-                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
+    # Create ng with graph and vector_db
+    ng = SimpleNamespace(graph=mock_graph, vector_db=mock_vector_db)
+    
+    # Mock commons
+    mock_commons = Mock()
+    
+    # Patch ng_embed.embed to track calls
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
         
-        mock_commons = Mock()
-        mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+        # Patch the flag to OFF
+        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False):
+            # Mock render_constitutional_core to return something
+            with patch.object(cc_module, 'render_constitutional_core', return_value="Honor agency."):
+                # Mock cc_pattern_completion_recall to return empty
+                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
+                    # Call pith_provider_context
+                    result = cc_module.pith_provider_context(
+                        ng=ng,
+                        current_instruction="test instruction",
+                        quest_focus="",
+                        conv_state={},
+                        commons=mock_commons,
+                        budget_chars=None,
+                        root_count=None
+                    )
+                    
+                    # ng_embed.embed should NOT be called because flag is OFF
+                    mock_embed.assert_not_called()
+                    
+                    # Result should be "empty" state
+                    assert result["state"] == "empty"
+
+
+def test_flag_on_embed_called_in_cc_assemble_recall():
+    """Test that ng_embed.embed() IS called when flag is ON in cc_assemble_recall."""
+    import cc_ng_organism as cc_module
+    from types import SimpleNamespace
+    
+    # Create a minimal mock graph
+    mock_graph = MockGraph()
+    mock_graph.nodes = {"core": MockNode("core")}
+    mock_graph.nodes["core"].metadata = {"constitutional": True}
+    
+    # Mock vector_db (needed for the embed path, returns hits for confidence)
+    mock_vector_db = MockVectorDB(hits=[("node1", 0.9), ("node2", 0.8)])
+    
+    # Create ng with graph and vector_db
+    ng = SimpleNamespace(
+        graph=mock_graph,
+        vector_db=mock_vector_db,
+        _surfacing_monitor=None  # No monitor items to simplify
+    )
+    
+    # Mock commons
+    mock_commons = Mock()
+    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+    
+    # Patch ng_embed.embed to track calls
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
         
-        # Mock objects that would be passed
-        mock_graph = MockGraph()
-        mock_vector_db = MockVectorDB()
-        mock_embedding = [0.1]*768
+        # Patch the flag to ON
+        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True):
+            # Also need other flags and mocks
+            with patch.object(cc_module, '_CC_PITH_ENABLED', False):  # Keep Pith OFF for simplicity
+                with patch.object(cc_module, '_CC_PITH_L1_BUDGET', 4000):
+                    with patch.object(cc_module, '_CC_PITH_L1_BREATHE', True):
+                        with patch.object(cc_module, '_CC_PITH_BREATHE_PARASYMPATHETIC', 1.4):
+                            # Mock cc_region_confidence to return a value
+                            with patch.object(cc_module, 'cc_region_confidence', return_value=0.8):
+                                # Mock pattern completion to return empty (simplify)
+                                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
+                                    # Call cc_assemble_recall
+                                    result = cc_module.cc_assemble_recall(
+                                        ng=ng,
+                                        query="test query",
+                                        k=5,
+                                        conv_state={},
+                                        commons=mock_commons,
+                                        on_monitor_error=None,
+                                        allow_pattern_completion=True
+                                    )
+                                    
+                                    # ng_embed.embed SHOULD be called because flag is ON
+                                    mock_embed.assert_called_once_with("test query")
+                                    
+                                    # Result should be empty string (no monitor items, no pattern completion)
+                                    assert result == ""
+
+
+def test_flag_on_embed_called_in_pith_provider_context():
+    """Test that ng_embed.embed() IS called when flag is ON in pith_provider_context."""
+    import cc_ng_organism as cc_module
+    from types import SimpleNamespace
+    
+    # Create a minimal mock graph with constitutional core
+    mock_graph = MockGraph()
+    mock_graph.nodes = {"core": MockNode("core")}
+    mock_graph.nodes["core"].metadata = {"constitutional": True, "core_text": "Honor agency."}
+    
+    # Mock vector_db (needed for the embed path, returns hits for confidence)
+    mock_vector_db = MockVectorDB(hits=[("node1", 0.9), ("node2", 0.8)])
+    
+    # Create ng with graph and vector_db
+    ng = SimpleNamespace(graph=mock_graph, vector_db=mock_vector_db)
+    
+    # Mock commons
+    mock_commons = Mock()
+    
+    # Patch ng_embed.embed to track calls
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
         
-        # Call with all parameters (as if pith_provider_context computed embedding)
-        budget_with_all = cc_module.cc_l1_budget(mock_commons, mock_graph, mock_vector_db, mock_embedding)
-        
-        # Call without parameters (original behavior)
-        budget_without = cc_module.cc_l1_budget(mock_commons)
-        
-        # Should be identical when flag is OFF
-        assert budget_with_all == budget_without == 5600
+        # Patch the flag to ON
+        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True):
+            # Mock other required functions
+            with patch.object(cc_module, 'render_constitutional_core', return_value="Honor agency."):
+                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
+                    # Mock constants for budget calculation
+                    with patch.object(cc_module, '_CC_PITH_L1_BUDGET', 4000):
+                        with patch.object(cc_module, '_CC_PITH_L1_BREATHE', False):  # Turn off breathing for simplicity
+                            # Mock cc_region_confidence to return a value
+                            with patch.object(cc_module, 'cc_region_confidence', return_value=0.8):
+                                # Call pith_provider_context
+                                result = cc_module.pith_provider_context(
+                                    ng=ng,
+                                    current_instruction="test instruction",
+                                    quest_focus="",
+                                    conv_state={},
+                                    commons=mock_commons,
+                                    budget_chars=None,
+                                    root_count=None
+                                )
+                                
+                                # ng_embed.embed SHOULD be called because flag is ON
+                                mock_embed.assert_called_once_with("test instruction")
+                                
+                                # Result should be "empty" state
+                                assert result["state"] == "empty"
 
 
 def test_flag_on_embed_called():
-    """Test that region confidence modulation works when flag is ON."""
+    """Test that region confidence modulation works when flag is ON (legacy test)."""
     import cc_ng_organism as cc_module
     
     # Mock the environment

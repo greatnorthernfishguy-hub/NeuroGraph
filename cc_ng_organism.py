@@ -20,7 +20,7 @@
 #   again become an unbounded injection. NOTE: neurograph_rpc.py:4902 carries the
 #   identical unbounded regex on Syl's syl_authored path — canonical file, needs
 #   Josh's approval, NOT fixed here (LAW 4 propagation pending).
-# [2026-09-24] Claude Code (groupb-comb04-shared-graduation-002) — COMB-04 Shared Graduation v2 (Pith half only)
+# [2026-09-24] deepseek-v3.2 (opencode worker) — COMB-04 Shared Graduation v2 (Pith half only)
 # What: add cc_region_confidence(graph, vector_db, embedding) -> float, read-only query
 #   that finds embedding's nearest nodes, aggregates synapse prediction confidence,
 #   returns [0,1]. Extend cc_l1_budget to accept optional graph/vector_db/embedding;
