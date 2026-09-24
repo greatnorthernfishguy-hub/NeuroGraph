@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ---- Changelog ----
+# [2026-09-24] zone manager (Claude Code, Z2) — Revision 6: env-var tests in a subprocess
+# What: test_env_vars_defaults/custom now read the module constants from a child
+#       process; added test_env_vars_clamped.
+# Why: the in-process importlib.reload left cc_ng_organism reloaded with custom
+#      values, breaking 8 Pith tests when run in the same pytest session.
+# How: _read_env_constants() imports cc_ng_organism under a controlled env in a subprocess.
+# -------------------
 """Tests for COMB-04 Shared Graduation region confidence signal.
 
 Tests:
@@ -344,46 +352,49 @@ def test_flag_on_embed_called():
             assert budget == expected
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV_NAMES = ('CC_PITH_REGION_CONFIDENCE_FALLOFF', 'CC_PITH_REGION_CONFIDENCE_K',
+              'CC_PITH_REGION_CONFIDENCE_THRESHOLD')
+
+
+def _read_env_constants(overrides):
+    """Import cc_ng_organism in a child process and return its parsed constants.
+
+    Never reload the module in-process: other test files hold objects from
+    `from cc_ng_organism import ...`, and a reload breaks them.
+    """
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_NAMES}
+    env.update(overrides)
+    out = subprocess.run(
+        [sys.executable, '-c',
+         'import cc_ng_organism as c; print(c._CC_PITH_REGION_CONFIDENCE_FALLOFF, '
+         'c._CC_PITH_REGION_CONFIDENCE_K, c._CC_PITH_REGION_CONFIDENCE_THRESHOLD, '
+         'c._CC_PITH_REGION_CONFIDENCE_NEUTRAL)'],
+        env=env, cwd=_REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1].split()
+    return float(out[0]), int(out[1]), float(out[2]), float(out[3])
+
+
 def test_env_vars_defaults():
-    assert cc._CC_PITH_REGION_CONFIDENCE_FALLOFF == 0.25
-    assert cc._CC_PITH_REGION_CONFIDENCE_K == 10
-    assert cc._CC_PITH_REGION_CONFIDENCE_THRESHOLD == 0.3
-    assert cc._CC_PITH_REGION_CONFIDENCE_NEUTRAL == 0.5
+    assert _read_env_constants({}) == (0.25, 10, 0.3, 0.5)
 
 
 def test_env_vars_custom():
-    import os
-    orig_falloff = os.environ.get('CC_PITH_REGION_CONFIDENCE_FALLOFF')
-    orig_k = os.environ.get('CC_PITH_REGION_CONFIDENCE_K')
-    orig_threshold = os.environ.get('CC_PITH_REGION_CONFIDENCE_THRESHOLD')
-    
-    os.environ['CC_PITH_REGION_CONFIDENCE_FALLOFF'] = '0.3'
-    os.environ['CC_PITH_REGION_CONFIDENCE_K'] = '20'  
-    os.environ['CC_PITH_REGION_CONFIDENCE_THRESHOLD'] = '0.1'
-    
-    import importlib
-    import cc_ng_organism
-    importlib.reload(cc_ng_organism)
-    
-    assert cc_ng_organism._CC_PITH_REGION_CONFIDENCE_FALLOFF == 0.3
-    assert cc_ng_organism._CC_PITH_REGION_CONFIDENCE_K == 20
-    assert cc_ng_organism._CC_PITH_REGION_CONFIDENCE_THRESHOLD == 0.1
-    
-    # Clean up
-    if orig_falloff is not None:
-        os.environ['CC_PITH_REGION_CONFIDENCE_FALLOFF'] = orig_falloff
-    else:
-        os.environ.pop('CC_PITH_REGION_CONFIDENCE_FALLOFF', None)
-        
-    if orig_k is not None:
-        os.environ['CC_PITH_REGION_CONFIDENCE_K'] = orig_k
-    else:
-        os.environ.pop('CC_PITH_REGION_CONFIDENCE_K', None)
-        
-    if orig_threshold is not None:
-        os.environ['CC_PITH_REGION_CONFIDENCE_THRESHOLD'] = orig_threshold
-    else:
-        os.environ.pop('CC_PITH_REGION_CONFIDENCE_THRESHOLD', None)
+    falloff, k, threshold, _ = _read_env_constants({
+        'CC_PITH_REGION_CONFIDENCE_FALLOFF': '0.3',
+        'CC_PITH_REGION_CONFIDENCE_K': '20',
+        'CC_PITH_REGION_CONFIDENCE_THRESHOLD': '0.1',
+    })
+    assert (falloff, k, threshold) == (0.3, 20, 0.1)
+
+
+def test_env_vars_clamped():
+    _, k, threshold, _ = _read_env_constants({
+        'CC_PITH_REGION_CONFIDENCE_K': '999',
+        'CC_PITH_REGION_CONFIDENCE_THRESHOLD': '5',
+    })
+    assert (k, threshold) == (50, 1.0)
 
 
 def test_region_confidence_basic():
