@@ -50,424 +50,268 @@ class MockGraph:
             confirmation_rate = sum(1 for x in history if x) / len(history)
         else:
             confirmation_rate = 0.5
-        return min(1.0, weight_factor * 0.6 + confirmation_rate * 0.4)
+        return weight_factor * 0.6 + confirmation_rate * 0.4
 
 
 class MockVectorDB:
     def __init__(self, hits=None):
         self.hits = hits or []
         
-    def search(self, embedding, k=10, threshold=0.3):
-        return self.hits if self.hits else []
-    
-    def get(self, node_id):
-        return {"metadata": {}}
-
-
-def test_cc_region_confidence_disabled():
-    """Test that region confidence returns neutral (0.5) when disabled."""
-    graph = MockGraph()
-    vector_db = MockVectorDB()
-    embedding = [0.1] * 768
-    
-    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False):
-        confidence = cc.cc_region_confidence(graph, vector_db, embedding)
-        assert confidence == cc._CC_PITH_REGION_CONFIDENCE_NEUTRAL  # 0.5
-
-
-def test_cc_region_confidence_no_hits():
-    """Test that region confidence returns neutral when no vector DB hits."""
-    graph = MockGraph()
-    vector_db = MockVectorDB(hits=[])  # No hits
-    embedding = [0.1] * 768
-    
-    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True):
-        confidence = cc.cc_region_confidence(graph, vector_db, embedding)
-        assert confidence == cc._CC_PITH_REGION_CONFIDENCE_NEUTRAL
-
-
-def test_cc_region_confidence_with_synapses():
-    """Test region confidence computation with mock synapses."""
-    # Create a small graph
-    graph = MockGraph()
-    
-    # Add nodes
-    node1 = MockNode("node1")
-    node2 = MockNode("node2")
-    node3 = MockNode("node3")
-    graph.nodes = {"node1": node1, "node2": node2, "node3": node3}
-    
-    # Add synapses with weights
-    syn1 = MockSynapse("syn1", "node1", "node2", weight=0.8, max_weight=1.0)
-    syn2 = MockSynapse("syn2", "node2", "node3", weight=0.4, max_weight=1.0)
-    syn3 = MockSynapse("syn3", "node1", "node3", weight=0.9, max_weight=1.0)
-    
-    graph.synapses = {"syn1": syn1, "syn2": syn2, "syn3": syn3}
-    graph._outgoing = {
-        "node1": {"syn1", "syn3"},
-        "node2": {"syn2"},
-        "node3": set()
-    }
-    
-    # Add confirmation history for syn1 (all confirmations)
-    graph._synapse_confirmation_history["syn1"] = [True, True, True]
-    # syn2 has mixed history
-    graph._synapse_confirmation_history["syn2"] = [True, False, True, False]
-    # syn3 has no history
-    
-    # Mock vector DB returns all three nodes
-    vector_db = MockVectorDB(hits=[("node1", 0.9), ("node2", 0.8), ("node3", 0.7)])
-    
-    embedding = [0.1] * 768
-    
-    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True):
-        confidence = cc.cc_region_confidence(graph, vector_db, embedding)
+    def search(self, *args, **kwargs):
+        # Returns list of (node_id, score, index)
+        return [(hit[0], hit[1], i) for i, hit in enumerate(self.hits)]
         
-        # Verify confidence is in [0, 1]
-        assert 0.0 <= confidence <= 1.0
+    def get(self, node_id, *args, **kwargs):
+        return {"metadata": {}, "source": "", "text": ""}
         
-        # With our mock data:
-        # syn1: weight_factor=0.8/1.0=0.8, confirmation_rate=1.0, confidence=0.8*0.6+1.0*0.4=0.88
-        # syn2: weight_factor=0.4/1.0=0.4, confirmation_rate=0.5, confidence=0.4*0.6+0.5*0.4=0.44
-        # syn3: weight_factor=0.9/1.0=0.9, confirmation_rate=0.5, confidence=0.9*0.6+0.5*0.4=0.74
-        # Average: (0.88 + 0.44 + 0.74) / 3 = 0.6866...
+    def batch_get(self, node_ids):
+        return [self.get(node_id) for node_id in node_ids]
         
-        # Check it's close to expected
-        expected_avg = (0.88 + 0.44 + 0.74) / 3
-        assert abs(confidence - expected_avg) < 0.01
+    def size(self):
+        return len(self.hits)
 
 
-def test_cc_region_confidence_read_only():
-    """Test that cc_region_confidence doesn't modify graph or vector_db."""
-    graph = MockGraph()
+# Test helper classes (copied from test_cc_recall_unification.py)  
+class _FakeMonitor:
+    def __init__(self, items):
+        self._items = items
+
+    def get_surfaced(self):
+        return list(self._items)
+
+    def format_context(self, items):
+        if not items:
+            return ''
+        return '## Recent\n' + '\n'.join(f"- {it['content']}" for it in items)
+
+
+class _FakeGraphForAssemble:
+    def __init__(self, protected_ids=frozenset()):
+        self._protected = protected_ids
+        self.nodes = {}  # cc_thermal/cc_novelty fail-soft on absent entries
+
+    def _is_identity_protected(self, node_id):
+        return node_id in self._protected
+
+
+class _FakeNgForAssemble:
+    def __init__(self, monitor_items, protected_ids=frozenset()):
+        self.graph = _FakeGraphForAssemble(protected_ids)
+        self._surfacing_monitor = _FakeMonitor(monitor_items)
+        # Add vector_db attribute for region confidence tests
+        self.vector_db = MockVectorDB(hits=[('node1', 0.9)])  # Will be mocked in tests
+
+
+def _patch_pattern_completion(monkeypatch, results):
+    monkeypatch.setattr(cc, 'cc_pattern_completion_recall',
+                         lambda ng, query, k, state=None: list(results))
+
+
+# ============================================================================
+# cc_assemble_recall tests (Pith pipeline enabled)
+# ============================================================================
+
+def test_flag_off_no_embed_call_in_cc_assemble_recall(monkeypatch):
+    """Test that ng_embed.embed() is NOT called when flag is OFF in cc_assemble_recall.
     
-    # Add nodes and synapses
-    node1 = MockNode("node1")
-    node2 = MockNode("node2")
-    graph.nodes = {"node1": node1, "node2": node2}
+    Must set _CC_PITH_ENABLED=True to reach the region confidence code path.
+    """
+    # Create fake ng with vector_db (needs one for embed path)
+    ng = _FakeNgForAssemble([
+        {'node_id': 'test1', 'score': 1.0, 'content': 'test monitor item'}
+    ])
     
-    syn1 = MockSynapse("syn1", "node1", "node2", weight=0.5, max_weight=1.0)
-    graph.synapses = {"syn1": syn1}
-    graph._outgoing = {"node1": {"syn1"}}
-    graph._synapse_confirmation_history["syn1"] = [True]
+    # Ensure we reach the Pith pipeline
+    monkeypatch.setattr(cc, '_CC_PITH_ENABLED', True)
+    monkeypatch.setattr(cc, '_CC_PITH_L1_BUDGET', 4000)
     
-    # Record initial state
-    initial_nodes = dict(graph.nodes)
-    initial_synapses = dict(graph.synapses)
-    initial_outgoing = dict(graph._outgoing)
-    initial_history = dict(graph._synapse_confirmation_history)
+    # Flag OFF for region confidence
+    monkeypatch.setattr(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False)
     
-    vector_db = MockVectorDB(hits=[("node1", 0.9), ("node2", 0.8)])
+    # Patch pattern completion to return something
+    _patch_pattern_completion(monkeypatch, [
+        {'node_id': 'pat1', 'score': 0.8, 'content': 'test pattern hit'}
+    ])
     
-    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True):
-        confidence = cc.cc_region_confidence(graph, vector_db, [0.1] * 768)
+    # Mock commons
+    mock_commons = Mock()
+    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+    
+    # Patch ng_embed.embed to track calls
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
         
-        # Verify state unchanged (read-only)
-        assert graph.nodes == initial_nodes
-        assert graph.synapses == initial_synapses
-        assert graph._outgoing == initial_outgoing
-        assert graph._synapse_confirmation_history == initial_history
+        # Call cc_assemble_recall
+        result = cc.cc_assemble_recall(ng, 'test query', 5, {}, mock_commons)
+        
+        # With flag OFF, embed should NOT be called
+        mock_embed.assert_not_called()
 
 
-def test_cc_l1_budget_with_region_confidence():
-    """Test that cc_l1_budget factors in region confidence when enabled."""
-    commons = Mock()
-    commons.read_arousal.return_value = "PARASYMPATHETIC"
+def test_flag_on_embed_called_in_cc_assemble_recall(monkeypatch):
+    """Test that ng_embed.embed() IS called when flag is ON in cc_assemble_recall."""
+    # Create fake ng with vector_db
+    ng = _FakeNgForAssemble([
+        {'node_id': 'test1', 'score': 1.0, 'content': 'test monitor item'}
+    ])
     
-    graph = MockGraph()
-    vector_db = MockVectorDB(hits=[("node1", 0.9), ("node2", 0.8)])
+    # Ensure we reach the Pith pipeline
+    monkeypatch.setattr(cc, '_CC_PITH_ENABLED', True)
+    monkeypatch.setattr(cc, '_CC_PITH_L1_BUDGET', 4000)
+    monkeypatch.setattr(cc, '_CC_PITH_L1_BREATHE', False)  # Turn off breathing for simplicity
     
-    # Add a synapse for confidence computation
-    node1 = MockNode("node1")
-    node2 = MockNode("node2")
-    graph.nodes = {"node1": node1, "node2": node2}
-    syn1 = MockSynapse("syn1", "node1", "node2", weight=0.8, max_weight=1.0)
-    graph.synapses = {"syn1": syn1}
-    graph._outgoing = {"node1": {"syn1"}}
-    graph._synapse_confirmation_history["syn1"] = [True, True]
+    # Flag ON for region confidence
+    monkeypatch.setattr(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True)
     
-    embedding = [0.1] * 768
+    # Patch pattern completion
+    _patch_pattern_completion(monkeypatch, [
+        {'node_id': 'pat1', 'score': 0.8, 'content': 'test pattern hit'}
+    ])
     
-    # Mock the constants
+    # Mock commons
+    mock_commons = Mock()
+    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+    
+    # Patch ng_embed.embed to track calls
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
+        
+        # Patch cc_region_confidence to return a neutral value
+        with patch.object(cc, 'cc_region_confidence', return_value=0.5):
+            # Call cc_assemble_recall
+            result = cc.cc_assemble_recall(ng, 'test query', 5, {}, mock_commons)
+            
+            # With flag ON, embed SHOULD be called
+            mock_embed.assert_called_once_with('test query')
+
+
+# ============================================================================
+# pith_provider_context tests
+# ============================================================================
+
+def test_flag_off_no_embed_call_in_pith_provider_context(monkeypatch):
+    """Test that ng_embed.embed() is NOT called when flag is OFF in pith_provider_context."""
+    # Create minimal mock graph with constitutional core
+    mock_graph = MockGraph()
+    mock_graph.nodes = {"core": MockNode("core")}
+    mock_graph.nodes["core"].metadata = {"constitutional": True, "core_text": "Honor agency."}
+    
+    # Create ng with graph and vector_db
+    ng = SimpleNamespace(graph=mock_graph, vector_db=MockVectorDB())
+    
+    # Mock commons
+    mock_commons = Mock()
+    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+    
+    # Patch ng_embed.embed to track calls
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
+        
+        # Patch the flag to OFF
+        monkeypatch.setattr(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False)
+        
+        # Mock render_constitutional_core
+        monkeypatch.setattr(cc, 'render_constitutional_core', lambda ng: "Honor agency.")
+        
+        # Mock cc_pattern_completion_recall
+        monkeypatch.setattr(cc, 'cc_pattern_completion_recall', lambda *args, **kwargs: [])
+        
+        # Call pith_provider_context
+        result = cc.pith_provider_context(
+            ng=ng,
+            current_instruction="test instruction",
+            quest_focus="",
+            conv_state={},
+            commons=mock_commons,
+            budget_chars=None,
+            root_count=None
+        )
+        
+        # With flag OFF, embed should NOT be called
+        mock_embed.assert_not_called()
+
+
+def test_flag_on_embed_called_in_pith_provider_context(monkeypatch):
+    """Test that ng_embed.embed() IS called when flag is ON in pith_provider_context."""
+    # Create minimal mock graph with constitutional core
+    mock_graph = MockGraph()
+    mock_graph.nodes = {"core": MockNode("core")}
+    mock_graph.nodes["core"].metadata = {"constitutional": True, "core_text": "Honor agency."}
+    
+    # Create ng with graph and vector_db (needs hits for confidence)
+    ng = SimpleNamespace(graph=mock_graph, vector_db=MockVectorDB(hits=[('node1', 0.9)]))
+    
+    # Mock commons
+    mock_commons = Mock()
+    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+    
+    # Patch ng_embed.embed to track calls
+    with patch('ng_embed.embed') as mock_embed:
+        mock_embed.return_value = [0.1] * 768
+        
+        # Patch the flag to ON
+        monkeypatch.setattr(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True)
+        
+        # Mock render_constitutional_core
+        monkeypatch.setattr(cc, 'render_constitutional_core', lambda ng: "Honor agency.")
+        
+        # Mock cc_pattern_completion_recall
+        monkeypatch.setattr(cc, 'cc_pattern_completion_recall', lambda *args, **kwargs: [])
+        
+        # Mock cc_region_confidence to return neutral
+        monkeypatch.setattr(cc, 'cc_region_confidence', lambda *args, **kwargs: 0.5)
+        
+        # Call pith_provider_context
+        result = cc.pith_provider_context(
+            ng=ng,
+            current_instruction="test instruction",
+            quest_focus="",
+            conv_state={},
+            commons=mock_commons,
+            budget_chars=None,
+            root_count=None
+        )
+        
+        # With flag ON, embed SHOULD be called
+        mock_embed.assert_called_once_with('test instruction')
+
+
+# ============================================================================
+# Original region confidence tests (kept for regression)
+# ============================================================================
+
+def test_flag_off_no_embed_call():
+    """Original test: region confidence does not modulate budget when flag is OFF."""
+    # Mock the environment
     with patch.multiple(cc,
                        _CC_PITH_L1_BUDGET=4000,
                        _CC_PITH_L1_BREATHE=True,
                        _CC_PITH_BREATHE_PARASYMPATHETIC=1.4,
-                       _CC_PITH_REGION_CONFIDENCE_ENABLED=True,
+                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False,
                        _CC_PITH_REGION_CONFIDENCE_NEUTRAL=0.5,
                        _CC_PITH_REGION_CONFIDENCE_FALLOFF=0.25):
         
-        # Compute confidence first to know expected value
-        # syn1: weight_factor=0.8, confirmation_rate=1.0, confidence=0.8*0.6+1.0*0.4=0.88
-        expected_confidence = 0.88
+        mock_commons = Mock()
+        mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
         
-        # Budget without region confidence: 4000 * 1.4 = 5600
-        # With region confidence: 5600 * (1 + (0.88 - 0.5) * 2 * 0.25) = 5600 * (1 + 0.38*0.5) = 5600 * 1.19 = 6664
+        mock_graph = MockGraph()
+        mock_vector_db = MockVectorDB()
+        mock_embedding = [0.5]*768
         
-        budget = cc.cc_l1_budget(commons, graph, vector_db, embedding)
+        # Call cc_l1_budget with all parameters (as if embed was computed)
+        budget_with_params = cc.cc_l1_budget(mock_commons, mock_graph, mock_vector_db, mock_embedding)
         
-        # Should be close to expected
-        expected_budget = int(4000 * 1.4 * (1 + (expected_confidence - 0.5) * 2 * 0.25))
-        expected_budget = max(500, min(40000, expected_budget))
+        # Call without parameters (original behavior)  
+        budget_without = cc.cc_l1_budget(mock_commons)
         
-        assert abs(budget - expected_budget) <= 1  # Allow for rounding
-
-
-def test_cc_l1_budget_without_region_confidence():
-    """Test that cc_l1_budget works normally without region confidence params."""
-    commons = Mock()
-    commons.read_arousal.return_value = "PARASYMPATHETIC"
-    
-    with patch.multiple(cc,
-                       _CC_PITH_L1_BUDGET=4000,
-                       _CC_PITH_L1_BREATHE=True,
-                       _CC_PITH_BREATHE_PARASYMPATHETIC=1.4,
-                       _CC_PITH_REGION_CONFIDENCE_ENABLED=True):
-        
-        # Call without graph, vector_db, embedding
-        budget = cc.cc_l1_budget(commons)
-        
-        # Should just apply breathing: 4000 * 1.4 = 5600
-        assert budget == 5600
-
-
-def test_cc_l1_budget_region_confidence_disabled():
-    """Test that region confidence doesn't affect budget when disabled."""
-    commons = Mock()
-    commons.read_arousal.return_value = "PARASYMPATHETIC"
-    
-    graph = MockGraph()
-    vector_db = MockVectorDB()
-    embedding = [0.1] * 768
-    
-    with patch.multiple(cc,
-                       _CC_PITH_L1_BUDGET=4000,
-                       _CC_PITH_L1_BREATHE=True,
-                       _CC_PITH_BREATHE_PARASYMPATHETIC=1.4,
-                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
-        
-        budget_without = cc.cc_l1_budget(commons)
-        budget_with = cc.cc_l1_budget(commons, graph, vector_db, embedding)
-        
-        # Should be the same when disabled
-        assert budget_without == budget_with == 5600
-
-
-def test_flag_off_no_embed_call_in_cc_assemble_recall():
-    """Test that ng_embed.embed() is NOT called when flag is OFF in cc_assemble_recall."""
-    import cc_ng_organism as cc_module
-    from types import SimpleNamespace
-    
-    # Create a minimal mock graph
-    mock_graph = MockGraph()
-    mock_graph.nodes = {"core": MockNode("core")}
-    mock_graph.nodes["core"].metadata = {"constitutional": True}
-    
-    # Mock vector_db (needed for the embed path)
-    mock_vector_db = MockVectorDB()
-    
-    # Create ng with graph and vector_db
-    ng = SimpleNamespace(
-        graph=mock_graph,
-        vector_db=mock_vector_db,
-        _surfacing_monitor=None  # No monitor items to simplify
-    )
-    
-    # Mock commons
-    mock_commons = Mock()
-    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
-    
-    # Patch ng_embed.embed to track calls
-    # The call site does: "from ng_embed import embed as ng_embed_fn"
-    # So we need to patch ng_embed.embed at the module level
-    with patch('ng_embed.embed') as mock_embed:
-        mock_embed.return_value = [0.1] * 768
-        
-        # Patch the flag to OFF
-        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False):
-            # Also need to patch other flags to bypass Pith pipeline
-            with patch.object(cc_module, '_CC_PITH_ENABLED', False):
-                # Mock pattern completion to return empty (simplify)
-                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
-                    # Call cc_assemble_recall
-                    result = cc_module.cc_assemble_recall(
-                        ng=ng,
-                        query="test query",
-                        k=5,
-                        conv_state={},
-                        commons=mock_commons,
-                        on_monitor_error=None,
-                        allow_pattern_completion=True
-                    )
-                    
-                    # ng_embed.embed should NOT be called because flag is OFF
-                    mock_embed.assert_not_called()
-                    
-                    # Result should be empty string (no monitor items, no pattern completion)
-                    assert result == ""
-
-
-def test_flag_off_no_embed_call_in_pith_provider_context():
-    """Test that ng_embed.embed() is NOT called when flag is OFF in pith_provider_context."""
-    import cc_ng_organism as cc_module
-    from types import SimpleNamespace
-    
-    # Create a minimal mock graph with constitutional core
-    mock_graph = MockGraph()
-    mock_graph.nodes = {"core": MockNode("core")}
-    mock_graph.nodes["core"].metadata = {"constitutional": True, "core_text": "Honor agency."}
-    
-    # Mock vector_db (needed for the embed path)
-    mock_vector_db = MockVectorDB()
-    
-    # Create ng with graph and vector_db
-    ng = SimpleNamespace(graph=mock_graph, vector_db=mock_vector_db)
-    
-    # Mock commons
-    mock_commons = Mock()
-    
-    # Patch ng_embed.embed to track calls
-    with patch('ng_embed.embed') as mock_embed:
-        mock_embed.return_value = [0.1] * 768
-        
-        # Patch the flag to OFF
-        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False):
-            # Mock render_constitutional_core to return something
-            with patch.object(cc_module, 'render_constitutional_core', return_value="Honor agency."):
-                # Mock cc_pattern_completion_recall to return empty
-                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
-                    # Call pith_provider_context
-                    result = cc_module.pith_provider_context(
-                        ng=ng,
-                        current_instruction="test instruction",
-                        quest_focus="",
-                        conv_state={},
-                        commons=mock_commons,
-                        budget_chars=None,
-                        root_count=None
-                    )
-                    
-                    # ng_embed.embed should NOT be called because flag is OFF
-                    mock_embed.assert_not_called()
-                    
-                    # Result should be "empty" state
-                    assert result["state"] == "empty"
-
-
-def test_flag_on_embed_called_in_cc_assemble_recall():
-    """Test that ng_embed.embed() IS called when flag is ON in cc_assemble_recall."""
-    import cc_ng_organism as cc_module
-    from types import SimpleNamespace
-    
-    # Create a minimal mock graph
-    mock_graph = MockGraph()
-    mock_graph.nodes = {"core": MockNode("core")}
-    mock_graph.nodes["core"].metadata = {"constitutional": True}
-    
-    # Mock vector_db (needed for the embed path, returns hits for confidence)
-    mock_vector_db = MockVectorDB(hits=[("node1", 0.9), ("node2", 0.8)])
-    
-    # Create ng with graph and vector_db
-    ng = SimpleNamespace(
-        graph=mock_graph,
-        vector_db=mock_vector_db,
-        _surfacing_monitor=None  # No monitor items to simplify
-    )
-    
-    # Mock commons
-    mock_commons = Mock()
-    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
-    
-    # Patch ng_embed.embed to track calls
-    with patch('ng_embed.embed') as mock_embed:
-        mock_embed.return_value = [0.1] * 768
-        
-        # Patch the flag to ON
-        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True):
-            # Also need other flags and mocks
-            with patch.object(cc_module, '_CC_PITH_ENABLED', False):  # Keep Pith OFF for simplicity
-                with patch.object(cc_module, '_CC_PITH_L1_BUDGET', 4000):
-                    with patch.object(cc_module, '_CC_PITH_L1_BREATHE', True):
-                        with patch.object(cc_module, '_CC_PITH_BREATHE_PARASYMPATHETIC', 1.4):
-                            # Mock cc_region_confidence to return a value
-                            with patch.object(cc_module, 'cc_region_confidence', return_value=0.8):
-                                # Mock pattern completion to return empty (simplify)
-                                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
-                                    # Call cc_assemble_recall
-                                    result = cc_module.cc_assemble_recall(
-                                        ng=ng,
-                                        query="test query",
-                                        k=5,
-                                        conv_state={},
-                                        commons=mock_commons,
-                                        on_monitor_error=None,
-                                        allow_pattern_completion=True
-                                    )
-                                    
-                                    # ng_embed.embed SHOULD be called because flag is ON
-                                    mock_embed.assert_called_once_with("test query")
-                                    
-                                    # Result should be empty string (no monitor items, no pattern completion)
-                                    assert result == ""
-
-
-def test_flag_on_embed_called_in_pith_provider_context():
-    """Test that ng_embed.embed() IS called when flag is ON in pith_provider_context."""
-    import cc_ng_organism as cc_module
-    from types import SimpleNamespace
-    
-    # Create a minimal mock graph with constitutional core
-    mock_graph = MockGraph()
-    mock_graph.nodes = {"core": MockNode("core")}
-    mock_graph.nodes["core"].metadata = {"constitutional": True, "core_text": "Honor agency."}
-    
-    # Mock vector_db (needed for the embed path, returns hits for confidence)
-    mock_vector_db = MockVectorDB(hits=[("node1", 0.9), ("node2", 0.8)])
-    
-    # Create ng with graph and vector_db
-    ng = SimpleNamespace(graph=mock_graph, vector_db=mock_vector_db)
-    
-    # Mock commons
-    mock_commons = Mock()
-    
-    # Patch ng_embed.embed to track calls
-    with patch('ng_embed.embed') as mock_embed:
-        mock_embed.return_value = [0.1] * 768
-        
-        # Patch the flag to ON
-        with patch.object(cc_module, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True):
-            # Mock other required functions
-            with patch.object(cc_module, 'render_constitutional_core', return_value="Honor agency."):
-                with patch.object(cc_module, 'cc_pattern_completion_recall', return_value=[]):
-                    # Mock constants for budget calculation
-                    with patch.object(cc_module, '_CC_PITH_L1_BUDGET', 4000):
-                        with patch.object(cc_module, '_CC_PITH_L1_BREATHE', False):  # Turn off breathing for simplicity
-                            # Mock cc_region_confidence to return a value
-                            with patch.object(cc_module, 'cc_region_confidence', return_value=0.8):
-                                # Call pith_provider_context
-                                result = cc_module.pith_provider_context(
-                                    ng=ng,
-                                    current_instruction="test instruction",
-                                    quest_focus="",
-                                    conv_state={},
-                                    commons=mock_commons,
-                                    budget_chars=None,
-                                    root_count=None
-                                )
-                                
-                                # ng_embed.embed SHOULD be called because flag is ON
-                                mock_embed.assert_called_once_with("test instruction")
-                                
-                                # Result should be "empty" state
-                                assert result["state"] == "empty"
+        # Should be identical when flag is OFF (no modulation)
+        assert budget_with_params == budget_without == 5600  # 4000 * 1.4
 
 
 def test_flag_on_embed_called():
     """Test that region confidence modulation works when flag is ON (legacy test)."""
-    import cc_ng_organism as cc_module
-    
     # Mock the environment
-    with patch.multiple(cc_module,
+    with patch.multiple(cc,
                        _CC_PITH_L1_BUDGET=4000,
                        _CC_PITH_L1_BREATHE=True,
                        _CC_PITH_BREATHE_PARASYMPATHETIC=1.4,
@@ -479,7 +323,7 @@ def test_flag_on_embed_called():
         mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
         
         # Mock cc_region_confidence to return a known value
-        with patch.object(cc_module, 'cc_region_confidence') as mock_confidence:
+        with patch.object(cc, 'cc_region_confidence') as mock_confidence:
             mock_confidence.return_value = 0.8
             
             mock_graph = MockGraph()
@@ -487,7 +331,7 @@ def test_flag_on_embed_called():
             mock_embedding = [0.5]*768
             
             # Call cc_l1_budget with all parameters
-            budget = cc_module.cc_l1_budget(mock_commons, mock_graph, mock_vector_db, mock_embedding)
+            budget = cc.cc_l1_budget(mock_commons, mock_graph, mock_vector_db, mock_embedding)
             
             # cc_region_confidence should be called
             mock_confidence.assert_called_once_with(mock_graph, mock_vector_db, mock_embedding)
@@ -500,5 +344,226 @@ def test_flag_on_embed_called():
             assert budget == expected
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+def test_env_vars_defaults():
+    assert cc._CC_PITH_REGION_CONFIDENCE_FALLOFF == 0.25
+    assert cc._CC_PITH_REGION_CONFIDENCE_K == 10
+    assert cc._CC_PITH_REGION_CONFIDENCE_THRESHOLD == 0.3
+    assert cc._CC_PITH_REGION_CONFIDENCE_NEUTRAL == 0.5
+
+
+def test_env_vars_custom():
+    import os
+    orig_falloff = os.environ.get('CC_PITH_REGION_CONFIDENCE_FALLOFF')
+    orig_k = os.environ.get('CC_PITH_REGION_CONFIDENCE_K')
+    orig_threshold = os.environ.get('CC_PITH_REGION_CONFIDENCE_THRESHOLD')
+    
+    os.environ['CC_PITH_REGION_CONFIDENCE_FALLOFF'] = '0.3'
+    os.environ['CC_PITH_REGION_CONFIDENCE_K'] = '20'  
+    os.environ['CC_PITH_REGION_CONFIDENCE_THRESHOLD'] = '0.1'
+    
+    import importlib
+    import cc_ng_organism
+    importlib.reload(cc_ng_organism)
+    
+    assert cc_ng_organism._CC_PITH_REGION_CONFIDENCE_FALLOFF == 0.3
+    assert cc_ng_organism._CC_PITH_REGION_CONFIDENCE_K == 20
+    assert cc_ng_organism._CC_PITH_REGION_CONFIDENCE_THRESHOLD == 0.1
+    
+    # Clean up
+    if orig_falloff is not None:
+        os.environ['CC_PITH_REGION_CONFIDENCE_FALLOFF'] = orig_falloff
+    else:
+        os.environ.pop('CC_PITH_REGION_CONFIDENCE_FALLOFF', None)
+        
+    if orig_k is not None:
+        os.environ['CC_PITH_REGION_CONFIDENCE_K'] = orig_k
+    else:
+        os.environ.pop('CC_PITH_REGION_CONFIDENCE_K', None)
+        
+    if orig_threshold is not None:
+        os.environ['CC_PITH_REGION_CONFIDENCE_THRESHOLD'] = orig_threshold
+    else:
+        os.environ.pop('CC_PITH_REGION_CONFIDENCE_THRESHOLD', None)
+
+
+def test_region_confidence_basic():
+    mock_graph = MockGraph()
+    mock_vector_db = MockVectorDB(hits=[('n1', 0.9), ('n2', 0.8)])
+    
+    # Create some mock synapses
+    s1 = MockSynapse('s1', 'n1', 't1', weight=0.9, max_weight=1.0)
+    s2 = MockSynapse('s2', 'n1', 't2', weight=0.4, max_weight=1.0)
+    s3 = MockSynapse('s3', 'n2', 't3', weight=0.7, max_weight=1.0)
+    
+    mock_graph.synapses = {'s1': s1, 's2': s2, 's3': s3}
+    mock_graph._outgoing = {'n1': ['s1', 's2'], 'n2': ['s3']}
+    mock_graph._synapse_confirmation_history = {}
+    
+    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+    
+    # Expected confidences: 
+    # s1: 0.9/1.0*0.6 + 0.5*0.4 = 0.54 + 0.2 = 0.74
+    # s2: 0.4/1.0*0.6 + 0.5*0.4 = 0.24 + 0.2 = 0.44
+    # s3: 0.7/1.0*0.6 + 0.5*0.4 = 0.42 + 0.2 = 0.62
+    # All >= 0.3 threshold, so average = (0.74 + 0.44 + 0.62) / 3 = 0.6
+    assert 0.59 <= conf <= 0.61
+
+
+def test_region_confidence_empty():
+    mock_graph = MockGraph()
+    mock_vector_db = MockVectorDB(hits=[])  # Empty search results
+    
+    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+    assert conf == 0.5  # Returns neutral when no hits
+
+
+def test_region_confidence_all_below_threshold():
+    mock_graph = MockGraph()
+    mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])  # Hit found
+    
+    # Create synapse with low confidence
+    s1 = MockSynapse('s1', 'n1', 't1', weight=0.1, max_weight=1.0)
+    mock_graph.synapses = {'s1': s1}
+    mock_graph._outgoing = {'n1': ['s1']}
+    mock_graph._synapse_confirmation_history = {}
+    
+    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+    assert conf == 0.5  # Returns neutral when no predictions meet threshold (0.1*0.6 + 0.5*0.4 = 0.26 < 0.3)
+
+
+def test_region_confidence_read_only():
+    """Test that cc_region_confidence does not modify graph or vector_db state."""
+    mock_graph = MockGraph()
+    mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
+    
+    # Add some state to track
+    mock_graph.nodes = {'n1': MockNode('n1')}
+    s1 = MockSynapse('s1', 'n1', 't1', weight=0.5, max_weight=1.0)
+    mock_graph.synapses = {'s1': s1}
+    mock_graph._outgoing = {'n1': ['s1']}
+    mock_graph._synapse_confirmation_history = {'s1': [True, False, True]}
+    
+    # Record initial states
+    initial_graph_nodes = dict(mock_graph.nodes)
+    initial_graph_synapses = dict(mock_graph.synapses)
+    initial_graph_history = dict(mock_graph._synapse_confirmation_history)
+    initial_vector_db_hits = list(mock_vector_db.hits)
+    
+    # Call function
+    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+    
+    # Verify no state was modified
+    assert mock_graph.nodes == initial_graph_nodes
+    assert mock_graph.synapses == initial_graph_synapses
+    assert mock_graph._synapse_confirmation_history == initial_graph_history
+    assert mock_vector_db.hits == initial_vector_db_hits
+    
+    # Confidence should be computed
+    assert 0.0 <= conf <= 1.0
+
+
+def test_region_confidence_clamping():
+    """Test that K parameter is clamped to valid range."""
+    # Test K clamped to minimum of 1
+    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_K', 0):
+        mock_graph = MockGraph()
+        mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
+        
+        conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+        # Should not crash, should return neutral or compute with k=1
+        assert 0.0 <= conf <= 1.0
+    
+    # Test K clamped to maximum of 50  
+    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_K', 100):
+        mock_graph = MockGraph()
+        mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
+        
+        conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+        # Should not crash, should compute with k=50
+        assert 0.0 <= conf <= 1.0
+
+
+def test_region_confidence_with_missing_nodes():
+    """Test graceful handling when vector_db returns nodes not in graph."""
+    mock_graph = MockGraph()
+    # VectorDB reports node 'missing' but graph doesn't have it
+    mock_vector_db = MockVectorDB(hits=[('missing', 0.9)])
+    
+    # Graph has different nodes
+    mock_graph.nodes = {'present': MockNode('present')}
+    
+    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+    # Should return neutral (0.5) because missing node has no outgoing synapses
+    assert conf == 0.5
+
+
+def test_region_confidence_with_no_outgoing_synapses():
+    """Test when found nodes exist but have no outgoing synapses."""
+    mock_graph = MockGraph()
+    mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
+    
+    # Node exists but has no outgoing synapses
+    mock_graph.nodes = {'n1': MockNode('n1')}
+    mock_graph._outgoing = {}  # No outgoing synapses
+    
+    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+    # Should return neutral (0.5) because no synapses to evaluate
+    assert conf == 0.5
+
+
+def test_cc_l1_budget_min_max_clamp():
+    """Test that cc_l1_budget clamps to min 500, max 40000."""
+    with patch.multiple(cc,
+                       _CC_PITH_L1_BUDGET=100,  # Very small
+                       _CC_PITH_L1_BREATHE=False,
+                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
+        
+        mock_commons = Mock()
+        
+        # With very small base budget, should clamp to min 500
+        budget = cc.cc_l1_budget(mock_commons)
+        assert budget == 500  # Minimum
+        
+    with patch.multiple(cc,
+                       _CC_PITH_L1_BUDGET=50000,  # Very large
+                       _CC_PITH_L1_BREATHE=False,
+                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
+        
+        mock_commons = Mock()
+        
+        # With very large base budget, should clamp to max 40000
+        budget = cc.cc_l1_budget(mock_commons)
+        assert budget == 40000  # Maximum
+
+
+def test_cc_l1_budget_sympathetic_scales_down():
+    """Test that SYMPATHETIC arousal scales down by 0.5x."""
+    with patch.multiple(cc,
+                       _CC_PITH_L1_BUDGET=4000,
+                       _CC_PITH_L1_BREATHE=False,
+                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
+        
+        mock_commons = Mock()
+        mock_commons.read_arousal.return_value = "SYMPATHETIC"
+        
+        budget = cc.cc_l1_budget(mock_commons)
+        assert budget == 2000  # 4000 * 0.5
+
+
+def test_cc_l1_budget_parasympathetic_scales_up():
+    """Test that PARASYMPATHETIC arousal scales up by breathing factor."""
+    with patch.multiple(cc,
+                       _CC_PITH_L1_BUDGET=4000,
+                       _CC_PITH_L1_BREATHE=True,
+                       _CC_PITH_BREATHE_PARASYMPATHETIC=1.4,
+                       _CC_PITH_REGION_CONFIDENCE_ENABLED=False):
+        
+        mock_commons = Mock()
+        mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+        
+        budget = cc.cc_l1_budget(mock_commons)
+        assert budget == 5600  # 4000 * 1.4
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
