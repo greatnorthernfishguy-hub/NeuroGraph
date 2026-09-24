@@ -14,6 +14,7 @@ Tests cover:
     - Edge cases (empty input, single chunk, etc.)
 """
 
+import hashlib
 import math
 import os
 import sys
@@ -440,14 +441,65 @@ class TestAdaptiveChunker(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # Embedding Tests
+#
+# [2026-09-24 reconciliation] EmbeddingEngine's own hash-fallback path
+# (_hash_embed) was deleted from universal_ingestor.py -- fail closed is now
+# unconditional (see the [2026-09-24] changelog entry in that file, and
+# chief-003's ruling on Packet 100/the primary source at
+# handoffs/PUNCHLIST-chief-20260921.md:95-99). Tests below that exercised
+# hash-fallback AS A FEATURE (model_name reporting, "still works" assertions)
+# are rewritten to assert fail-closed instead. Tests that only needed SOME
+# deterministic embedder to test unrelated mechanics (caching, dimension,
+# determinism) are given an explicit, in-test-only fake model double
+# (_DeterministicFakeNGEmbed) -- this is test scaffolding the test file
+# constructs and injects itself; it is not a production fallback and does
+# not touch EmbeddingEngine's own code path, so it does not reintroduce the
+# hash-fallback-in-production behavior Josh's ruling removed.
 # ---------------------------------------------------------------------------
+
+class _DeterministicFakeNGEmbed:
+    """In-test-only fake model double: deterministic, normalized vectors
+    keyed off a SHA-256 seed of the input text. Lives entirely in the test
+    file and is injected directly as engine._ng_embed -- the same injection
+    pattern test_encode_batch_runtime_fallback and
+    test_ingest_skips_deposit_on_embedding_failure already use for their own
+    fake/faulty models. Exists only so tests that are actually about caching,
+    determinism, and dimensionality (not about hash-fallback) still have a
+    real value to assert on now that EmbeddingEngine no longer fabricates one
+    itself."""
+
+    def __init__(self, dimension=768):
+        self.dimension = dimension
+
+    def embed_batch(self, texts, **kwargs):
+        vectors = []
+        for text in texts:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            seed = int.from_bytes(digest[:4], "big")
+            rng = np.random.RandomState(seed)
+            vec = rng.randn(self.dimension).astype(np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            vectors.append(vec)
+        return vectors
+
 
 class TestEmbeddingEngine(unittest.TestCase):
     """Tests for embedding generation and caching."""
 
     def setUp(self):
-        # Use hash fallback (no model) for testing
+        # [2026-09-24] Real hash-fallback is gone from production code, so
+        # this fixture wires in the in-test fake model double above rather
+        # than relying on EmbeddingEngine's own (now-deleted) fallback --
+        # these tests are about caching/determinism/dimension mechanics, not
+        # about fallback behavior itself. See test_model_name_fallback below
+        # for the test that IS about fallback behavior, now rewritten to
+        # assert fail-closed.
         self.engine = EmbeddingEngine({"use_model": False, "dimension": 64})
+        self.engine._model_available = True
+        self.engine.model_name = "fake-test-model"
+        self.engine._ng_embed = _DeterministicFakeNGEmbed(dimension=64)
 
     def test_embed_produces_vectors(self):
         """Embedding produces normalized vectors of correct dimension."""
@@ -491,10 +543,18 @@ class TestEmbeddingEngine(unittest.TestCase):
         self.assertFalse(np.allclose(vec1, vec2))
 
     def test_model_name_fallback(self):
-        """Fallback engine reports hash_fallback model name."""
+        """[2026-09-24 reconciliation] A genuinely no-model engine (no fake
+        double injected, unlike this class's fixture) now fails closed on
+        embed() rather than reporting a fabricated 'hash_fallback' model
+        name -- that label and the vectors behind it no longer exist.
+        status['model_name'] reports 'unavailable' instead (see the
+        universal_ingestor.py [2026-09-24] changelog entry's display-string
+        rename)."""
+        bare_engine = EmbeddingEngine({"use_model": False, "dimension": 64})
+        self.assertEqual(bare_engine.status["model_name"], "unavailable")
         chunks = [Chunk(text="test")]
-        embedded = self.engine.embed(chunks)
-        self.assertEqual(embedded[0].model_name, "hash_fallback")
+        with self.assertRaises(EmbeddingFailedError):
+            bare_engine.embed(chunks)
 
 
 class TestEmbeddingDeviceControl(unittest.TestCase):
@@ -511,30 +571,38 @@ class TestEmbeddingDeviceControl(unittest.TestCase):
         self.assertEqual(engine.device, "cpu")
 
     def test_explicit_cuda_device_falls_back(self):
-        """CUDA device gracefully falls back when CUDA unavailable."""
-        # In test environment, CUDA is typically not available
+        """CUDA device string resolution gracefully falls back when CUDA is
+        unavailable -- that part is unaffected by the hash-fallback removal.
+        [2026-09-24 reconciliation] What the docstring used to call 'engine
+        should still work (hash fallback)' no longer applies: with no model
+        and no fake double, embed_text() now fails closed instead of
+        returning a fabricated vector."""
         engine = EmbeddingEngine({"use_model": False, "device": "cuda"})
         self.assertEqual(engine.device, "cuda")
-        # Engine should still work (hash fallback since use_model=False)
-        vec = engine.embed_text("test")
-        self.assertEqual(vec.shape[0], 768)
+        with self.assertRaises(EmbeddingFailedError):
+            engine.embed_text("test")
 
     def test_status_property(self):
         """Status property returns diagnostic info."""
         engine = EmbeddingEngine({"use_model": False, "dimension": 64})
         status = engine.status
         self.assertFalse(status["model_available"])
-        self.assertEqual(status["model_name"], "hash_fallback")
+        # [2026-09-24 reconciliation] "hash_fallback" was a fabricated-vector
+        # label; no cache entry or successful embed can carry it anymore.
+        self.assertEqual(status["model_name"], "unavailable")
         self.assertEqual(status["device_requested"], "auto")
         self.assertIsNone(status["device_active"])
         self.assertEqual(status["dimension"], 64)
         self.assertEqual(status["cache_entries"], 0)
 
     def test_status_after_embedding(self):
-        """Status reflects cache entries after embedding."""
+        """[2026-09-24 reconciliation] A no-model engine's embed_text() now
+        fails closed rather than returning a vector to cache -- status must
+        show zero cache entries after the failed attempt, not one."""
         engine = EmbeddingEngine({"use_model": False, "dimension": 64})
-        engine.embed_text("test")
-        self.assertEqual(engine.status["cache_entries"], 1)
+        with self.assertRaises(EmbeddingFailedError):
+            engine.embed_text("test")
+        self.assertEqual(engine.status["cache_entries"], 0)
 
     def test_fallback_reason_when_model_disabled(self):
         """No fallback reason when model intentionally disabled."""
@@ -568,14 +636,27 @@ class TestEmbeddingDeviceControl(unittest.TestCase):
         with self.assertRaises(EmbeddingFailedError):
             engine._encode_batch(["hello", "world"])
 
-    def test_encode_batch_explicit_hash_mode_unaffected(self):
-        """use_model=False (explicit, e.g. tests/lightweight deployments)
-        still returns honest hash vectors — never raises, never pretends to
-        be a real model."""
+    def test_encode_batch_explicit_hash_mode_now_fails_closed(self):
+        """*** SUPERSEDED 2026-09-24 -- this test used to be named
+        test_encode_batch_explicit_hash_mode_unaffected and asserted the
+        opposite of what it asserts now. That test encoded a test-mode
+        carve-out (use_model=False silently returns honest hash vectors
+        instead of raising) that entered this codebase through a
+        chain-relayed packet summary, not from Josh. chief-003 traced it to
+        primary source (handoffs/PUNCHLIST-chief-20260921.md:95-99, Josh's
+        own verbatim 2026-09-21 ruling: "Universal ingestor is the
+        documentation only path... hashing here would also be worse than
+        useless. Same embedding only rules." -- no exceptions) and ruled the
+        carve-out has zero grounding there. See the universal_ingestor.py
+        [2026-09-24] changelog entry for the full reconciliation record.
+        use_model=False no longer means "return fabricated vectors instead
+        of raising" -- it only means "skip the model-load attempt at
+        construction." Every embed call now either uses a real model or
+        raises, unconditionally, regardless of use_model. ***
+        """
         engine = EmbeddingEngine({"use_model": False, "dimension": 64})
-        vecs = engine._encode_batch(["hello", "world"])
-        self.assertEqual(len(vecs), 2)
-        self.assertEqual(vecs[0].shape[0], 64)
+        with self.assertRaises(EmbeddingFailedError):
+            engine._encode_batch(["hello", "world"])
 
     def test_ingest_skips_deposit_on_embedding_failure(self):
         """UniversalIngestor.ingest() must not deposit anything when
