@@ -20,6 +20,18 @@
 #   again become an unbounded injection. NOTE: neurograph_rpc.py:4902 carries the
 #   identical unbounded regex on Syl's syl_authored path — canonical file, needs
 #   Josh's approval, NOT fixed here (LAW 4 propagation pending).
+# [2026-09-24] deepseek-v3.2 (opencode worker) — COMB-04 Shared Graduation v2 (Pith half only)
+# What: add cc_region_confidence(graph, vector_db, embedding) -> float, read-only query
+#   that finds embedding's nearest nodes, aggregates synapse prediction confidence,
+#   returns [0,1]. Extend cc_l1_budget to accept optional graph/vector_db/embedding;
+#   when CC_PITH_REGION_CONFIDENCE_ENABLED passes them, region confidence modulates
+#   L1 char budget at extraction time. Gated env var (default OFF).
+# Why: Packet 123(2) + LE verdict: signal source is CC host's full NeuroGraph, not
+#   ng_lite; no deposit/cache (LAW 7 violation at deposit). One pure query both ends
+#   can call; Pith half is clean.
+# How: cc_region_confidence uses graph._compute_prediction_confidence (no new formula,
+#   LAW 3). Flag gates embed call at both call sites (byte-for-byte OFF path).
+#   Tuning params (k, threshold, falloff) env-configurable (LAW 5).
 # [2026-09-13] Codex — construct provider context from connected CC topology.
 # What: add a bounded, read-only provider-context assembler over activation basins.
 # Why: individually ranked snippets lose causal relationships, exact anchors, and continuity.
@@ -1583,7 +1595,8 @@ def cc_region_confidence(graph, vector_db, embedding) -> float:
     
     try:
         # Find nearest nodes via vector DB
-        hits = vector_db.search(embedding, k=10, threshold=0.3)
+        hits = vector_db.search(embedding, k=_CC_PITH_REGION_CONFIDENCE_K, 
+                               threshold=_CC_PITH_REGION_CONFIDENCE_THRESHOLD)
         if not hits:
             return _CC_PITH_REGION_CONFIDENCE_NEUTRAL
             
@@ -3221,8 +3234,10 @@ _CC_PITH_BREATHE_PARASYMPATHETIC = float(os.environ.get("CC_PITH_BREATHE_PARASYM
 # Gated (CC_PITH_REGION_CONFIDENCE_ENABLED, default off); when off, region confidence
 # is neutral (0.5). Region confidence modulates the L1 budget alongside arousal.
 _CC_PITH_REGION_CONFIDENCE_ENABLED = os.environ.get("CC_PITH_REGION_CONFIDENCE_ENABLED", "0") not in ("0", "false", "False", "")
-_CC_PITH_REGION_CONFIDENCE_NEUTRAL = 0.5  # neutral confidence when disabled or on error
-_CC_PITH_REGION_CONFIDENCE_FALLOFF = 0.25  # how far from neutral confidence moves the budget
+_CC_PITH_REGION_CONFIDENCE_NEUTRAL = 0.5  # neutral confidence when disabled or on error (midpoint of [0,1])
+_CC_PITH_REGION_CONFIDENCE_FALLOFF = float(os.environ.get("CC_PITH_REGION_CONFIDENCE_FALLOFF", "0.25"))
+_CC_PITH_REGION_CONFIDENCE_K = max(1, min(50, int(os.environ.get("CC_PITH_REGION_CONFIDENCE_K", "10"))))
+_CC_PITH_REGION_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, float(os.environ.get("CC_PITH_REGION_CONFIDENCE_THRESHOLD", "0.3"))))
 
 # Same marker tuple as miniTID's is_synthetic_harness_text (Condensate
 # rust_core/src/minitid.rs) -- not importable here (Rust, separate process),
@@ -4818,24 +4833,27 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
     if graph is None:
         return _pith_provider_unavailable("ng_unavailable")
     if budget_chars is None:
-        # Try to compute budget with region confidence if available
-        try:
-            vector_db = getattr(ng, 'vector_db', None)
-            if vector_db is not None:
-                from ng_embed import embed as ng_embed_fn
-                # Create cue for embedding (same as will be used later)
-                cue_for_embedding = current_instruction.strip()
-                if quest_focus.strip():
-                    cue_for_embedding += "\n\n" + quest_focus.strip()
-                if cue_for_embedding:
-                    cue_embedding = ng_embed_fn(cue_for_embedding)
-                    budget = cc_l1_budget(commons, graph, vector_db, cue_embedding)
+        # Compute budget with region confidence if enabled and available
+        if _CC_PITH_REGION_CONFIDENCE_ENABLED:
+            try:
+                vector_db = getattr(ng, 'vector_db', None)
+                if vector_db is not None:
+                    from ng_embed import embed as ng_embed_fn
+                    # Create cue for embedding (same as will be used later)
+                    cue_for_embedding = current_instruction.strip()
+                    if quest_focus.strip():
+                        cue_for_embedding += "\n\n" + quest_focus.strip()
+                    if cue_for_embedding:
+                        cue_embedding = ng_embed_fn(cue_for_embedding)
+                        budget = cc_l1_budget(commons, graph, vector_db, cue_embedding)
+                    else:
+                        budget = cc_l1_budget(commons)
                 else:
                     budget = cc_l1_budget(commons)
-            else:
+            except Exception as exc:
+                logger.debug('Region confidence computation failed (non-fatal): %s', exc)
                 budget = cc_l1_budget(commons)
-        except Exception as exc:
-            logger.debug('Region confidence computation failed (non-fatal): %s', exc)
+        else:
             budget = cc_l1_budget(commons)
     elif (isinstance(budget_chars, int) and not isinstance(budget_chars, bool)
           and 500 <= budget_chars <= 40000):
@@ -5131,17 +5149,20 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # CC_PITH_W_RECENCY); budget breathes with commons arousal.
             _pre_l1 = survivors  # post-stage1, pre-budget: the full L1 candidate set
             
-            # Compute budget with region confidence if available
-            try:
-                vector_db = getattr(ng, 'vector_db', None)
-                if vector_db is not None:
-                    from ng_embed import embed as ng_embed_fn
-                    query_embedding = ng_embed_fn(query)
-                    budget = cc_l1_budget(commons, ng.graph, vector_db, query_embedding)
-                else:
+            # Compute budget with region confidence if enabled and available
+            if _CC_PITH_REGION_CONFIDENCE_ENABLED:
+                try:
+                    vector_db = getattr(ng, 'vector_db', None)
+                    if vector_db is not None:
+                        from ng_embed import embed as ng_embed_fn
+                        query_embedding = ng_embed_fn(query)
+                        budget = cc_l1_budget(commons, ng.graph, vector_db, query_embedding)
+                    else:
+                        budget = cc_l1_budget(commons)
+                except Exception as exc:
+                    logger.debug('Region confidence computation failed (non-fatal): %s', exc)
                     budget = cc_l1_budget(commons)
-            except Exception as exc:
-                logger.debug('Region confidence computation failed (non-fatal): %s', exc)
+            else:
                 budget = cc_l1_budget(commons)
             
             survivors = pith_stage3(survivors, budget_chars=budget)
