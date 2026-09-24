@@ -1637,7 +1637,7 @@ def _cc_kiss_find_redundant_node(graph, vector_db, embedding, commons=None) -> O
     else:
         threshold = base_threshold
     
-    try:
+try:
         hits = vector_db.search(embedding, k=5, threshold=threshold)
     except Exception as exc:
         logger.debug("CC KISS redundancy search failed (non-fatal): %s", exc)
