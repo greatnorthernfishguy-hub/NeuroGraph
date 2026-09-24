@@ -3,6 +3,30 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-24] Claude Sonnet 5 (Claude Code, groupb-kiss-shared-graduation-001) —
+#   COMB-04 Shared Graduation, KISS half: region confidence shifts the KISS
+#   redundancy threshold too.
+# What: _cc_kiss_find_redundant_node now computes an effective search threshold
+#   from cc_region_confidence(graph, vector_db, embedding) -- the same live
+#   query cc_l1_budget already reads (~l.3922-3947) -- instead of always using
+#   the fixed _CC_KISS_REDUNDANCY_THRESHOLD. effective = base - (conf-0.5)*2*span,
+#   clamped to [floor, 1.0]; at neutral confidence (0.5) effective == base
+#   exactly. Two new env vars, CC_KISS_REGION_CONFIDENCE_SPAN and _FLOOR, gated
+#   by CC_KISS_REGION_CONFIDENCE_ENABLED (default OFF -- flag off makes the
+#   exact same search(threshold=_CC_KISS_REDUNDANCY_THRESHOLD) call as before
+#   this change). New tests: tests/test_cc_kiss_shared_graduation.py.
+# Why: spec KISS_Pith_Combined_Architecture.md "Shared Graduation -- One
+#   Substrate, Two Ends" (l.163-174) -- one confidence map is the single
+#   authority for both KISS and Pith, not two independently-tuned formulas.
+#   LE re-run (returns/groupb-comb04-d1-le-rerun-001.md, Q-B) cleared the KISS
+#   half under four conditions; chief-003 GO (assignments/
+#   groupb-kiss-shared-graduation-001.md §2).
+# How: reused cc_region_confidence exactly as written (no edits to it or to
+#   neuro_foundation.py -- LAW 3); the confidence value is read once inline in
+#   _cc_kiss_find_redundant_node and never stored (LAW 7 / LE condition 1); no
+#   arousal, autonomic state, or content classification enters the threshold
+#   (LE condition 2); the reinforce/never-drop path and the identity-protected
+#   skip are untouched (LE condition 3; punchlist #523 held for Josh).
 # [2026-09-24] Grok (groupb-pith-cacheline-unknown-default-001) — honest CacheLine coherence default.
 # What: CacheLine.coherence defaults to "unknown" instead of "exclusive".
 # Why: Pith PRD — missing coherence evidence is unknown, never an inferred
@@ -1456,6 +1480,28 @@ _CC_KISS_REDUNDANCY_THRESHOLD = float(os.environ.get("CC_KISS_REDUNDANCY_THRESHO
 # (turns deposit fresh, pre-KISS behavior) without a code change or restart-to-old.
 _CC_KISS_GATE_ENABLED = os.environ.get("CC_KISS_GATE_ENABLED", "1") not in ("0", "false", "False", "")
 
+# ---- Shared Graduation (COMB-04): KISS half, 2026-09-24 ----
+# The same confidence query Pith already reads for cc_l1_budget (cc_region_confidence,
+# 4b3a86b) also shapes KISS's redundancy threshold -- one confidence map, two ends
+# (KISS_Pith_Combined_Architecture.md "Shared Graduation -- One Substrate, Two Ends",
+# l.163-174). Default OFF: with this flag off, _cc_kiss_find_redundant_node never
+# calls cc_region_confidence and issues the exact same search(threshold=...) call it
+# always has -- byte-for-byte today's behavior (LE condition 1/2).
+_CC_KISS_REGION_CONFIDENCE_ENABLED = os.environ.get(
+    "CC_KISS_REGION_CONFIDENCE_ENABLED", "0"
+) not in ("0", "false", "False", "")
+# How far region confidence can move the effective threshold off base, each
+# direction (e.g. span=0.1 -> +/-0.1 at the confidence extremes, before the floor
+# clamp). Clamped like the file's other threshold-shaped floats (_CC_PITH_REGION_
+# CONFIDENCE_THRESHOLD, ~l.3247).
+_CC_KISS_REGION_CONFIDENCE_SPAN = max(0.0, min(1.0, float(
+    os.environ.get("CC_KISS_REGION_CONFIDENCE_SPAN", "0.1"))))
+# Lower bound on the effective threshold -- keeps "redundant" meaning near-duplicate
+# even at confidence 1.0 (span alone could otherwise push it arbitrarily low).
+# Clamped to a sane range: never below a coin-flip similarity, never above 1.0.
+_CC_KISS_REGION_CONFIDENCE_FLOOR = max(0.5, min(1.0, float(
+    os.environ.get("CC_KISS_REGION_CONFIDENCE_FLOOR", "0.85"))))
+
 _CC_CONCEPT_FLOOR_MIN_CHARS = 5
 _CC_CONCEPT_FLOOR_STOPWORDS = frozenset(
     "a an and are as at be but by for from has have i if in is it its let me my not of on "
@@ -1554,9 +1600,28 @@ def _cc_kiss_find_redundant_node(graph, vector_db, embedding) -> Optional[str]:
     returned as a collapse target -- a redundant turn must not fold into a
     pinned node. Such matches are skipped; if only pinned nodes match, returns
     None so the turn deposits fresh.
+
+    Shared Graduation (COMB-04): when CC_KISS_REGION_CONFIDENCE_ENABLED is set,
+    the search threshold is no longer the fixed _CC_KISS_REDUNDANCY_THRESHOLD --
+    it is shifted by cc_region_confidence(graph, vector_db, embedding), the same
+    live, uncached confidence query Pith reads for cc_l1_budget (LAW 7: nothing
+    from that call is deposited, cached, or stored -- it is used once, here, and
+    discarded). Confidence above neutral (0.5) lowers the effective threshold
+    (collapses more readily); confidence below neutral raises it (collapses less);
+    at neutral -- also cc_region_confidence's own fail-soft value -- the effective
+    threshold equals _CC_KISS_REDUNDANCY_THRESHOLD exactly. Clamped to
+    [_CC_KISS_REGION_CONFIDENCE_FLOOR, 1.0] so "redundant" still means
+    near-duplicate even at confidence 1.0. With the flag off, this block is
+    skipped entirely -- no confidence call, same threshold, same search call as
+    before this feature existed.
     """
+    threshold = _CC_KISS_REDUNDANCY_THRESHOLD
+    if _CC_KISS_REGION_CONFIDENCE_ENABLED:
+        confidence = cc_region_confidence(graph, vector_db, embedding)
+        threshold = _CC_KISS_REDUNDANCY_THRESHOLD - (confidence - 0.5) * 2.0 * _CC_KISS_REGION_CONFIDENCE_SPAN
+        threshold = max(_CC_KISS_REGION_CONFIDENCE_FLOOR, min(1.0, threshold))
     try:
-        hits = vector_db.search(embedding, k=5, threshold=_CC_KISS_REDUNDANCY_THRESHOLD)
+        hits = vector_db.search(embedding, k=5, threshold=threshold)
     except Exception as exc:
         logger.debug("CC KISS redundancy search failed (non-fatal): %s", exc)
         return None
