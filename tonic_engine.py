@@ -26,6 +26,36 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — silent-zero coverage for G1 + G2,
+#   fix misleading log text, update class docstring (chief-003 follow-up to Packet 086(2)).
+#   Two additional silent-zero shapes the initial collapse left un-logged:
+#     G1 — caller passed transformer_body=<body> but the checkpoint failed to load
+#          (or was absent). _model stays None, _shared_body is the body. offer_shared_body
+#          CANNOT recover (default-mode init does not route bodies through offer, and the
+#          offer path only attaches under require_shared_body=True). start() must warn
+#          plainly that the BrainSwitcher must rebuild.
+#     G2 — torch + checkpoint present, no body passed. _try_load_model's own-copy branch
+#          loaded a wrapper with its private body; _model is set, _shared_body is None.
+#          Dispatch gate refuses forward; ticks are zero. offer_shared_body CAN recover
+#          (swap body + set _shared_body). start() must warn ADVISORILY (no rebuild).
+#   start() now logs four shapes: N1 (no torch, no body), N2 (torch, no body), G1 (body in
+#   hand, no model), G2 (model loaded, no body). The "TonicBrain loaded ... — surgical
+#   inference active" log is split: own-copy with no shared body now logs "wrapper is
+#   resident but inference is NOT active; the dispatch gate will refuse forward". The
+#   "will run as no-op until a shared body is offered" message is split: when a body is
+#   in hand it says "cannot self-recover" plainly (because offer_shared_body cannot
+#   recover). The no-torch advice no longer tells default-mode consumers to call
+#   offer_shared_body() — that path only attaches under require_shared_body=True.
+#   Class docstring at :380 updated to drop "heuristic fallback" language and describe
+#   the new contract.
+# Why: the law-enforcer review (genuine, commissioned by chief-003) named G1 and G2 as
+#   silent-zero shapes the initial fix missed, and called out the misleading "active"
+#   log text. Both reviews are required gates per Packet 077; this lands before the
+#   cross-family re-dispatch.
+# How: start() gains a four-branch dispatcher keyed on (_model is None, _shared_body is
+#   None). _try_load_model's load-outcome log is split on whether _shared_body is set.
+#   No structural change to the dispatch gate or the offer/revoke paths. Existing tests
+#   untouched; new tests test_g1_*, test_g2_* in tests/test_tonic_no_heuristic.py.
 # [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — collapse heuristic path; no-torch
 #   defined-state log (chief-003 Packet 086(2)). REQUIRE_SHARED_BODY OR shared-body
 #   attached: real model inference. Otherwise: zero activations, defined state, one-shot
@@ -380,8 +410,8 @@ def _extract_tonic_features(
 class TonicEngine:
     """Latent token generation engine — the real push between conversations.
 
-    Runs a surgical transformer (or heuristic fallback) that generates
-    latent tokens continuously. Each token:
+    Runs a surgical transformer that generates latent tokens continuously.
+    Each token:
     1. Encode current graph state (where attention is)
     2. Forward through transformer (the push — what comes next?)
     3. Decode to node activations (where attention should go)
@@ -391,12 +421,14 @@ class TonicEngine:
     The transformer IS the awareness. The output IS the next state.
     The ouroboros closes through actual inference, not a timer.
 
-    Shared-body-required consumers prohibit heuristic execution and wait for attachment.
-    For ordinary consumers, if the surgical model is not available (weights not trained yet),
-    falls back to a heuristic that still provides genuine forward
-    compression — it reads the graph topology and produces activation
-    decisions based on attractor analysis. Not as rich as the transformer,
-    but real graph reasoning, not a timer.
+    Shared-body-required consumers prohibit a private model load and wait
+    for attachment via offer_shared_body(). Ordinary consumers (Syl's
+    openclaw_hook.py:1073 construction) load their own copy when a
+    checkpoint is available AND they have access to a transformer body,
+    and run as a no-op otherwise. There is no heuristic fallback (Packet
+    086(2)): if the surgical model can't run, the engine mints zero
+    activations and surfaces the no-inference-path state via start()'s
+    one-shot warning and status['inference_path_ready'] / ['torch_available'].
     """
 
     def __init__(
@@ -475,8 +507,10 @@ class TonicEngine:
 
         No heuristic fallback exists anymore (Packet 086(2)). A failed or
         missing load leaves _model=None; the engine then runs as a no-op
-        (zero activations) until offer_shared_body lands a body. start()
-        logs the no-inference-path state once.
+        (zero activations). Whether a later offer_shared_body can recover
+        depends on the construction shape (see start() for the per-shape
+        warning). This method logs the load outcome accurately; start()
+        adds the user-actionable warning.
         """
         if self._require_shared_body:
             return  # This loader can allocate a private body; shared-only never uses it.
@@ -489,18 +523,42 @@ class TonicEngine:
                     transformer_body=self._shared_body,
                 )
                 self._model.eval()
-                shared = "shared body" if self._shared_body is not None else "own copy"
-                logger.info("TonicBrain loaded from %s (%s) — surgical inference active",
-                            weights_path, shared)
+                # The "surgical inference active" wording is misleading when the
+                # wrapper loaded with a private body but no shared body is in
+                # _shared_body — in that case the dispatch gate refuses the
+                # forward and ticks produce zero. Be precise.
+                if self._shared_body is not None:
+                    logger.info("TonicBrain loaded from %s (shared body) — "
+                                "surgical inference active", weights_path)
+                else:
+                    logger.info("TonicBrain loaded from %s (own copy, "
+                                "transformer_body=<none>) — wrapper is resident "
+                                "but inference is NOT active; the dispatch gate "
+                                "will refuse forward until a shared body lands "
+                                "(no heuristic fallback).", weights_path)
             except Exception as exc:
                 logger.info(
-                    "TonicBrain load error: %s — engine will run as no-op until a "
-                    "shared body is offered (no heuristic fallback)", exc,
+                    "TonicBrain load error: %s — engine will run as no-op "
+                    "(zero activations). %s", exc,
+                    self._shared_body is not None
+                    and "A later offer_shared_body() call cannot recover this "
+                         "state — _model is None, and offer_shared_body only "
+                         "attaches when require_shared_body=True. The "
+                         "BrainSwitcher must rebuild the engine."
+                    or "A later offer_shared_body() call from the "
+                       "BrainSwitcher can attach a body.",
                 )
         else:
             logger.info(
-                "No TonicBrain checkpoint at %s — engine will run as no-op until a "
-                "shared body is offered (no heuristic fallback)", weights_path,
+                "No TonicBrain checkpoint at %s — engine will run as no-op "
+                "(zero activations). %s", weights_path,
+                self._shared_body is not None
+                and "A later offer_shared_body() call cannot recover this "
+                     "state — _model is None, and offer_shared_body only "
+                     "attaches when require_shared_body=True. The "
+                     "BrainSwitcher must rebuild the engine."
+                or "A later offer_shared_body() call from the BrainSwitcher "
+                   "can attach a body.",
             )
 
     def _build_shared_wrapper(self, transformer_body):
@@ -1076,28 +1134,84 @@ class TonicEngine:
 
         # Packet 086(2): the laptop daemon PID 35833 runs under /usr/bin/python3.12
         # with no torch. Before this commit, the heuristic path produced activations
-        # on that host silently. With heuristic gone, a torch-less engine that has
-        # no shared body either would otherwise run as a silent zero — every tick
-        # {"fired": 0, "activated": 0}, no signal to the daemon that nothing real is
-        # happening. Log ONCE here (start-time is the right moment: before the loop
-        # thread begins) so the state is defined and observable in `journalctl` /
-        # the daemon's own logs. The status dict adds inference_path_ready +
+        # on that host silently. With heuristic gone, every shape that can't reach
+        # a real forward would otherwise be a silent zero — every tick
+        # {"fired": 0, "activated": 0}, no signal to the daemon that nothing real
+        # is happening. Log ONCE here (start-time is the right moment: before the
+        # loop thread begins) so the state is defined and observable in `journalctl`
+        # / the daemon's own logs. The status dict adds inference_path_ready +
         # torch_available keys for the same reason (machine-readable signal).
         # The log is one-shot per process; the daemon should not see it repeat on
         # restart / reload.
-        if self._model is None and self._shared_body is None:
-            if not _TORCH_AVAILABLE:
+        #
+        # Four silent-zero shapes, each with its own actionable warning:
+        #   N1 — _model is None AND _shared_body is None, no torch.
+        #        Original Packet 086(2) case. Daemon can recover if torch
+        #        is installed OR if a shared body lands via offer_shared_body
+        #        (require_shared_body path only).
+        #   N2 — _model is None AND _shared_body is None, torch available.
+        #        Same as N1 minus the torch-install advice.
+        #   G1 — _model is None AND _shared_body is not None (caller passed a
+        #        body at construction but _try_load_model failed or there was
+        #        no checkpoint). Ticks are zero; offer_shared_body cannot
+        #        recover this because require_shared_body is False (Syl-shape)
+        #        and the default-mode init does not route a body through
+        #        offer_shared_body. The BrainSwitcher must rebuild.
+        #   G2 — _model is not None AND _shared_body is None (a wrapper
+        #        loaded its own body successfully but no shared body is
+        #        attached). The dispatch gate refuses forward; ticks are
+        #        zero. offer_shared_body CAN recover this (it sets
+        #        _model.body to the supplied transformer and re-flips
+        #        _shared_body), so the warning is advisory.
+        inference_path_ready = (
+            self._model is not None and self._shared_body is not None
+        )
+        if not inference_path_ready:
+            model_is_loaded = self._model is not None
+            body_was_offered = self._shared_body is not None
+            if not model_is_loaded and not body_was_offered:
+                # N1 / N2
+                if not _TORCH_AVAILABLE:
+                    logger.warning(
+                        "Tonic started with no torch AND no shared body — "
+                        "every tick will produce zero activations (defined no-op "
+                        "state, not a crash). Install torch to enable a private "
+                        "model load; OR rebuild the engine with "
+                        "require_shared_body=True so the BrainSwitcher can "
+                        "attach a body via offer_shared_body()."
+                    )
+                else:
+                    logger.warning(
+                        "Tonic started with torch available but no shared body "
+                        "— every tick will produce zero activations until a "
+                        "shared body lands (no heuristic fallback, Packet 086(2))."
+                    )
+            elif not model_is_loaded and body_was_offered:
+                # G1 — caller passed transformer_body=<body> at construction,
+                # but the private load failed (or no checkpoint exists). The
+                # body sits in _shared_body unused; offer_shared_body cannot
+                # recover because it only attaches in require_shared_body=True
+                # mode and that path also requires a checkpoint. The
+                # BrainSwitcher must rebuild this engine.
                 logger.warning(
-                    "Tonic started with no torch AND no shared body — every tick will "
-                    "produce zero activations (defined no-op state, not a crash). "
-                    "Install torch and/or have the BrainSwitcher offer a shared body "
-                    "via TonicEngine.offer_shared_body() to enable inference."
+                    "Tonic started with a shared body in hand but no model "
+                    "could be loaded (checkpoint missing or load error). "
+                    "Every tick will produce zero activations. THIS STATE "
+                    "CANNOT SELF-RECOVER: the default-mode init path does not "
+                    "route a body through offer_shared_body, and "
+                    "offer_shared_body only attaches when require_shared_body=True. "
+                    "The BrainSwitcher must rebuild the engine."
                 )
             else:
+                # G2 — wrapper loaded successfully but no shared body in
+                # _shared_body. Dispatch gate refuses forward; ticks are zero.
+                # offer_shared_body CAN recover this; the warning is advisory.
                 logger.warning(
-                    "Tonic started with torch available but no shared body — every "
-                    "tick will produce zero activations until a shared body lands. "
-                    "No heuristic fallback exists (Packet 086(2))."
+                    "Tonic loaded a private-copy TonicBrain wrapper but no "
+                    "shared body is attached — the dispatch gate refuses forward, "
+                    "so every tick produces zero activations. Have the "
+                    "BrainSwitcher call offer_shared_body() with the shared "
+                    "body to enable inference."
                 )
 
         self._engine_thread = threading.Thread(

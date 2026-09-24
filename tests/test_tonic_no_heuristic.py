@@ -390,3 +390,225 @@ def test_use_heuristic_field_does_not_exist():
     assert not hasattr(engine, "_use_heuristic")
     assert engine.status["using_heuristic"] is False
     assert engine.status["heuristic_allowed"] is False
+
+
+# ---------------------------------------------------------------------------
+# G1 / G2 — the two additional silent-zero shapes the genuine law-enforcer
+# review identified. Each must produce zero activations AND a start-time
+# warning that accurately describes the state and what (if anything) can
+# recover it.
+# ---------------------------------------------------------------------------
+
+def test_g1_syl_shape_with_body_load_fails_logs_non_recoverable(monkeypatch, loader, caplog):
+    """G1 — caller passed transformer_body=<body> at construction (Syl's
+    openclaw_hook.py:1073 shape, default require_shared_body=False), but
+    _try_load_model failed (or no checkpoint was present). End state:
+    _model is None, _shared_body is the body. Ticks produce zero because
+    the dispatch gate requires both _model and _shared_body to be non-None.
+
+    Critical: offer_shared_body CANNOT recover this state. The default-mode
+    init does not route a body through offer_shared_body, and offer_shared_body
+    only attaches when require_shared_body=True. The BrainSwitcher must
+    rebuild the engine. start() must warn plainly about this.
+    """
+    # Syl's exact shape: transformer_body=<body>, no require_shared_body.
+    body = _FakeBody()
+    # The loader fixture raises if transformer_body=None is passed — that
+    # is the ~2GB own-copy branch. We want a DIFFERENT failure here: the
+    # caller passed a body, but the load fails for some other reason
+    # (checkpoint corrupt, etc). Make the loader raise on this body.
+    loader.fail_with = RuntimeError("simulated load failure")
+    monkeypatch.setattr(te, "_TORCH_AVAILABLE", True)
+    monkeypatch.setattr(te.os.path, "exists", lambda p: True)
+
+    engine = TonicEngine(_graph(), None, None,
+                         config=EngineConfig(), transformer_body=body)
+    # G1 invariant: _model is None (load failed), _shared_body is the body
+    # (held unused). offer_shared_body cannot recover — for default mode
+    # the path below refuses (require_shared_body=False).
+    assert engine._model is None
+    assert engine._shared_body is body
+    assert engine.offer_shared_body(body) is False  # default mode refuses
+    # Body is stuck in _shared_body, no recovery possible without rebuild.
+    assert engine._shared_body is body  # still held, still unused
+
+    # Ticks produce zero.
+    out = engine._generate_latent_token_inner()
+    assert out == {"fired": 0, "activated": 0}
+
+    # Status reflects the shape.
+    s = engine.status
+    assert s["inference_path_ready"] is False
+    assert s["model_loaded"] is False
+    assert s["shared_body_attached"] is True  # body IS held, just not used
+    assert s["require_shared_body"] is False
+    assert s["waiting_for_shared_body"] is False
+
+    # start() warns about the non-recoverable state.
+    with caplog.at_level(logging.WARNING, logger="neurograph.tonic.engine"):
+        engine.start()
+        engine.stop()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "shared body in hand" in m and "cannot self-recover" in m.lower()
+        and "BrainSwitcher must rebuild" in m
+        for m in msgs
+    ), f"G1 start() must warn that the state cannot self-recover. Got: {msgs}"
+
+
+def test_g1_syl_shape_with_body_no_checkpoint_logs_non_recoverable(monkeypatch, caplog):
+    """G1 sub-case: transformer_body=<body>, no checkpoint on disk. _try_load_model
+    logs the no-checkpoint message and never builds a wrapper. Same end state
+    as the load-failure case: _model None, _shared_body set, no recovery.
+    """
+    body = _FakeBody()
+    monkeypatch.setattr(te, "_TORCH_AVAILABLE", True)
+    monkeypatch.setattr(te.os.path, "exists", lambda p: False)
+
+    engine = TonicEngine(_graph(), None, None,
+                         config=EngineConfig(), transformer_body=body)
+    assert engine._model is None
+    assert engine._shared_body is body
+    # offer_shared_body refuses (default mode).
+    assert engine.offer_shared_body(body) is False
+
+    out = engine._generate_latent_token_inner()
+    assert out == {"fired": 0, "activated": 0}
+
+    with caplog.at_level(logging.WARNING, logger="neurograph.tonic.engine"):
+        engine.start()
+        engine.stop()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "shared body in hand" in m and "cannot self-recover" in m.lower()
+        for m in msgs
+    ), f"G1 (no checkpoint) start() must warn about non-recoverable state. Got: {msgs}"
+
+
+def test_g2_own_copy_loaded_without_shared_body_warns_advisory(monkeypatch, loader, caplog):
+    """G2 — torch present, checkpoint present, transformer_body=None at construction.
+    In production, _try_load_model calls load_tonic_brain(transformer_body=None)
+    which triggers the ~2GB own-copy allocation. The wrapper loads with its own
+    body; _model is set; _shared_body is None. The dispatch gate refuses forward
+    because _shared_body is None — ticks are zero.
+
+    Critical: offer_shared_body CAN recover this. The wrapper is resident
+    and offer_shared_body swaps the body and sets _shared_body. start()
+    must warn ADVISORILY (not as "cannot recover") so the daemon doesn't
+    rebuild when attach would work.
+
+    The standard _Loader fixture rejects transformer_body=None to enforce
+    the no-own-copy rule for shared-required consumers. We simulate the
+    G2 end-state directly: build a wrapper, attach it to engine._model,
+    leave _shared_body as None.
+    """
+    own_body = _FakeBody("own-copy")
+    wrapper = _FakeBrain(own_body)
+
+    monkeypatch.setattr(te, "_TORCH_AVAILABLE", True)
+    monkeypatch.setattr(te.os.path, "exists", lambda p: True)
+    engine = _engine()  # transformer_body=None
+    # Simulate the post-load state directly (the loader fixture can't reach
+    # this shape on its own; we're testing the post-load behavior).
+    engine._model = wrapper
+    engine._shared_body = None
+    # G2 invariant.
+    assert engine._model is not None
+    assert engine._shared_body is None
+    # status reflects the shape.
+    s = engine.status
+    assert s["inference_path_ready"] is False  # dispatch gate refuses
+    assert s["model_loaded"] is True
+    assert s["shared_body_attached"] is False
+    assert s["require_shared_body"] is False
+
+    # Ticks produce zero (dispatch gate refuses).
+    out = engine._generate_latent_token_inner()
+    assert out == {"fired": 0, "activated": 0}
+    # No forward landed.
+    assert wrapper.forward_calls == 0
+
+    # start() warns ADVISORILY while still in the G2 state (BEFORE attach).
+    with caplog.at_level(logging.WARNING, logger="neurograph.tonic.engine"):
+        engine.start()
+    msgs = [r.getMessage() for r in caplog.records]
+    # The advisory warning fires.
+    assert any(
+        "loaded a private-copy" in m and "dispatch gate refuses" in m
+        for m in msgs
+    ), f"G2 start() must warn that the wrapper is loaded but inference is blocked. Got: {msgs}"
+    # And it must NOT claim the state is unrecoverable.
+    assert not any("cannot self-recover" in m.lower() for m in msgs), (
+        f"G2 is recoverable via offer_shared_body; the warning must not say "
+        f"'cannot self-recover'. Got: {msgs}"
+    )
+    engine.stop()
+
+    # Now offer_shared_body CAN recover G2.
+    new_body = _FakeBody("proto")
+    assert engine.offer_shared_body(new_body) is True
+    assert engine._shared_body is new_body
+    assert wrapper.body is new_body  # body swapped in
+    s2 = engine.status
+    assert s2["inference_path_ready"] is True
+
+
+def test_g2_inference_does_not_forward_through_own_copy(monkeypatch, loader):
+    """G2 — the own-copy wrapper must NOT forward (seam A concern from
+    2026-06-12). The dispatch gate refuses; no forward calls land."""
+    own_body = _FakeBody("own-copy")
+    wrapper = _FakeBrain(own_body)
+
+    monkeypatch.setattr(te, "_TORCH_AVAILABLE", True)
+    monkeypatch.setattr(te.os.path, "exists", lambda p: True)
+    engine = _engine()
+    # Simulate post-load state.
+    engine._model = wrapper
+    engine._shared_body = None
+
+    monkeypatch.setattr(engine, "_extract_graph_features_for_model", lambda: object())
+
+    # 50 ticks — every one must NOT invoke the wrapper forward.
+    for _ in range(50):
+        out = engine._model_inference({"thread_nodes": [], "active_nodes": [],
+                                       "recent_spikes": []})
+        assert out == []
+    assert wrapper.forward_calls == 0
+
+
+def test_g2_offer_recovers_inference_path(monkeypatch, loader):
+    """G2 — after offer_shared_body attaches a body, real inference runs.
+    Verifies the wrapper is still alive and the gate passes."""
+    own_body = _FakeBody("own-copy")
+    wrapper = _FakeBrain(own_body)
+
+    monkeypatch.setattr(te, "_TORCH_AVAILABLE", True)
+    monkeypatch.setattr(te.os.path, "exists", lambda p: True)
+    engine = _engine()
+    engine._model = wrapper
+    engine._shared_body = None
+
+    body = _FakeBody("proto")
+    assert engine.offer_shared_body(body) is True
+    assert wrapper.body is body
+    assert engine._shared_body is body
+    assert engine.status["inference_path_ready"] is True
+
+    monkeypatch.setattr(engine, "_extract_graph_features_for_model", lambda: object())
+    monkeypatch.setattr(engine, "_get_activation_candidates",
+                        lambda features: [("A", 1.0), ("B", 1.0), ("C", 1.0)])
+    for nid in ("A", "B", "C"):
+        engine._graph.nodes[nid].voltage = 0.1
+
+    captured = {}
+    def fake_prime(node_ids, currents, steps, write_mode):
+        captured["ids"] = list(node_ids)
+        return types.SimpleNamespace(fired_entries=["A"])
+    engine._graph.prime_and_propagate = fake_prime
+
+    out = engine._generate_latent_token_inner()
+    assert wrapper.forward_calls == 1
+    assert out["activated"] > 0
+    assert captured["ids"]
