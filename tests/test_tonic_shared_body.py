@@ -1,4 +1,13 @@
 # ---- Changelog ----
+# [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — Packet 086(2) heuristic-collapse updates.
+# What: stripped every test reference to the removed `_heuristic_inference` method and
+#   the deleted `_use_heuristic` field. Replaced the two tests that asserted heuristic
+#   behavior (default-consumer-fallback, direct-heuristic-prohibited) with the new
+#   contract tests: `_fallback_inference()` returns [] under every construction path,
+#   including the require_shared_body=False default. Shared-body-present tests are
+#   untouched — they exercise surface that is unaffected by the heuristic deletion.
+# Why: the heuristic path was deleted; tests that patched/called it would not even
+#   import. The new contract is the structural invariant Packet 086(2) requires.
 # [2026-09-11] Claude Code (DudeMan CC, Fable 5.1) — shared-body-only attachment tests
 # What: TonicEngine(require_shared_body=True) — no private load at construction (with or
 #   without a body in hand), lazy wrapper build on first offer, retry after a missing
@@ -146,7 +155,6 @@ def _engine(**kw):
 
 def test_shared_only_engine_waits_without_heuristic_or_graph_writes(loader, monkeypatch):
     engine = _engine(require_shared_body=True)
-    monkeypatch.setattr(engine, "_heuristic_inference", lambda _: pytest.fail("heuristic ran"))
     monkeypatch.setattr(engine._graph, "prime_and_propagate", lambda **_: pytest.fail("graph write"))
     for _ in range(3):
         assert engine._generate_latent_token_inner()["waiting_for_shared_body"] is True
@@ -154,26 +162,35 @@ def test_shared_only_engine_waits_without_heuristic_or_graph_writes(loader, monk
     assert engine.status["using_heuristic"] is False
     assert engine.status["heuristic_allowed"] is False
     assert engine.status["waiting_for_shared_body"] is True
+    assert engine.status["inference_path_ready"] is False
     assert loader.calls == []
 
 
-def test_direct_heuristic_is_prohibited_for_shared_required_mode(loader):
+def test_fallback_inference_returns_empty_under_shared_required_mode(loader):
+    """Packet 086(2): _fallback_inference returns [] unconditionally. Required-sharing
+    consumers used to call _heuristic_inference, which then returned [] internally; the
+    new surface is a single method that is the no-op."""
     engine = _engine(require_shared_body=True)
-    assert engine._heuristic_inference(None) == []  # Does not even inspect features.
+    assert engine._fallback_inference(None) == []
+    assert engine._fallback_inference({}) == []
 
 
-def test_default_consumer_retains_fallback(loader, monkeypatch):
+def test_default_consumer_fallback_is_now_no_op(loader):
+    """Packet 086(2): default-mode consumers used to get heuristic-derived activations
+    from _fallback_inference. With heuristic deleted, the method is structurally [].
+    This is the NEW invariant: no construction path produces heuristic activations."""
     engine = _engine()
-    monkeypatch.setattr(engine, "_heuristic_inference", lambda _: [("A", 1.0)])
-    assert engine._fallback_inference({}) == [("A", 1.0)]
-    assert engine.status["heuristic_allowed"] is True
+    assert engine._fallback_inference(None) == []
+    assert engine._fallback_inference({}) == []
+    # Status reflects the collapse: the keys remain in the public API but as literal False.
+    assert engine.status["using_heuristic"] is False
+    assert engine.status["heuristic_allowed"] is False
 
 
 def test_missing_model_features_never_falls_back_on_vps(loader, monkeypatch):
     engine = _engine(require_shared_body=True)
     assert engine.offer_shared_body(_FakeBody())
     monkeypatch.setattr(engine, "_extract_graph_features_for_model", lambda: None)
-    monkeypatch.setattr(engine, "_heuristic_inference", lambda _: pytest.fail("heuristic ran"))
     assert engine._model_inference({}) == []
 
 
@@ -187,9 +204,10 @@ def test_construction_loads_nothing(loader):
     assert loader.calls == []
     assert eng._model is None
     assert eng._shared_body is None
-    assert eng._use_heuristic is True
+    assert not hasattr(eng, "_use_heuristic")  # field was removed (Packet 086(2))
     assert eng.status["require_shared_body"] is True
     assert eng.status["shared_body_attached"] is False
+    assert eng.status["inference_path_ready"] is False
 
 
 def test_construction_with_body_attaches_without_private_load(loader):
@@ -199,7 +217,7 @@ def test_construction_with_body_attaches_without_private_load(loader):
     eng = _engine(require_shared_body=True, transformer_body=body)
     assert loader.calls == [body]
     assert eng._model.body is body
-    assert eng._use_heuristic is False
+    assert eng._shared_body is body
 
 
 def test_try_load_model_is_never_called(monkeypatch, loader):
@@ -247,12 +265,10 @@ def test_missing_checkpoint_refuses_and_retries(monkeypatch, loader):
     assert eng.offer_shared_body(body) is False
     assert loader.calls == []
     assert eng._model is None
-    assert eng._use_heuristic is True
 
     monkeypatch.setattr(te.os.path, "exists", lambda p: True)
     assert eng.offer_shared_body(body) is True
     assert eng._model.body is body
-    assert eng._use_heuristic is False
 
 
 def test_loader_failure_refuses_and_retries(loader):
@@ -263,7 +279,6 @@ def test_loader_failure_refuses_and_retries(loader):
     assert eng.offer_shared_body(body) is False
     assert eng._model is None
     assert eng._shared_body is None
-    assert eng._use_heuristic is True
 
     loader.fail_with = None
     assert eng.offer_shared_body(body) is True
@@ -276,7 +291,6 @@ def test_none_body_offer_is_refused(loader):
     eng = _engine(require_shared_body=True)
     assert eng.offer_shared_body(None) is False
     assert loader.calls == []
-    assert eng._use_heuristic is True
 
 
 # ---------------------------------------------------------------------------
@@ -307,14 +321,12 @@ def test_revoke_keeps_wrapper_and_reoffer_rejoins_it(loader):
     assert eng._model is wrapper
     assert eng._model.body is None
     assert eng._shared_body is None
-    assert eng._use_heuristic is True
     assert eng.status["shared_body_attached"] is False
 
     body2 = _FakeBody("reloaded")
     assert eng.offer_shared_body(body2) is True
     assert eng._model is wrapper          # rejoined, not rebuilt
     assert eng._model.body is body2
-    assert eng._use_heuristic is False
     assert loader.calls == [body]         # still exactly one build
 
 
@@ -353,7 +365,6 @@ def test_success_requires_the_exact_offered_body(loader, monkeypatch):
     wrapper._locked = True
     previous_body = wrapper.body
     assert eng.offer_shared_body(_FakeBody("second")) is False
-    assert eng._use_heuristic is False
     assert eng._shared_body is previous_body
     assert eng._model is wrapper
     wrapper._locked = False
@@ -424,22 +435,20 @@ def test_shared_only_attachment_requires_declared_lock_file(loader, tmp_path):
 
 def test_forward_rechecks_body_inside_the_lock(loader, monkeypatch):
     """A revoke landing between the outer mode test and the forward must wait without
-    heuristic execution or calling a wrapper whose body is gone."""
+    calling a wrapper whose body is gone. With heuristic deleted, the fail-soft path
+    is _model_inference returning [] on the no-body recheck; we assert no forward
+    call lands and no graph write happens."""
     eng = _engine(require_shared_body=True)
     assert eng.offer_shared_body(_FakeBody()) is True
     wrapper = eng._model
 
     monkeypatch.setattr(eng, "_extract_graph_features_for_model", lambda: object())
-    heuristic_calls = []
-    monkeypatch.setattr(eng, "_heuristic_inference",
-                        lambda features: heuristic_calls.append(True) or [("A", 1.0)])
 
     # The revoke happens while the "caller" still believes transformer mode is on:
     # simulated by shedding after the outer check and before _model_inference runs.
     eng.revoke_shared_body()
     out = eng._model_inference({"thread_nodes": [], "active_nodes": [], "recent_spikes": []})
 
-    assert heuristic_calls == []
     assert wrapper.forward_calls == 0
     assert out == []
 
@@ -458,14 +467,13 @@ def test_forward_runs_when_body_is_attached(loader, monkeypatch):
 
 def test_forward_does_not_reenter_the_body_lock(loader, monkeypatch):
     """_body_lock is a plain non-reentrant Lock; the in-lock path must not take it twice
-    (and a required-sharing consumer must wait without heuristic execution)."""
+    (and a required-sharing consumer must wait without producing activations)."""
     eng = _engine(require_shared_body=True)
     assert eng.offer_shared_body(_FakeBody()) is True
     eng.set_body_lock(threading.Lock())   # deadlocks on re-entry
     eng.revoke_shared_body()
 
     monkeypatch.setattr(eng, "_extract_graph_features_for_model", lambda: object())
-    monkeypatch.setattr(eng, "_heuristic_inference", lambda features: [("A", 1.0)])
 
     done = []
     t = threading.Thread(
@@ -498,7 +506,6 @@ def test_failed_swap_preserves_existing_wrapper_and_can_retry(loader, required):
     assert engine._model is wrapper
     assert wrapper.body is old_body
     assert engine._shared_body is old_body
-    assert engine._use_heuristic is False
     assert engine.offer_shared_body(next_body) is True
     assert engine._model is wrapper
     assert wrapper.body is next_body
@@ -526,7 +533,6 @@ def test_failed_rollback_disables_forward_but_keeps_retryable_wrapper(loader, re
     assert engine.offer_shared_body(rejected) is False
     assert engine._model is wrapper
     assert engine._shared_body is None
-    assert engine._use_heuristic is True
     if required:
         assert engine._generate_latent_token_inner()["waiting_for_shared_body"]
         assert engine.status["using_heuristic"] is False
@@ -534,4 +540,3 @@ def test_failed_rollback_disables_forward_but_keeps_retryable_wrapper(loader, re
     assert engine.offer_shared_body(next_body) is True
     assert engine._model is wrapper
     assert engine._shared_body is next_body
-    assert engine._use_heuristic is False
