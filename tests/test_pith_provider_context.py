@@ -3,6 +3,12 @@
 # What: test connected basins, epistemic labels, exact anchors, whole-line budget, and host parity.
 # Why: prompt usefulness depends on preserved relationships and closed failure states, not snippet scores.
 # How: small in-memory topologies and wrapper sentinels; no checkpoint, daemon, model, or live service.
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — harness text never
+#   reaches provider context (Packet 175 M1 / LE sweep (vii), Pith work)
+# What: test_harness_text_joins_no_basin_and_never_reaches_provider_context.
+# Why: miniTID rejects a whole provider context containing the surfaced marker or
+#   the Quest banner anywhere; the substrate holds raw hook JSON carrying the marker
+#   mid-text, so one such node firing would void the turn's fresh context.
 # -------------------
 """Behavioral contract for fresh, topology-built CC provider context."""
 
@@ -523,3 +529,32 @@ def test_invalid_provider_requests_return_only_bounded_closed_notices(kwargs, wa
     assert result["state"] == "unavailable" and result["ok"] is False
     assert result["warnings"] == [warning]
     assert len(result["context"]) < 180
+
+
+def test_harness_text_joins_no_basin_and_never_reaches_provider_context(monkeypatch):
+    graph = _Graph()
+    graph.node("core", "Respect conscious agency.", constitutional=True)
+    graph.node("work", "Repair the marker drift between miniTID and Pith")
+    graph.node("fix", "Correction: one source of truth plus a parity check")
+    graph.node("hook", '{"type":"hook_additional_context","content":'
+                       '["[NeuroGraph Surfaced Knowledge]\\n- bash:git log"]}')
+    graph.node("rail", "old turn\n" + pith._PITH_QUEST_TRACKER_BANNER + "\nSQ1")
+    graph.node("notice", "<task-notification>subagent done</task-notification>")
+    graph.synapse("s1", "work", "hook", 3.0)
+    graph.synapse("s2", "work", "rail", 3.0)
+    graph.synapse("s3", "work", "fix", 1.0)
+    surfaced = [{"node_id": "hook", "score": 9.0}, {"node_id": "notice", "score": 8.0},
+                {"node_id": "work", "score": 1.0}]
+
+    lines = pith.pith_connected_activation_basins(
+        graph, surfaced, max_members=4, max_depth=2)
+    assert [line.node_id for line in lines] == ["work"]
+    assert lines[0].member_node_ids == ["work", "fix"]
+
+    monkeypatch.setattr(pith, "cc_pattern_completion_recall",
+                        lambda *_args, **_kwargs: surfaced)
+    result = pith.pith_provider_context(SimpleNamespace(graph=graph), "Continue")
+    assert result["state"] == "ok" and result["assemblies"] == 1
+    assert "Correction: one source of truth" in result["context"]
+    for rejected in pith._PITH_PROVIDER_REJECTED + pith._PITH_HARNESS_MARKERS:
+        assert rejected not in result["context"]

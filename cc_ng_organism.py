@@ -3243,15 +3243,29 @@ _CC_PITH_REGION_CONFIDENCE_FALLOFF = float(os.environ.get("CC_PITH_REGION_CONFID
 _CC_PITH_REGION_CONFIDENCE_K = max(1, min(50, int(os.environ.get("CC_PITH_REGION_CONFIDENCE_K", "10"))))
 _CC_PITH_REGION_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, float(os.environ.get("CC_PITH_REGION_CONFIDENCE_THRESHOLD", "0.3"))))
 
-# Same marker tuple as miniTID's is_synthetic_harness_text (Condensate
-# rust_core/src/minitid.rs) -- not importable here (Rust, separate process),
-# so inlined verbatim rather than left unguarded on the extraction side.
+# The source of truth for both lists below is miniTID (Condensate
+# rust_core/src/minitid.rs): its is_synthetic_harness_text MARKERS and the
+# strings its provider_context_is_usable rejects.  Rust in a separate process
+# can't be imported, so they are mirrored here in the same order, and
+# tests/test_pith_marker_parity.py reads minitid.rs to keep them equal.
+_PITH_SURFACED_MARKER = "[NeuroGraph Surfaced Knowledge]"
+_PITH_QUEST_TRACKER_BANNER = (
+    "ACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).")
 _PITH_HARNESS_MARKERS = (
+    _PITH_SURFACED_MARKER,
     "<task-notification>",
     "<system-reminder>",
     "<local-command-stdout>",
     "<local-command-caveat>",
 )
+# miniTID refuses a whole provider context that contains either of these
+# anywhere, so no provider line may carry them.
+_PITH_PROVIDER_REJECTED = (_PITH_SURFACED_MARKER, _PITH_QUEST_TRACKER_BANNER)
+
+
+def _pith_is_harness_text(text: str) -> bool:
+    """miniTID's is_synthetic_harness_text: starts (after lstrip) with a marker."""
+    return (text or "").lstrip().startswith(_PITH_HARNESS_MARKERS)
 
 
 @dataclass
@@ -3660,8 +3674,7 @@ def pith_stage1(cache_lines: List[CacheLine], conversation_text: str,
             survivors.append(line)
             continue
 
-        stripped_content = (line.content or "").lstrip()
-        if stripped_content.startswith(_PITH_HARNESS_MARKERS):
+        if _pith_is_harness_text(line.content):
             clutter_stripped += 1
             continue
 
@@ -4500,6 +4513,13 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
         rail_label = rail_labels.get(_pith_normalize(raw))
         if rail_label:
             return raw, f"[{rail_label} is present exactly once in the live tail]", True
+        # Stage 1's harness skip, plus miniTID's whole-context rejections: a
+        # node recorded as raw hook/transcript JSON can carry the surfaced
+        # marker mid-text, and one such line would void the whole context.
+        # No display text means the node joins no basin, as root or member.
+        if _pith_is_harness_text(raw) or any(
+                marker in raw for marker in _PITH_PROVIDER_REJECTED):
+            return raw, "", False
         return raw, _pith_node_text(node, fallback), False
 
     active_node_ids = {item.get("node_id") for item in surfaced if item.get("node_id")}

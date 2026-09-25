@@ -11,6 +11,10 @@
 #   than through the gated _recall() wiring in cc-ng-daemon.py.
 # How: Plain CacheLine construction + pith_stage1() calls; _PITH_METRICS is
 #   reset() in a fixture before each test so counter assertions are isolated.
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — surfaced-marker
+#   skip (Packet 175 M1, Pith work)
+# What: test_surfaced_marker_line_dropped: the tuple now carries miniTID's
+#   [NeuroGraph Surfaced Knowledge] marker (parity: test_pith_marker_parity.py).
 # -------------------
 import os
 import sys
@@ -27,6 +31,16 @@ def _reset_metrics():
     _PITH_METRICS.reset()
     yield
     _PITH_METRICS.reset()
+
+
+def test_surfaced_marker_line_dropped():
+    lines = [
+        CacheLine.from_surfaced("n1", "  [NeuroGraph Surfaced Knowledge]\n- old recall", score=1.0),
+        CacheLine.from_surfaced("n2", "the deploy pipeline breaks when redis is cold", score=1.0),
+    ]
+    survivors = pith_stage1(lines, conversation_text="", novelty=0.0)
+    assert [l.node_id for l in survivors] == ["n2"]
+    assert _PITH_METRICS.clutter_stripped == 1
 
 
 def test_harness_marker_line_dropped_genuine_line_kept():
