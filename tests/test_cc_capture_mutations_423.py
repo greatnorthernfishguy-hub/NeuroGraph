@@ -1,4 +1,17 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
+# ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane B merge
+# What: test_probation_and_kiss_keep_existing_clock_semantics became
+#       test_probation_keeps_existing_clock_semantics (fixture starts at
+#       probation_remaining=1). The removed half exercised
+#       _cc_kiss_reinforce_node, a symbol lane B deletes; the graduation
+#       and no-clock (not hasattr(g, 'timestep')) assertions are unchanged.
+# Why:  Executive Packet 153(3)(a) / 153(4) Q2 remove the vdb Delta Gate
+#       outright; 077 review (returns/z2-laneB-kiss-gate-removal-review-001.md,
+#       note 1) asked for this header at merge.
+# How:  Test edit only; cc_update_probation still has live coverage in
+#       tests/test_cc_dual_pass.py.
+# -------------------
 import ast
 import logging
 import threading
