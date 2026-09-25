@@ -3060,7 +3060,7 @@ def cc_novelty(state: dict, graph) -> float:
     """Pull-based MMN novelty for CC's surfacing (#255 parity, #358).
 
     Canonical updates _substrate_novelty_ema push-style per turn in
-    handle_after_turn() (rpc.py:3266-3272) from StepResult's HE-level
+    handle_after_turn() (rpc.py:3661-3667) from StepResult's HE-level
     prediction counts. CC's deposits run the dual pass, not on_message(), and
     step only through cc_deposit_step (CC_NG_DEPOSIT_STEP, default off) or the
     Tonic's autostep; neither pushes those stats -- so CC dips the bucket at
