@@ -5,8 +5,8 @@
 # ---- Changelog ----
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane C (ii-a):
 #   the conversational deposit steps again (CC_NG_DEPOSIT_STEP, default off)
-# What: cc_deposit_step(graph): under graph._step_lock, one graph.step(), the
-#   0.1 baseline reward when three_factor_enabled, then discover_hyperedges on
+# What: cc_deposit_step(graph, ingested): under graph._step_lock, one graph.step(), the
+#   0.1 baseline reward when ingested and three_factor_enabled, then discover_hyperedges on
 #   that step's fired_node_ids. Returns the StepResult; nothing consumes it yet
 #   (KISS ops 2/6 are unbuilt, so no consumer is invented here). No stimulus is
 #   injected. Flag _CC_NG_DEPOSIT_STEP reads CC_NG_DEPOSIT_STEP, default "0".
