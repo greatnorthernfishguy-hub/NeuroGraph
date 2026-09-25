@@ -16,7 +16,7 @@ def functions(*names):
     ns = dict(logger=logging.getLogger('test'), time=time, Optional=object,
               _CC_CONV_THRESHOLD_BOOST=2, _CC_CONV_NOVELTY_DAMPENING=.5,
               _CC_CONV_PROBATION_PERIOD=4, _CC_CONV_PROBATION_REQUIRE_SPIKE=False,
-              _CC_CONV_SYNAPSE_DELAY_MAX=3, _CC_KISS_GATE_ENABLED=False,
+              _CC_CONV_SYNAPSE_DELAY_MAX=3,
               _cc_embed_to_poincare_dir=lambda x:x, _cc_has_ever_fired=lambda n:False,
               cc_anticipate=lambda *a:None)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*nodes],type_ignores=[])),str(SOURCE),'exec'),ns)
@@ -78,19 +78,17 @@ def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_in
     monkeypatch.setitem(sys.modules,'ng_embed',SimpleNamespace(NGEmbed=SimpleNamespace(get_instance=lambda:Embed())))
     assert ns['run_conversational_dual_pass'](g,VDB(g,fail_insert),'text',[1],{}) is (not fail_insert and not extract_failed)
 
-def test_probation_and_kiss_keep_existing_clock_semantics():
-    ns=functions('_cc_kiss_reinforce_node','cc_update_probation')
+def test_probation_keeps_existing_clock_semantics():
+    ns=functions('cc_update_probation')
     g=Graph()
     class Metadata(dict):
         def __setitem__(self,k,v):
             assert g._step_lock._is_owned()
             super().__setitem__(k,v)
-    g.nodes['a']=SimpleNamespace(metadata=Metadata(probation_remaining=2,probation_total=4),threshold=3,intrinsic_excitability=.5)
-    assert ns['_cc_kiss_reinforce_node'](g,'a')
-    assert g.nodes['a'].metadata['probation_remaining']==1
+    g.nodes['a']=SimpleNamespace(metadata=Metadata(probation_remaining=1,probation_total=4),threshold=3,intrinsic_excitability=.5)
     assert ns['cc_update_probation'](g)==['a']
     assert g.nodes['a'].metadata['graduated'] is True
-    assert not hasattr(g,'timestep') # neither path requires/advances graph clock
+    assert not hasattr(g,'timestep') # probation graduation does not require/advance graph clock
 
 def test_geometry_embedding_outside_lock_and_stale_result_discarded(packer,monkeypatch):
     import sys

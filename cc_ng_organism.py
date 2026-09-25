@@ -3,6 +3,44 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-24] Claude Sonnet 5 (Claude Code, z2-laneB-kiss-gate-removal-001) —
+#   Lane B: remove the vdb Delta Gate, its #523 deposit-time Cricket skip, and
+#   everything built only on it.
+# What: removed _CC_KISS_REDUNDANCY_THRESHOLD, _CC_KISS_GATE_ENABLED, the
+#   COMB-04 KISS-half flags (_CC_KISS_REGION_CONFIDENCE_{ENABLED,SPAN,FLOOR})
+#   and their comment block, _cc_kiss_find_redundant_node (including the #523
+#   skip `if graph._is_identity_protected(node_id): continue`), and
+#   _cc_kiss_reinforce_node -- left with no caller once the gate is gone
+#   (LAW 3 shrapnel). run_conversational_dual_pass no longer branches on the
+#   gate; every turn now deposits raw straight to the fresh-deposit path that
+#   was already there. No replacement redundancy check, dedup, or threshold
+#   was added at deposit (Packet 154(6): fix, never pass or patch).
+#   cc_region_confidence and the Pith half of COMB-04 in cc_l1_budget are
+#   untouched (live caller outside the gate; held for the Law Enforcer's
+#   sweep item 153(3)(b)(iv)).
+# Why: Executive Packet 153(3)(a) -- the deposit-time Cricket bypass
+#   (_is_identity_protected checked only to decide whether a redundant node
+#   could be collapsed into) is a LAW 7 break: Packet 112(4), "Shaping IS a
+#   Law violation at deposit". Packet 153(4) Q2: the invented vdb Delta Gate
+#   is not retained, and anything built on it goes with it -- the #523 skip,
+#   the COMB-04 KISS half, FLOOR/SPAN (provenance: superpowers/plans/
+#   2026-07-08-cc-deposit-kiss.md Phase 1 steps 3-4). Packet 155 / chief's
+#   confirmation of the P153 counter: one combined deletion, including
+#   _cc_kiss_reinforce_node.
+# How: deleted the four source rows named in assignments/
+#   z2-laneB-kiss-gate-removal-001.md (env vars/flags, both KISS functions,
+#   the gate call + reinforce branch in run_conversational_dual_pass) and
+#   their docstring/comment references; left cc_region_confidence and
+#   cc_l1_budget's Pith half byte-identical. Deleted tests that only
+#   exercised removed code (tests/test_cc_kiss_shared_graduation.py in full;
+#   the KISS block in tests/test_cc_dual_pass.py; the _cc_kiss_reinforce_node
+#   case and _CC_KISS_GATE_ENABLED stub in tests/test_cc_capture_mutations_
+#   423.py, whose surviving cc_update_probation lock-semantics coverage was
+#   preserved as test_probation_keeps_existing_clock_semantics). Added tests
+#   asserting raw deposit on repeat (content-hashed target_id maps a repeat
+#   onto the same node with no reinforcement), zero _is_identity_protected
+#   calls during deposit (the #523 regression, shown failing on d4fbaf4), and
+#   `not hasattr(cc_ng_organism, name)` for every removed symbol.
 # [2026-09-24] Claude Sonnet 5 (Claude Code, groupb-kiss-shared-graduation-001) —
 #   Revision 1 (ZM review): pin the threshold shift's magnitude, cap the floor
 #   at base, and share one "neutral" definition with Pith.
@@ -1489,38 +1527,6 @@ _CC_CONV_PROBATION_REQUIRE_SPIKE = os.environ.get(
     "CC_CONV_PROBATION_REQUIRE_SPIKE", "1"
 ) not in ("0", "false", "False", "")
 
-# ---- Real-KISS redundancy->reinforcement gate (input boundary, #KISS 2026-07-08) ----
-# See docs/concepts/KISS.md "Current State" / KISS_Pith_Combined_Architecture.md.
-# Delta Gate (KISS op 1) applied where KISS actually belongs -- CC's own substrate
-# deposit path -- instead of the outbound-resend layer. Cosine-similarity change
-# detection only, no content classification (LAW 7 stays satisfied).
-_CC_KISS_REDUNDANCY_THRESHOLD = float(os.environ.get("CC_KISS_REDUNDANCY_THRESHOLD", "0.95"))
-# Live-daemon safety valve: set CC_KISS_GATE_ENABLED=0 to fully bypass the gate
-# (turns deposit fresh, pre-KISS behavior) without a code change or restart-to-old.
-_CC_KISS_GATE_ENABLED = os.environ.get("CC_KISS_GATE_ENABLED", "1") not in ("0", "false", "False", "")
-
-# ---- Shared Graduation (COMB-04): KISS half, 2026-09-24 ----
-# The same confidence query Pith already reads for cc_l1_budget (cc_region_confidence,
-# 4b3a86b) also shapes KISS's redundancy threshold -- one confidence map, two ends
-# (KISS_Pith_Combined_Architecture.md "Shared Graduation -- One Substrate, Two Ends",
-# l.163-174). Default OFF: with this flag off, _cc_kiss_find_redundant_node never
-# calls cc_region_confidence and issues the exact same search(threshold=...) call it
-# always has -- byte-for-byte today's behavior (LE condition 1/2).
-_CC_KISS_REGION_CONFIDENCE_ENABLED = os.environ.get(
-    "CC_KISS_REGION_CONFIDENCE_ENABLED", "0"
-) not in ("0", "false", "False", "")
-# How far region confidence can move the effective threshold off base, each
-# direction (e.g. span=0.1 -> +/-0.1 at the confidence extremes, before the floor
-# clamp). Clamped like the file's other threshold-shaped floats (_CC_PITH_REGION_
-# CONFIDENCE_THRESHOLD, ~l.3247).
-_CC_KISS_REGION_CONFIDENCE_SPAN = max(0.0, min(1.0, float(
-    os.environ.get("CC_KISS_REGION_CONFIDENCE_SPAN", "0.1"))))
-# Lower bound on the effective threshold -- keeps "redundant" meaning near-duplicate
-# even at confidence 1.0 (span alone could otherwise push it arbitrarily low).
-# Clamped to a sane range: never below a coin-flip similarity, never above 1.0.
-_CC_KISS_REGION_CONFIDENCE_FLOOR = max(0.5, min(1.0, float(
-    os.environ.get("CC_KISS_REGION_CONFIDENCE_FLOOR", "0.85"))))
-
 _CC_CONCEPT_FLOOR_MIN_CHARS = 5
 _CC_CONCEPT_FLOOR_STOPWORDS = frozenset(
     "a an and are as at be but by for from has have i if in is it its let me my not of on "
@@ -1600,74 +1606,6 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
         return node
 
 
-def _cc_kiss_find_redundant_node(graph, vector_db, embedding) -> Optional[str]:
-    """Delta Gate (KISS op 1), applied at CC's own deposit boundary: is this
-    turn's embedding a near-duplicate of an existing conversational
-    (forest-level) memory already in `vector_db`? Pure cosine-similarity
-    change detection -- never reads `content`, never classifies (LAW 7).
-
-    Scoped to nodes tagged {"cc": True, "creation_mode": "conversational"} --
-    i.e. whole-turn forest nodes -- not fine-grained tree concepts, so a
-    genuinely new sub-concept inside a similar-sounding turn still gets its
-    own recall entry via the tree pass; only whole-turn duplication is gated
-    here. Returns the matched node_id, or None if nothing redundant is found
-    (including on any vector_db error -- caller falls back to a fresh
-    deposit, which is always safe).
-
-    Cricket bypass (LAW-conditioned): an identity-protected node
-    (constitutional / syl_authored, per Graph._is_identity_protected) is NEVER
-    returned as a collapse target -- a redundant turn must not fold into a
-    pinned node. Such matches are skipped; if only pinned nodes match, returns
-    None so the turn deposits fresh.
-
-    Shared Graduation (COMB-04): when CC_KISS_REGION_CONFIDENCE_ENABLED is set,
-    the search threshold is no longer the fixed _CC_KISS_REDUNDANCY_THRESHOLD --
-    it is shifted by cc_region_confidence(graph, vector_db, embedding), the same
-    live, uncached confidence query Pith reads for cc_l1_budget (LAW 7: nothing
-    from that call is deposited, cached, or stored -- it is used once, here, and
-    discarded). Confidence above neutral lowers the effective threshold (collapses
-    more readily); confidence below neutral raises it (collapses less); at neutral
-    -- _CC_PITH_REGION_CONFIDENCE_NEUTRAL, the same constant cc_region_confidence
-    itself returns on fail-soft, so both ends of Shared Graduation share one
-    definition of "neutral" -- the effective threshold equals
-    _CC_KISS_REDUNDANCY_THRESHOLD exactly. Clamped to
-    [min(_CC_KISS_REGION_CONFIDENCE_FLOOR, _CC_KISS_REDUNDANCY_THRESHOLD), 1.0]:
-    the floor is capped at base so a misconfigured floor (set above base) can
-    never make the neutral-confidence threshold silently diverge from today's
-    fixed value -- "redundant" still means near-duplicate even at confidence 1.0.
-    With the flag off, this block is skipped entirely -- no confidence call, same
-    threshold, same search call as before this feature existed.
-    """
-    threshold = _CC_KISS_REDUNDANCY_THRESHOLD
-    if _CC_KISS_REGION_CONFIDENCE_ENABLED:
-        confidence = cc_region_confidence(graph, vector_db, embedding)
-        threshold = _CC_KISS_REDUNDANCY_THRESHOLD - (
-            confidence - _CC_PITH_REGION_CONFIDENCE_NEUTRAL
-        ) * 2.0 * _CC_KISS_REGION_CONFIDENCE_SPAN
-        floor = min(_CC_KISS_REGION_CONFIDENCE_FLOOR, _CC_KISS_REDUNDANCY_THRESHOLD)
-        threshold = max(floor, min(1.0, threshold))
-    try:
-        hits = vector_db.search(embedding, k=5, threshold=threshold)
-    except Exception as exc:
-        logger.debug("CC KISS redundancy search failed (non-fatal): %s", exc)
-        return None
-    for node_id, _sim in hits:
-        try:
-            entry = vector_db.get(node_id)
-        except Exception:
-            entry = None
-        meta = (entry or {}).get("metadata") or {}
-        if not (meta.get("cc") is True and meta.get("creation_mode") == "conversational"):
-            continue
-        try:
-            if graph._is_identity_protected(node_id):
-                continue
-        except AttributeError:
-            pass  # no such method -> treat as not protected
-        return node_id
-    return None
-
-
 def cc_region_confidence(graph, vector_db, embedding) -> float:
     """Shared Graduation (COMB-04): region confidence signal from the full NeuroGraph.
     
@@ -1733,57 +1671,6 @@ def cc_region_confidence(graph, vector_db, embedding) -> float:
         
     except Exception:
         return _CC_PITH_REGION_CONFIDENCE_NEUTRAL
-
-
-def _cc_kiss_reinforce_node(graph, node_id: str) -> bool:
-    """Hebbian reinforcement for a redundant conversational turn -- the
-    real-KISS counterpart to a fresh deposit. Never drops the turn (LAW 7:
-    the substrate still responds to it) and never duplicates a memory node
-    for content it already represents; instead the topology that already
-    stands for this content is confirmed.
-
-    - Bumps a confirmation counter/timestamp on the node's metadata.
-    - If the node is still inside its novelty-probation window, graduation
-      is ACCELERATED (probation_remaining ticks down one extra step) rather
-      than restarted -- repeated confirmation is evidence FOR the memory, the
-      opposite of what a brand-new deposit's fixed probation window means. An
-      already-graduated node is never pushed back into probation.
-
-    Returns False (non-fatal) if node_id no longer resolves -- e.g. pruned
-    between the vector-db hit and this call -- so the caller can decide
-    whether to fall back to a fresh deposit instead.
-    """
-    with _cc_mutation_lock(graph):
-        node = graph.nodes.get(node_id)
-        if node is None:
-            return False
-        node.metadata["kiss_reinforcement_count"] = int(node.metadata.get("kiss_reinforcement_count", 0)) + 1
-        node.metadata["kiss_last_reinforced_ts"] = time.time()
-        # Synapse-level LTP reinforcement is a reviewed follow-up (kept out of v1 for cost + to validate the collapse behavior in isolation first).
-        prob = node.metadata.get("probation_remaining")
-        if prob is not None and prob > 0:
-            prob -= 1
-            node.metadata["probation_remaining"] = prob
-            if prob <= 0:
-                # Novelty-dampening release stays unconditional on the timer (same
-                # rationale as cc_update_probation): gating it on firing would trap a
-                # never-fired node with a boosted threshold it can never earn release from.
-                node.intrinsic_excitability = 1.0
-                node.threshold = graph.config.get("default_threshold", 1.0)
-                # #131 (#111 sibling): reinforcement ACCELERATES the probation timer but is
-                # NOT itself evidence the node entered cognition. Gate the graduated stamp on
-                # the firing ledger, exactly as the timer-expiry path does (cc_update_probation
-                # ~line 1507). An un-fired node that ages out via reinforcement lands in the
-                # probation_expired_unfired cohort and re-earns graduation the first time it
-                # truly fires. kiss_reinforcement_count is still bumped above, so the
-                # confirmation signal is preserved for a future consumer (#113) -- it is just
-                # no longer conflated with earned-by-firing.
-                if not _CC_CONV_PROBATION_REQUIRE_SPIKE or _cc_has_ever_fired(node):
-                    node.metadata["graduated"] = True
-                else:
-                    node.metadata["graduated"] = False
-                    node.metadata["probation_expired_unfired"] = True
-        return True
 
 
 class _CCConversationalDualPassEco:
@@ -1977,27 +1864,15 @@ def cc_update_probation(graph) -> list:
 def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict) -> bool:
     """Core dual-pass on one turn's text. Returns True on success, False on
     failure -- caller decides retry policy (this function does not enqueue).
-    Mirrors canonical's _run_conversational_dual_pass exactly, parameterized,
-    with one CC-first addition on top: the real-KISS redundancy->reinforcement
-    gate (docs/concepts/KISS.md "Current State", 2026-07-08). Before depositing
-    a new memory, checks whether `embedding` is a near-duplicate of an existing
-    conversational node. If so, the turn still touches the substrate -- via
-    confirmation of the matched node and the same topology binding/anticipation
-    a fresh deposit gets -- it just doesn't duplicate a node for content the
-    substrate already represents (LAW 7: reinforced, not dropped). The whole
-    gate is bypassable at runtime via CC_KISS_GATE_ENABLED=0.
+    Mirrors canonical's _run_conversational_dual_pass exactly, parameterized.
+    Every turn deposits raw (LAW 7) -- no redundancy check, dedup, or
+    threshold runs at deposit; `target_id` is content-hashed (see below), so
+    an exact-repeat turn's deposit naturally lands on the same node instead
+    of creating a duplicate.
     """
     if graph is None or embedding is None:
         return False
     try:
-        if _CC_KISS_GATE_ENABLED:
-            redundant_id = _cc_kiss_find_redundant_node(graph, vector_db, embedding)
-            if redundant_id is not None and _cc_kiss_reinforce_node(graph, redundant_id):
-                _cc_bind_conversational_topology(graph, redundant_id, {}, embedding, state)
-                return True
-            # else: the matched node was pruned between the vdb hit and the
-            # reinforce call (stale hit) -- fall through to the fresh-deposit
-            # path below so the turn is never silently lost (LAW 7).
         from ng_embed import NGEmbed
         import hashlib
         target_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()

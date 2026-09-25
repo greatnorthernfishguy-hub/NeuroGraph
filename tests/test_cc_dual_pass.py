@@ -146,258 +146,142 @@ def test_probation_unfired_node_sheds_dampening_but_does_not_graduate(cc_ng, mon
     assert node.metadata.get("probation_expired_unfired") is None
 
 
-def test_kiss_redundancy_gate_reinforces_instead_of_duplicating(cc_ng):
-    """Real-KISS redundancy->reinforcement gate: an exact-repeat turn must
-    not create a second conversational node. It reinforces the existing one."""
+# ---- Changelog ----
+# [2026-09-24] Claude Sonnet 5 (Claude Code, z2-laneB-kiss-gate-removal-001)
+# What: Three tests replacing the deleted KISS-gate suite (l.149-402, prior
+#       revision): raw-deposit-on-repeat, the #523 Cricket-at-deposit
+#       regression, and removed-symbols-gone. Real deposit path throughout
+#       (run_conversational_dual_pass, _cc_deposit_memory_node,
+#       _is_identity_protected) -- nothing in cc_ng_organism.py is mocked.
+# Why:  Assignment z2-laneB-kiss-gate-removal-001 step 5 requires real-path
+#       coverage proving (a) an exact-repeat turn deposits raw onto the
+#       same content-hashed node instead of going through any special
+#       reinforcement branch, (b) Cricket's _is_identity_protected is never
+#       invoked during a conversational deposit (the #523 bypass this lane
+#       removed), and (c) every _cc_kiss_*/CC_KISS_* symbol is actually gone.
+# How:  patch("ng_embed.NGEmbed._extract_concepts", return_value=[]) +
+#       monkeypatch.delenv("NG_EMBED_REMOTE") isolate from two live-infra
+#       gaps in this sandbox (TID not running on 7437; NG_EMBED_REMOTE=hf
+#       leaking in from ~/.bashrc, documented there as Morphogenesis-only
+#       but read unconditionally by vendored ng_embed.py's _ensure_model --
+#       flagged separately, not fixed here). Both patches stub only the
+#       external TID/HF calls inside vendored ng_embed.py -- the exact,
+#       already-precedented pattern used by test_conversational_window_
+#       chains.py and test_memory_phase1.py elsewhere in this suite. No
+#       part of cc_ng_organism.py's deposit path is mocked.
+#       NGEmbed.get_instance() also caches its remote-vs-local decision on
+#       first call for the life of the process (_ensure_model's _model_
+#       loaded guard), so an earlier test in the same pytest run that saw
+#       NG_EMBED_REMOTE=hf before this test's delenv can poison it. Both
+#       tests bracket themselves with NGEmbed.reset_instance() (already a
+#       vendored public method, not a modification) so they are correct
+#       standalone and inside the full-file run alike, and leave no
+#       lingering singleton state for whatever test runs next.
+# -------------------
+def test_raw_deposit_on_exact_repeat_reuses_content_hashed_node(cc_ng, monkeypatch):
+    """LAW 7 (post-gate-removal): an exact-repeat turn deposits raw onto the
+    same node -- via ordinary content-hashing, not via any redundancy check
+    or reinforcement branch (both deleted). _cc_deposit_memory_node resets
+    probation/threshold/excitability unconditionally on every call, so the
+    second deposit looks identical to the first: no special-cased path.
+    """
     from cc_ng_organism import run_conversational_dual_pass
-    from ng_embed import embed
-    state = {"last_forest_id": None}
-    text = "the redundant turn text for the KISS gate test"
-    emb = embed(text)
+    from ng_embed import embed, NGEmbed
+    from unittest.mock import patch
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    NGEmbed.reset_instance()
+    try:
+        text = "the same exact turn, deposited twice"
+        emb = embed(text)
+        state = {"last_forest_id": None}
 
-    ok1 = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    assert ok1 is True
-    first_id = state["last_forest_id"]
+        with patch("ng_embed.NGEmbed._extract_concepts", return_value=[]):
+            ok1 = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+            first_id = state["last_forest_id"]
+            ok2 = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
+            second_id = state["last_forest_id"]
+    finally:
+        NGEmbed.reset_instance()
+
+    assert ok1 is True and ok2 is True
+    assert first_id == second_id, "content-hashed target_id must reuse the same node"
     conv_nodes = [n for n in cc_ng.graph.nodes.values()
                   if n.metadata.get("creation_mode") == "conversational"]
-    assert len(conv_nodes) == 1
-
-    ok2 = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    assert ok2 is True
-    conv_nodes_after = [n for n in cc_ng.graph.nodes.values()
-                        if n.metadata.get("creation_mode") == "conversational"]
-    assert len(conv_nodes_after) == 1  # no duplicate node
-    assert state["last_forest_id"] == first_id  # reinforcement targeted the existing node
-
-    node = cc_ng.graph.nodes[first_id]
-    assert node.metadata.get("kiss_reinforcement_count") == 1
+    assert len(conv_nodes) == 1, "no duplicate node -- and no separate reinforcement node either"
+    node = conv_nodes[0]
+    # No KISS-era reinforcement markers exist anymore -- ordinary deposit only.
+    assert "kiss_reinforcement_count" not in node.metadata
+    assert "kiss_reinforced" not in node.metadata
 
 
-def test_kiss_redundancy_gate_does_not_collapse_distinct_turns(cc_ng):
-    """Genuinely different content must not be gated -- the redundancy check
-    is pure change detection, not a bias toward fewer nodes."""
+def test_no_cricket_check_at_deposit_523_regression(cc_ng, monkeypatch):
+    """#523 regression: the KISS gate used to run graph._is_identity_protected
+    at deposit time to decide reinforce-vs-fresh -- a Cricket check gating
+    what should be an unconditional raw deposit (Packet 112(4): Shaping IS
+    a Law violation at deposit). Even when the deposited content collides
+    (same embedding) with an existing identity-protected node, deposit must
+    never consult _is_identity_protected. Proven to fail on base d4fbaf4
+    (see return doc) and pass here.
+    """
     from cc_ng_organism import run_conversational_dual_pass
-    from ng_embed import embed
-    state = {"last_forest_id": None}
-    t1 = "talk about pizza toppings and cheese preferences"
-    t2 = "debugging a segfault in the kernel driver's interrupt handler"
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t1, embed(t1), state)
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t2, embed(t2), state)
-    conv_nodes = [n for n in cc_ng.graph.nodes.values()
-                  if n.metadata.get("creation_mode") == "conversational"]
-    assert len(conv_nodes) == 2
+    from ng_embed import embed, NGEmbed
+    from unittest.mock import patch
+    import numpy as np
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    NGEmbed.reset_instance()
+    try:
+        seed_text = "the seed turn that becomes the identity-protected node"
+        with patch("ng_embed.NGEmbed._extract_concepts", return_value=[]):
+            seed_emb = embed(seed_text)
+        protected_id = "existing:protected:conv"
+        node = cc_ng.graph.create_node(node_id=protected_id, metadata={
+            "cc": True, "creation_mode": "conversational", "constitutional": True,
+        })
+        cc_ng.vector_db.insert(id=protected_id, embedding=np.asarray(seed_emb, dtype=np.float32),
+                                content=seed_text, metadata=node.metadata)
+
+        calls = []
+        real_is_identity_protected = type(cc_ng.graph)._is_identity_protected
+        def spy(self, nid):
+            calls.append(nid)
+            return real_is_identity_protected(self, nid)
+        monkeypatch.setattr(type(cc_ng.graph), "_is_identity_protected", spy)
+
+        state = {"last_forest_id": None}
+        text = "a brand new turn"
+        # Reuse the EXACT SAME embedding as the protected node so a would-be
+        # redundancy/vdb-collision check -- if one still existed -- would
+        # certainly fire. It must not, because none does anymore.
+        with patch("ng_embed.NGEmbed._extract_concepts", return_value=[]):
+            ok = run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, seed_emb, state)
+    finally:
+        NGEmbed.reset_instance()
+    assert ok is True
+    assert calls == [], f"expected zero Cricket checks during deposit, got {calls}"
 
 
-def test_kiss_redundancy_gate_confirms_without_duplicating_across_distinct_turns(cc_ng):
-    """A redundant hit reinforces (bumps the confirmation counter) without
-    adding a node, even when other distinct turns exist in the substrate."""
-    from cc_ng_organism import run_conversational_dual_pass
-    from ng_embed import embed
-    state = {"last_forest_id": None}
-    t1 = "first distinct turn about numpy conflicts"
-    t2 = "second distinct turn about the tract bridge cleanup"
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t1, embed(t1), state)
-    id1 = state["last_forest_id"]
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t2, embed(t2), state)
-
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, t1, embed(t1), state)
-    assert cc_ng.graph.nodes[id1].metadata.get("kiss_reinforcement_count") == 1
-    conv_nodes = [n for n in cc_ng.graph.nodes.values()
-                  if n.metadata.get("creation_mode") == "conversational"]
-    assert len(conv_nodes) == 2  # still only the two distinct nodes
-
-
-def test_kiss_gate_kill_switch_restores_fresh_deposit(cc_ng, monkeypatch):
-    """With CC_KISS_GATE_ENABLED off, the gate never fires -- an exact repeat
-    is not turned into reinforcement (pre-KISS behavior)."""
-    import cc_ng_organism
-    from cc_ng_organism import run_conversational_dual_pass
-    from ng_embed import embed
-    monkeypatch.setattr(cc_ng_organism, "_CC_KISS_GATE_ENABLED", False)
-    state = {"last_forest_id": None}
-    text = "kill switch test turn text"
-    emb = embed(text)
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    node_id = state["last_forest_id"]
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    assert "kiss_reinforcement_count" not in cc_ng.graph.nodes[node_id].metadata
-
-
-def test_kiss_gate_never_collapses_into_identity_protected_node(cc_ng, monkeypatch):
-    """Cricket bypass: a redundant turn must not fold into an identity-protected
-    (constitutional) node -- it deposits fresh instead."""
-    from cc_ng_organism import run_conversational_dual_pass
-    from ng_embed import embed
-    state = {"last_forest_id": None}
-    text = "identity protected collapse guard turn"
-    emb = embed(text)
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    first_id = state["last_forest_id"]
-
-    # Force the existing conversational node to read as identity-protected.
-    monkeypatch.setattr(type(cc_ng.graph), "_is_identity_protected",
-                        lambda self, nid: nid == first_id, raising=False)
-
-    # A near-duplicate (different text -> different target_id) must NOT collapse
-    # into the protected node; it deposits as its own fresh node.
-    text2 = text + " again"
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text2, embed(text2), state)
-    assert cc_ng.graph.nodes[first_id].metadata.get("kiss_reinforcement_count") is None
-    conv_nodes = [n for n in cc_ng.graph.nodes.values()
-                  if n.metadata.get("creation_mode") == "conversational"]
-    assert len(conv_nodes) == 2
-
-
-def test_kiss_reinforcement_accelerates_probation_instead_of_resetting(cc_ng):
-    """A redundant hit on a still-probationary node must tick it one step
-    closer to graduation, not restart the fixed probation window."""
-    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
-    from ng_embed import embed
-    state = {"last_forest_id": None}
-    text = "probation acceleration test text for the KISS gate"
-    emb = embed(text)
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    node_id = state["last_forest_id"]
-    node = cc_ng.graph.nodes[node_id]
-    assert node.metadata["probation_remaining"] == _CC_CONV_PROBATION_PERIOD
-
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    assert node.metadata["probation_remaining"] == _CC_CONV_PROBATION_PERIOD - 1
-    assert node.metadata.get("graduated") is not True
-
-
-def test_kiss_reinforcement_never_resets_a_graduated_node(cc_ng):
-    """Once a node has graduated out of probation, a later redundant hit must
-    not push it back into probation or dampen its excitability."""
-    from cc_ng_organism import run_conversational_dual_pass, cc_update_probation, _CC_CONV_PROBATION_PERIOD
-    from ng_embed import embed
-    state = {"last_forest_id": None}
-    text = "graduation reinforcement test text for the KISS gate"
-    emb = embed(text)
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    node_id = state["last_forest_id"]
-    node = cc_ng.graph.nodes[node_id]
-    # #93 — graduation now requires a real spike, not just an expired timer.
-    cc_ng.graph.stimulate(node_id, 20.0)
-    cc_ng.graph.step()
-    for _ in range(_CC_CONV_PROBATION_PERIOD):
-        cc_update_probation(cc_ng.graph)
-    assert node.metadata.get("graduated") is True
-    assert node.intrinsic_excitability == 1.0
-
-    run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-    assert node.metadata.get("graduated") is True
-    assert node.intrinsic_excitability == 1.0
-    base_threshold = cc_ng.graph.config.get("default_threshold", 1.0)
-    assert node.threshold == base_threshold
-
-
-def test_kiss_reinforcement_unfired_node_does_not_graduate(cc_ng, monkeypatch):
-    """#131 (the uncovered #111 sibling) — when repeated reinforcement, not the
-    wall-clock timer, is what drives probation_remaining to 0, an un-fired node
-    must still NOT be stamped 'graduated'. This is the reinforce-path counterpart
-    of test_probation_unfired_node_sheds_dampening_but_does_not_graduate: before
-    #131 this path stamped graduated=True unconditionally, producing exactly the
-    un-earned state (graduated=True with an empty spike_history) that #93/#111
-    outlawed. Dampening release still rides the timer; the stamp is gated on
-    firing; the node re-earns graduation on its first real spike.
+def test_kiss_gate_symbols_removed():
+    """Every symbol built for the vdb Delta Gate (#523's fix) and the
+    COMB-04 KISS-half built on top of it must be gone: the gate functions,
+    its enable flag, its redundancy threshold, and the three region-
+    confidence env-derived constants. cc_region_confidence and the Pith
+    half (_CC_PITH_REGION_CONFIDENCE_*) are untouched -- not asserted gone
+    here, see test_cc_region_confidence.py instead.
     """
     import cc_ng_organism as cc
-    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
-    from ng_embed import embed
-    monkeypatch.setattr(cc, "_CC_CONV_PROBATION_REQUIRE_SPIKE", True)
-
-    state = {"last_forest_id": None}
-    text = "reinforce-driven graduation gate: node that never fires"
-    emb = embed(text)
-    assert run_conversational_dual_pass(
-        cc_ng.graph, cc_ng.vector_db, text, emb, state) is True
-    node_id = state["last_forest_id"]
-    node = cc_ng.graph.nodes[node_id]
-    assert node.metadata.get("probation_remaining") == _CC_CONV_PROBATION_PERIOD
-
-    # Drive the window to 0 purely by redundant reinforcement — never stimulate it.
-    for _ in range(_CC_CONV_PROBATION_PERIOD):
-        run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-
-    assert len(node.spike_history) == 0, "precondition: node must not have fired"
-    assert node.metadata.get("probation_remaining") <= 0
-    # The stamp is withheld and the un-fired cohort is recorded...
-    assert node.metadata.get("graduated") is False
-    assert node.metadata.get("probation_expired_unfired") is True
-    # ...but the novelty handicap is lifted on schedule regardless.
-    assert node.intrinsic_excitability == 1.0
-    assert node.threshold == cc_ng.graph.config.get("default_threshold", 1.0)
-    # ...and the confirmation signal is preserved, not thrown away with the stamp.
-    assert node.metadata.get("kiss_reinforcement_count") == _CC_CONV_PROBATION_PERIOD
-
-    # Late graduation: fire it now and the very next probation sweep earns the stamp,
-    # exactly as the timer-expiry path does.
-    from cc_ng_organism import cc_update_probation
-    cc_ng.graph.stimulate(node_id, 20.0)
-    cc_ng.graph.step()
-    assert len(node.spike_history) > 0
-    graduated = cc_update_probation(cc_ng.graph)
-    assert node_id in graduated
-    assert node.metadata.get("graduated") is True
-    assert node.metadata.get("probation_expired_unfired") is None
-
-
-def test_kiss_reinforcement_fired_node_graduates(cc_ng, monkeypatch):
-    """#131 — the positive case: a node that HAS genuinely fired and is then
-    driven out of probation by reinforcement earns the graduated stamp on the
-    reinforce path, no separate probation sweep required."""
-    import cc_ng_organism as cc
-    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
-    from ng_embed import embed
-    monkeypatch.setattr(cc, "_CC_CONV_PROBATION_REQUIRE_SPIKE", True)
-
-    state = {"last_forest_id": None}
-    text = "reinforce-driven graduation gate: node that really fires"
-    emb = embed(text)
-    assert run_conversational_dual_pass(
-        cc_ng.graph, cc_ng.vector_db, text, emb, state) is True
-    node_id = state["last_forest_id"]
-    node = cc_ng.graph.nodes[node_id]
-    # Make it genuinely spike before the reinforcement window closes.
-    cc_ng.graph.stimulate(node_id, 20.0)
-    cc_ng.graph.step()
-    assert len(node.spike_history) > 0, "precondition: node must have really fired"
-
-    for _ in range(_CC_CONV_PROBATION_PERIOD):
-        run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-
-    assert node.metadata.get("probation_remaining") <= 0
-    assert node.metadata.get("graduated") is True
-    assert node.metadata.get("probation_expired_unfired") is None
-    assert node.intrinsic_excitability == 1.0
-
-
-def test_kiss_reinforcement_graduation_gate_kill_switch(cc_ng, monkeypatch):
-    """#131 / LAW-5 rollback parity — with CC_CONV_PROBATION_REQUIRE_SPIKE=0 the
-    reinforce path reverts to the old pure-timer rule: an un-fired node driven out
-    of probation by reinforcement graduates. Both graduation paths must honour the
-    same knob so the whole feature rolls back together."""
-    import cc_ng_organism as cc
-    from cc_ng_organism import run_conversational_dual_pass, _CC_CONV_PROBATION_PERIOD
-    from ng_embed import embed
-    monkeypatch.setattr(cc, "_CC_CONV_PROBATION_REQUIRE_SPIKE", False)
-
-    state = {"last_forest_id": None}
-    text = "reinforce-driven graduation gate: kill-switch restores pure timer"
-    emb = embed(text)
-    assert run_conversational_dual_pass(
-        cc_ng.graph, cc_ng.vector_db, text, emb, state) is True
-    node_id = state["last_forest_id"]
-    node = cc_ng.graph.nodes[node_id]
-
-    for _ in range(_CC_CONV_PROBATION_PERIOD):
-        run_conversational_dual_pass(cc_ng.graph, cc_ng.vector_db, text, emb, state)
-
-    assert len(node.spike_history) == 0, "precondition: node must not have fired"
-    assert node.metadata.get("probation_remaining") <= 0
-    assert node.metadata.get("graduated") is True
-    assert node.metadata.get("probation_expired_unfired") is None
+    removed = [
+        "_cc_kiss_find_redundant_node",
+        "_cc_kiss_reinforce_node",
+        "_CC_KISS_GATE_ENABLED",
+        "_CC_KISS_REDUNDANCY_THRESHOLD",
+        "_CC_KISS_REGION_CONFIDENCE_ENABLED",
+        "_CC_KISS_REGION_CONFIDENCE_SPAN",
+        "_CC_KISS_REGION_CONFIDENCE_FLOOR",
+    ]
+    for name in removed:
+        assert not hasattr(cc, name), f"{name} should have been removed"
+    # The Pith half survives untouched.
+    assert hasattr(cc, "cc_region_confidence")
 
 
 class _FakePred:
