@@ -10,6 +10,16 @@ Covers:
 - cc_ng_host: _cleanup_stale_socket stale removal and live-socket raise
 - cc_ng_host: init_cc_host already-initialized and construction-failure guards
 """
+# ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5) — punchlist #529
+# What: test_topology_owned_returns_false now mocks ng_updater with the other bootstrap deps.
+# Why: it reached the real ng_updater.auto_update() (pull=True, sync_vendored=True) through
+#      _handle_bootstrap_once. The vendored sync globs */*/ng_lite.py and overwrote the tracked
+#      Defunct-Historical/step5-backup-20260405-004916/ng_lite.py on every suite run.
+#      A test must not write to tracked files or pull the checkout.
+# How: added "ng_updater": MagicMock() to the existing patch.dict(sys.modules, ...). No source or
+#      vendored-file change (#529 scope, executive Packet 134(5)).
+# -------------------
 import os
 import socket
 import sys
@@ -86,7 +96,9 @@ class TestHandleBootstrap:
         mock_topo.claim.return_value = False
         mock_topo.owner_pid.return_value = 12345
         mock_oc = MagicMock()
-        with patch.dict(sys.modules, {"topology_owner": mock_topo, "openclaw_hook": mock_oc}):
+        # #529: mock the updater too, or bootstrap runs a real git pull + vendored sync on the checkout.
+        with patch.dict(sys.modules, {"topology_owner": mock_topo, "openclaw_hook": mock_oc,
+                                      "ng_updater": MagicMock()}):
             result = neurograph_rpc.handle_bootstrap({})
         assert result["bootstrapped"] is False
         assert "12345" in result["reason"]
