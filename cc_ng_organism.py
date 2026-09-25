@@ -3,6 +3,35 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — Pith
+#   cache-line cleanup (P224(1)(a)) + #522 coherence across victim eviction
+# What: CacheLine loses the four computed-never-read fields `lod`,
+#   `manifold_type` (the CacheLine field only), `keyframe` and `deltas` --
+#   they were declared, written and copied with no production reader. Stage
+#   3 graceful degradation keeps ONLY the compressed head in `content` plus
+#   the existing compressed_count/chars_saved metrics. The basin builder
+#   keeps `relations` (what the renderer reads) and drops its string
+#   duplicate list. pith_victim_capture now stores `coherence` and
+#   pith_victim_recover restores it (v.get("coherence", "unknown")), so an
+#   evicted line keeps its coherence state and a pre-fix entry degrades
+#   honestly to unknown (#522). The CacheLine docstring now names the
+#   fields actually read today, citing each reader by function name; the
+#   basin comment names `relations` instead of "deltas".
+# Why: chief-b1-ruling-002 (docs 9868accd) APPROVE-REVISED; P222(1) and
+#   P224(1)(a) -- dead, unconsumed, superseded code is deleted in the same
+#   change that makes it dead; punchlist #522. Assignment
+#   z2-b1-pith-cleanup-001 (lane z2-b1-pith-cleanup-001).
+# How: writes/copies deleted at pith_stage3, _pith_copy_cache_line,
+#   pith_connected_activation_basins, CacheLine and CacheLine.from_surfaced
+#   (the manifold_type param goes with its field). pith_stage2_keyframe's
+#   (keyframe, delta) return is UNCHANGED -- its other callers live; its
+#   docstring no longer names the deleted CacheLine field. Graph-node
+#   manifold_type reads (getattr on nodes, GSG geometry) are untouched.
+#   Tests: tests/test_pith_stage2.py (asserts the compression's real
+#   contract), tests/test_pith_provider_context.py (fixtures drop the dead
+#   kwargs), tests/test_pith_stage5.py (deleted-field absence,
+#   from_surfaced kwarg rejection, #522 round-trip, legacy-dict
+#   degradation).
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — #592 COMB-04
 #   L1 budget direction corrected (Executive Packet 193(1))
 # What: cc_l1_budget's region-confidence factor is now 1 - (c - NEUTRAL)*2*FALLOFF
@@ -3350,10 +3379,28 @@ _PITH_HARNESS_MARKERS = (
 @dataclass
 class CacheLine:
     """Cache-line-shaped view of one surfaced item, moving through the Pith
-    pipeline's stages. Most fields are inert placeholders for later phases
-    (thermal: Phase 2: lod/coherence/keyframe/deltas: Phase 3-5) -- Phase 0
-    only defines the shape; nothing constructs or reads these fields at
-    runtime yet outside pith_stage1().
+    pipeline's stages. Fields with production readers today (each reader
+    cited by function name):
+    - `pinned`: the stage3 pinned/unpinned split (pith_stage3) and the
+      victim-capture exclusion (pith_victim_capture).
+    - `thermal`: the stage3 rank fold (pith_stage3), the basin competition
+      (pith_connected_activation_basins) and the victim round-trip
+      (pith_victim_capture / pith_victim_recover).
+    - `coherence`: the basin competition tie-break
+      (pith_connected_activation_basins), the provider render label
+      (_pith_render_connected_line), the provider warnings/envelope rollups
+      (_pith_provider_sections, pith_provider_context) and the victim
+      round-trip (pith_victim_capture / pith_victim_recover).
+    - `stream`: per-stream score normalization and the D5 promotable-stream
+      tally (pith_stage3) and the victim-capture exclusion
+      (pith_victim_capture).
+    - `prefetch_origin`: the D5 promotable tally (pith_stage3) -- provenance
+      only, never scoring (see its own comment below).
+    The routing fields (`node_id`, `content`, `score`) and the basin
+    structure (`member_node_ids`, `relations`, `sources`, `anchors`) are read
+    by their owning stages (pith_stage1's dedup/clutter-strip; the provider
+    builder/renderer/fitter and anchor rollup). `epistemic` is set by the
+    basin builder and has no production reader yet.
 
     score carries the emitter's existing score (SurfacingMonitor's salience
     or cc_pattern_completion_recall's strength) verbatim -- Pith re-ranks and
@@ -3372,12 +3419,8 @@ class CacheLine:
     score: float = 0.0
     pinned: bool = False
     thermal: float = 0.0
-    lod: float = 1.0
     # Missing coherence evidence is unknown, never an inferred exclusive state.
     coherence: str = "unknown"
-    manifold_type: str = "hyperbolic"
-    keyframe: bool = False
-    deltas: list = field(default_factory=list)
     stream: str = "recall"
     # [D5] Provenance ONLY. Set when a line originates from Stage-4 predictive
     # promotion. It takes no part in scoring, normalization, weighting, sorting,
@@ -3387,8 +3430,9 @@ class CacheLine:
     # lines it is meant to count. Read at one counting site only.
     prefetch_origin: bool = False
     # Slice A: one provider-facing line is a connected activation basin.  The
-    # root is the keyframe; related observations remain attached as deltas so
-    # action -> outcome -> correction cannot be admitted as orphan fragments.
+    # root carries the assembly's own content; related observations remain
+    # attached as `relations` so action -> outcome -> correction cannot be
+    # admitted as orphan fragments.
     member_node_ids: list = field(default_factory=list)
     relations: list = field(default_factory=list)
     sources: list = field(default_factory=list)
@@ -3397,11 +3441,11 @@ class CacheLine:
 
     @classmethod
     def from_surfaced(cls, node_id: str, content: str, score: float = 0.0,
-                       pinned: bool = False, manifold_type: str = "hyperbolic",
+                       pinned: bool = False,
                        stream: str = "recall",
                        prefetch_origin: bool = False) -> "CacheLine":
         return cls(node_id=node_id, content=content, score=score, pinned=pinned,
-                    manifold_type=manifold_type, stream=stream,
+                    stream=stream,
                     prefetch_origin=prefetch_origin)
 
 
@@ -3894,8 +3938,9 @@ def pith_stage2_keyframe(content: str, max_chars: Optional[int] = None,
       interior "⋯" marks show where non-adjacent segments were joined. Empty
       string for empty/whitespace input; `content` unchanged (empty delta) when
       it already fits.
-    - `delta`: the dropped segments (original order), for `CacheLine.deltas`
-      (future victim-cache / expansion can restore it).
+    - `delta`: the dropped segments (original order) -- exactly what the
+      keyframe elided, kept as the compression's own record of what was left
+      out (a caller may inspect or re-expand it).
 
     max_chars defaults to CC_PITH_KEYFRAME_CHARS (env, clamped [60, 1000]).
     Never raises.
@@ -4074,6 +4119,7 @@ def pith_victim_recover(candidates: List[CacheLine]) -> List[CacheLine]:
             if v["node_id"] not in have:
                 cl = CacheLine.from_surfaced(v["node_id"], v["content"],
                                              score=v["score"], stream="victim")
+                cl.coherence = v.get("coherence", "unknown")
                 cl.thermal = v.get("thermal", 0.0)
                 merged.append(cl)
         _PITH_VICTIM[:] = live
@@ -4100,6 +4146,7 @@ def pith_victim_capture(kept: List[CacheLine], all_lines: List[CacheLine]) -> No
             else:
                 _PITH_VICTIM.append({"node_id": cl.node_id, "content": cl.content,
                                      "score": cl.score, "stream": cl.stream,
+                                     "coherence": cl.coherence,
                                      "thermal": cl.thermal, "ttl": _CC_PITH_VICTIM_TTL})
         if len(_PITH_VICTIM) > _CC_PITH_VICTIM_SIZE:
             del _PITH_VICTIM[:len(_PITH_VICTIM) - _CC_PITH_VICTIM_SIZE]
@@ -4285,14 +4332,9 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
             running_total += full_len
             continue
 
-        kf, delta = pith_stage2_keyframe(cl.content)
+        kf, _delta = pith_stage2_keyframe(cl.content)
         if running_total + len(kf) <= budget_chars and len(kf) < full_len:
             cl.content = kf
-            # lod = fraction of the original retained (1.0 = full, matching the
-            # CacheLine default); a compressed line records how much survived.
-            cl.lod = len(kf) / full_len if full_len else 1.0
-            cl.keyframe = True
-            cl.deltas = [delta]
             kept_unpinned.append(cl)
             running_total += len(kf)
             _PITH_METRICS.compressed_count += 1
@@ -4560,9 +4602,7 @@ def _pith_is_constitutional(graph: Any, node_id: str) -> bool:
 def _pith_copy_cache_line(line: CacheLine, stream: Optional[str] = None) -> CacheLine:
     return CacheLine(
         node_id=line.node_id, content=line.content, score=line.score,
-        pinned=line.pinned, thermal=line.thermal, lod=line.lod,
-        coherence=line.coherence, manifold_type=line.manifold_type,
-        keyframe=line.keyframe, deltas=list(line.deltas),
+        pinned=line.pinned, thermal=line.thermal, coherence=line.coherence,
         stream=stream or line.stream, prefetch_origin=line.prefetch_origin,
         member_node_ids=list(line.member_node_ids), relations=[dict(r) for r in line.relations],
         sources=list(line.sources), anchors=list(line.anchors), epistemic=line.epistemic,
@@ -4616,7 +4656,6 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
 
         members = [root_id]
         relations = []
-        deltas = []
         sources = _pith_node_sources(root)
         anchors = ([] if root_is_live else
                    _pith_exact_anchors(root_raw, getattr(root, "metadata", None)))
@@ -4651,7 +4690,6 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
                     "content": child_text,
                 }
                 relations.append(relation)
-                deltas.append(f"{label}: {child_text}")
                 sources.extend(_pith_node_sources(child))
                 if not child_is_live:
                     anchors.extend(_pith_exact_anchors(
@@ -4694,9 +4732,6 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
             pinned=False,
             thermal=cc_thermal(graph, root_id),
             coherence=coherence,
-            manifold_type=getattr(root, "manifold_type", "hyperbolic"),
-            keyframe=True,
-            deltas=deltas,
             stream="connected",
             prefetch_origin=bool(root_item.get("prefetch_origin", False)),
             member_node_ids=members,

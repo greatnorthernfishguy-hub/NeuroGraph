@@ -1,6 +1,15 @@
 # tests/test_pith_stage2.py
 #
 # ---- Changelog ----
+# [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — asserts the
+#   compression's real contract (P224(1)(a) cleanup).
+# What: the stage3 graceful-degradation tests no longer read the deleted
+#   CacheLine fields lod/keyframe/deltas; they assert the kept head is
+#   shorter than the original and carries the ⋯[+ marker, plus the metrics.
+# Why: chief-b1-ruling-002 + assignment z2-b1-pith-cleanup-001: the four
+#   fields were computed and never read (P224(1)(a)) and are deleted.
+# How: the pre-compression length is captured before pith_stage3() runs,
+#   since the kept line IS the mutated input object.
 # [2026-07-10] Claude Code (Opus 4.8) — Pith Stage 2 tests (concept-aware keyframe)
 # What: Direct tests of the EXTRACTIVE pith_stage2_keyframe() (keep the highest-
 #   information segments, not the head) + pith_stage3's graceful-degradation
@@ -120,6 +129,7 @@ def _long_item(node_id, score, stream="pattern"):
 def test_graceful_degradation_keeps_overflow_item_as_keyframe():
     top = CacheLine.from_surfaced("top", "A" * 50, score=10.0, stream="pattern")
     overflow = _long_item("mid", score=5.0)
+    original_len = len(overflow.content)  # pith_stage3 compresses in place
     tiny = CacheLine.from_surfaced("low", "z" * 10, score=1.0, stream="pattern")
 
     out = pith_stage3([top, overflow, tiny], budget_chars=300)
@@ -127,10 +137,8 @@ def test_graceful_degradation_keeps_overflow_item_as_keyframe():
 
     assert "mid" in ids, "overflow item should be kept as a keyframe, not dropped"
     mid = out[ids.index("mid")]
-    assert 0.0 < mid.lod < 1.0, "lod records the retained fraction"
-    assert mid.keyframe is True
+    assert len(mid.content) < original_len, "kept head is shorter than the original"
     assert "⋯[+" in mid.content
-    assert mid.deltas and mid.deltas[0] != ""
     assert _PITH_METRICS.compressed_count == 1
     assert _PITH_METRICS.chars_saved > 0
 
@@ -155,16 +163,16 @@ def test_pinned_never_compressed():
                                       pinned=True, stream="pattern")
     top = CacheLine.from_surfaced("top", "A" * 50, score=10.0, stream="pattern")
     overflow = _long_item("mid", score=5.0)
+    overflow_len = len(overflow.content)  # pith_stage3 compresses in place
 
     out = pith_stage3([pinned, top, overflow], budget_chars=300)
     ids = [l.node_id for l in out]
 
     pin_line = out[ids.index("pin")]
     assert pin_line.content == pinned_content, "pinned content untouched verbatim"
-    assert pin_line.lod == 1.0, "pinned line never entered the keyframe branch"
     assert "⋯[+" not in pin_line.content
     # a non-pinned peer still degraded under the same budget
-    assert out[ids.index("mid")].lod < 1.0
+    assert len(out[ids.index("mid")].content) < overflow_len
     assert _PITH_METRICS.compressed_count == 1
 
 

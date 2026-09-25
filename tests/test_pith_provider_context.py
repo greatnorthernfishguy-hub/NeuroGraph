@@ -1,4 +1,13 @@
 # ---- Changelog ----
+# [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — admission
+#   fixtures drop the deleted CacheLine fields.
+# What: test_admission_keeps_cache_lines_whole no longer passes keyframe= or
+#   deltas= to the CacheLine constructor; the assertions are unchanged.
+# Why: chief-b1-ruling-002 + assignment z2-b1-pith-cleanup-001: the four
+#   fields are deleted (P224(1)(a)); passing them still passing would prove
+#   nothing about admission, which never read them.
+# How: kwargs removed from both fixtures; the whole-line admission and
+#   render asserts stay byte-identical.
 # [2026-09-13] Codex — provider-context Slice A behavioral coverage.
 # What: test connected basins, epistemic labels, exact anchors, whole-line budget, and host parity.
 # Why: prompt usefulness depends on preserved relationships and closed failure states, not snippet scores.
@@ -193,18 +202,18 @@ def test_authored_want_remains_eligible_while_constitutional_node_is_not_duplica
 
 def test_admission_keeps_cache_lines_whole():
     first = pith.CacheLine(
-        node_id="first", content="first keyframe", score=2.0, keyframe=True,
+        node_id="first", content="first keyframe", score=2.0,
         member_node_ids=["first", "first-result"],
         relations=[{"from": "first", "to": "first-result", "kind": "action -> outcome",
                     "content": "first result"}],
-        deltas=["action -> outcome: first result"], anchors=["/tmp/first"],
+        anchors=["/tmp/first"],
         sources=["cc_gateway"], stream="connected")
     second = pith.CacheLine(
-        node_id="second", content="second keyframe", score=1.0, keyframe=True,
+        node_id="second", content="second keyframe", score=1.0,
         member_node_ids=["second", "second-fix"],
         relations=[{"from": "second", "to": "second-fix", "kind": "failure -> correction",
                     "content": "second correction"}],
-        deltas=["failure -> correction: second correction"], anchors=["/tmp/second"],
+        anchors=["/tmp/second"],
         sources=["cc_gateway"], stream="connected")
     first_size = len(pith._pith_render_connected_line(first))
     kept, blocks = pith._pith_provider_admit([first, second], first_size)

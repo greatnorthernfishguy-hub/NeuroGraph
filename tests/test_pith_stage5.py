@@ -1,4 +1,18 @@
 # ---- Changelog ----
+# [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — #522
+#   coherence across victim eviction + deleted-field guards.
+# What: capture/recover round-trips keep an explicit coherence; a legacy
+#   victim dict without a coherence key recovers as "unknown". New guards:
+#   the four deleted CacheLine fields (lod/manifold_type/keyframe/deltas)
+#   stay gone and from_surfaced no longer accepts manifold_type=. The old
+#   test_victim_recovered_line_is_not_labelled_exclusive asserted the
+#   pre-#522 bug (capture dropped coherence); it now asserts the faithful
+#   exclusive round-trip.
+# Why: chief-b1-ruling-002 + assignment z2-b1-pith-cleanup-001 (§1.4(a)
+#   #522; P224(1)(a) cleanup).
+# How: real pith_victim_capture/pith_victim_recover against the isolated
+#   module victim buffer; the legacy entry is simulated by popping the
+#   coherence key from a captured dict.
 # [2026-09-24] Grok (groupb-pith-cacheline-unknown-default-001) — coherence default tests.
 # What: CacheLine and from_surfaced default to unknown; an explicit exclusive
 #   is preserved; a victim-recovered line is not labelled exclusive.
@@ -81,14 +95,45 @@ def test_explicit_exclusive_coherence_is_preserved():
     line = CacheLine("n", "content", coherence="exclusive")
     assert line.coherence == "exclusive"
 
-def test_victim_recovered_line_is_not_labelled_exclusive():
-    # Capture stores no coherence; recover rebuilds via from_surfaced.
+def test_deleted_pith_fields_are_gone_from_cacheline():
+    # P224(1)(a): lod/manifold_type/keyframe/deltas were computed and never
+    # read; they were deleted and must stay deleted.
+    line = CacheLine(node_id="x", content="y")
+    for gone in ("lod", "manifold_type", "keyframe", "deltas"):
+        assert not hasattr(line, gone), f"{gone} was deleted and must stay gone"
+
+def test_from_surfaced_no_longer_accepts_manifold_type():
+    with pytest.raises(TypeError):
+        CacheLine.from_surfaced("n", "content", manifold_type="hyperbolic")
+
+def test_victim_capture_carries_coherence_through_recovery():
+    # #522: the victim buffer carries the line's coherence across eviction.
+    dropped = CacheLine("n", "had a record", coherence="shared")
+    pith_victim_capture(kept=[], all_lines=[dropped])
+    assert cc._PITH_VICTIM[0]["coherence"] == "shared"
+    merged = pith_victim_recover([])
+    recovered = next(cl for cl in merged if cl.node_id == "n")
+    assert recovered.coherence == "shared"
+
+def test_legacy_victim_entry_without_coherence_recovers_unknown():
+    # An entry captured before #522 has no coherence key; recovery degrades
+    # it honestly to unknown instead of inventing a state.
+    pith_victim_capture(kept=[], all_lines=[_line("old")])
+    with cc._PITH_VICTIM_LOCK:
+        for v in cc._PITH_VICTIM:
+            v.pop("coherence", None)  # simulate a pre-#522 capture dict
+    merged = pith_victim_recover([])
+    recovered = next(cl for cl in merged if cl.node_id == "old")
+    assert recovered.coherence == "unknown"
+
+def test_victim_recovered_line_carries_its_captured_coherence():
+    # Pre-#522 this round trip lost the state (came back "unknown"); since
+    # #522 an explicit coherence survives capture + recovery.
     dropped = CacheLine("n", "had a record", coherence="exclusive")
     pith_victim_capture(kept=[], all_lines=[dropped])
     merged = pith_victim_recover([])
     recovered = next(cl for cl in merged if cl.node_id == "n")
-    assert recovered.coherence != "exclusive"
-    assert recovered.coherence == "unknown"
+    assert recovered.coherence == "exclusive"
 
 
 # ---- victim buffer: capture + recover ----
