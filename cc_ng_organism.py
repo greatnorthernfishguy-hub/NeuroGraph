@@ -20,6 +20,10 @@
 #   what fires, CC-side only.
 # How: tests/test_cc_region_confidence.py updated (fired set reaches
 #   cc_region_confidence, no embed call; region tests now run with the flag on).
+#   077 note 2: cc_assemble_recall passes every id pattern completion fired
+#   (pc_fired_ids, taken before the display dedup against the monitor), so a
+#   node that both surfaced recently and fired still counts for the region,
+#   as on the pith_provider_context path.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b)
 #   note 3: PithMetrics.record_failure docstring corrected (comment-only).
 # What: the docstring still said a failing Pith path "falls back to un-Pithed
@@ -5097,15 +5101,20 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
 
     pc_block = ''
     pc_results: List[Dict[str, Any]] = []
+    # Everything pattern completion fired, before the display dedup against
+    # the monitor below: the L1 budget's region is what fired, not what is new.
+    pc_fired_ids: List[str] = []
     if allow_pattern_completion:
         try:
             pc_results = cc_pattern_completion_recall(ng, query, k, state=conv_state)
+            pc_fired_ids = [r.get('node_id') for r in pc_results if r.get('node_id')]
             pc_results = [r for r in pc_results if r.get('node_id') not in monitor_node_ids]
             pc_block = _format_cc_recall_block(pc_results)
         except Exception as exc:
             logger.debug('Pattern-completion recall failed (non-fatal): %s', exc)
             pc_block = ''
             pc_results = []
+            pc_fired_ids = []
 
     # Read-only instrumentation (CC_RECALL_DEBUG): capture both raw streams
     # BEFORE Pith merges them, to measure where the query signal is lost.
@@ -5189,9 +5198,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # Budget breathes with arousal and the confidence of the region
             # that fired for this query (pattern completion's fired set).
             _stage = 'L1 budget'
-            budget = cc_l1_budget(
-                commons, ng.graph,
-                [it.get('node_id') for it in pc_results if it.get('node_id')])
+            budget = cc_l1_budget(commons, ng.graph, pc_fired_ids)
             
             _stage = 'stage3'
             survivors = pith_stage3(survivors, budget_chars=budget)

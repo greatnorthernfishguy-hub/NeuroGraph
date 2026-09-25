@@ -12,6 +12,8 @@
 #       embed or search the vdb for it. K/THRESHOLD tests removed with the knobs.
 # Why: Packet 175a / KISS_Pith_Combined_Architecture.md "Shared Graduation".
 # How: tests assert the fired ids reach cc_region_confidence and embed is not called.
+#      077 note 2: a fired node the monitor already holds still counts for the
+#      region (test_fired_node_the_monitor_already_holds_still_counts_for_region).
 # -------------------
 """Tests for COMB-04 Shared Graduation region confidence signal.
 
@@ -197,6 +199,26 @@ def test_flag_on_fired_set_reaches_region_confidence_in_cc_assemble_recall(monke
             
             mock_conf.assert_called_once_with(ng.graph, ['pat1'])
             mock_embed.assert_not_called()
+
+
+def test_fired_node_the_monitor_already_holds_still_counts_for_region(monkeypatch):
+    """The monitor dedup trims the display block only; the region is all that fired."""
+    ng = _FakeNgForAssemble([
+        {'node_id': 'test1', 'score': 1.0, 'content': 'test monitor item'}
+    ])
+    monkeypatch.setattr(cc, '_CC_PITH_ENABLED', True)
+    monkeypatch.setattr(cc, '_CC_PITH_L1_BUDGET', 4000)
+    monkeypatch.setattr(cc, '_CC_PITH_L1_BREATHE', False)
+    monkeypatch.setattr(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True)
+    _patch_pattern_completion(monkeypatch, [
+        {'node_id': 'test1', 'score': 0.9, 'content': 'test monitor item'},
+        {'node_id': 'pat1', 'score': 0.8, 'content': 'test pattern hit'},
+    ])
+    mock_commons = Mock()
+    mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
+    with patch.object(cc, 'cc_region_confidence', return_value=0.5) as mock_conf:
+        cc.cc_assemble_recall(ng, 'test query', 5, {}, mock_commons)
+        mock_conf.assert_called_once_with(ng.graph, ['test1', 'pat1'])
 
 
 # ============================================================================
