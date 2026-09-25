@@ -11,7 +11,8 @@
 #   pith_provider_context passes the ids cc_pattern_completion_recall fired for
 #   the cue (the same set pith_connected_activation_basins treats as active),
 #   so its budget is computed after that call and the core-exceeds-budget check
-#   moved with it; cc_assemble_recall passes its pc_results ids. Flag off
+#   moved with it; cc_assemble_recall passes pc_fired_ids (every id pattern
+#   completion fired, before the display dedup). Flag off
 #   (CC_PITH_REGION_CONFIDENCE_ENABLED) is unchanged: the static/breathing
 #   budget. The shared seed step is untouched.
 # Why: KISS_Pith_Combined_Architecture.md "Shared Graduation" -- the substrate's
