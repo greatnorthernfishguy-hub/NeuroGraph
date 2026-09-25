@@ -6,6 +6,8 @@
 #   step + baseline reward, #543 discovery on the step's own fired set), behind
 #   CC_NG_DEPOSIT_STEP (default off). Chief rulings D1-D4.
 # How: fakes record lock and call order; one real Graph checks the clock moves.
+#   R1 (Chief): the reward is on_message()'s success-path form -- a failed dual
+#   pass still steps but earns no reward (pinned in the organism, host and daemon).
 #   CC_NG_DAEMON_SCRIPT points the daemon tests at a worktree copy of the script
 #   (default ~/docs/scripts/cc-ng-daemon.py).
 # -------------------
@@ -81,7 +83,7 @@ def test_default_flag_is_off():
 
 def test_steps_rewards_then_discovers_on_the_steps_fired_set_under_step_lock():
     g = _FakeGraph(fired=('n1', 'n2'))
-    result = cc_ng_organism.cc_deposit_step(g)
+    result = cc_ng_organism.cc_deposit_step(g, True)
     assert result.fired_node_ids == ['n1', 'n2']
     assert g.events == [
         ('enter', 'step'), ('step', True), ('reward', True),
@@ -93,27 +95,38 @@ def test_steps_rewards_then_discovers_on_the_steps_fired_set_under_step_lock():
 
 def test_reward_is_three_factor_gated():
     g = _FakeGraph(three_factor=False)
-    cc_ng_organism.cc_deposit_step(g)
+    cc_ng_organism.cc_deposit_step(g, True)
     assert g.rewards == []
     assert ('step', True) in g.events
 
 
+def test_failed_deposit_still_steps_but_earns_no_reward():
+    # R1: on_message()'s success-path form (openclaw_hook:1226).
+    g = _FakeGraph(fired=('n1',))
+    result = cc_ng_organism.cc_deposit_step(g, False)
+    assert g.rewards == []
+    assert g.events == [
+        ('enter', 'step'), ('step', True), ('discover', True), ('exit', 'step'),
+    ]
+    assert result.fired_node_ids == ['n1']
+
+
 def test_nothing_fired_means_no_discovery():
     g = _FakeGraph(fired=())
-    result = cc_ng_organism.cc_deposit_step(g)
+    result = cc_ng_organism.cc_deposit_step(g, True)
     assert result.fired_node_ids == []
     assert g.discovered == []
 
 
 def test_step_failure_is_soft_and_skips_reward_and_discovery():
     g = _FakeGraph(step_raises=RuntimeError('boom'))
-    assert cc_ng_organism.cc_deposit_step(g) is None
+    assert cc_ng_organism.cc_deposit_step(g, True) is None
     assert g.rewards == [] and g.discovered == []
     assert g.events[-1] == ('exit', 'step')
 
 
 def test_none_graph_returns_none():
-    assert cc_ng_organism.cc_deposit_step(None) is None
+    assert cc_ng_organism.cc_deposit_step(None, True) is None
 
 
 def test_real_graph_clock_advances_once_per_deposit_step():
@@ -121,7 +134,7 @@ def test_real_graph_clock_advances_once_per_deposit_step():
     g = Graph()
     g.create_node(node_id='a')
     before = g.timestep
-    result = cc_ng_organism.cc_deposit_step(g)
+    result = cc_ng_organism.cc_deposit_step(g, True)
     assert g.timestep == before + 1
     assert hasattr(result, 'fired_node_ids')
 
@@ -165,6 +178,14 @@ def test_host_flag_on_steps_even_when_the_dual_pass_fails(host, monkeypatch):
     host.dual_pass.ok = False
     host.mod._deposit('a turn')
     assert ('step', True) in host.graph.events
+    # R1: the failed turn is still a timestep, but earns no reward.
+    assert host.graph.rewards == []
+
+
+def test_host_flag_on_rewards_a_landed_turn(host, monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+    host.mod._deposit('a turn')
+    assert host.graph.rewards == [0.1]
 
 
 def test_host_flag_off_is_the_previous_path(host, monkeypatch):
@@ -207,13 +228,14 @@ def daemon(monkeypatch):
 
     def fake_dual_pass(graph, vdb, text, emb, state):
         g.events.append(('dual_pass', graph._concurrent_lock.held))
-        return True
+        return fake_dual_pass.ok
+    fake_dual_pass.ok = True
 
     monkeypatch.setattr(mod.STATE, 'ng', types.SimpleNamespace(graph=g, vector_db=None))
     monkeypatch.setattr(ng_embed, 'embed', lambda text: [0.0])
     monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', fake_dual_pass)
     monkeypatch.setattr(cc_ng_organism, 'deposit_cc_experience', lambda *a, **k: None)
-    return types.SimpleNamespace(mod=mod, graph=g)
+    return types.SimpleNamespace(mod=mod, graph=g, dual_pass=fake_dual_pass)
 
 
 def test_daemon_flag_on_steps_after_dual_pass_inside_concurrent_lock(daemon, monkeypatch):
@@ -224,6 +246,14 @@ def test_daemon_flag_on_steps_after_dual_pass_inside_concurrent_lock(daemon, mon
     assert ev[-2:] == [('exit', 'step'), ('exit', 'concurrent')]
     assert daemon.graph.rewards == [0.1]
     assert daemon.graph.discovered == [['n1', 'n2']]
+
+
+def test_daemon_flag_on_failed_dual_pass_steps_without_reward(daemon, monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+    daemon.dual_pass.ok = False
+    daemon.mod._deposit('a turn')
+    assert ('step', True) in daemon.graph.events
+    assert daemon.graph.rewards == []
 
 
 def test_daemon_flag_off_is_the_previous_path(daemon, monkeypatch):

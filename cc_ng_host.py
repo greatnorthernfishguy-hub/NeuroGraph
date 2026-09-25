@@ -30,7 +30,7 @@ were confirmed before this module was enabled.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane C (ii-a):
 #   _deposit steps through cc_deposit_step when CC_NG_DEPOSIT_STEP is on.
 # What: after the dual pass, inside the same _concurrent_lock, _deposit calls
-#   cc_ng_organism.cc_deposit_step (step + three_factor-gated 0.1 reward +
+#   cc_ng_organism.cc_deposit_step (step + 0.1 reward (landed turn, three_factor) +
 #   discovery on the step's fired set). Flag off keeps the _recent_spikes
 #   discovery exactly as before. The tool-experience reward comment is
 #   corrected: tool experience goes to Commons only, and the baseline reward
@@ -39,6 +39,9 @@ were confirmed before this module was enabled.
 #   discovery read the last step's spikes, not this deposit's. Chief D1-D4.
 # How: the shared step lives in cc_ng_organism (LAW 4); this file only wires
 #   it. Tests: tests/test_cc_deposit_step.py.
+#   R1: the dual pass's return is passed through, so the reward is given only
+#   when the turn landed. R2: CC_NG_DEPOSIT_STEP is never flipped without
+#   CC_NG_AUTOSTEP (same beat or after it; #117).
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b): wire the
 #   Pith failure deposit.
 # What: _recall() passes on_pith_failure=_deposit_pith_failure to cc_assemble_recall. On a Pith
@@ -589,10 +592,10 @@ def _deposit(text: str) -> None:
     try:
         import cc_ng_organism
         with ng.graph._concurrent_lock:
-            cc_ng_organism.run_conversational_dual_pass(
+            ingested = cc_ng_organism.run_conversational_dual_pass(
                 ng.graph, getattr(ng, "vector_db", None), text, embedding, _STATE.conv_state)
             if cc_ng_organism._CC_NG_DEPOSIT_STEP:
-                cc_ng_organism.cc_deposit_step(ng.graph)
+                cc_ng_organism.cc_deposit_step(ng.graph, ingested)
             else:
                 fired = [
                     nid for nid, spikes in ng.graph._recent_spikes.items()

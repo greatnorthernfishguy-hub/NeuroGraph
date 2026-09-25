@@ -22,6 +22,11 @@
 #   the AUTOSTEP gate (CALLOSUM-TRUTH §8.13, one-heartbeat tick, Packet 099):
 #   every deposit step advances graph.timestep. drain_ingest_tract (#563) and
 #   drain_gateway_conduit are not changed. Tests: tests/test_cc_deposit_step.py.
+#   R1 (Chief): the reward is on_message()'s success-path form -- given only when
+#   the dual pass landed the turn (ingested) and three_factor is on.
+#   FLIP RULE (Chief R2): CC_NG_DEPOSIT_STEP may NOT be flipped alone. It flips
+#   with CC_NG_AUTOSTEP on the same beat, or strictly after it; DEPOSIT_STEP on
+#   with AUTOSTEP off advances the clock only on conversation (#117, LAW 8).
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — COMB-04 region
 #   confidence reads the region that fired (Packet 175a (iv), Pith work)
 # What: cc_region_confidence(graph, fired_node_ids) and cc_l1_budget(commons,
@@ -1970,17 +1975,20 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
 # graph.timestep once per deposit, which ages unbound nodes toward the orphan
 # sweep, so it waits on the same gate as CC_NG_AUTOSTEP (CALLOSUM-TRUTH §8.13
 # _unbound_nodes empty, the one-heartbeat tick, Packet 099). Executive-ruled flip.
+# Never flipped alone: with CC_NG_AUTOSTEP on the same beat or after it (R2, #117).
 _CC_NG_DEPOSIT_STEP = os.environ.get("CC_NG_DEPOSIT_STEP", "0") not in ("0", "false", "False", "")
 
 
-def cc_deposit_step(graph):
+def cc_deposit_step(graph, ingested):
     """Step once after a conversational deposit; return the StepResult.
 
     Restores what on_message() did before #413 swapped it for the dual pass:
-    one graph.step(), the flat 0.1 baseline engagement reward when
-    three_factor_enabled (the same form as neurograph_rpc handle_after_turn),
-    then hyperedge discovery on that step's own fired set (#543). Always steps,
-    whether or not the dual pass succeeded -- a failed turn is still a timestep.
+    one graph.step(), the flat 0.1 baseline engagement reward, then hyperedge
+    discovery on that step's own fired set (#543). Always steps, whether or not
+    the dual pass succeeded -- a failed turn is still a timestep. The reward is
+    on_message()'s success-path form (openclaw_hook:1226): only when the turn's
+    experience landed (ingested = the dual pass's return) and three_factor is
+    enabled -- no phantom credit for a failed deposit (Chief ruling R1).
     No stimulus is injected: the step fires what the substrate already carries.
 
     Callers hold graph._concurrent_lock; this takes graph._step_lock (RLock)
@@ -1992,7 +2000,7 @@ def cc_deposit_step(graph):
     try:
         with graph._step_lock:
             result = graph.step()
-            if graph.config.get("three_factor_enabled", False):
+            if ingested and graph.config.get("three_factor_enabled", False):
                 graph.inject_reward(0.1)
             if result.fired_node_ids:
                 graph.discover_hyperedges(list(result.fired_node_ids))
