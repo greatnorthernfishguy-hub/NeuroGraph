@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — #592 direction
+# What: test_flag_on_embed_called expects 4760 (was 6440, which pinned the
+#       inversion); added high/low/neutral/monotonic direction tests.
+# Why: Executive Packet 193(1): assert direction against
+#      KISS_Pith_Combined_Architecture.md l.169-170 (quoted above the tests).
+# How: cc_region_confidence patched to fixed values; breathing off; budget 4000.
 # [2026-09-24] zone manager (Claude Code, Z2) — Revision 6: env-var tests in a subprocess
 # What: test_env_vars_defaults/custom now read the module constants from a child
 #       process; added test_env_vars_clamped.
@@ -375,10 +381,53 @@ def test_flag_on_embed_called():
             
             # Budget should include region confidence modulation
             # Without region confidence: 4000 * 1.4 = 5600
-            # With region confidence (0.8): 5600 * (1 + (0.8 - 0.5) * 2 * 0.25) = 5600 * 1.15 = 6440
-            expected = int(4000 * 1.4 * (1 + (0.8 - 0.5) * 2 * 0.25))
-            expected = max(500, min(40000, expected))
-            assert budget == expected
+            # With region confidence (0.8): 5600 * (1 - (0.8 - 0.5) * 2 * 0.25) = 5600 * 0.85 = 4760
+            # (#592: high confidence compresses; was 6440 under the inverted sign)
+            assert budget == 4760
+
+
+# ============================================================================
+# #592 direction tests: KISS_Pith_Combined_Architecture.md "Shared Graduation"
+#   l.169: "When the substrate has high confidence in a topological region, ...
+#          Pith can aggressively compress extraction from that region"
+#   l.170: "When the substrate has low confidence (novel territory), ... Pith
+#          loosens (promote more context to L1 — the model needs more to
+#          reason about unfamiliar territory)."
+# ============================================================================
+
+def _budget_at(confidence, mock_commons=None):
+    with patch.multiple(cc,
+                        _CC_PITH_L1_BUDGET=4000,
+                        _CC_PITH_L1_BREATHE=False,
+                        _CC_PITH_REGION_CONFIDENCE_ENABLED=True,
+                        _CC_PITH_REGION_CONFIDENCE_NEUTRAL=0.5,
+                        _CC_PITH_REGION_CONFIDENCE_FALLOFF=0.25):
+        with patch.object(cc, 'cc_region_confidence', return_value=confidence):
+            return cc.cc_l1_budget(mock_commons, MockGraph(), ['n1'])
+
+
+def test_high_confidence_shrinks_l1_budget():
+    """l.169: high confidence -> Pith compresses -> smaller L1 budget."""
+    assert _budget_at(1.0) < 4000
+    assert _budget_at(1.0) == 3000  # 4000 * (1 - 0.25)
+    assert _budget_at(0.8) < 4000
+
+
+def test_low_confidence_widens_l1_budget():
+    """l.170: low confidence (novel territory) -> Pith promotes more to L1."""
+    assert _budget_at(0.0) > 4000
+    assert _budget_at(0.0) == 5000  # 4000 * (1 + 0.25)
+    assert _budget_at(0.2) > 4000
+
+
+def test_neutral_confidence_leaves_l1_budget_unchanged():
+    assert _budget_at(0.5) == 4000
+
+
+def test_l1_budget_monotonically_decreasing_in_confidence():
+    budgets = [_budget_at(c / 10) for c in range(11)]
+    assert all(a >= b for a, b in zip(budgets, budgets[1:]))
+    assert budgets[0] > budgets[-1]
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

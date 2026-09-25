@@ -3,6 +3,18 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — #592 COMB-04
+#   L1 budget direction corrected (Executive Packet 193(1))
+# What: cc_l1_budget's region-confidence factor is now 1 - (c - NEUTRAL)*2*FALLOFF
+#   (was 1 + ...): high confidence shrinks the L1 budget, low widens it. Same
+#   neutral (0.5), falloff (CC_PITH_REGION_CONFIDENCE_FALLOFF) and [500, 40000] clamps.
+# Why: KISS_Pith_Combined_Architecture.md l.169 (high confidence -> "Pith can
+#   aggressively compress extraction") and l.170 (low -> "Pith loosens (promote
+#   more context to L1)"). The 50e05bc build inverted this (#592, grok
+#   direction check in groupb-comb04-shared-graduation-002-rev56-review-001).
+# How: one sign; docstring/comments quote the spec. Flag
+#   CC_PITH_REGION_CONFIDENCE_ENABLED stays default off (COMB-04 DISABLED).
+#   Tests: tests/test_cc_region_confidence.py direction tests.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane C (ii-a):
 #   the conversational deposit steps again (CC_NG_DEPOSIT_STEP, default off)
 # What: cc_deposit_step(graph, ingested): under graph._step_lock, one graph.step(), the
@@ -4000,8 +4012,12 @@ def cc_l1_budget(commons: Any, graph: Any = None, fired_node_ids: Any = None) ->
     
     Shared Graduation (COMB-04): when graph and the fired node ids are provided
     and CC_PITH_REGION_CONFIDENCE_ENABLED is True, the confidence of the region
-    that fired modulates the budget alongside arousal. Region confidence moves the budget up/down
-    from neutral (0.5) by _CC_PITH_REGION_CONFIDENCE_FALLOFF."""
+    that fired modulates the budget alongside arousal. High confidence SHRINKS
+    the budget, low confidence WIDENS it, by up to _CC_PITH_REGION_CONFIDENCE_FALLOFF
+    from neutral (0.5). KISS_Pith_Combined_Architecture.md l.169: "Pith can
+    aggressively compress extraction from that region"; l.170: "Pith loosens
+    (promote more context to L1 — the model needs more to reason about
+    unfamiliar territory)" (#592)."""
     # Start with base budget
     base_budget = _CC_PITH_L1_BUDGET
     
@@ -4019,9 +4035,10 @@ def cc_l1_budget(commons: Any, graph: Any = None, fired_node_ids: Any = None) ->
         try:
             confidence = cc_region_confidence(graph, fired_node_ids)
             # confidence in [0, 1], neutral = 0.5
-            # Scale: (confidence - 0.5) * 2 * falloff gives [-falloff, +falloff]
-            # e.g., confidence=1.0 -> +falloff, confidence=0.0 -> -falloff
-            confidence_factor = 1.0 + (confidence - _CC_PITH_REGION_CONFIDENCE_NEUTRAL) * 2.0 * _CC_PITH_REGION_CONFIDENCE_FALLOFF
+            # Scale: (confidence - 0.5) * 2 * falloff gives [-falloff, +falloff],
+            # SUBTRACTED: confidence=1.0 -> 1-falloff (compress, l.169),
+            # confidence=0.0 -> 1+falloff (loosen, l.170)
+            confidence_factor = 1.0 - (confidence - _CC_PITH_REGION_CONFIDENCE_NEUTRAL) * 2.0 * _CC_PITH_REGION_CONFIDENCE_FALLOFF
             base_budget = int(base_budget * confidence_factor)
         except Exception:
             pass  # Fail-soft: keep budget without region confidence
