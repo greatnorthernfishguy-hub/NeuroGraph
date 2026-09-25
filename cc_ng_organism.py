@@ -3,6 +3,23 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — COMB-04 region
+#   confidence reads the region that fired (Packet 175a (iv), Pith work)
+# What: cc_region_confidence(graph, fired_node_ids) and cc_l1_budget(commons,
+#   graph, fired_node_ids). The vector_db/embedding parameters, the cue
+#   re-embed at both call sites, and the K/THRESHOLD search knobs are gone.
+#   pith_provider_context passes the ids cc_pattern_completion_recall fired for
+#   the cue (the same set pith_connected_activation_basins treats as active),
+#   so its budget is computed after that call and the core-exceeds-budget check
+#   moved with it; cc_assemble_recall passes its pc_results ids. Flag off
+#   (CC_PITH_REGION_CONFIDENCE_ENABLED) is unchanged: the static/breathing
+#   budget. The shared seed step is untouched.
+# Why: KISS_Pith_Combined_Architecture.md "Shared Graduation" -- the substrate's
+#   confidence map is the single authority; a separate vdb search could name a
+#   different region than the one Pith extracts from. Packet 175a: region from
+#   what fires, CC-side only.
+# How: tests/test_cc_region_confidence.py updated (fired set reaches
+#   cc_region_confidence, no embed call; region tests now run with the flag on).
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b)
 #   note 3: PithMetrics.record_failure docstring corrected (comment-only).
 # What: the docstring still said a failing Pith path "falls back to un-Pithed
@@ -1637,13 +1654,14 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
         return node
 
 
-def cc_region_confidence(graph, vector_db, embedding) -> float:
+def cc_region_confidence(graph, fired_node_ids) -> float:
     """Shared Graduation (COMB-04): region confidence signal from the full NeuroGraph.
     
-    Read-only (LAW 4, no write-side bookkeeping). Finds the embedding's nearest
-    graph nodes via vector_db, aggregates prediction confidence across synapses
-    among them using graph._compute_prediction_confidence, and returns a
-    confidence value in [0,1].
+    Read-only (LAW 4, no write-side bookkeeping). The region is what FIRED:
+    the node ids the Pith basin's prime_and_propagate ignited for this cue
+    (KISS_Pith_Combined_Architecture.md "Shared Graduation", Packet 175a).
+    Aggregates prediction confidence across synapses among them using
+    graph._compute_prediction_confidence and returns a confidence in [0,1].
     
     Fail-soft: returns _CC_PITH_REGION_CONFIDENCE_NEUTRAL (0.5) on any error,
     when disabled (_CC_PITH_REGION_CONFIDENCE_ENABLED is False), or when no
@@ -1651,8 +1669,7 @@ def cc_region_confidence(graph, vector_db, embedding) -> float:
     
     Args:
         graph: NeuroGraph SNN instance (neuro_foundation.Graph)
-        vector_db: Vector database instance with search method
-        embedding: Query embedding vector
+        fired_node_ids: ids of the nodes that fired for this cue
     
     Returns:
         Confidence in [0.0, 1.0], neutral (0.5) on fail-soft.
@@ -1661,15 +1678,11 @@ def cc_region_confidence(graph, vector_db, embedding) -> float:
         return _CC_PITH_REGION_CONFIDENCE_NEUTRAL
     
     try:
-        # Find nearest nodes via vector DB
-        hits = vector_db.search(embedding, k=_CC_PITH_REGION_CONFIDENCE_K, 
-                               threshold=_CC_PITH_REGION_CONFIDENCE_THRESHOLD)
-        if not hits:
+        node_ids = {node_id for node_id in (fired_node_ids or ()) if node_id}
+        if not node_ids:
             return _CC_PITH_REGION_CONFIDENCE_NEUTRAL
-            
-        node_ids = [node_id for node_id, _sim in hits]
         
-        # Get synapses among the nearest nodes
+        # Get synapses among the fired nodes
         synapses_to_consider = []
         for node_id in node_ids:
             # Get outgoing synapses from this node
@@ -3237,11 +3250,10 @@ _CC_PITH_BREATHE_PARASYMPATHETIC = float(os.environ.get("CC_PITH_BREATHE_PARASYM
 # Shared Graduation (COMB-04): region confidence signal from the full NeuroGraph.
 # Gated (CC_PITH_REGION_CONFIDENCE_ENABLED, default off); when off, region confidence
 # is neutral (0.5). Region confidence modulates the L1 budget alongside arousal.
+# The region is what fired for this cue, so no search size or floor is tuned here.
 _CC_PITH_REGION_CONFIDENCE_ENABLED = os.environ.get("CC_PITH_REGION_CONFIDENCE_ENABLED", "0") not in ("0", "false", "False", "")
 _CC_PITH_REGION_CONFIDENCE_NEUTRAL = 0.5  # neutral confidence when disabled or on error (midpoint of [0,1])
 _CC_PITH_REGION_CONFIDENCE_FALLOFF = float(os.environ.get("CC_PITH_REGION_CONFIDENCE_FALLOFF", "0.25"))
-_CC_PITH_REGION_CONFIDENCE_K = max(1, min(50, int(os.environ.get("CC_PITH_REGION_CONFIDENCE_K", "10"))))
-_CC_PITH_REGION_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, float(os.environ.get("CC_PITH_REGION_CONFIDENCE_THRESHOLD", "0.3"))))
 
 # Same marker tuple as miniTID's is_synthetic_harness_text (Condensate
 # rust_core/src/minitid.rs) -- not importable here (Rust, separate process),
@@ -3909,7 +3921,7 @@ def cc_thermal(graph: Any, node_id: str) -> float:
         return 0.0
 
 
-def cc_l1_budget(commons: Any, graph: Any = None, vector_db: Any = None, embedding: Any = None) -> int:
+def cc_l1_budget(commons: Any, graph: Any = None, fired_node_ids: Any = None) -> int:
     """Pith §3.2 autonomic breathing: the L1 char budget breathes with arousal.
     PARASYMPATHETIC (calm/exploratory) -> expanded; SYMPATHETIC (threat/tunnel
     vision) -> contracted. Reads the single authoritative arousal Immunis
@@ -3917,9 +3929,9 @@ def cc_l1_budget(commons: Any, graph: Any = None, vector_db: Any = None, embeddi
     CC_PITH_L1_BREATHE; off (or no Commons) -> the static budget. Fail-soft ->
     static budget on any error, and clamped to the same [500, 40000] bounds.
     
-    Shared Graduation (COMB-04): when graph, vector_db, and embedding are provided
-    and CC_PITH_REGION_CONFIDENCE_ENABLED is True, region confidence modulates
-    the budget alongside arousal. Region confidence moves the budget up/down
+    Shared Graduation (COMB-04): when graph and the fired node ids are provided
+    and CC_PITH_REGION_CONFIDENCE_ENABLED is True, the confidence of the region
+    that fired modulates the budget alongside arousal. Region confidence moves the budget up/down
     from neutral (0.5) by _CC_PITH_REGION_CONFIDENCE_FALLOFF."""
     # Start with base budget
     base_budget = _CC_PITH_L1_BUDGET
@@ -3934,10 +3946,9 @@ def cc_l1_budget(commons: Any, graph: Any = None, vector_db: Any = None, embeddi
             pass  # Fail-soft to static budget
     
     # Apply region confidence modulation if enabled and parameters provided
-    if (_CC_PITH_REGION_CONFIDENCE_ENABLED and graph is not None and 
-        vector_db is not None and embedding is not None):
+    if _CC_PITH_REGION_CONFIDENCE_ENABLED and graph is not None and fired_node_ids:
         try:
-            confidence = cc_region_confidence(graph, vector_db, embedding)
+            confidence = cc_region_confidence(graph, fired_node_ids)
             # confidence in [0, 1], neutral = 0.5
             # Scale: (confidence - 0.5) * 2 * falloff gives [-falloff, +falloff]
             # e.g., confidence=1.0 -> +falloff, confidence=0.0 -> -falloff
@@ -4838,33 +4849,9 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
     graph = getattr(ng, "graph", None) if ng is not None else None
     if graph is None:
         return _pith_provider_unavailable("ng_unavailable")
-    if budget_chars is None:
-        # Compute budget with region confidence if enabled and available
-        if _CC_PITH_REGION_CONFIDENCE_ENABLED:
-            try:
-                vector_db = getattr(ng, 'vector_db', None)
-                if vector_db is not None:
-                    from ng_embed import embed as ng_embed_fn
-                    # Create cue for embedding (same as will be used later)
-                    cue_for_embedding = current_instruction.strip()
-                    if quest_focus.strip():
-                        cue_for_embedding += "\n\n" + quest_focus.strip()
-                    if cue_for_embedding:
-                        cue_embedding = ng_embed_fn(cue_for_embedding)
-                        budget = cc_l1_budget(commons, graph, vector_db, cue_embedding)
-                    else:
-                        budget = cc_l1_budget(commons)
-                else:
-                    budget = cc_l1_budget(commons)
-            except Exception as exc:
-                logger.debug('Region confidence computation failed (non-fatal): %s', exc)
-                budget = cc_l1_budget(commons)
-        else:
-            budget = cc_l1_budget(commons)
-    elif (isinstance(budget_chars, int) and not isinstance(budget_chars, bool)
-          and 500 <= budget_chars <= 40000):
-        budget = budget_chars
-    else:
+    if budget_chars is not None and not (
+            isinstance(budget_chars, int) and not isinstance(budget_chars, bool)
+            and 500 <= budget_chars <= 40000):
         return _pith_provider_unavailable("invalid_budget")
     roots = root_count if root_count is not None else _CC_PITH_PROVIDER_ROOTS
     if (not isinstance(roots, int) or isinstance(roots, bool)
@@ -4880,10 +4867,6 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
             # Constitutional identity is a non-evictable prerequisite, not a
             # best-effort memory.  Refuse to present a partial mind as healthy.
             return _pith_provider_unavailable("constitutional_core_missing")
-        if len(core) > budget:
-            # Identity is indivisible and non-evictable.  Never abbreviate it
-            # merely to make a context envelope look healthy.
-            return _pith_provider_unavailable("constitutional_core_exceeds_budget")
         # cc_novelty updates its caller-owned bookkeeping.  A shallow copy keeps
         # provider_context observational even at that non-graph boundary.
         recall_state = dict(conv_state or {})
@@ -4894,6 +4877,15 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
         recall_state["primed_nodes"] = {}
         surfaced = cc_pattern_completion_recall(
             ng, cue, roots, state=recall_state, preserve_graph_config=True)
+        # The budget breathes with arousal and the confidence of the region
+        # that just fired for this cue (Shared Graduation, Packet 175a).
+        budget = budget_chars if budget_chars is not None else cc_l1_budget(
+            commons, graph,
+            [item.get("node_id") for item in surfaced if item.get("node_id")])
+        if len(core) > budget:
+            # Identity is indivisible and non-evictable.  Never abbreviate it
+            # merely to make a context envelope look healthy.
+            return _pith_provider_unavailable("constitutional_core_exceeds_budget")
         live_rails = {current_instruction.strip(): "current instruction"}
         if quest_focus.strip():
             quest_text = quest_focus.strip()
@@ -5194,22 +5186,12 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # CC_PITH_W_RECENCY); budget breathes with commons arousal.
             _pre_l1 = survivors  # post-stage1, pre-budget: the full L1 candidate set
             
-            # Compute budget with region confidence if enabled and available
+            # Budget breathes with arousal and the confidence of the region
+            # that fired for this query (pattern completion's fired set).
             _stage = 'L1 budget'
-            if _CC_PITH_REGION_CONFIDENCE_ENABLED:
-                try:
-                    vector_db = getattr(ng, 'vector_db', None)
-                    if vector_db is not None:
-                        from ng_embed import embed as ng_embed_fn
-                        query_embedding = ng_embed_fn(query)
-                        budget = cc_l1_budget(commons, ng.graph, vector_db, query_embedding)
-                    else:
-                        budget = cc_l1_budget(commons)
-                except Exception as exc:
-                    logger.debug('Region confidence computation failed (non-fatal): %s', exc)
-                    budget = cc_l1_budget(commons)
-            else:
-                budget = cc_l1_budget(commons)
+            budget = cc_l1_budget(
+                commons, ng.graph,
+                [it.get('node_id') for it in pc_results if it.get('node_id')])
             
             _stage = 'stage3'
             survivors = pith_stage3(survivors, budget_chars=budget)

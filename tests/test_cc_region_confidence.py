@@ -6,6 +6,12 @@
 # Why: the in-process importlib.reload left cc_ng_organism reloaded with custom
 #      values, breaking 8 Pith tests when run in the same pytest session.
 # How: _read_env_constants() imports cc_ng_organism under a controlled env in a subprocess.
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — region = what fired
+# What: cc_region_confidence(graph, fired_node_ids) and cc_l1_budget(commons,
+#       graph, fired_node_ids); both recall paths pass their fired set and never
+#       embed or search the vdb for it. K/THRESHOLD tests removed with the knobs.
+# Why: Packet 175a / KISS_Pith_Combined_Architecture.md "Shared Graduation".
+# How: tests assert the fired ids reach cc_region_confidence and embed is not called.
 # -------------------
 """Tests for COMB-04 Shared Graduation region confidence signal.
 
@@ -156,8 +162,8 @@ def test_flag_off_no_embed_call_in_cc_assemble_recall(monkeypatch):
         mock_embed.assert_not_called()
 
 
-def test_flag_on_embed_called_in_cc_assemble_recall(monkeypatch):
-    """Test that ng_embed.embed() IS called when flag is ON in cc_assemble_recall."""
+def test_flag_on_fired_set_reaches_region_confidence_in_cc_assemble_recall(monkeypatch):
+    """Flag ON: the region is pattern completion's fired set; no embed call."""
     # Create fake ng with vector_db
     ng = _FakeNgForAssemble([
         {'node_id': 'test1', 'score': 1.0, 'content': 'test monitor item'}
@@ -185,12 +191,12 @@ def test_flag_on_embed_called_in_cc_assemble_recall(monkeypatch):
         mock_embed.return_value = [0.1] * 768
         
         # Patch cc_region_confidence to return a neutral value
-        with patch.object(cc, 'cc_region_confidence', return_value=0.5):
+        with patch.object(cc, 'cc_region_confidence', return_value=0.5) as mock_conf:
             # Call cc_assemble_recall
             result = cc.cc_assemble_recall(ng, 'test query', 5, {}, mock_commons)
             
-            # With flag ON, embed SHOULD be called
-            mock_embed.assert_called_once_with('test query')
+            mock_conf.assert_called_once_with(ng.graph, ['pat1'])
+            mock_embed.assert_not_called()
 
 
 # ============================================================================
@@ -239,8 +245,8 @@ def test_flag_off_no_embed_call_in_pith_provider_context(monkeypatch):
         mock_embed.assert_not_called()
 
 
-def test_flag_on_embed_called_in_pith_provider_context(monkeypatch):
-    """Test that ng_embed.embed() IS called when flag is ON in pith_provider_context."""
+def test_flag_on_fired_set_reaches_region_confidence_in_pith_provider_context(monkeypatch):
+    """Flag ON: the region is the cue's fired set; no embed call."""
     # Create minimal mock graph with constitutional core
     mock_graph = MockGraph()
     mock_graph.nodes = {"core": MockNode("core")}
@@ -263,11 +269,16 @@ def test_flag_on_embed_called_in_pith_provider_context(monkeypatch):
         # Mock render_constitutional_core
         monkeypatch.setattr(cc, 'render_constitutional_core', lambda ng: "Honor agency.")
         
-        # Mock cc_pattern_completion_recall
-        monkeypatch.setattr(cc, 'cc_pattern_completion_recall', lambda *args, **kwargs: [])
+        # Mock cc_pattern_completion_recall: what fired for the cue
+        monkeypatch.setattr(cc, 'cc_pattern_completion_recall', lambda *args, **kwargs: [
+            {'node_id': 'n1', 'score': 0.9, 'content': 'fired one'},
+            {'node_id': 'n2', 'score': 0.8, 'content': 'fired two'},
+        ])
         
-        # Mock cc_region_confidence to return neutral
-        monkeypatch.setattr(cc, 'cc_region_confidence', lambda *args, **kwargs: 0.5)
+        # Record what cc_region_confidence is asked about
+        seen = []
+        monkeypatch.setattr(cc, 'cc_region_confidence',
+                            lambda graph, fired: seen.append((graph, list(fired))) or 0.5)
         
         # Call pith_provider_context
         result = cc.pith_provider_context(
@@ -280,8 +291,8 @@ def test_flag_on_embed_called_in_pith_provider_context(monkeypatch):
             root_count=None
         )
         
-        # With flag ON, embed SHOULD be called
-        mock_embed.assert_called_once_with('test instruction')
+        assert seen == [(mock_graph, ['n1', 'n2'])]
+        mock_embed.assert_not_called()
 
 
 # ============================================================================
@@ -303,11 +314,9 @@ def test_flag_off_no_embed_call():
         mock_commons.read_arousal.return_value = "PARASYMPATHETIC"
         
         mock_graph = MockGraph()
-        mock_vector_db = MockVectorDB()
-        mock_embedding = [0.5]*768
         
-        # Call cc_l1_budget with all parameters (as if embed was computed)
-        budget_with_params = cc.cc_l1_budget(mock_commons, mock_graph, mock_vector_db, mock_embedding)
+        # Call cc_l1_budget with a fired set
+        budget_with_params = cc.cc_l1_budget(mock_commons, mock_graph, ['n1', 'n2'])
         
         # Call without parameters (original behavior)  
         budget_without = cc.cc_l1_budget(mock_commons)
@@ -335,14 +344,12 @@ def test_flag_on_embed_called():
             mock_confidence.return_value = 0.8
             
             mock_graph = MockGraph()
-            mock_vector_db = MockVectorDB()
-            mock_embedding = [0.5]*768
             
-            # Call cc_l1_budget with all parameters
-            budget = cc.cc_l1_budget(mock_commons, mock_graph, mock_vector_db, mock_embedding)
+            # Call cc_l1_budget with a fired set
+            budget = cc.cc_l1_budget(mock_commons, mock_graph, ['n1', 'n2'])
             
-            # cc_region_confidence should be called
-            mock_confidence.assert_called_once_with(mock_graph, mock_vector_db, mock_embedding)
+            # cc_region_confidence should be called with that set
+            mock_confidence.assert_called_once_with(mock_graph, ['n1', 'n2'])
             
             # Budget should include region confidence modulation
             # Without region confidence: 4000 * 1.4 = 5600
@@ -353,8 +360,7 @@ def test_flag_on_embed_called():
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_ENV_NAMES = ('CC_PITH_REGION_CONFIDENCE_FALLOFF', 'CC_PITH_REGION_CONFIDENCE_K',
-              'CC_PITH_REGION_CONFIDENCE_THRESHOLD')
+_ENV_NAMES = ('CC_PITH_REGION_CONFIDENCE_FALLOFF',)
 
 
 def _read_env_constants(overrides):
@@ -369,46 +375,31 @@ def _read_env_constants(overrides):
     out = subprocess.run(
         [sys.executable, '-c',
          'import cc_ng_organism as c; print(c._CC_PITH_REGION_CONFIDENCE_FALLOFF, '
-         'c._CC_PITH_REGION_CONFIDENCE_K, c._CC_PITH_REGION_CONFIDENCE_THRESHOLD, '
          'c._CC_PITH_REGION_CONFIDENCE_NEUTRAL)'],
         env=env, cwd=_REPO_ROOT, capture_output=True, text=True, check=True,
     ).stdout.strip().splitlines()[-1].split()
-    return float(out[0]), int(out[1]), float(out[2]), float(out[3])
+    return float(out[0]), float(out[1])
 
 
 def test_env_vars_defaults():
-    assert _read_env_constants({}) == (0.25, 10, 0.3, 0.5)
+    assert _read_env_constants({}) == (0.25, 0.5)
 
 
 def test_env_vars_custom():
-    falloff, k, threshold, _ = _read_env_constants({
-        'CC_PITH_REGION_CONFIDENCE_FALLOFF': '0.3',
-        'CC_PITH_REGION_CONFIDENCE_K': '20',
-        'CC_PITH_REGION_CONFIDENCE_THRESHOLD': '0.1',
-    })
-    assert (falloff, k, threshold) == (0.3, 20, 0.1)
-
-
-def test_env_vars_clamped():
-    _, k, threshold, _ = _read_env_constants({
-        'CC_PITH_REGION_CONFIDENCE_K': '999',
-        'CC_PITH_REGION_CONFIDENCE_THRESHOLD': '5',
-    })
-    assert (k, threshold) == (50, 1.0)
+    falloff, _ = _read_env_constants({'CC_PITH_REGION_CONFIDENCE_FALLOFF': '0.3'})
+    assert falloff == 0.3
 
 
 def test_region_confidence_basic():
     # Patch all region confidence constants
     with patch.multiple(cc,
                        _CC_PITH_REGION_CONFIDENCE_ENABLED=True,
-                       _CC_PITH_REGION_CONFIDENCE_K=10,
-                       _CC_PITH_REGION_CONFIDENCE_THRESHOLD=0.3,
                        _CC_PITH_REGION_CONFIDENCE_NEUTRAL=0.5):
         mock_graph = MockGraph()
-        # Three hit nodes that will have synapses between them
-        mock_vector_db = MockVectorDB(hits=[('n1', 0.9), ('n2', 0.8), ('n3', 0.7)])
+        # Three fired nodes that have synapses between them
+        fired = ['n1', 'n2', 'n3']
         
-        # Create synapses BETWEEN hit nodes (Scope 1: synapses among nearest nodes)
+        # Create synapses BETWEEN fired nodes
         s1 = MockSynapse('s1', 'n1', 'n2', weight=0.9, max_weight=1.0)
         s2 = MockSynapse('s2', 'n1', 'n3', weight=0.4, max_weight=1.0)
         s3 = MockSynapse('s3', 'n2', 'n3', weight=0.7, max_weight=1.0)
@@ -417,7 +408,7 @@ def test_region_confidence_basic():
         mock_graph._outgoing = {'n1': ['s1', 's2'], 'n2': ['s3']}  # n2→n3
         mock_graph._synapse_confirmation_history = {}
         
-        conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
+        conf = cc.cc_region_confidence(mock_graph, fired)
         
         # Compute expected confidences using MockGraph._compute_prediction_confidence formula:
         # weight/max_weight * 0.6 + confirmation_rate * 0.4
@@ -430,109 +421,79 @@ def test_region_confidence_basic():
         assert 0.59 <= conf <= 0.61
 
 
-def test_region_confidence_empty():
-    mock_graph = MockGraph()
-    mock_vector_db = MockVectorDB(hits=[])  # Empty search results
-    
-    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-    assert conf == 0.5  # Returns neutral when no hits
+@pytest.fixture
+def region_on(monkeypatch):
+    monkeypatch.setattr(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', True)
 
 
-def test_region_confidence_synapse_target_outside_hits_is_neutral():
-    """Test that synapses whose target node is not in the hit set are ignored."""
+def test_region_confidence_empty(region_on):
+    assert cc.cc_region_confidence(MockGraph(), []) == 0.5  # nothing fired
+    assert cc.cc_region_confidence(MockGraph(), None) == 0.5
+
+
+def test_region_confidence_disabled_is_neutral():
     mock_graph = MockGraph()
-    mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])  # Hit found
-    
-    # Create synapse n1→t1 where t1 is NOT in hits
+    mock_graph.synapses = {'s1': MockSynapse('s1', 'n1', 'n2', weight=1.0)}
+    mock_graph._outgoing = {'n1': ['s1']}
+    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_ENABLED', False):
+        assert cc.cc_region_confidence(mock_graph, ['n1', 'n2']) == 0.5
+
+
+def test_region_confidence_synapse_target_outside_fired_set_is_neutral(region_on):
+    """Synapses whose target did not fire are outside the region."""
+    mock_graph = MockGraph()
     s1 = MockSynapse('s1', 'n1', 't1', weight=0.1, max_weight=1.0)
     mock_graph.synapses = {'s1': s1}
     mock_graph._outgoing = {'n1': ['s1']}
-    mock_graph._synapse_confirmation_history = {}
-    
-    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-    # Returns neutral because syn.post_node_id ('t1') not in node_ids (['n1'])
-    # No synapses among hit nodes to consider
-    assert conf == 0.5
+    assert cc.cc_region_confidence(mock_graph, ['n1']) == 0.5
 
 
-def test_region_confidence_read_only():
-    """Test that cc_region_confidence does not modify graph or vector_db state."""
+def test_region_confidence_read_only(region_on):
+    """cc_region_confidence does not modify the graph or the fired set."""
     mock_graph = MockGraph()
-    mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
-    
-    # Add some state to track
-    mock_graph.nodes = {'n1': MockNode('n1')}
-    s1 = MockSynapse('s1', 'n1', 't1', weight=0.5, max_weight=1.0)
+    mock_graph.nodes = {'n1': MockNode('n1'), 'n2': MockNode('n2')}
+    s1 = MockSynapse('s1', 'n1', 'n2', weight=0.5, max_weight=1.0)
     mock_graph.synapses = {'s1': s1}
     mock_graph._outgoing = {'n1': ['s1']}
     mock_graph._synapse_confirmation_history = {'s1': [True, False, True]}
-    
-    # Record initial states
+    fired = ['n1', 'n2']
+
     initial_graph_nodes = dict(mock_graph.nodes)
     initial_graph_synapses = dict(mock_graph.synapses)
     initial_graph_history = dict(mock_graph._synapse_confirmation_history)
-    initial_vector_db_hits = list(mock_vector_db.hits)
-    
-    # Call function
-    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-    
-    # Verify no state was modified
+
+    conf = cc.cc_region_confidence(mock_graph, fired)
+
     assert mock_graph.nodes == initial_graph_nodes
     assert mock_graph.synapses == initial_graph_synapses
     assert mock_graph._synapse_confirmation_history == initial_graph_history
-    assert mock_vector_db.hits == initial_vector_db_hits
-    
-    # Confidence should be computed
-    assert 0.0 <= conf <= 1.0
+    assert fired == ['n1', 'n2']
+    # 0.5*0.6 + (2/3)*0.4
+    assert conf == pytest.approx(0.3 + 0.4 * 2 / 3)
 
 
-def test_region_confidence_clamping():
-    """Test that K parameter is clamped to valid range."""
-    # Test K clamped to minimum of 1
-    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_K', 0):
-        mock_graph = MockGraph()
-        mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
-        
-        conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-        # Should not crash, should return neutral or compute with k=1
-        assert 0.0 <= conf <= 1.0
-    
-    # Test K clamped to maximum of 50  
-    with patch.object(cc, '_CC_PITH_REGION_CONFIDENCE_K', 100):
-        mock_graph = MockGraph()
-        mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
-        
-        conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-        # Should not crash, should compute with k=50
-        assert 0.0 <= conf <= 1.0
-
-
-def test_region_confidence_with_missing_nodes():
-    """Test graceful handling when vector_db returns nodes not in graph."""
+def test_region_confidence_with_missing_nodes(region_on):
+    """A fired id the graph does not hold has no synapses: neutral."""
     mock_graph = MockGraph()
-    # VectorDB reports node 'missing' but graph doesn't have it
-    mock_vector_db = MockVectorDB(hits=[('missing', 0.9)])
-    
-    # Graph has different nodes
     mock_graph.nodes = {'present': MockNode('present')}
-    
-    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-    # Should return neutral (0.5) because missing node has no outgoing synapses
-    assert conf == 0.5
+    assert cc.cc_region_confidence(mock_graph, ['missing']) == 0.5
 
 
-def test_region_confidence_with_no_outgoing_synapses():
-    """Test when found nodes exist but have no outgoing synapses."""
+def test_region_confidence_with_no_outgoing_synapses(region_on):
     mock_graph = MockGraph()
-    mock_vector_db = MockVectorDB(hits=[('n1', 0.9)])
-    
-    # Node exists but has no outgoing synapses
     mock_graph.nodes = {'n1': MockNode('n1')}
-    mock_graph._outgoing = {}  # No outgoing synapses
-    
-    conf = cc.cc_region_confidence(mock_graph, mock_vector_db, [0.5]*768)
-    # Should return neutral (0.5) because no synapses to evaluate
-    assert conf == 0.5
+    mock_graph._outgoing = {}
+    assert cc.cc_region_confidence(mock_graph, ['n1']) == 0.5
+
+
+def test_cc_l1_budget_skips_region_when_nothing_fired():
+    with patch.multiple(cc,
+                        _CC_PITH_L1_BUDGET=4000,
+                        _CC_PITH_L1_BREATHE=False,
+                        _CC_PITH_REGION_CONFIDENCE_ENABLED=True):
+        with patch.object(cc, 'cc_region_confidence') as mock_confidence:
+            assert cc.cc_l1_budget(None, MockGraph(), []) == 4000
+            mock_confidence.assert_not_called()
 
 
 def test_cc_l1_budget_min_max_clamp():
