@@ -3,6 +3,25 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane C (ii-a):
+#   the conversational deposit steps again (CC_NG_DEPOSIT_STEP, default off)
+# What: cc_deposit_step(graph): under graph._step_lock, one graph.step(), the
+#   0.1 baseline reward when three_factor_enabled, then discover_hyperedges on
+#   that step's fired_node_ids. Returns the StepResult; nothing consumes it yet
+#   (KISS ops 2/6 are unbuilt, so no consumer is invented here). No stimulus is
+#   injected. Flag _CC_NG_DEPOSIT_STEP reads CC_NG_DEPOSIT_STEP, default "0".
+#   cc_novelty docstring corrected: CC deposits no longer run on_message().
+# Why: LAW 3 restore. Before #413 (eec6f38, 2026-09-07) both _deposit halves
+#   called on_message(), which stepped and rewarded; the swap to the dual pass
+#   dropped both, so the CC deposit never stepped (LE sweep (ii-a), audit §8.6
+#   lane C, #543 stale fired set). Chief rulings D1-D4 on the lane C design.
+# How: both host wrappers (cc_ng_host._deposit, docs/scripts/cc-ng-daemon.py
+#   _deposit) call it after the dual pass, inside their existing
+#   _concurrent_lock (the established _concurrent_lock -> _step_lock order).
+#   Flag off is the previous path. Flipping it is an executive-ruled event on
+#   the AUTOSTEP gate (CALLOSUM-TRUTH §8.13, one-heartbeat tick, Packet 099):
+#   every deposit step advances graph.timestep. drain_ingest_tract (#563) and
+#   drain_gateway_conduit are not changed. Tests: tests/test_cc_deposit_step.py.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — COMB-04 region
 #   confidence reads the region that fired (Packet 175a (iv), Pith work)
 # What: cc_region_confidence(graph, fired_node_ids) and cc_l1_budget(commons,
@@ -1947,6 +1966,42 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
         return False
 
 
+# Lane C (ii-a): the deposit steps. Default OFF -- flipping it advances
+# graph.timestep once per deposit, which ages unbound nodes toward the orphan
+# sweep, so it waits on the same gate as CC_NG_AUTOSTEP (CALLOSUM-TRUTH §8.13
+# _unbound_nodes empty, the one-heartbeat tick, Packet 099). Executive-ruled flip.
+_CC_NG_DEPOSIT_STEP = os.environ.get("CC_NG_DEPOSIT_STEP", "0") not in ("0", "false", "False", "")
+
+
+def cc_deposit_step(graph):
+    """Step once after a conversational deposit; return the StepResult.
+
+    Restores what on_message() did before #413 swapped it for the dual pass:
+    one graph.step(), the flat 0.1 baseline engagement reward when
+    three_factor_enabled (the same form as neurograph_rpc handle_after_turn),
+    then hyperedge discovery on that step's own fired set (#543). Always steps,
+    whether or not the dual pass succeeded -- a failed turn is still a timestep.
+    No stimulus is injected: the step fires what the substrate already carries.
+
+    Callers hold graph._concurrent_lock; this takes graph._step_lock (RLock)
+    inside it, the established order. Fails soft: the deposit already landed.
+    Nothing consumes the returned receipt yet (KISS ops 2/6 are unbuilt).
+    """
+    if graph is None:
+        return None
+    try:
+        with graph._step_lock:
+            result = graph.step()
+            if graph.config.get("three_factor_enabled", False):
+                graph.inject_reward(0.1)
+            if result.fired_node_ids:
+                graph.discover_hyperedges(list(result.fired_node_ids))
+        return result
+    except Exception as exc:
+        logger.debug("CC deposit step failed (non-fatal): %s", exc)
+        return None
+
+
 def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
                            instance_tag: str = "cc") -> Optional[Any]:
     """Start CC's own TriSynaptic concept-extraction manager. Watches `queue`
@@ -3006,8 +3061,9 @@ def cc_novelty(state: dict, graph) -> float:
 
     Canonical updates _substrate_novelty_ema push-style per turn in
     handle_after_turn() (rpc.py:3266-3272) from StepResult's HE-level
-    prediction counts. CC's deposits run graph.step() inside on_message()
-    (protected file) which discards those stats — so CC dips the bucket at
+    prediction counts. CC's deposits run the dual pass, not on_message(), and
+    step only through cc_deposit_step (CC_NG_DEPOSIT_STEP, default off) or the
+    Tonic's autostep; neither pushes those stats -- so CC dips the bucket at
     extraction time instead: read the HE-level CUMULATIVE counters, delta
     them against the previous recall, EMA the windowed surprise ratio.
 

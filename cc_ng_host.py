@@ -27,6 +27,18 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane C (ii-a):
+#   _deposit steps through cc_deposit_step when CC_NG_DEPOSIT_STEP is on.
+# What: after the dual pass, inside the same _concurrent_lock, _deposit calls
+#   cc_ng_organism.cc_deposit_step (step + three_factor-gated 0.1 reward +
+#   discovery on the step's fired set). Flag off keeps the _recent_spikes
+#   discovery exactly as before. The tool-experience reward comment is
+#   corrected: tool experience goes to Commons only, and the baseline reward
+#   lives on the conversational path.
+# Why: LE sweep (ii-a) / #543: #413 dropped on_message()'s step and reward, and
+#   discovery read the last step's spikes, not this deposit's. Chief D1-D4.
+# How: the shared step lives in cc_ng_organism (LAW 4); this file only wires
+#   it. Tests: tests/test_cc_deposit_step.py.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b): wire the
 #   Pith failure deposit.
 # What: _recall() passes on_pith_failure=_deposit_pith_failure to cc_assemble_recall. On a Pith
@@ -561,9 +573,11 @@ def _deposit(text: str) -> None:
     # ng.on_message() is the document pipeline (its own docstring: "Stage 1-5:
     # Extract -> Chunk -> Embed -> Register") and chunked every turn as if it
     # were a document. #294 Task A built the ingestor-free path in June and the
-    # tract drain uses it; this call site was the old door left standing. The
-    # dual-pass fires nodes the same way, so the _recent_spikes read and the
-    # hyperedge discovery below are unchanged.
+    # tract drain uses it; this call site was the old door left standing.
+    # Lane C (ii-a): on_message() also stepped once and gave the 0.1 baseline
+    # reward; cc_deposit_step restores both (CC_NG_DEPOSIT_STEP, default off)
+    # and discovers hyperedges on that step's fired set (#543). Flag off keeps
+    # the previous _recent_spikes discovery unchanged.
     from ng_embed import EmbeddingUnavailableError, embed as _embed
     try:
         embedding = _embed(text)
@@ -573,16 +587,19 @@ def _deposit(text: str) -> None:
         )
         return
     try:
-        from cc_ng_organism import run_conversational_dual_pass
+        import cc_ng_organism
         with ng.graph._concurrent_lock:
-            run_conversational_dual_pass(
+            cc_ng_organism.run_conversational_dual_pass(
                 ng.graph, getattr(ng, "vector_db", None), text, embedding, _STATE.conv_state)
-            fired = [
-                nid for nid, spikes in ng.graph._recent_spikes.items()
-                if spikes and spikes[-1] == ng.graph.timestep
-            ]
-            if fired:
-                ng.graph.discover_hyperedges(fired)
+            if cc_ng_organism._CC_NG_DEPOSIT_STEP:
+                cc_ng_organism.cc_deposit_step(ng.graph)
+            else:
+                fired = [
+                    nid for nid, spikes in ng.graph._recent_spikes.items()
+                    if spikes and spikes[-1] == ng.graph.timestep
+                ]
+                if fired:
+                    ng.graph.discover_hyperedges(fired)
     except Exception as exc:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1
@@ -1108,12 +1125,13 @@ def _handle_post_tool_use(data):
     # No reward pre-labeling (Josh, 2026-07-04): string-matching
     # traceback/exception/error in tool_response to pick a reward value
     # classifies the experience's valence at deposit time -- a LAW 7
-    # violation, and redundant besides. _deposit() already calls
-    # on_message(), which injects its own flat, content-independent
-    # baseline reward (0.1) on the success path (openclaw_hook.py) --
-    # "surprise-driven crystallization is the primary reward pathway,
-    # this is the heartbeat, not the main event." Syl's tool-adjacent
-    # experience gets reward the same way, with no external classification.
+    # violation. Tool experience goes to CC's Commons only
+    # (_deposit_tool_experience), never the graph, so no reward is injected
+    # here. The flat, content-independent 0.1 baseline reward lives on the
+    # conversational path: cc_deposit_step after _deposit's dual pass
+    # (CC_NG_DEPOSIT_STEP, default off), the same form as on_message() and
+    # Syl's handle_after_turn -- "surprise-driven crystallization is the
+    # primary reward pathway, this is the heartbeat, not the main event."
     _deposit_tool_experience(experience)
 
     return {"ok": True}
