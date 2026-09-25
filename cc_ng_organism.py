@@ -3,6 +3,14 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b)
+#   note 3: PithMetrics.record_failure docstring corrected (comment-only).
+# What: the docstring still said a failing Pith path "falls back to un-Pithed
+#   rendering"; it now names the failure envelope (the unavailable notice) and
+#   pith_prefetch_seed's empty result. No code change.
+# Why: 077 review of build item (b), note 3; chief ruling (A): main must not
+#   carry a wrong comment about envelope semantics.
+# How: docstring text only.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b):
 #   cc_assemble_recall Pith failure envelope.
 # What: an exception inside the gated Pith block (CC_PITH_ENABLED) no longer
@@ -3402,10 +3410,11 @@ class PithMetrics:
         self.l1_prefetch_distinct_promotable = 0
 
     def record_failure(self) -> None:
-        """Bump the fail-soft counter -- the Pith path swallows exceptions and
-        falls back to un-Pithed rendering, so without this a 100%-failing Pith
-        pass is indistinguishable from a working one. Call from the caller's
-        fallback except-handler."""
+        """Bump the fail-soft counter -- a failing Pith path returns its failure
+        envelope (cc_assemble_recall: the unavailable notice, never the
+        un-Pithed rendering) or an empty result (pith_prefetch_seed), so
+        without this a 100%-failing Pith pass is indistinguishable from a
+        working one. Call from the caller's except-handler."""
         with self._lock:
             self.pith_failures += 1
 
