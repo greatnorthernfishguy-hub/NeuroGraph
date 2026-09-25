@@ -27,6 +27,17 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b): wire the
+#   Pith failure deposit.
+# What: _recall() passes on_pith_failure=_deposit_pith_failure to cc_assemble_recall. On a Pith
+#   exception, the raw failure text (cc_pith_failure_text) goes through this host's normal raw
+#   deposit path, _deposit(), on a daemon thread -- the same way _handle_user_prompt_submit
+#   launches a turn's deposit.
+# Why: Pith PRD failure envelope: the failure is deposited raw (LAW 7). Chief ruling (b)(2): the
+#   contract lives at canonical source (cc_ng_organism), each hemisphere wrapper only wires it;
+#   VPS = the normal raw deposit path.
+# How: a thread, because _deposit embeds and takes graph._concurrent_lock (1-4 s) and the hook
+#   has a 2 s budget. Tests: tests/test_cc_recall_unification.py.
 # [2026-09-24] Grok — #513: embedding-unavailable is its own deposit skip.
 # What: _embed(text) sits outside the dual-pass fault barrier. EmbeddingUnavailableError
 #   logs a warning that the deposit was skipped because embedding is unavailable, then returns.
@@ -634,6 +645,14 @@ def _deposit_tool_experience(text: str) -> None:
         logger.debug("CC Commons deposit failed (non-fatal): %s", exc)
 
 
+def _deposit_pith_failure(exc: BaseException) -> None:
+    """cc_assemble_recall's on_pith_failure for this hemisphere: the raw failure text goes
+    through the normal raw deposit path (_deposit) in the background -- _deposit embeds and
+    takes the graph lock, which must not block the hook."""
+    from cc_ng_organism import cc_pith_failure_text
+    threading.Thread(target=_deposit, args=(cc_pith_failure_text(exc),), daemon=True).start()
+
+
 def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
     """Return surfacing context for CC hook injection.
 
@@ -662,7 +681,8 @@ def _recall(query: str, k: int, allow_pattern_completion: bool = True) -> str:
         from cc_ng_organism import cc_assemble_recall
         return cc_assemble_recall(ng, query, k, _STATE.conv_state, _STATE.commons,
                                    allow_pattern_completion=allow_pattern_completion,
-                                   on_monitor_error=_bump_error)
+                                   on_monitor_error=_bump_error,
+                                   on_pith_failure=_deposit_pith_failure)
     except Exception as exc:
         with _STATE.stats_lock:
             _STATE.stats["errors"] += 1

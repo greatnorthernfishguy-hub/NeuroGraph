@@ -3,6 +3,29 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b):
+#   cc_assemble_recall Pith failure envelope.
+# What: an exception inside the gated Pith block (CC_PITH_ENABLED) no longer
+#   falls back to the un-Pithed monitor_ctx + pc_block concatenation. It
+#   returns ONLY cc_pith_unavailable_notice(stage, exc) -- "[NeuroGraph recall
+#   unavailable: Pith <stage> failed: <Type>: <bounded msg>]", never blank --
+#   and hands the raw exception once to the new on_pith_failure= callback
+#   (mirrors on_monitor_error=; a failing callback is logged at warning).
+#   _PITH_METRICS.record_failure() and the rate-limited warning stay. New:
+#   cc_pith_failure_text (raw, unclassified failure text) and
+#   cc_deposit_pith_failure (the laptop's deposit: one ENTRY_EXPERIENCE frame,
+#   source "cc_gateway", on cc_gateway_tract_path() -- the tract its
+#   conversational turns ride). Gate-off path unchanged, byte for byte. The
+#   four inner fail-softs (pin, cc_thermal, cc_novelty, region confidence) and
+#   the victim-capture log are unchanged.
+# Why: Pith PRD failure envelope (NEVER the original history, NEVER blank;
+#   the failure deposited raw, LAW 7) and P153(3)/P154(6). Chief rulings on
+#   build item (b)(1)-(3): notice-only return; the deposit lives in a separate
+#   canonical function wired by each hemisphere wrapper (LAW 4 -- a query
+#   function does no write-side bookkeeping); inner fail-softs out of scope.
+# How: a local _stage names the running step (CacheLine build, victim_recover,
+#   stage1, L1 budget, stage3, render); the except returns the notice. Tests:
+#   tests/test_cc_recall_unification.py (per-failure-point injection).
 # [2026-09-24] Claude Sonnet 5 (Claude Code, z2-laneB-kiss-gate-removal-001) —
 #   Lane B: remove the vdb Delta Gate, its #523 deposit-time Cricket skip, and
 #   everything built only on it.
@@ -4975,9 +4998,41 @@ def _cc_recall_debug_log(query: str, monitor_items: List[Dict[str, Any]],
         logger.debug("recall-debug log failed (non-fatal): %s", exc)
 
 
+# Bound on the exception message carried in the recall notice -- it rides the
+# CC prompt every turn Pith keeps failing, so it must stay one short line.
+_PITH_NOTICE_MSG_MAX = 200
+
+
+def cc_pith_failure_text(exc: BaseException) -> str:
+    """Raw text of a Pith recall failure: the exception type and message,
+    as-is. No category, severity or tag (LAW 7) -- this is what the
+    hemisphere deposit paths hand to the substrate."""
+    return f"NeuroGraph recall Pith pass failed: {type(exc).__name__}: {exc}"
+
+
+def cc_pith_unavailable_notice(stage: str, exc: BaseException) -> str:
+    """The explicit notice cc_assemble_recall returns in place of recall when
+    its Pith pass raises (Pith PRD failure envelope): what failed and why.
+    Never blank -- the prefix alone is non-empty even for an empty message."""
+    msg = " ".join(str(exc).split())[:_PITH_NOTICE_MSG_MAX]
+    return f"[NeuroGraph recall unavailable: Pith {stage} failed: {type(exc).__name__}: {msg}]"
+
+
+def cc_deposit_pith_failure(exc: BaseException, tract_path: Optional[str] = None) -> None:
+    """Deposit a Pith recall failure raw onto the CC ingest tract -- the same
+    tract, entry type and source ("cc_gateway") miniTID uses for conversational
+    turns, so drain_ingest_tract absorbs it exactly as it absorbs a turn. The
+    laptop hemisphere's on_pith_failure. Raises on write failure; the caller
+    (cc_assemble_recall) logs it."""
+    import ng_tract
+    ng_tract.deposit_experience(cc_pith_failure_text(exc).encode("utf-8"),
+                                "cc_gateway", [tract_path or cc_gateway_tract_path()])
+
+
 def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: Any,
                         allow_pattern_completion: bool = True,
-                        on_monitor_error: Optional[Any] = None) -> str:
+                        on_monitor_error: Optional[Any] = None,
+                        on_pith_failure: Optional[Any] = None) -> str:
     """Return surfacing context for CC hook injection -- THE shared recall
     pipeline for both hemispheres (laptop cc-ng-daemon.py, VPS cc_ng_host.py).
 
@@ -5003,10 +5058,13 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     -> pith_stage1 -> pith_stage3(budget=cc_l1_budget(commons)) ->
     pith_victim_capture) instead of the plain two-block concatenation, with
     constitutional pins (ng.graph._is_identity_protected) preserved
-    unconditionally. Any exception anywhere in the Pith path is fail-soft --
-    falls back to the pre-Pith monitor_ctx/pc_block rendering, records a
-    _PITH_METRICS failure, and rate-limit-warns (a surfacing pass must never
-    crash or time out the hook).
+    unconditionally. An exception anywhere in the Pith path never falls back
+    to the un-Pithed monitor_ctx/pc_block rendering and never returns blank:
+    it returns ONLY cc_pith_unavailable_notice() (Pith PRD failure envelope),
+    records a _PITH_METRICS failure, rate-limit-warns, and hands the raw
+    exception to on_pith_failure (each hemisphere wires its own raw deposit
+    there -- this query function does no write-side work itself, LAW 4). It
+    never raises: a surfacing pass must not crash or time out the hook.
 
     Params only (ng/conv_state/commons) -- no module-global STATE access,
     so this function is process-agnostic (Syl's-Law) and safe to call from
@@ -5059,6 +5117,8 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     # cc_assemble_recall() falls straight through to the original
     # monitor_ctx/pc_block return, unchanged.
     if _CC_PITH_ENABLED:
+        # Which Pith step is running -- named in the notice if one raises.
+        _stage = 'CacheLine build'
         try:
             def _pinned(node_id):
                 try:
@@ -5098,6 +5158,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
 
             # Pith Stage 5 (victim recapture): merge still-live victim-cache
             # entries back in for a second chance at L1, and age the buffer.
+            _stage = 'victim_recover'
             cache_lines = pith_victim_recover(cache_lines)
 
             # Pith Stage 5 (thermal): populate each line's warmth from the
@@ -5116,6 +5177,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                 logger.debug('Pith novelty lookup failed (non-fatal): %s', exc)
                 novelty = 0.0
 
+            _stage = 'stage1'
             survivors = pith_stage1(cache_lines, query, novelty)
             # Stage 3: unified rank + char budget -- replaces block-order
             # concatenation with a single ranked, budget-bounded L1 read.
@@ -5124,6 +5186,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             _pre_l1 = survivors  # post-stage1, pre-budget: the full L1 candidate set
             
             # Compute budget with region confidence if enabled and available
+            _stage = 'L1 budget'
             if _CC_PITH_REGION_CONFIDENCE_ENABLED:
                 try:
                     vector_db = getattr(ng, 'vector_db', None)
@@ -5139,26 +5202,37 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             else:
                 budget = cc_l1_budget(commons)
             
+            _stage = 'stage3'
             survivors = pith_stage3(survivors, budget_chars=budget)
             # Pith Stage 5 (eviction): budget-dropped lines fall to the victim buffer.
             try:
                 pith_victim_capture(survivors, _pre_l1)
             except Exception as exc:
                 logger.debug('Pith victim capture failed (non-fatal): %s', exc)
+            _stage = 'render'
             survivor_results = [{'score': cl.score, 'content': cl.content} for cl in survivors]
             return _format_cc_recall_block(survivor_results)
         except Exception as exc:
-            # Fail-soft: fall back to the pre-Pith rendering below. But COUNT it
-            # and warn (rate-limited) -- a silently-failing Pith path degrades
-            # surfacing invisibly; the counter/warning make that observable.
+            # Failure envelope (Pith PRD): return ONLY the explicit notice --
+            # never the un-Pithed monitor_ctx/pc_block below, never blank.
+            # COUNT it and warn (rate-limited) so a failing Pith path is
+            # observable, then hand the raw exception to the caller's deposit.
             _PITH_METRICS.record_failure()
             global _last_pith_warn_ts
             _now = time.time()
             if _now - _last_pith_warn_ts >= _PITH_WARN_INTERVAL_S:
                 _last_pith_warn_ts = _now
-                logger.warning('Pith stage1 path failed, falling back to un-Pithed rendering: %s', exc)
+                logger.warning('Pith %s failed, returning the unavailable notice: %s', _stage, exc)
             else:
-                logger.debug('Pith stage1 path failed (non-fatal), falling back: %s', exc)
+                logger.debug('Pith %s failed (non-fatal), returning the unavailable notice: %s', _stage, exc)
+            if on_pith_failure is not None:
+                try:
+                    on_pith_failure(exc)
+                except Exception as cb_exc:
+                    # The deposit hook must never break recall -- but a lost
+                    # failure deposit is logged, not swallowed.
+                    logger.warning('Pith failure deposit failed: %s', cb_exc)
+            return cc_pith_unavailable_notice(_stage, exc)
 
     if monitor_ctx and pc_block:
         return monitor_ctx + "\n\n" + pc_block

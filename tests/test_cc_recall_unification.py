@@ -1,6 +1,22 @@
 # tests/test_cc_recall_unification.py
 #
 # ---- Changelog ----
+# [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b):
+#   Pith failure envelope tests.
+# What: test_assemble_recall_gate_on_falls_back_to_concat_on_pith_exception
+#   (asserted the old un-Pithed fallback) is replaced by
+#   test_assemble_recall_pith_failure_returns_notice_only, parametrized over
+#   the four failure points (CacheLine build, victim_recover, stage1, stage3):
+#   the return is exactly cc_pith_unavailable_notice, non-empty, carries no
+#   monitor/pattern content, and on_pith_failure gets the raw exception once.
+#   Added: gate-off byte-identical with on_pith_failure wired; a raising
+#   callback is logged, not raised; both wrappers wire their deposit; the
+#   laptop deposit lands as a cc_gateway ENTRY_EXPERIENCE on the tract. Also
+#   fixed a pre-existing vacuous test: the byte-for-byte parity stub had no
+#   **kwargs, so both wrappers' calls (which pass on_monitor_error=) raised
+#   TypeError, failed soft to '' and compared '' == ''.
+# Why: Pith PRD failure envelope; chief ruling on build item (b).
+# How: monkeypatch each Pith step on cc_ng_organism to raise.
 # [2026-07-22] Claude Code (Sonnet 5) — CC Recall Unification parity tests
 # What: Both hemispheres' _recall() wrappers (cc_ng_host.py for the VPS host,
 #   docs/scripts/cc-ng-daemon.py for the laptop) now delegate the entire
@@ -247,7 +263,8 @@ def test_both_wrappers_agree_byte_for_byte_given_identical_inputs(monkeypatch, d
     shared_conv = {'last_forest_id': None}
     shared_commons = _Sentinel()
 
-    def real_ish_assemble(ng, query, k, conv_state, commons, allow_pattern_completion=True):
+    def real_ish_assemble(ng, query, k, conv_state, commons, allow_pattern_completion=True,
+                          **kwargs):
         assert ng is shared_ng
         assert conv_state is shared_conv
         assert commons is shared_commons
@@ -266,7 +283,9 @@ def test_both_wrappers_agree_byte_for_byte_given_identical_inputs(monkeypatch, d
     host_result = cc_ng_host._recall('parity check', k=4, allow_pattern_completion=True)
     daemon_result = daemon_mod._recall('parity check', 4, allow_pattern_completion=True)
 
-    assert host_result == daemon_result
+    # Non-empty: a stub signature mismatch fails soft to '' in both wrappers,
+    # and '' == '' would pass vacuously.
+    assert host_result == daemon_result == '## Active Recall\n- [4] parity check (pc=True)'
 
 
 def test_wrappers_bump_error_stat_on_monitor_harvest_failure(monkeypatch, daemon_mod):
@@ -444,27 +463,170 @@ def test_assemble_recall_gate_on_pin_survives_thermal_and_budget(monkeypatch):
     assert 'PINNED_IDENTITY_LINE_' in result
 
 
-def test_assemble_recall_gate_on_falls_back_to_concat_on_pith_exception(monkeypatch):
-    """A real exception INSIDE the Pith path (here: pith_stage1 itself blows
-    up -- NOT one of the per-line-guarded calls like cc_thermal, which
-    swallow their own exceptions and would never reach the outer fallback)
-    must fail soft to the pre-Pith concat, not propagate or return empty."""
+def _boom(*args, **kwargs):
+    raise RuntimeError('INJECTED_PITH_FAILURE')
+
+
+_PITH_FAILURE_POINTS = {
+    'CacheLine build': lambda mp, org: mp.setattr(org.CacheLine, 'from_surfaced', classmethod(_boom)),
+    'victim_recover': lambda mp, org: mp.setattr(org, 'pith_victim_recover', _boom),
+    'stage1': lambda mp, org: mp.setattr(org, 'pith_stage1', _boom),
+    'stage3': lambda mp, org: mp.setattr(org, 'pith_stage3', _boom),
+}
+
+
+@pytest.mark.parametrize('stage', list(_PITH_FAILURE_POINTS))
+def test_assemble_recall_pith_failure_returns_notice_only(monkeypatch, stage):
+    """Pith PRD failure envelope: an exception at any Pith step returns ONLY
+    the explicit unavailable notice -- never the un-Pithed monitor/pattern
+    concat, never blank -- and hands the raw exception to on_pith_failure
+    exactly once."""
+    import cc_ng_organism
+
+    monkeypatch.setattr(cc_ng_organism, '_CC_PITH_ENABLED', True)
+    _PITH_FAILURE_POINTS[stage](monkeypatch, cc_ng_organism)
+    _patch_pattern_completion(monkeypatch, [
+        {'node_id': 'p1', 'score': 0.9, 'content': 'PATTERN_MARKER'},
+    ])
+    ng = _FakeNgForAssemble([{'node_id': 'm1', 'score': 1.0, 'content': 'MONITOR_MARKER'}])
+    received = []
+
+    result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None,
+                                               on_pith_failure=received.append)
+
+    assert len(received) == 1
+    exc = received[0]
+    assert isinstance(exc, RuntimeError) and str(exc) == 'INJECTED_PITH_FAILURE'
+    assert result == cc_ng_organism.cc_pith_unavailable_notice(stage, exc)
+    assert result == (f'[NeuroGraph recall unavailable: Pith {stage} failed: '
+                      'RuntimeError: INJECTED_PITH_FAILURE]')
+    assert 'MONITOR_MARKER' not in result and 'PATTERN_MARKER' not in result
+
+
+def test_assemble_recall_pith_failure_notice_never_blank_without_callback(monkeypatch):
+    """No callback wired, empty exception message: still a non-empty notice."""
     import cc_ng_organism
 
     monkeypatch.setattr(cc_ng_organism, '_CC_PITH_ENABLED', True)
 
-    def boom_stage1(cache_lines, query, novelty):
-        raise RuntimeError('stage1 blew up')
+    def blank_boom(*args, **kwargs):
+        raise ValueError()
 
-    monkeypatch.setattr(cc_ng_organism, 'pith_stage1', boom_stage1)
+    monkeypatch.setattr(cc_ng_organism, 'pith_stage1', blank_boom)
+    _patch_pattern_completion(monkeypatch, [])
+    ng = _FakeNgForAssemble([{'node_id': 'm1', 'score': 1.0, 'content': 'MONITOR_MARKER'}])
+
+    result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None)
+
+    assert result == '[NeuroGraph recall unavailable: Pith stage1 failed: ValueError: ]'
+
+
+def test_assemble_recall_pith_failure_callback_error_is_logged_not_raised(monkeypatch, caplog):
+    """A failing deposit callback must not break recall -- the notice still
+    returns -- and the lost deposit is logged at warning, not swallowed."""
+    import logging
+    import cc_ng_organism
+
+    monkeypatch.setattr(cc_ng_organism, '_CC_PITH_ENABLED', True)
+    monkeypatch.setattr(cc_ng_organism, 'pith_stage1', _boom)
+    _patch_pattern_completion(monkeypatch, [])
+    ng = _FakeNgForAssemble([{'node_id': 'm1', 'score': 1.0, 'content': 'm'}])
+
+    def bad_callback(exc):
+        raise OSError('tract unwritable')
+
+    with caplog.at_level(logging.WARNING, logger=cc_ng_organism.logger.name):
+        result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None,
+                                                   on_pith_failure=bad_callback)
+
+    assert result.startswith('[NeuroGraph recall unavailable: Pith stage1 failed:')
+    assert any('Pith failure deposit failed: tract unwritable' in r.getMessage()
+               for r in caplog.records)
+
+
+def test_assemble_recall_gate_off_byte_identical_with_callback_wired(monkeypatch):
+    """Gate off, on_pith_failure wired: the exact pre-Pith concat, and the
+    callback is never called (it belongs to the Pith path only)."""
+    import cc_ng_organism
+
+    monkeypatch.setattr(cc_ng_organism, '_CC_PITH_ENABLED', False)
+    monkeypatch.setattr(cc_ng_organism, 'pith_stage1', _boom)  # unreachable when gated off
     _patch_pattern_completion(monkeypatch, [
         {'node_id': 'p1', 'score': 0.9, 'content': 'pattern hit'},
     ])
     ng = _FakeNgForAssemble([{'node_id': 'm1', 'score': 1.0, 'content': 'monitor hit'}])
+    received = []
 
-    result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None)
+    result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None,
+                                               on_pith_failure=received.append)
 
-    expected_monitor = '## Recent\n- monitor hit'
     expected_pattern = cc_ng_organism._format_cc_recall_block(
         [{'node_id': 'p1', 'score': 0.9, 'content': 'pattern hit'}])
-    assert result == expected_monitor + '\n\n' + expected_pattern
+    assert result == '## Recent\n- monitor hit' + '\n\n' + expected_pattern
+    assert received == []
+
+
+def test_wrappers_wire_their_own_pith_failure_deposit(monkeypatch, daemon_mod):
+    """Each hemisphere wires its own raw deposit: VPS host ->
+    _deposit_pith_failure (normal raw deposit path), laptop daemon ->
+    cc_deposit_pith_failure (its own ingest tract)."""
+    import cc_ng_host
+    import cc_ng_organism
+
+    seen = []
+
+    def fake_assemble(ng, query, k, conv_state, commons, allow_pattern_completion=True, **kwargs):
+        seen.append(kwargs.get('on_pith_failure'))
+        return 'x'
+
+    monkeypatch.setattr(cc_ng_organism, 'cc_assemble_recall', fake_assemble)
+    monkeypatch.setattr(cc_ng_host._STATE, 'cc_ng', _Sentinel())
+    monkeypatch.setattr(daemon_mod.STATE, 'ng', _Sentinel())
+
+    cc_ng_host._recall('q', k=3)
+    daemon_mod._recall('q', 3)
+
+    assert seen == [cc_ng_host._deposit_pith_failure, cc_ng_organism.cc_deposit_pith_failure]
+
+
+def test_host_pith_failure_deposit_hands_raw_text_to_deposit(monkeypatch):
+    """VPS: the raw failure text goes through the host's normal _deposit
+    (on a thread -- the hook's 2s budget can't wait on embed + dual-pass)."""
+    import threading
+    import cc_ng_host
+    import cc_ng_organism
+
+    deposited = []
+    done = threading.Event()
+
+    def fake_deposit(text):
+        deposited.append(text)
+        done.set()
+
+    monkeypatch.setattr(cc_ng_host, '_deposit', fake_deposit)
+    exc = RuntimeError('INJECTED_PITH_FAILURE')
+
+    cc_ng_host._deposit_pith_failure(exc)
+
+    assert done.wait(5)
+    assert deposited == [cc_ng_organism.cc_pith_failure_text(exc)]
+    assert deposited[0] == 'NeuroGraph recall Pith pass failed: RuntimeError: INJECTED_PITH_FAILURE'
+
+
+def test_laptop_pith_failure_deposit_lands_on_the_ingest_tract(tmp_path):
+    """Laptop: one ENTRY_EXPERIENCE frame, source "cc_gateway", raw text --
+    exactly what drain_ingest_tract absorbs from a conversational turn."""
+    import ng_tract
+    import cc_ng_organism
+
+    tract = tmp_path / 'cc_ingest.tract'
+    exc = RuntimeError('INJECTED_PITH_FAILURE')
+
+    cc_ng_organism.cc_deposit_pith_failure(exc, tract_path=str(tract))
+
+    entries = list(ng_tract.TractReader(tract.read_bytes()))
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.entry_type == ng_tract.ENTRY_EXPERIENCE
+    assert entry.source == 'cc_gateway'
+    assert entry.content == cc_ng_organism.cc_pith_failure_text(exc)
