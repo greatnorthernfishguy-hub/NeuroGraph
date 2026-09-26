@@ -14,7 +14,7 @@
 #   punchlist #640.
 # How: `label = "learned from substrate" if line.epistemic == "learned" else line.epistemic`;
 #   `"- Keyframe:"` → `"- Root:"`. New tests:
-#   `test_source_coherence_and_exact_anchors_remain_attached_to_basin` (:160) stays unchanged
+#   `test_source_coherence_and_exact_anchors_remain_attached_to_basin` (:161) stays unchanged
 #   (still passes), plus new test A (verified line) and new test B (root label) in
 #   `tests/test_pith_provider_context.py`. Assignment z2-640-pith-epistemic-label-001.
 # [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — Pith
