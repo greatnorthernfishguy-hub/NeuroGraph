@@ -6,14 +6,15 @@
 # [2026-09-26] #640 coding worker (deepseek/deepseek-v3.2, OpenCode/T3 Code) — Pith connected-line label reads `line.epistemic`; `- Keyframe:` becomes `- Root:`
 # What: `_pith_render_connected_line` now reads `CacheLine.epistemic` for the heading
 #   label, showing `"learned from substrate"` only when `line.epistemic == "learned"`;
-#   otherwise shows the `epistemic` value directly. The heading changes from
-#   `"- Keyframe:"` to `"- Root:"` per PRD §5.3.1's nomenclature. CacheLine
+#   otherwise shows the `epistemic` value directly. The first bullet changes from
+#   `"- Keyframe:"` to `"- Root:"` per chief-640-ruling-001 Ruling B. CacheLine
 #   docstring updated to mention `_pith_render_connected_line` as reader.
 # Why: chief-640-ruling-001 APPROVE; chief-b1-ruling-003 §2 (LAW 4, wire the field,
 #   do not delete it); PRD §5.3.1 ("learned, never promoted to 'verified'");
 #   punchlist #640.
 # How: `label = "learned from substrate" if line.epistemic == "learned" else line.epistemic`;
-#   `"- Keyframe:"` → `"- Root:"`. New tests: `test_...` at :176-188 stays unchanged
+#   `"- Keyframe:"` → `"- Root:"`. New tests:
+#   `test_source_coherence_and_exact_anchors_remain_attached_to_basin` (:160) stays unchanged
 #   (still passes), plus new test A (verified line) and new test B (root label) in
 #   `tests/test_pith_provider_context.py`. Assignment z2-640-pith-epistemic-label-001.
 # [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — Pith
