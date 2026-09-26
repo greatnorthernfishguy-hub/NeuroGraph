@@ -1,5 +1,16 @@
 # tests/test_ng_embed_dualpass.py
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-ngembed-cap-roundrobin-20260926 — #666.
+# What: two tests for _extract_concepts round-robin interleave: (1) with 2 windows
+#   and the default cap of 20, both windows are represented and the exact
+#   interleaved order is asserted against a hand-computed literal list; (2) two
+#   identical windows collapse to a single concept and make 2 TID calls.
+# Why:  a positional union let the head window fill the cap and silently drop
+#   later windows' concepts (#666, Exec P267(2)).
+# How:  _extract_instance() + _TidResp + monkeypatched requests.post; text
+#   "word " * 600 (3000 chars) yields exactly 2 windows.
+# -------------------
 # [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 V-1/V-2/D-2/LAW-5
 #   corrective build.
 # What: (1) Replaced source-grep truncation test with a behavioral test using the
@@ -578,6 +589,55 @@ def test_extract_concepts_unions_then_caps_max_concepts(monkeypatch):
     out = emb._extract_concepts(text)
     assert out == ["alpha", "beta", "gamma"]
     assert calls["n"] >= 2
+
+
+def test_extract_concepts_round_robin_keeps_every_window_under_cap(monkeypatch):
+    import json
+    import requests
+    emb = _extract_instance()
+    text = "word " * 600
+    assert len(emb._char_extract_windows(text)) == 2
+    window0 = [f"w0-c{i:02d}" for i in range(20)]
+    window1 = window0[:5] + [f"w1-c{i:02d}" for i in range(10)]
+    payloads = [json.dumps(window0), json.dumps(window1)]
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        payload = payloads[min(calls["n"], len(payloads) - 1)]
+        calls["n"] += 1
+        return _TidResp(payload)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert len(out) == 20
+    assert len(set(out)) == 20
+    assert any(c.startswith("w1-c") for c in out)
+    expected = [
+        "w0-c00", "w0-c01", "w0-c02", "w0-c03", "w0-c04",
+        "w0-c05", "w1-c00", "w0-c06", "w1-c01", "w0-c07",
+        "w1-c02", "w0-c08", "w1-c03", "w0-c09", "w1-c04",
+        "w0-c10", "w1-c05", "w0-c11", "w1-c06", "w0-c12",
+    ]
+    assert out == expected
+
+
+def test_extract_concepts_identical_windows_single_concept(monkeypatch):
+    import json
+    import requests
+    emb = _extract_instance()
+    text = "word " * 600
+    payloads = [json.dumps(["word"]), json.dumps(["word"])]
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        payload = payloads[min(calls["n"], len(payloads) - 1)]
+        calls["n"] += 1
+        return _TidResp(payload)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out == ["word"]
+    assert calls["n"] == 2
 
 
 def test_extract_concepts_window_failure_returns_none(monkeypatch):

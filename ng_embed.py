@@ -24,6 +24,17 @@ Dual-pass (Punchlist #81 — Josh's invention):
 
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-ngembed-cap-roundrobin-20260926 — #666.
+# What: _extract_concepts now builds its concept union by round-robin interleave
+#   across windows (for rank i, each window contributes its i-th concept in
+#   window order; dedup; first-seen order within a window) before applying the
+#   unchanged max_concepts cap.
+# Why:  the prior positional union let the head window fill the cap and silently
+#   drop later windows' concepts (#666, Exec P267(2)).
+# How:  collect the per-window lists first (still fail-fast None), then
+#   round-robin; max_concepts stays 20, _DEFAULT_CONFIG untouched.
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-dualpass-reconcile-20260926 — P264(2) Task B, Z11 note.
 # What: the NGEmbed.__init__ comment block under "# Dual-pass stats" is reworded
 #   comment-only from "Forest-only warning rate-limit" to name the pass-2
@@ -1175,8 +1186,11 @@ class NGEmbed:
 
         Overlapping windows of `max_content_for_extraction` chars cover the
         full text. Each window is one TID call (same per-call timeout).
-        Window results are unioned in first-seen order, then capped at
-        `max_concepts`.
+        Window results are unioned by round-robin interleave — for rank i,
+        each window contributes its i-th concept in window order (dedup,
+        first-seen order within a window) — then capped at `max_concepts`.
+        A positional union let the head window fill the cap and silently
+        drop later windows' concepts (#666).
 
         Returns the list of concept strings (possibly empty `[]` when TID
         legitimately found none), or **`None`** when any window call FAILED
@@ -1186,14 +1200,20 @@ class NGEmbed:
         """
         union: List[str] = []
         seen = set()
+        per_window: List[List[str]] = []
         for window in self._char_extract_windows(text):
             concepts = self._tid_extract_window(window)
             if concepts is None:
                 return None
-            for concept in concepts:
-                if concept not in seen:
-                    seen.add(concept)
-                    union.append(concept)
+            per_window.append(concepts)
+        max_rank = max((len(concepts) for concepts in per_window), default=0)
+        for i in range(max_rank):
+            for concepts in per_window:
+                if i < len(concepts):
+                    concept = concepts[i]
+                    if concept not in seen:
+                        seen.add(concept)
+                        union.append(concept)
         return union[: self._config["max_concepts"]]
 
     def _extraction_warn_due(self) -> int:
