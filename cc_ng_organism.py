@@ -3,6 +3,13 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-26] Z2 zone manager (Claude Opus 5.5, Claude Code) — B3 fix round 1
+# What: cc_deposit_step docstring: "Always steps, whether or not the dual pass
+#   succeeded" scoped to the hook door. Docstring only; no code change.
+# Why: B3 P187 pair, LE note 3 — the sentence contradicted the new Doors
+#   paragraph (the drains step on applied records only); Chief B3 ruling 001
+#   requires the docstrings corrected.
+# How: one sentence reworded in place.
 # [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
 #   lane z2-b3-kiss-drain-step-001 — the drained turns step; Leg-1 docstring
 #   qualified
@@ -2045,8 +2052,9 @@ def cc_deposit_step(graph, ingested):
 
     Restores what on_message() did before #413 swapped it for the dual pass:
     one graph.step(), the flat 0.1 baseline engagement reward, then hyperedge
-    discovery on that step's own fired set (#543). Always steps, whether or not
-    the dual pass succeeded -- a failed turn is still a timestep. The reward is
+    discovery on that step's own fired set (#543). Once called, it always
+    steps; which calls happen depends on the door (below) -- the hook door
+    calls it whether or not the dual pass succeeded. The reward is
     on_message()'s success-path form (openclaw_hook:1226): only when the turn's
     experience landed (ingested = the dual pass's return) and three_factor is
     enabled -- no phantom credit for a failed deposit (Chief ruling R1).
