@@ -3,6 +3,20 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-26] #640 coding worker (deepseek/deepseek-v3.2, OpenCode/T3 Code) — Pith connected-line label reads `line.epistemic`; `- Keyframe:` becomes `- Root:`
+# What: `_pith_render_connected_line` now reads `CacheLine.epistemic` for the heading
+#   label, showing `"learned from substrate"` only when `line.epistemic == "learned"`;
+#   otherwise shows the `epistemic` value directly. The first bullet changes from
+#   `"- Keyframe:"` to `"- Root:"` per chief-640-ruling-001 Ruling B. CacheLine
+#   docstring updated to mention `_pith_render_connected_line` as reader.
+# Why: chief-640-ruling-001 APPROVE; chief-b1-ruling-003 §2 (LAW 4, wire the field,
+#   do not delete it); PRD §5.3.1 ("learned, never promoted to 'verified'");
+#   punchlist #640.
+# How: `label = "learned from substrate" if line.epistemic == "learned" else line.epistemic`;
+#   `"- Keyframe:"` → `"- Root:"`. New tests:
+#   `test_source_coherence_and_exact_anchors_remain_attached_to_basin` (:161) stays unchanged
+#   (still passes), plus new test A (verified line) and new test B (root label) in
+#   `tests/test_pith_provider_context.py`. Assignment z2-640-pith-epistemic-label-001.
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 r2 — drain_ingest_tract Locking wording
 #   (P187 finding 3)
@@ -3528,7 +3542,7 @@ class CacheLine:
     structure (`member_node_ids`, `relations`, `sources`, `anchors`) are read
     by their owning stages (pith_stage1's dedup/clutter-strip; the provider
     builder/renderer/fitter and anchor rollup). `epistemic` is set by the
-    basin builder and has no production reader yet.
+    basin builder and read by `_pith_render_connected_line` for the heading label.
 
     score carries the emitter's existing score (SurfacingMonitor's salience
     or cc_pattern_completion_recall's strength) verbatim -- Pith re-ranks and
@@ -4900,9 +4914,9 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
 
 def _pith_render_connected_line(line: CacheLine) -> str:
     """Model-facing Markdown for one whole cache line; never renders scores/ids."""
-    label = "learned from substrate"
+    label = "learned from substrate" if line.epistemic == "learned" else line.epistemic
     lines = [f"### Connected assembly [{label}; coherence: {line.coherence}]",
-             f"- Keyframe: {line.content}"]
+             f"- Root: {line.content}"]
     for relation in line.relations:
         lines.append(f"- {relation['kind']}: {relation['content']}")
     if line.sources:
