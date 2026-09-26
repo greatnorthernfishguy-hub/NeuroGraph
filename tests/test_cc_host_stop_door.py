@@ -1,4 +1,18 @@
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
+# What: the inline_thread stub in tests A and C now forwards `**kwargs` to the
+#   target and records them; A and C assert the Stop door's thread got
+#   kwargs == {"step": True}. The host fixture's _deposit spy becomes
+#   `def spy(text, step=False)` recording `(text, step)`; C asserts
+#   `host.deposit_calls == [(msg, True)]`. A still runs the REAL _deposit with
+#   _CC_NG_DEPOSIT_STEP pinned False, so its fake graph needs no step().
+# Why: Chief-p240-commission-001 row z2-one-step-per-turn-001; P241 (Lanes 1 and
+#   2 land together) — the Stop side is the only calling door that steps.
+# How: pass kwargs through, pin the flag off for A. cc_ng_host production code is
+#   unchanged by this round. The twin cc-ng-daemon.py is deliberately untouched
+#   (Z12's item).
+# -------------------
 # [2026-09-26] deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-stop-door-restore-001 fix round r2 — make test A prove P240(1b)
 # What: test A now runs the REAL cc_ng_host._deposit -> REAL
@@ -127,8 +141,8 @@ def base_host(monkeypatch):
 @pytest.fixture
 def host(base_host, monkeypatch):
     """Rig whose cc_ng_host._deposit is a recording spy (tests B and C)."""
-    def spy(text):
-        base_host.deposit_calls.append(text)
+    def spy(text, step=False):
+        base_host.deposit_calls.append((text, step))
     monkeypatch.setattr(cc_ng_host, '_deposit', spy)
     return base_host
 
@@ -147,11 +161,11 @@ def test_stop_with_want_materializes_want_node(base_host, monkeypatch):
     thread_calls = []
     original_thread = threading.Thread
 
-    def inline_thread(target=None, args=(), daemon=False, **kwargs):
+    def inline_thread(target=None, args=(), daemon=False, kwargs=None, **extra):
         if target:
-            target(*args)
+            target(*args, **(kwargs or {}))
         thread_obj = original_thread()
-        thread_calls.append((target, args, daemon))
+        thread_calls.append((target, args, daemon, kwargs))
         return thread_obj
 
     monkeypatch.setattr(cc_ng_host.threading, 'Thread', inline_thread)
@@ -165,9 +179,10 @@ def test_stop_with_want_materializes_want_node(base_host, monkeypatch):
 
     # The door launched exactly one daemon deposit carrying the exact message.
     assert len(thread_calls) == 1
-    target, args, daemon = thread_calls[0]
+    target, args, daemon, kwargs = thread_calls[0]
     assert daemon is True
     assert args == (msg,)
+    assert kwargs == {"step": True}
 
     # The REAL _deposit ran end-to-end and the REAL surface_wants_for_graph
     # materialized the WANT as a first-class want node in CC's graph.
@@ -211,11 +226,11 @@ def test_stop_non_empty_calls_deposit_with_exact_text(host, monkeypatch):
     thread_calls = []
     original_thread = threading.Thread
     
-    def inline_thread(target=None, args=(), daemon=False, **kwargs):
+    def inline_thread(target=None, args=(), daemon=False, kwargs=None, **extra):
         if target:
-            target(*args)
+            target(*args, **(kwargs or {}))
         thread_obj = original_thread()
-        thread_calls.append((target, args, daemon))
+        thread_calls.append((target, args, daemon, kwargs))
         return thread_obj
     
     monkeypatch.setattr(cc_ng_host.threading, 'Thread', inline_thread)
@@ -225,12 +240,13 @@ def test_stop_non_empty_calls_deposit_with_exact_text(host, monkeypatch):
     
     assert result == {"ok": True}
     assert len(thread_calls) == 1
-    target, args, daemon = thread_calls[0]
+    target, args, daemon, kwargs = thread_calls[0]
     assert daemon is True
     assert args == (msg,)
+    assert kwargs == {"step": True}
 
-    # The deposit itself (spy in this fixture) got the text exactly once.
-    assert host.deposit_calls == [msg]
+    # The deposit itself (spy in this fixture) got the text once, step=True.
+    assert host.deposit_calls == [(msg, True)]
 
 
 def test_stop_never_returns_context(host):

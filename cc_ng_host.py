@@ -27,6 +27,18 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
+# What: _deposit gains step=False. Only the Stop-side deposit passes step=True
+#   and so calls cc_deposit_step, once per turn, after the reply deposit. The
+#   prompt-side, pith-failure and PostToolUse deposits never step. The flag
+#   _CC_NG_DEPOSIT_STEP is unchanged (Lane 3 removes it).
+# Why: Chief-p240-commission-001 row z2-one-step-per-turn-001; P241 (Lanes 1 and
+#   2 land together); canonical cardinality: Syl's handle_after_turn does
+#   exactly one graph.step() per turn.
+# How: signature default + `if step and _CC_NG_DEPOSIT_STEP`; _handle_stop sends
+#   kwargs={"step": True}. The twin docs/scripts/cc-ng-daemon.py is deliberately
+#   untouched (Z12's item).
 # [2026-09-26] deepseek/deepseek-v3.2 (opencode, T3 Code harness) —
 #   lane z2-stop-door-restore-001 — Exec P240(1): restore the missing `Stop` native door
 # What: Add "Stop": _handle_stop to _DISPATCH table. Add _handle_stop(data) that reads
@@ -598,7 +610,7 @@ def get_cc_memory():
 # NG operations (hook side) — acquire graph._concurrent_lock blocking.
 # =============================================================================
 
-def _deposit(text: str) -> None:
+def _deposit(text: str, step: bool = False) -> None:
     ng = _STATE.cc_ng
     if ng is None or not text:
         return
@@ -609,10 +621,11 @@ def _deposit(text: str) -> None:
     # Extract -> Chunk -> Embed -> Register") and chunked every turn as if it
     # were a document. #294 Task A built the ingestor-free path in June and the
     # tract drain uses it; this call site was the old door left standing.
-    # Lane C (ii-a): on_message() also stepped once and gave the 0.1 baseline
-    # reward; cc_deposit_step restores both (CC_NG_DEPOSIT_STEP, default off)
-    # and discovers hyperedges on that step's fired set (#543). Flag off keeps
-    # the previous _recent_spikes discovery unchanged.
+    # P240(2): only the Stop-side deposit (step=True) steps -- once per turn,
+    # after the reply deposit, and only with CC_NG_DEPOSIT_STEP on. Every other
+    # deposit (prompt side, pith failure, PostToolUse) takes the non-step path,
+    # exactly as today's flag-off path: the previous _recent_spikes discovery,
+    # byte-for-byte unchanged.
     from ng_embed import EmbeddingUnavailableError, embed as _embed
     try:
         embedding = _embed(text)
@@ -626,7 +639,7 @@ def _deposit(text: str) -> None:
         with ng.graph._concurrent_lock:
             ingested = cc_ng_organism.run_conversational_dual_pass(
                 ng.graph, getattr(ng, "vector_db", None), text, embedding, _STATE.conv_state)
-            if cc_ng_organism._CC_NG_DEPOSIT_STEP:
+            if step and cc_ng_organism._CC_NG_DEPOSIT_STEP:
                 cc_ng_organism.cc_deposit_step(ng.graph, ingested)
             else:
                 fired = [
@@ -1117,7 +1130,7 @@ def _handle_stop(data):
     msg = data.get("last_assistant_message")
     if not isinstance(msg, str) or not msg.strip():
         return {"ok": True}
-    threading.Thread(target=_deposit, args=(msg,), daemon=True).start()
+    threading.Thread(target=_deposit, args=(msg,), kwargs={"step": True}, daemon=True).start()
     return {"ok": True}
 
 
@@ -1171,7 +1184,8 @@ def _handle_post_tool_use(data):
     # violation. Tool experience goes to CC's Commons only
     # (_deposit_tool_experience), never the graph, so no reward is injected
     # here. The flat, content-independent 0.1 baseline reward lives on the
-    # conversational path: cc_deposit_step after _deposit's dual pass
+    # Stop-side conversational deposit, once per turn: cc_deposit_step after
+    # _deposit's dual pass when _handle_stop passes step=True
     # (CC_NG_DEPOSIT_STEP, default off), the same form as on_message() and
     # Syl's handle_after_turn -- "surprise-driven crystallization is the
     # primary reward pathway, this is the heartbeat, not the main event."

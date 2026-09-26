@@ -1,4 +1,21 @@
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
+# What: host-section tests updated for the `step` parameter on cc_ng_host._deposit.
+#   The three former test_host_flag_on_* tests are renamed test_host_stop_side_*
+#   and call `_deposit('a turn', step=True)`. New:
+#   test_host_prompt_side_does_not_step_even_with_flag_on,
+#   test_one_turn_steps_exactly_once (UserPromptSubmit + Stop -> exactly one step),
+#   test_post_tool_use_never_steps. test_host_flag_off_is_the_previous_path also
+#   asserts the flag-off non-step path for step=True.
+# Why: Chief-p240-commission-001 row z2-one-step-per-turn-001; P241 (Lanes 1 and 2
+#   land together); Z11 return (PostToolUse does not step); canonical cardinality:
+#   Syl's handle_after_turn does exactly one graph.step() per turn.
+# How: drives the real _deposit and dispatch table with an inline Thread that
+#   forwards kwargs; host-level _nudge/_recall and organism-level
+#   render_constitutional_core/render_wants are patched to no-ops. The daemon
+#   section is deliberately untouched (its twin cc-ng-daemon.py is Z12's item).
+# -------------------
 # [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
 #   lane z2-b3-kiss-drain-step-001 — the drains step + #643 lock scope
 # What: new tests for the two drains calling cc_deposit_step once per APPLIED
@@ -188,9 +205,9 @@ def host(monkeypatch):
     return types.SimpleNamespace(mod=cc_ng_host, graph=g, dual_pass=fake_dual_pass)
 
 
-def test_host_flag_on_steps_after_dual_pass_inside_concurrent_lock(host, monkeypatch):
+def test_host_stop_side_steps_after_dual_pass_inside_concurrent_lock(host, monkeypatch):
     monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
-    host.mod._deposit('a turn')
+    host.mod._deposit('a turn', step=True)
     ev = host.graph.events
     assert ev[:3] == [('enter', 'concurrent'), ('dual_pass', True), ('enter', 'step')]
     assert ev[-2:] == [('exit', 'step'), ('exit', 'concurrent')]
@@ -198,18 +215,18 @@ def test_host_flag_on_steps_after_dual_pass_inside_concurrent_lock(host, monkeyp
     assert host.graph.discovered == [['n1', 'n2']]
 
 
-def test_host_flag_on_steps_even_when_the_dual_pass_fails(host, monkeypatch):
+def test_host_stop_side_steps_even_when_the_dual_pass_fails(host, monkeypatch):
     monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
     host.dual_pass.ok = False
-    host.mod._deposit('a turn')
+    host.mod._deposit('a turn', step=True)
     assert ('step', True) in host.graph.events
     # R1: the failed turn is still a timestep, but earns no reward.
     assert host.graph.rewards == []
 
 
-def test_host_flag_on_rewards_a_landed_turn(host, monkeypatch):
+def test_host_stop_side_rewards_a_landed_turn(host, monkeypatch):
     monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
-    host.mod._deposit('a turn')
+    host.mod._deposit('a turn', step=True)
     assert host.graph.rewards == [0.1]
 
 
@@ -223,13 +240,76 @@ def test_host_flag_off_is_the_previous_path(host, monkeypatch):
     assert host.graph.discovered == [['stale']]
     assert ev == [('enter', 'concurrent'), ('dual_pass', True),
                   ('discover', False), ('exit', 'concurrent')]
+    # Flag off stays the non-step path even when the Stop side asks for a step.
+    host.graph.events.clear()
+    host.graph.discovered.clear()
+    host.graph.rewards.clear()
+    host.mod._deposit('a turn', step=True)
+    ev = host.graph.events
+    assert not any(e[0] == 'step' for e in ev)
+    assert host.graph.rewards == []
+    assert host.graph.discovered == [['stale']]
+    assert ev == [('enter', 'concurrent'), ('dual_pass', True),
+                  ('discover', False), ('exit', 'concurrent')]
+
+
+def test_host_prompt_side_does_not_step_even_with_flag_on(host, monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+    host.mod._deposit('a turn')
+    ev = host.graph.events
+    assert not any(e[0] == 'step' for e in ev)
+    assert host.graph.rewards == []
+    assert ev == [('enter', 'concurrent'), ('dual_pass', True),
+                  ('discover', False), ('exit', 'concurrent')]
+
+
+def test_one_turn_steps_exactly_once(host, monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+    monkeypatch.setattr(host.mod, '_nudge', lambda text: None)
+    monkeypatch.setattr(host.mod, '_recall', lambda *a, **k: "")
+    monkeypatch.setattr(cc_ng_organism, 'render_constitutional_core',
+                        lambda *a, **k: "")
+    monkeypatch.setattr(cc_ng_organism, 'render_wants', lambda *a, **k: [])
+
+    original_thread = threading.Thread
+    thread_calls = []
+
+    def inline_thread(target=None, args=(), daemon=False, kwargs=None, **extra):
+        if target:
+            target(*args, **(kwargs or {}))
+        thread_obj = original_thread()
+        thread_calls.append((target, args, kwargs))
+        return thread_obj
+
+    monkeypatch.setattr(host.mod.threading, 'Thread', inline_thread)
+
+    host.mod._DISPATCH["UserPromptSubmit"]({"prompt": "a prompt"})
+    host.mod._DISPATCH["Stop"]({"last_assistant_message": "a reply"})
+
+    step_enters = [e for e in host.graph.events if e == ('enter', 'step')]
+    assert len(step_enters) == 1
+    # The one step came from the Stop side (kwargs step=True), not the prompt.
+    assert not thread_calls[0][2]
+    assert thread_calls[1][2] == {"step": True}
+
+
+def test_post_tool_use_never_steps(host, monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+    monkeypatch.setattr(cc_ng_organism, 'deposit_cc_experience',
+                        lambda *a, **k: None)
+    host.mod._DISPATCH["PostToolUse"]({
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/tmp/x"},
+        "tool_response": "contents",
+    })
+    assert not any(e[0] == 'step' for e in host.graph.events)
 
 
 def test_host_step_failure_does_not_count_a_deposit_error(host, monkeypatch):
     monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
     host.graph._step_raises = RuntimeError('boom')
     before = host.mod._STATE.stats['errors']
-    host.mod._deposit('a turn')
+    host.mod._deposit('a turn', step=True)
     assert host.mod._STATE.stats['errors'] == before
 
 

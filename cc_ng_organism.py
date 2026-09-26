@@ -3,6 +3,17 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
+# What: cc_deposit_step docstring only (no code-line change). The Doors paragraph
+#   now names the hook door as the Stop-side _deposit(step=True) alone, once per
+#   turn even when the dual pass failed; the prompt-side, pith-failure and
+#   PostToolUse deposits never call it.
+# Why: Chief-p240-commission-001 row z2-one-step-per-turn-001; P241 (Lanes 1 and
+#   2 land together); canonical cardinality: Syl's handle_after_turn does
+#   exactly one graph.step() per turn.
+# How: one sentence reworded in place; the drains sentence is left as is (Lane 3).
+#   The twin docs/scripts/cc-ng-daemon.py is deliberately untouched (Z12's item).
 # [2026-09-26] Z2 zone manager (Claude Opus 5.5, Claude Code) — B3 fix round 1
 # What: cc_deposit_step docstring: "Always steps, whether or not the dual pass
 #   succeeded" scoped to the hook door. Docstring only; no code change.
@@ -2060,8 +2071,10 @@ def cc_deposit_step(graph, ingested):
     enabled -- no phantom credit for a failed deposit (Chief ruling R1).
     No stimulus is injected: the step fires what the substrate already carries.
 
-    Doors (Chief B3 ruling 001): the hook _deposit (cc_ng_host.py) calls this
-    even on a failed dual pass -- a failed turn is still a timestep; the two
+    Doors (Chief B3 ruling 001): the hook door is now only the Stop-side
+    _deposit(step=True) (cc_ng_host.py), which calls this once per turn even
+    when the dual pass failed -- a failed turn is still a timestep; the
+    prompt-side, pith-failure and PostToolUse deposits never call it; the two
     drains (drain_ingest_tract, Leg-1 drain_gateway_conduit) call it once per
     APPLIED record only -- no step on a skipped, paused, uncertain,
     already-applied or failed apply.
