@@ -28,6 +28,19 @@ were confirmed before this module was enabled.
 
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: the Stop door steps unconditionally
+# What: _deposit's gate is now `if step:` (the flag is removed), so the Stop-side
+#   deposit steps once per turn with no flag; the else path is byte-identical.
+#   The comment above it and the _handle_post_tool_use / _autosave_loop comments
+#   no longer name the flag. The #643 lock is intact.
+# Why: Exec P240(3) (chief-p240-commission-001), P242; Chief's approval of the
+#   Z2 Lane 3 proposal. The twin cc-ng-daemon.py is deliberately untouched
+#   (Z12's rebuild item); the drains stay for P240(4).
+# How: `if step and cc_ng_organism._CC_NG_DEPOSIT_STEP:` -> `if step:`;
+#   comment-only elsewhere. R2's AUTOSTEP pairing becomes an activation
+#   condition; do not flip CC_NG_AUTOSTEP.
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
 # What: _deposit gains step=False. Only the Stop-side deposit passes step=True
 #   and so calls cc_deposit_step, once per turn, after the reply deposit. The
@@ -621,11 +634,11 @@ def _deposit(text: str, step: bool = False) -> None:
     # Extract -> Chunk -> Embed -> Register") and chunked every turn as if it
     # were a document. #294 Task A built the ingestor-free path in June and the
     # tract drain uses it; this call site was the old door left standing.
-    # P240(2): only the Stop-side deposit (step=True) steps -- once per turn,
-    # after the reply deposit, and only with CC_NG_DEPOSIT_STEP on. Every other
-    # deposit (prompt side, pith failure, PostToolUse) takes the non-step path,
-    # exactly as today's flag-off path: the previous _recent_spikes discovery,
-    # byte-for-byte unchanged.
+    # P240(2)/(3): only the Stop-side deposit (step=True) steps -- once per
+    # turn, after the reply deposit, unconditionally (the flag's gate is
+    # removed, P240(3)). Every other deposit (prompt side, pith failure,
+    # PostToolUse) takes the non-step path: the previous _recent_spikes
+    # discovery, byte-for-byte unchanged.
     from ng_embed import EmbeddingUnavailableError, embed as _embed
     try:
         embedding = _embed(text)
@@ -639,7 +652,7 @@ def _deposit(text: str, step: bool = False) -> None:
         with ng.graph._concurrent_lock:
             ingested = cc_ng_organism.run_conversational_dual_pass(
                 ng.graph, getattr(ng, "vector_db", None), text, embedding, _STATE.conv_state)
-            if step and cc_ng_organism._CC_NG_DEPOSIT_STEP:
+            if step:
                 cc_ng_organism.cc_deposit_step(ng.graph, ingested)
             else:
                 fired = [
@@ -1185,10 +1198,10 @@ def _handle_post_tool_use(data):
     # (_deposit_tool_experience), never the graph, so no reward is injected
     # here. The flat, content-independent 0.1 baseline reward lives on the
     # Stop-side conversational deposit, once per turn: cc_deposit_step after
-    # _deposit's dual pass when _handle_stop passes step=True
-    # (CC_NG_DEPOSIT_STEP, default off), the same form as on_message() and
-    # Syl's handle_after_turn -- "surprise-driven crystallization is the
-    # primary reward pathway, this is the heartbeat, not the main event."
+    # _deposit's dual pass when _handle_stop passes step=True, the same form as
+    # on_message() and Syl's handle_after_turn -- "surprise-driven
+    # crystallization is the primary reward pathway, this is the heartbeat,
+    # not the main event."
     _deposit_tool_experience(experience)
 
     return {"ok": True}
@@ -1495,8 +1508,7 @@ def _autosave_loop() -> None:
                     surface_wants, generate_emergent_want, drain_ingest_tract,
                     cc_update_probation,
                 )
-                # #643: the drain mutates the graph (the dual pass, and with
-                # CC_NG_DEPOSIT_STEP the per-record cc_deposit_step), so it runs
+                # #643: the drain mutates the graph (the dual pass), so it runs
                 # under graph._concurrent_lock, which both require. Scoped to the
                 # drain only -- probation/want surfacing stay outside, as before.
                 with _STATE.cc_ng.graph._concurrent_lock:

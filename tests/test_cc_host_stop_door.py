@@ -1,5 +1,16 @@
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: the flag is gone
+# What: the host fixture's _CC_NG_DEPOSIT_STEP=False pin is removed; test A (the
+#   REAL _deposit path) now monkeypatches cc_ng_organism.cc_deposit_step with a
+#   recording spy and asserts it was called exactly once (the Stop side steps
+#   once, unconditionally). Its fake graph still needs no step().
+# Why: Exec P240(3) (chief-p240-commission-001) and P242 — the Stop-side deposit
+#   steps once per turn with no flag; the twin cc-ng-daemon.py is deliberately
+#   untouched (Z12's rebuild item).
+# How: record only; cc_ng_host production code was already changed by P240(2).
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
 # What: the inline_thread stub in tests A and C now forwards `**kwargs` to the
 #   target and records them; A and C assert the Stop door's thread got
@@ -122,7 +133,7 @@ def _base_setup(monkeypatch):
     monkeypatch.setattr(ng_embed, 'embed', fake_embed)
     monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', fake_dual_pass)
     monkeypatch.setattr(cc_ng_organism, 'deposit_cc_experience', lambda *a, **k: None)
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
+
     return types.SimpleNamespace(
         mod=cc_ng_host,
         graph=g,
@@ -156,6 +167,11 @@ def test_stop_with_want_materializes_want_node(base_host, monkeypatch):
     g = base_host.graph
     phrase = "learn Python"
     msg = f"Here is my reply [WANT]{phrase}[/WANT] and some other text"
+
+    # The Stop side now steps once, unconditionally (P240(3)): record the call.
+    step_calls = []
+    monkeypatch.setattr(cc_ng_organism, 'cc_deposit_step',
+                        lambda *a, **k: step_calls.append(a))
 
     # Run the daemon thread target inline.
     thread_calls = []
@@ -191,6 +207,9 @@ def test_stop_with_want_materializes_want_node(base_host, monkeypatch):
     assert len(want_nodes) == 1
     assert want_nodes[0].metadata["want_text"] == phrase
     assert want_nodes[0].metadata["want_state"] == "open"
+
+    # P240(3): the one Stop-side deposit stepped exactly once, no flag.
+    assert len(step_calls) == 1
 
 
 def test_stop_empty_or_absent_no_deposit(host):

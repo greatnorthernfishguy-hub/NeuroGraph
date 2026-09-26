@@ -1,4 +1,14 @@
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: the drain no longer steps
+# What: the rig namespace stub _CC_NG_DEPOSIT_STEP=False is removed; the output
+#   gate removed the drain's read of that global, so the AST-extracted
+#   drain_gateway_conduit no longer resolves the name in this namespace.
+# Why: Exec P240(3) (chief-p240-commission-001) and P242 — drain_gateway_conduit
+#   never calls cc_deposit_step; the twin cc-ng-daemon.py is deliberately
+#   untouched (Z12's rebuild item).
+# How: one name removed from ns, mirroring the production deletion.
+# -------------------
 # [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
 #   lane z2-b3-kiss-drain-step-001 — rig ns provides _CC_NG_DEPOSIT_STEP
 # What: the rig namespace now also stubs _CC_NG_DEPOSIT_STEP=False.
@@ -36,7 +46,6 @@ def rig(tmp_path, monkeypatch):
     tree = ast.parse(source.read_text())
     ns = dict(os=os, glob=glob, uuid=uuid, logger=logging.getLogger('test'),
               _CC_CALLOSUM_LEG1_ENABLED=True,
-              _CC_NG_DEPOSIT_STEP=False,
               _CC_GATEWAY_CONDUIT_GLOB='*_cc_gateway.*.tract')
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and
                  n.name in ('drain_gateway_conduit', '_apply_gateway_experience')]

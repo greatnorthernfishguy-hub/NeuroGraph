@@ -1,5 +1,19 @@
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: drop the flag and every drain step
+# What: every monkeypatch of cc_ng_organism._CC_NG_DEPOSIT_STEP is removed, with
+#   the flag-default test; the host-door tests are rewritten to Lane 2's plain
+#   step=True / step=False cases; the B3 drain tests now prove each drain never
+#   steps (timestep unchanged, zero cc_deposit_step calls) for applied records
+#   and for a failed apply; the twin daemon tests are removed with the organism
+#   flag they monkeypatched. New test_flag_attribute_is_gone.
+# Why: Exec P240(3) (chief-p240-commission-001) and P242 — the Stop-side deposit
+#   steps once unconditionally; the two drains never step. The laptop daemon
+#   (docs/scripts/cc-ng-daemon.py) is deliberately untouched (Z12's rebuild item).
+# How: real cc_ng_organism drains over a real Graph, spy on
+#   cc_ng_organism.cc_deposit_step; runs unedited except for the flag removal.
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
 # What: host-section tests updated for the `step` parameter on cc_ng_host._deposit.
 #   The three former test_host_flag_on_* tests are renamed test_host_stop_side_*
@@ -51,7 +65,6 @@
 #   CC_NG_DAEMON_SCRIPT points the daemon tests at a worktree copy of the script
 #   (default ~/docs/scripts/cc-ng-daemon.py).
 # -------------------
-import importlib.util
 import os
 import sys
 import threading
@@ -116,11 +129,8 @@ class _FakeGraph:
 
 # ---- cc_deposit_step ----
 
-def test_default_flag_is_off():
-    env = os.environ.get('CC_NG_DEPOSIT_STEP')
-    if env not in (None, '', '0', 'false', 'False'):
-        pytest.skip('CC_NG_DEPOSIT_STEP set in this environment')
-    assert cc_ng_organism._CC_NG_DEPOSIT_STEP is False
+def test_flag_attribute_is_gone():
+    assert not hasattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP')
 
 
 def test_steps_rewards_then_discovers_on_the_steps_fired_set_under_step_lock():
@@ -205,8 +215,7 @@ def host(monkeypatch):
     return types.SimpleNamespace(mod=cc_ng_host, graph=g, dual_pass=fake_dual_pass)
 
 
-def test_host_stop_side_steps_after_dual_pass_inside_concurrent_lock(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+def test_host_stop_side_steps_after_dual_pass_inside_concurrent_lock(host):
     host.mod._deposit('a turn', step=True)
     ev = host.graph.events
     assert ev[:3] == [('enter', 'concurrent'), ('dual_pass', True), ('enter', 'step')]
@@ -215,8 +224,7 @@ def test_host_stop_side_steps_after_dual_pass_inside_concurrent_lock(host, monke
     assert host.graph.discovered == [['n1', 'n2']]
 
 
-def test_host_stop_side_steps_even_when_the_dual_pass_fails(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+def test_host_stop_side_steps_even_when_the_dual_pass_fails(host):
     host.dual_pass.ok = False
     host.mod._deposit('a turn', step=True)
     assert ('step', True) in host.graph.events
@@ -224,14 +232,12 @@ def test_host_stop_side_steps_even_when_the_dual_pass_fails(host, monkeypatch):
     assert host.graph.rewards == []
 
 
-def test_host_stop_side_rewards_a_landed_turn(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+def test_host_stop_side_rewards_a_landed_turn(host):
     host.mod._deposit('a turn', step=True)
     assert host.graph.rewards == [0.1]
 
 
-def test_host_flag_off_is_the_previous_path(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
+def test_host_default_deposit_is_the_previous_path(host):
     host.mod._deposit('a turn')
     ev = host.graph.events
     assert not any(e[0] == 'step' for e in ev)
@@ -240,21 +246,9 @@ def test_host_flag_off_is_the_previous_path(host, monkeypatch):
     assert host.graph.discovered == [['stale']]
     assert ev == [('enter', 'concurrent'), ('dual_pass', True),
                   ('discover', False), ('exit', 'concurrent')]
-    # Flag off stays the non-step path even when the Stop side asks for a step.
-    host.graph.events.clear()
-    host.graph.discovered.clear()
-    host.graph.rewards.clear()
-    host.mod._deposit('a turn', step=True)
-    ev = host.graph.events
-    assert not any(e[0] == 'step' for e in ev)
-    assert host.graph.rewards == []
-    assert host.graph.discovered == [['stale']]
-    assert ev == [('enter', 'concurrent'), ('dual_pass', True),
-                  ('discover', False), ('exit', 'concurrent')]
 
 
-def test_host_prompt_side_does_not_step_even_with_flag_on(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+def test_host_prompt_side_does_not_step(host):
     host.mod._deposit('a turn')
     ev = host.graph.events
     assert not any(e[0] == 'step' for e in ev)
@@ -264,7 +258,6 @@ def test_host_prompt_side_does_not_step_even_with_flag_on(host, monkeypatch):
 
 
 def test_one_turn_steps_exactly_once(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
     monkeypatch.setattr(host.mod, '_nudge', lambda text: None)
     monkeypatch.setattr(host.mod, '_recall', lambda *a, **k: "")
     monkeypatch.setattr(cc_ng_organism, 'render_constitutional_core',
@@ -294,7 +287,6 @@ def test_one_turn_steps_exactly_once(host, monkeypatch):
 
 
 def test_post_tool_use_never_steps(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
     monkeypatch.setattr(cc_ng_organism, 'deposit_cc_experience',
                         lambda *a, **k: None)
     host.mod._DISPATCH["PostToolUse"]({
@@ -305,67 +297,11 @@ def test_post_tool_use_never_steps(host, monkeypatch):
     assert not any(e[0] == 'step' for e in host.graph.events)
 
 
-def test_host_step_failure_does_not_count_a_deposit_error(host, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+def test_host_step_failure_does_not_count_a_deposit_error(host):
     host.graph._step_raises = RuntimeError('boom')
     before = host.mod._STATE.stats['errors']
     host.mod._deposit('a turn', step=True)
     assert host.mod._STATE.stats['errors'] == before
-
-
-# ---- laptop daemon _deposit ----
-
-def _load_daemon():
-    path = os.environ.get('CC_NG_DAEMON_SCRIPT',
-                          os.path.expanduser('~/docs/scripts/cc-ng-daemon.py'))
-    spec = importlib.util.spec_from_file_location('cc_ng_daemon_deposit_step', path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules['cc_ng_daemon_deposit_step'] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture
-def daemon(monkeypatch):
-    mod = _load_daemon()
-    import ng_embed
-    g = _FakeGraph()
-
-    def fake_dual_pass(graph, vdb, text, emb, state):
-        g.events.append(('dual_pass', graph._concurrent_lock.held))
-        return fake_dual_pass.ok
-    fake_dual_pass.ok = True
-
-    monkeypatch.setattr(mod.STATE, 'ng', types.SimpleNamespace(graph=g, vector_db=None))
-    monkeypatch.setattr(ng_embed, 'embed', lambda text: [0.0])
-    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', fake_dual_pass)
-    monkeypatch.setattr(cc_ng_organism, 'deposit_cc_experience', lambda *a, **k: None)
-    return types.SimpleNamespace(mod=mod, graph=g, dual_pass=fake_dual_pass)
-
-
-def test_daemon_flag_on_steps_after_dual_pass_inside_concurrent_lock(daemon, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
-    daemon.mod._deposit('a turn')
-    ev = daemon.graph.events
-    assert ev[:3] == [('enter', 'concurrent'), ('dual_pass', True), ('enter', 'step')]
-    assert ev[-2:] == [('exit', 'step'), ('exit', 'concurrent')]
-    assert daemon.graph.rewards == [0.1]
-    assert daemon.graph.discovered == [['n1', 'n2']]
-
-
-def test_daemon_flag_on_failed_dual_pass_steps_without_reward(daemon, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
-    daemon.dual_pass.ok = False
-    daemon.mod._deposit('a turn')
-    assert ('step', True) in daemon.graph.events
-    assert daemon.graph.rewards == []
-
-
-def test_daemon_flag_off_is_the_previous_path(daemon, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
-    daemon.mod._deposit('a turn')
-    assert daemon.graph.events == [('enter', 'concurrent'), ('dual_pass', True),
-                                   ('exit', 'concurrent')]
 
 
 # ---- the drains step (B3: assignment z2-b3-kiss-drain-step-001) ----
@@ -376,8 +312,7 @@ def leg1(tmp_path, monkeypatch):
     tests/test_cc_gateway_durable.py (conduit dir, journal, MACHINE_ID,
     refused save) but calls the real cc_ng_organism.drain_gateway_conduit
     with a real neuro_foundation.Graph: the durable rig AST-extracts the
-    drain into a bare namespace that the mandated
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', ...) cannot
+    drain into a bare namespace that module-level monkeypatches cannot
     reach, and its SimpleNamespace graph has no step clock to assert on."""
     import ng_embed
     monkeypatch.setattr(cc_ng_organism, '_CC_CALLOSUM_LEG1_ENABLED', True)
@@ -425,9 +360,8 @@ def leg1(tmp_path, monkeypatch):
                                  add=add, drain=drain, state=state, calls=calls)
 
 
-def test_flag_on_drain_ingest_tract_steps_once_per_absorbed_entry(cc_ng, tmp_path, monkeypatch):
+def test_drain_ingest_tract_never_steps(cc_ng, tmp_path, monkeypatch):
     import ng_tract
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
     tract_path = str(tmp_path / 'turns.tract')
     for raw in (b'turn one lands', b'turn two lands', b'turn three fails the dual pass'):
         ng_tract.deposit_experience(raw=raw, source='cc_gateway', tract_paths=[tract_path])
@@ -438,25 +372,9 @@ def test_flag_on_drain_ingest_tract_steps_once_per_absorbed_entry(cc_ng, tmp_pat
         return True
 
     monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', dual_pass)
-
-    if not hasattr(cc_ng.graph, '_concurrent_lock'):
-        cc_ng.graph._concurrent_lock = threading.RLock()
-    before = cc_ng.graph.timestep
-    with cc_ng.graph._concurrent_lock:
-        absorbed = cc_ng_organism.drain_ingest_tract(
-            cc_ng.graph, cc_ng.vector_db, {'last_forest_id': None},
-            tract_path=tract_path)
-    assert absorbed == 2
-    assert cc_ng.graph.timestep == before + 2
-
-
-def test_flag_off_drain_ingest_tract_does_not_step(cc_ng, tmp_path, monkeypatch):
-    import ng_tract
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
-    tract_path = str(tmp_path / 'turns.tract')
-    for raw in (b'flag off turn one', b'flag off turn two'):
-        ng_tract.deposit_experience(raw=raw, source='cc_gateway', tract_paths=[tract_path])
-    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', lambda *a: True)
+    steps = []
+    monkeypatch.setattr(cc_ng_organism, 'cc_deposit_step',
+                        lambda *a, **k: steps.append(a))
 
     if not hasattr(cc_ng.graph, '_concurrent_lock'):
         cc_ng.graph._concurrent_lock = threading.RLock()
@@ -467,29 +385,40 @@ def test_flag_off_drain_ingest_tract_does_not_step(cc_ng, tmp_path, monkeypatch)
             tract_path=tract_path)
     assert absorbed == 2
     assert cc_ng.graph.timestep == before
+    assert steps == []
 
 
-def test_flag_on_drain_gateway_conduit_steps_once_per_applied_record(leg1, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+def test_drain_gateway_conduit_never_steps(leg1, monkeypatch):
+    steps = []
+    monkeypatch.setattr(cc_ng_organism, 'cc_deposit_step',
+                        lambda *a, **k: steps.append(a))
     leg1.add()
     before = leg1.graph.timestep
     result = leg1.drain()
     assert result['applied'] == 2
-    assert leg1.graph.timestep == before + 2
+    assert leg1.graph.timestep == before
+    assert steps == []
     second = leg1.drain()
     assert second['applied'] == 0
     assert second['uncertain'] == 0
     assert len(leg1.calls) == 2
-    assert leg1.graph.timestep == before + 2
+    assert leg1.graph.timestep == before
+    assert steps == []
 
 
-def test_flag_off_drain_gateway_conduit_does_not_step(leg1, monkeypatch):
-    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
-    leg1.add(texts=('flag off leg one turn',))
+def test_drain_gateway_conduit_failed_apply_never_steps(leg1, monkeypatch):
+    steps = []
+    monkeypatch.setattr(cc_ng_organism, 'cc_deposit_step',
+                        lambda *a, **k: steps.append(a))
+    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass',
+                        lambda *a: False)
+    leg1.add(texts=('a record the dual pass refuses',))
     before = leg1.graph.timestep
     result = leg1.drain()
-    assert result['applied'] == 1
+    assert result['applied'] == 0
+    assert result['uncertain'] == 1
     assert leg1.graph.timestep == before
+    assert steps == []
 
 
 def test_autosave_loop_drains_the_tract_under_concurrent_lock_643(cc_ng, tmp_path, monkeypatch):

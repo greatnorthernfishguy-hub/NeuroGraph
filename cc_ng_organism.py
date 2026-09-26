@@ -4,6 +4,21 @@
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: drop the deposit-step flag
+# What: the _CC_NG_DEPOSIT_STEP flag and its comment are deleted; the two drain
+#   step sites in drain_ingest_tract and drain_gateway_conduit are deleted, so
+#   neither drain ever steps; cc_deposit_step stays (its only caller is the
+#   Stop-side host door, via P240(3)'s unconditional `if step:`). The Doors
+#   paragraph, the drain docstrings and the cc_novelty docstring no longer name
+#   the flag. The #643 lock is intact and the twin cc-ng-daemon.py is untouched
+#   (Z12's rebuild item); the drains stay for P240(4).
+# Why: Exec P240(3) (chief-p240-commission-001), P242 (transcripts don't step
+#   the graph) and Chief's approval of the Z2 Lane 3 proposal.
+# How: flag and both `if _CC_NG_DEPOSIT_STEP:` blocks removed; comment/docstring
+#   corrections only elsewhere. R2's AUTOSTEP pairing becomes an activation
+#   condition (gate removed per P240(3)); do not flip CC_NG_AUTOSTEP.
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-one-step-per-turn-001 — Exec P240(2)/P241: one step per turn
 # What: cc_deposit_step docstring only (no code-line change). The Doors paragraph
 #   now names the hook door as the Stop-side _deposit(step=True) alone, once per
@@ -2050,14 +2065,6 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
         return False
 
 
-# Lane C (ii-a): the deposit steps. Default OFF -- flipping it advances
-# graph.timestep once per deposit, which ages unbound nodes toward the orphan
-# sweep, so it waits on the same gate as CC_NG_AUTOSTEP (CALLOSUM-TRUTH §8.13
-# _unbound_nodes empty, the one-heartbeat tick, Packet 099). Executive-ruled flip.
-# Never flipped alone: with CC_NG_AUTOSTEP on the same beat or after it (R2, #117).
-_CC_NG_DEPOSIT_STEP = os.environ.get("CC_NG_DEPOSIT_STEP", "0") not in ("0", "false", "False", "")
-
-
 def cc_deposit_step(graph, ingested):
     """Step once after a conversational deposit; return the StepResult.
 
@@ -2071,13 +2078,12 @@ def cc_deposit_step(graph, ingested):
     enabled -- no phantom credit for a failed deposit (Chief ruling R1).
     No stimulus is injected: the step fires what the substrate already carries.
 
-    Doors (Chief B3 ruling 001): the hook door is now only the Stop-side
-    _deposit(step=True) (cc_ng_host.py), which calls this once per turn even
-    when the dual pass failed -- a failed turn is still a timestep; the
+    Doors (Chief B3 ruling 001; the drains were removed from the door set by
+    P240(3)): the hook door -- the Stop-side _deposit(step=True)
+    (cc_ng_host.py) -- is the only caller, and calls this once per turn even
+    when the dual pass failed -- a failed turn is still a timestep. The
     prompt-side, pith-failure and PostToolUse deposits never call it; the two
-    drains (drain_ingest_tract, Leg-1 drain_gateway_conduit) call it once per
-    APPLIED record only -- no step on a skipped, paused, uncertain,
-    already-applied or failed apply.
+    drains (drain_ingest_tract, Leg-1 drain_gateway_conduit) never step at all.
 
     This step, plus the fired-set gate below, is KISS op 1 at Apprentice --
     the Delta Gate on graph data (KISS.md:38: "Read the graph.step() receipt
@@ -2212,9 +2218,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     with no separate read and no window between them.
 
     Locking: the caller holds graph._concurrent_lock for the whole call --
-    the dual pass mutates the graph, and with CC_NG_DEPOSIT_STEP on, the
-    per-record cc_deposit_step(graph, True) requires the caller's lock hold,
-    which punchlist #643 (the autosave-loop caller) now provides.
+    the dual pass mutates the graph, which punchlist #643 (the autosave-loop
+    caller) now provides.
 
     Fails soft -- an ingest-tract drain failure must never break the
     daemon's autosave pulse.
@@ -2266,8 +2271,6 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             try:
                 if _apply_gateway_experience(graph, vector_db, state, entry):
                     absorbed += 1
-                    if _CC_NG_DEPOSIT_STEP:
-                        cc_deposit_step(graph, True)
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
             if max_entries and taken >= max_entries:
@@ -2452,11 +2455,7 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
     SQLite stores transport identities, exact raw BTF bytes and attempt states,
     never embeddings or derived cognition. FULL synchronous transactions precede
     every mutation. A filesystem lock serializes deliveries, while graph locking
-    remains one record (or save) at a time. No synthetic graph steps -- this
-    bars idle and consolidation cadence (the Sep-11 supersession), not the one
-    cc_deposit_step per applied record under CC_NG_DEPOSIT_STEP (Chief B3
-    ruling R2): a skipped, paused, uncertain, already-applied or failed apply
-    never steps.
+    remains one record (or save) at a time. No synthetic graph steps.
 
     Interrupted attempts, partial learning and unresolved prior-incarnation
     deliveries require reconciliation. Terminal accepted receipts survive normal
@@ -2627,8 +2626,6 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
                                     applied = _apply_gateway_experience(graph, vector_db, state, entry)
                                     if not applied:
                                         raise RuntimeError('dual-pass did not confirm full application')
-                                    if _CC_NG_DEPOSIT_STEP:
-                                        cc_deposit_step(graph, applied)
                                 with db:
                                     db.execute('UPDATE records SET status=? WHERE conduit=? AND name=? AND digest=? AND start=? AND end=?', ('applied',) + rkey)
                                 result['applied'] += 1
@@ -3176,8 +3173,7 @@ def cc_novelty(state: dict, graph) -> float:
     Canonical updates _substrate_novelty_ema push-style per turn in
     handle_after_turn() (rpc.py:3661-3667) from StepResult's HE-level
     prediction counts. CC's deposits run the dual pass, not on_message(), and
-    step only through cc_deposit_step (CC_NG_DEPOSIT_STEP, default off) or the
-    Tonic's autostep; neither pushes those stats -- so CC dips the bucket at
+    step only through cc_deposit_step or the Tonic's autostep; neither pushes those stats -- so CC dips the bucket at
     extraction time instead: read the HE-level CUMULATIVE counters, delta
     them against the previous recall, EMA the windowed surprise ratio.
 
