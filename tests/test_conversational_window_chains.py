@@ -1,4 +1,14 @@
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-dualpass-reconcile-20260926 — P264(2) follow-up (Addendum 1).
+# What: the cc_mem fixture no longer calls
+#   monkeypatch.setattr(org, "_CC_KISS_GATE_ENABLED", False); with the lane-B
+#   Delta Gate removal there is no such symbol to disable.
+# Why: main's d9106a3 (#523) deleted _CC_KISS_GATE_ENABLED; this file was based
+#   pre-lane-B and its cc_mem tests errored at fixture setup after the merge.
+#   LAW 3 — the Delta Gate stays removed; the symbol is never re-added.
+# How: delete that one setattr line. No symbol re-added, no raising=False.
+# -------------------
 # [2026-09-22] Grok 4.6 — punchlist-001 B1: CC organism window chains
 # What: Mirror the RPC 5a/5b assertions on cc_ng_organism.run_conversational_dual_pass.
 # Why:  CC's parameterized copy of the conversational path must grow the same
@@ -108,7 +118,6 @@ def cc_mem(monkeypatch):
     g._step_lock = threading.RLock()
     vdb = SimpleVectorDB()
     monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
-    monkeypatch.setattr(org, "_CC_KISS_GATE_ENABLED", False)
     yield org, g, vdb
 
 

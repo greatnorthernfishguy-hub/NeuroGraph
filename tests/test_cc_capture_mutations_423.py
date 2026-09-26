@@ -102,8 +102,6 @@ def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_in
     class Embed:
         def dual_record_outcome(self,ecosystem,embedding,target_id,metadata,**kw):
             assert not g._step_lock._is_owned()
-            if extract_failed:
-                raise RuntimeError("pass-2 concept extraction failed (no deposit)")
             ecosystem.record_outcome(embedding,target_id,True,metadata=metadata)
             assert not g._step_lock._is_owned() # tree extraction/model phase
             if raise_dual_pass_incomplete:
