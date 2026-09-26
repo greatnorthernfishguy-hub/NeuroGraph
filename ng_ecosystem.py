@@ -56,6 +56,14 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 D-3 contract-doc correction.
+#   What: dual_record_outcome docstring now describes the raise-on-failure
+#         (DualPassIncompleteError) contract instead of the obsolete forest-only
+#         fallback text.
+#   Why:  ng_embed.dual_record_outcome raised DualPassIncompleteError on pass-2
+#         failure after R3 atomicity; the wrapper docstring was stale.
+#   How:  One docstring line replaced. No behavior change.
+# -------------------
 # [2026-02-22] Claude (Sonnet 4.6) — Initial creation.
 #   What: NGEcosystem class — singleton wrapper implementing the
 #         standardized E-T Systems optional integration protocol.
@@ -499,7 +507,9 @@ class NGEcosystem:
         Pass 2: Extract concepts via TID → embed each → record_outcome()
                  per tree → create forest→tree substrate links.
 
-        Falls back to single-pass (forest only) if TID unavailable.
+        Raises DualPassIncompleteError if pass-2 concept extraction fails
+        (R3 atomicity: no forest-only deposit). Legitimate empty concepts []
+        still write the forest.
 
         Args:
             content: Raw text (for concept extraction in Pass 2).

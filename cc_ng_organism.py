@@ -96,6 +96,17 @@
 #   kwargs), tests/test_pith_stage5.py (deleted-field absence,
 #   from_surfaced kwarg rejection, #522 round-trip, legacy-dict
 #   degradation).
+# -------------------
+# [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 D-3: remove dead
+#   extraction_failed branch in run_conversational_dual_pass.
+# What: the check for _result.get("extraction_failed") and the comment
+#   "forest is real experience even when tree extraction failed" are removed.
+# Why:  ng_embed.dual_record_outcome now raises DualPassIncompleteError on
+#   pass-2 failure (R3 atomicity); a returned dict means extraction succeeded
+#   or legitimately returned no concepts. The old branch was unreachable.
+# How:  replaced with a comment describing the raise-based contract and kept
+#   the _cc_bind_conversational_topology call unchanged.
+# -------------------
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — #592 COMB-04
 #   L1 budget direction corrected (Executive Packet 193(1))
 # What: cc_l1_budget's region-confidence factor is now 1 - (c - NEUTRAL)*2*FALLOFF
@@ -2065,11 +2076,10 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
             metadata={"source": "cc_gateway", "creation_mode": "conversational",
                       "_forest_content": text},
         )
-        # The forest is real experience even when tree extraction failed. Keep
-        # its chronological binding, then report partial application to the journal.
+        # dual_record_outcome raises DualPassIncompleteError on pass-2 failure
+        # (R3 atomicity: no forest-only deposit). A return means forest+pass-2
+        # completed (legitimate empty concepts produce extraction_failed=False).
         _cc_bind_conversational_topology(graph, target_id, _result or {}, embedding, state)
-        if isinstance(_result, dict) and _result.get("extraction_failed"):
-            raise RuntimeError("CC dual-pass tree extraction failed after forest deposit")
         return True
     except Exception as exc:
         logger.debug("CC conversational dual-pass failed (non-fatal): %s", exc)

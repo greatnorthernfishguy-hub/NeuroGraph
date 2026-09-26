@@ -1,5 +1,15 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-09-26] Z11 zone-manager build dispatch — stale test correction
+# What: test_dual_pass_outcome_and_embedding_outside_lock third parametrize
+#       case now raises DualPassIncompleteError instead of returning
+#       extraction_failed=True, matching the R3 atomicity contract in
+#       ng_embed.dual_record_outcome.
+# Why:  Exec Packet 264 D-3 removed the dead extraction_failed dict check from
+#       run_conversational_dual_pass; real code raises before any forest write.
+#       The (False,True) case was asserting removed behavior.
+# How:  Import DualPassIncompleteError from ng_embed; rename param to
+#       raise_dual_pass_incomplete; raise on True; keep fail_insert coverage.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane B merge
 # What: test_probation_and_kiss_keep_existing_clock_semantics became
 #       test_probation_keeps_existing_clock_semantics (fixture starts at
@@ -19,6 +29,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
+from ng_embed import DualPassIncompleteError
 
 SOURCE = Path(__file__).parents[1] / 'cc_ng_organism.py'
 
@@ -76,8 +87,8 @@ def test_partial_insert_failure_propagates(packer):
     assert 'a' in g.nodes # retained partial application; no fabricated rollback
     assert not g._step_lock._is_owned()
 
-@pytest.mark.parametrize('fail_insert,extract_failed',[(False,False),(True,False),(False,True)])
-def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_insert,extract_failed):
+@pytest.mark.parametrize('fail_insert,raise_dual_pass_incomplete',[(False,False),(True,False),(False,True)])
+def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_insert,raise_dual_pass_incomplete):
     import sys
     ns=functions('_cc_deposit_memory_node','_CCConversationalDualPassEco','run_conversational_dual_pass','_cc_bind_conversational_topology')
     ns['_cc_concept_passes_floor']=lambda c:True
@@ -87,9 +98,11 @@ def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_in
             assert not g._step_lock._is_owned()
             ecosystem.record_outcome(embedding,target_id,True,metadata=metadata)
             assert not g._step_lock._is_owned() # tree extraction/model phase
-            return {'tree_ids':[],'extraction_failed':extract_failed}
+            if raise_dual_pass_incomplete:
+                raise DualPassIncompleteError("simulated pass-2 extraction failure")
+            return {'tree_ids':[],'extraction_failed':False}
     monkeypatch.setitem(sys.modules,'ng_embed',SimpleNamespace(NGEmbed=SimpleNamespace(get_instance=lambda:Embed())))
-    assert ns['run_conversational_dual_pass'](g,VDB(g,fail_insert),'text',[1],{}) is (not fail_insert and not extract_failed)
+    assert ns['run_conversational_dual_pass'](g,VDB(g,fail_insert),'text',[1],{}) is (not fail_insert and not raise_dual_pass_incomplete)
 
 def test_probation_keeps_existing_clock_semantics():
     ns=functions('cc_update_probation')

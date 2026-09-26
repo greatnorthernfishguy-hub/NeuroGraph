@@ -23,6 +23,30 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 V-1/V-2/D-2/D-3/LAW-5
+#   corrective build (chief-p226-ruling-001).
+#   What: (1) Call tokenizer.no_truncation() after every Tokenizer.from_pretrained
+#         calls so the shipped tokenizer.json max_length does not re-impose
+#         truncation; (2) build EmbedWindow.text from raw prefixed string char
+#         offsets instead of decode-round-trip; (3) wrap _ensure_tokenizer's
+#         from_pretrained in EmbeddingUnavailableError; (4) correct stale
+#         dual-pass contract docs; (5) read NG_EMBED_TID_ENDPOINT from env;
+#         (6) publish the fully-configured tokenizer BEFORE assigning to
+#         self._tokenizer in both load paths, closing the race where a concurrent
+#         caller could encode against a still-truncating tokenizer; (7) import
+#         Tokenizer inside the D-2 try block; (8) revert pad_token to the
+#         original string (the empty pad_token change was unexplained and broke
+#         tokenizer-emitted padding warnings).
+#   Why:  V-1: source-grep test "enable_truncation not in source" shipped while
+#         the tokenizer's own config still truncated. V-2: decode round-trip
+#         altered experience before deposit (LAW 7) and diverged local/remote
+#         vectors. D-2/D-3: contract leaks and stale docs. LAW 5: env is source
+#         of truth. Race/pad_token: identified by native law-enforcer review.
+#   How:  no_truncation() and enable_padding() now run on a local tokenizer
+#         variable before publishing to self._tokenizer. _ensure_tokenizer's from
+#         tokenizers import moved inside try/except. pad_token restored in both
+#         load paths. All other changes per Packet 214.
+# -------------------
 # [2026-09-21] Grok 4.6 — HF token is not a _hf_post parameter (R-2).
 #   What: _hf_post reads the bearer via _get_hf_token() internally.
 #         Token is no longer a function argument (traceback locals).
@@ -229,6 +253,9 @@ class NGEmbed:
         self._config = dict(_DEFAULT_CONFIG)
         if config:
             self._config.update(config)
+        self._config["tid_endpoint"] = os.environ.get(
+            "NG_EMBED_TID_ENDPOINT", self._config["tid_endpoint"]
+        )
 
         self._session = None          # ONNX InferenceSession (lazy)
         self._tokenizer = None        # tokenizers.Tokenizer (lazy)
@@ -331,11 +358,16 @@ class NGEmbed:
                     providers=["CPUExecutionProvider"],
                 )
 
-                # Load tokenizer
-                self._tokenizer = Tokenizer.from_pretrained(model_id)
-                self._tokenizer.enable_padding(
+                # Load tokenizer. The model's shipped tokenizer.json may
+                # include truncation config; disable it explicitly (V-1).
+                # Configure fully before publishing to self._tokenizer so a
+                # concurrent caller never sees truncation-enabled state.
+                _tokenizer = Tokenizer.from_pretrained(model_id)
+                _tokenizer.no_truncation()
+                _tokenizer.enable_padding(
                     pad_id=0, pad_token="[PAD]",
                 )
+                self._tokenizer = _tokenizer
 
                 self._model_loaded = True
                 logger.info(
@@ -416,10 +448,12 @@ class NGEmbed:
             window_jobs: List[tuple] = []
             for i in long_idx:
                 ids = list(encodings[i].ids)
-                for wrapped, interior_slice, weight, _start, _end in self._window_token_ids(ids):
-                    w_text = self._tokenizer.decode(
-                        interior_slice, skip_special_tokens=True,
-                    )
+                prefixed_text = prefixed[i]
+                enc = encodings[i]
+                for wrapped, _interior_slice, weight, start, end in self._window_token_ids(ids):
+                    char_start = enc.offsets[start][0]
+                    char_end = enc.offsets[end - 1][1]
+                    w_text = prefixed_text[char_start:char_end]
                     window_jobs.append((i, weight, wrapped, w_text))
             if self._remote_mode:
                 vecs = self._hf_remote_embed_batch(
@@ -477,10 +511,10 @@ class NGEmbed:
         embeddings: List[np.ndarray] = []
         weights: List[int] = []
         jobs = []
-        for wrapped, interior_slice, weight, _start, _end in self._window_token_ids(ids):
-            w_text = self._tokenizer.decode(
-                interior_slice, skip_special_tokens=True,
-            )
+        for wrapped, _interior_slice, weight, start, end in self._window_token_ids(ids):
+            char_start = encoding.offsets[start][0]
+            char_end = encoding.offsets[end - 1][1]
+            w_text = prefixed[char_start:char_end]
             jobs.append((w_text, wrapped, weight))
 
         if self._remote_mode:
@@ -511,14 +545,22 @@ class NGEmbed:
         )
 
     def _ensure_tokenizer(self) -> None:
-        """Load tokenizer without ONNX (needed to window in remote mode)."""
+        """Load tokenizer without ONNX (needed to window in remote mode).
+
+        Raises EmbeddingUnavailableError on any load failure.
+        """
         if self._tokenizer is not None:
             return
-        from tokenizers import Tokenizer
-        self._tokenizer = Tokenizer.from_pretrained(self._config["model_id"])
-        self._tokenizer.enable_padding(
-            pad_id=0, pad_token="[PAD]",
-        )
+        try:
+            from tokenizers import Tokenizer
+            _tokenizer = Tokenizer.from_pretrained(self._config["model_id"])
+            _tokenizer.no_truncation()
+            _tokenizer.enable_padding(
+                pad_id=0, pad_token="[PAD]",
+            )
+            self._tokenizer = _tokenizer
+        except Exception as exc:
+            raise EmbeddingUnavailableError(f"tokenizer load failed: {exc}") from exc
 
     def _apply_prefix(self, text: str, is_query: bool) -> str:
         if is_query:
@@ -541,6 +583,11 @@ class NGEmbed:
 
         Interior window length ≤ 510 so the wrapped sequence stays ≤ 512.
         Raises if the full encoding is missing a leading CLS or trailing SEP.
+
+        Returns tuples of (wrapped_ids, interior_slice, weight, start, end)
+        where start/end are ENCODING-relative indices (i.e., start points at
+        the first token after CLS and end is one-past the last interior token),
+        suitable for indexing encoding.offsets.
         """
         cls_id, sep_id = self._cls_sep_ids()
         if not ids or ids[0] != cls_id or ids[-1] != sep_id:
@@ -555,7 +602,8 @@ class NGEmbed:
             end = min(start + _WINDOW_INTERIOR, n)
             slice_ids = interior[start:end]
             wrapped = [cls_id] + slice_ids + [sep_id]
-            out.append((wrapped, slice_ids, end - start, start, end))
+            # +1 to make bounds encoding-relative (skip leading CLS).
+            out.append((wrapped, slice_ids, end - start, start + 1, end + 1))
             if end >= n:
                 break
             start += _WINDOW_INTERIOR - _WINDOW_OVERLAP
@@ -1092,7 +1140,7 @@ class NGEmbed:
             return None
 
     def _extraction_warn_due(self) -> int:
-        """Rate-limit the forest-only degradation warning. Returns the number of
+        """Rate-limit the pass-2 extraction failure warning. Returns the number of
         failures since the last emitted warning when a warning is due (>=1, truthy),
         else 0. Interval via CC_EXTRACT_WARN_INTERVAL_S (default 60s). Attrs are
         getattr-defaulted so it works regardless of construction path."""

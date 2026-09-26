@@ -1,4 +1,19 @@
 # ---- Changelog ----
+# [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 Q-1 corrective build.
+# What: (1) Renamed test_drops_after_max_attempts_no_infinite_loop to
+#   test_survives_past_max_attempts_no_infinite_loop and updated comments;
+#   (2) added starvation regression test using limit=1 to prove failures
+#   rotate to back and a later always-succeeding item is still processed
+#   within a bounded number of passes; (3) added backlog metric test for
+#   pending_count + oldest_age visibility.
+# Why:  Q-1 changed RetryQueue.drain() to rotate survivors to the back. The
+#   old 'drop' test name and comments were out of date; the new tests lock in
+#   the no-starvation and backlog-visibility requirements from the corrective
+#   build.
+# How:  Limit the drain to one item per pass, surround several permanently
+#   failing items with a succeeding item, assert the succeeding item is not
+#   starved. Backlog() returns pending_count/oldest_age/long_held_count.
+# -------------------
 # [2026-06-05] CC (Sonnet 4.6) — #297 review fixes: strengthen drop test + 2 new tests (corrupt-file, drain-limit)
 # What: test_drops_after_max_attempts_no_infinite_loop gets mid-point assert (pending==1 after first fail).
 #       test_corrupt_file_recovers_empty: corrupt msgpack → RetryQueue starts empty, no crash.
@@ -287,7 +302,7 @@ class TestRetryQueue(unittest.TestCase):
                 calls["n"] += 1
                 return calls["n"] >= 2  # fail first call, succeed second
 
-            # First drain: attempt #1 → False; item survives (attempts=1 < max_attempts=3)
+            # First drain: attempt #1 → False; item survives until success (Q-1).
             result1 = q.drain(attempt)
             self.assertEqual(result1, 0, "first drain: item fails → 0 succeeded")
             self.assertEqual(q.pending_count(), 1, "item must survive after one failed attempt")
@@ -300,20 +315,79 @@ class TestRetryQueue(unittest.TestCase):
             if _os.path.exists(path):
                 _os.unlink(path)
 
-    def test_drops_after_max_attempts_no_infinite_loop(self):
+    def test_survives_past_max_attempts_no_infinite_loop(self):
         from memory_retry_queue import RetryQueue
         path = tempfile.mktemp(suffix=".msgpack")
         try:
             q = RetryQueue(path, max_attempts=2)
             q.enqueue("conv::xyz", "always fails")
-            q.drain(lambda item: False)  # attempt 1 — survives (1 < 2)
+            q.drain(lambda item: False)  # attempt 1 — survives (rotated to back)
             # Fix 4: assert item survived the FIRST failure before subsequent drains
             self.assertEqual(q.pending_count(), 1,
                 "item must survive after one failed attempt (off-by-one guard)")
-            q.drain(lambda item: False)  # attempt 2 — dropped (2 >= 2)
-            q.drain(lambda item: False)  # extra drain — queue already empty, no cycle
-            self.assertEqual(q.pending_count(), 0,
-                "item must be dropped after max_attempts, never re-queued")
+            q.drain(lambda item: False)  # attempt 2 — survives (rotated to back, Q-1)
+            q.drain(lambda item: False)  # attempt 3 — still survives (Q-1)
+            self.assertEqual(q.pending_count(), 1,
+                "item must never be dropped; retry until success")
+            self.assertEqual(q.long_held_count(), 1,
+                "long_held_count must flag items past max_attempts")
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_backlog_surfaces_pending_and_oldest_age(self):
+        """backlog() exposes total pending and oldest queued age, not just
+        long_held_count (which is blind to items stuck behind others)."""
+        from memory_retry_queue import RetryQueue
+        path = tempfile.mktemp(suffix=".msgpack")
+        try:
+            q = RetryQueue(path, max_attempts=3)
+            q.enqueue("conv::abc", "first")
+            q.enqueue("conv::def", "second")
+            import time as _time
+            _before = _time.time()
+            metrics = q.backlog()
+            self.assertEqual(metrics["pending_count"], 2)
+            self.assertEqual(metrics["long_held_count"], 0)
+            self.assertGreaterEqual(
+                metrics["oldest_age"], 0.0,
+                "oldest_age must be non-negative",
+            )
+            self.assertLess(
+                metrics["oldest_age"], _time.time() - _before + 1.0,
+                "oldest_age must be small for freshly enqueued items",
+            )
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_starvation_regression_survivors_rotate_to_back(self):
+        """Failures must rotate to the back; a later always-succeeding item
+        must not be starved behind them."""
+        from memory_retry_queue import RetryQueue
+        path = tempfile.mktemp(suffix=".msgpack")
+        try:
+            q = RetryQueue(path, max_attempts=2)
+            for i in range(3):
+                q.enqueue(f"fail::{i}", f"always fails {i}")
+            q.enqueue("good::1", "always succeeds")
+
+            def attempt(item):
+                return item["target_id"].startswith("good::")
+
+            # Bounded drain: one per pass. The failing items rotate to the back.
+            # After at most len(failing)+1 passes the good item reaches the front.
+            for _ in range(5):
+                q.drain(attempt, limit=1)
+                if q.pending_count() == 3:
+                    break
+
+            self.assertEqual(q.pending_count(), 3,
+                "failing items must remain queued forever")
+            self.assertFalse(
+                any(item["target_id"].startswith("good::") for item in q._items),
+                "the always-succeeding item must not be starved (processed within bounded passes)",
+            )
         finally:
             if _os.path.exists(path):
                 _os.unlink(path)

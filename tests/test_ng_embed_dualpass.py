@@ -1,10 +1,34 @@
 # tests/test_ng_embed_dualpass.py
+# ---- Changelog ----
+# [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 V-1/V-2/D-2/LAW-5
+#   corrective build.
+# What: (1) Replaced source-grep truncation test with a behavioral test using the
+#   real tokenizer when locally cached: assert truncation is disabled and
+#   assert >512-token input encodes to >512 ids. (2) Added a V-2 behavioral
+#   test against the real cached tokenizer that proves EmbedWindow.text is built
+#   from raw input char offsets rather than tokenizer.decode round-trip (LAW 7).
+#   (3) Set HF_HUB_OFFLINE before the first import that may pull in huggingface
+#   hub code. (4) Added explicit delenv for NG_EMBED_TID_ENDPOINT and a test
+#   asserting the override actually takes effect.
+# Why:  V-1 source-grep was not enough; V-2 fake tokenizers could not distinguish
+#   decode-based text from offset-sliced text; real-tokenizer behavior locks the fix.
+#   HUB_OFFLINE must be set before import to have effect; the endpoint env override
+#   test makes LAW-5 observability explicit.
+# How:  test_tokenizer_truncation_is_not_enabled_on_loaded_instance uses real
+#   tokenizer; test_real_tokenizer_window_text_uses_raw_char_offsets compares
+#   window text to raw-input char slices, asserting decode was not used. env
+#   override test checks _config after construction. Fixture cleans NG_EMBED_TID_ENDPOINT.
+# -------------------
 import os
 import sys
 import inspect
 import threading
 import numpy as np
 import pytest
+
+# HF_HUB_OFFLINE must be set before huggingface_hub/tokenizers code is imported
+# for the constant to take effect on local tokenizer downloads.
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,6 +41,7 @@ def _reset_singleton_and_env(monkeypatch):
     monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
     monkeypatch.delenv("NG_EMBED_ALLOW_HASH_FALLBACK", raising=False)
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("NG_EMBED_TID_ENDPOINT", raising=False)
     NGEmbed.reset_instance()
     yield
     NGEmbed.reset_instance()
@@ -28,6 +53,70 @@ def test_hash_embed_symbol_does_not_exist():
     assert "_hash_embed" not in src
     assert "sha384" not in src.lower()
     assert "NG_EMBED_ALLOW_HASH_FALLBACK" not in src
+
+
+def test_tid_endpoint_env_override(monkeypatch):
+    """LAW-5: NG_EMBED_TID_ENDPOINT actually overrides the default endpoint."""
+    override = "http://127.0.0.1:9999/custom/chat"
+    monkeypatch.setenv("NG_EMBED_TID_ENDPOINT", override)
+    emb = NGEmbed()
+    assert emb._config["tid_endpoint"] == override
+
+
+def test_real_tokenizer_window_text_uses_raw_char_offsets(monkeypatch):
+    """V-2: EmbedWindow.text must come from the raw input via offset slices,
+    not from tokenizer.decode (which can normalize whitespace/unicode).
+
+    Uses the real cached tokenizer; skips if it is not available offline.
+    """
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_ensure_model", lambda: True)
+    emb._model_loaded = True
+    # Load the tokenizer through the configured path so no_truncation() is applied.
+    try:
+        emb._ensure_tokenizer()
+    except Exception:
+        pytest.skip("real tokenizer not available in local HF cache")
+    tok = emb._tokenizer
+
+    # Load the tokenizer through the configured path so no_truncation() is applied.
+    try:
+        emb._ensure_tokenizer()
+    except Exception:
+        pytest.skip("real tokenizer not available in local HF cache")
+    tok = emb._tokenizer
+
+    seen = []
+
+    def fake_onnx(text, normalize=False, is_query=False, _ids=None):
+        # Vector content is irrelevant; we only inspect the text argument.
+        return _one_hot(768, len(text) % 768)
+
+    monkeypatch.setattr(emb, "_onnx_embed", fake_onnx)
+
+    # Build an input guaranteed to need at least two windows. Each distinct word
+    # should be its own token(s), so 1000 space-separated words exceed 512.
+    chunk = " ".join(f"tok{i}" for i in range(1000))
+    we = emb.embed_windows(chunk)
+
+
+    assert we.token_count > ng_embed_mod._WINDOW_TOKENS, (
+        "test input must exceed one window"
+    )
+    assert len(we.windows) >= 2, "long input must produce multiple windows"
+
+    enc = tok.encode(chunk)
+    for idx, (wrapped, _interior, weight, start, end) in enumerate(
+        emb._window_token_ids(list(enc.ids))
+    ):
+        char_start = enc.offsets[start][0]
+        char_end = enc.offsets[end - 1][1]
+        expected = chunk[char_start:char_end]
+        actual = we.windows[idx].text
+        assert actual == expected, (
+            f"window {idx} text must match raw char-offset slice; "
+            f"got {actual!r}, expected {expected!r}"
+        )
 
 
 def test_embed_raises_when_model_unavailable(monkeypatch):
@@ -51,9 +140,10 @@ def test_empty_batch_returns_empty_without_touching_model(monkeypatch):
 
 
 class _Enc:
-    def __init__(self, ids):
+    def __init__(self, ids, offsets=None):
         self.ids = list(ids)
         self.attention_mask = [1] * len(self.ids)
+        self.offsets = offsets if offsets is not None else [(i, i + 1) for i in range(len(self.ids))]
 
 
 class _FakeTok:
@@ -79,7 +169,9 @@ class _ClsSepTok:
 
     def encode(self, text):
         interior = [100 + i for i in range(len(text))]
-        return _Enc([self.CLS] + interior + [self.SEP])
+        ids = [self.CLS] + interior + [self.SEP]
+        offsets = [(0, 0)] + [(i, i + 1) for i in range(len(text))] + [(0, 0)]
+        return _Enc(ids, offsets)
 
     def decode(self, ids, skip_special_tokens=True):
         seq = list(ids)
@@ -101,20 +193,24 @@ def _one_hot(dim, idx):
 
 
 def test_tokenizer_truncation_is_not_enabled_on_loaded_instance(monkeypatch):
+    """Behavioral V-1 test: real tokenizer must not truncate >512 tokens.
+
+    The vector-distinctness acceptance criterion (>512 tokens alter the
+    forest vector vs. a 512-token prefix) is covered by the fast fake-
+    tokenizer pooling tests below.
+    """
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     emb = NGEmbed()
-    called = {"trunc": False}
-    tok = _FakeTok()
-    def _boom(**k):
-        called["trunc"] = True
-        raise AssertionError("enable_truncation must not be called")
-    tok.enable_truncation = _boom  # type: ignore
-    # Force the load path to install our tokenizer. Easier: set attrs after fake load.
-    monkeypatch.setattr(emb, "_ensure_model", lambda: True)
-    emb._tokenizer = tok
-    emb._model_loaded = True
-    # The production _ensure_model body must not call enable_truncation.
-    src = inspect.getsource(NGEmbed._ensure_model)
-    assert "enable_truncation" not in src
+    if not emb._ensure_model():
+        pytest.skip("model files not in local HF cache")
+    tok = emb._tokenizer
+    # V-1: truncation config shipped with the tokenizer is disabled.
+    assert tok.truncation is None
+    # Build an input guaranteed to exceed 512 tokens while keeping the
+    # behavioral test fast on CPU.
+    long_text = "word " * 600
+    encoding = tok.encode(long_text)
+    assert len(encoding.ids) > 512, "no_truncation() must allow >512 token encodings"
 
 
 def test_short_input_matches_single_window_primitive(monkeypatch):

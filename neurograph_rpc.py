@@ -258,8 +258,8 @@ to an existing NeuroGraphMemory call.
 #       and _conversational_dual_pass (wrapper, enqueues on failure). Added _retry_queue(), _enqueue_failed_extraction(),
 #       _drain_pass2_retries(). Drain wired into handle_after_turn after self-observation block.
 # Why:  Failed pass-2 extractions were silently dropped forever. Retry-queue gives bounded recovery.
-#       Non-cyclic by construction: drain uses core (no enqueue path), items at max_attempts are dropped
-#       not re-queued, preventing the wire->absorb->extract OOM-recursion class.
+#       Non-cyclic by construction: drain uses core (no enqueue path); items at max_attempts
+#       are retained until success and rotated to the back of the queue, never dropped.
 # How:  memory_retry_queue.RetryQueue (msgpack-backed, dedup by target_id). Path/attempts from env vars
 #       ANIMA_PASS2_RETRY_PATH / ANIMA_PASS2_RETRY_MAX_ATTEMPTS (LAW 5). Drain on pulse = off ingest hot path.
 # [2026-06-05] CC (Sonnet 4.6) — #297 review fixes: per-pulse drain cap (LAW 5) + remove unused embedding param
@@ -2849,8 +2849,8 @@ def _conversational_dual_pass(text: str, embedding: Any) -> None:
 
 # ── Pass-2 retry-queue (#297) ─────────────────────────────────────────────────
 # Non-cyclic guarantee: drain uses _run_conversational_dual_pass (the CORE, no
-# enqueue), so a still-failing item is bounded by max_attempts and dropped —
-# it can never be re-enqueued during the drain pass.
+# enqueue), so a still-failing item is retained until success and rotated to the
+# back of the queue — it can never be re-enqueued during the drain pass.
 
 _RETRY_QUEUE = None
 
@@ -2881,14 +2881,14 @@ def _enqueue_failed_extraction(text: str) -> None:
 
 def _drain_pass2_retries() -> None:
     """Drain on the autonomic pulse — NOT during ingest (non-cyclic guarantee).
-    Uses the CORE (no enqueue), so a still-failing item is bounded by drain's
-    max_attempts and dropped, never re-cycled.
+    Uses the CORE (no enqueue), so a still-failing item is retained until
+    success and rotated to the back of the queue, never dropped or re-cycled.
 
     # [2026-06-05] CC (Sonnet 4.6) — #297: drain wired into handle_after_turn pulse
     # What: One bounded drain pass per turn; re-embeds content and retries core.
     # Why: Retries happen off the ingest hot path — pulse is the correct cadence.
     # How: attempt() re-embeds item content then calls _run_conversational_dual_pass.
-    #      Returns bool to drain(); bounded by max_attempts in RetryQueue.drain().
+    #      Returns bool to drain(); survivors are rotated to the back, never dropped.
     """
     if _memory is None:
         return
@@ -3756,7 +3756,7 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
     # Bounded retry drain for failed pass-2 concept extractions (#297).
     # Called here (pulse, NOT in ingest) — non-cyclic guarantee: drain uses
     # _run_conversational_dual_pass (core, no enqueue), so failed items are
-    # bounded by max_attempts and dropped, never re-queued within this pass.
+    # retained until success and rotated to the back, never dropped or re-queued.
     _drain_pass2_retries()
 
     # Clear after deposit — consumed
