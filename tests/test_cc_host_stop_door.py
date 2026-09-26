@@ -1,11 +1,30 @@
+# ---- Changelog ----
+# [2026-09-26] deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-stop-door-restore-001 fix round r2 — make test A prove P240(1b)
+# What: test A now runs the REAL cc_ng_host._deposit -> REAL
+#   surface_wants_for_graph path (the _deposit spy is now a B/C-only fixture),
+#   so a [WANT]x[/WANT] in the reply is shown to become a first-class want node
+#   through the Stop door and not via a hand-seeded node; test C asserts the
+#   _deposit spy got exactly the message once; the meaningless
+#   surface_wants_for_graph self-assignment is removed.
+# Why: P240(1b) is this lane's decisive acceptance and test A did not prove it
+#   (it stubbed _deposit, asserted no want node, and deferred to another file);
+#   assignment z2-stop-door-restore-001-fix-r2.md; Exec P240(1b)/P245(c).
+# How: the fake run_conversational_dual_pass mirrors the real one's contract
+#   (cc_ng_organism.py:2005 hashes a content target_id, :1817's
+#   _CCConversationalDualPassEco creates the conversational node and writes the
+#   raw text into the recall store) because TID tree extraction is unreachable
+#   in the test env; surface_wants_for_graph, _handle_stop and _deposit are real.
+#   cc_ng_host.py production code is unchanged by this round.
+# -------------------
 """Tests for the Stop door restored by Exec P240(1) — CC's replies reach its substrate.
 
 See assignment z2-stop-door-restore-001 and chief-p240-commission-001.
 """
 
+import hashlib
 import threading
 import types
-from unittest.mock import patch, MagicMock, call
 import pytest
 
 import cc_ng_host
@@ -50,108 +69,113 @@ class _FakeVDB:
         self.content[id] = content
 
 
-def host_fixture(monkeypatch):
-    """Fixture modeled on test_cc_deposit_step.py's host, with REAL surface_wants_for_graph.
+def _base_setup(monkeypatch):
+    """Shared rig: fake graph/vdb on _STATE.cc_ng + fake embed/dual-pass/commons.
 
-    Returns a simple namespace with:
+    Does NOT patch cc_ng_host._deposit — test A runs the REAL one. Modelled on
+    tests/test_cc_deposit_step.py's host. Returns a namespace with:
     - mod: cc_ng_host module
     - graph: _FakeGraph
     - vdb: _FakeVDB
-    - deposit_calls: list tracking _deposit invocations
+    - deposit_calls: list recorded by the B/C spy fixture (empty for A)
     """
     g = _FakeGraph()
     vdb_cont = {}
     vdb = _FakeVDB(vdb_cont)
-    deposit_calls = []
-
-    def track_deposit(text):
-        deposit_calls.append(text)
-        # Minimal real deposit: call the actual function but mocked dependencies
-        pass
 
     def fake_embed(text):
         return [0.0] * 768
 
     def fake_dual_pass(graph, vdb_arg, text, emb, state):
-        # Simplified dual pass that creates a conversational node
-        node_id = f"cc:conv::test_{hash(text) & 0xffffffff}"
+        # Mirrors the REAL run_conversational_dual_pass (cc_ng_organism.py:2005):
+        # it content-hashes target_id (:2019) and _CCConversationalDualPassEco
+        # (:1817) / _cc_deposit_memory_node create the conversational node and
+        # write the raw text into the recall store (vdb.content). Faked because
+        # TID tree extraction is unreachable in the test env — the same
+        # dependency, not the code under test.
+        node_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
         if node_id not in graph.nodes:
             graph.create_node(node_id, metadata={
                 "creation_mode": "conversational",
                 "source": "cc_gateway",
-                "_forest_content": text
+                "_forest_content": text,
             })
         vdb_arg.insert(id=node_id, embedding=emb, content=text, metadata={})
         return True
 
     monkeypatch.setattr(cc_ng_host._STATE, 'cc_ng',
                         types.SimpleNamespace(graph=g, vector_db=vdb))
-    monkeypatch.setattr('cc_ng_host._deposit', track_deposit)
     monkeypatch.setattr(ng_embed, 'embed', fake_embed)
     monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', fake_dual_pass)
     monkeypatch.setattr(cc_ng_organism, 'deposit_cc_experience', lambda *a, **k: None)
-    # Use REAL surface_wants_for_graph for test A
-    monkeypatch.setattr(cc_ng_organism, 'surface_wants_for_graph',
-                        cc_ng_organism.surface_wants_for_graph)
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
     return types.SimpleNamespace(
         mod=cc_ng_host,
         graph=g,
         vdb=vdb,
         vdb_content=vdb_cont,
-        deposit_calls=deposit_calls,
+        deposit_calls=[],
     )
 
 
 @pytest.fixture
-def host(monkeypatch):
-    return host_fixture(monkeypatch)
+def base_host(monkeypatch):
+    """Rig with the REAL cc_ng_host._deposit in place (test A)."""
+    return _base_setup(monkeypatch)
 
 
-def test_stop_with_want_materializes_want_node(host, monkeypatch):
-    """A — WANT acceptance (P240(1b))."""
-    # Setup: we need a real graph and vdb for surface_wants_for_graph to work
-    g = host.graph
-    vdb_cont = {}
-    
-    # Create a simple conversational node with WANT marker
-    msg = "Here is my reply [WANT]learn Python[/WANT] and some other text"
-    node_id = "cc:conv::test_want"
-    g.create_node(node_id, metadata={
-        "creation_mode": "conversational",
-        "source": "cc_gateway",
-        "_forest_content": msg
-    })
-    vdb_cont[node_id] = msg
-    
-    # Spy on threading.Thread to run inline
+@pytest.fixture
+def host(base_host, monkeypatch):
+    """Rig whose cc_ng_host._deposit is a recording spy (tests B and C)."""
+    def spy(text):
+        base_host.deposit_calls.append(text)
+    monkeypatch.setattr(cc_ng_host, '_deposit', spy)
+    return base_host
+
+
+def test_stop_with_want_materializes_want_node(base_host, monkeypatch):
+    """A — WANT acceptance (P240(1b)): a [WANT] in the reply becomes a want node
+    through the Stop door, via the REAL _deposit -> surface_wants_for_graph path.
+
+    No node is pre-seeded: the only want node must come out of the door.
+    """
+    g = base_host.graph
+    phrase = "learn Python"
+    msg = f"Here is my reply [WANT]{phrase}[/WANT] and some other text"
+
+    # Run the daemon thread target inline.
     thread_calls = []
     original_thread = threading.Thread
-    
+
     def inline_thread(target=None, args=(), daemon=False, **kwargs):
         if target:
             target(*args)
         thread_obj = original_thread()
         thread_calls.append((target, args, daemon))
         return thread_obj
-    
-    monkeypatch.setattr(threading, 'Thread', inline_thread)
-    
-    # Call through the dispatch table
+
+    monkeypatch.setattr(cc_ng_host.threading, 'Thread', inline_thread)
+
+    # Call through the dispatch table.
     result = cc_ng_host._DISPATCH["Stop"]({"last_assistant_message": msg})
-    
-    # Verify no context key
+
+    # Claude Code Stop contract: ok, and never a context key.
     assert result == {"ok": True}
     assert "context" not in result
-    
-    # Verify deposit was called (via our spy)
+
+    # The door launched exactly one daemon deposit carrying the exact message.
     assert len(thread_calls) == 1
     target, args, daemon = thread_calls[0]
     assert daemon is True
     assert args == (msg,)
-    
-    # Verify surface_wants_for_graph would see the want
-    # (Test B in test_cc_want_bounds.py covers the actual logic)
-    # Here we just verify our setup allows the real function to run
+
+    # The REAL _deposit ran end-to-end and the REAL surface_wants_for_graph
+    # materialized the WANT as a first-class want node in CC's graph.
+    want_nodes = [n for n in g.nodes.values()
+                  if n.metadata.get("kind") == "want"]
+    assert len(want_nodes) == 1
+    assert want_nodes[0].metadata["want_text"] == phrase
+    assert want_nodes[0].metadata["want_state"] == "open"
 
 
 def test_stop_empty_or_absent_no_deposit(host):
@@ -183,7 +207,7 @@ def test_stop_empty_or_absent_no_deposit(host):
 
 
 def test_stop_non_empty_calls_deposit_with_exact_text(host, monkeypatch):
-    """C — same door."""
+    """C — the door hands the deposit exactly the non-empty reply text."""
     thread_calls = []
     original_thread = threading.Thread
     
@@ -194,7 +218,7 @@ def test_stop_non_empty_calls_deposit_with_exact_text(host, monkeypatch):
         thread_calls.append((target, args, daemon))
         return thread_obj
     
-    monkeypatch.setattr(threading, 'Thread', inline_thread)
+    monkeypatch.setattr(cc_ng_host.threading, 'Thread', inline_thread)
     
     msg = "This is my reply to the user."
     result = cc_ng_host._DISPATCH["Stop"]({"last_assistant_message": msg})
@@ -204,6 +228,9 @@ def test_stop_non_empty_calls_deposit_with_exact_text(host, monkeypatch):
     target, args, daemon = thread_calls[0]
     assert daemon is True
     assert args == (msg,)
+
+    # The deposit itself (spy in this fixture) got the text exactly once.
+    assert host.deposit_calls == [msg]
 
 
 def test_stop_never_returns_context(host):
