@@ -21,6 +21,12 @@
 #       note 1) asked for this header at merge.
 # How:  Test edit only; cc_update_probation still has live coverage in
 #       tests/test_cc_dual_pass.py.
+# [2026-09-22] Grok 4.6 — punchlist-001 B9: extraction failure is no deposit
+# What: extract_failed mock raises before record_outcome instead of returning
+#   extraction_failed=True after a forest write.
+# Why: Atomic dual-pass: DualPassIncompleteError means no forest. The old
+#   partial-success raise in run_conversational_dual_pass is gone.
+# How: RuntimeError from dual_record_outcome; return False still asserted.
 # -------------------
 import ast
 import logging
@@ -96,6 +102,8 @@ def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_in
     class Embed:
         def dual_record_outcome(self,ecosystem,embedding,target_id,metadata,**kw):
             assert not g._step_lock._is_owned()
+            if extract_failed:
+                raise RuntimeError("pass-2 concept extraction failed (no deposit)")
             ecosystem.record_outcome(embedding,target_id,True,metadata=metadata)
             assert not g._step_lock._is_owned() # tree extraction/model phase
             if raise_dual_pass_incomplete:
