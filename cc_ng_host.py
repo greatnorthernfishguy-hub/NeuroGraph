@@ -27,6 +27,18 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-26] deepseek/deepseek-v3.2 (opencode, T3 Code harness) —
+#   lane z2-stop-door-restore-001 — Exec P240(1): restore the missing `Stop` native door
+# What: Add "Stop": _handle_stop to _DISPATCH table. Add _handle_stop(data) that reads
+#   last_assistant_message, validates it's a non-empty string, and launches the existing
+#   _deposit() on a daemon thread with the message text (same as _handle_user_prompt_submit).
+#   Never returns a context key (Claude Code Stop hook contract). Does not read transcript_path.
+# Why: Exec P240(1) / chief-p240-commission-001: CC's own replies never reached its substrate;
+#   only the prompt side did. Claude Code hooks specify Stop input carries last_assistant_message.
+#   A Stop handler that returns additionalContext keeps Claude running, so must never do that.
+# How: Thin wrapper that validates then calls _deposit exactly as _handle_user_prompt_submit does.
+#   The twin docs/scripts/cc-ng-daemon.py is deliberately not changed (P240(1d)). The host Stop
+#   door is inert until a Stop hook for cc-ng-hook.py is registered in settings (not this lane).
 # [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
 #   lane z2-b3-kiss-drain-step-001 — #643: the autosave-loop tract drain now
 #   holds graph._concurrent_lock
@@ -1101,6 +1113,14 @@ def _handle_user_prompt_submit(data):
     return {"ok": True, "context": context}
 
 
+def _handle_stop(data):
+    msg = data.get("last_assistant_message")
+    if not isinstance(msg, str) or not msg.strip():
+        return {"ok": True}
+    threading.Thread(target=_deposit, args=(msg,), daemon=True).start()
+    return {"ok": True}
+
+
 def _handle_pre_tool_use(data):
     tool = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
@@ -1378,6 +1398,7 @@ _DISPATCH = {
     "UserPromptSubmit": _handle_user_prompt_submit,
     "PreToolUse": _handle_pre_tool_use,
     "PostToolUse": _handle_post_tool_use,
+    "Stop": _handle_stop,
 }
 
 
