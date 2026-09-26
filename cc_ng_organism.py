@@ -16,6 +16,8 @@
 #   `"- Keyframe:"` → `"- Root:"`. New tests: `test_...` at :176-188 stays unchanged
 #   (still passes), plus new test A (verified line) and new test B (root label) in
 #   `tests/test_pith_provider_context.py`. Assignment z2-640-pith-epistemic-label-001.
+# [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — Pith
+#   cache-line cleanup (P224(1)(a)) + #522 coherence across victim eviction
 # What: CacheLine loses the four computed-never-read fields `lod`,
 #   `manifold_type` (the CacheLine field only), `keyframe` and `deltas` --
 #   they were declared, written and copied with no production reader. Stage
