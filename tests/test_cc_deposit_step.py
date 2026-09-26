@@ -8,9 +8,12 @@
 #   _deposit(step=True) steps once after the dual pass inside
 #   graph._concurrent_lock; the prompt side never steps; a one-turn run steps
 #   exactly once from Stop. No test monkeypatches the removed
-#   _CC_NG_DEPOSIT_STEP; each asserts STATE.stats['errors'] is unchanged. The r1
-#   entry below still records that the section was removed; this entry supersedes
-#   it in history.
+#   _CC_NG_DEPOSIT_STEP; each asserts STATE.stats['errors'] is unchanged. Per the
+#   r2 addendum the one-turn test also asserts DISPATCH['Stop'] is
+#   handle_session_stop and DISPATCH['UserPromptSubmit'] is
+#   handle_user_prompt_submit (the twin renamed the dead SessionStop key to
+#   'Stop'). The r1 entry below still records that the section was removed; this
+#   entry supersedes it in history.
 # Why: Chief-003 ruling on the Lane 3 twin ripple (the r1 deletion was a brief
 #   error; coverage must not be deleted) and P240(3). The twin is Z12's and was
 #   not touched.
@@ -419,6 +422,11 @@ def test_daemon_one_turn_steps_exactly_once_from_stop(daemon, monkeypatch):
     # The one step came from the Stop side (kwargs step=True), not the prompt.
     assert not thread_calls[0][2]
     assert thread_calls[1][2] == {'step': True}
+    # The landed twin renamed the dead SessionStop key to the event name
+    # Claude Code actually sends; the dispatch table points the two doors at
+    # their handlers.
+    assert daemon.mod.DISPATCH['Stop'] is daemon.mod.handle_session_stop
+    assert daemon.mod.DISPATCH['UserPromptSubmit'] is daemon.mod.handle_user_prompt_submit
     assert daemon.mod.STATE.stats['errors'] == before
 
 
