@@ -1,4 +1,14 @@
 # ---- Changelog ----
+# [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
+#   lane z2-b3-kiss-drain-step-001 — rig ns provides _CC_NG_DEPOSIT_STEP
+# What: the rig namespace now also stubs _CC_NG_DEPOSIT_STEP=False.
+# Why: drain_gateway_conduit reads that module global for the per-applied-
+#   record cc_deposit_step (Chief B3 ruling 001, assignment
+#   z2-b3-kiss-drain-step-001); the AST-extracted function resolves module
+#   globals in this namespace, so the name must exist here. Flag stays off:
+#   these tests cover durable transport semantics, not stepping.
+# How: one name added to ns, mirroring _CC_CALLOSUM_LEG1_ENABLED.
+# -------------------
 # [2026-09-11] Codex — #423 durable raw gateway transport failure boundaries.
 # What: fakes + real tract bytes, no NG/embedding initialization.
 # Why: learning attempts and checkpoint acceptance are separate crash boundaries.
@@ -26,6 +36,7 @@ def rig(tmp_path, monkeypatch):
     tree = ast.parse(source.read_text())
     ns = dict(os=os, glob=glob, uuid=uuid, logger=logging.getLogger('test'),
               _CC_CALLOSUM_LEG1_ENABLED=True,
+              _CC_NG_DEPOSIT_STEP=False,
               _CC_GATEWAY_CONDUIT_GLOB='*_cc_gateway.*.tract')
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and
                  n.name in ('drain_gateway_conduit', '_apply_gateway_experience')]

@@ -1,4 +1,27 @@
 # ---- Changelog ----
+# [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
+#   lane z2-b3-kiss-drain-step-001 — the drains step + #643 lock scope
+# What: new tests for the two drains calling cc_deposit_step once per APPLIED
+#   record under _CC_NG_DEPOSIT_STEP (flag on: exactly one timestep per
+#   absorbed/applied record, none on a failed dual pass or an already-applied
+#   re-drain; flag off: timestep unchanged), and for punchlist #643: the
+#   autosave loop's drain_ingest_tract call runs under
+#   graph._concurrent_lock (cross-thread acquire(blocking=False) probe inside
+#   the wrapped dual pass; that assertion fails on 2e58509).
+# Why: Chief B3 ruling 001 (docs 0ef6dac1) R1/R2/R3; P153(4) Q3; KISS.md:38
+#   (op 1 at Apprentice, the Delta Gate on graph data); punchlist #643;
+#   assignment z2-b3-kiss-drain-step-001.
+# How: every test runs the real cc_ng_organism drain functions and a real
+#   graph; run_conversational_dual_pass is faked (TID extraction is
+#   unreachable in the test env, the same condition behind the pre-existing
+#   dual-pass failures) because it is a dependency, not the code under test.
+#   The Leg-1 tests mirror tests/test_cc_gateway_durable.py's durable rig
+#   setup but call the real module function: the durable rig AST-extracts
+#   the drain into a bare namespace the mandated module-level
+#   monkeypatch.setattr cannot reach, and its SimpleNamespace graph has no
+#   step clock. cc_ng is imported from tests/test_cc_dual_pass.py (same
+#   package-relative pattern as tests/test_cc_durable_integration.py).
+# -------------------
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane C (ii-a)
 # What: tests for cc_ng_organism.cc_deposit_step and its two wrappers
 #   (cc_ng_host._deposit, docs/scripts/cc-ng-daemon.py _deposit).
@@ -14,6 +37,7 @@
 import importlib.util
 import os
 import sys
+import threading
 import types
 
 import pytest
@@ -21,6 +45,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cc_ng_organism  # noqa: E402
+from .test_cc_dual_pass import cc_ng  # noqa: E402,F401  (pytest fixture)
 
 
 class _RecordingLock:
@@ -261,3 +286,176 @@ def test_daemon_flag_off_is_the_previous_path(daemon, monkeypatch):
     daemon.mod._deposit('a turn')
     assert daemon.graph.events == [('enter', 'concurrent'), ('dual_pass', True),
                                    ('exit', 'concurrent')]
+
+
+# ---- the drains step (B3: assignment z2-b3-kiss-drain-step-001) ----
+
+@pytest.fixture
+def leg1(tmp_path, monkeypatch):
+    """Real-module Leg-1 conduit rig. Mirrors the durable rig setup in
+    tests/test_cc_gateway_durable.py (conduit dir, journal, MACHINE_ID,
+    refused save) but calls the real cc_ng_organism.drain_gateway_conduit
+    with a real neuro_foundation.Graph: the durable rig AST-extracts the
+    drain into a bare namespace that the mandated
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', ...) cannot
+    reach, and its SimpleNamespace graph has no step clock to assert on."""
+    import ng_embed
+    monkeypatch.setattr(cc_ng_organism, '_CC_CALLOSUM_LEG1_ENABLED', True)
+    monkeypatch.setattr(ng_embed, 'embed', lambda text: text)
+    monkeypatch.setitem(sys.modules, 'cc_refeed', types.SimpleNamespace(
+        should_pause_for_load=lambda ceiling: False))
+    monkeypatch.setenv('MACHINE_ID', 'vps')
+    calls = []
+
+    def dual_pass(graph, vdb, text, emb, state):
+        calls.append(text)
+        return True
+
+    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', dual_pass)
+
+    from neuro_foundation import Graph
+    g = Graph()
+    if not hasattr(g, '_concurrent_lock'):
+        g._concurrent_lock = threading.RLock()
+
+    def refused_save():
+        return {'accepted': False, 'outcome': 'retry'}
+
+    def add(texts=('leg one turn one', 'leg one turn two'),
+            name='laptop_cc_gateway.1.tract'):
+        import ng_tract
+        path = tmp_path / 'conduit' / name
+        for text in texts:
+            ng_tract.deposit_experience(raw=text.encode(), source='cc_gateway',
+                                        tract_paths=[str(path)])
+        return path
+
+    conduit = tmp_path / 'conduit'
+    conduit.mkdir()
+    journal = tmp_path / 'local' / 'delivery.sqlite3'
+    state = {}
+
+    def drain(**kw):
+        args = dict(conduit_dir=str(conduit), journal_path=str(journal),
+                    save_callback=refused_save)
+        args.update(kw)
+        return cc_ng_organism.drain_gateway_conduit(g, None, state, **args)
+
+    return types.SimpleNamespace(graph=g, conduit=conduit, journal=journal,
+                                 add=add, drain=drain, state=state, calls=calls)
+
+
+def test_flag_on_drain_ingest_tract_steps_once_per_absorbed_entry(cc_ng, tmp_path, monkeypatch):
+    import ng_tract
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+    tract_path = str(tmp_path / 'turns.tract')
+    for raw in (b'turn one lands', b'turn two lands', b'turn three fails the dual pass'):
+        ng_tract.deposit_experience(raw=raw, source='cc_gateway', tract_paths=[tract_path])
+
+    def dual_pass(graph, vdb, text, emb, state):
+        if 'fails the dual pass' in str(text):
+            return False
+        return True
+
+    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', dual_pass)
+
+    if not hasattr(cc_ng.graph, '_concurrent_lock'):
+        cc_ng.graph._concurrent_lock = threading.RLock()
+    before = cc_ng.graph.timestep
+    with cc_ng.graph._concurrent_lock:
+        absorbed = cc_ng_organism.drain_ingest_tract(
+            cc_ng.graph, cc_ng.vector_db, {'last_forest_id': None},
+            tract_path=tract_path)
+    assert absorbed == 2
+    assert cc_ng.graph.timestep == before + 2
+
+
+def test_flag_off_drain_ingest_tract_does_not_step(cc_ng, tmp_path, monkeypatch):
+    import ng_tract
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
+    tract_path = str(tmp_path / 'turns.tract')
+    for raw in (b'flag off turn one', b'flag off turn two'):
+        ng_tract.deposit_experience(raw=raw, source='cc_gateway', tract_paths=[tract_path])
+    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', lambda *a: True)
+
+    if not hasattr(cc_ng.graph, '_concurrent_lock'):
+        cc_ng.graph._concurrent_lock = threading.RLock()
+    before = cc_ng.graph.timestep
+    with cc_ng.graph._concurrent_lock:
+        absorbed = cc_ng_organism.drain_ingest_tract(
+            cc_ng.graph, cc_ng.vector_db, {'last_forest_id': None},
+            tract_path=tract_path)
+    assert absorbed == 2
+    assert cc_ng.graph.timestep == before
+
+
+def test_flag_on_drain_gateway_conduit_steps_once_per_applied_record(leg1, monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', True)
+    leg1.add()
+    before = leg1.graph.timestep
+    result = leg1.drain()
+    assert result['applied'] == 2
+    assert leg1.graph.timestep == before + 2
+    second = leg1.drain()
+    assert second['applied'] == 0
+    assert second['uncertain'] == 0
+    assert len(leg1.calls) == 2
+    assert leg1.graph.timestep == before + 2
+
+
+def test_flag_off_drain_gateway_conduit_does_not_step(leg1, monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, '_CC_NG_DEPOSIT_STEP', False)
+    leg1.add(texts=('flag off leg one turn',))
+    before = leg1.graph.timestep
+    result = leg1.drain()
+    assert result['applied'] == 1
+    assert leg1.graph.timestep == before
+
+
+def test_autosave_loop_drains_the_tract_under_concurrent_lock_643(cc_ng, tmp_path, monkeypatch):
+    import ng_tract
+    import cc_ng_host
+    tract_path = str(tmp_path / 'turns.tract')
+    ng_tract.deposit_experience(raw=b'autosave drain lock probe turn',
+                                source='cc_gateway', tract_paths=[tract_path])
+    monkeypatch.setenv('CC_GATEWAY_TRACT_PATH', tract_path)
+
+    monkeypatch.setattr(cc_ng_organism, 'cc_update_probation', lambda *a, **k: None)
+    monkeypatch.setattr(cc_ng_organism, 'surface_wants', lambda *a, **k: None)
+    monkeypatch.setattr(cc_ng_organism, 'generate_emergent_want', lambda *a, **k: None)
+    monkeypatch.setattr(cc_ng_organism, 'persist_cc_commons', lambda *a, **k: None)
+
+    monkeypatch.setattr(cc_ng_host._STATE, 'cc_ng', cc_ng)
+    monkeypatch.setattr(cc_ng_host._STATE, 'conv_state', {'last_forest_id': None})
+    monkeypatch.setattr(cc_ng_host._STATE, 'running', True)
+    monkeypatch.setattr(cc_ng_host, 'time', types.SimpleNamespace(sleep=lambda _s: None))
+
+    real_dual_pass = cc_ng_organism.run_conversational_dual_pass
+    probe = {'ran': False, 'acquired': None}
+
+    def probing_dual_pass(graph, vdb, text, emb, state):
+        probe['ran'] = True
+        seen = {}
+
+        def attempt():
+            seen['ok'] = graph._concurrent_lock.acquire(blocking=False)
+            if seen['ok']:
+                graph._concurrent_lock.release()
+
+        thread = threading.Thread(target=attempt)
+        thread.start()
+        thread.join()
+        probe['acquired'] = seen['ok']
+        outcome = real_dual_pass(graph, vdb, text, emb, state)
+        cc_ng_host._STATE.running = False
+        return outcome
+
+    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', probing_dual_pass)
+
+    if not hasattr(cc_ng.graph, '_concurrent_lock'):
+        cc_ng.graph._concurrent_lock = threading.RLock()
+
+    cc_ng_host._autosave_loop()
+
+    assert probe['ran'] is True
+    assert probe['acquired'] is False

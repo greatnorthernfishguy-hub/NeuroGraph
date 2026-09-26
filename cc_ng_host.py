@@ -27,6 +27,26 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
+#   lane z2-b3-kiss-drain-step-001 — #643: the autosave-loop tract drain now
+#   holds graph._concurrent_lock
+# What: _autosave_loop scopes a `with _STATE.cc_ng.graph._concurrent_lock:`
+#   around the drain_ingest_tract call (previously only save() was covered).
+#   The lock is NOT widened over cc_update_probation, surface_wants or
+#   generate_emergent_want. The hook path's locking (_deposit) is unchanged,
+#   as is drain_gateway_conduit's own locking.
+# Why: punchlist #643 — the dual pass (and, with CC_NG_DEPOSIT_STEP, the
+#   per-record cc_deposit_step this lane adds to the drain) mutated the graph
+#   unlocked on that path, so a tract drain could run concurrently with a
+#   hook deposit or a Leg-1 record. Fixed at source (LAW 4): the caller
+#   holds the lock, which drain_ingest_tract's contract and the deposit step
+#   both require. Chief B3 ruling 001 (docs 0ef6dac1) dispatch conditions;
+#   assignment z2-b3-kiss-drain-step-001 Part 2.
+# How: separate lock hold scoped to the drain call, after the existing
+#   save() hold. Tests: tests/test_cc_deposit_step.py
+#   (test_autosave_loop_drains_the_tract_under_concurrent_lock_643 — a
+#   cross-thread acquire(blocking=False) probe inside the wrapped dual pass;
+#   it fails on 2e58509, where the drain ran unlocked).
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — lane C (ii-a):
 #   _deposit steps through cc_deposit_step when CC_NG_DEPOSIT_STEP is on.
 # What: after the dual pass, inside the same _concurrent_lock, _deposit calls
@@ -1440,7 +1460,12 @@ def _autosave_loop() -> None:
                     surface_wants, generate_emergent_want, drain_ingest_tract,
                     cc_update_probation,
                 )
-                drain_ingest_tract(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
+                # #643: the drain mutates the graph (the dual pass, and with
+                # CC_NG_DEPOSIT_STEP the per-record cc_deposit_step), so it runs
+                # under graph._concurrent_lock, which both require. Scoped to the
+                # drain only -- probation/want surfacing stay outside, as before.
+                with _STATE.cc_ng.graph._concurrent_lock:
+                    drain_ingest_tract(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
                 # Leg1 raw conduit delivery runs through the socket sync job.
                 # The July28 topology/sleep rationale was superseded Sep11:
                 # raw experience has no synthetic consolidation cadence.

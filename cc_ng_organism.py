@@ -3,6 +3,26 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-26] GLM (z-ai/glm-5.3-flash, OpenCode harness on T3 Code),
+#   lane z2-b3-kiss-drain-step-001 — the drained turns step; Leg-1 docstring
+#   qualified
+# What: drain_ingest_tract and drain_gateway_conduit (Leg 1) each call
+#   cc_deposit_step once per APPLIED record, behind the existing
+#   _CC_NG_DEPOSIT_STEP flag (default off; nothing flips it). No step on a
+#   skipped, paused, uncertain, already-applied or failed apply; no
+#   threshold, dedup, similarity check or skip of the raw deposit (LAW 7).
+#   Docstrings: cc_deposit_step now names its three doors; drain_ingest_tract
+#   states the caller holds graph._concurrent_lock (required by both the
+#   step and #643); "No synthetic graph steps." is qualified per R2 (it bars
+#   idle/consolidation cadence, not the per-applied-record deposit step).
+# Why: Chief B3 ruling 001 (docs 0ef6dac1) R1/R2/R3; P153(4) Q3 — the CC
+#   deposit steps, and that is where KISS ops 1 and 6 get their receipt; op 1
+#   at Apprentice is the Delta Gate on graph data (KISS.md:38) — the step plus
+#   cc_deposit_step's existing fired-set gate. Assignment
+#   z2-b3-kiss-drain-step-001 Part 1.
+# How: flag-gated cc_deposit_step call immediately after each drain's truthy
+#   _apply_gateway_experience (conduit: inside the same graph._concurrent_lock
+#   hold, after the not-applied guard). Tests: tests/test_cc_deposit_step.py.
 # [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — Pith
 #   cache-line cleanup (P224(1)(a)) + #522 coherence across victim eviction
 # What: CacheLine loses the four computed-never-read fields `lod`,
@@ -2032,6 +2052,17 @@ def cc_deposit_step(graph, ingested):
     enabled -- no phantom credit for a failed deposit (Chief ruling R1).
     No stimulus is injected: the step fires what the substrate already carries.
 
+    Doors (Chief B3 ruling 001): the hook _deposit (cc_ng_host.py) calls this
+    even on a failed dual pass -- a failed turn is still a timestep; the two
+    drains (drain_ingest_tract, Leg-1 drain_gateway_conduit) call it once per
+    APPLIED record only -- no step on a skipped, paused, uncertain,
+    already-applied or failed apply.
+
+    This step, plus the fired-set gate below, is KISS op 1 at Apprentice --
+    the Delta Gate on graph data (KISS.md:38: "Read the graph.step() receipt
+    ... If nothing happened, nothing to report"); the step is where that
+    receipt comes from (P153(4) Q3), per Chief B3 ruling R3.
+
     Callers hold graph._concurrent_lock; this takes graph._step_lock (RLock)
     inside it, the established order. Fails soft: the deposit already landed.
     Nothing consumes the returned receipt yet (KISS ops 2/6 are unbuilt).
@@ -2159,6 +2190,11 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     it elsewhere byte-exact with what was actually removed from the file,
     with no separate read and no window between them.
 
+    Locking: the caller holds graph._concurrent_lock for the whole call --
+    the dual pass mutates the graph, and with CC_NG_DEPOSIT_STEP on, the
+    per-record cc_deposit_step(graph, True) requires the caller's lock hold,
+    which punchlist #643 (the autosave-loop caller) now provides.
+
     Fails soft -- an ingest-tract drain failure must never break the
     daemon's autosave pulse.
     """
@@ -2209,6 +2245,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             try:
                 if _apply_gateway_experience(graph, vector_db, state, entry):
                     absorbed += 1
+                    if _CC_NG_DEPOSIT_STEP:
+                        cc_deposit_step(graph, True)
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
             if max_entries and taken >= max_entries:
@@ -2393,7 +2431,11 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
     SQLite stores transport identities, exact raw BTF bytes and attempt states,
     never embeddings or derived cognition. FULL synchronous transactions precede
     every mutation. A filesystem lock serializes deliveries, while graph locking
-    remains one record (or save) at a time. No synthetic graph steps.
+    remains one record (or save) at a time. No synthetic graph steps -- this
+    bars idle and consolidation cadence (the Sep-11 supersession), not the one
+    cc_deposit_step per applied record under CC_NG_DEPOSIT_STEP (Chief B3
+    ruling R2): a skipped, paused, uncertain, already-applied or failed apply
+    never steps.
 
     Interrupted attempts, partial learning and unresolved prior-incarnation
     deliveries require reconciliation. Terminal accepted receipts survive normal
@@ -2562,8 +2604,10 @@ def drain_gateway_conduit(graph, vector_db, state: dict, conduit_dir: str = None
                             try:
                                 with graph._concurrent_lock:
                                     applied = _apply_gateway_experience(graph, vector_db, state, entry)
-                                if not applied:
-                                    raise RuntimeError('dual-pass did not confirm full application')
+                                    if not applied:
+                                        raise RuntimeError('dual-pass did not confirm full application')
+                                    if _CC_NG_DEPOSIT_STEP:
+                                        cc_deposit_step(graph, applied)
                                 with db:
                                     db.execute('UPDATE records SET status=? WHERE conduit=? AND name=? AND digest=? AND start=? AND end=?', ('applied',) + rkey)
                                 result['applied'] += 1
