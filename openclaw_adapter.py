@@ -399,5 +399,3 @@ class OpenClawAdapter(ABC):
                 f.write(json.dumps(event) + "\n")
         except Exception as exc:
             logger.debug("Event log write failed: %s", exc)
-
-

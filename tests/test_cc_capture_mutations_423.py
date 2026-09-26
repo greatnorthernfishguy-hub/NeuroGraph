@@ -1,5 +1,13 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code), lane z2-dualpass-reconcile-20260926 — P264(2) land corrections
+# What: (a) records the Addendum-1 deletion of the merge-orphan
+#       `if extract_failed: raise RuntimeError(...)` stub lines (commit 3670dba);
+#       (b) drops the stale 2026-09-22 B9 entry, whose RuntimeError mock was
+#       replaced by DualPassIncompleteError (see the Z11 entry below).
+# Why:  Z11 P187 review of 3670dba (notes 1-2): changelog must not claim
+#       behavior the file no longer has.
+# How:  Changelog-only; no test code changed.
 # [2026-09-26] Z11 zone-manager build dispatch — stale test correction
 # What: test_dual_pass_outcome_and_embedding_outside_lock third parametrize
 #       case now raises DualPassIncompleteError instead of returning
@@ -21,12 +29,6 @@
 #       note 1) asked for this header at merge.
 # How:  Test edit only; cc_update_probation still has live coverage in
 #       tests/test_cc_dual_pass.py.
-# [2026-09-22] Grok 4.6 — punchlist-001 B9: extraction failure is no deposit
-# What: extract_failed mock raises before record_outcome instead of returning
-#   extraction_failed=True after a forest write.
-# Why: Atomic dual-pass: DualPassIncompleteError means no forest. The old
-#   partial-success raise in run_conversational_dual_pass is gone.
-# How: RuntimeError from dual_record_outcome; return False still asserted.
 # -------------------
 import ast
 import logging

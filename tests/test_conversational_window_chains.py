@@ -13,7 +13,7 @@
 # What: Mirror the RPC 5a/5b assertions on cc_ng_organism.run_conversational_dual_pass.
 # Why:  CC's parameterized copy of the conversational path must grow the same
 #       graph-only window topology. Forest-only is not an outcome.
-# How:  FakeGraph + SimpleVectorDB + _step_lock; KISS gate off; same patches.
+# How:  FakeGraph + SimpleVectorDB + _step_lock; same patches.
 # [2026-09-21] Grok 4.6 — Lane 3 §7 polychrony window chains (graph-only)
 # What: Long-turn window nodes live in the SNN and stay out of recall vdb;
 #       delay-chained in order with the #257 sampler; forest-linked both
