@@ -28,6 +28,17 @@ were confirmed before this module was enabled.
 
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 r2 — #643 comment wording (P187 finding 2)
+# What: the _autosave_loop #643 comment is reworded comment-only — the dual pass
+#   mutates the graph, so the drain runs under graph._concurrent_lock. No code or
+#   lock line moves.
+# Why: Chief-003 ruling on the Lane 3 twin ripple; P187 LE finding 2 / Grok note 10
+#   ("both" was left over from the removed dual-pass + cc_deposit_step pair = P240(3)).
+# How: one comment sentence reworded. The flag gate is removed per P240(3); R2's
+#   AUTOSTEP pairing is an activation condition (CALLOSUM-TRUTH §8.13; the laptop
+#   is an exec ruling), not met here. CC_NG_AUTOSTEP untouched.
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: the Stop door steps unconditionally
 # What: _deposit's gate is now `if step:` (the flag is removed), so the Stop-side
 #   deposit steps once per turn with no flag; the else path is byte-identical.
@@ -1508,9 +1519,9 @@ def _autosave_loop() -> None:
                     surface_wants, generate_emergent_want, drain_ingest_tract,
                     cc_update_probation,
                 )
-                # #643: the drain mutates the graph (the dual pass), so it runs
-                # under graph._concurrent_lock, which both require. Scoped to the
-                # drain only -- probation/want surfacing stay outside, as before.
+                # #643: the dual pass mutates the graph, so the drain runs
+                # under graph._concurrent_lock. Scoped to the drain only --
+                # probation/want surfacing stay outside, as before.
                 with _STATE.cc_ng.graph._concurrent_lock:
                     drain_ingest_tract(_STATE.cc_ng.graph, _STATE.cc_ng.vector_db, _STATE.conv_state)
                 # Leg1 raw conduit delivery runs through the socket sync job.

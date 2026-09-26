@@ -1,5 +1,26 @@
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 r2 — restore the laptop-daemon tests on the
+#   twin's Stop-side contract
+# What: the laptop daemon section (_load_daemon, the daemon fixture) is restored
+#   verbatim from b0ff14c and four test_daemon_* tests are written against the
+#   landed twin (docs/scripts/cc-ng-daemon.py at docs 05245739): Stop-side
+#   _deposit(step=True) steps once after the dual pass inside
+#   graph._concurrent_lock; the prompt side never steps; a one-turn run steps
+#   exactly once from Stop. No test monkeypatches the removed
+#   _CC_NG_DEPOSIT_STEP; each asserts STATE.stats['errors'] is unchanged. The r1
+#   entry below still records that the section was removed; this entry supersedes
+#   it in history.
+# Why: Chief-003 ruling on the Lane 3 twin ripple (the r1 deletion was a brief
+#   error; coverage must not be deleted) and P240(3). The twin is Z12's and was
+#   not touched.
+# How: _load_daemon and the fixture restored verbatim; the four tests assert order
+#   via the fake graph's lock/step events and count errors. The flag gate is
+#   removed per P240(3); R2's AUTOSTEP pairing is an activation condition
+#   (CALLOSUM-TRUTH §8.13; the laptop is an exec ruling), not met here.
+#   CC_NG_AUTOSTEP untouched.
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: drop the flag and every drain step
 # What: every monkeypatch of cc_ng_organism._CC_NG_DEPOSIT_STEP is removed, with
 #   the flag-default test; the host-door tests are rewritten to Lane 2's plain
@@ -65,6 +86,7 @@
 #   CC_NG_DAEMON_SCRIPT points the daemon tests at a worktree copy of the script
 #   (default ~/docs/scripts/cc-ng-daemon.py).
 # -------------------
+import importlib.util
 import os
 import sys
 import threading
@@ -302,6 +324,102 @@ def test_host_step_failure_does_not_count_a_deposit_error(host):
     before = host.mod._STATE.stats['errors']
     host.mod._deposit('a turn', step=True)
     assert host.mod._STATE.stats['errors'] == before
+
+
+# ---- laptop daemon _deposit ----
+
+def _load_daemon():
+    path = os.environ.get('CC_NG_DAEMON_SCRIPT',
+                          os.path.expanduser('~/docs/scripts/cc-ng-daemon.py'))
+    spec = importlib.util.spec_from_file_location('cc_ng_daemon_deposit_step', path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['cc_ng_daemon_deposit_step'] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def daemon(monkeypatch):
+    mod = _load_daemon()
+    import ng_embed
+    g = _FakeGraph()
+
+    def fake_dual_pass(graph, vdb, text, emb, state):
+        g.events.append(('dual_pass', graph._concurrent_lock.held))
+        return fake_dual_pass.ok
+    fake_dual_pass.ok = True
+
+    monkeypatch.setattr(mod.STATE, 'ng', types.SimpleNamespace(graph=g, vector_db=None))
+    monkeypatch.setattr(ng_embed, 'embed', lambda text: [0.0])
+    monkeypatch.setattr(cc_ng_organism, 'run_conversational_dual_pass', fake_dual_pass)
+    monkeypatch.setattr(cc_ng_organism, 'deposit_cc_experience', lambda *a, **k: None)
+    return types.SimpleNamespace(mod=mod, graph=g, dual_pass=fake_dual_pass)
+
+
+def test_daemon_stop_side_steps_after_dual_pass_inside_concurrent_lock(daemon):
+    before = daemon.mod.STATE.stats['errors']
+    daemon.mod._deposit('a reply', step=True)
+    ev = daemon.graph.events
+    assert ev[:3] == [('enter', 'concurrent'), ('dual_pass', True), ('enter', 'step')]
+    assert ev[-2:] == [('exit', 'step'), ('exit', 'concurrent')]
+    assert [e for e in ev if e == ('enter', 'step')] == [('enter', 'step')]
+    assert daemon.graph.rewards == [0.1]
+    assert daemon.graph.discovered == [['n1', 'n2']]
+    assert daemon.mod.STATE.stats['errors'] == before
+
+
+def test_daemon_stop_side_failed_dual_pass_steps_without_reward(daemon):
+    daemon.dual_pass.ok = False
+    before = daemon.mod.STATE.stats['errors']
+    daemon.mod._deposit('a reply', step=True)
+    assert ('step', True) in daemon.graph.events
+    assert daemon.graph.rewards == []
+    assert daemon.mod.STATE.stats['errors'] == before
+
+
+def test_daemon_prompt_side_does_not_step(daemon):
+    before = daemon.mod.STATE.stats['errors']
+    daemon.mod._deposit('a prompt')
+    assert daemon.graph.events == [('enter', 'concurrent'), ('dual_pass', True),
+                                   ('exit', 'concurrent')]
+    assert daemon.mod.STATE.stats['errors'] == before
+
+
+def test_daemon_one_turn_steps_exactly_once_from_stop(daemon, monkeypatch):
+    """The old twin read the removed _CC_NG_DEPOSIT_STEP flag, raising
+    AttributeError on every deposit; _deposit swallowed it and bumped
+    STATE.stats['errors']. Errors-unchanged across these two calls is the
+    visible signal that the landed twin does not read the removed flag."""
+    monkeypatch.setattr(daemon.mod, '_nudge', lambda text: None)
+    monkeypatch.setattr(daemon.mod, '_recall', lambda *a, **k: "")
+    monkeypatch.setattr(cc_ng_organism, 'render_constitutional_core',
+                        lambda *a, **k: "")
+    monkeypatch.setattr(cc_ng_organism, 'render_wants', lambda *a, **k: [])
+    # REQUIRED: _write_refcount writes the live CC_NG_WORKSPACE/refcount file.
+    monkeypatch.setattr(daemon.mod, '_write_refcount', lambda n: None)
+
+    original_thread = threading.Thread
+    thread_calls = []
+
+    def inline_thread(target=None, args=(), daemon=False, kwargs=None, **extra):
+        if target:
+            target(*args, **(kwargs or {}))
+        thread_obj = original_thread()
+        thread_calls.append((target, args, kwargs))
+        return thread_obj
+
+    monkeypatch.setattr(daemon.mod.threading, 'Thread', inline_thread)
+
+    before = daemon.mod.STATE.stats['errors']
+    daemon.mod.handle_user_prompt_submit({'prompt': 'a prompt'})
+    daemon.mod.handle_session_stop({'last_assistant_message': 'a reply'})
+
+    step_enters = [e for e in daemon.graph.events if e == ('enter', 'step')]
+    assert len(step_enters) == 1
+    # The one step came from the Stop side (kwargs step=True), not the prompt.
+    assert not thread_calls[0][2]
+    assert thread_calls[1][2] == {'step': True}
+    assert daemon.mod.STATE.stats['errors'] == before
 
 
 # ---- the drains step (B3: assignment z2-b3-kiss-drain-step-001) ----

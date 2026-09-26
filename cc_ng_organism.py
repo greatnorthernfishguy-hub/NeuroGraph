@@ -4,6 +4,17 @@
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-remove-deposit-step-flag-001 r2 — drain_ingest_tract Locking wording
+#   (P187 finding 3)
+# What: the drain_ingest_tract docstring's Locking sentence is reworded
+#   comment-only — the caller's graph._concurrent_lock (punchlist #643) is what
+#   makes the dual pass's mutation of the graph safe. No code line moves.
+# Why: Chief-003 ruling on the Lane 3 twin ripple; P187 LE finding 3 / Grok note 10.
+# How: one docstring sentence reworded. The flag gate is removed per P240(3); R2's
+#   AUTOSTEP pairing is an activation condition (CALLOSUM-TRUTH §8.13; the laptop
+#   is an exec ruling), not met here. CC_NG_AUTOSTEP untouched.
+# -------------------
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: drop the deposit-step flag
 # What: the _CC_NG_DEPOSIT_STEP flag and its comment are deleted; the two drain
 #   step sites in drain_ingest_tract and drain_gateway_conduit are deleted, so
@@ -2217,9 +2228,9 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     it elsewhere byte-exact with what was actually removed from the file,
     with no separate read and no window between them.
 
-    Locking: the caller holds graph._concurrent_lock for the whole call --
-    the dual pass mutates the graph, which punchlist #643 (the autosave-loop
-    caller) now provides.
+    Locking: the caller holds graph._concurrent_lock (punchlist #643, the
+    autosave-loop caller) for the whole call -- that lock is what makes the
+    dual pass's mutation of the graph safe.
 
     Fails soft -- an ingest-tract drain failure must never break the
     daemon's autosave pulse.
