@@ -187,6 +187,38 @@ def test_source_coherence_and_exact_anchors_remain_attached_to_basin():
     assert "root" not in rendered  # internal node id never becomes an orphan reference
 
 
+def test_epistemic_label_verified_shows_verified_not_from_substrate():
+    """New test A: CacheLine with epistemic='verified' shows 'verified' in heading, not 'from substrate'."""
+    line = pith.CacheLine(
+        node_id="test",
+        content="Test content",
+        score=1.0,
+        epistemic="verified",
+        coherence="shared",
+        sources=["test"],
+        anchors=["test-anchor"]
+    )
+    rendered = pith._pith_render_connected_line(line)
+    assert "[verified; coherence: shared]" in rendered
+    assert "from substrate" not in rendered
+
+
+def test_root_label_not_keyframe():
+    """New test B: rendered line uses '- Root:' not '- Keyframe:'."""
+    line = pith.CacheLine(
+        node_id="test",
+        content="Test content",
+        score=1.0,
+        epistemic="learned",
+        coherence="exclusive",
+        sources=["test"],
+        anchors=["test-anchor"]
+    )
+    rendered = pith._pith_render_connected_line(line)
+    assert "- Root: Test content" in rendered
+    assert "Keyframe" not in rendered
+
+
 def test_authored_want_remains_eligible_while_constitutional_node_is_not_duplicated():
     graph = _Graph()
     graph.node("core", "Honor agency.", constitutional=True)
