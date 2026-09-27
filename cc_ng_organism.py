@@ -310,6 +310,15 @@
 #   window order is substrate structure; windows stay out of vector_db.
 # How: Same sampler as the prev-forest link (randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))).
 #   DualPassIncompleteError from NGEmbed already prevents a forest write.
+# [2026-09-22] Claude Code — correct stale Leg1 rationale comment (source, LAW 4).
+# What: Update the 2026-07-27 Leg1 changelog entry's "Why" (and its header) to
+#   reflect the current laptop/VPS embedding and Tonic responsibilities.
+# Why: Josh ruled on 2026-09-22 that the laptop's RAM upgrade removes the constraint
+#   that kept it from running the Tonic. The old comment ("laptop does zero embedding
+#   by design ... VPS is the sole Arborist for both hemispheres") had become false and
+#   was misdirecting architecture decisions. LAW 4: fix the stale claim at its source
+#   in this file, not in downstream consumers.
+# How: Reword the Leg1 header and "Why" paragraph only; no code or behavior change.
 # [2026-09-16] Claude Code (Opus 5) — bound want extraction and want rendering.
 # What: _WANT_RE caps the captured span at WANT_MAX_CHARS (600); surface_wants
 #   skips `[WANT]` preceded by a backtick (documentation of the marker) and any
@@ -452,7 +461,7 @@
 #   import_trickle (cc-ng-sync.py). Gate CC_CALLOSUM_LEG1_ENABLED unchanged, default off.
 #   Ref: docs/reports/Topology_Merge_Insights_from_FatherGraph_Training.md
 # [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70): raw-turn
-#   conduit, laptop -> VPS Arborist
+#   conduit, laptop -> VPS
 # What: New cc_gateway_conduit_dir()/trickle_gateway_conduit()/drain_gateway_
 #   conduit() in the same region as cc_gateway_tract_path()/drain_ingest_tract().
 #   trickle_gateway_conduit(data) writes a snapshot of the laptop's cc_gateway
@@ -463,12 +472,16 @@
 #   drain_ingest_tract() (unchanged), then deletes the now-emptied file.
 # Why: Retires the lossy top-N JSONL sync (cc-ng-sync.py: content-only, capped
 #   at EXPORT_SIZE, re-embedded via on_message() with no synapses/hyperedges/
-#   tree structure). The laptop does zero embedding by design (no forest, no
-#   tree, no TID) -- the VPS is the sole Arborist for both hemispheres. This
-#   is the pipe that gets the laptop's raw BTF conversation frames onto the
-#   VPS so they hit the same run_conversational_dual_pass() the VPS already
-#   runs for its own local tract. Spec: docs/superpowers/plans/2026-07-27-
-#   cc-corpus-callosum-leg1-spec.md.
+#   tree structure). Per Josh's 2026-09-22 ruling (EXECUTIVE-TODO Packet 052)
+#   and Packet 073(C)/(D), the laptop's RAM upgrade lets it run its own Tonic
+#   and embedding (protoUniBrain) instead of borrowing the VPS's for that --
+#   once it embeds for itself, Leg 1 retires. Tree growth (TID) stays VPS-side
+#   regardless (ng_embed.py's concept extraction needs TID; the laptop has
+#   none), so Leg 2 still carries that structure back down. CC-CALLOSUM-TRUTH.md
+#   §1.4/§1.4.1/§8.5.1 still describe the pre-ruling state; Packet 073(D)
+#   assigns Z12 to update it with a dated entry. Spec:
+#   docs/superpowers/plans/2026-07-27-cc-corpus-callosum-leg1-spec.md
+#   (superseded in part by the above rulings, pending that CALLOSUM-TRUTH update).
 # How: Per-batch filenames (not a shared append/truncate target) sidestep the
 #   binary-merge-conflict scenario a single conduit file would hit under
 #   repo-sync.sh's git push/pull cycle (git can't line-merge BTF) -- each
