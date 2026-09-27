@@ -1,6 +1,23 @@
 # tests/test_cc_recall_unification.py
 #
 # ---- Changelog ----
+# [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3
+#   Code), lane z2-ng-recall-passthrough-restore-001 — restore fallback tests.
+# What: every notice assertion is replaced by an un-Pithed fallback assertion.
+#   test_assemble_recall_pith_failure_returns_notice_only becomes
+#   test_assemble_recall_pith_failure_falls_back_to_un_pithed (still
+#   parametrized over the four failure points): the return equals exactly what
+#   gate-off returns for the same inputs, and on_pith_failure still gets the raw
+#   exception once. The old non-blank-notice test becomes
+#   test_assemble_recall_pith_failure_empty_inputs_return_blank (both inputs
+#   empty -> "" as before 46f9cf8). The callback-error test now asserts the
+#   fallback rendering, not a notice. test_assemble_recall_gate_on_falls_back_
+#   to_concat_on_pith_exception is restored from 46f9cf8^ verbatim.
+# Why: Josh's 2026-09-26 ruling; LAW 3 restore of the pre-46f9cf8 fallback;
+#   Exec P309(1)/P311(2); the notice envelope is superseded.
+# How: assert result == expected un-Pithed concat; monkeypatch Pith steps to
+#   raise. Full notice machinery (cc_pith_unavailable_notice) is gone from
+#   production, so no test may reference it.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (b):
 #   Pith failure envelope tests.
 # What: test_assemble_recall_gate_on_falls_back_to_concat_on_pith_exception
@@ -467,6 +484,32 @@ def _boom(*args, **kwargs):
     raise RuntimeError('INJECTED_PITH_FAILURE')
 
 
+def test_assemble_recall_gate_on_falls_back_to_concat_on_pith_exception(monkeypatch):
+    """A real exception INSIDE the Pith path (here: pith_stage1 itself blows
+    up -- NOT one of the per-line-guarded calls like cc_thermal, which
+    swallow their own exceptions and would never reach the outer fallback)
+    must fail soft to the pre-Pith concat, not propagate or return empty."""
+    import cc_ng_organism
+
+    monkeypatch.setattr(cc_ng_organism, '_CC_PITH_ENABLED', True)
+
+    def boom_stage1(cache_lines, query, novelty):
+        raise RuntimeError('stage1 blew up')
+
+    monkeypatch.setattr(cc_ng_organism, 'pith_stage1', boom_stage1)
+    _patch_pattern_completion(monkeypatch, [
+        {'node_id': 'p1', 'score': 0.9, 'content': 'pattern hit'},
+    ])
+    ng = _FakeNgForAssemble([{'node_id': 'm1', 'score': 1.0, 'content': 'monitor hit'}])
+
+    result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None)
+
+    expected_monitor = '## Recent\n- monitor hit'
+    expected_pattern = cc_ng_organism._format_cc_recall_block(
+        [{'node_id': 'p1', 'score': 0.9, 'content': 'pattern hit'}])
+    assert result == expected_monitor + '\n\n' + expected_pattern
+
+
 _PITH_FAILURE_POINTS = {
     'CacheLine build': lambda mp, org: mp.setattr(org.CacheLine, 'from_surfaced', classmethod(_boom)),
     'victim_recover': lambda mp, org: mp.setattr(org, 'pith_victim_recover', _boom),
@@ -476,11 +519,11 @@ _PITH_FAILURE_POINTS = {
 
 
 @pytest.mark.parametrize('stage', list(_PITH_FAILURE_POINTS))
-def test_assemble_recall_pith_failure_returns_notice_only(monkeypatch, stage):
-    """Pith PRD failure envelope: an exception at any Pith step returns ONLY
-    the explicit unavailable notice -- never the un-Pithed monitor/pattern
-    concat, never blank -- and hands the raw exception to on_pith_failure
-    exactly once."""
+def test_assemble_recall_pith_failure_falls_back_to_un_pithed(monkeypatch, stage):
+    """LAW 3 restore: an exception at any Pith step falls through to the
+    un-Pithed monitor_ctx/pc_block rendering -- exactly the bytes gate-off
+    returns for the same inputs -- and hands the raw exception to
+    on_pith_failure exactly once."""
     import cc_ng_organism
 
     monkeypatch.setattr(cc_ng_organism, '_CC_PITH_ENABLED', True)
@@ -497,14 +540,15 @@ def test_assemble_recall_pith_failure_returns_notice_only(monkeypatch, stage):
     assert len(received) == 1
     exc = received[0]
     assert isinstance(exc, RuntimeError) and str(exc) == 'INJECTED_PITH_FAILURE'
-    assert result == cc_ng_organism.cc_pith_unavailable_notice(stage, exc)
-    assert result == (f'[NeuroGraph recall unavailable: Pith {stage} failed: '
-                      'RuntimeError: INJECTED_PITH_FAILURE]')
-    assert 'MONITOR_MARKER' not in result and 'PATTERN_MARKER' not in result
+    expected_pattern = cc_ng_organism._format_cc_recall_block(
+        [{'node_id': 'p1', 'score': 0.9, 'content': 'PATTERN_MARKER'}])
+    assert result == '## Recent\n- MONITOR_MARKER' + '\n\n' + expected_pattern
+    assert 'MONITOR_MARKER' in result and 'PATTERN_MARKER' in result
 
 
-def test_assemble_recall_pith_failure_notice_never_blank_without_callback(monkeypatch):
-    """No callback wired, empty exception message: still a non-empty notice."""
+def test_assemble_recall_pith_failure_empty_inputs_return_blank(monkeypatch):
+    """Before 46f9cf8 (and again now): with both streams empty, a Pith failure
+    falls through to `monitor_ctx or pc_block`, i.e. "" -- no invented notice."""
     import cc_ng_organism
 
     monkeypatch.setattr(cc_ng_organism, '_CC_PITH_ENABLED', True)
@@ -514,16 +558,17 @@ def test_assemble_recall_pith_failure_notice_never_blank_without_callback(monkey
 
     monkeypatch.setattr(cc_ng_organism, 'pith_stage1', blank_boom)
     _patch_pattern_completion(monkeypatch, [])
-    ng = _FakeNgForAssemble([{'node_id': 'm1', 'score': 1.0, 'content': 'MONITOR_MARKER'}])
+    ng = _FakeNgForAssemble([])
 
     result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None)
 
-    assert result == '[NeuroGraph recall unavailable: Pith stage1 failed: ValueError: ]'
+    assert result == ""
 
 
 def test_assemble_recall_pith_failure_callback_error_is_logged_not_raised(monkeypatch, caplog):
-    """A failing deposit callback must not break recall -- the notice still
-    returns -- and the lost deposit is logged at warning, not swallowed."""
+    """A failing deposit callback must not break recall -- the un-Pithed
+    fallback still returns -- and the lost deposit is logged at warning, not
+    swallowed."""
     import logging
     import cc_ng_organism
 
@@ -539,7 +584,7 @@ def test_assemble_recall_pith_failure_callback_error_is_logged_not_raised(monkey
         result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None,
                                                    on_pith_failure=bad_callback)
 
-    assert result.startswith('[NeuroGraph recall unavailable: Pith stage1 failed:')
+    assert result == '## Recent\n- m'
     assert any('Pith failure deposit failed: tract unwritable' in r.getMessage()
                for r in caplog.records)
 

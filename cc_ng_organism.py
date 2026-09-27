@@ -3,6 +3,32 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
+#   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
+#   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
+# What: an exception inside the gated Pith block (CC_PITH_ENABLED) again falls
+#   through to the un-Pithed monitor_ctx/pc_block return -- monitor_ctx + "\n\n"
+#   + pc_block, or whichever of the two is non-empty -- exactly as before
+#   46f9cf8. The notice-only return is gone: cc_pith_unavailable_notice and
+#   _PITH_NOTICE_MSG_MAX are deleted as dead code (LAW 3; nothing else
+#   referenced them). The rate-limited log lines say "falling back to un-Pithed
+#   rendering" and keep the _stage name; the docstring and the
+#   _PITH_METRICS.record_failure docstring describe the fail-soft fallback
+#   again. Everything frozen stays frozen: the on_pith_failure callback and its
+#   call site, cc_pith_failure_text, cc_deposit_pith_failure, the raw failure
+#   deposit and its wiring in cc_ng_host.py and cc-ng-daemon.py,
+#   _PITH_METRICS.record_failure() and the rate limit, the Pith success path,
+#   the four inner fail-softs, victim capture, and gate-off (byte-identical).
+# Why: Josh's ruling 2026-09-26 ("When Pith fails, there HAS to be pass-through,
+#   in order for any model to remain useful to fix anything else. No massive
+#   history CAN build up, anyway, between KISS and Pith."); Exec P309(1)/P311(2);
+#   LAW 3 restore of the pre-46f9cf8 fallback; the notice envelope is superseded.
+# How: remove `return cc_pith_unavailable_notice(_stage, exc)` from the except in
+#   cc_assemble_recall; delete cc_pith_unavailable_notice and _PITH_NOTICE_MSG_MAX;
+#   reword the logs/docstrings. Tests: replace every notice assertion with a
+#   fallback assertion at each injection point, and restore the concat-fallback
+#   test 46f9cf8 replaced. Assignment z2-ng-recall-passthrough-restore-001.
+# -------------------
 # [2026-09-26] #640 coding worker (deepseek/deepseek-v3.2, OpenCode/T3 Code) — Pith connected-line label reads `line.epistemic`; `- Keyframe:` becomes `- Root:`
 # What: `_pith_render_connected_line` now reads `CacheLine.epistemic` for the heading
 #   label, showing `"learned from substrate"` only when `line.epistemic == "learned"`;
@@ -3702,11 +3728,11 @@ class PithMetrics:
         self.l1_prefetch_distinct_promotable = 0
 
     def record_failure(self) -> None:
-        """Bump the fail-soft counter -- a failing Pith path returns its failure
-        envelope (cc_assemble_recall: the unavailable notice, never the
-        un-Pithed rendering) or an empty result (pith_prefetch_seed), so
-        without this a 100%-failing Pith pass is indistinguishable from a
-        working one. Call from the caller's except-handler."""
+        """Bump the fail-soft counter -- a failing Pith path falls back to the
+        un-Pithed rendering in cc_assemble_recall, or returns an empty result
+        (pith_prefetch_seed), so without this a 100%-failing Pith pass is
+        indistinguishable from a working one. Call from the caller's
+        except-handler."""
         with self._lock:
             self.pith_failures += 1
 
@@ -5275,24 +5301,11 @@ def _cc_recall_debug_log(query: str, monitor_items: List[Dict[str, Any]],
         logger.debug("recall-debug log failed (non-fatal): %s", exc)
 
 
-# Bound on the exception message carried in the recall notice -- it rides the
-# CC prompt every turn Pith keeps failing, so it must stay one short line.
-_PITH_NOTICE_MSG_MAX = 200
-
-
 def cc_pith_failure_text(exc: BaseException) -> str:
     """Raw text of a Pith recall failure: the exception type and message,
     as-is. No category, severity or tag (LAW 7) -- this is what the
     hemisphere deposit paths hand to the substrate."""
     return f"NeuroGraph recall Pith pass failed: {type(exc).__name__}: {exc}"
-
-
-def cc_pith_unavailable_notice(stage: str, exc: BaseException) -> str:
-    """The explicit notice cc_assemble_recall returns in place of recall when
-    its Pith pass raises (Pith PRD failure envelope): what failed and why.
-    Never blank -- the prefix alone is non-empty even for an empty message."""
-    msg = " ".join(str(exc).split())[:_PITH_NOTICE_MSG_MAX]
-    return f"[NeuroGraph recall unavailable: Pith {stage} failed: {type(exc).__name__}: {msg}]"
 
 
 def cc_deposit_pith_failure(exc: BaseException, tract_path: Optional[str] = None) -> None:
@@ -5335,13 +5348,12 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     -> pith_stage1 -> pith_stage3(budget=cc_l1_budget(commons)) ->
     pith_victim_capture) instead of the plain two-block concatenation, with
     constitutional pins (ng.graph._is_identity_protected) preserved
-    unconditionally. An exception anywhere in the Pith path never falls back
-    to the un-Pithed monitor_ctx/pc_block rendering and never returns blank:
-    it returns ONLY cc_pith_unavailable_notice() (Pith PRD failure envelope),
-    records a _PITH_METRICS failure, rate-limit-warns, and hands the raw
-    exception to on_pith_failure (each hemisphere wires its own raw deposit
-    there -- this query function does no write-side work itself, LAW 4). It
-    never raises: a surfacing pass must not crash or time out the hook.
+    unconditionally. Any exception anywhere in the Pith path is fail-soft --
+    falls back to the pre-Pith monitor_ctx/pc_block rendering -- records a
+    _PITH_METRICS failure, rate-limit-warns, and hands the raw exception to
+    on_pith_failure (each hemisphere wires its own raw deposit there -- this
+    query function does no write-side work itself, LAW 4). It never raises:
+    a surfacing pass must not crash or time out the hook.
 
     Params only (ng/conv_state/commons) -- no module-global STATE access,
     so this function is process-agnostic (Syl's-Law) and safe to call from
@@ -5483,18 +5495,18 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             survivor_results = [{'score': cl.score, 'content': cl.content} for cl in survivors]
             return _format_cc_recall_block(survivor_results)
         except Exception as exc:
-            # Failure envelope (Pith PRD): return ONLY the explicit notice --
-            # never the un-Pithed monitor_ctx/pc_block below, never blank.
-            # COUNT it and warn (rate-limited) so a failing Pith path is
-            # observable, then hand the raw exception to the caller's deposit.
+            # Fail-soft: fall back to the un-Pithed monitor_ctx/pc_block
+            # rendering below. COUNT it and warn (rate-limited) so a failing
+            # Pith path is observable, then hand the raw exception to the
+            # caller's deposit (LAW 4: no write-side work in this query fn).
             _PITH_METRICS.record_failure()
             global _last_pith_warn_ts
             _now = time.time()
             if _now - _last_pith_warn_ts >= _PITH_WARN_INTERVAL_S:
                 _last_pith_warn_ts = _now
-                logger.warning('Pith %s failed, returning the unavailable notice: %s', _stage, exc)
+                logger.warning('Pith %s failed, falling back to un-Pithed rendering: %s', _stage, exc)
             else:
-                logger.debug('Pith %s failed (non-fatal), returning the unavailable notice: %s', _stage, exc)
+                logger.debug('Pith %s failed (non-fatal), falling back to un-Pithed rendering: %s', _stage, exc)
             if on_pith_failure is not None:
                 try:
                     on_pith_failure(exc)
@@ -5502,7 +5514,6 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                     # The deposit hook must never break recall -- but a lost
                     # failure deposit is logged, not swallowed.
                     logger.warning('Pith failure deposit failed: %s', cb_exc)
-            return cc_pith_unavailable_notice(_stage, exc)
 
     if monitor_ctx and pc_block:
         return monitor_ctx + "\n\n" + pc_block
