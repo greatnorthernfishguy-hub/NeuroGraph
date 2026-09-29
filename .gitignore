@@ -26,6 +26,7 @@ syl-checkpoint-backups/
 *.pt
 fastembed_cache/
 venv/
+.venv/
 node_modules/
 .neurograph/
 .claude/worktrees/
