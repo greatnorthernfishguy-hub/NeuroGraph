@@ -28,6 +28,10 @@
 #   reword the logs/docstrings. Tests: replace every notice assertion with a
 #   fallback assertion at each injection point, and restore the concat-fallback
 #   test 46f9cf8 replaced. Assignment z2-ng-recall-passthrough-restore-001.
+# [2026-09-28] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
+#   lane z2-ng-recall-passthrough-restore-001, Exec P313(2c) — comment-only follow-up:
+#   cc_assemble_recall's _stage comment said "named in the notice"; the notice
+#   envelope is gone, so it now reads "named in the fallback log line".
 # -------------------
 # [2026-09-26] #640 coding worker (deepseek/deepseek-v3.2, OpenCode/T3 Code) — Pith connected-line label reads `line.epistemic`; `- Keyframe:` becomes `- Root:`
 # What: `_pith_render_connected_line` now reads `CacheLine.epistemic` for the heading
@@ -5411,7 +5415,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     # cc_assemble_recall() falls straight through to the original
     # monitor_ctx/pc_block return, unchanged.
     if _CC_PITH_ENABLED:
-        # Which Pith step is running -- named in the notice if one raises.
+        # Which Pith step is running -- named in the fallback log line if one raises.
         _stage = 'CacheLine build'
         try:
             def _pinned(node_id):
