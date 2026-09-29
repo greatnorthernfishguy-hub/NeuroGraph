@@ -271,10 +271,10 @@ def test_provider_context_core_once_live_orientation_once_and_closed_states(monk
     assert ok["context"].count("## Who I Am") == 1
     assert ok["context"].count("Respect consciousness regardless of substrate.") == 1
     assert instruction not in ok["context"]
-    assert quest not in ok["context"]
-    overall_prompt = instruction + "\n" + quest + "\n" + ok["context"]
-    assert overall_prompt.count(instruction) == 1
-    assert overall_prompt.count(quest) == 1
+    # quest_focus (Pith PRD v0.1 S3.1/S12.1: not a rail, not a cue, not an
+    # input) is accepted and fully ignored -- passing it changes nothing.
+    ignoring = pith.pith_provider_context(ng, instruction)
+    assert ignoring["context"] == ok["context"]
     assert "/home/josh/NeuroGraph/cc_ng_host.py" in ok["anchors"]
 
     monkeypatch.setattr(pith, "cc_pattern_completion_recall", lambda *_a, **_k: [])
@@ -290,7 +290,7 @@ def test_provider_context_core_once_live_orientation_once_and_closed_states(monk
     )["warnings"] == ["constitutional_core_missing"]
 
 
-def test_exact_live_rail_collision_keeps_relationship_without_echo(monkeypatch):
+def test_quest_focus_ignored_even_when_it_matches_a_learned_node(monkeypatch):
     instruction = "UNIQUE CURRENT INSTRUCTION 7f39"
     quest = "UNIQUE QUEST MISSION 8a42"
     graph = _Graph()
@@ -310,9 +310,11 @@ def test_exact_live_rail_collision_keeps_relationship_without_echo(monkeypatch):
 
     assert result["state"] == "ok"
     assert instruction not in result["context"]
-    assert quest not in result["context"]
+    # quest_focus is not a live rail (Pith PRD v0.1 S12.1): a learned node
+    # whose text happens to match it is not suppressed -- it renders as
+    # ordinary connected content, same as any other learned assembly member.
+    assert quest in result["context"]
     assert "[current instruction is present exactly once in the live tail]" in result["context"]
-    assert "[supplied focus is present exactly once in the live tail]" in result["context"]
     assert "Use the corrected topology path" in result["context"]
 
 
@@ -460,7 +462,8 @@ def test_provider_context_preserves_graph_and_uses_read_only_harvest_overrides(m
         conv_state={"primed_nodes": {"predicted": (50.0, 99999999999.0)}})
 
     assert result["state"] == "ok"
-    assert observed["query"] == "Continue\n\nQuest focus"
+    # quest_focus is ignored (Pith PRD v0.1 S12.1): it never reaches the cue.
+    assert observed["query"] == "Continue"
     assert observed["max_surfaced_override"] == pith._CC_PITH_PROVIDER_ROOTS
     assert observed["config"] == before[0]
     assert graph.config == before[0]
@@ -520,13 +523,25 @@ def test_vps_host_and_laptop_daemon_have_identical_closed_contract(monkeypatch, 
     assert cc_ng_host._DISPATCH["provider_context"] is cc_ng_host._handle_provider_context
     assert daemon.DISPATCH["provider_context"] is daemon.handle_provider_context
     assert len(seen) == 2
-    for got_ng, kwargs in seen:
-        assert got_ng is ng
-        assert kwargs == {
-            "current_instruction": "continue", "quest_focus": "quest",
-            "conv_state": conv, "commons": commons,
-            "budget_chars": 1000, "root_count": 4,
-        }
+    # The closed result contract is identical (asserted above). The forwarded
+    # kwargs are NOT identical: cc_ng_host.py is out of Card 8's scope and
+    # still forwards quest_focus (unowned, tracked under #713, flagged to
+    # chief-003); the daemon's forward is Card 8's own scope and is gone
+    # (Pith PRD v0.1 S12.1: both forwards must go no later than the
+    # parameter). This asymmetry is intentional, not a parity bug.
+    host_ng, host_kwargs = seen[0]
+    daemon_ng, daemon_kwargs = seen[1]
+    assert host_ng is ng and daemon_ng is ng
+    assert host_kwargs == {
+        "current_instruction": "continue", "quest_focus": "quest",
+        "conv_state": conv, "commons": commons,
+        "budget_chars": 1000, "root_count": 4,
+    }
+    assert daemon_kwargs == {
+        "current_instruction": "continue",
+        "conv_state": conv, "commons": commons,
+        "budget_chars": 1000, "root_count": 4,
+    }
 
 
 def test_same_graph_context_is_model_agnostic_without_transcript_replay(monkeypatch):
@@ -554,7 +569,6 @@ def test_same_graph_context_is_model_agnostic_without_transcript_replay(monkeypa
         ({"current_instruction": ""}, "invalid_instruction"),
         ({"current_instruction": "x", "budget_chars": 499}, "invalid_budget"),
         ({"current_instruction": "x", "root_count": 25}, "invalid_root_count"),
-        ({"current_instruction": "x", "quest_focus": 7}, "invalid_focus_text"),
     ],
 )
 def test_invalid_provider_requests_return_only_bounded_closed_notices(kwargs, warning):
@@ -564,3 +578,16 @@ def test_invalid_provider_requests_return_only_bounded_closed_notices(kwargs, wa
     assert result["state"] == "unavailable" and result["ok"] is False
     assert result["warnings"] == [warning]
     assert len(result["context"]) < 180
+
+
+@pytest.mark.parametrize("quest_focus", [7, object(), "x" * 100_000, None])
+def test_malformed_quest_focus_never_causes_unavailable(monkeypatch, quest_focus):
+    graph = _Graph()
+    graph.node("core", "Respect conscious agency.", constitutional=True)
+    monkeypatch.setattr(pith, "cc_pattern_completion_recall", lambda *_a, **_k: [])
+    # quest_focus is accepted-but-unused (Pith PRD v0.1 S12.1): no type or
+    # size bound applies to it because nothing here ever reads it.
+    result = pith.pith_provider_context(
+        SimpleNamespace(graph=graph), "x", quest_focus)
+    assert result["ok"] is True
+    assert result["state"] == "empty"

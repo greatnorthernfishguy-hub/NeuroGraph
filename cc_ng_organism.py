@@ -5,26 +5,49 @@
 # ---- Changelog ----
 # [2026-09-28] Z11 zone manager (Claude Sonnet 5, T3 Code) — remove Quest from
 #   pith_provider_context (Card 8, KISS/Pith zero-replay track, Exec Packet
-#   336)
-# What: generalized every internal-only Quest-named string this function owns:
-#   docstring wording ("fetched from Quest storage" -> "fetched from any
-#   persistent storage... opaque"), the invalid-input reason string
-#   (invalid_quest_focus -> invalid_focus_text), the local variable
-#   (quest_text -> focus_text), and the two live_rails labels ("Quest focus" /
-#   "current instruction and Quest focus" -> "supplied focus" / "current
-#   instruction and supplied focus"). The `quest_focus` parameter name itself,
-#   and every _CC_PITH_PROVIDER_MAX_QUEST_CHARS occurrence (env var, telemetry
-#   allow-list key), are UNCHANGED and deliberately out of scope for this PR:
-#   cc_ng_host.py (VPS half, parked under #713, not touched here) calls this
-#   function via **kwargs with the literal key "quest_focus" -- renaming the
-#   parameter now would TypeError that live caller the next time this shared
-#   file propagates. The env var is LAW-5 governed (.bashrc) and is a follow-up.
-# Why: Josh: "removing is correct, then, carry on" (Exec Packet 336). Card 8:
-#   the CC side no longer needs to know what Quest is -- it only forwards an
-#   opaque caller-supplied focus string.
-# How: renamed the four internal-only strings/identifiers above; left the
-#   parameter name, env var, and telemetry key untouched with an inline note
-#   each. tests/test_pith_provider_context.py:315,557 updated to match.
+#   336; corrected same day per Pith_PRD_v0.1.md S12.1, merged fef33d2b after
+#   this branch was cut)
+# What: FIRST PASS (superseded below): renamed the internal-only Quest-flavored
+#   strings (docstring wording, invalid_quest_focus -> invalid_focus_text, a
+#   local variable, two live_rails labels) but left the quest_focus
+#   VALIDATION, CUE-BUILDING, and LIVE_RAILS USE all still running -- i.e. Pith
+#   still let a malformed quest_focus close the whole call `unavailable`, still
+#   folded it into the recall cue, and still fenced it into live_rails. A
+#   neurograph-law-enforcer review correctly FAILed this: the governing PRD
+#   requires deleting that behavior now, not relabeling it.
+#   CORRECTED: deleted all three blocks outright -- the `quest_focus is None`/
+#   `invalid_focus_text` validation, the `cue += ...` concatenation, and the
+#   live_rails collision-labeling branch. quest_focus is no longer read
+#   anywhere in this function's body. Only the bare parameter NAME stays in
+#   the signature (with a real inline comment at the signature, not a
+#   changelog-only note): cc_ng_host.py (VPS half, unowned, tracked #713,
+#   flagged to chief-003) still calls this function via **kwargs with the
+#   literal key "quest_focus", and removing the parameter now would TypeError
+#   that live caller. The CC_PITH_PROVIDER_MAX_QUEST_CHARS env var/telemetry-
+#   key cluster is also still unchanged: cc-ng-service.py's preflight() hard-
+#   requires that exact var name to start the laptop service, so the code-side
+#   removal must land before the .bashrc removal, not the other way around --
+#   this needs its own punchlist row (full lockstep site list: code first,
+#   then cc-ng-service.py preflight + its test, then .bashrc last).
+# Why: Josh: "removing is correct, then, carry on" (Exec Packet 336). Pith PRD
+#   v0.1 S3.1: "Quest is not part of Pith or NeuroGraph... not a rail, not a
+#   cue, and not an input to provider_context." S12.1: "The parameter and its
+#   live_rails use go, and so do both forwards... Both forwards must go no
+#   later than the parameter."
+# How: deleted the three behavior blocks named above; reverted the now-
+#   pointless cosmetic renames from the first pass since the code they
+#   decorated no longer exists; added a real inline comment at the
+#   quest_focus parameter explaining why it stays present-but-unused.
+#   tests/test_pith_provider_context.py rewritten to match: the cue-
+#   concatenation and live-rail-collision assertions now assert quest_focus
+#   has NO effect on output (including when it collides with a learned
+#   node's own text), the invalid_focus_text parametrize case is deleted
+#   (no validation left to trigger it), and a new parametrized test proves a
+#   malformed quest_focus (wrong type, oversized, None) never causes
+#   `unavailable`. cc-ng-daemon.py's forward (Card 8's own scope, no cross-
+#   caller risk) is removed in the same PR per S12.1's "both forwards... no
+#   later than the parameter"; cc_ng_host.py's forward is NOT (out of scope,
+#   #713).
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -5149,21 +5172,31 @@ def _pith_provider_unavailable(reason: str) -> Dict[str, Any]:
     }
 
 
-def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = "",
-                          conv_state: Optional[Dict[str, Any]] = None,
-                          commons: Any = None,
-                          budget_chars: Optional[int] = None,
-                          root_count: Optional[int] = None) -> Dict[str, Any]:
+def pith_provider_context(
+        ng: Any, current_instruction: str,
+        # Accepted-but-unused: cc_ng_host.py:1027,1036-1037 (unowned, #713)
+        # still forwards this kwarg. Delete once that forward is gone.
+        quest_focus: str = "",
+        conv_state: Optional[Dict[str, Any]] = None,
+        commons: Any = None,
+        budget_chars: Optional[int] = None,
+        root_count: Optional[int] = None) -> Dict[str, Any]:
     """Construct a fresh provider-ready situational model from CC's live SNN.
 
-    `current_instruction` and the already-rendered `quest_focus` orient attention
-    but are not echoed: miniTID owns their one exact occurrence in the live
-    message tail.  They are never deposited, classified, or fetched from any
-    persistent storage here -- this function does not know what produced
-    `quest_focus`'s text, only that it is caller-supplied and opaque.  Learned
-    material comes only from the current
-    topology/activation path: pattern completion provides roots and the graph's
-    synapses/hyperedges provide connected assemblies.
+    `current_instruction` orients attention but is not echoed: miniTID owns
+    its one exact occurrence in the live message tail.  It is never
+    deposited, classified, or fetched from any persistent storage here.
+    Learned material comes only from the current topology/activation path:
+    pattern completion provides roots and the graph's synapses/hyperedges
+    provide connected assemblies.
+
+    `quest_focus` is accepted and IGNORED (Pith PRD v0.1 S3.1/S12.1: Quest is
+    not part of Pith or NeuroGraph -- not a rail, not a cue, not an input to
+    this function).  The parameter stays only because cc_ng_host.py:1027,1036-
+    1037 still forwards it via **kwargs; removing the parameter now would
+    TypeError that live VPS caller.  Card 8 owns this file; cc_ng_host.py's
+    Quest forward is unowned (#713, flagged to chief-003).  Once that forward
+    is gone, delete this parameter too.
 
     Closed result states are ``ok``, ``empty``, and ``unavailable``.  There is no
     heuristic, faux, transcript-replay, or raw-history fallback.
@@ -5172,10 +5205,6 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
         return _pith_provider_unavailable("invalid_instruction")
     if len(current_instruction) > _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS:
         return _pith_provider_unavailable("instruction_too_large")
-    if quest_focus is None:
-        quest_focus = ""
-    if not isinstance(quest_focus, str) or len(quest_focus) > _CC_PITH_PROVIDER_MAX_QUEST_CHARS:
-        return _pith_provider_unavailable("invalid_focus_text")
     graph = getattr(ng, "graph", None) if ng is not None else None
     if graph is None:
         return _pith_provider_unavailable("ng_unavailable")
@@ -5189,8 +5218,6 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
         return _pith_provider_unavailable("invalid_root_count")
 
     cue = current_instruction.strip()
-    if quest_focus.strip():
-        cue += "\n\n" + quest_focus.strip()
     try:
         core = render_constitutional_core(graph)
         if not core:
@@ -5217,11 +5244,6 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
             # merely to make a context envelope look healthy.
             return _pith_provider_unavailable("constitutional_core_exceeds_budget")
         live_rails = {current_instruction.strip(): "current instruction"}
-        if quest_focus.strip():
-            focus_text = quest_focus.strip()
-            prior = live_rails.get(focus_text)
-            live_rails[focus_text] = (
-                "current instruction and supplied focus" if prior else "supplied focus")
         fresh = pith_connected_activation_basins(
             graph, surfaced, live_rails=live_rails)
         candidates = fresh
