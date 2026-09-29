@@ -7,6 +7,21 @@
 # How: verified against main cc_ng_host.py, cc_ng_organism.py, and the Stop
 #   and deposit-step tests; no runtime edit
 # -------------------
+# [2026-09-28] Z11 zone_manager (Exec Packet 313(3), P187 pair on PR #57) —
+#   three wording fixes from the Law Enforcer's COMPLIANT-with-nits verdict
+# What: disambiguated the _concurrent_lock sentence (both paths take the
+#   lock, only step=True makes the cc_deposit_step call); scoped the
+#   cc_deposit_step "only caller" claim to this repo and named the laptop
+#   twin instead of silently repeating a stale docstring claim; split the
+#   single test-file bullet into its two actual tests (real-_deposit path
+#   vs exact-kwargs path) instead of implying one test proves both
+# Why: LE review (agent a67055b88975c31aa) flagged all three as LOW/
+#   non-blocking accuracy nits before merge; the "only caller" root cause
+#   lives in cc_ng_organism.py's cc_deposit_step docstring (~:2177), out of
+#   this PR's scope, filed as a separate LAW-4 punchlist item, not fixed here
+# How: doc wording only, no code/test changes; independently re-verified
+#   every citation against tests/test_cc_host_stop_door.py before editing
+# -------------------
 -->
 
 # CC Stop door — one step per turn
@@ -39,14 +54,14 @@ threading.Thread(target=_deposit, args=(msg,), kwargs={"step": True}, daemon=Tru
 
 The handler returns `{"ok": True}`. It does not return a context key. An empty string, whitespace, or a non-string returns `{"ok": True}` and does not start a deposit.
 
-`_deposit(text, step=False)` runs `cc_ng_organism.run_conversational_dual_pass` under `graph._concurrent_lock`. The step call sits on that same lock, and only the `step=True` path takes it:
+`_deposit(text, step=False)` runs `cc_ng_organism.run_conversational_dual_pass` under `graph._concurrent_lock`. Both paths take that same lock; only the `step=True` path makes that call:
 
 ```python
 if step:
     cc_ng_organism.cc_deposit_step(ng.graph, ingested)
 ```
 
-`cc_deposit_step` takes `graph._step_lock`, calls `graph.step()` once, injects the flat `0.1` reward when the dual pass landed and `three_factor_enabled` is on, then runs `discover_hyperedges` on that step's fired set. Its docstring names this door: the Stop-side `_deposit(step=True)` is the only caller, once per turn, including when the dual pass failed.
+`cc_deposit_step` takes `graph._step_lock`, calls `graph.step()` once, injects the flat `0.1` reward when the dual pass landed and `three_factor_enabled` is on, then runs `discover_hyperedges` on that step's fired set. Its docstring names this door: the Stop-side `_deposit(step=True)` is the only caller in this repo, once per turn, including when the dual pass failed. (The laptop twin `~/docs/scripts/cc-ng-daemon.py` has its own separate Stop handler that also reaches `cc_deposit_step` — see `tests/test_cc_deposit_step.py`'s `test_daemon_*` cases. That docstring's "only caller" claim predates the twin and needs its own fix at the source; this note just avoids repeating it uncorrected.)
 
 These paths leave `step` at the default, or never call `_deposit`, and they do not call `cc_deposit_step`:
 
@@ -75,5 +90,5 @@ Code: `cc_ng_host.py` (`_handle_stop`, `_deposit`, `_DISPATCH`) and `cc_ng_organ
 
 Tests:
 
-- `tests/test_cc_host_stop_door.py` — Stop deposits `last_assistant_message` through the real `_deposit` with `kwargs == {"step": True}`, and never returns context.
+- `tests/test_cc_host_stop_door.py` — `test_stop_with_want_materializes_want_node` runs the real `_deposit` end to end (a `[WANT]` in the reply becomes a want node); `test_stop_non_empty_calls_deposit_with_exact_text` asserts the door's daemon thread carries `kwargs == {"step": True}`. Together they cover both the real path and the exact-call contract. Neither test returns a context key, and `test_stop_never_returns_context` checks that directly.
 - `tests/test_cc_deposit_step.py` — `test_flag_attribute_is_gone`, `test_host_prompt_side_does_not_step`, `test_one_turn_steps_exactly_once`, `test_post_tool_use_never_steps`, `test_drain_ingest_tract_never_steps`, `test_drain_gateway_conduit_never_steps`.
