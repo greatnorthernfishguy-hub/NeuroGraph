@@ -3,6 +3,28 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-28] Z11 zone manager (Claude Sonnet 5, T3 Code) — remove Quest from
+#   pith_provider_context (Card 8, KISS/Pith zero-replay track, Exec Packet
+#   336)
+# What: generalized every internal-only Quest-named string this function owns:
+#   docstring wording ("fetched from Quest storage" -> "fetched from any
+#   persistent storage... opaque"), the invalid-input reason string
+#   (invalid_quest_focus -> invalid_focus_text), the local variable
+#   (quest_text -> focus_text), and the two live_rails labels ("Quest focus" /
+#   "current instruction and Quest focus" -> "supplied focus" / "current
+#   instruction and supplied focus"). The `quest_focus` parameter name itself,
+#   and every _CC_PITH_PROVIDER_MAX_QUEST_CHARS occurrence (env var, telemetry
+#   allow-list key), are UNCHANGED and deliberately out of scope for this PR:
+#   cc_ng_host.py (VPS half, parked under #713, not touched here) calls this
+#   function via **kwargs with the literal key "quest_focus" -- renaming the
+#   parameter now would TypeError that live caller the next time this shared
+#   file propagates. The env var is LAW-5 governed (.bashrc) and is a follow-up.
+# Why: Josh: "removing is correct, then, carry on" (Exec Packet 336). Card 8:
+#   the CC side no longer needs to know what Quest is -- it only forwards an
+#   opaque caller-supplied focus string.
+# How: renamed the four internal-only strings/identifiers above; left the
+#   parameter name, env var, and telemetry key untouched with an inline note
+#   each. tests/test_pith_provider_context.py:315,557 updated to match.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -5136,8 +5158,10 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
 
     `current_instruction` and the already-rendered `quest_focus` orient attention
     but are not echoed: miniTID owns their one exact occurrence in the live
-    message tail.  They are never deposited, classified, or fetched from Quest
-    storage here.  Learned material comes only from the current
+    message tail.  They are never deposited, classified, or fetched from any
+    persistent storage here -- this function does not know what produced
+    `quest_focus`'s text, only that it is caller-supplied and opaque.  Learned
+    material comes only from the current
     topology/activation path: pattern completion provides roots and the graph's
     synapses/hyperedges provide connected assemblies.
 
@@ -5151,7 +5175,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
     if quest_focus is None:
         quest_focus = ""
     if not isinstance(quest_focus, str) or len(quest_focus) > _CC_PITH_PROVIDER_MAX_QUEST_CHARS:
-        return _pith_provider_unavailable("invalid_quest_focus")
+        return _pith_provider_unavailable("invalid_focus_text")
     graph = getattr(ng, "graph", None) if ng is not None else None
     if graph is None:
         return _pith_provider_unavailable("ng_unavailable")
@@ -5194,10 +5218,10 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
             return _pith_provider_unavailable("constitutional_core_exceeds_budget")
         live_rails = {current_instruction.strip(): "current instruction"}
         if quest_focus.strip():
-            quest_text = quest_focus.strip()
-            prior = live_rails.get(quest_text)
-            live_rails[quest_text] = (
-                "current instruction and Quest focus" if prior else "Quest focus")
+            focus_text = quest_focus.strip()
+            prior = live_rails.get(focus_text)
+            live_rails[focus_text] = (
+                "current instruction and supplied focus" if prior else "supplied focus")
         fresh = pith_connected_activation_basins(
             graph, surfaced, live_rails=live_rails)
         candidates = fresh

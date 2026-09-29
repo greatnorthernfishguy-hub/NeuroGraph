@@ -312,7 +312,7 @@ def test_exact_live_rail_collision_keeps_relationship_without_echo(monkeypatch):
     assert instruction not in result["context"]
     assert quest not in result["context"]
     assert "[current instruction is present exactly once in the live tail]" in result["context"]
-    assert "[Quest focus is present exactly once in the live tail]" in result["context"]
+    assert "[supplied focus is present exactly once in the live tail]" in result["context"]
     assert "Use the corrected topology path" in result["context"]
 
 
@@ -554,7 +554,7 @@ def test_same_graph_context_is_model_agnostic_without_transcript_replay(monkeypa
         ({"current_instruction": ""}, "invalid_instruction"),
         ({"current_instruction": "x", "budget_chars": 499}, "invalid_budget"),
         ({"current_instruction": "x", "root_count": 25}, "invalid_root_count"),
-        ({"current_instruction": "x", "quest_focus": 7}, "invalid_quest_focus"),
+        ({"current_instruction": "x", "quest_focus": 7}, "invalid_focus_text"),
     ],
 )
 def test_invalid_provider_requests_return_only_bounded_closed_notices(kwargs, warning):
