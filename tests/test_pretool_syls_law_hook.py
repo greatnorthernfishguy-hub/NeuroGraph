@@ -192,7 +192,7 @@ class TestSylsLawHook:
     def _env_stub_no_jq(self):
         stub = os.path.join(self._tmpdir, "stub_nojq")
         os.makedirs(stub, exist_ok=True)
-        for t in ["git", "timeout", "realpath", "sed", "tr", "dirname", "bash"]:
+        for t in ["git", "timeout", "realpath", "sed", "tr", "dirname", "bash", "cat", "printf"]:
             tp = subprocess.check_output(["which", t]).decode().strip()
             lk = os.path.join(stub, t)
             if not os.path.lexists(lk): os.symlink(tp, lk)
@@ -235,7 +235,7 @@ class TestSylsLawHook:
         record = os.path.join(self._tmpdir, "lc_all_value")
         git_stub = os.path.join(stub, "git")
         with open(git_stub, "w") as f:
-            f.write(f"#!/usr/bin/env bash\necho \"$LC_ALL\" > {record}\nexit 128\n")
+            f.write(f"#!/usr/bin/env bash\necho \"$LC_ALL\" > {record}\n")
             f.write("echo 'fatal: not a git repository' >&2\nexit 128\n")
         os.chmod(git_stub, 0o755)
         return {"HOME": self._fake_home, "PATH": stub, "RECORD": record}
