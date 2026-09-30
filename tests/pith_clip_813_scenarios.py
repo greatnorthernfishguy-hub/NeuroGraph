@@ -1,6 +1,12 @@
 # tests/pith_clip_813_scenarios.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 turn 2: recall scenarios
+# What: adds build_recall_scenarios() -- cc_assemble_recall on SHORT items for the Pith-ON path,
+#   the gate-off path and one stream only, plus FakeMonitor/fake_ng helpers the regression
+#   tests reuse. Generated against BASE e4ebf982 into the same golden fixture.
+# Why: #816 changes both paths; short items must render exactly as before.
+# How: recall/novelty are swapped on the module object under test and restored in a finally.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 golden scenarios
 # What: builds fixed, fake in-memory provider_context scenarios of WELL-FORMED SHORT
 #   nodes (every node < 700 chars, everything fits its budget) and returns the
@@ -113,4 +119,79 @@ def build_scenarios(pith):
     out["live_rail_placeholder"] = _run(
         pith, g, [{"node_id": "live", "score": 1.0}], "Do this exactly please")
 
+    return out
+
+
+# ----------------------------------------------------------------- recall (turn 2)
+
+class FakeMonitor:
+    """Stands in for surfacing.SurfacingMonitor: get_surfaced() is fixed, format_context is the
+    REAL shared one (bound), so the gate-off baseline is exactly what the shared code renders."""
+
+    def __init__(self, items):
+        import types
+        from surfacing import SurfacingMonitor
+        self._items = [dict(i) for i in items]
+        self.format_context = types.MethodType(SurfacingMonitor.format_context, self)
+
+    def get_surfaced(self, max_items=None):
+        return [dict(i) for i in self._items]
+
+
+class FakeVectorDB:
+    def __init__(self, entries=None):
+        self._entries = entries or {}
+
+    def get(self, node_id):
+        return self._entries.get(node_id)
+
+
+def fake_ng(graph, monitor_items, vdb=None):
+    ng = SimpleNamespace(graph=graph, _surfacing_monitor=FakeMonitor(monitor_items),
+                         vector_db=vdb or FakeVectorDB())
+    return ng
+
+
+def run_recall(pith, ng, pc_items, pith_on, budget_env=None, query="what next"):
+    """cc_assemble_recall with pattern completion + novelty swapped for fixed values."""
+    saved = (pith.cc_pattern_completion_recall, pith.cc_novelty, pith._CC_PITH_ENABLED)
+    pith.cc_pattern_completion_recall = lambda *_a, **_k: [dict(i) for i in pc_items]
+    pith.cc_novelty = lambda *_a, **_k: 0.0
+    pith._CC_PITH_ENABLED = pith_on
+    pith._PITH_VICTIM.clear()
+    pith._PITH_METRICS.reset()
+    try:
+        return pith.cc_assemble_recall(ng, query, 5, {}, None)
+    finally:
+        pith.cc_pattern_completion_recall, pith.cc_novelty, pith._CC_PITH_ENABLED = saved
+        pith._PITH_VICTIM.clear()
+
+
+def build_recall_scenarios(pith):
+    """name -> rendered recall string; every item is short and everything fits."""
+    out = {}
+    g = FakeGraph()
+    _core(g)
+    texts = {
+        "m1": "The reconcile pass pruned 76 entities and kept the watermark.",
+        "m2": "Checkpoint cadence changed after the rebuild.",
+        "p1": "Use /home/josh/NeuroGraph/cc_ng_host.py for the hosted path (#813).",
+        "p2": "The Quest guard stays until card 7 lands on both hosts.",
+    }
+    for nid, text in texts.items():
+        g.node(nid, text)
+    monitor_items = [
+        {"node_id": "m1", "content": texts["m1"], "score": 1.7321},
+        {"node_id": "m2", "content": texts["m2"], "score": 1.2},
+    ]
+    pc_items = [
+        {"node_id": "p1", "score": 120.5, "content": texts["p1"], "prefetch_origin": False},
+        {"node_id": "p2", "score": 60.25, "content": texts["p2"], "prefetch_origin": False},
+        {"node_id": "m2", "score": 30.0, "content": texts["m2"], "prefetch_origin": False},
+    ]
+    for on in (False, True):
+        tag = "pith_on" if on else "gate_off"
+        out[f"{tag}_both_streams"] = run_recall(pith, fake_ng(g, monitor_items), pc_items, on)
+        out[f"{tag}_pattern_only"] = run_recall(pith, fake_ng(g, []), pc_items, on)
+        out[f"{tag}_monitor_only"] = run_recall(pith, fake_ng(g, monitor_items), [], on)
     return out

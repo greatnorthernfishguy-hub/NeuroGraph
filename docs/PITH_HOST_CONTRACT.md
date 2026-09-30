@@ -187,8 +187,13 @@ at all. The budget is met by fewer whole assemblies: admission is a strict ranke
 prefix, so the lowest-relevance assemblies are the ones left out, and an assembly
 that could not fit even an empty envelope is skipped rather than blanking the
 rest. Whenever anything is left out, the organism logs one INFO line naming how
-many whole assemblies were dropped and their total rendered size; a budget drop
-is never silent. (A keyframe applies only together with its delta; a budgeted
+many whole assemblies were dropped and their total rendered size (and the node ids of
+any assembly that could never fit, first time seen); a budget drop is never silent.
+The same rule ("the ONE budget rule") governs the L1 recall path and the un-Pithed
+recall rendering: every recalled item, from both the pattern stream and the
+SurfacingMonitor stream, is rendered WHOLE (the monitor stream is re-resolved whole by
+node id on the CC side; the shared monitor is not modified), and the budget decides
+how MANY items, never how much of one. (A keyframe applies only together with its delta; a budgeted
 context has no room for the delta, so no keyframe is used here.)
 
 Slice A does not add a provider-specific victim cache. Recapture remains owned

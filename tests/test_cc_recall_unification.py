@@ -1,6 +1,15 @@
 # tests/test_cc_recall_unification.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 turn 2 (#816): CC-side monitor block
+# What: expected monitor blocks come from cc_ng_organism._format_cc_monitor_block (was the fake
+#   monitor's canned '## Recent' string); the fake monitor's format_context now FAILS if called;
+#   the pattern-completion double accepts **kw (whole_content=True).
+# Why: the shared SurfacingMonitor.format_context cuts items at 200 chars and serves Syl's
+#   /assemble, so it must not be edited; the CC path renders the monitor block itself and
+#   re-resolves each item whole by node_id (Exec P410(c)). A test that still passed with the
+#   canned string would prove nothing about that path.
+# How: assertion strings only; the gate-off/fallback/dedup INTENT of every test is unchanged.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3
 #   Code), lane z2-ng-recall-passthrough-restore-001 — restore fallback tests.
 # What: every notice assertion is replaced by an un-Pithed fallback assertion.
@@ -367,9 +376,8 @@ class _FakeMonitor:
         return list(self._items)
 
     def format_context(self, items):
-        if not items:
-            return ''
-        return '## Recent\n' + '\n'.join(f"- {it['content']}" for it in items)
+        raise AssertionError('shared SurfacingMonitor.format_context (200-char cut) must not be '
+                             'used by the CC recall path (#816)')
 
 
 class _FakeGraphForAssemble:
@@ -387,10 +395,15 @@ class _FakeNgForAssemble:
         self._surfacing_monitor = _FakeMonitor(monitor_items)
 
 
+def _mon(content, score=1.0):
+    import cc_ng_organism
+    return cc_ng_organism._format_cc_monitor_block([{'content': content, 'score': score}])
+
+
 def _patch_pattern_completion(monkeypatch, results):
     import cc_ng_organism
     monkeypatch.setattr(cc_ng_organism, 'cc_pattern_completion_recall',
-                         lambda ng, query, k, state=None: list(results))
+                         lambda ng, query, k, state=None, **kw: list(results))
 
 
 def test_assemble_recall_gate_off_is_plain_two_block_concat(monkeypatch):
@@ -407,7 +420,7 @@ def test_assemble_recall_gate_off_is_plain_two_block_concat(monkeypatch):
 
     result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None)
 
-    expected_monitor = '## Recent\n- monitor hit'
+    expected_monitor = _mon('monitor hit')
     expected_pattern = cc_ng_organism._format_cc_recall_block(
         [{'node_id': 'p1', 'score': 0.9, 'content': 'pattern hit'}])
     assert result == expected_monitor + '\n\n' + expected_pattern
@@ -450,7 +463,7 @@ def test_assemble_recall_gate_on_runs_the_real_pith_pipeline(monkeypatch):
 
     result = cc_ng_organism.cc_assemble_recall(ng, 'query text', 5, {}, None)
 
-    plain_concat = ('## Recent\n- a genuinely distinct monitor hit' + '\n\n'
+    plain_concat = (_mon('a genuinely distinct monitor hit') + '\n\n'
                      + cc_ng_organism._format_cc_recall_block(
                          [{'node_id': 'novel', 'score': 0.8,
                            'content': 'a genuinely distinct pattern-completion hit'}]))
@@ -504,7 +517,7 @@ def test_assemble_recall_gate_on_falls_back_to_concat_on_pith_exception(monkeypa
 
     result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None)
 
-    expected_monitor = '## Recent\n- monitor hit'
+    expected_monitor = _mon('monitor hit')
     expected_pattern = cc_ng_organism._format_cc_recall_block(
         [{'node_id': 'p1', 'score': 0.9, 'content': 'pattern hit'}])
     assert result == expected_monitor + '\n\n' + expected_pattern
@@ -542,7 +555,7 @@ def test_assemble_recall_pith_failure_falls_back_to_un_pithed(monkeypatch, stage
     assert isinstance(exc, RuntimeError) and str(exc) == 'INJECTED_PITH_FAILURE'
     expected_pattern = cc_ng_organism._format_cc_recall_block(
         [{'node_id': 'p1', 'score': 0.9, 'content': 'PATTERN_MARKER'}])
-    assert result == '## Recent\n- MONITOR_MARKER' + '\n\n' + expected_pattern
+    assert result == _mon('MONITOR_MARKER') + '\n\n' + expected_pattern
     assert 'MONITOR_MARKER' in result and 'PATTERN_MARKER' in result
 
 
@@ -584,7 +597,7 @@ def test_assemble_recall_pith_failure_callback_error_is_logged_not_raised(monkey
         result = cc_ng_organism.cc_assemble_recall(ng, 'q', 5, {}, None,
                                                    on_pith_failure=bad_callback)
 
-    assert result == '## Recent\n- m'
+    assert result == _mon('m')
     assert any('Pith failure deposit failed: tract unwritable' in r.getMessage()
                for r in caplog.records)
 
@@ -607,7 +620,7 @@ def test_assemble_recall_gate_off_byte_identical_with_callback_wired(monkeypatch
 
     expected_pattern = cc_ng_organism._format_cc_recall_block(
         [{'node_id': 'p1', 'score': 0.9, 'content': 'pattern hit'}])
-    assert result == '## Recent\n- monitor hit' + '\n\n' + expected_pattern
+    assert result == _mon('monitor hit') + '\n\n' + expected_pattern
     assert received == []
 
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 turn 2 (#816)
+# What: the recall double accepts **kw (cc_assemble_recall now passes whole_content=True).
+# Why: the old-signature double raised TypeError inside the fail-soft try -> empty fired set.
+# How: signature only; assertions unchanged.
 # [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — #592 direction
 # What: test_flag_on_embed_called expects 4760 (was 6440, which pinned the
 #       inversion); added high/low/neutral/monotonic direction tests.
@@ -126,7 +130,7 @@ class _FakeNgForAssemble:
 
 def _patch_pattern_completion(monkeypatch, results):
     monkeypatch.setattr(cc, 'cc_pattern_completion_recall',
-                         lambda ng, query, k, state=None: list(results))
+                         lambda ng, query, k, state=None, **kw: list(results))
 
 
 # ============================================================================
