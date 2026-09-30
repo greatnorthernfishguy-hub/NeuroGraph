@@ -329,6 +329,23 @@
 #   EVERY node with the key INCLUDING `ingested` ones (this mirror skips them), so her window
 #   does not advance on the autonomic clock (LAW 8). Whether and when she registers is Josh's
 #   rollout decision, not this trial's.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2,
+#   le-014 corrections C1-C4 + LAW 5) -- the parser again gives the SAME result as base for
+#   every well-formed want shape.
+# What: the code_adjacent / escaped / quoted adjacency guesses now apply to OPENERS only
+#   (_want_marker_mention_reason takes is_close); fences and inline code spans still mask any
+#   marker. The three WANT_SKIP_* log bounds are env-sourced (CC_WANT_SKIP_SUMMARY_INTERVAL_S,
+#   CC_WANT_SKIP_SEEN_MAX, CC_WANT_SKIP_DETAIL_PER_CALL_MAX; current values are the defaults).
+#   The flood claim is stated exactly; the "never logs marker text" wording is corrected (the
+#   detail line carries the literal marker token as its kind, no body or surrounding text).
+# Why: le-014 C1 (HIGH): a real want that ENDS IN INLINE CODE (`[WANT]check `foo()`[/WANT]`)
+#   was dropped, opener included, because the closer was treated as code_adjacent; base only
+#   ever guarded the opener. C2: a real want ending inside a quote pair (`x "[WANT]I want
+#   "x"[/WANT]" y`) was dropped the same way. The #801 id-equality guarantee requires the
+#   parser to equal base on well-formed wants (LAW 4: fix at the source).
+# How: is_close short-circuits after the two structural masks; golden cases and a
+#   combinatorial parity corpus are asserted against BASE e4ebf982 in
+#   tests/test_cc_want_legitimacy_810.py.
 # [2026-09-29] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810,
 #   Exec P406/P408) -- WANT extraction is structural LEGITIMACY, not a length limit.
 # What: new pure parse_wants(content) -> WantParse (+ want_id_for_text) is the ONE
@@ -339,7 +356,7 @@
 #   closer, an unclosed opener and an empty pair are skipped. surface_wants calls it and
 #   logs skips at INFO in a flood-bounded form (per-call summary on change + hourly
 #   heartbeat, per-marker detail once per (node, offset, reason), <=50 detail lines per
-#   call, no marker text). _WANT_RE (the 600-char pattern) is removed. WANT_MAX_CHARS stays
+#   call, no want body or surrounding text in the log -- the literal marker token is the kind). _WANT_RE (the 600-char pattern) is removed. WANT_MAX_CHARS stays
 #   DEFINED only because render_wants still clamps with it -- render_wants is NOT touched
 #   here (Exec P408: the standing "## What I Want" block is retired in a separate turn).
 # Why: Josh (Exec P406): "WANTs just need to have the WANT brackets on either side. A parser
@@ -1936,10 +1953,24 @@ WANT_SKIP_REASONS = (
     "opener_unclosed", "closer_without_opener", "empty_pair",
 )
 
-# Flood bounds for the INFO skip log (surface_wants runs on every autosave pulse).
-WANT_SKIP_SUMMARY_INTERVAL_S = 3600     # heartbeat when nothing changed
-WANT_SKIP_SEEN_MAX = 4096               # bounded FIFO of (node, offset, reason) already detailed
-WANT_SKIP_DETAIL_PER_CALL_MAX = 50      # detail lines per surface_wants call; rest deferred
+# Flood bounds for the INFO skip log (surface_wants runs on every autosave pulse). Operational
+# tunables, so env-with-default like the other CC_* knobs in this file (LAW 5); a junk value
+# falls back to the default rather than breaking import.
+# Volume claim, stated exactly: while the corpus holds <= WANT_SKIP_SEEN_MAX distinct
+# (node, offset, reason) skips, a static corpus costs ~1 INFO line per heartbeat interval
+# (1/hour by default). Beyond WANT_SKIP_SEEN_MAX distinct skips the FIFO evicts entries that
+# then re-qualify as unseen, so the steady state degrades to at most
+# WANT_SKIP_DETAIL_PER_CALL_MAX detail lines per pulse (never unbounded).
+def _want_skip_env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+WANT_SKIP_SUMMARY_INTERVAL_S = _want_skip_env_int("CC_WANT_SKIP_SUMMARY_INTERVAL_S", 3600, 1)
+WANT_SKIP_SEEN_MAX = _want_skip_env_int("CC_WANT_SKIP_SEEN_MAX", 4096, 1)
+WANT_SKIP_DETAIL_PER_CALL_MAX = _want_skip_env_int("CC_WANT_SKIP_DETAIL_PER_CALL_MAX", 50, 1)
 
 _WANT_FENCE_LINE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)\r?$", re.MULTILINE)
 _WANT_BLANK_LINE_RE = re.compile(r"\r?\n[ \t]*\r?\n")
@@ -2041,18 +2072,27 @@ def _want_code_span_ranges(content: str, fences: List[Tuple[int, int]]) -> List[
     return spans
 
 
-def _want_marker_mention_reason(content: str, start: int, end: int,
+def _want_marker_mention_reason(content: str, start: int, end: int, is_close: bool,
                                  fences: List[Tuple[int, int]], fence_starts: List[int],
                                  codes: List[Tuple[int, int]], code_starts: List[int]) -> Optional[str]:
-    """Why the marker at content[start:end] is a mention, or None if it is a real tag."""
+    """Why the marker at content[start:end] is a mention, or None if it is a real tag.
+
+    Two tiers, on purpose (le-014 C1/C2): a fenced block or balanced inline code span is
+    STRUCTURE and masks any marker, opener or closer. The adjacency guesses (a backtick,
+    backslash or quote pair touching the token) are guesses about a mentioned OPENER only;
+    base never guarded closers, and a closer guard turns `[WANT]check `foo()`[/WANT]` into
+    a dropped want. A mentioned opener's orphan closer is skipped as closer_without_opener.
+    """
     k = bisect_right(fence_starts, start) - 1
     if k >= 0 and start < fences[k][1]:
         return "in_fence"
     k = bisect_right(code_starts, start) - 1
     if k >= 0 and start < codes[k][1]:
         return "in_code_span"
+    if is_close:
+        return None
     if start > 0 and content[start - 1] == "`":
-        return "code_adjacent"      # the pre-#810 guard, kept for runs that cannot be paired
+        return "code_adjacent"      # the pre-#810 guard (OPENER only, as in base), for runs that cannot be paired
     n_slash = 0
     while start - 1 - n_slash >= 0 and content[start - 1 - n_slash] == "\\":
         n_slash += 1
@@ -2089,7 +2129,7 @@ def parse_wants(content: str) -> WantParse:
     for m in _WANT_MARKER_RE.finditer(content):
         is_close = bool(m.group(1))
         marker = WANT_CLOSE if is_close else WANT_OPEN
-        reason = _want_marker_mention_reason(content, m.start(), m.end(),
+        reason = _want_marker_mention_reason(content, m.start(), m.end(), is_close,
                                              fences, fence_starts, codes, code_starts)
         if reason is not None:
             skipped.append(SkippedMarker(marker, m.start(), reason))
@@ -2133,8 +2173,9 @@ def _log_want_skips(events: List[Tuple[str, SkippedMarker]]) -> None:
     marker found by ONE surface_wants call as (node_id, SkippedMarker). Summary line when
     the per-reason counts changed or WANT_SKIP_SUMMARY_INTERVAL_S elapsed; per-marker detail
     once per (node, offset, reason) (bounded FIFO, <= WANT_SKIP_DETAIL_PER_CALL_MAX per
-    call, the rest deferred). NEVER logs marker or surrounding text -- id, offset, kind,
-    reason only -- so a pasted secret can never reach the log."""
+    call, the rest deferred). Logs NO want body and NO surrounding text: a detail line carries
+    only the node id, the offset, the literal marker token ("[WANT]" / "[/WANT]") as its
+    kind, and the reason -- so a pasted secret can never reach the log."""
     try:
         with _WANT_SKIP_LOCK:
             counts = Counter(sk.reason for _, sk in events)
