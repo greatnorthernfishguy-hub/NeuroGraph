@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-09-30] Claude Code (claude-sonnet-5-5, Z12 BUILD worker seat, dispatch #11952, FOLD of the delta pair's corrections)
+# What: (1) a repeated map key is a STOP, never a merge: a repeated top-level nodes / synapses / hyperedges key or node id /
+#   hyperedge id in main.msgpack, a repeated top-level entries key or entry id in vectors.msgpack (canonical restore/load is
+#   last-wins; a stale first copy must never survive). (2) two stale comments edited IN PLACE (the section banner above the
+#   readers and the original "How" sentence below): one truth. (3) DISCLOSURE - since #11805 Phase-1 analyze() no longer
+#   canonical-validates the INPUT: main.msgpack / vectors.msgpack are streamed with skip() of the embedding / metadata /
+#   unread values (no validation) and strict_map_key=False, so a file the canonical Graph.restore / SimpleVectorDB.load
+#   would REJECT can be classified. NO tool step canonical-restores the INPUT (copy or live): V11 (build_outputs, g2.restore)
+#   restores the OUTPUT of a rewrite of that same input, and stage_apply's analyze() on the live bytes streams it too; the
+#   first canonical load of the live input is the daemon's own at the S4 start (outside this tool). (4) _streamed keeps its
+#   BROAD `except Exception` by Z12 ruling (the Stop text names the exception type).
+# Why: le-035 / checker-028 corrections 1, 2, 4, 5 (returns/build-tool-007d.md).
+# How: tests first (failing-first), then the change; V11, the canonical loaders and every pre-flight are untouched.
 # [2026-09-30] Claude Code (claude-sonnet-5-5, Z12 BUILD worker seat, dispatch #11805, DELTA BUILD) - analyze() no longer
 #   builds a live Graph or loads the whole vectors file.
 # What: load_pair + incident_figures(g, ...) REPLACED (not added) by stream_graph_nodes / stream_incident_figures
@@ -7,8 +20,8 @@
 #   all STORED fields of main.msgpack, streamed) and load_content_subset (pass V: the vdb `content` of the S source ids and
 #   of every entry containing `WANT]`, one entry at a time; embeddings and vdb metadata are skip()ped, never decoded).
 #   A truncated / malformed / trailing-garbage file is a STOP. The canonical Graph.restore stays in build_outputs (V11,
-#   the verifier's restore of the OUTPUT - plan-004 6.6 and 7 place it in Phase 1). This SUPERSEDES the "How" sentence
-#   below that says the checkpoint is read with Graph.restore + SimpleVectorDB.load.
+#   the verifier's restore of the OUTPUT - plan-004 6.6 and 7 place it in Phase 1). The "How" sentence of the TURN A entry
+#   below was edited in place by #11952 to say so.
 # Why: Chief-003 delta ruling ("fix the JOB, not the box") and Exec P437; evidence in returns/build-tool-007b.md section 1.
 # How: pin code untouched (LAW 4: the canonical loader is neither edited nor wrapped); equivalence to the canonical
 #   path is PROVEN by tests whose OLD path (Graph().restore + SimpleVectorDB().load) is built inside the tests.
@@ -25,8 +38,10 @@
 #   synapse is altered except by the approved repair under row #801 - and Phase 1 (this build) only READS.
 # How: ONE file (its own sha256 is the tool's identity for the retirement refusal, plan 6.8). It imports
 #   `parse_wants` / `want_id_for_text` (the ONE shared pure function, LAW 3/4) from the PIN worktree ONLY, fail-
-#   closed (plan 6.2); it never re-implements either. The checkpoint is read with the canonical readers
-#   (Graph.restore + SimpleVectorDB.load = the analysis-001 loader, analyze_pair.py:84-86; nothing forked) and
+#   closed (plan 6.2); it never re-implements either. [Edited in place, #11952: this sentence originally said the checkpoint
+#   is read with Graph.restore + SimpleVectorDB.load, the analysis-001 loader; since #11805 analyze() READS it with the
+#   tool-local streamed readers stream_graph_nodes / stream_incident_figures / load_content_subset - no Graph, no whole-file
+#   vectors load, no canonical validation of the INPUT - and the canonical Graph.restore is used only by V11.] The checkpoint is
 #   written value-granularly (untouched values are RAW byte slices; only values that hold an old id are
 #   re-encoded, each proven by pack(unpack(raw)) == raw, V13). The canonical Graph.restore of the output is
 #   the verifier (V11). Nothing protected or vendored is edited; no checkpoint under Syl's directories, no
@@ -1553,7 +1568,8 @@ def gate_write_set(records: List[Dict[str, Any]], approvals: Dict[str, Any], *, 
 
 
 # --------------------------------------------------------------------------------------------------
-# the analysis stage: the analysis-001 loader (canonical readers) -> classification -> reports
+# the analysis stage: tool-local STREAMED readers (pass G: main.msgpack; pass V: the vectors content subset; no Graph, no
+# whole-file load, no canonical validation of the input - see the #11952 header entry) -> classification -> reports
 # --------------------------------------------------------------------------------------------------
 
 @contextlib.contextmanager
@@ -1570,8 +1586,21 @@ def _streamed(path: str, what: str):
                 raise Stop("%s: %d byte(s) after the top-level map (file is %d bytes)" % (what, size - up.tell(), size))
         except Stop:
             raise
-        except Exception as e:  # noqa: BLE001 - OutOfData / ValueError / KeyError / TypeError all mean "not the file we expect"
+        except Exception as e:  # noqa: BLE001 - KEPT BROAD by Z12 ruling (#11952): still fail-closed, and the Stop text names the
+            # exception type so an operator can tell a reader bug (AttributeError...) from a malformed file (OutOfData, ValueError...)
             raise Stop("%s: truncated or malformed (%s)" % (what, type(e).__name__)) from e
+
+
+_ONCE_KEYS = ("nodes", "synapses", "hyperedges")
+
+
+def _once(seen: set, key) -> None:
+    """A repeated top-level nodes / synapses / hyperedges key is a STOP (the canonical restore is last-wins; a streamed
+    pass would merge the two maps). Only the three fixed names are checked, so no file text can reach the message."""
+    if key in _ONCE_KEYS:
+        if key in seen:
+            raise Stop("main checkpoint: the top-level key '%s' is repeated" % key)
+        seen.add(key)
 
 
 def load_content_subset(path: str, keep_ids) -> Dict[str, Any]:
@@ -1579,17 +1608,26 @@ def load_content_subset(path: str, keep_ids) -> Dict[str, Any]:
     `keep_ids` or whose content contains `WANT]`, streamed one entry at a time (the canonical loader inflates the
     whole ~1 GB file and copies every embedding; Phase 1 reads neither embeddings nor vdb metadata - both are skip()ped
     as raw bytes, never decoded). Same dict the canonical load would give for those ids (a missing `content` is ''; an
-    entry with no `embedding` is a STOP, as the canonical loader raises on it; a later duplicate id wins)."""
+    entry with no `embedding` is a STOP, as the canonical loader raises on it). A REPEATED `entries` key or entry id is a
+    STOP: the canonical load is last-wins and a streamed merge or a stale first copy must never stand in for it."""
     out: Dict[str, Any] = {}
+    seen_ids: set = set()
     with _streamed(path, "vectors file") as up:
+        seen_entries = False
         for _ in range(up.read_map_header()):
             if up.unpack() != "entries":
                 up.skip()                                     # version / count: not needed
                 continue
+            if seen_entries:
+                raise Stop("vectors file: the top-level key 'entries' is repeated")
+            seen_entries = True
             for _ in range(up.read_map_header()):
                 eid = up.unpack()
                 if not isinstance(eid, str):
                     raise Stop("vectors file: a non-string entry id")
+                if eid in seen_ids:
+                    raise Stop("vectors file: an entry id is repeated inside entries")
+                seen_ids.add(eid)
                 c, has_embedding = "", False
                 for _ in range(up.read_map_header()):
                     field = up.unpack()
@@ -1602,8 +1640,6 @@ def load_content_subset(path: str, keep_ids) -> Dict[str, Any]:
                     raise Stop("vectors file: an entry without an embedding")
                 if eid in keep_ids or (isinstance(c, str) and "WANT]" in c):
                     out[eid] = c
-                else:
-                    out.pop(eid, None)
     return out
 
 
@@ -1620,13 +1656,18 @@ def stream_graph_nodes(path: str) -> Dict[str, Any]:
     at a time. No `Graph` is constructed; every other top-level value is skip()ped."""
     nodes_meta: Dict[str, Any] = {}
     wants: Dict[str, _ViewNode] = {}
+    seen_top: set = set()
     with _streamed(path, "main checkpoint") as up:
         for _ in range(up.read_map_header()):
-            if up.unpack() != "nodes":
+            key = up.unpack()
+            _once(seen_top, key)
+            if key != "nodes":
                 up.skip()
                 continue
             for _ in range(up.read_map_header()):
                 nid, nd = up.unpack(), up.unpack()
+                if nid in nodes_meta:
+                    raise Stop("main checkpoint: a node id is repeated inside nodes")
                 md = nd.get("metadata", {})
                 nodes_meta[nid] = md
                 if (md or {}).get("kind") == "want":
@@ -1642,14 +1683,21 @@ def stream_incident_figures(path: str, ids, existing_ids) -> Dict[str, Tuple[int
     out_s: Dict[str, set] = {i: set() for i in want}
     in_s: Dict[str, set] = {i: set() for i in want}
     he_s: Dict[str, set] = {i: set() for i in want}
+    seen_top: set = set()
+    seen_he: set = set()
     with _streamed(path, "main checkpoint") as up:
         for _ in range(up.read_map_header()):
             key = up.unpack()
+            _once(seen_top, key)
             if key not in ("synapses", "hyperedges"):
                 up.skip()                                     # includes archived_hyperedges: never indexed by restore
                 continue
             for _ in range(up.read_map_header()):
                 eid, val = up.unpack(), up.unpack()
+                if key == "hyperedges":
+                    if eid in seen_he:
+                        raise Stop("main checkpoint: a hyperedge id is repeated inside hyperedges")
+                    seen_he.add(eid)
                 if key == "synapses":
                     if val.get("pre_node_id") in want:
                         out_s[val["pre_node_id"]].add(eid)
