@@ -1335,12 +1335,12 @@ def test_a_retired_receipt_for_the_same_checkpoint_directory_refuses(world):
     run.mkdir()
     target = os.path.realpath(world.ckpt)
     tool.refuse_if_retired(target)                                               # nothing yet
-    (run / "RETIRED-x.receipt").write_text(json.dumps({"checkpoint_dir": target, "tool_sha256": "0" * 64}))
+    # plan 6.8(3): a receipt for the SAME checkpoint directory refuses whatever mapping / tool sha it records
+    (run / "RETIRED-x.receipt").write_text(json.dumps({"checkpoint_dir": target, "tool_sha256": "0" * 64, "mapping_sha256": "1" * 64}))
     try:
         with pytest.raises(tool.Refusal, match="RETIRED"):
             tool.refuse_if_retired(target)
-        with pytest.raises(tool.Refusal, match="RETIRED"):
-            tool.refuse_if_retired(str(world.base / "some-other-dir"))            # ANY receipt for this dir; a different mapping too
+        tool.refuse_if_retired(str(world.base / "some-other-dir"))                # another directory, another tool sha: not blocked
     finally:
         (run / "RETIRED-x.receipt").unlink()
     tool.refuse_if_retired(target)
