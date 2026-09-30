@@ -11,6 +11,8 @@
 
 # #813 TURN 2 — RETURN build-002
 
+> **SUPERSEDED IN PART by `build-003.md` (turn 3, dispatch #11011): #817 was REVERTED and is DEFERRED.** **DEFERRED to the post-track VPS/daemon lane: the function + BOTH live Python handlers (`cc_ng_host.py:974`, `cc-ng-daemon.py:1617`) to be removed TOGETHER (LAW 3).** Chief ruling docs `084b4161`; the turn-2 removal was reverted in turn 3 (`82cbbcd` NG, `336954c3` docs). In this file §1 (`afc9b3e`, `771f006a`), §3 "#817", §4 row #10, §5 and §6 D9 describe the retirement and are no longer true; everything else here (#816, the ONE budget rule, #818, #819, F2/F3/F6/F8) stands. The claim "no live caller" was wrong: it was true of Rust only.
+
 Lane `pith-clip-removal-813` · dispatch #10952 · worker seat (`worktree_write`) · returned **unreviewed**; a DELTA pair reviews the turn-2 diff (`bc4ae7a..HEAD`).
 Related: [[NeuroGraph]] · [[Pith]] · [[NeuroGraph Is a Mind, Not a Database]] · [[Format-for-Purpose Principle]] · plan `../plan-002.md` · prior `build-001.md`.
 
