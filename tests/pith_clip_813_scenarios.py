@@ -55,7 +55,11 @@ class FakeGraph:
         self._incoming[post].add(sid)
 
     def _is_identity_protected(self, node_id):
-        meta = self.nodes[node_id].metadata
+        # Mirrors neuro_foundation.Graph._is_identity_protected: an unknown node is NOT protected
+        # (it never raises).  Turn 6: a raising guard is now treated as PINNED (fail closed), so a
+        # fake that raised KeyError here would have pinned every unknown node.
+        node = self.nodes.get(node_id)
+        meta = (node.metadata if node is not None else None) or {}
         return bool(meta.get("constitutional")
                     or str(meta.get("provenance") or "").endswith("_authored"))
 

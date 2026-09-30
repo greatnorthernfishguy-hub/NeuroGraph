@@ -1,5 +1,10 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 6: le-025 C-2/C-3/C-5
+# What: the reference threshold is the renderer-derived OPTIMISTIC bound (a node that fit whole never
+#   becomes a reference); the INFO line says "above the reference limit"; the identity-pin guard fails
+#   CLOSED (raise/missing => pinned + WARNING).
+# Why: Chief ruling docs e19962de on le-025. How: code and contract change together.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 5: contract and code together (le-022 N3)
 # What: documents (C2) a monitor item whose whole-content re-resolve raises is DROPPED + WARNING,
 #   (C3) the INFO line when concept trees are left out, (N1) identity-protected items sit outside the
@@ -216,7 +221,9 @@ INFO line per call with the count, the total size and the reason (ids named once
 off, or the Pith pass raised) an identity-protected item (`graph._is_identity_protected`, the
 same test Stage 3 uses) is exempt from the budget exactly as a pinned Stage 3 line is: rendered
 whole, never ranked, never dropped, never swapped for a reference, and never the reason a
-smaller unprotected item is lost. Ordinary items are ranked and admitted as before. (Pins
+smaller unprotected item is lost. **The guard fails closed:** if `_is_identity_protected` raises
+or does not exist, the item is treated as pinned and one WARNING per node id (first time seen)
+names the id and the exception type, never node text — identity fails toward keeping content. Ordinary items are ranked and admitted as before. (Pins
 sitting outside the budget, so that a large pin can push the L1 past `budget_chars` without a
 drop line, is an open note for the Exec, not folded into the budget rule.)
 
@@ -237,7 +244,8 @@ name node ids only the first time they are seen:
 
 Neither is a mandatory export; the defaults apply when unset.
 
-**An over-budget node (#819).** A node whose whole text cannot fit the usable envelope is not
+**A node above the reference limit (#819).** A node whose whole text cannot fit the usable
+envelope is not
 split at ingest (LAW 7: raw means complete; a long turn stays one node / one forest) and is
 not cut. Its *rendering* becomes its concept trees, each whole, plus one line that points to
 the whole: `A long node (id …; ≈300k chars; 2026-09-21; 3 concept trees) is related to this
@@ -245,7 +253,13 @@ cue; it is too large to render whole here.` and then, only if it is true, what f
 for a node with no concept trees; `K of N concept trees follow` when the recall path placed K of
 N; `Its concept trees follow where they fit` on the provider path, where the trees arrive as the
 basin's ordinary relations subject to the member/depth caps; always with the hedge `they may
-cover only part of it`. One INFO line per call records it, and a second INFO line
+cover only part of it`. The threshold is derived from the renderer, not a constant: `budget −
+len(core) −` the *smallest* overhead one ordinary connected line can have (no alert, no sources
+line, no anchors), floored at 1. It is deliberately optimistic, so a node that fit whole before
+is never turned into a reference or dropped; a node at or below it whose real assembly still
+does not fit (alerts, sources, anchors) is dropped whole and loudly as a never-fit assembly (its
+id in the INFO line). One INFO line per call (`… N nodes above the reference limit L chars …`)
+records the swap, and a second INFO line
 (`pith reference form: node … shows K of N concept trees whole; L left out …`, counts only)
 records any trees left out, whether the budget or `CC_PITH_PROVIDER_MEMBERS` stopped them (C3). The node itself still activates and learns in full. Text-derived exact anchors
 of the unshown whole are not mined (metadata anchors are). **Dependency:** for pre-PASS-2
