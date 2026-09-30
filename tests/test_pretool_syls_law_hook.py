@@ -609,38 +609,28 @@ class TestSylsLawHook:
         assert r.returncode == 2
 
     def test_locale_stub_git_receives_LC_ALL_C(self):
-        """Behavioural: stub timeout just runs git, stub git records LC_ALL."""
-        stub = os.path.join(self._tmpdir, "stub_lc_real")
-        os.makedirs(stub, exist_ok=True)
-        for t in ["jq", "realpath", "sed", "tr", "dirname", "bash"]:
-            tp = subprocess.check_output(["which", t]).decode().strip()
-            lk = os.path.join(stub, t)
-            if not os.path.lexists(lk): os.symlink(tp, lk)
-        # Stub timeout: drop the '3' argument, shift, exec the rest
-        timeout_stub = os.path.join(stub, "timeout")
-        with open(timeout_stub, "w") as f:
-            f.write("#!/bin/bash\nshift\nexec \"$@\"\n")
-        os.chmod(timeout_stub, 0o755)
-        record = os.path.join(self._tmpdir, "lc_all_recorded")
-        with open(record, "w") as f: f.write("NOT_SET\n")
+        """ZM recipe: stub git records LC_ALL via printf append; test both hooks."""
+        stub = self._build_stub_dir("stub_lc_zm")
+        record = os.path.join(self._tmpdir, "lc_zms_record")
+        open(record, "w").close()  # pre-create empty file
         git_stub = os.path.join(stub, "git")
         with open(git_stub, "w") as f:
-            f.write("#!/bin/bash\n")
-            f.write(f"echo -n \"$LC_ALL\" > {record}\n")
-            f.write("case \"$*\" in\n")
-            f.write("  *rev-parse*show-toplevel*) echo /fake_repo ;;\n")
-            f.write("  *config*get-regexp*url*) echo 'remote.origin.url https://github.com/greatnorthernfishguy-hub/NeuroGraph.git' ;;\n")
-            f.write("  *) exit 1 ;;\n")
-            f.write("esac\n")
-            f.write("exit 0\n")
+            f.write("#!/usr/bin/env bash\n")
+            f.write(f"printf '%s\\n' \"${{LC_ALL-UNSET}}\" >> {record}\n")
+            f.write("printf '%s\\n' 'fatal: not a git repository (or any of the parent directories): .git' >&2\n")
+            f.write("exit 128\n")
         os.chmod(git_stub, 0o755)
-        env = {"HOME": self._fake_home, "PATH": stub}
-        path = os.path.join(self._wt_outside, "neuro_foundation.py")
-        r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=env)
-        assert r.returncode != 0
+        env = {"HOME": self._fake_home, "PATH": stub, "LC_ALL": "fr_FR.UTF-8", "LANG": "fr_FR.UTF-8"}
+        path = os.path.join(self._non_git, "x.txt")
+        for hook, label in [(NEW_HOOK, "gate"), (DBL_HOOK, "dbl")]:
+            ti = json.dumps({"tool_input": {"file_path": path}})
+            r = subprocess.run([hook], input=ti.encode(), capture_output=True, timeout=15, start_new_session=True, env=env)
+            assert r.returncode == 0, f"{label} should allow non-repo path"
         with open(record, "r") as f:
-            val = f.read().strip()
-        assert val == "C", f"LC_ALL should be C, got '{val}'"
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+        assert len(lines) >= 1, f"no LC_ALL values recorded in {record}"
+        for line in lines:
+            assert line == "C", f"LC_ALL should be C, got '{line}'"
 
     # ══════════════════════════════════════════════════════════════════
     # ORIGIN MATRIX
@@ -843,25 +833,47 @@ class TestSylsLawHook:
     # GIT FAILURE-SHAPE DECISION EQUIVALENCE (Change B)
     # ══════════════════════════════════════════════════════════════════
 
-    def _make_git_failure_stub(self, exit_code, stderr_msg=None, hang=False):
-        """Create a stub git with specific exit code and optional stderr."""
-        stub = os.path.join(self._tmpdir, f"stub_git_{exit_code}")
+    _COMPLETE_STUB_TOOLS = [
+        "bash", "jq", "realpath", "dirname", "sed", "tr", "cat",
+        "timeout", "touch", "mkdir", "echo", "basename", "grep",
+        "head", "date", "sleep", "printf",
+    ]
+
+    def _build_stub_dir(self, name, include_git=True, extra_tools=None):
+        stub = os.path.join(self._tmpdir, name)
         os.makedirs(stub, exist_ok=True)
-        for t in ["jq", "timeout", "realpath", "sed", "tr", "dirname", "bash"]:
-            tp = subprocess.check_output(["which", t]).decode().strip()
-            lk = os.path.join(stub, t)
-            if not os.path.lexists(lk): os.symlink(tp, lk)
+        for t in self._COMPLETE_STUB_TOOLS + (extra_tools or []):
+            tp = shutil.which(t)
+            if tp:
+                lk = os.path.join(stub, t)
+                if not os.path.lexists(lk):
+                    os.symlink(tp, lk)
+        if not include_git:
+            lk = os.path.join(stub, "git")
+            if os.path.lexists(lk):
+                os.unlink(lk)
+        return stub
+
+    def _make_git_failure_stub(self, exit_code, stderr_msg=None, hang=False):
+        """Create a stub git with specific exit code, complete tool env."""
+        stub = self._build_stub_dir(f"stub_git_{exit_code}")
         git_stub = os.path.join(stub, "git")
         if hang:
             with open(git_stub, "w") as f:
-                f.write("#!/bin/bash\nsleep 10\n")
+                f.write("#!/usr/bin/env bash\nsleep 10\n")
         else:
             with open(git_stub, "w") as f:
-                f.write("#!/bin/bash\n")
+                f.write("#!/usr/bin/env bash\n")
                 if stderr_msg:
-                    f.write(f"echo '{stderr_msg}' >&2\n")
+                    f.write(f"printf '%s\\n' '{stderr_msg}' >&2\n")
                 f.write(f"exit {exit_code}\n")
         os.chmod(git_stub, 0o755)
+        # Precondition: key tools resolve inside stub
+        r = subprocess.run(
+            ["/usr/bin/bash", "-c", "command -v bash && command -v cat && command -v timeout"],
+            capture_output=True, env={"PATH": stub, "HOME": self._fake_home},
+        )
+        assert r.returncode == 0, f"stub tools missing: {r.stdout}"
         return {"HOME": self._fake_home, "PATH": stub}
 
     def _test_decision_cell(self, stub_env, path, cell_name):
