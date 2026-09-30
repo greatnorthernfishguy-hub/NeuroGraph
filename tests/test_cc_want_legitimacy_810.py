@@ -1,4 +1,14 @@
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2, le-014)
+# What: golden cases ASSERTED AGAINST BASE e4ebf982 for a want that ENDS in inline code, BEGINS
+#   with it, both, with a follow-on second want (C1); a closer wrapped in quotes (C2); a want
+#   ending in a backslash / a URL; a 1,980-shape combinatorial parity corpus; an adversarial
+#   'real want next to code/quotes/stray backticks' corpus; the stray-backtick residual pinned
+#   as documented; env-sourcing of the three WANT_SKIP_* bounds; the exact flood claim.
+#   Two existing reason assertions updated (an orphan closer is closer_without_opener).
+# Why: le-014 C1 (HIGH) found a base regression the turn-1 corpus never exercised (it put
+#   backticks only mid-want). The #801 id-equality guarantee is a property of SHAPES.
+# How: same fakes; base loaded via `git show`; a missing base FAILS, never skips.
 # [2026-09-29] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810, Exec P406/P408)
 # What: tests for the structural-legitimacy WANT parser (cc_ng_organism.parse_wants /
 #   want_id_for_text / surface_wants): a whole 2,000-char want, the 2026-09-16 mis-parse shapes
@@ -19,6 +29,7 @@ Run from the worktree root with NG_EMBED_* unset:
 import ast
 import hashlib
 import inspect
+import itertools
 import logging
 import os
 import subprocess
@@ -204,8 +215,10 @@ def test_mention_reasons_are_the_specific_ones():
         return {s.reason for s in org.parse_wants(text).skipped}
     assert reasons(_MENTION_SHAPES["backticked mention running to a far closer"]) == {"in_code_span"}
     assert reasons(_MENTION_SHAPES["fenced block"]) == {"in_fence"}
-    assert reasons(_MENTION_SHAPES["quoted mention"]) == {"quoted"}
-    assert reasons(_MENTION_SHAPES["escaped mention"]) == {"escaped"}
+    # adjacency guesses (quote / escape / backtick) are OPENER-only (le-014 C1/C2): the orphan
+    # closer of a mentioned opener is skipped as a stray closer, not as the same guess
+    assert reasons(_MENTION_SHAPES["quoted mention"]) == {"quoted", "closer_without_opener"}
+    assert reasons(_MENTION_SHAPES["escaped mention"]) == {"escaped", "closer_without_opener"}
     assert "code_adjacent" in reasons(_MENTION_SHAPES["backtick right before the opener"])
 
 
@@ -585,3 +598,198 @@ def test_documented_deltas_against_base(base_org, name):
     content, base_expected, new_expected, _reason = _DELTAS[name]
     assert _texts(_run(base_org, [content])[0]) == base_expected
     assert _texts(_run(org, [content])[0]) == new_expected
+
+
+# ---------------------------------------------------------------------------
+# le-014 corrections (turn 2): the parser equals base for every well-formed want shape
+# ---------------------------------------------------------------------------
+
+# C1/C2 and their neighbours. Every one is asserted against BASE and against an explicit list,
+# so a future guard cannot silently suppress a real want that base minted.
+_LE014_GOLDEN = {
+    "C1 ends in inline code": (
+        "I noticed it. [WANT]check `foo()`[/WANT] done.", ["check `foo()`"]),
+    "C1 follow-on want after one ending in code": (
+        "[WANT]fix `a`[/WANT] and later [WANT]rest[/WANT]", ["fix `a`", "rest"]),
+    "C1 second follow-on shape": (
+        "[WANT]do `x`[/WANT] tail [WANT]second[/WANT]", ["do `x`", "second"]),
+    "begins with inline code": (
+        "[WANT]`foo()` needs work[/WANT]", ["`foo()` needs work"]),
+    "begins and ends with inline code": (
+        "[WANT]`foo()` and `bar()`[/WANT] ok", ["`foo()` and `bar()`"]),
+    "C2 closer wrapped in a quote pair": (
+        'x "[WANT]I want "x"[/WANT]" y', ['I want "x"']),
+    "ends in a backslash": (
+        "[WANT]path is C:\\[/WANT] ok", ["path is C:\\"]),
+    "ends in a URL": (
+        "[WANT]read https://example.com/docs[/WANT] then", ["read https://example.com/docs"]),
+    "want ending in a URL, then an adjacent want": (
+        "[WANT]read https://x.com/a[/WANT][WANT]second[/WANT]", ["read https://x.com/a", "second"]),
+    "want that contains a URL, a quoted word and code": (
+        'revisit [WANT]see "docs" at https://x.org/a and `code`[/WANT] thanks',
+        ['see "docs" at https://x.org/a and `code`']),
+    "opener right after a closing backtick (guard kept, same as base)": (
+        "see `x`[WANT]real[/WANT]", []),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_LE014_GOLDEN))
+def test_le014_golden_against_base(base_org, name):
+    content, expected = _LE014_GOLDEN[name]
+    assert _texts(_run(base_org, [content])[0]) == expected, "the expectation must be what BASE mints"
+    assert _run(org, [content]) == _run(base_org, [content])
+    assert _texts(_run(org, [content])[0]) == expected
+
+
+def test_closer_adjacency_guesses_do_not_apply_to_closers():
+    # C1: a closer right after a backtick is a real closer
+    parsed = org.parse_wants("[WANT]check `foo()`[/WANT]")
+    assert [w.text for w in parsed.wants] == ["check `foo()`"] and parsed.skipped == ()
+    # C2: a closer wrapped in a quote pair is a real closer
+    parsed = org.parse_wants('[WANT]I want "x"[/WANT]" y')
+    assert [w.text for w in parsed.wants] == ['I want "x"']
+    # a closer after an odd backslash is a real closer (a want may end in a path separator)
+    parsed = org.parse_wants("[WANT]path is C:\\[/WANT]")
+    assert [w.text for w in parsed.wants] == ["path is C:\\"]
+    # ...while the OPENER guesses still hold
+    assert org.parse_wants("x`[WANT]a[/WANT]").wants == ()
+    assert org.parse_wants('"[WANT]" a "[/WANT]"').wants == ()
+    assert org.parse_wants("\\[WANT]a[/WANT]").wants == ()
+
+
+def test_structural_masks_still_apply_to_closers():
+    parsed = org.parse_wants("[WANT] replace `[/WANT]` tokens [/WANT]")
+    assert [w.text for w in parsed.wants] == ["replace `[/WANT]` tokens"]
+    parsed = org.parse_wants("[WANT] a\n```\n[/WANT]\n```\n b [/WANT]")
+    assert [w.text for w in parsed.wants] == ["a\n```\n[/WANT]\n```\n b"]
+
+
+_PARITY_PREFIXES = ["", "Noted. ", "Line one.\n", "para\n\n", "see `x` and ", 'he said "hi" then ',
+                    "path C:\\dir ", "values: 1, 2, ", "a (b) ", "Ok!\r\n", "emoji \u2728 "]
+_PARITY_BODIES = ["plain want", "`code` begins", "ends `code()`", "`a` both `b`", "mid `x` code here",
+                  'has "quoted" word', 'ends with "quote"', '"begins with quote" here',
+                  "ends with backslash \\", "visit https://example.com/docs now",
+                  "read https://example.com/docs", '{"a": "b"} json inside', "multi\nline\nbody",
+                  "unicode \u00e9\u4e2d", "crlf\r\nbody", "ends with url https://x.org/a?b=[1]",
+                  "with (parens) and [brackets]", "tab\tinside", "pair ``double`` end", 'x "[y" z']
+_PARITY_SUFFIXES = ["", " tail", "\ntail", " [WANT]second[/WANT]", "[WANT]adj[/WANT]",
+                    " and `code` after", "\n\n```\nfence after\n```\n", ' and "q" after', " `"]
+
+
+def test_parity_with_base_on_every_well_formed_shape(base_org):
+    """The property the #801 id-equality guarantee rests on: for EVERY combination of
+    {prose prefix} x {want body, incl. begins/ends in code, quotes, backslash, URL, JSON-ish}
+    x {suffix, incl. a follow-on want} the parser returns base's wants, ids, node metadata and
+    synapses. No marker/fence/quote structure wraps the real opener in any of them; shapes
+    that do are the documented deltas and the adversarial list below."""
+    total = 0
+    diverged = []
+    for prefix, body, suffix in itertools.product(_PARITY_PREFIXES, _PARITY_BODIES, _PARITY_SUFFIXES):
+        content = prefix + "[WANT]" + body + "[/WANT]" + suffix
+        total += 1
+        if _run(org, [content]) != _run(base_org, [content]):
+            diverged.append(content)
+    assert total == len(_PARITY_PREFIXES) * len(_PARITY_BODIES) * len(_PARITY_SUFFIXES) >= 1900
+    assert diverged == [], "diverged from base on %d/%d shapes, first: %r" % (len(diverged), total, diverged[:3])
+
+
+# 'a real want next to code / quotes / stray backticks' -- asserted against base so that no
+# future guard can silently suppress one of these.
+_ADVERSARIAL_PARITY = [
+    "see `x`, then [WANT]real want[/WANT] and `y`",
+    'he said "go" [WANT]real want[/WANT] "later"',
+    "[WANT]a[/WANT] `b` [WANT]c[/WANT] `d`",
+    "`a` [WANT]real[/WANT]",
+    "``double`` [WANT]real with `inner` code[/WANT] ``double``",
+    "'[WANT]real[/WANT]'",
+    "(see [WANT]real want[/WANT])",
+    "**bold** [WANT]real want[/WANT] *em*",
+    "it's a ` character.\n\n[WANT]real[/WANT]\n\nanother ` char",
+    "[WANT]unbalanced quote \" here[/WANT] and [WANT]second[/WANT]",
+    "[WANT]ends with a quote char '[/WANT]",
+]
+
+
+@pytest.mark.parametrize("content", _ADVERSARIAL_PARITY)
+def test_adversarial_real_want_near_code_quotes_backticks_equals_base(base_org, content):
+    base_result = _run(base_org, [content])
+    assert base_result[0], "corpus error: base must mint something here"
+    assert _run(org, [content]) == base_result
+
+
+# Known, documented divergences that are NOT deliberate features but residuals (le-014 C3):
+# CommonMark-faithful, a real-want false negative whose only trace is an INFO skip line.
+_ADVERSARIAL_RESIDUAL = {
+    "stray backtick masks a real pair in the same paragraph": (
+        "I saw `foo. Then [WANT]do X[/WANT] later `bar` end", ["do X"], []),
+    "stray backtick inside a real want masks its closer": (
+        "[WANT]fix `a[/WANT] and `b` here", ["fix `a"], []),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_ADVERSARIAL_RESIDUAL))
+def test_stray_backtick_residual_is_exactly_as_documented(base_org, name):
+    content, base_expected, new_expected = _ADVERSARIAL_RESIDUAL[name]
+    assert _texts(_run(base_org, [content])[0]) == base_expected
+    assert _texts(_run(org, [content])[0]) == new_expected
+    skipped = org.parse_wants(content).skipped
+    assert skipped and {s.reason for s in skipped} <= {"in_code_span", "opener_unclosed"}   # visible, never silent
+
+
+# ---------------------------------------------------------------------------
+# LAW 5: the log bounds come from the environment; the flood claim is exact
+# ---------------------------------------------------------------------------
+
+def _import_with_env(env_extra):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("NG_EMBED", "CC_WANT_SKIP"))}
+    env.update(env_extra)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import cc_ng_organism as o; print(o.WANT_SKIP_SUMMARY_INTERVAL_S, o.WANT_SKIP_SEEN_MAX, "
+         "o.WANT_SKIP_DETAIL_PER_CALL_MAX)"],
+        cwd=str(_WORKTREE), env=env, capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-500:]
+    return out.stdout.split()
+
+
+def test_skip_log_bounds_are_env_sourced_with_current_values_as_defaults():
+    assert _import_with_env({}) == ["3600", "4096", "50"]
+    assert _import_with_env({"CC_WANT_SKIP_SUMMARY_INTERVAL_S": "120", "CC_WANT_SKIP_SEEN_MAX": "7",
+                             "CC_WANT_SKIP_DETAIL_PER_CALL_MAX": "3"}) == ["120", "7", "3"]
+    # junk falls back to the default; below-minimum clamps to the minimum -- never breaks import
+    assert _import_with_env({"CC_WANT_SKIP_SEEN_MAX": "not-a-number"})[1] == "4096"
+    assert _import_with_env({"CC_WANT_SKIP_DETAIL_PER_CALL_MAX": "0"})[2] == "1"
+
+
+def test_flood_claim_beyond_seen_max_degrades_to_the_per_call_cap(monkeypatch, caplog, clock):
+    """le-014 C4, stated exactly: <= SEEN_MAX distinct skips -> quiet after draining;
+    > SEEN_MAX -> evicted keys re-qualify, so up to DETAIL_PER_CALL_MAX lines per pulse, never more."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    monkeypatch.setattr(org, "WANT_SKIP_SEEN_MAX", 10)
+    monkeypatch.setattr(org, "WANT_SKIP_DETAIL_PER_CALL_MAX", 5)
+    g, vdb = _graph_with(*["stray [/WANT] %d" % i for i in range(30)])
+    per_pulse = []
+    for _ in range(12):
+        before = len([l for l in _info(caplog) if "node=" in l])
+        clock.now += 60
+        org.surface_wants(g, vdb)
+        per_pulse.append(len([l for l in _info(caplog) if "node=" in l]) - before)
+    assert max(per_pulse) <= 5
+    assert per_pulse[-1] == 5                        # does NOT go quiet: the documented degraded regime
+    org._reset_want_skip_log_state()
+    monkeypatch.setattr(org, "WANT_SKIP_SEEN_MAX", 4096)
+    g, vdb = _graph_with(*["stray [/WANT] %d" % i for i in range(12)])
+    tail = []
+    for _ in range(6):
+        before = len([l for l in _info(caplog) if "node=" in l])
+        clock.now += 60
+        org.surface_wants(g, vdb)
+        tail.append(len([l for l in _info(caplog) if "node=" in l]) - before)
+    assert tail[-1] == 0                             # within SEEN_MAX it drains and goes quiet
+
+
+def test_log_docstring_no_longer_claims_no_marker_text():
+    doc = org._log_want_skips.__doc__
+    assert "NEVER logs marker" not in doc
+    assert "literal marker token" in doc
