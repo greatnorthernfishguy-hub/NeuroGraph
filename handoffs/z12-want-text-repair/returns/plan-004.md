@@ -143,6 +143,9 @@ Change log (one entry per change; each changed passage carries its tag):
                            (ii) rewrite + V11 is scheduled SEPARATELY at the MEASURED heavy floor, V11 stays canonical and a GATE and REMAINS
                            in Phase 1 (§6.6, §7); (iii) the heavy floor is re-derived ONLY from a MEASURED V11 peak (probe P4) and stays
                            8 GiB until then. Still a scheduling decomposition: the repair plan is unchanged.
+58 [R4f·pin]               The [R4f·seq] commit (the sequencing note, with the Exec Packet 439 confirmation folded in) is
+                           `cf3fb9b395839754b4a999b88b7f64da3d3deeb4` (`git rev-parse HEAD` at that commit). Downstream citations pin THAT hash. The return is
+                           `returns/plan-004-r4f.md`.
 -------------------
 ```
 
