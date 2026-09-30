@@ -177,11 +177,12 @@ def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_
     if include_protected:
         g.create_node(node_id=rim, metadata={"constitutional": True})
     if flagged_in_scope:                                  # a want IN S under an ordinary id that carries the constitutional flag
+        flag_md = dict(flagged_in_scope) if isinstance(flagged_in_scope, dict) else {"constitutional": True}
         flag_text = prose("flag")
         ids["FLAG"] = wid(flag_text)
         g.create_node(node_id=ids["FLAG"], metadata={"kind": "want", "want_text": flag_text, "want_state": "open",
-                      "provenance": "cc_authored", "source_node": "cc:conv::plain", "creation_mode": "conversational",
-                      "constitutional": True})
+                      **{"provenance": "cc_authored", "source_node": "cc:conv::plain", "creation_mode": "conversational"},
+                      **flag_md})
     g.create_node(node_id="n1", metadata={})
     g.create_node(node_id="n2", metadata={})
     edges = [(ids["SEP1"], ids["GEN"], 0.4), (short1, ids["SEP1"], 0.5), ("n1", ids["SEP1"], 0.2)]
@@ -1090,7 +1091,7 @@ def test_an_approved_id_is_written_and_an_unapproved_or_struck_id_is_refused(bui
     path, sha = _write_approvals(tmp_path, body)
     ap = tool.load_approvals(path, sha, rl, sc)
     write, refused = tool.gate_write_set(built.A["records"], ap)
-    assert len(write) == 1 and sorted(r["reason"] for r in refused) == ["not_approved", "not_approved"]
+    assert len(write) == 1 and sorted(r["reason"] for r in refused) == ["not_approved", "struck"]
     assert not set(write) & {r["id"] for r in refused}
 
 
@@ -1287,7 +1288,7 @@ def test_p3_refuses_a_parser_that_regresses_the_closer_after_backtick_repro(pinn
 
 
 def _p4kw(world, placed=None):
-    return {"code_placed_at": (time.time() + 3600) if placed is None else placed, "daemon_log": str(world.log)}
+    return {"code_placed_at": (time.time() - 60) if placed is None else placed, "daemon_log": str(world.log)}
 
 
 def _manifest_of(d):
@@ -1327,7 +1328,7 @@ def test_p4_a_pid_file_naming_a_live_process_fails_and_a_log_newer_than_the_plac
         assert not r["ok"] and not r["checks"]["daemon_pid_file_names_a_dead_pid"]
         r = tool.gate_p4(FakeProbes(), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world, placed=1.0))
         assert not r["ok"] and not r["checks"]["no_pulse_since_code_placement"]
-        r = tool.gate_p4(FakeProbes(), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world, placed=10 ** 12))
+        r = tool.gate_p4(FakeProbes(), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world, placed=time.time() - 1))
         assert r["ok"]
     finally:
         (world.ws / "daemon.pid").unlink()
@@ -1444,7 +1445,7 @@ def _phase2_world(pinned, tmp_path, mp, **world_kw):
 
 
 def _p2_argv(w, *extra, step="phase2-backup", placed=True):
-    more = ["--code-placed-at", str(time.time() + 3600)] if placed else []
+    more = ["--code-placed-at", str(time.time() - 60)] if placed else []
     return argv_for(w, "--conduit-dir", str(w.conduit), *more, *extra, step=step)
 
 
@@ -1494,25 +1495,6 @@ def test_apply_refuses_when_the_daemon_organism_file_is_not_the_pin(pinned, tmp_
                                  "--daemon-organism-file", str(fake), "--josh-go", "GO-1", "--josh-go-manifest-sha256", msha),
                         probes=FakeProbes())
     assert rc == 2 and "P2" in err and file_hashes(w.ckpt) == before
-
-
-def test_apply_stops_on_any_deviation_from_the_approved_list_and_writes_nothing(pinned, tmp_path, monkeypatch, p3_stub):
-    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
-    body = json.loads(Path(ap).read_text())
-    body.pop("pin_stamp")
-    body["entries"][0]["decision"] = "struck"
-    data = tool.canonical_json(tool.stamped(body))
-    Path(ap).write_bytes(data)
-    aps2 = hashlib.sha256(data).hexdigest()
-    rc, res, err = cli(_p2_argv(w), probes=FakeProbes())
-    p2, msha = res["run_dir"], res["backup_manifest_sha256"]
-    before = file_hashes(w.ckpt)
-    rc, res2, err = cli(_p2_argv(w, "--apply", "--run-dir", p2, "--frozen-dir", str(frozen), "--approvals", ap, "--approvals-sha256", aps2,
-                                 "--daemon-organism-file", str(w.org_copy), "--josh-go", "GO-1",
-                                 "--josh-go-manifest-sha256", msha), probes=FakeProbes())
-    assert rc == 3 and "deviation" in err
-    assert file_hashes(w.ckpt) == before
-    assert not list(Path(p2).glob("RETIRED-*.receipt"))
 
 
 def test_apply_writes_the_pair_atomically_verifies_it_then_retires_the_tool(pinned, tmp_path, monkeypatch, p3_stub):
@@ -1629,12 +1611,14 @@ def _applied(pinned, tmp_path, mp):
     before, ino_before = file_hashes(w.ckpt), {n: _ident(w.ckpt / n) for n in tool.SIX_FILES}
     rc, res2, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps), probes=FakeProbes())
     assert rc == 0, err
+    receipt = next(Path(p2).glob("post-apply-receipt-FINAL-*.json"))
     return types.SimpleNamespace(w=w, p2=p2, msha=msha, frozen=frozen, ap=ap, aps=aps, before=before, ino_before=ino_before,
-                                 after=file_hashes(w.ckpt))
+                                 after=file_hashes(w.ckpt), receipt_sha=tool.sha256_file(str(receipt)), receipt=receipt)
 
 
 def _rb_argv(a, *extra, **kw):
-    return _p2_argv(a.w, "--run-dir", a.p2, "--josh-go", "GO-RB", "--josh-go-manifest-sha256", a.msha, *extra, step="rollback", **kw)
+    return _p2_argv(a.w, "--run-dir", a.p2, "--josh-go", "GO-RB", "--josh-go-manifest-sha256", a.msha,
+                    "--josh-go-receipt-sha256", a.receipt_sha, *extra, step="rollback", **kw)
 
 
 # ---- C1: --code-placed-at and a readable daemon.log are REQUIRED; the leg is never omitted --------------------------
@@ -1642,8 +1626,8 @@ def _rb_argv(a, *extra, **kw):
 def test_c1_gate_p4_never_omits_the_code_placement_leg_and_a_missing_log_is_not_ok(world):
     d, man = str(world.ckpt), _manifest_of(str(world.ckpt))
     for kw in ({"code_placed_at": None, "daemon_log": str(world.log)},
-               {"code_placed_at": time.time() + 3600, "daemon_log": str(world.ws / "missing.log")},
-               {"code_placed_at": time.time() + 3600, "daemon_log": None}):
+               {"code_placed_at": time.time() - 60, "daemon_log": str(world.ws / "missing.log")},
+               {"code_placed_at": time.time() - 60, "daemon_log": None}):
         r = tool.gate_p4(FakeProbes(), d, manifest_files=man, **kw)
         assert "no_pulse_since_code_placement" in r["checks"] and r["checks"]["no_pulse_since_code_placement"] is False and not r["ok"], kw
     world.log.chmod(0)
@@ -1707,22 +1691,6 @@ def test_c2_real_probes_crontab_errors_are_errors_not_an_empty_crontab(monkeypat
         monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(rc, "", err)))
         with pytest.raises(ProbeError):
             tool.Probes().crontab_text()
-
-
-def test_c2_real_probes_answer_only_the_exact_reachable_bus_states(monkeypatch):
-    P = tool.Probes()
-    for rc, out, want in ((3, "inactive", False), (3, "failed", False), (4, "inactive", False), (0, "active", True),
-                          (3, "activating", True), (0, "reloading", True)):
-        monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(rc, out + "\n")))
-        assert P.unit_active(tool.DAEMON_UNIT) is want, (rc, out)
-    for out, want in (("enabled", True), ("enabled-runtime", True), ("static", True), ("linked", True),
-                      ("disabled", False), ("masked", False)):
-        monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(0 if want else 1, out + "\n")))
-        assert P.unit_enabled(tool.LEG2_TIMER) is want, out
-    monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(0, "0 3 * * * /x/job\n")))
-    assert P.crontab_text() == "0 3 * * * /x/job\n"
-    monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(1, "", "no crontab for josh")))
-    assert P.crontab_text() == ""                                                      # rc 1 + the exact stderr = an empty crontab
 
 
 def test_c2_proc_scans_fail_when_an_own_entry_cannot_be_read_and_skip_vanished_ones(tmp_path, monkeypatch):
@@ -2046,15 +2014,6 @@ def test_c7_v15_records_presence_in_the_input_and_the_output(built, pinned, worl
     assert sorted(d["present_in_input"]) == want and sorted(d["present_in_output"]) == want
 
 
-def test_c8_the_deny_check_reads_the_metadata_flag_not_only_the_literal_ids():
-    ok = {"cc:want::1111111111111111": {"kind": "want", "provenance": "cc_authored"}}
-    assert tool.deny_check(list(ok), {}, (), nodes_meta=ok)["clean"] is True
-    for md in ({"constitutional": True}, {"choice_clause": True}, {"tags": ["Choice_Clause"]}, {"tag": "choice_clause"}):
-        nm = {"cc:want::2222222222222222": dict(ok["cc:want::1111111111111111"], **md)}
-        with pytest.raises(tool.Stop, match="deny-check"):
-            tool.deny_check(list(nm), {}, (), nodes_meta=nm)
-
-
 def test_c8_a_flagged_want_in_s_under_an_ordinary_id_stops_the_classify_step(pinned, tmp_path, monkeypatch):
     w = build_world(tmp_path, pinned, flagged_in_scope=True)
     patch_world(monkeypatch, w)
@@ -2103,3 +2062,453 @@ def test_p1_the_run_record_carries_both_heads(phase1):
     assert rec["p1"]["tree_head"] == "ae798b94cb14740d200fc3f4fd8d36eef8b86c6a"
     assert rec["p1"]["frozen_branch_head"] == "c7921b8436fb174c3f70fcf02827f16bb16deff0"
     assert rec["p1"]["cc_ng_organism_sha256"] == tool.PIN["cc_ng_organism_sha256"]
+
+
+# ==================================================================================================
+# TURN A2b - Exec P432 rulings (marker set, struck, H2) + le-031 R-1..R-8.
+# FAILING-FIRST: committed and pushed BEFORE the tool change; they fail against the A2 tool.
+# ==================================================================================================
+
+# ---- P432 (1): the Choice Clause deny-check marker set ------------------------------------------------------------
+
+MARKERS = [{"constitutional": True}, {"source": "cricket_rim"}, {"creation_mode": "constitutional"},
+           {"rim_source": "seed_cc_rim.py"}, {"rim_source": ""}]                       # rim_source: PRESENCE of the key, any value
+DROPPED_NAMES = [{"tag": "choice_clause"}, {"tags": ["choice_clause"]}, {"kind": "choice_clause"},
+                 {"category": "choice_clause"}, {"choice_clause": True}]                 # speculative names: none exists in source
+_ORD = {"kind": "want", "provenance": "cc_authored", "creation_mode": "conversational"}
+
+
+@pytest.mark.parametrize("marker", MARKERS, ids=lambda m: "-".join("%s=%s" % kv for kv in m.items()))
+def test_p432_each_marker_refuses_in_classify(pinned, tmp_path, monkeypatch, marker):
+    w = build_world(tmp_path, pinned, flagged_in_scope=marker)
+    patch_world(monkeypatch, w)
+    rc, res, err = cli(argv_for(w))
+    assert rc == 3 and "deny-check" in err
+
+
+@pytest.mark.parametrize("marker", MARKERS, ids=lambda m: "-".join("%s=%s" % kv for kv in m.items()))
+def test_p432_each_marker_refuses_in_the_build_and_in_v15(built, pinned, world, marker):
+    nid = built.A["scope"][0]
+    nm = dict(built.A["nodes_meta"])
+    nm[nid] = dict(nm[nid], **marker)
+    A2 = dict(built.A, nodes_meta=nm)
+    run_dir, utc = tool.new_run_dir()
+    with pytest.raises(tool.Stop, match="deny-check"):
+        tool.build_outputs(pinned, A2, built.approvals, in_dir=built.in_dir, out_dir=os.path.join(run_dir, "out"), run_dir=run_dir,
+                           utc=utc, in_hashes=built.ctx["in_hashes"])
+    V = tool.run_verifier(pinned, A2, built.ctx, world.expect)
+    assert "V15" in V.failed()
+
+
+def test_p432_the_dropped_speculative_names_are_not_refused_by_the_name_alone():
+    for extra in DROPPED_NAMES:
+        nm = {"cc:want::3333333333333333": dict(_ORD, **extra)}
+        assert tool.deny_check(list(nm), {}, (), nodes_meta=nm)["clean"] is True, extra
+    ordinary = {"cc:want::4444444444444444": dict(_ORD)}
+    assert tool.deny_check(list(ordinary), {}, (), nodes_meta=ordinary)["clean"] is True
+
+
+def test_p432_the_literal_ids_refuse_with_no_metadata_marker_at_all():
+    for cid in tool.CHOICE_CLAUSE_IDS + (tool.CONSTITUTIONAL_ID,):
+        nm = {cid: dict(_ORD)}                                     # NO marker: the literal id IS the identity
+        with pytest.raises(tool.Stop, match="deny-check"):
+            tool.deny_check([cid], {}, (), nodes_meta=nm)
+        with pytest.raises(tool.Stop, match="deny-check"):
+            tool.deny_check([], {}, [cid], nodes_meta=nm)          # also as an approval entry
+    assert tool.is_choice_clause_marked({"rim_source": None}, "cc:want::5555555555555555") is True     # presence, not truthiness
+    assert tool.is_choice_clause_marked({"creation_mode": "conversational"}, tool.CHOICE_CLAUSE_IDS[0]) is True
+    assert tool.is_choice_clause_marked(dict(_ORD), "cc:want::5555555555555555") is False
+
+
+def test_p432_no_new_marker_is_written_on_any_want(built, world):
+    """H-1: a re-tag would be an identity edit. Every carried node keeps exactly its input metadata keys."""
+    for nid, md in built.ctx["meta_after"].items():
+        old = built.ctx["plan"]["inverse"].get(nid, nid)
+        assert set(md) == set(built.A["nodes_meta"][old]), nid
+    assert not any(k in json.dumps(sorted(md)) for md in built.ctx["meta_after"].values() for k in ("rim_source", "cricket_rim") if k in md)
+
+
+# ---- P432 (2): struck = a recorded deviation; the apply CONTINUES ---------------------------------------------------
+
+def _retouch_approvals(rd, ap, mutate):
+    body = json.loads(Path(ap).read_text())
+    body.pop("pin_stamp")
+    mutate(body)
+    data = tool.canonical_json(tool.stamped(body))
+    Path(ap).write_bytes(data)
+    return hashlib.sha256(data).hexdigest()
+
+
+def _backup_and_args(w, rd, frozen, ap, aps, *extra):
+    rc, res, err = cli(_p2_argv(w, *_partner_args(w), *extra), probes=FakeProbes())
+    assert rc == 0, err
+    return res["run_dir"], res["backup_manifest_sha256"]
+
+
+def _node_entry_bytes(main_path, nid):
+    raw = Path(main_path).read_bytes()
+    for sec, ek, ks, vs, ve in tool.iter_sections(raw):
+        if sec == "nodes" and ek == nid:
+            return raw[ks:ve]
+    return None
+
+
+def test_p432_a_struck_id_does_not_block_the_apply_and_is_recorded_as_a_deviation(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    struck_old = w.ids["SEP2"]
+    aps2 = _retouch_approvals(rd, ap, lambda b: [e.__setitem__("decision", "struck") for e in b["entries"] if e["id"] == struck_old])
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps2)
+    before_entry = _node_entry_bytes(w.ckpt / tool.MAIN_NAME, struck_old)
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps2), probes=FakeProbes())
+    assert rc == 0, err
+    assert res["applied"] == 2
+    assert _node_entry_bytes(w.ckpt / tool.MAIN_NAME, struck_old) == before_entry          # the struck node is byte-identical
+    g = pinned.nf.Graph()
+    g.restore(str(w.ckpt / tool.MAIN_NAME))
+    assert struck_old in g.nodes and w.new["SEP2"] not in g.nodes                         # old id kept, new id never created
+    assert w.new["SEP1"] in g.nodes and w.new["BIG"] in g.nodes                            # the other two were repaired
+    rec = json.loads(next(Path(p2).glob("post-apply-receipt-FINAL-*.json")).read_text())
+    assert [d["id"] for d in rec["struck_deviations"]] == [struck_old]
+    fwd = json.loads(next(Path(p2).glob("id-map-2*.json")).read_text())
+    inv = json.loads(next(Path(p2).glob("id-map-inverse-*.json")).read_text())
+    assert struck_old not in {o for o, n in fwd["pairs"]} and w.new["SEP2"] not in {o for o, n in inv["pairs"]}
+    assert len(fwd["pairs"]) == 2 == len(inv["pairs"])
+
+
+@pytest.mark.parametrize("who", ["cc1", "cc2", "rim"])
+def test_p432_a_struck_choice_clause_want_or_the_rim_stops_the_apply(pinned, tmp_path, monkeypatch, p3_stub, who):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    target = getattr(w, who)
+    aps2 = _retouch_approvals(rd, ap, lambda b: b["entries"].append(
+        {"id": target, "decision": "struck", "excerpt_sha256": "0" * 64, "x_sha16": "0" * 16, "t_sha16": "0" * 16}))
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps2)
+    before = file_hashes(w.ckpt)
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps2), probes=FakeProbes())
+    assert rc == 3 and "deny-check" in err and file_hashes(w.ckpt) == before
+
+
+def test_p432_an_unapproved_or_mismatching_id_still_stops_the_apply(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    victim = w.ids["SEP1"]
+    aps2 = _retouch_approvals(rd, ap, lambda b: b.__setitem__("entries", [e for e in b["entries"] if e["id"] != victim]))    # absent
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps2)
+    before = file_hashes(w.ckpt)
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps2), probes=FakeProbes())
+    assert rc == 3 and "deviation" in err and file_hashes(w.ckpt) == before
+    aps3 = _retouch_approvals(rd, ap, lambda b: b.__setitem__(
+        "entries", [dict(e, x_sha16="0" * 16) if e["id"] == w.ids["BIG"] else e for e in b["entries"]]))
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps3), probes=FakeProbes())
+    assert rc == 3 and file_hashes(w.ckpt) == before                                       # an approval whose hashes differ: STOP
+
+
+def test_p432_a_live_scope_size_mismatch_stops_the_apply(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    monkeypatch.setattr(tool, "EXPECTED_SCOPE", w.expect["scope"] - 1)
+    argv_b = _with_flag(_p2_argv(w, *_partner_args(w)), "--expect-scope", w.expect["scope"] - 1)
+    rc, res, err = cli(argv_b, probes=FakeProbes())
+    assert rc == 0, err
+    p2, msha = res["run_dir"], res["backup_manifest_sha256"]
+    before = file_hashes(w.ckpt)
+    rc, res, err = cli(_with_flag(_apply_argv(w, p2, msha, frozen, ap, aps), "--expect-scope", w.expect["scope"] - 1), probes=FakeProbes())
+    assert rc == 3 and "P9" in err and file_hashes(w.ckpt) == before
+
+
+# ---- P432 (3): H2 with the REAL Probes, subprocess.run stubbed at the run boundary ----------------------------------
+
+GOOD_BUS = _cp(0, "running\n")
+_NOBUS = _cp(1, "", _BUS_MSG)
+
+
+def _sd(**ans):
+    """A subprocess.run stub that answers by systemctl sub-command (and crontab); anything unrouted is an error answer."""
+    def run(argv, *a, **k):
+        if argv[0] == "crontab":
+            return ans.get("crontab", _cp(1, "", "no crontab for josh"))
+        r = ans.get(argv[2], _cp(1, "", "unrouted"))
+        if isinstance(r, BaseException):
+            raise r
+        return r
+    return run
+
+
+def _h2(monkeypatch, world, **ans):
+    monkeypatch.setattr(tool.glob, "glob", lambda pat: [])                 # no /proc entries: only the systemd/cron answers matter
+    monkeypatch.delenv("CC_CALLOSUM_LEG1_ENABLED", raising=False)
+    monkeypatch.setattr(tool.subprocess, "run", _sd(**ans))
+    return tool.gate_p6(tool.Probes(), str(world.conduit))
+
+
+def test_p432_h2_linked_and_inactive_passes_and_disabled_and_inactive_passes(world, monkeypatch):
+    r = _h2(monkeypatch, world, **{"is-system-running": GOOD_BUS, "is-active": _cp(3, "inactive\n"), "is-enabled": _cp(0, "linked\n")})
+    assert r["ok"] and r["violations"] == [], r["violations"]
+    r = _h2(monkeypatch, world, **{"is-system-running": GOOD_BUS, "is-active": _cp(3, "inactive\n"), "is-enabled": _cp(1, "disabled\n")})
+    assert r["ok"] and r["violations"] == [], r["violations"]
+
+
+def test_p432_h2_enabled_fails_and_active_fails(world, monkeypatch):
+    r = _h2(monkeypatch, world, **{"is-system-running": GOOD_BUS, "is-active": _cp(3, "inactive\n"), "is-enabled": _cp(0, "enabled\n")})
+    assert not r["ok"] and "h2_leg2_timer_enabled" in r["violations"]
+    r = _h2(monkeypatch, world, **{"is-system-running": GOOD_BUS, "is-active": _cp(0, "active\n"), "is-enabled": _cp(0, "linked\n")})
+    assert not r["ok"] and "h2_leg2_timer_active" in r["violations"]
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_p432_h2_a_unit_proven_absent_by_list_unit_files_counts_as_off(world, monkeypatch, rc):
+    r = _h2(monkeypatch, world, **{"is-system-running": GOOD_BUS, "is-active": _cp(4, "inactive\n"),
+                                    "is-enabled": _cp(4, "not-found\n"), "list-unit-files": _cp(rc, "", "")})
+    assert r["ok"] and r["violations"] == [], r["violations"]
+
+
+def test_p432_h2_absent_is_not_proven_when_the_unit_file_is_listed_or_the_bus_did_not_answer(world, monkeypatch):
+    listed = _cp(0, "cc-callosum-leg2.timer linked enabled\n")
+    r = _h2(monkeypatch, world, **{"is-system-running": GOOD_BUS, "is-active": _cp(4, "inactive\n"),
+                                    "is-enabled": _cp(4, "not-found\n"), "list-unit-files": listed})
+    assert not r["ok"] and any(v.startswith("probe_error") for v in r["violations"])
+    r = _h2(monkeypatch, world, **{"is-system-running": _cp(1, "offline\n"), "is-active": _cp(4, "inactive\n"),
+                                    "is-enabled": _cp(4, "not-found\n"), "list-unit-files": _cp(1, "", "")})
+    assert not r["ok"]                                                                 # an empty listing WITHOUT a bus witness proves nothing
+
+
+def test_p432_h2_an_unreachable_bus_or_an_unknown_answer_fails_closed(world, monkeypatch):
+    r = _h2(monkeypatch, world, **{"is-system-running": _NOBUS, "is-active": _NOBUS, "is-enabled": _NOBUS, "list-unit-files": _NOBUS})
+    assert not r["ok"] and any(v.startswith("probe_error") for v in r["violations"])
+    for word in ("weird-state\n", "masked\n", "\n"):
+        r = _h2(monkeypatch, world, **{"is-system-running": GOOD_BUS, "is-active": _cp(3, "inactive\n"), "is-enabled": _cp(1, word),
+                                       "list-unit-files": _cp(0, "cc-callosum-leg2.timer masked\n")})
+        assert not r["ok"] and any(v.startswith("probe_error") for v in r["violations"]), word
+    r = _h2(monkeypatch, world, **{"is-system-running": _cp(1, "offline\n"), "is-active": _cp(3, "inactive\n"), "is-enabled": _cp(0, "linked\n")})
+    assert not r["ok"]                                                                 # N-b: a 'down'/'off' verdict needs a positive bus witness
+
+
+def test_p432_real_probes_answer_only_the_exact_reachable_bus_states(monkeypatch):
+    P = tool.Probes()
+    for rc, out, want in ((3, "inactive", False), (3, "failed", False), (4, "inactive", False), (0, "active", True),
+                          (3, "activating", True), (0, "reloading", True)):
+        monkeypatch.setattr(tool.subprocess, "run", _sd(**{"is-system-running": GOOD_BUS, "is-active": _cp(rc, out + "\n")}))
+        assert P.unit_active(tool.DAEMON_UNIT) is want, (rc, out)
+    for out, want in (("enabled", True), ("enabled-runtime", True), ("static", True), ("linked", False), ("disabled", False)):
+        monkeypatch.setattr(tool.subprocess, "run", _sd(**{"is-system-running": GOOD_BUS, "is-enabled": _cp(0 if want else 1, out + "\n")}))
+        assert P.unit_enabled(tool.LEG2_TIMER) is want, out
+    monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(0, "0 3 * * * /x/job\n")))
+    assert P.crontab_text() == "0 3 * * * /x/job\n"
+    monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(1, "", "no crontab for josh")))
+    assert P.crontab_text() == ""
+
+
+# ---- R-1 / R-2: the rollback is bound to the receipt(s) the go quotes; it does not need exactly one -----------------
+
+def test_r1_the_rollback_needs_the_receipt_hash_and_refuses_an_edited_or_unknown_receipt(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    argv = _rb_argv(a)
+    no_flag = [x for x in argv if x not in ("--josh-go-receipt-sha256", a.receipt_sha)]
+    rc, res, err = cli(no_flag, probes=FakeProbes())
+    assert rc == 2 and "receipt" in err and file_hashes(w.ckpt) == a.after
+    rc, res, err = cli(_with_flag(argv, "--josh-go-receipt-sha256", "0" * 64), probes=FakeProbes())
+    assert rc == 2 and "receipt" in err and file_hashes(w.ckpt) == a.after                # a quoted hash that names no receipt
+    third = hashlib.sha256(b"a third state").hexdigest()                                    # FORGE the receipt: after-hash of main -> a third state
+    d = json.loads(a.receipt.read_text())
+    d["six_file_sha256_after"][tool.MAIN_NAME] = third
+    a.receipt.write_text(json.dumps(d))
+    with open(w.ckpt / tool.MAIN_NAME, "ab") as f:
+        f.write(b"x")                                                                       # live main is now a third state the forged receipt names?
+    forged_live = file_hashes(w.ckpt)
+    rc, res, err = cli(argv, probes=FakeProbes())                                            # still quotes the ORIGINAL receipt hash
+    assert rc == 2 and "receipt" in err and file_hashes(w.ckpt) == forged_live              # the edit is REFUSED, live untouched
+
+
+def test_r1_an_unquoted_receipt_never_widens_the_identity_check(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    with open(w.ckpt / tool.COMMONS_NAME, "ab") as f:
+        f.write(b"x")
+    third = tool.sha256_file(str(w.ckpt / tool.COMMONS_NAME))
+    d = json.loads(a.receipt.read_text())
+    d["six_file_sha256_after"][tool.COMMONS_NAME] = third
+    (a.receipt.parent / "post-apply-receipt-20990101T000000Z.json").write_text(json.dumps(d))   # a forged EXTRA draft, not quoted
+    changed = file_hashes(w.ckpt)
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 2 and "identity" in err and file_hashes(w.ckpt) == changed
+
+
+def test_r2_a_failed_apply_then_a_torn_apply_leaves_two_drafts_and_the_rollback_completes(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    tick = iter(range(10, 99))
+    monkeypatch.setattr(tool, "utc_stamp", lambda: "20260930T12%02d00Z" % next(tick))       # two attempts must not share a receipt name
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps)
+    before = file_hashes(w.ckpt)
+    cg = sys.modules["checkpoint_guardian"]
+    real = cg.atomic_file_write
+    calls = {"n": 0}
+
+    def dies_first(final, fn):                                                             # attempt 1: dies BEFORE any replace
+        raise RuntimeError("synthetic death before the replace")
+    monkeypatch.setattr(cg, "atomic_file_write", dies_first)
+    with pytest.raises(RuntimeError):
+        cli(_apply_argv(w, p2, msha, frozen, ap, aps), probes=FakeProbes())
+    assert file_hashes(w.ckpt) == before
+
+    def dies_second(final, fn):                                                            # attempt 2: main replaced, then dies
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("synthetic death between the two replaces")
+        return real(final, fn)
+    monkeypatch.setattr(cg, "atomic_file_write", dies_second)
+    with pytest.raises(RuntimeError):
+        cli(_apply_argv(w, p2, msha, frozen, ap, aps), probes=FakeProbes())
+    monkeypatch.setattr(cg, "atomic_file_write", real)
+    drafts = sorted(Path(p2).glob("post-apply-receipt-[0-9]*.json"))
+    assert len(drafts) == 2 and not list(Path(p2).glob("post-apply-receipt-FINAL-*.json"))
+    torn = file_hashes(w.ckpt)
+    assert torn[tool.MAIN_NAME] != before[tool.MAIN_NAME] and torn[tool.SIDECAR_NAME] == before[tool.SIDECAR_NAME]
+    argv = _p2_argv(w, "--run-dir", p2, "--josh-go", "GO-RB", "--josh-go-manifest-sha256", msha,
+                    "--josh-go-receipt-sha256", tool.sha256_file(str(drafts[-1])), step="rollback")
+    rc, res, err = cli(argv, probes=FakeProbes())
+    assert rc == 0, err
+    assert file_hashes(w.ckpt) == before
+    argv2 = _p2_argv(w, "--run-dir", p2, "--josh-go", "GO-RB", "--josh-go-manifest-sha256", msha,
+                     "--josh-go-receipt-sha256", tool.sha256_file(str(drafts[0])), "--josh-go-receipt-sha256", tool.sha256_file(str(drafts[-1])),
+                     step="rollback")
+    rc, res, err = cli(argv2, probes=FakeProbes())                                         # quoting BOTH also works (already restored: a no-op)
+    assert rc == 0, err
+
+
+# ---- R-3, R-4, R-5 ---------------------------------------------------------------------------------------------------
+
+def test_r3_a_manifest_that_names_another_target_stops_apply_and_rollback(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    mp = next(Path(a.p2).glob("backup-manifest-*.json"))
+    d = json.loads(mp.read_text())
+    d["target_realpath"] = "/somewhere/else/entirely"
+    mp.write_text(json.dumps(d))
+    newsha = tool.sha256_file(str(mp))
+    rc, res, err = cli(_with_flag(_rb_argv(a), "--josh-go-manifest-sha256", newsha), probes=FakeProbes())
+    assert rc == 3 and "target_realpath" in err and file_hashes(w.ckpt) == a.after
+    w2, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path / "second", monkeypatch)
+    p2, msha = _backup_and_args(w2, rd, frozen, ap, aps)
+    mp2 = next(Path(p2).glob("backup-manifest-*.json"))
+    d2 = json.loads(mp2.read_text())
+    d2["target_realpath"] = "/somewhere/else/entirely"
+    mp2.write_text(json.dumps(d2))
+    before = file_hashes(w2.ckpt)
+    rc, res, err = cli(_apply_argv(w2, p2, tool.sha256_file(str(mp2)), frozen, ap, aps), probes=FakeProbes())
+    assert rc == 3 and "target_realpath" in err and file_hashes(w2.ckpt) == before
+
+
+def test_r4_a_conduit_path_under_the_checkpoint_directory_is_refused_and_never_walked(pinned, tmp_path, monkeypatch):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    walked = []
+
+    class Rec(FakeProbes):
+        def stat_snapshot(self, d):
+            walked.append(d)
+            return {}
+    (tmp_path / "via").symlink_to(w.gen)
+    for c in (w.gen, w.ckpt, w.gen / "20260923T104614Z", tmp_path / "via"):
+        r = tool.gate_p6(Rec(), str(c))
+        assert not r["ok"] and any("conduit" in v for v in r["violations"]), str(c)
+    assert walked == []
+    real_walk = os.walk
+    monkeypatch.setattr(os, "walk", lambda p, *a, **k: (walked.append(str(p)), real_walk(p, *a, **k))[1])
+    r = tool.gate_p6(tool.Probes(), str(w.gen))
+    assert not r["ok"] and not [x for x in walked if "generations" in x]
+    rc, res, err = cli(_with_flag(_p2_argv(w), "--conduit-dir", w.gen), probes=FakeProbes())
+    assert rc == 2 and "P4/P6" in err
+
+
+@pytest.mark.parametrize("step", ["apply", "rollback"])
+def test_r5_a_stale_hard_linked_tmp_in_the_live_directory_is_never_written_through(pinned, tmp_path, monkeypatch, p3_stub, step):
+    if step == "apply":
+        w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+        p2, msha = _backup_and_args(w, rd, frozen, ap, aps)
+        argv = _apply_argv(w, p2, msha, frozen, ap, aps)
+    else:
+        a = _applied(pinned, tmp_path, monkeypatch)
+        w, argv = a.w, _rb_argv(a)
+    decoy = tmp_path / "decoy"
+    decoy.write_text("decoy content that must survive")
+    stale = w.ckpt / ("main.tmp-%d.msgpack" % os.getpid())                                  # the exact name atomic_file_write will use
+    os.link(decoy, stale)
+    assert os.stat(stale).st_nlink == 2
+    before = file_hashes(w.ckpt)
+    rc, res, err = cli(argv, probes=FakeProbes())
+    assert rc == 2 and "link" in err
+    assert decoy.read_text() == "decoy content that must survive"
+    assert file_hashes(w.ckpt).get(tool.MAIN_NAME) == before[tool.MAIN_NAME]
+
+
+# ---- R-7: the displaced bytes always survive somewhere hash-equal ---------------------------------------------------
+
+def test_r7_rollback_keeps_a_hash_equal_copy_of_what_it_displaces(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 0, err
+    rec = json.loads(next(Path(a.p2).glob("rollback-receipt-*.json")).read_text())
+    assert {d["name"]: d["where"] for d in rec["displaced"]} == {tool.MAIN_NAME: "stage", tool.SIDECAR_NAME: "stage"}
+    assert not list(Path(a.p2).glob("displaced-*"))
+    for d in rec["displaced"]:
+        assert d["sha256"] == a.after[d["name"]] and tool.sha256_file(os.path.join(a.p2, "stage", d["name"])) == d["sha256"]
+
+
+def test_r7_when_the_stage_copy_is_gone_or_wrong_a_displaced_copy_is_written_first(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    shutil.rmtree(Path(a.p2) / "stage")                                                     # someone cleaned the run directory
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 0, err
+    rec = json.loads(next(Path(a.p2).glob("rollback-receipt-*.json")).read_text())
+    assert all(d["where"] == "displaced" for d in rec["displaced"])
+    ddir = next(Path(a.p2).glob("displaced-*"))
+    for d in rec["displaced"]:
+        assert tool.sha256_file(str(ddir / d["name"])) == a.after[d["name"]]                # the post-apply bytes survive
+    a2 = _applied(pinned, tmp_path / "b", monkeypatch)
+    with open(Path(a2.p2) / "stage" / tool.MAIN_NAME, "ab") as f:
+        f.write(b"x")                                                                       # a WRONG stage copy is not a copy
+    rc, res, err = cli(_rb_argv(a2), probes=FakeProbes())
+    assert rc == 0, err
+    rec2 = json.loads(next(Path(a2.p2).glob("rollback-receipt-*.json")).read_text())
+    assert {d["name"]: d["where"] for d in rec2["displaced"]}[tool.MAIN_NAME] == "displaced"
+
+
+# ---- R-8 -------------------------------------------------------------------------------------------------------------
+
+def test_r8_a_code_placed_at_later_than_now_is_refused_at_backup_apply_and_rollback(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    future = time.time() + 3600
+    rc, res, err = cli(_with_flag(_p2_argv(w), "--code-placed-at", future), probes=FakeProbes())
+    assert rc == 2 and "later than now" in err
+    rc, res, err = cli(_with_flag(_rb_argv(a), "--code-placed-at", future), probes=FakeProbes())
+    assert rc == 2 and "later than now" in err and file_hashes(w.ckpt) == a.after
+    rc, res, err = cli(_with_flag(_apply_argv(w, a.p2, a.msha, a.frozen, a.ap, a.aps), "--code-placed-at", future), probes=FakeProbes())
+    assert rc == 2 and "later than now" in err
+
+
+def test_r8_foreign_unreadable_is_surfaced_in_the_gate_result(world, tmp_path, monkeypatch):
+    root = tmp_path / "proc"
+    (root / "4242" / "fd").mkdir(parents=True)
+    cmd = root / "4242" / "cmdline"
+    cmd.write_bytes(b"x")
+    cmd.chmod(0)
+    (root / "4242" / "fd").chmod(0)
+    monkeypatch.setattr(tool.glob, "glob", lambda pat: [str(root / "4242")])
+    monkeypatch.setattr(tool.subprocess, "run", _sd(**{"is-system-running": GOOD_BUS, "is-active": _cp(3, "inactive\n")}))
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)                                # the entry now belongs to "another user"
+    try:
+        r = tool.gate_p4(tool.Probes(), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world))
+    finally:
+        cmd.chmod(0o644)
+        (root / "4242" / "fd").chmod(0o755)
+    assert r["foreign_unreadable"] >= 1 and r["ok"] is True, r
+
+
+def test_r8_p3b_has_a_timeout_and_a_timeout_fails_the_gate(pinned, monkeypatch):
+    seen = {}
+
+    def run(argv, *a, **k):
+        seen.update(k)
+        raise subprocess.TimeoutExpired(argv, k.get("timeout", 0))
+    monkeypatch.setattr(tool.subprocess, "run", run)
+    r = tool.gate_p3(pinned, run_pinned_tests=True)
+    assert seen.get("timeout") and not r["ok"] and r["pinned_tests"]["timed_out"] is True
