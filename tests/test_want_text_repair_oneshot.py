@@ -2742,7 +2742,15 @@ def test_c2_foreign_unreadable_is_persisted_in_the_manifest_hold_start_and_both_
 
 # ---- le-034 C-3: a non-finite --code-placed-at is refused with a clear message -------------------------------------------
 
-@pytest.mark.parametrize("bad", ["nan", "NaN", "inf", "-inf", "Infinity"])
+def test_c3_the_input_check_itself_refuses_every_non_finite_form_including_minus_inf():
+    for bad in ("nan", "NaN", "inf", "-inf", "+inf", "Infinity", "-Infinity"):             # `-inf` cannot reach it through argparse
+        ns = types.SimpleNamespace(expect_wants=tool.EXPECTED_WANTS, expect_protected=tool.EXPECTED_PROTECTED,
+                                   expect_scope=tool.EXPECTED_SCOPE, code_placed_at=bad)
+        with pytest.raises(tool.Refusal, match="finite"):
+            tool._require_phase2_inputs(ns)
+
+
+@pytest.mark.parametrize("bad", ["nan", "NaN", "inf", "Infinity"])
 def test_c3_a_non_finite_code_placed_at_is_refused_clearly(pinned, tmp_path, monkeypatch, bad):
     w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
     n_runs = len(list(w.backups.iterdir()))
