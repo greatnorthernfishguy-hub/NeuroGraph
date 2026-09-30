@@ -1,6 +1,18 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 6 (dispatch #11238): le-025 C-1..C-5
+# What: C-2 the measured provider node limit must never drop or reference a node that fit whole before
+#   (tight-budget cases + a sweep of (core, budget, node) against BASE e4ebf982 AND the turn-5 parent
+#   b2f3d18: old-whole implies new-whole, and no cut ever); C-5 the identity-pin guard FAILS CLOSED
+#   (raises/missing -> PINNED + a WARNING, id and exception type only) on Stage 3 and the un-Pithed
+#   renderer; C-1 the pin probe is compared with BASE's closure (identical except the deliberate C-5
+#   change); C-4 one shared alert-coherence constant drives both the renderer and the measured limit;
+#   C-3 the INFO line says "above the reference limit L".
+# Why: Chief ruling docs e19962de on le-025 (PASS-WITH-NOTES). C-2 and C-5 tests were written FIRST and
+#   shown failing on the turn-5 head.
+# How: fake in-memory graph; older modules loaded from `git show <commit>:cc_ng_organism.py` (a missing
+#   commit FAILS the test, it never skips).
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 5 (dispatch #11114): le-022 N1-N3 + LOWs
 # What: N1 the un-Pithed (gate-off / Pith-failure) renderer exempts identity-protected items from
 #   the budget exactly as Stage 3 does (pins outside the budget, rendered whole, never dropped, never
@@ -812,7 +824,7 @@ def _giant_world(giant_len=30000, trees=3, with_meta_anchor=True):
 
 def _ref_records(caplog):
     return [r.getMessage() for r in caplog.records
-            if r.levelno == logging.INFO and "over-budget node" in r.getMessage()]
+            if r.levelno == logging.INFO and "above the reference limit" in r.getMessage()]
 
 
 def test_819_provider_over_budget_node_surfaces_through_its_trees_plus_one_reference_line(caplog):
@@ -831,7 +843,7 @@ def test_819_provider_over_budget_node_surfaces_through_its_trees_plus_one_refer
     for tt in tree_texts:                                             # its concepts follow, WHOLE
         assert tt in ctx
     (message,) = _ref_records(caplog)
-    assert "1 over-budget node" in message and "cc:conv::bigforest" in message
+    assert "1 node above the reference limit" in message and "cc:conv::bigforest" in message
 
 
 def test_819_the_node_itself_is_never_modified_or_split():
@@ -1127,17 +1139,16 @@ def test_low_the_node_limit_is_measured_from_the_renderer_not_a_constant():
     core = pith.render_constitutional_core(_giant_world()[0])
     limit = pith._pith_provider_node_limit(core, 4000)
     assert 1 <= limit < 4000 - len(core)
-    # it must really be the room a single assembly has: a node of exactly `limit` chars plus its
-    # own line structure, inside the WORST-CASE shell, still fits the budget
-    line = pith.CacheLine(node_id="n", content="x" * limit, sources=["substrate topology"], stream="connected",
-                          coherence="unknown")
-    worst = pith._pith_provider_sections(core, [line], [pith._pith_render_connected_line(line)])[0]
-    assert len(worst) <= 4000
-    # tiny budgets floor at 1 (never 0, which would silently disable the reference form)
-    assert pith._pith_provider_node_limit(core, 10) == 1
-    # a bigger budget gives a strictly bigger limit, 1:1
-    assert pith._pith_provider_node_limit(core, 8000) - limit == 4000
-
+    # Turn 6 (C-2): the limit is the OPTIMISTIC bound -- the room a single ORDINARY line has (no
+    # alert, no sources line, no anchors/relations).  A node of exactly `limit` chars in such a line
+    # fits the budget exactly; an alert/sources/anchor-bearing assembly may need more and is then
+    # caught at admit as a loud never-fit (whole-or-absent).
+    line = pith.CacheLine(node_id="n", content="x" * limit, sources=[], stream="connected",
+                          coherence="shared")
+    fitted = pith._pith_provider_sections(core, [line], [pith._pith_render_connected_line(line)])[0]
+    assert len(fitted) == 4000
+    assert pith._pith_provider_node_limit(core, 10) == 1               # never 0 (0 would disable the form)
+    assert pith._pith_provider_node_limit(core, 8000) - limit == 4000  # 1:1 with the budget
 
 def test_n3_the_contract_states_the_log_knobs_with_the_defaults_and_clamps_the_code_uses():
     text = open(os.path.join(_ROOT, "docs", "PITH_HOST_CONTRACT.md")).read()
@@ -1155,3 +1166,228 @@ def test_n3_the_contract_describes_c2_c3_n1_and_the_truthful_reference():
     assert "pith reference form" in body and "left out" in body
     assert "Identity is outside the recall budget" in body
     assert "so its concepts follow" not in body
+
+
+# ====================================================================== TURN 6
+import functools
+import importlib.util
+import tempfile
+
+_BASE_COMMIT = "e4ebf982b1989fd9066d610b94853bc68bf70d37"
+_TURN5_PARENT = "b2f3d183c8922302ecbc6e204141d229a02ddcdc"        # turn-5 head: the OLD 800/200 constants
+
+
+@functools.lru_cache(maxsize=None)
+def _module_at(commit):
+    """cc_ng_organism as it was at `commit` (a missing commit raises -> the test FAILS, never skips)."""
+    src = subprocess.check_output(["git", "-C", _ROOT, "show", f"{commit}:cc_ng_organism.py"])
+    path = os.path.join(tempfile.mkdtemp(prefix="cc_ng_organism_old_"), f"cc_ng_organism_{commit[:8]}.py")
+    open(path, "wb").write(src)
+    name = f"cc_ng_organism_{commit[:8]}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _tight(mod, core_len, budget, node_len):
+    """One provider_context render on `mod` with a core of `core_len` chars and ONE node."""
+    g = FakeGraph()
+    g.node("core", "K" * max(1, core_len), constitutional=True)
+    text = "N" * node_len
+    g.node("x", text)
+    result = _run(mod, g, [{"node_id": "x", "score": 1.0}], "go on", budget_chars=budget)
+    ctx = result.get("context") or ""
+    return result, ctx, text
+
+
+def _is_whole(ctx, text):
+    return text in ctx
+
+
+_TIGHT_CASES = [(800, 1500, 60), (800, 1500, 120), (800, 1200, 30), (800, 1200, 60),
+                (400, 1000, 30), (400, 1000, 60), (400, 1000, 120)]
+
+
+@pytest.mark.parametrize("core_len,budget,node_len", _TIGHT_CASES)
+def test_c2_a_node_that_fit_whole_before_stays_whole_in_the_tight_regime(core_len, budget, node_len):
+    _r_old, ctx_old, text = _tight(_module_at(_TURN5_PARENT), core_len, budget, node_len)
+    assert _is_whole(ctx_old, text), "precondition: the turn-5 parent rendered this node whole"
+    result, ctx, text = _tight(pith, core_len, budget, node_len)
+    assert result["state"] == "ok", result["warnings"]
+    assert _is_whole(ctx, text) and "long node" not in ctx           # WHOLE: not dropped, not a reference
+
+
+def test_c2_sweep_old_whole_implies_new_whole_and_nothing_is_ever_cut():
+    base, parent = _module_at(_BASE_COMMIT), _module_at(_TURN5_PARENT)
+    checked = old_whole_points = 0
+    for core_len in (0, 200, 400, 800):
+        for budget in (500, 1000, 1200, 1500, 4000):
+            for node_len in (30, 60, 120, 600):
+                res = {}
+                for label, mod in (("base", base), ("parent", parent), ("head", pith)):
+                    res[label] = _tight(mod, core_len, budget, node_len)
+                text = res["head"][2]
+                _r, head_ctx, _t = res["head"]
+                old_whole = _is_whole(res["base"][1], text) or _is_whole(res["parent"][1], text)
+                if old_whole:
+                    old_whole_points += 1
+                    assert _is_whole(head_ctx, text), (core_len, budget, node_len, "old-whole but head is not")
+                # no cut, ever: the node is whole, or absent, or represented by the reference line
+                assert "⋯" not in head_ctx and " …" not in head_ctx, (core_len, budget, node_len)
+                partial = ("N" * max(2, node_len // 2)) in head_ctx and not _is_whole(head_ctx, text)
+                assert not partial, (core_len, budget, node_len, "a cut node")
+                assert len(head_ctx) <= budget, (core_len, budget, node_len)
+                checked += 1
+    assert checked == 80 and old_whole_points >= 20                     # the grid really exercises the invariant
+
+
+def test_c2_the_limit_is_the_optimistic_bound_a_lone_ordinary_line_is_never_rejected():
+    core = pith.render_constitutional_core(_giant_world()[0])
+    for budget in (500, 1000, 1500, 4000):
+        limit = pith._pith_provider_node_limit(core, budget)
+        # the room a single ORDINARY connected line (no alert, no correction, no sources line) has
+        line = pith.CacheLine(node_id="n", content="x" * max(0, limit), stream="connected",
+                              coherence="shared", sources=[])
+        room = pith._pith_provider_sections(core, [line], [pith._pith_render_connected_line(line)])[0]
+        assert limit == 1 or len(room) <= budget, (budget, limit, len(room))
+
+
+# ------------------------------------------------------------------ C-5: the pin guard fails CLOSED
+def _ng_with_guard(fn):
+    g = FakeGraph()
+    _core(g)
+    g._is_identity_protected = fn
+    return SimpleNamespace(graph=g)
+
+
+def test_c5_a_raising_guard_is_treated_as_pinned_with_a_warning_naming_id_and_type_only(caplog):
+    pith._PITH_DROP_SEEN.clear()
+
+    def boom(node_id):
+        raise RuntimeError("SECRET-GUARD-TEXT-DO-NOT-LOG " + node_id)
+    probe = pith._cc_pin_probe(_ng_with_guard(boom))
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        assert probe("ident-1") is True                                  # identity fails toward KEEPING content
+        assert probe("ident-1") is True                                  # ... every time,
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, warnings                                  # ... but names the id ONCE (no flood)
+    assert "ident-1" in warnings[0] and "RuntimeError" in warnings[0] and "PINNED" in warnings[0]
+    assert "SECRET-GUARD-TEXT-DO-NOT-LOG" not in warnings[0]
+
+
+def test_c5_a_missing_guard_is_treated_as_pinned_too(caplog):
+    pith._PITH_DROP_SEEN.clear()
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        assert pith._cc_pin_probe(SimpleNamespace())("n1") is True                      # no .graph at all
+        assert pith._cc_pin_probe(SimpleNamespace(graph=SimpleNamespace()))("n2") is True  # graph without the guard
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 2
+
+
+def test_c5_a_working_guard_is_unchanged():
+    probe = pith._cc_pin_probe(_ng_with_guard(lambda nid: nid == "yes"))
+    assert probe("yes") is True and probe("no") is False
+
+
+@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
+def test_c5_with_a_raising_guard_identity_content_is_kept_on_both_paths(monkeypatch, caplog, pith_on):
+    pith._PITH_DROP_SEEN.clear()
+    g, a, b, ident, pat = _n1_world()
+
+    def boom(node_id):
+        raise RuntimeError("guard down")
+    g._is_identity_protected = boom
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        out, _ = _recall(pith, fake_ng(g, []), pat, pith_on, monkeypatch)
+    assert ident in out and a in out and b in out                        # nothing budget-dropped: all treated as pinned
+    assert any("PINNED" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+# ------------------------------------------------------------------ C-1: the probe vs BASE's closure
+def _closure_pinned(src, outer):
+    tree = ast.parse(src)
+    outer_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == outer)
+    return next(n for n in ast.walk(outer_fn) if isinstance(n, ast.FunctionDef) and n.name == "_pinned")
+
+
+def test_c1_the_pin_probe_is_the_base_closure_except_the_deliberate_c5_change():
+    base_src = subprocess.check_output(["git", "-C", _ROOT, "show", f"{_BASE_COMMIT}:cc_ng_organism.py"]).decode()
+    base_fn = _closure_pinned(base_src, "cc_assemble_recall")
+    head_fn = _closure_pinned(open(_ORGANISM_SRC).read(), "_cc_pin_probe")
+    assert base_fn.args.args[0].arg == head_fn.args.args[0].arg == "node_id"
+    base_try, head_try = base_fn.body[0], head_fn.body[0]
+    assert isinstance(base_try, ast.Try) and isinstance(head_try, ast.Try)
+    # the guarded call is IDENTICAL to base
+    assert ast.dump(base_try.body[0]) == ast.dump(head_try.body[0])
+    # the handler is the ONE deliberate difference: base failed soft to False (DEBUG), head fails closed
+    base_ret = [n for n in ast.walk(base_try.handlers[0]) if isinstance(n, ast.Return)][-1]
+    head_ret = [n for n in ast.walk(head_try.handlers[0]) if isinstance(n, ast.Return)][-1]
+    assert isinstance(base_ret.value, ast.Constant) and base_ret.value.value is False
+    assert (isinstance(head_ret.value, ast.Constant) and head_ret.value.value is True) or \
+        "True" in ast.dump(head_ret.value) or "_pin_guard_failed" in ast.dump(head_ret.value)
+    assert ast.dump(base_try.handlers[0]) != ast.dump(head_try.handlers[0])
+
+
+def test_c1_executed_on_the_le025_cases_identical_except_when_the_guard_raises():
+    base_src = subprocess.check_output(["git", "-C", _ROOT, "show", f"{_BASE_COMMIT}:cc_ng_organism.py"]).decode()
+    seg = ast.get_source_segment(base_src, _closure_pinned(base_src, "cc_assemble_recall"))
+    import textwrap
+
+    def base_probe(ng):
+        scope = {"ng": ng, "logger": logging.getLogger("base-probe")}
+        exec(textwrap.dedent(seg), scope)
+        return scope["_pinned"]
+    def raiser(exc):
+        return lambda nid: (_ for _ in ()).throw(exc)
+    cases = [("true", lambda n: True, False), ("false", lambda n: False, False), ("truthy str", lambda n: "yes", False),
+             ("none", lambda n: None, False), ("empty list", lambda n: [], False), ("zero", lambda n: 0, False),
+             ("raises Runtime", raiser(RuntimeError("x")), True), ("raises Key", raiser(KeyError("k")), True)]
+    pith._PITH_DROP_SEEN.clear()
+    for label, fn, raises in cases:
+        ng = _ng_with_guard(fn)
+        b, h = base_probe(ng)("n"), pith._cc_pin_probe(ng)("n")
+        if raises:
+            assert (b, h) == (False, True), label                        # the deliberate C-5 change
+        else:
+            assert b == h, label                                          # identical to base
+    for ng in (SimpleNamespace(), SimpleNamespace(graph=None)):          # a missing guard raises too
+        assert (base_probe(ng)("n"), pith._cc_pin_probe(ng)("n")) == (False, True)
+
+
+# ------------------------------------------------------------------ C-4: ONE shared alert constant
+def test_c4_one_alert_constant_drives_both_the_renderer_and_the_measured_limit(monkeypatch):
+    assert pith._PITH_ALERT_COHERENCE == ("conflict", "stale", "uncertain", "unknown")
+    core = "## Who I Am\n- k"
+    line = pith.CacheLine(node_id="n", content="x", coherence="shared", stream="connected")
+    _ctx, warnings = pith._pith_provider_sections(core, [line], [pith._pith_render_connected_line(line)])
+    assert warnings == []
+    before = pith._pith_provider_node_limit(core, 4000)
+    monkeypatch.setattr(pith, "_PITH_ALERT_COHERENCE", pith._PITH_ALERT_COHERENCE + ("shared",))
+    _ctx, warnings = pith._pith_provider_sections(core, [line], [pith._pith_render_connected_line(line)])
+    assert warnings == ["shared_material"]                               # the renderer follows the constant
+    assert pith._pith_provider_node_limit(core, 4000) < before           # ... and so does the measured limit
+    src = open(_ORGANISM_SRC).read()
+    assert src.count('("conflict", "stale", "uncertain", "unknown")') == 1   # defined once, not re-listed
+
+
+# ------------------------------------------------------------------ C-3: the wording tells the truth
+def test_c3_the_info_line_says_above_the_reference_limit_not_over_budget(caplog):
+    g, _text, _ = _giant_world()
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        _run(pith, g, [{"node_id": "cc:conv::bigforest", "score": 1.0}], "go on", budget_chars=4000)
+    lines = [r.getMessage() for r in caplog.records if "whole-node reference" in r.getMessage()]
+    assert lines and all("above the reference limit" in l and "over-budget" not in l for l in lines)
+
+
+def test_c3_the_limit_docstring_no_longer_claims_admit_catches_the_between_band():
+    doc = pith._pith_provider_node_limit.__doc__
+    assert "conservative (worst-case shell) direction" not in doc
+    assert "optimistic" in doc.lower() and "never-fit" in doc.lower()
+
+
+def test_turn6_the_contract_states_the_optimistic_limit_and_the_fail_closed_guard():
+    body = open(os.path.join(_ROOT, "docs", "PITH_HOST_CONTRACT.md")).read().split("-->", 1)[1]
+    assert "The guard fails closed" in body and "treated as pinned" in body
+    assert "smallest* overhead" in body and "optimistic" in body and "never-fit" in body
+    assert "above the reference limit" in body
