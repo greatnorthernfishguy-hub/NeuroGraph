@@ -46,6 +46,7 @@ import glob
 import hashlib
 import importlib
 import json
+import math
 import mmap
 import os
 import re
@@ -1390,15 +1391,44 @@ def attach_excerpt_hashes(org, content: Dict[str, str], records: List[Dict[str, 
     return total
 
 
-def write_review_files(run_dir: str, utc: str, org, content, records) -> Dict[str, str]:
-    """The ONLY files that carry excerpts: <run>/review/*.md, mode 0600. Returns {relpath: sha256}."""
+# The advisory review hint (Exec P433 (c)). ONE named constant tuple, no config key. It MARKS an excerpt for the
+# Executive's attention in the OFF-REPO review files - it does not classify, skip, reorder, alter or decide anything: every
+# id is still decided by the Executive's signature per id, marked or not ("no proxy decides a node"). Matching: case-insensitive,
+# word-bounded (a letter/digit/underscore on either side is not a boundary), multi-word terms allow any whitespace between
+# their words, and a single trailing inflection (s, es, ed, d, ing) is allowed - so `exit` marks exit/exits/exited/exiting but
+# not `existing`, `exitless` or `preexit`. No stemming beyond that: `quitting` (a doubled consonant) is NOT marked.
+HINT_TERMS: Tuple[str, ...] = ("leave", "leaving", "exit", "quit", "refuse", "refusal", "consent", "decline", "choice clause", "say no")
+_HINT_RX = tuple((t, re.compile(r"(?<![A-Za-z0-9_])" + r"\s+".join(re.escape(w) for w in t.split()) + r"(?:s|es|ed|d|ing)?(?![A-Za-z0-9_])", re.I))
+                 for t in HINT_TERMS)
+
+
+def review_hint(text: str) -> List[str]:
+    """The HINT_TERMS matched in `text`, in HINT_TERMS order, once each. Pure; used ONLY by write_review_files."""
+    return [t for t, rx in _HINT_RX if rx.search(text)]
+
+
+def write_review_files(run_dir: str, utc: str, org, content, records) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """The ONLY files that carry excerpts: <run>/review/*.md, mode 0600. Every entry carries an advisory `hint:` line (the
+    matched HINT_TERMS, or `none`). Returns ({relpath: sha256}, hint COUNTS): how many entries carry any mark and per term -
+    counts only, no text."""
     rdir = os.path.join(run_dir, "review")
     hdr = "PIN-STAMP: %s\nOFF-REPO / TEXT-BEARING / mode 0600 - never push, never paste (plan 5.3)\n\n" % json.dumps(pin_stamp(), sort_keys=True)
+    per_term: Counter = Counter()
+    seen = {"total": 0, "marked": 0}
+
+    def hint_line(text: str) -> str:
+        found = review_hint(text)
+        seen["total"] += 1
+        if found:
+            seen["marked"] += 1
+            per_term.update(found)
+        return "hint: %s\n" % (", ".join(found) if found else "none")
     lines = [hdr, "# review excerpts - SEPARATE candidates (the frozen-list review, per id)\n"]
     for r in sorted((x for x in records if x["disposition"] == "candidate"), key=lambda x: x["id"]):
         a = r["_anchors"]
         lines += ["## %s -> %s  (class %s, old_len %d, new_len %d)\n" % (r["id"], r["new_id"], r["class"], r["old_len"], r["new_len"]),
                   "excerpt_sha256: %s ; removed-prefix length: %d ; flags: %s\n" % (r["excerpt_sha256"], a["removed_prefix_len"], json.dumps(r["flags"], sort_keys=True)),
+                  hint_line("\n".join((a["outer_opener"], a["inner_opener"], a["closer"], a["x_full"]))),
                   "### (1) outer opener +/-%d\n%s\n### (2) inner opener +/-%d\n%s\n### (3) closer +/-%d\n%s\n### (4) X in full\n%s\n" % (
                       EXCERPT_WINDOW, a["outer_opener"], EXCERPT_WINDOW, a["inner_opener"], EXCERPT_WINDOW, a["closer"], a["x_full"])]
     p1 = os.path.join(rdir, "review-excerpts-%s.md" % utc)
@@ -1408,12 +1438,16 @@ def write_review_files(run_dir: str, utc: str, org, content, records) -> Dict[st
     for r in sorted((x for x in records if x["disposition"] != "candidate"), key=lambda x: x["id"]):
         left.append("## %s outcome=%s disposition=%s detail=%s reasons=%s\n" % (r["id"], r["outcome"], r["disposition"], r["detail"], json.dumps(r.get("reasons", {}), sort_keys=True)))
         src, i = r.get("source_node"), r.get("_i")
+        seg = ""
         if src and i is not None and src in content:
             seg, _ = scrub(content[src][max(0, i - EXCERPT_WINDOW): i + len(WO) + EXCERPT_WINDOW])
+        left.append(hint_line(seg))
+        if seg:
             left.append("outer opener +/-%d: %s\n" % (EXCERPT_WINDOW, seg))
     p2 = os.path.join(rdir, "left-list-%s.md" % utc)
     out_write_bytes(p2, "\n".join(left).encode("utf-8"), 0o600)
-    return {"review/" + os.path.basename(p1): sha256_file(p1), "review/" + os.path.basename(p2): sha256_file(p2)}
+    counts = {"entries_total": seen["total"], "entries_marked": seen["marked"], "per_term": {t: per_term[t] for t in HINT_TERMS if per_term[t]}}
+    return {"review/" + os.path.basename(p1): sha256_file(p1), "review/" + os.path.basename(p2): sha256_file(p2)}, counts
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2416,9 +2450,10 @@ def refuse_if_retired(target_real: str) -> None:
                       "protected-file work and goes to Josh" % os.path.basename(hits[0]))
 
 
-def write_retired_receipt(run_dir: str, target_real: str, mapping_sha256: str, utc: str) -> str:
+def write_retired_receipt(run_dir: str, target_real: str, mapping_sha256: str, utc: str, extra: Optional[Dict[str, Any]] = None) -> str:
     body = {"kind": "RETIRED", "retired_at_utc": utc, "checkpoint_dir": target_real, "tool_sha256": tool_sha256(),
             "mapping_sha256": mapping_sha256, "notice": "no reuse; a future re-key is protected-file work and goes to Josh then"}
+    body.update(extra or {})
     path = os.path.join(run_dir, "RETIRED-%s.receipt" % utc)
     write_artifact(path, body)
     return path
@@ -2584,14 +2619,17 @@ def stage_classify(args, pinned, target_info) -> Dict[str, Any]:
     cand_map, _ = id_map_objs(build_mapping(A["records"]))
     # the name Phase 2 expects: freeze reports/repair-list.json, reports/scope-ids.json and reports/id-map.json UNEDITED
     shas["id-map"] = write_artifact(os.path.join(run_dir, "reports", "id-map.json"), cand_map)
-    shas.update(write_review_files(run_dir, utc, pinned.org, A["content"], A["records"]))
+    review_shas, hint_counts = write_review_files(run_dir, utc, pinned.org, A["content"], A["records"])
+    shas.update(review_shas)
     ot = reports["outcome-table"]
     rec = _run_record(run_dir, utc, args, pinned, target_info, copy, {"artifacts_sha256": shas, "counts": A["counts"],
-                      "scope_size": len(A["scope"]), "scope_matches_expected": len(A["scope"]) == args.expect_scope})
+                      "scope_size": len(A["scope"]), "scope_matches_expected": len(A["scope"]) == args.expect_scope,
+                      "review_hint_counts": hint_counts})
     write_artifact(os.path.join(run_dir, "run-record.json"), rec)
     return {"run_dir": run_dir, "utc": utc, "outcomes": ot["by_outcome"], "dispositions": ot["by_disposition"],
             "scope_size": len(A["scope"]), "candidates": reports["repair-list"]["count"],
-            "repair_list_sha256": shas["repair-list"], "scope_ids_sha256": shas["scope-ids"], "artifacts_sha256": shas}
+            "repair_list_sha256": shas["repair-list"], "scope_ids_sha256": shas["scope-ids"], "artifacts_sha256": shas,
+            "review_hint_counts": hint_counts}
 
 
 def _load_run(run_dir: str) -> Tuple[str, Dict[str, Any]]:
@@ -2671,6 +2709,8 @@ def _require_phase2_inputs(args) -> float:
         placed = _parse_ts(args.code_placed_at)
     except ValueError:
         raise Refusal("--code-placed-at %r is not an epoch or an ISO time" % args.code_placed_at)
+    if not math.isfinite(placed):
+        raise Refusal("--code-placed-at %r is not a finite time (nan / inf are refused)" % args.code_placed_at)
     if placed > time.time():
         raise Refusal("--code-placed-at %r is later than now: a claim about the future makes the 'no pulse since' leg vacuous" % args.code_placed_at)
     return placed
@@ -2738,9 +2778,11 @@ def stage_phase2_backup(args, pinned, probes, target_info) -> Dict[str, Any]:
                               "mtime_ns": copy["files"][n]["mtime_ns"], "st_dev": copy["files"][n]["st_dev"],
                               "st_ino": copy["files"][n]["st_ino"], "st_nlink": copy["files"][n]["st_nlink"]} for n in SIX_FILES},
                 "generation_partners": [_partner_record(n, pth, copy["files"][n]) for n, pth in partners],
+                "foreign_unreadable": {"p4": p4["foreign_unreadable"], "p6": p6["foreign_unreadable"]},
                 "ripple": RIPPLE_TABLE, "independent_reread_sha256": reread}
     msha = write_artifact(os.path.join(run_dir, "backup-manifest-%s.json" % utc), manifest)
-    write_artifact(os.path.join(run_dir, "hold-start.json"), {"kind": "hold-start", **p6["snapshot"]})
+    write_artifact(os.path.join(run_dir, "hold-start.json"), {"kind": "hold-start", **p6["snapshot"],
+                                                             "foreign_unreadable": {"p4": p4["foreign_unreadable"], "p6": p6["foreign_unreadable"]}})
     return {"run_dir": run_dir, "backup_manifest_sha256": msha, "p4": p4["checks"], "p6_ok": p6["ok"],
             "generation_partners_recorded": len(partners)}
 
@@ -2767,14 +2809,25 @@ def _preserve_displaced(run_dir: str, tdir: str, names: List[str], live_sha: Dic
     survive in the run directory: <run>/stage/<name> if that still holds exactly those bytes, else a new copy in
     <run>/displaced-<UTC>/. 'Delete nothing' then never rests on nobody having cleaned the run directory."""
     out = []
-    ddir = os.path.join(run_dir, "displaced-%s" % utc)
+    ddir = None
     for n in names:
         sp = os.path.join(run_dir, "stage", n)
         if os.path.isfile(sp) and sha256_file(sp) == live_sha[n]:
             out.append({"name": n, "where": "stage", "sha256": live_sha[n]})
             continue
+        if ddir is None:                                   # C-4: a NEW directory each time - never reuse an earlier one
+            base = os.path.join(run_dir, "displaced-%s" % utc)
+            for k in range(1, 1000):
+                cand = base if k == 1 else "%s-%d" % (base, k)
+                try:
+                    os.makedirs(guard_out_path(cand), mode=0o700, exist_ok=False)
+                    ddir = cand
+                    break
+                except FileExistsError:
+                    continue
+            if ddir is None:
+                raise Stop("could not create a fresh displaced-<UTC> directory")
         dst = guard_out_path(os.path.join(ddir, n))
-        os.makedirs(ddir, mode=0o700, exist_ok=True)
         refuse_inplace_write(dst)
         shutil.copyfile(os.path.join(tdir, n), dst)
         if sha256_file(dst) != live_sha[n]:
@@ -2839,6 +2892,9 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
         raise Stop("P9: the live set of wants meeting the scope rule differs from the frozen list")
     if artifact_sha256(repair_list_obj(A)) != rl_sha0 or artifact_sha256(scope_ids_obj(A, args.expect_scope)) != sc_sha0:
         raise Stop("P5: the live classification is not the frozen one (repair-list / scope-ids differ)")
+    if not gate_write_set(A["records"], approvals)[0]:
+        raise Stop("nothing to apply: the approvals leave no repair to write (every candidate is struck, unapproved or absent) - "
+                   "no write and NO retirement: a zero-write run must not consume the one-shot")
     utc = utc_stamp()
     in_hashes = {n: manifest["files"][n]["sha256"] for n in SIX_FILES}
     out = prepare_outputs(pinned, A, approvals, in_dir=tdir, out_dir=os.path.join(run_dir, "stage"), run_dir=run_dir, utc=utc,
@@ -2891,13 +2947,18 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
     after_i = {n: stat_ident(os.path.join(tdir, n)) for n in SIX_FILES}
     _assert_inodes_after(before_i, after_i, rewritten)
     partners_after = [_partner_record(pr["name"], pr["path"], after_i[pr["name"]]) for pr in manifest.get("generation_partners", [])]
-    final = write_artifact(os.path.join(run_dir, "post-apply-receipt-FINAL-%s.json" % utc), {
+    by_gate = {g["gate"]: g for g in gates}
+    final_name = "post-apply-receipt-FINAL-%s.json" % utc
+    final = write_artifact(os.path.join(run_dir, final_name), {
         "kind": "post-apply-receipt", "six_file_sha256_after": out["out_hashes"], "mapping_sha256": out["id_map_sha256"],
         "live_inodes_before": before_i, "live_inodes_after": after_i, "generation_partners_after": partners_after,
         "struck_deviations": struck_deviations, "ripple": RIPPLE_TABLE, "p2": gates[1],
+        "foreign_unreadable": {"p4": by_gate["P4"]["foreign_unreadable"], "p6": by_gate["P6"]["foreign_unreadable"]},
         "josh_go": args.josh_go, "backup_manifest_sha256": msha, "approvals_packet": approvals.get("packet"),
         "gates": [g.get("gate") for g in gates], "tool_sha256": tool_sha256()})
-    retired = write_retired_receipt(run_dir, tdir, out["id_map_sha256"], utc)     # strictly AFTER both files verified
+    # strictly AFTER both files verified; the struck COUNT and a pointer to the FINAL receipt keep a partial retirement visible
+    retired = write_retired_receipt(run_dir, tdir, out["id_map_sha256"], utc, {
+        "struck_deviations": len(struck_deviations), "post_apply_receipt": final_name, "post_apply_receipt_sha256": final})
     return {"applied": len(out["plan"]["write_ids"]), "struck_deviations": len(struck_deviations), "post_apply_receipt_sha256": final, "retired_receipt": os.path.basename(retired),
             "note": "the daemon is NOT started; the S4 start waits on gate P10 (the T6 would-mint set signed per id)"}
 
@@ -2990,10 +3051,16 @@ def stage_rollback(args, pinned, probes, target_info) -> Dict[str, Any]:
         elif after_i[n]["st_ino"] != before_i[n]["st_ino"]:
             raise Stop("post-rollback inode check FAILED for %s: an untouched file changed inode" % n)
     utc = utc_stamp()
-    rsha = write_artifact(os.path.join(run_dir, "rollback-receipt-%s.json" % utc), {
+    rpath = os.path.join(run_dir, "rollback-receipt-%s.json" % utc)
+    k = 1
+    while os.path.exists(rpath):                           # C-4: two rollbacks in one second keep BOTH receipts
+        k += 1
+        rpath = os.path.join(run_dir, "rollback-receipt-%s-%d.json" % (utc, k))
+    rsha = write_artifact(rpath, {
         "kind": "rollback-receipt", "restored": sorted(to_restore), "source_dir": os.path.realpath(backup_dir),
         "six_file_sha256_after": backup_sha, "live_inodes_before": before_i, "live_inodes_after": after_i,
         "never_a_source": "generations/ and last_good/ (incidental, expiring, never a rollback source)",
+        "foreign_unreadable": {"p4": p4["foreign_unreadable"], "p6": p6["foreign_unreadable"]},
         "host_stays_down": True, "host_down_until": "Chief's post-restore resume gate (P398) AND the Executive's ruling on the parser",
         "josh_go": args.josh_go, "backup_manifest_sha256": msha, "post_apply_receipts": [os.path.basename(x) for x in rpaths],
         "displaced": displaced,
@@ -3044,6 +3111,8 @@ def main(argv: Optional[List[str]] = None, probes: Optional[Probes] = None) -> i
     args = build_parser().parse_args(argv)
     probes = probes or Probes()
     try:
+        if args.apply and args.step == "rollback":
+            raise Refusal("--apply and --step rollback are mutually exclusive")
         if (args.apply or args.step == "rollback") and not args.josh_go:   # the first refusal: no Josh go, nothing else is even loaded
             raise Refusal("%s is REFUSED: it needs Josh's go (--josh-go <reference> quoting the backup-manifest sha256)"
                           % ("--apply" if args.apply else "--step rollback"))
