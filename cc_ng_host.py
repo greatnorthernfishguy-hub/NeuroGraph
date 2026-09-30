@@ -27,13 +27,6 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
-# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2a) / #817: retire compress_history
-# What: removed _handle_compress_history and its _DISPATCH entry; the socket now answers
-#   {"ok": false, "error": "unknown event: compress_history"} like any unknown event.
-# Why: cc_ng_organism.pith_compress_history was retired (LAW 3): a lossy keyframe that discarded
-#   its delta, with no live caller (Condensate master mentions it only in a header comment).
-# How: no other host code referenced it. NOTE the VPS host is otherwise NOT edited by this lane
-#   (its telemetry allow-list still names CC_PITH_PROVIDER_NODE_CHARS -> #821).
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 r2 — #643 comment wording (P187 finding 2)
 # What: the _autosave_loop #643 comment is reworded comment-only — the dual pass
@@ -978,6 +971,38 @@ def _handle_pith_metrics(_data):
         return {"ok": False, "error": str(exc)}
 
 
+def _handle_compress_history(data):
+    """Compress miniTID's older turns through the shared Pith implementation.
+
+    miniTID owns message ordering and splices this positionally aligned result
+    back into the provider request. This boundary is read-only over CC's graph.
+    Fail soft to the original turns so a compressor problem cannot discard
+    conversation history.
+    """
+    turns = data.get("turns") or []
+    if not isinstance(turns, list) or not turns:
+        return {"ok": True, "compressed": turns}
+    try:
+        from cc_ng_organism import pith_compress_history
+        ng = _STATE.cc_ng
+        graph = getattr(ng, "graph", None) if ng is not None else None
+        per_turn_chars = data.get("per_turn_chars")
+        lock = getattr(graph, "_concurrent_lock", None) if graph is not None else None
+        if lock is not None:
+            with lock:
+                compressed = pith_compress_history(
+                    turns, graph, per_turn_chars=per_turn_chars
+                )
+        else:
+            compressed = pith_compress_history(
+                turns, graph, per_turn_chars=per_turn_chars
+            )
+        return {"ok": True, "compressed": compressed}
+    except Exception as exc:
+        logger.warning("compress_history failed (returning turns unchanged): %s", exc)
+        return {"ok": True, "compressed": turns}
+
+
 def _handle_provider_context(data):
     """Return fresh, bounded context assembled from this CC topology.
 
@@ -1397,6 +1422,7 @@ _DISPATCH = {
     "ping": _handle_ping,
     "status": _handle_status,
     "pith_metrics": _handle_pith_metrics,
+    "compress_history": _handle_compress_history,
     "provider_context": _handle_provider_context,
     "export": _handle_export,
     "import": _handle_import,
