@@ -18,6 +18,7 @@
 """
 import contextlib
 import copy
+import gc
 import hashlib
 import importlib.util
 import io
@@ -135,7 +136,37 @@ def _specs(wid, hint=None):
     return specs
 
 
-def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_in_scope=False, hint_phrases=None):
+def _add_extras(g, vdb, ids, wid):
+    """Delta-build (#11805) extras for the equivalence tests: an S source with NO vdb entry, an S source with EMPTY
+    content, an S source with content but NO marker, a non-ASCII SEPARATE candidate, a conversational marker node that
+    is nobody's source, and vdb-only entries (marker / plain / empty / rich metadata). Invented filler text only."""
+    vec = np.array([0.5, 0.5, 0.0, 0.0])
+
+    def want(name, text, src):
+        ids[name] = wid(text)
+        g.create_node(node_id=ids[name], metadata={"kind": "want", "want_text": text, "want_state": "open",
+                      "provenance": "cc_authored", "source_node": src, "creation_mode": "conversational"})
+        g.create_synapse(src, ids[name], weight=0.3)
+
+    g.create_node(node_id="cc:conv::nocontent", metadata={"creation_mode": "conversational"})       # in the graph, NOT in the vdb
+    want("NOCONTENT", prose("nocn"), "cc:conv::nocontent")
+    g.create_node(node_id="cc:conv::emptyc", metadata={"creation_mode": "conversational"})
+    vdb.insert("cc:conv::emptyc", vec, "", {})
+    want("EMPTYC", prose("empt"), "cc:conv::emptyc")
+    want("NOMARK", prose("nomk"), "cc:conv::plain")                                                  # S source has content, no marker
+    xna = "caf\u00e9 intent \u2713 \u65e5\u672c\u8a9e"
+    tna = "na\u00efve " + prose("nasc") + " [WANT]" + xna
+    g.create_node(node_id="cc:conv::nonascii", metadata={"creation_mode": "conversational"})
+    vdb.insert("cc:conv::nonascii", vec, "pr\u00e9ambule \u2603 [WANT]" + tna + "[/WANT] fin \u2713", {"k": ["\u00e9", 1]})
+    want("NONASCII", tna, "cc:conv::nonascii")
+    g.create_node(node_id="cc:conv::markeronly", metadata={"creation_mode": "conversational"})       # a marker node, nobody's source
+    vdb.insert("cc:conv::markeronly", vec, "[WANT]" + prose("mko") + "[/WANT] \u00fcber", {"a": {"b": [1, 2, 3]}})
+    vdb.insert("orph:marker", vec, "orphan [WANT]x[/WANT]", {"z": 1})                                # vdb-only entries
+    vdb.insert("orph:plain", vec, "orphan plain \u00fc \u2713", {})
+    vdb.insert("orph:empty", vec, "", {"rich": {"deep": list(range(20))}})
+
+
+def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_in_scope=False, hint_phrases=None, extras=False):
     """A tiny REAL checkpoint pair (Graph + SimpleVectorDB) plus the four small files, under `base`."""
     org, nf, ui = pinned.org, pinned.nf, pinned.ui
     wid = org.want_id_for_text
@@ -187,6 +218,8 @@ def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_
                       **flag_md})
     g.create_node(node_id="n1", metadata={})
     g.create_node(node_id="n2", metadata={})
+    if extras:
+        _add_extras(g, vdb, ids, wid)
     edges = [(ids["SEP1"], ids["GEN"], 0.4), (short1, ids["SEP1"], 0.5), ("n1", ids["SEP1"], 0.2)]
     if include_protected:
         edges += [(cc1, ids["SEP1"], 0.6), (cc2, ids["GEN"], 0.6), (rim, ids["SEP1"], 0.7), (ids["SEP2"], rim, 0.7),
@@ -203,7 +236,10 @@ def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_
     g.nodes[ids["SEP1"]].pred_weights = {"n2": 0.3}
     he = g.create_hyperedge({ids["SEP1"], "n1", "n2"}, member_weights={ids["SEP1"]: 1.0, "n1": 0.5, "n2": 0.5},
                             output_targets=[ids["SEP2"]])
+    he2 = g.create_hyperedge({ids["NONASCII"], "n1", "n2"}, member_weights={ids["NONASCII"]: 1.0, "n1": 0.5, "n2": 0.5}) if extras else None
     cap = g.capture_checkpoint(nf.CheckpointMode.FULL)
+    if extras:          # an ARCHIVED hyperedge listing an S id: the canonical restore does NOT index it into _node_hyperedges
+        cap["archived_hyperedges"][he2.hyperedge_id] = dict(cap["hyperedges"].pop(he2.hyperedge_id), is_archived=True)
     far = 10 ** 6
     pred = {"prediction_id": "p1", "source_node_id": ids["SEP1"], "target_node_id": "n1", "strength": 0.5, "confidence": 0.5,
             "created_at": 0, "expires_at": far, "chain_depth": 0, "via_hyperedge": None, "pre_charge_applied": 0.0}
@@ -2787,3 +2823,289 @@ def test_n2_apply_and_step_rollback_together_are_mutually_exclusive(pinned, tmp_
     a = _applied(pinned, tmp_path, monkeypatch)
     rc, res, err = cli(_rb_argv(a, "--apply"), probes=FakeProbes())
     assert rc == 2 and "mutually exclusive" in err and file_hashes(a.w.ckpt) == a.after
+
+
+# ==================================================================================================
+# DELTA BUILD (#11805): the streamed content-subset vectors read + the Graph-free analyze() (item 8).
+# The OLD path (canonical Graph().restore + SimpleVectorDB().load, the pre-delta analyze) is built INSIDE these tests
+# as test-only code; it is not the tool's path. SYNTHETIC data only.
+# ==================================================================================================
+
+def _old_load_pair(dirpath, pinned):
+    """TEST-ONLY: the pre-delta loader (the two canonical readers)."""
+    g = pinned.nf.Graph()
+    g.restore(os.path.join(dirpath, tool.MAIN_NAME))
+    vdb = pinned.ui.SimpleVectorDB()
+    vdb.load(os.path.join(dirpath, tool.VECTORS_NAME))
+    return g, vdb
+
+
+def _old_figures(g, ids):
+    return {i: (len(g._outgoing.get(i, ())), len(g._incoming.get(i, ())), len(g._node_hyperedges.get(i, ())))
+            for i in ids if i in g.nodes}
+
+
+def _old_analyze(pinned, dirpath, *, scope_min_len, frozen_scope=None, base_mod=None, full_reports=True):
+    """TEST-ONLY copy of the pre-delta analyze(): Graph().restore + SimpleVectorDB().load, every value taken FROM the
+    live Graph. Returns the same dict plus `before_figures_scope` (figures for S + the three protected ids)."""
+    org = pinned.org
+    g, vdb = _old_load_pair(dirpath, pinned)
+    nodes_meta = {nid: n.metadata for nid, n in g.nodes.items()}
+    existing_ids = set(g.nodes)
+    content = vdb.content
+    vdb.embeddings = {}
+    derived = tool.derive_scope(nodes_meta, scope_min_len)
+    scope = list(frozen_scope) if frozen_scope is not None else derived
+    cl = tool.Classifier(org, nodes_meta, content)
+    records = [cl.classify_node(nid) for nid in scope]
+    dropped = tool.apply_collision_rule(records, existing_ids)
+    tool.attach_excerpt_hashes(org, content, records)
+    for r in records:
+        if r["disposition"] == "candidate":
+            r["flags"]["collision_candidate"] = False
+            r["flags"]["mention_shapes"] = tool.mention_shape_flags(content[r["source_node"]], r["_w_open"], r["_closer_end"])
+    cand_old = [r["id"] for r in records if r["disposition"] == "candidate"]
+    watch = list(tool.CHOICE_CLAUSE_IDS) + [tool.CONSTITUTIONAL_ID]
+    before_fig = _old_figures(g, set(cand_old) | set(watch))
+    before_fig_scope = _old_figures(g, set(scope) | set(watch))
+    render_before = len(org.render_wants(g).encode("utf-8"))
+    counts = {"nodes": len(g.nodes),
+              "wants": sum(1 for md in nodes_meta.values() if md.get("kind") == "want"),
+              "protected": sum(1 for md in nodes_meta.values() if tool.is_protected(md))}
+    del g, vdb
+    gc.collect()
+    raw_main = Path(os.path.join(dirpath, tool.MAIN_NAME)).read_bytes()
+    want_ids = {nid for nid, md in nodes_meta.items() if md.get("kind") == "want"}
+    syn = tool.synapse_stats(raw_main, want_ids, set(scope), set(cand_old))
+    del raw_main
+    A = {"dir": dirpath, "records": records, "dropped": dropped, "scope": scope, "scope_derived": derived,
+         "scope_min_len": scope_min_len, "nodes_meta": nodes_meta, "content": content, "existing_ids": existing_ids,
+         "cl": cl, "before_figures": before_fig, "before_figures_scope": before_fig_scope,
+         "render_len_before": render_before, "counts": counts, "syn": syn}
+    if full_reports:
+        s_sources = sorted({r["source_node"] for r in records if r.get("source_node")})
+        marker_nodes = tool.conversational_marker_nodes(nodes_meta, content)
+        A["s_sources"], A["marker_nodes"] = s_sources, marker_nodes
+        A["histograms"] = tool.reason_histograms(cl, s_sources, marker_nodes)
+        mb = tool.marker_bearing_minted(cl, marker_nodes, set(s_sources))
+        for e in mb:
+            e["shape_flags"] = tool.mention_shape_flags(content[e["source_node"]], e["open_start"], e["close_end"])
+        A["marker_bearing"] = mb
+        A["residuals"] = tool.residual_classes(pinned, base_mod or tool.load_base_module(pinned), nodes_meta, content, marker_nodes, cl)
+    return A
+
+
+@pytest.fixture(scope="module")
+def xworld(pinned, tmp_path_factory):
+    """The EXTRAS world (S source without vdb entry / with empty content / without marker, non-ASCII candidate,
+    archived hyperedge, vdb-only entries) - its own directory; no recorded-path patching is needed (analyze only reads)."""
+    return build_world(tmp_path_factory.mktemp("xworld"), pinned, extras=True)
+
+
+def _keep_for(A):
+    return {md.get("source_node") for nid in A["scope"] for md in [A["nodes_meta"][nid]] if isinstance(md.get("source_node"), str)}
+
+
+def _scrub_obj(o):
+    return json.dumps(o, sort_keys=True, default=repr)
+
+
+def test_the_extras_world_covers_every_named_edge(xworld, pinned):
+    """The synthetic corpus really exercises: S source with content but no WANT], S source with NO content entry, empty
+    and odd content, non-ASCII, marker nodes that are nobody's source, vdb-only entries."""
+    A = _old_analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN)
+    by = {r["id"]: r for r in A["records"]}
+    assert by[xworld.ids["NOMARK"]]["detail"] == "content_has_marker"                        # content present, no WANT]
+    assert by[xworld.ids["NOCONTENT"]]["detail"] == "content_present,content_has_marker"     # no vdb entry at all
+    assert by[xworld.ids["EMPTYC"]]["detail"] == "content_present,content_has_marker"        # empty string content
+    assert by[xworld.ids["NONASCII"]]["disposition"] == "candidate"
+    assert "cc:conv::markeronly" in A["marker_nodes"] and "cc:conv::markeronly" not in _keep_for(A)
+    assert {"orph:marker", "orph:plain", "orph:empty"} <= set(A["content"])
+
+
+def test_the_streamed_content_reader_equals_the_filtered_canonical_load(xworld, pinned):
+    A = _old_analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN)
+    keep = _keep_for(A)
+    got = tool.load_content_subset(str(xworld.ckpt / tool.VECTORS_NAME), keep)
+    want = {k: v for k, v in A["content"].items() if k in keep or (isinstance(v, str) and "WANT]" in v)}
+    assert got == want and list(got) == list(want)                     # same entries, same values, same order
+    assert "orph:marker" in got and "orph:plain" not in got and "orph:empty" not in got
+    assert got["cc:conv::emptyc"] == "" and "cc:conv::nocontent" not in got
+    assert any(not v.isascii() for v in got.values())
+
+
+def test_the_streamed_reader_never_decodes_an_embedding_or_metadata(xworld, pinned, monkeypatch):
+    """A tracking Unpacker records every object `unpack()` returns: only str (ids, field names, content) may come out;
+    an embedding (bytes) or a metadata dict must never be materialised - they are skip()ped."""
+    real = tool._mp()
+    seen = []
+
+    class Tracking(real.Unpacker):
+        def unpack(self, *a, **k):
+            v = super().unpack(*a, **k)
+            seen.append(v)
+            return v
+
+    monkeypatch.setattr(tool, "_mp", lambda: types.SimpleNamespace(Unpacker=Tracking, packb=real.packb, unpackb=real.unpackb, Packer=real.Packer))
+    tool.load_content_subset(str(xworld.ckpt / tool.VECTORS_NAME), {"cc:conv::nonascii"})
+    assert seen and all(isinstance(v, str) for v in seen), {type(v).__name__ for v in seen}
+
+
+def _vfile(tmp_path, raw=None):
+    p = tmp_path / "vectors.msgpack"
+    p.write_bytes(raw)
+    return str(p)
+
+
+def test_a_truncated_or_malformed_vectors_file_fails_closed(xworld, tmp_path):
+    raw = (xworld.ckpt / tool.VECTORS_NAME).read_bytes()
+    assert tool.load_content_subset(_vfile(tmp_path, raw), {"x"}) is not None           # the intact file reads
+    for cut in (len(raw) - 1, len(raw) - 37, len(raw) // 2, len(raw) // 3, 30, 5, 1):
+        with pytest.raises(tool.Stop):
+            tool.load_content_subset(_vfile(tmp_path, raw[:cut]), {"x"})                # never a silently smaller content set
+    with pytest.raises(tool.Stop):                                                      # trailing bytes after the top map
+        tool.load_content_subset(_vfile(tmp_path, raw + b"\x00"), {"x"})
+    with pytest.raises(tool.Stop):                                                      # not a map at all
+        tool.load_content_subset(_vfile(tmp_path, msgpack.packb([1, 2, 3])), {"x"})
+    bad = msgpack.packb({"version": "1.0.0", "count": 1, "entries": {"a": {"content": "c", "metadata": {}}}}, use_bin_type=True)
+    with pytest.raises(tool.Stop):                                                      # an entry with no embedding: the canonical loader raises too
+        tool.load_content_subset(_vfile(tmp_path, bad), {"a"})
+
+
+def test_a_duplicate_entry_id_keeps_the_last_value_like_the_canonical_dict(tmp_path):
+    e = lambda c: {"embedding": b"\x00" * 16, "content": c, "metadata": {}}          # noqa: E731
+    raw = b"\x83" + msgpack.packb("version") + msgpack.packb("1.0.0") + msgpack.packb("count") + msgpack.packb(2) \
+        + msgpack.packb("entries") + b"\x82" + msgpack.packb("a") + msgpack.packb(e("first [WANT]")) \
+        + msgpack.packb("a") + msgpack.packb(e("second"))
+    assert msgpack.unpackb(raw)["entries"]["a"]["content"] == "second"                # the canonical loader's view
+    assert tool.load_content_subset(_vfile(tmp_path, raw), set()) == {}               # last entry has no marker and is not kept
+
+
+def test_the_graph_stream_equals_the_canonical_restore(xworld, pinned):
+    g, _ = _old_load_pair(str(xworld.ckpt), pinned)
+    V = tool.stream_graph_nodes(str(xworld.ckpt / tool.MAIN_NAME))
+    assert V["nodes_meta"] == {nid: n.metadata for nid, n in g.nodes.items()}
+    assert list(V["nodes_meta"]) == list(g.nodes)                                    # same order (the render sort is stable)
+    assert V["existing_ids"] == set(g.nodes)
+    assert len(pinned.org.render_wants(V["render_graph"]).encode("utf-8")) == len(pinned.org.render_wants(g).encode("utf-8"))
+    ids = set(g.nodes) | {"not-a-node"}                                              # EVERY node, plus a stranger
+    assert tool.stream_incident_figures(str(xworld.ckpt / tool.MAIN_NAME), ids, V["existing_ids"]) == _old_figures(g, ids)
+    assert any(f[2] for f in _old_figures(g, ids).values())                          # the world has hyperedge membership
+    assert len(g._node_hyperedges[xworld.ids["NONASCII"]]) == 0                      # ...and an ARCHIVED one that does not count
+
+
+def test_the_streamed_analysis_is_identical_to_the_canonical_graph_and_vdb_analysis(xworld, pinned):
+    base = tool.load_base_module(pinned)
+    O = _old_analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN, base_mod=base)
+    N = tool.analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN, base_mod=base)
+    for k in ("scope", "scope_derived", "dropped", "nodes_meta", "existing_ids", "counts", "render_len_before", "syn",
+              "s_sources", "marker_nodes", "histograms", "marker_bearing", "residuals", "records"):
+        assert _scrub_obj(sorted(O[k]) if isinstance(O[k], set) else O[k]) == _scrub_obj(sorted(N[k]) if isinstance(N[k], set) else N[k]), k
+    # V11 'before' figures: the new set is S + the three protected ids (a superset of the old candidates + watch);
+    # the old keys are equal, and the whole new set equals the canonical figures over that same id set.
+    assert N["before_figures"] == O["before_figures_scope"]
+    assert {k: N["before_figures"][k] for k in O["before_figures"]} == O["before_figures"]
+    keep = _keep_for(O)
+    assert N["content"] == {k: v for k, v in O["content"].items() if k in keep or (isinstance(v, str) and "WANT]" in v)}
+    # every stamped report artifact, byte for byte (sha256 over the canonical serialisation)
+    ro, rn = tool.build_reports(O, xworld.expect["scope"]), tool.build_reports(N, xworld.expect["scope"])
+    assert {k: tool.artifact_sha256(v) for k, v in ro.items()} == {k: tool.artifact_sha256(v) for k, v in rn.items()}
+    assert _scrub_obj(ro) == _scrub_obj(rn)
+
+
+def test_the_review_files_and_the_verifier_and_t6_are_identical(xworld, pinned, tmp_path):
+    base = tool.load_base_module(pinned)
+    utc = "20260930T000000Z"
+    outs = []
+    for tag, fn in (("old", _old_analyze), ("new", tool.analyze)):
+        A = fn(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN, base_mod=base)
+        run = tmp_path / tag
+        (run / "reports").mkdir(parents=True)
+        rl, sc = tool.artifact_sha256(tool.repair_list_obj(A)), tool.artifact_sha256(tool.scope_ids_obj(A, xworld.expect["scope"]))
+        approvals = tool.stamped(tool.approvals_body_for(A["records"], rl, sc, "EXEC-SYNTHETIC-PACKET"))
+        rshas, hints = tool.write_review_files(str(run), utc, pinned.org, A["content"], A["records"])
+        review_bytes = {p.name: p.read_bytes() for p in sorted(run.rglob("*")) if p.is_file()}
+        in_hashes = {n: tool.sha256_file(str(xworld.ckpt / n)) for n in tool.SIX_FILES}
+        out = tool.prepare_outputs(pinned, A, approvals, in_dir=str(xworld.ckpt), out_dir=str(run / "out"), run_dir=str(run),
+                                   utc=utc, expect=xworld.expect, in_hashes=in_hashes)
+        outs.append({"review_shas": rshas, "hint_counts": hints, "review_bytes": review_bytes,
+                     "results": out["results"], "failed": out["failed"], "t6": out["t6"], "out_hashes": out["out_hashes"],
+                     "id_map_sha256": out["id_map_sha256"], "walk": out["walk_counts"], "writer": out["writer_stats"],
+                     "sidecar": out["sidecar_stats"], "written": out["plan"]["write_ids"],
+                     "rewritten_main": (run / "out" / tool.MAIN_NAME).read_bytes()})
+    o, n = outs
+    assert o["failed"] == [] and len(o["results"]) == 19 and n["failed"] == []
+    assert len(o["written"]) >= 4                                                      # the non-ASCII candidate is among the writes
+    for k in o:
+        assert o[k] == n[k], k                                                         # byte for byte
+
+
+def test_analyze_needs_no_live_graph_and_no_vdb_load(xworld, pinned, monkeypatch):
+    """item 8: the classify/id-mapping analysis constructs NO Graph and calls NO vector-db load."""
+    def boom(*a, **k):
+        raise AssertionError("analyze() built a Graph / loaded the whole vectors file")
+
+    monkeypatch.setattr(pinned.nf, "Graph", boom)
+    monkeypatch.setattr(pinned.ui.SimpleVectorDB, "load", boom)
+    A = tool.analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN)
+    assert A["counts"]["nodes"] > 0 and A["records"]
+
+
+def test_the_old_whole_file_paths_are_gone_from_the_tool_source():
+    """LAW 3 / item 2: REPLACED, not added - no dead old path left in the tool (needles built by concatenation so this
+    test file never matches itself)."""
+    src = TOOL_PATH.read_text(encoding="utf-8")
+    code = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    body = "\n".join(code)
+    for needle in ("Simple" + "VectorDB", "load" + "_pair", "vdb" + ".load", "vdb" + ".content", "incident_figures(g" + ","):
+        assert needle not in body, needle
+    assert body.count(".restore(") == 1                                               # the ONE canonical restore left: V11's output restore
+
+
+def _synth_vectors(path, n, dim=768, content_len=700, marker_every=1000):
+    """A synthetic vectors file in the canonical format (version/count/entries), written entry by entry."""
+    rng = np.random.default_rng(7)
+    with open(path, "wb") as f:
+        f.write(b"\x83" + msgpack.packb("version") + msgpack.packb("1.0.0") + msgpack.packb("count") + msgpack.packb(n)
+                + msgpack.packb("entries"))
+        f.write(b"\xdf" + n.to_bytes(4, "big"))
+        for i in range(n):
+            c = ("filler-%d " % i) * (content_len // 10)
+            if i % marker_every == 0:
+                c += " [WANT]synthetic[/WANT]"
+            f.write(msgpack.packb("id-%06d" % i))
+            f.write(msgpack.packb({"embedding": rng.random(dim, dtype=np.float32).tobytes(), "content": c, "metadata": {"i": i}}, use_bin_type=True))
+    return os.path.getsize(path)
+
+
+def _traced_peak(fn):
+    import tracemalloc
+    gc.collect()
+    tracemalloc.start()
+    try:
+        out = fn()
+        cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return out, cur, peak
+
+
+def test_memory_shape_the_streamed_reader_scales_with_the_keep_set_not_the_file(pinned, tmp_path):
+    """SHAPE check (tracemalloc; NOT the real peak): new path retained/peak bytes vs the canonical whole-file load, on two
+    synthetic files (one twice the size of the other, tens of MB). Numbers are printed for the return."""
+    rows = []
+    for n in (8000, 16000):
+        p = str(tmp_path / ("v%d.msgpack" % n))
+        size = _synth_vectors(p, n)
+        keep = {"id-%06d" % i for i in range(0, n, 2000)}
+        old, _, old_peak = _traced_peak(lambda: pinned.ui.SimpleVectorDB().load(p))            # noqa: B023
+        new, new_cur, new_peak = _traced_peak(lambda: tool.load_content_subset(p, keep))       # noqa: B023
+        retained = sum(len(v.encode()) for v in new.values())
+        rows.append((n, size, old_peak, new_peak, new_cur, retained, len(new)))
+        print("MEMSHAPE n=%d file=%.1fMB old_peak=%.1fMB new_peak=%.2fMB new_retained_current=%.2fMB content_kept=%d entries=%d"
+              % (n, size / 1e6, old_peak / 1e6, new_peak / 1e6, new_cur / 1e6, retained, len(new)))
+        assert len(new) == len(keep | {"id-%06d" % i for i in range(0, n, 1000)})          # keep set + the marker entries only
+        assert new_peak < old_peak / 10 and new_peak < size / 5
+    (n1, s1, o1, w1, c1, r1, _), (n2, s2, o2, w2, c2, r2, _) = rows
+    assert o2 > 1.6 * o1                                                                  # the old peak grows with the file
+    assert w2 < 2.5 * w1 + 1_000_000                                                      # the new peak does not track the file
