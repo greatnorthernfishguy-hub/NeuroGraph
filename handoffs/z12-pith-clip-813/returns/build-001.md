@@ -106,3 +106,11 @@ NG: revert `5a8120a` (and `d4bc615` if the docs should go too). docs: revert `8c
 D1 gate-off `## Active Recall` snippet cap · D2 `compress_history` (no live Rust caller; retire the handler or make it lossless/identity) · D3 wants (`_WANT_RE` silently un-captures >600-char wants) · D4 deposit-path clips (LAW 7) · D5 silent member/overlap drops · D6 `surfacing.py` 200-char cut · D7 `MAX_QUEST_CHARS` premise. Detail: `../plan-001-audit.md` §8.
 
 Pairing: a cross-family (non-glm) reviewer + LE must review before anything merges; this worker does not self-accept.
+
+
+---
+## Turn-2 corrections to this return (2026-09-30)
+* **§3 row "recall snippet 300 chars, gate-off `## Active Recall`" and plan row #7 were wrong** that the non-provider path has no budget: the **Pith-ON L1 path** feeds the same 300-char strings to `pith_stage3` (a budget). Fixed in turn 2 (#816) for both Pith-ON streams and the gate-off path. My statement in §2/§3 that the provider path "renders whole nodes" was true of `provider_context` only, never of `cc_assemble_recall`.
+* **§5.4:** "cannot fit 40,000" should read "cannot fit `learned_budget`" (checker-019 C2).
+* **§5.1 / D7:** cite Condensate `origin/cc-laptop-minitid-card7-quest-removal-20260929` (`88ddfec`) as the Quest-removed blob; keep `MAX_QUEST_CHARS` until it and both hosts move together.
+* **§6:** the 223-passed figure was correct for the turn-1 head; turn 2 supersedes it in `returns/build-002.md`.
