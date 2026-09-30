@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5c·LE18-N8] — the [R5c·…] fold below is commit 25ae7a2a72346db0091c3a2d0d25b48e15cd0821 on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #10968) — plan-005 EDITED IN PLACE, the ONE fold [R5c·…]
 #   What: plan-005 edited in place (no new file): Exec Packet 418 (docs 5285f260; via Chief-003) — the four questions RULED — plus
 #     le-018 (ROLE B delta: 4 MEDIUM + 4 LOW) and checker-020 (ROLE A delta: PASS-WITH-NOTES, 2 LOW). Read in full first. Marks: [R5c·P418]
