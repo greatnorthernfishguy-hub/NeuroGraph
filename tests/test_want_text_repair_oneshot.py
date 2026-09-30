@@ -2410,11 +2410,12 @@ def test_r4_a_conduit_path_under_the_checkpoint_directory_is_refused_and_never_w
         assert not r["ok"] and any("conduit" in v for v in r["violations"]), str(c)
     assert walked == []
     real_walk = os.walk
-    monkeypatch.setattr(os, "walk", lambda p, *a, **k: (walked.append(str(p)), real_walk(p, *a, **k))[1])
-    monkeypatch.setattr(tool.glob, "glob", lambda pat: [])                                   # the REAL Probes, with the host stubbed
-    monkeypatch.setattr(tool.subprocess, "run", _sd(**{"is-system-running": GOOD_BUS, "is-active": _cp(3, "inactive\n"),
-                                                     "is-enabled": _cp(0, "linked\n")}))
-    r = tool.gate_p6(tool.Probes(), str(w.gen))
+    with monkeypatch.context() as mc:                                                        # the stubs live ONLY inside this block
+        mc.setattr(os, "walk", lambda p, *a, **k: (walked.append(str(p)), real_walk(p, *a, **k))[1])
+        mc.setattr(tool.glob, "glob", lambda pat: [])                                        # the REAL Probes, with the host stubbed
+        mc.setattr(tool.subprocess, "run", _sd(**{"is-system-running": GOOD_BUS, "is-active": _cp(3, "inactive\n"),
+                                                  "is-enabled": _cp(0, "linked\n")}))
+        r = tool.gate_p6(tool.Probes(), str(w.gen))
     assert not r["ok"] and not [x for x in walked if "generations" in x]
     rc, res, err = cli(_with_flag(_p2_argv(w), "--conduit-dir", w.gen), probes=FakeProbes())
     assert rc == 2 and "P4/P6" in err
