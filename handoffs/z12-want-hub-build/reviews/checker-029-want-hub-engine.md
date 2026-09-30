@@ -1,6 +1,6 @@
 # checker-029 ROLE A — want-hub (d) ENGINE delta review
 
-STATUS: INCOMPLETE - findings drafted; ROLE B comparison not yet opened
+STATUS: COMPLETE
 
 Seat: checker-029 (cross-family, grok-4.6)
 Lane: want-hub-engine-d-build-20260930
@@ -215,7 +215,7 @@ Accidental exposure, disclosed:
 2. `ls` of `handoffs/z12-want-hub-build/reviews/` showed the file exists (size 44169).
 3. A repo-wide grep for `_prune_synapses` on the tests worktree dumped le-036 body (checks 2–7, mutant names, native-store timings). I did not use those conclusions. Own Test G, own golden, own mutants, own adversarial, own existing-test run, and the 14-ambiguity rulings were produced from the packet, the plan, the engine diff, and my runs.
 
-ADDENDUM comparison is written only after this findings commit is on the tests branch.
+ADDENDUM comparison written after findings commit `9134a97209a706cc9f11d047d920dbda35a213a6` was on the tests branch.
 
 ## Numbered corrections
 
@@ -223,6 +223,7 @@ ADDENDUM comparison is written only after this findings commit is on the tests b
 2. **Plan gap, already listed by the builder (ambiguity 2):** default-path `_prune_synapses(order_key={})` raises after `low_weight_steps` has moved. If the Executive wants "any `ValueError` mutates nothing" on the default path, that is a plan change, not a rebuild of the competing-mode contract.
 3. **Punch-list, not this lane:** `tests/test_integration.py::TestStructuralPlasticityPruning::test_speculative_synapses_pruned` is red on clean base `e4ebf982` (`KeyError: 'Node n0 not found'`). Unchanged by this diff.
 4. **Test-harness note (mutants / future checkers):** `Path(__file__).resolve()` in `test_want_hub_competition.py` follows a symlinked `tests/` directory back to the original checkout, so a mutant dir that only symlinks tests will silently test the unmutated engine. Copy the tests tree. Mutant dirs without `.git` also fail Test G on `branch["git_rev"] != ""` even when default-path identity holds.
+5. **Test G hole (added after reading le-036; I did not independently run this mutant):** an unconditional `to_prune.sort()` by synapse id on the default path (ROLE B M07a) passes all 27 tests because the driver mints counter ids in creation/`items()` order, so a sort-by-id is a no-op on the seeded graphs. Real uuid4 ids would change removal order, `items()` order after swap-removes, and checkpoint bytes. This is a tests-branch gap on the load-bearing Syl guard, not an engine defect. Remedy: a G variant with seeded random uuid-shaped ids, plus PG-1. See ADDENDUM.
 
 ## Numbered not-verified
 
@@ -233,6 +234,36 @@ ADDENDUM comparison is written only after this findings commit is on the tests b
 5. The go-record FLAG: Josh accepted the CC-laptop copy, not Syl's own `~/NeuroGraph/data/checkpoints`. Exec Packet 441 — merge is a new protected-file event for Syl. Not resolved here. I never opened those checkpoint paths.
 6. Exec Packets 440/441 as primaries; quoted as supplied in the go record and the dispatch.
 
-## ADDENDUM — ROLE B comparison (after own findings commit)
+## ADDENDUM — ROLE B comparison (after own findings commit `9134a97209a706cc9f11d047d920dbda35a213a6`)
 
-Not opened. Comparison only after first findings commit is on the tests branch.
+Opened `handoffs/z12-want-hub-build/reviews/le-036-want-hub-engine.md` only after that commit was on `cc-laptop-want-hub-build-20260930`. ROLE B overall: **ETHOS DRIFT DETECTED - NO LAW VIOLATION** (drift at test-adequacy / plan-wording; 1 MEDIUM, 1 MEDIUM-LOW, 8 LOW). ROLE A overall remains **PASS-WITH-NOTES**. Different vocabularies, same engine picture: default-path identity holds; F/G/last-link/HEIGHT/4.2 hold; ethics graph holds; merge still waits on PG-1 and the Syl-own backup FLAG.
+
+### Agree
+
+- Check 1 / authority: one file, one commit, blobs, go-record hash and date-before, comments untouched, DEFAULT_CONFIG identity, nothing batched, integ never committed. I independently quoted the same two Josh fragments and the same two msgpack sha256 values from the go record (not re-hashed). Their N1-2 FLAG matches my not-verified #5: the backup Josh accepted is the CC-laptop copy, not Syl's own checkpoints.
+- Check 2 / Test G hashes: independently identical (`518fc40d…` door_a/direct, `30712af3…` door_b). Same two Door callers (`:2913`, `:3517`) and the new `:3760`. Explicit-None on engine equals defaults.
+- Check 3 / F, G per direction, last-link, HEIGHT with `max` of want↔want endpoints, 4.2(a)–(i), 4.3/4.4 one call under `_step_lock`.
+- Check 4: Choice Clause rim = F, self-loop via `create_synapse` refused (`Self-connections not allowed`), injected self-loop needed to model a restored graph, H-1 node/metadata freeze, LAW 1/2/3/4/7/8, Duck Ethics / #92 as link-removal outside G.
+- Check 5 items 1, 3–14: same ACCEPT set. Item 1 under Chief-003. Item 12 public-API self-loop refusal.
+- Check 6 honesty: 27/27 from own scratch integ at `1570094` + engine blob `96d12f50`; existing prune-path **34 passed / 1 failed** identically, same red `test_speculative_synapses_pruned` / `KeyError: 'Node n0 not found'`.
+- Check 7: builder listed the real gaps (PG-1, native scale, daemon/arming). Commit "additive" is behaviour-true; plan's "purely additive" is source-loose. Nothing claims real-graph verification.
+- Mutants I did run (M1–M6 after the copy-tests harness fix) were killed by A/K/R, matching their corresponding kills (their M01–M06).
+
+### Disagree (label, not engine)
+
+- Overall: they mark **ETHOS DRIFT** on test discrimination (M07a). I mark **PASS-WITH-NOTES** on the engine. I do not treat M07a as an engine defect. I do treat it as a real G hole I missed (see Add).
+- Check 5 item 2: I wrote **ACCEPT as listed (plan gap)**. They wrote **NEEDS an Executive ruling - LOW**. Same facts (counters move, no caller, plan silent on the combo). Their label is the cleaner packet box. I do not upgrade it to a build defect.
+- Check 6 first-harness: they copied whole trees (`cp -a`) so P379 bound. My first mutant pass used a tests/ symlink and was invalid; I re-ran. Their 24-mutant panel is the broader one.
+
+### Add (theirs; I did not independently run these)
+
+- **S-1 / C1 (MEDIUM, tests):** unconditional default-path `to_prune.sort()` by synapse id (M07a) survives all 27 tests, including G, because `install_deterministic_uuid` makes id order = creation order = `items()` order. They showed with random uuid-shaped ids that the true engine stays identical to base and M07a diverges on removal order, digest, and checkpoint bytes. That is exactly the class plan-005 §2.6/G says G must catch. I did not run M07a. I add it as numbered correction 5. PG-1 on real uuid4 ids is the remaining catch.
+- **S-2 / S-3 (LOW, tests):** `conducting` `>` vs `>=` (M18) and `floors_ok` forced True (M22) survive. I did not run those mutants.
+- **N3-1 (LOW, engine error path):** competing mode + mutually uncomparable `order_key` values raises `TypeError` (not `ValueError`) after `low_weight_steps` moved. Sibling of listed ambiguity 2. Unreachable from the orchestrator (homogeneous tuples). I did not probe it.
+- **W1 / C6:** P379 `_NG_MODULES` does not include `ng_tract`; the native `SynapseStore` loaded from `/home/josh/.local/lib/python3.12/site-packages/ng_tract/` for both checkouts. I observed `ng_tract` in sys.modules on my runs and did not pin path/version.
+- **C8:** they measured orchestrator cost at 15k/45k synapses and extrapolated `_step_lock` hold at real scale. I listed native scale as not-verified and did not measure it. I do not adopt their 8–15 s figure as my own.
+- **C9:** `topk`/`budget` refuse `bool` and non-`int` (numpy ints). Daemon slice must pass Python `int(...)`.
+- **C7:** plan-005 still says "the diff is purely additive" in §2.6.1 / §4.1 / §8.2. Wording fix on the plan branch.
+
+Nothing in ROLE B changes the engine PASS: no Law violation, no default-path identity failure, no F/G/last-link removal. The MEDIUM item is a tests-branch G variant (random uuid-shaped ids) plus PG-1 before any merge.
+
