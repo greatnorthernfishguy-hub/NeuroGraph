@@ -3259,3 +3259,28 @@ def test_the_extras_world_holds_the_fold_shapes(xworld, pinned):
     assert s1["source_node"] == s2["source_node"] == "cc:conv::shared" and s1["outcome"] == s2["outcome"] == "GENUINE"
     assert A["before_figures_scope"][xworld.ids["SEP1"]][2] == 2 and A["before_figures_scope"][xworld.ids["GEN"]][2] == 1
     assert A["before_figures_scope"][xworld.ids["SEP1"]][1] >= 2                                    # incoming includes the ghost-pre synapse
+
+
+def test_the_incident_figures_count_a_non_node_endpoint_on_both_sides_and_a_self_loop(pinned, tmp_path):
+    """the OUTGOING-side corner the verifier world cannot hold (a synapse from a real node to a non-node endpoint would be a
+    dangling V11 failure there): a small graph with byte-surgery synapses - real node -> ghost post, ghost pre -> real node,
+    and a self-loop - restored canonically and streamed; the figures must agree (mutation M6: 'node-to-node only')."""
+    nf = pinned.nf
+    g = nf.Graph()
+    for n in ("a", "b"):
+        g.create_node(node_id=n, metadata={})
+    g.create_synapse("a", "b", weight=0.3)
+    cap = g.capture_checkpoint(nf.CheckpointMode.FULL)
+    syn = msgpack.unpackb(bytes(cap["synapses"]), raw=False, strict_map_key=False)
+    tmpl = next(iter(syn.values()))
+    for sid, pre, post in (("s-out", "a", "ghost:post"), ("s-in", "ghost:pre", "a"), ("s-self", "b", "b"), ("s-self2", "a", "a")):
+        syn[sid] = dict(tmpl, synapse_id=sid, pre_node_id=pre, post_node_id=post)
+    cap["synapses"] = msgpack.packb(syn, use_bin_type=True)
+    p = str(tmp_path / "main.msgpack")
+    g.write_checkpoint(p, cap)
+    g2 = nf.Graph()
+    g2.restore(p)
+    ids = {"a", "b", "ghost:post", "ghost:pre"}
+    want = _old_figures(g2, ids)
+    assert want == {"a": (3, 2, 0), "b": (1, 2, 0)}          # a: out a->b, a->ghost, a->a; in ghost->a, a->a. b: out b->b; in a->b, b->b
+    assert tool.stream_incident_figures(p, ids, set(tool.stream_graph_nodes(p)["existing_ids"])) == want
