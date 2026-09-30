@@ -1,4 +1,13 @@
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2, #815)
+# What: tests for in_json_string / in_url / in_link_target: checker-016's exact examples (incl.
+#   a backtick-fence variant and its independence from the inline-code coincidence) rejected with
+#   their reasons; a genuine >600-char want in plain prose beside each (4 arrangements) captured
+#   whole; the boundary (reason applies to the OPENER's context, not the want text); a pinned
+#   list of what is NOT recognised; log flow unchanged; linearity on adversarial input; the
+#   parity corpus widened to 3,726 shapes with URL/link/JSON/escaped-quote near-misses.
+# Why: Exec P414. Precision over cleverness: each rule's failure modes are pinned.
+# How: same fakes; no graph load.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2, le-014)
 # What: golden cases ASSERTED AGAINST BASE e4ebf982 for a want that ENDS in inline code, BEGINS
 #   with it, both, with a follow-on second want (C1); a closer wrapped in quotes (C2); a want
@@ -665,13 +674,18 @@ def test_structural_masks_still_apply_to_closers():
 
 
 _PARITY_PREFIXES = ["", "Noted. ", "Line one.\n", "para\n\n", "see `x` and ", 'he said "hi" then ',
-                    "path C:\\dir ", "values: 1, 2, ", "a (b) ", "Ok!\r\n", "emoji \u2728 "]
+                    "path C:\\dir ", "values: 1, 2, ", "a (b) ", "Ok!\r\n", "emoji \u2728 ",
+                    # #815 near-misses: URL / link / JSON-ish / escaped quotes NEAR a real opener
+                    "see https://example.com/docs ", "(https://example.com/docs)", "see https://example.com/docs.",
+                    'he typed \\"go\\" then ', '{"a": "b"} and ', "[link](https://x.org/a) then ",
+                    "[link](https://x.org/a)"]
 _PARITY_BODIES = ["plain want", "`code` begins", "ends `code()`", "`a` both `b`", "mid `x` code here",
                   'has "quoted" word', 'ends with "quote"', '"begins with quote" here',
                   "ends with backslash \\", "visit https://example.com/docs now",
                   "read https://example.com/docs", '{"a": "b"} json inside', "multi\nline\nbody",
                   "unicode \u00e9\u4e2d", "crlf\r\nbody", "ends with url https://x.org/a?b=[1]",
-                  "with (parens) and [brackets]", "tab\tinside", "pair ``double`` end", 'x "[y" z']
+                  "with (parens) and [brackets]", "tab\tinside", "pair ``double`` end", 'x "[y" z',
+                  "see [the docs](https://example.com/x)", '["a", "b"] list', "ends with link [d](https://x.org)"]
 _PARITY_SUFFIXES = ["", " tail", "\ntail", " [WANT]second[/WANT]", "[WANT]adj[/WANT]",
                     " and `code` after", "\n\n```\nfence after\n```\n", ' and "q" after', " `"]
 
@@ -707,6 +721,12 @@ _ADVERSARIAL_PARITY = [
     "it's a ` character.\n\n[WANT]real[/WANT]\n\nanother ` char",
     "[WANT]unbalanced quote \" here[/WANT] and [WANT]second[/WANT]",
     "[WANT]ends with a quote char '[/WANT]",
+    # #815: a real want next to a URL / link / JSON / escaped quotes is still a want
+    "see https://example.com/docs [WANT]real want[/WANT]",
+    "(https://x.org/a)[WANT]real want[/WANT]",
+    "typed \\\"go\\\" [WANT]real want[/WANT]",
+    '{"a": "b"} then [WANT]real want[/WANT]',
+    "[WANT]real want ending in a link [d](https://x.org)[/WANT]",
 ]
 
 
@@ -793,3 +813,183 @@ def test_log_docstring_no_longer_claims_no_marker_text():
     doc = org._log_want_skips.__doc__
     assert "NEVER logs marker" not in doc
     assert "literal marker token" in doc
+
+
+# ---------------------------------------------------------------------------
+# #815 (Exec P414): in_json_string / in_url / in_link_target
+# A want tag inside JSON, a URL or a link target is text being CARRIED or TALKED ABOUT.
+# The reason applies to the context the OPENER sits in -- never to what the want text contains.
+# ---------------------------------------------------------------------------
+
+_LONG_WANT = ("I genuinely want the parser to keep every sentence of a long forward intention intact. " * 9).strip()
+
+# checker-016's exact examples -> (content, opener reason, closer reason)
+_815_EXAMPLES = {
+    "json object value": (
+        '{"cmd":"[WANT] not a want [/WANT]"}', "in_json_string", "in_json_string"),
+    "json-escaped quotes": (
+        '\\"[WANT]\\" then later \\"[/WANT]\\"', "in_json_string", "closer_without_opener"),
+    "tilde fence inside a JSON string (literal backslash-n)": (
+        '{"code": "~~~\\n[WANT] documented [/WANT]\\n~~~"}', "in_json_string", "in_json_string"),
+    "backtick fence inside a JSON string (literal backslash-n)": (
+        '{"code": "```\\n[WANT] documented [/WANT]\\n```"}', "in_json_string", "in_json_string"),
+    "URL path": (
+        "https://example.com/path/[WANT]secret-want[/WANT]/docs", "in_url", "closer_without_opener"),
+    "markdown link target": (
+        "[the docs](https://example.com/[WANT]linked[/WANT])", "in_link_target", "closer_without_opener"),
+}
+
+
+def test_815_reasons_are_registered():
+    for reason in ("in_json_string", "in_url", "in_link_target"):
+        assert reason in org.WANT_SKIP_REASONS
+
+
+@pytest.mark.parametrize("name", sorted(_815_EXAMPLES))
+def test_815_example_is_rejected_with_its_reason(base_org, name):
+    content, opener_reason, closer_reason = _815_EXAMPLES[name]
+    parsed = org.parse_wants(content)
+    assert parsed.wants == ()
+    assert [(s.marker, s.reason) for s in parsed.skipped] == [("[WANT]", opener_reason), ("[/WANT]", closer_reason)]
+    g, vdb = _graph_with(content)
+    assert org.surface_wants(g, vdb) == [] and _want_nodes(g) == {}
+    # a deliberate delta: base minted a (bogus) want from every one of these
+    assert _texts(_run(base_org, [content])[0]) != []
+
+
+@pytest.mark.parametrize("order", ["after", "before"])
+@pytest.mark.parametrize("sep", ["\n\n", " "], ids=["new-paragraph", "same-line"])
+@pytest.mark.parametrize("name", sorted(_815_EXAMPLES))
+def test_815_genuine_long_want_in_plain_prose_beside_each_is_captured_whole(name, sep, order):
+    content, opener_reason, closer_reason = _815_EXAMPLES[name]
+    real = "[WANT]" + _LONG_WANT + "[/WANT]"
+    text = content + sep + real if order == "after" else real + sep + content
+    assert len(_LONG_WANT) > 600
+    parsed = org.parse_wants(text)
+    assert [w.text for w in parsed.wants] == [_LONG_WANT]          # whole, > 600 chars
+    assert sorted((s.marker, s.reason) for s in parsed.skipped) == sorted(
+        [("[WANT]", opener_reason), ("[/WANT]", closer_reason)])    # and the example is still skipped
+    g, vdb = _graph_with(text)
+    assert _texts(org.surface_wants(g, vdb)) == [_LONG_WANT]
+
+
+def test_815_backtick_fence_rejection_does_not_depend_on_the_inline_code_coincidence():
+    content = _815_EXAMPLES["backtick fence inside a JSON string (literal backslash-n)"][0]
+    # the coincidence checker-016 noticed: the two ``` runs pair up as an inline code span...
+    fences = org._want_fence_spans(content)
+    spans = org._want_code_span_ranges(content, fences)
+    opener = content.index("[WANT]")
+    assert any(a <= opener < b for a, b in spans)
+    # ...but the rejection is by JSON structure, which is checked FIRST
+    assert {s.reason for s in org.parse_wants(content).skipped} == {"in_json_string"}
+    # same content with the JSON wrapper broken (not a string literal) falls back to the old reason
+    broken = content.replace('"code": ', "code = ")
+    assert "in_json_string" not in {s.reason for s in org.parse_wants(broken).skipped}
+
+
+# The BOUNDARY: context of the OPENER, not the contents of the want. (content, wants, skip reasons)
+_815_BOUNDARY = {
+    "want text that CONTAINS a URL": (
+        "[WANT]please check https://example.com/path/ for x[/WANT]",
+        ["please check https://example.com/path/ for x"], []),
+    "want text that contains JSON": (
+        '[WANT]add {"cmd": "run"} support to the parser[/WANT]',
+        ['add {"cmd": "run"} support to the parser'], []),
+    "want text that contains a markdown link": (
+        "[WANT]read [the docs](https://example.com/x) first[/WANT]",
+        ["read [the docs](https://example.com/x) first"], []),
+    "a quoted word INSIDE the want, real tags in prose": (
+        'He said "ship it" so [WANT]ship "it" today[/WANT]', ['ship "it" today'], []),
+    "URL followed by a want in the same paragraph": (
+        "see https://example.com/docs [WANT]follow up[/WANT]", ["follow up"], []),
+    "URL then sentence dot glued to the opener": (
+        "see https://example.com/docs.[WANT]follow up[/WANT]", ["follow up"], []),
+    "parenthesised URL glued to the opener": (
+        "(https://example.com/docs)[WANT]follow up[/WANT]", ["follow up"], []),
+    "link glued to the opener": (
+        "[t](https://x.org/a)[WANT]follow up[/WANT]", ["follow up"], []),
+    "escaped quotes in prose": (
+        'He typed \\"go\\" and then [WANT]follow up[/WANT]', ["follow up"], []),
+    "prose quote followed by a comma": (
+        'He said "go [WANT]x[/WANT] now", then left', ["x"], []),
+    "a want after a quoted list": (
+        'Items: "a", "b", [WANT]follow up[/WANT]', ["follow up"], []),
+    "want that ENDS in a URL": (
+        "[WANT]read https://example.com/docs[/WANT]", ["read https://example.com/docs"], []),
+    "want that ends in a link": (
+        "[WANT]read [d](https://x.org)[/WANT]", ["read [d](https://x.org)"], []),
+    "a closer inside a JSON literal is masked like a code span": (
+        '[WANT]use {"k": "[/WANT]"} form[/WANT]', ['use {"k": "[/WANT]"} form'], ["in_json_string"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_815_BOUNDARY))
+def test_815_boundary_reason_applies_to_the_openers_context_only(name):
+    content, expected_wants, expected_reasons = _815_BOUNDARY[name]
+    parsed = org.parse_wants(content)
+    assert [w.text for w in parsed.wants] == expected_wants
+    assert [s.reason for s in parsed.skipped] == expected_reasons
+
+
+# JSON-looking contexts reject (pretty-printed, array element, inside a sentence).
+_815_JSON_CONTEXTS = {
+    "pretty-printed object": '{\n  "cmd": "[WANT] x [/WANT]"\n}',
+    "array element": '["a", "[WANT] x [/WANT]"]',
+    "legitimate want typed inside a JSON-looking sentence (KNOWN false negative)":
+        'Use {"note": "[WANT] revisit X [/WANT]"} for it',
+}
+
+
+@pytest.mark.parametrize("name", sorted(_815_JSON_CONTEXTS))
+def test_815_json_contexts_are_rejected_and_reported(name):
+    parsed = org.parse_wants(_815_JSON_CONTEXTS[name])
+    assert parsed.wants == ()
+    assert {s.reason for s in parsed.skipped} == {"in_json_string"}
+
+
+# What the delta deliberately does NOT recognise (pinned, so a future change is a visible decision).
+_815_NOT_RECOGNISED = {
+    "single-quoted JSON-ish": ("{'cmd': '[WANT] x [/WANT]'}", ["x"]),
+    "markdown link TEXT containing a pair": ("[[WANT]text[/WANT]](https://x.org)", ["text"]),
+    "a 'JSON string' with a raw newline is not JSON": ('{"cmd": "[WANT] x\n [/WANT]"}', ["x"]),
+    "reference-style link definition without a scheme": ("[id]: ./dir/[WANT]x[/WANT]", ["x"]),
+    "bare prose mention that pairs cleanly": ("use [WANT] to mark one, and [/WANT] closes it",
+                                               ["to mark one, and"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_815_NOT_RECOGNISED))
+def test_815_not_recognised_shapes_stay_real_markers(name):
+    content, expected = _815_NOT_RECOGNISED[name]
+    assert [w.text for w in org.parse_wants(content).wants] == expected
+
+
+def test_815_new_reasons_flow_through_the_flood_safe_log_unchanged(caplog, clock):
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    g, vdb = _graph_with(_815_EXAMPLES["json object value"][0],
+                         _815_EXAMPLES["URL path"][0],
+                         _815_EXAMPLES["markdown link target"][0])
+    org.surface_wants(g, vdb)
+    lines = _info(caplog)
+    summary = [l for l in lines if "marker(s) in" in l]
+    assert len(summary) == 1
+    for frag in ("in_json_string=2", "in_url=1", "in_link_target=1", "closer_without_opener=2"):
+        assert frag in summary[0], summary[0]
+    assert all("secret-want" not in r.getMessage() and "not a want" not in r.getMessage()
+               for r in caplog.records)                             # no body / surrounding text
+    before = len(lines)
+    for _ in range(10):
+        clock.now += 60
+        org.surface_wants(g, vdb)
+    assert len(_info(caplog)) == before                             # flood-safe form unchanged: quiet
+
+
+def test_815_finders_are_linear_on_adversarial_input():
+    import time as _time
+    for content in ('"' * 200_000 + "[WANT] x [/WANT]",
+                    '{"a":"' * 20_000 + "[WANT] x [/WANT]",
+                    "a" * 100_000 + "[WANT] x [/WANT]",
+                    ("https://x.org/" * 5_000) + "[WANT] x [/WANT]"):
+        t0 = _time.perf_counter()
+        org.parse_wants(content)
+        assert _time.perf_counter() - t0 < 5.0
