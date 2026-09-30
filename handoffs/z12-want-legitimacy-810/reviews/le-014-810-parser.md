@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (own B1-B5 draft committed; checker-016 NOT yet read)
+STATUS: COMPLETE
 
 # le-014 — LAW ENFORCER ROLE B — #810 parser-half build (code c9fe56d, return e462c17, base e4ebf982)
 
@@ -86,5 +86,28 @@ Numbered corrections:
 
 Not verified: behaviour under the live daemon (nothing restarted; correctly out of scope); the exact re-parse of the 09-16 source nodes (derived data only; #801 dry-run); `ng_embed.embed` behaviour on very long `want_text` (geometry backfill); whether the docs daemon branch `cc-laptop-daemon-recall-756-20260930` merges cleanly with the retirement turn; the full suite (not run, by instruction). I ran the worker's file ONCE (65 passed) and my own pure-string probe.
 
-## Comparison with checker-016 (only after own draft committed)
-(pending — checker-016-810-parser.md not yet opened)
+## Comparison with checker-016 (read only AFTER my B1-B5 draft was committed as `01ec3dc453f88d215fb6ee160e332e1862286e67` and pushed)
+
+checker-016 ROLE A: overall PASS-WITH-NOTES, "No must-fix corrections for this pair". I read the whole file (244 lines) after committing. Nothing in B1-B5 above was changed in response; this section is the only addition, plus the STATUS line.
+
+**Where we agree**
+- Independent runs match: 65 passed with the P379 preamble printing the worktree `cc_ng_organism.py`, `NG_EMBED_*` unset. No length limit on any parser path; `render_wants`/`WANT_RENDER_LIMIT` untouched; `WANT_MAX_CHARS` read only by the renderer; no protected/vendored/`cc_ng_host.py`/`neurograph_rpc.py` file in the diff.
+- The parser is content-blind (checker-016 ran a Choice-Clause-shaped want and it minted whole) — same as my B3 opening.
+- Host twin `surface_wants_for_graph` and Syl's `_surface_wants` remain unbounded and are parked (#755 / Josh); same debt I recorded under LAW 3/4.
+- Log lines carry the literal marker token as "kind" and never surrounding text, so the return's "NEVER logs marker text" is slightly overstated (their note 4). My B3/B2 wording ("node id, offset, marker kind, reason only") already reflects the as-built lines; agreed the return sentence should be tightened. No secret can reach the log.
+- Importing `parse_wants` runs the whole module but opens no file and loads no NG engine (their A5, note 5); my LAW 1 remark (offline repair-tool import only) is consistent.
+- Residual false-positive contexts (JSON/escaped quotes, URL, markdown link, HTML comment, `<code>`, bold, tab-indented fences) mint mentions; these are notes, same family as the stated bare-mention residual. I did not probe URL/markdown-link/tab-fence; I accept their runs.
+
+**Where I DISAGREE (this changes the gate)**
+- checker-016 treats `code_adjacent` as a single-sided, base-equivalent guard ("matches base", "do not fix without a ruling", tested only `` `foo`[WANT] … `` — the *opener* case). It is NOT equivalent to base on the *closer*: base guarded only the opener; the build applies `code_adjacent` (`cc_ng_organism.py:1668-1669`) to every marker, so a real want that ends in inline code (`[WANT]check `foo()`[/WANT]`) loses its closer and its opener. Base minted `check `foo()``; the build mints nothing (my probe table, C1). This is a *regression vs base on a well-formed, common want shape* that neither the worker's golden corpus (`tests/test_cc_want_legitimacy_810.py:527-539`) nor checker-016's five new golden corpora (none had a backtick adjacent to the closer) exercised, and it contradicts checker-016's A2 statement "well-formed short wants keep the same id/node/metadata/synapse". I therefore rate it HIGH and merge-blocking, not a note. Fixing it (openers-only) does not "reopen unpaired-run mentions" for openers: the guard stays where it was in base. A closer that follows an unbalanced backtick becomes at worst a `closer_without_opener` skip, which is harmless.
+- Same reasoning for `quoted` on closers (my C2, MEDIUM): a real want ending in `"x"` inside a surrounding quote pair is dropped; not covered by their inputs either.
+- The FIFO 4096 eviction (their "not verified") I reasoned through from the code (C4): beyond 4096 distinct skip keys the ~1-line/hour claim fails to ≤50 detail lines per pulse; they left it unverified, so this is an addition, LOW.
+
+**What I add that they did not have**
+- LAW-by-LAW ruling with file:line (B2): LAW 5 LOW (the three `WANT_SKIP_*` bounds are literals where this file uses `CC_*` env-with-default for tunables, `:2051-2057`, `:3093-3114`, `:3401-3780`); LAW 7 net repair (the 600-char cap was truncation of raw experience); LAW 8 pass (autosave-pulse clock, `time.monotonic` heartbeat).
+- Envelope notes: new top-level `handoffs/` tree in the code repo; Vault docs/wikilinks still open; #801's id-equality guarantee is wrong for wants that end in code until C1 is fixed (B4).
+- A ruling that the host-twin/Syl-twin debt be written to the punchlist as a concrete statement (mints mentions unbounded under a second id scheme), not left in a return footnote.
+
+**Net effect on the gate:** my overall verdict differs from checker-016's. ROLE A: PASS-WITH-NOTES (no must-fix). ROLE B (this file): VIOLATIONS FOUND / **not ready to merge as is** on C1; PASS-WITH-NOTES after C1 (and preferably C2) is fixed at the source with golden cases asserted against base. The pair should not be counted as passed until the zone manager has decided between (a) send C1 back to the worker for a small fix + tests, and (b) an explicit Josh ruling that dropping closer-adjacent-to-code wants is acceptable. I do not merge, settle or dispatch.
+
+STATUS: COMPLETE
