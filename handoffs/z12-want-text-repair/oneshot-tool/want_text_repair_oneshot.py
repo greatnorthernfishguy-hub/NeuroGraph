@@ -89,9 +89,8 @@ CONSTITUTIONAL_ID = "constitutional::rim::choice_clause"
 # The ripple table this tool carries into every backup manifest (Exec P428 / le-029 C6): what else holds bytes of
 # the pre-repair checkpoint, and what may NEVER be used to undo the repair.
 RIPPLE_TABLE: Dict[str, str] = {
-    "generations/": ("incidental, expiring (the daemon's rotation prunes it), never a rollback source; the live main.msgpack / "
-                     "vectors.msgpack may be hard-linked into it (Exec P428, judged by inode) and keep the PRE-repair bytes there; "
-                     "never listed or opened by this tool beyond stat/hash of the recorded partner paths"),
+    "generations/": ("incidental, expiring (rotation prunes it), never a rollback source; live files may be hard-linked into it "
+                     "(Exec P428, by inode); only stat/hash of recorded partner paths, never listed"),
     "last_good/": "NOT a link partner (Exec P428); never a rollback source; never touched by this tool",
     "rollback source": "ONLY the tool's own named pre-apply backup (<run>/backup/ + backup-manifest-<UTC>.json), every sha256 verified",
 }
