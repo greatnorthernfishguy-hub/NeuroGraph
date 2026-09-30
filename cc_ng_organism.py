@@ -13,6 +13,24 @@
 # How:  One argument removed, on the e4ebf982 base. Expected conflict with #813 (84a0968a) at
 #   this call site: see the #812 turn-1 return for the correct merged form.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
+#   TURN 6 (dispatch #11238) -- le-025 C-1..C-5 (Chief ruling docs e19962de)
+# What: (C-2, MEDIUM) _pith_provider_node_limit is now the OPTIMISTIC bound -- measured from the
+#   SMALLEST overhead the renderer can have (one ordinary alert-free line, no sources/anchors/
+#   relations) -- so it can never be smaller than what fits: every (core, budget, node) that BASE
+#   or the turn-5 parent rendered whole renders whole (swept in a test); a node that truly cannot
+#   fit is caught at admit as a loud NEVER-FIT drop (whole-or-absent). Turn 5 measured the worst
+#   case and dropped/referenced small nodes in a tight budget. (C-5) _cc_pin_probe FAILS CLOSED: a
+#   raising or missing identity guard => PINNED + a WARNING (id, exception type; first-seen), on
+#   Stage 3 and the un-Pithed renderer; base failed soft to NOT pinned at DEBUG. (C-4) the alert
+#   coherence set is defined once (_PITH_COHERENCE_STATES / _PITH_ALERT_COHERENCE) and drives both
+#   the renderer and the limit. (C-3) the docstring no longer claims admit catches an over-estimated
+#   band, and the INFO line says "above the reference limit L", not "over-budget". (C-1) a test
+#   compares the pin probe with e4ebf982's closure: identical except the deliberate C-5 change.
+# Why: le-025 (fresh law enforcer, turn 5): C-2 violated "never so small it drops what fit before";
+#   the Chief ruled C-5 (identity fails toward keeping content, #92 / Duck Ethics).
+# How: cc_ng_host.py, surfacing.py, surface_resolver.py untouched. The same fail-soft exists in
+#   shared code -- recorded in returns/build-006.md (row #829), NOT edited.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
 #   TURN 5 (dispatch #11114) -- le-022 N1/N2/N3 + LOWs (Chief ruling docs 3604cfb1)
 # What: (N1) _cc_render_unpithed exempts identity-protected items from the budget EXACTLY as
 #   Stage 3 does (one shared test, _cc_pin_probe): rendered whole, never ranked/dropped/swapped for
@@ -4633,24 +4651,31 @@ def _pith_log_drop(where: str, reason: str, unit: str, entries: Any) -> None:
 # ---------------------------------------------------------------------------
 
 def _pith_provider_node_limit(core: str, budget: int) -> int:
-    """The per-node character limit above which a node is rendered as a reference (#819).
+    """The per-node character limit ABOVE which a node is rendered as a reference (#819).
 
-    MEASURED from the renderer itself (turn 5 / le-022 LOW -- was the constants 800 and 200):
-      * the worst-case section shell = what _pith_provider_sections adds around the core when
-        EVERY section and EVERY alert is present (a candidate line of each alert coherence, one
-        of them a correction), rendered with empty blocks;
-      * the smallest line overhead = _pith_render_connected_line of an EMPTY line (heading,
-        root label, the default source).
-    limit = budget - len(core) - shell - line overhead, floored at 1.  It is deliberately the
-    conservative (worst-case shell) direction; a node between this and the true learned budget is
-    still caught, loudly and by id, as a never-fit assembly at admit."""
-    probes = [CacheLine(node_id="", content="", coherence=c, stream="connected",
-                        relations=([{"from": "", "to": "", "kind": "failure -> correction",
-                                     "content": ""}] if i == 0 else []))
-              for i, c in enumerate(("conflict", "stale", "uncertain", "unknown"))]
-    shell = len(_pith_provider_sections(core, probes, [""] * len(probes))[0]) - len(core)
-    line = len(_pith_render_connected_line(CacheLine(node_id="", content="", sources=["substrate topology"])))
-    return max(1, budget - len(core) - shell - line)
+    An OPTIMISTIC bound, measured from the renderer itself (turn 6 / le-025 C-2; turn 5 had
+    measured the WORST case, which in a tight budget fell BELOW what fits and dropped or
+    referenced nodes that used to render whole):
+      overhead = the SMALLEST envelope the renderer can wrap around one node -- ONE ordinary
+      connected line (an alert-free coherence, no correction, no sources line, no anchors,
+      no relations) inside the "Learned Situation" section, measured by rendering it with
+      empty text and subtracting the core;
+      limit    = budget - len(core) - overhead, floored at 1.
+    A node ABOVE the limit cannot fit whole under ANY real assembly, so it takes the reference
+    form.  A node at or below it is left WHOLE; if its real assembly needs more overhead than the
+    minimum (alerts, sources, anchors, relations) it is caught at admit as a NEVER-FIT assembly:
+    dropped whole, loudly, by id (THE ONE rule).  The two errors are not symmetric: a limit too
+    large costs a loud whole-or-absent drop of a node that could not fit anyway; a limit too small
+    (turn 5) turned a node that DID fit into a reference or nothing.  Whole-or-absent favours the
+    first.  The ordinary-line choice reads _PITH_COHERENCE_STATES / _PITH_ALERT_COHERENCE, the
+    same constants the renderer uses."""
+    ordinary = [c for c in _PITH_COHERENCE_STATES if c not in _PITH_ALERT_COHERENCE]
+    overheads = []
+    for coherence in ordinary:
+        line = CacheLine(node_id="", content="", coherence=coherence, stream="connected", sources=[])
+        section = _pith_provider_sections(core, [line], [_pith_render_connected_line(line)])[0]
+        overheads.append(len(section) - len(core))
+    return max(1, budget - len(core) - (min(overheads) if overheads else 0))
 
 
 def _pith_tree_nodes(graph: Any, node_id: str, limit: Optional[int] = None) -> List[tuple]:
@@ -4703,7 +4728,10 @@ def _pith_whole_node_reference(graph: Any, node_id: str, node: Any, text: str,
 
 
 def _pith_log_reference(where: str, entries: Any, limit: int) -> None:
-    """One INFO line for over-budget nodes rendered as trees + reference (never a silent swap)."""
+    """One INFO line for nodes ABOVE the reference limit rendered as trees + reference (never a
+    silent swap).  `limit` is the threshold that rejected them: the L1 budget on the recall paths,
+    the measured per-node limit on the provider path -- so this says "above the reference limit",
+    not "over budget" (a node the limit rejects need not exceed the budget)."""
     entries = list(entries)
     if not entries:
         return
@@ -4712,10 +4740,10 @@ def _pith_log_reference(where: str, entries: Any, limit: int) -> None:
     named = ", ".join("%s (%d chars)" % (k.split("|", 1)[1], sizes[k]) for k in shown)
     extra = "".join([" [%d already reported]" % already if already else "",
                      " [+%d more]" % more if more else ""])
-    logger.info("pith %s: %d over-budget node%s (%d chars) surfaced through their trees + a "
-                "whole-node reference (limit %d chars); first seen: %s%s",
-                where, len(entries), "" if len(entries) == 1 else "s",
-                sum(c for _i, c in entries), limit, named or "-", extra)
+    logger.info("pith %s: %d node%s above the reference limit %d chars (%d chars) surfaced through "
+                "their trees + a whole-node reference; first seen: %s%s",
+                where, len(entries), "" if len(entries) == 1 else "s", limit,
+                sum(c for _i, c in entries), named or "-", extra)
 
 
 def _pith_reference_text(graph: Any, node_id: str, text: str, budget: int) -> Optional[str]:
@@ -5226,7 +5254,7 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
         if isinstance(text, str) and text.strip()
     }
 
-    referenced: Dict[str, int] = {}      # #819: over-budget node id -> whole size
+    referenced: Dict[str, int] = {}      # #819: node id above the reference limit -> whole size
 
     def _display_text(node, fallback="", node_id=None):
         raw = _pith_node_raw_text(node, fallback)
@@ -5450,6 +5478,14 @@ def _pith_line_is_correction(line: CacheLine) -> bool:
                for relation in line.relations)
 
 
+# The renderer's coherence vocabulary, defined ONCE (turn 6 / le-025 C-4).  The alert set is what
+# _pith_provider_sections turns into an "Uncertainty and Conflicts" paragraph + a warning, and
+# _pith_provider_node_limit derives its ORDINARY (alert-free) line from the same constants, so a
+# change here moves the renderer and the measured limit together -- no second, drifting list.
+_PITH_COHERENCE_STATES = ("exclusive", "shared", "modified", "uncertain", "stale", "conflict", "unknown")
+_PITH_ALERT_COHERENCE = ("conflict", "stale", "uncertain", "unknown")
+
+
 def _pith_provider_sections(core: str, lines: List[CacheLine],
                             blocks: List[str]) -> tuple:
     """Render complete provider context and its learned-state warnings."""
@@ -5459,7 +5495,7 @@ def _pith_provider_sections(core: str, lines: List[CacheLine],
     alert_states = []
     for line, block in zip(lines, blocks):
         (corrections if _pith_line_is_correction(line) else situation).append(block)
-        if line.coherence in ("conflict", "stale", "uncertain", "unknown"):
+        if line.coherence in _PITH_ALERT_COHERENCE:
             alert_states.append(line.coherence)
             warnings.append(f"{line.coherence}_material")
 
@@ -5694,17 +5730,35 @@ def cc_deposit_pith_failure(exc: BaseException, tract_path: Optional[str] = None
                                 "cc_gateway", [tract_path or cc_gateway_tract_path()])
 
 
+def _cc_pin_guard_failed(node_id: Any, exc: BaseException) -> bool:
+    """The identity-pin guard raised (or is missing): FAIL CLOSED -- the item is PINNED.
+
+    Identity fails toward KEEPING content (#92 "nothing protected dies"; Duck Ethics): a broken
+    guard must never make an identity item budget-droppable.  Loud, not silent: a WARNING naming
+    the node id and the exception TYPE only (never node text), the id first-time-seen (bounded,
+    flood-safe -- the same tracker as the drop lines).  Returns True."""
+    shown, _already, _more = _pith_note_ids(["pin|%s" % (node_id,)])   # a LIST: a bare str iterates chars
+    if shown:
+        logger.warning("Pith identity-pin guard failed for node %s (%s); treated as PINNED "
+                       "(fail closed: identity keeps its content, outside the budget)",
+                       node_id, type(exc).__name__)
+    return True
+
+
 def _cc_pin_probe(ng: Any) -> Any:
     """The identity-pin test used by Stage 3 AND the un-Pithed renderer (turn 5 / le-022 N1):
-    `ng.graph._is_identity_protected(node_id)`.  Fail-soft to NOT pinned so ONE node's bad pin
-    lookup cannot sink the whole pass; the failure is logged so a vanished/erroring
-    constitutional-pin guard surfaces rather than going silent."""
+    `ng.graph._is_identity_protected(node_id)`.
+
+    Turn 6 (le-025 C-5, Chief ruling): the guard FAILS CLOSED.  When it raises, or does not exist
+    (no `.graph`, no `_is_identity_protected`), the item is treated as PINNED and a WARNING is
+    logged (_cc_pin_guard_failed) -- base failed soft to NOT pinned at DEBUG, which let a vanished
+    guard make identity items budget-droppable.  The guarded call itself is unchanged from base
+    (a test compares it with e4ebf982's closure)."""
     def _pinned(node_id):
         try:
             return bool(ng.graph._is_identity_protected(node_id))
         except Exception as exc:
-            logger.debug('Pith pin lookup failed for %r (treating as unpinned): %s', node_id, exc)
-            return False
+            return _cc_pin_guard_failed(node_id, exc)
     return _pinned
 
 
