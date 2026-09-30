@@ -1562,7 +1562,8 @@ def _streamed(path: str, what: str):
     malformed or trailing-garbage file is a STOP - never a silently smaller result (LAW 7, raw means complete)."""
     size = os.path.getsize(path)
     with open(path, "rb") as f:
-        up = _mp().Unpacker(f, raw=False, strict_map_key=False, max_buffer_size=size + 1, read_size=1 << 20)
+        up = _mp().Unpacker(f, raw=False, strict_map_key=False, max_buffer_size=size + 1,
+                             read_size=min(1 << 20, size + 1))
         try:
             yield up
             if up.tell() != size:
