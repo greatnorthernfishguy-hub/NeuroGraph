@@ -19,6 +19,18 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane want-hub-engine-d-build-20260930, dispatch #12011) — want-hub (d) ENGINE FOLD: two error-path hardenings
+# (PROTECTED CHANGE; the SAME (d) change as the entry below, per le-036 C2/C3 + checker-029; Josh's go recorded in
+#  a434525cd3cdf68da5f282aa319a2323715d3938 [Exec Packet 440] still governs; branch build, synthetic graphs only, nothing merged or armed)
+# What: only _prune_synapses' validation and its order_key sort change. (C2) In competing mode every order_key entry must be a TUPLE of numbers/strings and
+#       all entries must have the SAME shape (same length, same number-or-string kind at each position); otherwise ValueError BEFORE the loop — so an
+#       uncomparable key can no longer raise TypeError from the sort AFTER every competitor's low_weight_steps has moved. (C3) order_key on the DEFAULT path
+#       (competing_ids None) is refused outright with ValueError before anything is touched; it had no caller, and accepting it could only fail late
+#       (missing entry) after the predicates had already advanced counters. The default-path behaviour with all parameters None is unchanged.
+# Why: plan-005 §4.2(d) "a refusal mutates nothing" (LAW 4: at the source, in the function, not in the orchestrator); le-036 N3-1 / C2 / C3.
+# How: competing-mode validation loop reads each order_key entry once (try/except KeyError -> ValueError), checks tuple + element kinds + one common shape;
+#       the post-loop sort no longer needs its KeyError guard (coverage is proven before the loop). Cost: one isinstance pass over the entries in the
+#       once-per-dream-cycle orchestrator path; zero on the default path. No config key, no DEFAULT_CONFIG change, nothing else in the file.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane want-hub-engine-d-build-20260930, dispatch #11877) — want-hub (d) ENGINE CHANGE
 # (PROTECTED CHANGE; Josh's go recorded in a434525cd3cdf68da5f282aa319a2323715d3938 [Exec Packet 440]; branch build, synthetic graphs only,
 #  no live checkpoint operation, no merge, nothing armed)
@@ -3545,8 +3557,10 @@ class Graph:
                 constitutional node.
             max_removals: at most this many of the function's own eligible list are removed
                 (int >= 1). REQUIRED in competing mode.
-            order_key: mapping synapse_id -> sortable; the eligible list is sorted by it
-                BEFORE truncation. REQUIRED in competing mode, with an entry for every id.
+            order_key: mapping synapse_id -> tuple of numbers/strings; the eligible list is sorted by it
+                BEFORE truncation. COMPETING MODE ONLY: REQUIRED there, with an entry for every id, every
+                entry a tuple and all entries of one shape (same length, same number-or-string kind per
+                position) so the sort can never raise; REFUSED (ValueError) on the default path.
             report: dict; filled with report['eligible'] (count before truncation) and
                 report['removed_ids'] (list, removal order).
         """
@@ -3563,6 +3577,10 @@ class Graph:
             raise ValueError("_prune_synapses: max_removals must be an int >= 1 (got %r)" % (max_removals,))
         if report is not None and not isinstance(report, dict):
             raise ValueError("_prune_synapses: report must be a dict or None (got %s)" % type(report).__name__)
+        if not competing_mode and order_key is not None:
+            # No caller uses this, and it could only fail LATE (an entry missing for an eligible id) after the predicates
+            # below had already advanced low_weight_steps: refuse it up front so a refusal mutates nothing.
+            raise ValueError("_prune_synapses: order_key is only valid in competing mode (competing_ids/excluded_ids)")
         if competing_mode:
             if max_removals is None:
                 raise ValueError("_prune_synapses: max_removals is required in competing mode")
@@ -3573,6 +3591,7 @@ class Graph:
             except TypeError as exc:
                 raise ValueError("_prune_synapses: competing_ids must be comparable synapse ids (%s)" % exc) from exc
             excluded = set(excluded_ids)
+            key_kinds = None     # the ONE shape every order_key entry must have (kind per position: 1 number, 2 string)
             for sid in competing:
                 if sid in excluded:
                     raise ValueError("_prune_synapses: competing synapse %r is also excluded" % (sid,))
@@ -3585,8 +3604,20 @@ class Graph:
                         raise ValueError("_prune_synapses: competing synapse %r has a missing endpoint node %r" % (sid, nid))
                     if (node.metadata or {}).get("constitutional"):
                         raise ValueError("_prune_synapses: competing synapse %r touches constitutional node %r" % (sid, nid))
-                if sid not in order_key:
-                    raise ValueError("_prune_synapses: order_key has no entry for competing synapse %r" % (sid,))
+                try:
+                    okey = order_key[sid]
+                except KeyError:
+                    raise ValueError("_prune_synapses: order_key has no entry for competing synapse %r" % (sid,)) from None
+                if not isinstance(okey, tuple):
+                    raise ValueError("_prune_synapses: order_key entry for %r must be a tuple (got %s)" % (sid, type(okey).__name__))
+                kinds = tuple(1 if isinstance(x, (int, float)) else 2 if isinstance(x, str) else 0 for x in okey)
+                if 0 in kinds:
+                    raise ValueError("_prune_synapses: order_key entry for %r may hold only numbers and strings" % (sid,))
+                if key_kinds is None:
+                    key_kinds = kinds
+                elif kinds != key_kinds:
+                    raise ValueError("_prune_synapses: order_key entries are not mutually comparable "
+                                     "(%r has element kinds %r, expected %r)" % (sid, kinds, key_kinds))
 
         if competing_mode:
             candidates = ((sid, self.synapses[sid]) for sid in competing)
@@ -3628,10 +3659,8 @@ class Graph:
         if report is not None:
             report["eligible"] = len(to_prune)
         if order_key is not None:
-            try:
-                to_prune.sort(key=lambda s: order_key[s])
-            except KeyError as exc:
-                raise ValueError("_prune_synapses: order_key has no entry for synapse %r" % (exc.args[0],)) from None
+            # competing mode only (refused otherwise above); coverage and sortability were proven BEFORE the loop
+            to_prune.sort(key=lambda s: order_key[s])
         if max_removals is not None:
             to_prune = to_prune[:max_removals]
 
