@@ -123,7 +123,11 @@ class TestSylsLawHook:
         return r.returncode, r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
 
     def _run_raw(self, hook, stdin_bytes, env=None):
-        e = env or self._env()
+        e = {"HOME": self._fake_home, "USER": os.environ.get("USER", ""),
+             "SHELL": os.environ.get("SHELL", "/usr/bin/bash"),
+             "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if env:
+            e.update(env)
         r = subprocess.run([hook], input=stdin_bytes, capture_output=True, timeout=15, start_new_session=True, env=e)
         return r.returncode, r.stderr.decode(errors="replace"), r.stdout.decode(errors="replace")
 
@@ -606,21 +610,25 @@ class TestSylsLawHook:
     # ══════════════════════════════════════════════════════════════════
 
     def test_git_hang_exit2(self):
-        e = self._env_stub_git_hanging()
+        e_stub = self._env_stub_git_hanging()
+        e = self._env(); e.update(e_stub)
         r = subprocess.run([NEW_HOOK], input=b'{"tool_input":{"file_path":"/x"}}', capture_output=True, timeout=20, start_new_session=True, env=e)
         assert r.returncode == 2
 
     def test_git_exit1_exit2(self):
-        e = self._env_stub_git_exit1()
+        e_stub = self._env_stub_git_exit1()
+        e = self._env(); e.update(e_stub)
         r = subprocess.run([NEW_HOOK], input=b'{"tool_input":{"file_path":"/x"}}', capture_output=True, timeout=15, start_new_session=True, env=e)
         assert r.returncode == 2
 
     def test_locale_stub_git_receives_LC_ALL_C(self):
         e = self._env_stub_git_records_lc_all()
         record_path = e.pop("RECORD")
+        # Merge with base env so bash/git stub can run
+        e2 = self._env(); e2.update(e)
         path = os.path.join(self._ng_dir, "neuro_foundation.py")
-        r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=e)
-        assert r.returncode != 0  # protected file fires
+        r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=e2)
+        assert r.returncode != 0
         try:
             with open(record_path, "r") as f:
                 val = f.read().strip()
