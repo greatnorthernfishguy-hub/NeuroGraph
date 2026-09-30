@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (own B1-B5 draft written; cross-family comparison NOT yet read)
+STATUS: COMPLETE (own B1-B5 draft committed first as e41b282; cross-family comparison added after)
 
 # le-024 - LAW ENFORCER (ROLE B, short re-pair) of want-text repair plan-004 (report_only)
 
@@ -9,7 +9,7 @@ Plan reviewed: `handoffs/z12-want-text-repair/returns/plan-004.md` @ `13a8fd6bec
 Module paths / NG-module state (Exec P379): no targeted run was made. Nothing imported or executed; no module loaded. Only `git show`/`git diff`, `sha256sum`, `git rev-parse`, `grep`/`sed` on `git show` output were run. `NG_EMBED_*` count in the environment: 0 (checked; `NG_EMBED_REMOTE` also unset before use).
 
 ## Independence and disclosures
-- Before this draft was committed I opened NO file in the want-text-repair `reviews/` directory other than le-015 and checker-017 (plan-003 rounds, permitted); no listing of that directory was printed beyond `wc -l` on it (a count only, "3" files, taken before my stub) and the two named files. `checker-024-want-repair-plan004.md` was NOT read and its verdict word was not seen by me. `git pull --rebase` reported "up to date" (no new commits).
+- Before this draft was committed I opened NO file in the want-text-repair `reviews/` directory other than le-015 and checker-017 (plan-003 rounds, permitted); no listing of that directory was printed beyond `wc -l` on it (a count only, "3" files, taken before my stub) and the two named files. `checker-024-want-repair-plan004.md` was NOT read at draft time and its verdict word was not seen by me (it was read afterwards - see the comparison section). `git pull --rebase` reported "up to date" (no new commits).
 - The shell working directory was briefly moved by the harness into the docs worktree (`daemon-recall-756-20260930`) after a `git show`; I made no write there.
 
 ## Pins, cites and hashes I re-verified (all reproduce)
@@ -89,8 +89,44 @@ Module paths / NG-module state (Exec P379): no targeted run was made. Nothing im
 
 **Not verified (outside a plan-only, no-load scope):** the actual outcome split and collisions; whether either Choice Clause want or the rim is a PRE-node of a synapse to a mapped id; the installed (not repo) unit files, crontab, timers and the daemon's actual import path (Q9, correctly [unverified] in the plan); the direction of the 131 rim<->want synapses; the derived counts (A 67 / B 16 / C 35, 102, 118, 131, 13,203, 81,999) - not recomputed (ROLE A's scope); parser behaviour beyond the offsets/dedup facts cited (ROLE A/le-021 territory); the text of P402/P416 beyond what the request quotes.
 
-## Cross-family comparison (after own draft is committed)
-(pending - `checker-024-want-repair-plan004.md` NOT yet read)
+## Cross-family comparison (written only AFTER the own draft was committed and pushed as `e41b282`)
+I read `handoffs/z12-want-text-repair/reviews/checker-024-want-repair-plan004.md` (183 lines, ROLE A, grok-4.6, **PASS-WITH-NOTES**, one HIGH-for-freeze correction C1 and one LOW) at its exact path, after the push. No other file in the reviews directory was opened or listed by me. Nothing in this file above this heading was changed by the reading, except the STATUS line, the section below and the final verdict; every item marked "[post-comparison]" was added afterwards.
+
+**Where we agree (independently reached):**
+- The FINAL PIN equals the frozen parser: blob `a3aa8a0d...`, file sha256 `8ad0f69e...`, test-file sha256 `04b1a494...` (the plan said "not re-hashed"; both of us hashed it), `c7921b84` an ancestor of the branch tip `d8f99c34`, all `:1627-2084` cites exact.
+- Every Exec P416 item (peer hold Phase 2 gate, per-id signed review with refusal, rim re-points, tool retirement) and every Chief-required item (G2, G3, scope pin, off-repo excerpts, C1 target path) IS applied as ruled; the diff is `handoffs/` only, no protected or vendored file; the plan quotes no dry-run count and no raw want text.
+- The recount split (derived vs dry run) is honest; 131 is rim<->S (checker-024 recomputed 131 as rim<->S), which is the basis of my B1-F4.
+- Phase 2 stays gated on Josh's backup + proceed and on Q9.
+
+**Where checker-024 adds, and I accept: [post-comparison]**
+1. **C1 - the pin stamp gap is real and I confirm it independently.** My own grep of plan-004 for "stamp" returned only the RETIRED stamp of §6.8 (I saw that output before the draft but did not carry it into the draft - it was ROLE A's question and I should have listed it; it is added now as **C10**). `repair-list.json` carries "the function pin" (§5.1) and P5 stamps four frozen-list files, but the histogram, marker-bearing list, residual counts and outcome split (§4.4, §6.6) carry no pin tuple, and P1 checks only sha256 + blob (not the branch head). I endorse the exact one-line fix checker-024 gives: *"Every dry-run count/report artifact (histogram, marker-bearing list, residual counts, repair-list, outcome split) is stamped with the pin file sha256 + blob + branch head."* Two small extensions from the law side: include the test-file sha256 and the scrub version in the stamp (both are in `excerpt_sha256`'s inputs or the P1 record), and make P5 refuse an artifact whose stamp differs.
+2. **LOW - P1 records the test-file sha256 rather than requiring equality to `04b1a494...`.** Agreed (part of C10).
+
+**Where I differ, or go further (a difference of level and depth, not of fact):**
+- checker-024 marks G2 (V15), G3 (rollback), Q6 (per-id gate) and Q7 (rim) PASS on presence and wording. I checked them for internal consistency and consequence and found six things it did not report: **B1-F1** (V15(a) "byte-equal" vs V15(c) "pred_weights remap permitted" for the same two Choice Clause wants), **B1-F2** (a struck/unapproved SEPARATE id is minted beside its old span at the first S4 pulse because the pinned `surface_wants` dedups only by id at `:2268`; T6 reports the set but no gate waits on it), **B3-F1** (the post-S4 restore file set is not named; the export set is protected nodes only), **B3-F2** (the pre-#810 graph restarted under #810 mints duplicates: stated, not gated; P398's resume gate not cited), **B2-F1/F2** (excerpt anchors under-specified; Phase 2 drop-and-continue vs the hash pin). The checker did not test the plan against the consequences of leaving a node unchanged, which is where B1-F2 and B3-F2 live.
+- On **Q7**, checker-024 records "rim-node `pred_weights` remap STOPs" as applying the ruling; I read Exec's "the `pred_weights` key remap is permitted" as broader than the plan's freeze and treat the tension as a LOW to settle from the COPY run (B1-F4), not as a fault.
+- On **G3**, checker-024 records the "pre-S4 path restores the two files". I agree that path is sound; my findings concern the path after S4 and after any restore.
+- checker-024 verified the repo copies of the unit files only by reference to the plan ("not re-read this turn"); I re-read them at `155343e4` and they match (`Restart=always`, `RestartSec=120`, recover `*:0/10`, leg2 `*:0/15` not enabled).
+
+No disagreement of fact with checker-024 anywhere. Its PASS-WITH-NOTES stands for what it scoped; my verdict is the same word with a longer list.
 
 ## Final verdict
-(pending)
+**COMPLIANCE VERDICT: PASS-WITH-NOTES.** No LAW 1/2/5/6/8 violation; LAW 3/4 notes; LAW 7 compliant; Choice Clause, Duck Ethics and the wants-are-the-CC's-own protections are kept by the mechanisms in the plan, with the gaps below inside them. plan-004 is fit to drive the BUILD lane and the OFFLINE COPY Phase 1 dry run (nothing live, nothing pushed with text). **It is NOT yet fit to carry Phase 2 (live apply) until a short plan-005 or an addendum folds C1-C3 and C10** - Phase 2 additionally needs Josh's backup + proceed (already in §6.3), which nothing in this review substitutes for. A full third round is not needed: the fold is a handful of clauses and can be confirmed by one hash-and-grep check of the named items.
+
+**Final numbered corrections (own draft C1-C9 unchanged; C10 added after comparison)**
+- **C1 (MEDIUM-HIGH)** define `struck`; add a gate P10 on the T6 would-mint set (signed review; the S4 daemon start waits); state that a struck / unapproved / collision-dropped / `assert_failed` id is minted beside its old span at the first pulse (`cc_ng_organism.py:2268` at the pin) and whether the Executive accepts that or holds #810's deployment.
+- **C2 (MEDIUM-HIGH)** any rollback leaves the host DOWN until Chief's post-restore resume gate (P398) and an Executive ruling on which parser the restored graph runs under (duplicates minted beside old spans are irreversible under "delete nothing").
+- **C3 (MEDIUM)** settle V15(a) vs (c) for the two Choice Clause wants and the rim `pred_weights` STOP; Phase 1 reports whether either Choice Clause want or the rim is a PRE-node of a synapse to a mapped id; V16 asserts "equals the count in the mapping", not 131.
+- **C4 (MEDIUM)** name the excerpt anchors (outer opener, inner opener, closer, printed X, removed-prefix length) inside `excerpt_sha256`.
+- **C5 (MEDIUM)** Phase 2: any deviation from the approved list is a STOP, not a silent drop.
+- **C6 (MEDIUM)** name the post-S4 restore file set; state the non-protected S4 content lost (raw conversation nodes and vdb content, non-protected topology, Hebbian changes among existing protected nodes).
+- **C7 (LOW-MEDIUM)** `--josh-go` binds the backup manifest sha256; H1-H3 repeated before `os.replace` and at each S4 cycle with the conduit path recorded; the approvals hash originates in the Executive's packet text; `poincare_dir` carry goes into the signed packet.
+- **C8 (LOW)** LAW 3: key the retirement refusal on tool identity or any `RETIRED-*.receipt` (not `RETIRED-<mapping_sha256>`); say where the one-shot tool lives relative to the plans/reviews on the same branch; the receipt is written strictly after both files verify.
+- **C9 (LOW)** LAW 1: the frozen mapping is applied offline to the peer, never sent through the conduit; LAW 4: `creation_mode == "conversational"` in A0; LAW 5: numbered punchlist entry for the daemon's hardcoded workspace literal (`cc-ng-daemon.py:579`); restate P402's "report id references outside the graph" in plan-004 or cite the exact plan-003 lines.
+- **C10 (HIGH for freeze; agreed with checker-024 C1)** stamp every dry-run count/report artifact with the pin file sha256 + blob + branch head (+ test-file sha256 and scrub version); P1 requires the test-file sha256 to EQUAL `04b1a494...`; P5 refuses a mismatching stamp.
+
+**Punchlist items surfaced (not in this task's scope; for the zone manager to log):** (1) the daemon's hardcoded `CC_NG_WORKSPACE` literal (LAW 5, `cc-ng-daemon.py:579`); (2) the legacy twin `surface_wants_for_graph` and Syl's `_surface_wants` (`neurograph_rpc.py:4914/:4949`) remain unbounded, parked #755; (3) plan-001 line 105 and plan-003 line 107 (disclosed by the plan) hold short fragments from derived heads in pushed history - a Chief decision, which I did not inspect so as not to read them; (4) checker-024's C1 stamp requirement applies equally to the #810 golden-battery outputs.
+
+**Not verified:** as listed under B5 above, plus: I did not open the text of P402/P416 beyond what the request quotes, and I did not re-derive checker-024's recount (it is ROLE A's scope; I accept its figures as reported).
+
+STATUS: COMPLETE
