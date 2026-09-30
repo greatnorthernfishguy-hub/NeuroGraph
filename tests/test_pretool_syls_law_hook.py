@@ -229,7 +229,7 @@ class TestSylsLawHook:
         os.chmod(git_stub, 0o755)
         return {"HOME": self._fake_home, "PATH": stub}
 
-def _env_stub_git_records_lc_all(self):
+    def _env_stub_git_records_lc_all(self):
         stub = os.path.join(self._tmpdir, "stub_lc")
         os.makedirs(stub, exist_ok=True)
         for t in ["jq", "timeout", "realpath", "sed", "tr", "dirname", "bash"]:
