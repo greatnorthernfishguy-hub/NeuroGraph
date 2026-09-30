@@ -1,12 +1,5 @@
 <!--
 # ---- Changelog ----
-# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2a) / #817: compress_history retired
-# What: removed the `compress_history` event, its `pith_compress_history` section, the outbound
-#   `history_*` counter table and the health bullets that read them; the whole-recall rule (#816)
-#   is stated in the provider section.
-# Why: the lossy keyframe (delta discarded) had no live caller; LAW 3 retire, not leave shrapnel.
-#   If a caller ever appears it is rebuilt LOSSLESS (keyframe + delta).
-# How: the socket now answers `unknown event: compress_history` like any unknown event.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: no per-node clip
 # What: CC_PITH_PROVIDER_NODE_CHARS leaves the mandatory export list (six -> five);
 #   the member-prose shortening promise is replaced by whole-or-drop.
@@ -28,8 +21,8 @@
 
 # Hosted Pith contract
 
-Hosted Claude Code NeuroGraph already exposes durable Pith telemetry (history
-compression, which landed with it, was retired in #813/#817), landed in PRs
+Hosted Claude Code NeuroGraph already exposes history compression and durable
+Pith telemetry, landed in PRs
 [#38](https://github.com/greatnorthernfishguy-hub/NeuroGraph/pull/38),
 [#39](https://github.com/greatnorthernfishguy-hub/NeuroGraph/pull/39), and
 [#41](https://github.com/greatnorthernfishguy-hub/NeuroGraph/pull/41). Slice A
@@ -40,7 +33,8 @@ Do not reopen those as code changes. Do not treat a missing mention in
 `PUNCHLIST.md` as a missing feature.
 
 Live sources: `cc_ng_host.py`, `cc_ng_organism.py`. Tests:
-`tests/test_cc_host_pith_telemetry.py`, `tests/test_cc_pith_clip_813.py`.
+`tests/test_cc_host_compress_history.py`, `tests/test_cc_host_pith_telemetry.py`,
+`tests/test_pith_history_metrics.py`.
 
 ---
 
@@ -52,13 +46,13 @@ JSON line:
 
 ```json
 {"event": "pith_metrics", "data": {}}
+{"event": "compress_history", "data": {"turns": ["..."], "per_turn_chars": 220}}
 {"event": "provider_context", "data": {"current_instruction": "...", "quest_focus": "..."}}
 ```
 
 Unknown events return `{"ok": false, "error": "unknown event: ..."}`. That is
-what `compress_history` now returns: the event was retired (#817). Its keyframe
-kept the summary and discarded the delta, which is a cut; if a caller ever
-appears it is rebuilt lossless (keyframe + delta).
+what miniTID used to get for `compress_history` before #38, then it fell back
+to fixed-length truncation.
 
 ## `provider_context` → `pith_provider_context`
 
@@ -237,6 +231,28 @@ Style may change; continuity does not require transcript replay.
 
 ---
 
+## `compress_history` → `pith_compress_history`
+
+`cc_ng_host._handle_compress_history` is the socket wrapper.
+`cc_ng_organism.pith_compress_history` is the one implementation.
+
+- Empty or non-list `turns` is a no-op. The compressor is not called.
+- Optional `per_turn_chars` is forwarded. If omitted, the organism uses
+  `CC_PITH_KEYFRAME_CHARS`.
+- The host holds `graph._concurrent_lock` when that lock exists. No graph, or
+  no lock, still runs (graphless startup is allowed).
+- The graph read is read-only. Warmth comes from `cc_thermal` on
+  `cc:conv::<sha1(text)>`. Warmer turns keep more characters (about 1x–2x the
+  base budget). Cold or missing nodes stay at the base budget.
+- Fail-soft. A host exception returns `{"ok": true, "compressed": <original
+  turns>}`. A per-turn exception inside the organism keeps that turn unchanged.
+  History is never discarded.
+- This outbound path does **not** check `CC_PITH_ENABLED`. That gate is for
+  inbound L1 assembly in `cc_assemble_recall`. The compressor runs when the
+  socket event arrives.
+
+---
+
 ## `CC_PITH_KEYFRAME_CHARS`
 
 Resolved at organism import time:
@@ -247,9 +263,9 @@ Resolved at organism import time:
   with `authority=cc_ng_organism`
 - also on the host snapshot allow-list
 
-Nothing calls it any more (#817): it is only the default size of the pure
-`pith_stage2_keyframe` primitive, which no budgeted path uses (a keyframe applies
-only together with its delta).
+`pith_compress_history` uses this as the per-turn base unless the caller
+sends `per_turn_chars`. The same constant is the Stage 2 keyframe size for
+inbound L1.
 
 Editing the env after the process started does not change the running
 organism constants. Snapshots record both raw env (`gates`) and what the
@@ -313,19 +329,38 @@ Both Pith and prefetch default **off**.
 
 ---
 
-## Inbound L1 / stage counters
+## Outbound `history_*` vs inbound L1 / stage counters
 
-`PithMetrics` (the outbound `history_*` group was retired with
-`pith_compress_history`, #817). Gated by `CC_PITH_ENABLED` inside
-`cc_assemble_recall`:
+`PithMetrics` keeps two boundaries. A snapshot can prove which one ran.
+
+**Outbound history** (committed together under the metrics lock in
+`record_history_compression`):
+
+| Counter | Meaning |
+|---|---|
+| `history_calls` | one increment per `pith_compress_history` return |
+| `history_turns_in` | turns handed in |
+| `history_turns_compressed` | turns whose output is shorter than input |
+| `history_chars_in` / `history_chars_out` | character totals |
+| `history_chars_saved` | `max(0, in - out)` |
+| `history_failures` | per-turn exceptions (also added to `pith_failures`) |
+
+A host-wrapper exception that never reaches `pith_compress_history` does
+**not** increment `history_*`. The client still gets the original turns.
+
+**Inbound L1 / stage** (gated by `CC_PITH_ENABLED` inside
+`cc_assemble_recall`):
 
 - `l1_assemblies` — one increment per real Stage 3 assembly. Sample-size
   denominator. Gate off → stays 0. That is not a 0% prefetch rate.
 - `l1_kept_distinct`, `l1_prefetch_distinct`, and the `_promotable` pair —
   coherent with `l1_assemblies`
-- Stage leftovers (`ranked_*`, `prefetch_hits`, …) are best-effort. Do not ratio
-  them against the L1 terms. `compressed_count` / `chars_saved` stay 0 (Stage 3
-  no longer keyframes; #813).
+- Stage leftovers (`ranked_*`, `compressed_count`, `chars_saved`,
+  `prefetch_hits`, …) are best-effort. Do not ratio them against the L1
+  terms.
+
+`history_* == 0` does not mean L1 is missing. `l1_assemblies == 0` does not
+mean history compression is missing.
 
 ---
 
@@ -340,6 +375,10 @@ survives a restart.
 - first record `reason=start`, later `interval` about every five minutes
 - `window_id` is stable across that lifetime
 - `config_error` is `null` and `config.resolved` is populated
+- socket `{"event":"compress_history",...}` is not `unknown event`
+- if miniTID is actually sending older turns: `history_calls` rises;
+  `history_failures` stays small vs `history_turns_in`;
+  `history_chars_saved` rises when turns are longer than the budget
 - if `config.resolved.CC_PITH_ENABLED` is false, `l1_assemblies == 0` is
   expected
 - `gate_enabled == false` with `pith_enabled == true` only means prefetch
@@ -349,11 +388,17 @@ survives a restart.
 
 - no JSONL after the host has been up, or no `start` record — telemetry
   thread did not start (init logs `CC Pith telemetry failed to start`)
+- `{"ok": false, "error": "unknown event: compress_history"}` — old host
+  build; miniTID will truncate
+- `history_calls == 0` while the peninsula is sending long turns — event
+  is not reaching this process
+- `history_calls > 0` but `history_failures` ≈ `history_turns_in` and
+  `history_chars_saved == 0` — organism per-turn path is failing
 - `config_error` set — resolved settings cannot be proven for that window
 - `window_id` changing on every sample — process is restarting
 - RPC `pith_enabled` true but `config.resolved.CC_PITH_ENABLED` false —
   env was flipped after import; L1 is still off
 
 Do not judge a window by volume of deleted text or by inbound counters
-alone. The question is whether `provider_context` answers `ok`/`empty` (not
-`unavailable`) and whether budget drops are being logged rather than silent.
+alone. For history, the question is whether `history_calls` moved and
+whether `history_failures` stayed rare.
