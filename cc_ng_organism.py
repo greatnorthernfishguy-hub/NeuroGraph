@@ -4,6 +4,21 @@
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
+#   TURN 5 (dispatch #11114) -- le-022 N1/N2/N3 + LOWs (Chief ruling docs 3604cfb1)
+# What: (N1) _cc_render_unpithed exempts identity-protected items from the budget EXACTLY as
+#   Stage 3 does (one shared test, _cc_pin_probe): rendered whole, never ranked/dropped/swapped for
+#   a reference, never lost to the strict-prefix stop; ordinary items behave as before (golden
+#   unchanged). Pins are NOT folded into THE ONE rule (C4 stays the Exec's open note).
+#   (N2) _pith_whole_node_reference no longer promises "so its concepts follow": nothing is said
+#   for a 0-tree node; "K of N concept trees follow" when the L1/un-Pithed path knows; "where they
+#   fit" on the provider path; a hedge that trees may cover only part of it. (LOW) the constants
+#   800/200 are gone: _pith_provider_node_limit MEASURES the renderer's own worst-case shell and
+#   minimum line overhead. (T1) pointer comments: _cc_monitor_items_whole / _format_cc_monitor_block
+#   are an INTERIM fork that the #812 source fix deletes.
+# Why: le-022 (law enforcer, final diff): N1 was an identity-continuity regression on the DEFAULT
+#   (gate-off) path -- an identity-protected item was budget-droppable there.
+# How: cc_ng_host.py, surfacing.py, surface_resolver.py untouched.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
 #   TURN 4 (dispatch #11061) -- checker-022 C1/C2/C3 (Chief ruling docs 2a3b5fbf)
 # What: (C1) pith_stage3's docstring step 5 now describes what the body does: an over-budget
 #   line, even the first, is skipped whole-or-absent with the INFO drop line (D8 CONFIRMED: the
@@ -4608,10 +4623,25 @@ def _pith_log_drop(where: str, reason: str, unit: str, entries: Any) -> None:
 # the first 2,000 chars until PASS 2 (the laptop TID) runs; full coverage arrives with PASS 2.
 # ---------------------------------------------------------------------------
 
-# Worst-case section-header / alert overhead (chars) that the provider context reserves besides
-# the constitutional core.  Used only to pick the per-node limit; a node between the true
-# learned budget and this bound is still caught, loudly, as a never-fit assembly at admit.
-_PITH_SHELL_ALLOWANCE = 800
+def _pith_provider_node_limit(core: str, budget: int) -> int:
+    """The per-node character limit above which a node is rendered as a reference (#819).
+
+    MEASURED from the renderer itself (turn 5 / le-022 LOW -- was the constants 800 and 200):
+      * the worst-case section shell = what _pith_provider_sections adds around the core when
+        EVERY section and EVERY alert is present (a candidate line of each alert coherence, one
+        of them a correction), rendered with empty blocks;
+      * the smallest line overhead = _pith_render_connected_line of an EMPTY line (heading,
+        root label, the default source).
+    limit = budget - len(core) - shell - line overhead, floored at 1.  It is deliberately the
+    conservative (worst-case shell) direction; a node between this and the true learned budget is
+    still caught, loudly and by id, as a never-fit assembly at admit."""
+    probes = [CacheLine(node_id="", content="", coherence=c, stream="connected",
+                        relations=([{"from": "", "to": "", "kind": "failure -> correction",
+                                     "content": ""}] if i == 0 else []))
+              for i, c in enumerate(("conflict", "stale", "uncertain", "unknown"))]
+    shell = len(_pith_provider_sections(core, probes, [""] * len(probes))[0]) - len(core)
+    line = len(_pith_render_connected_line(CacheLine(node_id="", content="", sources=["substrate topology"])))
+    return max(1, budget - len(core) - shell - line)
 
 
 def _pith_tree_nodes(graph: Any, node_id: str, limit: Optional[int] = None) -> List[tuple]:
@@ -4629,9 +4659,18 @@ def _pith_tree_nodes(graph: Any, node_id: str, limit: Optional[int] = None) -> L
     return out if limit is None else out[:limit]
 
 
-def _pith_whole_node_reference(graph: Any, node_id: str, node: Any, text: str) -> str:
+def _pith_whole_node_reference(graph: Any, node_id: str, node: Any, text: str,
+                               shown: Optional[int] = None) -> str:
     """The ONE-LINE reference to a node too large to render whole here: id, size, date, tree
-    count.  It says the whole exists and where; it shows none of it."""
+    count.  It says the whole exists and where; it shows none of it.
+
+    The trailing clause is TRUE, not a promise (turn 5 / le-022 N2): nothing about "concepts
+    following" is said for a node with no concept trees; when the caller knows how many trees it
+    will place (`shown`) the line says exactly that ("K of N concept trees follow"); when it does
+    not (the provider path: the trees arrive as the basin's ordinary relations, subject to the
+    member/depth caps) it says they follow "where they fit".  Concept trees are summaries, so the
+    line also says they may cover only part of the node (for a pre-PASS-2 forest, only its first
+    2,000 chars -- nothing on a node marks PASS 2, so the hedge is unconditional)."""
     size = len(text)
     size_text = ("\u2248%dk" % round(size / 1000.0)) if size >= 10000 else ("\u2248%d" % size)
     stamp = getattr(node, "creation_time", None)
@@ -4639,9 +4678,19 @@ def _pith_whole_node_reference(graph: Any, node_id: str, node: Any, text: str) -
             if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and stamp > 0
             else "undated")
     trees = len(_pith_tree_nodes(graph, node_id))
-    return ("A long node (id %s; %s chars; %s; %d concept tree%s) is related to this cue; it is "
-            "too large to render whole here, so its concepts follow."
+    line = ("A long node (id %s; %s chars; %s; %d concept tree%s) is related to this cue; it is "
+            "too large to render whole here."
             % (node_id, size_text, date, trees, "" if trees == 1 else "s"))
+    if trees == 0:
+        return line
+    if shown is None:
+        return line + " Its concept trees follow where they fit; they may cover only part of it."
+    if shown <= 0:
+        return line + " None of its concept trees fit here."
+    if shown >= trees:
+        return line + (" %d concept tree%s follow%s; they may cover only part of it."
+                       % (trees, "" if trees == 1 else "s", "s" if trees == 1 else ""))
+    return line + " %d of %d concept trees follow; they may cover only part of it." % (shown, trees)
 
 
 def _pith_log_reference(where: str, entries: Any, limit: int) -> None:
@@ -4667,26 +4716,32 @@ def _pith_reference_text(graph: Any, node_id: str, text: str, budget: int) -> Op
     node = graph.nodes.get(node_id) if (graph is not None and node_id) else None
     if node is None:
         return None
-    reference = _pith_whole_node_reference(graph, node_id, node, text)
-    if len(reference) > budget:
-        return None
-    parts, used = [reference], len(reference)
     trees = _pith_tree_nodes(graph, node_id)
+    candidates = trees[:_CC_PITH_PROVIDER_MEMBERS]
+
+    def build(k: int) -> str:
+        reference = _pith_whole_node_reference(graph, node_id, node, text, shown=k)
+        return "\n".join([reference] + ["- concept: " + t for _tid, t in candidates[:k]])
+
+    if len(build(0)) > budget:
+        return None
     included = 0
-    for _tid, tree_text in trees[:_CC_PITH_PROVIDER_MEMBERS]:
+    used = len(build(0))
+    for _tid, tree_text in candidates:
         piece = "- concept: " + tree_text
         if used + 1 + len(piece) > budget:
             break
-        parts.append(piece)
         used += 1 + len(piece)
         included += 1
+    while included > 0 and len(build(included)) > budget:      # the "K of N" wording is a few chars longer
+        included -= 1
     if included < len(trees):
         # Turn 4 / checker-022 C3: the node swap is loud, so the trees it could not carry are too
         # (whether the budget or the CC_PITH_PROVIDER_MEMBERS cap stopped them).  Counts only.
         logger.info("pith reference form: node %s shows %d of %d concept trees whole; %d left out "
                     "(budget %d chars, tree cap %d)", node_id, included, len(trees),
                     len(trees) - included, budget, _CC_PITH_PROVIDER_MEMBERS)
-    return "\n".join(parts)
+    return build(included)
 
 
 def _pith_reference_lines(graph: Any, lines: List[CacheLine], budget: int) -> List[CacheLine]:
@@ -4707,12 +4762,13 @@ def _pith_reference_lines(graph: Any, lines: List[CacheLine], budget: int) -> Li
 
 
 def _pith_reference_items(graph: Any, items: List[Dict[str, Any]], budget: int,
-                          swapped: List[tuple]) -> List[Dict[str, Any]]:
-    """Un-Pithed input: the same swap for recall dicts (copies; `swapped` collects entries)."""
+                          swapped: List[tuple], pinned: Any = None) -> List[Dict[str, Any]]:
+    """Un-Pithed input: the same swap for recall dicts (copies; `swapped` collects entries).
+    An identity-protected item (`pinned(node_id)`) is never swapped -- identity is indivisible."""
     out: List[Dict[str, Any]] = []
     for item in items:
         content = item.get("content", "") or ""
-        if len(content) > budget:
+        if len(content) > budget and not (pinned is not None and pinned(item.get("node_id"))):
             form = _pith_reference_text(graph, item.get("node_id"), content, budget)
             if form is not None:
                 swapped.append((item.get("node_id"), len(content)))
@@ -5505,7 +5561,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
                 "current instruction and Quest focus" if prior else "Quest focus")
         fresh = pith_connected_activation_basins(
             graph, surfaced, live_rails=live_rails,
-            node_limit=max(200, budget - len(core) - _PITH_SHELL_ALLOWANCE))
+            node_limit=_pith_provider_node_limit(core, budget))
         candidates = fresh
         # Reserve every possible section/alert delimiter before admitting prose.
         # Empty placeholder blocks let the real renderer calculate that fixed
@@ -5629,6 +5685,23 @@ def cc_deposit_pith_failure(exc: BaseException, tract_path: Optional[str] = None
                                 "cc_gateway", [tract_path or cc_gateway_tract_path()])
 
 
+def _cc_pin_probe(ng: Any) -> Any:
+    """The identity-pin test used by Stage 3 AND the un-Pithed renderer (turn 5 / le-022 N1):
+    `ng.graph._is_identity_protected(node_id)`.  Fail-soft to NOT pinned so ONE node's bad pin
+    lookup cannot sink the whole pass; the failure is logged so a vanished/erroring
+    constitutional-pin guard surfaces rather than going silent."""
+    def _pinned(node_id):
+        try:
+            return bool(ng.graph._is_identity_protected(node_id))
+        except Exception as exc:
+            logger.debug('Pith pin lookup failed for %r (treating as unpinned): %s', node_id, exc)
+            return False
+    return _pinned
+
+
+# INTERIM FORK (T1, le-022): _cc_monitor_items_whole + _format_cc_monitor_block below exist only
+# because the producer's cut lives in SHARED surfacing.py / surface_resolver.py (Syl's /assemble,
+# P329). The SOURCE fix -- a whole-content option there (#812, Josh's post-track go) -- DELETES both.
 def _cc_monitor_items_whole(ng: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """#816 CC-ONLY route for the SurfacingMonitor stream.
 
@@ -5674,6 +5747,7 @@ def _cc_monitor_items_whole(ng: Any, items: List[Dict[str, Any]]) -> List[Dict[s
     return out
 
 
+# INTERIM FORK (T1): deleted together with _cc_monitor_items_whole by the #812 source fix.
 def _format_cc_monitor_block(items: List[Dict[str, Any]]) -> str:
     """The CC-side twin of SurfacingMonitor.format_context WITHOUT its 200-char cut.
 
@@ -5703,7 +5777,9 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
     Size is controlled by HOW MANY (#816, Exec P410/P416): items are ranked by the same unified
     rank as Stage 3 and admitted by THE ONE BUDGET RULE against the existing L1 budget
     (cc_l1_budget); the lowest-ranked WHOLE items are dropped and ONE INFO line reports the
-    count and total size.  Short items that all fit render exactly as before."""
+    count and total size.  Short items that all fit render exactly as before.  Identity-
+    protected items (`ng.graph._is_identity_protected`, the same test Stage 3 uses) are outside
+    the budget: rendered whole, never dropped, never swapped for a reference."""
     # Josh 2026-09-26: "When Pith fails, there HAS to be pass-through".  This is the fallback for
     # a failed Pith pass, so it must not depend on the machinery that may have just failed, and
     # it must never raise: if the ranking/budget step itself fails, every item is rendered WHOLE
@@ -5716,8 +5792,9 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
             budget = _CC_PITH_L1_BUDGET
         swapped: List[tuple] = []
         graph = getattr(ng, "graph", None)
-        monitor_items = _pith_reference_items(graph, monitor_items, budget, swapped)
-        pc_results = _pith_reference_items(graph, pc_results, budget, swapped)
+        pinned = _cc_pin_probe(ng)
+        monitor_items = _pith_reference_items(graph, monitor_items, budget, swapped, pinned)
+        pc_results = _pith_reference_items(graph, pc_results, budget, swapped, pinned)
         _pith_log_reference("recall (un-Pithed)", swapped, budget)
         tagged = (
             [(CacheLine(node_id=i.get("node_id") or "", content=i.get("content", "") or "",
@@ -5727,7 +5804,11 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
                           score=float(i.get("score", 0.0) or 0.0), stream="pattern"), i)
                for i in pc_results])
         origin = {id(cl): item for cl, item in tagged}         # line -> its recall item
-        ranked = _pith_unified_rank([cl for cl, _item in tagged])
+        # N1: identity-protected items sit OUTSIDE the budget exactly as in Stage 3 -- kept whole,
+        # never ranked, never dropped, and never the reason a strict-prefix stop loses a smaller
+        # unprotected neighbour.  Only the ordinary items are ranked and admitted.
+        pinned_items = {id(item) for cl, item in tagged if pinned(cl.node_id)}
+        ranked = _pith_unified_rank([cl for cl, item in tagged if id(item) not in pinned_items])
         kept_lines, dropped, never_fit, used = _pith_admit_strict_prefix(
             [cl for _u, _ix, cl in ranked], budget, lambda cl: len(cl.content or ""), separator=0)
         if dropped:
@@ -5735,7 +5816,7 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
                 "recall (un-Pithed)", "L1 budget", "items", "chars", budget, len(dropped),
                 sum(len(cl.content or "") for cl in dropped), len(kept_lines), used,
                 [(cl.node_id, len(cl.content or "")) for cl in never_fit])
-        kept = {id(origin[id(cl)]) for cl in kept_lines}
+        kept = {id(origin[id(cl)]) for cl in kept_lines} | pinned_items
     except Exception as exc:
         logger.warning("un-Pithed budget step failed; rendering every item whole and unbudgeted: %s",
                        exc)
@@ -5846,15 +5927,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
         # Which Pith step is running -- named in the fallback log line if one raises.
         _stage = 'CacheLine build'
         try:
-            def _pinned(node_id):
-                try:
-                    return bool(ng.graph._is_identity_protected(node_id))
-                except Exception as exc:
-                    # Fail-soft to not-pinned so ONE node's bad pin lookup can't
-                    # sink the whole Pith pass; log it so a vanished/erroring
-                    # constitutional-pin guard surfaces rather than going silent.
-                    logger.debug('Pith pin lookup failed for %r (treating as unpinned): %s', node_id, exc)
-                    return False
+            _pinned = _cc_pin_probe(ng)      # the ONE pin test, shared with the un-Pithed renderer
 
             # Stream-tag each half so pith_stage3 can per-stream normalize
             # (SurfacingMonitor recency ~1.7 vs Active Recall/GSG relevance
