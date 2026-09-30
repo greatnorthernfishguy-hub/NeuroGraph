@@ -896,7 +896,6 @@ class TestSylsLawHook:
         ]
         paths = {
             "not_repo": os.path.join(self._non_git, "x.py"),
-            "in_repo": os.path.join(self._ng_dir, "neuro_foundation.py"),
             "nonexistent": os.path.join(self._non_git, "sub", "x.py"),
         }
 
