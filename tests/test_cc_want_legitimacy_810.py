@@ -1168,19 +1168,19 @@ def test_t3_words_that_merely_end_in_true_false_null_do_not_open_a_json_literal(
     _assert_mints_like_base(base_org, content, expected)
 
 
-def test_t3_a_real_json_token_still_counts_named_residual(base_org):
-    """le-016's stronger variant, stated exactly: with a REAL `true` / `false` / `null` TOKEN, a
-    comma and an opening quote (`ok: true, "[WANT]x[/WANT]"`) the text IS JSON-shaped (an array element
-    after a finished value), so it is classed in_json_string -- the same accepted precision trade as a
-    want typed inside `{"note": "..."}`. The boundary fix closes only the substring defect
-    (`untrue,`); this is a NAMED RESIDUAL, pinned so a change is a visible decision."""
+def test_t3_real_json_tokens_inside_a_container_still_count(base_org):
+    """turn 4 (le-019 F2): this was the turn-3 'named residual' (`ok: true, "..."` dropped). The
+    trigger was NOT limited to JSON-looking sentences -- ANY word true/false/null or digit run +
+    comma + quote dropped a well-formed want -- so it is FIXED, not named: a true/false/null/number
+    before the comma counts only inside a REAL JSON array/object. Real containers still reject."""
+    for word in ("true", "false", "null", "1", "-1.5e3"):
+        for content in ('[%s, "[WANT]revisit this[/WANT]"]' % word,
+                        '{"a": %s, "[WANT]revisit this[/WANT]": 2}' % word):
+            parsed = org.parse_wants(content)
+            assert parsed.wants == () and {s.reason for s in parsed.skipped} == {"in_json_string"}, content
+    # ...and the same words in ordinary prose / YAML-ish text mint like base
     for word in ("true", "false", "null"):
-        content = 'ok: %s, "[WANT]revisit this[/WANT]"' % word
-        parsed = org.parse_wants(content)
-        assert parsed.wants == () and {s.reason for s in parsed.skipped} == {"in_json_string"}
-        assert _texts(_run(base_org, [content])[0]) == ["revisit this"]      # base minted it
-    assert org._want_json_opens_literal('x true, "', len('x true, "') - 1) is True
-    assert org._want_json_opens_literal('x untrue, "', len('x untrue, "') - 1) is False
+        _assert_mints_like_base(base_org, 'ok: %s, "[WANT]revisit this[/WANT]"' % word, ["revisit this"])
 
 
 # --- (4) in_link_target needs a real markdown link: a `[` that opens it ---
@@ -1239,7 +1239,7 @@ def test_t3_named_residual_unclosed_fence_glued_to_a_closer_swallows_later_wants
 
 # --- (5) the changelog no longer over-claims ---
 def test_t3_changelog_claim_is_qualified_to_the_tested_grammar():
-    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0][:12000]
+    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0][:40000]
     assert "TESTED grammar" in header and "NOT for every string" in header
 
 
@@ -1252,3 +1252,242 @@ def test_t3_link_and_url_scanners_stay_bounded_on_adversarial_input():
         t0 = _time.perf_counter()
         org.parse_wants(content)
         assert _time.perf_counter() - t0 < 10.0
+
+
+# ---------------------------------------------------------------------------
+# TURN 4 (le-019 F1-F5): the NEW final function. Golden cases ASSERTED AGAINST BASE e4ebf982.
+# ---------------------------------------------------------------------------
+
+def _inner(content):
+    return content.split("[WANT]", 1)[1].split("[/WANT]", 1)[0]
+
+
+# --- F2: a bare prose word / number + comma + quote is NOT a JSON literal ---
+_T4_F2_MINTS = {
+    "true": 'It is true, "[WANT]revisit this[/WANT]", she said.',
+    "false": 'That is false, "[WANT]revisit this[/WANT]", ok',
+    "null": 'if null, "[WANT]revisit this[/WANT]", ok',
+    "year (le-019)": 'In 2026, "[WANT]revisit the exit policy[/WANT]", I wrote.',
+    "chapter number": 'Chapter 3, "[WANT]revisit this[/WANT]"',
+    "number": 'we saw 12, "[WANT]revisit this[/WANT]", ok',
+    "minus true": '-true, "[WANT]revisit this[/WANT]"',
+    "dot null": '.null, "[WANT]revisit this[/WANT]"',
+    "digit glued to comma quote (le-016)": '3,"[WANT]x[/WANT]",done',
+    "quoted phrase list in prose (le-016)": 'She said "a", "b [WANT]x[/WANT]", and left.',
+    "YAML-ish ok: true": 'ok: true, "[WANT]revisit this[/WANT]"',
+    "the answer is true": 'the answer is true, "[WANT]revisit this[/WANT]", yes',
+    "it was 3": 'it was 3, "[WANT]revisit this[/WANT]", yes',
+    "number then brace closer": 'we saw 12, "[WANT]revisit this[/WANT]"}',
+    "word then bracket closer": 'see two, "[WANT]revisit this[/WANT]"]',
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T4_F2_MINTS))
+def test_t4_f2_prose_word_or_number_comma_quote_mints_like_base(base_org, name):
+    content = _T4_F2_MINTS[name]
+    _assert_mints_like_base(base_org, content, [_inner(content)])
+
+
+# Real JSON context (a structural opener `{` / `[` reached by walking back over complete values
+# and `"key":` members) stays rejected: checker-016's examples, le-016's and checker-018's.
+_T4_JSON_REJECTS = {
+    "checker-016 object value": '{"cmd":"[WANT] not a want [/WANT]"}',
+    "checker-016 escaped quotes": '\\"[WANT]\\" then later \\"[/WANT]\\"',
+    "checker-016 tilde fence in JSON": '{"code": "~~~\\n[WANT] documented [/WANT]\\n~~~"}',
+    "checker-016 backtick fence in JSON": '{"code": "```\\n[WANT] documented [/WANT]\\n```"}',
+    "JSON string list": '["a", "[WANT] x [/WANT]"]',
+    "object: true then a key": '{"a": true, "[WANT]x[/WANT]": 1}',
+    "array: true first": '[true, "[WANT]x[/WANT]"]',
+    "object: number then a key": '{"a": 1, "[WANT]x[/WANT]": 2}',
+    "array of numbers": '[1, 2, "[WANT]x[/WANT]"]',
+    "array: float": '[-1.5e3, "[WANT]x[/WANT]"]',
+    "array: nested array first": '[["a"], "[WANT]x[/WANT]"]',
+    "array: nested object first": '[{"k": 1}, "[WANT]x[/WANT]"]',
+    "array: null first": '[null, "[WANT]x[/WANT]"]',
+    "pretty-printed array": '[\n  "a",\n  "[WANT]x[/WANT]"\n]',
+    "pretty-printed object": '{\n  "a": 1,\n  "b": "[WANT]x[/WANT]"\n}',
+    "object: several members": '{"a": 1, "b": 2, "c": "[WANT]x[/WANT]"}',
+    "object: array member then key": '{"a": [1, 2], "[WANT]x[/WANT]": 3}',
+    "known false negative: a want inside {\"note\": ...}": 'Use {"note": "[WANT] revisit X [/WANT]"} for it',
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T4_JSON_REJECTS))
+def test_t4_f2_real_json_context_is_still_rejected(name):
+    parsed = org.parse_wants(_T4_JSON_REJECTS[name])
+    assert parsed.wants == (), parsed
+    assert {s.reason for s in parsed.skipped} <= {"in_json_string", "closer_without_opener"}
+    assert "in_json_string" in {s.reason for s in parsed.skipped}
+
+
+_T4_WALK_CASES = [      # (text ending in the candidate opening quote, expected "JSON opener context")
+    ('x true, "', False), ('[true, "', True), ('{"a": true, "', True), ('it was 3, "', False),
+    ('[1, 2, "', True), ('["a", "b", "', True), ('"a", "', False), ('ok: true, "', False),
+    ('{"a": 1, "b": 2, "', True), ('[[1], "', True), ('{"a": [1, 2], "', True),
+    ('{"a": "x", "', True), ('abc12, "', False), ('[untrue, "', False), ('word, "', False),
+    ('1, "', False), ('{"a": 1 "', False), ('["a" "', False),
+]
+
+
+@pytest.mark.parametrize("text,expected", _T4_WALK_CASES)
+def test_t4_f2_structure_walk_unit(text, expected):
+    assert org._want_json_opens_literal(text, len(text) - 1) is expected
+    assert org._want_json_opens_literal(text, len(text) - 1, {}) is expected       # memoised form agrees
+
+
+_T4_PROSE_PREFIXES = ['It is true, "', 'In 2026, "', 'Chapter 3, "', 'we saw 12, "', 'if null, "',
+                      'the answer is false, "', 'She said "a", "', "x, "]
+_T4_PROSE_BODIES = ["plain want", "revisit this", "ends `code()`", 'has "inner" word', "with (parens) and [brackets]",
+                    "multi\nline body", "see https://example.com/docs now", '{"a": 1} inside']
+_T4_PROSE_SUFFIXES = ['", she said.', '",', '"', '"}', '"]', '", next', ' tail', ".", '",\n']
+
+
+def test_t4_parity_prose_comma_quote_shapes_with_base(base_org):
+    """The F2 regression net: {bare prose word/number/quoted phrase + comma + quote} x {body} x
+    {JSON-closer-looking suffix}: the parser equals base on every one (none sits in a real JSON
+    container, and no body starts with a quote, so no `"[WANT]"` hug is built)."""
+    total = 0
+    diverged = []
+    for prefix, body, suffix in itertools.product(_T4_PROSE_PREFIXES, _T4_PROSE_BODIES, _T4_PROSE_SUFFIXES):
+        content = prefix + "[WANT]" + body + "[/WANT]" + suffix
+        total += 1
+        if _run(org, [content]) != _run(base_org, [content]):
+            diverged.append(content)
+    assert total == len(_T4_PROSE_PREFIXES) * len(_T4_PROSE_BODIES) * len(_T4_PROSE_SUFFIXES) >= 500
+    assert diverged == [], "diverged on %d/%d, first: %r" % (len(diverged), total, diverged[:3])
+
+
+# --- F1: cost -- the `? # = &` branch is linear in the node ---
+def test_t4_f1_url_query_glue_scan_is_linear_not_quadratic():
+    import time as _time
+    timings = {}
+    for n in (5_000, 20_000, 40_000):
+        content = ("https://x.org/a?[WANT]w " * n) + "[/WANT]-x"     # URL chars continue after the closer
+        t0 = _time.perf_counter()
+        parsed = org.parse_wants(content)
+        timings[n] = _time.perf_counter() - t0
+        # behaviour unchanged vs turn 3: every opener is in_url (inside the token), the closer is stray
+        assert len(parsed.skipped) == n + 1 and parsed.wants == ()
+        assert [s.reason for s in parsed.skipped].count("in_url") == n
+    assert timings[40_000] < 8.0, timings                    # was 16.3 s (le-019); ~1.2 s now
+    assert timings[40_000] < timings[5_000] * 20, timings    # 8x the input, far from the 64x of quadratic
+
+
+def test_t4_f1_next_closer_is_a_bisect_over_the_precomputed_closer_list():
+    content = "a?[WANT]x[/WANT]-tail [WANT]y[/WANT] z"
+    closers = [content.index("[/WANT]"), content.rindex("[/WANT]")]
+    first_end = content.index("[WANT]") + len("[WANT]")
+    assert org._want_url_continues_after_pair(content, first_end, closers) is True       # `-` continues a URL
+    second_end = content.rindex("[WANT]") + len("[WANT]")
+    assert org._want_url_continues_after_pair(content, second_end, closers) is False     # space follows
+    assert org._want_url_continues_after_pair(content, len(content), closers) is False   # no closer left
+
+
+def test_t4_json_and_link_scanners_stay_bounded_on_adversarial_input():
+    import time as _time
+    for content in ('"a", ' * 40_000 + "[WANT] x [/WANT]",
+                    '["a", ' * 40_000 + '"[WANT]x[/WANT]"]',
+                    "1, " * 100_000 + '"[WANT]x[/WANT]"',
+                    "{}, " * 50_000 + '"[WANT]x[/WANT]"',
+                    '"' * 200_000 + "[WANT] x [/WANT]"):
+        t0 = _time.perf_counter()
+        org.parse_wants(content)
+        assert _time.perf_counter() - t0 < 8.0
+
+
+# --- F3: a mention opener nested in a real want pairs with the next closer (nearest opener) ---
+_T4_F3_WHOLE = {       # base minted NOTHING (inner holds a marker); the build keeps the whole want, pair and all
+    "URL-carried mention pair": ('[WANT]see https://x.org/[WANT]z[/WANT] ok[/WANT]',
+                                 "see https://x.org/[WANT]z[/WANT] ok"),
+    "link-carried mention pair": ('[WANT]see [t](https://x.org/[WANT]z[/WANT]) ok[/WANT]',
+                                  "see [t](https://x.org/[WANT]z[/WANT]) ok"),
+    "quoted mention pair": ('[WANT]use "[WANT]" to start and "[/WANT]" to end[/WANT]',
+                            'use "[WANT]" to start and "[/WANT]" to end'),
+    "escaped mention pair": ('[WANT]use \\[WANT] to start and \\[/WANT] to end[/WANT]',
+                             'use \\[WANT] to start and \\[/WANT] to end'),
+    "region mention pair (contrast: already whole since turn 3)": ('[WANT]see `[WANT]z[/WANT]` ok[/WANT]',
+                                                                  "see `[WANT]z[/WANT]` ok"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T4_F3_WHOLE))
+def test_t4_f3_a_mention_pair_inside_a_real_want_stays_inside_it(base_org, name):
+    """NOT a truncated marker-bearing mint (turn 3 minted `see https://x.org/[WANT]z` here): the want is
+    kept WHOLE, because the nested mention opener pairs with the NEXT closer (nearest-opener rule) and the
+    real opener with the one after. Base minted nothing (its inner text holds a marker): a deliberate P406 delta."""
+    content, whole = _T4_F3_WHOLE[name]
+    assert _texts(_run(base_org, [content])[0]) == []
+    parsed = org.parse_wants(content)
+    assert [w.text for w in parsed.wants] == [whole]
+    assert len(parsed.skipped) % 2 == 0 and {s.marker for s in parsed.skipped} == {"[WANT]", "[/WANT]"}
+
+
+def test_t4_f3_two_mention_pairs_in_one_real_want_stay_inside_it(base_org):
+    """Base minted a garbage fragment here (its regex paired the real opener with the FIRST closer, then
+    `d\\` from the second pair); the build keeps the whole want."""
+    content = '[WANT]a \\[WANT]b\\[/WANT] c \\[WANT]d\\[/WANT] e[/WANT]'
+    assert _texts(_run(base_org, [content])[0]) == ["d\\"]
+    assert [w.text for w in org.parse_wants(content).wants] == ["a \\[WANT]b\\[/WANT] c \\[WANT]d\\[/WANT] e"]
+
+
+_T4_F3_LIKE_BASE = {   # an UNPAIRED mention opener in a real want: its closer pairs with it -> nothing minted, as base
+    "unpaired escaped mention": ('[WANT]use \\[WANT] to start[/WANT]', []),
+    "unpaired quoted mention": ('[WANT]stop writing "[WANT]" by hand[/WANT]', []),
+    "unpaired mention, then a second want": ('[WANT]use \\[WANT] ok[/WANT] later [WANT]second[/WANT]', ["second"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T4_F3_LIKE_BASE))
+def test_t4_f3_an_unpaired_mention_yields_nothing_exactly_like_base(base_org, name):
+    content, expected = _T4_F3_LIKE_BASE[name]
+    _assert_mints_like_base(base_org, content, expected)
+    assert "opener_unclosed" in {s.reason for s in org.parse_wants(content).skipped}    # visible, never silent
+
+
+def test_t4_f3_mention_openers_outside_a_pending_want_are_unchanged():
+    parsed = org.parse_wants('the "[WANT]" tag and "[/WANT]" end')
+    assert parsed.wants == () and [s.reason for s in parsed.skipped] == ["quoted", "closer_without_opener"]
+    assert [w.text for w in org.parse_wants('the "[WANT]" tag then [WANT]real[/WANT]').wants] == ["real"]
+
+
+# --- F4: the complete named-residual list, pinned at CURRENT behaviour ---
+_T4_F4A = {            # a previous want's OWN body starts a region that masks a LATER want's opener
+    "unpaired backtick in the first want's body":
+        ("[WANT]first has a ` tick[/WANT] then [WANT]second `code` here[/WANT]", ["first has a ` tick"]),
+    "fence-looking line in the first want's body":
+        ("[WANT]first\n~~~\nx[/WANT] then [WANT]second[/WANT]", ["first\n~~~\nx"]),
+    "JSON-literal opener in the first want's body":
+        ('[WANT]first "k": "v[/WANT] then [WANT]second[/WANT] x"}', ['first "k": "v']),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T4_F4A))
+def test_t4_f4a_named_residual_a_previous_bodys_region_masks_a_later_opener(base_org, name):
+    """KNOWN RESIDUAL: the FIRST want never diverges from base; a LATER want whose opener falls inside a
+    region started in an earlier want's body is dropped (logged, in_code_span / in_fence / in_json_string)."""
+    content, new_expected = _T4_F4A[name]
+    base_texts = _texts(_run(base_org, [content])[0])
+    assert len(base_texts) == 2 and base_texts[0] == new_expected[0]     # base minted both; the first is identical
+    assert _texts(_run(org, [content])[0]) == new_expected
+    assert {s.reason for s in org.parse_wants(content).skipped} & {"in_code_span", "in_fence", "in_json_string"}
+
+
+def test_t4_f4bc_named_residuals_link_glued_to_a_word_and_a_url_char_after_a_link():
+    # (b) a real link glued to a preceding word fails the `[`-neighbour rule; scheme-less, it mints
+    assert [w.text for w in org.parse_wants("word[docs](./d/[WANT]x[/WANT])").wants] == ["x"]
+    # (c) the glued run still holds the closed link's `scheme://`, and `/` is URL-internal glue
+    parsed = org.parse_wants("See [t](https://x.org/a)/[WANT]x[/WANT]")
+    assert parsed.wants == () and parsed.skipped[0].reason == "in_url"
+
+
+def test_t4_f4_named_residual_a_json_container_with_a_very_long_element_is_not_recognised():
+    """Fail-open toward minting: an element longer than the 512-character string window is not walked."""
+    content = '["%s", "[WANT]x[/WANT]"]' % ("a" * 600)
+    assert [w.text for w in org.parse_wants(content).wants] == ["x"]
+
+
+# --- F5: doc ---
+def test_t4_f5_turn2_url_terminator_rule_is_marked_superseded_and_turn4_entry_exists():
+    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0][:40000]
+    assert "SUPERSEDED BY TURN 3" in header
+    assert "#810 turn 4" in header and "NEW FINAL FUNCTION" in header

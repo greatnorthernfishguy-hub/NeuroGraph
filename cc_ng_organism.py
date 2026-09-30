@@ -3,6 +3,25 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 4,
+#   le-019 F1/F2/F3/F4/F5) -- NEW FINAL FUNCTION (supersedes the turn-3 pin).
+# What: (F2) a comma-continued JSON literal needs REAL JSON context: walking back over complete
+#   JSON values (string, number, whole-token true/false/null, balanced [..]/{..}, `"key":`
+#   members) separated by commas must reach an opening `{` or `[`
+#   (_want_json_element_in_container, memoised per comma). A bare prose word, number or quoted
+#   phrase + comma + quote (`it was 3, "[WANT]..`, `the answer is true, "..`, `In 2026, ".."`,
+#   `She said "a", "b [WANT]x[/WANT]"`, `ok: true, ".."`) is NOT JSON and mints like base.
+#   (F1) _want_url_continues_after_pair bisects a closer-offset list computed once per node
+#   (was a `find` per opener: O(openers x node), 16.3 s at 40,000 openers; now linear, ~1.2 s).
+#   (F3) an opener-only-masked mention opener that arrives while a real opener is pending pairs
+#   with the next closer by the nearest-opener rule (mention_stack), so a mention pair inside a
+#   real want stays inside it (whole want) and an unpaired mention yields nothing, as base does.
+# Why: le-019: F2 dropped well-formed plain-prose wants (year/number/word + comma + quote) that
+#   base minted; F1 was a quadratic scan under the mutation lock; F3 let a nested mention's closer
+#   END the real want and mint a truncated marker-bearing text permanently.
+# How: golden cases ASSERTED AGAINST BASE e4ebf982 in tests/test_cc_want_legitimacy_810.py; the
+#   complete named-residual list (F4) is pinned there and in returns/build-004.md. The turn-2
+#   "SAME result as base" claim remains qualified to the tested grammar (entry below).
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 3,
 #   le-016 MEDIUM #2/#3 + checker-018 notes 1-2) -- FINAL FUNCTION: lexical-guess false
 #   negatives fixed ONCE, before the #801 counts.
@@ -39,7 +58,8 @@
 #   coincidence that its backtick runs pair up -- OR the opener is hugged by JSON-escaped quotes
 #   (\"[WANT]\"). in_url / in_link_target = the OPENER is glued (no whitespace, no other WANT
 #   marker between) to a run containing `scheme://` (a trailing `) ] } > " ' ` , ; ! .` ends URL
-#   context) or to the destination of a `](`. Logged at INFO exactly like the existing skips.
+#   context -- SUPERSEDED BY TURN 3: the blocklist is gone, in_url is an allowlist of URL-internal
+#   glue; see the turn-3 entry) or to the destination of a `](` (turn 3: a real link's `[` is required). Logged at INFO exactly like the existing skips.
 # Why: Exec P414 (checker-016's examples). The reason applies to the context the OPENER sits in,
 #   never to what the want text contains, and closers are never judged by the URL/link/hug
 #   guesses (a closer guard would drop `[WANT]read https://x.com/a[/WANT]` -- the le-014 C1 class).
@@ -1100,7 +1120,7 @@ import re
 import threading
 import time
 import uuid
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -1755,43 +1775,147 @@ _WANT_URL_QUERY_GLUE = frozenset("?#=&")
 _WANT_URL_CONTINUE_RE = re.compile(r"[A-Za-z0-9/_~%&=+#@\-]")
 _WANT_LINK_TEXT_LOOKBACK = 1024
 _WANT_JSON_WORDS = ("true", "false", "null")
+_WANT_JSON_NUMBER_CHARS = frozenset("0123456789.+-eE")
+# Windows for the backward JSON-structure walk (turn 4). Fail-open toward minting: a container
+# whose elements are longer than these is simply not recognised.
+_WANT_JSON_STRING_WINDOW = 512
+_WANT_JSON_CONTAINER_WINDOW = 256
 
 
-def _want_json_opens_literal(content: str, q: int) -> bool:
-    """True when the `"` at content[q] is in JSON opener context: after `{` / `[`, after
-    `"key":`, or after a completed JSON value (string, number, true/false/null, `]`/`}`) and a
-    comma. Constant work per quote (looks at the previous one or two non-space characters)."""
-    j = q - 1
-    while j >= 0 and content[j].isspace():
-        j -= 1
+def _want_json_string_start(content: str, end_quote: int) -> int:
+    """Index of the opening `"` of the JSON string whose closing `"` is at `end_quote` (same
+    line, bounded window, backslash-escaped quotes skipped), else -1."""
+    lo = max(0, end_quote - _WANT_JSON_STRING_WINDOW)
+    i = end_quote - 1
+    while i >= lo:
+        c = content[i]
+        if c == "\r" or c == "\n":
+            return -1
+        if c == '"':
+            slashes = 0
+            while i - 1 - slashes >= lo and content[i - 1 - slashes] == "\\":
+                slashes += 1
+            if slashes % 2 == 0:
+                return i
+        i -= 1
+    return -1
+
+
+def _want_json_container_start(content: str, close_idx: int) -> int:
+    """Index of the `[` / `{` matching the `]` / `}` at `close_idx` (bracket counting, bounded
+    window), else -1."""
+    lo = max(0, close_idx - _WANT_JSON_CONTAINER_WINDOW)
+    depth = 0
+    i = close_idx
+    while i >= lo:
+        c = content[i]
+        if c == "]" or c == "}":
+            depth += 1
+        elif c == "[" or c == "{":
+            depth -= 1
+            if depth == 0:
+                return i
+        i -= 1
+    return -1
+
+
+def _want_json_value_start(content: str, j: int) -> int:
+    """Start index of the complete JSON VALUE ending at content[j] -- a string, a number, a
+    WHOLE-token true/false/null, or a balanced [...] / {...} -- else -1."""
+    c = content[j]
+    if c == '"':
+        return _want_json_string_start(content, j)
+    if c == "]" or c == "}":
+        return _want_json_container_start(content, j)
+    if c.isdigit():
+        i = j
+        while i > 0 and content[i - 1] in _WANT_JSON_NUMBER_CHARS:
+            i -= 1
+        if i > 0 and (content[i - 1].isalnum() or content[i - 1] == "_"):
+            return -1
+        return i
+    for word in _WANT_JSON_WORDS:
+        if content.endswith(word, 0, j + 1):
+            i = j + 1 - len(word)
+            if i == 0 or not (content[i - 1].isalnum() or content[i - 1] == "_"):
+                return i
+    return -1
+
+
+def _want_json_prev_nonspace(content: str, i: int) -> int:
+    while i >= 0 and content[i].isspace():
+        i -= 1
+    return i
+
+
+def _want_json_element_in_container(content: str, comma_idx: int, memo: Optional[Dict[int, bool]]) -> bool:
+    """True when the comma at `comma_idx` continues a JSON ARRAY or OBJECT: walking back over
+    complete JSON values (and `"key":` members) separated by commas reaches an opening `{` / `[`.
+    A bare prose word, number or quoted phrase before the comma (`it was 3,` `the answer is true,`
+    `She said "a",`) never does (turn 4, le-019 F2). Memoised per comma, so a whole node is linear."""
+    visited: List[int] = []
+    pos = comma_idx
+    result = False
+    while True:
+        if memo is not None and pos in memo:
+            result = memo[pos]
+            break
+        visited.append(pos)
+        j = _want_json_prev_nonspace(content, pos - 1)
+        if j < 0:
+            break
+        s = _want_json_value_start(content, j)
+        if s < 0:
+            break
+        k = _want_json_prev_nonspace(content, s - 1)
+        if k < 0:
+            break
+        p = content[k]
+        if p == "[" or p == "{":
+            result = True
+            break
+        if p == ",":
+            pos = k
+            continue
+        if p == ":":
+            k2 = _want_json_prev_nonspace(content, k - 1)
+            if k2 < 0 or content[k2] != '"':
+                break
+            ks = _want_json_string_start(content, k2)
+            if ks < 0:
+                break
+            k3 = _want_json_prev_nonspace(content, ks - 1)
+            if k3 < 0:
+                break
+            if content[k3] == "{":
+                result = True
+                break
+            if content[k3] == ",":
+                pos = k3
+                continue
+        break
+    if memo is not None:
+        for v in visited:
+            memo[v] = result
+    return result
+
+
+def _want_json_opens_literal(content: str, q: int, memo: Optional[Dict[int, bool]] = None) -> bool:
+    """True when the `"` at content[q] is in REAL JSON opener context: right after `{` / `[`,
+    right after `"key":`, or after a comma that continues a JSON array/object
+    (_want_json_element_in_container). A bare prose word or number + comma + quote is NOT JSON
+    context. Bounded work per quote."""
+    j = _want_json_prev_nonspace(content, q - 1)
     if j < 0:
         return False
     c = content[j]
-    if c in "{[":
+    if c == "{" or c == "[":
         return True
     if c == ":":
-        j -= 1
-        while j >= 0 and content[j].isspace():
-            j -= 1
+        j = _want_json_prev_nonspace(content, j - 1)
         return j >= 0 and content[j] == '"'
     if c == ",":
-        j -= 1
-        while j >= 0 and content[j].isspace():
-            j -= 1
-        if j < 0:
-            return False
-        prev = content[j]
-        if prev in '"]}' or prev.isdigit():
-            return True
-        # true / false / null only as a WHOLE token: `untrue,` `nonnull,` `intrue,` are words
-        # that merely end in one (turn 3). A real `true,` token still counts (named residual:
-        # a want typed in a JSON-looking sentence).
-        for word in _WANT_JSON_WORDS:
-            if content.endswith(word, 0, j + 1):
-                before = j - len(word)
-                if before < 0 or not (content[before].isalnum() or content[before] == "_"):
-                    return True
-        return False
+        return _want_json_element_in_container(content, j, memo)
     return False
 
 
@@ -1800,6 +1924,7 @@ def _want_json_string_ranges(content: str) -> List[Tuple[int, int]]:
     unescaped `"` in JSON opener context, closed by the next unescaped `"` on the SAME line
     (JSON strings carry no raw newline), followed by JSON closer context. Linear."""
     ranges: List[Tuple[int, int]] = []
+    memo: Dict[int, bool] = {}
     n = len(content)
     pos = 0
     while True:
@@ -1809,7 +1934,7 @@ def _want_json_string_ranges(content: str) -> List[Tuple[int, int]]:
         slashes = 0
         while q - 1 - slashes >= 0 and content[q - 1 - slashes] == "\\":
             slashes += 1
-        if slashes % 2 == 1 or not _want_json_opens_literal(content, q):
+        if slashes % 2 == 1 or not _want_json_opens_literal(content, q, memo):
             pos = q + 1
             continue
         i = q + 1
@@ -1875,17 +2000,19 @@ def _want_link_text_opens_a_link(content: str, close_bracket: int) -> bool:
     return False
 
 
-def _want_url_continues_after_pair(content: str, opener_end: int) -> bool:
+def _want_url_continues_after_pair(content: str, opener_end: int, closer_starts: List[int]) -> bool:
     """True when the WANT pair that starts after `opener_end` is INSIDE a URL token: URL
-    characters continue immediately after the nearest closing tag."""
-    close = content.find(WANT_CLOSE, opener_end)
-    if close < 0:
+    characters continue immediately after the nearest closing tag. `closer_starts` is the sorted
+    offset list of every `[/WANT]` in the node, computed once by parse_wants, so this is a
+    bisect, not a scan (turn 4, le-019 F1: the old per-opener `find` was O(openers x node))."""
+    i = bisect_left(closer_starts, opener_end)
+    if i >= len(closer_starts):
         return False
-    after = close + len(WANT_CLOSE)
+    after = closer_starts[i] + len(WANT_CLOSE)
     return after < len(content) and _WANT_URL_CONTINUE_RE.match(content, after) is not None
 
 
-def _want_opener_carried_reason(content: str, start: int, end: int) -> Optional[str]:
+def _want_opener_carried_reason(content: str, start: int, end: int, closer_starts: List[int]) -> Optional[str]:
     """#815, OPENER context only (a closer guard would swallow `[WANT]read https://x/a[/WANT]`,
     the le-014 C1 class): is this opener glued to a link destination or a URL?
       in_link_target  the glued run holds `](` with no `)` after it AND that `]` closes the text
@@ -1902,7 +2029,7 @@ def _want_opener_carried_reason(content: str, start: int, end: int) -> Optional[
         prev = run[-1]
         if prev == _WANT_URL_PATH_GLUE:
             return "in_url"             # scheme://host/path/[WANT]...  -- in a URL path
-        if prev in _WANT_URL_QUERY_GLUE and _want_url_continues_after_pair(content, end):
+        if prev in _WANT_URL_QUERY_GLUE and _want_url_continues_after_pair(content, end, closer_starts):
             return "in_url"             # scheme://host/a?[WANT]s[/WANT]&p=1  -- inside the token
     return None
 
@@ -1929,13 +2056,13 @@ def _want_marker_region(start: int,
     return None
 
 
-def _want_opener_mention_reason(content: str, start: int, end: int) -> Optional[str]:
+def _want_opener_mention_reason(content: str, start: int, end: int, closer_starts: List[int]) -> Optional[str]:
     """Why an OPENER outside every structural region is still a mention, or None. These are
     guesses about the context the OPENER sits in and are NEVER applied to a closer (le-014
     C1/C2, le-016 #3: base never guarded closers, and a closer judged by a lexical guess on its
     own text turns `[WANT]check `foo()`[/WANT]` / `[WANT]rename "a", "b[/WANT]", next` into a
     dropped want). A mentioned opener's orphan closer is skipped as closer_without_opener."""
-    carried = _want_opener_carried_reason(content, start, end)
+    carried = _want_opener_carried_reason(content, start, end, closer_starts)
     if carried is not None:
         return carried
     if start >= 2 and content[start - 2:start] == '\\"' and content[end:end + 2] == '\\"':
@@ -1962,9 +2089,11 @@ def parse_wants(content: str) -> WantParse:
     literal, a fenced block or an inline code span, glued to a link destination or URL, hugged
     by JSON-escaped quotes, directly after a backtick, backslash-escaped, or wrapped in a
     matching quote pair is a mention. A CLOSER is judged only relative to its OPENER: it is a
-    mention when it closes a masked opener of the same JSON literal / fence / code span, or
-    when no live opener is pending; a closer with a live opener pending is that want's closer
-    whatever surrounds it (le-014 C1/C2, le-016 #3). Skipped; the closer pairs with the
+    mention when it closes a masked opener of the same JSON literal / fence / code span, when it
+    closes a mention opener nested inside the pending want (nearest-opener rule), or when no
+    live opener is pending; otherwise it is that want's closer whatever surrounds it (le-014
+    C1/C2, le-016 #3, le-019 F3). JSON context is REAL JSON only: a bare prose word/number +
+    comma + quote is not (le-019 F2). Skipped; the closer pairs with the
     NEAREST live opener, so a returned want contains no live marker; a stray closer, an
     unclosed opener and an empty pair are skipped. Every skip carries its reason and offset
     (the caller logs them -- never silent). `wants[i].text` is `.strip()`ped inner text,
@@ -1982,7 +2111,10 @@ def parse_wants(content: str) -> WantParse:
     skipped: List[SkippedMarker] = []
     pending: Optional[Tuple[int, int]] = None       # (start, end) of the live opener awaiting a closer
     masked_openers: Dict[Tuple[str, int], int] = {}  # region -> masked openers not yet closed
-    for m in _WANT_MARKER_RE.finditer(content):
+    mention_stack: List[str] = []                    # opener-only mention openers nested in the pending want
+    markers = list(_WANT_MARKER_RE.finditer(content))
+    closer_starts = [mk.start() for mk in markers if mk.group(1)]
+    for m in markers:
         is_close = bool(m.group(1))
         marker = WANT_CLOSE if is_close else WANT_OPEN
         region = _want_marker_region(m.start(), fences, fence_starts, codes, code_starts,
@@ -2004,17 +2136,25 @@ def parse_wants(content: str) -> WantParse:
             # region is the closer of the real want -- judged relative to ITS opener, not by the
             # text around it (le-016 #3). Fall through to pairing.
         elif not is_close:
-            reason = _want_opener_mention_reason(content, m.start(), m.end())
+            reason = _want_opener_mention_reason(content, m.start(), m.end(), closer_starts)
             if reason is not None:
+                if pending is not None:
+                    # a mention opener INSIDE a real want: by the nearest-opener rule it pairs with
+                    # the next closer, so a mention pair stays inside the real want (turn 4, F3)
+                    mention_stack.append(reason)
                 skipped.append(SkippedMarker(marker, m.start(), reason))
                 continue
         if not is_close:
             if pending is not None:     # a nearer opener arrived: the earlier one never closed
                 skipped.append(SkippedMarker(WANT_OPEN, pending[0], "opener_unclosed"))
             pending = (m.start(), m.end())
+            mention_stack.clear()
             continue
         if pending is None:
             skipped.append(SkippedMarker(WANT_CLOSE, m.start(), "closer_without_opener"))
+            continue
+        if mention_stack:               # closes the nearest (mention) opener, not the real one
+            skipped.append(SkippedMarker(WANT_CLOSE, m.start(), mention_stack.pop()))
             continue
         inner = content[pending[1]:m.start()].strip()
         if inner:
