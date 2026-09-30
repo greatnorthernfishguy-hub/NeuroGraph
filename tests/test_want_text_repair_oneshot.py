@@ -3110,3 +3110,25 @@ def test_memory_shape_the_streamed_reader_scales_with_the_keep_set_not_the_file(
     (n1, s1, o1, w1, c1, r1, _), (n2, s2, o2, w2, c2, r2, _) = rows
     assert o2 > 1.6 * o1                                                                  # the old peak grows with the file
     assert w2 < 2.5 * w1 + 1_000_000                                                      # the new peak does not track the file
+
+
+def test_the_streamed_render_view_orders_and_truncates_like_the_canonical_graph(pinned, tmp_path):
+    """render_wants sorts by the STORED creation_time (stable on ties) and keeps the newest WANT_RENDER_LIMIT: with more
+    wants than the limit, varied lengths (some over WANT_MAX_CHARS) and tied timestamps, the streamed view must give the
+    byte-identical block length (a view with a wrong creation_time or node order would pick a different top-N)."""
+    nf, org = pinned.nf, pinned.org
+    n = org.WANT_RENDER_LIMIT + 15
+    g = nf.Graph()
+    for i in range(n):
+        nid = "w%03d" % i
+        g.create_node(node_id=nid, metadata={"kind": "want", "want_text": "t%03d " % i + "x" * ((i * 37) % (org.WANT_MAX_CHARS + 200)),
+                                             "want_state": "open", "provenance": "cc_authored" if i % 3 else "cc_emergent"})
+        g.nodes[nid].creation_time = (i * 7) % 11 if i % 4 else 5                       # scrambled, with many ties
+    p = str(tmp_path / "main.msgpack")
+    g.write_checkpoint(p, g.capture_checkpoint(nf.CheckpointMode.FULL))
+    g2 = nf.Graph()
+    g2.restore(p)
+    V = tool.stream_graph_nodes(p)
+    want = org.render_wants(g2)
+    assert len(want.encode("utf-8")) > 1000 and want.count("\n") == org.WANT_RENDER_LIMIT   # the limit really bit
+    assert org.render_wants(V["render_graph"]) == want
