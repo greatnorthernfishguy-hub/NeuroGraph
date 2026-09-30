@@ -159,6 +159,11 @@ def _add_extras(g, vdb, ids, wid):
     g.create_node(node_id="cc:conv::nonascii", metadata={"creation_mode": "conversational"})
     vdb.insert("cc:conv::nonascii", vec, "pr\u00e9ambule \u2603 [WANT]" + tna + "[/WANT] fin \u2713", {"k": ["\u00e9", 1]})
     want("NONASCII", tna, "cc:conv::nonascii")
+    t1, t2 = prose("shr1"), prose("shr2")                                                            # two S wants, ONE source
+    g.create_node(node_id="cc:conv::shared", metadata={"creation_mode": "conversational"})
+    vdb.insert("cc:conv::shared", vec, "[WANT]" + t1 + "[/WANT] and then [WANT]" + t2 + "[/WANT]", {})
+    want("SHARED1", t1, "cc:conv::shared")
+    want("SHARED2", t2, "cc:conv::shared")
     g.create_node(node_id="cc:conv::markeronly", metadata={"creation_mode": "conversational"})       # a marker node, nobody's source
     vdb.insert("cc:conv::markeronly", vec, "[WANT]" + prose("mko") + "[/WANT] \u00fcber", {"a": {"b": [1, 2, 3]}})
     vdb.insert("orph:marker", vec, "orphan [WANT]x[/WANT]", {"z": 1})                                # vdb-only entries
@@ -237,9 +242,21 @@ def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_
     he = g.create_hyperedge({ids["SEP1"], "n1", "n2"}, member_weights={ids["SEP1"]: 1.0, "n1": 0.5, "n2": 0.5},
                             output_targets=[ids["SEP2"]])
     he2 = g.create_hyperedge({ids["NONASCII"], "n1", "n2"}, member_weights={ids["NONASCII"]: 1.0, "n1": 0.5, "n2": 0.5}) if extras else None
+    he3 = g.create_hyperedge({ids["SEP1"], "n2", ids["NONASCII"]}, member_weights={ids["SEP1"]: 1.0, "n2": 0.5, ids["NONASCII"]: 0.5}) if extras else None
+    he4 = g.create_hyperedge({ids["GEN"], "n1"}, member_weights={ids["GEN"]: 1.0, "n1": 0.5}) if extras else None
     cap = g.capture_checkpoint(nf.CheckpointMode.FULL)
     if extras:          # an ARCHIVED hyperedge listing an S id: the canonical restore does NOT index it into _node_hyperedges
         cap["archived_hyperedges"][he2.hyperedge_id] = dict(cap["hyperedges"].pop(he2.hyperedge_id), is_archived=True)
+        # (fold #11952) a hyperedge whose STORED is_archived flag is true but which still lives in `hyperedges`: the canonical
+        # restore indexes it (it never reads the flag); SEP1 is also in TWO other non-archived hyperedges (he, he3)
+        cap["hyperedges"][he4.hyperedge_id]["is_archived"] = True
+        # (fold #11952) a self-loop and a synapse whose PRE endpoint is not a node, injected into the native synapse sub-map
+        # by byte surgery (the Graph API refuses both); the canonical restore indexes them (_outgoing gets the ghost key)
+        syn = msgpack.unpackb(bytes(cap["synapses"]), raw=False, strict_map_key=False)
+        tmpl = next(iter(syn.values()))
+        for sid, pre, post in (("syn-ghost-0001", "ghost:not-a-node", ids["SEP1"]), ("syn-self-0001", ids["GEN"], ids["GEN"])):
+            syn[sid] = dict(tmpl, synapse_id=sid, pre_node_id=pre, post_node_id=post)
+        cap["synapses"] = msgpack.packb(syn, use_bin_type=True)
     far = 10 ** 6
     pred = {"prediction_id": "p1", "source_node_id": ids["SEP1"], "target_node_id": "n1", "strength": 0.5, "confidence": 0.5,
             "created_at": 0, "expires_at": far, "chain_depth": 0, "via_hyperedge": None, "pre_charge_applied": 0.0}
@@ -2856,6 +2873,9 @@ def _old_analyze(pinned, dirpath, *, scope_min_len, frozen_scope=None, base_mod=
     vdb.embeddings = {}
     derived = tool.derive_scope(nodes_meta, scope_min_len)
     scope = list(frozen_scope) if frozen_scope is not None else derived
+    missing = [i for i in scope if i not in nodes_meta or not isinstance(nodes_meta[i].get("want_text"), str)]
+    if missing:                                          # the pre-delta analyze() Stop (09a032c:1607-1609), now part of the OLD path
+        raise tool.Stop("scope: %d id(s) of S are not want nodes in the graph (first: %s)" % (len(missing), missing[0]))
     cl = tool.Classifier(org, nodes_meta, content)
     records = [cl.classify_node(nid) for nid in scope]
     dropped = tool.apply_collision_rule(records, existing_ids)
@@ -2972,15 +2992,6 @@ def test_a_truncated_or_malformed_vectors_file_fails_closed(xworld, tmp_path):
         tool.load_content_subset(_vfile(tmp_path, bad), {"a"})
 
 
-def test_a_duplicate_entry_id_keeps_the_last_value_like_the_canonical_dict(tmp_path):
-    e = lambda c: {"embedding": b"\x00" * 16, "content": c, "metadata": {}}          # noqa: E731
-    raw = b"\x83" + msgpack.packb("version") + msgpack.packb("1.0.0") + msgpack.packb("count") + msgpack.packb(2) \
-        + msgpack.packb("entries") + b"\x82" + msgpack.packb("a") + msgpack.packb(e("first [WANT]")) \
-        + msgpack.packb("a") + msgpack.packb(e("second"))
-    assert msgpack.unpackb(raw)["entries"]["a"]["content"] == "second"                # the canonical loader's view
-    assert tool.load_content_subset(_vfile(tmp_path, raw), set()) == {}               # last entry has no marker and is not kept
-
-
 def test_the_graph_stream_equals_the_canonical_restore(xworld, pinned):
     g, _ = _old_load_pair(str(xworld.ckpt), pinned)
     V = tool.stream_graph_nodes(str(xworld.ckpt / tool.MAIN_NAME))
@@ -2991,7 +3002,11 @@ def test_the_graph_stream_equals_the_canonical_restore(xworld, pinned):
     ids = set(g.nodes) | {"not-a-node"}                                              # EVERY node, plus a stranger
     assert tool.stream_incident_figures(str(xworld.ckpt / tool.MAIN_NAME), ids, V["existing_ids"]) == _old_figures(g, ids)
     assert any(f[2] for f in _old_figures(g, ids).values())                          # the world has hyperedge membership
-    assert len(g._node_hyperedges[xworld.ids["NONASCII"]]) == 0                      # ...and an ARCHIVED one that does not count
+    assert len(g._node_hyperedges[xworld.ids["NONASCII"]]) == 1                      # ONE live hyperedge; the ARCHIVED one does not count
+    assert len(g._node_hyperedges[xworld.ids["SEP1"]]) == 2                          # a node in TWO live hyperedges
+    assert len(g._node_hyperedges[xworld.ids["GEN"]]) == 1                           # only via the hyperedge whose STORED is_archived is true
+    assert "ghost:not-a-node" in g._outgoing and "ghost:not-a-node" not in g.nodes   # the non-node endpoint is indexed by the canonical restore
+    assert any(sr.pre_node_id == sr.post_node_id for sr in (g.synapses[k] for k in g.synapses.keys()))   # and so is the self-loop
 
 
 def test_the_streamed_analysis_is_identical_to_the_canonical_graph_and_vdb_analysis(xworld, pinned):
@@ -3132,3 +3147,115 @@ def test_the_streamed_render_view_orders_and_truncates_like_the_canonical_graph(
     want = org.render_wants(g2)
     assert len(want.encode("utf-8")) > 1000 and want.count("\n") == org.WANT_RENDER_LIMIT + 1   # the limit really bit (header + LIMIT + the "older" line)
     assert org.render_wants(V["render_graph"]) == want
+
+
+# ==================================================================================================
+# FOLD (#11952): duplicate map keys are a STOP; the extras-world gaps; the missing-scope Stop before the vectors open.
+# ==================================================================================================
+
+def _m(n):
+    """a msgpack map header for n pairs (n < 16)"""
+    return bytes([0x80 | n])
+
+
+def _pk(o):
+    return msgpack.packb(o, use_bin_type=True)
+
+
+def _node(meta=None):
+    return {"node_id": "x", "voltage": 0.0, "threshold": 1.0, "metadata": meta or {}}
+
+
+def _graph_file(tmp_path, *, top=None, name="main.msgpack"):
+    """A minimal main-shaped file built BYTE BY BYTE so a map key can be repeated (a Python dict cannot emit one).
+    `top` is a list of (key, raw value bytes) pairs, written in order."""
+    top = top if top is not None else [("nodes", _m(1) + _pk("a") + _pk(_node())), ("synapses", _m(0)), ("hyperedges", _m(0))]
+    raw = _m(len(top)) + b"".join(_pk(k) + v for k, v in top)
+    p = tmp_path / name
+    p.write_bytes(raw)
+    return str(p)
+
+
+def test_a_clean_minimal_graph_file_reads(tmp_path):
+    """control for the duplicate-key tests: the same shape WITHOUT a repeated key streams fine."""
+    p = _graph_file(tmp_path)
+    assert list(tool.stream_graph_nodes(p)["nodes_meta"]) == ["a"]
+    assert tool.stream_incident_figures(p, {"a"}, {"a"}) == {"a": (0, 0, 0)}
+
+
+def test_a_repeated_node_id_inside_nodes_is_a_stop_never_a_merge(tmp_path):
+    """canonical restore is last-wins (a dict); the streamed view must never keep a stale first copy (le-035 C1)."""
+    want = {"kind": "want", "want_text": "t", "want_state": "open", "provenance": "cc_authored"}
+    dup = _m(2) + _pk("a") + _pk(_node(want)) + _pk("a") + _pk(_node({}))
+    p = _graph_file(tmp_path, top=[("nodes", dup), ("synapses", _m(0)), ("hyperedges", _m(0))])
+    assert msgpack.unpackb(open(p, "rb").read(), raw=False)["nodes"]["a"]["metadata"] == {}         # the canonical (last-wins) view
+    with pytest.raises(tool.Stop):
+        tool.stream_graph_nodes(p)
+
+
+@pytest.mark.parametrize("key", ["nodes", "synapses", "hyperedges"])
+def test_a_repeated_top_level_graph_key_is_a_stop_in_both_graph_readers(tmp_path, key):
+    base = {"nodes": _m(1) + _pk("a") + _pk(_node()), "synapses": _m(0), "hyperedges": _m(0)}
+    top = [(k, v) for k, v in base.items()] + [(key, base[key] if key != "nodes" else _m(1) + _pk("b") + _pk(_node()))]
+    p = _graph_file(tmp_path, top=top)
+    with pytest.raises(tool.Stop):
+        tool.stream_graph_nodes(p)                                   # every top-level key is checked, descended or skipped
+    with pytest.raises(tool.Stop):
+        tool.stream_incident_figures(p, {"a"}, {"a", "b"})
+
+
+def test_a_repeated_hyperedge_id_is_a_stop_in_the_incident_pass(tmp_path):
+    he = lambda members: {"hyperedge_id": "h", "member_nodes": members}                                # noqa: E731
+    dup = _m(2) + _pk("h") + _pk(he(["a"])) + _pk("h") + _pk(he(["b"]))
+    p = _graph_file(tmp_path, top=[("nodes", _m(2) + _pk("a") + _pk(_node()) + _pk("b") + _pk(_node())), ("synapses", _m(0)), ("hyperedges", dup)])
+    with pytest.raises(tool.Stop):
+        tool.stream_incident_figures(p, {"a", "b"}, {"a", "b"})
+
+
+def _vectors_bytes(entries_pairs, *, extra_top=()):
+    e = lambda c: {"embedding": b"\x00" * 16, "content": c, "metadata": {}}                          # noqa: E731
+    body = _m(len(entries_pairs)) + b"".join(_pk(k) + _pk(e(c)) for k, c in entries_pairs)
+    top = [("version", _pk("1.0.0")), ("count", _pk(1)), ("entries", body), *extra_top]
+    return _m(len(top)) + b"".join(_pk(k) + v for k, v in top)
+
+
+def test_a_repeated_entries_key_or_entry_id_in_the_vectors_file_is_a_stop(tmp_path):
+    ok = _vfile(tmp_path, _vectors_bytes([("a", "c [WANT]")]))
+    assert tool.load_content_subset(ok, set()) == {"a": "c [WANT]"}                                # control: one entry reads
+    two_entries = _vectors_bytes([("a", "first [WANT]")], extra_top=[("entries", _m(1) + _pk("b") + _pk({"embedding": b"", "content": "x", "metadata": {}}))])
+    assert msgpack.unpackb(two_entries, raw=False)["entries"].keys() == {"b"}                      # canonical: the LAST map wins as a whole
+    with pytest.raises(tool.Stop):                                                                 # never the merged {a, b}
+        tool.load_content_subset(_vfile(tmp_path, two_entries), set())
+    dup = _vectors_bytes([("a", "first [WANT]"), ("a", "second")])
+    assert msgpack.unpackb(dup, raw=False)["entries"]["a"]["content"] == "second"                  # canonical: last wins
+    with pytest.raises(tool.Stop):                                                                 # never a silently chosen value
+        tool.load_content_subset(_vfile(tmp_path, dup), set())
+
+
+def test_analyze_a_missing_scope_id_stops_with_the_old_paths_message_before_the_vectors_file_is_opened(xworld, pinned, monkeypatch):
+    """a frozen scope naming a non-node / a non-want: the SAME Stop text as the pre-delta path (now built into the test's
+    OLD path), raised BEFORE load_content_subset is ever called (the cheaper early stop)."""
+    base = tool.load_base_module(pinned)
+    for frozen in (["cc:want::not-a-node"], ["n1"]):                                               # absent; present but not a want
+        with pytest.raises(tool.Stop) as old:
+            _old_analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN, frozen_scope=frozen, base_mod=base)
+
+        def opened(*a, **k):
+            raise AssertionError("the vectors file was opened before the scope check")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(tool, "load_content_subset", opened)
+            with pytest.raises(tool.Stop) as new:
+                tool.analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN, frozen_scope=frozen, base_mod=base)
+        assert str(new.value) == str(old.value) and "not want nodes in the graph" in str(new.value)
+
+
+def test_the_extras_world_holds_the_fold_shapes(xworld, pinned):
+    """the fold's world gaps are really present: two S wants on ONE source; a live-hyperedge flag; a ghost endpoint and a
+    self-loop (asserted on the canonical restore in the graph-stream test); and the S wants are classified, not skipped."""
+    A = _old_analyze(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN)
+    by = {r["id"]: r for r in A["records"]}
+    s1, s2 = by[xworld.ids["SHARED1"]], by[xworld.ids["SHARED2"]]
+    assert s1["source_node"] == s2["source_node"] == "cc:conv::shared" and s1["outcome"] == s2["outcome"] == "GENUINE"
+    assert A["before_figures_scope"][xworld.ids["SEP1"]][2] == 2 and A["before_figures_scope"][xworld.ids["GEN"]][2] == 1
+    assert A["before_figures_scope"][xworld.ids["SEP1"]][1] >= 2                                    # incoming includes the ghost-pre synapse
