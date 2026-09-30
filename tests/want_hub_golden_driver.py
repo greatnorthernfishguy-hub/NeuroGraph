@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (Z12 builder, dispatch #12011, ADDENDUM 3 tests fold) — driver additions for le-036 / checker-029 C1, C5, C6, C2, C3:
+#   (C1) --ids random: engine-minted synapse ids come from a SEEDED random uuid4-shaped stream, so id order != creation order != items() order
+#        (the counter ids hid an unconditional default-path sort-by-id, mutant M07a); (C6) every record carries ng_tract_file / ng_tract_version
+#        (the native SynapseStore is an installed wheel, not a file of either checkout); (C5) ref_order_key counts a link once per distinct
+#        endpoint (a self-loop is ONE link) and inject_self_loop() builds a restored-style self-loop (create_synapse refuses them);
+#        (C2) bad_calls gains order_key entries that are not mutually comparable / not tuples. No existing scenario or comparison changed.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11135) — want-hub (d) test driver
 # What: NEW helper for tests/test_want_hub_competition.py — NOT a test module (no test_ prefix, no pytest import).
 #   (1) build_graph(): the ONE seeded synthetic-graph builder shared by test G (run as a script, once per checkout)
@@ -35,6 +41,25 @@ def install_deterministic_uuid():
 
     uuid.uuid4 = _det_uuid4
     return box
+
+
+def install_seeded_random_uuid(seed=20260930):
+    """C1: engine-minted ids become SEEDED random uuid4-shaped values (deterministic across processes, but NOT ascending in
+    creation order — like the uuid4 ids of a real graph). Returns the Random so a caller can see it is stateful."""
+    rng = random.Random(seed)
+    uuid.uuid4 = lambda: uuid.UUID(int=rng.getrandbits(128), version=4)
+    return rng
+
+
+def ng_tract_info():
+    """C6: where the native SynapseStore comes from and its installed version (an installed wheel, NOT a checkout file)."""
+    import importlib.metadata
+    import ng_tract
+    try:
+        ver = importlib.metadata.version("ng_tract")
+    except Exception as exc:  # recorded, never hidden
+        ver = "UNKNOWN(%s)" % type(exc).__name__
+    return os.path.realpath(ng_tract.__file__), ver
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +251,8 @@ def ref_order_key(g, competing):
     by_want = collections.defaultdict(list)
     for sid in competing:
         s = g.synapses[sid]
-        for nid in (s.pre_node_id, s.post_node_id):
+        # C5: a link counts ONCE per distinct endpoint (a self-loop is one link of its want), as plan 4A.2 "c_w = w's number of competing links"
+        for nid in {s.pre_node_id, s.post_node_id}:
             if g._is_identity_protected(nid) and not is_constitutional(g, nid):
                 by_want[nid].append(sid)
     height = {}
@@ -296,7 +322,38 @@ def bad_calls(g, K, B):
     calls.append(("max_removals omitted in competing mode", {k: v for k, v in with_().items() if k != "max_removals"}))
     for bad in (None, 0, -1, -3, 5.0, "5"):
         calls.append(("max_removals=%r in competing mode" % (bad,), with_(max_removals=bad)))
+    # C2 (le-036 N3-1): order_key VALUES that cannot be sorted together. The poisoned entry belongs to an ELIGIBLE competitor, so a
+    # validator that only looks at keys lazily (after the loop) would reach the sort with it and raise TypeError AFTER every competitor's
+    # low_weight_steps moved. Each must be a ValueError raised BEFORE the loop, state unchanged.
+    elig = sorted(x for x in ok["competing_ids"] if ref_eligible(g, x))
+    assert len(elig) >= 2, "C2 fixture needs >= 2 eligible competitors"
+    mixed = with_()
+    mixed["order_key"][elig[0]] = ("not-a-number", 1, 1.0, elig[0])
+    calls.append(("order_key values not mutually comparable (str vs number)", mixed))
+    scalar = with_()
+    scalar["order_key"][elig[1]] = 7
+    calls.append(("order_key entry is not a tuple", scalar))
+    short = with_()
+    short["order_key"][elig[0]] = (0, 0)
+    calls.append(("order_key entries are tuples of different length", short))
     return calls
+
+
+def inject_self_loop(nf, g, nid, weight=0.0, **fields):
+    """C5: a restored-style self-loop. Graph.create_synapse refuses pre == post ("Self-connections not allowed"), but a synapse can
+    arrive in a restored checkpoint; this builds it exactly the way create_synapse does, minus the refusal. Returns its id."""
+    syn = nf.Synapse(pre_node_id=nid, post_node_id=nid, weight=weight, max_weight=g.config["max_weight"], delay=1,
+                     synapse_type=nf.SynapseType.EXCITATORY, creation_time=float(g.timestep),
+                     last_update_time=float(g.timestep), peak_weight=weight)
+    sid = syn.synapse_id
+    with g._step_lock:
+        g.synapses[sid] = syn
+        g._outgoing[nid].add(sid)
+        g._incoming[nid].add(sid)
+        g._dirty_synapses.add(sid)
+    for k, v in fields.items():
+        setattr(g.synapses[sid], k, v)
+    return sid
 
 
 def _synapse_row(sid, s):
@@ -361,7 +418,7 @@ def git_rev(checkout):
 SCENARIOS = ("door_a", "door_b", "direct_defaults", "direct_explicit_none")
 
 
-def _run(checkout, scenario, ckpt_path):
+def _run(checkout, scenario, ckpt_path, ids="counter"):
     checkout = os.path.realpath(checkout)
     sys.path.insert(0, checkout)
     random.seed(0)
@@ -370,7 +427,10 @@ def _run(checkout, scenario, ckpt_path):
         numpy.random.seed(0)
     except Exception:
         pass
-    install_deterministic_uuid()
+    if ids == "random":
+        install_seeded_random_uuid()      # C1: uuid4-shaped ids NOT ascending in creation order
+    else:
+        install_deterministic_uuid()
     import neuro_foundation as nf
     nf_file = os.path.realpath(nf.__file__)
     if os.path.dirname(nf_file) != checkout:
@@ -402,7 +462,11 @@ def _run(checkout, scenario, ckpt_path):
         "void": False,
         "scenario": scenario,
         "variant": variant,
+        "ids": ids,
+        "creation_order_sorted": before_ids == sorted(before_ids),
         "neuro_foundation_file": nf_file,
+        "ng_tract_file": ng_tract_info()[0],
+        "ng_tract_version": ng_tract_info()[1],
         "git_rev": git_rev(checkout),
         "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
         "new_api_present": new_api_present(nf),
@@ -423,5 +487,7 @@ if __name__ == "__main__":
     ap.add_argument("--checkout", required=True)
     ap.add_argument("--scenario", required=True, choices=SCENARIOS)
     ap.add_argument("--ckpt", required=True, help="scratch temp .msgpack path (never a live path)")
+    ap.add_argument("--ids", choices=("counter", "random"), default="counter",
+                    help="synapse id stream: counter (creation order == id order) or seeded random uuid4-shaped (C1)")
     a = ap.parse_args()
-    sys.exit(_run(a.checkout, a.scenario, a.ckpt))
+    sys.exit(_run(a.checkout, a.scenario, a.ckpt, a.ids))

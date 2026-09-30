@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (Z12 builder, dispatch #12011, ADDENDUM 3 tests fold — le-036 / checker-029) — tests-first for the engine fold:
+#   C1 a Test G variant with SEEDED RANDOM uuid-shaped ids (id order != creation order; kills mutant M07a, an unconditional default-path sort
+#   by id, which passed all 27 tests because the counter ids made a sort a no-op); C4 the `conducting` boundary (weight == weight_threshold,
+#   mutant M18) and a `floors_ok` that can be observed False (mutant M22); C5 the reference counts a self-loop ONCE + a restored-style self-loop
+#   fixture; C6 the P379 guard prints and asserts ng_tract.__file__ + version + that Graph.synapses is the native SynapseStore; K: order_key
+#   values that are not mutually comparable (C2) and order_key on the DEFAULT path (C3) must be ValueError with no state change.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, dispatch #11903, Z12 ruling ADDENDUM 2) — test_A_orchestrator_…: compute the reference order key BEFORE the call (it read removed synapses); no assertion weakened.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11135) — want-hub (d) tests G / A / K / R
 # What: NEW test file for the ENGINE change plan-005 sec 2.6 specifies (additive keyword-only parameters on
@@ -16,6 +22,7 @@
 #   Names bound by these tests are the plan's ILLUSTRATIVE names (plan 4.2 "names illustrative", 4.3 "name suggestion").
 # -------------------
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -61,6 +68,15 @@ def det_ids():
 
 
 @pytest.fixture
+def rand_ids():
+    """C1: engine-minted synapse ids are SEEDED random uuid4-shaped values (not ascending in creation order) for the test's duration."""
+    orig = uuid.uuid4
+    drv.install_seeded_random_uuid()
+    yield
+    uuid.uuid4 = orig
+
+
+@pytest.fixture
 def new_api():
     """The tests below that need the additive surface FAIL (never skip) when it is absent — build-001 states this."""
     if not drv.new_api_present(nf):
@@ -87,12 +103,12 @@ def _digest(g):
     return drv.state_digest(g)
 
 
-def _run_driver(checkout, scenario, out_dir, tag):
-    ckpt = Path(out_dir) / ("%s-%s.msgpack" % (scenario, tag))
+def _run_driver(checkout, scenario, out_dir, tag, ids="counter"):
+    ckpt = Path(out_dir) / ("%s-%s-%s.msgpack" % (scenario, ids, tag))
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "NG_EMBED_REMOTE")}
     env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONHASHSEED="0")
     p = subprocess.run([sys.executable, str(REPO / "tests" / "want_hub_golden_driver.py"), "--checkout", str(checkout),
-                        "--scenario", scenario, "--ckpt", str(ckpt)],
+                        "--scenario", scenario, "--ckpt", str(ckpt), "--ids", ids],
                        capture_output=True, text=True, env=env, cwd=str(out_dir), timeout=600)
     lines = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
     assert lines, "driver produced no JSON (rc=%s)\nSTDOUT:%s\nSTDERR:%s" % (p.returncode, p.stdout[-2000:], p.stderr[-2000:])
@@ -126,6 +142,15 @@ def test_p379_module_under_test_is_this_worktree(capsys):
     with capsys.disabled():
         print("\nP379 neuro_foundation.__file__=%s git_rev=%s base_rev=%s new_api_present=%s"
               % (nf.__file__, drv.git_rev(str(REPO)), BASE_REV, drv.new_api_present(nf)))
+    # C6 (le-036 W1 / checker-029): the native SynapseStore is an INSTALLED WHEEL, not a file of either checkout. Print and pin it.
+    import ng_tract
+    nt_file, nt_ver = drv.ng_tract_info()
+    with capsys.disabled():
+        print("P379 ng_tract.__file__=%s ng_tract.version=%s Graph.synapses=%s" % (nt_file, nt_ver, type(nf.Graph().synapses).__name__))
+    assert hasattr(ng_tract, "SynapseStore")
+    assert REPO not in Path(nt_file).parents, "ng_tract resolved INSIDE the worktree (shadowed wheel): %s" % nt_file
+    assert not nt_ver.startswith("UNKNOWN"), "ng_tract version unreadable: %s" % nt_ver
+    assert isinstance(nf.Graph().synapses, ng_tract.SynapseStore), "Graph.synapses is not the native SynapseStore"
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +233,8 @@ def test_G_default_path_base_vs_branch(scenario, base_checkout, tmp_path):
     for k in _COMPARE:
         assert base[k] == branch[k], "default-path divergence in %s (%s)" % (k, scenario)
     assert Path(base["_ckpt"]).read_bytes() == Path(branch["_ckpt"]).read_bytes(), "serialized checkpoint bytes differ"
+    # C6: both checkouts ran the SAME native wheel (path + version), so this comparison is not two different stores
+    assert (base["ng_tract_file"], base["ng_tract_version"]) == (branch["ng_tract_file"], branch["ng_tract_version"])
 
 
 def test_G_all_new_parameters_at_defaults_equal_the_base_default_path(base_checkout, tmp_path):
@@ -306,6 +333,12 @@ def test_K_refusals_are_explicit_raises_not_asserts_under_python_dash_O(new_api)
         "d0 = d.state_digest(g)\n"
         "out = {'debug': __debug__, 'cases': []}\n"
         "for label, kw in d.bad_calls(g, %d, %d):\n"
+        "    try:\n"
+        "        g._prune_synapses(**kw)\n"
+        "        out['cases'].append([label, 'NO-RAISE', d.state_digest(g) == d0])\n"
+        "    except BaseException as e:\n"
+        "        out['cases'].append([label, type(e).__name__, d.state_digest(g) == d0])\n"
+        "for label, kw in (('default path + order_key (C3)', {'order_key': {}}),):\n"
         "    try:\n"
         "        g._prune_synapses(**kw)\n"
         "        out['cases'].append([label, 'NO-RAISE', d.state_digest(g) == d0])\n"
@@ -513,3 +546,187 @@ def test_R_ordinary_synapses_outside_the_arena_are_never_touched_by_the_pass(det
     for sid, row in before.items():
         if sid not in s.competing:
             assert after.get(sid) == row, "%s (not a competitor) changed" % sid
+
+
+# ===========================================================================
+# ADDENDUM 3 tests fold (le-036 / checker-029). C2/C3 (engine error-path hardening) are pinned here FIRST and must FAIL against
+# engine 8e578532; the rest pin behaviour the engine already has and earn their keep by killing mutants (see build-003).
+# ===========================================================================
+
+# --- C1: Test G with synapse ids that are NOT ascending in creation order -------------------------------------------------------
+def test_C1_harness_random_ids_are_not_ascending_in_creation_order(rand_ids):
+    """If the id stream came out sorted the variant below could not see an unconditional sort-by-id (mutant M07a)."""
+    g, _ = drv.build_graph(nf, 11)
+    ids = list(g.synapses.keys())
+    assert ids != sorted(ids), "random-id stream came out sorted — the variant would not discriminate a sort-by-id"
+    ascending = sum(1 for a, b in zip(ids, ids[1:]) if a < b)
+    assert 0.3 < ascending / (len(ids) - 1) < 0.7, "ids look ordered (ascending adjacent pairs: %d/%d)" % (ascending, len(ids) - 1)
+
+
+@pytest.mark.parametrize("scenario", ["door_a", "door_b", "direct_defaults"])
+def test_C1_G0_control_random_ids_base_vs_base_is_deterministic(scenario, base_checkout, tmp_path):
+    a = _run_driver(base_checkout, scenario, tmp_path, "base1", ids="random")
+    b = _run_driver(base_checkout, scenario, tmp_path, "base2", ids="random")
+    assert a["ids"] == b["ids"] == "random" and a["creation_order_sorted"] is False
+    for k in _COMPARE:
+        assert a[k] == b[k], "random-id harness is non-deterministic on %s: %s" % (scenario, k)
+    assert Path(a["_ckpt"]).read_bytes() == Path(b["_ckpt"]).read_bytes()
+
+
+@pytest.mark.parametrize("scenario", ["door_a", "door_b", "direct_defaults"])
+def test_C1_G_random_ids_default_path_base_vs_branch(scenario, base_checkout, tmp_path):
+    """Return value, removal ORDER, `pruned` events, full state digest (store items() order after swap-removes) and serialized
+    checkpoint BYTES, on a graph whose ids are NOT ascending in creation order (like the uuid4 ids of a real graph)."""
+    base = _run_driver(base_checkout, scenario, tmp_path, "base", ids="random")
+    branch = _run_driver(REPO, scenario, tmp_path, "branch", ids="random")
+    assert base["neuro_foundation_file"] != branch["neuro_foundation_file"], "the two runs imported the same file (vacuous)"
+    assert branch["neuro_foundation_file"].startswith(str(REPO))
+    assert base["ids"] == branch["ids"] == "random"
+    assert base["creation_order_sorted"] is False and branch["creation_order_sorted"] is False
+    assert base["removal_order"], "seed removes nothing on the default path — comparison would be vacuous"
+    assert base["removal_order"] != sorted(base["removal_order"]), \
+        "base removal order is already id-sorted — a default-path sort-by-id (M07a) would be invisible"
+    for k in _COMPARE:
+        assert base[k] == branch[k], "default-path divergence with random ids in %s (%s)" % (k, scenario)
+    assert Path(base["_ckpt"]).read_bytes() == Path(branch["_ckpt"]).read_bytes(), "serialized checkpoint bytes differ (random ids)"
+    assert (base["ng_tract_file"], base["ng_tract_version"]) == (branch["ng_tract_file"], branch["ng_tract_version"])
+
+
+def test_C1_G_random_ids_all_new_parameters_at_defaults_equal_the_base_default_path(base_checkout, tmp_path):
+    base = _run_driver(base_checkout, "direct_defaults", tmp_path, "base", ids="random")
+    branch = _run_driver(REPO, "direct_explicit_none", tmp_path, "branch", ids="random")
+    assert branch["variant"] == "ok", branch["variant"]
+    for k in _COMPARE:
+        assert base[k] == branch[k], "explicit-None call diverges from base default path (random ids) in %s" % k
+    assert Path(base["_ckpt"]).read_bytes() == Path(branch["_ckpt"]).read_bytes()
+
+
+# --- C4: the `conducting` boundary and an observable floors_ok -------------------------------------------------------------------
+def _expected_tally(g, eligible_ids, wt):
+    """Independent recount (from PRE-call state) of the counts-by-want record: a link counts once per distinct want endpoint;
+    `conducting` means weight >= weight_threshold (plan 4A.6)."""
+    wants = set(drv.protected_wants(g))
+    conducting = 0
+    tally = {}
+    for x in eligible_ids:
+        s = g.synapses[x]
+        cond = 1 if s.weight >= wt else 0
+        conducting += cond
+        for nid in {s.pre_node_id, s.post_node_id}:
+            if nid in wants:
+                t = tally.setdefault(nid, {"removed": 0, "conducting": 0})
+                t["removed"] += 1
+                t["conducting"] += cond
+    return conducting, dict(sorted(tally.items()))
+
+
+def test_C4_conducting_count_pins_the_weight_threshold_boundary(det_ids, new_api):
+    """A competitor whose weight is EXACTLY weight_threshold is conducting (>=); a `>` mutant (M18) undercounts."""
+    g, _ = make()
+    s = drv.ref_sets(g, K)
+    wt = g.config["weight_threshold"]
+    elig = sorted(x for x in s.competing if drv.ref_eligible(g, x))
+    ws = [g.synapses[x].weight for x in elig]
+    assert any(w == wt for w in ws) and any(w < wt for w in ws) and any(w > wt for w in ws), "fixture must straddle the boundary"
+    want_cond, want_tally = _expected_tally(g, elig, wt)
+    assert want_cond > sum(1 for w in ws if w > wt), "the ==wt competitors must matter to the count"
+    rec = g.compete_protected_links(K, 10 ** 6)
+    assert rec["removed"] == len(elig)
+    assert rec["conducting_links_removed"] == want_cond
+    assert rec["by_want"] == want_tally
+
+
+def test_C4_floors_ok_is_true_and_logged_at_info_on_a_normal_call(det_ids, new_api, caplog):
+    g, _ = make()
+    with caplog.at_level(logging.INFO, logger=nf.logger.name):
+        rec = g.compete_protected_links(K, B_SMALL)
+    assert rec["floors_ok"] is True
+    lines = [r for r in caplog.records if r.getMessage().startswith("compete_protected_links:")]
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO
+
+
+def test_C4_floors_ok_goes_false_and_warns_when_a_guaranteed_link_is_lost(det_ids, new_api, caplog):
+    """floors_ok is a real post-call recount, not a constant (mutant M22 forces it True). Simulate a buggy prune that also removes
+    every non-rim link of one want; the orchestrator must notice and WARN."""
+    g, _ = make()
+    F = drv.frozen_rim(g)
+    w = drv.protected_wants(g)[0]
+    orig = g._prune_synapses
+
+    def lossy(**kw):
+        n = orig(**kw)
+        for x in list(g._outgoing.get(w, ())) + list(g._incoming.get(w, ())):
+            if x not in F and x in g.synapses:
+                g._remove_synapse_internal(x)
+        return n
+
+    g._prune_synapses = lossy
+    with caplog.at_level(logging.INFO, logger=nf.logger.name):
+        rec = g.compete_protected_links(K, B_SMALL)
+    assert rec["floors_ok"] is False
+    lines = [r for r in caplog.records if r.getMessage().startswith("compete_protected_links:")]
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING and "floors_ok=False" in lines[0].getMessage()
+
+
+# --- C5: self-loops (API refuses them; a restored checkpoint can carry one) ---------------------------------------------------------
+def _make_with_self_loop():
+    g, _ = make()
+    w = max(drv.protected_wants(g), key=lambda x: len(g._outgoing[x] | g._incoming[x]))
+    sid = drv.inject_self_loop(nf, g, w, weight=0.0, inactive_steps=10 ** 6)
+    return g, w, sid
+
+
+def test_C5_the_api_refuses_a_self_loop_so_the_fixture_is_restored_style(det_ids):
+    g, _ = make()
+    w = drv.protected_wants(g)[0]
+    with pytest.raises(ValueError):
+        g.create_synapse(w, w)
+    sid = drv.inject_self_loop(nf, g, w)
+    assert g.synapses[sid].pre_node_id == g.synapses[sid].post_node_id == w and sid in g._outgoing[w] and sid in g._incoming[w]
+
+
+def test_C5_self_loop_counts_once_in_the_reference_and_in_the_engine_key(det_ids, new_api):
+    """The stalest link of a want has rank 0, so its height == c_w. c_w is the number of competing LINKS of the want: a
+    self-loop is ONE link. A reference that walks (pre, post) counts it twice (c_w + 1) and disagrees with the plan and the engine."""
+    g, w, sid = _make_with_self_loop()
+    s = drv.ref_sets(g, K)
+    assert sid in s.competing, "fixture: the self-loop must compete (not be in G or the last-link set)"
+    c_once = len({x for x in s.competing if w in (g.synapses[x].pre_node_id, g.synapses[x].post_node_id)})
+    ok = drv.ref_order_key(g, s.competing)
+    assert -ok[sid][0] == c_once, "reference double-counted the self-loop (height %d, links %d)" % (-ok[sid][0], c_once)
+    calls = []
+    orig = g._prune_synapses
+
+    def spy(*a, **k):
+        calls.append(k)
+        return orig(*a, **k)
+
+    g._prune_synapses = spy
+    g.compete_protected_links(K, B_SMALL)
+    assert {x: tuple(calls[0]["order_key"][x]) for x in s.competing} == ok
+
+
+def test_C5_self_loop_is_tallied_once_and_every_guarantee_holds(det_ids, new_api):
+    g, w, sid = _make_with_self_loop()
+    s = drv.ref_sets(g, K)
+    wt = g.config["weight_threshold"]
+    elig = sorted(x for x in s.competing if drv.ref_eligible(g, x))
+    assert sid in elig
+    want_cond, want_tally = _expected_tally(g, elig, wt)
+    guarded = {x: drv._synapse_row(x, g.synapses[x]) for x in (s.F | s.G | s.last)}
+    rec = g.compete_protected_links(K, 10 ** 6)
+    assert sid not in g.synapses, "an eligible competing self-loop should be removed"
+    assert rec["by_want"] == want_tally and rec["conducting_links_removed"] == want_cond and rec["floors_ok"] is True
+    for x, row in guarded.items():
+        assert x in g.synapses and drv._synapse_row(x, g.synapses[x]) == row, "F/G/last-link synapse %s was touched" % x
+
+
+# --- C3 (le-036 #2): order_key on the DEFAULT path is refused up front, nothing mutated ---------------------------------------------
+@pytest.mark.parametrize("label", ["empty mapping", "mapping covering every synapse"])
+def test_K_default_path_refuses_order_key_and_mutates_nothing(label, det_ids, new_api):
+    g, _ = make()
+    d0 = _digest(g)
+    ok = {} if label == "empty mapping" else {sid: (0, 0, 0.0, sid) for sid in g.synapses.keys()}
+    with pytest.raises(ValueError):
+        g._prune_synapses(order_key=ok)
+    assert _digest(g) == d0, "the refusal mutated state (counters advanced before the raise)"
