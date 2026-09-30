@@ -13,6 +13,18 @@
 # How:  One argument removed, on the e4ebf982 base. Expected conflict with #813 (84a0968a) at
 #   this call site: see the #812 turn-1 return for the correct merged form.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
+#   TURN 4 (dispatch #11061) -- checker-022 C1/C2/C3 (Chief ruling docs 2a3b5fbf)
+# What: (C1) pith_stage3's docstring step 5 now describes what the body does: an over-budget
+#   line, even the first, is skipped whole-or-absent with the INFO drop line (D8 CONFIRMED: the
+#   first-line overrun guard stays REMOVED). (C2) _cc_monitor_items_whole: an item whose
+#   re-resolve RAISES is dropped (never the shared 240-char snippet), with a WARNING naming the
+#   node id + exception type (no text; id first-time-seen); the pattern-stream dedupe set is
+#   recomputed from the SURVIVING monitor items so the dropped node's whole twin is not lost too.
+#   (C3) _pith_reference_text logs ONE INFO line when it leaves concept trees out (included /
+#   total / left out, counts only). (C4) pinned Stage-3 lines sit off-budget: recorded, unchanged.
+# Why: checker-022 PASS-WITH-NOTES on turns 2+3. No behaviour change on the happy path.
+# How: cc_ng_host.py, surfacing.py, surface_resolver.py untouched.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
 #   TURN 3 (dispatch #11011) -- #817 REVERTED, DEFERRED to the post-track VPS/daemon lane
 # What: pith_compress_history and the PithMetrics.history_* group (7 fields, reset/snapshot
 #   lines, record_history_compression) are RESTORED exactly as at turn 1; cc_ng_host.py is
@@ -4668,12 +4680,21 @@ def _pith_reference_text(graph: Any, node_id: str, text: str, budget: int) -> Op
     if len(reference) > budget:
         return None
     parts, used = [reference], len(reference)
-    for _tid, tree_text in _pith_tree_nodes(graph, node_id, _CC_PITH_PROVIDER_MEMBERS):
+    trees = _pith_tree_nodes(graph, node_id)
+    included = 0
+    for _tid, tree_text in trees[:_CC_PITH_PROVIDER_MEMBERS]:
         piece = "- concept: " + tree_text
         if used + 1 + len(piece) > budget:
             break
         parts.append(piece)
         used += 1 + len(piece)
+        included += 1
+    if included < len(trees):
+        # Turn 4 / checker-022 C3: the node swap is loud, so the trees it could not carry are too
+        # (whether the budget or the CC_PITH_PROVIDER_MEMBERS cap stopped them).  Counts only.
+        logger.info("pith reference form: node %s shows %d of %d concept trees whole; %d left out "
+                    "(budget %d chars, tree cap %d)", node_id, included, len(trees),
+                    len(trees) - included, budget, _CC_PITH_PROVIDER_MEMBERS)
     return "\n".join(parts)
 
 
@@ -4800,11 +4821,17 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
        "recall": CC_PITH_W_RELEVANCE}; an unknown stream fails open to 1.0
        (kept in contention rather than zeroed out).
     4. Stable-sort unpinned lines by unified score, descending.
-    5. Greedy budget fill over the sorted list, accumulating len(content):
-       keep while the running total stays <= budget_chars, stop at the first
-       line that would exceed it. A single line longer than the whole budget
-       is still kept if nothing has been added yet (never emit an empty L1
-       just because the top item is large), then fill stops.
+    5. Budget fill by THE ONE BUDGET RULE (see _pith_admit_strict_prefix),
+       accumulating len(content): whole or absent, never shortened. Keep
+       lines while the running total stays <= budget_chars; the first line
+       that does not fit the REMAINING budget ends the ranked prefix. A line
+       longer than the whole (empty) budget -- including the FIRST, top-ranked
+       one -- is skipped, never emitted over budget (#813 D8: the old "keep
+       the first line even if it alone exceeds the budget" guard is gone; it
+       was a silent overrun), and it does not end the prefix. Every drop is
+       ONE INFO line: count, total chars, and the never-fit node ids. (An
+       over-budget recall item normally reaches this function already in its
+       trees + reference form, #819.) Pinned lines are outside the budget.
     6. Assemble: pinned lines first (original order), then kept unpinned
        lines in ranked order.
 
@@ -5619,13 +5646,16 @@ def _cc_monitor_items_whole(ng: Any, items: List[Dict[str, Any]]) -> List[Dict[s
     that default or surfacing.py would change Syl's live /assemble path (P329, #812), so instead
     this wrapper re-resolves each item's WHOLE content by node_id from the same node + vector-db
     entry the monitor used (Exec P410(c): the wrapper renders full stored content).  Returns new
-    dicts -- the monitor's own items are never mutated.  Fail-soft per item: one that cannot be
-    re-resolved (unknown node, image frame, filtered, error) keeps what the monitor gave us and
-    is never dropped for that.
+    dicts -- the monitor's own items are never mutated.  Per item: one that is not re-resolvable
+    by design (unknown node, image frame, filtered/empty) keeps what the monitor gave us.  One
+    whose re-resolve RAISES is DROPPED -- whole-or-absent (turn 4 / checker-022 C2): keeping the
+    shared 240-char snippet would leak a cut item.  The drop is a WARNING naming the node id and
+    the exception TYPE (never node text), the id first-time-seen only (flood-safe).
     """
     graph = getattr(ng, "graph", None)
     vdb = getattr(ng, "vector_db", None)
     out: List[Dict[str, Any]] = []
+    failed: List[tuple] = []
     for item in items or []:
         fresh = dict(item)
         nid = item.get("node_id")
@@ -5638,9 +5668,18 @@ def _cc_monitor_items_whole(ng: Any, items: List[Dict[str, Any]]) -> List[Dict[s
                 if text:
                     fresh["content"] = text
         except Exception as exc:
-            logger.debug("CC monitor whole-content re-resolve failed for %r (kept as given): %s",
-                         nid, exc)
+            failed.append((nid, type(exc).__name__))
+            continue                         # whole-or-absent: never append the cut snippet
         out.append(fresh)
+    if failed:
+        shown, already, more = _pith_note_ids("monitor|%s" % nid for nid, _why in failed)
+        why = {"monitor|%s" % nid: w for nid, w in failed}
+        named = ", ".join("%s (%s)" % (k.split("|", 1)[1], why[k]) for k in shown)
+        extra = "".join([" [%d already reported]" % already if already else "",
+                         " [+%d more]" % more if more else ""])
+        logger.warning("CC monitor whole-content re-resolve failed for %d item%s; DROPPED "
+                       "(whole-or-absent -- a cut item is never kept): %s%s",
+                       len(failed), "" if len(failed) == 1 else "s", named or "-", extra)
     return out
 
 
@@ -5780,6 +5819,9 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     # reached us (surfacing.py:192 -> surface_resolver default).  Re-resolve every item's WHOLE
     # content by node_id here; the shared modules stay untouched (Syl's /assemble, P329).
     monitor_items = _cc_monitor_items_whole(ng, monitor_items)
+    # An item dropped by the whole-or-absent rule must not also suppress its pattern-stream twin
+    # (which is whole): dedupe against the items that SURVIVED.
+    monitor_node_ids = {item.get('node_id') for item in monitor_items}
 
     pc_results: List[Dict[str, Any]] = []
     # Everything pattern completion fired, before the display dedup against
