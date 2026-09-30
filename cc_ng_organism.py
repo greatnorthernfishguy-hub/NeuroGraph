@@ -3,6 +3,30 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane ingest-tract-swallow-781 — #794:
+#   opt-in hold_on_failure on drain_ingest_tract (Chief-003 ruling / Exec P386)
+# What: drain_ingest_tract gains ONE new LAST keyword, hold_on_failure=False. With
+#   hold_on_failure=True the tract offset advances only past entries that were
+#   absorbed (dual pass True) or legitimately filter-skipped (wrong type / wrong
+#   source / empty text). At the FIRST entry whose absorb returns False or raises,
+#   the drain stops, truncates ONLY the prefix before it, leaves that entry and
+#   everything after it in the file, emits ONE logger.warning (fixed reason code +
+#   exception CLASS NAME only, never str(exc)/entry text/path) and RETURNS NORMALLY.
+#   With the default False every path, return value, side effect, log line and
+#   exception is byte-identical to e4ebf982 (the new code is reachable only under
+#   the flag). on_degraded, the daemon slice, per-step try, frame policy and the
+#   drain cap stay parked.
+# Why: #794. Today consumed_offset is set BEFORE the filters and BEFORE the absorb
+#   attempt for every entry, so an entry whose absorb returned False or raised is
+#   truncated out of the file and lost (LAW 7: raw experience destroyed, no retry,
+#   no signal). Exec P386: the offset must advance only AFTER a successful absorb.
+#   Default stays off because cc_ng_host.py:1526 (VPS half, Path B, Josh-gated) and
+#   the Leg 1 return_consumed callers must not change behaviour.
+# How: safe_offset tracks the offset just past the last absorbed-or-filter-skipped
+#   entry; under the flag the truncation prefix is data[:safe_offset] instead of
+#   data[:consumed_offset]. safe_offset == 0 takes the existing early return (file
+#   not rewritten). The parse-failure handler, consumed_actual/return_consumed logic
+#   and the truncate step are untouched. Tests: tests/test_cc_drain_hold_on_failure.py.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -2297,7 +2321,8 @@ def _apply_gateway_experience(graph, vector_db, state, entry):
 
 
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
-                        return_consumed: bool = False, max_entries: int = 0):
+                        return_consumed: bool = False, max_entries: int = 0,
+                        hold_on_failure: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -2325,6 +2350,22 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     successes would mean a file whose entries all fail the dual-pass never
     reaches the cap and gets drained in one unbounded lock hold. This is a
     resource bound, not FatherGraph topology consolidation.
+
+    hold_on_failure=False (default) is byte-identical to the historical
+    behaviour: every entry the reader yields is consumed whether or not its
+    absorb succeeded, so an entry whose dual pass returned False or raised is
+    truncated out of the file and lost (#794). hold_on_failure=True (opt-in;
+    #794, Chief-003 ruling / Exec P386) advances the offset ONLY past entries
+    that were absorbed (True) or legitimately filter-skipped (wrong type, wrong
+    source, empty text -- looked at, nothing to absorb). At the FIRST entry
+    whose absorb returns False or raises, the loop stops; only the prefix before
+    that entry is truncated; that entry and everything after it stay in the file
+    for the next call (a held entry is retried every cycle); ONE logger.warning
+    is emitted (fixed reason code + exception CLASS NAME only); and the function
+    RETURNS NORMALLY -- it never raises. If nothing precedes the held entry the
+    file is not rewritten at all. max_entries still counts entries ATTEMPTED (a
+    held entry was attempted). return_consumed still reports exactly the bytes
+    this call removed.
 
     Returns the count of entries absorbed (int) by default. If
     return_consumed=True, returns (absorbed, consumed_bytes) instead --
@@ -2377,6 +2418,10 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     # looked at, and leaving it in the file would make every later call re-scan
     # it forever. 0 means we never got past the first entry.
     consumed_offset = 0
+    # hold_on_failure only (#794): offset just past the last entry that was
+    # absorbed or legitimately filter-skipped. Unused (and never read) when the
+    # flag is off, so the default path is unchanged.
+    safe_offset = 0
     try:
         reader = ng_tract.TractReader(data)
         for entry in reader:
@@ -2385,20 +2430,43 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             consumed_offset = reader.position()
             # Check entry type using ng_tract.ENTRY_EXPERIENCE (the real module constant)
             if entry.entry_type != ng_tract.ENTRY_EXPERIENCE:
+                safe_offset = consumed_offset
                 continue
             if entry.source != "cc_gateway":
+                safe_offset = consumed_offset
                 continue
             text = entry.content
             if not text or not text.strip():
+                safe_offset = consumed_offset
                 continue
             taken += 1
+            hold_reason = None
+            hold_exc_type = "-"
             try:
                 if _apply_gateway_experience(graph, vector_db, state, entry):
                     absorbed += 1
+                    safe_offset = consumed_offset
+                else:
+                    hold_reason = "absorb_returned_false"
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
+                hold_reason = "absorb_raised"
+                hold_exc_type = type(exc).__name__
+            if hold_on_failure and hold_reason is not None:
+                # #794: stop at the FIRST failed entry. Hardcoded text only: a
+                # fixed reason code and the exception CLASS NAME -- never
+                # str(exc), the entry text, a path or a secret.
+                logger.warning(
+                    "CC ingest-tract hold: reason=%s exc_type=%s -- failed entry "
+                    "and everything after it kept in the tract for the next cycle",
+                    hold_reason, hold_exc_type)
+                break
             if max_entries and taken >= max_entries:
                 break
+        if hold_on_failure:
+            # Truncate only what precedes the first failed entry (or the whole
+            # walked span when nothing failed: safe_offset == consumed_offset).
+            consumed_offset = safe_offset
     except Exception as exc:
         # Parse failure -- truncate below never runs, so nothing was actually
         # consumed from the file. Elevated to warning (was debug): silent at
