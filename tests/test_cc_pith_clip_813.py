@@ -1,6 +1,14 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 4 (dispatch #11061): checker-022 C1-C3
+# What: C1 pin the pith_stage3 docstring to what the body does (an over-budget FIRST unpinned line is
+#   skipped, never kept); C2 a monitor item whose whole-content re-resolve RAISES is dropped
+#   (whole-or-absent, never the shared 240-char snippet) with a WARNING naming node id + exception type
+#   and no text, and its pattern-stream twin is NOT deduped away with it; C3 one INFO line when the #819
+#   reference form leaves concept trees out (count only).
+# Why: Chief ruling docs 2a3b5fbf on checker-022 PASS-WITH-NOTES; D8 confirmed (guard stays removed).
+# How: fake in-memory graph; a resolver that raises; caplog.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2c) / #819: over-budget node
 # What: a node whose WHOLE text cannot fit the usable envelope surfaces through its TREES (whole,
 #   each small) plus a ONE-LINE whole-node reference (id, size, date, tree count) and one INFO line,
@@ -868,3 +876,132 @@ def test_819_l1_and_unpithed_paths_use_the_same_reference_form(monkeypatch, capl
     assert "long node" in out and "cc:conv::bigforest" in out
     assert all(tt in out for tt in tree_texts)
     assert _ref_records(caplog)
+
+
+# ====================================================================== TURN 4: C1 / C2 / C3
+def test_c1_stage3_docstring_describes_the_skip_not_the_removed_guard():
+    doc = pith.pith_stage3.__doc__
+    assert "is\n       still kept if nothing has been added yet" not in doc
+    assert "still kept if nothing has been added" not in doc
+    assert "never emit an empty L1" not in doc
+    assert "skipped" in doc and "whole" in doc.lower() and "INFO" in doc
+
+
+def test_c1_a_first_unpinned_line_longer_than_the_budget_is_absent_with_the_info_line(caplog):
+    giant = pith.CacheLine.from_surfaced("FIRST-GIANT", "G" * 900, score=10.0, stream="pattern")
+    small = pith.CacheLine.from_surfaced("small", "s" * 40, score=1.0, stream="pattern")
+    pin = pith.CacheLine.from_surfaced("pin", "P" * 2000, score=0.0, pinned=True, stream="pattern")
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.pith_stage3([pin, giant, small], budget_chars=500)
+    assert [l.node_id for l in out] == ["pin", "small"]              # rank-1 giant absent, pin untouched
+    (record,) = _drop_records(caplog, "whole items")
+    assert "FIRST-GIANT" in record.getMessage() and "900" in record.getMessage()
+
+
+class _Boom(Exception):
+    pass
+
+
+def _raising_resolver(bad_ids, secret="SECRET-NODE-TEXT-DO-NOT-LOG"):
+    import surface_resolver
+    real = surface_resolver.resolve_surface_content
+
+    def fake(node, entry, *a, **k):
+        if getattr(node, "node_id", None) in bad_ids:
+            raise _Boom(secret)
+        return real(node, entry, *a, **k)
+    return fake
+
+
+def test_c2_a_monitor_item_whose_re_resolve_raises_is_dropped_and_warned_without_text(monkeypatch, caplog):
+    import surface_resolver
+    pith._PITH_DROP_SEEN.clear()
+    g = FakeGraph()
+    g.node("ok", "fine " * 100)
+    g.node("bad", "BAD-NODE-BODY " * 40)
+    monkeypatch.setattr(surface_resolver, "resolve_surface_content", _raising_resolver({"bad"}))
+    ng = fake_ng(g, [])
+    items = [{"node_id": "ok", "content": "cut…", "score": 1.0},
+             {"node_id": "bad", "content": "the shared 240-char snippet…", "score": 0.9}]
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        out = pith._cc_monitor_items_whole(ng, items)
+    assert [o["node_id"] for o in out] == ["ok"]                     # whole-or-ABSENT: no cut item kept
+    assert out[0]["content"] == ("fine " * 100).strip()
+    (record,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    msg = record.getMessage()
+    assert "bad" in msg and "_Boom" in msg and "1 item" in msg
+    assert "SECRET-NODE-TEXT-DO-NOT-LOG" not in msg and "BAD-NODE-BODY" not in msg
+    assert "shared 240-char snippet" not in msg
+
+
+def test_c2_repeated_failures_still_warn_but_name_the_id_once(monkeypatch, caplog):
+    import surface_resolver
+    pith._PITH_DROP_SEEN.clear()
+    g = FakeGraph()
+    g.node("bad", "x" * 300)
+    monkeypatch.setattr(surface_resolver, "resolve_surface_content", _raising_resolver({"bad"}))
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        pith._cc_monitor_items_whole(fake_ng(g, []), [{"node_id": "bad", "content": "c…", "score": 1.0}])
+        pith._cc_monitor_items_whole(fake_ng(g, []), [{"node_id": "bad", "content": "c…", "score": 1.0}])
+    first, second = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "bad" in first and "bad" not in second and "already reported" in second
+
+
+@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
+def test_c2_a_dropped_monitor_item_does_not_take_its_pattern_twin_with_it(monkeypatch, pith_on):
+    import surface_resolver
+    g = FakeGraph()
+    _core(g)
+    full = "TWIN-WHOLE-TEXT " + ("t" * 500)
+    g.node("twin", full)
+    monkeypatch.setattr(surface_resolver, "resolve_surface_content", _raising_resolver({"twin"}))
+    monitor_items = [{"node_id": "twin", "content": full[:239] + "…", "score": 1.5}]
+    pat = [{"node_id": "twin", "score": 90.0, "content": full, "prefetch_origin": False}]
+    out, _ = _recall(pith, fake_ng(g, monitor_items), pat, pith_on, monkeypatch)
+    assert out.count(full) == 1                                      # present once, via the pattern stream
+    assert "…" not in out
+
+
+def _tree_world(n_trees, tree_len=200):
+    g = FakeGraph()
+    big = g.node("cc:conv::big", "B" * 30000)
+    big.creation_time = 1790000000.0
+    for i in range(n_trees):
+        txt = f"tree{i} " + ("c" * tree_len)
+        g.node(f"t{i}", txt, _tree_concept=True, _concept=txt)
+        g.synapse(f"f{i}", "cc:conv::big", f"t{i}", 1.0 - i * 0.01)
+    return g
+
+
+def _tree_lines(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and "concept trees" in r.getMessage() and "left out" in r.getMessage()]
+
+
+def test_c3_trees_left_out_by_the_budget_get_one_info_line_with_counts_only(caplog):
+    g = _tree_world(5)
+    ref_len = len(pith._pith_whole_node_reference(g, "cc:conv::big", g.nodes["cc:conv::big"], "B" * 30000))
+    budget = ref_len + 2 * (len("- concept: ") + 206 + 1) + 5          # reference + exactly two trees
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        text = pith._pith_reference_text(g, "cc:conv::big", "B" * 30000, budget)
+    assert text.count("- concept: ") == 2
+    (message,) = _tree_lines(caplog)
+    assert "cc:conv::big" in message and "2 of 5" in message and "3 left out" in message
+    assert "tree0" not in message and "ccccc" not in message         # ids/counts only, no tree text
+
+
+def test_c3_trees_left_out_by_the_member_cap_are_counted_too(monkeypatch, caplog):
+    monkeypatch.setattr(pith, "_CC_PITH_PROVIDER_MEMBERS", 3)
+    g = _tree_world(5, tree_len=20)
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        text = pith._pith_reference_text(g, "cc:conv::big", "B" * 30000, 40000)
+    assert text.count("- concept: ") == 3
+    (message,) = _tree_lines(caplog)
+    assert "3 of 5" in message and "2 left out" in message
+
+
+def test_c3_no_line_when_every_tree_is_included(caplog):
+    g = _tree_world(2, tree_len=20)
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        text = pith._pith_reference_text(g, "cc:conv::big", "B" * 30000, 40000)
+    assert text.count("- concept: ") == 2 and _tree_lines(caplog) == []
