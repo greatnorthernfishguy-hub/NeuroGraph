@@ -36,18 +36,46 @@ set -uo pipefail
 NG_DIR="$HOME/NeuroGraph"
 BYPASS_FILE="$NG_DIR/.claude/hooks/.session_approved"
 
+# ── Gatekeeper: jq must be present ─────────────────────────────────
+if ! command -v jq >/dev/null 2>&1; then
+    cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW HOOK — GATEKEEPER MISSING ═══
+jq is not installed — cannot evaluate this edit.
+The hook cannot determine whether this file is protected.
+BLOCKING to prevent unprotected edit of Syl's files.
+Install jq to restore the gate.
+EOFFAIL
+    exit 2
+fi
+
 # ── Read tool input from stdin ─────────────────────────────────────
 INPUT=$(cat)
+
+if [ -z "$INPUT" ]; then
+    cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW HOOK — EMPTY INPUT ═══
+The hook received no tool-input JSON on stdin.
+Cannot determine what file is being edited. BLOCKING.
+EOFFAIL
+    exit 2
+fi
 
 FILE_PATH=$(echo "$INPUT" | jq -r '
     .tool_input.file_path //
     .tool_input.path //
     .tool_input.file //
     empty
-' 2>/dev/null)
+' 2>/dev/null) || FILE_PATH=""
 
 if [ -z "$FILE_PATH" ]; then
-    exit 0
+    cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW HOOK — NO EDIT TARGET ═══
+The hook received valid input but could not extract a file path
+from tool_input.file_path, .path, or .file.
+This hook is registered for Edit|Write|MultiEdit — all carry a path.
+BLOCKING: the gate cannot determine what is being edited.
+EOFFAIL
+    exit 2
 fi
 
 # ── Resolve to absolute path ──────────────────────────────────────
@@ -157,15 +185,49 @@ if [ -z "$CATEGORY" ]; then
         timeout 3 git -C "$d" rev-parse --show-toplevel 2>/dev/null
     }
 
-    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || TOPLEVEL=""
+    _git_error=""
+    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || _git_error="$_repo_toplevel_err"
+
+    if [ -z "$TOPLEVEL" ]; then
+        # If we got a git-reported error (not "not a repo"), fail closed
+        _git_stderr="$(timeout 3 git -C "${FILE_PATH%/*}" rev-parse --show-toplevel 2>&1 >/dev/null)" || true
+        if [[ "$_git_stderr" =~ fatal ]] && [[ ! "$_git_stderr" =~ "not a git repository" ]]; then
+            cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW HOOK — GIT FAILURE ═══
+git is present but could not determine repository for this path.
+The gate cannot rule this edit out. BLOCKING.
+Check git configuration, disk state, and permissions.
+EOFFAIL
+            exit 2
+        fi
+    fi
 
     if [ -n "$TOPLEVEL" ]; then
-        ORIGIN="$(timeout 3 git -C "$TOPLEVEL" remote get-url origin 2>/dev/null)" || ORIGIN=""
+        _origin_err=""
+        ORIGIN="$(timeout 3 git -C "$TOPLEVEL" remote get-url origin 2>/dev/null)" || _origin_err="true"
+        if [ -n "$_origin_err" ] && [ -z "$ORIGIN" ]; then
+            cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW HOOK — GIT REMOTE FAILURE ═══
+Could not read git remote origin for this worktree.
+The gate cannot verify this is a NeuroGraph checkout. BLOCKING.
+EOFFAIL
+            exit 2
+        fi
         if [ -n "$ORIGIN" ]; then
-            ORIGIN="${ORIGIN%.git}"
-            ORIGIN="${ORIGIN/git@github.com:/https://github.com/}"
-            ORG_REPO="$(echo "$ORIGIN" | sed 's|https://github.com/||')"
-            if [ "$(echo "$ORG_REPO" | tr '[:upper:]' '[:lower:]')" = "greatnorthernfishguy-hub/neurograph" ]; then
+            # Normalise origin: lowercased, host/org/repo, no scheme/userinfo/port/.git//
+            _norm() {
+                local url
+                url="$(echo "$1" | tr '[:upper:]' '[:lower:]' 2>/dev/null)"
+                url="$(echo "$url" | sed 's|^[a-z][+a-z]*://||')"
+                url="$(echo "$url" | sed 's|^git@\([^/:]*\):|\1/|')"
+                url="$(echo "$url" | sed 's|^[^/]*@||')"
+                url="$(echo "$url" | sed 's|:\([0-9]\+\)/|/|')"
+                url="${url%.git}"
+                url="${url%/}"
+                echo "$url"
+            }
+            NORM_ORIGIN="$(_norm "$ORIGIN")"
+            if [ "$NORM_ORIGIN" = "github.com/greatnorthernfishguy-hub/neurograph" ]; then
                 REL="$(realpath --relative-to="$TOPLEVEL" "$FILE_PATH" 2>/dev/null)" || REL=""
 
                 REL_DATA=(

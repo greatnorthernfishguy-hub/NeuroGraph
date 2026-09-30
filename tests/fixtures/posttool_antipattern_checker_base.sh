@@ -19,41 +19,17 @@
 
 set -uo pipefail
 
-# ── Gatekeeper: jq must be present ─────────────────────────────────
-if ! command -v jq >/dev/null 2>&1; then
-    cat >&2 <<'EOFFAIL'
-═══ ANTIPATTERN CHECKER — GATEKEEPER MISSING ═══
-jq is not installed — cannot check for anti-patterns.
-This hook is advisory but its absence was silent. BLOCKING
-so the model sees the fault and can report it.
-Install jq.
-EOFFAIL
-    exit 2
-fi
-
 INPUT=$(cat)
-
-if [ -z "$INPUT" ]; then
-    cat >&2 <<'EOFFAIL'
-═══ ANTIPATTERN CHECKER — EMPTY INPUT ═══
-No tool-input JSON received. BLOCKING so the model sees it.
-EOFFAIL
-    exit 2
-fi
 
 FILE_PATH=$(echo "$INPUT" | jq -r '
     .tool_input.file_path //
     .tool_input.path //
     .tool_input.file //
     empty
-' 2>/dev/null) || FILE_PATH=""
+' 2>/dev/null)
 
 if [ -z "$FILE_PATH" ]; then
-    cat >&2 <<'EOFFAIL'
-═══ ANTIPATTERN CHECKER — NO PATH ═══
-Could not extract file_path. BLOCKING so the model sees it.
-EOFFAIL
-    exit 2
+    exit 0
 fi
 
 NG_DIR="$HOME/NeuroGraph"

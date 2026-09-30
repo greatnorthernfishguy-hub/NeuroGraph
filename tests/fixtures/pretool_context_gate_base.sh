@@ -17,28 +17,16 @@
 
 set -uo pipefail
 
-# ── Gatekeeper: jq must be present ─────────────────────────────────
-if ! command -v jq >/dev/null 2>&1; then
-    printf '{"additionalContext":"context gate INACTIVE: jq is not installed — cannot inject critical-file reminders for this Read. Install jq to restore."}\n'
-    exit 0
-fi
-
 INPUT=$(cat)
-
-if [ -z "$INPUT" ]; then
-    printf '{"additionalContext":"context gate INACTIVE: empty tool-input — cannot determine file for this Read."}\n'
-    exit 0
-fi
 
 FILE_PATH=$(echo "$INPUT" | jq -r '
     .tool_input.file_path //
     .tool_input.path //
     .tool_input.file //
     empty
-' 2>/dev/null) || FILE_PATH=""
+' 2>/dev/null)
 
 if [ -z "$FILE_PATH" ]; then
-    printf '{"additionalContext":"context gate INACTIVE: could not extract file path from tool input."}\n'
     exit 0
 fi
 
