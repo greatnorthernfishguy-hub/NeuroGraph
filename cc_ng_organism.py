@@ -330,6 +330,25 @@
 #   does not advance on the autonomic clock (LAW 8). Whether and when she registers is Josh's
 #   rollout decision, not this trial's.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2,
+#   #815 / Exec P414) -- three more structural skip reasons: in_json_string, in_url,
+#   in_link_target.
+# What: a want tag inside a JSON string literal, a URL or a markdown link destination is text
+#   being CARRIED or TALKED ABOUT, not the author wanting something (P406: not legitimate).
+#   in_json_string = the marker lies inside a structurally valid JSON string literal (opener
+#   context `{` `[` `"key":` or a finished value + `,`; no raw newline; closer context `, } ] :`
+#   or end) -- checked FIRST so a fence carried inside JSON is rejected as JSON, not by the
+#   coincidence that its backtick runs pair up -- OR the opener is hugged by JSON-escaped quotes
+#   (\"[WANT]\"). in_url / in_link_target = the OPENER is glued (no whitespace, no other WANT
+#   marker between) to a run containing `scheme://` (a trailing `) ] } > " ' ` , ; ! .` ends URL
+#   context) or to the destination of a `](`. Logged at INFO exactly like the existing skips.
+# Why: Exec P414 (checker-016's examples). The reason applies to the context the OPENER sits in,
+#   never to what the want text contains, and closers are never judged by the URL/link/hug
+#   guesses (a closer guard would drop `[WANT]read https://x.com/a[/WANT]` -- the le-014 C1 class).
+# How: _want_json_string_ranges / _want_json_opens_literal (constant work per quote: measured
+#   0.5 s on a 200k-quote node), _want_opener_carried_reason; parity vs base stays 0 divergences
+#   on a 3,726-shape corpus. NOT recognised (pinned in tests): single-quoted JSON-ish, link TEXT,
+#   JSON with raw newlines, scheme-less reference definitions, bare prose mentions.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2,
 #   le-014 corrections C1-C4 + LAW 5) -- the parser again gives the SAME result as base for
 #   every well-formed want shape.
 # What: the code_adjacent / escaped / quoted adjacency guesses now apply to OPENERS only
@@ -1950,6 +1969,7 @@ _WANT_MARKER_RE = re.compile(r"\[(/?)WANT\]")
 # Why a marker was skipped (a failing marker is DISCUSSION, never a want).
 WANT_SKIP_REASONS = (
     "in_fence", "in_code_span", "code_adjacent", "escaped", "quoted",
+    "in_json_string", "in_url", "in_link_target",
     "opener_unclosed", "closer_without_opener", "empty_pair",
 )
 
@@ -2072,17 +2092,134 @@ def _want_code_span_ranges(content: str, fences: List[Tuple[int, int]]) -> List[
     return spans
 
 
+# --- #815: a want tag inside JSON, a URL or a link target is text being CARRIED or TALKED ABOUT ---
+# JSON string literal opener context: `{` / `[` (first element / key), `key":` (value), or a
+# completed JSON value then `,` (next element). Closer context: `, } ] :` or end of content.
+# Deliberately NOT "any quoted text": prose like `He said "go [WANT]x[/WANT]", then left` has
+# no such context and stays a real want.
+_WANT_JSON_AFTER_RE = re.compile(r'\s*(?:[}\],:]|$)')
+_WANT_URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
+_WANT_URL_LOOKBACK = 2048
+# A character right before an opener that ENDS a URL / link rather than continuing it.
+_WANT_URL_TERMINATORS = frozenset(").]}>\"'`,;!.")
+
+
+def _want_json_opens_literal(content: str, q: int) -> bool:
+    """True when the `"` at content[q] is in JSON opener context: after `{` / `[`, after
+    `"key":`, or after a completed JSON value (string, number, true/false/null, `]`/`}`) and a
+    comma. Constant work per quote (looks at the previous one or two non-space characters)."""
+    j = q - 1
+    while j >= 0 and content[j].isspace():
+        j -= 1
+    if j < 0:
+        return False
+    c = content[j]
+    if c in "{[":
+        return True
+    if c == ":":
+        j -= 1
+        while j >= 0 and content[j].isspace():
+            j -= 1
+        return j >= 0 and content[j] == '"'
+    if c == ",":
+        j -= 1
+        while j >= 0 and content[j].isspace():
+            j -= 1
+        if j < 0:
+            return False
+        prev = content[j]
+        return (prev in '"]}' or prev.isdigit()
+                or content.endswith("true", 0, j + 1) or content.endswith("false", 0, j + 1)
+                or content.endswith("null", 0, j + 1))
+    return False
+
+
+def _want_json_string_ranges(content: str) -> List[Tuple[int, int]]:
+    """(start, end) of every structurally valid JSON string literal (quotes included): an
+    unescaped `"` in JSON opener context, closed by the next unescaped `"` on the SAME line
+    (JSON strings carry no raw newline), followed by JSON closer context. Linear."""
+    ranges: List[Tuple[int, int]] = []
+    n = len(content)
+    pos = 0
+    while True:
+        q = content.find('"', pos)
+        if q < 0:
+            break
+        slashes = 0
+        while q - 1 - slashes >= 0 and content[q - 1 - slashes] == "\\":
+            slashes += 1
+        if slashes % 2 == 1 or not _want_json_opens_literal(content, q):
+            pos = q + 1
+            continue
+        i = q + 1
+        closed = False
+        while i < n:
+            c = content[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                closed = True
+                break
+            if c in "\r\n":
+                break
+            i += 1
+        if not closed or not _WANT_JSON_AFTER_RE.match(content, i + 1):
+            pos = q + 1
+            continue
+        ranges.append((q, i + 1))
+        pos = i + 1
+    return ranges
+
+
+def _want_glued_run_before(content: str, start: int) -> str:
+    """The non-whitespace characters immediately before `start`, never crossing another WANT
+    marker -- the token an opener is glued to (empty when whitespace precedes it)."""
+    lo = max(0, start - _WANT_URL_LOOKBACK)
+    i = start
+    while i > lo and not content[i - 1].isspace():
+        i -= 1
+    run = content[i:start]
+    last = None
+    for last in _WANT_MARKER_RE.finditer(run):
+        pass
+    return run[last.end():] if last is not None else run
+
+
+def _want_opener_carried_reason(content: str, start: int) -> Optional[str]:
+    """#815, OPENER context only (a closer guard would swallow `[WANT]read https://x/a[/WANT]`,
+    the le-014 C1 class): is this opener glued to a link destination or a URL?"""
+    run = _want_glued_run_before(content, start)
+    if not run:
+        return None
+    idx = run.rfind("](")
+    if idx >= 0 and ")" not in run[idx + 2:]:
+        return "in_link_target"         # [text](dest/[WANT]...  -- the opener sits in the destination
+    if run[-1] not in _WANT_URL_TERMINATORS and _WANT_URL_SCHEME_RE.search(run):
+        return "in_url"                 # scheme://host/path/[WANT]...  -- glued to a URL
+    return None
+
+
 def _want_marker_mention_reason(content: str, start: int, end: int, is_close: bool,
                                  fences: List[Tuple[int, int]], fence_starts: List[int],
-                                 codes: List[Tuple[int, int]], code_starts: List[int]) -> Optional[str]:
+                                 codes: List[Tuple[int, int]], code_starts: List[int],
+                                 jsons: List[Tuple[int, int]], json_starts: List[int]) -> Optional[str]:
     """Why the marker at content[start:end] is a mention, or None if it is a real tag.
 
-    Two tiers, on purpose (le-014 C1/C2): a fenced block or balanced inline code span is
-    STRUCTURE and masks any marker, opener or closer. The adjacency guesses (a backtick,
-    backslash or quote pair touching the token) are guesses about a mentioned OPENER only;
-    base never guarded closers, and a closer guard turns `[WANT]check `foo()`[/WANT]` into
-    a dropped want. A mentioned opener's orphan closer is skipped as closer_without_opener.
+    Three tiers, on purpose:
+      1. STRUCTURE, any marker (opener or closer): inside a JSON string literal (#815), a fenced
+         block, or a balanced inline code span. JSON is checked first so a fence carried inside a
+         JSON string is rejected as JSON, not by the coincidence that its backtick runs pair up.
+      2. A closer that survived tier 1 is REAL. Base never guarded closers, and a closer guard
+         turns `[WANT]check `foo()`[/WANT]` into a dropped want (le-014 C1/C2).
+      3. OPENER context guesses: glued to a link destination / URL (#815), JSON-escaped quote hug
+         (#815), directly after a backtick, backslash-escaped, quote-wrapped. The reason applies
+         to the context the OPENER sits in, never to what the want text contains. A mentioned
+         opener's orphan closer is skipped as closer_without_opener.
     """
+    k = bisect_right(json_starts, start) - 1
+    if k >= 0 and start < jsons[k][1]:
+        return "in_json_string"
     k = bisect_right(fence_starts, start) - 1
     if k >= 0 and start < fences[k][1]:
         return "in_fence"
@@ -2091,6 +2228,11 @@ def _want_marker_mention_reason(content: str, start: int, end: int, is_close: bo
         return "in_code_span"
     if is_close:
         return None
+    carried = _want_opener_carried_reason(content, start)
+    if carried is not None:
+        return carried
+    if start >= 2 and content[start - 2:start] == '\\"' and content[end:end + 2] == '\\"':
+        return "in_json_string"         # JSON-escaped text: \"[WANT]\"
     if start > 0 and content[start - 1] == "`":
         return "code_adjacent"      # the pre-#810 guard (OPENER only, as in base), for runs that cannot be paired
     n_slash = 0
@@ -2110,8 +2252,10 @@ def parse_wants(content: str) -> WantParse:
 
     PURE function of the string: no I/O, no logging, no graph. A want is the text between
     a real opener and its paired closer, with NO length limit. A marker that is inside a
-    fenced block or inline code span, directly after a backtick, backslash-escaped, or
-    wrapped in a matching quote pair is a mention and is skipped; the closer pairs with the
+    JSON string literal, a fenced block or an inline code span is a mention (any marker); an
+    OPENER glued to a link destination or URL, hugged by JSON-escaped quotes, directly after a
+    backtick, backslash-escaped, or wrapped in a matching quote pair is a mention too (closers
+    are never judged by those guesses -- le-014 C1/C2). Skipped; the closer pairs with the
     NEAREST live opener, so a returned want contains no live marker; a stray closer, an
     unclosed opener and an empty pair are skipped. Every skip carries its reason and offset
     (the caller logs them -- never silent). `wants[i].text` is `.strip()`ped inner text,
@@ -2121,8 +2265,10 @@ def parse_wants(content: str) -> WantParse:
         return WantParse((), ())
     fences = _want_fence_spans(content)
     codes = sorted(_want_code_span_ranges(content, fences))
+    jsons = _want_json_string_ranges(content)
     fence_starts = [s for s, _ in fences]
     code_starts = [s for s, _ in codes]
+    json_starts = [s for s, _ in jsons]
     wants: List[WantSpan] = []
     skipped: List[SkippedMarker] = []
     pending: Optional[Tuple[int, int]] = None       # (start, end) of the live opener awaiting a closer
@@ -2130,7 +2276,8 @@ def parse_wants(content: str) -> WantParse:
         is_close = bool(m.group(1))
         marker = WANT_CLOSE if is_close else WANT_OPEN
         reason = _want_marker_mention_reason(content, m.start(), m.end(), is_close,
-                                             fences, fence_starts, codes, code_starts)
+                                             fences, fence_starts, codes, code_starts,
+                                             jsons, json_starts)
         if reason is not None:
             skipped.append(SkippedMarker(marker, m.start(), reason))
             continue
