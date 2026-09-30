@@ -1,6 +1,28 @@
 # tests/test_ng_embed_r5_failover.py
 # ---- Changelog ----
 # [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 C4 (worker-004): fail-back (#766).
+# What: tests for failover that lasts only while local is down, for BOTH episode
+#   kinds (load failure, inference failure) with a controllable clock (nothing
+#   sleeps): fail back when local recovers with one WARNING each way including
+#   duration and served-count; still-down probes exactly once per interval (two
+#   calls at a boundary make one probe) with one log line each and no traceback,
+#   and a failed load probe leaves state untouched; explicit NG_EMBED_REMOTE=hf
+#   never probes or fails back; NG_EMBED_REPROBE_SECS=0 disables (and the log
+#   says so), default when unset, non-number falls back with one warning; fail
+#   back then fail over again logs again, in order; require_local while failed
+#   over never calls remote and may trigger a due probe; one prober at a time
+#   (simulated with the lock); a bug-class probe defect is raised; the probe is
+#   local-only (socket connect and DNS raise; load probe uses local_files_only;
+#   inference probe sends exactly the fixed probe text); keepalive stops pinging
+#   after a fail-back.
+# Why:  Josh's #766 ruling. The probe must never leak caller text or touch the
+#   network, and a failed probe must be visible but not spammy.
+# How:  _Scenario builds either episode kind with a switchable "local is up"
+#   flag, patched ng_embed._now, and the C3 remote spy. Each test sets/deletes
+#   NG_EMBED_REMOTE and NG_EMBED_REPROBE_SECS itself and asserts them.
+# -------------------
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
 #   z11-r5-embed-failover-20260929 — R5 C3 (worker-003, delta-LE finding F1).
 # What: require_local is honored by the inference path. With
 #   require_local=True, embed/embed_batch/embed_windows raise
@@ -132,6 +154,7 @@ def _reset_singleton_and_env(monkeypatch):
     monkeypatch.delenv("NG_EMBED_ALLOW_HASH_FALLBACK", raising=False)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("NG_EMBED_TID_ENDPOINT", raising=False)
+    monkeypatch.delenv("NG_EMBED_REPROBE_SECS", raising=False)
     NGEmbed.reset_instance()
     yield
     NGEmbed.reset_instance()
@@ -1244,3 +1267,470 @@ def test_c3_reembed_aborts_when_local_inference_fails_mid_run(dry_run, monkeypat
     assert session.calls == 2, "batch 1 ok, batch 2 failed, batch 3 never attempted"
     assert remote == _NO_REMOTE and emb._remote_mode is False
     assert vec_path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# C4 (worker-004, Josh's #766 ruling): failover lasts only while local is down.
+# The code re-probes LOCAL ONLY (no network, no caller text) and fails back,
+# logging loudly both ways. All timing goes through ng_embed._now, patched with
+# a controllable clock, so nothing here sleeps. NG_EMBED_* names used:
+# NG_EMBED_REMOTE and NG_EMBED_REPROBE_SECS (each test sets or deletes both
+# itself and asserts them before the call under test).
+# ---------------------------------------------------------------------------
+
+import socket
+
+_TEXT = "hello world"
+_LOCAL_VEC = np.full(768, 0.5, dtype=np.float32)
+
+
+def _remote_vec(text):
+    return np.asarray(_text_vec(text), dtype=np.float32)
+
+
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
+class _StubTok(_FakeTok):
+    """_FakeTok plus the no_truncation() that ng_embed calls on a loaded tokenizer."""
+
+    def no_truncation(self):
+        return None
+
+
+class _SwitchSession:
+    """Local ONNX session that fails while scenario.up is False; records every feed."""
+
+    def __init__(self, scenario):
+        self.scn = scenario
+        self.calls = 0
+        self.feeds = []
+
+    def run(self, output_names, feed):
+        self.calls += 1
+        self.feeds.append(feed["input_ids"].copy())
+        if self.scn.probe_exc is not None:
+            raise self.scn.probe_exc
+        if not self.scn.up:
+            raise RuntimeError("simulated: local is down")
+        n = feed["input_ids"].shape[0]
+        return [np.zeros((n, 768), dtype=np.float32), np.full((n, 768), 0.5, dtype=np.float32)]
+
+
+class _Scenario:
+    """A failover episode of either kind ('load' or 'inference') with a switchable
+    'local is up' flag, a controllable clock, and the remote spy installed."""
+
+    def __init__(self, kind, monkeypatch, tmp_path, interval="60"):
+        self.kind, self.up, self.probe_exc, self.dl_calls = kind, False, None, []
+        self.clock = _Clock()
+        monkeypatch.setattr(ng_embed_mod, "_now", self.clock)
+        monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+        if interval is None:
+            monkeypatch.delenv("NG_EMBED_REPROBE_SECS", raising=False)
+            assert os.environ.get("NG_EMBED_REPROBE_SECS") is None
+        else:
+            monkeypatch.setenv("NG_EMBED_REPROBE_SECS", interval)
+            assert os.environ.get("NG_EMBED_REPROBE_SECS") == interval
+        assert os.environ.get("NG_EMBED_REMOTE") is None
+        monkeypatch.setenv("HF_TOKEN", "tok-test")
+        self.session = _SwitchSession(self)
+        if kind == "inference":
+            self.emb = _local_ready_instance(monkeypatch, tmp_path, _FakeTok, self.session)
+        else:
+            self._install_world(monkeypatch)
+            self.emb = NGEmbed()
+            self.emb._config["cache_dir"] = str(tmp_path)
+        self.remote = _spy_remote(monkeypatch, self.emb)
+
+    def _install_world(self, monkeypatch):
+        import huggingface_hub
+        import onnxruntime
+        import tokenizers
+
+        def fake_download(**kw):
+            self.dl_calls.append(dict(kw))
+            if kw.get("local_files_only") and self.probe_exc is not None:
+                raise self.probe_exc
+            if not self.up:
+                raise OSError("simulated: model files unavailable")
+            return "stub-" + kw["filename"].replace("/", "_")
+
+        class _TokFactory:
+            @staticmethod
+            def from_pretrained(model_id):
+                return _StubTok()
+
+            @staticmethod
+            def from_file(path):
+                return _StubTok()
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+        monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **k: self.session)
+        monkeypatch.setattr(tokenizers, "Tokenizer", _TokFactory)
+
+    def start_episode(self):
+        vec = self.emb.embed(_TEXT)
+        assert np.array_equal(vec, _remote_vec(_TEXT)), "the failing call is served remotely"
+        assert self.emb._remote_mode is True and self.emb._failover_since == self.clock.t
+        assert self.emb._failover_kind == self.kind
+        return vec
+
+    def probes(self):
+        if self.kind == "inference":
+            probe_ids = np.arange(len(ng_embed_mod._PROBE_TEXT))
+            return sum(1 for f in self.session.feeds
+                       if f.shape == (1, len(probe_ids)) and np.array_equal(f[0], probe_ids))
+        onnx = ng_embed_mod._DEFAULT_CONFIG["onnx_filename"]
+        return sum(1 for c in self.dl_calls if c.get("local_files_only") and c["filename"] == onnx)
+
+
+def _msgs(caplog, level, needle):
+    return [r for r in _log_records(caplog, level) if needle in r.getMessage()]
+
+
+_KINDS = [pytest.param("load", id="load_episode"), pytest.param("inference", id="inference_episode")]
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_c4_fails_back_when_local_recovers_and_logs_both_ways(kind, monkeypatch, tmp_path, caplog):
+    """After the interval a default call re-probes local, fails BACK, and is served
+    locally; loud WARNING with duration and served-count; probes stay local-only.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=60 (asserted)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    scn = _Scenario(kind, monkeypatch, tmp_path)
+    emb = scn.emb
+    scn.start_episode()
+    scn.clock.advance(10)
+    assert np.array_equal(emb.embed(_TEXT), _remote_vec(_TEXT))
+    scn.clock.advance(10)
+    assert np.array_equal(emb.embed(_TEXT), _remote_vec(_TEXT))
+    assert scn.probes() == 0 and emb._remote_mode is True, "no probe inside the interval"
+
+    scn.up = True
+    scn.clock.advance(41)
+    posts_before = scn.remote["post"]
+    got = emb.embed(_TEXT)
+
+    assert np.array_equal(got, _LOCAL_VEC), "served by the recovered local model"
+    assert scn.remote["post"] == posts_before, "the probe and the local call made no remote call"
+    assert emb._remote_mode is False and emb._failover_since is None
+    assert emb._model_failed is True, "documented meaning: local has failed at least once"
+    assert emb._session is scn.session
+    assert scn.probes() == 1
+    assert len(_failover_warnings(caplog)) == 1
+    back = _msgs(caplog, logging.WARNING, "failing BACK")
+    assert len(back) == 1
+    assert "after 61.0s" in back[0].getMessage()
+    assert "served remotely during the episode: 3 calls, 3 vectors" in back[0].getMessage()
+    if kind == "load":
+        onnx_probe = [c for c in scn.dl_calls if c.get("local_files_only")]
+        assert {c["filename"] for c in onnx_probe} == {ng_embed_mod._DEFAULT_CONFIG["onnx_filename"], "tokenizer.json"}
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_c4_still_down_probes_exactly_once_per_interval_and_logs_once_each(kind, monkeypatch, tmp_path, caplog):
+    """Local stays down: many calls inside an interval trigger no probe, exactly one
+    probe fires at each interval boundary (even for two calls in the same instant),
+    each failed probe logs once with no traceback, and a failed load probe leaves the
+    state exactly as it was.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=60 (asserted)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    scn = _Scenario(kind, monkeypatch, tmp_path)
+    emb = scn.emb
+    scn.start_episode()
+
+    for _ in range(50):
+        scn.clock.advance(1)
+        emb.embed(_TEXT)
+    assert scn.probes() == 0, "no probe before the interval elapses"
+
+    snapshot = lambda: (emb._session, emb._tokenizer, emb._remote_mode, emb._model_loaded,
+                        emb._failover_since, emb._failover_kind)
+    before = snapshot()
+    scn.clock.advance(10)
+    emb.embed(_TEXT)
+    emb.embed(_TEXT)
+    assert scn.probes() == 1, "two calls at the boundary make one probe"
+    assert snapshot() == before, "a failed probe leaves the state exactly as it was"
+
+    for _ in range(59):
+        scn.clock.advance(1)
+        emb.embed(_TEXT)
+    assert scn.probes() == 1
+    scn.clock.advance(1)
+    emb.embed(_TEXT)
+    assert scn.probes() == 2
+
+    failed = _msgs(caplog, logging.WARNING, "re-probe failed")
+    assert len(failed) == 2, "one log line per failed probe, no more"
+    assert all(r.exc_info is None for r in failed), "no traceback storm"
+    assert "RuntimeError" in failed[0].getMessage() or "OSError" in failed[0].getMessage()
+    assert not _msgs(caplog, logging.WARNING, "failing BACK")
+    assert emb._remote_mode is True
+
+
+def test_c4_explicit_remote_hf_never_probes_or_fails_back(monkeypatch, tmp_path, caplog):
+    """NG_EMBED_REMOTE=hf is an operator choice: no episode, no probe, no fail-back,
+    however much time passes, and the episode counters stay untouched.
+
+    Env: NG_EMBED_REMOTE=hf (asserted), NG_EMBED_REPROBE_SECS=1 (asserted)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    clock = _Clock()
+    monkeypatch.setattr(ng_embed_mod, "_now", clock)
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+    monkeypatch.setenv("NG_EMBED_REPROBE_SECS", "1")
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    assert os.environ.get("NG_EMBED_REMOTE") == "hf" and os.environ.get("NG_EMBED_REPROBE_SECS") == "1"
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(tmp_path)
+    emb._tokenizer = _FakeTok()
+    remote = _spy_remote(monkeypatch, emb)
+    probes = []
+    monkeypatch.setattr(emb, "_load_local", lambda *a, **k: probes.append("load") or (_ for _ in ()).throw(AssertionError("probed")))
+    monkeypatch.setattr(emb, "_onnx_embed", lambda *a, **k: probes.append("infer") or (_ for _ in ()).throw(AssertionError("probed")))
+
+    for _ in range(5):
+        clock.advance(1000)
+        assert np.array_equal(emb.embed(_TEXT), _remote_vec(_TEXT))
+    emb._maybe_fail_back()
+
+    assert probes == []
+    assert emb._remote_mode is True and emb._failover_since is None
+    assert emb._failover_remote_calls == 0 and remote["post"] == 5
+    assert not _msgs(caplog, logging.WARNING, "failing BACK")
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_c4_reprobe_secs_zero_disables_and_says_so(kind, monkeypatch, tmp_path, caplog):
+    """NG_EMBED_REPROBE_SECS=0 never probes, and the failover WARNING says re-probing is disabled.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=0 (asserted)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    scn = _Scenario(kind, monkeypatch, tmp_path, interval="0")
+    scn.start_episode()
+    scn.up = True
+    scn.clock.advance(10 ** 7)
+    assert np.array_equal(scn.emb.embed(_TEXT), _remote_vec(_TEXT))
+    assert scn.probes() == 0 and scn.emb._remote_mode is True
+    warns = _failover_warnings(caplog)
+    assert len(warns) == 1 and "DISABLED" in warns[0].getMessage()
+
+
+def test_c4_reprobe_secs_default_and_invalid_value(monkeypatch, tmp_path, caplog):
+    """Unset uses the in-code default; a non-numeric value falls back to it with ONE warning.
+
+    Env: NG_EMBED_REMOTE deleted (asserted); NG_EMBED_REPROBE_SECS unset (asserted), then "abc" (asserted)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    default = ng_embed_mod._REPROBE_SECS_DEFAULT
+    assert default > 0
+    scn = _Scenario("inference", monkeypatch, tmp_path, interval=None)
+    scn.start_episode()
+    assert scn.emb._reprobe_interval() == default
+    scn.clock.advance(default - 1)
+    scn.emb.embed(_TEXT)
+    assert scn.probes() == 0
+    scn.clock.advance(1)
+    scn.emb.embed(_TEXT)
+    assert scn.probes() == 1
+
+    monkeypatch.setenv("NG_EMBED_REPROBE_SECS", "abc")
+    assert os.environ.get("NG_EMBED_REPROBE_SECS") == "abc"
+    for _ in range(3):
+        assert scn.emb._reprobe_interval() == default
+    assert len(_msgs(caplog, logging.WARNING, "is not a number")) == 1
+
+
+def test_c4_fail_back_then_fail_over_again_logs_again(monkeypatch, tmp_path, caplog):
+    """The failover WARNING is once per EPISODE, not once per process: fail over,
+    fail back, fail over again, and both failovers and the fail-back are logged, in order.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=60 (asserted)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    scn = _Scenario("inference", monkeypatch, tmp_path)
+    emb = scn.emb
+    scn.start_episode()
+    scn.up = True
+    scn.clock.advance(60)
+    assert np.array_equal(emb.embed(_TEXT), _LOCAL_VEC)
+    assert emb._remote_mode is False
+
+    scn.up = False
+    scn.clock.advance(5)
+    assert np.array_equal(emb.embed(_TEXT), _remote_vec(_TEXT))
+    assert emb._remote_mode is True and emb._failover_since == scn.clock.t
+    assert emb._failover_remote_calls == 1, "episode counters restart"
+
+    order = [
+        "BACK" if "failing BACK" in r.getMessage() else "OVER"
+        for r in _log_records(caplog, logging.WARNING)
+        if "failing BACK" in r.getMessage() or "failing over to HF remote" in r.getMessage()
+    ]
+    assert order == ["OVER", "BACK", "OVER"]
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("state", ["not_due", "due_still_down", "due_recovered"])
+def test_c4_require_local_while_failed_over_may_probe_but_never_calls_remote(
+    kind, state, monkeypatch, tmp_path,
+):
+    """A require_local call while failed over never makes a network call. It may
+    trigger a DUE local probe: proceeds locally if that recovered local, otherwise
+    refuses as before. It does not probe when no probe is due.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=60 (asserted)."""
+    scn = _Scenario(kind, monkeypatch, tmp_path)
+    emb = scn.emb
+    scn.start_episode()
+    remote_before = dict(scn.remote)
+    if state != "not_due":
+        scn.clock.advance(60)
+    scn.up = state == "due_recovered"
+
+    if state == "due_recovered":
+        got = emb.embed_batch(["alpha beta"], require_local=True)
+        assert np.array_equal(got[0], _LOCAL_VEC) and emb._remote_mode is False
+    else:
+        with pytest.raises(EmbeddingUnavailableError):
+            emb.embed_batch(["alpha beta"], require_local=True)
+        assert emb._remote_mode is True
+
+    assert scn.remote == remote_before, "require_local must never add a remote call"
+    assert scn.probes() == (0 if state == "not_due" else 1)
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_c4_only_one_thread_probes_and_others_keep_using_remote_without_waiting(kind, monkeypatch, tmp_path):
+    """While another thread holds the probe lock (mid-probe), a due call neither
+    probes nor blocks: it is served remotely. Once released, the next call probes.
+    Simulated with the lock itself; no real race is claimed.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=60 (asserted)."""
+    scn = _Scenario(kind, monkeypatch, tmp_path)
+    emb = scn.emb
+    scn.start_episode()
+    scn.up = True
+    scn.clock.advance(60)
+
+    assert emb._probe_lock.acquire(blocking=False)
+    try:
+        assert np.array_equal(emb.embed(_TEXT), _remote_vec(_TEXT)), "served remotely, not blocked"
+        assert scn.probes() == 0 and emb._remote_mode is True
+    finally:
+        emb._probe_lock.release()
+
+    assert np.array_equal(emb.embed(_TEXT), _LOCAL_VEC), "the skipped call did not consume the interval"
+    assert scn.probes() == 1
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_c4_bug_class_defect_in_a_probe_is_raised_not_swallowed_as_still_down(kind, monkeypatch, tmp_path, caplog):
+    """A bug-class exception during a probe is raised (ERROR + traceback, as #765),
+    leaves the episode untouched, releases the probe lock, and does not storm: the
+    interval was consumed, so the next call inside it just uses remote.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=60 (asserted)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    scn = _Scenario(kind, monkeypatch, tmp_path)
+    emb = scn.emb
+    scn.start_episode()
+    since = emb._failover_since
+    exc = TypeError("simulated probe defect")
+    scn.probe_exc = exc
+    scn.clock.advance(60)
+
+    with pytest.raises(TypeError) as ei:
+        emb.embed(_TEXT)
+
+    assert ei.value is exc
+    assert emb._remote_mode is True and emb._failover_since == since
+    errs = _log_records(caplog, logging.ERROR)
+    assert len(errs) == 1 and errs[0].exc_info[1] is exc
+    assert not _msgs(caplog, logging.WARNING, "re-probe failed")
+    assert emb._probe_lock.acquire(blocking=False)
+    emb._probe_lock.release()
+    probes_after = scn.probes()
+    scn.clock.advance(1)
+    assert np.array_equal(emb.embed(_TEXT), _remote_vec(_TEXT))
+    assert scn.probes() == probes_after
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_c4_probe_is_local_only_and_sends_only_the_fixed_probe_text(kind, monkeypatch, tmp_path):
+    """The probe makes no remote call of any kind, no network attempt at all (socket
+    connect and DNS raise), and sends only the fixed probe text, never caller text.
+    Called directly (no caller in flight), so nothing else can explain a remote call.
+
+    Env: NG_EMBED_REMOTE deleted (asserted), NG_EMBED_REPROBE_SECS=60 (asserted)."""
+    scn = _Scenario(kind, monkeypatch, tmp_path)
+    emb = scn.emb
+    scn.start_episode()
+    scn.up = True
+    scn.clock.advance(60)
+    remote_before = dict(scn.remote)
+    attempts = []
+
+    def blocked(*a, **k):
+        attempts.append(1)
+        raise AssertionError("network attempted by the probe")
+
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+
+    emb._maybe_fail_back()
+
+    assert emb._remote_mode is False, "the probe itself performed the fail-back"
+    assert scn.remote == remote_before and attempts == []
+    assert len(ng_embed_mod._PROBE_TEXT) != len(_TEXT)
+    if kind == "inference":
+        probe_feed = scn.session.feeds[-1]
+        assert probe_feed.shape == (1, len(ng_embed_mod._PROBE_TEXT))
+        assert np.array_equal(probe_feed[0], np.arange(len(ng_embed_mod._PROBE_TEXT)))
+        assert scn.probes() == 1
+    else:
+        probe_dl = [c for c in scn.dl_calls if c.get("local_files_only")]
+        assert len(probe_dl) == 2 and all(c["local_files_only"] is True for c in probe_dl)
+        assert not scn.session.feeds, "a load probe runs no inference at all"
+
+
+class _Stopper:
+    """Stand-in for the keepalive stop Event: wait() answers from a script, so the
+    loop can be driven synchronously with no thread and no sleep."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def wait(self, interval):
+        return self.answers.pop(0)
+
+
+@pytest.mark.parametrize("remote_mode", [False, True], ids=["failed_back_to_local", "on_remote"])
+def test_c4_keepalive_pings_only_while_on_remote(remote_mode, monkeypatch, tmp_path):
+    """After a fail-back the keepalive loop must stop pinging the HF endpoint (the
+    process is local again) and resume if it fails over again.
+
+    Env: NG_EMBED_REMOTE deleted (asserted); NG_EMBED_REPROBE_SECS deleted (asserted)."""
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    monkeypatch.delenv("NG_EMBED_REPROBE_SECS", raising=False)
+    assert os.environ.get("NG_EMBED_REMOTE") is None
+    assert os.environ.get("NG_EMBED_REPROBE_SECS") is None
+    emb = NGEmbed()
+    emb._remote_mode = remote_mode
+    pings = []
+    monkeypatch.setattr(emb, "_hf_remote_embed", lambda *a, **k: pings.append(a))
+    emb._keepalive_stop = _Stopper([False, False, True])
+
+    emb._keepalive_loop()
+
+    assert len(pings) == (2 if remote_mode else 0)

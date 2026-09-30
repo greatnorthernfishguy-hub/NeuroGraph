@@ -24,6 +24,48 @@ Dual-pass (Punchlist #81 — Josh's invention):
 
 # ---- Changelog ----
 # [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 C4 (worker-004): fail-back (#766, Josh
+#   ruling via Executive Packet 382).
+# What: a failover now lasts only while local is down. The process re-probes
+#   local and FAILS BACK, logging a WARNING both ways. (1) A failover EPISODE is
+#   recorded explicitly (_failover_since / _failover_kind / _failover_remote_*);
+#   explicit NG_EMBED_REMOTE=hf never starts one, so it never probes or fails
+#   back. (2) NG_EMBED_REPROBE_SECS (default _REPROBE_SECS_DEFAULT = 60, read
+#   live like the file's other env vars; <= 0 disables and the failover WARNING
+#   says so; a non-number falls back to the default with one WARNING).
+#   (3) _maybe_fail_back(), called from _require_model() so it rides the calling
+#   thread (no new thread), probes at most once per interval, one prober at a
+#   time via a non-blocking _probe_lock (other threads keep using remote, never
+#   wait). (4) The probe is LOCAL ONLY: a load-episode probe calls the new
+#   private loader _load_local(local_only=True), which resolves both model files
+#   with local_files_only=True (no network); an inference-episode probe runs the
+#   fixed string _PROBE_TEXT through the local session. Never caller text, never
+#   the network. A failed probe changes nothing and logs one WARNING (type and
+#   message, no traceback) per interval; a bug-class exception in a probe is
+#   raised as in #765. (5) _fail_back() flips under _model_lock, installs the
+#   probe's session/tokenizer for a load episode, clears the episode (which is
+#   also the failover-warning latch, so a later failover logs again) and logs
+#   how long the process was on remote and how many calls/vectors it served.
+#   (6) A require_local call may trigger a due probe; it never makes a network
+#   call. (7) _keepalive_loop skips its ping while not on remote.
+# Why:  Josh's ruling on #766: failover must last only as long as local is down.
+#   Before this, _remote_mode was one-way for the life of the process, so one
+#   transient ORT error or a briefly missing model pinned Syl's sidecar on the
+#   HF API (her text leaving the machine) until restart.
+# How:  _load_local() is the old load body split out (it builds and returns
+#   (session, tokenizer) and touches no state; the first load still calls
+#   hf_hub_download/Tokenizer.from_pretrained exactly as before, and now assigns
+#   both only after both succeed). _model_lock becomes an RLock because
+#   _fail_over_or_raise now takes it and is also called from inside
+#   _ensure_model. _model_lock is held only for the state flip, never across a
+#   probe; lock order is _probe_lock then _model_lock. Time comes from a module
+#   _now() (time.monotonic) so tests can control it. _model_failed keeps its
+#   meaning (local has failed at least once) and is not reset on fail-back.
+#   Measured on this laptop under heavy load: load probe median 2.7s (2.3-4.7s),
+#   inference probe median 0.54s (max 2.1s), zero network attempts with sockets
+#   and DNS blocked.
+# -------------------
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
 #   z11-r5-embed-failover-20260929 — R5 C3 (worker-003, delta law-enforcer F1).
 # What: embed(), embed_batch() and embed_windows() take require_local=False.
 #   With require_local=True: (1) new _require_model() refuses up front, via
@@ -315,6 +357,13 @@ _BUG_CLASS_EXCEPTIONS = (
     ValueError, AssertionError, NotImplementedError,
 )
 
+_REPROBE_SECS_DEFAULT = 60.0  # NG_EMBED_REPROBE_SECS default; <= 0 disables fail-back
+_PROBE_TEXT = "ng_embed local recovery probe"  # fixed and benign: never caller text
+
+
+def _now() -> float:
+    return time.monotonic()
+
 _DEFAULT_CONFIG = {
     # Model
     "model_id": "Snowflake/snowflake-arctic-embed-m-v1.5",
@@ -394,7 +443,15 @@ class NGEmbed:
         self._model_loaded = False
         self._model_failed = False
         self._remote_mode = False
-        self._model_lock = threading.Lock()
+        self._model_lock = threading.RLock()
+        # Failover episode (None = not failed over; explicit NG_EMBED_REMOTE=hf never sets it).
+        self._failover_since: Optional[float] = None
+        self._failover_kind: Optional[str] = None   # "load" | "inference"
+        self._next_probe_at = 0.0
+        self._failover_remote_calls = 0
+        self._failover_remote_vectors = 0
+        self._probe_lock = threading.Lock()
+        self._reprobe_env_warned = False
         self._keepalive_lock = threading.Lock()
         self._keepalive_refs = 0
         self._keepalive_thread: Optional[threading.Thread] = None
@@ -441,7 +498,9 @@ class NGEmbed:
         """Lazy-load ONNX model + tokenizer on first use.
 
         Default: a local load failure fails over to the same-model HF remote
-        API (R5) and this returns True. require_local=True is for callers that
+        API (R5) and this returns True. The failover lasts only while local is
+        down: _maybe_fail_back() re-probes local and fails back (explicit
+        NG_EMBED_REMOTE=hf never does). require_local=True is for callers that
         must have the local model: it returns False, with no failover and no
         remote call, when local is unavailable (load failed, already failed
         over, or NG_EMBED_REMOTE selects remote). _model_failed is a
@@ -469,48 +528,14 @@ class NGEmbed:
                 return not require_local
 
             try:
-                import onnxruntime as ort
-                from huggingface_hub import hf_hub_download
-                from tokenizers import Tokenizer
-
-                model_id = self._config["model_id"]
-                cache_dir = self._config["cache_dir"]
-                os.makedirs(cache_dir, exist_ok=True)
-
-                # Download ONNX model
-                onnx_path = hf_hub_download(
-                    repo_id=model_id,
-                    filename=self._config["onnx_filename"],
-                    cache_dir=cache_dir,
-                )
-
-                # Load ONNX session (CPU, optimized)
-                sess_opts = ort.SessionOptions()
-                sess_opts.graph_optimization_level = (
-                    ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                )
-                sess_opts.intra_op_num_threads = max(1, os.cpu_count() // 2)
-                self._session = ort.InferenceSession(
-                    onnx_path,
-                    sess_options=sess_opts,
-                    providers=["CPUExecutionProvider"],
-                )
-
-                # Load tokenizer. The model's shipped tokenizer.json may
-                # include truncation config; disable it explicitly (V-1).
-                # Configure fully before publishing to self._tokenizer so a
-                # concurrent caller never sees truncation-enabled state.
-                _tokenizer = Tokenizer.from_pretrained(model_id)
-                _tokenizer.no_truncation()
-                _tokenizer.enable_padding(
-                    pad_id=0, pad_token="[PAD]",
-                )
-                self._tokenizer = _tokenizer
+                session, tokenizer = self._load_local()
+                self._session = session
+                self._tokenizer = tokenizer
 
                 self._model_loaded = True
                 logger.info(
                     "ng_embed: loaded %s (ONNX, %d-dim, CLS pooling)",
-                    model_id, self._config["embedding_dim"],
+                    self._config["model_id"], self._config["embedding_dim"],
                 )
                 return True
 
@@ -527,6 +552,56 @@ class NGEmbed:
                 self._model_loaded = True
                 return True
 
+    def _load_local(self, local_only: bool = False) -> tuple:
+        """Build (session, tokenizer) without touching self; raises on any failure.
+
+        local_only resolves both model files from the local HF caches with no
+        network (the fail-back probe); the normal first load may download them.
+        """
+        import onnxruntime as ort
+        from huggingface_hub import hf_hub_download
+        from tokenizers import Tokenizer
+
+        model_id = self._config["model_id"]
+        cache_dir = self._config["cache_dir"]
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Download ONNX model
+        onnx_path = hf_hub_download(
+            repo_id=model_id,
+            filename=self._config["onnx_filename"],
+            cache_dir=cache_dir,
+            **({"local_files_only": True} if local_only else {}),
+        )
+
+        # Load ONNX session (CPU, optimized)
+        sess_opts = ort.SessionOptions()
+        sess_opts.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+        sess_opts.intra_op_num_threads = max(1, os.cpu_count() // 2)
+        session = ort.InferenceSession(
+            onnx_path,
+            sess_options=sess_opts,
+            providers=["CPUExecutionProvider"],
+        )
+
+        # Load tokenizer. The model's shipped tokenizer.json may
+        # include truncation config; disable it explicitly (V-1).
+        # Configure fully before the caller publishes it so a
+        # concurrent caller never sees truncation-enabled state.
+        if local_only:
+            tokenizer = Tokenizer.from_file(hf_hub_download(
+                repo_id=model_id, filename="tokenizer.json", local_files_only=True,
+            ))
+        else:
+            tokenizer = Tokenizer.from_pretrained(model_id)
+        tokenizer.no_truncation()
+        tokenizer.enable_padding(
+            pad_id=0, pad_token="[PAD]",
+        )
+        return session, tokenizer
+
     def _raise_if_bug_class(self, exc: BaseException, stage: str) -> None:
         """Bug-class defects are logged at ERROR with traceback and raised, never failed over (#765)."""
         if isinstance(exc, _BUG_CLASS_EXCEPTIONS):
@@ -541,8 +616,10 @@ class NGEmbed:
     ) -> None:
         """Raise a bug-class defect; otherwise route to the same-model HF remote API (R5).
 
-        Environment/runtime failures fail over and log one WARNING per process
-        with the traceback; the _hf_remote_* retry/quarantine path is reused.
+        Environment/runtime failures start a failover EPISODE and log one
+        WARNING with the traceback per episode; the _hf_remote_* retry/
+        quarantine path is reused. The episode lasts only while local is down:
+        _maybe_fail_back() re-probes local and fails back (Josh, #766).
         With require_local the failure is logged and raised as
         EmbeddingUnavailableError instead: no failover, no remote call.
         """
@@ -556,15 +633,102 @@ class NGEmbed:
             raise EmbeddingUnavailableError(
                 f"local {stage} failed and require_local forbids remote failover: {exc}"
             ) from exc
-        if not self._remote_mode:
-            logger.warning(
-                "ng_embed: local %s failed (%s) — failing over to HF remote API (R5)",
-                stage, exc, exc_info=exc,
-            )
-        self._remote_mode = True
+        with self._model_lock:
+            if self._failover_since is None:
+                interval = self._reprobe_interval()
+                self._failover_since = _now()
+                self._failover_kind = "load" if stage == "model load" else "inference"
+                self._next_probe_at = self._failover_since + interval
+                self._failover_remote_calls = 0
+                self._failover_remote_vectors = 0
+                logger.warning(
+                    "ng_embed: local %s failed (%s) — failing over to HF remote API (R5); %s",
+                    stage, exc,
+                    "re-probing is DISABLED (NG_EMBED_REPROBE_SECS<=0): staying on remote until restart"
+                    if interval <= 0 else
+                    f"will re-probe local every {interval:g}s and fail back when it recovers",
+                    exc_info=exc,
+                )
+            self._remote_mode = True
+
+    def _reprobe_interval(self) -> float:
+        """Seconds between local re-probes (NG_EMBED_REPROBE_SECS); <= 0 disables fail-back."""
+        raw = os.environ.get("NG_EMBED_REPROBE_SECS")
+        if raw is None:
+            return _REPROBE_SECS_DEFAULT
+        try:
+            return float(raw)
+        except ValueError:
+            if not self._reprobe_env_warned:
+                self._reprobe_env_warned = True
+                logger.warning(
+                    "ng_embed: NG_EMBED_REPROBE_SECS=%r is not a number; using the default %gs",
+                    raw, _REPROBE_SECS_DEFAULT,
+                )
+            return _REPROBE_SECS_DEFAULT
+
+    def _maybe_fail_back(self) -> None:
+        """If failed over and a re-probe is due, probe local and fail back on success.
+
+        Local only: no network call, no caller text. Runs inline on the calling
+        thread (no background thread); only one thread probes at a time and the
+        others keep using remote without waiting. A no-op for explicit
+        NG_EMBED_REMOTE=hf (no episode) and when not failed over.
+        """
+        if self._failover_since is None:
+            return
+        interval = self._reprobe_interval()
+        if interval <= 0 or _now() < self._next_probe_at:
+            return
+        if not self._probe_lock.acquire(blocking=False):
+            return
+        try:
+            now = _now()
+            if self._failover_since is None or now < self._next_probe_at:
+                return
+            self._next_probe_at = now + interval
+            try:
+                if self._failover_kind == "load":
+                    session, tokenizer = self._load_local(local_only=True)
+                else:
+                    self._onnx_embed(_PROBE_TEXT)
+                    session = tokenizer = None
+            except Exception as exc:
+                self._raise_if_bug_class(exc, "probe")
+                logger.warning(
+                    "ng_embed: local re-probe failed (%s: %s); still on HF remote "
+                    "after %.0fs, next probe in %gs",
+                    type(exc).__name__, exc, now - self._failover_since, interval,
+                )
+                return
+            self._fail_back(session, tokenizer, now)
+        finally:
+            self._probe_lock.release()
+
+    def _fail_back(self, session: Any, tokenizer: Any, now: float) -> None:
+        """Local recovered: leave the failover episode and go back to local (loud)."""
+        with self._model_lock:
+            if self._failover_since is None:
+                return
+            if session is not None:
+                self._session = session
+                self._tokenizer = tokenizer
+            duration = now - self._failover_since
+            calls, vectors = self._failover_remote_calls, self._failover_remote_vectors
+            self._remote_mode = False
+            self._failover_since = None
+            self._failover_kind = None
+            self._failover_remote_calls = 0
+            self._failover_remote_vectors = 0
+        logger.warning(
+            "ng_embed: local model RECOVERED (probe ok) — failing BACK to local after "
+            "%.1fs on HF remote; served remotely during the episode: %d calls, %d vectors",
+            duration, calls, vectors,
+        )
 
     def _require_model(self, require_local: bool = False) -> None:
         """Raise EmbeddingUnavailableError unless the model is usable (local only when require_local)."""
+        self._maybe_fail_back()
         ready = self._ensure_model(require_local=True) if require_local else self._ensure_model()
         if not ready:
             raise EmbeddingUnavailableError("embedding model unavailable")
@@ -1087,6 +1251,7 @@ class NGEmbed:
             normalize=normalize,
             parse=self._parse_hf_vector,
         )
+        self._count_served_remotely(1)
         return self._maybe_l2(vec, normalize)
 
     def _hf_remote_embed_batch(
@@ -1112,7 +1277,15 @@ class NGEmbed:
             normalize=normalize,
             parse=_parse_batch,
         )
+        self._count_served_remotely(len(texts))
         return [self._maybe_l2(v, normalize) for v in vecs]
+
+    def _count_served_remotely(self, vectors: int) -> None:
+        """Failover-episode counter for the fail-back log (approximate under concurrency;
+        keepalive pings made during an episode are included)."""
+        if self._failover_since is not None:
+            self._failover_remote_calls += 1
+            self._failover_remote_vectors += vectors
 
     def start_keepalive(self) -> None:
         """Increment keepalive refcount; start the pinger on 0→1 if remote."""
@@ -1141,6 +1314,8 @@ class NGEmbed:
 
     def _keepalive_loop(self) -> None:
         while not self._keepalive_stop.wait(self._keepalive_interval):
+            if not self._remote_mode:
+                continue  # failed back to local: no remote endpoint to keep warm
             try:
                 self._hf_remote_embed("ping", normalize=False, is_query=False)
             except Exception:
