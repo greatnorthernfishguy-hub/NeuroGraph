@@ -377,3 +377,41 @@ def test_bashrc_script_reverse_does_not_clobber_later_batch_edits(tmp_path):
     assert "export SOME_LATER_BATCH_CHANGE=1\n" in text
     assert text.count("export CC_PITH_PROVIDER_NODE_CHARS=700\n") == 1
     assert "SECRETVALUE123" not in result.stdout + result.stderr
+
+
+# ------------------------------------------------- turn 2: F3a (rollback) / F3b (symlink)
+
+def test_bashrc_script_apply_rolls_back_when_its_own_verify_fails(tmp_path):
+    # le-017's reproduction: the sole export sits inside `if true; then ... fi`, so deleting
+    # it makes `bash -n` fail. The old script left the file broken; it must now restore it.
+    broken_on_delete = ("export A_KEEP=1\nif true; then\nexport CC_PITH_PROVIDER_NODE_CHARS=700\nfi\n"
+                        "export CC_PITH_PROVIDER_ROOTS=8\n")
+    rc = tmp_path / "bashrc"
+    rc.write_text(broken_on_delete)
+    result = _sh(tmp_path, "apply")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert rc.read_text() == broken_on_delete                        # byte-identical: rolled back
+    assert "rolled back" in result.stderr
+    assert not list(tmp_path.glob("bashrc.bak-813.*")), "pointer files must not outlive a rollback"
+    assert len(list(tmp_path.glob("bashrc.bak-813-*"))) == 1        # the backup itself is kept
+    assert "SECRET" not in result.stdout + result.stderr
+
+
+def test_bashrc_script_follows_a_symlinked_bashrc_and_keeps_it_a_symlink(tmp_path):
+    real = tmp_path / "dotfiles_bashrc"
+    real.write_text(_BASHRC)
+    link = tmp_path / "bashrc"
+    link.symlink_to(real)
+    applied = _sh(tmp_path, "apply")
+    assert applied.returncode == 0, applied.stderr
+    assert link.is_symlink() and link.resolve() == real.resolve()   # F3b: still a symlink
+    assert "CC_PITH_PROVIDER_NODE_CHARS" not in real.read_text()    # the TARGET was edited
+    assert _sh(tmp_path, "reverse").returncode == 0
+    assert link.is_symlink() and real.read_text() == _BASHRC
+
+
+def test_bashrc_script_apply_prints_the_s4_checklist_reminder(tmp_path):
+    (tmp_path / "bashrc").write_text(_BASHRC)
+    out = _sh(tmp_path, "apply")
+    assert out.returncode == 0
+    assert "S4 checklist" in out.stdout and "cannot check" in out.stdout
