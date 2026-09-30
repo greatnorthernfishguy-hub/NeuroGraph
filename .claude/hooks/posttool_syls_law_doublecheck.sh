@@ -140,6 +140,11 @@ if [ "$FOUND" -eq 0 ]; then
 EOFFAIL
         exit 2; }
 
+    [ "$_top_rc" -ne 0 ] && [ "$_top_rc" -ne 128 ] && { cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW DOUBLECHECK — GIT FAILURE ═══
+EOFFAIL
+        exit 2; }
+
     if [ -n "$TOPLEVEL" ]; then
         ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)" || true
         _rr=$?

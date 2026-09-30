@@ -202,6 +202,15 @@ EOFFAIL
         exit 2
     fi
 
+    if [ "$_top_rc" -ne 0 ] && [ "$_top_rc" -ne 128 ]; then
+        cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW HOOK — GIT FAILURE ═══
+git rev-parse failed with unexpected exit code.
+The gate cannot rule this edit out. BLOCKING.
+EOFFAIL
+        exit 2
+    fi
+
     if [ -z "$TOPLEVEL" ]; then
         # Not inside a git repo. Check stderr only to discriminate a
         # real git error from "not a repository". Use nearest existing
