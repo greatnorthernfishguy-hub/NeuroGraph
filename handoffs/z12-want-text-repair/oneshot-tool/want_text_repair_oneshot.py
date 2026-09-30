@@ -86,6 +86,16 @@ REGION_FORCE_REVIEW = ("in_url", "in_json_string", "in_link_target")
 CHOICE_CLAUSE_IDS: Tuple[str, str] = ("cc:want::7bd0f5fdca6eb404", "cc:want::3eecfa18710e3b6b")
 CONSTITUTIONAL_ID = "constitutional::rim::choice_clause"
 
+# The ripple table this tool carries into every backup manifest (Exec P428 / le-029 C6): what else holds bytes of
+# the pre-repair checkpoint, and what may NEVER be used to undo the repair.
+RIPPLE_TABLE: Dict[str, str] = {
+    "generations/": ("incidental, expiring (the daemon's rotation prunes it), never a rollback source; the live main.msgpack / "
+                     "vectors.msgpack may be hard-linked into it (Exec P428, judged by inode) and keep the PRE-repair bytes there; "
+                     "never listed or opened by this tool beyond stat/hash of the recorded partner paths"),
+    "last_good/": "NOT a link partner (Exec P428); never a rollback source; never touched by this tool",
+    "rollback source": "ONLY the tool's own named pre-apply backup (<run>/backup/ + backup-manifest-<UTC>.json), every sha256 verified",
+}
+
 # The checkpoint set (plan 6.3; real names per checkpoint_guardian.manifest_path_for/guard_state_path_for).
 MAIN_NAME = "main.msgpack"
 VECTORS_NAME = "vectors.msgpack"
@@ -295,7 +305,10 @@ def load_pinned(pin_root: str) -> types.SimpleNamespace:
 
 def p379_lines(pinned: types.SimpleNamespace) -> List[str]:
     iso = pinned.record["isolation"]
-    lines = ["P379 sys.executable %s" % iso["sys_executable"],
+    p1 = pinned.record["p1"]
+    lines = ["P1 pin/stack head (frozen) %s ; actual pin-worktree HEAD %s ; both recorded" % (p1["frozen_branch_head"], p1["tree_head"]),
+             "P1 cc_ng_organism.py sha256 asserted equal to the pin: %s" % p1["cc_ng_organism_sha256"],
+             "P379 sys.executable %s" % iso["sys_executable"],
              "P379 sys.path[0:6] %s" % iso["sys_path_head"],
              "P379 cc_ng_organism.__file__ %s" % iso["cc_ng_organism_file"],
              "P379 cc_ng_organism sha256 %s" % iso["cc_ng_organism_sha256"],
@@ -375,8 +388,20 @@ def guard_out_path(path: str) -> str:
     return real
 
 
+def refuse_inplace_write(path: str) -> None:
+    """A destination that already exists with st_nlink > 1 is never opened for write (Exec P428 / le-029 C6):
+    writing through it would change EVERY name that shares the inode (e.g. a generation copy). The only writer to a
+    live file is the atomic tmp + os.replace path, which gives the live name a NEW inode."""
+    if os.path.lexists(path):
+        n = os.stat(path).st_nlink
+        if n > 1:
+            raise Refusal("write refused: %s has %d hard links - never written in place (a write would change every name "
+                          "that shares the inode)" % (path, n))
+
+
 def out_write_bytes(path: str, data: bytes, mode: int = 0o644) -> str:
     real = guard_out_path(path)
+    refuse_inplace_write(real)
     os.makedirs(os.path.dirname(real), exist_ok=True)
     fd = os.open(real, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "wb") as f:
@@ -837,6 +862,7 @@ def rewrite_main(raw: bytes, out_path: str, m: Dict[str, str], old_text: Dict[st
     byte-identical to the input). Returns stats (substitutions per site, entries re-encoded). Raises Stop on
     a fidelity failure (V13) or an id found outside the site table (census). The caller guards `out_path`."""
     out_path = guard_out_path(out_path)
+    refuse_inplace_write(out_path)
     try:
         return _rewrite_main_into(raw, out_path, m, old_text, new_text)
     except BaseException:
@@ -1111,10 +1137,31 @@ def build_mapping(records: List[Dict[str, Any]], only_ids=None) -> Dict[str, str
     return m
 
 
-def deny_check(scope_ids, mapping: Dict[str, str], approval_ids=()) -> Dict[str, Any]:
+def is_choice_clause_marked(md: Dict[str, Any]) -> bool:
+    """The metadata flag the deny-check reads (le-029 C8): a truthy `constitutional`, a truthy `choice_clause`, or a
+    tag / tags / kind / category mentioning choice_clause. (The plan names no other tag: this is my reading of
+    'a Choice-Clause tag', flagged in the return.)"""
+    if md.get("constitutional") or md.get("choice_clause"):
+        return True
+    for k in ("tag", "tags", "kind", "category"):
+        v = md.get(k)
+        for x in (v if isinstance(v, (list, tuple, set)) else [v]):
+            if isinstance(x, str) and "choice_clause" in x.lower().replace(" ", "_").replace("-", "_"):
+                return True
+    return False
+
+
+def deny_check(scope_ids, mapping: Dict[str, str], approval_ids=(), nodes_meta: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """V15 deny-check: neither Choice Clause id, nor the constitutional id, is in S, in the mapping (old or new)
-    or in any approval entry. The collision rule drops and lists; this is the proof that it held."""
+    or in any approval entry - AND no member of S (nor any id it maps from) carries the constitutional / Choice
+    Clause flag in its metadata under some other id. The collision rule drops and lists; this is the proof it held."""
     protected = set(CHOICE_CLAUSE_IDS) | {CONSTITUTIONAL_ID}
+    flagged = []
+    if nodes_meta is not None:
+        flagged = sorted(i for i in set(scope_ids) | set(mapping) if is_choice_clause_marked(nodes_meta.get(i, {})))
+        if flagged:
+            raise Stop("V15 deny-check: %d member(s) of S / the mapping carry the constitutional or Choice Clause flag "
+                       "under another id (first: %s)" % (len(flagged), flagged[0]))
     bad = {
         "in_scope": sorted(protected & set(scope_ids)),
         "in_mapping_old": sorted(protected & set(mapping)),
@@ -1387,8 +1434,16 @@ def approvals_body_for(records: List[Dict[str, Any]], repair_list_sha256: str, s
     }
 
 
-def load_approvals(path: str, expected_file_sha256: str, repair_list_sha256: str, scope_ids_sha256: str,
-                   *, allow_provisional: bool = False) -> Dict[str, Any]:
+def provisional_body_for(records: List[Dict[str, Any]], repair_list_sha256: str, scope_ids_sha256: str) -> Dict[str, Any]:
+    """The DRY-RUN packet (le-029 C5): decision `provisional` (not in approved/struck) and a top-level
+    `provisional: true`. ONLY stage_rewrite accepts it (provisional_ok); load_approvals - the only door to
+    Phase 2 - refuses it, whatever else is edited."""
+    body = approvals_body_for(records, repair_list_sha256, scope_ids_sha256, PROVISIONAL_PACKET, decision="provisional")
+    body["provisional"] = True
+    return body
+
+
+def load_approvals(path: str, expected_file_sha256: str, repair_list_sha256: str, scope_ids_sha256: str) -> Dict[str, Any]:
     if not expected_file_sha256:
         raise Refusal("approvals: --approvals-sha256 (the hash relayed from the Executive's packet) is REQUIRED")
     obj = load_artifact(path, expected_file_sha256)          # file sha256 == relayed value; stamp == frozen pin (P5)
@@ -1405,7 +1460,7 @@ def load_approvals(path: str, expected_file_sha256: str, repair_list_sha256: str
         problems.append("poincare_dir_carried")
     if not isinstance(obj.get("packet"), str) or not obj["packet"]:
         problems.append("packet")
-    if obj.get("packet") == PROVISIONAL_PACKET and not allow_provisional:
+    if obj.get("packet") == PROVISIONAL_PACKET or obj.get("provisional"):
         problems.append("provisional_packet_is_not_an_approval")
     ents = obj.get("entries")
     if not isinstance(ents, list) or len({e.get("id") for e in ents if isinstance(e, dict)}) != len(ents):
@@ -1419,16 +1474,24 @@ def load_approvals(path: str, expected_file_sha256: str, repair_list_sha256: str
     return obj
 
 
-def gate_write_set(records: List[Dict[str, Any]], approvals: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, str]]]:
+def approved_decisions(approvals: Dict[str, Any], provisional_ok: bool) -> Tuple[str, ...]:
+    """The decisions that count as 'approved'. `provisional` counts ONLY for the dry-run rewrite path."""
+    if provisional_ok and approvals.get("provisional") is True and approvals.get("packet") == PROVISIONAL_PACKET:
+        return ("approved", "provisional")
+    return ("approved",)
+
+
+def gate_write_set(records: List[Dict[str, Any]], approvals: Dict[str, Any], *, provisional_ok: bool = False) -> Tuple[List[str], List[Dict[str, str]]]:
     """(write_ids, refusals). `struck` = leave the node EXACTLY as-is (Exec P423-C1). Every recompute is from
     the run's own live data; an entry's hashes must equal them."""
     by_id = {e["id"]: e for e in approvals["entries"]}
+    ok_dec = approved_decisions(approvals, provisional_ok)
     write, refused = [], []
     for r in sorted(records, key=lambda x: x["id"]):
         if r["disposition"] != "candidate":
             continue
         e = by_id.get(r["id"])
-        if e is None or e["decision"] != "approved":
+        if e is None or e["decision"] not in ok_dec:
             refused.append({"id": r["id"], "reason": "not_approved"})
         elif (e.get("excerpt_sha256") != r["excerpt_sha256"] or e.get("x_sha16") != r["new_sha16"]
               or e.get("t_sha16") != r["old_sha16"]):
@@ -1668,7 +1731,7 @@ class Verifier:
             "cc_present": [], "syn_bad": [], "syn_a": 0, "syn_b": 0, "inc_a": Counter(), "inc_b": Counter(),
             "rim_bad": [], "rim_incident": 0, "rim_incident_mapped": 0, "rim_changed": 0, "he_bad": [],
             "misc_bad": [], "other_top_bad": [], "walker_subs": 0, "written": set(), "b_node_keys": set(),
-            "v2_bad": [], "text_bad": [],
+            "v2_bad": [], "text_bad": [], "a_node_keys": set(),
         }
         prot_names = set(CHOICE_CLAUSE_IDS) | {CONSTITUTIONAL_ID}
         for a, b in itertools.zip_longest(iter_sections(raw_a), iter_sections(raw_b)):
@@ -1707,6 +1770,7 @@ class Verifier:
                 W["prot_a"] += is_protected(mda)
                 W["prot_b"] += is_protected(mdb)
                 W["b_node_keys"].add(ekb)
+                W["a_node_keys"].add(eka)
                 if ekb != eka:
                     W["walker_subs"] += 1                            # the map key itself
                 diffs, s = diff_modulo(da, db, m)
@@ -1859,7 +1923,9 @@ class Verifier:
         os.unlink(ident_tmp)
         self.check("V12", not rer_bad and idem, {"not_rederived": rer_bad[:5], "identity_rewrite_is_noop": idem})
         # V13 fidelity (each re-encoded value was proven inside the writer; the sidecar round-trips)
-        self.check("V13", True, {"reencoded_entries": writer_stats["reencoded_entries"], "sidecar_round_trip": True})
+        self.check("V13", True, {"enforced_by": "writer-enforced: rewrite_main raises Stop on any pack(unpack(raw)) != raw and the "
+                                 "sidecar must round-trip through json; this line records the writer's counts, it is not a second pass",
+                                 "reencoded_entries": writer_stats["reencoded_entries"], "sidecar_round_trip": True})
         # V14 shared-function proof
         src = Path(__file__).read_text(encoding="utf-8")
         shared = (("def " + "parse_wants") not in src and ("def " + "want_id_for_text") not in src
@@ -1867,14 +1933,19 @@ class Verifier:
         self.check("V14", shared, {"p1": self.pinned.record["p1"], "isolation_file": self.pinned.record["isolation"]["cc_ng_organism_file"]})
         # V15 Choice Clause / constitutional / every unrepaired want, plus the deny-check
         try:
-            dc = deny_check(A["scope"], m, plan["approved_ids"])
+            dc = deny_check(A["scope"], m, plan["approved_ids"], nodes_meta=A["nodes_meta"])
         except Stop as exc:
             dc = {"clean": False, "error": str(exc)[:120]}
-        self.check("V15", not W["v15_bad"] and bool(dc.get("clean")),
-                   {"bad": W["v15_bad"][:5], "choice_clause_present": W["cc_present"], "deny_check": dc})
+        prot = set(CHOICE_CLAUSE_IDS) | {CONSTITUTIONAL_ID}                     # le-029 C7: PRESENT in the input AND the output
+        present_in, present_out = sorted(prot & W["a_node_keys"]), sorted(prot & W["b_node_keys"])
+        self.check("V15", not W["v15_bad"] and bool(dc.get("clean")) and set(present_in) == prot and set(present_out) == prot,
+                   {"bad": W["v15_bad"][:5], "present_in_input": present_in, "present_in_output": present_out,
+                    "missing": sorted(prot - set(present_in) - set(present_out)), "deny_check": dc})
         # V16 rim
-        self.check("V16", not W["rim_bad"] and W["rim_changed"] == W["rim_incident_mapped"],
-                   {"rim_incident": W["rim_incident"], "rim_incident_with_mapped_want": W["rim_incident_mapped"],
+        rim_present = CONSTITUTIONAL_ID in W["a_node_keys"] and CONSTITUTIONAL_ID in W["b_node_keys"]
+        self.check("V16", rim_present and not W["rim_bad"] and W["rim_changed"] == W["rim_incident_mapped"],
+                   {"rim_present_in_input_and_output": rim_present,
+                    "rim_incident": W["rim_incident"], "rim_incident_with_mapped_want": W["rim_incident_mapped"],
                     "rim_changed": W["rim_changed"], "rim_to_scope_total": A["syn"]["rim_to_scope"], "bad": W["rim_bad"][:5]})
         # V17 approvals
         self.check("V17", W["written"] == set(plan["write_ids"]) and set(plan["write_ids"]) <= set(plan["approved_ids"]),
@@ -1882,7 +1953,7 @@ class Verifier:
                     "refused": plan["refused"][:10]})
         # V18 rollback artefacts: inverse o mapping == identity, both files exist and hash-verify
         art = plan.get("artifacts", {})
-        v18 = all(os.path.isfile(p) and sha256_file(p) == h for p, h in art.values()) and bool(art) or (not m and bool(art))
+        v18 = bool(art) and all(os.path.isfile(p) and sha256_file(p) == h for p, h in art.values())   # the hash check is UNCONDITIONAL (c026-C3)
         self.check("V18", v18 and all(inv[m[o]] == o for o in m) and len(inv) == len(m), {"artifacts": sorted(art)})
         # V19 all-or-nothing evaluation
         self.check("V19", plan.get("evaluated") == len(A["scope"]) and plan.get("assert_failed_listed") ==
@@ -1965,16 +2036,64 @@ DAEMON_PROC_PATTERNS = ("cc-ng-service.py", "cc-ng-daemon.py", "neurograph_rpc.p
 SYNC_PROC_PATTERNS = ("cc-ng-sync.py leg2-tick", "cc_topology_merge", "cc-ng-sync.py")
 
 
+class ProbeError(Exception):
+    """A host query could not be answered: the truth is UNKNOWN. A gate must read this as 'not satisfied' -
+    never as 'down', 'off', 'inactive' or 'no cron line' (le-029 C2 / checker-026 c026-C7)."""
+
+
+_ACTIVE_WORDS = ("active", "activating", "reloading", "deactivating", "refreshing", "maintenance")
+_DOWN_WORDS = ("inactive", "failed")
+_ENABLED_WORDS = ("enabled", "enabled-runtime", "static", "linked", "linked-runtime", "alias", "indirect", "generated", "transient")
+_OFF_WORDS = ("disabled", "masked", "masked-runtime")
+PROBE_TIMEOUT_S = 20
+
+
 class Probes:
-    def _sysctl(self, *a) -> str:
-        p = subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True)
-        return (p.stdout or "").strip()
+    """Read-only host queries that FAIL CLOSED. `systemctl --user` counts as 'down' only for an exact
+    inactive/failed answer (rc 3/4) from a REACHABLE bus; an empty answer, any other word, a non-zero rc that does
+    not fit, an unreachable bus, a timeout or a missing binary raises ProbeError. `crontab -l`: rc 0 = the text,
+    rc 1 with 'no crontab for' = empty, anything else raises. The /proc scans skip an entry only if it VANISHED
+    mid-scan or belongs to another user (counted in foreign_unreadable); an unreadable entry of our own uid raises.
+    Tests inject fakes - nothing here is ever run by a Phase-1 step."""
+
+    def __init__(self):
+        self.foreign_unreadable = 0
+
+    def _run(self, argv):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as exc:            # FileNotFoundError, PermissionError, TimeoutExpired ...
+            raise ProbeError("%s: %s" % (argv[0], exc.__class__.__name__))
+
+    def _sysctl(self, *a):
+        p = self._run(["systemctl", "--user", *a])
+        if "Failed to connect to bus" in (p.stderr or ""):
+            raise ProbeError("systemctl --user: the user bus is unreachable")
+        return p
 
     def unit_active(self, unit: str) -> bool:
-        return self._sysctl("is-active", unit) in ("active", "activating", "reloading")
+        p = self._sysctl("is-active", unit)
+        word = (p.stdout or "").strip()
+        if word in _DOWN_WORDS and p.returncode in (3, 4):
+            return False
+        if word in _ACTIVE_WORDS:
+            return True
+        raise ProbeError("systemctl is-active %s: rc %s, answer %r is neither up nor down" % (unit, p.returncode, word[:40]))
 
     def unit_enabled(self, unit: str) -> bool:
-        return self._sysctl("is-enabled", unit) in ("enabled", "enabled-runtime", "static", "linked")
+        p = self._sysctl("is-enabled", unit)
+        word = (p.stdout or "").strip()
+        if word in _ENABLED_WORDS:
+            return True
+        if word in _OFF_WORDS:
+            return False
+        raise ProbeError("systemctl is-enabled %s: rc %s, answer %r is neither on nor off" % (unit, p.returncode, word[:40]))
+
+    def _foreign(self, d: str) -> Optional[bool]:
+        try:
+            return os.stat(d).st_uid != os.getuid()
+        except (FileNotFoundError, ProcessLookupError):
+            return None                                                    # the process vanished
 
     def processes_matching(self, patterns) -> List[int]:
         pids = []
@@ -1982,11 +2101,22 @@ class Probes:
         for d in glob.glob("/proc/[0-9]*"):
             try:
                 pid = int(os.path.basename(d))
-                if pid == me:
-                    continue
-                cmd = Path(d, "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
-            except (OSError, ValueError):
+            except ValueError:
                 continue
+            if pid == me:
+                continue
+            try:
+                cmd = Path(d, "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+            except (FileNotFoundError, ProcessLookupError, NotADirectoryError):
+                continue                                                    # vanished mid-scan
+            except OSError as exc:
+                foreign = self._foreign(d)
+                if foreign is None:
+                    continue
+                if foreign:
+                    self.foreign_unreadable += 1
+                    continue
+                raise ProbeError("cannot read %s/cmdline (our own uid): %s" % (d, exc.__class__.__name__))
             if any(pat in cmd for pat in patterns) and "want_text_repair_oneshot" not in cmd:
                 pids.append(pid)
         return sorted(pids)
@@ -1997,92 +2127,159 @@ class Probes:
         for d in glob.glob("/proc/[0-9]*"):
             try:
                 pid = int(os.path.basename(d))
-                for fd in os.listdir(os.path.join(d, "fd")):
-                    try:
-                        t = os.path.realpath(os.readlink(os.path.join(d, "fd", fd)))
-                    except OSError:
-                        continue
-                    if t in want and pid != os.getpid():
-                        held.append((pid, t))
-            except (OSError, ValueError):
+            except ValueError:
                 continue
+            if pid == os.getpid():
+                continue
+            try:
+                names = os.listdir(os.path.join(d, "fd"))
+            except (FileNotFoundError, ProcessLookupError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                foreign = self._foreign(d)
+                if foreign is None:
+                    continue
+                if foreign:
+                    self.foreign_unreadable += 1
+                    continue
+                raise ProbeError("cannot list %s/fd (our own uid): %s" % (d, exc.__class__.__name__))
+            for fd in names:
+                try:
+                    t = os.path.realpath(os.readlink(os.path.join(d, "fd", fd)))
+                except OSError:
+                    continue                                                # that descriptor closed while we looked
+                if t in want:
+                    held.append((pid, t))
         return held
 
     def pid_alive(self, pid: int) -> bool:
         return os.path.isdir("/proc/%d" % pid)
 
     def crontab_text(self) -> str:
-        p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        return p.stdout if p.returncode == 0 else ""
+        p = self._run(["crontab", "-l"])
+        if p.returncode == 0:
+            return p.stdout
+        if p.returncode == 1 and "no crontab for" in (p.stderr or ""):
+            return ""
+        raise ProbeError("crontab -l: rc %s, %r" % (p.returncode, (p.stderr or "")[:60]))
 
     def env_get(self, name: str) -> Optional[str]:
         return os.environ.get(name)
 
     def stat_snapshot(self, dirpath: str) -> Dict[str, List[int]]:
-        """names, sizes, mtimes, inodes - by stat only; the conduit files are NEVER opened (H3)."""
+        """names, sizes, mtimes, inodes - by stat only; the conduit files are NEVER opened (H3). An unreadable
+        conduit is an error, not an empty conduit."""
         snap: Dict[str, List[int]] = {}
         if not dirpath or not os.path.isdir(dirpath):
             return snap
-        for root, _dirs, files in os.walk(dirpath):
+
+        def boom(exc):
+            raise ProbeError("cannot walk the conduit: %s" % exc.__class__.__name__)
+        for root, _dirs, files in os.walk(dirpath, onerror=boom):
             for n in sorted(files):
                 p = os.path.join(root, n)
                 try:
                     st = os.stat(p)
-                except OSError:
+                except FileNotFoundError:
                     continue
+                except OSError as exc:
+                    raise ProbeError("cannot stat a conduit file: %s" % exc.__class__.__name__)
                 snap[os.path.relpath(p, dirpath)] = [st.st_size, int(st.st_mtime_ns), st.st_ino]
         return snap
 
 
-def gate_p4(probes, target_dir: str, *, manifest_files: Optional[Dict[str, Dict[str, Any]]] = None,
-            code_placed_at: Optional[float] = None, daemon_log: Optional[str] = None) -> Dict[str, Any]:
-    """P4 - 'daemon down' is a MECHANICAL check (plan 6.4), all of it, recorded."""
+def _leg(checks: Dict[str, bool], errors: Dict[str, str], name: str, fn: Callable[[], Any]) -> None:
+    try:
+        checks[name] = bool(fn())
+    except ProbeError as exc:
+        checks[name] = False                                                # unknown is NOT satisfied
+        errors[name] = str(exc)[:160]
+
+
+def stat_ident(path: str) -> Dict[str, int]:
+    """(st_dev, st_ino, st_nlink) - the inode evidence of Exec P428. A file identity is the (dev, ino) pair; a link
+    count says only how many names an inode has, never which files share it."""
+    st = os.stat(path)
+    return {"st_dev": st.st_dev, "st_ino": st.st_ino, "st_nlink": st.st_nlink}
+
+
+def _files_equal_backup(target_dir: str, manifest_files: Dict[str, Dict[str, Any]]) -> bool:
+    for n in SIX_FILES:
+        p = os.path.join(target_dir, n)
+        st = os.stat(p)
+        m = manifest_files.get(n, {})
+        if not (m.get("sha256") == sha256_file(p) and m.get("size") == st.st_size and m.get("mtime_ns") == st.st_mtime_ns
+                and m.get("st_dev") == st.st_dev and m.get("st_ino") == st.st_ino):
+            return False
+    return True
+
+
+def gate_p4(probes, target_dir: str, *, code_placed_at: Optional[float], daemon_log: Optional[str],
+            manifest_files: Optional[Dict[str, Dict[str, Any]]] = None, require_files_equal: bool = True) -> Dict[str, Any]:
+    """P4 - 'daemon down' is a MECHANICAL check (plan 6.4), all of it, recorded. EVERY leg is always present in
+    `checks`: a missing --code-placed-at, an absent or unreadable daemon.log, an unanswerable probe, or a missing
+    manifest is a leg that is False - never a leg that is left out (le-029 C1/C2). `require_files_equal=False`
+    (the rollback step only) records the equality leg under `skipped`, with the reason, instead of dropping it."""
     files = [os.path.join(target_dir, n) for n in SIX_FILES]
-    checks: Dict[str, Any] = {}
-    checks["unit_inactive"] = not probes.unit_active(DAEMON_UNIT)
-    checks["recover_timer_inactive"] = not probes.unit_active(RECOVER_TIMER)
-    checks["no_daemon_process"] = probes.processes_matching(DAEMON_PROC_PATTERNS) == []
-    checks["no_process_holds_the_six_files"] = probes.files_held_open(files) == []
-    pidf = os.path.join(target_dir, "..", "daemon.pid")
-    pid_ok = True
-    if os.path.isfile(pidf):
+    checks: Dict[str, bool] = {}
+    errors: Dict[str, str] = {}
+    skipped: Dict[str, str] = {}
+    _leg(checks, errors, "unit_inactive", lambda: not probes.unit_active(DAEMON_UNIT))
+    _leg(checks, errors, "recover_timer_inactive", lambda: not probes.unit_active(RECOVER_TIMER))
+    _leg(checks, errors, "no_daemon_process", lambda: probes.processes_matching(DAEMON_PROC_PATTERNS) == [])
+    _leg(checks, errors, "no_process_holds_the_six_files", lambda: probes.files_held_open(files) == [])
+
+    def pid_leg():
+        pidf = os.path.join(target_dir, "..", "daemon.pid")
+        if not os.path.isfile(pidf):
+            return True
         try:
-            pid_ok = not probes.pid_alive(int(Path(pidf).read_text().strip()))
+            return not probes.pid_alive(int(Path(pidf).read_text().strip()))
         except ValueError:
-            pid_ok = False
-    checks["daemon_pid_file_names_a_dead_pid"] = pid_ok
-    if manifest_files is not None:
-        same = True
-        for n in SIX_FILES:
-            p = os.path.join(target_dir, n)
-            st = os.stat(p)
-            m = manifest_files.get(n, {})
-            if not (m.get("sha256") == sha256_file(p) and m.get("size") == st.st_size and m.get("mtime_ns") == st.st_mtime_ns):
-                same = False
-        checks["six_files_equal_the_start_of_phase2_backup"] = same
-    if code_placed_at is not None:
-        log_ok = True
-        if daemon_log and os.path.isfile(daemon_log):
-            log_ok = os.stat(daemon_log).st_mtime <= code_placed_at
-        checks["no_pulse_since_code_placement"] = checks["unit_inactive"] and log_ok
-    return {"gate": "P4", "checks": checks, "ok": all(checks.values())}
+            return False
+    _leg(checks, errors, "daemon_pid_file_names_a_dead_pid", pid_leg)
+    if require_files_equal:
+        checks["six_files_equal_the_start_of_phase2_backup"] = manifest_files is not None and _files_equal_backup(target_dir, manifest_files)
+    else:
+        skipped["six_files_equal_the_start_of_phase2_backup"] = "rollback: replaced by the identity check against the backup and the post-apply receipt"
+
+    def pulse_ok() -> bool:
+        if code_placed_at is None or not daemon_log:
+            return False
+        try:
+            with open(daemon_log, "rb") as f:
+                f.read(1)                                                   # a log that cannot be read is not evidence
+            return bool(checks.get("unit_inactive")) and os.stat(daemon_log).st_mtime <= float(code_placed_at)
+        except (OSError, ValueError):
+            return False
+    checks["no_pulse_since_code_placement"] = pulse_ok()
+    return {"gate": "P4", "checks": checks, "probe_errors": errors, "skipped_legs": skipped, "ok": all(checks.values())}
 
 
 def hold_snapshot(probes, conduit_dir: str) -> Dict[str, Any]:
     """P6 H1-H3, recorded (plan 6.5). H1: the callosum cron line and the Leg 1 flag. H2: no Leg 2 timer/process.
-    H3: the conduit compared by stat only."""
-    cron = probes.crontab_text()
+    H3: the conduit compared by stat only. A probe that cannot answer is recorded in `probe_errors` (and fails the gate)."""
+    errs: Dict[str, str] = {}
+
+    def q(name, fn, default):
+        try:
+            return fn()
+        except ProbeError as exc:
+            errs[name] = str(exc)[:160]
+            return default
+    cron = q("h1_crontab", probes.crontab_text, "")
     live_cron = [ln for ln in cron.splitlines() if "callosum" in ln.lower() and not ln.lstrip().startswith("#")]
     return {
         "h1_crontab_sha256": sha256_bytes(cron.encode()),
         "h1_callosum_cron_line_firing": bool(live_cron),
         "h1_leg1_flag_env_is_1": probes.env_get("CC_CALLOSUM_LEG1_ENABLED") == "1",
-        "h2_leg2_timer_enabled": probes.unit_enabled(LEG2_TIMER),
-        "h2_leg2_timer_active": probes.unit_active(LEG2_TIMER),
-        "h2_leg2_service_active": probes.unit_active(LEG2_SERVICE),
-        "h2_sync_or_merge_process": probes.processes_matching(SYNC_PROC_PATTERNS),
+        "h2_leg2_timer_enabled": q("h2_leg2_timer_enabled", lambda: probes.unit_enabled(LEG2_TIMER), False),
+        "h2_leg2_timer_active": q("h2_leg2_timer_active", lambda: probes.unit_active(LEG2_TIMER), False),
+        "h2_leg2_service_active": q("h2_leg2_service_active", lambda: probes.unit_active(LEG2_SERVICE), False),
+        "h2_sync_or_merge_process": q("h2_sync_or_merge_process", lambda: probes.processes_matching(SYNC_PROC_PATTERNS), []),
         "h3_conduit_dir": conduit_dir,
-        "h3_conduit_stat": probes.stat_snapshot(conduit_dir),
+        "h3_conduit_stat": q("h3_conduit_stat", lambda: probes.stat_snapshot(conduit_dir), {}),
+        "probe_errors": errs,
     }
 
 
@@ -2092,6 +2289,7 @@ def gate_p6(probes, conduit_dir: str, start: Optional[Dict[str, Any]] = None) ->
                        "h2_leg2_timer_active", "h2_leg2_service_active") if now[k]]
     if now["h2_sync_or_merge_process"]:
         bad.append("h2_sync_or_merge_process")
+    bad += ["probe_error:%s" % k for k in now["probe_errors"]]
     if not conduit_dir or _under(conduit_dir, SYL_CHECKPOINTS) or _under(conduit_dir, os.path.join(_HOME, "NeuroGraph", "data")):
         bad.append("h3_conduit_path_not_recorded_or_under_syls_directories")
     if start is not None:
@@ -2100,6 +2298,34 @@ def gate_p6(probes, conduit_dir: str, start: Optional[Dict[str, Any]] = None) ->
         if now["h3_conduit_stat"] != start["h3_conduit_stat"]:
             bad.append("h3_conduit_stat_changed_since_start")
     return {"gate": "P6", "snapshot": now, "violations": bad, "ok": not bad}
+
+
+def gate_p2(daemon_organism_file: str, pin_root: str, tool_root: Optional[str] = None) -> Dict[str, Any]:
+    """P2 (le-029 C3). The sha256 of the file the daemon imports must equal the pin - AND the path must be the
+    unit's own import root: a file that resolves inside the PIN worktree or this tool's worktree satisfies the hash
+    vacuously and is REFUSED. The file's realpath / inode / mtime are recorded. The Chief names the actual import
+    root (Q9) in the go request."""
+    tool_root = tool_root or _tool_worktree_root()
+    out: Dict[str, Any] = {"gate": "P2", "path": daemon_organism_file, "ok": False}
+    if not daemon_organism_file or not os.path.isfile(daemon_organism_file):
+        out["reason"] = "not a readable file"
+        return out
+    real = os.path.realpath(daemon_organism_file)
+    st = os.stat(real)
+    out.update(realpath=real, st_ino=st.st_ino, st_dev=st.st_dev, mtime_ns=st.st_mtime_ns, sha256=sha256_file(real))
+    if _under(real, pin_root) or _under(real, tool_root):
+        out["reason"] = "resolves inside the pin worktree or the tool worktree - name the unit's actual import root"
+        return out
+    out["ok"] = out["sha256"] == PIN["cc_ng_organism_sha256"]
+    if not out["ok"]:
+        out["reason"] = "sha256 is not the pin"
+    return out
+
+
+def _tool_worktree_root() -> str:
+    here = os.path.dirname(os.path.realpath(__file__))
+    p = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return os.path.realpath(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip() else os.path.realpath(os.path.join(here, "..", "..", ".."))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2164,7 +2390,8 @@ def copy_six(src_dir: str, dst_dir: str) -> Dict[str, Any]:
     and after the copy and of the copy: all three must agree or the run STOPS."""
     def stat_row(p):
         st = os.stat(p)
-        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "inode": st.st_ino}
+        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "inode": st.st_ino,
+                "st_dev": st.st_dev, "st_ino": st.st_ino, "st_nlink": st.st_nlink}
     before = {}
     for n in SIX_FILES:
         p = os.path.join(src_dir, n)
@@ -2176,6 +2403,7 @@ def copy_six(src_dir: str, dst_dir: str) -> Dict[str, Any]:
     copies = {}
     for n in SIX_FILES:
         d = guard_out_path(os.path.join(dst_dir, n))
+        refuse_inplace_write(d)
         shutil.copyfile(os.path.join(src_dir, n), d)       # a new file, never a link
         if os.stat(d).st_ino == before[n]["inode"]:
             raise Stop("copy: %s shares an inode with the source" % n)
@@ -2197,15 +2425,16 @@ def _write_reports(run_dir: str, reports: Dict[str, Dict[str, Any]]) -> Dict[str
 
 
 def build_outputs(pinned, A: Dict[str, Any], approvals: Dict[str, Any], *, in_dir: str, out_dir: str, run_dir: str,
-                  utc: str, in_hashes: Dict[str, str]) -> Dict[str, Any]:
+                  utc: str, in_hashes: Dict[str, str], provisional_ok: bool = False) -> Dict[str, Any]:
     """The build core shared by Phase 1 (rewrite to TMP) and Phase 2 (stage). Every node of S has ALREADY been
     evaluated (A) - no byte is written before that (V19). Writes the rewritten pair, the mapping + INVERSE
     mapping and the post-apply receipt draft; returns everything the verifier needs."""
     records = A["records"]
-    write_ids, refused = gate_write_set(records, approvals)
-    approved_ids = sorted(e["id"] for e in approvals["entries"] if e["decision"] == "approved")
+    write_ids, refused = gate_write_set(records, approvals, provisional_ok=provisional_ok)
+    ok_dec = approved_decisions(approvals, provisional_ok)
+    approved_ids = sorted(e["id"] for e in approvals["entries"] if e["decision"] in ok_dec)
     mapping = build_mapping(records, only_ids=set(write_ids))
-    deny_check(A["scope"], mapping, [e["id"] for e in approvals["entries"]])
+    deny_check(A["scope"], mapping, [e["id"] for e in approvals["entries"]], nodes_meta=A["nodes_meta"])
     by_id = {r["id"]: r for r in records}
     old_text = {o: by_id[o]["_t"] for o in mapping}
     new_text = {o: by_id[o]["_x"] for o in mapping}
@@ -2259,9 +2488,10 @@ def run_verifier(pinned, A: Dict[str, Any], ctx: Dict[str, Any], expect: Dict[st
 
 
 def prepare_outputs(pinned, A: Dict[str, Any], approvals: Dict[str, Any], *, in_dir: str, out_dir: str, run_dir: str,
-                    utc: str, expect: Dict[str, int], in_hashes: Dict[str, str]) -> Dict[str, Any]:
+                    utc: str, expect: Dict[str, int], in_hashes: Dict[str, str], provisional_ok: bool = False) -> Dict[str, Any]:
     """Build + verify V1-V19 + the T6 replay. Returns the plan, results, paths and stats."""
-    ctx = build_outputs(pinned, A, approvals, in_dir=in_dir, out_dir=out_dir, run_dir=run_dir, utc=utc, in_hashes=in_hashes)
+    ctx = build_outputs(pinned, A, approvals, in_dir=in_dir, out_dir=out_dir, run_dir=run_dir, utc=utc, in_hashes=in_hashes,
+                        provisional_ok=provisional_ok)
     V = run_verifier(pinned, A, ctx, expect)
     cl_after = Classifier(pinned.org, ctx["meta_after"], A["content"])
     t6 = t6_replay(pinned, A["nodes_meta"], ctx["meta_after"], A["content"], ctx["plan"]["mapping"], cl_after)
@@ -2291,11 +2521,12 @@ def stage_classify(args, pinned, target_info) -> Dict[str, Any]:
     copy = copy_six(target_info["target_realpath"], copy_dir)
     write_artifact(os.path.join(run_dir, "copy-hashes.json"), {"kind": "copy-hashes", "files": copy["files"], "copy_sha256": copy["copy_sha256"]})
     A = analyze(pinned, copy_dir, scope_min_len=args.scope_min_len)
-    deny_check(A["scope"], build_mapping(A["records"]), ())
+    deny_check(A["scope"], build_mapping(A["records"]), (), nodes_meta=A["nodes_meta"])
     reports = build_reports(A, args.expect_scope)
     shas = _write_reports(run_dir, reports)
     cand_map, _ = id_map_objs(build_mapping(A["records"]))
-    shas["candidate-id-map"] = write_artifact(os.path.join(run_dir, "reports", "candidate-id-map.json"), cand_map)
+    # the name Phase 2 expects: freeze reports/repair-list.json, reports/scope-ids.json and reports/id-map.json UNEDITED
+    shas["id-map"] = write_artifact(os.path.join(run_dir, "reports", "id-map.json"), cand_map)
     shas.update(write_review_files(run_dir, utc, pinned.org, A["content"], A["records"]))
     ot = reports["outcome-table"]
     rec = _run_record(run_dir, utc, args, pinned, target_info, copy, {"artifacts_sha256": shas, "counts": A["counts"],
@@ -2331,13 +2562,13 @@ def stage_rewrite(args, pinned, target_info) -> Dict[str, Any]:
         raise Stop("P5: the re-derived classification is not the saved one (repair-list/scope-ids sha256 differ)")
     utc = utc_stamp()
     if args.provisional_approve_all:
-        prov = approvals_body_for(A["records"], rl_sha, sc_sha, PROVISIONAL_PACKET)
+        prov = provisional_body_for(A["records"], rl_sha, sc_sha)
         write_artifact(os.path.join(run_dir, "reports", "PROVISIONAL-approvals-%s.json" % utc), prov)
         approvals = stamped(prov)
     else:
         approvals = load_approvals(args.approvals, args.approvals_sha256, rl_sha, sc_sha)
     out = prepare_outputs(pinned, A, approvals, in_dir=copy_dir, out_dir=os.path.join(run_dir, "rewrite-tmp"), run_dir=run_dir,
-                          utc=utc, expect=_expect(args), in_hashes=chash)
+                          utc=utc, expect=_expect(args), in_hashes=chash, provisional_ok=bool(args.provisional_approve_all))
     report = {"kind": "verify-report", "approvals": {"packet": approvals.get("packet"),
               "provisional": approvals.get("packet") == PROVISIONAL_PACKET, "refused": out["plan"]["refused"]},
               "written_ids": out["plan"]["write_ids"], "checks": out["results"], "failed": out["failed"],
@@ -2369,16 +2600,74 @@ def _daemon_log_for(target_real: str) -> str:
     return os.path.join(os.path.dirname(target_real), "daemon.log")
 
 
+def _require_phase2_inputs(args) -> float:
+    """C1 + C4, shared by phase2-backup, --apply and rollback: --code-placed-at is REQUIRED and must parse (a
+    readable daemon.log is required by the P4 gate itself); the --expect-* flags must equal the module constants
+    (118/182/183) - Phase 1 may take other values for a COPY, Phase 2 never."""
+    got, pinned_c = (args.expect_wants, args.expect_protected, args.expect_scope), (EXPECTED_WANTS, EXPECTED_PROTECTED, EXPECTED_SCOPE)
+    if got != pinned_c:
+        raise Refusal("--expect-wants/--expect-protected/--expect-scope must equal the plan's pinned constants %s at Phase 2 (got %s)"
+                      % ("/".join(map(str, pinned_c)), "/".join(map(str, got))))
+    if not args.code_placed_at:
+        raise Refusal("--code-placed-at is REQUIRED at Phase 2 (the 'no pulse since the code was placed' leg of P4 is never skipped)")
+    try:
+        return _parse_ts(args.code_placed_at)
+    except ValueError:
+        raise Refusal("--code-placed-at %r is not an epoch or an ISO time" % args.code_placed_at)
+
+
+def _partner_specs(args, tdir: str) -> List[Tuple[str, str]]:
+    """--generation-partner NAME=PATH: the two KNOWN partner paths, validated without listing anything. A path must
+    lie under <target>/generations/ and be a regular file; the directory itself is never listed or opened."""
+    root = os.path.join(tdir, "generations")
+    out = []
+    for spec in (getattr(args, "generation_partner", None) or []):
+        name, sep, path = spec.partition("=")
+        if not sep or name not in SIX_FILES or not path:
+            raise Refusal("--generation-partner wants NAME=PATH with NAME one of the six checkpoint files (got %r)" % spec)
+        real = os.path.realpath(path)
+        if real == os.path.realpath(root) or not _under(real, root):
+            raise Refusal("--generation-partner %s must lie under %s (a recorded path is stat/hashed only; the directory is never listed)"
+                          % (name, root))
+        if not os.path.isfile(real):
+            raise Refusal("--generation-partner %s: %s is not a regular file" % (name, path))
+        out.append((name, path))
+    return out
+
+
+def _partner_record(name: str, path: str, live: Dict[str, int]) -> Dict[str, Any]:
+    """Read-only evidence about one generation partner: its inode identity and sha256. `same_file_as_live` is decided by
+    the (st_dev, st_ino) pair - never by a link count."""
+    if not os.path.isfile(path):
+        return {"name": name, "path": path, "present": False}
+    st = os.stat(path)
+    return {"name": name, "path": path, "present": True, "st_dev": st.st_dev, "st_ino": st.st_ino, "st_nlink": st.st_nlink,
+            "size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": sha256_file(path),
+            "same_file_as_live": (st.st_dev, st.st_ino) == (live["st_dev"], live["st_ino"])}
+
+
+def _hold_start_of(hold: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: hold[k] for k in hold if k.startswith("h")}
+
+
+def _p4_failures(p4: Dict[str, Any], p6: Dict[str, Any]) -> str:
+    return "%s %s %s" % ([k for k, v in p4["checks"].items() if not v], sorted(p4["probe_errors"]), p6["violations"])
+
+
 def stage_phase2_backup(args, pinned, probes, target_info) -> Dict[str, Any]:
     """The START-OF-PHASE-2 BACKUP (plan 6.3/6.6): only with the daemon mechanically down and the peer hold in
     place; copies the six files to a new run directory, re-hashes, re-reads independently, writes
-    backup-manifest-<UTC>.json and returns its sha256 - the value Josh's go must quote."""
+    backup-manifest-<UTC>.json and returns its sha256 - the value Josh's go must quote. The manifest carries the
+    BEFORE inode evidence (st_dev/st_ino/st_nlink of the six live files), the read-only generation-partner records
+    and the ripple table (Exec P428)."""
     tdir = target_info["target_realpath"]
+    placed = _require_phase2_inputs(args)
+    partners = _partner_specs(args, tdir)
     refuse_if_retired(tdir)
-    p4 = gate_p4(probes, tdir, code_placed_at=_parse_ts(args.code_placed_at), daemon_log=_daemon_log_for(tdir))
+    p4 = gate_p4(probes, tdir, code_placed_at=placed, daemon_log=_daemon_log_for(tdir), require_files_equal=False)
     p6 = gate_p6(probes, args.conduit_dir or "")
     if not (p4["ok"] and p6["ok"]):
-        raise Refusal("phase2-backup: P4/P6 not satisfied: %s %s" % ([k for k, v in p4["checks"].items() if not v], p6["violations"]))
+        raise Refusal("phase2-backup: P4/P6 not satisfied: %s" % _p4_failures(p4, p6))
     run_dir, utc = new_run_dir()
     copy = copy_six(tdir, os.path.join(run_dir, "backup"))
     reread = {n: sha256_file(os.path.join(run_dir, "backup", n)) for n in SIX_FILES}
@@ -2386,11 +2675,36 @@ def stage_phase2_backup(args, pinned, probes, target_info) -> Dict[str, Any]:
         raise Stop("backup: the independent re-read differs from the source hashes")
     manifest = {"kind": "backup-manifest", "utc": utc, "target_realpath": tdir,
                 "files": {n: {"sha256": copy["files"][n]["sha256"], "size": copy["files"][n]["size"],
-                              "mtime_ns": copy["files"][n]["mtime_ns"]} for n in SIX_FILES},
-                "independent_reread_sha256": reread}
+                              "mtime_ns": copy["files"][n]["mtime_ns"], "st_dev": copy["files"][n]["st_dev"],
+                              "st_ino": copy["files"][n]["st_ino"], "st_nlink": copy["files"][n]["st_nlink"]} for n in SIX_FILES},
+                "generation_partners": [_partner_record(n, pth, copy["files"][n]) for n, pth in partners],
+                "ripple": RIPPLE_TABLE, "independent_reread_sha256": reread}
     msha = write_artifact(os.path.join(run_dir, "backup-manifest-%s.json" % utc), manifest)
     write_artifact(os.path.join(run_dir, "hold-start.json"), {"kind": "hold-start", **p6["snapshot"]})
-    return {"run_dir": run_dir, "backup_manifest_sha256": msha, "p4": p4["checks"], "p6_ok": p6["ok"]}
+    return {"run_dir": run_dir, "backup_manifest_sha256": msha, "p4": p4["checks"], "p6_ok": p6["ok"],
+            "generation_partners_recorded": len(partners)}
+
+
+def _one_manifest(run_dir: str, quoted_sha256: str) -> Tuple[str, str, Dict[str, Any]]:
+    mpaths = sorted(glob.glob(os.path.join(run_dir, "backup-manifest-*.json")))
+    if len(mpaths) != 1:
+        raise Refusal("P8: the run directory must hold exactly one backup-manifest")
+    msha = sha256_file(mpaths[0])
+    if quoted_sha256 != msha:
+        raise Refusal("P8: Josh's go quotes %s, the backup manifest is %s" % (quoted_sha256, msha))
+    return mpaths[0], msha, load_artifact(mpaths[0])
+
+
+def _assert_inodes_after(before: Dict[str, Dict[str, Any]], after: Dict[str, Dict[str, int]], rewritten) -> None:
+    """The replace must have behaved as Exec P428 says: every REWRITTEN live file is a NEW inode on the same device
+    with link count 1; every file that was not rewritten is still the same inode."""
+    for n in SIX_FILES:
+        b, a = before[n], after[n]
+        if n in rewritten:
+            if a["st_dev"] != b["st_dev"] or a["st_ino"] == b["st_ino"] or a["st_nlink"] != 1:
+                raise Stop("post-write inode check FAILED for %s: expected a NEW inode with link count 1 (before %s, after %s)" % (n, b, a))
+        elif (a["st_dev"], a["st_ino"]) != (b["st_dev"], b["st_ino"]):
+            raise Stop("post-write inode check FAILED for %s: an untouched file changed inode" % n)
 
 
 def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
@@ -2407,24 +2721,18 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
     tdir = target_info["target_realpath"]
     if tdir != os.path.realpath(RECORDED_CC_CHECKPOINT_DIR):
         raise Refusal("P7: the live write target must be the recorded CC checkpoint directory")
+    placed = _require_phase2_inputs(args)
     refuse_if_retired(tdir)
     run_dir = guard_out_path(args.run_dir)
-    mpaths = sorted(glob.glob(os.path.join(run_dir, "backup-manifest-*.json")))
-    if len(mpaths) != 1:
-        raise Refusal("P8: the run directory must hold exactly one backup-manifest")
-    msha = sha256_file(mpaths[0])
-    if args.josh_go_manifest_sha256 != msha:
-        raise Refusal("P8: Josh's go quotes %s, the backup manifest is %s" % (args.josh_go_manifest_sha256, msha))
-    manifest = load_artifact(mpaths[0])
+    mpath, msha, manifest = _one_manifest(run_dir, args.josh_go_manifest_sha256)
     hold_start = load_artifact(os.path.join(run_dir, "hold-start.json"))
+    log = _daemon_log_for(tdir)
     gates = []
     gates.append({"gate": "P1", "ok": True, "p1": pinned.record["p1"]})
-    gates.append({"gate": "P2", "ok": os.path.isfile(args.daemon_organism_file)
-                  and sha256_file(args.daemon_organism_file) == PIN["cc_ng_organism_sha256"], "file": args.daemon_organism_file})
+    gates.append(gate_p2(args.daemon_organism_file, pinned.root))
     gates.append(gate_p3(pinned, run_pinned_tests=True))
-    gates.append(gate_p4(probes, tdir, manifest_files=manifest["files"], code_placed_at=_parse_ts(args.code_placed_at),
-                         daemon_log=_daemon_log_for(tdir)))
-    gates.append(gate_p6(probes, args.conduit_dir, {k: hold_start[k] for k in hold_start if k.startswith("h")}))
+    gates.append(gate_p4(probes, tdir, manifest_files=manifest["files"], code_placed_at=placed, daemon_log=log))
+    gates.append(gate_p6(probes, args.conduit_dir, _hold_start_of(hold_start)))
     gates.append({"gate": "P8", "ok": True, "go": args.josh_go, "manifest_sha256": msha})
     failed_gates = [g["gate"] for g in gates if not g["ok"]]
     if failed_gates:
@@ -2455,11 +2763,10 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
         raise Stop("any deviation from the approved list is a STOP at Phase 2 (never a silent drop)")
 
     def recheck():
-        p4 = gate_p4(probes, tdir, manifest_files=manifest["files"], code_placed_at=_parse_ts(args.code_placed_at),
-                     daemon_log=_daemon_log_for(tdir))
-        p6 = gate_p6(probes, args.conduit_dir, {k: hold_start[k] for k in hold_start if k.startswith("h")})
+        p4 = gate_p4(probes, tdir, manifest_files=manifest["files"], code_placed_at=placed, daemon_log=log)
+        p6 = gate_p6(probes, args.conduit_dir, _hold_start_of(hold_start))
         if not (p4["ok"] and p6["ok"]):
-            raise Refusal("immediately before os.replace: P4/P6 no longer hold")
+            raise Refusal("immediately before os.replace: P4/P6 no longer hold: %s" % _p4_failures(p4, p6))
 
     def writer(staged: str, want: str, is_main: bool):
         def fn(tmp: str):
@@ -2472,20 +2779,111 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
 
     if os.path.realpath(tdir) != os.path.realpath(RECORDED_CC_CHECKPOINT_DIR):
         raise Refusal("P7: refusing the live write - the target is not the recorded CC checkpoint directory")
+    rewritten = (MAIN_NAME, SIDECAR_NAME)
     pinned.cg.atomic_file_write(os.path.join(tdir, MAIN_NAME), writer(out["out_main"], out["out_hashes"][MAIN_NAME], True))
     pinned.cg.atomic_file_write(os.path.join(tdir, SIDECAR_NAME), writer(out["out_sidecar"], out["out_hashes"][SIDECAR_NAME], False))
     live_ok = (sha256_file(os.path.join(tdir, MAIN_NAME)) == out["out_hashes"][MAIN_NAME]
                and sha256_file(os.path.join(tdir, SIDECAR_NAME)) == out["out_hashes"][SIDECAR_NAME]
                and not sum(census_msgpack_file(os.path.join(tdir, MAIN_NAME), list(out["plan"]["mapping"])).values()))
     if not live_ok:
-        raise Stop("post-apply verification of the live files FAILED - restore from the backup manifest")
+        raise Stop("post-apply verification of the live files FAILED - roll back with --step rollback from the backup manifest")
+    before_i = {n: {k: manifest["files"][n][k] for k in ("st_dev", "st_ino", "st_nlink")} for n in SIX_FILES}
+    after_i = {n: stat_ident(os.path.join(tdir, n)) for n in SIX_FILES}
+    _assert_inodes_after(before_i, after_i, rewritten)
+    partners_after = [_partner_record(pr["name"], pr["path"], after_i[pr["name"]]) for pr in manifest.get("generation_partners", [])]
     final = write_artifact(os.path.join(run_dir, "post-apply-receipt-FINAL-%s.json" % utc), {
         "kind": "post-apply-receipt", "six_file_sha256_after": out["out_hashes"], "mapping_sha256": out["id_map_sha256"],
+        "live_inodes_before": before_i, "live_inodes_after": after_i, "generation_partners_after": partners_after,
+        "ripple": RIPPLE_TABLE, "p2": gates[1],
         "josh_go": args.josh_go, "backup_manifest_sha256": msha, "approvals_packet": approvals.get("packet"),
         "gates": [g.get("gate") for g in gates], "tool_sha256": tool_sha256()})
     retired = write_retired_receipt(run_dir, tdir, out["id_map_sha256"], utc)     # strictly AFTER both files verified
     return {"applied": len(out["plan"]["write_ids"]), "post_apply_receipt_sha256": final, "retired_receipt": os.path.basename(retired),
             "note": "the daemon is NOT started; the S4 start waits on gate P10 (the T6 would-mint set signed per id)"}
+
+
+def stage_rollback(args, pinned, probes, target_info) -> Dict[str, Any]:
+    """--step rollback (le-029 C6, decided: ADDED). Restores the six files from the tool's OWN named pre-apply
+    backup (<run>/backup/, every sha256 verified against backup-manifest-<UTC>.json BEFORE any write) - never from a
+    generation directory or last_good/. Gated like the apply: Josh's go quoting the manifest sha256, P4 (daemon down,
+    the equality leg replaced by the identity check below), P6, --code-placed-at and the pinned --expect-*; refused
+    unless EVERY live file is either the backup's bytes or the post-apply receipt's bytes (an apply that died between
+    the two replaces, or a finished apply); it cannot undo anything after S4 (that needs the P391 export first, and its
+    identity check refuses it). Writes only through atomic tmp + os.replace; the RETIRED receipt is left in place; the
+    host stays DOWN until Chief's resume gate and the Executive's parser ruling (plan 6.7)."""
+    if not args.josh_go:
+        raise Refusal("--step rollback is REFUSED: it needs Josh's go (--josh-go <reference> quoting the backup-manifest sha256)")
+    if not (args.run_dir and args.josh_go_manifest_sha256 and args.conduit_dir):
+        raise Refusal("--step rollback needs --run-dir --josh-go-manifest-sha256 --conduit-dir")
+    tdir = target_info["target_realpath"]
+    if tdir != os.path.realpath(RECORDED_CC_CHECKPOINT_DIR):
+        raise Refusal("P7: the live write target must be the recorded CC checkpoint directory")
+    placed = _require_phase2_inputs(args)
+    run_dir = guard_out_path(args.run_dir)
+    mpath, msha, manifest = _one_manifest(run_dir, args.josh_go_manifest_sha256)
+    hold_start = load_artifact(os.path.join(run_dir, "hold-start.json"))
+    log = _daemon_log_for(tdir)
+    p4 = gate_p4(probes, tdir, code_placed_at=placed, daemon_log=log, require_files_equal=False)
+    p6 = gate_p6(probes, args.conduit_dir, _hold_start_of(hold_start))
+    if not (p4["ok"] and p6["ok"]):
+        raise Refusal("rollback: gate(s) P4/P6 not satisfied: %s" % _p4_failures(p4, p6))
+    finals = sorted(glob.glob(os.path.join(run_dir, "post-apply-receipt-FINAL-*.json")))
+    drafts = sorted(glob.glob(os.path.join(run_dir, "post-apply-receipt-[0-9]*.json")))
+    rpaths = finals or drafts
+    if len(rpaths) != 1:
+        raise Refusal("rollback: the run directory must hold exactly one post-apply receipt (final, or the pre-replace draft); found %d" % len(rpaths))
+    after_sha = load_artifact(rpaths[0])["six_file_sha256_after"]
+    backup_sha = {n: manifest["files"][n]["sha256"] for n in SIX_FILES}
+    live_sha = {n: sha256_file(os.path.join(tdir, n)) for n in SIX_FILES}
+    for n in SIX_FILES:
+        if live_sha[n] not in (backup_sha[n], after_sha[n]):
+            raise Refusal("rollback: identity - live %s matches neither the pre-apply backup nor the post-apply receipt "
+                          "(something else wrote it; a post-S4 restore needs the P391 export first)" % n)
+    backup_dir = os.path.join(run_dir, "backup")
+    for n in SIX_FILES:                                                    # EVERY sha256 verified before ANY write
+        bp = guard_out_path(os.path.join(backup_dir, n))
+        if not os.path.isfile(bp) or sha256_file(bp) != backup_sha[n]:
+            raise Refusal("rollback: the backup copy of %s does not match its sha256 in the manifest" % n)
+    to_restore = [n for n in SIX_FILES if live_sha[n] != backup_sha[n]]
+    before_i = {n: stat_ident(os.path.join(tdir, n)) for n in SIX_FILES}
+
+    def recheck():
+        q4 = gate_p4(probes, tdir, code_placed_at=placed, daemon_log=log, require_files_equal=False)
+        q6 = gate_p6(probes, args.conduit_dir, _hold_start_of(hold_start))
+        if not (q4["ok"] and q6["ok"]):
+            raise Refusal("immediately before os.replace: P4/P6 no longer hold: %s" % _p4_failures(q4, q6))
+
+    def writer(src: str, want: str):
+        def fn(tmp: str):
+            shutil.copyfile(src, tmp)
+            if sha256_file(tmp) != want:
+                raise Stop("the backup copy changed while copying to the live tmp")
+            recheck()
+        return fn
+
+    if os.path.realpath(tdir) != os.path.realpath(RECORDED_CC_CHECKPOINT_DIR):
+        raise Refusal("P7: refusing the live write - the target is not the recorded CC checkpoint directory")
+    for n in to_restore:
+        pinned.cg.atomic_file_write(os.path.join(tdir, n), writer(os.path.join(backup_dir, n), backup_sha[n]))
+    if {n: sha256_file(os.path.join(tdir, n)) for n in SIX_FILES} != backup_sha:
+        raise Stop("post-rollback verification FAILED: a live file is not the backup's bytes")
+    after_i = {n: stat_ident(os.path.join(tdir, n)) for n in SIX_FILES}
+    for n in SIX_FILES:
+        if n in to_restore:
+            if after_i[n]["st_ino"] == before_i[n]["st_ino"] or after_i[n]["st_nlink"] != 1:
+                raise Stop("post-rollback inode check FAILED for %s: expected a NEW inode with link count 1" % n)
+        elif after_i[n]["st_ino"] != before_i[n]["st_ino"]:
+            raise Stop("post-rollback inode check FAILED for %s: an untouched file changed inode" % n)
+    utc = utc_stamp()
+    rsha = write_artifact(os.path.join(run_dir, "rollback-receipt-%s.json" % utc), {
+        "kind": "rollback-receipt", "restored": sorted(to_restore), "source_dir": os.path.realpath(backup_dir),
+        "six_file_sha256_after": backup_sha, "live_inodes_before": before_i, "live_inodes_after": after_i,
+        "never_a_source": "generations/ and last_good/ (incidental, expiring, never a rollback source)",
+        "host_stays_down": True, "host_down_until": "Chief's post-restore resume gate (P398) AND the Executive's ruling on the parser",
+        "josh_go": args.josh_go, "backup_manifest_sha256": msha, "post_apply_receipt": os.path.basename(rpaths[0]),
+        "ripple": RIPPLE_TABLE, "tool_sha256": tool_sha256()})
+    return {"restored": sorted(to_restore), "rollback_receipt_sha256": rsha, "host_stays_down": True,
+            "note": "the daemon is NOT started; the host stays DOWN until the resume gate and the parser ruling"}
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2498,7 +2896,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--target-dir", required=True, help="the CC checkpoint directory (REQUIRED, no default; read-only in Phase 1)")
     ap.add_argument("--daemon-script", required=True, help="cc-ng-daemon.py, read as text to cross-check CHECKPOINT_DIR")
     ap.add_argument("--scope-min-len", type=int, required=True, help="reported cross-check only (600); the enumerated list selects")
-    ap.add_argument("--step", choices=("classify", "rewrite", "phase2-backup"), default="classify")
+    ap.add_argument("--step", choices=("classify", "rewrite", "phase2-backup", "rollback"), default="classify")
     ap.add_argument("--run-dir")
     ap.add_argument("--approvals")
     ap.add_argument("--approvals-sha256", help="the hash relayed from the Executive's packet text")
@@ -2510,8 +2908,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--apply", action="store_true", help="Phase 2 live write - REFUSED without Josh's go and every gate")
     ap.add_argument("--josh-go", help="Josh's go reference; it must quote the backup-manifest sha256")
     ap.add_argument("--josh-go-manifest-sha256")
-    ap.add_argument("--frozen-dir", help="directory holding the frozen repair-list.json, scope-ids.json, id-map.json")
-    ap.add_argument("--daemon-organism-file", help="the cc_ng_organism.py the daemon imports (P2), resolved by the operator")
+    ap.add_argument("--frozen-dir", help="a directory holding UNEDITED copies of exactly three files of the classify run: "
+                    "reports/repair-list.json, reports/scope-ids.json and reports/id-map.json (keep those names)")
+    ap.add_argument("--daemon-organism-file", help="P2: the cc_ng_organism.py in the daemon unit's ACTUAL import root, named by the "
+                    "Chief in the go request (Q9); a path inside the pin worktree or this tool's worktree is refused")
+    ap.add_argument("--generation-partner", action="append", default=[], metavar="NAME=PATH",
+                    help="phase2-backup: a KNOWN generation-directory partner of a live file, e.g. main.msgpack=<target>/generations/<stamp>/main.msgpack; "
+                    "stat/hashed read-only and recorded by inode, never listed or used as a rollback source")
     ap.add_argument("--conduit-dir", help="the ng_topology conduit directory (H3; stat only)")
     ap.add_argument("--code-placed-at", help="when the pinned code was placed for the daemon (epoch or ISO)")
     return ap
@@ -2521,8 +2924,9 @@ def main(argv: Optional[List[str]] = None, probes: Optional[Probes] = None) -> i
     args = build_parser().parse_args(argv)
     probes = probes or Probes()
     try:
-        if args.apply and not args.josh_go:              # the first refusal: no Josh go, nothing else is even loaded
-            raise Refusal("--apply is REFUSED: Phase 2 needs Josh's go (--josh-go <reference> quoting the backup-manifest sha256)")
+        if (args.apply or args.step == "rollback") and not args.josh_go:   # the first refusal: no Josh go, nothing else is even loaded
+            raise Refusal("%s is REFUSED: it needs Josh's go (--josh-go <reference> quoting the backup-manifest sha256)"
+                          % ("--apply" if args.apply else "--step rollback"))
         pinned = load_pinned(args.pin_root)
         print("\n".join(p379_lines(pinned)))
         target_info = guard_target(args.target_dir, args.daemon_script)
@@ -2532,6 +2936,8 @@ def main(argv: Optional[List[str]] = None, probes: Optional[Probes] = None) -> i
             res = stage_classify(args, pinned, target_info)
         elif args.step == "rewrite":
             res = stage_rewrite(args, pinned, target_info)
+        elif args.step == "rollback":
+            res = stage_rollback(args, pinned, probes, target_info)
         else:
             res = stage_phase2_backup(args, pinned, probes, target_info)
         _assert_text_free(res)
