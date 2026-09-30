@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (B1-B5 DRAFT written BEFORE reading checker-015; comparison + final verdict pending)
+STATUS: COMPLETE
 
 # le-013 — LAW ENFORCER review, ROLE B, want-hub-d plan REVISION 4
 
@@ -9,7 +9,7 @@ Protected file read via `git show e4ebf982b1989fd9066d610b94853bc68bf70d37:neuro
 Read in full: the packet incl. ADDENDUM and ADDENDUM 2; plan-004 end to end; the agent file.
 
 ## Process record (independence + P379)
-- **Independence:** this DRAFT (B1-B5) is committed before I read `reviews/checker-015-...` (or any file in `reviews/`). Disclosures of accidental exposure: (1) `ls handoffs/z12-want-hub-d/` listed the two directory NAMES (`returns`, `reviews`), nothing inside `reviews/`. (2) `git log -1 --format=%s` printed HEAD's subject line, which is checker-015's commit subject ("checker-015 ROLE A: COMPLETE ... PASS-WITH-NOTES") — the verdict label the task text already stated; no content. (3) I ran `git grep -n _prune_synapses -- .` over the whole worktree, which technically includes `handoffs/z12-want-hub-d/reviews/`; output was truncated by `head -25` before any `reviews/` path (visible paths stopped at `returns/plan-002.md`), so I saw no content from `reviews/`, but the search did span that directory. I did not open le-012 either; where I mention le-012 I rely on plan-004's own account of it.
+- **Independence:** this DRAFT (B1-B5) was committed and pushed as `4caea813a7e9f4e8321ed96af5570f583960cb41` (stub first-write earlier in the same turn) BEFORE I read `reviews/checker-015-...` (or any file in `reviews/`). Everything in B1-B5 below was written in that draft except **L12**, which I added after reading checker-015 (credited there), and the small edits marked in the comparison section. Disclosures of accidental exposure: (1) `ls handoffs/z12-want-hub-d/` listed the two directory NAMES (`returns`, `reviews`), nothing inside `reviews/`. (2) `git log -1 --format=%s` printed HEAD's subject line, which is checker-015's commit subject ("checker-015 ROLE A: COMPLETE ... PASS-WITH-NOTES") — the verdict label the task text already stated; no content. (3) I ran `git grep -n _prune_synapses -- .` over the whole worktree, which technically includes `handoffs/z12-want-hub-d/reviews/`; output was truncated by `head -25` before any `reviews/` path (visible paths stopped at `returns/plan-002.md`), so I saw no content from `reviews/`, but the search did span that directory. I did not open le-012 either; where I mention le-012 I rely on plan-004's own account of it.
 - **P379 (targeted runs):** I imported NO NeuroGraph module and loaded NO graph/checkpoint/msgpack. The only Python I ran was stdlib arithmetic on the plan's own numbers (no `neuro_foundation`, no `checkpoint_guardian`, no `ng_tract` import). Resolved module paths: none. NG-module state: none loaded. `NG_EMBED_*`: one such variable was present in my shell; I unset it in the shell call that inspected the repo, and no embedding/daemon/TID call was made. Daemon source was read only via `git show <commit>:scripts/cc-ng-daemon.py` (docs commit `039a3bf4f39da8a2024b65724e31509e69f3119c`).
 
 ## ROLE B — B1: authority envelope
@@ -52,7 +52,7 @@ Read in full: the packet incl. ADDENDUM and ADDENDUM 2; plan-004 end to end; the
 ## ROLE B — B5: verdict, numbered corrections, not verified
 
 ### COMPLIANCE VERDICT
-**VIOLATIONS FOUND — plan-level only.** No CRITICAL. No Law breach in the mechanism as ruled (LAW 1, 2, 4, 5, 6, 7, 8 clean; LAW 3 clean for code with a doc-shrapnel and an unlisted-parallel-mechanism gap). One HIGH gate-integrity/sequencing defect (L1) that the delta pair cannot repair. **Do not BUILD from plan-004 as written**; fold L1-L11 into ONE plan revision (rev 5), then build. No correction contradicts P399/P404's rulings.
+**VIOLATIONS FOUND — plan-level only.** No CRITICAL. No Law breach in the mechanism as ruled (LAW 1, 2, 4, 5, 6, 7, 8 clean; LAW 3 clean for code with a doc-shrapnel and an unlisted-parallel-mechanism gap). One HIGH gate-integrity/sequencing defect (L1) that the delta pair cannot repair. Total: 1 HIGH, 8 MEDIUM, 3 LOW (12 corrections). **Do not BUILD from plan-004 as written**; fold L1-L12 into ONE plan revision (rev 5), then build. No correction contradicts P399/P404's rulings.
 
 ### Numbered corrections
 | # | Sev | Correction |
@@ -64,10 +64,12 @@ Read in full: the packet incl. ADDENDUM and ADDENDUM 2; plan-004 end to end; the
 | **L5** | MED | **Protected-file approval step 4.** State that the `neuro_foundation.py` commit contains only that file, and that the tests, dry-run/census tooling and docs are separate commits (tests may precede it). §9 currently separates only the daemon slice. |
 | **L6** | MED | **Make the cheap stop conditions automatic.** Between cycles nothing refuses when the previous autosave was refused/quarantined (§4A.4 lists it as operator-level); with a refused-save regime (#799) mid-schedule the next dream cycle removes another B in RAM. Add a fail-closed pre-call refusal in the daemon/orchestrator on "last autosave refused/quarantined since the previous pass". State the assumption behind "at most one more cycle's B can be lost" (operator reacts within one 6 h interval; stop = env unset + restart). Any tolerance "the pair sets" lives in env (LAW 5), not as a literal. |
 | **L7** | MED | **Consent / Duck Ethics as explicit ARMING preconditions.** (a) Cite the primary Packet 392 (id + hash) in the consent record instead of the assignment's transcription; (b) record the Executive's answer to the surfaced question (is a CC-substrate session shown the §4A.6 census before ARMING); (c) record the Executive's/Josh's confirmation that #92's "access" is read as "reachable via the guaranteed floor + frozen rim" (§7 caveat); (d) state the revocation path and its latency. |
-| **L8** | MED→LOW | **Doc shrapnel (LAW 3).** Put a one-line SUPERSEDED pointer on plan-001..003 (or add a `returns/` index) — plan-003 contradicts P399 and looks live — and correct §11's "Nothing declined" to "declined by assignment" for the banner item. (I rely on plan-004's account of le-012 C11; I did not open le-012.) |
+| **L8** | MED | **Doc shrapnel (LAW 3).** Put a one-line SUPERSEDED pointer on plan-001..003 (or add a `returns/` index) — plan-003 contradicts P399 and looks live — and correct §11's "Nothing declined" to "declined by assignment" for the banner item. (I rely on plan-004's account of le-012 C11; I did not open le-012.) |
 | **L9** | LOW | **§4B read list.** Add `CC_NG_TONIC_IDLE*` to the by-name env read and to "what stops arming": if enabled, the Tonic drops to latent at 90 s idle, inside the ≥ 1,800 s idle window the dream pass needs, and Door B aging could stop when the pass runs. (Names checked in `.bashrc`: unset today.) |
 | **L10** | LOW | **Contract wording.** (a) Assertion set (§4.2 (d)): add "every competing id exists in `self.synapses`" (a missing id must `raise`, not `KeyError` mid-loop); (b) say the `pruned` event count is the post-truncation *removed* count; (c) test G's state hash should include the store's `items()` iteration order (the native store swap-removes); (d) fix the cite `:3524-3529` → `:3524-3530`. |
 | **L11** | LOW | **Finite-horizon dormancy.** "≤ 22 increments ≪ `grace_period` 5,000" holds for the 19-22-cycle schedule; the pass stays armed and advances every surviving ineligible competitor's counter each cycle, so the weight criterion matures after ~5,000 cycles (~3.4 years at 4/day). State that, and state what "armed" means after convergence (continues at B until env unset?). |
+
+| **L12** | MED | **Competing mode must refuse a missing budget or order (LAW 4: refuse at the source function, not only in the caller). *Added after reading checker-015 (its C2, extended).*** §4.2(d) makes `max_removals` optional ("if given"), so a competing call that omits it removes every eligible competitor in one pass — the one-pass cliff Exec 397 removed — and the orchestrator's own "B < 1 ⇒ raise" does not protect the function from another caller. Require, before the loop and by explicit `raise`, in competing mode: `max_removals` an `int ≥ 1` **and** an `order_key` (or an ordered `competing_ids` sequence). Reason for the second: with no key the truncation takes the first B ids in the order the caller supplied, and a `set` iterates in an order that varies between processes (string-hash randomization), which breaks the plan's own determinism requirement (test R-7) and the "two runs, identical removal list" dry-run item. The default path keeps `max_removals is None` (no truncation), and the sort/slice/report must be gated on the new parameters so the all-defaults path is untouched — add that as an explicit test-G clause. |
 
 ### Correct implementations (brief)
 - Option (i) as ruled: one implementation of the three predicates, orchestrator with no predicate copy / no removal loop; exactly one call per cycle.
@@ -80,11 +82,11 @@ Read in full: the packet incl. ADDENDUM and ADDENDUM 2; plan-004 end to end; the
 ### Remediation priority
 - **CRITICAL:** none.
 - **HIGH:** L1.
-- **MEDIUM:** L2, L3, L4, L5, L6, L7, L8.
+- **MEDIUM:** L2, L3, L4, L5, L6, L7, L8, L12.
 - **LOW:** L9, L10, L11.
 
 ### Recommended next steps
-1. One plan revision (rev 5) folding L1-L11; L3 and L7 need Executive answers, the rest are edits.
+1. One plan revision (rev 5) folding L1-L12; L3 and L7 need Executive answers (L2 needs one only if the cheap serialized-bytes test is not adopted), the rest are edits.
 2. Delta pair after BUILD, with L1's pre-merge real-graph golden as a named review item.
 3. Punchlist (not this lane): fail-open `protected()` in the daemon's admin removers; the daemon/host config fork (plan R9); Door B telemetry; `_prune_synapses` has no direct test at base.
 
@@ -97,5 +99,27 @@ Read in full: the packet incl. ADDENDUM and ADDENDUM 2; plan-004 end to end; the
 - **The other lane's edits to `_dream_loop`** at `cdcf8ce2` — I read only the pinned `039a3bf4` copy (dream loop `:2156`, `_DREAM_ENABLED :1963`, thread start `:2440`, admin handlers `:1418`/`:1515` — all consistent with the plan's cites).
 - **The daemon's own process environment** for `NG_GUARDIAN_*`/`CC_NG_*` — not read; I checked `.bashrc` by variable name only.
 
-## Comparison to checker-015
-(pending — written only after this draft is committed and pushed)
+## Comparison to checker-015 (read only AFTER my draft `4caea813` was committed and pushed)
+checker-015 (ROLE A, cross-family, PASS-WITH-NOTES, 3 corrections, no HIGH) and this review are compatible; the difference is scope, not fact. It recomputed the probe numbers and read the code for implementability; I reviewed Law/gate/ethos fit.
+
+**Agree (independently reached, or confirmed by it):**
+- **Cite range `:3524-3529` → `:3524-3530`** (its C1 = my L10(d)); the C1 mutation statement itself is TRUE. Both of us re-read the base code.
+- **X7 (height key) is not ruled** (its C3 = my L3). It adds a useful split I endorse: the *surface* (static caller-supplied key on `to_prune` before truncation) is ruled by P404 C5 and can be built; the *formula* waits for the Executive. I add that §10's "No values remain unruled" is contradicted by X7/X8 and must be corrected.
+- **Dream-loop failure isolation is real and correctly specified:** `last_pass` set only on the success path, the `except` skips it, so an exception in the new call inside the same `try` would re-run `consolidate_hyperedges` every 60 s tick. I read the pinned `039a3bf4` copy; it also read `cdcf8ce2` (same control flow, lines moved). Agreed on both.
+- **No contradiction of P399/P404's option choice, explicit-ids rule, no-weight-path rule or no-config-key rule** — same conclusion, reached from different reads.
+- **`_step_lock` is an `RLock` (`neuro_foundation.py:1751`)**, so the daemon holding it while the orchestrator acquires it does not deadlock (I saw the declaration; it stated the consequence — I accept its wording).
+- Its recomputed numbers (F = 4,127; arena 124,232; competing 106,841 → 106,825; eligible 94,630–106,825; 19–22 cycles; worst #21 = 87.098% / #19 = 90.503%; one-pass 23.0% / 31.8%; adverse 60.3%) match the plan, and match my arithmetic-only check. **I did not recompute the probe data; I rely on its recompute for that**, and it in turn did not call `evaluate_save_health` (neither did I).
+
+**Add (things I found that checker-015 did not, all from my draft):** **L1** (HIGH — the only empirical Syl evidence runs after merge = deploy), **L2** (P399 "byte-identical" narrowed by §3.2.5), **L4** (the daemon's two existing `remove_synapse` loops missing from the "every remover" proof and from the LAW 3 relationship), **L5** (CLAUDE.md §2 step 4 batching), **L6** (operator-only stop conditions between cycles), **L7** (consent/Duck Ethics as arming preconditions), **L8** (plan-003 shrapnel), **L9** (`CC_NG_TONIC_IDLE*`), **L10 (a)-(c)**, **L11**. These are Law/gate/ethics matters outside a cross-family implementability check.
+
+**Add (from reading it):** **L12** — it found (its C2) that §4.2(d) leaves `max_removals` optional, which would let a competing call recreate the one-pass cliff; I missed it. I adopt it and extend it with `order_key` (or an ordered sequence) because an unordered `set` of ids truncated at B is nondeterministic across processes. I also adopt, as an explicit test-G clause, its point that sort/slice/report must be gated on the new parameters or the default path's removal order changes.
+
+**Disagree / differ in weight (respectfully; scope-driven):**
+- **Its item (2) marks P399 condition 4 ("OFF = checkpoint byte-identical, no new config keys") as held.** The no-config-key half is held; the *byte-identical* half is narrowed by the plan itself (§3.2.5 "content-identical" = config dict + top-level key list) and test G hashes in-memory state, not serialized bytes. I treat that as a correction (L2), not a hold.
+- **Severity:** it found no HIGH. I rate L1 HIGH because merge = deploy (P329) puts the edited hot-path function into Syl's process, and the plan's own words call the real-graph golden run "the empirical half of the Syl claim" yet sequence it after that merge (§9). That is a gate-order defect, not an implementability one — outside its brief, which is why it did not see it.
+- **§11's "appears nowhere" for option (ii):** it calls this an overclaim that leaves a correct residue (rejection mentions); I have no quarrel with that residue and did not count it.
+
+**Net:** overall verdict stays **VIOLATIONS FOUND — plan-level only** (L1 HIGH; no CRITICAL; no Law breach in the mechanism); checker-015's PASS-WITH-NOTES stands for its own scope. The two verdicts do not conflict: fold checker-015's C1-C3 (with L3/L10(d)/L12 overlapping) and my L1-L12 into the single rev-5 revision.
+
+## Closing
+Verdict file complete. Nothing was built, merged, armed, settled or dispatched. Commit contains only this file; pushed by name to `cc-laptop-want-hub-d-20260930`.
