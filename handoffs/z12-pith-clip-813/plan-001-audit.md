@@ -159,3 +159,10 @@ Independent. That wrapper concerns how `[NeuroGraph Surfaced Knowledge]` is stri
 * **D5** — silent member/overlap drops (#18), same INFO discipline?
 * **D6** — `surfacing.py` 200-char cut (#22), shared with Syl's `/assemble`.
 * **D7** — `MAX_QUEST_CHARS`: the "removed Quest lane" premise is contradicted by Condensate master (§1A #6). Confirm intent before anyone removes it.
+
+## 9. Post-build amendments (2026-09-30, same lane — see `returns/build-001.md`)
+The plan above was committed before code (`d4bc615`). Where the build differs from it:
+* **§1A row 1 / §2 item 1:** `CC_PITH_PROVIDER_NODE_CHARS` is **not** removed from `_PITH_CONFIG_KEYS`. The suite asserts `env` keys == `resolved` keys == `_PITH_CONFIG_KEYS` == the VPS host allow-list (`tests/test_pith_metrics_concurrency.py`, `tests/test_cc_host_pith_telemetry.py`) and the host is not editable this turn, so the name stays and `pith_effective_config()` reports it `resolved=None` / `authority="retired (#813: nodes render whole)"`. The constant `_CC_PITH_PROVIDER_NODE_CHARS` itself is deleted. Remove the name from all three places together when the host is next edited.
+* **§1A row 7 / §2 item 6:** as planned (`whole_content` opt-in). **Row 11** as planned (LOD staging removed; the dead constants stay).
+* **docs base:** the docs branch is based at `7cf85149`, not `933f7158` (docs `origin/main` advanced before my first pull); the merger rebases.
+* Nothing in §1E (Condensate) changed: proposals only.
