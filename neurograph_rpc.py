@@ -802,8 +802,20 @@ _MAX_DRAIN_NODES: int = 15000  # Stop experience ingestion above this node count
 # NOT Syl's-Law protected: this is the shared ecosystem medium (experience/topology/metrics/
 # repair deposits from all modules), not her identity. Same directory for operational
 # convenience (one place to look), distinct file so it never touches her checkpoint I/O.
+#
+# ---- Changelog ----
+# [2026-09-30] worker-001 (Claude Sonnet 5) — lane commons-test-isolation-738, rows #738/#742
+# What: path now reads env var NG_COMMONS_CHECKPOINT_PATH, falling back to the same default
+#       string as before.
+# Why: LAW 5 (env vars are the source of truth) — the hardcoded constant gave tests no way to
+#      redirect it, so a standalone run of tests/test_coordinator.py's live_memory fixture
+#      wrote the real ~/NeuroGraph/data/checkpoints/commons.msgpack via handle_after_turn's
+#      time-based auto-save trigger (#738).
+# How: os.environ.get() with the previous literal as the default; no behavior change when the
+#      var is unset. Matches the existing NG_COMMONS_* naming (see NG_COMMONS_ENHANCE* below).
+# -------------------
 _COMMONS_CHECKPOINT_PATH = os.path.expanduser(
-    "~/NeuroGraph/data/checkpoints/commons.msgpack"
+    os.environ.get("NG_COMMONS_CHECKPOINT_PATH", "~/NeuroGraph/data/checkpoints/commons.msgpack")
 )
 
 # Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)

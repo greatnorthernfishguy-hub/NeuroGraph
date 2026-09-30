@@ -34,18 +34,44 @@ import cc_ng_host
 
 # ── Fixtures ──────────────────────────────────────────────────────────
 
+# ---- Changelog ----
+# [2026-09-30] worker-001 (Claude Sonnet 5) — lane commons-test-isolation-738, rows #738/#742
+# What: reset_rpc_globals now redirects _COMMONS_CHECKPOINT_PATH under tmp_path, resets
+#       _last_save_time to 0.0 for the test then restores it, and swaps commons._commons to a
+#       fresh (None) singleton for the test then restores the original.
+# Why: without this, a standalone run of this file's live_memory-backed handle_after_turn
+#      tests wrote the REAL ~/NeuroGraph/data/checkpoints/commons.msgpack — _last_save_time
+#      starts at 0.0 module-wide so the time-based auto-save trigger fires on the first
+#      afterTurn in a fresh process, and the hardcoded path (now env-overridable, see
+#      neurograph_rpc.py) sent that write to the real file (#738).
+# How: monkeypatch.setattr for the two module globals (auto-restored by pytest's monkeypatch
+#      teardown), explicit save/restore for commons._commons to match this fixture's existing
+#      style for the other globals.
+# -------------------
 @pytest.fixture(autouse=True)
-def reset_rpc_globals():
+def reset_rpc_globals(tmp_path, monkeypatch):
     """Save and restore neurograph_rpc module globals after each test."""
     orig_memory = neurograph_rpc._memory
     orig_tract = neurograph_rpc._tract
     orig_ingest_text = neurograph_rpc._ingest_text
     orig_ingest_embedding = neurograph_rpc._ingest_embedding
+
+    monkeypatch.setattr(
+        neurograph_rpc, "_COMMONS_CHECKPOINT_PATH", str(tmp_path / "commons.msgpack")
+    )
+    monkeypatch.setattr(neurograph_rpc, "_last_save_time", 0.0)
+
+    import commons
+    orig_commons_singleton = commons._commons
+    commons._commons = None
+
     yield
+
     neurograph_rpc._memory = orig_memory
     neurograph_rpc._tract = orig_tract
     neurograph_rpc._ingest_text = orig_ingest_text
     neurograph_rpc._ingest_embedding = orig_ingest_embedding
+    commons._commons = orig_commons_singleton
 
 
 @pytest.fixture
