@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 turn 2: F3a/F3b hardening
+# What: (F3a) `apply` now runs its own verify and, if it fails, RESTORES the just-made
+#   backup byte-exact and exits non-zero. (F3b) `sed -i --follow-symlinks`, so a symlinked
+#   ~/.bashrc stays a symlink and the target is the file edited/restored.
+# Why: le-017 (ROLE B) reproduced a broken file: the sole export inside `if true; then ... fi`
+#   -> deleting it makes `bash -n` fail (rc=2) and the old script left the file broken.
+#   Other CCs edit .bashrc before S4, so today's clean rehearsal is not a guarantee.
+# How: verify() returns failure EXPLICITLY (set -e is suspended inside `if ! verify`).
+#   THE SCRIPT CANNOT CHECK that both merges are deployed: that is a CHECKLIST ITEM in the
+#   S4 batch (apply prints the reminder).
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 STAGED .bashrc edit (NOT APPLIED)
 # What: removes the single line `export CC_PITH_PROVIDER_NODE_CHARS=...` from ~/.bashrc.
 # Why: Exec P413 -- CCs maintain .bashrc; the owning worker removes the export in the S4
@@ -33,10 +43,12 @@ REMOVED="${TARGET_BASHRC}.bak-813.line"        # the one removed line (a non-sec
 count_matches() { grep -c -- "$PATTERN" "$TARGET_BASHRC" || true; }
 
 verify() {
-  bash -n "$TARGET_BASHRC"                     # syntax only; does not execute the file
+  # Explicit `|| return 1` everywhere: apply() calls this inside `if ! verify`, where
+  # `set -e` is suspended, so a failed check must not fall through to a 0 status.
+  bash -n "$TARGET_BASHRC" || { echo "FAIL: bash -n rejects $TARGET_BASHRC" >&2; return 1; }
   echo "syntax: ok"
   echo "CC_PITH_PROVIDER_* exports now present (names only):"
-  grep -oE '^export CC_PITH_PROVIDER_[A-Z_]+' "$TARGET_BASHRC" | sed 's/^export /  /'
+  grep -oE '^export CC_PITH_PROVIDER_[A-Z_]+' "$TARGET_BASHRC" | sed 's/^export /  /' || true
   if [ "$(count_matches)" != "0" ]; then echo "FAIL: $NAME still present" >&2; return 1; fi
   for keep in "${KEEP[@]}"; do
     grep -q "^export ${keep}=" "$TARGET_BASHRC" || { echo "FAIL: $keep missing" >&2; return 1; }
@@ -51,13 +63,26 @@ apply() {
     return 1
   fi
   local ts backup; ts="$(date +%Y%m%d-%H%M%S)"; backup="${TARGET_BASHRC}.bak-813-${ts}"
-  cp -p -- "$TARGET_BASHRC" "$backup"
+  cp -p -- "$TARGET_BASHRC" "$backup"           # cp follows a symlink: the backup is the CONTENT
   grep -- "$PATTERN" "$TARGET_BASHRC" > "$REMOVED"
-  sed -i "/${PATTERN}/d" "$TARGET_BASHRC"
+  sed -i --follow-symlinks "/${PATTERN}/d" "$TARGET_BASHRC"
   printf '%s\n' "$backup" > "$LATEST"
   sha256sum "$TARGET_BASHRC" | cut -d' ' -f1 > "$POSTSHA"
   echo "removed 1 line matching '$PATTERN' (name only); backup: $backup"
-  verify
+  if ! verify; then
+    # F3a: never leave a broken .bashrc behind. Restore the backup we just made.
+    echo "verify FAILED after the edit -- restoring the backup" >&2
+    cp -p -- "$backup" "$TARGET_BASHRC"
+    if cmp -s -- "$backup" "$TARGET_BASHRC"; then
+      rm -f -- "$LATEST" "$POSTSHA" "$REMOVED"   # state is exactly as before apply
+      echo "rolled back: $TARGET_BASHRC is byte-identical to the backup; nothing applied" >&2
+    else
+      echo "CRITICAL: rollback copy differs from the backup; restore by hand from $backup" >&2
+    fi
+    return 1
+  fi
+  echo "REMINDER (S4 checklist): this script cannot check it, so confirm BOTH merges (NeuroGraph" \
+       "code + docs preflight) are DEPLOYED, and restart AFTER this step."
 }
 
 reverse() {
