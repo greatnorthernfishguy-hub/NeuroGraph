@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (findings written; final pass pending)
+STATUS: COMPLETE (verdict: COMPLIANT on LAW 1-8; PASS-WITH-NOTES; rollback needs R-1 and R-2 before it is relied on; fit for TURN B Phase 1)
 
 # le-031 — law-enforcer TINY RE-LOOK, ADDENDUM 3: TURN A2 hardening of the 118-want repair one-shot tool (incl. the NEW gated `--step rollback`)
 
