@@ -259,10 +259,12 @@ class TestSylsLawHook:
     def test_pretool_unparseable_stdin_exit2(self):
         rc, stderr, _ = self._run_raw(NEW_HOOK, b"not json")
         assert rc == 2
+        assert "target" in stderr.lower() or "path" in stderr.lower()
 
     def test_pretool_no_path_exit2(self):
         rc, stderr, _ = self._run_raw(NEW_HOOK, b'{"tool_input":{}}')
         assert rc == 2
+        assert "target" in stderr.lower() or "path" in stderr.lower()
 
     # ══════════════════════════════════════════════════════════════════
     # FAULT-CLOSED — posttool_doublecheck
@@ -607,18 +609,34 @@ class TestSylsLawHook:
         assert r.returncode == 2
 
     def test_locale_stub_git_receives_LC_ALL_C(self):
-        """LC_ALL=C is hardcoded in hook on every git call — verified by code
-        review (pretool_syls_law.sh lines with 'LC_ALL=C'). This test confirms
-        the hook operates correctly with LC_ALL set. A file-creation stub proved
-        unreliable in this harness; the git-call lines are read directly."""
-        # Confirm the hook has LC_ALL=C on its git calls
-        with open(NEW_HOOK) as f:
-            hook_text = f.read()
-        assert "LC_ALL=C" in hook_text, "LC_ALL=C must appear in hook git calls"
-        # Functional test: hook works with LC_ALL set in environment
-        path = os.path.join(self._ng_dir, "neuro_foundation.py")
-        rc, _ = self._run(NEW_HOOK, path, extra_env={"LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"})
-        assert rc != 0
+        """Behavioural: stub git (bash builtins only) records LC_ALL to a pre-created file."""
+        stub = os.path.join(self._tmpdir, "stub_lc_real")
+        os.makedirs(stub, exist_ok=True)
+        for t in ["jq", "timeout", "realpath", "sed", "tr", "dirname", "bash"]:
+            tp = subprocess.check_output(["which", t]).decode().strip()
+            lk = os.path.join(stub, t)
+            if not os.path.lexists(lk): os.symlink(tp, lk)
+        record = os.path.join(self._tmpdir, "lc_all_recorded")
+        with open(record, "w") as f: f.write("NOT_SET\n")
+        # Git stub: bash builtins only (echo, case, exit, redirects)
+        git_stub = os.path.join(stub, "git")
+        with open(git_stub, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write(f"echo -n \"$LC_ALL\" > {record}\n")
+            f.write("case \"$*\" in\n")
+            f.write("  *rev-parse*show-toplevel*) echo /fake_repo ;;\n")
+            f.write("  *config*get-regexp*url*) echo 'remote.origin.url https://github.com/greatnorthernfishguy-hub/NeuroGraph.git' ;;\n")
+            f.write("  *) exit 1 ;;\n")
+            f.write("esac\n")
+            f.write("exit 0\n")
+        os.chmod(git_stub, 0o755)
+        env = {"HOME": self._fake_home, "PATH": stub}
+        path = os.path.join(self._wt_outside, "neuro_foundation.py")
+        r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=env)
+        assert r.returncode != 0
+        with open(record, "r") as f:
+            val = f.read().strip()
+        assert val == "C", f"LC_ALL should be C, got '{val}'"
 
     # ══════════════════════════════════════════════════════════════════
     # ORIGIN MATRIX
@@ -691,3 +709,204 @@ class TestSylsLawHook:
 
     def test_home_guard(self):
         assert self._fake_home.startswith(self._tmpdir)
+
+    # ══════════════════════════════════════════════════════════════════
+    # NORMALISER FUNCTION EQUIVALENCE (Change A)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _extract_norm(self, hook_path):
+        """Extract _norm_origin() function body from hook using sed.
+        Returns (found_count, function_body)."""
+        result = subprocess.run(
+            ["sed", "-n", "/^_norm_origin() {/,/^}/p", hook_path],
+            capture_output=True, check=True,
+        )
+        body = result.stdout.decode()
+        count = body.count("_norm_origin() {")
+        return count, body
+
+    def test_normaliser_extraction_counts(self):
+        """Each hook has exactly one _norm_origin function."""
+        c1, _ = self._extract_norm(NEW_HOOK)
+        c2, _ = self._extract_norm(DBL_HOOK)
+        assert c1 == 1, f"pretool has {c1} _norm_origin functions"
+        assert c2 == 1, f"doublecheck has {c2} _norm_origin functions"
+
+    def _run_norm(self, hook_path, url):
+        """Run the extracted _norm_origin function in bash and return output."""
+        _, body = self._extract_norm(hook_path)
+        script = f"{body}\n_norm_origin '{url}'"
+        result = subprocess.run(
+            ["bash"], input=script.encode(), capture_output=True, timeout=5,
+        )
+        return result.stdout.decode().strip()
+
+    @staticmethod
+    def _gen_origin_matrix():
+        """Cross-product: scheme × userinfo × port × case × suffix × org/repo.
+        Scrub tokens: use 'user:dummy@' in userinfo."""
+        schemes_host = [
+            ("https://", "github.com"),
+            ("http://", "github.com"),
+            ("ssh://", "github.com"),
+            ("git://", "github.com"),
+            ("git+ssh://", "github.com"),
+            ("", "github.com"),  # scp form
+        ]
+        userinfos = ["", "git@", "deploy@", "user:dummy@"]
+        ports = ["", ":22", ":443"]
+        names = [
+            ("GREATNORTHERNFISHGUY-HUB/NEUROGRAPH", True),
+            ("evil-org/NeuroGraph", False),
+            ("greatnorthernfishguy-hub/neurograph-fork", False),
+        ]
+        suffixes = ["", ".git", "/", ".git/"]
+        test_urls = []
+        for scheme, host in schemes_host:
+            for userinfo in userinfos:
+                if scheme == "" and userinfo == "":
+                    continue  # no valid scp form without user
+                for port in ports:
+                    for orgrepo, expected in names:
+                        for suffix in suffixes:
+                            if scheme:
+                                url = f"{scheme}{userinfo}{host}{port}/{orgrepo}{suffix}"
+                            else:
+                                url = f"{userinfo}{host}:{port.lstrip(':')}{orgrepo}" if port else f"{userinfo}{host}:{orgrepo}"
+                                if suffix:
+                                    url += suffix
+                            test_urls.append((url, expected))
+        return test_urls
+
+    def test_normaliser_function_equivalence(self):
+        """Both hooks' _norm_origin() produce byte-identical output for every generated URL."""
+        matrix = self._gen_origin_matrix()
+        assert len(matrix) > 200, f"matrix too small: {len(matrix)}"
+        mismatches = []
+        for url, expected in matrix:
+            p = self._run_norm(NEW_HOOK, url)
+            d = self._run_norm(DBL_HOOK, url)
+            if p != d:
+                mismatches.append((url, p, d))
+        assert not mismatches, f"Normaliser mismatch: {mismatches[:5]}"
+        print(f"Normaliser equiv: {len(matrix)} URLs, 0 mismatches")
+
+    def test_normaliser_verdict_equivalence(self):
+        """For a representative subset, both hooks agree on whether a repo is NeuroGraph."""
+        subset = [
+            # positive forms
+            ("https://github.com/greatnorthernfishguy-hub/NeuroGraph.git", True),
+            ("git@github.com:greatnorthernfishguy-hub/NeuroGraph.git", True),
+            ("ssh://git@github.com/greatnorthernfishguy-hub/NeuroGraph", True),
+            ("https://user:dummy@github.com/greatnorthernfishguy-hub/NeuroGraph", True),
+            ("deploy@github.com:greatnorthernfishguy-hub/NeuroGraph.git", True),
+            # negative forms
+            ("https://github.com/evil-org/NeuroGraph.git", False),
+            ("https://evil.com/greatnorthernfishguy-hub/NeuroGraph", False),
+            ("https://github.com/greatnorthernfishguy-hub/neurograph-fork", False),
+        ]
+        for origin, is_ng in subset:
+            repo = self._tmp_repo(origin)
+            path = os.path.join(repo, "neuro_foundation.py")
+            p_rc, _ = self._run(NEW_HOOK, path)
+            d_rc, _ = self._run(DBL_HOOK, path)
+            p_fires = p_rc != 0
+            d_fires = d_rc != 0
+            assert p_fires == d_fires, f"Verdict mismatch for {origin}: gate={p_fires} dbl={d_fires}"
+            assert p_fires == is_ng, f"Gate wrong for {origin}: got {p_fires}, expected {is_ng}"
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_normaliser_mutation_detects_drift(self):
+        """Changing the doublecheck's normaliser makes the equivalence test fail."""
+        _, body = self._extract_norm(DBL_HOOK)
+        # Mutation: drop the .git strip line
+        mutated = body.replace(".git", ".XYZ", 1)
+        assert mutated != body, "mutation had no effect"
+        matrix = self._gen_origin_matrix()
+        found_mismatch = False
+        for url, _ in matrix:
+            p = self._run_norm(NEW_HOOK, url)
+            m = subprocess.run(
+                ["bash"], input=f"{mutated}\n_norm_origin '{url}'".encode(), capture_output=True, timeout=5,
+            )
+            m_out = m.stdout.decode().strip()
+            if p != m_out:
+                found_mismatch = True
+                break
+        assert found_mismatch, "Mutation test should detect a mismatch"
+
+    # ══════════════════════════════════════════════════════════════════
+    # GIT FAILURE-SHAPE DECISION EQUIVALENCE (Change B)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _make_git_failure_stub(self, exit_code, stderr_msg=None, hang=False):
+        """Create a stub git with specific exit code and optional stderr."""
+        stub = os.path.join(self._tmpdir, f"stub_git_{exit_code}")
+        os.makedirs(stub, exist_ok=True)
+        for t in ["jq", "timeout", "realpath", "sed", "tr", "dirname", "bash"]:
+            tp = subprocess.check_output(["which", t]).decode().strip()
+            lk = os.path.join(stub, t)
+            if not os.path.lexists(lk): os.symlink(tp, lk)
+        git_stub = os.path.join(stub, "git")
+        if hang:
+            with open(git_stub, "w") as f:
+                f.write("#!/bin/bash\nsleep 10\n")
+        else:
+            with open(git_stub, "w") as f:
+                f.write("#!/bin/bash\n")
+                if stderr_msg:
+                    f.write(f"echo '{stderr_msg}' >&2\n")
+                f.write(f"exit {exit_code}\n")
+        os.chmod(git_stub, 0o755)
+        return {"HOME": self._fake_home, "PATH": stub}
+
+    def _test_decision_cell(self, stub_env, path, cell_name):
+        """Return (gate_exit, dbl_exit) for a given stub env and path."""
+        env = stub_env.copy()
+        g_rc, _ = self._run(NEW_HOOK, path)
+        e2 = stub_env.copy()
+        d_rc, _ = self._run(DBL_HOOK, path)
+        return g_rc, d_rc
+
+    def test_decision_equivalence_failure_shapes(self):
+        """Gate and doublecheck return same verdict for every git failure shape."""
+        cells = []
+        # Failure shapes
+        shapes = [
+            (1, "something went wrong", False, "exit1"),
+            (2, "", False, "exit2"),
+            (124, "", True, "hang"),
+            (128, "fatal: not a git repository", False, "not_a_repo"),
+            (128, "fatal: detected dubious ownership in repository", False, "dubious_ownership"),
+        ]
+        paths = {
+            "not_repo": os.path.join(self._non_git, "x.py"),
+            "in_repo": os.path.join(self._ng_dir, "neuro_foundation.py"),
+            "nonexistent": os.path.join(self._non_git, "sub", "x.py"),
+        }
+
+        mismatches = []
+        for exit_code, stderr, hang, shape_name in shapes:
+            stub = self._make_git_failure_stub(exit_code, stderr, hang)
+            for path_name, path in paths.items():
+                g_rc, d_rc = self._test_decision_cell(stub, path, f"{shape_name}_{path_name}")
+                cell = f"{shape_name}/{path_name}: gate={g_rc} dbl={d_rc}"
+                # "not_a_repo" shapes should both exit 0 (allowed)
+                # All other shapes should both exit 2 (fault)
+                if shape_name == "not_a_repo":
+                    expected = 0
+                else:
+                    expected = 2
+                if g_rc != expected or d_rc != expected:
+                    mismatches.append(cell)
+                if g_rc != d_rc:
+                    mismatches.append(f"MISMATCH: {cell}")
+        assert not mismatches, f"Decision mismatches: {mismatches}"
+        print(f"Decision equiv: {len(shapes) * len(paths)} cells, 0 mismatches")
+
+    def test_git_absent_both_fault(self):
+        """With git removed from PATH, both hooks exit 2 (preflight)."""
+        e = self._env_stub_no_git()
+        p_rc, _, _ = self._run_raw(NEW_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
+        d_rc, _, _ = self._run_raw(DBL_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
+        assert p_rc == d_rc == 2

@@ -145,6 +145,21 @@ EOFFAIL
 EOFFAIL
         exit 2; }
 
+    if [ -z "$TOPLEVEL" ]; then
+        _probe_dir="$FILE_PATH"
+        while [ -n "$_probe_dir" ] && [ "$_probe_dir" != "/" ] && [ ! -d "$_probe_dir" ]; do
+            _probe_dir="$(dirname "$_probe_dir")"
+        done
+        [ -d "$_probe_dir" ] || _probe_dir="/"
+        _git_stderr="$(LC_ALL=C timeout 3 git -C "$_probe_dir" rev-parse --show-toplevel 2>&1 >/dev/null)" || true
+        if [ -n "$_git_stderr" ] && echo "$_git_stderr" | grep -q fatal && ! echo "$_git_stderr" | grep -q "not a git repository"; then
+            cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW DOUBLECHECK — GIT FAILURE ═══
+EOFFAIL
+            exit 2
+        fi
+    fi
+
     if [ -n "$TOPLEVEL" ]; then
         ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)" || true
         _rr=$?
