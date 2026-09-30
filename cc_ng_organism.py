@@ -4,6 +4,23 @@
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
+#   TURN 2 (dispatch #10952) step (2c) -- #819: an over-budget node surfaces through its TREES
+#   plus a one-line whole-node REFERENCE
+# What: a node whose whole text cannot fit the usable envelope renders as ONE reference line (id,
+#   size, date, tree count) and its concept trees -- whole, each small -- on the provider path
+#   (pith_connected_activation_basins(node_limit=...): the trees are the basin's ordinary graph
+#   neighbours), the Pith-ON L1 path (_pith_reference_lines) and the un-Pithed path
+#   (_pith_reference_items); one INFO line (_pith_log_reference). Text-derived anchors are not
+#   mined from the unshown whole (metadata anchors are kept).
+# Why: Exec P417 (LAW 7: raw means complete; Josh P360: a long turn stays ONE node / one forest);
+#   brief TURN 2 item 4; le-017 F8. NO split at ingest, NO new node type, the node is never
+#   modified and still activates and learns in full: ONLY its RENDERING changes.
+# How: DEPENDENCY -- for pre-PASS-2 forests the trees cover only the first 2,000 chars until
+#   PASS 2 (the laptop TID) runs; full coverage arrives with PASS 2. Until then the reference is
+#   honest that the whole exists and is not shown. The per-node limit is budget - core - 800
+#   (a fixed shell allowance); a node between that and the true learned budget is still caught,
+#   loudly, as a never-fit assembly at admit.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
 #   TURN 2 (dispatch #10952) step (2b) -- #818: EVERY drop is loud
 # What: _pith_log_drop (ONE INFO line per call and reason: count, total chars, reason; ids
 #   named first-time-seen only, bounded -- the #810 skip-log shape) now reports the drops that
@@ -1091,7 +1108,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("cc_ng_organism")
@@ -4467,6 +4484,120 @@ def _pith_log_drop(where: str, reason: str, unit: str, entries: Any) -> None:
     logger.info("%s; first seen: %s%s", message, named or "-", extra)
 
 
+# ---------------------------------------------------------------------------
+# #819 -- an OVER-BUDGET NODE surfaces through its TREES plus a whole-node REFERENCE
+# (Exec P417; LAW 7: raw means complete; Josh P360: a long turn stays ONE node / one forest --
+# windowed pooling, not chunking).  NO split at ingest, no new node type: the node still
+# participates FULLY in activation and learning; ONLY its RENDERING takes this form.  A reference
+# points to the whole; it is not a cut.  DEPENDENCY: for pre-PASS-2 forests the trees cover only
+# the first 2,000 chars until PASS 2 (the laptop TID) runs; full coverage arrives with PASS 2.
+# ---------------------------------------------------------------------------
+
+# Worst-case section-header / alert overhead (chars) that the provider context reserves besides
+# the constitutional core.  Used only to pick the per-node limit; a node between the true
+# learned budget and this bound is still caught, loudly, as a never-fit assembly at admit.
+_PITH_SHELL_ALLOWANCE = 800
+
+
+def _pith_tree_nodes(graph: Any, node_id: str, limit: Optional[int] = None) -> List[tuple]:
+    """[(tree_id, text)] for the concept trees linked to `node_id`, strongest link first.
+    Trees are the forest's graph neighbours carrying `_tree_concept` (the real link made by
+    _cc_bind_conversational_topology); each is small and is rendered WHOLE."""
+    out: List[tuple] = []
+    for nid, _kind, _strength in _pith_graph_neighbors(graph, node_id):
+        node = graph.nodes.get(nid)
+        if node is None or not (getattr(node, "metadata", None) or {}).get("_tree_concept"):
+            continue
+        text = _pith_node_raw_text(node)
+        if text:
+            out.append((nid, text))
+    return out if limit is None else out[:limit]
+
+
+def _pith_whole_node_reference(graph: Any, node_id: str, node: Any, text: str) -> str:
+    """The ONE-LINE reference to a node too large to render whole here: id, size, date, tree
+    count.  It says the whole exists and where; it shows none of it."""
+    size = len(text)
+    size_text = ("\u2248%dk" % round(size / 1000.0)) if size >= 10000 else ("\u2248%d" % size)
+    stamp = getattr(node, "creation_time", None)
+    date = (time.strftime("%Y-%m-%d", time.gmtime(stamp))
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and stamp > 0
+            else "undated")
+    trees = len(_pith_tree_nodes(graph, node_id))
+    return ("A long node (id %s; %s chars; %s; %d concept tree%s) is related to this cue; it is "
+            "too large to render whole here, so its concepts follow."
+            % (node_id, size_text, date, trees, "" if trees == 1 else "s"))
+
+
+def _pith_log_reference(where: str, entries: Any, limit: int) -> None:
+    """One INFO line for over-budget nodes rendered as trees + reference (never a silent swap)."""
+    entries = list(entries)
+    if not entries:
+        return
+    shown, already, more = _pith_note_ids("ref|%s" % i for i, _c in entries)
+    sizes = {"ref|%s" % i: c for i, c in entries}
+    named = ", ".join("%s (%d chars)" % (k.split("|", 1)[1], sizes[k]) for k in shown)
+    extra = "".join([" [%d already reported]" % already if already else "",
+                     " [+%d more]" % more if more else ""])
+    logger.info("pith %s: %d over-budget node%s (%d chars) surfaced through their trees + a "
+                "whole-node reference (limit %d chars); first seen: %s%s",
+                where, len(entries), "" if len(entries) == 1 else "s",
+                sum(c for _i, c in entries), limit, named or "-", extra)
+
+
+def _pith_reference_text(graph: Any, node_id: str, text: str, budget: int) -> Optional[str]:
+    """The L1 / un-Pithed form of an over-budget item: the reference line plus as many of its
+    strongest trees, WHOLE, as fit.  None when the node is unknown or even the reference cannot
+    fit (the caller then drops the item loudly under THE ONE RULE)."""
+    node = graph.nodes.get(node_id) if (graph is not None and node_id) else None
+    if node is None:
+        return None
+    reference = _pith_whole_node_reference(graph, node_id, node, text)
+    if len(reference) > budget:
+        return None
+    parts, used = [reference], len(reference)
+    for _tid, tree_text in _pith_tree_nodes(graph, node_id, _CC_PITH_PROVIDER_MEMBERS):
+        piece = "- concept: " + tree_text
+        if used + 1 + len(piece) > budget:
+            break
+        parts.append(piece)
+        used += 1 + len(piece)
+    return "\n".join(parts)
+
+
+def _pith_reference_lines(graph: Any, lines: List[CacheLine], budget: int) -> List[CacheLine]:
+    """Stage 3 input: replace each UNPINNED line longer than the whole budget by its
+    trees + reference form (new CacheLine copies; the originals -- and the nodes -- untouched)."""
+    out: List[CacheLine] = []
+    swapped: List[tuple] = []
+    for cl in lines:
+        if not cl.pinned and len(cl.content or "") > budget:
+            form = _pith_reference_text(graph, cl.node_id, cl.content, budget)
+            if form is not None:
+                swapped.append((cl.node_id, len(cl.content)))
+                out.append(_dc_replace(cl, content=form))
+                continue
+        out.append(cl)
+    _pith_log_reference("L1", swapped, budget)
+    return out
+
+
+def _pith_reference_items(graph: Any, items: List[Dict[str, Any]], budget: int,
+                          swapped: List[tuple]) -> List[Dict[str, Any]]:
+    """Un-Pithed input: the same swap for recall dicts (copies; `swapped` collects entries)."""
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        content = item.get("content", "") or ""
+        if len(content) > budget:
+            form = _pith_reference_text(graph, item.get("node_id"), content, budget)
+            if form is not None:
+                swapped.append((item.get("node_id"), len(content)))
+                out.append(dict(item, content=form))
+                continue
+        out.append(item)
+    return out
+
+
 def _pith_admit_strict_prefix(ordered: List[Any], budget: int, size_of: Any,
                               separator: int = 0) -> tuple:
     """The ONE rule over units already in rank order.  size_of(unit) is the unit's whole size
@@ -4879,7 +5010,8 @@ def _pith_copy_cache_line(line: CacheLine, stream: Optional[str] = None) -> Cach
 def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
                                       max_members: Optional[int] = None,
                                       max_depth: Optional[int] = None,
-                                      live_rails: Optional[Dict[str, str]] = None) -> List[CacheLine]:
+                                      live_rails: Optional[Dict[str, str]] = None,
+                                      node_limit: Optional[int] = None) -> List[CacheLine]:
     """Build relationship-preserving cache lines from SNN-surfaced roots.
 
     Every returned CacheLine is a connected basin: one fired root plus direct
@@ -4899,11 +5031,19 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
         if isinstance(text, str) and text.strip()
     }
 
-    def _display_text(node, fallback=""):
+    referenced: Dict[str, int] = {}      # #819: over-budget node id -> whole size
+
+    def _display_text(node, fallback="", node_id=None):
         raw = _pith_node_raw_text(node, fallback)
         rail_label = rail_labels.get(_pith_normalize(raw))
         if rail_label:
             return raw, f"[{rail_label} is present exactly once in the live tail]", True
+        if node_limit and node_id and len(raw) > node_limit:
+            # #819: too large to render whole -> ONE reference line; its trees are this basin's
+            # ordinary graph neighbours and arrive whole as relations.  Returning "" as the raw
+            # text means no anchors are mined from the unshown whole (metadata anchors remain).
+            referenced[node_id] = len(raw)
+            return "", _pith_whole_node_reference(graph, node_id, node, raw), False
         return raw, _pith_node_text(node, fallback), False
 
     active_node_ids = {item.get("node_id") for item in surfaced if item.get("node_id")}
@@ -4918,7 +5058,7 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
         if root is None or _pith_is_constitutional(graph, root_id):
             continue
         root_raw, root_text, root_is_live = _display_text(
-            root, root_item.get("content", ""))
+            root, root_item.get("content", ""), root_id)
         if not root_text:
             continue
 
@@ -4947,7 +5087,7 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
                 if child_id in visited or _pith_is_constitutional(graph, child_id):
                     continue
                 child = graph.nodes.get(child_id)
-                child_raw, child_text, child_is_live = _display_text(child)
+                child_raw, child_text, child_is_live = _display_text(child, "", child_id)
                 if not child_text:
                     continue
                 visited.add(child_id)
@@ -5067,6 +5207,9 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
                     if why == "depth_limit" and nid not in covered])
     _pith_log_drop("basins", "overlap (>=60% of its members already covered by a higher-ranked basin)",
                    "basins", overlapped)
+    if referenced:
+        _pith_log_reference("basins", [(nid, n) for nid, n in referenced.items() if nid in covered],
+                            node_limit or 0)
     return selected
 
 
@@ -5231,7 +5374,8 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
             live_rails[quest_text] = (
                 "current instruction and Quest focus" if prior else "Quest focus")
         fresh = pith_connected_activation_basins(
-            graph, surfaced, live_rails=live_rails)
+            graph, surfaced, live_rails=live_rails,
+            node_limit=max(200, budget - len(core) - _PITH_SHELL_ALLOWANCE))
         candidates = fresh
         # Reserve every possible section/alert delimiter before admitting prose.
         # Empty placeholder blocks let the real renderer calculate that fixed
@@ -5428,6 +5572,11 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
         except Exception as exc:                               # never let the budget sink recall
             logger.debug("un-Pithed budget lookup failed (static budget used): %s", exc)
             budget = _CC_PITH_L1_BUDGET
+        swapped: List[tuple] = []
+        graph = getattr(ng, "graph", None)
+        monitor_items = _pith_reference_items(graph, monitor_items, budget, swapped)
+        pc_results = _pith_reference_items(graph, pc_results, budget, swapped)
+        _pith_log_reference("recall (un-Pithed)", swapped, budget)
         tagged = (
             [(CacheLine(node_id=i.get("node_id") or "", content=i.get("content", "") or "",
                         score=float(i.get("score", 0.0) or 0.0), stream="monitor"), i)
@@ -5623,6 +5772,10 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             budget = cc_l1_budget(commons, ng.graph, pc_fired_ids)
             
             _stage = 'stage3'
+            # #819: an item longer than the whole L1 budget surfaces through its trees + a
+            # one-line whole-node reference (copies; the node and the victim buffer's lines
+            # are untouched), instead of being dropped as never-fit.
+            survivors = _pith_reference_lines(ng.graph, survivors, budget)
             survivors = pith_stage3(survivors, budget_chars=budget)
             # Pith Stage 5 (eviction): budget-dropped lines fall to the victim buffer.
             try:

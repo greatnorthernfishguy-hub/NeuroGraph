@@ -1,6 +1,14 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2c) / #819: over-budget node
+# What: a node whose WHOLE text cannot fit the usable envelope surfaces through its TREES (whole,
+#   each small) plus a ONE-LINE whole-node reference (id, size, date, tree count) and one INFO line,
+#   on the provider path, the Pith-ON L1 path and the un-Pithed path. NO split at ingest; the node
+#   is never modified and still participates fully in activation/learning; only its RENDERING changes.
+# Why: Exec P417 (LAW 7: raw means complete; Josh P360: a long turn stays ONE node/one forest);
+#   brief TURN 2 item 4; le-017 F8 (a never-fit assembly was permanently absent and unidentified).
+# How: fake in-memory graph with forest -> tree synapses (the real link, _cc_bind_conversational_topology).
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2b) / #818: every drop is loud
 # What: member_limit / depth_limit / overlap / roots drops each log ONE INFO line per call with
 #   count, total chars and reason; ids named first-time-seen only (flood-safe).
@@ -813,3 +821,97 @@ def test_818_a_one_member_budget_still_reports_and_does_not_crash(caplog):
     assert line.member_node_ids == ["root"]
     (message,) = _drop_lines(caplog, "member_limit")
     assert "dropped 2 " in message
+
+
+# ====================================================================== TURN 2 (2c): #819
+def _giant_world(giant_len=30000, trees=3, with_meta_anchor=True):
+    g = FakeGraph()
+    _core(g)
+    text = "GIANT-START " + "/home/josh/a/b/c.py " * 5 + ("filler words " * (giant_len // 13)) + " GIANT-END"
+    meta = {"path": "/exact/metadata/anchor.txt"} if with_meta_anchor else {}
+    big = g.node("cc:conv::bigforest", text, **meta)
+    big.creation_time = 1790000000.0                                   # 2026-09-21 in UTC
+    tree_texts = []
+    for i in range(trees):
+        tt = f"concept {i}: the checkpoint cadence decision number {i}"
+        tree_texts.append(tt)
+        g.node(f"tree{i}", tt, _tree_concept=True, _concept=tt)
+        g.synapse(f"f{i}", "cc:conv::bigforest", f"tree{i}", 0.2)
+        g.synapse(f"b{i}", f"tree{i}", "cc:conv::bigforest", 0.15)
+    return g, text, tree_texts
+
+
+def _ref_records(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and "over-budget node" in r.getMessage()]
+
+
+def test_819_provider_over_budget_node_surfaces_through_its_trees_plus_one_reference_line(caplog):
+    g, text, tree_texts = _giant_world()
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        result = _run(pith, g, [{"node_id": "cc:conv::bigforest", "score": 1.0}], "go on",
+                      budget_chars=4000)
+    ctx = result["context"]
+    assert result["state"] == "ok" and result["assemblies"] == 1 and len(ctx) <= 4000
+    assert "GIANT-START" not in ctx and "GIANT-END" not in ctx        # the whole is NOT shown ...
+    ref_lines = [l for l in ctx.splitlines() if "cc:conv::bigforest" in l and "long node" in l]
+    assert len(ref_lines) == 1                                        # ... one line points to it
+    ref = ref_lines[0]
+    assert "cc:conv::bigforest" in ref and "3 concept trees" in ref and "2026-" in ref
+    assert re.search(r"≈\d+k", ref) or re.search(r"≈\d{3,}", ref)
+    for tt in tree_texts:                                             # its concepts follow, WHOLE
+        assert tt in ctx
+    (message,) = _ref_records(caplog)
+    assert "1 over-budget node" in message and "cc:conv::bigforest" in message
+
+
+def test_819_the_node_itself_is_never_modified_or_split():
+    g, text, _ = _giant_world()
+    before = dict(g.nodes["cc:conv::bigforest"].metadata)
+    _run(pith, g, [{"node_id": "cc:conv::bigforest", "score": 1.0}], "go on", budget_chars=4000)
+    assert g.nodes["cc:conv::bigforest"].metadata == before          # LAW 7: raw stays complete
+    assert len(g.nodes) == 1 + 1 + 3                                  # core + giant + trees: no new nodes
+
+
+def test_819_text_derived_anchors_of_the_unshown_whole_are_not_extracted_but_metadata_ones_are():
+    g, _text, _ = _giant_world()
+    result = _run(pith, g, [{"node_id": "cc:conv::bigforest", "score": 1.0}], "go on",
+                  budget_chars=4000)
+    assert "/exact/metadata/anchor.txt" in result["anchors"]
+    assert "/home/josh/a/b/c.py" not in result["anchors"]
+
+
+def test_819_no_trees_still_gives_the_reference_and_says_zero():
+    g, _text, _ = _giant_world(trees=0)
+    result = _run(pith, g, [{"node_id": "cc:conv::bigforest", "score": 1.0}], "go on",
+                  budget_chars=4000)
+    assert result["state"] == "ok" and "0 concept trees" in result["context"]
+    assert "GIANT-START" not in result["context"]
+
+
+def test_819_a_node_that_fits_is_rendered_whole_not_referenced():
+    g, _text, _ = _giant_world(giant_len=2500)
+    result = _run(pith, g, [{"node_id": "cc:conv::bigforest", "score": 1.0}], "go on",
+                  budget_chars=8000)
+    assert "GIANT-START" in result["context"] and "GIANT-END" in result["context"]
+    assert "long node" not in result["context"]
+
+
+def test_819_reference_is_one_line_and_undated_when_there_is_no_timestamp():
+    g, _text, _ = _giant_world()
+    del g.nodes["cc:conv::bigforest"].creation_time
+    node = g.nodes["cc:conv::bigforest"]
+    ref = pith._pith_whole_node_reference(g, "cc:conv::bigforest", node, "x" * 300000)
+    assert "\n" not in ref and "undated" in ref and "≈300k" in ref and "3 concept trees" in ref
+
+
+@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
+def test_819_l1_and_unpithed_paths_use_the_same_reference_form(monkeypatch, caplog, pith_on):
+    g, text, tree_texts = _giant_world()
+    pat = [{"node_id": "cc:conv::bigforest", "score": 50.0, "content": text, "prefetch_origin": False}]
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out, _ = _recall(pith, fake_ng(g, []), pat, pith_on, monkeypatch)
+    assert "GIANT-START" not in out and "GIANT-END" not in out
+    assert "long node" in out and "cc:conv::bigforest" in out
+    assert all(tt in out for tt in tree_texts)
+    assert _ref_records(caplog)
