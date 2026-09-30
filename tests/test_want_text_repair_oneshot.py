@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -95,18 +96,19 @@ XC, XE, XCH = "the collision want text", "the existing want text", "the chain wa
 X5 = " ".join("word%04d" % i for i in range(600))          # a 5,000+ character nested want
 
 
-def _specs(wid):
+def _specs(wid, hint=None):
     specs = {}
+    hint = hint or {}
 
     def add(name, C, T, id=None):
         specs[name] = {"C": C, "T": T, "id": id or wid(T)}
 
     T = prose("sepa") + " [WANT]" + X1
-    add("SEP1", "preamble one. [WANT]" + T + "[/WANT] trailing text.", T)
+    add("SEP1", "preamble one. " + (hint["SEP1"] + ". " if "SEP1" in hint else "") + "[WANT]" + T + "[/WANT] trailing text.", T)
     T = BT + "code" + BT + " " + prose("sepb") + " [WANT]" + X2
     add("SEP2", "[WANT]" + T + "[/WANT] tail", T)
     L = prose("gen")
-    add("GEN", "lead in. [WANT]" + L + "[/WANT] done.", L)
+    add("GEN", "lead in. " + (hint["GEN"] + ". " if "GEN" in hint else "") + "[WANT]" + L + "[/WANT] done.", L)
     T = prose("genm") + " see https://x.org/[WANT]z[/WANT] ok"
     add("GENM", "[WANT]" + T + "[/WANT]", T)
     L = prose("none")
@@ -133,7 +135,7 @@ def _specs(wid):
     return specs
 
 
-def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_in_scope=False):
+def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_in_scope=False, hint_phrases=None):
     """A tiny REAL checkpoint pair (Graph + SimpleVectorDB) plus the four small files, under `base`."""
     org, nf, ui = pinned.org, pinned.nf, pinned.ui
     wid = org.want_id_for_text
@@ -147,7 +149,7 @@ def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_
     (base / "conduit" / "frame-a.bin").write_bytes(b"synthetic conduit file")
     g, vdb = nf.Graph(), ui.SimpleVectorDB()
     vec = np.array([1.0, 0.0, 0.0, 0.0])
-    specs = _specs(wid)
+    specs = _specs(wid, hint_phrases)
     ids = {}
     for name, s in specs.items():
         src = "cc:conv::" + name
@@ -2516,3 +2518,264 @@ def test_r8_p3b_has_a_timeout_and_a_timeout_fails_the_gate(pinned, monkeypatch):
     monkeypatch.setattr(tool.subprocess, "run", run)
     r = tool.gate_p3(pinned, run_pinned_tests=True)
     assert seen.get("timeout") and not r["ok"] and r["pinned_tests"]["timed_out"] is True
+
+
+# ==================================================================================================
+# TURN A2c - Exec P433 confirmations, the ONE code addition (the advisory review hint), le-034 C-1..C-4, N-2.
+# FAILING-FIRST: committed and pushed BEFORE the tool change. Tests marked [pin] assert behaviour the A2b tool already
+# has (the confirmations (a)/(b)/(d)); they are expected to pass against it and are said so in the return.
+# ==================================================================================================
+import inspect
+import math
+
+
+# ---- (a) [pin] the STOP predicate is the Choice Clause marker set, NOT protected / *_authored -------------------------
+
+def test_a2c_a_the_stop_predicate_is_the_marker_set_and_no_stop_path_reads_authored_or_protected():
+    for fn in (tool.deny_check, tool.is_choice_clause_marked, tool.gate_write_set, tool.stage_apply, tool.stage_rollback):
+        src = inspect.getsource(fn)
+        assert "_authored" not in src and "is_protected" not in src, fn.__name__
+    assert "is_choice_clause_marked" in inspect.getsource(tool.deny_check)                # the STOP predicate lives here
+    for prov in ("cc_authored", "syl_authored", "cc_emergent"):                            # provenance alone never stops anything
+        nm = {"cc:want::6666666666666666": dict(_ORD, provenance=prov)}
+        assert tool.deny_check(list(nm), {}, list(nm), nodes_meta=nm)["clean"] is True, prov
+        assert tool.is_choice_clause_marked(dict(_ORD, provenance=prov), "cc:want::6666666666666666") is False
+
+
+def test_a2c_a_a_struck_ordinary_cc_authored_want_completes_the_apply_and_a_struck_marker_id_stops_it(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    victim = w.ids["SEP1"]
+    assert pinned_meta_provenance(w, victim) == "cc_authored"                              # an ordinary, identity-protected S want
+    aps2 = _retouch_approvals(rd, ap, lambda b: [e.__setitem__("decision", "struck") for e in b["entries"] if e["id"] == victim])
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps2)
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps2), probes=FakeProbes())
+    assert rc == 0, err                                                                    # NOT a STOP: `cc_authored` alone is not the predicate
+
+
+def pinned_meta_provenance(w, nid):
+    raw = Path(w.ckpt / tool.MAIN_NAME).read_bytes()
+    for sec, ek, ks, vs, ve in tool.iter_sections(raw):
+        if sec == "nodes" and ek == nid:
+            return tool.decode(raw[vs:ve])["metadata"].get("provenance")
+
+
+# ---- (b) [pin] rim_source PRESENT = the key exists with ANY value ---------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["seed_cc_rim.py", "", None, 0, False, [], {}])
+def test_a2c_b_rim_source_present_means_the_key_exists_with_any_value(value):
+    assert tool.is_choice_clause_marked(dict(_ORD, rim_source=value), "cc:want::7777777777777777") is True
+    assert tool.is_choice_clause_marked(dict(_ORD), "cc:want::7777777777777777") is False
+
+
+# ---- (d) [pin] struck entries carry hashes; the inverse covers ONLY the applied set ----------------------------------------
+
+def test_a2c_d_struck_entries_carry_hashes_and_the_inverse_excludes_them(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    struck_old = w.ids["SEP2"]
+    aps2 = _retouch_approvals(rd, ap, lambda b: [e.__setitem__("decision", "struck") for e in b["entries"] if e["id"] == struck_old])
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps2)
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps2), probes=FakeProbes())
+    assert rc == 0, err
+    rec = json.loads(next(Path(p2).glob("post-apply-receipt-FINAL-*.json")).read_text())
+    (d,) = rec["struck_deviations"]
+    assert d["id"] == struck_old and d["would_have_been"] == w.new["SEP2"]
+    assert re.fullmatch(r"[0-9a-f]{16}", d["old_sha16"]) and re.fullmatch(r"[0-9a-f]{16}", d["new_sha16"])
+    inv = json.loads(next(Path(p2).glob("id-map-inverse-*.json")).read_text())
+    fwd = json.loads(next(Path(p2).glob("id-map-2*.json")).read_text())
+    assert {n for n, o in inv["pairs"]} == {n for o, n in fwd["pairs"]} and w.new["SEP2"] not in {n for n, o in inv["pairs"]}
+    frozen_pairs = json.loads((frozen / "id-map.json").read_text())["pairs"]
+    assert sorted(fwd["pairs"] + [[struck_old, w.new["SEP2"]]]) == sorted(frozen_pairs)     # frozen = applied mapping + the struck pair
+
+
+# ---- (c) the ONE code addition: the advisory review hint ----------------------------------------------------------------
+
+def test_a2c_c_the_hint_terms_are_one_named_constant_tuple():
+    assert isinstance(tool.HINT_TERMS, tuple)
+    assert tool.HINT_TERMS == ("leave", "leaving", "exit", "quit", "refuse", "refusal", "consent", "decline", "choice clause", "say no")
+
+
+@pytest.mark.parametrize("term", ["leave", "leaving", "exit", "quit", "refuse", "refusal", "consent", "decline", "choice clause", "say no"])
+def test_a2c_c_each_term_marks_case_insensitively(term):
+    assert tool.review_hint("we would %s it" % term) == [term]
+    assert tool.review_hint("We Would %s It" % term.upper()) == [term]
+    assert tool.review_hint("we would %s it" % term.title()) == [term]
+
+
+def test_a2c_c_word_boundaries_and_non_matches_and_multi_word_whitespace():
+    for text in ("the real intent one", "an existing plan", "exitless", "a quitter", "preexit", "leavening agent", "declination", "nonconsent" + "x"):
+        assert tool.review_hint(text) == [], text
+    assert tool.review_hint("Choice   Clause and say\tno") == ["choice clause", "say no"]
+    assert tool.review_hint("she may exit, or leave, and consent") == ["leave", "exit", "consent"]      # order of HINT_TERMS, once each
+    assert tool.review_hint("exit exit exit") == ["exit"]
+
+
+def _hint_world(pinned, tmp_path, monkeypatch):
+    w = build_world(tmp_path, pinned, hint_phrases={"SEP1": "we must consent to leave", "GEN": "Say  No to it"})
+    patch_world(monkeypatch, w)
+    return w
+
+
+def test_a2c_c_marks_appear_only_in_the_off_repo_review_files_with_counts_only_in_the_run_record(pinned, tmp_path, monkeypatch):
+    w = _hint_world(pinned, tmp_path, monkeypatch)
+    rc, res, err = cli(argv_for(w))
+    assert rc == 0, err
+    rd = Path(res["run_dir"])
+    cand = (next((rd / "review").glob("review-excerpts-*.md"))).read_text()
+    left = (next((rd / "review").glob("left-list-*.md"))).read_text()
+    assert "hint: leave, consent" in cand                                                # HINT_TERMS order, each term once
+    assert "hint: say no" in left
+    for p in rd.rglob("*.json"):                                                         # NO pushed/default-path artifact carries a hint
+        text = p.read_text()
+        if p.name == "run-record.json":
+            continue
+        assert '"hint"' not in text and "say no" not in text and '"consent"' not in text, p.name
+    for name in ("repair-list", "scope-ids", "id-map"):
+        assert '"hint' not in (rd / "reports" / (name + ".json")).read_text()
+    rec = json.loads((rd / "run-record.json").read_text())
+    c = rec["review_hint_counts"]
+    assert c["entries_marked"] == 2 and c["entries_total"] >= 3
+    assert c["per_term"] == {"leave": 1, "consent": 1, "say no": 1}
+    assert set(c["per_term"]) <= set(tool.HINT_TERMS) and all(isinstance(v, int) for v in c["per_term"].values())
+    assert res["review_hint_counts"] == c
+
+
+def test_a2c_c_the_hint_decides_nothing_reports_and_mapping_are_byte_equal_with_it_off(pinned, tmp_path, monkeypatch):
+    w = _hint_world(pinned, tmp_path, monkeypatch)
+    rc, on, err = cli(argv_for(w))
+    assert rc == 0, err
+    with monkeypatch.context() as mc:
+        mc.setattr(tool, "review_hint", lambda text: [])
+        rc, off, err = cli(argv_for(w))
+    assert rc == 0, err
+    ron, roff = Path(on["run_dir"]), Path(off["run_dir"])
+    names = sorted(p.name for p in (ron / "reports").iterdir())
+    assert names == sorted(p.name for p in (roff / "reports").iterdir())
+    for n in names:                                                                        # every report, the mapping and the frozen lists: byte-equal
+        assert (ron / "reports" / n).read_bytes() == (roff / "reports" / n).read_bytes(), n
+    assert on["repair_list_sha256"] == off["repair_list_sha256"] and on["scope_ids_sha256"] == off["scope_ids_sha256"]
+    assert on["outcomes"] == off["outcomes"] and on["candidates"] == off["candidates"]
+    strip = lambda t: "\n".join(l for l in t.splitlines() if not l.startswith("hint:"))
+    for pat in ("review-excerpts-*.md", "left-list-*.md"):                                 # identical apart from the hint lines
+        a, b = next((ron / "review").glob(pat)).read_text(), next((roff / "review").glob(pat)).read_text()
+        assert strip(a) == strip(b) and a != b
+    assert json.loads((roff / "run-record.json").read_text())["review_hint_counts"] == {"entries_marked": 0, "entries_total": json.loads((ron / "run-record.json").read_text())["review_hint_counts"]["entries_total"], "per_term": {}}
+
+
+def test_a2c_c_the_review_hint_never_changes_the_excerpt_hashes_or_the_gates(pinned, tmp_path, monkeypatch, p3_stub):
+    w = _hint_world(pinned, tmp_path, monkeypatch)
+    rc, res, err = cli(argv_for(w))
+    assert rc == 0, err
+    rl = json.loads((Path(res["run_dir"]) / "reports" / "repair-list.json").read_text())
+    for c in rl["candidates"]:
+        assert set(c) == {"id", "outcome", "class", "old_len", "new_len", "old_sha16", "new_sha16", "excerpt_sha256", "flags",
+                          "source_node", "inner_open_rel", "closer_rel", "removed_prefix_len"}
+        assert "hint" not in json.dumps(c["flags"])
+
+
+# ---- le-034 C-1: a zero-write apply STOPs and retires nothing; the RETIRED receipt carries the struck trace -----------------
+
+def _copy_and_retouch(rd, ap, name, mutate):
+    ap2 = rd / name
+    shutil.copy(ap, ap2)
+    return str(ap2), _retouch_approvals(rd, str(ap2), mutate)
+
+
+def test_c1_an_all_struck_packet_stops_writes_nothing_and_retires_nothing(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    ap2, aps2 = _copy_and_retouch(rd, ap, "approvals-allstruck.json", lambda b: [e.__setitem__("decision", "struck") for e in b["entries"]])
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps)
+    before = file_hashes(w.ckpt)
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap2, aps2), probes=FakeProbes())
+    assert rc == 3 and "nothing to apply" in err
+    assert file_hashes(w.ckpt) == before
+    assert not list(Path(p2).glob("RETIRED-*.receipt")) and not list(Path(p2).glob("post-apply-receipt-FINAL-*.json"))
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps), probes=FakeProbes())    # the one-shot was NOT consumed: a real packet still applies
+    assert rc == 0, err
+
+
+def test_c1_a_partly_struck_packet_completes_and_the_retired_receipt_carries_the_count_and_a_pointer(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    struck_old = w.ids["SEP2"]
+    aps2 = _retouch_approvals(rd, ap, lambda b: [e.__setitem__("decision", "struck") for e in b["entries"] if e["id"] == struck_old])
+    p2, msha = _backup_and_args(w, rd, frozen, ap, aps2)
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps2), probes=FakeProbes())
+    assert rc == 0, err
+    final = next(Path(p2).glob("post-apply-receipt-FINAL-*.json"))
+    ret = json.loads(next(Path(p2).glob("RETIRED-*.receipt")).read_text())
+    assert ret["struck_deviations"] == 1                                                  # the COUNT only; ids/hashes stay in the FINAL receipt
+    assert ret["post_apply_receipt"] == final.name and ret["post_apply_receipt_sha256"] == tool.sha256_file(str(final))
+    assert struck_old not in json.dumps(ret)
+
+
+# ---- le-034 C-2: foreign_unreadable is PERSISTED in the manifest, hold-start and both receipts -------------------------------
+
+class ForeignProbes(FakeProbes):
+    foreign_unreadable = 0
+
+    def processes_matching(self, patterns):
+        self.foreign_unreadable += 2
+        return super().processes_matching(patterns)
+
+    def files_held_open(self, paths):
+        self.foreign_unreadable += 1
+        return super().files_held_open(paths)
+
+
+def test_c2_foreign_unreadable_is_persisted_in_the_manifest_hold_start_and_both_receipts(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    rc, res, err = cli(_p2_argv(w, *_partner_args(w)), probes=ForeignProbes())
+    assert rc == 0, err
+    p2, msha = res["run_dir"], res["backup_manifest_sha256"]
+    want = {"p4": 3, "p6": 2}
+    assert json.loads(next(Path(p2).glob("backup-manifest-*.json")).read_text())["foreign_unreadable"] == want
+    assert json.loads((Path(p2) / "hold-start.json").read_text())["foreign_unreadable"] == want
+    rc, res2, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps), probes=ForeignProbes())
+    assert rc == 0, err
+    final = next(Path(p2).glob("post-apply-receipt-FINAL-*.json"))
+    assert json.loads(final.read_text())["foreign_unreadable"] == want
+    argv = _p2_argv(w, "--run-dir", p2, "--josh-go", "GO-RB", "--josh-go-manifest-sha256", msha,
+                    "--josh-go-receipt-sha256", tool.sha256_file(str(final)), step="rollback")
+    rc, res3, err = cli(argv, probes=ForeignProbes())
+    assert rc == 0, err
+    assert json.loads(next(Path(p2).glob("rollback-receipt-*.json")).read_text())["foreign_unreadable"] == want
+
+
+# ---- le-034 C-3: a non-finite --code-placed-at is refused with a clear message -------------------------------------------
+
+@pytest.mark.parametrize("bad", ["nan", "NaN", "inf", "-inf", "Infinity"])
+def test_c3_a_non_finite_code_placed_at_is_refused_clearly(pinned, tmp_path, monkeypatch, bad):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    n_runs = len(list(w.backups.iterdir()))
+    rc, res, err = cli(_with_flag(_p2_argv(w), "--code-placed-at", bad), probes=FakeProbes())
+    assert rc == 2 and "finite" in err
+    assert len(list(w.backups.iterdir())) == n_runs
+
+
+# ---- le-034 C-4: two rollbacks in the same second never overwrite an earlier displaced copy --------------------------------
+
+def test_c4_a_same_second_collision_never_overwrites_an_earlier_displaced_copy(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    shutil.rmtree(Path(a.p2) / "stage")                                                   # force the displaced-copy branch both times
+    monkeypatch.setattr(tool, "utc_stamp", lambda: "20260930T130000Z")                    # ONE second for everything below
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 0, err
+    first = Path(a.p2) / "displaced-20260930T130000Z"
+    assert first.is_dir()
+    first_state = {n: (os.stat(first / n).st_ino, tool.sha256_file(str(first / n))) for n in (tool.MAIN_NAME, tool.SIDECAR_NAME)}
+    for n in (tool.MAIN_NAME, tool.SIDECAR_NAME):                                         # put the post-apply state back, then roll back AGAIN
+        shutil.copyfile(first / n, w.ckpt / n)
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 0, err
+    second = sorted(p.name for p in Path(a.p2).glob("displaced-*"))
+    assert len(second) == 2 and "displaced-20260930T130000Z" in second
+    assert {n: (os.stat(first / n).st_ino, tool.sha256_file(str(first / n))) for n in first_state} == first_state     # the first copy untouched
+    assert len(list(Path(a.p2).glob("rollback-receipt-*.json"))) == 2                       # nor the earlier rollback receipt
+
+
+# ---- N-2: --apply and --step rollback together are refused ----------------------------------------------------------------
+
+def test_n2_apply_and_step_rollback_together_are_mutually_exclusive(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    rc, res, err = cli(_rb_argv(a, "--apply"), probes=FakeProbes())
+    assert rc == 2 and "mutually exclusive" in err and file_hashes(a.w.ckpt) == a.after
