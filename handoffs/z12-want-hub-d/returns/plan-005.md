@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5d] — the [R5d·…] edit below is commit 37d7e848b97ad3ba25d3c5ed078b8b49259f2977 on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11037) — plan-005 EDITED IN PLACE, the ONE small edit [R5d·…]
 #   What: plan-005 edited in place (no new file): Exec Packet 419 (docs 3c9e4447; via Chief-003) — M1(a), E1 and the build gate RULED — plus le-020
 #     (ROLE B re-check of the R5c fold: NO LAW VIOLATION, 2 MEDIUM at arming + 5 LOW) and checker-021 (ROLE A: PASS, 1 LOW). Read in full first.
