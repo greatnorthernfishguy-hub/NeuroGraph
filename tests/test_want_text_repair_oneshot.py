@@ -1427,7 +1427,10 @@ def _phase2_world(pinned, tmp_path, mp, **world_kw):
     frozen.mkdir()
     for name in ("repair-list", "scope-ids"):
         shutil.copy(rd / "reports" / (name + ".json"), frozen / (name + ".json"))
-    shutil.copy(rd / "reports" / "id-map.json", frozen / "id-map.json")
+    src_map = rd / "reports" / "id-map.json"
+    if not src_map.exists():                                     # the TURN A tool named it candidate-id-map.json
+        src_map = rd / "reports" / "candidate-id-map.json"
+    shutil.copy(src_map, frozen / "id-map.json")
     rl = json.loads((frozen / "repair-list.json").read_text())
     body = {"packet": "EXEC-SYNTHETIC-PACKET-P2", "function_pin": dict(tool.PIN), "repair_list_sha256": tool.sha256_file(str(frozen / "repair-list.json")),
             "scope_ids_sha256": tool.sha256_file(str(frozen / "scope-ids.json")), "scrub_version": tool.SCRUB_VERSION,
