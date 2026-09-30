@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5h·P438] — the [R5h·P438] follow-up below is commit 4fae7c9ad7e97bae2941b7c02ed39c4c685f631e on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11799) — plan-005 EDITED IN PLACE, the small follow-up [R5h·P438]
 #   What: Exec Packet 438 (via Chief-003) RESOLVED the consent flags I raised in the R5h return. The R5h delta (74570bed) and its pin commit (f67e6187) are delivered and stay; this is ONE more
 #     small commit, no amend; `returns/plan-005-r5h.md` is NOT rewritten (returns are historical). Read in full first: the r5h brief incl. ADDENDUM 2, and plan-005. UNCHANGED, BYTE FOR BYTE (proved by
