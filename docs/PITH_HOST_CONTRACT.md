@@ -204,7 +204,17 @@ how MANY items, never how much of one.
 The other places a learned item can be left out are loud too (#818): a neighbour declined
 by `CC_PITH_PROVIDER_MEMBERS` or `CC_PITH_PROVIDER_DEPTH`, a basin skipped at ≥60 %
 overlap with a higher-ranked one, and a recall result beyond the root count. Each is one
-INFO line per call with the count, the total size and the reason (ids named once). (A keyframe applies only together with its delta; a budgeted
+INFO line per call with the count, the total size and the reason (ids named once).
+
+**An over-budget node (#819).** A node whose whole text cannot fit the usable envelope is not
+split at ingest (LAW 7: raw means complete; a long turn stays one node / one forest) and is
+not cut. Its *rendering* becomes its concept trees, each whole, plus one line that points to
+the whole: `A long node (id …; ≈300k chars; 2026-09-21; 3 concept trees) is related to this
+cue; it is too large to render whole here, so its concepts follow.` One INFO line per call
+records it. The node itself still activates and learns in full. Text-derived exact anchors
+of the unshown whole are not mined (metadata anchors are). **Dependency:** for pre-PASS-2
+forests the trees cover only the first 2,000 characters until PASS 2 (the laptop TID) runs;
+full coverage arrives with PASS 2. (A keyframe applies only together with its delta; a budgeted
 context has no room for the delta, so no keyframe is used here.)
 
 Slice A does not add a provider-specific victim cache. Recapture remains owned
