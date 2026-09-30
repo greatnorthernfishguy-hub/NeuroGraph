@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5j·#852] — the [R5j·#852] plan-sync below is commit 4beb05787b2a7852561da314506f4914310c2962 on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #12089) — plan-005 PLAN-SYNC to the accepted (d) engine fold [R5j·#852]
 #   What: Chief-003 / Exec P448 ruled the (d) engine fold pair-look MET: the CODE STANDS, the PLAN TEXT is the drift (#852 D-1: "amend plan-005 4.2(d)/(f) … in a plan-sync commit BEFORE any arming/merge;
 #     wording fold, no re-look"). ONE wording fold, no engine change, no re-look. The engine facts are taken from the brief and the two accepted pair verdicts (`git show

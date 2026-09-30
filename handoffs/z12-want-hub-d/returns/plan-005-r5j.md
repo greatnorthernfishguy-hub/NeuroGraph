@@ -2,7 +2,7 @@
 
 Lane `want-hub-competition-d` · dispatch #12089 · author thread `097da447` · PLAN ONLY: `neuro_foundation.py` untouched, no data load, nothing built. Branch `cc-laptop-want-hub-d-20260930`, head at dispatch `e62fc2d35350694b535136c8976e2e0128fab843`.
 
-**Commits:** the `[R5j·#852]` commit on `handoffs/z12-want-hub-d/returns/plan-005.md` + this file, then ONE pin-line follow-up; a commit cannot contain its own hash, so both full hashes are in plan-005's changelog pin line and in my report. Cite the hash, never the file name.
+**Commits:** `4beb05787b2a7852561da314506f4914310c2962` — the `[R5j·#852]` commit on `handoffs/z12-want-hub-d/returns/plan-005.md` + this file (pinned here and in plan-005's changelog by ONE one-line follow-up; a commit cannot contain its own hash, so that follow-up's hash is in my report). Cite the hash, never the file name.
 
 ## Hunks changed in plan-005 (section — one line each; `git diff --stat`: ONE file + this return)
 - **Changelog (top):** new entry `[R5j·#852]`, one bullet per item (1 default-path refused · 2 tuple/one-shape · 3 C7 wording + random-id G · 4 merge precondition · 5 #850/#851 pointers). **Lead / legend:** #852 named.
