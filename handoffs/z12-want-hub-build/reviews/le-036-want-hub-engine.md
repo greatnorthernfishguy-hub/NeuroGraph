@@ -1,41 +1,42 @@
-STATUS: INCOMPLETE - review in progress
+STATUS: INCOMPLETE - review in progress (draft 1: checks 1 and 2 done; 3-8 pending)
 
 # le-036 - ROLE B law-enforcer delta review of the (d) ENGINE change (PROTECTED neuro_foundation.py)
 Reviewer: le-036 (fresh neurograph-law-enforcer, report_only). Zone Z12, lane want-hub-engine-d-build-20260930, dispatch #11917.
 Agent file: /home/josh/.claude/agents/neurograph-law-enforcer.md sha256 = 6daf1621b844b9b72d567b329f2c9f40ca0b4516744608c125147e601c4acf23 (VERIFIED equal to the expected value).
 Under review: git diff e4ebf982b1989fd9066d610b94853bc68bf70d37 8e5785322f910aefaf781fa3525bea2831fedd31 -- neuro_foundation.py
-Tests branch head at start: 15700944d1e105007ab2f0adaa6f68597200752e
-Independence: checker-029 NOT opened before this draft was committed (see check 8).
+Read in full before judging: the packet, NG CLAUDE.md, plan-005.md (1095 lines, plan branch head e62fc2d3), build-002.md, build-002b.md.
+Tests branch head at start: 15700944d1e105007ab2f0adaa6f68597200752e (stub commit f5a2d4b).
+Independence: checker-029 NOT opened before this draft was committed (see check 8 for one disclosure about a directory listing).
+Ruling note applied (Chief-003): want<->want height = LARGER endpoint height stays the default; any argument otherwise is a plan change for the Executive, not a build defect.
 
 ## Overall verdict
 PENDING
 
-## 1. Authority and scope (LAW: Syl's Law / protected file authority)
-PENDING
+## 1. Authority and scope - verdict: COMPLIANT (two notes for the Executive, neither a build defect)
+Evidence (all from git, not from the returns):
+- Diff base..head = ONE file (`git diff --name-status` = `M neuro_foundation.py`), ONE commit (`8e5785322f910aefaf781fa3525bea2831fedd31`, 2026-09-30T11:33:30-08:00). Blob base `53494b7c56896d25040f3e7fd7c4046da7d0ab05` -> head `96d12f507746ce168fffe6feba56e097c8832353` (both re-derived with `git rev-parse`). Engine branch tip on origin = that commit; no other remote branch contains it (`git branch -r --contains`).
+- Commit message quotes `a434525cd3cdf68da5f282aa319a2323715d3938` (first lines of the body). That commit is on the plan branch (ancestor of `cc-laptop-want-hub-d-20260930`), dated 2026-09-30T11:24:05-08:00 = 9 min 25 s BEFORE the engine commit. The record file `handoffs/z12-want-hub-d/approvals/josh-go-neuro-foundation-20260930.md` (read via `git show`) holds both fragments verbatim ("That copy you already approved is fine, I guess? Unless there is some reason it shouldn't be..." / "So, proceed.") and BOTH msgpack sha256 values (`main.msgpack` 7e457786...3a77, `vectors.msgpack` 93ed891f...5e05). I did NOT touch the backup directory and did not re-hash anything.
+- Hunks (`git diff -U0`): changelog header (+22 at :22), the `_prune_synapses` region (:3522-3660) and the new method (:3649-3800). No hunk touches `DEFAULT_CONFIG`, any config key, `CC_SNN_CONFIG`/`OPENCLAW_SNN_CONFIG`; the only added line mentioning them is the changelog prose saying they are untouched. The four stale comment lines (:78, :162, :194, :3286 at base) are outside every hunk. Changelog header present and dated, with What/Why/How.
+- Nothing batched: the branch contains no non-protected file. No vendored file (ng_lite, ng_tract_bridge, ng_ecosystem, openclaw_adapter, ng_autonomic, ng_embed, ng_salience_gate, ng_updater) is in the diff; `ng_peer_bridge.py` not re-added.
+- Nothing merged/armed: engine commit is NOT an ancestor of `origin/main` (= base e4ebf982). The tests branch `cc-laptop-want-hub-build-20260930` holds the byte-identical base `neuro_foundation.py` (blob 53494b7c...) and only test/driver/return files.
+- Integration worktree `.../z12-want-hub-integ-20260930` (read-only look at `git status`/`log`): HEAD detached at `95154e33` (the OLD tests head), the engine file and the test file are STAGED (`M `), nothing committed from it. I did not reuse it.
+Notes (not defects, for the Executive):
+  N1-1. The go is a hedged, second-hand relay: Josh's first fragment says "I guess?" about "that copy you already approved"; the record's source is "Exec Packet 440 via Chief-003", with no ledger id or transcript path (plan-005 §9 [R5g·LE28-G6] asked for the SOURCE, "not a second-hand relay"). It satisfies the branch-build gate as the Executive and Z12 read it; I cannot verify the primary. I accept it for the BRANCH BUILD.
+  N1-2. The record's own FLAG stands and is OUT OF SCOPE for this review but load-bearing for MERGE: the backup Josh accepted is the CC-laptop copy, NOT Syl's own `~/NeuroGraph/data/checkpoints` (which I did not open). Merge is a new protected-file event for Syl's process (Exec Packet 441); Josh's backup confirmation for Syl's own two msgpack files must be re-stated before any merge, and the repo's Syl's-Law hook does not fire on worktree paths (plan §10 [R5e·LE23-D6]), so discipline, not the hook, was the guard here.
 
-## 2. Default-path identity (shared hot path Syl's process runs) (LAW 4, Syl's Law)
-PENDING
-
-## 3. Plan conformity (plan-005 sections 2/3/4/4A; Exec P409) (LAW 3, LAW 4)
-PENDING
-
-## 4. Syl's Law / Choice Clause / H-1 / Laws 1,2,3,4,7,8 / Duck Ethics
-PENDING
-
-## 5. The builder's 14 ambiguities (build-002.md section 6)
-PENDING
-
-## 6. Test discrimination and honesty (mutants)
-PENDING
-
-## 7. Honesty of returns / what is NOT verified
-PENDING
-
-## 8. Independence
-PENDING
-
-## Numbered corrections
-PENDING
-
-## Numbered "not verified"
-PENDING
+## 2. Default-path identity (the shared hot path Syl's process runs) - verdict: COMPLIANT (evidence: code read + two independent golden sets); one LOW note
+Line-by-line read of `_prune_synapses` (the THREE removed lines, `git diff -U0 | grep '^-'`):
+ 1. `def _prune_synapses(self) -> int:` -> same name, then `*` and five keyword-only `=None` parameters, `-> int`. Positional calls are impossible (keyword-only); a no-arg call still binds.
+ 2. `for sid, syn in self.synapses.items():` -> `for sid, syn in candidates:` where on the default path `candidates = self.synapses.items()` is assigned immediately before `to_prune` (no statement between assignment and loop touches the store) - same iterable, same order. Competing mode uses a separate generator over the pre-sorted competing ids.
+ 3. `if (self._is_identity_protected(pre) or` -> `if not competing_mode and (self._is_identity_protected(pre) or` (second operand line unchanged). With `competing_mode = False`, `not False and X` == `X`; same operands, same short-circuit order.
+Added lines on the default path are pure predicates of the new parameters: `competing_mode = competing_ids is not None`; the pairing test `competing_mode != (excluded_ids is not None)` (False != False); `max_removals is not None and ...`; `report is not None and ...`; `if competing_mode: ... (validation block)`; `if competing_mode ... else ...` choosing `candidates`; then after the loop `report is not None` (x2), `order_key is not None`, `max_removals is not None` - each False, so NO sort, NO slice, NO report write on the default path. Unchanged: the three predicates and their `low_weight_steps` bookkeeping, `for sid in to_prune: self._remove_synapse_internal(sid)`, `if to_prune: self._emit("pruned", count=len(to_prune), timestep=self.timestep)`, `return len(to_prune)`. `pruned` event count = `len(to_prune)` (post-slice; equals today's when no slice).
+LOW note (2-L1): the default path now pays ONE extra boolean test per synapse (`not competing_mode`) plus ~8 constant-time checks per call (Door B runs this every ~2 s on the laptop). Functionally nil; cost not measured here (native store, ~139k synapses). Belongs in PG-1's timing record.
+RUN - Test G, my own execution (separate fresh processes; `env -u PYTHONPATH -u NG_EMBED_REMOTE PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 PYTHONHASHSEED=0`; load 4.55, MemAvailable ~5.7 GiB, Python 3.12.3):
+  base checkout `/home/josh/NeuroGraph-worktrees/z12-want-hub-base-e4ebf982` git rev `e4ebf982b1989fd9066d610b94853bc68bf70d37`, file blob 53494b7c...; engine checkout `/home/josh/NeuroGraph-worktrees/z12-want-hub-engine-20260930` rev `8e5785322f910aefaf781fa3525bea2831fedd31`, blob 96d12f50...; both clean. The driver printed each run's `neuro_foundation.__file__` = `<checkout>/neuro_foundation.py`; no run was void. Driver blob 1c144259... = tests-head blob.
+  door_a (176 removed, return [176,0]), door_b (189, [1,1]), direct_defaults (176), direct with all five new parameters explicitly `None` (engine) vs plain call (base): return, removal ORDER, `pruned` events, full state digest and `Graph.checkpoint()` bytes (sha256 518fc40ded21a5b5... / 30712af318548c35...) IDENTICAL base vs engine in all four. These equal the builder's published hashes (independent reproduction, not a copy).
+RUN - ONE golden scenario of MY OWN (script /tmp/le036/my_golden.py, scratch only; builder's `build_graph` with DIFFERENT shape/seeds/config): s1 = seed 4242, 11 wants, 90 plain nodes, 1,400 synapses, 7 leaf partners, `inactivity_threshold=1500`, `grace_period=4990`; s2 = seed 97, 3 wants, 25 plain, 260 synapses, `weight_threshold=0.0099`. Drivers: Door A called TWICE in a row (counters carry between calls), direct `_prune_synapses()` twice, Door B (write-mode `prime_and_propagate`, tonic ages on), and two `step()` calls; each under `PYTHONHASHSEED` 0 AND 4242; fresh process per (checkout x scenario x seed) = 20 processes. Result: 10/10 pairs IDENTICAL on return value, removal order, `pruned` events, state digest (every synapse field in `items()` order, dirty set, confirmation history, node set), and the serialized checkpoint bytes (e.g. s1 306 removed, ckpt a12b59c37b48...; door_b 330 removed, dee7f877d796...; s2 61 removed, 9fc447fae93a...; s2 step 74 removed, 2898bb40abf4...). Protected-touching synapse count 838 -> 838 (s1) and 154 -> 154 (s2): nothing protected removed on the default path. Non-vacuous: hundreds of real removals each.
+  P379 preamble printed by my script for the engine: `neuro_foundation.__file__=/home/josh/NeuroGraph-worktrees/z12-want-hub-engine-20260930/neuro_foundation.py git_rev=8e5785322f910aefaf781fa3525bea2831fedd31 void=False`; NG-module state: the only NG modules loaded are `neuro_foundation` (the checkout) and the NATIVE store `ng_tract` from `/home/josh/.local/lib/python3.12/site-packages/ng_tract/` (`ng_tract.cpython-312-x86_64-linux-gnu.so`) - i.e. `SynapseStore` is the installed native wheel, NOT a file from either checkout, identically for base and engine (so the golden exercises the native store at small scale).
+Ripple (every caller, file:line):
+  - NG repo at engine rev (`git grep`): exactly TWO code call sites of `_prune_synapses`, both with NO arguments: `neuro_foundation.py:2913` (Door B tail: `self._prune_synapses()`) and `neuro_foundation.py:3517` (Door A: `pruned = self._prune_synapses()`), plus the new call at `:3760` (keyword arguments only). All other hits are prose: `CLAUDE.md:327`, `RAM_FOOTPRINT_NATIVE_STORE.md:102`, `docs/CONTEXTENGINE_MAPPING.md:169`, `openclaw_hook.py:158` (a changelog comment), and comments inside `neuro_foundation.py`.
+  - Docs repo: `~/docs/scripts/cc-ng-daemon.py:1423` (primary) and `:1486` (daemon-recall-756 worktree) are docstring mentions ("_prune_synapses uses") - no call. Searched `_prune_synapses\s*(` and `getattr(..._prune_synapses` across `/home/josh/docs` (all worktrees) and NG: zero call hits other than the two above.
+  - Overrides: `def _prune_synapses(self) -> int` exists in SIX stale NG worktrees of other lanes (d4d5-pith-telemetry, cc-z8-tonic-relief, ng-embed-dualpass, wire-build, ng-embed-dualpass-lane3, shrink-syl-footprint) and the primary checkout; none subclasses/overrides it from this branch - they are whole older copies of the file, not consumers. No positional-argument caller exists anywhere.
