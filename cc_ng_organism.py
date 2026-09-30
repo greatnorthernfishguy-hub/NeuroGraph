@@ -446,6 +446,29 @@
 #   same lossy-clipping class as the resolver's 240 default; fixed at the source.
 # How:  One argument removed, on the e4ebf982 base. Expected conflict with #813 (84a0968a) at
 #   this call site: see the #812 turn-1 return for the correct merged form.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
+#   TURN 2 (dispatch #10952) step (1b) -- #816 on BOTH Pith-ON streams AND the gate-off path,
+#   plus THE ONE budget rule
+# What: (1) cc_assemble_recall asks recall for whole_content=True (was the 300-char snippet on
+#   the Pith-ON pattern stream AND the gate-off block). (2) The SurfacingMonitor stream -- cut
+#   at 240 chars in SHARED surfacing.py/surface_resolver -- is re-resolved WHOLE by node_id
+#   through a CC-ONLY route (_cc_monitor_items_whole); the shared modules are not edited.
+#   (3) The gate-off / Pith-failure rendering is _cc_render_unpithed: a CC-side monitor block
+#   (_format_cc_monitor_block, layout-identical, no 200-char cut) + the Active Recall block,
+#   size controlled by HOW MANY items under the existing cc_l1_budget. (4) THE ONE BUDGET RULE
+#   (_pith_admit_strict_prefix + _pith_log_budget_drop) now serves _pith_provider_admit,
+#   pith_stage3 and _cc_render_unpithed: whole or absent; strict rank prefix on the remaining
+#   envelope; a never-fit unit is skipped (not emitted over budget, does not end the prefix);
+#   every drop is ONE INFO line naming count, total chars and never-fit node ids (bounded,
+#   first-time-seen). pith_stage3's "keep the first line even if it exceeds the budget" guard is
+#   REMOVED (silent overrun; le-017 F2 / checker-019 C3). (5) _pith_unified_rank factored out of
+#   pith_stage3 (no behaviour change; the un-Pithed path ranks by the same rule).
+#   _pith_fit_connected_line deleted (dead after the rewrite).
+# Why: checker-019 C1 (HIGH), C3; le-017 F1 (HIGH), F2, F8; Exec P410(c)/P416; brief TURN 2
+#   ADDENDUM 2. Shared surfacing.py/surface_resolver.py serve Syl's /assemble (P329, #812).
+# How: see handoffs/z12-pith-clip-813/plan-002.md sections 2-3. Decision D8 for the reviewer:
+#   the Stage 3 first-line guard is gone, so a recall whose every item is never-fit is empty
+#   (loudly) until #819's reference form supplies content.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813
 #   (dispatch #10841) — remove the Pith per-node clip; the budget is met by fewer
 #   WHOLE items, loudly
@@ -6231,6 +6254,126 @@ def pith_compress_history(turn_texts: List[str], graph: Any, per_turn_chars: Opt
     return out
 
 
+# ---------------------------------------------------------------------------
+# #813 -- THE ONE BUDGET RULE (Exec P411/P413/P416; checker-019 C3, le-017 F2/F8)
+# Used by the provider admit, Stage 3 and the un-Pithed renderer, so no budgeted path can
+# emit over budget, shorten an item, or drop one silently:
+#   1. WHOLE OR ABSENT -- nothing is shortened to fit.
+#   2. STRICT RANK PREFIX on the remaining envelope: the first unit that does not fit the
+#      space left ends admission; a lower-ranked unit never jumps it.
+#   3. NEVER-FIT (a unit that cannot fit an EMPTY envelope) is never emitted over budget
+#      and does NOT end the prefix; it is skipped (the #819 reference form is tried first).
+#   4. LOUD: every drop is ONE INFO line -- count, total chars, and the never-fit node ids
+#      (bounded, first-time-seen only, so a recurring giant cannot flood the log).
+# ---------------------------------------------------------------------------
+
+_CC_PITH_DROP_LOG_IDS_PER_CALL = max(1, min(64, int(os.environ.get("CC_PITH_DROP_LOG_IDS_PER_CALL", "8"))))
+_CC_PITH_DROP_LOG_SEEN_MAX = max(16, min(65536, int(os.environ.get("CC_PITH_DROP_LOG_SEEN_MAX", "4096"))))
+_PITH_DROP_SEEN: Dict[str, None] = {}          # insertion-ordered; oldest evicted past the max
+_PITH_DROP_SEEN_LOCK = threading.Lock()
+
+
+def _pith_note_ids(ids: Any) -> tuple:
+    """(shown, already_reported, more): the ids worth NAMING this call. An id is named the
+    first time it is seen; repeats are only counted (flood-safe), and at most
+    CC_PITH_DROP_LOG_IDS_PER_CALL new ids are named per call."""
+    shown: List[str] = []
+    already = more = 0
+    with _PITH_DROP_SEEN_LOCK:
+        for key in (str(i) for i in ids):
+            if key in _PITH_DROP_SEEN:
+                already += 1
+            elif len(shown) < _CC_PITH_DROP_LOG_IDS_PER_CALL:
+                shown.append(key)
+                _PITH_DROP_SEEN[key] = None
+                if len(_PITH_DROP_SEEN) > _CC_PITH_DROP_LOG_SEEN_MAX:
+                    _PITH_DROP_SEEN.pop(next(iter(_PITH_DROP_SEEN)))
+            else:
+                more += 1
+    return shown, already, more
+
+
+def _pith_log_budget_drop(where: str, budget_label: str, unit: str, size_note: str, budget: int,
+                          dropped: int, dropped_chars: int, kept: int, kept_chars: int,
+                          never_fit: Any = ()) -> None:
+    """The ONE INFO line for a budget drop (never called when nothing was dropped)."""
+    message = ("pith %s: %s %d chars met by dropping %d whole %s (%d %s); kept %d (%d chars)"
+               % (where, budget_label, budget, dropped, unit, dropped_chars, size_note,
+                  kept, kept_chars))
+    never_fit = list(never_fit)
+    if never_fit:
+        shown, already, more = _pith_note_ids(nid for nid, _chars in never_fit)
+        sizes = {str(nid): chars for nid, chars in never_fit}
+        named = ", ".join("%s (%d chars)" % (nid, sizes[nid]) for nid in shown)
+        extra = "".join([" [%d already reported]" % already if already else "",
+                         " [+%d more]" % more if more else ""])
+        message += "; never-fit (cannot fit an empty envelope): %s%s" % (named or "-", extra)
+    logger.info(message)
+
+
+def _pith_admit_strict_prefix(ordered: List[Any], budget: int, size_of: Any,
+                              separator: int = 0) -> tuple:
+    """The ONE rule over units already in rank order.  size_of(unit) is the unit's whole size
+    in an empty envelope; `separator` chars are charged between admitted units.
+    Returns (kept, dropped, never_fit, used) -- `dropped` includes `never_fit`."""
+    kept: List[Any] = []
+    dropped: List[Any] = []
+    never_fit: List[Any] = []
+    used = 0
+    stopped = False
+    for unit in ordered:
+        alone = size_of(unit)
+        if alone > budget:
+            never_fit.append(unit)
+            dropped.append(unit)
+            continue
+        if stopped:
+            dropped.append(unit)
+            continue
+        cost = alone + (separator if kept else 0)
+        if used + cost > budget:
+            dropped.append(unit)
+            stopped = True
+            continue
+        kept.append(unit)
+        used += cost
+    return kept, dropped, never_fit, used
+
+
+def _pith_default_weights() -> Dict[str, float]:
+    return {
+        "pattern": _CC_PITH_W_RELEVANCE,
+        "monitor": _CC_PITH_W_RECENCY,
+        "recall": _CC_PITH_W_RELEVANCE,
+        "victim": _CC_PITH_W_RECENCY,   # recovered drops: secondary prior, like recency
+    }
+
+
+def _pith_unified_rank(unpinned_lines: List[CacheLine],
+                       weights: Optional[Dict[str, float]] = None) -> List[tuple]:
+    """Stage 3 steps 2-4, factored out (no metrics, no side effects) so the un-Pithed
+    renderer ranks by EXACTLY the same rule: per-stream min-max normalisation, stream weight,
+    thermal fold, stable sort descending.  Returns [(unified, input_index, line)]."""
+    if weights is None:
+        weights = _pith_default_weights()
+    stream_bounds: Dict[str, tuple] = {}
+    for cl in unpinned_lines:
+        lo, hi = stream_bounds.get(cl.stream, (cl.score, cl.score))
+        stream_bounds[cl.stream] = (min(lo, cl.score), max(hi, cl.score))
+    scored: List[tuple] = []
+    for idx, cl in enumerate(unpinned_lines):
+        lo, hi = stream_bounds.get(cl.stream, (cl.score, cl.score))
+        norm = 1.0 if hi <= lo else (cl.score - lo) / (hi - lo)
+        weight = weights.get(cl.stream, 1.0)
+        # Stage 5 thermal fold: warm content (high Ca_i/firing) is gently preferred.
+        # thermal defaults 0.0 -> multiplier 1.0 -> byte-identical to pre-Stage-5 ranking.
+        unified = weight * norm * (1.0 + _CC_PITH_THERMAL_GAIN * cl.thermal)
+        scored.append((unified, idx, cl))
+    # Ties keep input order because idx (ascending) is the secondary sort key.
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return scored
+
+
 def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None,
                  weights: Optional[Dict[str, float]] = None) -> List[CacheLine]:
     """Pith Stage 3: unified rank + char budget -- the L1 assembler core.
@@ -6289,72 +6432,30 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
 
     if budget_chars is None:
         budget_chars = _CC_PITH_L1_BUDGET
-    if weights is None:
-        weights = {
-            "pattern": _CC_PITH_W_RELEVANCE,
-            "monitor": _CC_PITH_W_RECENCY,
-            "recall": _CC_PITH_W_RELEVANCE,
-            "victim": _CC_PITH_W_RECENCY,   # recovered drops: secondary prior, like recency
-        }
 
     # Step 1: split pinned vs unpinned.
     pinned_lines = [cl for cl in cache_lines if cl.pinned]
     unpinned_lines = [cl for cl in cache_lines if not cl.pinned]
 
-    # Step 2: per-stream min/max over unpinned lines only.
-    stream_bounds: Dict[str, tuple] = {}
-    for cl in unpinned_lines:
-        lo, hi = stream_bounds.get(cl.stream, (cl.score, cl.score))
-        stream_bounds[cl.stream] = (min(lo, cl.score), max(hi, cl.score))
+    # Steps 2-4: normalise + weight + thermal fold + stable sort (shared with the
+    # un-Pithed renderer -- one ranking rule).
+    scored = _pith_unified_rank(unpinned_lines, weights)
 
-    # Steps 2-3: normalize + weight -> unified score, index-paired with
-    # unpinned_lines so the stable sort in step 4 can carry input order
-    # through as an explicit tie-breaker (Python's sort is already stable,
-    # but pairing with the original index makes that ties-keep-input-order
-    # guarantee explicit rather than incidental).
-    scored: List[tuple] = []
-    for idx, cl in enumerate(unpinned_lines):
-        lo, hi = stream_bounds.get(cl.stream, (cl.score, cl.score))
-        norm = 1.0 if hi <= lo else (cl.score - lo) / (hi - lo)
-        weight = weights.get(cl.stream, 1.0)
-        # Stage 5 thermal fold: warm content (high Ca_i/firing) is gently
-        # preferred. thermal defaults 0.0 -> multiplier 1.0 -> byte-identical
-        # to pre-Stage-5 ranking until the daemon populates cl.thermal.
-        unified = weight * norm * (1.0 + _CC_PITH_THERMAL_GAIN * cl.thermal)
-        scored.append((unified, idx, cl))
-
-    # Step 4: stable sort by unified score, descending. Ties keep input
-    # order because idx (ascending) is the secondary sort key.
-    scored.sort(key=lambda t: (-t[0], t[1]))
-
-    # Step 5: greedy budget fill, STRICT rank-prefix -- keep the top-ranked
-    # run that fits and stop at the first line that would overflow. We do NOT
-    # keep scanning for smaller lower-ranked lines that happen to fit: that
-    # would let rank-20 recency junk jump ahead of a dropped rank-8 relevance
-    # block, inverting the very ordering Stage 3 exists to enforce. The first
-    # line is always kept (even if it alone exceeds the budget) so a large top
-    # item never yields an empty L1. #813 (Exec P411/P413, Josh: no truncation): a
-    # line that doesn't fit is dropped WHOLE -- never replaced by a keyframe, which
-    # without its delta is a cut.  The drop is reported at INFO below.
-    kept_unpinned: List[CacheLine] = []
-    running_total = 0
-    for _unified, _idx, cl in scored:
-        full_len = len(cl.content or "")
-        if not kept_unpinned or running_total + full_len <= budget_chars:
-            kept_unpinned.append(cl)
-            running_total += full_len
-            continue
-
-        break
-    dropped = len(scored) - len(kept_unpinned)
+    # Step 5: THE ONE BUDGET RULE (see the block above).  Strict rank prefix on the remaining
+    # budget; a line is kept WHOLE or dropped WHOLE.  #813 (Exec P411/P413/P416, Josh: no
+    # truncation): never replaced by a keyframe (a keyframe without its delta is a cut), and
+    # -- checker-019 C3 / le-017 F2 -- no longer kept "even if it alone exceeds the budget":
+    # that guard was a silent overrun and made this the only budgeted path that emitted over
+    # budget.  A line that cannot fit an EMPTY budget is skipped and named in the INFO line.
+    kept_unpinned, dropped_lines, never_fit, running_total = _pith_admit_strict_prefix(
+        [cl for _unified, _idx, cl in scored], budget_chars,
+        lambda cl: len(cl.content or ""), separator=0)
+    dropped = len(dropped_lines)
     if dropped:
-        _kept_ids = {id(cl) for cl in kept_unpinned}
-        logger.info(
-            "pith stage3: L1 budget %d chars met by dropping %d whole items (%d chars); "
-            "kept %d (%d chars)",
-            budget_chars, dropped,
-            sum(len(cl.content or "") for _u, _i, cl in scored if id(cl) not in _kept_ids),
-            len(kept_unpinned), running_total)
+        _pith_log_budget_drop(
+            "stage3", "L1 budget", "items", "chars", budget_chars, dropped,
+            sum(len(cl.content or "") for cl in dropped_lines), len(kept_unpinned),
+            running_total, [(cl.node_id, len(cl.content or "")) for cl in never_fit])
 
     # [D5] Spec sec 13.3 terms, counted here because this is where the final L1
     # set exists: `pinned_lines + kept_unpinned` is exactly what this function
@@ -6794,66 +6895,26 @@ def _pith_render_connected_line(line: CacheLine) -> str:
     return "\n".join(lines)
 
 
-def _pith_fit_connected_line(line: CacheLine, max_chars: int) -> Optional[CacheLine]:
-    """Admit one relationship CacheLine WHOLE, or not at all.
-
-    #813 (Exec P411/P413, Josh: no truncation): a line is never shortened to fit.
-    Its prose, every relation, source, exact anchor and coherence/epistemic label
-    travel together exactly as rendered.  If the whole rendering does not fit
-    `max_chars` the line is refused (None) and the caller drops it, loudly.
-    """
-    if max_chars <= 0:
-        return None
-    if len(_pith_render_connected_line(line)) <= max_chars:
-        return _pith_copy_cache_line(line)
-    return None
-
-
 def _pith_provider_admit(lines: List[CacheLine], budget_chars: int) -> tuple:
-    """Admit a strict ranked prefix as WHOLE relationship cache lines.
+    """Admit WHOLE relationship cache lines by THE ONE BUDGET RULE (see its block above).
 
-    The budget is met by fewer whole assemblies, never by shortening one (#813).
-    The first line that does not fit the REMAINING envelope ends admission, so a
-    lower-ranked line never jumps a dropped higher-ranked one.  One refinement: a
-    line that could not fit even an EMPTY envelope is skipped instead of ending
-    admission, so one giant top-ranked assembly cannot blank all the others.
-
-    Anything dropped is reported at INFO -- how many whole assemblies and their
-    total rendered size -- so a budget drop is never silent.
+    #813 (Exec P411/P413, Josh: no truncation): nothing is shortened.  A cache line -- prose,
+    every relation, sources, coherence, exact anchors -- is admitted whole or not at all.
+    Admission is a strict ranked prefix on the remaining envelope; an assembly that could not
+    fit even an EMPTY envelope is skipped (it does not blank the rest) and named in the INFO
+    line; every drop is reported there with its count and total rendered size.
     """
     ordered = sorted(lines, key=lambda line: (-line.score, line.node_id))
-    kept = []
-    rendered = []
-    dropped_chars = 0
-    dropped_count = 0
-    stopped = False
-    used = 0
-    for line in ordered:
-        if stopped:
-            dropped_count += 1
-            dropped_chars += len(_pith_render_connected_line(line))
-            continue
-        separator = 2 if rendered else 0
-        fitted = _pith_fit_connected_line(line, budget_chars - used - separator)
-        if fitted is None:
-            whole = len(_pith_render_connected_line(line))
-            dropped_count += 1
-            dropped_chars += whole
-            if whole <= budget_chars:
-                # Would have fit an empty envelope: it lost on rank/space, so the
-                # ranked prefix ends here.  (Otherwise it can never fit -- skip it.)
-                stopped = True
-            continue
-        block = _pith_render_connected_line(fitted)
-        cost = len(block) + separator
-        kept.append(fitted)
-        rendered.append(block)
-        used += cost
-    if dropped_count:
-        logger.info(
-            "pith provider_context: learned budget %d chars met by dropping %d whole "
-            "assemblies (%d chars rendered); kept %d (%d chars)",
-            budget_chars, dropped_count, dropped_chars, len(kept), used)
+    sizes = {id(line): len(_pith_render_connected_line(line)) for line in ordered}
+    kept_lines, dropped, never_fit, used = _pith_admit_strict_prefix(
+        ordered, budget_chars, lambda line: sizes[id(line)], separator=2)
+    kept = [_pith_copy_cache_line(line) for line in kept_lines]
+    rendered = [_pith_render_connected_line(line) for line in kept]
+    if dropped:
+        _pith_log_budget_drop(
+            "provider_context", "learned budget", "assemblies", "chars rendered", budget_chars,
+            len(dropped), sum(sizes[id(line)] for line in dropped), len(kept), used,
+            [(line.node_id, sizes[id(line)]) for line in never_fit])
     return kept, rendered
 
 
@@ -7105,6 +7166,118 @@ def cc_deposit_pith_failure(exc: BaseException, tract_path: Optional[str] = None
                                 "cc_gateway", [tract_path or cc_gateway_tract_path()])
 
 
+def _cc_monitor_items_whole(ng: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """#816 CC-ONLY route for the SurfacingMonitor stream.
+
+    The shared monitor resolves each fired node with the shared resolver's default 240-char
+    bound (surfacing.py:192 -> surface_resolver.resolve_surface_item) BEFORE we see it.  Editing
+    that default or surfacing.py would change Syl's live /assemble path (P329, #812), so instead
+    this wrapper re-resolves each item's WHOLE content by node_id from the same node + vector-db
+    entry the monitor used (Exec P410(c): the wrapper renders full stored content).  Returns new
+    dicts -- the monitor's own items are never mutated.  Fail-soft per item: one that cannot be
+    re-resolved (unknown node, image frame, filtered, error) keeps what the monitor gave us and
+    is never dropped for that.
+    """
+    graph = getattr(ng, "graph", None)
+    vdb = getattr(ng, "vector_db", None)
+    out: List[Dict[str, Any]] = []
+    for item in items or []:
+        fresh = dict(item)
+        nid = item.get("node_id")
+        try:
+            node = graph.nodes.get(nid) if (graph is not None and nid) else None
+            if node is not None and not item.get("image_ref"):
+                from surface_resolver import resolve_surface_content
+                entry = vdb.get(nid) if vdb is not None else None
+                text = resolve_surface_content(node, entry, max_chars=sys.maxsize)
+                if text:
+                    fresh["content"] = text
+        except Exception as exc:
+            logger.debug("CC monitor whole-content re-resolve failed for %r (kept as given): %s",
+                         nid, exc)
+        out.append(fresh)
+    return out
+
+
+def _format_cc_monitor_block(items: List[Dict[str, Any]]) -> str:
+    """The CC-side twin of SurfacingMonitor.format_context WITHOUT its 200-char cut.
+
+    The layout is byte-identical for items the shared code would not cut (a parity test pins
+    it against the real shared function): the `[NeuroGraph Surfaced Knowledge]` header is
+    miniTID's rail marker and must not change.  Kept here rather than editing the shared
+    formatter, which also serves Syl's /assemble."""
+    if not items:
+        return ""
+    lines = ["[NeuroGraph Surfaced Knowledge]"]
+    for item in items:
+        content = item.get("content", "")
+        score = item.get("score", 0.0)
+        if not content and item.get("image_ref"):
+            lines.append(f"- [something you saw \u2014 image attached] (salience: {score:.2f})")
+            continue
+        lines.append(f"- {content} (salience: {score:.2f})")
+    return "\n".join(lines)
+
+
+def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
+                        pc_results: List[Dict[str, Any]], commons: Any,
+                        pc_fired_ids: List[str], on_surfaced: Optional[Any] = None) -> str:
+    """The un-Pithed recall rendering (gate OFF, or the Pith path raised): the SurfacingMonitor
+    block then the Active Recall block, every item WHOLE.
+
+    Size is controlled by HOW MANY (#816, Exec P410/P416): items are ranked by the same unified
+    rank as Stage 3 and admitted by THE ONE BUDGET RULE against the existing L1 budget
+    (cc_l1_budget); the lowest-ranked WHOLE items are dropped and ONE INFO line reports the
+    count and total size.  Short items that all fit render exactly as before."""
+    # Josh 2026-09-26: "When Pith fails, there HAS to be pass-through".  This is the fallback for
+    # a failed Pith pass, so it must not depend on the machinery that may have just failed, and
+    # it must never raise: if the ranking/budget step itself fails, every item is rendered WHOLE
+    # and unbudgeted, LOUDLY (warning) -- never dropped, never cut.
+    try:
+        try:
+            budget = cc_l1_budget(commons, getattr(ng, "graph", None), pc_fired_ids)
+        except Exception as exc:                               # never let the budget sink recall
+            logger.debug("un-Pithed budget lookup failed (static budget used): %s", exc)
+            budget = _CC_PITH_L1_BUDGET
+        tagged = (
+            [(CacheLine(node_id=i.get("node_id") or "", content=i.get("content", "") or "",
+                        score=float(i.get("score", 0.0) or 0.0), stream="monitor"), i)
+             for i in monitor_items]
+            + [(CacheLine(node_id=i.get("node_id") or "", content=i.get("content", "") or "",
+                          score=float(i.get("score", 0.0) or 0.0), stream="pattern"), i)
+               for i in pc_results])
+        origin = {id(cl): item for cl, item in tagged}         # line -> its recall item
+        ranked = _pith_unified_rank([cl for cl, _item in tagged])
+        kept_lines, dropped, never_fit, used = _pith_admit_strict_prefix(
+            [cl for _u, _ix, cl in ranked], budget, lambda cl: len(cl.content or ""), separator=0)
+        if dropped:
+            _pith_log_budget_drop(
+                "recall (un-Pithed)", "L1 budget", "items", "chars", budget, len(dropped),
+                sum(len(cl.content or "") for cl in dropped), len(kept_lines), used,
+                [(cl.node_id, len(cl.content or "")) for cl in never_fit])
+        kept = {id(origin[id(cl)]) for cl in kept_lines}
+    except Exception as exc:
+        logger.warning("un-Pithed budget step failed; rendering every item whole and unbudgeted: %s",
+                       exc)
+        kept = {id(i) for i in list(monitor_items) + list(pc_results)}
+    monitor_block = _format_cc_monitor_block([i for i in monitor_items if id(i) in kept])
+    pc_block = _format_cc_recall_block([i for i in pc_results if id(i) in kept])
+    if on_surfaced is not None:
+        # [lane 812-813-onto-s4] report exactly what this render emitted (the WHOLE kept items,
+        # monitor first; a monitor item counts only if its block rendered) and what the ONE
+        # budget rule dropped (whole).  Guarded by _cc_report: never changes the return.
+        _rendered = ([_cc_surfaced_item(i, 'monitor') for i in monitor_items
+                      if id(i) in kept and monitor_block]
+                     + [_cc_surfaced_item(i, 'pattern') for i in pc_results
+                        if id(i) in kept and pc_block])
+        _dropped = ([_cc_surfaced_item(i, 'monitor') for i in monitor_items if id(i) not in kept]
+                    + [_cc_surfaced_item(i, 'pattern') for i in pc_results if id(i) not in kept])
+        _cc_report(on_surfaced, _rendered, _dropped)
+    if monitor_block and pc_block:
+        return monitor_block + "\n\n" + pc_block
+    return monitor_block or pc_block
+
+
 def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: Any,
                         allow_pattern_completion: bool = True,
                         on_monitor_error: Optional[Any] = None,
@@ -7164,7 +7337,9 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     on_surfaced: optional reporter, on_surfaced(rendered, dropped), called once
     just before the return with what this pass actually surfaced. Each list
     holds {'stream', 'node_id', 'score', 'content'} dicts in render order;
-    `dropped` is what the Pith budget cut (always [] on the un-Pithed path).
+    `dropped` is what the budget dropped WHOLE (Pith Stage 3, or the un-Pithed
+    renderer's ONE budget rule since #813). `content` is the WHOLE text actually
+    rendered (an over-budget item reports its trees + one-line reference form).
     Reporting only -- the caller decides where it goes (LAW 4). Guarded like
     on_degraded; unset (default) = behaviour byte-identical.
 
@@ -7172,7 +7347,6 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     so this function is process-agnostic (Syl's-Law) and safe to call from
     either hemisphere with its own isolated instances.
     """
-    monitor_ctx = ''
     monitor_node_ids: set = set()
     monitor_items: List[Dict[str, Any]] = []
     try:
@@ -7180,10 +7354,8 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
         if monitor is not None:
             monitor_items = monitor.get_surfaced()
             monitor_node_ids = {item.get('node_id') for item in monitor_items}
-            monitor_ctx = monitor.format_context(monitor_items)
     except RuntimeError as exc:
-        monitor_ctx = ''  # dict mutation race during concurrent deposit
-        monitor_node_ids = set()
+        monitor_node_ids = set()  # dict mutation race during concurrent deposit
         monitor_items = []
         _cc_report(on_degraded, 'monitor_race', exc)
     except Exception as exc:
@@ -7193,11 +7365,13 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                 on_monitor_error(exc)
             except Exception:
                 pass  # the error-reporting hook itself must never break recall
-        monitor_ctx = ''
         monitor_node_ids = set()
         monitor_items = []
+    # #816 CC-ONLY ROUTE: the shared SurfacingMonitor cut each item at 240 chars before it
+    # reached us (surfacing.py:192 -> surface_resolver default).  Re-resolve every item's WHOLE
+    # content by node_id here; the shared modules stay untouched (Syl's /assemble, P329).
+    monitor_items = _cc_monitor_items_whole(ng, monitor_items)
 
-    pc_block = ''
     pc_results: List[Dict[str, Any]] = []
     # Everything pattern completion fired, before the display dedup against
     # the monitor below: the L1 budget's region is what fired, not what is new.
@@ -7209,13 +7383,15 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                 # Reporting only: lets the swallow INSIDE cc_pattern_completion_recall
                 # be seen. Not passed when unset, so the default call is unchanged.
                 pc_extra['on_error'] = lambda exc: _cc_report(on_degraded, 'pattern_completion_failed', exc)
-            pc_results = cc_pattern_completion_recall(ng, query, k, state=conv_state, **pc_extra)
+            # #816: WHOLE content for BOTH the Pith-ON stream and the gate-off block -- the
+            # budget (Stage 3 / the un-Pithed renderer) decides how MANY items, never how
+            # much of one (a 300-char snippet here was cut before any budget could see it).
+            pc_results = cc_pattern_completion_recall(
+                ng, query, k, state=conv_state, whole_content=True, **pc_extra)
             pc_fired_ids = [r.get('node_id') for r in pc_results if r.get('node_id')]
             pc_results = [r for r in pc_results if r.get('node_id') not in monitor_node_ids]
-            pc_block = _format_cc_recall_block(pc_results)
         except Exception as exc:
             logger.debug('Pattern-completion recall failed (non-fatal): %s', exc)
-            pc_block = ''
             pc_results = []
             pc_fired_ids = []
             _cc_report(on_degraded, 'pattern_completion_failed', exc)
@@ -7342,11 +7518,8 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # the WARNING/metrics above are untouched (guarded: never raises).
             _cc_report(on_degraded, 'pith_fallback', exc)
 
-    if on_surfaced is not None:
-        _cc_report(on_surfaced,
-                   [_cc_surfaced_item(it, 'monitor') for it in (monitor_items if monitor_ctx else [])]
-                   + [_cc_surfaced_item(it, 'pattern') for it in (pc_results if pc_block else [])],
-                   [])
-    if monitor_ctx and pc_block:
-        return monitor_ctx + "\n\n" + pc_block
-    return monitor_ctx or pc_block
+    # Gate OFF, or the Pith path failed: the un-Pithed rendering -- two blocks, monitor first --
+    # now WHOLE per item, size controlled by how MANY (the ONE budget rule, INFO on any drop).
+    # on_surfaced is reported by the renderer: only it knows which WHOLE items were kept.
+    return _cc_render_unpithed(ng, monitor_items, pc_results, commons, pc_fired_ids,
+                               on_surfaced=on_surfaced)

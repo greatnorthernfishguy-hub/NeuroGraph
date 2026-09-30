@@ -1,6 +1,16 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (1b): #816 + ONE rule
+# What: regression tests for the pair's HIGH (F1/C1): a >300-char pattern item and a >240-char
+#   monitor item survive Stage 3 WHOLE or are dropped WHOLE with the INFO line, on Pith-ON, on
+#   the gate-off path and on the Pith-failure fallback; the CC-only monitor route (shared
+#   surfacing.py / surface_resolver.py untouched); the ONE budget rule (F2, C3, F8); the AST guard
+#   now walks the COMPLETE caller set (C4, F6); golden vs BASE for cc_assemble_recall.
+# Why: checker-019 C1-C4, le-017 F1/F2/F6/F8; Exec P410(c)/P416.
+# How: fake in-memory ng/graph; recall swapped by an honest fake that cuts at 300 unless the
+#   caller asks whole_content=True (mirroring the real function), so a caller that forgets to ask
+#   FAILS the test. No live path.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 Pith clip removal tests
 # What: covers (1) a well-formed short node renders byte-identically to BASE e4ebf982
 #   (golden), (2) an over-700 node renders WHOLE, (3) when the budget binds whole
@@ -50,8 +60,10 @@ def test_p379_module_under_test_is_the_worktree_copy():
 @pytest.fixture(autouse=True)
 def _reset_metrics():
     pith._PITH_METRICS.reset()
+    pith._PITH_DROP_SEEN.clear()          # "first-time-seen" ids are process state by design
     yield
     pith._PITH_METRICS.reset()
+    pith._PITH_DROP_SEEN.clear()
 
 
 def _drop_records(caplog, marker):
@@ -211,20 +223,24 @@ def test_stage3_over_budget_line_is_dropped_whole_not_keyframed(caplog):
     low = pith.CacheLine.from_surfaced("low", "z" * 10, score=1.0, stream="pattern")
     with caplog.at_level(logging.INFO, logger=pith.logger.name):
         out = pith.pith_stage3([top, mid, low], budget_chars=300)
-    assert [l.node_id for l in out] == ["top"]
+    # turn 2 (ONE rule): mid cannot fit even an empty 300-char budget, so it is skipped WHOLE and
+    # does not end the prefix; the small lower-ranked line that fits is kept.
+    assert [l.node_id for l in out] == ["top", "low"]
     assert mid.content == mid_text                                   # never rewritten in place
     assert pith._PITH_METRICS.compressed_count == 0
     assert pith._PITH_METRICS.chars_saved == 0
     (record,) = _drop_records(caplog, "whole items")
-    assert "dropping 2 whole items" in record.getMessage()
-    assert f"({len(mid_text) + 10} chars)" in record.getMessage()
+    assert "dropping 1 whole items" in record.getMessage()
+    assert f"({len(mid_text)} chars)" in record.getMessage()
+    assert "mid" in record.getMessage() and "never-fit" in record.getMessage()
 
 
-def test_stage3_never_returns_an_empty_l1_and_logs_nothing_when_nothing_dropped(caplog):
-    big = pith.CacheLine.from_surfaced("big", "B" * 900, score=1.0, stream="pattern")
+def test_stage3_logs_nothing_when_nothing_is_dropped(caplog):
+    a = pith.CacheLine.from_surfaced("a", "A" * 200, score=2.0, stream="pattern")
+    b = pith.CacheLine.from_surfaced("b", "B" * 200, score=1.0, stream="pattern")
     with caplog.at_level(logging.INFO, logger=pith.logger.name):
-        out = pith.pith_stage3([big], budget_chars=500)
-    assert [l.node_id for l in out] == ["big"] and out[0].content == "B" * 900
+        out = pith.pith_stage3([a, b], budget_chars=500)
+    assert [l.node_id for l in out] == ["a", "b"]
     assert _drop_records(caplog, "whole items") == []
 
 
@@ -261,23 +277,7 @@ def test_provider_context_asks_recall_for_whole_content(monkeypatch):
     assert seen.get("whole_content") is True
 
 
-# ------------------------------------------------ structural: no cut in budgeted paths
-
-_BUDGETED = ("pith_stage3", "_pith_node_text", "_pith_fit_connected_line",
-             "_pith_provider_admit", "pith_provider_context",
-             "cc_pattern_completion_recall", "pith_connected_activation_basins",
-             "_pith_node_sources")
-_CUTTERS = {"pith_stage2_keyframe", "_pith_cut_at_word_boundary", "_pith_fit_statement"}
-
-
-def test_no_keyframe_or_word_cut_call_in_any_budgeted_path():
-    tree = ast.parse(open(_ORGANISM_SRC).read())
-    defs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    assert "_pith_fit_statement" not in defs
-    for name in _BUDGETED:
-        called = {c.func.id for c in ast.walk(defs[name])
-                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-        assert not (called & _CUTTERS), (name, called & _CUTTERS)
+# ------------------------------------------------ structural (turn 2: complete-caller-set tests below)
 
 
 def test_node_chars_knob_is_gone_from_the_organism_config_surface():
@@ -415,3 +415,251 @@ def test_bashrc_script_apply_prints_the_s4_checklist_reminder(tmp_path):
     out = _sh(tmp_path, "apply")
     assert out.returncode == 0
     assert "S4 checklist" in out.stdout and "cannot check" in out.stdout
+
+
+# =================================================================== TURN 2 (1b): #816 + ONE rule
+import surfacing as _shared_surfacing                                   # the REAL shared module
+from pith_clip_813_scenarios import FakeVectorDB, fake_ng, run_recall, build_recall_scenarios
+
+
+def _honest_recall(items_by_full):
+    """A recall fake that behaves like the real one: 300-char cut unless whole_content=True."""
+    seen = {}
+
+    def fake(_ng, _query, _k, *_a, **kwargs):
+        seen.update(kwargs)
+        out = []
+        for item in items_by_full:
+            item = dict(item)
+            if not kwargs.get("whole_content") and len(item["content"]) > 300:
+                item["content"] = item["content"][:299].rstrip() + "…"
+            out.append(item)
+        return out
+    return fake, seen
+
+
+def _recall(pith, ng, pc_items, pith_on, monkeypatch, commons=None):
+    fake, seen = _honest_recall(pc_items)
+    monkeypatch.setattr(pith, "cc_pattern_completion_recall", fake)
+    monkeypatch.setattr(pith, "cc_novelty", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(pith, "_CC_PITH_ENABLED", pith_on)
+    pith._PITH_VICTIM.clear()
+    try:
+        return pith.cc_assemble_recall(ng, "what next", 5, {}, commons), seen
+    finally:
+        pith._PITH_VICTIM.clear()
+
+
+def _long_world(long_len=900, count=1):
+    """A graph whose monitor node and pattern node are LONG; the fake monitor hands out the
+    240-char-cut text the SHARED surfacing.py produces."""
+    g = FakeGraph()
+    _core(g)
+    mon_full = "MONITOR-" + ("m" * (long_len - 8))
+    g.node("mon", mon_full)
+    monitor_items = [{"node_id": "mon", "content": mon_full[:239].rstrip() + "…", "score": 1.5}]
+    pc_full = []
+    pat = []
+    for i in range(count):
+        text = f"PATTERN{i}-" + ("p" * (long_len - 10))
+        g.node(f"pat{i}", text)
+        pat.append({"node_id": f"pat{i}", "score": 100.0 - i, "content": text,
+                    "prefetch_origin": False})
+        pc_full.append(text)
+    return g, mon_full, monitor_items, pat
+
+
+@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
+def test_816_long_pattern_and_monitor_items_are_rendered_whole(monkeypatch, pith_on):
+    g, mon_full, monitor_items, pat = _long_world(900)
+    out, seen = _recall(pith, fake_ng(g, monitor_items), pat, pith_on, monkeypatch)
+    assert seen.get("whole_content") is True, "the caller must ask recall for whole content"
+    assert pat[0]["content"] in out                                   # >300-char pattern item whole
+    assert mon_full in out                                            # >240-char monitor item whole
+    assert "…" not in out and "..." not in out
+
+
+@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
+def test_816_when_the_budget_binds_whole_items_are_dropped_with_an_info_line(monkeypatch, caplog,
+                                                                              pith_on):
+    g, mon_full, monitor_items, pat = _long_world(1500, count=3)     # 4 items x ~1500 > 4000
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out, _seen = _recall(pith, fake_ng(g, monitor_items), pat, pith_on, monkeypatch)
+    fulls = [mon_full] + [p["content"] for p in pat]
+    kept = [f for f in fulls if f in out]
+    dropped = [f for f in fulls if f not in out]
+    assert 1 <= len(kept) < len(fulls) and dropped
+    for f in dropped:                                                 # whole or ABSENT, never a piece
+        assert f[:20] not in out
+    assert "…" not in out
+    records = _drop_records(caplog, "whole items")
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    message = records[0].getMessage()
+    assert f"dropping {len(dropped)} whole items" in message
+    assert f"({sum(len(f) for f in dropped)} chars)" in message
+
+
+def test_816_failure_fallback_is_also_whole_and_budgeted(monkeypatch, caplog):
+    g, mon_full, monitor_items, pat = _long_world(1500, count=3)
+    monkeypatch.setattr(pith, "pith_stage1", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out, _ = _recall(pith, fake_ng(g, monitor_items), pat, True, monkeypatch)
+    fulls = [mon_full] + [p["content"] for p in pat]
+    assert any(f in out for f in fulls) and not all(f in out for f in fulls)
+    assert "…" not in out
+    assert _drop_records(caplog, "whole items")
+
+
+def test_816_shared_surfacing_and_resolver_are_not_edited():
+    changed = subprocess.run(
+        ["git", "-C", _ROOT, "diff", "--name-only", "e4ebf982b1989fd9066d610b94853bc68bf70d37"],
+        capture_output=True, text=True, check=True).stdout.split()
+    for shared in ("surfacing.py", "surface_resolver.py", "neurograph_rpc.py", "kiss_filter.py",
+                   "tonic_thread.py"):
+        assert shared not in changed, shared
+
+
+def test_cc_monitor_block_is_layout_identical_to_the_shared_format_context():
+    items = [{"node_id": "a", "content": "short one", "score": 1.7321},
+             {"node_id": "b", "content": "", "score": 1.1, "image_ref": "/tmp/x.png"},
+             {"node_id": "c", "content": "x" * 200, "score": 0.8}]              # exactly at the shared cut
+    shared = _shared_surfacing.SurfacingMonitor.format_context(SimpleNamespace(), items)
+    assert pith._format_cc_monitor_block(items) == shared
+    assert pith._format_cc_monitor_block([]) == ""
+
+
+def test_monitor_items_are_re_resolved_whole_by_node_id_and_fail_soft():
+    g = FakeGraph()
+    full = "z" * 700
+    g.node("a", full)
+    ng = fake_ng(g, [], vdb=FakeVectorDB({"v": {"content": "from the vdb " + "q" * 400}}))
+    g.node("v", "")                                                   # substrate empty -> vdb fallback
+    items = [{"node_id": "a", "content": full[:239] + "…", "score": 1.0},
+             {"node_id": "v", "content": "cut…", "score": 0.9},
+             {"node_id": "gone", "content": "kept as-is", "score": 0.5}]
+    out = pith._cc_monitor_items_whole(ng, items)
+    assert out[0]["content"] == full
+    assert out[1]["content"] == "from the vdb " + "q" * 400
+    assert out[2]["content"] == "kept as-is"                          # unknown node: never dropped
+    assert [o["score"] for o in out] == [1.0, 0.9, 0.5]
+
+
+def test_recall_short_items_render_exactly_as_base():
+    golden = json.load(open(os.path.join(
+        _ROOT, "tests", "fixtures", "pith_clip_813_golden_base.json")))["recall_scenarios"]
+    now = build_recall_scenarios(pith)
+    assert set(now) == set(golden) and len(now) == 6
+    for name, expected in golden.items():
+        assert now[name] == expected, name
+
+
+# ------------------------------------------------------------------- the ONE rule
+
+def test_one_rule_stage3_skips_a_never_fit_line_and_names_it(caplog):
+    top = pith.CacheLine.from_surfaced("top", "A" * 50, score=10.0, stream="pattern")
+    giant = pith.CacheLine.from_surfaced("GIANT-ID", "G" * 5000, score=5.0, stream="pattern")
+    small = pith.CacheLine.from_surfaced("small", "s" * 30, score=1.0, stream="pattern")
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.pith_stage3([top, giant, small], budget_chars=300)
+    assert [l.node_id for l in out] == ["top", "small"]              # never-fit does not end the prefix
+    assert giant.content == "G" * 5000
+    (record,) = _drop_records(caplog, "whole items")
+    assert "GIANT-ID" in record.getMessage() and "never-fit" in record.getMessage()
+
+
+def test_one_rule_stage3_never_emits_over_budget_F2(caplog):
+    big = pith.CacheLine.from_surfaced("big", "B" * 900, score=1.0, stream="pattern")
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.pith_stage3([big], budget_chars=500)
+    assert out == []                                                  # no silent overrun (F2)
+    (record,) = _drop_records(caplog, "whole items")
+    assert "big" in record.getMessage() and "900" in record.getMessage()
+
+
+def test_one_rule_stage3_pinned_lines_stay_outside_the_budget():
+    pin = pith.CacheLine.from_surfaced("pin", "P" * 2000, score=0.0, pinned=True, stream="pattern")
+    out = pith.pith_stage3([pin], budget_chars=500)
+    assert [l.node_id for l in out] == ["pin"] and out[0].content == "P" * 2000
+
+
+def test_one_rule_provider_admit_names_never_fit_ids_once_flood_safe(caplog):
+    pith._PITH_DROP_SEEN.clear()
+    giant, small = _cl("NEVERFIT-1", 9.0, 5000), _cl("s1", 2.0, 60)
+    budget = len(pith._pith_render_connected_line(small)) + 10
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        pith._pith_provider_admit([giant, small], budget)
+        pith._pith_provider_admit([giant, small], budget)
+    first, second = _drop_records(caplog, "whole assemblies")
+    assert "NEVERFIT-1" in first.getMessage() and "never-fit" in first.getMessage()
+    assert "NEVERFIT-1" not in second.getMessage()                    # first-time-seen only
+    assert "already reported" in second.getMessage()                  # but the drop is still counted
+
+
+# ------------------------------------------- F6 / C4: the COMPLETE caller set, not a name list
+
+def _module_calls(tree):
+    """[(enclosing function name, called name)] for Name AND Attribute calls, whole module."""
+    out = []
+
+    class V(ast.NodeVisitor):
+        def __init__(self):
+            self.stack = []
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node):
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+            if name:
+                out.append((self.stack[-1] if self.stack else "<module>", name))
+            self.generic_visit(node)
+    V().visit(tree)
+    return out
+
+
+def test_complete_caller_set_of_the_cutters_is_empty_outside_the_keyframe_primitive():
+    tree = ast.parse(open(_ORGANISM_SRC).read())
+    calls = _module_calls(tree)
+    keyframe_callers = {fn for fn, name in calls if name == "pith_stage2_keyframe"}
+    word_cut_callers = {fn for fn, name in calls if name == "_pith_cut_at_word_boundary"}
+    assert keyframe_callers <= {"pith_compress_history"}, keyframe_callers   # #817 removes it
+    assert word_cut_callers <= {"pith_stage2_keyframe"}, word_cut_callers
+    assert "_pith_fit_statement" not in {name for _fn, name in calls}
+
+
+def test_no_resolve_surface_content_call_passes_a_literal_character_cap():
+    tree = ast.parse(open(_ORGANISM_SRC).read())
+    seen = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if name in ("resolve_surface_content", "resolve_surface_item"):
+                seen += 1
+                for kw in node.keywords:
+                    if kw.arg == "max_chars":
+                        assert not isinstance(kw.value, ast.Constant), ast.dump(kw.value)
+    assert seen >= 2                                                  # recall + the CC monitor route
+
+
+def test_cc_assemble_recall_asks_recall_for_whole_content_by_literal_true():
+    tree = ast.parse(open(_ORGANISM_SRC).read())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "cc_assemble_recall")
+    hits = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+            and getattr(c.func, "id", None) == "cc_pattern_completion_recall"]
+    assert hits and all(any(k.arg == "whole_content" and isinstance(k.value, ast.Constant)
+                            and k.value.value is True for k in c.keywords) for c in hits)
+
+
+def test_unpithed_renderer_fails_open_loudly_when_its_own_budget_step_breaks(monkeypatch, caplog):
+    # Josh 2026-09-26: when Pith fails there HAS to be pass-through.  The fallback must not
+    # depend on the machinery that failed, and must never raise or cut: whole, unbudgeted, LOUD.
+    g, mon_full, monitor_items, pat = _long_world(900)
+    monkeypatch.setattr(pith, "_pith_unified_rank",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("rank broke")))
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        out, _ = _recall(pith, fake_ng(g, monitor_items), pat, False, monkeypatch)
+    assert pat[0]["content"] in out and mon_full in out and "…" not in out
+    assert any("rendering every item whole and unbudgeted" in r.getMessage() for r in caplog.records)

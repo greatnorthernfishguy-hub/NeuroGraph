@@ -1,6 +1,11 @@
 # tests/test_cc_recall_dedup.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 turn 2 (#816)
+# What: the fake_pc doubles accept **kwargs (cc_assemble_recall now passes whole_content=True).
+# Why: a double with the old signature raised TypeError inside cc_assemble_recall's fail-soft
+#   try, silently emptying the pattern stream -- the tests would have compared nothing.
+# How: signature only; assertions unchanged.
 # [2026-07-07] Claude Code (Sonnet 5) — Cross-block dedup coverage for _recall()
 # What: Exercises cc_ng_host._recall() to confirm a node that is both
 #   recently-fired (SurfacingMonitor) and semantically matching the query
@@ -65,7 +70,7 @@ def test_recall_dedups_node_shared_across_both_blocks(monkeypatch, cc_ng_state):
     monitor = _FakeMonitor([{"node_id": "n1", "content": "shared content", "score": 1.2}])
     cc_ng_state.cc_ng._surfacing_monitor = monitor
 
-    def fake_pc(ng, query, k, state=None):
+    def fake_pc(ng, query, k, state=None, **kwargs):
         return [
             {"node_id": "n1", "score": 0.9, "content": "shared content"},
             {"node_id": "n2", "score": 0.8, "content": "genuinely new content"},
@@ -89,7 +94,7 @@ def test_recall_renders_both_blocks_when_no_overlap(monkeypatch, cc_ng_state):
     monitor = _FakeMonitor([{"node_id": "n1", "content": "recency content", "score": 1.0}])
     cc_ng_state.cc_ng._surfacing_monitor = monitor
 
-    def fake_pc(ng, query, k, state=None):
+    def fake_pc(ng, query, k, state=None, **kwargs):
         return [{"node_id": "n2", "score": 0.7, "content": "semantic content"}]
 
     monkeypatch.setattr(cc_ng_organism, "cc_pattern_completion_recall", fake_pc)
@@ -112,7 +117,7 @@ def test_recall_returns_monitor_only_when_pattern_completion_disabled(monkeypatc
 
     called = []
 
-    def fake_pc(ng, query, k, state=None):
+    def fake_pc(ng, query, k, state=None, **kwargs):
         called.append(True)
         return [{"node_id": "n2", "score": 0.7, "content": "should not appear"}]
 

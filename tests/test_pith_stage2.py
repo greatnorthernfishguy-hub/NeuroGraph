@@ -1,6 +1,11 @@
 # tests/test_pith_stage2.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 turn 2: the ONE budget rule
+# What: test_overflow_item_is_dropped_whole_not_keyframed now expects the never-fit overflow
+#   item to be SKIPPED whole while the small line that fits is kept (was: strict-prefix stop).
+# Why: checker-019 C3 / le-017 F2 -- one rule across the budgeted paths.
+# How: expected ids/ranked_dropped only.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: Stage 3 no longer keyframes
 # What: the three pith_stage3 integration tests that expected an over-budget line to be
 #   KEPT as a keyframe now expect it to be DROPPED WHOLE (content untouched,
@@ -144,13 +149,14 @@ def test_overflow_item_is_dropped_whole_not_keyframed():
     out = pith_stage3([top, overflow, tiny], budget_chars=300)
     ids = [l.node_id for l in out]
 
-    # #813: the over-budget line is dropped WHOLE (strict rank prefix ends there);
-    # it is never shortened to a keyframe, and its content is never rewritten.
-    assert ids == ["top"]
+    # #813: the over-budget line cannot fit even an empty 300-char budget, so it is skipped
+    # WHOLE (it does not end the prefix); it is never shortened to a keyframe and its content
+    # is never rewritten.
+    assert ids == ["top", "low"]
     assert overflow.content == original
     assert _PITH_METRICS.compressed_count == 0
     assert _PITH_METRICS.chars_saved == 0
-    assert _PITH_METRICS.ranked_dropped == 2
+    assert _PITH_METRICS.ranked_dropped == 1
 
 
 def test_break_when_even_keyframe_overflows():
