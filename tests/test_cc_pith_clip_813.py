@@ -1,6 +1,15 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 7 (dispatch #11293): le-027 N-2/N-4/N-5
+# What: N-2 a dead or missing identity guard (which FAILS CLOSED and pins everything) now also emits ONE
+#   count-only WARNING per call -- "K of N items pinned because the identity guard failed (<type>); L1 X
+#   chars vs budget B" -- on BOTH paths, and a WORKING guard emits none (written and shown FAILING first on
+#   the turn-6 head); N-4 the coherence vocabulary is asserted equal across every place that lists it;
+#   N-5 the C-1 handler assertion is exact (it fails on the turn-5 module and on a handler that merely
+#   says `return True`), and the fake guard uses isinstance exactly like the real one.
+# Why: Chief ruling on le-027 (COMPLIANT, PASS-WITH-NOTES). N-1 is RECORD ONLY (not implemented).
+# How: fake in-memory graph; le-027's probe world (5 items 1500/1500/1500/6000/40000 chars, default budget).
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 6 (dispatch #11238): le-025 C-1..C-5
 # What: C-2 the measured provider node limit must never drop or reference a node that fit whole before
 #   (tight-budget cases + a sweep of (core, budget, node) against BASE e4ebf982 AND the turn-5 parent
@@ -1322,11 +1331,36 @@ def test_c1_the_pin_probe_is_the_base_closure_except_the_deliberate_c5_change():
     assert ast.dump(base_try.body[0]) == ast.dump(head_try.body[0])
     # the handler is the ONE deliberate difference: base failed soft to False (DEBUG), head fails closed
     base_ret = [n for n in ast.walk(base_try.handlers[0]) if isinstance(n, ast.Return)][-1]
-    head_ret = [n for n in ast.walk(head_try.handlers[0]) if isinstance(n, ast.Return)][-1]
     assert isinstance(base_ret.value, ast.Constant) and base_ret.value.value is False
-    assert (isinstance(head_ret.value, ast.Constant) and head_ret.value.value is True) or \
-        "True" in ast.dump(head_ret.value) or "_pin_guard_failed" in ast.dump(head_ret.value)
+    _assert_fail_closed_handler(head_try.handlers[0])
     assert ast.dump(base_try.handlers[0]) != ast.dump(head_try.handlers[0])
+
+
+def _assert_fail_closed_handler(handler):
+    """EXACT structure (turn 7 / le-027 N-5i): `except Exception as exc: return
+    _cc_pin_guard_failed(node_id, exc, failed)` -- one statement, that call, those arguments.  A
+    handler that merely mentions True (or returns it without going through the logging helper) fails."""
+    assert isinstance(handler.type, ast.Name) and handler.type.id == "Exception" and handler.name == "exc"
+    assert len(handler.body) == 1 and isinstance(handler.body[0], ast.Return)
+    call = handler.body[0].value
+    assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    assert call.func.id == "_cc_pin_guard_failed" and not call.keywords
+    assert [a.id for a in call.args if isinstance(a, ast.Name)] == ["node_id", "exc", "failed"]
+    assert len(call.args) == 3
+
+
+def test_n5_the_exact_handler_assertion_rejects_the_turn5_module_and_a_bare_return_true():
+    turn5 = subprocess.check_output(["git", "-C", _ROOT, "show", "a26c77410db8f065d2c6fd7e7a91953208c99f6e:cc_ng_organism.py"]).decode()
+    t5_handler = _closure_pinned(turn5, "_cc_pin_probe").body[0].handlers[0]
+    with pytest.raises(AssertionError):
+        _assert_fail_closed_handler(t5_handler)                       # turn 5 went through `return True`-shaped helper
+    bare = ast.parse("def f():\n try:\n  x()\n except Exception as exc:\n  return True\n").body[0].body[0].handlers[0]
+    with pytest.raises(AssertionError):
+        _assert_fail_closed_handler(bare)                             # merely says True: rejected
+    base = subprocess.check_output(["git", "-C", _ROOT, "show", f"{_BASE_COMMIT}:cc_ng_organism.py"]).decode()
+    with pytest.raises(AssertionError):
+        _assert_fail_closed_handler(_closure_pinned(base, "cc_assemble_recall").body[0].handlers[0])   # base: soft False
+    _assert_fail_closed_handler(_closure_pinned(open(_ORGANISM_SRC).read(), "_cc_pin_probe").body[0].handlers[0])
 
 
 def test_c1_executed_on_the_le025_cases_identical_except_when_the_guard_raises():
@@ -1391,3 +1425,126 @@ def test_turn6_the_contract_states_the_optimistic_limit_and_the_fail_closed_guar
     assert "The guard fails closed" in body and "treated as pinned" in body
     assert "smallest* overhead" in body and "optimistic" in body and "never-fit" in body
     assert "above the reference limit" in body
+
+
+# ====================================================================== TURN 7: N-2 / N-4 / N-5
+def _dead_guard_world():
+    """le-027's probe: 5 non-identity items (1500/1500/1500/6000/40000 chars), default budget."""
+    g = FakeGraph()
+    _core(g)
+    pat, texts = [], []
+    for i, size in enumerate((1500, 1500, 1500, 6000, 40000)):
+        text = f"ITEM{i}-" + ("z" * (size - 6))
+        g.node(f"n{i}", text)
+        texts.append(text)
+        pat.append({"node_id": f"n{i}", "score": 100.0 - i, "content": text, "prefetch_origin": False})
+    return g, texts, pat
+
+
+_PIN_LINE = re.compile(r"(\d+) of (\d+) items pinned because the identity guard failed \(([A-Za-z_/]+)\); "
+                       r"L1 (\d+) chars vs budget (\d+)")
+
+
+def _pin_lines(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and "pinned because the identity guard failed" in r.getMessage()]
+
+
+@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
+@pytest.mark.parametrize("mode", ["raising", "missing"])
+def test_n2_a_dead_guard_pins_everything_AND_emits_one_count_only_line_per_call(monkeypatch, caplog, pith_on, mode):
+    pith._PITH_DROP_SEEN.clear()
+    g, texts, pat = _dead_guard_world()
+    if mode == "raising":
+        def boom(node_id):
+            raise RuntimeError("SECRET-GUARD-TEXT " + node_id)
+        g._is_identity_protected = boom
+        expected_type = "RuntimeError"
+    else:
+        class _NoGuard(FakeGraph):                                       # the guard does not exist
+            @property
+            def _is_identity_protected(self):
+                raise AttributeError("no identity guard on this graph")
+        g.__class__ = _NoGuard
+        expected_type = "AttributeError"
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out, _ = _recall(pith, fake_ng(g, []), pat, pith_on, monkeypatch)
+    assert all(text in out for text in texts)                            # FAIL CLOSED: all 5 kept whole
+    (line,) = _pin_lines(caplog)                                         # ONE line per call, not per item
+    m = _PIN_LINE.search(line)
+    assert m, line
+    assert (int(m.group(1)), int(m.group(2))) == (5, 5) and m.group(3) == expected_type
+    assert int(m.group(4)) > int(m.group(5)) and int(m.group(4)) >= 50000    # L1 far over its budget: the signal
+    assert int(m.group(5)) == 4000
+    for secret in ("SECRET-GUARD-TEXT", "ITEM0-", "zzzz"):               # counts only: no node text
+        assert secret not in line
+    assert "n0" not in line and "n3" not in line                         # no ids beyond the first-seen WARNING
+
+
+@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
+def test_n2_a_working_guard_emits_no_such_line_and_the_l1_stays_bounded(monkeypatch, caplog, pith_on):
+    pith._PITH_DROP_SEEN.clear()
+    g, texts, pat = _dead_guard_world()
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out, _ = _recall(pith, fake_ng(g, []), pat, pith_on, monkeypatch)
+    assert _pin_lines(caplog) == []
+    assert len(out) < 10000 and texts[4] not in out                      # the 40k node is a reference/dropped, not injected
+
+
+def test_n2_the_line_repeats_each_call_while_the_guard_stays_dead_but_never_names_ids_twice(monkeypatch, caplog):
+    pith._PITH_DROP_SEEN.clear()
+    g, texts, pat = _dead_guard_world()
+    g._is_identity_protected = lambda nid: (_ for _ in ()).throw(RuntimeError("down"))
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        for _ in range(3):
+            _recall(pith, fake_ng(g, []), pat, True, monkeypatch)
+    assert len(_pin_lines(caplog)) == 3                                  # the signal persists while it costs the prompt
+    per_id = [r for r in caplog.records if r.levelno >= logging.WARNING and "identity-pin guard failed for node" in r.getMessage()]
+    assert len(per_id) == 5                                              # ... the per-id WARNING stays first-seen only
+
+
+def test_n2_only_the_items_the_failed_guard_pinned_are_counted(monkeypatch, caplog):
+    pith._PITH_DROP_SEEN.clear()
+    g, texts, pat = _dead_guard_world()
+
+    def flaky(node_id):
+        if node_id in ("n0", "n1"):
+            raise KeyError(node_id)
+        return False
+    g._is_identity_protected = flaky
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        _recall(pith, fake_ng(g, []), pat, False, monkeypatch)
+    (line,) = _pin_lines(caplog)
+    m = _PIN_LINE.search(line)
+    assert (int(m.group(1)), int(m.group(2)), m.group(3)) == (2, 5, "KeyError")
+
+
+# ------------------------------------------------------------------ N-4: the coherence vocabulary, one truth
+def _string_consts(node):
+    return {n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+
+
+def test_n4_every_place_that_lists_a_coherence_state_agrees_with_the_shared_vocabulary():
+    tree = ast.parse(open(_ORGANISM_SRC).read())
+    fn = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    states = set(pith._PITH_COHERENCE_STATES)
+    # 1. the assignment ladder in the basins: every `coherence = "<state>"`
+    ladder = {a.value.value for a in ast.walk(fn["pith_connected_activation_basins"])
+              if isinstance(a, ast.Assign) and any(getattr(t, "id", None) == "coherence" for t in a.targets)
+              and isinstance(a.value, ast.Constant) and isinstance(a.value.value, str)}
+    # 2. the competition weights
+    support = next(a for a in ast.walk(fn["pith_connected_activation_basins"]) if isinstance(a, ast.Assign)
+                   and any(getattr(t, "id", None) == "coherence_support" for t in a.targets))
+    weights = {k.value for k in support.value.keys}
+    # 3. the envelope order in provider_context
+    order = next(a for a in ast.walk(fn["pith_provider_context"]) if isinstance(a, ast.Assign)
+                 and any(getattr(t, "id", None) == "coherence_order" for t in a.targets))
+    ordered = {e.value for e in order.value.elts}
+    # 4. what a node can report
+    reported = {r.value.value for r in ast.walk(fn["_pith_node_coherence"]) if isinstance(r, ast.Return)
+                and isinstance(r.value, ast.Constant)} | {"modified", "exclusive", "shared"}
+    for name, found in (("ladder", ladder), ("coherence_support", weights), ("coherence_order", ordered),
+                        ("_pith_node_coherence", reported)):
+        assert found == states, (name, sorted(found ^ states))
+    assert set(pith._PITH_ALERT_COHERENCE) < states                      # the alerts are a strict subset
+    assert states - set(pith._PITH_ALERT_COHERENCE)                      # ... and an ordinary state exists

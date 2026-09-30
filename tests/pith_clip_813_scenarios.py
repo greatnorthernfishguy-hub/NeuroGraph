@@ -60,8 +60,9 @@ class FakeGraph:
         # fake that raised KeyError here would have pinned every unknown node.
         node = self.nodes.get(node_id)
         meta = (node.metadata if node is not None else None) or {}
+        prov = meta.get("provenance")                # exactly as neuro_foundation.py:3551-3572
         return bool(meta.get("constitutional")
-                    or str(meta.get("provenance") or "").endswith("_authored"))
+                    or (isinstance(prov, str) and prov.endswith("_authored")))
 
 
 def _run(pith, graph, surfaced, instruction, quest="", budget_chars=4000):
