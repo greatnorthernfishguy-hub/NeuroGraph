@@ -8,6 +8,8 @@ Related: [[NeuroGraph]] · [[The Laws]] (LAW 3/4/7) · [[NeuroGraph Is a Mind, N
 > (`2ab4a85`, before any code). Section A onward is what was built, the evidence, the deviations
 > from the plan, the read-only render-retirement inventory (section 8) and the flags (section 9).
 > Code + tests: `c9fe56d`. Nothing merged, wired or restarted; not self-accepted.
+> **Turn 2 (`build-002.md`) superseded parts of this return:** le-014's C1-C4 corrections, the #815 delta and several
+> statements marked `[corrected turn 2]` below. Read `build-002.md` for the current state of the parser.
 
 ## 0. Scope, and the two amendments that changed it
 
@@ -172,7 +174,7 @@ lock (no I/O under `_step_lock`). Bounded form, module constants:
   the FIRST time a `(node_id, offset, reason)` key is seen in-process. Seen-set is a bounded
   FIFO (`WANT_SKIP_SEEN_MAX = 4096`); at most `WANT_SKIP_DETAIL_PER_CALL_MAX = 50` detail lines per
   call, the rest deferred (not marked seen) to the next pulses, the summary says how many.
-- **No marker TEXT at all** in the log — node id, offset, marker kind, reason only. This is stricter
+- **No marker TEXT at all** *[corrected turn 2: the detail line carries the literal marker token `[WANT]`/`[/WANT]` as its kind; there is no want body and no surrounding text]* in the log — node id, offset, marker kind, reason only. This is stricter
   than the brief's "short length-bounded prefix": a prefix of surrounding prose could carry a pasted
   secret, and offsets are enough to find the span in the source node. Never a secret by construction.
 - **Expected volume:** first pulse after a daemon start = 1 summary + up to 50 detail lines, then
@@ -261,13 +263,16 @@ untouched; `WANT_MAX_CHARS` is referenced by no parser path (asserted by a test)
 **Flood-safe INFO log, as built** (constants `WANT_SKIP_SUMMARY_INTERVAL_S=3600`,
 `WANT_SKIP_SEEN_MAX=4096`, `WANT_SKIP_DETAIL_PER_CALL_MAX=50`):
 `surface_wants: skipped 2 marker(s) in 1 node(s) as mentions, not wants (closer_without_opener=1, in_code_span=1)`
-and `surface_wants: skipped [/WANT] node=<node id> offset=<n> reason=<reason>`. No marker text, no
-surrounding text, ever (a sentinel test proves prose around a masked marker never reaches a record).
+and `surface_wants: skipped [/WANT] node=<node id> offset=<n> reason=<reason>`. No want body and no
+surrounding text, ever (a sentinel test proves prose around a masked marker never reaches a record) *[corrected turn 2: the
+detail line does carry the literal marker token as its kind, so "no marker text" overstated it]*.
 Expected volume (logic fixed by the tests with a fake clock; asserted: the first call over 120 distinct skips emits 51
 lines, the 5th pulse 0, every marker detailed exactly once, 30 pulses over an unchanged corpus = 0 new lines, one heartbeat
 summary after an hour, a new mention node = one summary + its own detail line). The 50/20 middle calls follow from the cap
 and are not separately asserted.
-Steady state ≈ 1 line/hour, vs 1/minute unfiltered.
+Steady state ≈ 1 line/hour, vs 1/minute unfiltered. *[corrected turn 2 (le-014 C4): true only while the corpus holds
+<= `WANT_SKIP_SEEN_MAX` distinct (node, offset, reason) skips; beyond that the FIFO evicts entries that re-qualify, so the steady
+state degrades to at most `WANT_SKIP_DETAIL_PER_CALL_MAX` (50) detail lines per pulse — bounded, not ~1/hour.]*
 
 ## B. Evidence
 
@@ -401,7 +406,9 @@ and (4) gate the size; everything else is mechanical.
    masked marker inside a real pair is now kept in the text (base dropped the whole pair). Both deliberate (P406) and asserted;
    listed so the review pair can reject them.
 5. **`code_adjacent` keeps the pre-#810 guard:** a real want typed directly after a closing backtick (`foo`[WANT]...`) is
-   still skipped (logged). Same as base.
+   still skipped (logged). Same as base. *[corrected turn 2 (le-014 C1): "same as base" held for OPENERS only. The
+   build also applied `code_adjacent` to CLOSERS, which base never did, so a real want ENDING in inline code
+   (`[WANT]check `foo()`[/WANT]`) was dropped, opener included. Fixed in `6e3376e`; see `build-002.md`.]*
 6. **Same-function conflict risk for turn 2:** the docs branch `cc-laptop-daemon-recall-756-20260930` restructured
    `_append_identity_blocks` (#779/#756); a retirement edit on `origin/main` lines will conflict with it. Decide the base branch.
 7. **Return-doc location:** written into THIS (NeuroGraph) branch under `handoffs/z12-want-legitimacy-810/returns/`, because the
