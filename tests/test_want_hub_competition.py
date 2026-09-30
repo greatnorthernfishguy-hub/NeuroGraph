@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (Z12 builder, dispatch #11903, Z12 ruling ADDENDUM 2) — test_A_orchestrator_…: compute the reference order key BEFORE the call (it read removed synapses); no assertion weakened.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11135) — want-hub (d) tests G / A / K / R
 # What: NEW test file for the ENGINE change plan-005 sec 2.6 specifies (additive keyword-only parameters on
 #   Graph._prune_synapses + ONE orchestrator, Graph.compete_protected_links). Tests G (golden equivalence, two separate
@@ -251,6 +252,7 @@ def test_A_only_low_weight_steps_moves_on_competitors_everything_else_untouched(
 def test_A_orchestrator_makes_exactly_one_call_and_passes_the_callers_sets(det_ids, new_api):
     g, _ = make()
     s = drv.ref_sets(g, K)
+    ok = drv.ref_order_key(g, s.competing)   # computed BEFORE the call: the call removes synapses, and the reference reads g.synapses[sid]
     calls = []
     orig = g._prune_synapses
 
@@ -266,7 +268,6 @@ def test_A_orchestrator_makes_exactly_one_call_and_passes_the_callers_sets(det_i
     assert set(k["competing_ids"]) == s.competing
     assert set(k["excluded_ids"]) == s.excluded and s.F <= set(k["excluded_ids"])
     assert k["max_removals"] == B_SMALL
-    ok = drv.ref_order_key(g, s.competing)
     assert {sid: tuple(k["order_key"][sid]) for sid in s.competing} == ok
 
 
