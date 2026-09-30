@@ -3013,13 +3013,14 @@ def test_the_streamed_analysis_is_identical_to_the_canonical_graph_and_vdb_analy
     assert _scrub_obj(ro) == _scrub_obj(rn)
 
 
-def test_the_review_files_and_the_verifier_and_t6_are_identical(xworld, pinned, tmp_path):
+def test_the_review_files_and_the_verifier_and_t6_are_identical(xworld, pinned, monkeypatch):
+    patch_world(monkeypatch, xworld)                                                   # writes are guarded to the backups root
     base = tool.load_base_module(pinned)
     utc = "20260930T000000Z"
     outs = []
     for tag, fn in (("old", _old_analyze), ("new", tool.analyze)):
         A = fn(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN, base_mod=base)
-        run = tmp_path / tag
+        run = xworld.backups / ("eq-" + tag)
         (run / "reports").mkdir(parents=True)
         rl, sc = tool.artifact_sha256(tool.repair_list_obj(A)), tool.artifact_sha256(tool.scope_ids_obj(A, xworld.expect["scope"]))
         approvals = tool.stamped(tool.approvals_body_for(A["records"], rl, sc, "EXEC-SYNTHETIC-PACKET"))
