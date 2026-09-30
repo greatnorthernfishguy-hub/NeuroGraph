@@ -173,7 +173,8 @@ def test_reference_sets_are_consistent(det_ids):
     for w in drv.protected_wants(g):
         for idx in (g._outgoing, g._incoming):
             nonF = [x for x in idx[w] if x not in s.F]
-            assert len([x for x in nonF if x in s.G]) == min(K, len(nonF))
+            # >=, not ==: a want<->want link is guarded if it is in EITHER endpoint's list (plan sec 2.2 union)
+            assert len([x for x in nonF if x in s.G]) >= min(K, len(nonF))
     assert len([x for x in s.competing if drv.ref_eligible(g, x)]) > B_SMALL, "B_SMALL would not bind"
 
 
