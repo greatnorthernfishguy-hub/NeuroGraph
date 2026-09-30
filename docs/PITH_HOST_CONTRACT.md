@@ -1,5 +1,13 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 5: contract and code together (le-022 N3)
+# What: documents (C2) a monitor item whose whole-content re-resolve raises is DROPPED + WARNING,
+#   (C3) the INFO line when concept trees are left out, (N1) identity-protected items sit outside the
+#   un-Pithed recall budget exactly as in Stage 3, (N2) the truthful reference line, and the two log
+#   knobs CC_PITH_DROP_LOG_IDS_PER_CALL / CC_PITH_DROP_LOG_SEEN_MAX (names, defaults, clamps).
+# Why: Chief ruling docs 3604cfb1 on le-022: the contract and the code changed together for every
+#   earlier item; do the same here.
+# How: a test reads the defaults out of the code and asserts this file states them.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 3: #817 DEFERRED (reverted)
 # What: the compress_history event / section / history_* counters are RESTORED and marked deferred.
 # Why: two live Python callers (VPS host, laptop daemon); Chief ruling docs 084b4161.
@@ -204,12 +212,42 @@ by `CC_PITH_PROVIDER_MEMBERS` or `CC_PITH_PROVIDER_DEPTH`, a basin skipped at �
 overlap with a higher-ranked one, and a recall result beyond the root count. Each is one
 INFO line per call with the count, the total size and the reason (ids named once).
 
+**Identity is outside the recall budget (N1).** On the un-Pithed rendering (`CC_PITH_ENABLED`
+off, or the Pith pass raised) an identity-protected item (`graph._is_identity_protected`, the
+same test Stage 3 uses) is exempt from the budget exactly as a pinned Stage 3 line is: rendered
+whole, never ranked, never dropped, never swapped for a reference, and never the reason a
+smaller unprotected item is lost. Ordinary items are ranked and admitted as before. (Pins
+sitting outside the budget, so that a large pin can push the L1 past `budget_chars` without a
+drop line, is an open note for the Exec, not folded into the budget rule.)
+
+**A monitor item that cannot be re-resolved whole is dropped (C2).** The CC side re-resolves
+each SurfacingMonitor item's whole content by node id. If that re-resolve *raises*, the item is
+dropped, never kept as the shared monitor's 240-character snippet (whole or absent). One
+WARNING per call names the count, the node ids (first time seen) and the exception *type*, never
+node text. Its pattern-stream twin is not lost with it. (Not-re-resolvable by design — an
+unknown node, an image frame, a filtered or empty result — keeps the monitor's item.)
+
+**Log knobs (LAW 5, environment variables, read once at import).** The drop and reference lines
+name node ids only the first time they are seen:
+
+| Variable | Default | Clamp | Meaning |
+|---|---|---|---|
+| `CC_PITH_DROP_LOG_IDS_PER_CALL` | `8` | `[1, 64]` | most new ids named in one log line |
+| `CC_PITH_DROP_LOG_SEEN_MAX` | `4096` | `[16, 65536]` | ids remembered as already reported (oldest evicted) |
+
+Neither is a mandatory export; the defaults apply when unset.
+
 **An over-budget node (#819).** A node whose whole text cannot fit the usable envelope is not
 split at ingest (LAW 7: raw means complete; a long turn stays one node / one forest) and is
 not cut. Its *rendering* becomes its concept trees, each whole, plus one line that points to
 the whole: `A long node (id …; ≈300k chars; 2026-09-21; 3 concept trees) is related to this
-cue; it is too large to render whole here, so its concepts follow.` One INFO line per call
-records it. The node itself still activates and learns in full. Text-derived exact anchors
+cue; it is too large to render whole here.` and then, only if it is true, what follows: nothing
+for a node with no concept trees; `K of N concept trees follow` when the recall path placed K of
+N; `Its concept trees follow where they fit` on the provider path, where the trees arrive as the
+basin's ordinary relations subject to the member/depth caps; always with the hedge `they may
+cover only part of it`. One INFO line per call records it, and a second INFO line
+(`pith reference form: node … shows K of N concept trees whole; L left out …`, counts only)
+records any trees left out, whether the budget or `CC_PITH_PROVIDER_MEMBERS` stopped them (C3). The node itself still activates and learns in full. Text-derived exact anchors
 of the unshown whole are not mined (metadata anchors are). **Dependency:** for pre-PASS-2
 forests the trees cover only the first 2,000 characters until PASS 2 (the laptop TID) runs;
 full coverage arrives with PASS 2. (A keyframe applies only together with its delta; a budgeted
