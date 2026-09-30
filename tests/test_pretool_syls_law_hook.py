@@ -237,15 +237,14 @@ def _env_stub_git_records_lc_all(self):
             lk = os.path.join(stub, t)
             if not os.path.lexists(lk): os.symlink(tp, lk)
         record = os.path.join(self._tmpdir, "lc_all_value")
-        # Pre-create the file so we know the directory exists
         with open(record, "w") as f: f.write("NOT_SET\n")
         git_stub = os.path.join(stub, "git")
         with open(git_stub, "w") as f:
             f.write("#!/bin/bash\n")
             f.write(f"echo -n \"$LC_ALL\" > {record}\n")
             f.write("case \"$*\" in\n")
-            f.write("  *rev-parse*show-toplevel*) echo /fake_repo ;;\\n")
-            f.write(f"  *config*get-regexp*url*) echo 'remote.origin.url https://github.com/greatnorthernfishguy-hub/NeuroGraph.git' ;;\\n")
+            f.write("  *rev-parse*show-toplevel*) echo /fake_repo ;;\n")
+            f.write(f"  *config*get-regexp*url*) echo 'remote.origin.url https://github.com/greatnorthernfishguy-hub/NeuroGraph.git' ;;\n")
             f.write("  *) exit 1 ;;\n")
             f.write("esac\n")
             f.write("exit 0\n")
