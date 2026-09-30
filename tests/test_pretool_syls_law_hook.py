@@ -169,8 +169,8 @@ class TestSylsLawHook:
 
     def _env_stub_no_git(self):
         """PATH that keeps jq and timeout but excludes git."""
-        jq_dir = os.path.dirname(subprocess.check_output(["command", "-v", "jq"]).decode().strip())
-        timeout_dir = os.path.dirname(subprocess.check_output(["command", "-v", "timeout"]).decode().strip())
+        jq_dir = os.path.dirname(subprocess.check_output(["which", "jq"]).decode().strip())
+        timeout_dir = os.path.dirname(subprocess.check_output(["which", "timeout"]).decode().strip())
         return {"HOME": self._fake_home, "PATH": f"{jq_dir}:{timeout_dir}:/usr/bin:/bin"}
 
     # ═══════════════════════════════════════════════════════════════════
@@ -269,6 +269,7 @@ class TestSylsLawHook:
             corpus.append(("rel_wi", rel, {"CLAUDE_PROJECT_DIR": self._wt_inside}))
             corpus.append(("rel_m", rel, {"CLAUDE_PROJECT_DIR": self._ng_dir}))
         corpus.append(("ckpt_s", os.path.join(self._ng_dir, "data", "checkpoints", "sub.msgpack"), {}))
+        corpus.append(("wt_ckpt_s", os.path.join(self._wt_outside, "data", "checkpoints", "sub.msgpack"), {}))
         corpus.append(("ckpt_o", os.path.join(self._ng_dir, "data", "checkpoints-old", "stale.txt"), {}))
         for rel in ["README.md", "tests/test_foo.py"]:
             corpus.append(("unprot", os.path.join(self._ng_dir, rel), {}))
@@ -301,7 +302,7 @@ class TestSylsLawHook:
         for r in new_vendored:
             exp.add(("home", os.path.join(self._ng_dir, r)))
             exp.add(("rel_m", r))
-        exp.add(("wt_o", os.path.join(self._wt_outside, "data", "checkpoints", "sub.msgpack")))
+        exp.add(("wt_ckpt_s", os.path.join(self._wt_outside, "data", "checkpoints", "sub.msgpack")))
         act = nf - bf
         assert not (exp - act), f"missing: {sorted(exp - act)[:5]}"
         assert not (act - exp), f"unexpected: {sorted(act - exp)[:5]}"
@@ -349,7 +350,7 @@ class TestSylsLawHook:
 
     def test_fault_jq_missing(self):
         e = self._env_no_git()
-        rc, stderr = self._run_raw(NEW_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
+        rc, stderr, _ = self._run_raw(NEW_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
         assert rc == 2; assert "TOOL MISSING" in stderr
 
     def test_fault_empty_stdin(self):
@@ -400,10 +401,10 @@ class TestSylsLawHook:
             c.append((f"sl_{os.path.basename(rel)}", lp, {}))
         c.append(("unr", os.path.join(self._unrelated, "neuro_foundation.py"), {}))
         c.append(("nogit", os.path.join(self._non_git, "neuro_foundation.py"), {}))
-        return c
+        return c, lk
 
     def test_doublecheck_differential(self):
-        corpus = self._make_dbl_corpus()
+        corpus, lk = self._make_dbl_corpus()
         bf = set(); nf = set()
         for label, path, extra in corpus:
             be, _ = self._run(DBL_BASE, path, env=self._env(extra or None))
