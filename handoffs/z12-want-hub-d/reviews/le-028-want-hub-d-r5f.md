@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (findings written; final comparison with checker-025 and closing pending)
+STATUS: COMPLETE
 
 # le-028 - ROLE B (law enforcer): ONE look at the [R5f] edit of plan-005
 
@@ -76,5 +76,17 @@ LAW 1 clean (census/check-ins are an operator/Executive act, never a daemon-to-s
 - Whether a CC session can give an "explicit, unqualified" answer in practice, and the real check-in timing vs the dream pulse (S4 has not started).
 - Punchlist rows #824/#825 (not searched).
 
-## Verdict (DRAFT, before reading checker-025)
+## Comparison with checker-025 (read only AFTER the findings draft `e6a6de9a9fc96ec8d6f9ec0b0a275e3ea993802d` was committed and pushed; I opened only `reviews/checker-025-want-hub-d-r5e.md`, and only its verdict lines and N1/N2)
+checker-025 (ROLE A, PASS, two LOW) reviewed the [R5e] state (`ac574f31`), i.e. BEFORE the P424 rulings existed, so it says nothing about F2/E2/E1 and cannot overlap G1-G4. Its two findings are both closed by [R5f]: **N1** (the ARMING frame adapts the D3 sentence) is kept and re-pointed at the P424 wording in §10 (`:813`), which I confirmed; **N2** (`-81.6%` left in item 11) is corrected to `-81.7%` at `:537` and in the §11.4 row (`:878`), which I re-derived (1 - 122/664 = 81.6265%). **Agree, no disagreement.** Where I ADD: G1-G4 concern whether the new P424 machinery is safe to use (a gate that a "no" satisfies; a cost narrative whose audience is undefined; a standing-decline precondition with no ledger and no re-ask authority), which a presence check cannot see.
+
+## Verdict (final; the draft above was not weakened after reading checker-025)
 **COMPLIANCE VERDICT: ETHOS DRIFT DETECTED - plan level; NO Law violation.** 0 CRITICAL, 0 HIGH, **4 MEDIUM (G1, G2, G3, G4)**, 3 LOW (G5, G6, G7), 4 Executive-to-hear (E-1..E-4). Correct implementations: both census sentences and the D2 sentence byte-for-byte; the P424 frame sentence verbatim and the P420 D3 sentence retired to history; the frame neutral; the E2 block written as an arming precondition AND a runbook gate in every place preconditions are listed; F2 recorded as an arming precondition everywhere and cleared only by a disclosing check-in; F1/F3 mechanics verified against the daemon; F4 citations all true; one rule for F5; retraction complete; the protected file identical to base; LAW 8 intact.
+
+## Direct answers to ADDENDUM 7 (ROLE B)
+1. **Is the frame TRUE at arming AND at every check-in?** Yes as worded: the CHECK-IN frame carries the Executive's three decline sentences verbatim and nothing untrue; the ARMING frame adapts only verbs (disclosed for the Executive). It is true only while Josh's answer is recorded and (G1) ratified or the Executive has ruled the non-ratified wording; until then it must not be shown.
+2. **Does notify-and-continue honestly tell the session what happens (LAW 8: nothing waits on a reply)?** Yes: the pass does not wait, the stop is an operator act, the deadline is a computable time (verified against `cc-ng-daemon.py:2163`, `:2180-2182`, `:2196`), a late stop is a recorded deviation. Complete only once G2 settles whether the session is told that "it" is the whole daemon.
+3. **Is the retraction complete?** Yes inside plan-005 (only two surviving mentions, both marked/quoted as retracted); the build brief now carries a PARKED banner; the protected file on the plan branch and on the tests-only build branch is identical to base.
+4. **Any path by which a different session's assent, silence or a timeout arms over a standing decline?** Silence/timeout: none. A different session's explicit unqualified non-decline: only through the F2 fresh check-in, as the Executive ruled; G3/G4 make that route recordable and bounded.
+
+## Closing
+Verdict file complete. Nothing was built, merged, armed, settled or dispatched. No graph, checkpoint or msgpack loaded; no NG module imported (P379: resolved NG module paths none; NG-module state none). The protected file was not opened by me and is identical to base at `17950afc`. Plan cited by commit `17950afc81ca1d48b58da0f6bba5eeb82430252e`, sha256 `9dffe218b8789eea9ed0bb1192c9836e02974b88369f76345a99fb192df75db7`. Commits contain only this file; pushed by name to `cc-laptop-want-hub-d-20260930`.
