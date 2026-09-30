@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (B1-B5 own draft written; cross-family comparison pending)
+STATUS: COMPLETE
 
 # le-016 — LAW ENFORCER ROLE B — #810 TURN-2 DELTA (`e462c17a..ab2c29d1`)
 
@@ -84,5 +84,35 @@ Remediation priority / numbered corrections:
 
 **Not verified:** behaviour under the live daemon (nothing restarted); prune/lifetime of conversational source nodes (so the "recoverable" claim is conditional); the full suite (not run, by instruction); `plan-003` and the #801 dry-run counts (must be re-taken on `ab2c29d1`); `ng_embed.embed` on very long want text; the docs daemon branch `cc-laptop-daemon-recall-756-20260930`; line-by-line review of the 148 new test cases (I ran them and probed independently); parse timings on hardware other than this laptop.
 
-## Cross-family comparison
-(pending — to be written only after this draft is committed and pushed)
+## Cross-family comparison (written only AFTER B1-B5 was committed and pushed as `78874f62f1b359737f1509801c9f2e0ba0744187`)
+
+I then read all 240 lines of `reviews/checker-018-810-delta.md` (ROLE A, grok-4.6: overall PASS-WITH-NOTES, "no must-fix corrections"). Nothing in B1-B5 above was edited in response except the STATUS line; this section is the only addition. I re-ran checker-018's two extra findings myself (pure strings, base vs build) rather than take them on trust.
+
+**Where we agree**
+- Same run result: 156 passed, P379 preamble printing the worktree `cc_ng_organism.py`, other NG modules `not loaded`, `NG_EMBED_*` unset (both of us stripped `NG_EMBED_REMOTE`). Both reviewed code-identical heads (`8864c8ca` vs `ab2c29d1`; the difference is the ROLE A file only).
+- le-014's three repros and C2 equal base; well-formed shapes outside the worker's matrix equal base (their 14 classes, my 15 + a 149,002-shape fuzz). The le-014 HIGH is closed at the source (`is_close`, `:1817`/`:1843`).
+- checker-016's five examples (+ the backtick-fence variant) are rejected with the named reasons; the opener-context boundary holds (want text containing a URL / JSON / link / quote is captured whole).
+- LAW 5 knobs: defaults 3600/4096/50, junk -> default, `<=0` -> 1, import never breaks (identical tables, independently run). `render_wants`, `WANT_RENDER_LIMIT`, `WANT_MAX_CHARS` byte-identical to base (both did an `ast` comparison). No protected/vendored/host file in the diff. The C4 flood claim is now stated exactly.
+- #801 recount must be re-taken on the final function (both of us: `2a2703f5`/`ab2c29d1`, not `c9fe56d`/`e462c17`); build-002 §5 is right on every item. Overall gate: PASS-WITH-NOTES.
+
+**Where checker-018 found things I did not (I reproduced each; they are real)**
+- `_want_json_opens_literal` `content.endswith("true"/"false"/"null", 0, j+1)` has no token boundary: `The claim is untrue, "[WANT]revisit this[/WANT]"` and `…nonnull, "[WANT]check it[/WANT]"` both markers `in_json_string`; base mints (their note 1). Confirmed. A stronger version I found while reproducing: even a REAL `true` token (`ok: true, "[WANT]revisit this[/WANT]"`) drops the want — that is the documented JSON-looking-sentence trade, not a bug, but it shows the boundary check they propose fixes only the substring case.
+- `in_link_target` fires on `arr[0](https://x.org/[WANT]x[/WANT])` (their note 2) because `rfind("](")` does not require the `[` to open a markdown link. Confirmed; base mints.
+- `?` and `#` glued to a URL also drop the opener (`https://x.org/a?[WANT]…`, `…a#[WANT]…`): confirmed. This is the same family as my B5 #2 (the URL terminator set is a list of guesses); their finding adds two characters I had not probed.
+- `[id]: https://…/[WANT]`, autolinks and `<a href="…">` are caught by `in_url` because `scheme://` suffices; correct behaviour as mentions.
+- Broader inventory of leftover mention-mints (single-quoted JSON, raw-newline JSON, `www.`/`mailto:`/`data:`, HTML comment/`<code>`, YAML/TOML, link text, bare prose pair): I did not enumerate these and defer to their table; it is frozen-list material for #801.
+
+**What I found that they did not**
+- **The closer is judged by a lexical guess (B5 #3).** Tier 1 applies `in_json_string` to ANY marker, so `[WANT]rename "a", "b[/WANT]", next` (opener in plain prose, want text ending inside a quote fragment) drops the whole want, opener included; base mints `rename "a", "b`. This is the C1 class (a closer guarded by a heuristic) reintroduced through the new JSON rule. Their A1/A2 probes did not include a closer inside a JSON-lookalike literal whose opener is outside it, so they concluded "the #801 id-equality property holds on every well-formed shape run here" — true of the shapes run, not of this one.
+- **More glue characters drop a genuine opener** (B5 #2): `:` `—` `**` `_` `/` and a literal backslash-`n` between a URL and a real opener. They tested space / dot / paren (all fine) and `?`/`#`; the ordinary typing habits (`url:` , a bold or italic URL then a want) were not in their set. I demonstrated them with a Choice-Clause-shaped payload (B3) to make the ethical stake concrete.
+- **Recoverability is conditional (B2 LAW 7 / B3):** a declined want has no node and no substrate trace; it is re-mintable only while the source node lives (prune lifetime not verified). They say "visible… recoverable: the source conversational node is untouched" — the first half is right; the second holds only until the source is culled.
+- **A3 cost:** their A3 PASS is right for their shapes (all <0.5 s). My worst case is different: 890 KB with 5,000 glued openers each carrying a 150-char URL-like run = 3.05 s, held under `_cc_mutation_lock` every pulse for such a node (`_want_glued_run_before` is O(openers x 2048)). Adversarial, LOW; their 5,000-URL test had one opener, not 5,000.
+- LAW-by-LAW file:line ruling (B2), the `origin/main` upstream / `push.default` hygiene note (B1), and the carried LAW 3/4 twin debt (#755).
+
+**Where we differ on severity**
+- checker-018: "No must-fix corrections for this delta pair; notes 1-2 are extra false negatives in the precision-trade family P414 already accepted." My view: I agree with PASS-WITH-NOTES and that nothing here blocks accepting the branch, but I rate B5 #2 and #3 MEDIUM rather than note. #3 (closer judged by a JSON guess with a plain-prose opener) is not covered by the P414 trade (which accepted *wants typed inside a JSON-looking sentence*), and the delta's own stated principle is "closers are never judged by these guesses". #2 is where a common typing habit reaches an exit/identity-shaped want. Neither needs a semantic exemption; both are fixable at the source (B5) or dispositioned by an explicit Josh ruling, and should be settled BEFORE the #801 recount is trusted (checker-018 note 4 makes the same sequencing point about the recount, but only for re-taking it on the final tip).
+- Their notes 1 and 2 plus my #2 and #3 are one theme (each new reason is a lexical guess with a few natural false-negative doors). I would take them as ONE small follow-up turn with golden cases asserted against base, not four separate ones.
+
+**Net effect on the gate:** the two verdicts agree: PASS-WITH-NOTES, le-014 HIGH closed, no Law violation. ROLE B adds two MEDIUM dispositions (glue-terminator set; closer-only JSON guess) that ROLE A rated as notes/did not find. The pair may be counted as passed for the branch; the zone manager should decide between (a) one small follow-up fixing these at the source with golden cases, or (b) an explicit Josh ruling accepting them as named residuals, before the #801 dry-run is trusted or anything is wired. I do not merge, settle or dispatch.
+
+STATUS: COMPLETE
