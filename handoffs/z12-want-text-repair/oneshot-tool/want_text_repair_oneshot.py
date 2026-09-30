@@ -52,6 +52,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import types
 from collections import Counter
 from pathlib import Path
@@ -1136,18 +1137,18 @@ def build_mapping(records: List[Dict[str, Any]], only_ids=None) -> Dict[str, str
     return m
 
 
-def is_choice_clause_marked(md: Dict[str, Any]) -> bool:
-    """The metadata flag the deny-check reads (le-029 C8): a truthy `constitutional`, a truthy `choice_clause`, or a
-    tag / tags / kind / category mentioning choice_clause. (The plan names no other tag: this is my reading of
-    'a Choice-Clause tag', flagged in the return.)"""
-    if md.get("constitutional") or md.get("choice_clause"):
+def is_choice_clause_marked(md: Dict[str, Any], nid: Optional[str] = None) -> bool:
+    """The Executive-ruled marker set (P432), replacing my A2 guess. A node is refused if ANY of: its id is the rim id
+    or either literal Choice Clause want id (the two wants carry NO metadata marker - their literal ids ARE the
+    identity); `constitutional` is truthy; `source == "cricket_rim"`; `creation_mode == "constitutional"`; or a
+    `rim_source` key is PRESENT (my reading of 'present': the key exists, whatever its value, even None or empty -
+    the conservative one). No tag / kind / category name is consulted: none exists in source. Nothing here writes a
+    marker on any want (a re-tag would be an H-1 violation)."""
+    if nid is not None and (nid in CHOICE_CLAUSE_IDS or nid == CONSTITUTIONAL_ID):
         return True
-    for k in ("tag", "tags", "kind", "category"):
-        v = md.get(k)
-        for x in (v if isinstance(v, (list, tuple, set)) else [v]):
-            if isinstance(x, str) and "choice_clause" in x.lower().replace(" ", "_").replace("-", "_"):
-                return True
-    return False
+    if md.get("constitutional") or md.get("source") == "cricket_rim" or md.get("creation_mode") == "constitutional":
+        return True
+    return "rim_source" in md
 
 
 def deny_check(scope_ids, mapping: Dict[str, str], approval_ids=(), nodes_meta: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -1157,10 +1158,11 @@ def deny_check(scope_ids, mapping: Dict[str, str], approval_ids=(), nodes_meta: 
     protected = set(CHOICE_CLAUSE_IDS) | {CONSTITUTIONAL_ID}
     flagged = []
     if nodes_meta is not None:
-        flagged = sorted(i for i in set(scope_ids) | set(mapping) if is_choice_clause_marked(nodes_meta.get(i, {})))
+        flagged = sorted(i for i in set(scope_ids) | set(mapping) | set(approval_ids)
+                         if is_choice_clause_marked(nodes_meta.get(i, {}), i))
         if flagged:
-            raise Stop("V15 deny-check: %d member(s) of S / the mapping carry the constitutional or Choice Clause flag "
-                       "under another id (first: %s)" % (len(flagged), flagged[0]))
+            raise Stop("V15 deny-check: %d member(s) of S / the mapping / the approvals match the Choice Clause marker set "
+                       "(first: %s)" % (len(flagged), flagged[0]))
     bad = {
         "in_scope": sorted(protected & set(scope_ids)),
         "in_mapping_old": sorted(protected & set(mapping)),
@@ -1490,7 +1492,11 @@ def gate_write_set(records: List[Dict[str, Any]], approvals: Dict[str, Any], *, 
         if r["disposition"] != "candidate":
             continue
         e = by_id.get(r["id"])
-        if e is None or e["decision"] not in ok_dec:
+        if e is None:
+            refused.append({"id": r["id"], "reason": "not_approved"})
+        elif e["decision"] == "struck":
+            refused.append({"id": r["id"], "reason": "struck"})            # a legitimate decision: recorded as a deviation, node untouched
+        elif e["decision"] not in ok_dec:
             refused.append({"id": r["id"], "reason": "not_approved"})
         elif (e.get("excerpt_sha256") != r["excerpt_sha256"] or e.get("x_sha16") != r["new_sha16"]
               or e.get("t_sha16") != r["old_sha16"]):
@@ -1999,6 +2005,9 @@ FINGERPRINT: Tuple[Tuple[str, str, Tuple[str, ...], Tuple[Tuple[int, int], ...],
 )
 
 
+P3B_TIMEOUT_S = 1800
+
+
 def gate_p3(pinned, *, run_pinned_tests: bool = False, parse_fn=None) -> Dict[str, Any]:
     """P3. (a) the in-process fingerprint battery; (b) optionally the pinned test file itself, run as a
     subprocess from the pin tree with a clean environment (zero failures, zero errors, zero skips)."""
@@ -2014,10 +2023,15 @@ def gate_p3(pinned, *, run_pinned_tests: bool = False, parse_fn=None) -> Dict[st
     if run_pinned_tests and not bad:
         env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "NG_EMBED_REMOTE")}
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        p = subprocess.run([sys.executable, "-B", "-m", "pytest", TEST_FILE_RELPATH, "-q", "-p", "no:cacheprovider"],
-                           cwd=pinned.root, env=env, capture_output=True, text=True)
+        try:
+            p = subprocess.run([sys.executable, "-B", "-m", "pytest", TEST_FILE_RELPATH, "-q", "-p", "no:cacheprovider"],
+                               cwd=pinned.root, env=env, capture_output=True, text=True, timeout=P3B_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            out["pinned_tests"] = {"returncode": None, "summary": "timed out after %ds" % P3B_TIMEOUT_S, "timed_out": True}
+            out["ok"] = False
+            return out
         tail = (p.stdout or "").strip().splitlines()[-1:] or [""]
-        out["pinned_tests"] = {"returncode": p.returncode, "summary": tail[0][:200]}
+        out["pinned_tests"] = {"returncode": p.returncode, "summary": tail[0][:200], "timed_out": False}
         out["ok"] = p.returncode == 0 and " failed" not in tail[0] and " error" not in tail[0] and " skipped" not in tail[0]
     return out
 
@@ -2043,7 +2057,8 @@ class ProbeError(Exception):
 _ACTIVE_WORDS = ("active", "activating", "reloading", "deactivating", "refreshing", "maintenance")
 _DOWN_WORDS = ("inactive", "failed")
 _ENABLED_WORDS = ("enabled", "enabled-runtime", "static", "linked", "linked-runtime", "alias", "indirect", "generated", "transient")
-_OFF_WORDS = ("disabled", "masked", "masked-runtime")
+_OFF_WORDS = ("linked", "disabled")                # P432: the ONLY is-enabled answers that count as 'off' (never `enabled`)
+_WITNESS_WORDS = ("running", "degraded", "starting", "initializing", "stopping", "maintenance")
 PROBE_TIMEOUT_S = 20
 
 
@@ -2070,22 +2085,47 @@ class Probes:
             raise ProbeError("systemctl --user: the user bus is unreachable")
         return p
 
+    def _bus_witness(self) -> None:
+        """A POSITIVE witness that the user bus answered (le-031 N-b): `is-system-running` must print a known manager
+        state. Required before any 'down' / 'off' / 'absent' verdict, so those never rest on the ABSENCE of an error
+        message (which a different systemd version or a translated message could hide)."""
+        p = self._sysctl("is-system-running")
+        word = (p.stdout or "").strip()
+        if word not in _WITNESS_WORDS:
+            raise ProbeError("systemctl is-system-running: %r is not a positive bus answer" % word[:40])
+
     def unit_active(self, unit: str) -> bool:
         p = self._sysctl("is-active", unit)
         word = (p.stdout or "").strip()
         if word in _DOWN_WORDS and p.returncode in (3, 4):
+            self._bus_witness()
             return False
         if word in _ACTIVE_WORDS:
             return True
         raise ProbeError("systemctl is-active %s: rc %s, answer %r is neither up nor down" % (unit, p.returncode, word[:40]))
 
+    def _unit_absent(self, unit: str) -> bool:
+        """A unit counts as absent ONLY when list-unit-files, on a bus that just answered, lists nothing for it."""
+        self._bus_witness()
+        p = self._sysctl("list-unit-files", "--no-legend", unit)
+        if p.returncode not in (0, 1):
+            raise ProbeError("systemctl list-unit-files %s: rc %s" % (unit, p.returncode))
+        return not (p.stdout or "").strip()
+
     def unit_enabled(self, unit: str) -> bool:
+        """True = the unit could start on its own (`enabled` and its family, `static`): the gate FAILS. False = `linked` or
+        `disabled` (Exec P432), or PROVEN ABSENT from list-unit-files. Any other answer, or no bus witness, is a ProbeError."""
         p = self._sysctl("is-enabled", unit)
         word = (p.stdout or "").strip()
         if word in _ENABLED_WORDS:
             return True
         if word in _OFF_WORDS:
+            self._bus_witness()
             return False
+        if word in ("not-found", ""):
+            if self._unit_absent(unit):
+                return False
+            raise ProbeError("systemctl is-enabled %s: %r, but list-unit-files lists it" % (unit, word))
         raise ProbeError("systemctl is-enabled %s: rc %s, answer %r is neither on nor off" % (unit, p.returncode, word[:40]))
 
     def _foreign(self, d: str) -> Optional[bool]:
@@ -2220,6 +2260,8 @@ def gate_p4(probes, target_dir: str, *, code_placed_at: Optional[float], daemon_
     manifest is a leg that is False - never a leg that is left out (le-029 C1/C2). `require_files_equal=False`
     (the rollback step only) records the equality leg under `skipped`, with the reason, instead of dropping it."""
     files = [os.path.join(target_dir, n) for n in SIX_FILES]
+    if hasattr(probes, "foreign_unreadable"):
+        probes.foreign_unreadable = 0
     checks: Dict[str, bool] = {}
     errors: Dict[str, str] = {}
     skipped: Dict[str, str] = {}
@@ -2252,7 +2294,20 @@ def gate_p4(probes, target_dir: str, *, code_placed_at: Optional[float], daemon_
         except (OSError, ValueError):
             return False
     checks["no_pulse_since_code_placement"] = pulse_ok()
-    return {"gate": "P4", "checks": checks, "probe_errors": errors, "skipped_legs": skipped, "ok": all(checks.values())}
+    return {"gate": "P4", "checks": checks, "probe_errors": errors, "skipped_legs": skipped,
+            "foreign_unreadable": getattr(probes, "foreign_unreadable", 0), "ok": all(checks.values())}
+
+
+def conduit_path_refused(conduit_dir: str) -> Optional[str]:
+    """R-4: the conduit is stat-walked, so it must never be (or contain) the checkpoint directory - which holds
+    generations/ - nor Syl's data. Judged on realpaths; returns the reason or None."""
+    if not conduit_dir:
+        return "h3_conduit_path_not_recorded_or_under_syls_directories"
+    if _under(conduit_dir, SYL_CHECKPOINTS) or _under(conduit_dir, os.path.join(_HOME, "NeuroGraph", "data")):
+        return "h3_conduit_path_not_recorded_or_under_syls_directories"
+    if _under(conduit_dir, RECORDED_CC_CHECKPOINT_DIR) or _under(RECORDED_CC_CHECKPOINT_DIR, conduit_dir):
+        return "h3_conduit_path_is_or_contains_the_checkpoint_directory"
+    return None
 
 
 def hold_snapshot(probes, conduit_dir: str) -> Dict[str, Any]:
@@ -2277,26 +2332,29 @@ def hold_snapshot(probes, conduit_dir: str) -> Dict[str, Any]:
         "h2_leg2_service_active": q("h2_leg2_service_active", lambda: probes.unit_active(LEG2_SERVICE), False),
         "h2_sync_or_merge_process": q("h2_sync_or_merge_process", lambda: probes.processes_matching(SYNC_PROC_PATTERNS), []),
         "h3_conduit_dir": conduit_dir,
-        "h3_conduit_stat": q("h3_conduit_stat", lambda: probes.stat_snapshot(conduit_dir), {}),
+        "h3_conduit_stat": ({} if conduit_path_refused(conduit_dir) else q("h3_conduit_stat", lambda: probes.stat_snapshot(conduit_dir), {})),
         "probe_errors": errs,
     }
 
 
 def gate_p6(probes, conduit_dir: str, start: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if hasattr(probes, "foreign_unreadable"):
+        probes.foreign_unreadable = 0
     now = hold_snapshot(probes, conduit_dir)
     bad = [k for k in ("h1_callosum_cron_line_firing", "h1_leg1_flag_env_is_1", "h2_leg2_timer_enabled",
                        "h2_leg2_timer_active", "h2_leg2_service_active") if now[k]]
     if now["h2_sync_or_merge_process"]:
         bad.append("h2_sync_or_merge_process")
     bad += ["probe_error:%s" % k for k in now["probe_errors"]]
-    if not conduit_dir or _under(conduit_dir, SYL_CHECKPOINTS) or _under(conduit_dir, os.path.join(_HOME, "NeuroGraph", "data")):
-        bad.append("h3_conduit_path_not_recorded_or_under_syls_directories")
+    why = conduit_path_refused(conduit_dir)
+    if why:
+        bad.append(why)
     if start is not None:
         if now["h1_crontab_sha256"] != start["h1_crontab_sha256"]:
             bad.append("h1_crontab_changed_since_start")
         if now["h3_conduit_stat"] != start["h3_conduit_stat"]:
             bad.append("h3_conduit_stat_changed_since_start")
-    return {"gate": "P6", "snapshot": now, "violations": bad, "ok": not bad}
+    return {"gate": "P6", "snapshot": now, "violations": bad, "foreign_unreadable": getattr(probes, "foreign_unreadable", 0), "ok": not bad}
 
 
 def gate_p2(daemon_organism_file: str, pin_root: str, tool_root: Optional[str] = None) -> Dict[str, Any]:
@@ -2610,9 +2668,12 @@ def _require_phase2_inputs(args) -> float:
     if not args.code_placed_at:
         raise Refusal("--code-placed-at is REQUIRED at Phase 2 (the 'no pulse since the code was placed' leg of P4 is never skipped)")
     try:
-        return _parse_ts(args.code_placed_at)
+        placed = _parse_ts(args.code_placed_at)
     except ValueError:
         raise Refusal("--code-placed-at %r is not an epoch or an ISO time" % args.code_placed_at)
+    if placed > time.time():
+        raise Refusal("--code-placed-at %r is later than now: a claim about the future makes the 'no pulse since' leg vacuous" % args.code_placed_at)
+    return placed
 
 
 def _partner_specs(args, tdir: str) -> List[Tuple[str, str]]:
@@ -2694,6 +2755,34 @@ def _one_manifest(run_dir: str, quoted_sha256: str) -> Tuple[str, str, Dict[str,
     return mpaths[0], msha, load_artifact(mpaths[0])
 
 
+def _assert_manifest_target(manifest: Dict[str, Any], tdir: str) -> None:
+    """R-3: the backup manifest must be about THIS target: its recorded realpath must equal the target directory."""
+    got = os.path.realpath(str(manifest.get("target_realpath", "")))
+    if got != tdir:
+        raise Stop("R-3: the backup manifest's target_realpath %r is not the target directory %r" % (manifest.get("target_realpath"), tdir))
+
+
+def _preserve_displaced(run_dir: str, tdir: str, names: List[str], live_sha: Dict[str, str], utc: str) -> List[Dict[str, str]]:
+    """R-7 (P382 literal): before a live file whose hash is not the backup's is replaced, a HASH-EQUAL copy of it must
+    survive in the run directory: <run>/stage/<name> if that still holds exactly those bytes, else a new copy in
+    <run>/displaced-<UTC>/. 'Delete nothing' then never rests on nobody having cleaned the run directory."""
+    out = []
+    ddir = os.path.join(run_dir, "displaced-%s" % utc)
+    for n in names:
+        sp = os.path.join(run_dir, "stage", n)
+        if os.path.isfile(sp) and sha256_file(sp) == live_sha[n]:
+            out.append({"name": n, "where": "stage", "sha256": live_sha[n]})
+            continue
+        dst = guard_out_path(os.path.join(ddir, n))
+        os.makedirs(ddir, mode=0o700, exist_ok=True)
+        refuse_inplace_write(dst)
+        shutil.copyfile(os.path.join(tdir, n), dst)
+        if sha256_file(dst) != live_sha[n]:
+            raise Stop("R-7: the displaced copy of %s does not match the live file it preserves" % n)
+        out.append({"name": n, "where": "displaced", "sha256": live_sha[n]})
+    return out
+
+
 def _assert_inodes_after(before: Dict[str, Dict[str, Any]], after: Dict[str, Dict[str, int]], rewritten) -> None:
     """The replace must have behaved as Exec P428 says: every REWRITTEN live file is a NEW inode on the same device
     with link count 1; every file that was not rewritten is still the same inode."""
@@ -2724,6 +2813,7 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
     refuse_if_retired(tdir)
     run_dir = guard_out_path(args.run_dir)
     mpath, msha, manifest = _one_manifest(run_dir, args.josh_go_manifest_sha256)
+    _assert_manifest_target(manifest, tdir)
     hold_start = load_artifact(os.path.join(run_dir, "hold-start.json"))
     log = _daemon_log_for(tdir)
     gates = []
@@ -2755,11 +2845,21 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
                           expect=_expect(args), in_hashes=in_hashes)
     if out["failed"]:
         raise Stop("verifier FAILED on the staged pair: %s" % ",".join(out["failed"]))
+    by_rec = {r["id"]: r for r in A["records"]}
     approved_and_candidate = sorted(r["id"] for r in A["records"] if r["disposition"] == "candidate"
                                     and r["id"] in set(out["plan"]["approved_ids"]))
-    if out["plan"]["refused"] or sorted(out["plan"]["write_ids"]) != approved_and_candidate or \
-            sorted(map(list, out["plan"]["mapping"].items())) != sorted(frozen_map["pairs"]):
+    struck = [r for r in out["plan"]["refused"] if r["reason"] == "struck"]
+    other_refusals = [r for r in out["plan"]["refused"] if r["reason"] != "struck"]
+    # a `struck` decision (P432 / P423-C1) is a recorded DEVIATION: the node is left exactly as-is and the apply continues.
+    # A struck id in the Choice Clause marker set already STOPPED in build_outputs (deny_check reads every approval id).
+    # Anything else refused (unapproved, absent, hash mismatch), a write set that is not approved-and-candidate, or a
+    # mapping that is not the frozen one (minus the struck ids) is a STOP.
+    expected_pairs = sorted([list(x) for x in out["plan"]["mapping"].items()] + [[r["id"], by_rec[r["id"]]["new_id"]] for r in struck])
+    if other_refusals or sorted(out["plan"]["write_ids"]) != approved_and_candidate or expected_pairs != sorted(frozen_map["pairs"]):
         raise Stop("any deviation from the approved list is a STOP at Phase 2 (never a silent drop)")
+    struck_deviations = [{"id": r["id"], "would_have_been": by_rec[r["id"]]["new_id"], "class": by_rec[r["id"]]["class"],
+                          "old_sha16": by_rec[r["id"]]["old_sha16"], "new_sha16": by_rec[r["id"]]["new_sha16"],
+                          "left": "exactly as-is (text, id, flags, synapses)"} for r in struck]
 
     def recheck():
         p4 = gate_p4(probes, tdir, manifest_files=manifest["files"], code_placed_at=placed, daemon_log=log)
@@ -2769,6 +2869,7 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
 
     def writer(staged: str, want: str, is_main: bool):
         def fn(tmp: str):
+            refuse_inplace_write(tmp)                                      # R-5: never write through a stale multi-link tmp
             shutil.copyfile(staged, tmp)
             if sha256_file(tmp) != want:
                 raise Stop("staged file changed while copying to the live tmp")
@@ -2793,11 +2894,11 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
     final = write_artifact(os.path.join(run_dir, "post-apply-receipt-FINAL-%s.json" % utc), {
         "kind": "post-apply-receipt", "six_file_sha256_after": out["out_hashes"], "mapping_sha256": out["id_map_sha256"],
         "live_inodes_before": before_i, "live_inodes_after": after_i, "generation_partners_after": partners_after,
-        "ripple": RIPPLE_TABLE, "p2": gates[1],
+        "struck_deviations": struck_deviations, "ripple": RIPPLE_TABLE, "p2": gates[1],
         "josh_go": args.josh_go, "backup_manifest_sha256": msha, "approvals_packet": approvals.get("packet"),
         "gates": [g.get("gate") for g in gates], "tool_sha256": tool_sha256()})
     retired = write_retired_receipt(run_dir, tdir, out["id_map_sha256"], utc)     # strictly AFTER both files verified
-    return {"applied": len(out["plan"]["write_ids"]), "post_apply_receipt_sha256": final, "retired_receipt": os.path.basename(retired),
+    return {"applied": len(out["plan"]["write_ids"]), "struck_deviations": len(struck_deviations), "post_apply_receipt_sha256": final, "retired_receipt": os.path.basename(retired),
             "note": "the daemon is NOT started; the S4 start waits on gate P10 (the T6 would-mint set signed per id)"}
 
 
@@ -2814,28 +2915,41 @@ def stage_rollback(args, pinned, probes, target_info) -> Dict[str, Any]:
         raise Refusal("--step rollback is REFUSED: it needs Josh's go (--josh-go <reference> quoting the backup-manifest sha256)")
     if not (args.run_dir and args.josh_go_manifest_sha256 and args.conduit_dir):
         raise Refusal("--step rollback needs --run-dir --josh-go-manifest-sha256 --conduit-dir")
+    if not args.josh_go_receipt_sha256:
+        raise Refusal("--step rollback needs --josh-go-receipt-sha256 (the sha256 of the FINAL post-apply receipt, or of the "
+                      "draft(s) after a torn apply; repeat the flag to quote several) - the receipt is bound by the go like the manifest")
     tdir = target_info["target_realpath"]
     if tdir != os.path.realpath(RECORDED_CC_CHECKPOINT_DIR):
         raise Refusal("P7: the live write target must be the recorded CC checkpoint directory")
     placed = _require_phase2_inputs(args)
     run_dir = guard_out_path(args.run_dir)
     mpath, msha, manifest = _one_manifest(run_dir, args.josh_go_manifest_sha256)
+    _assert_manifest_target(manifest, tdir)
     hold_start = load_artifact(os.path.join(run_dir, "hold-start.json"))
     log = _daemon_log_for(tdir)
     p4 = gate_p4(probes, tdir, code_placed_at=placed, daemon_log=log, require_files_equal=False)
     p6 = gate_p6(probes, args.conduit_dir, _hold_start_of(hold_start))
     if not (p4["ok"] and p6["ok"]):
         raise Refusal("rollback: gate(s) P4/P6 not satisfied: %s" % _p4_failures(p4, p6))
-    finals = sorted(glob.glob(os.path.join(run_dir, "post-apply-receipt-FINAL-*.json")))
-    drafts = sorted(glob.glob(os.path.join(run_dir, "post-apply-receipt-[0-9]*.json")))
-    rpaths = finals or drafts
-    if len(rpaths) != 1:
-        raise Refusal("rollback: the run directory must hold exactly one post-apply receipt (final, or the pre-replace draft); found %d" % len(rpaths))
-    after_sha = load_artifact(rpaths[0])["six_file_sha256_after"]
+    # R-1 / R-2: the receipts the identity check trusts are the ones the go QUOTES (by sha256, like the manifest) - an edited
+    # or invented receipt is not trusted; there may be several (a failed apply, then a torn one): the union of the quoted
+    # ones' after-hashes is what a live file may equal besides the backup's bytes. Unquoted receipts are ignored.
+    cands = sorted(glob.glob(os.path.join(run_dir, "post-apply-receipt-FINAL-*.json"))) + \
+        sorted(glob.glob(os.path.join(run_dir, "post-apply-receipt-[0-9]*.json")))
+    by_sha = {sha256_file(pth): pth for pth in cands}
+    after_union: Dict[str, set] = {n: set() for n in SIX_FILES}
+    for q in args.josh_go_receipt_sha256:
+        if q not in by_sha:
+            raise Refusal("rollback: the quoted receipt sha256 %s names no post-apply receipt in the run directory "
+                          "(edited, or not tool-made)" % q)
+        rc_after = load_artifact(by_sha[q])["six_file_sha256_after"]
+        for n in SIX_FILES:
+            after_union[n].add(rc_after[n])
+    rpaths = [by_sha[q] for q in args.josh_go_receipt_sha256]
     backup_sha = {n: manifest["files"][n]["sha256"] for n in SIX_FILES}
     live_sha = {n: sha256_file(os.path.join(tdir, n)) for n in SIX_FILES}
     for n in SIX_FILES:
-        if live_sha[n] not in (backup_sha[n], after_sha[n]):
+        if live_sha[n] not in ({backup_sha[n]} | after_union[n]):
             raise Refusal("rollback: identity - live %s matches neither the pre-apply backup nor the post-apply receipt "
                           "(something else wrote it; a post-S4 restore needs the P391 export first)" % n)
     backup_dir = os.path.join(run_dir, "backup")
@@ -2845,6 +2959,7 @@ def stage_rollback(args, pinned, probes, target_info) -> Dict[str, Any]:
             raise Refusal("rollback: the backup copy of %s does not match its sha256 in the manifest" % n)
     to_restore = [n for n in SIX_FILES if live_sha[n] != backup_sha[n]]
     before_i = {n: stat_ident(os.path.join(tdir, n)) for n in SIX_FILES}
+    displaced = _preserve_displaced(run_dir, tdir, to_restore, live_sha, utc_stamp())        # R-7: before ANY replace
 
     def recheck():
         q4 = gate_p4(probes, tdir, code_placed_at=placed, daemon_log=log, require_files_equal=False)
@@ -2854,6 +2969,7 @@ def stage_rollback(args, pinned, probes, target_info) -> Dict[str, Any]:
 
     def writer(src: str, want: str):
         def fn(tmp: str):
+            refuse_inplace_write(tmp)                                      # R-5: never write through a stale multi-link tmp
             shutil.copyfile(src, tmp)
             if sha256_file(tmp) != want:
                 raise Stop("the backup copy changed while copying to the live tmp")
@@ -2879,7 +2995,8 @@ def stage_rollback(args, pinned, probes, target_info) -> Dict[str, Any]:
         "six_file_sha256_after": backup_sha, "live_inodes_before": before_i, "live_inodes_after": after_i,
         "never_a_source": "generations/ and last_good/ (incidental, expiring, never a rollback source)",
         "host_stays_down": True, "host_down_until": "Chief's post-restore resume gate (P398) AND the Executive's ruling on the parser",
-        "josh_go": args.josh_go, "backup_manifest_sha256": msha, "post_apply_receipt": os.path.basename(rpaths[0]),
+        "josh_go": args.josh_go, "backup_manifest_sha256": msha, "post_apply_receipts": [os.path.basename(x) for x in rpaths],
+        "displaced": displaced,
         "ripple": RIPPLE_TABLE, "tool_sha256": tool_sha256()})
     return {"restored": sorted(to_restore), "rollback_receipt_sha256": rsha, "host_stays_down": True,
             "note": "the daemon is NOT started; the host stays DOWN until the resume gate and the parser ruling"}
@@ -2904,9 +3021,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--expect-wants", type=int, default=EXPECTED_WANTS)
     ap.add_argument("--expect-protected", type=int, default=EXPECTED_PROTECTED)
     ap.add_argument("--expect-scope", type=int, default=EXPECTED_SCOPE)
-    ap.add_argument("--apply", action="store_true", help="Phase 2 live write - REFUSED without Josh's go and every gate")
+    ap.add_argument("--apply", action="store_true", help="Phase 2 live write - REFUSED without Josh's go and every gate. P3(b) (the pinned test file, run as a "
+                    "subprocess with a %ds timeout) has never been exercised by this tool: run it ONCE, read-only, before Phase 2" % P3B_TIMEOUT_S)
     ap.add_argument("--josh-go", help="Josh's go reference; it must quote the backup-manifest sha256")
     ap.add_argument("--josh-go-manifest-sha256")
+    ap.add_argument("--josh-go-receipt-sha256", action="append", default=[], metavar="SHA256",
+                    help="rollback: the sha256 of a post-apply receipt (the FINAL one, or the draft(s) after a torn apply) - the go "
+                    "quotes it beside the manifest's; repeat to quote several. Unquoted receipts are never trusted")
     ap.add_argument("--frozen-dir", help="a directory holding UNEDITED copies of exactly three files of the classify run: "
                     "reports/repair-list.json, reports/scope-ids.json and reports/id-map.json (keep those names)")
     ap.add_argument("--daemon-organism-file", help="P2: the cc_ng_organism.py in the daemon unit's ACTUAL import root, named by the "
