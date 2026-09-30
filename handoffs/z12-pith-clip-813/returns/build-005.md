@@ -10,6 +10,8 @@
 
 # #813 TURN 5 — RETURN build-005 (small)
 
+> **CORRECTION (turn 6, 2026-09-30; history below is left as written):** the row "LOW — constants 800 / 200" and the `_pith_provider_node_limit` docstring said the measured limit is conservative and that a node between it and the true budget "is still caught loudly ... as a never-fit assembly at admit". **That was wrong.** The limit measured the WORST-case shell, so in a tight budget it fell *below* what fits and the node was dropped or turned into a reference instead (le-025 C-2: core 800 / budget 1200 / node 30 → `capacity_empty`; 800/1500/60 and 400/1000/30 → reference). Fixed in turn 6 (`77a18ce`): the limit is now the optimistic bound. See `build-006.md`.
+
 Lane `pith-clip-removal-813` · dispatch #11114 · worker seat · returned **unreviewed**.
 Related: [[NeuroGraph]] · [[Pith]] · [[Duck Ethics]] · previous `build-004.md` · review `../reviews/le-022-813-delta.md` (read in full).
 
