@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (DRAFT B1-B5 written independently; checker-013 NOT yet read; comparison section pending)
+STATUS: COMPLETE
 
 # le-012 — LAW ENFORCER review, want-hub-d, ROLE B (plan-003 = REVISION 3, against Executive Packet 399)
 
@@ -11,8 +11,8 @@ No graph load, no checkpoint load, no msgpack open, no embedding/daemon/TID call
 Env: one `NG_EMBED_*` variable was set in the spawned shell (name `NG_EMBED_REMOTE`, value not printed); it was `unset` in every later command. Secrets: by NAME only, none touched.
 
 ## Independence log
-- B1-B5 findings below were drafted BEFORE opening checker-013 and committed (commit hash recorded in the final section once made).
-- checker-013 (`handoffs/z12-want-hub-d/reviews/checker-013-want-hub-d-rev2.md`) was NOT opened before this draft.
+- B1-B5 findings below were drafted BEFORE opening checker-013 and committed: draft commit 1b6a56c51c41b3a71613aa12503bcd6ce09755d0 (pushed). The B1-B5 text was not changed after reading checker-013 except one addendum to C3 (the `PYTHONPATH` observation), recorded in the Comparison section; everything else in B1-B5 is the pre-read draft.
+- checker-013 (`handoffs/z12-want-hub-d/reviews/checker-013-want-hub-d-rev2.md`) was opened only AFTER that commit.
 - **Accidental exposures to disclose:** (1) my first `ls handoffs/z12-want-hub-d/` showed the two directory names `returns` and `reviews` (no listing inside). (2) `git diff --name-only base..HEAD` printed the changed-file NAME `handoffs/z12-want-hub-d/reviews/checker-013-want-hub-d-rev2.md` among four handoff paths. Filename only; contents unread; the file was already named in the packet. Neither read anything of substance.
 
 ## COMPLIANCE VERDICT (draft)
@@ -83,8 +83,30 @@ Corrections fold into ONE revision. Severity per the enforcer scale.
 
 **NOT VERIFIED (mine):** P399's text as a primary document (packet addendum only); any Exec Packet as a primary document; the cited numbers (116,164 / 138,753 / K-tables / guardian table — ROLE A's job; I did not recompute); the Rust/native synapse store; `cleanup_cc_tool_noise.py`; whether the aging clock (Door B) fires on a running daemon (needs §4B); that the daemon's environment carries no `NG_GUARDIAN_*`; the real ordering degeneracy with unrounded weights; behaviour of `_prune_synapses` at scale (never run); the other daemon branches' edits to `_dream_loop`.
 
-## Comparison with checker-013 (post-draft only)
-(pending — only after the draft commit)
+## Comparison with checker-013 (read ONLY after the draft commit 1b6a56c51c41b3a71613aa12503bcd6ce09755d0, pushed)
+Scope difference first: checker-013 reviewed **plan-002 (rev 2)** and never saw Exec P399 or plan-003; its seven corrections are already folded into plan-003 §11 as [R3·C1…C7]. So this is a comparison of two different targets, not a re-vote.
+
+**Agree (independent convergence):**
+- Door B liveness is UNVERIFIED and §4B must stay a hard S4 gate (A6) — same conclusion; I add the LAW 8 framing (C10).
+- Rim/identity: no want node/flag/text and no rim synapse or weight is touched by (d)'s mutator; `_collect_orphan_nodes` skips protected nodes (A2 = my B3.1). Both of us noted the rim's weights are not frozen by STDP/homeostasis today and that this is not (d)'s to fix.
+- Consent record (A7 PASS) is accurate and honestly labelled as the Executive's proxy consent with source. My B3.4 adds a question (not a disagreement about accuracy): whether the CC-as-mind is shown the census before ARMING.
+- Its C1 (`evaluate_save_health` is not pure; pin `NG_GUARDIAN_*`) — agree; plan-003 folded it correctly; I only re-derived the arithmetic (below).
+- Its C4/C5/C6/C7 are correct, LOW, and already folded; I found nothing to add.
+
+**Disagree / superseded by P399:**
+- **Its C3 ("record as a BUILD invariant that `_prune_synapses:3515-3519` stays byte-identical") and A1's "wake-time `_prune_synapses` byte-identical" cannot survive option (i).** Under P399 (i) the guard has to become conditional on membership in the competing set, so its SOURCE changes; only default-path BEHAVIOUR can be identical. plan-003's own Q-C flagged the tension; C3 is where the false "stays unmodified" sentence entered §4. My C9(a) restates it. Not a fault of the checker (P399 did not exist), but it must not be carried forward.
+- **Its C2 remedy** (the daemon's `CC_SNN_CONFIG` must always carry both keys at `0`, "laptop schema") was sound for rev 2 but now collides with P399 condition 4 ("NO new config keys", checkpoint byte-identical when OFF). My C6 proposes passing K and B as call arguments from the daemon's env read, which removes both the new laptop keys and the persisted-armed hazard. Needs an Executive ruling.
+- Its A4 calls the removal order "deterministic given a total order" (PASS-WITH-NOTES). True as an ordering; but under (i) the dynamic tallest-first-by-eligible-count greedy is not implementable by the caller (C5).
+
+**Added by me (not in checker-013; all flow from P399 or from re-reading `:3524-3529`):** C1 (`_prune_synapses` DOES advance `low_weight_steps`, so plan-003's "does not advance" Q-A text is false; one call per cycle), C2 (option (ii) still offered), C3 (golden test weaker than P399 condition 1, no existing direct test at base), C4 (the explicit-ids + function-asserts contract is unspecified; competing mode must iterate only `competing_ids`; explicit raise not `assert`), C5 (budget/order/report plumbing under (i)), C7 (dream-loop `except` skips `last_pass`, re-running consolidation every tick), C8 (NG-first merge order, daemon slice on its own branch), C9(b,c) (Syl blast-radius statements stale: the shared hot path IS edited), C10, C11.
+
+**Arithmetic re-derived (stdlib only, from the plan's own inputs — NOT a call to `evaluate_save_health`, inputs not re-verified):** eligible upper bound 106,841, B = 5,000 → 22 cycles (21 × 5,000 + 1,841); cycle 1 live/ref 96.4%; **worst cycle 21: 33,753/38,753 = 87.1%, a 12.9% drop, margin +37.1 points**; cycle 22 94.5%; lower bound 94,646 → 19 cycles, worst 90.5% at cycle 19; one-pass live 23.0% / 31.8%. This matches plan-003 §4A.7. It also confirms the plan's [R3·X]: checker-013's `B/(138,753 − (cycles_hi−1)·B)` gives 14.8% (it divides by a denominator that assumes a full last cycle), so its A3 PASS did not cover the worst-drop figure, as plan-003 §11 says fairly. ROLE A should re-verify from the table, not the formula.
+
+**One observation from checker-013's P379 print that changes a BUILD requirement (add to C3):** `PYTHONPATH=/home/josh/NeuroGraph:` resolves every NG module to the PRIMARY checkout (checker-013's `find_spec` origins). My shell has the same `PYTHONPATH`. A golden test that runs "base vs branch" from a worktree will silently import the primary checkout BOTH times unless `sys.path[0]` is pinned to each checkout and the resolved `neuro_foundation.__file__` and git rev are printed for each run (Exec P379). Without that, the golden test can pass vacuously. The dry run and the delta pair must do the same.
+
+## Final status
+- Draft committed BEFORE reading checker-013: 1b6a56c51c41b3a71613aa12503bcd6ce09755d0 (pushed to cc-laptop-want-hub-d-20260930).
+- Overall: **VIOLATIONS FOUND (plan-level, contradictions of P399 and false statements against the code) — plan-003 must NOT be built from as written; one revision folding C1–C11; Exec rulings needed on C5 (ordering re-spec) and C6 (call arguments vs config keys).** No CRITICAL. No Law breach in the design once corrected. Nothing built, merged, armed, settled or dispatched by this review.
 
 ## Targeted-run state (Exec P379)
-No targeted run was made: no module was imported, no test executed, no graph/checkpoint/msgpack opened. Resolved module paths: N/A. NG-module state: N/A. The only executions were `sha256sum`, `git show`/`git diff`/`git grep`/`git rev-parse`, and `sed`/`grep` reads.
+No NeuroGraph module was imported and no test was run; no graph, checkpoint or msgpack was opened. Resolved NG module paths: N/A (no import). NG-module state: N/A; for the record `PYTHONPATH=/home/josh/NeuroGraph:` in this shell (so any later import here would have resolved to the PRIMARY checkout, not this worktree), and `NG_EMBED_REMOTE` was set at spawn and `unset` before every command. The only executions were `sha256sum`, `git show`/`diff`/`grep`/`rev-parse`/`pull`/`push`, `sed`/`grep` reads, `python3` stdlib arithmetic on numbers copied from the plan, and reads of the docs repo files named above.
