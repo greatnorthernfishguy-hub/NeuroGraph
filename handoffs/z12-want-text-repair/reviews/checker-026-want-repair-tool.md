@@ -1,8 +1,8 @@
 # checker-026 ROLE A (cross-family) — 118-want text repair ONE-SHOT TOOL (TURN A)
 
-STATUS: INCOMPLETE - draft findings (1)-(8) filled; ROLE B file not yet read
+STATUS: COMPLETE
 
-- Seat: checker-026 (cross-family, grok-4.6, `report_only`). ROLE A only of ADDENDUM 2; ROLE B not written and not read.
+- Seat: checker-026 (cross-family, grok-4.6, `report_only`). ROLE A only of ADDENDUM 2. Own draft findings (1)-(8) pushed as `98dfcda847dd17b74bb07bd378c058008c268c6f` before this seat opened `le-029-want-repair-tool.md`.
 - Lane: `z12-s3-restore-bundle-20260929`. Dispatch #11342. Zone manager Z12 session `52d39aba-db92-4bf2-b3b1-0e4c13f77d8c`.
 - Packet: `/home/josh/docs/.claude/worktrees/daemon-recall-756-20260930/handoffs/z12-silent-failure-lanes-20260930/assignments/review-packet-want-text-repair-118.md` LAST section ADDENDUM 2. Docs branch `cc-laptop-daemon-recall-756-20260930` @ `da893559f7c2359a737c89e14f9bf70bdceadfe6` (read, not edited). Packet file sha256 `0bfd95d0e5af439ca7b650d090af53739a8d7095f2d5e63073dc0b7efd82e1a8`.
 - Assignment: `assignments/build-want-text-repair-118.md` sha256 `d71dd75d68d5e3b0e9384f43910732e4204a1d2535d3fb8364ba019ff23efa41`.
@@ -132,7 +132,7 @@ Phase 1 classify+rewrite on that synthetic directory: rc 0 / 0; target sha256 un
 
 ## (4) the rim / `pred_weights` assertion, Choice Clause, id-follows-text, collision, mapping + inverse, idempotent re-run
 
-**Verdict: PASS**
+**Verdict: PASS-WITH-NOTES**
 
 V15 `:1726-1731` / `:1868-1874`: unrepaired wants, both Choice Clause ids, and the constitutional node allow only `pred_weights` key remap of moved ids; any other field, a value change, an added/removed key, or a text edit is `v15_bad`. Deny-check `deny_check` `:1114` STOPS if either Choice Clause id or the constitutional id is in S, the mapping (old or new), or approvals. Presence of those ids in the output walk is not part of V15's `ok` (C9). Deny-check is by id constant, not by metadata (the synthetic tests mint those ids with filler text). V16 `:1746-1755` / `:1876`: rim-incident synapses identical apart from the mapped want-side endpoint; `rim_changed == rim_incident_mapped`. Tests: `test_choice_clause_wants_and_the_rim_are_byte_equal_apart_from_the_key_remap`, `test_v15_fails_for_any_change_other_than_the_key_remap_of_moved_ids` (value / added key / removed keys / other field / unrepaired text), `test_the_rim_synapses_are_repointed_at_the_want_side_only`, `test_v16_fails_when_a_rim_synapse_field_changes`, `test_the_collision_rule_drops_and_lists_both_parties_never_merges`, `test_the_mapping_and_its_inverse_are_written_hash_verified_and_inverse_composes`, `test_an_empty_mapping_makes_a_byte_identical_output_and_the_rewrite_is_idempotent`, `test_separate_takes_the_nested_pair_verbatim_and_the_id_follows_the_text`.
 
@@ -233,7 +233,11 @@ HEAD additionally has this reviews directory (`checker-026` stub + `le-029`). No
 
 **C9 (HIGH).** V15's `ok` is `not W["v15_bad"] and bool(dc.get("clean"))` (`:1873`). `choice_clause_present` is recorded in the detail only. If both Choice Clause ids (and the rim) are absent from the graph, the lockstep never appends them to `v15_bad`, deny-check stays clean (they are not in S/mapping/approvals), and V15 passes. Presence is not asserted.
 
-**C10 (HIGH for apply, NOTE for TURN A).** `stage_apply` `:2475-2476` `os.replace`s main then the sidecar. A death between them is documented as "idempotent re-run from the mapping"; there is no automatic restore of a partial live write. Combined with C1 (no before/after inode record), a torn apply is not mechanically proven. RETIRED is written after both files verify, so a re-run is not blocked by 6.8 — that part matches the plan.
+**C10 (HIGH for apply, NOTE for TURN A).** `stage_apply` `:2475-2476` `os.replace`s main then the sidecar. A death between them is documented as "idempotent re-run from the mapping"; there is no `--step rollback`. After main is replaced, P4's `six_files_equal_the_start_of_phase2_backup` (`:2054-2062`) fails on the changed main, so a re-run is REFUSED — the documented completion path does not run. Recovery is a manual restore from the named backup. Combined with C1 (no before/after inode record), a torn apply is not mechanically proven. RETIRED is written after both files verify, so 6.8 does not block the operator.
+
+**C11 (NOTE).** Deny-check is by the two literal Choice Clause ids plus the constitutional id (`:86-87`, `:1114`). A `constitutional`-flagged want inside S under a different id is not caught. The recorded population uses those ids; the plan's "provably outside" is only as strong as the literals.
+
+**C12 (MEDIUM — flag 4).** P2 is the sha256 of whatever path the operator passes as `--daemon-organism-file` (`:2422`). Pointing it at the PIN worktree file satisfies it. Q9 is open. Interim: record realpath/inode/mtime and refuse a path inside the pin or tool worktree.
 
 ---
 
@@ -252,6 +256,25 @@ HEAD additionally has this reviews directory (`checker-026` stub + `le-029`). No
 
 ---
 
+## Cross-family after own draft `98dfcda` (le-029 C1–C8)
+
+Own draft (1)-(8) was pushed at `98dfcda847dd17b74bb07bd378c058008c268c6f` (11:41:17Z) with ROLE B unread. le-029 COMPLETE at `4115844` was then read. Independent `/tmp` probes (no checkpoint dirs listed or opened) against the same tool:
+
+| le-029 | This seat | Result |
+|---|---|---|
+| C1 P4 `--code-placed-at` skippable | my C6 | **Reproduced.** `gate_p4(Fake, tmp)` with the flag omitted: `ok True`, keys are the five daemon-down legs only, `no_pulse_since_code_placement` absent. Tests `:1269` and `:1278` assert `gate_p4(...)["ok"]` with the argument omitted — the suite encodes the missing leg as a PASS. |
+| C2 fail-open systemd/cron probes | my C7 | **Concur on the code.** `_sysctl` `:1969` ignores returncode; empty stdout ⇒ `unit_active` False ⇒ P4 "down". `crontab_text` `:2016` returns `""` on any nonzero. **This host's bus answered:** `systemctl --user is-active checker026-nonexistent-unit.service` rc 4 stdout `inactive` (not empty). The empty-bus case was not reproduced here; the fail-open shape is still in the source. `FakeProbes` overrides the query methods, so those error paths have no test. |
+| C3 P2 attested, not resolved | my C12 / flag 4 | **Concur.** |
+| C4 CLI-overridable `--expect-*` | my C8 | **Concur.** |
+| C5 forgeable provisional | (added this pass) | **Reproduced.** Unedited provisional file: `load_approvals` Refusal `provisional_packet_is_not_an_approval`. After changing `packet` to `FORGED-EXEC-PACKET` and re-hashing: **accepted**, 1 entry, decisions `approved`. Same trust class as any approvals file (plan 5.2); the dry-run artifact is one string away from a real one. |
+| C6 torn-apply + inode evidence | my C1 + C10 | **Concur, with a tighter reading of torn-apply:** after main is replaced, P4 backup-equality fails, so the plan's "idempotent re-run" is refused. Rollback is the named backup. Inode/`st_nlink` still unrecorded (P428 follow-up). |
+| C7 Choice Clause presence not asserted | my C9 | **Reproduced.** `deny_check([], {}, ())` returns `clean True`. V15 `ok` does not require `cc_present` to hold the three ids. |
+| C8 metadata deny-check | my C11 | **Concur.** Literal ids only. |
+
+No disagreement on substance. Severity: this seat rates C6/C7/C8/C9/C10 HIGH for Phase 2 the same way le-029 rates its C1/C2 HIGH (silent-failure shapes in gates the plan calls mechanical). TURN A remains **PASS-WITH-NOTES**; C6–C10 (and C12) should land before a TURN-B `phase2-backup` / `--apply`.
+
+---
+
 ## Isolation / closing check
 
-Pin worktree remained detached at `ae798b94`, porcelain empty. Real `~/.bashrc` sha256 unchanged. No live tract open. No Syl path, no `~/NeuroGraph/data/checkpoints`, no primary checkout write. No PR, merge, settle, or dispatch. ROLE B not written. Commit of this file only; push `origin cc-laptop-want-repair-tool-20260930` by name.
+Pin worktree remained detached at `ae798b94`, porcelain empty. Real `~/.bashrc` sha256 unchanged. No live tract open. No Syl path, no `~/NeuroGraph/data/checkpoints`, no primary checkout write. Live CC checkpoint directories were not listed or opened. No PR, merge, settle, or dispatch. Commit of this file only; push `origin cc-laptop-want-repair-tool-20260930` by name. Draft findings commit `98dfcda847dd17b74bb07bd378c058008c268c6f`; this COMPLETE commit follows.
