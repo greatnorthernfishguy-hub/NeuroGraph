@@ -19,6 +19,28 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane want-hub-engine-d-build-20260930, dispatch #11877) — want-hub (d) ENGINE CHANGE
+# (PROTECTED CHANGE; Josh's go recorded in a434525cd3cdf68da5f282aa319a2323715d3938 [Exec Packet 440]; branch build, synthetic graphs only,
+#  no live checkpoint operation, no merge, nothing armed)
+# What: (1) Graph._prune_synapses gains FIVE keyword-only parameters, all default None: competing_ids, excluded_ids, max_removals, order_key,
+#       report. With all of them None the function is today's function (same walk, same identity skip, same counters, same removals, same single
+#       `pruned` event, same return). (2) ONE new method, Graph.compete_protected_links(topk, budget): the dream-time orchestrator. It builds the
+#       frozen rim F, the guaranteed set G (each authored want's strongest K per direction), the last-link set, competing_ids, excluded_ids and the
+#       static HEIGHT order key; makes EXACTLY ONE _prune_synapses call; and returns + logs the counts-by-want record. No DEFAULT_CONFIG change,
+#       no config key, CC_SNN_CONFIG untouched; K and B are call arguments.
+# Why: plan-005 (handoffs/z12-want-hub-d/returns/plan-005.md) §2.6 tests G/A/K/R, §4.2 contract (a)-(i), §4.3, §4A.2 (Exec P409 HEIGHT key),
+#       §4A.3 (last-link), §4A.6 (INFO record), §9; Exec P399 Q-C = option (i), P404 C5/C6, P412 X8 (keep report['eligible']), P440 (Josh: proceed).
+#       The 183 protected nodes' 128k links are exempt from every prune rule today; this lets the dream pass lift that exemption for the COMPETING
+#       set only, within a per-cycle budget, while F, G and the last-link set stay untouchable and no node is ever removed.
+# How: _prune_synapses — in competing mode (competing_ids is not None) the loop iterates ONLY the sorted, de-duplicated competing ids and the
+#       identity skip is not applied to them; the three predicates and their low_weight_steps bookkeeping are the SAME code as the default path.
+#       All validation (explicit ValueError, never assert, so it survives `python -O`) runs BEFORE the loop: competing/excluded supplied together,
+#       no overlap, every id exists, both endpoints exist, none touches a constitutional node, max_removals an int >= 1 AND an order_key entry for
+#       every competing id REQUIRED. Then, each gated on its own parameter being non-None: report['eligible'] = len(to_prune); to_prune sorted by
+#       order_key; to_prune sliced to max_removals; report['removed_ids'] filled after removal. The pruned event count is the post-truncation count.
+#       compete_protected_links — no predicate copy, no _remove_synapse_internal call, no removal loop, no _collect_orphan_nodes call; builds its
+#       sets twice and refuses (RuntimeError) if they differ; captures id -> (pre, post, conducting) BEFORE the call; holds graph._step_lock
+#       (re-entrant, so harmless under the daemon's own hold).
 # [2026-09-13] Codex — Make observational propagation exception-safe
 # (PROTECTED CHANGE; Josh authorized offline source repair; no live checkpoint operation)
 # What: Read-mode prime_and_propagate restores node voltage/refractory and hyperedge
@@ -3497,24 +3519,86 @@ class Graph:
         sprouted = self._sprout_synapses(fired_ids)
         return pruned, sprouted
 
-    def _prune_synapses(self) -> int:
+    def _prune_synapses(
+        self,
+        *,
+        competing_ids: Optional[Any] = None,
+        excluded_ids: Optional[Any] = None,
+        max_removals: Optional[int] = None,
+        order_key: Optional[Any] = None,
+        report: Optional[Dict[str, Any]] = None,
+    ) -> int:
         """Prune weak/inactive synapses (PRD §3.3.1).
 
         Rules:
             Weight-based: weight < threshold for > grace_period steps → remove.
             Activity-based: unused for > inactivity_threshold steps → remove.
             Age-based: age > grace_period AND peak_weight < 2× initial → remove.
+
+        Keyword-only parameters (want-hub (d), plan-005 §4.2) — ALL default None, and with
+        all of them None this is exactly the function above (both wake-time callers):
+            competing_ids / excluded_ids: supplied TOGETHER, by the caller, as synapse ids
+                (membership is never inferred here). Competing mode: the exemption for
+                identity-protected endpoints is lifted for exactly these ids and the loop
+                visits ONLY these ids. Refused (ValueError, before anything is touched) if
+                an id is also excluded, is absent, lacks an endpoint node, or touches a
+                constitutional node.
+            max_removals: at most this many of the function's own eligible list are removed
+                (int >= 1). REQUIRED in competing mode.
+            order_key: mapping synapse_id -> sortable; the eligible list is sorted by it
+                BEFORE truncation. REQUIRED in competing mode, with an entry for every id.
+            report: dict; filled with report['eligible'] (count before truncation) and
+                report['removed_ids'] (list, removal order).
         """
         wt = self.config["weight_threshold"]
         grace = self.config["grace_period"]
         inactivity = self.config["inactivity_threshold"]
         initial_w = self.config["initial_sprouting_weight"]
 
+        competing_mode = competing_ids is not None
+        if competing_mode != (excluded_ids is not None):
+            raise ValueError("_prune_synapses: competing_ids and excluded_ids must be supplied together")
+        if max_removals is not None and (
+                isinstance(max_removals, bool) or not isinstance(max_removals, int) or max_removals < 1):
+            raise ValueError("_prune_synapses: max_removals must be an int >= 1 (got %r)" % (max_removals,))
+        if report is not None and not isinstance(report, dict):
+            raise ValueError("_prune_synapses: report must be a dict or None (got %s)" % type(report).__name__)
+        if competing_mode:
+            if max_removals is None:
+                raise ValueError("_prune_synapses: max_removals is required in competing mode")
+            if order_key is None:
+                raise ValueError("_prune_synapses: order_key is required in competing mode")
+            try:
+                competing = sorted(set(competing_ids))
+            except TypeError as exc:
+                raise ValueError("_prune_synapses: competing_ids must be comparable synapse ids (%s)" % exc) from exc
+            excluded = set(excluded_ids)
+            for sid in competing:
+                if sid in excluded:
+                    raise ValueError("_prune_synapses: competing synapse %r is also excluded" % (sid,))
+                if sid not in self.synapses:
+                    raise ValueError("_prune_synapses: competing synapse %r does not exist" % (sid,))
+                csyn = self.synapses[sid]
+                for nid in (csyn.pre_node_id, csyn.post_node_id):
+                    node = self.nodes.get(nid)
+                    if node is None:
+                        raise ValueError("_prune_synapses: competing synapse %r has a missing endpoint node %r" % (sid, nid))
+                    if (node.metadata or {}).get("constitutional"):
+                        raise ValueError("_prune_synapses: competing synapse %r touches constitutional node %r" % (sid, nid))
+                if sid not in order_key:
+                    raise ValueError("_prune_synapses: order_key has no entry for competing synapse %r" % (sid,))
+
+        if competing_mode:
+            candidates = ((sid, self.synapses[sid]) for sid in competing)
+        else:
+            candidates = self.synapses.items()
+
         to_prune: List[str] = []
-        for sid, syn in self.synapses.items():
+        for sid, syn in candidates:
             # Cricket rim (#92): never prune synapses touching identity-protected nodes.
             # Protected nodes survive orphan collection but were being silenced here.
-            if (self._is_identity_protected(syn.pre_node_id) or
+            # (Competing mode lifts this for the caller's competing ids ONLY.)
+            if not competing_mode and (self._is_identity_protected(syn.pre_node_id) or
                     self._is_identity_protected(syn.post_node_id)):
                 continue
 
@@ -3540,13 +3624,178 @@ class Graph:
             if age > grace and syn.peak_weight < 2.0 * initial_w:
                 to_prune.append(sid)
 
+        # want-hub (d): report / order / budget — each ONLY when its parameter is given (default path: none of these run).
+        if report is not None:
+            report["eligible"] = len(to_prune)
+        if order_key is not None:
+            try:
+                to_prune.sort(key=lambda s: order_key[s])
+            except KeyError as exc:
+                raise ValueError("_prune_synapses: order_key has no entry for synapse %r" % (exc.args[0],)) from None
+        if max_removals is not None:
+            to_prune = to_prune[:max_removals]
+
         for sid in to_prune:
             self._remove_synapse_internal(sid)
 
         if to_prune:
             self._emit("pruned", count=len(to_prune), timestep=self.timestep)
 
+        if report is not None:
+            report["removed_ids"] = list(to_prune)
+
         return len(to_prune)
+
+    def compete_protected_links(self, topk: int, budget: int) -> Dict[str, Any]:
+        """Dream-time competition among the links of the authored wants (want-hub (d), plan-005 §4.3).
+
+        Called ONLY by a dream loop that owns the cycle clock and reads K and B from its own env
+        (LAW 5) — there is no config key and no default here (plan-005 §3). One call = one dream
+        cycle = EXACTLY ONE _prune_synapses call (a second call would advance every competitor's
+        low_weight_steps a second time, §4.4). This method contains NO copy of the prune predicates,
+        NO removal loop and NO _remove_synapse_internal call: eligibility and removal stay inside
+        _prune_synapses; everything below is scoping the caller supplies.
+
+        Sets (plan-005 §2.1-2.3, §4A.3), recomputed from current values every call:
+            F           every synapse touching a constitutional node (the frozen rim) — never read for
+                        weight, never written, never competing.
+            G           for each protected non-constitutional node ("want"), its `topk` strongest non-F
+                        OUTGOING and `topk` strongest non-F INCOMING synapses, ranked weight desc ->
+                        peak_weight desc -> inactive_steps asc -> synapse_id asc. Never competing.
+            last-link   for each UNPROTECTED partner whose every incident synapse would compete, the
+                        strongest one (same ranking). Conservative: decided WITHOUT eligibility. Never
+                        competing — so no partner node is left with zero synapses by this pass.
+            competing   (non-F synapses touching a want) - G - last-link.
+        Order (Exec P409, §4A.2): the static HEIGHT key — per want, its competing links stalest-first
+        (inactive_steps desc, weight asc, id asc) get rank r, height = c_w - r; a want<->want link takes
+        the LARGER of its two endpoint heights; key = (-height, -inactive_steps, weight, synapse_id).
+
+        Returns (and logs at INFO, even when 0 are removed) the counts record of plan-005 §4A.6. A
+        want<->want removal is tallied under BOTH wants, so by_want can sum to more than `removed`.
+        Raises ValueError for topk/budget not an int >= 1, before touching anything.
+        """
+        for label, val in (("topk", topk), ("budget", budget)):
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                raise ValueError("compete_protected_links: %s must be an int >= 1 (got %r)" % (label, val))
+
+        def _rank(sid):
+            s = self.synapses[sid]
+            return (-s.weight, -s.peak_weight, s.inactive_steps, sid)
+
+        def _plan():
+            protected = [n for n in self.nodes if self._is_identity_protected(n)]
+            const = {n for n in protected if (self.nodes[n].metadata or {}).get("constitutional")}
+            wants = sorted(n for n in protected if n not in const)
+            want_set = set(wants)
+            F: Set[str] = set()
+            for n in const:
+                F.update(self._outgoing.get(n, ()))
+                F.update(self._incoming.get(n, ()))
+            arena: Set[str] = set()
+            for w in wants:
+                arena.update(self._outgoing.get(w, ()))
+                arena.update(self._incoming.get(w, ()))
+            arena -= F
+            G: Set[str] = set()
+            need: Dict[Tuple[str, str], int] = {}
+            for w in wants:
+                for d, idx in (("out", self._outgoing), ("in", self._incoming)):
+                    ids = [sid for sid in idx.get(w, ()) if sid not in F]
+                    G.update(sorted(ids, key=_rank)[:topk])
+                    need[(w, d)] = min(topk, len(ids))
+            competing0 = arena - G
+            partners: Set[str] = set()
+            for sid in competing0:
+                s = self.synapses[sid]
+                for nid in (s.pre_node_id, s.post_node_id):
+                    if not self._is_identity_protected(nid):
+                        partners.add(nid)
+            last: Set[str] = set()
+            for nid in partners:
+                inc = set(self._outgoing.get(nid, ())) | set(self._incoming.get(nid, ()))
+                if inc and inc <= competing0:
+                    last.add(min(inc, key=_rank))
+            competing = competing0 - last
+            by_want: Dict[str, List[str]] = {}
+            for sid in competing:
+                s = self.synapses[sid]
+                for nid in {s.pre_node_id, s.post_node_id}:
+                    if nid in want_set:
+                        by_want.setdefault(nid, []).append(sid)
+            height: Dict[str, int] = {}
+            for ids in by_want.values():
+                ids.sort(key=lambda x: (-self.synapses[x].inactive_steps, self.synapses[x].weight, x))
+                c = len(ids)
+                for r, sid in enumerate(ids):
+                    height[sid] = max(height.get(sid, c - r), c - r)
+            order_key = {}
+            for sid in competing:
+                s = self.synapses[sid]
+                order_key[sid] = (-height[sid], -s.inactive_steps, s.weight, sid)
+            return {"F": F, "G": G, "last": last, "competing": competing, "excluded": F | G | last,
+                    "order_key": order_key, "wants": wants, "need": need, "protected": len(protected)}
+
+        with self._step_lock:
+            plan = _plan()
+            again = _plan()
+            if ((plan["competing"], plan["excluded"], plan["order_key"])
+                    != (again["competing"], again["excluded"], again["order_key"])):
+                raise RuntimeError("compete_protected_links: the competing set / order key build is not deterministic — refusing")
+            F, G = plan["F"], plan["G"]
+            want_set = set(plan["wants"])
+
+            # Guaranteed floor, asserted BEFORE the call (impossible to break by construction: G is excluded).
+            for (w, d), need in plan["need"].items():
+                idx = self._outgoing if d == "out" else self._incoming
+                if len([x for x in idx.get(w, ()) if x in G]) < need:
+                    raise RuntimeError("compete_protected_links: guaranteed floor for %s/%s would end below %d — refusing" % (w, d, need))
+
+            wt = self.config["weight_threshold"]
+            captured: Dict[str, Tuple[str, str, bool]] = {}
+            for sid in plan["competing"]:
+                s = self.synapses[sid]
+                captured[sid] = (s.pre_node_id, s.post_node_id, s.weight >= wt)   # removed synapses no longer exist afterwards
+
+            rep: Dict[str, Any] = {}
+            self._prune_synapses(competing_ids=plan["competing"], excluded_ids=plan["excluded"],
+                                 max_removals=budget, order_key=plan["order_key"], report=rep)
+
+            removed_ids = rep["removed_ids"]
+            tally: Dict[str, List[int]] = {}
+            conducting = 0
+            for sid in removed_ids:
+                pre, post, cond = captured[sid]
+                if cond:
+                    conducting += 1
+                for nid in {pre, post}:
+                    if nid in want_set:
+                        t = tally.setdefault(nid, [0, 0])
+                        t[0] += 1
+                        if cond:
+                            t[1] += 1
+            floors_ok = True
+            for (w, d), need in plan["need"].items():
+                idx = self._outgoing if d == "out" else self._incoming
+                if len([x for x in idx.get(w, ()) if x not in F]) < need:
+                    floors_ok = False
+            record = {
+                "timestep": self.timestep, "K_in": topk, "K_out": topk, "B": budget,
+                "eligible": rep["eligible"], "removed": len(removed_ids),
+                "conducting_links_removed": conducting, "held_back_last_link": len(plan["last"]),
+                "floors_ok": floors_ok, "F_links": len(F), "protected_nodes": plan["protected"],
+                "wants_with_removals": len(tally), "wants_zero": len(want_set) - len(tally),
+                "by_want": {w: {"removed": t[0], "conducting": t[1]} for w, t in sorted(tally.items())},
+            }
+        logger.log(
+            logging.INFO if floors_ok else logging.WARNING,
+            "compete_protected_links: t=%s K=%d+%d B=%d eligible=%d removed=%d conducting=%d held_back_last_link=%d "
+            "floors_ok=%s F_links=%d protected_nodes=%d wants_with_removals=%d wants_zero=%d by_want[removed(conducting)]: %s",
+            record["timestep"], topk, topk, budget, record["eligible"], record["removed"], conducting,
+            record["held_back_last_link"], floors_ok, record["F_links"], record["protected_nodes"],
+            record["wants_with_removals"], record["wants_zero"],
+            "; ".join("%s=%d(%d)" % (w, v["removed"], v["conducting"]) for w, v in record["by_want"].items()) or "-",
+        )
+        return record
 
     def _is_identity_protected(self, nid: str) -> bool:
         """#spine — never prune a mind's self-authored identity nodes.
