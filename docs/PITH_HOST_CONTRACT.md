@@ -1,5 +1,9 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 3: #817 DEFERRED (reverted)
+# What: the compress_history event / section / history_* counters are RESTORED and marked deferred.
+# Why: two live Python callers (VPS host, laptop daemon); Chief ruling docs 084b4161.
+# How: revert of the turn-2 removal; every other turn-2 contract paragraph (#816/#818/#819) is kept.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: no per-node clip
 # What: CC_PITH_PROVIDER_NODE_CHARS leaves the mandatory export list (six -> five);
 #   the member-prose shortening promise is replaced by whole-or-drop.
@@ -232,6 +236,12 @@ Style may change; continuity does not require transcript replay.
 ---
 
 ## `compress_history` → `pith_compress_history`
+
+> **#817 (retire this) is DEFERRED** to the post-track VPS/daemon lane: the function and BOTH
+> live Python handlers (`cc_ng_host._handle_compress_history`, the laptop daemon's
+> `handle_compress_history`) are to be removed together (LAW 3). Until then this section is
+> current. Note it keeps the keyframe and discards the delta (a cut); if it is ever kept, it
+> must be rebuilt lossless (keyframe + delta).
 
 `cc_ng_host._handle_compress_history` is the socket wrapper.
 `cc_ng_organism.pith_compress_history` is the one implementation.
