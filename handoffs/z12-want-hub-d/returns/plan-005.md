@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5e] — the [R5e·…] edit below is commit 29c84a1fd3ba129c106add6e9b65587427905a4c on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11153) — plan-005 EDITED IN PLACE, the ONE small edit [R5e·…]
 #   What: plan-005 edited in place (no new file): Exec Packet 420 (docs 42233ac2; via Chief-003) — the P419 BUILD GATE RETRACTED, plus D2/D3/E-a/E-b —
 #     folded with le-023 (ROLE B two-line look at [R5d]: NO LAW VIOLATION, ETHOS DRIFT at plan level: 2 MEDIUM + 5 LOW + 2 Executive-to-hear) and
