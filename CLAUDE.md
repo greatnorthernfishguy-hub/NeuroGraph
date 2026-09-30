@@ -147,28 +147,31 @@ It contains:
 
 NeuroGraph is the **canonical source** for all vendored files. Every other module in the ecosystem copies from here. The vendored files in this repo are not copies — they are the originals.
 
+> **[2026-09-30] Correction (#843):** `ng_peer_bridge.py` was removed from the vendored set on 2026-06-03 (`faa4a91`) per LAW 2. It must NOT be re-added. `ng_salience_gate.py` and `ng_updater.py` are designated vendored but not yet fully propagated to all modules. This section has been updated to match. See global `~/.claude/CLAUDE.md` LAW 2 for the authoritative list.
+
 | File | Vendored To |
 |------|-------------|
 | `ng_lite.py` | TID, TrollGuard, Immunis, Elmer, THC, Bunyan, Praxis, Agent Zero |
-| `ng_peer_bridge.py` | Same (legacy, retained until v1.0 tract migration) |
-| `ng_tract_bridge.py` | Same (v0.3+, per-pair directional tracts, preferred over ng_peer_bridge) |
+| `ng_tract_bridge.py` | Same (v0.3+, per-pair directional tracts) |
 | `ng_ecosystem.py` | Same |
 | `ng_autonomic.py` | Same |
 | `openclaw_adapter.py` | Same |
 | `ng_embed.py` | Same (centralized embedding + dual-pass, added 2026-03-22) |
+| `ng_salience_gate.py` | Same (designated vendored, not yet fully propagated) |
+| `ng_updater.py` | Same (designated vendored, not yet fully propagated) |
 
 **When you change a vendored file here, you are changing the canonical source for the entire ecosystem.** The change must be re-vendored to every module simultaneously. Do not change a vendored file here to fix a NeuroGraph-specific issue — vendored files serve every module. If NeuroGraph needs behavior other modules don't, that behavior lives in NeuroGraph-specific code, not in the vendored file.
 
 ### The ng_tract Migration
 
-`ng_peer_bridge.py` is the legacy River implementation (JSONL broadcast). `ng_tract_bridge.py` is the active replacement (v0.3, per-pair directional tracts). Both are vendored. `ng_ecosystem.py` prefers the tract bridge with automatic fallback to the legacy bridge. `openclaw_hook.py` uses the same pattern.
+`ng_peer_bridge.py` (removed 2026-06-03, `faa4a91`) was the legacy River implementation (JSONL broadcast). `ng_tract_bridge.py` is the replacement (v0.3, per-pair directional tracts) and is vendored per LAW 2. `ng_ecosystem.py` uses the tract bridge. `openclaw_hook.py` uses the same pattern.
 
 **Three tract-related files — do not conflate:**
 - `ng_tract.py` — feeder→topology-owner tracts (GUI, feed-syl → ContextEngine). NOT vendored.
-- `ng_tract_bridge.py` — per-pair inter-module tracts implementing NGBridge. Vendored. Replaces `ng_peer_bridge.py`.
-- `ng_peer_bridge.py` — legacy JSONL bridge. Vendored. Do not deprecate until v1.0.
+- `ng_tract_bridge.py` — per-pair inter-module tracts implementing NGBridge. Vendored.
+- `ng_peer_bridge.py` — removed 2026-06-03 (`faa4a91`). Do NOT re-add (LAW 2).
 
-v0.4 (myelination) is complete (2026-03-23): `MmapTract` double-buffer transport in `ng_tract_bridge.py`, `MyelinationSocket` in Elmer. v0.5 (vagus nerve) and v1.0 (full cutover) are planned. Do not deprecate `ng_peer_bridge.py` unilaterally.
+v0.4 (myelination) is complete (2026-03-23): `MmapTract` double-buffer transport in `ng_tract_bridge.py`, `MyelinationSocket` in Elmer. v0.5 (vagus nerve) and v1.0 (full cutover) are planned.
 
 ### ng_bridge.py — The Tier 3 SaaS Bridge
 

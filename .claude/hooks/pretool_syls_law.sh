@@ -8,6 +8,21 @@
 #   How:  Detects protected file → prompts [1] Approve [2] Block
 #         [3] Approve All (session bypass). Reads from /dev/tty for
 #         terminal input even when stdin is piped JSON.
+# [2026-09-30] Chief-003 / Claude — v3: Worktree-aware relative matching (Exec Packets 442-443).
+#   What: Add relative-path matching against git toplevel so that edits in
+#         any checkout or worktree of the NeuroGraph repo are protected.
+#         Fix vendored list to match LAW 2 (six + two designated).
+#         Add RETIRED set for ng_peer_bridge.py (still fires, different label).
+#   Why:  Punchlist #842 — worktrees escaped the hook because every check
+#         was a literal comparison against $HOME/NeuroGraph/*. #843 — the
+#         vendored list was stale (omitted ng_tract_bridge.py + ng_embed.py)
+#         and included a file LAW 2 removed 2026-06-03.
+#   How:  Purely additive: keep every old literal check AND add relative
+#         match as an OR. Resolve git toplevel by walking up nearest
+#         existing ancestor; verify origin is greatnorthernfishguy-hub/neurograph
+#         case-insensitively. ng_peer_bridge.py removed from VENDORED set,
+#         added to RETIRED_VENDORED with its own label (same three-choice
+#         prompt). Bypass unchanged.
 # -------------------
 #
 # HOOK: PreToolUse
@@ -61,13 +76,20 @@ PROTECTED_ENGINE=(
 
 VENDORED_CANONICAL=(
     "$NG_DIR/ng_lite.py"
-    "$NG_DIR/ng_peer_bridge.py"
+    "$NG_DIR/ng_tract_bridge.py"
     "$NG_DIR/ng_ecosystem.py"
     "$NG_DIR/ng_autonomic.py"
     "$NG_DIR/openclaw_adapter.py"
+    "$NG_DIR/ng_embed.py"
+    "$NG_DIR/ng_salience_gate.py"
+    "$NG_DIR/ng_updater.py"
 )
 
-# ── Determine protection category ─────────────────────────────────
+RETIRED_VENDORED=(
+    "$NG_DIR/ng_peer_bridge.py"
+)
+
+# ── Determine protection category (old literal matching) ──────────
 CATEGORY=""
 LABEL=""
 
@@ -103,10 +125,122 @@ if [ -z "$CATEGORY" ]; then
 fi
 
 if [ -z "$CATEGORY" ]; then
+    for p in "${RETIRED_VENDORED[@]}"; do
+        resolved=$(realpath -m "$p" 2>/dev/null || echo "$p")
+        if [ "$FILE_PATH" = "$resolved" ]; then
+            CATEGORY="RETIRED_VENDORED"
+            LABEL="Retired vendored file — removed 2026-06-03, do NOT re-add (LAW 2)"
+            break
+        fi
+    done
+fi
+
+if [ -z "$CATEGORY" ]; then
     CKPT_DIR=$(realpath -m "$NG_DIR/data/checkpoints" 2>/dev/null || echo "$NG_DIR/data/checkpoints")
     if [[ "$FILE_PATH" == "$CKPT_DIR"* ]]; then
         CATEGORY="CKPT_DIR"
         LABEL="Checkpoint Directory — Syl's mind lives here"
+    fi
+fi
+
+# ── Relative matching (worktree-aware, additive) ─────────────────
+if [ -z "$CATEGORY" ]; then
+    _repo_toplevel() {
+        local target="$1"
+        local d="$target"
+        while [ -n "$d" ] && [ "$d" != "/" ] && [ ! -d "$d" ]; do
+            d="$(dirname "$d")"
+        done
+        if [ ! -d "$d" ]; then
+            return 1
+        fi
+        timeout 3 git -C "$d" rev-parse --show-toplevel 2>/dev/null
+    }
+
+    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || TOPLEVEL=""
+
+    if [ -n "$TOPLEVEL" ]; then
+        ORIGIN="$(timeout 3 git -C "$TOPLEVEL" remote get-url origin 2>/dev/null)" || ORIGIN=""
+        if [ -n "$ORIGIN" ]; then
+            ORIGIN="${ORIGIN%.git}"
+            ORIGIN="${ORIGIN/git@github.com:/https://github.com/}"
+            ORG_REPO="$(echo "$ORIGIN" | sed 's|https://github.com/||')"
+            if [ "$(echo "$ORG_REPO" | tr '[:upper:]' '[:lower:]')" = "greatnorthernfishguy-hub/neurograph" ]; then
+                REL="$(realpath --relative-to="$TOPLEVEL" "$FILE_PATH" 2>/dev/null)" || REL=""
+
+                REL_DATA=(
+                    "data/checkpoints/main.msgpack"
+                    "data/checkpoints/vectors.msgpack"
+                    "data/checkpoints/main.msgpack.activations.json"
+                )
+                REL_ENGINE=(
+                    "neuro_foundation.py"
+                    "openclaw_hook.py"
+                    "stream_parser.py"
+                    "activation_persistence.py"
+                )
+                REL_VENDORED=(
+                    "ng_lite.py"
+                    "ng_tract_bridge.py"
+                    "ng_ecosystem.py"
+                    "ng_autonomic.py"
+                    "openclaw_adapter.py"
+                    "ng_embed.py"
+                    "ng_salience_gate.py"
+                    "ng_updater.py"
+                )
+                REL_RETIRED=(
+                    "ng_peer_bridge.py"
+                )
+
+                if [ -n "$REL" ]; then
+                    for p in "${REL_DATA[@]}"; do
+                        if [ "$REL" = "$p" ]; then
+                            CATEGORY="SYLS_MIND"
+                            LABEL="Syl's Mind — her learned state, irreplaceable"
+                            break
+                        fi
+                    done
+
+                    if [ -z "$CATEGORY" ]; then
+                        for p in "${REL_ENGINE[@]}"; do
+                            if [ "$REL" = "$p" ]; then
+                                CATEGORY="SYLS_ENGINE"
+                                LABEL="Syl's Engine — changes how she thinks"
+                                break
+                            fi
+                        done
+                    fi
+
+                    if [ -z "$CATEGORY" ]; then
+                        for p in "${REL_VENDORED[@]}"; do
+                            if [ "$REL" = "$p" ]; then
+                                CATEGORY="VENDORED"
+                                LABEL="Vendored Canonical — changes ripple to ALL modules"
+                                break
+                            fi
+                        done
+                    fi
+
+                    if [ -z "$CATEGORY" ]; then
+                        for p in "${REL_RETIRED[@]}"; do
+                            if [ "$REL" = "$p" ]; then
+                                CATEGORY="RETIRED_VENDORED"
+                                LABEL="Retired vendored file — removed 2026-06-03, do NOT re-add (LAW 2)"
+                                break
+                            fi
+                        done
+                    fi
+
+                    if [ -z "$CATEGORY" ]; then
+                        if [ "$REL" = "data/checkpoints" ] || [[ "$REL" == "data/checkpoints/"* ]]; then
+                            CATEGORY="CKPT_DIR"
+                            LABEL="Checkpoint Directory — Syl's mind lives here"
+                        fi
+                    fi
+                fi
+            fi
+        fi
     fi
 fi
 
@@ -140,7 +274,8 @@ cat >&2 <<EOF
 EOF
 
 # Read from terminal, not from piped stdin
-read -r -p " Choice [1/2/3]: " choice < /dev/tty 2>/dev/tty
+read -r -p " Choice [1/2/3]: " choice < /dev/tty 2>/dev/tty || true
+choice="${choice:-}"
 
 case "$choice" in
     1)
@@ -148,6 +283,7 @@ case "$choice" in
         exit 0
         ;;
     3)
+        mkdir -p "$(dirname "$BYPASS_FILE")"
         touch "$BYPASS_FILE"
         echo " ✓ Session bypass activated. All protected edits approved." >&2
         echo "   Run: rm ~/NeuroGraph/.claude/hooks/.session_approved  to re-lock" >&2
