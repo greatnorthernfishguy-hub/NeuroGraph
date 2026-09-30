@@ -3020,7 +3020,7 @@ def test_the_review_files_and_the_verifier_and_t6_are_identical(xworld, pinned, 
     outs = []
     for tag, fn in (("old", _old_analyze), ("new", tool.analyze)):
         A = fn(pinned, str(xworld.ckpt), scope_min_len=MIN_LEN, base_mod=base)
-        run = xworld.backups / ("eq-" + tag)
+        run = xworld.backups / (tool.RUN_DIR_PREFIX + "eq-" + tag)
         (run / "reports").mkdir(parents=True)
         rl, sc = tool.artifact_sha256(tool.repair_list_obj(A)), tool.artifact_sha256(tool.scope_ids_obj(A, xworld.expect["scope"]))
         approvals = tool.stamped(tool.approvals_body_for(A["records"], rl, sc, "EXEC-SYNTHETIC-PACKET"))
