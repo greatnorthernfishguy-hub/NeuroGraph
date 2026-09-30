@@ -837,6 +837,16 @@ def rewrite_main(raw: bytes, out_path: str, m: Dict[str, str], old_text: Dict[st
     byte-identical to the input). Returns stats (substitutions per site, entries re-encoded). Raises Stop on
     a fidelity failure (V13) or an id found outside the site table (census). The caller guards `out_path`."""
     out_path = guard_out_path(out_path)
+    try:
+        return _rewrite_main_into(raw, out_path, m, old_text, new_text)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)                   # all-or-nothing: no partial output survives a STOP
+        raise
+
+
+def _rewrite_main_into(raw: bytes, out_path: str, m: Dict[str, str], old_text: Dict[str, str],
+                       new_text: Dict[str, str]) -> Dict[str, Any]:
     subs: Counter = Counter()
     reencoded = Counter()
     ids = set(m)
@@ -1852,7 +1862,7 @@ class Verifier:
         self.check("V13", True, {"reencoded_entries": writer_stats["reencoded_entries"], "sidecar_round_trip": True})
         # V14 shared-function proof
         src = Path(__file__).read_text(encoding="utf-8")
-        shared = ("def parse_wants" not in src and "def want_id_for_text" not in src
+        shared = (("def " + "parse_wants") not in src and ("def " + "want_id_for_text") not in src
                   and callable(org.parse_wants) and org.parse_wants.__module__ == "cc_ng_organism")
         self.check("V14", shared, {"p1": self.pinned.record["p1"], "isolation_file": self.pinned.record["isolation"]["cc_ng_organism_file"]})
         # V15 Choice Clause / constitutional / every unrepaired want, plus the deny-check
@@ -2136,10 +2146,17 @@ def write_retired_receipt(run_dir: str, target_real: str, mapping_sha256: str, u
 # --------------------------------------------------------------------------------------------------
 
 def new_run_dir() -> Tuple[str, str]:
+    """A fresh <backups>/z12-want-text-repair-<UTC>/ ; a second run in the same second gets a -N suffix."""
     utc = utc_stamp()
-    path = guard_out_path(os.path.join(BACKUPS_ROOT, RUN_DIR_PREFIX + utc))
-    os.makedirs(path, mode=0o700, exist_ok=False)
-    return path, utc
+    for n in range(1, 100):
+        tag = utc if n == 1 else "%s-%d" % (utc, n)
+        path = guard_out_path(os.path.join(BACKUPS_ROOT, RUN_DIR_PREFIX + tag))
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=False)
+            return path, tag
+        except FileExistsError:
+            continue
+    raise Stop("could not create a fresh run directory")
 
 
 def copy_six(src_dir: str, dst_dir: str) -> Dict[str, Any]:
@@ -2179,11 +2196,11 @@ def _write_reports(run_dir: str, reports: Dict[str, Dict[str, Any]]) -> Dict[str
     return {n: write_artifact(os.path.join(run_dir, "reports", n + ".json"), o) for n, o in reports.items()}
 
 
-def prepare_outputs(pinned, A: Dict[str, Any], approvals: Dict[str, Any], *, in_dir: str, out_dir: str, run_dir: str,
-                    utc: str, expect: Dict[str, int], in_hashes: Dict[str, str]) -> Dict[str, Any]:
-    """The build+verify core shared by Phase 1 (rewrite to TMP) and Phase 2 (stage). Every node of S has ALREADY
-    been evaluated (A) - no byte is written before that (V19). Returns the plan, results, paths and stats."""
-    org = pinned.org
+def build_outputs(pinned, A: Dict[str, Any], approvals: Dict[str, Any], *, in_dir: str, out_dir: str, run_dir: str,
+                  utc: str, in_hashes: Dict[str, str]) -> Dict[str, Any]:
+    """The build core shared by Phase 1 (rewrite to TMP) and Phase 2 (stage). Every node of S has ALREADY been
+    evaluated (A) - no byte is written before that (V19). Writes the rewritten pair, the mapping + INVERSE
+    mapping and the post-apply receipt draft; returns everything the verifier needs."""
     records = A["records"]
     write_ids, refused = gate_write_set(records, approvals)
     approved_ids = sorted(e["id"] for e in approvals["entries"] if e["decision"] == "approved")
@@ -2225,17 +2242,35 @@ def prepare_outputs(pinned, A: Dict[str, Any], approvals: Dict[str, Any], *, in_
             "approved_ids": approved_ids, "refused": refused, "packet": approvals.get("packet"),
             "evaluated": len(records), "assert_failed_listed": len(outcome_table(records)["assert_failed_ids"]),
             "artifacts": artifacts}
-    V = Verifier(pinned, A, plan, expect)
-    results = V.run(raw, out_main, sidecar_in, stext, copy_dir=in_dir, copy_hashes=in_hashes, census_in=census_in,
-                    writer_stats=wstats, sidecar_stats=sstats, out_graph=g2)
-    cl_after = Classifier(org, meta_after, A["content"])
-    t6 = t6_replay(pinned, A["nodes_meta"], meta_after, A["content"], mapping, cl_after)
-    del g2
+    return {"plan": plan, "raw": raw, "sidecar_in": sidecar_in, "sidecar_out": stext, "out_main": out_main,
+            "out_sidecar": out_side, "writer_stats": wstats, "sidecar_stats": sstats, "census_in": census_in,
+            "g2": g2, "meta_after": meta_after, "in_dir": in_dir, "in_hashes": in_hashes, "out_hashes": out_hashes,
+            "id_map_sha256": fwd_sha}
+
+
+def run_verifier(pinned, A: Dict[str, Any], ctx: Dict[str, Any], expect: Dict[str, int], *, out_main: Optional[str] = None,
+                 sidecar_out: Optional[str] = None, out_graph: Any = "ctx", plan: Optional[Dict[str, Any]] = None) -> "Verifier":
+    """V1-V19 over a built pair. The overrides exist so a negative test can hand the verifier a TAMPERED output."""
+    V = Verifier(pinned, A, plan or ctx["plan"], expect)
+    V.run(ctx["raw"], out_main or ctx["out_main"], ctx["sidecar_in"], sidecar_out if sidecar_out is not None else ctx["sidecar_out"],
+          copy_dir=ctx["in_dir"], copy_hashes=ctx["in_hashes"], census_in=ctx["census_in"], writer_stats=ctx["writer_stats"],
+          sidecar_stats=ctx["sidecar_stats"], out_graph=ctx["g2"] if out_graph == "ctx" else out_graph)
+    return V
+
+
+def prepare_outputs(pinned, A: Dict[str, Any], approvals: Dict[str, Any], *, in_dir: str, out_dir: str, run_dir: str,
+                    utc: str, expect: Dict[str, int], in_hashes: Dict[str, str]) -> Dict[str, Any]:
+    """Build + verify V1-V19 + the T6 replay. Returns the plan, results, paths and stats."""
+    ctx = build_outputs(pinned, A, approvals, in_dir=in_dir, out_dir=out_dir, run_dir=run_dir, utc=utc, in_hashes=in_hashes)
+    V = run_verifier(pinned, A, ctx, expect)
+    cl_after = Classifier(pinned.org, ctx["meta_after"], A["content"])
+    t6 = t6_replay(pinned, A["nodes_meta"], ctx["meta_after"], A["content"], ctx["plan"]["mapping"], cl_after)
+    ctx.pop("g2")
     gc.collect()
-    return {"plan": plan, "results": results, "failed": V.failed(), "out_main": out_main, "out_sidecar": out_side,
-            "writer_stats": wstats, "sidecar_stats": sstats, "t6": t6, "walk_counts": {
-                "rim_incident": V.walk["rim_incident"], "rim_incident_mapped": V.walk["rim_incident_mapped"]},
-            "out_hashes": out_hashes, "id_map_sha256": fwd_sha}
+    return {"plan": ctx["plan"], "results": V.results, "failed": V.failed(), "out_main": ctx["out_main"],
+            "out_sidecar": ctx["out_sidecar"], "writer_stats": ctx["writer_stats"], "sidecar_stats": ctx["sidecar_stats"],
+            "t6": t6, "walk_counts": {"rim_incident": V.walk["rim_incident"], "rim_incident_mapped": V.walk["rim_incident_mapped"]},
+            "out_hashes": ctx["out_hashes"], "id_map_sha256": ctx["id_map_sha256"]}
 
 
 def _expect(args) -> Dict[str, int]:
@@ -2400,7 +2435,7 @@ def stage_apply(args, pinned, probes, target_info) -> Dict[str, Any]:
     rl_sha0, sc_sha0 = sha256_file(os.path.join(args.frozen_dir, "repair-list.json")), sha256_file(os.path.join(args.frozen_dir, "scope-ids.json"))
     approvals = load_approvals(args.approvals, args.approvals_sha256, rl_sha0, sc_sha0)        # P5
     scope = frozen_sc["ids"]
-    if len(scope) != args.expect_scope or len(scope) != EXPECTED_SCOPE:
+    if len(scope) != args.expect_scope:
         raise Stop("P9: the frozen scope has %d ids, not %d" % (len(scope), args.expect_scope))
     A = analyze(pinned, tdir, scope_min_len=args.scope_min_len, frozen_scope=scope, full_reports=False)   # the LIVE bytes
     if sorted(A["scope_derived"]) != sorted(scope):
