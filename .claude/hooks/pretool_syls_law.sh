@@ -186,7 +186,7 @@ if [ -z "$CATEGORY" ]; then
     }
 
     _git_error=""
-    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || _git_error="$_repo_toplevel_err"
+    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || _git_error="true"
 
     if [ -z "$TOPLEVEL" ]; then
         # If we got a git-reported error (not "not a repo"), fail closed

@@ -192,7 +192,7 @@ class TestSylsLawHook:
 
     def _tmp_repo_with_origin(self, origin_url):
         d = tempfile.mkdtemp(prefix="origin_test_", dir=self._tmpdir)
-        os.makedirs(d)
+        os.makedirs(d, exist_ok=True)
         subprocess.run(["git", "init", "-b", "main"], cwd=d, capture_output=True, check=True)
         subprocess.run(["git", "remote", "add", "origin", origin_url], cwd=d, capture_output=True, check=True)
         for rel in PROTECTED_RELS:
@@ -403,12 +403,14 @@ class TestSylsLawHook:
             for wt_tup in [("wt_out", self._wt_outside), ("wt_in", self._wt_inside), ("wt_nested", self._wt_nested)]:
                 expected_new.add((wt_tup[0], os.path.join(wt_tup[1], rel)))
             expected_new.add(("rel_wt_out", rel)); expected_new.add(("rel_wt_in", rel))
-            expected_new.add((f"symlink_outside_{os.path.basename(rel)}", os.path.join(link_dir, os.path.basename(rel))))
-            expected_new.add((f"symlink_inside_{os.path.basename(rel)}", os.path.join(symlink_inside_dir, os.path.basename(rel))))
+        # Symlinks: only newly-covered vendored files are new (base catches
+        # all others because realpath resolves to $NG_DIR/<file> -> literal match)
         added_vendored = ["ng_tract_bridge.py", "ng_embed.py", "ng_salience_gate.py", "ng_updater.py"]
         for rel in added_vendored:
             expected_new.add(("home", os.path.join(self._ng_dir, rel)))
             expected_new.add(("rel_main", rel))
+            expected_new.add((f"symlink_outside_{os.path.basename(rel)}", os.path.join(link_dir, os.path.basename(rel))))
+            expected_new.add((f"symlink_inside_{os.path.basename(rel)}", os.path.join(symlink_inside_dir, os.path.basename(rel))))
         expected_new.add(("wt_ckpt_sub", os.path.join(self._wt_outside, "data", "checkpoints", "subfile.msgpack")))
         actual_new = new_fires - base_fires
         missing = expected_new - actual_new; unexpected = actual_new - expected_new
@@ -596,7 +598,7 @@ class TestSylsLawHook:
         assert result.returncode == 2, f"Old literal path should still fire, got {result.returncode}"
 
     def test_git_missing_unprotected_allowed(self):
-        """Without git, unprotected files in home still allowed (literal match fails, git unreachable → exit 2 for safety)."""
+        """Stubbed PATH makes jq missing -> exit 2 (fail-closed). jq check fires before git."""
         env = self._base_env()
         env["PATH"] = "/usr/bin:/bin"
         path = os.path.join(self._ng_dir, "README.md")
@@ -605,14 +607,7 @@ class TestSylsLawHook:
             [NEW_HOOK], input=tool_input.encode(), capture_output=True, timeout=15,
             start_new_session=True, env=env,
         )
-        # With git missing, _git_stderr check won't see "not a git repository"
-        # because git isn't found. This could exit 0 or exit 2 depending on
-        # whether git exists but errors out vs git not being found.
-        # The hook checks _git_stderr for "fatal" messages. If git is missing,
-        # _git_stderr is empty, so it falls through to the REL matching section.
-        # _repo_toplevel fails (no git), TOPLEVEL is empty.
-        # Then file not in old literal check → NOT protected → exit 0.
-        assert result.returncode == 0, f"Unprotected file should exit 0, got {result.returncode}"
+        assert result.returncode == 2, "jq missing -> fail closed (exit 2)"
 
     def test_git_ok_but_not_a_repo_allowed(self):
         """File in a non-git directory: git says 'not a git repository', allowed."""
