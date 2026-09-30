@@ -666,11 +666,23 @@ def test_closer_adjacency_guesses_do_not_apply_to_closers():
     assert org.parse_wants("\\[WANT]a[/WANT]").wants == ()
 
 
-def test_structural_masks_still_apply_to_closers():
+def test_structural_masks_judge_a_closer_relative_to_its_opener():
+    """turn 3 (le-016 #3): a closer in a fence / code span with a REAL opener pending and no mention
+    opener in that region is the real want's closer (base parity). A mention PAIR inside one
+    region is still masked, so a want may discuss markup."""
     parsed = org.parse_wants("[WANT] replace `[/WANT]` tokens [/WANT]")
-    assert [w.text for w in parsed.wants] == ["replace `[/WANT]` tokens"]
+    assert [w.text for w in parsed.wants] == ["replace `"]                      # = base
+    assert [(s.marker, s.reason) for s in parsed.skipped] == [("[/WANT]", "closer_without_opener")]
     parsed = org.parse_wants("[WANT] a\n```\n[/WANT]\n```\n b [/WANT]")
-    assert [w.text for w in parsed.wants] == ["a\n```\n[/WANT]\n```\n b"]
+    assert [w.text for w in parsed.wants] == ["a\n```"]                        # = base
+    # a mention pair inside ONE region stays masked: the want keeps it as text
+    for content, text in (
+            ("[WANT] see\n```\n[WANT]x[/WANT]\n```\n ok [/WANT]", "see\n```\n[WANT]x[/WANT]\n```\n ok"),
+            ("[WANT]see `[WANT]z[/WANT]` ok[/WANT]", "see `[WANT]z[/WANT]` ok"),
+            ('[WANT]use {"k": "[WANT]z[/WANT]"} form[/WANT]', 'use {"k": "[WANT]z[/WANT]"} form')):
+        parsed = org.parse_wants(content)
+        assert [w.text for w in parsed.wants] == [text], content
+        assert sorted(s.marker for s in parsed.skipped) == ["[/WANT]", "[WANT]"]
 
 
 _PARITY_PREFIXES = ["", "Noted. ", "Line one.\n", "para\n\n", "see `x` and ", 'he said "hi" then ',
@@ -678,16 +690,24 @@ _PARITY_PREFIXES = ["", "Noted. ", "Line one.\n", "para\n\n", "see `x` and ", 'h
                     # #815 near-misses: URL / link / JSON-ish / escaped quotes NEAR a real opener
                     "see https://example.com/docs ", "(https://example.com/docs)", "see https://example.com/docs.",
                     'he typed \\"go\\" then ', '{"a": "b"} and ', "[link](https://x.org/a) then ",
-                    "[link](https://x.org/a)"]
+                    "[link](https://x.org/a)",
+                    # turn 3: glue characters between a URL and a real opener, and index/call shapes
+                    "See https://x.org/a:", "See https://x.org/a\u2014", "See **https://x.org/a**",
+                    "_https://x.org/a_", "https://x.org/a\\n", "See https://x.org/a~", "arr[0](./d/"]
 _PARITY_BODIES = ["plain want", "`code` begins", "ends `code()`", "`a` both `b`", "mid `x` code here",
                   'has "quoted" word', 'ends with "quote"', '"begins with quote" here',
                   "ends with backslash \\", "visit https://example.com/docs now",
                   "read https://example.com/docs", '{"a": "b"} json inside', "multi\nline\nbody",
                   "unicode \u00e9\u4e2d", "crlf\r\nbody", "ends with url https://x.org/a?b=[1]",
                   "with (parens) and [brackets]", "tab\tinside", "pair ``double`` end", 'x "[y" z',
-                  "see [the docs](https://example.com/x)", '["a", "b"] list', "ends with link [d](https://x.org)"]
+                  "see [the docs](https://example.com/x)", '["a", "b"] list', "ends with link [d](https://x.org)",
+                  # turn 3: want text that ENDS inside a quote fragment / JSON-looking literal
+                  'rename "a", "b', 'list 1, "b', 'use {"a": "b', "stray ` tick",
+                  "ends with a fence\n```\ncode\n```\n"]
 _PARITY_SUFFIXES = ["", " tail", "\ntail", " [WANT]second[/WANT]", "[WANT]adj[/WANT]",
-                    " and `code` after", "\n\n```\nfence after\n```\n", ' and "q" after', " `"]
+                    " and `code` after", "\n\n```\nfence after\n```\n", ' and "q" after', " `",
+                    # turn 3: a closer followed by JSON-ish closers
+                    '", next', '"}', '",\n']
 
 
 def test_parity_with_base_on_every_well_formed_shape(base_org):
@@ -727,6 +747,8 @@ _ADVERSARIAL_PARITY = [
     "typed \\\"go\\\" [WANT]real want[/WANT]",
     '{"a": "b"} then [WANT]real want[/WANT]',
     "[WANT]real want ending in a link [d](https://x.org)[/WANT]",
+    # turn 3: a stray backtick INSIDE a real want no longer masks its closer (le-014 C3 second shape)
+    "[WANT]fix `a[/WANT] and `b` here",
 ]
 
 
@@ -742,8 +764,6 @@ def test_adversarial_real_want_near_code_quotes_backticks_equals_base(base_org, 
 _ADVERSARIAL_RESIDUAL = {
     "stray backtick masks a real pair in the same paragraph": (
         "I saw `foo. Then [WANT]do X[/WANT] later `bar` end", ["do X"], []),
-    "stray backtick inside a real want masks its closer": (
-        "[WANT]fix `a[/WANT] and `b` here", ["fix `a"], []),
 }
 
 
@@ -918,8 +938,8 @@ _815_BOUNDARY = {
         "[WANT]read https://example.com/docs[/WANT]", ["read https://example.com/docs"], []),
     "want that ends in a link": (
         "[WANT]read [d](https://x.org)[/WANT]", ["read [d](https://x.org)"], []),
-    "a closer inside a JSON literal is masked like a code span": (
-        '[WANT]use {"k": "[/WANT]"} form[/WANT]', ['use {"k": "[/WANT]"} form'], ["in_json_string"]),
+    "a closer inside a JSON-looking literal with a REAL opener pending is the want's closer (turn 3)": (
+        '[WANT]use {"k": "[/WANT]"} form[/WANT]', ['use {"k": "'], ["closer_without_opener"]),
 }
 
 
@@ -993,3 +1013,242 @@ def test_815_finders_are_linear_on_adversarial_input():
         t0 = _time.perf_counter()
         org.parse_wants(content)
         assert _time.perf_counter() - t0 < 5.0
+
+
+# ---------------------------------------------------------------------------
+# TURN 3 (le-016 MEDIUM #2/#3, checker-018 notes 1-2): the lexical-guess false negatives, fixed
+# ONCE. Every "must mint again" case is ASSERTED AGAINST BASE e4ebf982 (git show; missing = FAIL).
+# ---------------------------------------------------------------------------
+
+_T3_PAYLOAD = "follow up on the recall path"
+
+
+def _assert_mints_like_base(base_org, content, expected):
+    assert _texts(_run(base_org, [content])[0]) == expected, "the expectation must be what BASE mints"
+    assert _run(org, [content]) == _run(base_org, [content])
+    assert _texts(_run(org, [content])[0]) == expected
+
+
+# --- (1) the CLOSER rule: a closer is judged relative to its OPENER, never by its own text ---
+_T3_CLOSER_GOLDEN = {
+    "le-016: want text ends inside a quote fragment":
+        ('[WANT]rename "a", "b[/WANT]", next', ['rename "a", "b']),
+    "fuzz-derived: key/value fragment": ('[WANT]set "x": "y[/WANT]", done', ['set "x": "y']),
+    "fuzz-derived: list fragment": ('[WANT]list 1, "b[/WANT]", c', ['list 1, "b']),
+    "fuzz-derived: brace fragment": ('[WANT]use {"a": "b[/WANT]"} now', ['use {"a": "b']),
+    "fuzz-derived: array fragment": ('[WANT]pick ["a", "b[/WANT]"]', ['pick ["a", "b']),
+    "fuzz-derived: two quote fragments": ('[WANT]use "a","b[/WANT]","c"', ['use "a","b']),
+    "closer in a FENCE, real opener outside": ("[WANT] a\n```\n[/WANT]\n```\n b [/WANT]", ["a\n```"]),
+    "closer in a CODE SPAN, real opener outside": ("[WANT] replace `[/WANT]` tokens [/WANT]", ["replace `"]),
+    "closer in a stray-backtick span (le-014 C3, second shape)": ("[WANT]fix `a[/WANT] and `b` here", ["fix `a"]),
+    "closer wrapped in a quote pair": ('x "[WANT]I want "x"[/WANT]" y', ['I want "x"']),
+    "closer after an odd backslash": ("[WANT]path C:\\[/WANT]", ["path C:\\"]),
+    "closer glued to a URL path": ("[WANT]read https://x.org/a/[/WANT]", ["read https://x.org/a/"]),
+    "closer glued to a link destination": ("[WANT]read [d](https://x.org/a[/WANT]", ["read [d](https://x.org/a"]),
+    "closer right after inline code": ("[WANT]check `foo()`[/WANT]", ["check `foo()`"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T3_CLOSER_GOLDEN))
+def test_t3_closer_judged_only_relative_to_its_opener_equals_base(base_org, name):
+    content, expected = _T3_CLOSER_GOLDEN[name]
+    _assert_mints_like_base(base_org, content, expected)
+
+
+def test_t3_a_closer_is_a_mention_only_with_a_mention_opener_in_its_region_or_no_opener():
+    """The rule, both halves, one assertion each."""
+    # half 1: a mention PAIR inside one region -> both masked (region reason), the real want keeps them
+    for content, reason in (('{"cmd":"[WANT] x [/WANT]"}', "in_json_string"),
+                            ("```\n[WANT] x [/WANT]\n```", "in_fence"),
+                            ("`[WANT] x [/WANT]`", "in_code_span")):
+        parsed = org.parse_wants(content)
+        assert parsed.wants == () and [s.reason for s in parsed.skipped] == [reason, reason], content
+    # half 2a: no live opener pending -> a closer inside a region is a mention, with the region's reason
+    for content, reason in (('{"cmd":"x [/WANT]"}', "in_json_string"), ("```\nx [/WANT]\n```", "in_fence"),
+                            ("`x [/WANT]`", "in_code_span")):
+        parsed = org.parse_wants(content)
+        assert parsed.wants == () and [s.reason for s in parsed.skipped] == [reason], content
+    # half 2b: a REAL opener pending -> the closer pairs with it, whatever surrounds the closer
+    for content, text in (('[WANT]a "b[/WANT]", c', 'a "b'), ("[WANT]a `b[/WANT]` c", "a `b"),
+                          ("[WANT]a\n```\nb[/WANT]\n```\n", "a\n```\nb")):
+        assert [w.text for w in org.parse_wants(content).wants] == [text], content
+
+
+def test_t3_no_closer_is_judged_by_a_guess_on_its_own_surroundings():
+    """AUDIT: each adjacency guess is opener-only. For every guess, a CLOSER in that exact
+    context (real opener in plain prose) pairs; the same context on an OPENER is still a mention."""
+    closer_contexts = {
+        "quoted": '[WANT]say "x"[/WANT]" y',                       # closer hugged by a quote pair
+        "escaped": "[WANT]path C:\\[/WANT] z",                     # odd backslash before the closer
+        "code_adjacent": "[WANT]check `x`[/WANT] z",               # backtick right before the closer
+        "in_url": "[WANT]read https://x.org/a/[/WANT] z",          # closer glued to a URL path
+        "in_link_target": "[WANT]read [d](https://x.org/a[/WANT] z",
+        "json-escaped hug": '[WANT]typed \\"go\\"[/WANT]\\" z',
+    }
+    for guess, content in closer_contexts.items():
+        parsed = org.parse_wants(content)
+        assert len(parsed.wants) == 1 and parsed.skipped == (), (guess, parsed)
+    opener_contexts = {
+        "quoted": '"[WANT]" x', "escaped": "\\[WANT] x", "code_adjacent": "a`[WANT] x",
+        "in_url": "https://x.org/a/[WANT] x", "in_link_target": "[t](./d/[WANT] x",
+        "in_json_string": '\\"[WANT]\\" x',
+    }
+    for reason, content in opener_contexts.items():
+        parsed = org.parse_wants(content)
+        assert parsed.skipped and parsed.skipped[0] == org.SkippedMarker("[WANT]", parsed.skipped[0].start, reason), (reason, parsed)
+
+
+# --- (2) URL glue: only genuine URL-internal glue drops an opener ---
+_T3_URL_MINTS = {
+    "colon after the URL": "See https://x.org/a:[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "em dash": "See https://x.org/a\u2014[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "en dash": "See https://x.org/a\u2013[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "bold URL": "See **https://x.org/a**[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "italic URL": "_https://x.org/a_[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "tilde": "See https://x.org/a~[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "literal backslash-n (JSON-escaped text)": "See https://x.org/a\\n[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "sentence dot": "See https://x.org/a.[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "closing paren": "See (https://x.org/a)[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "comma": "See https://x.org/a,[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "hyphen": "See https://x.org/a-[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "? with the want AFTER the URL (closer ends the node)": "See https://x.org/a?[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "# with the want AFTER the URL": "See https://x.org/a#[WANT]%s[/WANT]" % _T3_PAYLOAD,
+    "? with the want AFTER the URL (closer then space)": "See https://x.org/a?[WANT]%s[/WANT] ok" % _T3_PAYLOAD,
+    "? with the want AFTER the URL (closer then sentence dot)": "See https://x.org/a?[WANT]%s[/WANT]." % _T3_PAYLOAD,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T3_URL_MINTS))
+def test_t3_url_glue_that_is_not_url_internal_mints_like_base(base_org, name):
+    _assert_mints_like_base(base_org, _T3_URL_MINTS[name], [_T3_PAYLOAD])
+
+
+# the REJECTED set (deliberate deltas vs base): (content, opener reason). `/` always; `? # = &` only
+# when the marker is INSIDE the URL token -- URL characters continue right after the closing tag.
+_T3_URL_REJECTS = {
+    "slash: checker-016's example (kept)": ("https://example.com/path/[WANT]secret-want[/WANT]/docs", "in_url"),
+    "slash at the end of the node": ("https://example.com/path/[WANT]secret-want[/WANT]", "in_url"),
+    "? INSIDE the token (query continues)": ("https://x.org/a?[WANT]secret[/WANT]&p=1", "in_url"),
+    "# INSIDE the token (fragment continues)": ("https://x.org/a#[WANT]secret[/WANT]section", "in_url"),
+    "= INSIDE the token (query value)": ("https://x.org/s?q=[WANT]secret[/WANT]&p=1", "in_url"),
+    "& INSIDE the token": ("https://x.org/s?p=1&[WANT]secret[/WANT]=2", "in_url"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T3_URL_REJECTS))
+def test_t3_url_internal_glue_still_rejects_the_opener(base_org, name):
+    content, reason = _T3_URL_REJECTS[name]
+    parsed = org.parse_wants(content)
+    assert parsed.wants == ()
+    assert parsed.skipped[0].reason == reason and parsed.skipped[0].marker == "[WANT]"
+    assert _texts(_run(base_org, [content])[0]) != []          # a deliberate delta: base minted it
+
+
+def test_t3_url_rule_is_an_allowlist_not_a_blocklist():
+    assert org._WANT_URL_PATH_GLUE == "/"
+    assert set(org._WANT_URL_QUERY_GLUE) == set("?#=&")
+    assert not hasattr(org, "_WANT_URL_TERMINATORS")
+
+
+# --- (3) token boundary for true / false / null ---
+_T3_TOKEN_MINTS = {
+    "untrue": 'The claim is untrue, "[WANT]revisit this[/WANT]"',
+    "nonnull": 'The pointer is nonnull, "[WANT]check it[/WANT]"',
+    "intrue": 'It is intrue, "[WANT]check it[/WANT]"',
+    "notfalse": 'notfalse, "[WANT]check it[/WANT]"',
+    "underscore word": 'my_true, "[WANT]check it[/WANT]"',
+    "digit-glued word": '2null, "[WANT]check it[/WANT]"',
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T3_TOKEN_MINTS))
+def test_t3_words_that_merely_end_in_true_false_null_do_not_open_a_json_literal(base_org, name):
+    content = _T3_TOKEN_MINTS[name]
+    expected = [content.split("[WANT]")[1].split("[/WANT]")[0]]
+    _assert_mints_like_base(base_org, content, expected)
+
+
+def test_t3_a_real_json_token_still_counts_named_residual(base_org):
+    """le-016's stronger variant, stated exactly: with a REAL `true` / `false` / `null` TOKEN, a
+    comma and an opening quote (`ok: true, "[WANT]x[/WANT]"`) the text IS JSON-shaped (an array element
+    after a finished value), so it is classed in_json_string -- the same accepted precision trade as a
+    want typed inside `{"note": "..."}`. The boundary fix closes only the substring defect
+    (`untrue,`); this is a NAMED RESIDUAL, pinned so a change is a visible decision."""
+    for word in ("true", "false", "null"):
+        content = 'ok: %s, "[WANT]revisit this[/WANT]"' % word
+        parsed = org.parse_wants(content)
+        assert parsed.wants == () and {s.reason for s in parsed.skipped} == {"in_json_string"}
+        assert _texts(_run(base_org, [content])[0]) == ["revisit this"]      # base minted it
+    assert org._want_json_opens_literal('x true, "', len('x true, "') - 1) is True
+    assert org._want_json_opens_literal('x untrue, "', len('x untrue, "') - 1) is False
+
+
+# --- (4) in_link_target needs a real markdown link: a `[` that opens it ---
+_T3_LINK_NOT_A_LINK = {     # relative destinations: NOT a link target, no URL scheme -> mints like base
+    "array index": "arr[0](./dir/[WANT]x[/WANT])",
+    "call then index": "f(x)[0](./dir/[WANT]x[/WANT])",
+    "snake_case index": "foo_bar[i](./dir/[WANT]x[/WANT])",
+    "chained index": "a[b][c](./dir/[WANT]x[/WANT])",
+    "no `[` in the paragraph": "unclosed](./dir/[WANT]x[/WANT])",
+    "link text broken by a blank line": "[unclosed\n\ntext](./dir/[WANT]x[/WANT])",
+}
+_T3_LINK_IS_A_LINK = {
+    "plain link": "[text](https://x.org/[WANT]x[/WANT])",
+    "link with spaces in the text": "see [the docs](./dir/[WANT]x[/WANT])",
+    "bold link": "**[t](./u/[WANT]x[/WANT])**",
+    "image": "![alt text](./u/[WANT]x[/WANT])",
+    "nested brackets in the text": "[a [b] c](./u/[WANT]x[/WANT])",
+    "link after punctuation": "(see [t](./u/[WANT]x[/WANT]))",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_T3_LINK_NOT_A_LINK))
+def test_t3_a_bracket_paren_pair_that_is_not_a_link_is_not_a_link_target(base_org, name):
+    _assert_mints_like_base(base_org, _T3_LINK_NOT_A_LINK[name], ["x"])
+
+
+@pytest.mark.parametrize("name", sorted(_T3_LINK_IS_A_LINK))
+def test_t3_a_real_markdown_link_destination_is_still_in_link_target(base_org, name):
+    content = _T3_LINK_IS_A_LINK[name]
+    parsed = org.parse_wants(content)
+    assert parsed.wants == () and parsed.skipped[0].reason == "in_link_target"
+    assert _texts(_run(base_org, [content])[0]) == ["x"]       # deliberate delta: base minted it
+
+
+def test_t3_index_then_a_url_destination_is_not_a_link_target_but_is_still_a_url():
+    """checker-018 note 2, stated exactly: `arr[0](https://x.org/[WANT]x[/WANT])` is NOT a link target
+    (the `[` is an index); the opener is nevertheless glued to a URL PATH (`https://x.org/`), so the
+    URL rule (not the link rule) still rejects it. The scheme-less sibling mints."""
+    parsed = org.parse_wants("arr[0](https://x.org/[WANT]x[/WANT])")
+    assert parsed.wants == () and parsed.skipped[0].reason == "in_url"
+    assert [w.text for w in org.parse_wants("arr[0](./dir/[WANT]x[/WANT])").wants] == ["x"]
+
+
+# --- named residuals that STILL behave as documented (pinned) ---
+def test_t3_named_residual_unclosed_fence_glued_to_a_closer_swallows_later_wants(base_org):
+    """A want whose text ends with a fence-closing line GLUED to the closer never closes that fence
+    (CommonMark: a closing fence carries nothing after it), so the fence runs to the end of the node
+    and a later want is masked in_fence. The first want now mints (turn-3 closer rule); base also
+    minted the second. Documented failure mode 2, unchanged."""
+    content = "[WANT]ends with a fence\n```\ncode\n```[/WANT] [WANT]second[/WANT]"
+    assert _texts(_run(base_org, [content])[0]) == ["ends with a fence\n```\ncode\n```", "second"]
+    parsed = org.parse_wants(content)
+    assert [w.text for w in parsed.wants] == ["ends with a fence\n```\ncode\n```"]
+    assert [(s.marker, s.reason) for s in parsed.skipped] == [("[WANT]", "in_fence"), ("[/WANT]", "in_fence")]
+
+
+# --- (5) the changelog no longer over-claims ---
+def test_t3_changelog_claim_is_qualified_to_the_tested_grammar():
+    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0][:12000]
+    assert "TESTED grammar" in header and "NOT for every string" in header
+
+
+# --- cost: the new lookbacks stay bounded on adversarial input ---
+def test_t3_link_and_url_scanners_stay_bounded_on_adversarial_input():
+    import time as _time
+    for content in (("[t](https://x.org/[WANT]x[/WANT]) " * 3_000),
+                    ("[" * 50_000 + "](./d/[WANT]x[/WANT])"),
+                    ("a[0](./d/[WANT]x[/WANT]) " * 3_000)):
+        t0 = _time.perf_counter()
+        org.parse_wants(content)
+        assert _time.perf_counter() - t0 < 10.0

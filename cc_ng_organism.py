@@ -329,6 +329,31 @@
 #   EVERY node with the key INCLUDING `ingested` ones (this mirror skips them), so her window
 #   does not advance on the autonomic clock (LAW 8). Whether and when she registers is Josh's
 #   rollout decision, not this trial's.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 3,
+#   le-016 MEDIUM #2/#3 + checker-018 notes 1-2) -- FINAL FUNCTION: lexical-guess false
+#   negatives fixed ONCE, before the #801 counts.
+# What: (1) CLOSERS: a marker inside a JSON literal / fence / inline code span is masked as a
+#   mention only when it pairs with a MASKED OPENER IN THE SAME REGION (or nothing is pending);
+#   a closer in a region with a REAL opener pending and no mention opener in that region is the
+#   closer of the real want (`[WANT]rename "a", "b[/WANT]", next` mints again; so does a want
+#   whose closer sits in a stray-backtick span). Quoted / escaped / code_adjacent / URL / link /
+#   JSON-hug stay OPENER-only (audited: no closer is judged by a guess on its own text).
+#   parse_wants pairs masked markers per region; _want_marker_mention_reason is replaced by
+#   _want_marker_region (any marker) + _want_opener_mention_reason (openers). (2) in_url: the
+#   blocklist _WANT_URL_TERMINATORS is gone; in_url needs URL-internal glue -- `/` always;
+#   `? # = &` only when URL characters CONTINUE after the paired closing tag (marker INSIDE the
+#   token); `: - em/en dash * _ ~ literal backslash-n .` etc. mint again. (3) true/false/null
+#   in _want_json_opens_literal must be a whole token (`untrue,` `nonnull,` `intrue,`).
+#   (4) in_link_target needs a real link: the `]` must close a balanced `[` whose left
+#   neighbour is not an identifier / `)` / `]` (`arr[0](https://x/[WANT]..)` is not a link
+#   target; it is still in_url because the opener is glued to a URL path). (5) this header's
+#   turn-2 claim is qualified to the tested grammar.
+# Why: le-016 (MEDIUM #2, #3) and checker-018 notes 1-2: each was a real want base minted that
+#   the turn-2 build dropped by a lexical guess; P406's boundary is the OPENER's context. The
+#   #801 counts and the repair plan's function pin are taken only on this final function.
+# How: golden cases ASSERTED AGAINST BASE e4ebf982 in tests/test_cc_want_legitimacy_810.py.
+#   Named residuals (still mint / still drop) are pinned there and listed in build-003.md.
+#   The INFO skip log is unchanged and no content-aware exemption was added (correct).
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2,
 #   #815 / Exec P414) -- three more structural skip reasons: in_json_string, in_url,
 #   in_link_target.
@@ -350,7 +375,10 @@
 #   JSON with raw newlines, scheme-less reference definitions, bare prose mentions.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2,
 #   le-014 corrections C1-C4 + LAW 5) -- the parser again gives the SAME result as base for
-#   every well-formed want shape.
+#   every want shape in the TESTED grammar (the prefix x body x suffix corpus in
+#   tests/test_cc_want_legitimacy_810.py), NOT for every string: le-016 found shapes outside
+#   that grammar (a closer inside a quote fragment whose opener is plain prose, glued URL
+#   punctuation, `untrue,`, `arr[0](...)`) that were fixed in turn 3 (entry above).
 # What: the code_adjacent / escaped / quoted adjacency guesses now apply to OPENERS only
 #   (_want_marker_mention_reason takes is_close); fences and inline code spans still mask any
 #   marker. The three WANT_SKIP_* log bounds are env-sourced (CC_WANT_SKIP_SUMMARY_INTERVAL_S,
@@ -2100,8 +2128,19 @@ def _want_code_span_ranges(content: str, fences: List[Tuple[int, int]]) -> List[
 _WANT_JSON_AFTER_RE = re.compile(r'\s*(?:[}\],:]|$)')
 _WANT_URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
 _WANT_URL_LOOKBACK = 2048
-# A character right before an opener that ENDS a URL / link rather than continuing it.
-_WANT_URL_TERMINATORS = frozenset(").]}>\"'`,;!.")
+# in_url fires ONLY on genuine URL-internal glue (turn 3; the turn-2 blocklist of "terminators"
+# dropped real wants after `url:` / bold / italic / dash / tilde / literal backslash-n).
+#   `/`            the opener sits in a URL path: `https://x.org/a/[WANT]...`   -> in_url, always.
+#   `? # = &`      query / fragment glue: in_url ONLY when the marker is INSIDE the URL token, i.e.
+#                  URL characters CONTINUE right after the paired closing tag
+#                  (`https://x.org/a?[WANT]s[/WANT]&p=1`); a want typed AFTER the URL
+#                  (`https://x.org/a?[WANT]follow up[/WANT]` + end/space/punctuation) stays real.
+#   anything else  (`: - – * _ ~ . , ) ] } > " ' ! ;` a letter, a literal backslash-n ...) stays real.
+_WANT_URL_PATH_GLUE = "/"
+_WANT_URL_QUERY_GLUE = frozenset("?#=&")
+_WANT_URL_CONTINUE_RE = re.compile(r"[A-Za-z0-9/_~%&=+#@\-]")
+_WANT_LINK_TEXT_LOOKBACK = 1024
+_WANT_JSON_WORDS = ("true", "false", "null")
 
 
 def _want_json_opens_literal(content: str, q: int) -> bool:
@@ -2128,9 +2167,17 @@ def _want_json_opens_literal(content: str, q: int) -> bool:
         if j < 0:
             return False
         prev = content[j]
-        return (prev in '"]}' or prev.isdigit()
-                or content.endswith("true", 0, j + 1) or content.endswith("false", 0, j + 1)
-                or content.endswith("null", 0, j + 1))
+        if prev in '"]}' or prev.isdigit():
+            return True
+        # true / false / null only as a WHOLE token: `untrue,` `nonnull,` `intrue,` are words
+        # that merely end in one (turn 3). A real `true,` token still counts (named residual:
+        # a want typed in a JSON-looking sentence).
+        for word in _WANT_JSON_WORDS:
+            if content.endswith(word, 0, j + 1):
+                before = j - len(word)
+                if before < 0 or not (content[before].isalnum() or content[before] == "_"):
+                    return True
+        return False
     return False
 
 
@@ -2186,49 +2233,95 @@ def _want_glued_run_before(content: str, start: int) -> str:
     return run[last.end():] if last is not None else run
 
 
-def _want_opener_carried_reason(content: str, start: int) -> Optional[str]:
+def _want_link_text_opens_a_link(content: str, close_bracket: int) -> bool:
+    """True when the `]` at content[close_bracket] closes the text of a real markdown link: a
+    balanced `[` is found before it (same paragraph, bounded lookback, backslash-escaped
+    brackets ignored) and that `[` is not glued to an identifier / `)` / `]` -- `arr[0](...)`,
+    `f(x)[0](...)`, `a[b][c](...)` are index / call shapes, not links (turn 3)."""
+    lo = max(0, close_bracket - _WANT_LINK_TEXT_LOOKBACK)
+    floor = lo
+    for blank in _WANT_BLANK_LINE_RE.finditer(content, lo, close_bracket):
+        floor = blank.end()
+    depth = 1
+    i = close_bracket - 1
+    while i >= floor:
+        c = content[i]
+        if c == "]" or c == "[":
+            slashes = 0
+            while i - 1 - slashes >= floor and content[i - 1 - slashes] == "\\":
+                slashes += 1
+            if slashes % 2 == 0:
+                if c == "]":
+                    depth += 1
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        return i == 0 or not (content[i - 1].isalnum() or content[i - 1] in "_)]")
+        i -= 1
+    return False
+
+
+def _want_url_continues_after_pair(content: str, opener_end: int) -> bool:
+    """True when the WANT pair that starts after `opener_end` is INSIDE a URL token: URL
+    characters continue immediately after the nearest closing tag."""
+    close = content.find(WANT_CLOSE, opener_end)
+    if close < 0:
+        return False
+    after = close + len(WANT_CLOSE)
+    return after < len(content) and _WANT_URL_CONTINUE_RE.match(content, after) is not None
+
+
+def _want_opener_carried_reason(content: str, start: int, end: int) -> Optional[str]:
     """#815, OPENER context only (a closer guard would swallow `[WANT]read https://x/a[/WANT]`,
-    the le-014 C1 class): is this opener glued to a link destination or a URL?"""
+    the le-014 C1 class): is this opener glued to a link destination or a URL?
+      in_link_target  the glued run holds `](` with no `)` after it AND that `]` closes the text
+                      of a real markdown link (`[` present, not an index/call shape);
+      in_url          the glued run holds `scheme://` and the character right before the opener
+                      is URL-internal glue (see _WANT_URL_PATH_GLUE / _WANT_URL_QUERY_GLUE)."""
     run = _want_glued_run_before(content, start)
     if not run:
         return None
     idx = run.rfind("](")
-    if idx >= 0 and ")" not in run[idx + 2:]:
+    if idx >= 0 and ")" not in run[idx + 2:] and _want_link_text_opens_a_link(content, start - len(run) + idx):
         return "in_link_target"         # [text](dest/[WANT]...  -- the opener sits in the destination
-    if run[-1] not in _WANT_URL_TERMINATORS and _WANT_URL_SCHEME_RE.search(run):
-        return "in_url"                 # scheme://host/path/[WANT]...  -- glued to a URL
+    if _WANT_URL_SCHEME_RE.search(run):
+        prev = run[-1]
+        if prev == _WANT_URL_PATH_GLUE:
+            return "in_url"             # scheme://host/path/[WANT]...  -- in a URL path
+        if prev in _WANT_URL_QUERY_GLUE and _want_url_continues_after_pair(content, end):
+            return "in_url"             # scheme://host/a?[WANT]s[/WANT]&p=1  -- inside the token
     return None
 
 
-def _want_marker_mention_reason(content: str, start: int, end: int, is_close: bool,
-                                 fences: List[Tuple[int, int]], fence_starts: List[int],
-                                 codes: List[Tuple[int, int]], code_starts: List[int],
-                                 jsons: List[Tuple[int, int]], json_starts: List[int]) -> Optional[str]:
-    """Why the marker at content[start:end] is a mention, or None if it is a real tag.
-
-    Three tiers, on purpose:
-      1. STRUCTURE, any marker (opener or closer): inside a JSON string literal (#815), a fenced
-         block, or a balanced inline code span. JSON is checked first so a fence carried inside a
-         JSON string is rejected as JSON, not by the coincidence that its backtick runs pair up.
-      2. A closer that survived tier 1 is REAL. Base never guarded closers, and a closer guard
-         turns `[WANT]check `foo()`[/WANT]` into a dropped want (le-014 C1/C2).
-      3. OPENER context guesses: glued to a link destination / URL (#815), JSON-escaped quote hug
-         (#815), directly after a backtick, backslash-escaped, quote-wrapped. The reason applies
-         to the context the OPENER sits in, never to what the want text contains. A mentioned
-         opener's orphan closer is skipped as closer_without_opener.
-    """
+def _want_marker_region(start: int,
+                        fences: List[Tuple[int, int]], fence_starts: List[int],
+                        codes: List[Tuple[int, int]], code_starts: List[int],
+                        jsons: List[Tuple[int, int]], json_starts: List[int]
+                        ) -> Optional[Tuple[str, Tuple[str, int]]]:
+    """The structural region (JSON string literal, fenced block, inline code span) the marker at
+    `start` lies in, as (reason, (kind, index)), or None. JSON is checked first so a fence
+    carried inside a JSON string is rejected as JSON, not by the coincidence that its backtick
+    runs pair up. The (kind, index) key identifies the region so parse_wants can pair a masked
+    closer with a masked opener of the SAME region."""
     k = bisect_right(json_starts, start) - 1
     if k >= 0 and start < jsons[k][1]:
-        return "in_json_string"
+        return "in_json_string", ("j", k)
     k = bisect_right(fence_starts, start) - 1
     if k >= 0 and start < fences[k][1]:
-        return "in_fence"
+        return "in_fence", ("f", k)
     k = bisect_right(code_starts, start) - 1
     if k >= 0 and start < codes[k][1]:
-        return "in_code_span"
-    if is_close:
-        return None
-    carried = _want_opener_carried_reason(content, start)
+        return "in_code_span", ("c", k)
+    return None
+
+
+def _want_opener_mention_reason(content: str, start: int, end: int) -> Optional[str]:
+    """Why an OPENER outside every structural region is still a mention, or None. These are
+    guesses about the context the OPENER sits in and are NEVER applied to a closer (le-014
+    C1/C2, le-016 #3: base never guarded closers, and a closer judged by a lexical guess on its
+    own text turns `[WANT]check `foo()`[/WANT]` / `[WANT]rename "a", "b[/WANT]", next` into a
+    dropped want). A mentioned opener's orphan closer is skipped as closer_without_opener."""
+    carried = _want_opener_carried_reason(content, start, end)
     if carried is not None:
         return carried
     if start >= 2 and content[start - 2:start] == '\\"' and content[end:end + 2] == '\\"':
@@ -2251,11 +2344,13 @@ def parse_wants(content: str) -> WantParse:
     """THE legitimacy test (#810): which [WANT]...[/WANT] pairs in `content` are real wants.
 
     PURE function of the string: no I/O, no logging, no graph. A want is the text between
-    a real opener and its paired closer, with NO length limit. A marker that is inside a
-    JSON string literal, a fenced block or an inline code span is a mention (any marker); an
-    OPENER glued to a link destination or URL, hugged by JSON-escaped quotes, directly after a
-    backtick, backslash-escaped, or wrapped in a matching quote pair is a mention too (closers
-    are never judged by those guesses -- le-014 C1/C2). Skipped; the closer pairs with the
+    a real opener and its paired closer, with NO length limit. An OPENER inside a JSON string
+    literal, a fenced block or an inline code span, glued to a link destination or URL, hugged
+    by JSON-escaped quotes, directly after a backtick, backslash-escaped, or wrapped in a
+    matching quote pair is a mention. A CLOSER is judged only relative to its OPENER: it is a
+    mention when it closes a masked opener of the same JSON literal / fence / code span, or
+    when no live opener is pending; a closer with a live opener pending is that want's closer
+    whatever surrounds it (le-014 C1/C2, le-016 #3). Skipped; the closer pairs with the
     NEAREST live opener, so a returned want contains no live marker; a stray closer, an
     unclosed opener and an empty pair are skipped. Every skip carries its reason and offset
     (the caller logs them -- never silent). `wants[i].text` is `.strip()`ped inner text,
@@ -2272,15 +2367,33 @@ def parse_wants(content: str) -> WantParse:
     wants: List[WantSpan] = []
     skipped: List[SkippedMarker] = []
     pending: Optional[Tuple[int, int]] = None       # (start, end) of the live opener awaiting a closer
+    masked_openers: Dict[Tuple[str, int], int] = {}  # region -> masked openers not yet closed
     for m in _WANT_MARKER_RE.finditer(content):
         is_close = bool(m.group(1))
         marker = WANT_CLOSE if is_close else WANT_OPEN
-        reason = _want_marker_mention_reason(content, m.start(), m.end(), is_close,
-                                             fences, fence_starts, codes, code_starts,
-                                             jsons, json_starts)
-        if reason is not None:
-            skipped.append(SkippedMarker(marker, m.start(), reason))
-            continue
+        region = _want_marker_region(m.start(), fences, fence_starts, codes, code_starts,
+                                     jsons, json_starts)
+        if region is not None:
+            reason, key = region
+            if not is_close:
+                masked_openers[key] = masked_openers.get(key, 0) + 1
+                skipped.append(SkippedMarker(marker, m.start(), reason))
+                continue
+            if masked_openers.get(key, 0) > 0:      # closes a mention opener in the SAME region
+                masked_openers[key] -= 1
+                skipped.append(SkippedMarker(marker, m.start(), reason))
+                continue
+            if pending is None:                     # nothing it could close: a stray mention closer
+                skipped.append(SkippedMarker(marker, m.start(), reason))
+                continue
+            # else: a closer in a region with a REAL opener pending and no mention opener in that
+            # region is the closer of the real want -- judged relative to ITS opener, not by the
+            # text around it (le-016 #3). Fall through to pairing.
+        elif not is_close:
+            reason = _want_opener_mention_reason(content, m.start(), m.end())
+            if reason is not None:
+                skipped.append(SkippedMarker(marker, m.start(), reason))
+                continue
         if not is_close:
             if pending is not None:     # a nearer opener arrived: the earlier one never closed
                 skipped.append(SkippedMarker(WANT_OPEN, pending[0], "opener_unclosed"))
