@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -132,7 +133,7 @@ def _specs(wid):
     return specs
 
 
-def build_world(base: Path, pinned, *, tag="w"):
+def build_world(base: Path, pinned, *, tag="w", include_protected=True, flagged_in_scope=False):
     """A tiny REAL checkpoint pair (Graph + SimpleVectorDB) plus the four small files, under `base`."""
     org, nf, ui = pinned.org, pinned.nf, pinned.ui
     wid = org.want_id_for_text
@@ -165,23 +166,36 @@ def build_world(base: Path, pinned, *, tag="w"):
     # short (unrepaired) wants: the existing X_EX want, one ordinary, and the two Choice Clause wants (synthetic text)
     g.create_node(node_id="cc:conv::plain", metadata={"creation_mode": "conversational"})
     vdb.insert("cc:conv::plain", vec, prose("plain"), {})
-    for nid, txt in ((wid(XE), XE), (wid("a short want"), "a short want"),
-                     (tool.CHOICE_CLAUSE_IDS[0], "synthetic choice clause want one"),
-                     (tool.CHOICE_CLAUSE_IDS[1], "synthetic choice clause want two")):
+    shorts = [(wid(XE), XE), (wid("a short want"), "a short want")]
+    if include_protected:
+        shorts += [(tool.CHOICE_CLAUSE_IDS[0], "synthetic choice clause want one"),
+                   (tool.CHOICE_CLAUSE_IDS[1], "synthetic choice clause want two")]
+    for nid, txt in shorts:
         g.create_node(node_id=nid, metadata={"kind": "want", "want_text": txt, "want_state": "open",
                       "provenance": "cc_authored", "source_node": "cc:conv::plain", "creation_mode": "conversational"})
     short1, cc1, cc2, rim = wid("a short want"), tool.CHOICE_CLAUSE_IDS[0], tool.CHOICE_CLAUSE_IDS[1], tool.CONSTITUTIONAL_ID
-    g.create_node(node_id=rim, metadata={"constitutional": True})
+    if include_protected:
+        g.create_node(node_id=rim, metadata={"constitutional": True})
+    if flagged_in_scope:                                  # a want IN S under an ordinary id that carries the constitutional flag
+        flag_text = prose("flag")
+        ids["FLAG"] = wid(flag_text)
+        g.create_node(node_id=ids["FLAG"], metadata={"kind": "want", "want_text": flag_text, "want_state": "open",
+                      "provenance": "cc_authored", "source_node": "cc:conv::plain", "creation_mode": "conversational",
+                      "constitutional": True})
     g.create_node(node_id="n1", metadata={})
     g.create_node(node_id="n2", metadata={})
-    for a, b, w in ((ids["SEP1"], ids["GEN"], 0.4), (short1, ids["SEP1"], 0.5), (cc1, ids["SEP1"], 0.6), (cc2, ids["GEN"], 0.6),
-                    (rim, ids["SEP1"], 0.7), (ids["SEP2"], rim, 0.7), (rim, ids["GEN"], 0.7), ("n1", ids["SEP1"], 0.2)):
+    edges = [(ids["SEP1"], ids["GEN"], 0.4), (short1, ids["SEP1"], 0.5), ("n1", ids["SEP1"], 0.2)]
+    if include_protected:
+        edges += [(cc1, ids["SEP1"], 0.6), (cc2, ids["GEN"], 0.6), (rim, ids["SEP1"], 0.7), (ids["SEP2"], rim, 0.7),
+                  (rim, ids["GEN"], 0.7)]
+    for a, b, w in edges:
         g.create_synapse(a, b, weight=w)
     syn = g.create_synapse("n1", "n2", weight=0.2)
     syn.metadata = {"creation_mode": "surprise_driven", "expected_target": ids["SEP2"], "timestep": 0}
     g.nodes["n1"].pred_weights = {ids["SEP1"]: 0.5, ids["GEN"]: 0.2}
-    g.nodes[cc1].pred_weights = {ids["SEP1"]: 0.7, ids["GEN"]: 0.1}
-    g.nodes[rim].pred_weights = {ids["SEP1"]: 0.4}
+    if include_protected:
+        g.nodes[cc1].pred_weights = {ids["SEP1"]: 0.7, ids["GEN"]: 0.1}
+        g.nodes[rim].pred_weights = {ids["SEP1"]: 0.4}
     g.nodes[short1].pred_weights = {ids["SEP2"]: 0.3}
     g.nodes[ids["SEP1"]].pred_weights = {"n2": 0.3}
     he = g.create_hyperedge({ids["SEP1"], "n1", "n2"}, member_weights={ids["SEP1"]: 1.0, "n1": 0.5, "n2": 0.5},
@@ -208,12 +222,19 @@ def build_world(base: Path, pinned, *, tag="w"):
     (ckpt / "main.msgpack.guard_state.json").write_text(json.dumps({"healthy": True}))
     (ckpt / "main.msgpack.manifest.json").write_text(json.dumps({"guardian_nodes": len(g.nodes), "nodes": len(g.nodes)}))
     (ckpt / "commons.msgpack").write_bytes(msgpack.packb({"k": "v"}, use_bin_type=True))
+    (ws / "daemon.log").write_text("synthetic daemon log")
+    os.utime(ws / "daemon.log", (1_000_000_000, 1_000_000_000))
+    gen = ckpt / "generations" / "20260923T104614Z"          # the incidental hard-link partners (Exec P428), synthetic
+    gen.mkdir(parents=True)
+    os.link(ckpt / "main.msgpack", gen / "main.msgpack")
+    os.link(ckpt / "vectors.msgpack", gen / "vectors.msgpack")
     wants = [n for n, nd in g.nodes.items() if nd.metadata.get("kind") == "want"]
     scope = sorted(n for n in wants if len(g.nodes[n].metadata["want_text"]) > MIN_LEN)
     w = types.SimpleNamespace(base=base, ws=ws, ckpt=ckpt, daemon=daemon, backups=base / "backups", conduit=base / "conduit",
                               ids=ids, specs=specs, scope=scope, short1=short1, cc1=cc1, cc2=cc2, rim=rim, he=he.hyperedge_id,
                               new={"SEP1": wid(X1), "SEP2": wid(X2), "BIG": wid(X5)},
-                              expect={"wants": len(wants), "protected": len(wants) + 1, "scope": len(scope)})
+                              gen=gen, log=ws / "daemon.log",
+                              expect={"wants": len(wants), "protected": len(wants) + (1 if include_protected else 0), "scope": len(scope)})
     del g, vdb
     return w
 
@@ -377,7 +398,7 @@ def test_every_report_artifact_is_stamped_with_the_pin_tuple(phase1):
     reports = sorted((phase1.run_dir / "reports").glob("*.json"))
     names = {p.stem for p in reports}
     for need in ("outcome-table", "histograms", "marker-bearing-minted", "residual-classes", "repair-list", "scope-ids",
-                 "pre-node-report", "candidate-id-map"):
+                 "pre-node-report", "id-map"):
         assert need in names
     for p in reports + [phase1.run_dir / "run-record.json", phase1.run_dir / "copy-hashes.json"]:
         assert json.loads(p.read_text())["pin_stamp"] == tool.pin_stamp(), p.name
@@ -1120,7 +1141,6 @@ def test_a_provisional_self_approval_is_never_accepted_as_an_approval(built, wor
     p, s = _write_approvals(tmp_path, body)
     with pytest.raises(tool.Refusal, match="provisional"):
         tool.load_approvals(p, s, rl, sc)
-    assert tool.load_approvals(p, s, rl, sc, allow_provisional=True)["packet"] == tool.PROVISIONAL_PACKET
 
 
 def test_the_rewrite_step_refuses_a_run_directory_outside_the_backups_root(world, phase1, tmp_path):
@@ -1156,9 +1176,10 @@ def test_the_rewrite_step_stops_when_the_rederived_classification_is_not_the_sav
 def test_phase_1_reads_a_read_only_target_and_never_writes_it(pinned, tmp_path):
     w = build_world(tmp_path, pinned)
     before = file_hashes(w.ckpt)
-    mtimes = {p.name: p.stat().st_mtime_ns for p in w.ckpt.iterdir()}
+    mtimes = {p.name: p.stat().st_mtime_ns for p in w.ckpt.iterdir() if p.is_file()}
     for p in w.ckpt.iterdir():
-        p.chmod(0o444)
+        if p.is_file():
+            p.chmod(0o444)
     w.ckpt.chmod(0o555)
     mp = pytest.MonkeyPatch()
     patch_world(mp, w)
@@ -1171,8 +1192,9 @@ def test_phase_1_reads_a_read_only_target_and_never_writes_it(pinned, tmp_path):
         mp.undo()
         w.ckpt.chmod(0o755)
         for p in w.ckpt.iterdir():
-            p.chmod(0o644)
-    assert file_hashes(w.ckpt) == before and {p.name: p.stat().st_mtime_ns for p in w.ckpt.iterdir()} == mtimes
+            if p.is_file():
+                p.chmod(0o644)
+    assert file_hashes(w.ckpt) == before and {p.name: p.stat().st_mtime_ns for p in w.ckpt.iterdir() if p.is_file()} == mtimes
     copy = json.loads((Path(res["run_dir"]) / "copy-hashes.json").read_text())
     assert copy["copy_sha256"] == before
     for n in tool.SIX_FILES:
@@ -1264,36 +1286,51 @@ def test_p3_refuses_a_parser_that_regresses_the_closer_after_backtick_repro(pinn
     assert not r["ok"] and r["mismatched_rows"] == ["closer_after_backtick"]
 
 
+def _p4kw(world, placed=None):
+    return {"code_placed_at": (time.time() + 3600) if placed is None else placed, "daemon_log": str(world.log)}
+
+
+def _manifest_of(d):
+    out = {}
+    for n in tool.SIX_FILES:
+        st = os.stat(os.path.join(d, n))
+        out[n] = {"sha256": tool.sha256_file(os.path.join(d, n)), "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                  "st_dev": st.st_dev, "st_ino": st.st_ino, "st_nlink": st.st_nlink}
+    return out
+
+
 def test_p4_daemon_down_is_mechanical_and_every_leg_can_fail(world):
     d = str(world.ckpt)
-    assert tool.gate_p4(FakeProbes(), d)["ok"]
-    for kw, leg in (({"units_active": {tool.DAEMON_UNIT}}, "unit_inactive"),
-                    ({"units_active": {tool.RECOVER_TIMER}}, "recover_timer_inactive"),
-                    ({"procs": [("cc-ng-service.py", 4242)]}, "no_daemon_process"),
-                    ({"held": [(4242, d + "/main.msgpack")]}, "no_process_holds_the_six_files")):
-        r = tool.gate_p4(FakeProbes(**kw), d)
+    kw = _p4kw(world)
+    ok = tool.gate_p4(FakeProbes(), d, manifest_files=_manifest_of(d), **kw)
+    assert ok["ok"] and "no_pulse_since_code_placement" in ok["checks"]
+    for extra, leg in (({"units_active": {tool.DAEMON_UNIT}}, "unit_inactive"),
+                       ({"units_active": {tool.RECOVER_TIMER}}, "recover_timer_inactive"),
+                       ({"procs": [("cc-ng-service.py", 4242)]}, "no_daemon_process"),
+                       ({"held": [(4242, d + "/main.msgpack")]}, "no_process_holds_the_six_files")):
+        r = tool.gate_p4(FakeProbes(**extra), d, manifest_files=_manifest_of(d), **kw)
         assert not r["ok"] and not r["checks"][leg]
-    manifest = {n: {"sha256": tool.sha256_file(os.path.join(d, n)), "size": os.stat(os.path.join(d, n)).st_size,
-                    "mtime_ns": os.stat(os.path.join(d, n)).st_mtime_ns} for n in tool.SIX_FILES}
-    assert tool.gate_p4(FakeProbes(), d, manifest_files=manifest)["ok"]
+    manifest = _manifest_of(d)
     manifest[tool.MAIN_NAME]["sha256"] = "0" * 64
-    r = tool.gate_p4(FakeProbes(), d, manifest_files=manifest)
+    r = tool.gate_p4(FakeProbes(), d, manifest_files=manifest, **kw)
+    assert not r["ok"] and not r["checks"]["six_files_equal_the_start_of_phase2_backup"]
+    manifest = _manifest_of(d)
+    manifest[tool.MAIN_NAME]["st_ino"] += 1                      # equal bytes, a DIFFERENT inode: the file was replaced
+    r = tool.gate_p4(FakeProbes(), d, manifest_files=manifest, **kw)
     assert not r["ok"] and not r["checks"]["six_files_equal_the_start_of_phase2_backup"]
 
 
 def test_p4_a_pid_file_naming_a_live_process_fails_and_a_log_newer_than_the_placement_fails(world):
     (world.ws / "daemon.pid").write_text("4242")
-    (world.ws / "daemon.log").write_text("x")
     try:
-        r = tool.gate_p4(FakeProbes(alive=True), str(world.ckpt))
+        r = tool.gate_p4(FakeProbes(alive=True), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world))
         assert not r["ok"] and not r["checks"]["daemon_pid_file_names_a_dead_pid"]
-        r = tool.gate_p4(FakeProbes(), str(world.ckpt), code_placed_at=1.0, daemon_log=str(world.ws / "daemon.log"))
+        r = tool.gate_p4(FakeProbes(), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world, placed=1.0))
         assert not r["ok"] and not r["checks"]["no_pulse_since_code_placement"]
-        r = tool.gate_p4(FakeProbes(), str(world.ckpt), code_placed_at=10 ** 12, daemon_log=str(world.ws / "daemon.log"))
+        r = tool.gate_p4(FakeProbes(), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world, placed=10 ** 12))
         assert r["ok"]
     finally:
         (world.ws / "daemon.pid").unlink()
-        (world.ws / "daemon.log").unlink()
 
 
 def test_p6_the_peer_hold_h1_h2_h3_each_fail_closed(world):
@@ -1374,9 +1411,15 @@ def test_an_unrelated_receipt_does_not_block_and_an_unreadable_one_does(world):
 # the WHOLE Phase-2 path, on a SYNTHETIC directory, with fake probes (nothing real is touched)
 # ==================================================================================================
 
-def _phase2_world(pinned, tmp_path, mp):
-    w = build_world(tmp_path, pinned)
+def _phase2_world(pinned, tmp_path, mp, **world_kw):
+    w = build_world(tmp_path, pinned, **world_kw)
     patch_world(mp, w)
+    for name, key in (("EXPECTED_WANTS", "wants"), ("EXPECTED_PROTECTED", "protected"), ("EXPECTED_SCOPE", "scope")):
+        mp.setattr(tool, name, w.expect[key])                     # Phase 2 pins the module constants: the synthetic world has its own
+    root = tmp_path / "daemon-import-root"                       # stands in for the unit's import root the Chief names (Q9)
+    root.mkdir()
+    shutil.copy(PIN_ROOT / "cc_ng_organism.py", root / "cc_ng_organism.py")
+    w.org_copy = root / "cc_ng_organism.py"
     rc, c1, err = cli(argv_for(w))
     assert rc == 0, err
     rd = Path(c1["run_dir"])
@@ -1384,7 +1427,7 @@ def _phase2_world(pinned, tmp_path, mp):
     frozen.mkdir()
     for name in ("repair-list", "scope-ids"):
         shutil.copy(rd / "reports" / (name + ".json"), frozen / (name + ".json"))
-    shutil.copy(rd / "reports" / "candidate-id-map.json", frozen / "id-map.json")
+    shutil.copy(rd / "reports" / "id-map.json", frozen / "id-map.json")
     rl = json.loads((frozen / "repair-list.json").read_text())
     body = {"packet": "EXEC-SYNTHETIC-PACKET-P2", "function_pin": dict(tool.PIN), "repair_list_sha256": tool.sha256_file(str(frozen / "repair-list.json")),
             "scope_ids_sha256": tool.sha256_file(str(frozen / "scope-ids.json")), "scrub_version": tool.SCRUB_VERSION,
@@ -1397,8 +1440,9 @@ def _phase2_world(pinned, tmp_path, mp):
     return w, rd, frozen, str(ap), hashlib.sha256(data).hexdigest()
 
 
-def _p2_argv(w, *extra, step="phase2-backup"):
-    return argv_for(w, "--conduit-dir", str(w.conduit), *extra, step=step)
+def _p2_argv(w, *extra, step="phase2-backup", placed=True):
+    more = ["--code-placed-at", str(time.time() + 3600)] if placed else []
+    return argv_for(w, "--conduit-dir", str(w.conduit), *more, *extra, step=step)
 
 
 @pytest.fixture()
@@ -1428,7 +1472,7 @@ def test_apply_refuses_when_josh_go_does_not_quote_the_backup_manifest(pinned, t
     p2 = res["run_dir"]
     before = file_hashes(w.ckpt)
     common = ["--apply", "--run-dir", p2, "--frozen-dir", str(frozen), "--approvals", ap, "--approvals-sha256", aps,
-              "--daemon-organism-file", str(PIN_ROOT / "cc_ng_organism.py")]
+              "--daemon-organism-file", str(w.org_copy)]
     rc, res2, err = cli(_p2_argv(w, *common, "--josh-go", "GO-1", "--josh-go-manifest-sha256", "0" * 64), probes=FakeProbes())
     assert rc == 2 and "quotes" in err
     rc, res2, err = cli(_p2_argv(w, *common), probes=FakeProbes())
@@ -1461,7 +1505,7 @@ def test_apply_stops_on_any_deviation_from_the_approved_list_and_writes_nothing(
     p2, msha = res["run_dir"], res["backup_manifest_sha256"]
     before = file_hashes(w.ckpt)
     rc, res2, err = cli(_p2_argv(w, "--apply", "--run-dir", p2, "--frozen-dir", str(frozen), "--approvals", ap, "--approvals-sha256", aps2,
-                                 "--daemon-organism-file", str(PIN_ROOT / "cc_ng_organism.py"), "--josh-go", "GO-1",
+                                 "--daemon-organism-file", str(w.org_copy), "--josh-go", "GO-1",
                                  "--josh-go-manifest-sha256", msha), probes=FakeProbes())
     assert rc == 3 and "deviation" in err
     assert file_hashes(w.ckpt) == before
@@ -1475,7 +1519,7 @@ def test_apply_writes_the_pair_atomically_verifies_it_then_retires_the_tool(pinn
     p2, msha = res["run_dir"], res["backup_manifest_sha256"]
     before = file_hashes(w.ckpt)
     args = _p2_argv(w, "--apply", "--run-dir", p2, "--frozen-dir", str(frozen), "--approvals", ap, "--approvals-sha256", aps,
-                    "--daemon-organism-file", str(PIN_ROOT / "cc_ng_organism.py"), "--josh-go", "GO-1", "--josh-go-manifest-sha256", msha)
+                    "--daemon-organism-file", str(w.org_copy), "--josh-go", "GO-1", "--josh-go-manifest-sha256", msha)
     rc, res2, err = cli(args, probes=FakeProbes())
     assert rc == 0, err
     after = file_hashes(w.ckpt)
@@ -1511,8 +1555,548 @@ def test_apply_rechecks_the_gates_immediately_before_the_replace(pinned, tmp_pat
         return dict(r, ok=False) if calls["n"] >= 2 else r                    # call 1 = the gate list; call 2 = the re-check
     monkeypatch.setattr(tool, "gate_p4", p4)
     args = _p2_argv(w, "--apply", "--run-dir", p2, "--frozen-dir", str(frozen), "--approvals", ap, "--approvals-sha256", aps,
-                    "--daemon-organism-file", str(PIN_ROOT / "cc_ng_organism.py"), "--josh-go", "GO-1", "--josh-go-manifest-sha256", msha)
+                    "--daemon-organism-file", str(w.org_copy), "--josh-go", "GO-1", "--josh-go-manifest-sha256", msha)
     rc, res2, err = cli(args, probes=FakeProbes())
     assert rc == 2 and "immediately before os.replace" in err and calls["n"] == 2
     assert file_hashes(w.ckpt) == before
     assert not list(Path(p2).glob("RETIRED-*.receipt"))
+
+
+# ==================================================================================================
+# TURN A2 - the hardening follow-up (le-029 C1-C8 + N1, checker-026 c026-C3, the P1 heads).
+# FAILING-FIRST: every test below was committed BEFORE the tool change and fails against the TURN A tool.
+# ==================================================================================================
+
+ProbeError = getattr(tool, "ProbeError", type("MissingProbeError", (Exception,), {}))     # old tool: behavioural failure, not AttributeError
+
+
+def _cp(rc=0, out="", err=""):
+    return subprocess.CompletedProcess([], rc, stdout=out, stderr=err)
+
+
+def _returns(cp):
+    return lambda *a, **k: cp
+
+
+def _raises(exc):
+    def f(*a, **k):
+        raise exc
+    return f
+
+
+_BUS_MSG = "Failed to connect to bus: No medium found"
+HOST_ERRORS = {                                   # what the REAL Probes must treat as "cannot tell", never as "down"/"off"
+    "bus_unreachable": _returns(_cp(1, "", _BUS_MSG)),
+    "empty_stdout_rc0": _returns(_cp(0, "", "")),
+    "nonzero_rc_with_a_word": _returns(_cp(1, "inactive", "")),
+    "unknown_word": _returns(_cp(3, "weird-state", "")),
+    "timeout": _raises(subprocess.TimeoutExpired("systemctl", 15)),
+    "missing_binary": _raises(FileNotFoundError("systemctl")),
+    "os_error": _raises(OSError("boom")),
+}
+
+
+def _with_flag(argv, flag, value):
+    out = list(argv)
+    out[out.index(flag) + 1] = str(value)
+    return out
+
+
+def _apply_argv(w, p2, msha, frozen, ap, aps, **kw):
+    return _p2_argv(w, "--apply", "--run-dir", p2, "--frozen-dir", str(frozen), "--approvals", ap, "--approvals-sha256", aps,
+                    "--daemon-organism-file", str(w.org_copy), "--josh-go", "GO-1", "--josh-go-manifest-sha256", msha, **kw)
+
+
+def _partner_args(w):
+    return ["--generation-partner", "main.msgpack=%s" % (w.gen / "main.msgpack"),
+            "--generation-partner", "vectors.msgpack=%s" % (w.gen / "vectors.msgpack")]
+
+
+def _ident(path):
+    st = os.stat(path)
+    return {"st_dev": st.st_dev, "st_ino": st.st_ino, "st_nlink": st.st_nlink}
+
+
+def _applied(pinned, tmp_path, mp):
+    """A complete synthetic Phase 2: classify, backup (with the two generation partners), gated apply."""
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, mp)
+    rc, res, err = cli(_p2_argv(w, *_partner_args(w)), probes=FakeProbes())
+    assert rc == 0, err
+    p2, msha = res["run_dir"], res["backup_manifest_sha256"]
+    before, ino_before = file_hashes(w.ckpt), {n: _ident(w.ckpt / n) for n in tool.SIX_FILES}
+    rc, res2, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps), probes=FakeProbes())
+    assert rc == 0, err
+    return types.SimpleNamespace(w=w, p2=p2, msha=msha, frozen=frozen, ap=ap, aps=aps, before=before, ino_before=ino_before,
+                                 after=file_hashes(w.ckpt))
+
+
+def _rb_argv(a, *extra, **kw):
+    return _p2_argv(a.w, "--run-dir", a.p2, "--josh-go", "GO-RB", "--josh-go-manifest-sha256", a.msha, *extra, step="rollback", **kw)
+
+
+# ---- C1: --code-placed-at and a readable daemon.log are REQUIRED; the leg is never omitted --------------------------
+
+def test_c1_gate_p4_never_omits_the_code_placement_leg_and_a_missing_log_is_not_ok(world):
+    d, man = str(world.ckpt), _manifest_of(str(world.ckpt))
+    for kw in ({"code_placed_at": None, "daemon_log": str(world.log)},
+               {"code_placed_at": time.time() + 3600, "daemon_log": str(world.ws / "missing.log")},
+               {"code_placed_at": time.time() + 3600, "daemon_log": None}):
+        r = tool.gate_p4(FakeProbes(), d, manifest_files=man, **kw)
+        assert "no_pulse_since_code_placement" in r["checks"] and r["checks"]["no_pulse_since_code_placement"] is False and not r["ok"], kw
+    world.log.chmod(0)
+    try:
+        r = tool.gate_p4(FakeProbes(), d, manifest_files=man, **_p4kw(world))
+        assert not r["ok"] and not r["checks"]["no_pulse_since_code_placement"]          # an unreadable log is not evidence
+    finally:
+        world.log.chmod(0o644)
+    assert tool.gate_p4(FakeProbes(), d, manifest_files=man, **_p4kw(world))["ok"]
+
+
+def test_c1_the_manifest_leg_is_not_omitted_by_omission_either(world):
+    r = tool.gate_p4(FakeProbes(), str(world.ckpt), **_p4kw(world))
+    assert not r["ok"] and r["checks"]["six_files_equal_the_start_of_phase2_backup"] is False
+
+
+def test_c1_phase2_backup_and_apply_refuse_without_a_parseable_code_placed_at_and_a_readable_log(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    before = file_hashes(w.ckpt)
+    runs = lambda: sorted(p.name for p in w.backups.iterdir())
+    n_runs = len(runs())
+    rc, res, err = cli(_p2_argv(w, placed=False), probes=FakeProbes())
+    assert rc == 2 and "code-placed-at" in err
+    rc, res, err = cli(argv_for(w, "--conduit-dir", str(w.conduit), "--code-placed-at", "not-a-time", step="phase2-backup"), probes=FakeProbes())
+    assert rc == 2 and "code-placed-at" in err
+    assert len(runs()) == n_runs                                                        # refused BEFORE a run dir or any copy
+    rc, res, err = cli(_p2_argv(w), probes=FakeProbes())
+    assert rc == 0, err
+    p2, msha = res["run_dir"], res["backup_manifest_sha256"]
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps, placed=False), probes=FakeProbes())
+    assert rc == 2 and "code-placed-at" in err and file_hashes(w.ckpt) == before
+    w.log.unlink()                                                                      # a missing daemon.log is NOT ok either
+    rc, res, err = cli(_apply_argv(w, p2, msha, frozen, ap, aps), probes=FakeProbes())
+    assert rc == 2 and file_hashes(w.ckpt) == before
+    rc, res, err = cli(_p2_argv(w), probes=FakeProbes())
+    assert rc == 2 and "P4/P6" in err
+
+
+# ---- C2: the probes FAIL CLOSED (the REAL Probes, subprocess stubbed at the run boundary) -------------------------
+
+@pytest.mark.parametrize("case", sorted(HOST_ERRORS))
+def test_c2_real_probes_unit_active_cannot_tell_is_an_error_not_inactive(monkeypatch, case):
+    monkeypatch.setattr(tool.subprocess, "run", HOST_ERRORS[case])
+    with pytest.raises(ProbeError):
+        tool.Probes().unit_active(tool.DAEMON_UNIT)
+
+
+@pytest.mark.parametrize("case", sorted(HOST_ERRORS))
+def test_c2_real_probes_unit_enabled_cannot_tell_is_an_error_not_off(monkeypatch, case):
+    monkeypatch.setattr(tool.subprocess, "run", HOST_ERRORS[case])
+    with pytest.raises(ProbeError):
+        tool.Probes().unit_enabled(tool.LEG2_TIMER)
+
+
+@pytest.mark.parametrize("case", ("bus_unreachable", "timeout", "missing_binary", "os_error"))
+def test_c2_real_probes_crontab_errors_are_errors_not_an_empty_crontab(monkeypatch, case):
+    monkeypatch.setattr(tool.subprocess, "run", HOST_ERRORS[case])
+    with pytest.raises(ProbeError):
+        tool.Probes().crontab_text()
+    for rc, err in ((2, "crontab: internal error"), (1, "some other crontab failure"), (1, ""), (127, "not found")):
+        monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(rc, "", err)))
+        with pytest.raises(ProbeError):
+            tool.Probes().crontab_text()
+
+
+def test_c2_real_probes_answer_only_the_exact_reachable_bus_states(monkeypatch):
+    P = tool.Probes()
+    for rc, out, want in ((3, "inactive", False), (3, "failed", False), (4, "inactive", False), (0, "active", True),
+                          (3, "activating", True), (0, "reloading", True)):
+        monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(rc, out + "\n")))
+        assert P.unit_active(tool.DAEMON_UNIT) is want, (rc, out)
+    for out, want in (("enabled", True), ("enabled-runtime", True), ("static", True), ("linked", True),
+                      ("disabled", False), ("masked", False)):
+        monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(0 if want else 1, out + "\n")))
+        assert P.unit_enabled(tool.LEG2_TIMER) is want, out
+    monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(0, "0 3 * * * /x/job\n")))
+    assert P.crontab_text() == "0 3 * * * /x/job\n"
+    monkeypatch.setattr(tool.subprocess, "run", _returns(_cp(1, "", "no crontab for josh")))
+    assert P.crontab_text() == ""                                                      # rc 1 + the exact stderr = an empty crontab
+
+
+def test_c2_proc_scans_fail_when_an_own_entry_cannot_be_read_and_skip_vanished_ones(tmp_path, monkeypatch):
+    root = tmp_path / "proc"
+    (root / "4242").mkdir(parents=True)
+    (root / "4243").mkdir()                                                           # vanished mid-scan: no cmdline / no fd dir
+    cmd = root / "4242" / "cmdline"
+    cmd.write_bytes(b"python3\0cc-ng-service.py\0run")
+    fd = root / "4242" / "fd"
+    fd.mkdir()
+    monkeypatch.setattr(tool.glob, "glob", lambda pat: [str(root / "4242"), str(root / "4243")])
+    assert tool.Probes().processes_matching(("cc-ng-service.py",)) == [4242]
+    assert tool.Probes().files_held_open([str(tmp_path / "nothing")]) == []
+    cmd.chmod(0)
+    fd.chmod(0)
+    try:
+        with pytest.raises(ProbeError):
+            tool.Probes().processes_matching(("cc-ng-service.py",))
+        with pytest.raises(ProbeError):
+            tool.Probes().files_held_open([str(tmp_path / "nothing")])
+    finally:
+        cmd.chmod(0o644)
+        fd.chmod(0o755)
+
+
+def test_c2_gates_with_the_real_probes_fail_closed_when_the_host_cannot_be_queried(world, monkeypatch):
+    for case in ("bus_unreachable", "missing_binary", "timeout"):
+        monkeypatch.setattr(tool.subprocess, "run", HOST_ERRORS[case])
+        r = tool.gate_p4(tool.Probes(), str(world.ckpt), manifest_files=_manifest_of(str(world.ckpt)), **_p4kw(world))
+        assert not r["ok"] and not r["checks"]["unit_inactive"] and not r["checks"]["recover_timer_inactive"], case
+        assert r.get("probe_errors"), case
+        r6 = tool.gate_p6(tool.Probes(), str(world.conduit))
+        assert not r6["ok"] and r6["violations"], case
+        snap = tool.hold_snapshot(tool.Probes(), str(world.conduit))                     # never raises; records the errors
+        assert snap.get("probe_errors"), case
+
+
+def test_c2_phase2_backup_with_the_real_probes_refuses_when_the_host_cannot_be_queried(pinned, tmp_path, monkeypatch):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    n_runs = len(list(w.backups.iterdir()))
+    before = file_hashes(w.ckpt)
+    real_run = subprocess.run
+
+    def only_systemctl_and_crontab_fail(argv, *a, **k):
+        if argv and argv[0] in ("systemctl", "crontab"):
+            raise FileNotFoundError(argv[0])
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(tool.subprocess, "run", only_systemctl_and_crontab_fail)
+    rc, res, err = cli(_p2_argv(w), probes=None)                                        # probes=None -> the REAL Probes()
+    assert rc == 2 and "P4/P6" in err
+    assert len(list(w.backups.iterdir())) == n_runs and file_hashes(w.ckpt) == before
+
+
+# ---- C3: P2 - record the file identity and refuse a path inside the pin or the tool worktree -----------------------
+
+def test_c3_gate_p2_records_the_identity_and_refuses_the_pin_and_tool_worktrees(tmp_path):
+    good = tmp_path / "unit-root" / "cc_ng_organism.py"
+    good.parent.mkdir()
+    shutil.copy(PIN_ROOT / "cc_ng_organism.py", good)
+    r = tool.gate_p2(str(good), str(PIN_ROOT), str(tmp_path / "toolwt"))
+    assert r["ok"] and r["realpath"] == os.path.realpath(good) and r["sha256"] == tool.PIN["cc_ng_organism_sha256"]
+    assert r["st_ino"] == os.stat(good).st_ino and r["mtime_ns"] == os.stat(good).st_mtime_ns
+    assert not tool.gate_p2(str(PIN_ROOT / "cc_ng_organism.py"), str(PIN_ROOT), str(tmp_path / "toolwt"))["ok"]
+    inside_tool = tmp_path / "toolwt" / "sub" / "cc_ng_organism.py"
+    inside_tool.parent.mkdir(parents=True)
+    shutil.copy(PIN_ROOT / "cc_ng_organism.py", inside_tool)
+    r2 = tool.gate_p2(str(inside_tool), str(PIN_ROOT), str(tmp_path / "toolwt"))
+    assert not r2["ok"] and "inside" in r2["reason"]
+    link = tmp_path / "link.py"
+    link.symlink_to(PIN_ROOT / "cc_ng_organism.py")
+    assert not tool.gate_p2(str(link), str(PIN_ROOT), str(tmp_path / "toolwt"))["ok"]      # realpath resolves into the pin
+    assert not tool.gate_p2(str(tmp_path / "absent.py"), str(PIN_ROOT), str(tmp_path / "toolwt"))["ok"]
+
+
+def test_c3_apply_refuses_a_daemon_organism_file_that_is_the_pin_worktrees_own_file(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    rc, res, err = cli(_p2_argv(w), probes=FakeProbes())
+    p2, msha = res["run_dir"], res["backup_manifest_sha256"]
+    before = file_hashes(w.ckpt)
+    link = tmp_path / "via-symlink.py"
+    link.symlink_to(PIN_ROOT / "cc_ng_organism.py")
+    for bad in (PIN_ROOT / "cc_ng_organism.py", link):
+        argv = _apply_argv(w, p2, msha, frozen, ap, aps)
+        argv = _with_flag(argv, "--daemon-organism-file", bad)
+        rc, res2, err = cli(argv, probes=FakeProbes())
+        assert rc == 2 and "P2" in err and file_hashes(w.ckpt) == before, str(bad)
+    assert "import root" in tool.build_parser().format_help()                           # the help names what the operator must give
+
+
+# ---- C4: --expect-* are pinned to the module constants at phase2-backup and --apply ---------------------------------
+
+def test_c4_backup_and_apply_refuse_expect_flags_that_differ_from_the_module_constants(pinned, tmp_path, monkeypatch, p3_stub):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    for flag, key in (("--expect-wants", "wants"), ("--expect-protected", "protected"), ("--expect-scope", "scope")):
+        rc, res, err = cli(_with_flag(_p2_argv(w), flag, w.expect[key] - 1), probes=FakeProbes())
+        assert rc == 2 and "expect" in err, flag
+    rc, res, err = cli(_p2_argv(w), probes=FakeProbes())
+    assert rc == 0, err
+    p2, msha = res["run_dir"], res["backup_manifest_sha256"]
+    before = file_hashes(w.ckpt)
+    for flag, key in (("--expect-wants", "wants"), ("--expect-protected", "protected"), ("--expect-scope", "scope")):
+        rc, res2, err = cli(_with_flag(_apply_argv(w, p2, msha, frozen, ap, aps), flag, w.expect[key] - 1), probes=FakeProbes())
+        assert rc == 2 and "expect" in err and file_hashes(w.ckpt) == before, flag
+    rc, res3, err = cli(_with_flag(argv_for(w), "--expect-scope", w.expect["scope"] - 1))
+    assert rc == 0, err                                                                 # Phase 1 on a COPY may still take other values
+
+
+# ---- C5: the dry-run packet is structurally not an approval --------------------------------------------------------
+
+def test_c5_the_dry_run_packet_is_structurally_not_an_approval(phase1):
+    p = next((phase1.run_dir / "reports").glob("PROVISIONAL-approvals-*.json"))
+    d = json.loads(p.read_text())
+    assert d["provisional"] is True and d["entries"] and all(e["decision"] == "provisional" for e in d["entries"])
+    assert "provisional" not in ("approved", "struck")
+
+
+def test_c5_a_forged_provisional_packet_is_still_refused_for_phase_2(phase1, tmp_path):
+    p = next((phase1.run_dir / "reports").glob("PROVISIONAL-approvals-*.json"))
+    rl, sc = phase1.classify["repair_list_sha256"], phase1.classify["scope_ids_sha256"]
+
+    def try_load(obj):
+        f = tmp_path / "forged.json"
+        data = tool.canonical_json(obj)
+        f.write_bytes(data)
+        return tool.load_approvals(str(f), hashlib.sha256(data).hexdigest(), rl, sc)
+    base = json.loads(p.read_text())
+    forged = copy.deepcopy(base)
+    forged["packet"] = "FORGED-EXEC-PACKET"                                              # ONE string edited, then re-hashed
+    with pytest.raises(tool.Refusal, match="provisional|decision"):
+        try_load(forged)
+    forged = copy.deepcopy(base)
+    forged["provisional"] = False                                                       # the flag alone is not enough either
+    with pytest.raises(tool.Refusal, match="provisional|decision"):
+        try_load(forged)
+    forged = copy.deepcopy(base)
+    forged["packet"] = "FORGED-EXEC-PACKET"
+    for e in forged["entries"]:
+        e["decision"] = "approved"                                                      # the flag is still set: refused
+    with pytest.raises(tool.Refusal, match="provisional"):
+        try_load(forged)
+
+
+# ---- C6: inode evidence, the write guard, the ripple row, and the gated rollback -----------------------------------
+
+def test_c6_the_ripple_table_names_generations_as_incidental_and_never_a_rollback_source():
+    row = tool.RIPPLE_TABLE["generations/"]
+    assert "incidental" in row and "expiring" in row and "never a rollback source" in row
+
+
+def test_c6_the_backup_manifest_records_before_inodes_and_the_generation_partners_by_inode(pinned, tmp_path, monkeypatch):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    seen = []
+    real_listdir, real_scandir, real_glob = os.listdir, os.scandir, tool.glob.glob
+    monkeypatch.setattr(os, "listdir", lambda p=".", *a: (seen.append(str(p)), real_listdir(p, *a))[1])
+    monkeypatch.setattr(os, "scandir", lambda p=".", *a: (seen.append(str(p)), real_scandir(p, *a))[1])
+    monkeypatch.setattr(tool.glob, "glob", lambda pat, *a, **k: (seen.append(str(pat)), real_glob(pat, *a, **k))[1])
+    ino = {n: _ident(w.ckpt / n) for n in tool.SIX_FILES}
+    rc, res, err = cli(_p2_argv(w, *_partner_args(w)), probes=FakeProbes())
+    assert rc == 0, err
+    assert not [s for s in seen if "generations" in s]                                  # never listed, only stat/hash of the known paths
+    man = json.loads(next(Path(res["run_dir"]).glob("backup-manifest-*.json")).read_text())
+    for n in tool.SIX_FILES:
+        for k in ("st_dev", "st_ino", "st_nlink"):
+            assert man["files"][n][k] == ino[n][k], (n, k)
+    assert man["files"][tool.MAIN_NAME]["st_nlink"] == 2                                # measured, not inferred: os.link made it 2
+    parts = {p["name"]: p for p in man["generation_partners"]}
+    assert set(parts) == {tool.MAIN_NAME, tool.VECTORS_NAME}
+    for n, p in parts.items():
+        assert p["same_file_as_live"] is True and (p["st_dev"], p["st_ino"]) == (ino[n]["st_dev"], ino[n]["st_ino"])
+        assert p["sha256"] == man["files"][n]["sha256"] and p["path"] == str(w.gen / n)
+    assert "never a rollback source" in man["ripple"]["generations/"]
+
+
+def test_c6_a_partner_is_judged_by_inode_never_by_link_count(pinned, tmp_path, monkeypatch):
+    w, rd, frozen, ap, aps = _phase2_world(pinned, tmp_path, monkeypatch)
+    copy_dir = w.ckpt / "generations" / "20260924T000000Z"
+    copy_dir.mkdir()
+    shutil.copy(w.ckpt / "main.msgpack", copy_dir / "main.msgpack")                     # same bytes, DIFFERENT inode, link count 1
+    rc, res, err = cli(_p2_argv(w, "--generation-partner", "main.msgpack=%s" % (copy_dir / "main.msgpack")), probes=FakeProbes())
+    assert rc == 0, err
+    man = json.loads(next(Path(res["run_dir"]).glob("backup-manifest-*.json")).read_text())
+    p = man["generation_partners"][0]
+    assert p["same_file_as_live"] is False and p["sha256"] == man["files"][tool.MAIN_NAME]["sha256"]
+    outside = tmp_path / "elsewhere" / "main.msgpack"
+    outside.parent.mkdir()
+    shutil.copy(w.ckpt / "main.msgpack", outside)
+    rc, res, err = cli(_p2_argv(w, "--generation-partner", "main.msgpack=%s" % outside), probes=FakeProbes())
+    assert rc == 2 and "generations" in err                                             # only a path under <target>/generations/
+    rc, res, err = cli(_p2_argv(w, "--generation-partner", "bogus.msgpack=%s" % (copy_dir / "main.msgpack")), probes=FakeProbes())
+    assert rc == 2
+
+
+def test_c6_apply_records_before_and_after_inodes_and_asserts_new_inode_with_link_count_1(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    rc_file = next(Path(a.p2).glob("post-apply-receipt-FINAL-*.json"))
+    rec = json.loads(rc_file.read_text())
+    assert rec["live_inodes_before"] == {n: a.ino_before[n] for n in tool.SIX_FILES}
+    now = {n: _ident(w.ckpt / n) for n in tool.SIX_FILES}
+    assert rec["live_inodes_after"] == now
+    for n in (tool.MAIN_NAME, tool.SIDECAR_NAME):                                       # rewritten: NEW inode, link count 1
+        assert now[n]["st_ino"] != a.ino_before[n]["st_ino"] and now[n]["st_nlink"] == 1 and now[n]["st_dev"] == a.ino_before[n]["st_dev"]
+    for n in (tool.GUARD_NAME, tool.MANIFEST_NAME, tool.COMMONS_NAME, tool.VECTORS_NAME):   # not rewritten: the SAME inode
+        assert now[n]["st_ino"] == a.ino_before[n]["st_ino"]
+    assert now[tool.VECTORS_NAME]["st_nlink"] == 2                                      # still shares its inode with the generation copy
+    pa = {p["name"]: p for p in rec["generation_partners_after"]}
+    assert pa[tool.MAIN_NAME]["st_ino"] == a.ino_before[tool.MAIN_NAME]["st_ino"] and pa[tool.MAIN_NAME]["st_nlink"] == 1
+    assert pa[tool.MAIN_NAME]["sha256"] == json.loads(next(Path(a.p2).glob("backup-manifest-*.json")).read_text())["files"][tool.MAIN_NAME]["sha256"]
+    assert pa[tool.MAIN_NAME]["same_file_as_live"] is False and pa[tool.VECTORS_NAME]["same_file_as_live"] is True
+
+
+def test_c6_a_write_destination_with_more_than_one_link_is_refused(world, tmp_path):
+    run = world.backups / (tool.RUN_DIR_PREFIX + "nlink")
+    run.mkdir()
+    target, other = run / "x.json", tmp_path / "other-name"
+    target.write_text("a")
+    os.link(target, other)
+    assert os.stat(target).st_nlink == 2
+    with pytest.raises(tool.Refusal, match="link"):
+        tool.out_write_bytes(str(target), b"b")
+    assert other.read_text() == "a"                                                      # the other name was never written through
+    with pytest.raises(tool.Refusal, match="link"):
+        tool.rewrite_main(b"\x80", str(target), {}, {}, {})
+    (run / "solo.json").write_text("a")
+    assert tool.out_write_bytes(str(run / "solo.json"), b"b")                            # a link-count-1 destination is fine
+
+
+def test_c6_rollback_after_a_complete_apply_restores_the_six_files_from_the_named_backup(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    part_before = {n: (_ident(w.gen / n), tool.sha256_file(str(w.gen / n))) for n in (tool.MAIN_NAME, tool.VECTORS_NAME)}
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 0, err
+    assert file_hashes(w.ckpt) == a.before                                               # all six equal the pre-apply bytes
+    for n in (tool.MAIN_NAME, tool.SIDECAR_NAME):
+        assert _ident(w.ckpt / n)["st_nlink"] == 1                                       # restored by tmp + os.replace: a new inode
+    rec = json.loads(next(Path(a.p2).glob("rollback-receipt-*.json")).read_text())
+    assert rec["restored"] == sorted([tool.MAIN_NAME, tool.SIDECAR_NAME]) and rec["source_dir"] == os.path.join(os.path.realpath(a.p2), "backup")
+    assert rec["live_inodes_after"] == {n: _ident(w.ckpt / n) for n in tool.SIX_FILES}
+    assert "generations" in rec["never_a_source"] and rec["host_stays_down"] is True
+    assert {n: (_ident(w.gen / n), tool.sha256_file(str(w.gen / n))) for n in part_before} == part_before   # the partners were never written
+    assert list(Path(a.p2).glob("RETIRED-*.receipt"))                                    # the tool stays retired
+    rc, res, err = cli(_apply_argv(w, a.p2, a.msha, a.frozen, a.ap, a.aps), probes=FakeProbes())
+    assert rc == 2 and "RETIRED" in err
+
+
+def test_c6_rollback_completes_a_torn_apply(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    shutil.copyfile(Path(a.p2) / "backup" / tool.SIDECAR_NAME, w.ckpt / tool.SIDECAR_NAME)         # main NEW, sidecar OLD
+    torn = file_hashes(w.ckpt)
+    assert torn[tool.MAIN_NAME] != a.before[tool.MAIN_NAME] and torn[tool.SIDECAR_NAME] == a.before[tool.SIDECAR_NAME]
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 0, err
+    assert file_hashes(w.ckpt) == a.before
+    rec = json.loads(next(Path(a.p2).glob("rollback-receipt-*.json")).read_text())
+    assert rec["restored"] == [tool.MAIN_NAME]
+
+
+def test_c6_rollback_is_gated_go_manifest_daemon_down_and_pinned_expectations(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w, after = a.w, a.after
+    argv = _rb_argv(a)
+    cases = [
+        ([x for x in argv if x != "--josh-go" and x != "GO-RB"], FakeProbes(), "Josh's go"),
+        (_with_flag(argv, "--josh-go-manifest-sha256", "0" * 64), FakeProbes(), "quotes"),
+        (argv, FakeProbes(units_active={tool.DAEMON_UNIT}), "P4"),
+        (argv, FakeProbes(cron="0 3 * * * callosum\n"), "P6"),
+        (_rb_argv(a, placed=False), FakeProbes(), "code-placed-at"),
+        (_with_flag(argv, "--expect-wants", w.expect["wants"] - 1), FakeProbes(), "expect"),
+    ]
+    for av, probes, needle in cases:
+        rc, res, err = cli(av, probes=probes)
+        assert rc == 2 and needle in err, (needle, err[-200:])
+        assert file_hashes(w.ckpt) == after, needle
+
+
+def test_c6_rollback_refuses_a_live_file_that_matches_neither_the_backup_nor_the_receipt(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    with open(w.ckpt / tool.COMMONS_NAME, "ab") as f:
+        f.write(b"x")                                                                    # someone else wrote it after the apply
+    changed = file_hashes(w.ckpt)
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 2 and "identity" in err and file_hashes(w.ckpt) == changed
+
+
+def test_c6_rollback_verifies_every_backup_sha256_before_writing_anything(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    with open(Path(a.p2) / "backup" / tool.MAIN_NAME, "ab") as f:
+        f.write(b"x")                                                                    # the named backup was corrupted
+    rc, res, err = cli(_rb_argv(a), probes=FakeProbes())
+    assert rc == 2 and "sha256" in err and file_hashes(w.ckpt) == a.after
+
+
+def test_c6_rollback_source_is_only_the_tools_own_run_directory_never_a_generation_or_last_good(pinned, tmp_path, monkeypatch, p3_stub):
+    a = _applied(pinned, tmp_path, monkeypatch)
+    w = a.w
+    for bad in (str(w.gen), str(w.ckpt / "last_good"), str(tmp_path)):
+        argv = _with_flag(_rb_argv(a), "--run-dir", bad)
+        rc, res, err = cli(argv, probes=FakeProbes())
+        assert rc == 2, bad
+        assert file_hashes(w.ckpt) == a.after
+
+
+# ---- C7 / C8: the Choice Clause records must be PRESENT; the deny-check reads the metadata flag --------------------
+
+def test_c7_v15_and_v16_stop_when_the_choice_clause_wants_or_the_rim_are_absent(pinned, tmp_path, monkeypatch):
+    w = build_world(tmp_path, pinned, include_protected=False)
+    patch_world(monkeypatch, w)
+    rc, r1, err = cli(argv_for(w))
+    assert rc == 0, err
+    rc, r2, err = cli(argv_for(w, "--run-dir", r1["run_dir"], "--provisional-approve-all", step="rewrite"))
+    assert rc == 3 and "V15" in err and "V16" in err
+
+
+def test_c7_v15_records_presence_in_the_input_and_the_output(built, pinned, world):
+    d = _check(_verify(built, pinned, world), "V15")["detail"]
+    want = sorted(set(tool.CHOICE_CLAUSE_IDS) | {tool.CONSTITUTIONAL_ID})
+    assert sorted(d["present_in_input"]) == want and sorted(d["present_in_output"]) == want
+
+
+def test_c8_the_deny_check_reads_the_metadata_flag_not_only_the_literal_ids():
+    ok = {"cc:want::1111111111111111": {"kind": "want", "provenance": "cc_authored"}}
+    assert tool.deny_check(list(ok), {}, (), nodes_meta=ok)["clean"] is True
+    for md in ({"constitutional": True}, {"choice_clause": True}, {"tags": ["Choice_Clause"]}, {"tag": "choice_clause"}):
+        nm = {"cc:want::2222222222222222": dict(ok["cc:want::1111111111111111"], **md)}
+        with pytest.raises(tool.Stop, match="deny-check"):
+            tool.deny_check(list(nm), {}, (), nodes_meta=nm)
+
+
+def test_c8_a_flagged_want_in_s_under_an_ordinary_id_stops_the_classify_step(pinned, tmp_path, monkeypatch):
+    w = build_world(tmp_path, pinned, flagged_in_scope=True)
+    patch_world(monkeypatch, w)
+    rc, res, err = cli(argv_for(w))
+    assert rc == 3 and "deny-check" in err
+
+
+# ---- N1, the frozen-dir naming, c026-C3 (V18), and the P1 heads ---------------------------------------------------
+
+def test_n1_v13_is_labelled_writer_enforced(built, pinned, world):
+    d = _check(_verify(built, pinned, world), "V13")["detail"]
+    assert "writer-enforced" in json.dumps(d)
+
+
+def test_the_help_names_exactly_which_copies_the_operator_freezes(phase1):
+    h = tool.build_parser().format_help()
+    for name in ("reports/repair-list.json", "reports/scope-ids.json", "reports/id-map.json"):
+        assert name in h
+    assert (phase1.run_dir / "reports" / "id-map.json").is_file()                         # Phase 1 writes the name Phase 2 expects
+
+
+def test_c026_c3_v18_requires_the_artifact_hash_check_even_with_an_empty_mapping(built, pinned, world):
+    ident = os.path.join(built.run_dir, "ident-out.msgpack")
+    tool.rewrite_main(built.ctx["raw"], ident, {}, {}, {})
+    good = dict(built.ctx["plan"], mapping={}, inverse={}, write_ids=[], approved_ids=[], old_text={}, new_text={})
+    V = tool.run_verifier(pinned, built.A, built.ctx, world.expect, out_main=ident, plan=good)
+    assert _check(V, "V18")["ok"] is True
+    art = dict(good["artifacts"])
+    art["id-map"] = (art["id-map"][0], "0" * 64)                                          # a listed file's hash FAILS
+    V2 = tool.run_verifier(pinned, built.A, built.ctx, world.expect, out_main=ident, plan=dict(good, artifacts=art))
+    assert _check(V2, "V18")["ok"] is False
+
+
+def test_p1_prints_both_heads_and_asserts_the_loaded_file_sha256(pinned, monkeypatch):
+    text = "\n".join(tool.p379_lines(pinned))
+    assert "ae798b94cb14740d200fc3f4fd8d36eef8b86c6a" in text and "c7921b8436fb174c3f70fcf02827f16bb16deff0" in text
+    assert tool.PIN["cc_ng_organism_sha256"] in text
+    real = tool.sha256_file
+    monkeypatch.setattr(tool, "sha256_file", lambda p, chunk=1 << 22: "0" * 64 if str(p).endswith("cc_ng_organism.py") else real(p, chunk))
+    with pytest.raises(tool.Refusal, match="LOADED cc_ng_organism.py sha256"):
+        tool.load_pinned(str(PIN_ROOT))
+
+
+def test_p1_the_run_record_carries_both_heads(phase1):
+    rec = json.loads((phase1.run_dir / "run-record.json").read_text())
+    assert rec["p1"]["tree_head"] == "ae798b94cb14740d200fc3f4fd8d36eef8b86c6a"
+    assert rec["p1"]["frozen_branch_head"] == "c7921b8436fb174c3f70fcf02827f16bb16deff0"
+    assert rec["p1"]["cc_ng_organism_sha256"] == tool.PIN["cc_ng_organism_sha256"]
