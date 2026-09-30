@@ -1,6 +1,11 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2b) / #818: every drop is loud
+# What: member_limit / depth_limit / overlap / roots drops each log ONE INFO line per call with
+#   count, total chars and reason; ids named first-time-seen only (flood-safe).
+# Why: brief TURN 2 item 3 (Exec P416): silent member/overlap drops.
+# How: fake in-memory graphs; counts assert the candidates the walk REACHED and declined.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2a) / #817
 # What: pith_compress_history retired: it, the PithMetrics.history_* group and the host
 #   `compress_history` event are gone (the socket answers `unknown event`); the complete-caller-set
@@ -712,3 +717,99 @@ def test_817_a_compress_history_request_over_the_socket_gets_unknown_event():
     finally:
         client.close()
     assert reply == {"ok": False, "error": "unknown event: compress_history"}
+
+
+# ====================================================================== TURN 2 (2b): #818
+def _star(n_leaves, leaf_len=40, prefix="L"):
+    g = FakeGraph()
+    _core(g)
+    g.node("root", "the root situation")
+    for i in range(n_leaves):
+        g.node(f"{prefix}{i}", f"{prefix}{i} " + ("x" * leaf_len))
+        g.synapse(f"s{prefix}{i}", "root", f"{prefix}{i}", 1.0 - i * 0.01)
+    return g
+
+
+def _drop_lines(caplog, reason):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and "dropped" in r.getMessage() and reason in r.getMessage()]
+
+
+def test_818_member_limit_drops_are_counted_sized_and_named_once(caplog):
+    g = _star(5)                                             # root + 5 leaves, room for 3 members
+    surfaced = [{"node_id": "root", "score": 1.0}]
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        (line,) = pith.pith_connected_activation_basins(g, surfaced, max_members=3)
+    assert len(line.member_node_ids) == 3
+    dropped_ids = [f"L{i}" for i in range(5) if f"L{i}" not in line.member_node_ids]
+    (message,) = _drop_lines(caplog, "member_limit")
+    assert f"dropped {len(dropped_ids)} " in message
+    assert f"({sum(len(g.nodes[i].metadata['_forest_content']) for i in dropped_ids)} chars)" in message
+    assert all(i in message for i in dropped_ids)
+    assert "CC_PITH_PROVIDER_MEMBERS" in message
+    # second identical call: still counted, ids not repeated (flood-safe)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        pith.pith_connected_activation_basins(g, surfaced, max_members=3)
+    (again,) = _drop_lines(caplog, "member_limit")
+    assert f"dropped {len(dropped_ids)} " in again
+    assert not any(i in again for i in dropped_ids) and "already reported" in again
+
+
+def test_818_depth_limit_drops_the_neighbours_the_walk_declined(caplog):
+    g = FakeGraph()
+    _core(g)
+    for nid in ("root", "a", "b"):
+        g.node(nid, f"node {nid} " + "y" * 30)
+    g.synapse("s1", "root", "a", 0.9)
+    g.synapse("s2", "a", "b", 0.9)                           # b is 2 hops away; depth limit 1
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        (line,) = pith.pith_connected_activation_basins(
+            g, [{"node_id": "root", "score": 1.0}], max_depth=1, max_members=6)
+    assert line.member_node_ids == ["root", "a"]
+    (message,) = _drop_lines(caplog, "depth_limit")
+    assert "dropped 1 " in message and "b" in message and "CC_PITH_PROVIDER_DEPTH" in message
+
+
+def test_818_overlapping_basins_are_dropped_loudly(caplog):
+    g = _star(3)
+    g.node("root2", "a second root that fires")
+    for i in range(3):
+        g.synapse(f"t{i}", "root2", f"L{i}", 0.9)            # same three leaves -> heavy overlap
+    surfaced = [{"node_id": "root", "score": 2.0}, {"node_id": "root2", "score": 1.0}]
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        lines = pith.pith_connected_activation_basins(g, surfaced, max_members=6)
+    assert [l.node_id for l in lines] == ["root"]
+    (message,) = _drop_lines(caplog, "overlap")
+    assert "dropped 1 basins" in message and "root2" in message
+
+
+def test_818_roots_beyond_k_are_dropped_loudly(monkeypatch, caplog):
+    monkeypatch.setattr(pith, "cc_gsg_rescore", lambda surfaced, *_a, **_k: surfaced)
+    g = FakeGraph()
+    for i in range(3):
+        g.node(f"n{i}", f"root {i} " + "z" * 50)
+    ng = SimpleNamespace(graph=g)
+    ng._harvest_associations = lambda *a, **k: [{"node_id": f"n{i}", "strength": 3.0 - i} for i in range(3)]
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.cc_pattern_completion_recall(ng, "q", 1)
+    assert len(out) == 1
+    (message,) = _drop_lines(caplog, "roots")
+    assert "dropped 2 " in message and "n1" in message and "n2" in message
+
+
+def test_818_nothing_dropped_logs_nothing(caplog):
+    g = _star(2)
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        pith.pith_connected_activation_basins(g, [{"node_id": "root", "score": 1.0}], max_members=6)
+    assert [r for r in caplog.records if "dropped" in r.getMessage()] == []
+
+
+def test_818_a_one_member_budget_still_reports_and_does_not_crash(caplog):
+    g = _star(2)
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        (line,) = pith.pith_connected_activation_basins(
+            g, [{"node_id": "root", "score": 1.0}], max_members=1)
+    assert line.member_node_ids == ["root"]
+    (message,) = _drop_lines(caplog, "member_limit")
+    assert "dropped 2 " in message
