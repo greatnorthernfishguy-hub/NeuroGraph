@@ -2,7 +2,7 @@
 
 Lane `want-hub-competition-d` · dispatch #11762 (RETRY of #11734) · author thread `097da447` · PLAN ONLY: `neuro_foundation.py` untouched, no graph load, nothing built. Branch `cc-laptop-want-hub-d-20260930`, head at dispatch `a65e59bb8551e97c72271ab5e0cbe2001333aa26`.
 
-**Commit:** the R5h delta commit on `handoffs/z12-want-hub-d/returns/plan-005.md` + this file. A commit cannot contain its own hash: the full hash is recorded in plan-005's changelog pin line (follow-up commit) and in my report. Cite that hash, never the file name.
+**Commit:** `74570bedcb0da12ac4de2b0757e88b77d2506b33` — the R5h delta on `handoffs/z12-want-hub-d/returns/plan-005.md` + this file (pinned here and in plan-005's changelog by a one-line follow-up commit, since a commit cannot contain its own hash). Cite that hash, never the file name.
 
 ## Hunks changed in plan-005 (section — one line each)
 - **Changelog (top):** new entry `[R5h·P435][R5h·P436]`, one bullet per item; the old line appears here as the superseded wording. Two history lines in the R5f/§10-424 text that carried the old string now say "the ratified-variant line".

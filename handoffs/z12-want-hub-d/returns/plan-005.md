@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5h] — the [R5h·…] delta below is commit 74570bedcb0da12ac4de2b0757e88b77d2506b33 on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11762 = RETRY of #11734, with its P436 addendum) — plan-005 EDITED IN PLACE, the small delta [R5h·P435][R5h·P436]
 #   What: plan-005 edited in place (no new file): Exec Packet 435 ITEM 1 (Josh's ratification of the consent frame; via Chief-003; the packet text is dated 2026-10-01 — "stated as
 #     2026-10-01 in Exec Packet 435"; the real clock when I wrote this is `date -u` = 2026-09-30, I do not reconcile them) and Exec Packet 436 ADDENDUM (the session-facing frame
