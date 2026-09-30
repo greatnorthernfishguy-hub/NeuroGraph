@@ -319,15 +319,15 @@ class TestSylsLawHook:
 
     def test_context_gate_jq_missing_exit0_with_context(self):
         e = self._env_stub_no_jq()
-        rc, stdout, _ = self._run_raw(CG_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
+        rc, _, stdout = self._run_raw(CG_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
         assert rc == 0; assert "jq" in stdout.lower()
 
     def test_context_gate_empty_stdin_exit0_with_context(self):
-        rc, stdout, _ = self._run_raw(CG_HOOK, b"")
+        rc, _, stdout = self._run_raw(CG_HOOK, b"")
         assert rc == 0; assert "INACTIVE" in stdout
 
     def test_context_gate_no_path_exit0_with_context(self):
-        rc, stdout, _ = self._run_raw(CG_HOOK, b'{"tool_input":{}}')
+        rc, _, stdout = self._run_raw(CG_HOOK, b'{"tool_input":{}}')
         assert rc == 0; assert "INACTIVE" in stdout
 
     def test_context_gate_normal_same_as_base(self):
@@ -624,10 +624,8 @@ class TestSylsLawHook:
     def test_locale_stub_git_receives_LC_ALL_C(self):
         e = self._env_stub_git_records_lc_all()
         record_path = e.pop("RECORD")
-        # Merge with base env so bash/git stub can run
-        e2 = self._env(); e2.update(e)
         path = os.path.join(self._ng_dir, "neuro_foundation.py")
-        r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=e2)
+        r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=e)
         assert r.returncode != 0
         try:
             with open(record_path, "r") as f:
