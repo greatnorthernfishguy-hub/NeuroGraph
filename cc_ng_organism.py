@@ -3,6 +3,28 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-30] Claude Code (Sonnet 5.5, Z12 worker), lane unbounded-want-twin-808
+#   (dispatch #10694, Chief-003 Exec ruling) — retire the unbounded want twin
+# What: surface_wants_for_graph is now a one-line delegate to surface_wants (same
+#   name, signature, return shape and `want::` ids). surface_wants gains ONE
+#   keyword-only, defaulted parameter, id_prefix (default "cc:want::" = today's
+#   ids), and counts what it skips: backtick-preceded markers, nested markers and
+#   `[WANT]` openers no bounded match covers (oversized/unterminated). The count
+#   logs once per call, WARNING when it changes from the previous call in this
+#   process, DEBUG otherwise. Skip rules themselves are unchanged.
+# Why: the per-deposit hook (cc_ng_host.py:698-700) called an independent copy of
+#   the want parser with the unbounded `(.*?)` regex and neither guard -- the
+#   mis-parse shape behind the 118 oversized "wants" (d75efeb bounded only
+#   surface_wants). Two parsers is LAW 3 shrapnel; the fix belongs at the source
+#   (LAW 4). A skipped span was silent by construction: the bounded regex never
+#   returns an oversized span, so nothing could count it.
+# How: option (b) of handoffs/z12-want-twin-808/plan-001.md. id_prefix keeps the
+#   twin's ids (the golden test compares base vs branch output). No new env key;
+#   the cap stays WANT_MAX_CHARS. Behaviour difference on the delegated path only
+#   when graph.create_node raises: it now propagates to the caller (cc_ng_host.py
+#   :703 already catches at DEBUG) instead of being swallowed per want. Nothing
+#   merged, wired or restarted; merge = deploy (P329). Syl's neurograph_rpc.py
+#   :4945 carries the same unbounded regex: cited only, NOT edited.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -1136,63 +1158,13 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
     re-running never duplicates. Returns the OPEN want nodes.
 
     Adapted from Syl's _surface_wants() in neurograph_rpc.py for CC's own graph.
+
+    [2026-09-30] #808: this is now a thin delegate to surface_wants(), the ONE
+    bounded, guarded implementation (cap, backtick guard, nested-marker guard).
+    Name, signature, return shape and the `want::` id prefix are unchanged for the
+    per-deposit caller in cc_ng_host.py.
     """
-    with _cc_mutation_lock(graph):
-        import re
-        import hashlib
-        if graph is None:
-            return []
-        open_wants = []
-        for nid, node in list(graph.nodes.items()):
-            meta = getattr(node, "metadata", None) or {}
-            if meta.get("kind") == "want":
-                if meta.get("want_state", "open") == "open":
-                    open_wants.append({
-                        "id": nid,
-                        "text": meta.get("want_text", ""),
-                        "provenance": meta.get("provenance"),
-                        "state": "open",
-                        "source": meta.get("source_node"),
-                    })
-                continue
-            if meta.get("creation_mode") != "conversational":
-                continue
-            content = (vdb.content.get(nid) if vdb is not None else "") or ""
-            if "[WANT]" not in content:
-                continue
-            for m in re.finditer(r'\[WANT\](.*?)\[/WANT\]', content, re.DOTALL):
-                inner = m.group(1).strip()
-                if not inner:
-                    continue
-                want_id = "want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
-                if want_id in graph.nodes:
-                    continue
-                try:
-                    graph.create_node(
-                        node_id=want_id,
-                        metadata={
-                            "kind": "want",
-                            "want_text": inner,
-                            "want_state": "open",
-                            "provenance": "cc_authored",
-                            "source_node": nid,
-                            "creation_mode": "conversational",
-                        }
-                    )
-                    try:
-                        graph.create_synapse(nid, want_id, weight=0.3)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    open_wants.append({
-                        "id": want_id,
-                        "text": inner,
-                        "provenance": "cc_authored",
-                        "state": "open",
-                        "source": nid,
-                    })
-                except Exception as exc:
-                    logger.debug("Failed to create want node: %s", exc)
-        return open_wants
+    return surface_wants(graph, vdb, "cc_authored", id_prefix=_WANT_ID_PREFIX_TWIN)
 
 
 def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
@@ -1512,9 +1484,20 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
 WANT_MAX_CHARS = 600
 WANT_RENDER_LIMIT = 40
 _WANT_RE = re.compile(r"\[WANT\](.{1,%d}?)\[/WANT\]" % WANT_MAX_CHARS, re.DOTALL)
+# Node-id namespaces. surface_wants() owns "cc:want::" (the autosave/daemon path);
+# the per-deposit host hook reaches it through surface_wants_for_graph() and keeps
+# the "want::" ids it has always minted (#808). Two names for the same parser.
+_WANT_ID_PREFIX = "cc:want::"
+_WANT_ID_PREFIX_TWIN = "want::"
+_WANT_OPEN_RE = re.compile(r"\[WANT\]")
+# Skip total logged by the previous surface_wants() call in THIS process; the next
+# call logs at WARNING only when its total differs (a skipped span stays in its
+# conversation node, so an unconditional WARNING would repeat forever).
+_want_skip_last = 0
 
 
-def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -> List[Dict[str, Any]]:
+def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored",
+                  *, id_prefix: str = _WANT_ID_PREFIX) -> List[Dict[str, Any]]:
     """Materialize [WANT]...[/WANT] markers from conversational deposits into
     first-class want-nodes in the SNN topology. Idempotent (want id = hash of
     the text) -- safe to call repeatedly, e.g. on every autosave pulse.
@@ -1523,12 +1506,19 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
     substrate -- not text buried in a conversation node. Classification
     happens HERE at the bucket (LAW 7), never at deposit time. Returns the
     open want dicts.
+
+    id_prefix (#808) is the node-id namespace; the default is unchanged. The
+    per-deposit hook's surface_wants_for_graph() delegates here with "want::".
+    Spans this function refuses to materialize are counted and logged (counts
+    only, never text): see _want_skip_last.
     """
+    global _want_skip_last
     with _cc_mutation_lock(graph):
         import hashlib
         open_wants: List[Dict[str, Any]] = []
         if graph is None:
             return open_wants
+        skipped_backtick = skipped_nested = skipped_unbounded = 0
         for nid, node in list(graph.nodes.items()):
             meta = getattr(node, "metadata", None) or {}
             if meta.get("kind") == "want":
@@ -1542,11 +1532,13 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
             content = (vector_db.content.get(nid) if vector_db is not None else "") or ""
             if "[WANT]" not in content:
                 continue
-            for m in _WANT_RE.finditer(content):
+            matches = list(_WANT_RE.finditer(content))
+            for m in matches:
                 # `[WANT]` inside a code span is documentation ABOUT the marker,
                 # not a want. 83 of the 118 oversized nodes began with the
                 # backtick that closed such a span (2026-09-16).
                 if m.start() > 0 and content[m.start() - 1] == "`":
+                    skipped_backtick += 1
                     continue
                 inner = m.group(1).strip()
                 if not inner:
@@ -1554,8 +1546,9 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
                 # A well-formed want contains no further markers; if it does, the
                 # opening tag was not the one that belongs to this closing tag.
                 if "[WANT]" in inner or "[/WANT]" in inner:
+                    skipped_nested += 1
                     continue
-                want_id = "cc:want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
+                want_id = id_prefix + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
                 if want_id in graph.nodes:
                     continue
                 graph.create_node(node_id=want_id, metadata={
@@ -1569,6 +1562,20 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
                     pass
                 open_wants.append({"id": want_id, "text": inner,
                                     "provenance": provenance, "state": "open", "source": nid})
+            # An opener that no bounded match starts at or lies inside is an
+            # oversized or unterminated span: _WANT_RE never returns it, so it
+            # was skipped in silence. Count it (the skip itself is unchanged).
+            spans = [(m.start(), m.end()) for m in matches]
+            for o in _WANT_OPEN_RE.finditer(content):
+                if not any(s <= o.start() < e for s, e in spans):
+                    skipped_unbounded += 1
+        skipped = skipped_backtick + skipped_nested + skipped_unbounded
+        if skipped:
+            logger.log(
+                logging.WARNING if skipped != _want_skip_last else logging.DEBUG,
+                "want surfacing skipped %d span(s) (backtick=%d, nested=%d, unbounded=%d)",
+                skipped, skipped_backtick, skipped_nested, skipped_unbounded)
+        _want_skip_last = skipped
         return open_wants
 
 
