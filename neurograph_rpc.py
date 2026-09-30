@@ -4338,6 +4338,143 @@ def _run_commons_enhance_scoop() -> None:
 _LOOP_MUST_PROPAGATE = (KeyboardInterrupt, SystemExit, GeneratorExit)
 
 
+# ---- No-advance alarm (row #117, LAW 8 family) ------------------------------
+# ---- Changelog ----
+# [2026-09-29] Claude Code (Sonnet 5.5) — no-advance alarm for frozen NG step counter
+# What: A READ-ONLY watchdog, hosted in the existing scan-drain pulse, that notices
+#       when graph.timestep stops advancing (paused or not) and when the autonomous
+#       step() call raises every tick, and makes both loud at default log level.
+# Why:  Executive Packet 370 row #117 — both graphs' step counters were found frozen
+#       with nothing reporting it (laptop unchanged 17 days, VPS >=25h). The step
+#       failure was swallowed at logger.debug only, and nothing anywhere watched the
+#       counter itself, so a stuck Rust panic or a long pause was invisible at
+#       default log level. This lane builds the alarm, not the cure — curing the
+#       freeze itself is #117 / S7, a separate lane.
+# How:  _no_advance_tick() is a pure, unit-testable helper driven every pulse tick
+#       from _scan_drain_pulse_loop with the observed timestep + wall clock + pause
+#       state; it never calls graph.step() or otherwise mutates the graph or loop
+#       state. Module-global state (mirrors the file's other loop-state globals,
+#       e.g. _tonic_idle_*). Surfaced additively in handle_stats(). Threshold is
+#       LAW 5 env-driven (NG_NO_ADVANCE_ALARM_SECS, default 300s = one full
+#       _SAVE_INTERVAL_SECS cadence: the pulse ticks every 2s, so a healthy
+#       substrate steps ~150 times within one save interval — going a whole save
+#       interval without a single successful step is already anomalous and worth
+#       paging, while still tolerant of a brief SYMPATHETIC-driven pause). Set to
+#       0 to disable. Re-emit/failure-warn cadences are separately env-tunable for
+#       the same LAW 5 reason, defaulting to the assignment's suggested values.
+# -------------------
+_NO_ADVANCE_ALARM_SECS: float = float(os.environ.get("NG_NO_ADVANCE_ALARM_SECS", "300"))
+_NO_ADVANCE_REEMIT_SECS: float = float(os.environ.get("NG_NO_ADVANCE_REEMIT_SECS", "900"))
+_NO_ADVANCE_FAILURE_WARN_EVERY: int = int(os.environ.get("NG_NO_ADVANCE_FAILURE_WARN_EVERY", "30"))
+
+_no_advance_state: Dict[str, Any] = {
+    "last_timestep": None,        # last observed graph.timestep
+    "last_change_ts": None,       # wall-clock time timestep last changed
+    "alarm": False,               # currently latched in the alarm state
+    "last_emit_ts": 0.0,          # wall-clock time of the last ERROR emit (entry or re-emit)
+    "paused": False,              # pause state as of the last tick
+    "paused_by": None,            # "sentinel" | "autonomic" | "sentinel+autonomic" | None
+    "consecutive_step_failures": 0,
+    "last_step_error": None,      # repr() of the most recent graph.step() exception
+}
+
+
+def _no_advance_note_step_failure(exc: BaseException) -> None:
+    """Count a failed autonomous graph.step() call and surface it at WARNING.
+
+    Was silent at default log level (logger.debug only) — a step that raises every
+    tick left the timestep frozen with no visible trace. Does not change what
+    happens to the failure itself (the pulse loop still swallows it and continues).
+    """
+    st = _no_advance_state
+    st["consecutive_step_failures"] += 1
+    st["last_step_error"] = repr(exc)
+    n = st["consecutive_step_failures"]
+    if n == 1 or n % _NO_ADVANCE_FAILURE_WARN_EVERY == 0:
+        logger.warning(
+            "Autonomous substrate step failed (consecutive=%d): %s", n, st["last_step_error"],
+        )
+
+
+def _no_advance_note_step_success() -> None:
+    """Reset the consecutive-failure count after a graph.step() call succeeds."""
+    _no_advance_state["consecutive_step_failures"] = 0
+    _no_advance_state["last_step_error"] = None
+
+
+def _no_advance_tick(timestep: Any, now: float, paused: bool, paused_by: Optional[str]) -> None:
+    """One READ-ONLY watchdog tick — never calls graph.step() or mutates any graph/loop state.
+
+    Records whether `timestep` changed since the last tick. Once it has been frozen
+    past _NO_ADVANCE_ALARM_SECS, latches an alarm and logs one ERROR on entry, then
+    re-emits at _NO_ADVANCE_REEMIT_SECS while it stays frozen so a long freeze stays
+    visible. Logs one INFO line on recovery. Runs every pulse tick — including
+    paused ticks and ticks where the autonomous step() raised.
+    """
+    st = _no_advance_state
+    st["paused"] = paused
+    st["paused_by"] = paused_by
+
+    if st["last_timestep"] is None or timestep != st["last_timestep"]:
+        was_alarmed = st["alarm"]
+        frozen_secs = (now - st["last_change_ts"]) if st["last_change_ts"] is not None else 0.0
+        st["last_timestep"] = timestep
+        st["last_change_ts"] = now
+        if was_alarmed:
+            st["alarm"] = False
+            logger.info(
+                "No-advance alarm resumed: timestep advancing again after %.0fs frozen",
+                frozen_secs,
+            )
+        return
+
+    if st["last_change_ts"] is None:
+        st["last_change_ts"] = now
+        return
+
+    if _NO_ADVANCE_ALARM_SECS <= 0:
+        return  # disabled via NG_NO_ADVANCE_ALARM_SECS=0
+
+    frozen_secs = now - st["last_change_ts"]
+    if frozen_secs < _NO_ADVANCE_ALARM_SECS:
+        return
+
+    if not st["alarm"]:
+        st["alarm"] = True
+        st["last_emit_ts"] = now
+        logger.error(
+            "No-advance alarm: timestep=%s frozen for %.0fs (paused=%s paused_by=%s "
+            "consecutive_step_failures=%d last_step_error=%s)",
+            timestep, frozen_secs, paused, paused_by,
+            st["consecutive_step_failures"], st["last_step_error"],
+        )
+    elif (now - st["last_emit_ts"]) >= _NO_ADVANCE_REEMIT_SECS:
+        st["last_emit_ts"] = now
+        logger.error(
+            "No-advance alarm (still frozen): timestep=%s frozen for %.0fs (paused=%s "
+            "paused_by=%s consecutive_step_failures=%d last_step_error=%s)",
+            timestep, frozen_secs, paused, paused_by,
+            st["consecutive_step_failures"], st["last_step_error"],
+        )
+
+
+def _no_advance_stats_block() -> Dict[str, Any]:
+    """Additive handle_stats() block — a read-only snapshot of the current alarm state."""
+    st = _no_advance_state
+    now = time.time()
+    frozen_secs = (now - st["last_change_ts"]) if st["last_change_ts"] is not None else 0.0
+    return {
+        "alarm": st["alarm"],
+        "timestep": st["last_timestep"],
+        "frozen_secs": frozen_secs,
+        "paused": st["paused"],
+        "paused_by": st["paused_by"],
+        "consecutive_step_failures": st["consecutive_step_failures"],
+        "last_step_error": st["last_step_error"],
+        "threshold_secs": _NO_ADVANCE_ALARM_SECS,
+    }
+
+
 def _scan_drain_pulse_loop() -> None:
     """Background loop: drain per-feeder experience tracts on cortical cadence.
 
@@ -4393,13 +4530,16 @@ def _scan_drain_pulse_loop() -> None:
                         # Bunyan/THC/Immunis health-monitor the substrate while idle, no conversation
                         # needed ([[feedback_no_conversation_dependency]]).
                         _deposit_substrate_metrics(_auto_step, to_jsonl=False)
+                        _no_advance_note_step_success()
                     except BaseException as _exc:  # noqa: BLE001 - see _LOOP_MUST_PROPAGATE
                         if isinstance(_exc, _LOOP_MUST_PROPAGATE):
                             raise
                         # A Rust panic reaches here as PanicException. The substrate
                         # step is skipped for this pulse; draining and the scoop below
                         # still run, and the thread survives to try again next tick.
-                        logger.debug("Autonomous substrate step failed: %r", _exc)
+                        # #117: counted + surfaced at WARNING — was logger.debug-only, silent
+                        # at default log level, which is how the frozen counter went unnoticed.
+                        _no_advance_note_step_failure(_exc)
                 # Commons leg-2 scoop (flag-gated, default OFF): perceive newest raw module
                 # deposits through Syl's live graph (read-only, under _step_lock) → salt to Commons.
                 _run_commons_enhance_scoop()
@@ -4409,6 +4549,20 @@ def _scan_drain_pulse_loop() -> None:
                     tid_peninsula_push_enhanced()
                 except Exception as _exc:
                     logger.debug("TID peninsula push failed (non-fatal): %s", _exc)
+            # #117: no-advance watchdog — READ-ONLY, runs every tick including paused ticks
+            # and ticks where the step above raised (LAW 8: must not depend on a conversation,
+            # so it lives here in the wall-clock pulse, not on-message/afterTurn). Never calls
+            # graph.step() or otherwise mutates state.
+            if _memory is not None:
+                if sentinel_paused and autonomic_paused:
+                    _paused_by = "sentinel+autonomic"
+                elif sentinel_paused:
+                    _paused_by = "sentinel"
+                elif autonomic_paused:
+                    _paused_by = "autonomic"
+                else:
+                    _paused_by = None
+                _no_advance_tick(_memory.graph.timestep, time.time(), paused, _paused_by)
             # Time-based auto-save — fires on every tick, paused or not.
             # Shared _last_save_time with the afterTurn save path; whichever
             # fires first resets the clock so we don't double-save.
@@ -5320,6 +5474,8 @@ def handle_stats(params: Dict[str, Any]) -> Dict[str, Any]:
         "loaded": [],  # modules are autonomous, no fan-out registry
         "errors": dict(_module_errors),
     }
+    # #117: no-advance watchdog snapshot — additive, existing keys untouched.
+    stats["no_advance"] = _no_advance_stats_block()
     return stats
 
 
