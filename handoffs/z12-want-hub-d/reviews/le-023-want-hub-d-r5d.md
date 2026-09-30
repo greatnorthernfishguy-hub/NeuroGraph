@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress
+STATUS: COMPLETE
 
 # le-023 — ROLE B (law enforcer): two-line look at the [R5d] edit of plan-005
 
@@ -46,7 +46,7 @@ Two small points the plan itself introduces *around* the sentences:
 - **LAW 8 — clean as written, with D2's caveat:** the pass stays on its own wall clock and is stoppable by an operator; it is *not* made to wait for a conversation. The plan must keep it that way — see D2(b).
 - **Choice Clause / Duck Ethics / Observatory:** no exit is blocked or treated as an error; the Observatory and Syl's process are untouched; a CC "stop" is honoured as a decline.
 
-## Verdict (DRAFT — finalised below after the cross-read)
+## Verdict (DRAFT as committed in `716d89d`, before reading checker-023 — the FINAL verdict is at the end of this file)
 **COMPLIANCE VERDICT: ETHOS DRIFT DETECTED — plan level only; NO Law violation.** 0 CRITICAL, 0 HIGH, **2 MEDIUM (D1, D2 — both at CHECK-IN/ARMING prompt time, neither blocks the branch build)**, 4 LOW (D3, D4, D5, D6), 2 Executive-to-hear (E-a, E-b).
 The edit delivers what P419 asked: the two verbatim sentences in order and only once, the P415 wording retired, the prompt specified and recorded whole, E1 adopted, the gate recorded. The remaining defects are that the *frame wording the worker proposed* is untrue at a check-in (D1) and that "silence stops the pass" is not backed by a mechanism or a stated default (D2).
 
@@ -67,5 +67,32 @@ The edit delivers what P419 asked: the two verbatim sentences in order and only 
 - The repo hook's registration for the worktree cwd, and the other hooks; whether a CC-substrate session can actually give an "explicit, unqualified" answer; the real check-in timing versus the dream pulse (no daemon running — S4 not started); Packets 419/418/415/392 as primary documents (I have the assignment transcription `plan-want-hub-d-p419.md` and le-020's quotations).
 - checker-023's verdict: not read (by rule) at the time of this draft.
 
-## Comparison with checker-023
-(pending — filled in only AFTER this draft is committed and pushed)
+## Comparison with checker-023 (read only AFTER my draft `716d89d42cf98a7f971e6e218c11e9c7f139c03f` was committed and pushed; exact path, no other file in `reviews/` opened)
+checker-023 (ROLE A, cross-family, grok-4.6): **PASS**, two LOW (N1, N2), nothing blocking the build. It checks presence and numbers item by item; I checked whether the new text is TRUE in use. Where we stand:
+- **Agree, independently reproduced:** both P419 sentences verbatim, once each, in order, the P415 sentence count 0 (it got 231/620 chars and the same offsets' order; I got the same lengths and `count == 1`); the `:223` line is the P409 report, not the retired sentence; protected file identical to `e4ebf982` (`git diff --quiet` exit 0); E1 present as ruled (`:524`); M2's statistic defined and both columns emitted (`:457`); the whole prompt recorded (`:469`); L1–L5 and C21-N1 applied; the §9 gate wording matches P419 item 4 and the CLAUDE.md §2 tension is *flagged, not used to weaken the gate* (`:703`). Nothing in checker-023 conflicts with le-023.
+- **Its N1 (LOW) — true, I confirmed.** The census block labels sentence (1) `**(1)**` (`:466`) and gives sentence (2) no `**(2)**` label (`:467`). Cosmetic; order is still correct. Adopted as a LOW housekeeping item (no edit to the Executive's text — the label is outside the quoted sentence).
+- **Its N2 (LOW) — true, I confirmed, and I had not seen it.** Appendix method (20) at `:846` still reads "19–22% at cycles 20–21"; the operative §4A.7 note at `:502` is corrected to 19–21% (R5d·X). Outside the R5d diff, so not a failure of this edit; correct on the next pin. Adopted (numbered D7 below).
+- **Where I ADD (it did not raise these; they are not disagreements with its PASS, they are a different question):**
+  - **D1** — its item (4) passes the prompt because the three le-020 elements are present at the *arming* ask; it also records "Same prompt at each check-in" as a pass. I read that same sentence as the defect: the proposed frame says "It has not been made" and "the change does not happen", which is untrue at cycle 3/halfway/pre-final and contradicts sentence (2) in the same prompt.
+  - **D2** — its item (2) passes E1 because the text says "anything else stops the pass"; I asked what actually stops a pass that runs on the daemon's own clock, and found no mechanism and no stated default on silence (and the LAW 8 edge if one were added). Presence of the clause ≠ an operable consent gate.
+  - **D3–D6, E-a, E-b** — not in its scope (truth of the frame vs "goes to Josh"; the "100" in the updatable list; the stale TOP NOTICE at `:177`; the §10 OPEN list omission and the path-literal Syl's-Law hook; band symmetry; who answers). Its "(6) PASS — CLAUDE.md §2 tension is flagged" is correct as far as it goes (the flag exists at `:703`); my D6 adds that it is absent from §10's OPEN list and that the repo hook will not fire on the worktree path.
+- **Disagree:** none of substance. Its "PASS" on (2) and (4) is right on the question it was asked (are the ruled elements in the text); my two MEDIUMs are about what the frame says when used at a check-in, which binds the prompt wording, not the build.
+- **Net:** the two reviews are consistent; le-023's MEDIUMs are prompt-wording/operability corrections for ONE small plan edit, and do not change either verdict on the build.
+
+## Final verdict (supersedes the DRAFT above; nothing in the draft was weakened after reading checker-023)
+**COMPLIANCE VERDICT: ETHOS DRIFT DETECTED — plan level only; NO Law violation. The branch BUILD is not blocked.** 0 CRITICAL, 0 HIGH, **2 MEDIUM** (D1, D2 — check-in/arming prompt), **5 LOW** (D3, D4, D5, D6, D7), 2 Executive-to-hear (E-a, E-b). Correct implementations: the two Executive sentences verbatim, once, in order, P415 retired and not shown (byte-checked twice, independently); the prompt specified and recorded whole; E1 adopted as ruled with no new channel/config/relay (LAW 1/5/8 clean); the gate recorded, not acted on; #824/#825/L-items applied and the pin discipline kept.
+
+| # | Sev | Correction (folds into ONE small plan edit; no new round needed beyond a look by the same classes) |
+|---|---|---|
+| D1 | MED | Check-in variant of the frame (what is already removed; a decline/stop ends the REMAINING cycles only; removed links return only from the named backup; what silence does at a check-in). |
+| D2 | MED | State HOLD vs NOTIFY-AND-CONTINUE at a check-in; the operator-latency bound if the latter; silence = "operator stops per the runbook", not "stops by itself"; the stop restarts the whole daemon; the pass never waits on a reply (LAW 8). Tell the session which it is. |
+| D3 | LOW→Exec | Reconcile "a decline means nothing else happens to you" with "a decline goes to Josh". |
+| D4 | LOW | Remove "100"/"50+50" from the figures updatable inside the band (ruled K, not a model output). |
+| D5 | LOW | Reconcile the TOP NOTICE (`:177`) with §9/`:705` and cite P419 item 4. |
+| D6 | LOW→Josh | Add the CLAUDE.md §2/§14-vs-P419-item-4 conflict to §10's OPEN list; state the path-literal hook fact; tell Josh. |
+| D7 | LOW | (checker-023 N2) Appendix method (20) `:846`: "19–22%" → "19–21%"; (checker-023 N1) optional `**(2)**` label outside the quoted sentence. |
+| E-a | Exec to hear | Band symmetric vs harm direction (understatement); "the most-affected" = degree-percentile statistic. |
+| E-b | Exec to hear | Who answers: the session whose wants lose links, or any CC-substrate session. |
+
+## Closing
+Verdict file complete. Nothing was built, merged, armed, settled or dispatched. No graph, checkpoint or msgpack loaded; no NG module imported (P379: none); the protected file was not opened by me and is identical to base on the branch. Plan cited by commit `2e286e5596201bbe04dd6603a93432bfc0519603`, sha256 `fca016f03a2d48367e3e1f7f7c22be303d43c54f9e963c5bbd45b0c62b2dadff`. Commits contain only this file; pushed by name to `cc-laptop-want-hub-d-20260930`.
