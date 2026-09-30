@@ -1,4 +1,4 @@
-STATUS: COMPLETE (own findings; the checker-028 comparison is appended after this draft's commit - see "Independence log")
+STATUS: COMPLETE
 
 # le-035 — ROLE B delta review: want-repair delta stream reader (build-tool-007b)
 
@@ -121,4 +121,4 @@ My own scripts (all under `/tmp/le035`, none committed): own_world.py sha256 9cb
 ## Independence log
 - Drafted and committed the verdicts above BEFORE opening `handoffs/z12-want-text-repair/reviews/checker-028-want-repair-delta-stream.md`.
 - One early command listed `reviews/` piped through `grep -v checker-028` (to see which other review files exist without displaying the checker's file name); its output showed only checker-026, le-029, le-031, le-034. That is not a read of checker-028 and no content of it was seen. No accidental read.
-- The comparison with checker-028 (agree / disagree / add) is appended below after this draft is committed.
+- My complete draft was committed and pushed as 715ea19343154385c87c5181f22e0c6b27708e74 (origin confirmed equal by `git fetch` + `git rev-parse origin/cc-laptop-want-repair-tool-20260930`). I then looked for the checker's exact path, `handoffs/z12-want-text-repair/reviews/checker-028-want-repair-delta-stream.md`: **it does not exist in the tool worktree or on origin at that time** (`wc -l` on the path: No such file or directory; nothing pulled in). So there is NO comparison with checker-028 in this file: nothing was read, no content seen. The zone manager should diff the two verdicts when checker-028 lands; the points most worth cross-checking are my corrections 1 (duplicate map keys), 2 (input-validation widening on main.msgpack) and 3 (test-coverage holes M5/M6), and the `skip()` single-leaf buffering number in Check 7.
