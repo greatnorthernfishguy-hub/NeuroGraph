@@ -609,16 +609,20 @@ class TestSylsLawHook:
         assert r.returncode == 2
 
     def test_locale_stub_git_receives_LC_ALL_C(self):
-        """Behavioural: stub git (bash builtins only) records LC_ALL to a pre-created file."""
+        """Behavioural: stub timeout just runs git, stub git records LC_ALL."""
         stub = os.path.join(self._tmpdir, "stub_lc_real")
         os.makedirs(stub, exist_ok=True)
-        for t in ["jq", "timeout", "realpath", "sed", "tr", "dirname", "bash"]:
+        for t in ["jq", "realpath", "sed", "tr", "dirname", "bash"]:
             tp = subprocess.check_output(["which", t]).decode().strip()
             lk = os.path.join(stub, t)
             if not os.path.lexists(lk): os.symlink(tp, lk)
+        # Stub timeout: drop the '3' argument, shift, exec the rest
+        timeout_stub = os.path.join(stub, "timeout")
+        with open(timeout_stub, "w") as f:
+            f.write("#!/bin/bash\nshift\nexec \"$@\"\n")
+        os.chmod(timeout_stub, 0o755)
         record = os.path.join(self._tmpdir, "lc_all_recorded")
         with open(record, "w") as f: f.write("NOT_SET\n")
-        # Git stub: bash builtins only (echo, case, exit, redirects)
         git_stub = os.path.join(stub, "git")
         with open(git_stub, "w") as f:
             f.write("#!/bin/bash\n")
@@ -862,11 +866,10 @@ class TestSylsLawHook:
 
     def _test_decision_cell(self, stub_env, path, cell_name):
         """Return (gate_exit, dbl_exit) for a given stub env and path."""
-        env = stub_env.copy()
-        g_rc, _ = self._run(NEW_HOOK, path)
-        e2 = stub_env.copy()
-        d_rc, _ = self._run(DBL_HOOK, path)
-        return g_rc, d_rc
+        ti = json.dumps({"tool_input": {"file_path": path}})
+        gr = subprocess.run([NEW_HOOK], input=ti.encode(), capture_output=True, timeout=15, start_new_session=True, env=stub_env)
+        dr = subprocess.run([DBL_HOOK], input=ti.encode(), capture_output=True, timeout=15, start_new_session=True, env=stub_env)
+        return gr.returncode, dr.returncode
 
     def test_decision_equivalence_failure_shapes(self):
         """Gate and doublecheck return same verdict for every git failure shape."""
