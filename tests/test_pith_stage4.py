@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: no LOD keyframe staging
+# What: test_promotion_lod_summarizes_far_content becomes
+#   test_promotion_lod_far_content_stays_whole -- a FAR promoted node keeps its full
+#   content; no "⋯[+" marker.
+# Why: Exec P411/P413 (Josh: no truncation): the far-node keyframe discarded its delta,
+#   which is a cut. The budget decides whether a promoted node survives, not a summary.
+# How: same fixture/threshold; the assertion flips. The near and no-stamp tests are unchanged.
 # [2026-07-22] Claude Code (Sonnet 5) — Pith Stage 4 phase 5a unit tests (#55)
 # What: first tests for Stage 4 predictive promotion — the promotion-at-recall
 #   extension to cc_pattern_completion_recall()'s anticipatory bonus block
@@ -199,7 +206,7 @@ def test_promotion_lod_keeps_near_content_full(cc_ng, monkeypatch):
     assert "⋯[+" not in item["content"], "near prediction must stage at full resolution"
 
 
-def test_promotion_lod_summarizes_far_content(cc_ng, monkeypatch):
+def test_promotion_lod_far_content_stays_whole(cc_ng, monkeypatch):
     from ng_embed import embed
     from cc_ng_organism import _cc_embed_to_poincare_dir
     monkeypatch.setattr(cc, "_CC_PITH_PREFETCH_ENABLED", True)
@@ -214,8 +221,8 @@ def test_promotion_lod_summarizes_far_content(cc_ng, monkeypatch):
     state = {"primed_nodes": {"far": (5.0, time.time() + 60)}}
     results = cc_pattern_completion_recall(cc_ng, query, k=5, threshold=0.3, state=state)
     item = next(r for r in results if r["node_id"] == "far")
-    assert "⋯[+" in item["content"], "far prediction must be staged as a keyframe summary"
-    assert len(item["content"]) < len(long_content)
+    assert "⋯[+" not in item["content"], "far prediction must NOT be keyframed (#813)"
+    assert item["content"] == long_content
 
 
 def test_promotion_lod_no_stamp_stays_full(cc_ng, monkeypatch):

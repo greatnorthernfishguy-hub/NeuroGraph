@@ -1,5 +1,12 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: no per-node clip
+# What: CC_PITH_PROVIDER_NODE_CHARS leaves the mandatory export list (six -> five);
+#   the member-prose shortening promise is replaced by whole-or-drop.
+# Why: Exec P411/P413 (Josh: no truncation). Changed together with the
+#   scripts/cc-ng-service.py preflight (docs repo) so a launch is never refused for
+#   a variable the code no longer reads.
+# How: matches cc_ng_organism.py _pith_node_text / _pith_provider_admit as of this change.
 # [2026-09-13] Codex — specify the topology-built provider_context boundary
 # What: add closed states, ownership, cue rules, epistemic labels, and whole-basin output
 # Why: history compression cannot provide fresh model-agnostic situational continuity
@@ -115,10 +122,15 @@ the new controls explicitly (normally `.bashrc`, inherited by the service):
 export CC_PITH_PROVIDER_ROOTS=8
 export CC_PITH_PROVIDER_MEMBERS=6
 export CC_PITH_PROVIDER_DEPTH=2
-export CC_PITH_PROVIDER_NODE_CHARS=700
 export CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS=8000
 export CC_PITH_PROVIDER_MAX_QUEST_CHARS=8000
 ```
+
+Five controls, not six: `CC_PITH_PROVIDER_NODE_CHARS` (the old 700-char per-node
+clip) no longer exists (#813). A node is rendered whole. If a host still exports
+it, it is ignored and harmless. The two `MAX_*_CHARS` controls are request
+guards, not clips: an oversized request is refused whole with a closed
+`unavailable` state (see below), never shortened.
 
 They appear in `pith_effective_config()` and both hosts' allow-listed telemetry,
 so an operator can verify resolved authority after restart. This branch does not
@@ -168,10 +180,16 @@ notice. It never defaults to `exclusive` or implies that learned material is
 currently verified.
 
 `len(context)` never exceeds `budget_chars`. The constitutional core remains
-whole; if it alone cannot fit, the response is closed `unavailable`. Oversized
-learned cache lines may shorten each member's prose, but all recorded
-relationships, sources, coherence, and exact anchors remain attached. If that
-fixed structure cannot fit, the whole line stays out.
+whole; if it alone cannot fit, the response is closed `unavailable`. **Nothing is
+ever shortened to fit (#813).** Every node renders whole, and a cache line is
+admitted whole (prose, every relation, sources, coherence, exact anchors) or not
+at all. The budget is met by fewer whole assemblies: admission is a strict ranked
+prefix, so the lowest-relevance assemblies are the ones left out, and an assembly
+that could not fit even an empty envelope is skipped rather than blanking the
+rest. Whenever anything is left out, the organism logs one INFO line naming how
+many whole assemblies were dropped and their total rendered size; a budget drop
+is never silent. (A keyframe applies only together with its delta; a budgeted
+context has no room for the delta, so no keyframe is used here.)
 
 Slice A does not add a provider-specific victim cache. Recapture remains owned
 by Pith's existing Stage-5/canonical autonomic design; a later slice must use
