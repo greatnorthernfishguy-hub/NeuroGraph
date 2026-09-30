@@ -1,6 +1,13 @@
 # tests/test_pith_stage3.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 turn 2: the ONE budget rule
+# What: test_oversized_top_line_kept_alone_no_empty_l1 becomes
+#   test_oversized_top_line_is_skipped_whole_never_emitted_over_budget: a line that cannot fit
+#   an EMPTY budget is skipped (and named in the INFO line); lower-ranked lines that fit are kept.
+# Why: checker-019 C3 / le-017 F2: the "keep the first line even if it alone exceeds the budget"
+#   guard was a silent overrun and made Stage 3 the only budgeted path that emitted over budget.
+# How: assertions only. Full coverage in tests/test_cc_pith_clip_813.py.
 # [2026-07-09] Claude Code (Sonnet 5) — Pith Stage 3 tests (unified rank + char budget)
 # What: Direct, ungated tests of pith_stage3() + CacheLine's `stream` field --
 #   cross-stream ranking (per-stream normalization + weighting), budget-bounded
@@ -78,15 +85,14 @@ def test_pinned_reserved_off_budget_does_not_evict_fitting_unpinned():
     assert out[0].node_id == "pin"
 
 
-def test_oversized_top_line_kept_alone_no_empty_l1():
-    # A single unpinned line longer than the whole budget must still be
-    # emitted (never an empty L1 just because the top item is large), and
-    # fill must stop after it (no other lines follow).
+def test_oversized_top_line_is_skipped_whole_never_emitted_over_budget():
+    # ONE rule (#813 turn 2): a line longer than the whole budget is never emitted over budget;
+    # it is skipped WHOLE (and named in the INFO line) and does not end the prefix.
     big = CacheLine.from_surfaced("big", "z" * 500, score=10.0, stream="pattern")
     small = CacheLine.from_surfaced("small", "w" * 10, score=1.0, stream="pattern")
     out = pith_stage3([big, small], budget_chars=200)
-    ids = [l.node_id for l in out]
-    assert ids == ["big"]
+    assert [l.node_id for l in out] == ["small"]
+    assert big.content == "z" * 500
 
 
 def test_empty_input_returns_empty_list():

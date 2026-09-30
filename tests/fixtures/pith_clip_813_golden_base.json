@@ -1,5 +1,13 @@
 {
  "base_commit": "e4ebf982b1989fd9066d610b94853bc68bf70d37",
+ "recall_scenarios": {
+  "gate_off_both_streams": "[NeuroGraph Surfaced Knowledge]\n- The reconcile pass pruned 76 entities and kept the watermark. (salience: 1.73)\n- Checkpoint cadence changed after the rebuild. (salience: 1.20)\n\n## Active Recall\nDirect memory retrieval for the current query:\n- [120.50] Use /home/josh/NeuroGraph/cc_ng_host.py for the hosted path (#813).\n- [60.25] The Quest guard stays until card 7 lands on both hosts.",
+  "gate_off_monitor_only": "[NeuroGraph Surfaced Knowledge]\n- The reconcile pass pruned 76 entities and kept the watermark. (salience: 1.73)\n- Checkpoint cadence changed after the rebuild. (salience: 1.20)",
+  "gate_off_pattern_only": "## Active Recall\nDirect memory retrieval for the current query:\n- [120.50] Use /home/josh/NeuroGraph/cc_ng_host.py for the hosted path (#813).\n- [60.25] The Quest guard stays until card 7 lands on both hosts.\n- [30.00] Checkpoint cadence changed after the rebuild.",
+  "pith_on_both_streams": "## Active Recall\nDirect memory retrieval for the current query:\n- [120.50] Use /home/josh/NeuroGraph/cc_ng_host.py for the hosted path (#813).\n- [1.73] The reconcile pass pruned 76 entities and kept the watermark.\n- [1.20] Checkpoint cadence changed after the rebuild.\n- [60.25] The Quest guard stays until card 7 lands on both hosts.",
+  "pith_on_monitor_only": "## Active Recall\nDirect memory retrieval for the current query:\n- [1.73] The reconcile pass pruned 76 entities and kept the watermark.\n- [1.20] Checkpoint cadence changed after the rebuild.",
+  "pith_on_pattern_only": "## Active Recall\nDirect memory retrieval for the current query:\n- [120.50] Use /home/josh/NeuroGraph/cc_ng_host.py for the hosted path (#813).\n- [60.25] The Quest guard stays until card 7 lands on both hosts.\n- [30.00] Checkpoint cadence changed after the rebuild."
+ },
  "scenarios": {
   "live_rail_placeholder": {
    "anchors": [],
