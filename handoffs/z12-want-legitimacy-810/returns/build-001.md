@@ -4,8 +4,10 @@ Lane `want-parser-legitimacy-810` · Zone manager Z12 · dispatch #10715 · work
 Branch `cc-laptop-want-legitimacy-810-20260930` · base `e4ebf982b1989fd9066d610b94853bc68bf70d37`
 Related: [[NeuroGraph]] · [[The Laws]] (LAW 3/4/7) · [[NeuroGraph Is a Mind, Not a Database]]
 
-> **Status: PLAN (commit 1 of 3).** Nothing below is built yet. Sections 6-8 (what was built,
-> evidence, render-retirement inventory) are appended by the later commits of this same file.
+> **Status: RETURNED (commit 3 of 3).** Sections 0-7 are the PLAN exactly as committed first
+> (`2ab4a85`, before any code). Section A onward is what was built, the evidence, the deviations
+> from the plan, the read-only render-retirement inventory (section 8) and the flags (section 9).
+> Code + tests: `c9fe56d`. Nothing merged, wired or restarted; not self-accepted.
 
 ## 0. Scope, and the two amendments that changed it
 
@@ -225,6 +227,187 @@ repair is applied live, and both before S4.** The repaired `cc:want::`+sha1(text
 what the running parser mints on the next re-parse. The offline dry-run of the repair on a COPY may
 import `parse_wants` / `want_id_for_text` from this branch.
 
-## 8. Render-retirement inventory (read-only) — appended in commit 3
+## A. What was built (commit `c9fe56d`)
 
-## 9. Flags raised — appended in commit 3
+Files: `cc_ng_organism.py`, `tests/test_cc_want_legitimacy_810.py` (new), `tests/test_cc_want_bounds.py`.
+`git diff e4ebf982 --name-only` = those three + this doc. No protected, vendored, `cc_ng_host.py`
+or `neurograph_rpc.py` file is in the diff (checked).
+
+**The ONE function and its signature (for the #801 repair tool to import):**
+```python
+from cc_ng_organism import parse_wants, want_id_for_text
+parse_wants(content: str) -> WantParse          # cc_ng_organism.py:1682  (PURE)
+#   WantParse(wants: Tuple[WantSpan, ...], skipped: Tuple[SkippedMarker, ...])
+#   WantSpan(text, want_id, open_start, close_end)      text == inner.strip(), exactly what is stored and hashed
+#   SkippedMarker(marker, start, reason)                reason in WANT_SKIP_REASONS
+want_id_for_text(text: str) -> str              # cc_ng_organism.py:1587  "cc:want::" + sha1(text utf-8)[:16]
+```
+`surface_wants` (`:1791`) is now: for each conversational node containing `WANT]`, `parse_wants(content)`,
+create a node per `WantSpan` (same metadata / synapse `weight=0.3` / id as base), collect
+`parsed.skipped`, and call `_log_want_skips` AFTER the graph lock is released (`:1745`).
+Removed: `_WANT_RE` and the inline hashlib derivation. Helpers: `_want_fence_spans` `:1595`,
+`_want_code_span_ranges` `:1616`, `_want_marker_mention_reason` `:1658`. Constants `:1541-1556`.
+`WANT_MAX_CHARS` (`:1541`) and `WANT_RENDER_LIMIT` (`:1542`) and `render_wants` (`:1844`) are
+untouched; `WANT_MAX_CHARS` is referenced by no parser path (asserted by a test).
+
+**Repair-tool notes (#801):**
+- Only `provenance == "cc_authored"` want nodes are parser outputs. `cc_emergent` wants
+  (`generate_emergent_want`, `cc_ng_organism.py:~1916`) also use `cc:want::`+sha1(want_text)[:16], but
+  their text is a synthesised `"tonic-triggered: ..."` string, never parsed from a conversation node —
+  the separation rule must not be applied to them.
+- The host twin mints `want::`+sha1 (no `cc:` prefix, see section 9) — a different id scheme.
+- Offsets in `WantSpan`/`SkippedMarker` are character indexes into the exact `content` string given.
+
+**Flood-safe INFO log, as built** (constants `WANT_SKIP_SUMMARY_INTERVAL_S=3600`,
+`WANT_SKIP_SEEN_MAX=4096`, `WANT_SKIP_DETAIL_PER_CALL_MAX=50`):
+`surface_wants: skipped 2 marker(s) in 1 node(s) as mentions, not wants (closer_without_opener=1, in_code_span=1)`
+and `surface_wants: skipped [/WANT] node=<node id> offset=<n> reason=<reason>`. No marker text, no
+surrounding text, ever (a sentinel test proves prose around a masked marker never reaches a record).
+Expected volume (logic fixed by the tests with a fake clock; asserted: the first call over 120 distinct skips emits 51
+lines, the 5th pulse 0, every marker detailed exactly once, 30 pulses over an unchanged corpus = 0 new lines, one heartbeat
+summary after an hour, a new mention node = one summary + its own detail line). The 50/20 middle calls follow from the cap
+and are not separately asserted.
+Steady state ≈ 1 line/hour, vs 1/minute unfiltered.
+
+## B. Evidence
+
+Environment: worktree root, `env -u NG_EMBED_REMOTE` (`NG_EMBED_REMOTE` was the only `NG_EMBED_*`
+name set in the shell; the preamble prints `NG_EMBED_* names set in env: none`), python 3.12.3, pytest 9.0.2.
+Command: `env -u NG_EMBED_REMOTE PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tests/test_cc_want_legitimacy_810.py tests/test_cc_want_bounds.py -s -q -p no:cacheprovider`
+
+- **Run 1:** `64 passed, 1 failed`. The failure was a bug in MY test harness, not the parser:
+  `inspect.getsource` cannot read a function compiled under the synthetic base filename, so the
+  "render_wants source identical to base" test raised `OSError`. Fixed (compare `ast` source segments of
+  the two files). The brief asked for the new file to be run once; it was run twice for this reason.
+- **Run 2 (final):** `65 passed in 1.61s` — 56 in `test_cc_want_legitimacy_810.py` (incl. the preamble and the golden
+  / delta tests) and 8 in `test_cc_want_bounds.py` (its 2 render tests are unchanged and passing).
+- **P379 preamble (run 2):** `cc_ng_organism in sys.modules /home/josh/NeuroGraph-worktrees/z12-want-legitimacy-810-20260930/cc_ng_organism.py`;
+  `neurograph_rpc`, `neuro_foundation`, `ng_lite`, `ng_embed`, `ng_ecosystem`, `ng_tract_bridge`,
+  `ng_autonomic`, `openclaw_adapter`, `surface_resolver`, `surfacing`, `cc_ng_host` all `not loaded`
+  (the code under test imports none of them, so none is in `sys.modules`; the test FAILS the whole file
+  if `cc_ng_organism`, or any of those that IS loaded, resolves outside the worktree).
+- **Golden vs base `e4ebf982b1989fd9066d610b94853bc68bf70d37`** (`git show` of base `cc_ng_organism.py`,
+  loaded under a private module name, never skipped): 11 well-formed corpora + preexisting-want-nodes +
+  provenance-argument + `graph=None` all give an IDENTICAL `(returned wants, node ids+metadata, synapses)`.
+- **Documented deltas vs base** (asserted both ways): >600-char want (base `[]`, new captured); nested
+  opener (base `[]`, new `["inner"]`); fenced mention (base minted `documented`, new `[]`); quote-wrapped
+  mention (base minted `" tag and "`, new `[]`); backticked marker inside a real pair (base `[]`, new captured whole).
+- **`render_wants`:** source segment byte-identical to base and output equal to base on 4 graphs,
+  including the held 600-clamp (`"w"*1500` still renders as 600 chars): it is untouched.
+- Raw transcripts: `/tmp/z12-810-pytest-run1.txt`, `/tmp/z12-810-pytest-run2.txt` (local to this machine).
+- Not run, by instruction: the full suite. Not verified: behaviour under the live daemon (nothing restarted).
+
+## C. Deviations from the plan
+1. The plan said the two old extraction tests "and the nested test" are replaced; in fact only the
+   over-cap test and the nested test flipped. `test_span_at_cap_is_accepted` (a 600-char want is captured)
+   is still true and was kept.
+2. "render_wants source identical" compares `ast` source segments, not `inspect.getsource` (see Run 1).
+3. The cheap pre-filter is `"WANT]" not in content` (covers a stray `[/WANT]`-only node, which base ignored
+   silently and is now logged as `closer_without_opener`); base used `"[WANT]" not in content`.
+4. `surface_wants` logs after leaving the `with` block; `return open_wants` moved to the end (same value).
+Everything else is as planned.
+
+## D. What the re-parse of the 09-16 sources now produces (derived data only)
+As in section 5. Additionally, the derived probe holds no source content beyond ≤100-char heads, so no
+per-node re-parse count is claimed here; the #801 dry-run computes it on a COPY by importing the function
+above. The category statement stands: marker-bearing (123) and backtick-led (91) stored wants are
+mention-shaped and are not re-minted; the 16 marker-free >600 rows are the only ones the no-limit parser
+can re-derive under the same id (no duplicate), *if* their source opener is structurally real.
+For the record (derived), what the UNTOUCHED renderer produces over those 182 open `cc_authored` rows
+today: 18,577 chars (40-cap + 600-clamp); 486,803 with the clamp removed (40-cap only); 78,635 with the
+clamp and no cap; 2,267,508 with neither — the 09-16 figure. This is context for why P408 retires the
+block rather than clamping it; no decision is made here.
+
+## 8. Render-retirement inventory (read-only) — sizing the second turn
+
+Nothing below was edited. Daemon lines are given for docs `origin/main` (the lines the brief cites; the
+unit runs `~/docs/scripts/...`) AND for the docs branch `cc-laptop-daemon-recall-756-20260930` HEAD
+`155343e4`, because that branch restructured the same function (#779/#756) and the numbers differ.
+
+### 8.1 (1) Remove the standing wants block from the per-prompt context; fix the SessionStart hint
+| What | `origin/main` | branch `155343e4` |
+|---|---|---|
+| SessionStart hint text promising `'## What I Want'` | `scripts/cc-ng-daemon.py:1067-1073` (in `handle_session_start` `:1058`) | `:1125-1131` (`handle_session_start` `:1115`) |
+| per-prompt import + `render_wants(STATE.ng.graph)` + append loop, one `try` with the "Who I Am" block | `:1113-1120` (`handle_user_prompt_submit` `:1092`) | `_append_identity_blocks` `:1951-1985`; import `:1965`; `render_wants` call `:1977`; caller `:1177` in `handle_user_prompt_submit` `:1152` |
+| wants-specific failure codes/fields | (none on main) | `IDENTITY_ERR_WANTS` `:776`, `IDENTITY_ERR_CORE_AND_WANTS` `:777`, `_identity_fields` `:1937-1949` (the `core_and_wants_render_failed` collapse `:1946-1947`), `_report_recall(..., IDENTITY_ERR_WANTS ...)` `:1979`, module header note `:13-14` |
+| docs-repo tests that encode the block | — | `scripts/tests/test_cc_ng_daemon_recall_status.py`: `:137` (fake `render_wants`), `:283-301`, `:317-319` (`drop=('render_constitutional_core','render_wants')`), `:329-334`, `:389-392`, `:439-447`, `:458` |
+| NeuroGraph host (VPS half) | `cc_ng_host.py:1141-1149` — imports `render_constitutional_core, render_wants`, appends `wants_block` | same (this repo; NOT touched this turn; the brief says `cc_ng_host.py` is out of this lane — turn 2 must be told whether the VPS host block is in scope) |
+| the renderer | `cc_ng_organism.py:1844` `render_wants`; constants `:1541` `WANT_MAX_CHARS`, `:1542` `WANT_RENDER_LIMIT` (both die with it; `WANT_MAX_CHARS` has no other user) | |
+| NeuroGraph tests touching it | `tests/test_cc_want_bounds.py:114-135` (render count-cap + clamp + no-elision: obsolete on retirement); `tests/test_cc_want_legitimacy_810.py:459-511` (this turn's "render_wants unchanged vs base" — must be deleted or inverted in turn 2); `tests/test_cc_deposit_step.py:54,290,400` (monkeypatch `render_wants` to a no-op: harmless but stale). `tests/test_self_render.py` is **Syl's** `_render_self_and_wants` (`syl_authored`, `neurograph_rpc`) — NOT affected ("Syl's block is untouched"). |
+| "Who I Am" | `render_constitutional_core` `cc_ng_organism.py:1882` — unchanged; it shares the `try`/append loop with the wants block on main (`:1113-1120`), so the edit must keep it |
+| docs / vault references to the string `## What I Want` | `constitutional spine` and dev-log pages, punchlist `punchlist/open/neurograph.md`, `punchlist/open/tid.md`, `prd/2026-06-21-reach-teaching-plan.md`, `handoffs/z12-daemon-recall-swallow-756/returns/{plan,build}-001.md` (history; update only if they describe current behaviour) |
+
+### 8.2 (2) Make want nodes eligible in the EXISTING recall/surfacing path, rendered in FULL
+The existing path (one shared pipeline for both hemispheres): `cc_assemble_recall`
+`cc_ng_organism.py:5595` = `SurfacingMonitor` block (`surfacing.py`) + Active Recall block
+(`cc_pattern_completion_recall` `:3117`, formatted by `_format_cc_recall_block` `:3301`), optionally Pith.
+
+**How a want node is shaped today:** created by `surface_wants` with metadata
+`{kind:"want", want_text, want_state:"open", provenance, source_node, creation_mode:"conversational"}`
+plus a `poincare_dir` stamped by `cc_stamp_missing_geometry` (`:3657`, which reads `want_text`), and ONE synapse
+`source conversational node -> want` at weight 0.3. It has NO `_forest_content`, NO `_label`, and NO vector_db entry.
+
+**Why it is not eligible today (read from the code; not exercised against a live graph):** the want node carries a
+synapse and a `poincare_dir`, so spreading activation can plausibly fire it, but every consumer then resolves display text with `surface_resolver.resolve_surface_content`
+(`surface_resolver.py:54-115`), which reads only `_forest_content`, then the vdb entry, then `_label` — never
+`want_text` — so the want resolves to `None` and is dropped:
+- Active Recall: `cc_ng_organism.py:3252` (`text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)`; `if not text: continue` `:3253-3254`);
+- SurfacingMonitor: `surfacing.py:192-193` (`resolve_surface_item` -> `resolve_surface_content`), dropped at `surfacing.py:207` (`if not content and not image_ref: continue`).
+(The Pith text resolver `_pith_node_raw_text` `cc_ng_organism.py:4909` ALREADY reads `want_text` — it is only reached for items that survive the two filters above.)
+
+**Smallest change that makes a want eligible:** teach the resolver (or a CC-only wrapper at `:3252`) that a
+`kind == "want"` node with `want_state == "open"` resolves to its `want_text`. Retrieval needs no new node/embedding
+because the substrate path (synapse + `poincare_dir`) is what fires it.
+
+**Four things the turn-2 plan must decide (surfaced, not decided):**
+1. **`surface_resolver.py` is shared with Syl.** `resolve_surface_content` is also called by `neurograph_rpc.py:3276,3458,3520`
+   (Syl's `/assemble`) and `tonic_thread.py:588`. Editing it would make Syl's own want nodes (also `kind:"want"`) eligible in
+   her recall and Tonic surfacing too — "Syl's block is untouched" does not cover that. Either gate it (CC-only wrapper
+   at `cc_ng_organism.py:3252` + a `surfacing.py` hook) or get Josh's ruling that Syl's wants surfacing is wanted.
+2. **"In FULL, never cut" vs the path's existing bounds.** Every stage of the existing path clips: `resolve_surface_content`
+   `max_chars` (240 default; `300` at `cc_ng_organism.py:3252`; `surface_resolver.py:112-114`), `SurfacingMonitor.format_context`
+   hard-trims to 200 chars (`surfacing.py:293-295`), and the Pith provider clips per node to `_CC_PITH_PROVIDER_NODE_CHARS`
+   (default 700, `cc_ng_organism.py:3781`; `_pith_node_text` `:4924`) inside an L1 budget (`cc_l1_budget` `:4504`).
+   Making a want render whole needs a per-kind exemption at each of those stages, or a separate want lane beside them.
+3. **Existing `want_state`/`provenance` semantics:** `render_wants` filtered `provenance in {cc_authored, cc_emergent}` and
+   `want_state == "open"`; the eligibility rule must reproduce that filter (closed wants must not surface).
+4. **The 182 existing nodes** include ~123 mis-parse wants (section D). Making wants eligible BEFORE the #801 repair
+   would surface up to 136k-char mention-spans through the recall path, unbounded. Sequencing: #810 lands -> #801 repair
+   applied -> THEN eligibility (this is the same ordering as the sequencing ruling, section 7, plus this constraint).
+
+### 8.3 (3) Spontaneous surfacing — plan-only for S4 (what already fires)
+Existing independent clocks a plan could reuse, none changed: the autosave pulse that already calls
+`surface_wants` + `generate_emergent_want` (`cc_ng_host.py:1519-1531`; docs `scripts/cc-ng-daemon.py:1929` on main /
+`:2116` on the branch, ~60 s), and the Tonic (`_tonic_thread`, reported in `handle_status`; the laptop has none until S4,
+same Door-B-style gate as the brief says). `generate_emergent_want` already writes `cc_emergent` want nodes from the
+substrate's own predictions. No timer or quota is proposed.
+
+### 8.4 Sizing read (for the zone manager)
+Turn 2 = one docs-repo daemon edit (two hunks on main, four on the #756 branch) + its test file, one NG edit
+(`cc_ng_organism.py` renderer + constants removal, resolver eligibility) + NG tests (delete/invert ~6), and — only if
+Josh wants them — the `cc_ng_host.py` VPS block and the `surface_resolver` Syl question. The decisions in 8.2 (1), (2)
+and (4) gate the size; everything else is mechanical.
+
+## 9. Flags raised (not acted on)
+1. **Host twin `surface_wants_for_graph`** (`cc_ng_organism.py:1151-1218`, called from `cc_ng_host.py:698-700`): still the
+   UNBOUNDED, legitimacy-free `re.finditer(r'\[WANT\](.*?)\[/WANT\]')` — the exact 09-16 mis-parse bug class — and it mints
+   `want::`+sha1 ids (no `cc:` prefix), a DIFFERENT scheme from `surface_wants`, so the same want text can exist under two
+   ids if both run. Parked in #755 per the brief; flagged for the punchlist (LAW 4: fix at the source, one implementation).
+2. **`neurograph_rpc.py:4902/4914`** (Syl's `_surface_wants`): identical unbounded regex on the `syl_authored` path; needs Josh's approval.
+3. **Residual failure mode:** a bare, unquoted prose mention that pairs cleanly ("use [WANT] to mark one and [/WANT] closes
+   it") is structurally identical to a real want and WILL be minted. There is no structural signal for it that is not a length
+   heuristic. Reviewers should weigh it; the INFO log does not cover it (it is not skipped).
+4. **Nearest-opener pairing changes base behaviour** for `[WANT] a [WANT] b [/WANT]` (base dropped both; new mints `b`) and a
+   masked marker inside a real pair is now kept in the text (base dropped the whole pair). Both deliberate (P406) and asserted;
+   listed so the review pair can reject them.
+5. **`code_adjacent` keeps the pre-#810 guard:** a real want typed directly after a closing backtick (`foo`[WANT]...`) is
+   still skipped (logged). Same as base.
+6. **Same-function conflict risk for turn 2:** the docs branch `cc-laptop-daemon-recall-756-20260930` restructured
+   `_append_identity_blocks` (#779/#756); a retirement edit on `origin/main` lines will conflict with it. Decide the base branch.
+7. **Return-doc location:** written into THIS (NeuroGraph) branch under `handoffs/z12-want-legitimacy-810/returns/`, because the
+   NeuroGraph branch is the only one I was told to push. Copy it into the docs repo's `handoffs/` if the vault layout needs it there.
+   Vault Context-Map/wikilink updates were NOT done (the docs branch is not mine to edit this turn).
+8. **P379 nuance:** in the test process the NG modules other than `cc_ng_organism` are not imported at all, so the "resolved
+   path" check for them is vacuous; the load-bearing check is `cc_ng_organism` resolving to the worktree.
+9. A stray `find / ...` I started early (before scoping it) was killed and its partial output discarded; nothing was read
+   outside the named locations except the listed read-only greps of the docs repo daemon/tests and git objects.
