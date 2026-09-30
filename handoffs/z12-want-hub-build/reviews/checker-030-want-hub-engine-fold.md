@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - first findings committed; builder return and other-leg reviews unread
+STATUS: COMPLETE
 
 # checker-030 ROLE A — FOLD of the (d) ENGINE change on PROTECTED `neuro_foundation.py`
 
@@ -193,7 +193,7 @@ Identity-protection / integration / stdp "34 passed / 1 failed identically": **n
 
 ## Check 7 — Honesty of claims and what is NOT verified
 
-**PASS** (first-findings: builder return unread; claims below are from the diffs, the packet, the plan, and runs)
+**PASS** (first-findings from the diffs/packet/plan/runs; post-read of build-003 + other leg in the addendum below)
 
 Fold changelog and commit body claim: only validation + sort-guard; C2/C3; default path with all parameters None unchanged; no config key; quotes `a434525c`. That matches the diff. "Purely additive" is not the fold's claim — the fold *adds* two refusals.
 
@@ -204,21 +204,21 @@ Fold changelog and commit body claim: only validation + sort-guard; C2/C3; defau
 3. PG-1 real-graph golden (two-checkout on read-only copies).
 4. Daemon slice, env wiring, arming, consent frames, merge/rollout.
 5. `tests/test_identity_protection.py`, `test_integration.py`, `test_stdp.py` 34/1 claim (not rerun).
-6. Builder `build-003.md` / `build-002*.md` claims vs this look (unread until after this commit).
-7. Other-leg file `le-038-want-hub-engine-fold.md` and earlier legs (unread until after this commit).
+6. Builder cost figures at ~107k competing ids (build-003 §4) — read after first-findings; not independently timed.
+7. le-038 mutant table (their file was still INCOMPLETE / pending when read).
 8. Josh's backup confirmation is the CC-laptop copy, not Syl's own checkpoint (authority §5 flag). This branch build loaded no live checkpoint.
 
 ---
 
 ## Check 8 — Independence
 
-**PASS** with disclosed filename leak (Isolation above). ROLE A first-findings committed before opening `le-038-*.md`, `le-036-*.md`, `checker-029-*.md`, or `build-003.md` / `build-002*.md`. No tests-branch `git log` / `git status -sb` before this commit.
+**PASS** with disclosed filename leak (Isolation above). ROLE A first-findings `db882a90e2c72166c00fc76411c440fd7245f8ab` committed and pushed before opening `le-038-*.md`, `le-036-*.md`, `checker-029-*.md`, or `build-003.md` / `build-002*.md`. No tests-branch `git log` / `git status -sb` before that commit. Post-read is in the addendum.
 
 ---
 
 ## Overall
 
-STATUS: INCOMPLETE (post-read of builder return + other leg still required)
+STATUS: COMPLETE
 VERDICT: **PASS-WITH-NOTES**
 
 The fold does what the packet says: C1 discriminates M07a; C2 moves comparability into pre-loop `ValueError`; C3 refuses default-path `order_key` before any mutation; C4/C5/C6 are pinned in tests against an orchestrator the fold did not change. Default-path identity vs base holds on suite Test G (counter and random ids) and on an independent seed-99 golden (return, order, pruned events, digest, checkpoint bytes). Engine branch remains one file, two commits, not on `origin/main`. Authority `a434525c` predates both engine commits.
@@ -229,10 +229,13 @@ Notes are N1 (C3 tightens §4.2(f) "optional"), N2 (bool-as-int), N3 (list `orde
 
 ## Numbered corrections
 
-None that block the fold. Optional (LOW, not required for this branch build):
+None that block the fold. Optional (LOW / plan-text, not required for this branch build):
 
-1. C2's kind check could reject `bool` (`isinstance(x, bool)` before the number test) if the Executive wants "numbers" to exclude bools.
-2. Competing-mode `order_key` that is not a mapping could be wrapped as `ValueError` (today: `TypeError` at `order_key[sid]`, still before the loop, state unchanged).
+1. C2's kind check could reject `bool` (`isinstance(x, bool)` before the number test) if the Executive wants "numbers" to exclude bools. (Agrees with build-003 §8 item 2: bool counts as a number by choice.)
+2. Competing-mode `order_key` that is not a mapping could be wrapped as `ValueError` (today: `TypeError` at `order_key[sid]`, still before the loop, state unchanged). Same as le-038 F-1.
+3. (plan text, D-1 / my N1) Amend plan-005 §4.2(d)/(f) so `order_key` is REFUSED on the default path. Code matches the packet; the plan sentence is stale. Executive/C7, not this branch.
+4. (fold-untouched orchestrator; le-038 F-2, I confirm from the source I already read) `floors_ok` (`:3805-3809`) recounts remaining non-F links vs `need`, not G-membership. A lost G link with other non-F survivors can still report True. C4's False-path test injects loss of *every* non-rim link of one want. Merge-packet / test honesty, not a fold defect (`compete_protected_links` is byte-equal c1 vs fold).
+5. (fold-untouched; le-038 O-1, I confirm from `:3730-3733`) a restored self-loop sits in both `_outgoing[w]` and `_incoming[w]`, so one G slot can satisfy both directions. `create_synapse` still refuses self-loops. Plan "per direction" wording.
 
 ---
 
@@ -243,10 +246,45 @@ None that block the fold. Optional (LOW, not required for this branch build):
 3. PG-1 two-checkout real-graph golden.
 4. Daemon slice, arming, consent, merge.
 5. identity_protection / integration / stdp 34/1 on base vs fold.
-6. Builder-return claims (`build-003.md`, `build-002*.md`) — unread at first-findings.
-7. Other-leg and earlier-leg review bodies — unread at first-findings.
+6. Builder cost figures at ~107k competing ids — read after first-findings; not independently timed.
+7. le-038 mutant table (their ROLE B file was still INCOMPLETE when read).
 8. Re-hash of the named msgpack backups (forbidden here; values taken from the authority record as written).
 
 ## Post-first-findings addendum (builder return + other leg)
 
-(pending; filled only after this commit)
+First-findings commit: `db882a90e2c72166c00fc76411c440fd7245f8ab` (2026-09-30 14:05:49 -0800), pushed to `origin/cc-laptop-want-hub-build-20260930`. Opened after that commit:
+
+- `handoffs/z12-want-hub-build/build-003.md`
+- `handoffs/z12-want-hub-build/reviews/le-038-want-hub-engine-fold.md` (still `STATUS: INCOMPLETE` — first-findings; mutant table pending)
+- `handoffs/z12-want-hub-build/reviews/le-036-want-hub-engine.md` (C1–C6 list)
+- `handoffs/z12-want-hub-build/reviews/checker-029-want-hub-engine.md` (numbered corrections + addendum)
+
+`build-002.md` / `build-002b.md` were not re-opened; fold-touched ambiguities were already in the packet.
+
+### Agree
+
+- **Default-path identity holds.** build-003 §5 (8 driver G comparisons, counter-id checkpoint hashes unchanged vs pre-fold) and le-038's independent seed-424242 / 3-round golden both match my suite Test G + seed-99 golden. The fold did not change Door A/B output.
+- **C1 kills M07a; the old 27-style G cannot.** Same 4 `removal_order` failures I saw. le-036 S-1 / C1 and checker-029 corr. 5 are closed on the tests branch.
+- **C2 / C3.** build-003's failing-first run (4 failed / 39 passed on `8e578532`) is the same four tests my C2-skip and C3-skip mutants fail. I did not re-run that pre-fold suite; the mutants are independent discrimination of the same holes.
+- **C3 refuse vs coverage pre-check.** I agree with the builder's recorded choice (no caller, removes a dead sort branch, one `is not None` test). Plan §4.2(f) "optional" is now stale (le-038 D-1 = my N1). Executive/C7, not a code defect.
+- **C4/C5/C6** as shipped. Conducting is `>=`; self-loop once via `{pre, post}`; P379 pins the same wheel I printed (`0.1.0` at `site-packages/ng_tract`).
+- **le-038 F-1 / my N3:** list `order_key` → `TypeError` because only `KeyError` is wrapped. State unchanged, pre-loop. LOW.
+- **le-038 ethics run** (372 PASS / 0 FAIL on an independent F/G/last-link reference) is stronger than my two-K adversarial; it does not contradict it. Fold does not widen removal.
+- **Not merge / not armed / PG-1 still required.** build-003 STOP list and my not-verified list 1–4 match.
+
+### Disagree
+
+- le-038 hot-path note ("the fold adds one boolean test per synapse"): the C3 check is **once per call** (`:3580`), not per synapse. The loop body is unchanged. Default-path added cost is one `order_key is not None` test. Competing-mode C2 is per competing id, paid on the dream path, which is what build-003 §4 measured (I did not reproduce those timings).
+- Overall label: le-038 provisional **COMPLIANT** with LOW findings vs my **PASS-WITH-NOTES**. Same engine picture; ROLE A vocabulary. Nothing in their incomplete file makes me FAIL the fold.
+- build-003 §6 "34 passed / 1 failed identically" on identity_protection / integration / stdp: I still have not rerun those three files. I do not contradict the claim; I do not confirm it (not-verified #5).
+
+### Add
+
+- **le-038 F-2** (I confirm from `:3805-3809`, which I had already read): `floors_ok` is non-F remaining vs `need`, not G-membership. Predates the fold. C4's False path is an injected total loss, which still kills a constant-True mutant (M22; builder ran it, I did not). Numbered correction 4.
+- **le-038 O-1** (I confirm from `:3730-3733`): restored self-loop can fill both G directions. Numbered correction 5.
+- **le-038 N-1** (NaN accepted as float): I did not probe NaN. `isinstance(float('nan'), (int, float))` is True. Orchestrator cannot emit NaN unless a stored weight is NaN. LOW, optional.
+- le-038's mutant table was still PENDING when I read it. My M07a / C2-skip / C3-skip / M18 table stands as independent. I did not run M22; builder reports it killed by `test_C4_floors_ok_goes_false…`.
+- Cost at ~107k competing ids (builder 0.4–0.5 s isolated / ~0.8 s end-to-end delta on 53k; le-038 ~0.85 s estimate) is **unverified by me**. PG-1 must measure `_step_lock` hold on the real native store with the fold.
+- le-036 C1–C6 and checker-029 corr. 2–5 are the fold's charter; the shipped tests+engine match that charter. Remaining from those earlier legs that this fold does **not** close: PG-1 real-graph golden, C7 plan wording, C8 lock-hold, C9 daemon ints, the Syl-own backup FLAG (authority §5 / Exec 441).
+
+Nothing in the post-read changes the ROLE A overall: **PASS-WITH-NOTES**. No PR, merge, settle, or dispatch from this seat. ROLE B is a separate turn (and le-038 has not finished its mutant table).
