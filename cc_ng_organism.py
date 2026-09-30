@@ -13,6 +13,18 @@
 # How:  One argument removed, on the e4ebf982 base. Expected conflict with #813 (84a0968a) at
 #   this call site: see the #812 turn-1 return for the correct merged form.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
+#   TURN 2 (dispatch #10952) step (2b) -- #818: EVERY drop is loud
+# What: _pith_log_drop (ONE INFO line per call and reason: count, total chars, reason; ids
+#   named first-time-seen only, bounded -- the #810 skip-log shape) now reports the drops that
+#   were silent: neighbours declined by CC_PITH_PROVIDER_MEMBERS (member_limit) and by
+#   CC_PITH_PROVIDER_DEPTH (depth_limit) in pith_connected_activation_basins, basins skipped at
+#   >=60% overlap, and recall results beyond the root/result count k (roots).
+# Why: brief TURN 2 item 3 (Exec P416): silent member/overlap/count-limit drops. Counted: only
+#   candidates the walk REACHED and declined, and only if they appear in no selected basin.
+# How: no behaviour change to WHAT is selected. NOT covered (named in build-002): Stage-1
+#   clutter/dedup drops (counted in _PITH_METRICS, not logged) and the graph engine's own
+#   max_surfaced cap inside _harvest_associations (shared neuro_foundation code).
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
 #   TURN 2 (dispatch #10952) step (2a) -- #817: RETIRE pith_compress_history (LAW 3)
 # What: deleted pith_compress_history and the PithMetrics.history_* group (7 fields, their
 #   reset/snapshot lines, record_history_compression). pith_stage2_keyframe stays as a pure
@@ -3076,6 +3088,9 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             out.sort(key=lambda x: x["score"], reverse=True)
 
         final = out[:k]
+        # #818: results beyond the root/result count k are dropped -- say so.
+        _pith_log_drop("recall", "roots (result limit k=%d)" % k, "results",
+                       [(item.get("node_id"), len(item.get("content") or "")) for item in out[k:]])
         # Pith Stage 4 (#55) §13.3 measurement: a "hit" here is scoped to what
         # this function can see -- a promoted-and-unsurfaced node that
         # survived ranking into this turn's returned set. It is an honest
@@ -4443,6 +4458,24 @@ def _pith_log_budget_drop(where: str, budget_label: str, unit: str, size_note: s
     logger.info(message)
 
 
+def _pith_log_drop(where: str, reason: str, unit: str, entries: Any) -> None:
+    """#818: ONE INFO line for a structural (non-budget) drop -- a count limit or an overlap.
+    `entries` is [(id, chars)].  Count, total chars and the reason are ALWAYS reported; ids are
+    named first-time-seen only (bounded), so a recurring drop cannot flood the log (same shape
+    as the #810 skip log).  Never called when nothing was dropped."""
+    entries = list(entries)
+    if not entries:
+        return
+    message = "pith %s: dropped %d %s (%d chars) - reason: %s" % (
+        where, len(entries), unit, sum(chars for _i, chars in entries), reason)
+    shown, already, more = _pith_note_ids("%s|%s" % (reason.split(" ")[0], i) for i, _c in entries)
+    sizes = {"%s|%s" % (reason.split(" ")[0], i): c for i, c in entries}
+    named = ", ".join("%s (%d chars)" % (k.split("|", 1)[1], sizes[k]) for k in shown)
+    extra = "".join([" [%d already reported]" % already if already else "",
+                     " [+%d more]" % more if more else ""])
+    logger.info("%s; first seen: %s%s", message, named or "-", extra)
+
+
 def _pith_admit_strict_prefix(ordered: List[Any], budget: int, size_of: Any,
                               separator: int = 0) -> tuple:
     """The ONE rule over units already in rank order.  size_of(unit) is the unit's whole size
@@ -4883,6 +4916,7 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
         return raw, _pith_node_text(node, fallback), False
 
     active_node_ids = {item.get("node_id") for item in surfaced if item.get("node_id")}
+    count_declined: Dict[str, tuple] = {}      # #818: node id -> (reason, chars), across all basins
     root_scores = [float(item.get("score", 0.0) or 0.0) for item in surfaced]
     score_lo = min(root_scores) if root_scores else 0.0
     score_hi = max(root_scores) if root_scores else 0.0
@@ -4907,12 +4941,16 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
         visited = {root_id}
         internal_support = 0.0
         total_support = 0.0
+        declined: Dict[str, str] = {}      # #818: neighbour the walk reached but did not admit -> reason
+        parent_id = root_id                # last expanded parent (defined even if the walk never runs)
 
         while frontier and len(members) < member_limit:
             parent_id, parent_text, parent_node, depth = frontier.pop(0)
             neighbors = _pith_graph_neighbors(graph, parent_id, active_node_ids)
             total_support += sum(strength for _nid, _kind, strength in neighbors)
             if depth >= depth_limit:
+                for _cid, _k, _s in neighbors:
+                    declined.setdefault(_cid, "depth_limit")
                 continue
             for child_id, edge_kind, strength in neighbors:
                 if child_id in visited or _pith_is_constitutional(graph, child_id):
@@ -4941,6 +4979,20 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
                 frontier.append((child_id, child_text, child, depth + 1))
                 if len(members) >= member_limit:
                     break
+
+        if len(members) >= member_limit:
+            # The member budget is spent: everything still unexpanded or unvisited was declined.
+            for _cid, _k, _s in _pith_graph_neighbors(graph, parent_id, active_node_ids):
+                declined.setdefault(_cid, "member_limit")
+            for f_id, _t, _n, f_depth in frontier:
+                for _cid, _k, _s in _pith_graph_neighbors(graph, f_id, active_node_ids):
+                    declined.setdefault(_cid, "depth_limit" if f_depth >= depth_limit else "member_limit")
+        for _cid, _reason in declined.items():
+            if _cid not in visited and not _pith_is_constitutional(graph, _cid):
+                _dnode = graph.nodes.get(_cid)
+                _dchars = len(_pith_node_raw_text(_dnode)) if _dnode is not None else 0
+                if _dchars:                                   # a node with no text carries nothing
+                    count_declined.setdefault(_cid, (_reason, _dchars))
 
         if "conflict" in coherence_states:
             coherence = "conflict"
@@ -5004,12 +5056,26 @@ def pith_connected_activation_basins(graph: Any, surfaced: List[Dict[str, Any]],
     raw_basins.sort(key=lambda line: (-line.score, line.node_id))
     selected = []
     covered = set()
+    overlapped = []
     for line in raw_basins:
         members = set(line.member_node_ids)
         if members and len(members & covered) / len(members) >= 0.6:
+            overlapped.append((line.node_id, len(_pith_render_connected_line(line))))
             continue
         selected.append(line)
         covered.update(members)
+    # #818: nothing above vanishes silently.  A declined neighbour counts only if it is in NO
+    # selected basin (it may have been admitted to another root's basin).
+    _pith_log_drop("basins", "member_limit (CC_PITH_PROVIDER_MEMBERS=%d)" % member_limit,
+                   "neighbour nodes",
+                   [(nid, chars) for nid, (why, chars) in count_declined.items()
+                    if why == "member_limit" and nid not in covered])
+    _pith_log_drop("basins", "depth_limit (CC_PITH_PROVIDER_DEPTH=%d)" % depth_limit,
+                   "neighbour nodes",
+                   [(nid, chars) for nid, (why, chars) in count_declined.items()
+                    if why == "depth_limit" and nid not in covered])
+    _pith_log_drop("basins", "overlap (>=60% of its members already covered by a higher-ranked basin)",
+                   "basins", overlapped)
     return selected
 
 

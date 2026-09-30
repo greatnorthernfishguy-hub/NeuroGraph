@@ -199,7 +199,12 @@ The same rule ("the ONE budget rule") governs the L1 recall path and the un-Pith
 recall rendering: every recalled item, from both the pattern stream and the
 SurfacingMonitor stream, is rendered WHOLE (the monitor stream is re-resolved whole by
 node id on the CC side; the shared monitor is not modified), and the budget decides
-how MANY items, never how much of one. (A keyframe applies only together with its delta; a budgeted
+how MANY items, never how much of one.
+
+The other places a learned item can be left out are loud too (#818): a neighbour declined
+by `CC_PITH_PROVIDER_MEMBERS` or `CC_PITH_PROVIDER_DEPTH`, a basin skipped at ≥60 %
+overlap with a higher-ranked one, and a recall result beyond the root count. Each is one
+INFO line per call with the count, the total size and the reason (ids named once). (A keyframe applies only together with its delta; a budgeted
 context has no room for the delta, so no keyframe is used here.)
 
 Slice A does not add a provider-specific victim cache. Recapture remains owned
