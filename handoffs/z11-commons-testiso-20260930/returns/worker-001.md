@@ -75,3 +75,20 @@ This is a real, executed, safe reproduction of the exact causal gap #738 exploit
 
 ## Commit / push
 
+Commit `7950c03aa85d5e6f87498e9bc3ae8036b7b21f47`, pushed to `origin/cc-laptop-commons-testiso-20260930` (`git push -u origin cc-laptop-commons-testiso-20260930` — new branch created on remote, tracking set up). No PR opened, nothing merged.
+
+```
+$ git status -sb && git log -1
+## cc-laptop-commons-testiso-20260930...origin/cc-laptop-commons-testiso-20260930
+?? handoffs/z11-commons-testiso-20260930/assignments/
+commit 7950c03aa85d5e6f87498e9bc3ae8036b7b21f47
+Author: greatnorthernfishguy-hub <greatnorthernfishguy@gmail.com>
+Date:   Tue Sep 29 18:08:05 2026 -0800
+
+    commons: env-drive checkpoint path (LAW 5) + test isolation (#738/#742)
+    ...
+    Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+```
+
+The one remaining untracked entry, `handoffs/z11-commons-testiso-20260930/assignments/`, is the assignment file itself — present (untracked) before I started, not created or modified by me, and outside my allowed-files list, so I left it as-is rather than committing it.
+
