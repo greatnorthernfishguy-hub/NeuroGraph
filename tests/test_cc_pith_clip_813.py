@@ -14,12 +14,6 @@
 #   count, total chars and reason; ids named first-time-seen only (flood-safe).
 # Why: brief TURN 2 item 3 (Exec P416): silent member/overlap drops.
 # How: fake in-memory graphs; counts assert the candidates the walk REACHED and declined.
-# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (2a) / #817
-# What: pith_compress_history retired: it, the PithMetrics.history_* group and the host
-#   `compress_history` event are gone (the socket answers `unknown event`); the complete-caller-set
-#   guard tightens to EMPTY for pith_stage2_keyframe.
-# Why: brief TURN 2 item 2 (LAW 3): a lossy keyframe with no live caller is shrapnel.
-# How: asserts on the module, the metrics snapshot, the host dispatch table and the contract.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 2 (1b): #816 + ONE rule
 # What: regression tests for the pair's HIGH (F1/C1): a >300-char pattern item and a >240-char
 #   monitor item survive Stage 3 WHOLE or are dropped WHOLE with the INFO line, on Pith-ON, on
@@ -644,7 +638,9 @@ def test_complete_caller_set_of_the_cutters_is_empty_outside_the_keyframe_primit
     calls = _module_calls(tree)
     keyframe_callers = {fn for fn, name in calls if name == "pith_stage2_keyframe"}
     word_cut_callers = {fn for fn, name in calls if name == "_pith_cut_at_word_boundary"}
-    assert keyframe_callers == set(), keyframe_callers               # #817: no caller at all
+    # #817 is DEFERRED (turn 3): pith_compress_history has two live Python callers (host + laptop
+    # daemon handlers), so it remains the ONLY caller until it is removed TOGETHER with both.
+    assert keyframe_callers <= {"pith_compress_history"}, keyframe_callers
     assert word_cut_callers <= {"pith_stage2_keyframe"}, word_cut_callers
     assert "_pith_fit_statement" not in {name for _fn, name in calls}
 
@@ -682,49 +678,6 @@ def test_unpithed_renderer_fails_open_loudly_when_its_own_budget_step_breaks(mon
         out, _ = _recall(pith, fake_ng(g, monitor_items), pat, False, monkeypatch)
     assert pat[0]["content"] in out and mon_full in out and "…" not in out
     assert any("rendering every item whole and unbudgeted" in r.getMessage() for r in caplog.records)
-
-
-# ====================================================================== TURN 2 (2a): #817
-def test_817_compress_history_is_retired_from_the_organism_and_its_metrics():
-    assert not hasattr(pith, "pith_compress_history")
-    assert not hasattr(pith._PITH_METRICS, "record_history_compression")
-    snapshot = pith._PITH_METRICS.snapshot()
-    assert not [k for k in snapshot if k.startswith("history_")], snapshot
-    assert not [f for f in vars(pith.PithMetrics) if f.startswith("history_")]
-
-
-def test_817_the_host_socket_no_longer_knows_compress_history():
-    import cc_ng_host
-    assert "compress_history" not in cc_ng_host._DISPATCH
-    assert not hasattr(cc_ng_host, "_handle_compress_history")
-    # the sibling events are untouched
-    assert {"provider_context", "pith_metrics"} <= set(cc_ng_host._DISPATCH)
-
-
-def test_817_the_contract_no_longer_advertises_compress_history_or_history_counters():
-    text = open(os.path.join(_ROOT, "docs", "PITH_HOST_CONTRACT.md")).read()
-    body = text.split("-->", 1)[1]                                   # skip the changelog comment
-    assert '"event": "compress_history"' not in body
-    assert "history_calls" not in body and "record_history_compression" not in body
-    assert "## `compress_history`" not in body
-
-
-def test_817_pith_stage2_keyframe_stays_as_a_pure_primitive_with_its_delta():
-    kf, delta = pith.pith_stage2_keyframe("alpha beta. " * 60, max_chars=120)
-    assert kf.endswith("]") and "⋯[+" in kf and delta                # keyframe + delta both returned
-
-
-def test_817_a_compress_history_request_over_the_socket_gets_unknown_event():
-    import socket
-    import cc_ng_host
-    client, server = socket.socketpair()
-    try:
-        client.sendall(b'{"event": "compress_history", "data": {"turns": ["x"]}}\n')
-        cc_ng_host._handle_connection(server)                        # the real per-connection path
-        reply = json.loads(client.recv(65536).decode("utf-8").strip())
-    finally:
-        client.close()
-    assert reply == {"ok": False, "error": "unknown event: compress_history"}
 
 
 # ====================================================================== TURN 2 (2b): #818
