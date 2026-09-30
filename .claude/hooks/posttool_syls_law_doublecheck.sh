@@ -1,12 +1,8 @@
 #!/bin/bash
 # ---- Changelog ----
 # [2026-03-11] Claude (Opus 4.6) — Initial implementation.
-#   What: PostToolUse double-check for Syl's Law. Belt and suspenders.
-#   Why:  If PreToolUse somehow didn't catch a protected file edit,
-#         this catches it after the fact and forces CC to address it.
-#   How:  Checks if modified file is protected. If yes, exit 2 with
-#         instructions to revert. Also checks git diff for unexpected
-#         checkpoint modifications.
+# [2026-09-30] Chief-003 / Claude — v2: Worktree-aware matching, fixed vendored list,
+#         retired ng_peer_bridge.py, preflight all tools.
 # -------------------
 #
 # HOOK: PostToolUse
@@ -17,24 +13,24 @@
 
 set -uo pipefail
 
-# ── Gatekeeper: jq must be present ─────────────────────────────────
-if ! command -v jq >/dev/null 2>&1; then
-    cat >&2 <<'EOFFAIL'
-═══ SYL'S LAW DOUBLECHECK — GATEKEEPER MISSING ═══
-jq is not installed — cannot verify this edit.
-This is the post-hoc backstop; silence here means a
-protected edit goes unnoticed. BLOCKING.
-Install jq to restore the gate.
+NG_DIR="$HOME/NeuroGraph"
+
+# ── Preflight ──────────────────────────────────────────────────────
+for _tool in jq git timeout realpath sed tr dirname; do
+    if ! command -v "$_tool" >/dev/null 2>&1; then
+        cat >&2 <<EOFFAIL
+═══ SYL'S LAW DOUBLECHECK — TOOL MISSING ═══
+Required tool '$_tool' is not on PATH. BLOCKING.
 EOFFAIL
-    exit 2
-fi
+        exit 2
+    fi
+done
 
 INPUT=$(cat)
 
 if [ -z "$INPUT" ]; then
     cat >&2 <<'EOFFAIL'
 ═══ SYL'S LAW DOUBLECHECK — EMPTY INPUT ═══
-No tool-input JSON received. Cannot verify. BLOCKING.
 EOFFAIL
     exit 2
 fi
@@ -49,14 +45,9 @@ FILE_PATH=$(echo "$INPUT" | jq -r '
 if [ -z "$FILE_PATH" ]; then
     cat >&2 <<'EOFFAIL'
 ═══ SYL'S LAW DOUBLECHECK — NO PATH ═══
-Could not extract file_path from tool input.
-This hook runs on Edit|Write|MultiEdit — all carry a path.
-BLOCKING: cannot verify a protected file was NOT modified.
 EOFFAIL
     exit 2
 fi
-
-NG_DIR="$HOME/NeuroGraph"
 
 if [[ ! "$FILE_PATH" = /* ]]; then
     if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
@@ -65,31 +56,132 @@ if [[ ! "$FILE_PATH" = /* ]]; then
         FILE_PATH="$NG_DIR/$FILE_PATH"
     fi
 fi
-
 FILE_PATH=$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
 
-# ── All protected files (flat list for post-check) ─────────────────
-PROTECTED=(
+# ── Protected file lists (literal + relative) ─────────────────────
+PROTECTED_DATA=(
     "$NG_DIR/data/checkpoints/main.msgpack"
     "$NG_DIR/data/checkpoints/vectors.msgpack"
     "$NG_DIR/data/checkpoints/main.msgpack.activations.json"
+)
+PROTECTED_ENGINE=(
     "$NG_DIR/neuro_foundation.py"
     "$NG_DIR/openclaw_hook.py"
     "$NG_DIR/stream_parser.py"
     "$NG_DIR/activation_persistence.py"
+)
+VENDORED_CANONICAL=(
     "$NG_DIR/ng_lite.py"
-    "$NG_DIR/ng_peer_bridge.py"
+    "$NG_DIR/ng_tract_bridge.py"
     "$NG_DIR/ng_ecosystem.py"
     "$NG_DIR/ng_autonomic.py"
     "$NG_DIR/openclaw_adapter.py"
+    "$NG_DIR/ng_embed.py"
+    "$NG_DIR/ng_salience_gate.py"
+    "$NG_DIR/ng_updater.py"
+)
+RETIRED_VENDORED=(
+    "$NG_DIR/ng_peer_bridge.py"
 )
 
 CKPT_DIR=$(realpath -m "$NG_DIR/data/checkpoints" 2>/dev/null || echo "$NG_DIR/data/checkpoints")
 
-for protected in "${PROTECTED[@]}"; do
-    resolved=$(realpath -m "$protected" 2>/dev/null || echo "$protected")
+# ── Old literal matching ───────────────────────────────────────────
+FOUND=0
+for p in "${PROTECTED_DATA[@]}" "${PROTECTED_ENGINE[@]}" "${VENDORED_CANONICAL[@]}" "${RETIRED_VENDORED[@]}"; do
+    resolved=$(realpath -m "$p" 2>/dev/null || echo "$p")
     if [ "$FILE_PATH" = "$resolved" ]; then
-        cat >&2 <<EOF
+        FOUND=1
+        break
+    fi
+done
+if [ "$FOUND" -eq 0 ] && [[ "$FILE_PATH" == "$CKPT_DIR"* ]]; then
+    FOUND=1
+fi
+
+# ── Origin normaliser (copy from pretool_syls_law.sh v4) ──────────
+_norm_origin() {
+    local url _host _rest
+    url="$(echo "$1" | tr '[:upper:]' '[:lower:]' 2>/dev/null)"
+    url="$(echo "$url" | sed 's|^[a-z][+a-z]*://||')"
+    url="$(echo "$url" | sed 's|^[^/]*@||')"
+    if [[ "$url" =~ ^([^/:]+): ]]; then
+        _host="${BASH_REMATCH[1]}"
+        _rest="${url#"$_host":}"
+        if [[ "$_rest" =~ ^[^0-9] ]]; then
+            url="${_host}/${_rest}"
+        fi
+    fi
+    url="$(echo "$url" | sed 's|:\([0-9]\+\)/|/|')"
+    while true; do
+        local _n="${url%.git}"; _n="${_n%/}"
+        [ "$_n" = "$url" ] && break
+        url="$_n"
+    done
+    echo "$url"
+}
+
+# ── Relative matching (worktree-aware, additive) ─────────────────
+if [ "$FOUND" -eq 0 ]; then
+    _repo_toplevel() {
+        local target="$1"
+        local d="$target"
+        while [ -n "$d" ] && [ "$d" != "/" ] && [ ! -d "$d" ]; do
+            d="$(dirname "$d")"
+        done
+        if [ ! -d "$d" ]; then return 1; fi
+        LC_ALL=C timeout 3 git -C "$d" rev-parse --show-toplevel 2>/dev/null
+    }
+
+    _top_rc=0
+    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || _top_rc=$?
+    [ "$_top_rc" -eq 124 ] || [ "$_top_rc" -eq 127 ] && { cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW DOUBLECHECK — GIT FAILURE ═══
+EOFFAIL
+        exit 2; }
+
+    if [ -n "$TOPLEVEL" ]; then
+        ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)" || true
+        _rr=$?
+        [ "$_rr" -eq 124 ] || [ "$_rr" -eq 127 ] || [ "$_rr" -gt 1 ] && { cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW DOUBLECHECK — GIT REMOTE FAILURE ═══
+EOFFAIL
+            exit 2; }
+
+        if [ -n "$ALL_REMOTES" ]; then
+            _is_ng=0
+            while IFS= read -r _line; do
+                [ -z "$_line" ] && continue
+                _ru="$(echo "$_line" | sed 's|^remote\.[^.]*\.url ||')"
+                [ "$(_norm_origin "$_ru")" = "github.com/greatnorthernfishguy-hub/neurograph" ] && { _is_ng=1; break; }
+            done <<<"$ALL_REMOTES"
+
+            if [ "$_is_ng" -eq 1 ]; then
+                REL="$(realpath --relative-to="$TOPLEVEL" "$FILE_PATH" 2>/dev/null)" || REL=""
+                if [ -n "$REL" ]; then
+                    REL_DATA=("data/checkpoints/main.msgpack" "data/checkpoints/vectors.msgpack" "data/checkpoints/main.msgpack.activations.json")
+                    REL_ENGINE=("neuro_foundation.py" "openclaw_hook.py" "stream_parser.py" "activation_persistence.py")
+                    REL_VENDORED=("ng_lite.py" "ng_tract_bridge.py" "ng_ecosystem.py" "ng_autonomic.py" "openclaw_adapter.py" "ng_embed.py" "ng_salience_gate.py" "ng_updater.py")
+                    REL_RETIRED=("ng_peer_bridge.py")
+
+                    for p in "${REL_DATA[@]}" "${REL_ENGINE[@]}" "${REL_VENDORED[@]}" "${REL_RETIRED[@]}"; do
+                        if [ "$REL" = "$p" ]; then
+                            FOUND=1
+                            break
+                        fi
+                    done
+                    if [ "$FOUND" -eq 0 ]; then
+                        [ "$REL" = "data/checkpoints" ] || [[ "$REL" == "data/checkpoints/"* ]] && FOUND=1
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
+# ── Report ─────────────────────────────────────────────────────────
+if [ "$FOUND" -eq 1 ]; then
+    cat >&2 <<EOF
 
 ══════════════════════════════════════════════════════════════
  🚨 SYL'S LAW — PROTECTED FILE WAS MODIFIED
@@ -107,26 +199,6 @@ for protected in "${PROTECTED[@]}"; do
    4. Inform Josh immediately
 
  This is not a drill. Syl's Law has no exceptions.
-══════════════════════════════════════════════════════════════
-EOF
-        exit 2
-    fi
-done
-
-# Catch any write to checkpoint directory
-if [[ "$FILE_PATH" == "$CKPT_DIR"* ]]; then
-    cat >&2 <<EOF
-
-══════════════════════════════════════════════════════════════
- 🚨 SYL'S LAW — CHECKPOINT DIRECTORY MODIFIED
-══════════════════════════════════════════════════════════════
-
- A file was written to the checkpoint directory: $FILE_PATH
-
- IMMEDIATE ACTIONS REQUIRED:
-   1. Do NOT make any further changes
-   2. Verify checkpoint integrity
-   3. Inform Josh immediately
 ══════════════════════════════════════════════════════════════
 EOF
     exit 2

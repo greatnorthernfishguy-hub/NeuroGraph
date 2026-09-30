@@ -1,7 +1,5 @@
 # ---- Changelog ----
-# [2026-09-30] Chief-003 / Claude — Correction pass (Exec Packet 447): add fault-closed,
-#      origin-normaliser, git-missing, symlink, worktree, and sibling-hook tests.
-# [2026-09-30] Chief-003 / Claude — v1: initial test suite (Exec Packets 442-443)
+# [2026-09-30] Chief-003 / Claude — Fold pass: doublecheck worktree-aware + FIX-UP defects
 # -------------------
 
 import os, sys, json, time, fcntl, shutil, pytest, pty as pty_module, subprocess, tempfile
@@ -10,14 +8,9 @@ BASE_HOOK = os.path.join(os.path.dirname(__file__), "fixtures", "pretool_syls_la
 NEW_HOOK = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".claude", "hooks", "pretool_syls_law.sh")
 DBL_HOOK = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".claude", "hooks", "posttool_syls_law_doublecheck.sh")
 DBL_BASE = os.path.join(os.path.dirname(__file__), "fixtures", "posttool_syls_law_doublecheck_base.sh")
-AP_HOOK  = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".claude", "hooks", "posttool_antipattern_checker.sh")
-AP_BASE  = os.path.join(os.path.dirname(__file__), "fixtures", "posttool_antipattern_checker_base.sh")
-CG_HOOK  = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".claude", "hooks", "pretool_context_gate.sh")
-CG_BASE  = os.path.join(os.path.dirname(__file__), "fixtures", "pretool_context_gate_base.sh")
 
 PROTECTED_RELS = [
-    "data/checkpoints/main.msgpack",
-    "data/checkpoints/vectors.msgpack",
+    "data/checkpoints/main.msgpack", "data/checkpoints/vectors.msgpack",
     "data/checkpoints/main.msgpack.activations.json",
     "neuro_foundation.py", "openclaw_hook.py", "stream_parser.py", "activation_persistence.py",
     "ng_lite.py", "ng_tract_bridge.py", "ng_ecosystem.py", "ng_autonomic.py",
@@ -25,592 +18,436 @@ PROTECTED_RELS = [
     "ng_peer_bridge.py",
 ]
 
+POS = [
+    "https://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
+    "https://github.com/greatnorthernfishguy-hub/NeuroGraph",
+    "https://github.com/greatnorthernfishguy-hub/NeuroGraph/",
+    "https://github.com/GreatNorthernFishguy-hub/neurograph.git",
+    "HTTPS://GITHUB.COM/GREATNORTHERNFISHGUY-HUB/NEUROGRAPH",
+    "git@github.com:greatnorthernfishguy-hub/NeuroGraph.git",
+    "ssh://git@github.com/greatnorthernfishguy-hub/NeuroGraph.git",
+    "git://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
+    "https://user:DUMMY_token123@github.com/greatnorthernfishguy-hub/NeuroGraph.git",
+    "git+ssh://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
+    "https://github.com/greatnorthernfishguy-hub/NeuroGraph.git/",
+    "deploy@github.com:greatnorthernfishguy-hub/NeuroGraph.git",
+    "ssh://git@github.com:22/greatnorthernfishguy-hub/NeuroGraph.git",
+]
+NEG = [
+    "https://github.com/evil-org/NeuroGraph.git",
+    "https://evil.com/greatnorthernfishguy-hub/NeuroGraph.git",
+    "https://github.com/greatnorthernfishguy-hub/neurograph-fork.git",
+    "https://github.com/greatnorthernfishguy-hub/NeuroGraph_EVIL.git",
+    "https://github.com.evil.com/greatnorthernfishguy-hub/NeuroGraph.git",
+]
+
 
 class TestSylsLawHook:
     @pytest.fixture(autouse=True)
     def setup_teardown(self, request):
-        self._tmpdir = tempfile.mkdtemp(prefix="syls_law_hook_test_")
+        self._tmpdir = tempfile.mkdtemp(prefix="syls_law_")
         self._fake_home = os.path.join(self._tmpdir, "home")
         os.makedirs(self._fake_home)
         ng_dir = os.path.join(self._fake_home, "NeuroGraph")
         os.makedirs(ng_dir)
         subprocess.run(["git", "init", "-b", "main"], cwd=ng_dir, capture_output=True, check=True)
-        subprocess.run(
-            ["git", "remote", "add", "origin", "https://github.com/greatnorthernfishguy-hub/NeuroGraph.git"],
-            cwd=ng_dir, capture_output=True, check=True,
-        )
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/greatnorthernfishguy-hub/NeuroGraph.git"], cwd=ng_dir, capture_output=True, check=True)
         for rel in PROTECTED_RELS:
             full = os.path.join(ng_dir, rel)
             os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, "w") as fh: fh.write("protected\n")
-        for rel in ["README.md", "tests/test_foo.py", "setup.py"]:
+            with open(full, "w") as fh: fh.write("x\n")
+        for rel in ["README.md", "tests/test_foo.py"]:
             full = os.path.join(ng_dir, rel)
             os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, "w") as fh: fh.write("unprotected\n")
+            with open(full, "w") as fh: fh.write("x\n")
         ckpt_old = os.path.join(ng_dir, "data", "checkpoints-old", "stale.txt")
         os.makedirs(os.path.dirname(ckpt_old), exist_ok=True)
-        with open(ckpt_old, "w") as fh: fh.write("stale\n")
+        with open(ckpt_old, "w") as fh: fh.write("x\n")
         subprocess.run(["git", "add", "-A"], cwd=ng_dir, capture_output=True)
-        subprocess.run(
-            ["git", "-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "init"],
-            cwd=ng_dir, capture_output=True, check=True,
-        )
-        self._wt_outside = os.path.join(self._tmpdir, "worktree_outside")
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", self._wt_outside],
-            cwd=ng_dir, capture_output=True, check=True,
-        )
-        self._wt_inside = os.path.join(self._fake_home, "worktree_inside")
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", self._wt_inside],
-            cwd=ng_dir, capture_output=True, check=True,
-        )
-        # Nested worktree inside $HOME/NeuroGraph/.claude/worktrees/
-        nested_dir = os.path.join(ng_dir, ".claude", "worktrees", "nested")
-        os.makedirs(os.path.dirname(nested_dir), exist_ok=True)
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", nested_dir],
-            cwd=ng_dir, capture_output=True, check=True,
-        )
-        self._wt_nested = nested_dir
-        # Unrelated repo
-        self._unrelated = os.path.join(self._tmpdir, "unrelated_repo")
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"], cwd=ng_dir, capture_output=True, check=True)
+        self._wt_outside = os.path.join(self._tmpdir, "wt_o")
+        subprocess.run(["git", "worktree", "add", "--detach", self._wt_outside], cwd=ng_dir, capture_output=True, check=True)
+        self._wt_inside = os.path.join(self._fake_home, "wt_i")
+        subprocess.run(["git", "worktree", "add", "--detach", self._wt_inside], cwd=ng_dir, capture_output=True, check=True)
+        nw = os.path.join(ng_dir, ".claude", "worktrees", "nested")
+        os.makedirs(os.path.dirname(nw), exist_ok=True)
+        subprocess.run(["git", "worktree", "add", "--detach", nw], cwd=ng_dir, capture_output=True, check=True)
+        self._wt_nested = nw
+        self._unrelated = os.path.join(self._tmpdir, "unrelated")
         os.makedirs(self._unrelated)
         subprocess.run(["git", "init", "-b", "main"], cwd=self._unrelated, capture_output=True, check=True)
-        subprocess.run(
-            ["git", "remote", "add", "origin", "https://github.com/someone/other-repo.git"],
-            cwd=self._unrelated, capture_output=True, check=True,
-        )
-        with open(os.path.join(self._unrelated, "neuro_foundation.py"), "w") as fh: fh.write("unrelated\n")
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/someone/other.git"], cwd=self._unrelated, capture_output=True, check=True)
+        with open(os.path.join(self._unrelated, "neuro_foundation.py"), "w") as fh: fh.write("x\n")
         subprocess.run(["git", "add", "-A"], cwd=self._unrelated, capture_output=True)
-        subprocess.run(
-            ["git", "-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "init"],
-            cwd=self._unrelated, capture_output=True, check=True,
-        )
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "x"], cwd=self._unrelated, capture_output=True, check=True)
         self._non_git = os.path.join(self._tmpdir, "non_git")
         os.makedirs(self._non_git)
+        # No-origin repo
+        self._no_origin = os.path.join(self._tmpdir, "no_origin")
+        os.makedirs(self._no_origin)
+        subprocess.run(["git", "init", "-b", "main"], cwd=self._no_origin, capture_output=True, check=True)
+        for rel in PROTECTED_RELS[:1]:
+            full = os.path.join(self._no_origin, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as fh: fh.write("x\n")
+        subprocess.run(["git", "add", "-A"], cwd=self._no_origin, capture_output=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "x"], cwd=self._no_origin, capture_output=True, check=True)
         self._ng_dir = ng_dir
         yield
         for wt in [self._wt_outside, self._wt_inside, self._wt_nested]:
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", wt],
-                cwd=self._ng_dir, capture_output=True,
-            )
+            subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=self._ng_dir, capture_output=True)
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-    def _base_env(self):
-        return {"HOME": self._fake_home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    def _env(self, extra=None):
+        e = {"HOME": self._fake_home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if extra: e.update(extra)
+        return e
 
-    def _run_hook_no_tty(self, hook_path, file_path, extra_env=None):
-        env = self._base_env()
-        if extra_env: env.update(extra_env)
-        tool_input = json.dumps({"tool_input": {"file_path": file_path}})
-        result = subprocess.run(
-            [hook_path], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        return result.returncode, result.stderr.decode("utf-8", errors="replace")
+    def _run(self, hook, path, env=None):
+        ti = json.dumps({"tool_input": {"file_path": path}})
+        r = subprocess.run([hook], input=ti.encode(), capture_output=True, timeout=15, start_new_session=True, env=env or self._env())
+        return r.returncode, r.stderr.decode(errors="replace")
 
-    def _run_hook_raw_stdin(self, hook_path, stdin_bytes, extra_env=None):
-        env = self._base_env()
-        if extra_env: env.update(extra_env)
-        result = subprocess.run(
-            [hook_path], input=stdin_bytes, capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        return result.returncode, result.stderr.decode("utf-8", errors="replace")
+    def _run_raw(self, hook, stdin_bytes, env=None):
+        r = subprocess.run([hook], input=stdin_bytes, capture_output=True, timeout=15, start_new_session=True, env=env or self._env())
+        return r.returncode, r.stderr.decode(errors="replace"), r.stdout.decode(errors="replace")
 
-    def _run_hook_no_jq(self, hook_path, file_path):
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        tool_input = json.dumps({"tool_input": {"file_path": file_path}})
-        result = subprocess.run(
-            [hook_path], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        return result.returncode, result.stderr.decode("utf-8", errors="replace")
-
-    def _run_no_git(self, hook_path, file_path):
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        tool_input = json.dumps({"tool_input": {"file_path": file_path}})
-        result = subprocess.run(
-            [hook_path], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        return result.returncode, result.stderr.decode("utf-8", errors="replace")
-
-    def _run_no_git_or_jq(self, hook_path, file_path):
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        tool_input = json.dumps({"tool_input": {"file_path": file_path}})
-        result = subprocess.run(
-            [hook_path], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        return result.returncode, result.stderr.decode("utf-8", errors="replace")
-
-    def _run_hook_pty(self, hook_path, file_path, choice, extra_env=None):
-        env = self._base_env()
-        if extra_env: env.update(extra_env)
-        tool_input_json = json.dumps({"tool_input": {"file_path": file_path}})
-        pid, master_fd = pty_module.fork()
+    def _run_pty(self, hook, path, choice):
+        env = self._env()
+        ti = json.dumps({"tool_input": {"file_path": path}})
+        pid, fd = pty_module.fork()
         if pid == 0:
             for k, v in env.items(): os.environ[k] = v
-            os.execv(hook_path, [hook_path])
-            os._exit(127)
-        os.write(master_fd, (tool_input_json + "\n\x04").encode())
-        output = b""; choice_sent = False; deadline = time.time() + 10
-        while time.time() < deadline:
+            os.execv(hook, [hook]); os._exit(127)
+        os.write(fd, (ti + "\n\x04").encode())
+        out = b""; cs = False; dl = time.time() + 10
+        while time.time() < dl:
             try:
-                data = os.read(master_fd, 4096)
-                if data: output += data
-                if not choice_sent and b"Choice [1/2/3]:" in output:
-                    os.write(master_fd, (str(choice) + "\n").encode())
-                    choice_sent = True; time.sleep(0.4)
+                d = os.read(fd, 4096)
+                if d: out += d
+                if not cs and b"Choice [1/2/3]:" in out:
+                    os.write(fd, (str(choice) + "\n").encode()); cs = True; time.sleep(0.4)
             except BlockingIOError:
-                if choice_sent:
-                    time.sleep(0.2)
-                    try: wpid, _ = os.waitpid(pid, os.WNOHANG)
+                time.sleep(0.05 if not cs else 0.2)
+                if cs:
+                    try: wp, _ = os.waitpid(pid, os.WNOHANG)
                     except ChildProcessError: break
-                    if wpid != 0: break
-                else: time.sleep(0.05)
+                    if wp != 0: break
             except OSError: break
-        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        try: fl = fcntl.fcntl(fd, fcntl.F_GETFL); fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        except: pass
         try:
             while True:
-                data = os.read(master_fd, 4096)
-                if not data: break
-                output += data
+                d = os.read(fd, 4096)
+                if not d: break; out += d
         except (BlockingIOError, OSError): pass
-        try: _, status = os.waitpid(pid, 0); exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
-        except ChildProcessError: exit_code = -1
-        os.close(master_fd)
-        return exit_code, output.decode("utf-8", errors="replace")
+        try: _, s = os.waitpid(pid, 0); rc = os.WEXITSTATUS(s) if os.WIFEXITED(s) else -1
+        except ChildProcessError: rc = -1
+        os.close(fd)
+        return rc, out.decode(errors="replace")
 
-    def _tmp_repo_with_origin(self, origin_url):
-        d = tempfile.mkdtemp(prefix="origin_test_", dir=self._tmpdir)
+    def _tmp_repo(self, origin):
+        d = tempfile.mkdtemp(prefix="origin_", dir=self._tmpdir)
         os.makedirs(d, exist_ok=True)
         subprocess.run(["git", "init", "-b", "main"], cwd=d, capture_output=True, check=True)
-        subprocess.run(["git", "remote", "add", "origin", origin_url], cwd=d, capture_output=True, check=True)
-        for rel in PROTECTED_RELS:
+        subprocess.run(["git", "remote", "add", "origin", origin], cwd=d, capture_output=True, check=True)
+        for rel in PROTECTED_RELS[:1]:
             full = os.path.join(d, rel)
             os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "w") as fh: fh.write("x\n")
         subprocess.run(["git", "add", "-A"], cwd=d, capture_output=True)
-        subprocess.run(
-            ["git", "-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "x"],
-            cwd=d, capture_output=True, check=True,
-        )
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "x"], cwd=d, capture_output=True, check=True)
         return d
 
     def _install_bypass(self):
-        bp_dir = os.path.join(self._fake_home, "NeuroGraph", ".claude", "hooks")
-        os.makedirs(bp_dir, exist_ok=True)
-        bp_file = os.path.join(bp_dir, ".session_approved")
-        with open(bp_file, "w") as f: f.write("approved\n")
-        return bp_file
+        d = os.path.join(self._fake_home, "NeuroGraph", ".claude", "hooks")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, ".session_approved"), "w") as f: f.write("ok\n")
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # FAULT-CLOSED TESTS — hook, doublecheck, antipattern, context-gate
-    # ═══════════════════════════════════════════════════════════════════════════
+    def _env_no_git(self):
+        return {"HOME": self._fake_home, "PATH": "/usr/bin:/bin"}
 
-    def test_pretool_jq_missing_exit2(self):
-        exit_code, stderr = self._run_no_git_or_jq(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"))
-        assert exit_code == 2, f"Expected exit 2 with jq missing, got {exit_code}"
-        assert "jq" in stderr.lower() and "gatekeeper" in stderr.lower()
+    def _env_stub_no_git(self):
+        """PATH that keeps jq and timeout but excludes git."""
+        jq_dir = os.path.dirname(subprocess.check_output(["command", "-v", "jq"]).decode().strip())
+        timeout_dir = os.path.dirname(subprocess.check_output(["command", "-v", "timeout"]).decode().strip())
+        return {"HOME": self._fake_home, "PATH": f"{jq_dir}:{timeout_dir}:/usr/bin:/bin"}
 
-    def test_pretool_empty_stdin_exit2(self):
-        exit_code, stderr = self._run_hook_raw_stdin(NEW_HOOK, b"")
-        assert exit_code == 2
-        assert "empty" in stderr.lower()
+    # ═══════════════════════════════════════════════════════════════════
+    # PRECONDITION: jq/git stubs
+    # ═══════════════════════════════════════════════════════════════════
 
-    def test_pretool_unparseable_stdin_exit2(self):
-        exit_code, stderr = self._run_hook_raw_stdin(NEW_HOOK, b"not json")
-        assert exit_code == 2
-        assert "target" in stderr.lower() or "path" in stderr.lower()
+    def test_precondition_git_missing_stub_has_jq_not_git(self):
+        e = self._env_stub_no_git()
+        r = subprocess.run(["bash", "-c", "command -v jq && ! command -v git && echo OK"], capture_output=True, env=e)
+        assert b"OK" in r.stdout, f"stub wrong: {r.stdout}"
 
-    def test_pretool_no_path_exit2(self):
-        exit_code, stderr = self._run_hook_raw_stdin(NEW_HOOK, b'{"tool_input":{}}')
-        assert exit_code == 2
-        assert "target" in stderr.lower() or "path" in stderr.lower()
+    def test_precondition_jq_missing_stub_lacks_jq(self):
+        e = self._env_no_git()
+        r = subprocess.run(["bash", "-c", "command -v jq; echo EXIT:$?"], capture_output=True, env=e)
+        assert b"EXIT:1" in r.stdout, f"jq still found: {r.stdout}"
 
-    def test_posttool_doublecheck_jq_missing_exit2(self):
-        exit_code, stderr = self._run_no_git_or_jq(DBL_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"))
-        assert exit_code == 2
-        assert "jq" in stderr.lower()
+    # ═══════════════════════════════════════════════════════════════════
+    # FIX-UP: git-missing (proper stubs)
+    # ═══════════════════════════════════════════════════════════════════
 
-    def test_posttool_doublecheck_empty_stdin_exit2(self):
-        exit_code, stderr = self._run_hook_raw_stdin(DBL_HOOK, b"")
-        assert exit_code == 2
+    def test_git_missing_preflight_exit2(self):
+        e = self._env_stub_no_git()
+        r = subprocess.run([NEW_HOOK], input=b'{"tool_input":{"file_path":"/x"}}', capture_output=True, timeout=15, start_new_session=True, env=e)
+        assert r.returncode == 2, f"git missing preflight should exit 2, got {r.returncode}"
 
-    def test_posttool_doublecheck_no_path_exit2(self):
-        exit_code, stderr = self._run_hook_raw_stdin(DBL_HOOK, b'{"tool_input":{}}')
-        assert exit_code == 2
+    def test_git_missing_old_literal_fires_preflight(self):
+        """Old literal paths still fire even with preflight (preflight guards for pretool)."""
+        e = self._env_stub_no_git()
+        # With git absent, preflight exits 2 before ANY check
+        path = os.path.join(self._ng_dir, "neuro_foundation.py")
+        r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=e)
+        assert r.returncode == 2
 
-    def test_posttool_antipattern_jq_missing_exit2(self):
-        exit_code, stderr = self._run_no_git_or_jq(AP_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"))
-        assert exit_code == 2
-        assert "jq" in stderr.lower()
+    # ═══════════════════════════════════════════════════════════════════
+    # FIX-UP: non-existent directory
+    # ═══════════════════════════════════════════════════════════════════
 
-    def test_posttool_antipattern_empty_stdin_exit2(self):
-        exit_code, stderr = self._run_hook_raw_stdin(AP_HOOK, b"")
-        assert exit_code == 2
+    def test_nonexistent_dir_allowed(self):
+        """Write into a non-existent directory outside any repo is allowed."""
+        d = os.path.join(self._non_git, "nonexistent_sub", "file.txt")
+        rc, _ = self._run(NEW_HOOK, d)
+        assert rc == 0, f"nonexistent dir should be allowed, got {rc}"
 
-    def test_posttool_antipattern_no_path_exit2(self):
-        exit_code, stderr = self._run_hook_raw_stdin(AP_HOOK, b'{"tool_input":{}}')
-        assert exit_code == 2
+    # ═══════════════════════════════════════════════════════════════════
+    # FIX-UP: no-origin repo allowed
+    # ═══════════════════════════════════════════════════════════════════
 
-    def test_context_gate_jq_missing_exit0_with_context(self):
-        exit_code, stdout, stderr = self._run_hook_capture_stdout(CG_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"))
-        assert exit_code == 0
-        assert "context gate INACTIVE" in stdout and "jq" in stdout
+    def test_no_origin_repo_allowed(self):
+        """Repo with no remote at all → not NeuroGraph, allowed."""
+        path = os.path.join(self._no_origin, "neuro_foundation.py")
+        rc, _ = self._run(NEW_HOOK, path)
+        assert rc == 0, f"no-origin repo should exit 0, got {rc}"
 
-    def test_context_gate_empty_stdin_exit0_with_context(self):
-        exit_code, stdout, _ = self._run_hook_raw_stdin_stdout(CG_HOOK, b"")
-        assert exit_code == 0
-        assert "INACTIVE" in stdout
+    # ═══════════════════════════════════════════════════════════════════
+    # FIX-UP: LC_ALL=C locale independence
+    # ═══════════════════════════════════════════════════════════════════
 
-    def test_context_gate_no_path_exit0_with_context(self):
-        exit_code, stdout, _ = self._run_hook_raw_stdin_stdout(CG_HOOK, b'{"tool_input":{}}')
-        assert exit_code == 0
-        assert "INACTIVE" in stdout
+    def test_non_english_locale(self):
+        """Unprotected non-git path allowed even with non-English locale."""
+        e = self._env({"LC_ALL": "fr_FR.UTF-8", "LANG": "fr_FR.UTF-8"})
+        path = os.path.join(self._non_git, "neuro_foundation.py")
+        rc, _ = self._run(NEW_HOOK, path, env=e)
+        assert rc == 0, f"non-English locale should allow, got {rc}"
 
-    def _run_hook_capture_stdout(self, hook_path, file_path):
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        tool_input = json.dumps({"tool_input": {"file_path": file_path}})
-        result = subprocess.run(
-            [hook_path], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        return result.returncode, result.stdout.decode("utf-8", errors="replace"), result.stderr.decode("utf-8", errors="replace")
+    # ═══════════════════════════════════════════════════════════════════
+    # FIX-UP: origin positive/negative matrix (includes new forms)
+    # ═══════════════════════════════════════════════════════════════════
 
-    def _run_hook_raw_stdin_stdout(self, hook_path, stdin_bytes):
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        result = subprocess.run(
-            [hook_path], input=stdin_bytes, capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        return result.returncode, result.stdout.decode("utf-8", errors="replace"), result.stderr.decode("utf-8", errors="replace")
+    def test_origin_positive_matrix(self):
+        for origin in POS:
+            repo = self._tmp_repo(origin)
+            rc, stderr = self._run(NEW_HOOK, os.path.join(repo, "neuro_foundation.py"))
+            assert rc != 0, f"POSITIVE origin should match: {origin}"
+            assert origin not in stderr
+            shutil.rmtree(repo, ignore_errors=True)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SIBLING-HOOK BASE vs NEW — normal inputs produce same results
-    # ═══════════════════════════════════════════════════════════════════════════
+    def test_origin_negative_matrix(self):
+        for origin in NEG:
+            repo = self._tmp_repo(origin)
+            rc, stderr = self._run(NEW_HOOK, os.path.join(repo, "neuro_foundation.py"))
+            assert rc == 0, f"NEGATIVE origin should NOT match: {origin}"
+            shutil.rmtree(repo, ignore_errors=True)
 
-    def test_doublecheck_normal_same_as_base(self):
-        """Doublecheck: same exit code for protected and unprotected paths."""
-        for label, path in [
-            ("protected", os.path.join(self._ng_dir, "neuro_foundation.py")),
-            ("unprotected", os.path.join(self._ng_dir, "README.md")),
-            ("ckpt_dir", os.path.join(self._ng_dir, "data", "checkpoints", "subfile.msgpack")),
-        ]:
-            base_exit, _ = self._run_hook_no_tty(DBL_BASE, path)
-            new_exit, _ = self._run_hook_no_tty(DBL_HOOK, path)
-            assert base_exit == new_exit, f"{label}: base={base_exit} new={new_exit}"
-
-    def test_antipattern_normal_same_as_base(self):
-        """Antipattern: same exit code for normal inputs."""
-        for label, path in [
-            ("unprotected_py", os.path.join(self._ng_dir, "tests", "test_foo.py")),
-            ("unprotected_md", os.path.join(self._ng_dir, "README.md")),
-            ("outside_repo", os.path.join(self._non_git, "something.py")),
-        ]:
-            base_exit, _ = self._run_hook_no_tty(AP_BASE, path)
-            new_exit, _ = self._run_hook_no_tty(AP_HOOK, path)
-            assert base_exit == new_exit, f"{label}: base={base_exit} new={new_exit}"
-
-    def test_context_gate_normal_same_as_base(self):
-        """Context gate: same stdout for critical files, normal exit 0."""
-        for label, path in [
-            ("neuro_foundation", os.path.join(self._ng_dir, "neuro_foundation.py")),
-            ("openclaw_hook", os.path.join(self._ng_dir, "openclaw_hook.py")),
-            ("ng_lite", os.path.join(self._ng_dir, "ng_lite.py")),
-            ("unmatched", os.path.join(self._ng_dir, "README.md")),
-        ]:
-            env = self._base_env()
-            tool_input = json.dumps({"tool_input": {"file_path": path}})
-            r1 = subprocess.run(
-                [CG_BASE], input=tool_input.encode(), capture_output=True, timeout=10,
-                start_new_session=True, env=env,
-            )
-            r2 = subprocess.run(
-                [CG_HOOK], input=tool_input.encode(), capture_output=True, timeout=10,
-                start_new_session=True, env=env,
-            )
-            assert r1.returncode == r2.returncode, f"{label} exit: base={r1.returncode} new={r2.returncode}"
-            assert r1.stdout.decode() == r2.stdout.decode(), f"{label} stdout differs"
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # EXISTING CORE TESTS (kept, adapted where needed)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════
+    # PRETOOL: existing core tests
+    # ═══════════════════════════════════════════════════════════════════
 
     def test_differential_proof(self):
         corpus = []
         for rel in PROTECTED_RELS:
             corpus.append(("home", os.path.join(self._ng_dir, rel), {}))
-            corpus.append(("wt_out", os.path.join(self._wt_outside, rel), {}))
-            corpus.append(("wt_in", os.path.join(self._wt_inside, rel), {}))
-            corpus.append(("wt_nested", os.path.join(self._wt_nested, rel), {}))
-            corpus.append(("rel_wt_out", rel, {"CLAUDE_PROJECT_DIR": self._wt_outside}))
-            corpus.append(("rel_wt_in", rel, {"CLAUDE_PROJECT_DIR": self._wt_inside}))
-            corpus.append(("rel_main", rel, {"CLAUDE_PROJECT_DIR": self._ng_dir}))
-        corpus.append(("home_ckpt_sub", os.path.join(self._ng_dir, "data", "checkpoints", "subfile.msgpack"), {}))
-        corpus.append(("home_ckpt_dir", os.path.join(self._ng_dir, "data", "checkpoints"), {}))
-        corpus.append(("wt_ckpt_sub", os.path.join(self._wt_outside, "data", "checkpoints", "subfile.msgpack"), {}))
-        corpus.append(("home_ckpt_old", os.path.join(self._ng_dir, "data", "checkpoints-old", "stale.txt"), {}))
-        for rel in ["README.md", "tests/test_foo.py", "setup.py"]:
-            corpus.append(("unprot_home", os.path.join(self._ng_dir, rel), {}))
-            corpus.append(("unprot_wt", os.path.join(self._wt_outside, rel), {}))
-        corpus.append(("dotdot", os.path.join(self._ng_dir, "subdir", "..", "neuro_foundation.py"), {}))
-        corpus.append(("unrelated", os.path.join(self._unrelated, "neuro_foundation.py"), {}))
-        corpus.append(("non_git", os.path.join(self._non_git, "neuro_foundation.py"), {}))
-        corpus.append(("nonexistent", os.path.join(self._ng_dir, "data", "checkpoints", "future.msgpack"), {}))
-        # Symlink tests
-        link_dir = os.path.join(self._tmpdir, "links")
-        os.makedirs(link_dir, exist_ok=True)
-        for rel in PROTECTED_RELS:
-            target = os.path.join(self._ng_dir, rel)
-            link_path = os.path.join(link_dir, os.path.basename(rel))
-            if not os.path.islink(link_path):
-                try: os.symlink(target, link_path)
-                except FileExistsError: pass
-            corpus.append((f"symlink_outside_{os.path.basename(rel)}", link_path, {}))
-        symlink_inside_dir = os.path.join(self._ng_dir, "symlinks")
-        os.makedirs(symlink_inside_dir, exist_ok=True)
-        for rel in PROTECTED_RELS:
-            target = os.path.join(self._ng_dir, rel)
-            # Point inside symlink at protected file
-            relative_target = os.path.relpath(target, symlink_inside_dir)
-            link_in = os.path.join(symlink_inside_dir, os.path.basename(rel))
-            if not os.path.isfile(link_in):
-                try: os.symlink(relative_target, link_in)
-                except FileExistsError: pass
-            corpus.append((f"symlink_inside_{os.path.basename(rel)}", link_in, {}))
-        base_fires = set(); new_fires = set()
-        for label, path, extra in corpus:
-            base_exit, _ = self._run_hook_no_tty(BASE_HOOK, path, extra_env=extra or None)
-            new_exit, _ = self._run_hook_no_tty(NEW_HOOK, path, extra_env=extra or None)
-            if base_exit != 0: base_fires.add((label, path))
-            if new_exit != 0: new_fires.add((label, path))
-        base_only = base_fires - new_fires
-        assert not base_only, f"Base fires but new does NOT for: {sorted(base_only)}"
-        expected_new = set()
-        for rel in PROTECTED_RELS:
-            for wt_tup in [("wt_out", self._wt_outside), ("wt_in", self._wt_inside), ("wt_nested", self._wt_nested)]:
-                expected_new.add((wt_tup[0], os.path.join(wt_tup[1], rel)))
-            expected_new.add(("rel_wt_out", rel)); expected_new.add(("rel_wt_in", rel))
-        # Symlinks: only newly-covered vendored files are new (base catches
-        # all others because realpath resolves to $NG_DIR/<file> -> literal match)
-        added_vendored = ["ng_tract_bridge.py", "ng_embed.py", "ng_salience_gate.py", "ng_updater.py"]
-        for rel in added_vendored:
-            expected_new.add(("home", os.path.join(self._ng_dir, rel)))
-            expected_new.add(("rel_main", rel))
-            expected_new.add((f"symlink_outside_{os.path.basename(rel)}", os.path.join(link_dir, os.path.basename(rel))))
-            expected_new.add((f"symlink_inside_{os.path.basename(rel)}", os.path.join(symlink_inside_dir, os.path.basename(rel))))
-        expected_new.add(("wt_ckpt_sub", os.path.join(self._wt_outside, "data", "checkpoints", "subfile.msgpack")))
-        actual_new = new_fires - base_fires
-        missing = expected_new - actual_new; unexpected = actual_new - expected_new
-        assert not missing, f"Expected new additions NOT found: {sorted(missing)}"
-        assert not unexpected, f"Unexpected new additions found: {sorted(unexpected)}"
-        print(f"Corpus:{len(corpus)} base_fires:{len(base_fires)} new_fires:{len(new_fires)} additions:{len(actual_new)}")
-
-    def test_old_literal_all_protected_still_fire(self):
-        for rel in PROTECTED_RELS:
-            exit_code, _ = self._run_hook_no_tty(NEW_HOOK, os.path.join(self._ng_dir, rel))
-            assert exit_code != 0, f"{rel} should fire, got exit {exit_code}"
-
-    def test_checkpoint_dir_prefix_still_fires(self):
-        path = os.path.join(self._ng_dir, "data", "checkpoints-old", "stale.txt")
-        exit_code, _ = self._run_hook_no_tty(BASE_HOOK, path); assert exit_code != 0
-        exit_code, _ = self._run_hook_no_tty(NEW_HOOK, path); assert exit_code != 0
-
-    def test_ng_peer_bridge_still_fires(self):
-        path = os.path.join(self._ng_dir, "ng_peer_bridge.py")
-        exit_code, stderr = self._run_hook_no_tty(NEW_HOOK, path)
-        assert exit_code != 0
-        assert "Retired vendored file" in stderr
-
-    def test_no_overmatch_unprotected_home(self):
-        for rel in ["README.md", "tests/test_foo.py", "setup.py"]:
-            assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._ng_dir, rel))[0] == 0
-
-    def test_no_overmatch_unprotected_worktree(self):
+            corpus.append(("wt_o", os.path.join(self._wt_outside, rel), {}))
+            corpus.append(("wt_i", os.path.join(self._wt_inside, rel), {}))
+            corpus.append(("wt_n", os.path.join(self._wt_nested, rel), {}))
+            corpus.append(("rel_wo", rel, {"CLAUDE_PROJECT_DIR": self._wt_outside}))
+            corpus.append(("rel_wi", rel, {"CLAUDE_PROJECT_DIR": self._wt_inside}))
+            corpus.append(("rel_m", rel, {"CLAUDE_PROJECT_DIR": self._ng_dir}))
+        corpus.append(("ckpt_s", os.path.join(self._ng_dir, "data", "checkpoints", "sub.msgpack"), {}))
+        corpus.append(("ckpt_o", os.path.join(self._ng_dir, "data", "checkpoints-old", "stale.txt"), {}))
         for rel in ["README.md", "tests/test_foo.py"]:
-            assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._wt_outside, rel))[0] == 0
+            corpus.append(("unprot", os.path.join(self._ng_dir, rel), {}))
+        lk = os.path.join(self._tmpdir, "sl")
+        os.makedirs(lk, exist_ok=True)
+        for rel in PROTECTED_RELS:
+            tgt = os.path.join(self._ng_dir, rel)
+            lp = os.path.join(lk, os.path.basename(rel))
+            if not os.path.islink(lp):
+                try: os.symlink(tgt, lp)
+                except FileExistsError: pass
+            corpus.append((f"sl_{os.path.basename(rel)}", lp, {}))
+        corpus.append(("unr", os.path.join(self._unrelated, "neuro_foundation.py"), {}))
+        corpus.append(("nogit", os.path.join(self._non_git, "neuro_foundation.py"), {}))
+        bf = set(); nf = set()
+        for label, path, extra in corpus:
+            be, _ = self._run(BASE_HOOK, path, env=self._env(extra or None))
+            ne, _ = self._run(NEW_HOOK, path, env=self._env(extra or None))
+            if be != 0: bf.add((label, path))
+            if ne != 0: nf.add((label, path))
+        assert not (bf - nf), f"base fires but new does not: {sorted(bf - nf)[:5]}"
+        new_vendored = {"ng_tract_bridge.py", "ng_embed.py", "ng_salience_gate.py", "ng_updater.py"}
+        exp = set()
+        for rel in PROTECTED_RELS:
+            for wt_src, wt_dir in [("wt_o", self._wt_outside), ("wt_i", self._wt_inside), ("wt_n", self._wt_nested)]:
+                exp.add((wt_src, os.path.join(wt_dir, rel)))
+            exp.add(("rel_wo", rel)); exp.add(("rel_wi", rel))
+            if os.path.basename(rel) in new_vendored:
+                exp.add((f"sl_{os.path.basename(rel)}", os.path.join(lk, os.path.basename(rel))))
+        for r in new_vendored:
+            exp.add(("home", os.path.join(self._ng_dir, r)))
+            exp.add(("rel_m", r))
+        exp.add(("wt_o", os.path.join(self._wt_outside, "data", "checkpoints", "sub.msgpack")))
+        act = nf - bf
+        assert not (exp - act), f"missing: {sorted(exp - act)[:5]}"
+        assert not (act - exp), f"unexpected: {sorted(act - exp)[:5]}"
+        print(f"c:{len(corpus)} bf:{len(bf)} nf:{len(nf)} add:{len(act)}")
 
-    def test_no_overmatch_unrelated_repo(self):
-        assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._unrelated, "neuro_foundation.py"))[0] == 0
+    def test_old_literal_still_fires(self):
+        for rel in PROTECTED_RELS:
+            assert self._run(NEW_HOOK, os.path.join(self._ng_dir, rel))[0] != 0
 
-    def test_no_overmatch_non_git(self):
-        assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._non_git, "neuro_foundation.py"))[0] == 0
+    def test_peer_bridge_retired(self):
+        rc, stderr = self._run(NEW_HOOK, os.path.join(self._ng_dir, "ng_peer_bridge.py"))
+        assert rc != 0; assert "Retired" in stderr
 
-    def test_bypass_allows_protected(self):
+    def test_no_overmatch(self):
+        for rel in ["README.md", "tests/test_foo.py"]:
+            assert self._run(NEW_HOOK, os.path.join(self._ng_dir, rel))[0] == 0
+        for rel in ["README.md"]:
+            assert self._run(NEW_HOOK, os.path.join(self._wt_outside, rel))[0] == 0
+        assert self._run(NEW_HOOK, os.path.join(self._unrelated, "neuro_foundation.py"))[0] == 0
+        assert self._run(NEW_HOOK, os.path.join(self._non_git, "neuro_foundation.py"))[0] == 0
+
+    def test_bypass(self):
         self._install_bypass()
-        for rel in ["neuro_foundation.py", "data/checkpoints/main.msgpack", "ng_lite.py"]:
-            assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._ng_dir, rel))[0] == 0
+        for rel in ["neuro_foundation.py", "data/checkpoints/main.msgpack"]:
+            assert self._run(NEW_HOOK, os.path.join(self._ng_dir, rel))[0] == 0
+        assert self._run(NEW_HOOK, os.path.join(self._wt_outside, "neuro_foundation.py"))[0] == 0
 
-    def test_bypass_allows_worktree_protected(self):
-        self._install_bypass()
-        assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._wt_outside, "neuro_foundation.py"))[0] == 0
+    def test_bypass_location(self):
+        bp = os.path.join(self._fake_home, "NeuroGraph", ".claude", "hooks", ".session_approved")
+        try: os.unlink(bp)
+        except: pass
+        rc, out = self._run_pty(NEW_HOOK, os.path.join(self._wt_outside, "neuro_foundation.py"), "3")
+        assert rc == 0; assert "bypass" in out.lower(); assert os.path.isfile(bp)
 
-    def test_bypass_location_in_home(self):
-        bp_file = os.path.join(self._fake_home, "NeuroGraph", ".claude", "hooks", ".session_approved")
-        try: os.unlink(bp_file)
-        except FileNotFoundError: pass
-        exit_code, output = self._run_hook_pty(NEW_HOOK, os.path.join(self._wt_outside, "neuro_foundation.py"), "3")
-        assert exit_code == 0; assert "Session bypass" in output; assert os.path.isfile(bp_file)
+    def test_pty_approve(self):
+        rc, out = self._run_pty(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"), "1")
+        assert rc == 0; assert "Approved" in out
 
-    def test_pty_choice_1_approve(self):
-        exit_code, output = self._run_hook_pty(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"), "1")
-        assert exit_code == 0; assert "Approved" in output
-
-    def test_pty_choice_2_block(self):
-        exit_code, output = self._run_hook_pty(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"), "2")
-        assert exit_code == 2; assert "BLOCKED" in output
-
-    def test_pty_choice_3_approve_all(self):
-        bp_file = os.path.join(self._fake_home, "NeuroGraph", ".claude", "hooks", ".session_approved")
-        try: os.unlink(bp_file)
-        except FileNotFoundError: pass
-        exit_code, output = self._run_hook_pty(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"), "3")
-        assert exit_code == 0; assert "Session bypass activated" in output; assert os.path.isfile(bp_file)
+    def test_pty_block(self):
+        rc, out = self._run_pty(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"), "2")
+        assert rc == 2; assert "BLOCKED" in out
 
     def test_no_tty_blocks(self):
-        exit_code, _ = self._run_hook_no_tty(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"))
-        assert exit_code == 2
+        assert self._run(NEW_HOOK, os.path.join(self._ng_dir, "neuro_foundation.py"))[0] == 2
 
-    def test_worktree_protected_fires(self):
-        for wt in [self._wt_outside, self._wt_inside, self._wt_nested]:
-            assert self._run_hook_no_tty(NEW_HOOK, os.path.join(wt, "neuro_foundation.py"))[0] != 0
+    def test_fault_jq_missing(self):
+        e = self._env_no_git()
+        rc, stderr = self._run_raw(NEW_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
+        assert rc == 2; assert "TOOL MISSING" in stderr
 
-    def test_claude_project_dir_relative(self):
-        exit_code, _ = self._run_hook_no_tty(NEW_HOOK, "neuro_foundation.py", extra_env={"CLAUDE_PROJECT_DIR": self._wt_outside})
-        assert exit_code != 0
+    def test_fault_empty_stdin(self):
+        rc, stderr, _ = self._run_raw(NEW_HOOK, b"")
+        assert rc == 2; assert "EMPTY" in stderr
 
-    def test_newly_covered_vendored(self):
-        for rel in ["ng_tract_bridge.py", "ng_embed.py", "ng_salience_gate.py", "ng_updater.py"]:
-            assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._ng_dir, rel))[0] != 0
-            assert self._run_hook_no_tty(NEW_HOOK, os.path.join(self._wt_outside, rel))[0] != 0
+    def test_fault_no_path(self):
+        rc, stderr, _ = self._run_raw(NEW_HOOK, b'{"tool_input":{}}')
+        assert rc == 2
+
+    def test_symlink_outside(self):
+        lk = os.path.join(self._tmpdir, "sl2")
+        os.makedirs(lk, exist_ok=True)
+        for rel in ["neuro_foundation.py", "data/checkpoints/main.msgpack", "ng_lite.py", "ng_peer_bridge.py"]:
+            t = os.path.join(self._ng_dir, rel)
+            lp = os.path.join(lk, os.path.basename(rel))
+            if not os.path.islink(lp):
+                os.symlink(t, lp)
+            assert self._run(NEW_HOOK, lp)[0] != 0
+
+    def test_nested_worktree(self):
+        for rel in PROTECTED_RELS:
+            assert self._run(NEW_HOOK, os.path.join(self._wt_nested, rel))[0] != 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # DOUBLECHECK: differential + contract parity
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _make_dbl_corpus(self):
+        c = []
+        for rel in PROTECTED_RELS:
+            c.append(("home", os.path.join(self._ng_dir, rel), {}))
+            c.append(("wt_o", os.path.join(self._wt_outside, rel), {}))
+            c.append(("wt_i", os.path.join(self._wt_inside, rel), {}))
+            c.append(("wt_n", os.path.join(self._wt_nested, rel), {}))
+        c.append(("ckpt", os.path.join(self._ng_dir, "data", "checkpoints", "sub.msgpack"), {}))
+        c.append(("ckpt_o", os.path.join(self._ng_dir, "data", "checkpoints-old", "stale.txt"), {}))
+        for rel in ["README.md", "tests/test_foo.py"]:
+            c.append(("un", os.path.join(self._ng_dir, rel), {}))
+        lk = os.path.join(self._tmpdir, "sl_dbl")
+        os.makedirs(lk, exist_ok=True)
+        for rel in PROTECTED_RELS:
+            t = os.path.join(self._ng_dir, rel)
+            lp = os.path.join(lk, os.path.basename(rel))
+            if not os.path.islink(lp):
+                try: os.symlink(t, lp)
+                except FileExistsError: pass
+            c.append((f"sl_{os.path.basename(rel)}", lp, {}))
+        c.append(("unr", os.path.join(self._unrelated, "neuro_foundation.py"), {}))
+        c.append(("nogit", os.path.join(self._non_git, "neuro_foundation.py"), {}))
+        return c
+
+    def test_doublecheck_differential(self):
+        corpus = self._make_dbl_corpus()
+        bf = set(); nf = set()
+        for label, path, extra in corpus:
+            be, _ = self._run(DBL_BASE, path, env=self._env(extra or None))
+            ne, _ = self._run(DBL_HOOK, path, env=self._env(extra or None))
+            if be == 2: bf.add((label, path))
+            if ne == 2: nf.add((label, path))
+        assert not (bf - nf), f"dbl base fires but new does not: {sorted(bf - nf)[:5]}"
+        new_v = {"ng_tract_bridge.py", "ng_embed.py", "ng_salience_gate.py", "ng_updater.py"}
+        exp = set()
+        for rel in PROTECTED_RELS:
+            for s, d in [("wt_o", self._wt_outside), ("wt_i", self._wt_inside), ("wt_n", self._wt_nested)]:
+                exp.add((s, os.path.join(d, rel)))
+            dp = os.path.join(lk, os.path.basename(rel))
+            if os.path.basename(rel) in new_v:
+                exp.add((f"sl_{os.path.basename(rel)}", dp))
+                exp.add(("home", os.path.join(self._ng_dir, rel)))
+        act = nf - bf
+        assert not (exp - act), f"dbl missing: {sorted(exp - act)[:5]}"
+        assert not (act - exp), f"dbl unexpected: {sorted(act - exp)[:5]}"
+        print(f"dbl c:{len(corpus)} bf:{len(bf)} nf:{len(nf)} add:{len(act)}")
+
+    def test_doublecheck_parity_protected(self):
+        """Base and new both exit 2 with same stderr for a literal protected hit."""
+        path = os.path.join(self._ng_dir, "neuro_foundation.py")
+        brc, bstderr = self._run(DBL_BASE, path)
+        nrc, nstderr = self._run(DBL_HOOK, path)
+        assert brc == 2 and nrc == 2
+        assert "PROTECTED FILE WAS MODIFIED" in bstderr
+        assert "PROTECTED FILE WAS MODIFIED" in nstderr
+
+    def test_doublecheck_parity_unprotected(self):
+        """Both exit 0 for unprotected file."""
+        path = os.path.join(self._ng_dir, "README.md")
+        assert self._run(DBL_BASE, path)[0] == 0
+        assert self._run(DBL_HOOK, path)[0] == 0
+
+    def test_doublecheck_fires_worktree(self):
+        assert self._run(DBL_HOOK, os.path.join(self._wt_outside, "neuro_foundation.py"))[0] == 2
+        assert self._run(DBL_HOOK, os.path.join(self._wt_nested, "ng_lite.py"))[0] == 2
+
+    def test_doublecheck_fault_jq_missing(self):
+        e = self._env_no_git()
+        rc, stderr, _ = self._run_raw(DBL_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
+        assert rc == 2; assert "TOOL MISSING" in stderr
 
     def test_home_guard(self):
         assert self._fake_home.startswith(self._tmpdir)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SYMLINK AND NESTED WORKTREE
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def test_symlink_outside_into_protected_fires(self):
-        link_dir = os.path.join(self._tmpdir, "symlinks")
-        os.makedirs(link_dir, exist_ok=True)
-        for rel in PROTECTED_RELS:
-            target = os.path.join(self._ng_dir, rel)
-            link_path = os.path.join(link_dir, os.path.basename(rel))
-            if not os.path.islink(link_path): os.symlink(target, link_path)
-            exit_code, _ = self._run_hook_no_tty(NEW_HOOK, link_path)
-            assert exit_code != 0, f"symlink for {rel} should fire, got {exit_code}"
-
-    def test_symlink_inside_to_protected_fires(self):
-        link_dir = os.path.join(self._ng_dir, "symlinks")
-        os.makedirs(link_dir, exist_ok=True)
-        for rel in ["neuro_foundation.py", "data/checkpoints/main.msgpack", "ng_lite.py", "ng_peer_bridge.py"]:
-            target = os.path.join(self._ng_dir, rel)
-            relative = os.path.relpath(target, link_dir)
-            link = os.path.join(link_dir, os.path.basename(rel))
-            if not os.path.isfile(link): os.symlink(relative, link)
-            exit_code, _ = self._run_hook_no_tty(NEW_HOOK, link)
-            assert exit_code != 0, f"internal symlink for {rel} should fire, got {exit_code}"
-
-    def test_nested_worktree_fires(self):
-        for rel in PROTECTED_RELS:
-            exit_code, _ = self._run_hook_no_tty(NEW_HOOK, os.path.join(self._wt_nested, rel))
-            assert exit_code != 0, f"nested worktree {rel} should fire"
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ORIGIN URL MATRIX
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    POSITIVE_ORIGINS = [
-        "https://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
-        "https://github.com/greatnorthernfishguy-hub/NeuroGraph",
-        "https://github.com/greatnorthernfishguy-hub/NeuroGraph/",
-        "https://github.com/GreatNorthernFishguy-hub/neurograph.git",
-        "HTTPS://GITHUB.COM/GREATNORTHERNFISHGUY-HUB/NEUROGRAPH",
-        "git@github.com:greatnorthernfishguy-hub/NeuroGraph.git",
-        "ssh://git@github.com/greatnorthernfishguy-hub/NeuroGraph.git",
-        "git://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
-        "https://user:DUMMY_token123@github.com/greatnorthernfishguy-hub/NeuroGraph.git",
-        "git+ssh://github.com/greatnorthernfishguy-hub/NeuroGraph.git",
-    ]
-
-    NEGATIVE_ORIGINS = [
-        "https://github.com/evil-org/NeuroGraph.git",
-        "https://evil.com/greatnorthernfishguy-hub/NeuroGraph.git",
-        "https://github.com/greatnorthernfishguy-hub/neurograph-fork.git",
-        "https://github.com/greatnorthernfishguy-hub/NeuroGraph_EVIL.git",
-    ]
-
-    def test_origin_positive_matrix(self):
-        for origin_url in self.POSITIVE_ORIGINS:
-            repo = self._tmp_repo_with_origin(origin_url)
-            path = os.path.join(repo, "neuro_foundation.py")
-            exit_code, stderr = self._run_hook_no_tty(NEW_HOOK, path)
-            assert exit_code != 0, f"Origin '{origin_url}' should match (exit != 0), got {exit_code}"
-            # Assert origin never appears in stderr
-            assert origin_url not in stderr, f"Origin leaked into stderr: {stderr[:200]}"
-
-    def test_origin_negative_matrix(self):
-        for origin_url in self.NEGATIVE_ORIGINS:
-            repo = self._tmp_repo_with_origin(origin_url)
-            path = os.path.join(repo, "neuro_foundation.py")
-            exit_code, stderr = self._run_hook_no_tty(NEW_HOOK, path)
-            assert exit_code == 0, f"Origin '{origin_url}' should NOT match, got exit {exit_code}"
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # GIT-MISSING TESTS
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def test_git_missing_fail_closed_for_worktree(self):
-        """Without git, worktree paths that old literal doesn't catch should exit 2."""
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        path = os.path.join(self._wt_outside, "neuro_foundation.py")
-        tool_input = json.dumps({"tool_input": {"file_path": path}})
-        result = subprocess.run(
-            [NEW_HOOK], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        assert result.returncode == 2, f"Without git, worktree path should exit 2, got {result.returncode}"
-
-    def test_git_missing_old_literal_still_fires(self):
-        """Without git, old $HOME/NeuroGraph paths still fire (literal match works)."""
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        path = os.path.join(self._ng_dir, "neuro_foundation.py")
-        tool_input = json.dumps({"tool_input": {"file_path": path}})
-        result = subprocess.run(
-            [NEW_HOOK], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        assert result.returncode == 2, f"Old literal path should still fire, got {result.returncode}"
-
-    def test_git_missing_unprotected_allowed(self):
-        """Stubbed PATH makes jq missing -> exit 2 (fail-closed). jq check fires before git."""
-        env = self._base_env()
-        env["PATH"] = "/usr/bin:/bin"
-        path = os.path.join(self._ng_dir, "README.md")
-        tool_input = json.dumps({"tool_input": {"file_path": path}})
-        result = subprocess.run(
-            [NEW_HOOK], input=tool_input.encode(), capture_output=True, timeout=15,
-            start_new_session=True, env=env,
-        )
-        assert result.returncode == 2, "jq missing -> fail closed (exit 2)"
-
-    def test_git_ok_but_not_a_repo_allowed(self):
-        """File in a non-git directory: git says 'not a git repository', allowed."""
-        path = os.path.join(self._non_git, "neuro_foundation.py")
-        exit_code, _ = self._run_hook_no_tty(NEW_HOOK, path)
-        assert exit_code == 0

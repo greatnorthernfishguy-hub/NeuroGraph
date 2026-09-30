@@ -2,51 +2,35 @@
 # ---- Changelog ----
 # [2026-03-11] Claude (Opus 4.6) — Initial implementation.
 # [2026-03-11] Claude (Opus 4.6) — v2: Interactive approval prompt.
-#   What: Instead of hard block, prompts Josh in terminal for approval.
-#   Why:  Punch list items legitimately require protected file edits.
-#         Josh should approve in real-time, not toggle permissions.
-#   How:  Detects protected file → prompts [1] Approve [2] Block
-#         [3] Approve All (session bypass). Reads from /dev/tty for
-#         terminal input even when stdin is piped JSON.
-# [2026-09-30] Chief-003 / Claude — v3: Worktree-aware relative matching (Exec Packets 442-443).
-#   What: Add relative-path matching against git toplevel so that edits in
-#         any checkout or worktree of the NeuroGraph repo are protected.
-#         Fix vendored list to match LAW 2 (six + two designated).
-#         Add RETIRED set for ng_peer_bridge.py (still fires, different label).
-#   Why:  Punchlist #842 — worktrees escaped the hook because every check
-#         was a literal comparison against $HOME/NeuroGraph/*. #843 — the
-#         vendored list was stale (omitted ng_tract_bridge.py + ng_embed.py)
-#         and included a file LAW 2 removed 2026-06-03.
-#   How:  Purely additive: keep every old literal check AND add relative
-#         match as an OR. Resolve git toplevel by walking up nearest
-#         existing ancestor; verify origin is greatnorthernfishguy-hub/neurograph
-#         case-insensitively. ng_peer_bridge.py removed from VENDORED set,
-#         added to RETIRED_VENDORED with its own label (same three-choice
-#         prompt). Bypass unchanged.
+# [2026-09-30] Chief-003 / Claude — v3: Worktree-aware relative matching, fail-closed, origin normaliser.
+# [2026-09-30] Chief-003 / Claude — v4: FIX-UP: preflight all tools; _norm() handles .git/,
+#         deploy@ scp, host:port; no-origin repos are allowed; git errors by exit code
+#         not English stderr; LC_ALL=C; non-existent dir uses nearest ancestor.
 # -------------------
 #
 # HOOK: PreToolUse
 # MATCHER: Edit|Write|MultiEdit
 # PURPOSE: Prompt Josh for approval before edits to protected files.
 # EXIT 0: Approved or not a protected file.
-# EXIT 2: Josh chose to block.
+# EXIT 2: BLOCKED (Josh chose block, or gate cannot evaluate).
 
 set -uo pipefail
 
 NG_DIR="$HOME/NeuroGraph"
 BYPASS_FILE="$NG_DIR/.claude/hooks/.session_approved"
 
-# ── Gatekeeper: jq must be present ─────────────────────────────────
-if ! command -v jq >/dev/null 2>&1; then
-    cat >&2 <<'EOFFAIL'
-═══ SYL'S LAW HOOK — GATEKEEPER MISSING ═══
-jq is not installed — cannot evaluate this edit.
-The hook cannot determine whether this file is protected.
-BLOCKING to prevent unprotected edit of Syl's files.
-Install jq to restore the gate.
+# ── Preflight: every tool the gate depends on ──────────────────────
+for _tool in jq git timeout realpath sed tr dirname; do
+    if ! command -v "$_tool" >/dev/null 2>&1; then
+        cat >&2 <<EOFFAIL
+═══ SYL'S LAW HOOK — TOOL MISSING ═══
+Required tool '$_tool' is not on PATH.
+The gate cannot evaluate edits without it. BLOCKING.
+Install $_tool to restore the gate.
 EOFFAIL
-    exit 2
-fi
+        exit 2
+    fi
+done
 
 # ── Read tool input from stdin ─────────────────────────────────────
 INPUT=$(cat)
@@ -70,9 +54,7 @@ FILE_PATH=$(echo "$INPUT" | jq -r '
 if [ -z "$FILE_PATH" ]; then
     cat >&2 <<'EOFFAIL'
 ═══ SYL'S LAW HOOK — NO EDIT TARGET ═══
-The hook received valid input but could not extract a file path
-from tool_input.file_path, .path, or .file.
-This hook is registered for Edit|Write|MultiEdit — all carry a path.
+The hook received valid input but could not extract a file path.
 BLOCKING: the gate cannot determine what is being edited.
 EOFFAIL
     exit 2
@@ -171,6 +153,29 @@ if [ -z "$CATEGORY" ]; then
     fi
 fi
 
+# ── Origin normaliser (shared) ─────────────────────────────────────
+# Never prints the origin. Exact match only.
+_norm_origin() {
+    local url _host _rest
+    url="$(echo "$1" | tr '[:upper:]' '[:lower:]' 2>/dev/null)"
+    url="$(echo "$url" | sed 's|^[a-z][+a-z]*://||')"
+    url="$(echo "$url" | sed 's|^[^/]*@||')"
+    if [[ "$url" =~ ^([^/:]+): ]]; then
+        _host="${BASH_REMATCH[1]}"
+        _rest="${url#"$_host":}"
+        if [[ "$_rest" =~ ^[^0-9] ]]; then
+            url="${_host}/${_rest}"
+        fi
+    fi
+    url="$(echo "$url" | sed 's|:\([0-9]\+\)/|/|')"
+    while true; do
+        local _n="${url%.git}"; _n="${_n%/}"
+        [ "$_n" = "$url" ] && break
+        url="$_n"
+    done
+    echo "$url"
+}
+
 # ── Relative matching (worktree-aware, additive) ─────────────────
 if [ -z "$CATEGORY" ]; then
     _repo_toplevel() {
@@ -182,52 +187,68 @@ if [ -z "$CATEGORY" ]; then
         if [ ! -d "$d" ]; then
             return 1
         fi
-        timeout 3 git -C "$d" rev-parse --show-toplevel 2>/dev/null
+        LC_ALL=C timeout 3 git -C "$d" rev-parse --show-toplevel 2>/dev/null
     }
 
-    _git_error=""
-    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || _git_error="true"
+    _top_rc=0
+    TOPLEVEL="$(_repo_toplevel "$FILE_PATH")" || _top_rc=$?
+
+    if [ "$_top_rc" -eq 124 ] || [ "$_top_rc" -eq 127 ]; then
+        cat >&2 <<'EOFFAIL'
+═══ SYL'S LAW HOOK — GIT FAILURE ═══
+git command timed out or could not start.
+The gate cannot rule this edit out. BLOCKING.
+EOFFAIL
+        exit 2
+    fi
 
     if [ -z "$TOPLEVEL" ]; then
-        # If we got a git-reported error (not "not a repo"), fail closed
-        _git_stderr="$(timeout 3 git -C "${FILE_PATH%/*}" rev-parse --show-toplevel 2>&1 >/dev/null)" || true
-        if [[ "$_git_stderr" =~ fatal ]] && [[ ! "$_git_stderr" =~ "not a git repository" ]]; then
+        # Not inside a git repo. Check stderr only to discriminate a
+        # real git error from "not a repository". Use nearest existing
+        # ancestor (same directory _repo_toplevel resolved to).
+        _probe_dir="$FILE_PATH"
+        while [ -n "$_probe_dir" ] && [ "$_probe_dir" != "/" ] && [ ! -d "$_probe_dir" ]; do
+            _probe_dir="$(dirname "$_probe_dir")"
+        done
+        [ -d "$_probe_dir" ] || _probe_dir="/"
+        _git_stderr="$(LC_ALL=C timeout 3 git -C "$_probe_dir" rev-parse --show-toplevel 2>&1 >/dev/null)" || true
+        if [ -n "$_git_stderr" ] && echo "$_git_stderr" | grep -q fatal && ! echo "$_git_stderr" | grep -q "not a git repository"; then
             cat >&2 <<'EOFFAIL'
 ═══ SYL'S LAW HOOK — GIT FAILURE ═══
-git is present but could not determine repository for this path.
+git failed while checking whether this path is in a repository.
 The gate cannot rule this edit out. BLOCKING.
-Check git configuration, disk state, and permissions.
 EOFFAIL
             exit 2
         fi
     fi
 
     if [ -n "$TOPLEVEL" ]; then
-        _origin_err=""
-        ORIGIN="$(timeout 3 git -C "$TOPLEVEL" remote get-url origin 2>/dev/null)" || _origin_err="true"
-        if [ -n "$_origin_err" ] && [ -z "$ORIGIN" ]; then
+        # Check all remotes (not just origin); any matching URL means NeuroGraph
+        ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)" || true
+        _remote_rc=$?
+        if [ "$_remote_rc" -eq 124 ] || [ "$_remote_rc" -eq 127 ] || [ "$_remote_rc" -gt 1 ]; then
             cat >&2 <<'EOFFAIL'
 ═══ SYL'S LAW HOOK — GIT REMOTE FAILURE ═══
-Could not read git remote origin for this worktree.
-The gate cannot verify this is a NeuroGraph checkout. BLOCKING.
+git config failed while listing remotes. BLOCKING.
 EOFFAIL
             exit 2
         fi
-        if [ -n "$ORIGIN" ]; then
-            # Normalise origin: lowercased, host/org/repo, no scheme/userinfo/port/.git//
-            _norm() {
-                local url
-                url="$(echo "$1" | tr '[:upper:]' '[:lower:]' 2>/dev/null)"
-                url="$(echo "$url" | sed 's|^[a-z][+a-z]*://||')"
-                url="$(echo "$url" | sed 's|^git@\([^/:]*\):|\1/|')"
-                url="$(echo "$url" | sed 's|^[^/]*@||')"
-                url="$(echo "$url" | sed 's|:\([0-9]\+\)/|/|')"
-                url="${url%.git}"
-                url="${url%/}"
-                echo "$url"
-            }
-            NORM_ORIGIN="$(_norm "$ORIGIN")"
-            if [ "$NORM_ORIGIN" = "github.com/greatnorthernfishguy-hub/neurograph" ]; then
+        if [ -z "$ALL_REMOTES" ]; then
+            # No remotes at all — not NeuroGraph (a push-only repo, etc.)
+            :
+        else
+            _is_neurograph=0
+            while IFS= read -r _line; do
+                [ -z "$_line" ] && continue
+                _remote_url="$(echo "$_line" | sed 's|^remote\.[^.]*\.url ||')"
+                [ -z "$_remote_url" ] && continue
+                if [ "$(_norm_origin "$_remote_url")" = "github.com/greatnorthernfishguy-hub/neurograph" ]; then
+                    _is_neurograph=1
+                    break
+                fi
+            done <<<"$ALL_REMOTES"
+
+            if [ "$_is_neurograph" -eq 1 ]; then
                 REL="$(realpath --relative-to="$TOPLEVEL" "$FILE_PATH" 2>/dev/null)" || REL=""
 
                 REL_DATA=(
@@ -318,7 +339,6 @@ if [ -f "$BYPASS_FILE" ]; then
 fi
 
 # ── Prompt Josh ───────────────────────────────────────────────────
-# /dev/tty reads from the terminal even when stdin is piped
 cat >&2 <<EOF
 
 ══════════════════════════════════════════════════════════════
@@ -335,7 +355,6 @@ cat >&2 <<EOF
 ══════════════════════════════════════════════════════════════
 EOF
 
-# Read from terminal, not from piped stdin
 read -r -p " Choice [1/2/3]: " choice < /dev/tty 2>/dev/tty || true
 choice="${choice:-}"
 
