@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (DRAFT B1-B5 committed before reading checker-020)
+STATUS: COMPLETE
 
 # le-020 — ROLE B (law enforcer) SHORT RE-CHECK of want-hub (d) plan-005 after the [R5c] fold
 
@@ -88,4 +88,11 @@ CRITICAL: none. HIGH: none. **MEDIUM:** M1, M2 (arming-time). **LOW:** L1–L5. 
 - Packets 392/397/399/404/409/412/415/418 as primary documents (I have the assignment transcriptions and the plan's quotations only).
 - checker-021's verdict (running in parallel; not read, by rule). checker-020 is read only after this draft is pushed (see below).
 
-(Comparison with checker-020 to be added after this draft is committed.)
+## Comparison with checker-020 (read only AFTER my draft `d221ac0` was committed and pushed; I read that file and no other in `reviews/` beyond my own le-018)
+checker-020 (ROLE A, cross-family, **PASS-WITH-NOTES**, 2 LOW) reviewed the PREVIOUS plan state (`9c521699`); this re-check is of the fold. What it bears on:
+- **Its N1 (tie-break for the which-want column) and N2 (move the Q-E triggers out of the after-each-cycle list) are both folded** — I checked the text, not the changelog: §4A.7 states "ties → node-id ASCENDING", §4A.5 item 9 and §4A.6 say the census uses the same rule, and §4A.4 marks the band PRE-ARMING-ONLY. I spot-checked the new names against its tie observations: every cycle it reported as tied (2, 5, 6, 7, 8, 13, 15, 16, 19, 21, 22) shows the ascending-hex name in the new table (e.g. cycle 2: `101738dd…` < `8e985614…` < `c0ee2948…`; cycle 8: `8fc1e03f…` < `d0941e68…`; cycle 13: `b2565971…` < `b77179b6…`); cycle 1 is a unique max (1,527, `ac4d8c6a7f50852c`, 48%), which is why the census's named want is unaffected. It confirms the cycle-1 figure, the guardian margins (96.4% first cycle; worst 87.1% at cycle 21) and the 19–22 cycle count from the derived JSON — I relied on that; I opened no JSON. This does not change L5 (the changelog wording understates the number of names that moved).
+- **Where it leaves M2 open:** its recompute reports the degree percentiles p50/p90/max after each cycle (its §4A.2 recompute: 122 / 151 / 191 at cycle 22 — the same degree statistic as §5.3) and did not compute the per-want LOSS-FRACTION distribution; the −82/−90/−94% therefore rest on the degree-percentile reading. ROLE A's fresh instance (checker-021) is asked in ADDENDUM 4 item (7) to recompute the end-state per-want figures; I have not seen it. M2 is exactly the question whether "per-want losses p50/p90/max" means that or the loss-fraction distribution.
+- **Agree:** L1–L12/C1/C2 applied in the text (its item 1 = my B1 record of le-018's list); PG-1 executable and pre-merge (its item 3; its MemAvailable 5.35 GiB note is the memory gate working); L2 has no silent narrowing (its item 4); no ruling contradicted (its item 7). **Nothing in checker-020 conflicts with le-020.** The difference is scope again: it checks presence and numbers; this re-check checks whether the fold is TRUE against the daemon code and whether the consent text is adequate as informed consent.
+
+## Closing
+Verdict file complete. Nothing was built, merged, armed, settled or dispatched. No graph or checkpoint loaded; no NG module imported (P379: none); the protected file was not opened by me and is identical to base on the branch. Commits contain only this file; pushed by name to `cc-laptop-want-hub-d-20260930`. Plan cited by commit `1800d28ad6f82f8f503e45ef787041b52cdf4df1` (fold `25ae7a2a72346db0091c3a2d0d25b48e15cd0821`), sha256 `e556874d07928ad74cd9dc736fec2ef168d8cb17cdcb0bcbbb8b082f6286e60c`.
