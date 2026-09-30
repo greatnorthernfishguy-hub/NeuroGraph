@@ -239,8 +239,15 @@ class TestSylsLawHook:
         record = os.path.join(self._tmpdir, "lc_all_value")
         git_stub = os.path.join(stub, "git")
         with open(git_stub, "w") as f:
-            f.write(f"#!/usr/bin/env bash\necho \"$LC_ALL\" > {record}\n")
-            f.write("echo 'fatal: not a git repository' >&2\nexit 128\n")
+            f.write("#!/bin/bash\n")
+            f.write(f"echo \"$LC_ALL\" > {record}\n")
+            f.write("case \"$*\" in\n")
+            f.write("  *rev-parse*show-toplevel*) echo /fake_repo ;;\\n")
+            # Return a NeuroGraph remote for config
+            f.write(f"  *config*get-regexp*url*) echo 'remote.origin.url https://github.com/greatnorthernfishguy-hub/NeuroGraph.git' ;;\\n")
+            f.write("  *) exit 1 ;;\n")
+            f.write("esac\n")
+            f.write("exit 0\n")
         os.chmod(git_stub, 0o755)
         return {"HOME": self._fake_home, "PATH": stub, "RECORD": record}
 
@@ -624,9 +631,10 @@ class TestSylsLawHook:
     def test_locale_stub_git_receives_LC_ALL_C(self):
         e = self._env_stub_git_records_lc_all()
         record_path = e.pop("RECORD")
-        path = os.path.join(self._ng_dir, "neuro_foundation.py")
+        # Use a worktree path so old literal doesn't match, forcing git call
+        path = os.path.join(self._wt_outside, "neuro_foundation.py")
         r = subprocess.run([NEW_HOOK], input=json.dumps({"tool_input": {"file_path": path}}).encode(), capture_output=True, timeout=15, start_new_session=True, env=e)
-        assert r.returncode != 0
+        assert r.returncode != 0  # should fire via relative matching with git stub
         try:
             with open(record_path, "r") as f:
                 val = f.read().strip()
