@@ -23,6 +23,44 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 correction pass (worker-002):
+#   C2 + #765 + #763 (Executive Packet 376). Supplements the 2026-09-29 R5 entry.
+# What: (C2) the failover WARNING now carries the triggering traceback
+#   (exc_info) and _model_failed is set on ANY failover, load or inference,
+#   matching its "local has failed at least once" docstring; nothing reads it.
+#   (#765) only environment/runtime failures fail over. Bug-class defects
+#   (_BUG_CLASS_EXCEPTIONS: TypeError, AttributeError, IndexError, KeyError,
+#   NameError, ValueError, AssertionError, NotImplementedError) are logged at
+#   ERROR with exc_info and RAISED at all five failover sites instead of being
+#   masked behind a remote vector. _fail_over_to_remote is renamed
+#   _fail_over_or_raise (it can now raise) and _raise_if_bug_class is new.
+#   (#763) _ensure_model(require_local=False): the default is unchanged (R5
+#   failover, returns True). require_local=True returns False, with no
+#   failover and no remote call, when local is unavailable (load failed,
+#   already failed over, or NG_EMBED_REMOTE selects remote); a bug-class
+#   defect during that load still raises. reembed_snowflake.py uses it.
+# Why:  Cross-family + law-enforcer review of 0f5ca4c. A bare "except Exception"
+#   let a real local defect ride a successful remote vector (#765); the failover
+#   log had no traceback and _model_failed contradicted its docstring (C2); and
+#   R5 made every _ensure_model() return True, so reembed_snowflake.py could no
+#   longer learn that local was down and would have re-embedded Syl's
+#   vectors.msgpack over the network (#763).
+# How:  Denylist, not allowlist, chosen from verified classes: onnxruntime
+#   NoSuchFile/InvalidProtobuf (load) and InvalidArgument/Fail/RuntimeException
+#   (run) all derive from bare Exception, NOT OSError/RuntimeError, so a stdlib
+#   allowlist would let real ORT failures raise (the original R5 bug) and an
+#   ORT-class allowlist depends on a private pybind module path that can move
+#   silently. A denylist fails safe toward failover; its cost is that an ORT
+#   InvalidArgument caused by our own bad dtype/rank still fails over (ORT uses
+#   one class for that and for out-of-range token ids) - visible in the single
+#   WARNING with traceback. ValueError is in the denylist because the two
+#   verified sources are caller defects (ORT feed-name mismatch; HF
+#   HFValidationError for a bad repo id). The three "if not _ensure_model()"
+#   guards in embed/embed_batch/embed_windows are kept: the default path can no
+#   longer return False, but the guards state the fail-closed contract and the
+#   existing tests stub _ensure_model to False. #764 and #766 are untouched.
+# -------------------
 # [2026-09-29] Claude Sonnet 5 (T3 harness), lane
 #   z11-r5-embed-failover-20260929 — Executive Packet 139 R5.
 # What: With NG_EMBED_REMOTE unset, a local load failure or a local
@@ -246,6 +284,12 @@ _WINDOW_TOKENS = 512
 _WINDOW_OVERLAP = 64
 _WINDOW_INTERIOR = _WINDOW_TOKENS - 2  # room for [CLS] + [SEP] wrap
 
+# Bug-class defects: raised, never failed over (#765). ORT errors are bare Exception subclasses, so this is a denylist.
+_BUG_CLASS_EXCEPTIONS = (
+    TypeError, AttributeError, IndexError, KeyError, NameError,
+    ValueError, AssertionError, NotImplementedError,
+)
+
 _DEFAULT_CONFIG = {
     # Model
     "model_id": "Snowflake/snowflake-arctic-embed-m-v1.5",
@@ -368,21 +412,22 @@ class NGEmbed:
 
     # -- Model loading -------------------------------------------------------
 
-    def _ensure_model(self) -> bool:
+    def _ensure_model(self, require_local: bool = False) -> bool:
         """Lazy-load ONNX model + tokenizer on first use.
 
-        A load failure (NG_EMBED_REMOTE unset) fails over to the same-model
-        HF remote API (R5) rather than returning False — _model_loaded is
-        set True in that case too, so there is no longer a state where
-        _model_loaded is False and _model_failed is True. _model_failed is
-        kept purely as a diagnostic "local has failed at least once" flag.
+        Default: a local load failure fails over to the same-model HF remote
+        API (R5) and this returns True. require_local=True is for callers that
+        must have the local model: it returns False, with no failover and no
+        remote call, when local is unavailable (load failed, already failed
+        over, or NG_EMBED_REMOTE selects remote). _model_failed is a
+        diagnostic "local has failed at least once" flag; nothing reads it.
         """
         if self._model_loaded:
-            return True
+            return not (require_local and self._remote_mode)
 
         with self._model_lock:
             if self._model_loaded:
-                return True
+                return not (require_local and self._remote_mode)
 
             remote = os.environ.get("NG_EMBED_REMOTE")
             if remote is not None:
@@ -396,7 +441,7 @@ class NGEmbed:
                     "ng_embed: NG_EMBED_REMOTE=hf — using HF remote inference, "
                     "no local ONNX load"
                 )
-                return True
+                return not require_local
 
             try:
                 import onnxruntime as ort
@@ -445,26 +490,39 @@ class NGEmbed:
                 return True
 
             except Exception as exc:
-                self._model_failed = True
-                self._fail_over_to_remote(exc, "model load")
+                if require_local:
+                    self._raise_if_bug_class(exc, "model load")
+                    self._model_failed = True
+                    logger.warning(
+                        "ng_embed: local model load failed (%s); caller requires "
+                        "local, not failing over", exc, exc_info=exc,
+                    )
+                    return False
+                self._fail_over_or_raise(exc, "model load")
                 self._model_loaded = True
                 return True
 
-    def _fail_over_to_remote(self, exc: BaseException, stage: str) -> None:
-        """Local ONNX is unusable — route to the same-model HF remote API (R5).
+    def _raise_if_bug_class(self, exc: BaseException, stage: str) -> None:
+        """Bug-class defects are logged at ERROR with traceback and raised, never failed over (#765)."""
+        if isinstance(exc, _BUG_CLASS_EXCEPTIONS):
+            logger.error(
+                "ng_embed: local %s raised %s, a bug-class defect - NOT failing "
+                "over to remote: %s", stage, type(exc).__name__, exc, exc_info=exc,
+            )
+            raise exc
 
-        Called from a load failure (_ensure_model) or an inference failure
-        (the four call sites that reach _onnx_embed_ids_batch). Either origin
-        lands here and then reaches the identical _hf_remote_* retry/
-        quarantine machinery already used by explicit NG_EMBED_REMOTE=hf —
-        no second fallback mechanism. Idempotent: only logs the transition
-        once per process; subsequent calls (local or remote re-failing) are
-        silent here.
+    def _fail_over_or_raise(self, exc: BaseException, stage: str) -> None:
+        """Raise a bug-class defect; otherwise route to the same-model HF remote API (R5).
+
+        Environment/runtime failures fail over and log one WARNING per process
+        with the traceback; the _hf_remote_* retry/quarantine path is reused.
         """
+        self._raise_if_bug_class(exc, stage)
+        self._model_failed = True
         if not self._remote_mode:
             logger.warning(
                 "ng_embed: local %s failed (%s) — failing over to HF remote API (R5)",
-                stage, exc,
+                stage, exc, exc_info=exc,
             )
         self._remote_mode = True
 
@@ -532,7 +590,7 @@ class NGEmbed:
                 except EmbeddingUnavailableError:
                     raise
                 except Exception as exc:
-                    self._fail_over_to_remote(exc, "inference")
+                    self._fail_over_or_raise(exc, "inference")
                     short_vecs = self._hf_remote_embed_batch(
                         short_texts, normalize=normalize, is_query=is_query,
                     )
@@ -565,7 +623,7 @@ class NGEmbed:
                 except EmbeddingUnavailableError:
                     raise
                 except Exception as exc:
-                    self._fail_over_to_remote(exc, "inference")
+                    self._fail_over_or_raise(exc, "inference")
                     vecs = self._hf_remote_embed_batch(
                         [job[3] for job in window_jobs],
                         normalize=False,
@@ -615,7 +673,7 @@ class NGEmbed:
                 except EmbeddingUnavailableError:
                     raise
                 except Exception as exc:
-                    self._fail_over_to_remote(exc, "inference")
+                    self._fail_over_or_raise(exc, "inference")
                     vec = self._hf_remote_embed(
                         text, normalize=normalize, is_query=is_query,
                     )
@@ -649,7 +707,7 @@ class NGEmbed:
             except EmbeddingUnavailableError:
                 raise
             except Exception as exc:
-                self._fail_over_to_remote(exc, "inference")
+                self._fail_over_or_raise(exc, "inference")
                 vecs = self._hf_remote_embed_batch(
                     [j[0] for j in jobs],
                     normalize=False,

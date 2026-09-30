@@ -1,5 +1,14 @@
 # tests/test_ng_embed_dualpass.py
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 correction pass, #763.
+# What: test_tokenizer_truncation_is_not_enabled_on_loaded_instance now calls
+#   _ensure_model(require_local=True) in its skip guard.
+# Why:  since R5 (0f5ca4c) _ensure_model() always returns True, so the guard
+#   could never skip; with no cached model the test would fail on a None
+#   tokenizer instead of skipping.
+# How:  one-line swap; require_local=True returns False when local is down.
+# -------------------
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-ngembed-cap-roundrobin-20260926 — #666.
 # What: two tests for _extract_concepts round-robin interleave: (1) with 2 windows
@@ -235,7 +244,7 @@ def test_tokenizer_truncation_is_not_enabled_on_loaded_instance(monkeypatch):
     """
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     emb = NGEmbed()
-    if not emb._ensure_model():
+    if not emb._ensure_model(require_local=True):
         pytest.skip("model files not in local HF cache")
     tok = emb._tokenizer
     # V-1: truncation config shipped with the tokenizer is disabled.

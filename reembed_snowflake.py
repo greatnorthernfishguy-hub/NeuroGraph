@@ -22,6 +22,15 @@ Usage:
   python3 reembed_snowflake.py              # Actually re-embed
 
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 correction pass, #763.
+# What: the model check calls _ensure_model(require_local=True) and aborts
+#   with a clearer message when the local ONNX model is unavailable.
+# Why:  since R5 (0f5ca4c) _ensure_model() always returns True, so this guard
+#   was dead and a missing local model would have silently re-embedded
+#   vectors.msgpack over the network via the HF failover.
+# How:  require_local=True returns False with no failover and no remote call.
+# -------------------
 # [2026-03-22] Claude (Opus 4.6) — Initial creation.
 #   What: One-time migration script for snowflake-arctic-embed-m-v1.5.
 #   Why:  Ecosystem-wide model upgrade from BAAI/bge-base-en-v1.5.
@@ -75,8 +84,12 @@ def main():
     logger.info("Initializing ng_embed (snowflake-arctic-embed-m-v1.5)...")
     from ng_embed import NGEmbed
     emb = NGEmbed.get_instance()
-    if not emb._ensure_model():
-        logger.error("Failed to load embedding model. Aborting.")
+    if not emb._ensure_model(require_local=True):
+        logger.error(
+            "Local ONNX embedding model unavailable (load failed, or "
+            "NG_EMBED_REMOTE selects remote). Aborting: this tool never "
+            "re-embeds Syl's vectors over the network."
+        )
         sys.exit(1)
 
     # Verify old dimensions
