@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-09-30] Claude Code (claude-sonnet-5-5, Z12 BUILD worker seat, dispatch #11805, DELTA BUILD) - analyze() no longer
+#   builds a live Graph or loads the whole vectors file.
+# What: load_pair + incident_figures(g, ...) REPLACED (not added) by stream_graph_nodes / stream_incident_figures
+#   (pass G: nodes metadata, existing ids, the V11 'before' figures for S + the three protected ids, the render length -
+#   all STORED fields of main.msgpack, streamed) and load_content_subset (pass V: the vdb `content` of the S source ids and
+#   of every entry containing `WANT]`, one entry at a time; embeddings and vdb metadata are skip()ped, never decoded).
+#   A truncated / malformed / trailing-garbage file is a STOP. The canonical Graph.restore stays in build_outputs (V11,
+#   the verifier's restore of the OUTPUT - plan-004 6.6 and 7 place it in Phase 1). This SUPERSEDES the "How" sentence
+#   below that says the checkpoint is read with Graph.restore + SimpleVectorDB.load.
+# Why: Chief-003 delta ruling ("fix the JOB, not the box") and Exec P437; evidence in returns/build-tool-007b.md section 1.
+# How: pin code untouched (LAW 4: the canonical loader is neither edited nor wrapped); equivalence to the canonical
+#   path is PROVEN by tests whose OLD path (Graph().restore + SimpleVectorDB().load) is built inside the tests.
 # [2026-09-30] Claude Code (claude-sonnet-5-5, Z12 BUILD worker seat, dispatch #11228, TURN A) — the
 #   118-want TEXT repair ONE-SHOT TOOL, built exactly to plan-004 [R4b] (NG branch
 #   cc-laptop-want-text-repair-20260930, HEAD 5b539216756bb0f9d731bef929ac0a104ff81912).
@@ -1544,20 +1556,108 @@ def gate_write_set(records: List[Dict[str, Any]], approvals: Dict[str, Any], *, 
 # the analysis stage: the analysis-001 loader (canonical readers) -> classification -> reports
 # --------------------------------------------------------------------------------------------------
 
-def load_pair(dirpath: str, pinned):
-    """THE analysis-001 loader (analysis-scratch/analyze_pair.py:84-86): Graph().restore + SimpleVectorDB().load,
-    the two canonical readers. Nothing is forked; the checkpoint is only READ."""
-    g = pinned.nf.Graph()
-    g.restore(os.path.join(dirpath, MAIN_NAME))
-    vdb = pinned.ui.SimpleVectorDB()
-    vdb.load(os.path.join(dirpath, VECTORS_NAME))
-    return g, vdb
+@contextlib.contextmanager
+def _streamed(path: str, what: str):
+    """A FILE-LIKE msgpack Unpacker over `path` (never the whole file in memory, never a whole-file load). A truncated,
+    malformed or trailing-garbage file is a STOP - never a silently smaller result (LAW 7, raw means complete)."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        up = _mp().Unpacker(f, raw=False, strict_map_key=False, max_buffer_size=size + 1, read_size=1 << 20)
+        try:
+            yield up
+            if up.tell() != size:
+                raise Stop("%s: %d byte(s) after the top-level map (file is %d bytes)" % (what, size - up.tell(), size))
+        except Stop:
+            raise
+        except Exception as e:  # noqa: BLE001 - OutOfData / ValueError / KeyError / TypeError all mean "not the file we expect"
+            raise Stop("%s: truncated or malformed (%s)" % (what, type(e).__name__)) from e
 
 
-def incident_figures(g, ids) -> Dict[str, Tuple[int, int, int]]:
-    """V11 'before' figures: (#outgoing, #incoming, #hyperedges) per id, from the canonical restore."""
-    return {i: (len(g._outgoing.get(i, ())), len(g._incoming.get(i, ())), len(g._node_hyperedges.get(i, ())))
-            for i in ids if i in g.nodes}
+def load_content_subset(path: str, keep_ids) -> Dict[str, Any]:
+    """The vectors file's `content` values for the keep set ONLY: {entry id: content} for every entry whose id is in
+    `keep_ids` or whose content contains `WANT]`, streamed one entry at a time (the canonical loader inflates the
+    whole ~1 GB file and copies every embedding; Phase 1 reads neither embeddings nor vdb metadata - both are skip()ped
+    as raw bytes, never decoded). Same dict the canonical load would give for those ids (a missing `content` is ''; an
+    entry with no `embedding` is a STOP, as the canonical loader raises on it; a later duplicate id wins)."""
+    out: Dict[str, Any] = {}
+    with _streamed(path, "vectors file") as up:
+        for _ in range(up.read_map_header()):
+            if up.unpack() != "entries":
+                up.skip()                                     # version / count: not needed
+                continue
+            for _ in range(up.read_map_header()):
+                eid = up.unpack()
+                if not isinstance(eid, str):
+                    raise Stop("vectors file: a non-string entry id")
+                c, has_embedding = "", False
+                for _ in range(up.read_map_header()):
+                    field = up.unpack()
+                    if field == "content":
+                        c = up.unpack()
+                    else:
+                        has_embedding = has_embedding or field == "embedding"
+                        up.skip()                             # embedding bytes / metadata dict: never materialised
+                if not has_embedding:
+                    raise Stop("vectors file: an entry without an embedding")
+                if eid in keep_ids or (isinstance(c, str) and "WANT]" in c):
+                    out[eid] = c
+                else:
+                    out.pop(eid, None)
+    return out
+
+
+class _ViewNode:
+    """What `render_wants` reads from a node: `metadata` and `creation_time` (pin cc_ng_organism.py:2303-2312)."""
+    def __init__(self, metadata, creation_time):
+        self.metadata, self.creation_time = metadata, creation_time
+
+
+def stream_graph_nodes(path: str) -> Dict[str, Any]:
+    """Pass G, part 1: the Graph-side values Phase 1 takes from `main.msgpack`'s `nodes` map - `nodes_meta`
+    (`nd.get("metadata", {})`, pin neuro_foundation.py:5403), `existing_ids` (the map keys) and a `render_graph`
+    holding only the want nodes (metadata + stored `creation_time`, `:5410`, in map order) - streamed one node entry
+    at a time. No `Graph` is constructed; every other top-level value is skip()ped."""
+    nodes_meta: Dict[str, Any] = {}
+    wants: Dict[str, _ViewNode] = {}
+    with _streamed(path, "main checkpoint") as up:
+        for _ in range(up.read_map_header()):
+            if up.unpack() != "nodes":
+                up.skip()
+                continue
+            for _ in range(up.read_map_header()):
+                nid, nd = up.unpack(), up.unpack()
+                md = nd.get("metadata", {})
+                nodes_meta[nid] = md
+                if (md or {}).get("kind") == "want":
+                    wants[nid] = _ViewNode(md, nd.get("creation_time", 0))
+    return {"nodes_meta": nodes_meta, "existing_ids": set(nodes_meta), "render_graph": types.SimpleNamespace(nodes=wants)}
+
+
+def stream_incident_figures(path: str, ids, existing_ids) -> Dict[str, Tuple[int, int, int]]:
+    """V11 'before' figures, (#outgoing, #incoming, #hyperedges) per id that is a node - the counts the canonical restore
+    indexes (pin neuro_foundation.py:5454-5457 from each synapse's pre/post node id; :5487 from each NON-archived
+    hyperedge's member_nodes) - computed in one streamed pass over `synapses` and `hyperedges`."""
+    want = {i for i in ids if i in existing_ids}
+    out_s: Dict[str, set] = {i: set() for i in want}
+    in_s: Dict[str, set] = {i: set() for i in want}
+    he_s: Dict[str, set] = {i: set() for i in want}
+    with _streamed(path, "main checkpoint") as up:
+        for _ in range(up.read_map_header()):
+            key = up.unpack()
+            if key not in ("synapses", "hyperedges"):
+                up.skip()                                     # includes archived_hyperedges: never indexed by restore
+                continue
+            for _ in range(up.read_map_header()):
+                eid, val = up.unpack(), up.unpack()
+                if key == "synapses":
+                    if val.get("pre_node_id") in want:
+                        out_s[val["pre_node_id"]].add(eid)
+                    if val.get("post_node_id") in want:
+                        in_s[val["post_node_id"]].add(eid)
+                else:
+                    for nid in set(val["member_nodes"]) & want:
+                        he_s[nid].add(eid)
+    return {i: (len(out_s[i]), len(in_s[i]), len(he_s[i])) for i in ids if i in want}
 
 
 def synapse_stats(raw_main: bytes, want_ids: set, scope_ids: set, mapped: set) -> Dict[str, Any]:
@@ -1594,19 +1694,31 @@ def synapse_stats(raw_main: bytes, want_ids: set, scope_ids: set, mapped: set) -
 
 def analyze(pinned, dirpath: str, *, scope_min_len: int, frozen_scope: Optional[List[str]] = None,
             base_mod=None, full_reports: bool = True) -> Dict[str, Any]:
-    """Load the pair with the canonical readers and classify every node of S (plan 4.2). `frozen_scope`
-    (Phase 2) replaces the rule-derived scope; the rule stays a reported cross-check."""
+    """Classify every node of S (plan 4.2). `frozen_scope` (Phase 2) replaces the rule-derived scope; the rule stays a
+    reported cross-check. NO live `Graph` and NO whole-file vectors load (P437 / Chief-003 delta): pass G streams the
+    Graph-side values from `main.msgpack` (nodes metadata, the V11 'before' figures for S + the three protected ids,
+    the render length), THEN pass V streams only the vdb `content` the keep set needs (the S source ids + every entry
+    containing `WANT]`). The canonical `Graph.restore` remains in `build_outputs` (V11, the verifier's restore of the
+    OUTPUT, which plan-004 6.6/7 places in Phase 1)."""
     org = pinned.org
-    g, vdb = load_pair(dirpath, pinned)
-    nodes_meta = {nid: n.metadata for nid, n in g.nodes.items()}
-    existing_ids = set(g.nodes)
-    content = vdb.content
-    vdb.embeddings = {}                      # free the vectors; only content is needed from here
+    main_path = os.path.join(dirpath, MAIN_NAME)
+    G = stream_graph_nodes(main_path)
+    nodes_meta, existing_ids = G["nodes_meta"], G["existing_ids"]
     derived = derive_scope(nodes_meta, scope_min_len)
     scope = list(frozen_scope) if frozen_scope is not None else derived
     missing = [i for i in scope if i not in nodes_meta or not isinstance(nodes_meta[i].get("want_text"), str)]
     if missing:
         raise Stop("scope: %d id(s) of S are not want nodes in the graph (first: %s)" % (len(missing), missing[0]))
+    watch = list(CHOICE_CLAUSE_IDS) + [CONSTITUTIONAL_ID]
+    # figures for S + watch (a superset of the candidates + watch): independent of the classification, so of cand_old
+    before_fig = stream_incident_figures(main_path, set(scope) | set(watch), existing_ids)
+    render_before = len(org.render_wants(G["render_graph"]).encode("utf-8"))
+    counts = {"nodes": len(nodes_meta),
+              "wants": sum(1 for md in nodes_meta.values() if md.get("kind") == "want"),
+              "protected": sum(1 for md in nodes_meta.values() if is_protected(md))}
+    del G
+    keep = {nodes_meta[nid].get("source_node") for nid in scope if isinstance(nodes_meta[nid].get("source_node"), str)}
+    content = load_content_subset(os.path.join(dirpath, VECTORS_NAME), keep)
     cl = Classifier(org, nodes_meta, content)
     records = [cl.classify_node(nid) for nid in scope]
     dropped = apply_collision_rule(records, existing_ids)
@@ -1616,14 +1728,6 @@ def analyze(pinned, dirpath: str, *, scope_min_len: int, frozen_scope: Optional[
             r["flags"]["collision_candidate"] = False
             r["flags"]["mention_shapes"] = mention_shape_flags(content[r["source_node"]], r["_w_open"], r["_closer_end"])
     cand_old = [r["id"] for r in records if r["disposition"] == "candidate"]
-    watch = list(CHOICE_CLAUSE_IDS) + [CONSTITUTIONAL_ID]
-    before_fig = incident_figures(g, set(cand_old) | set(watch))
-    render_before = len(org.render_wants(g).encode("utf-8"))
-    counts = {"nodes": len(g.nodes),
-              "wants": sum(1 for md in nodes_meta.values() if md.get("kind") == "want"),
-              "protected": sum(1 for md in nodes_meta.values() if is_protected(md))}
-    del g, vdb
-    gc.collect()
     raw_main = Path(os.path.join(dirpath, MAIN_NAME)).read_bytes()
     want_ids = {nid for nid, md in nodes_meta.items() if md.get("kind") == "want"}
     syn = synapse_stats(raw_main, want_ids, set(scope), set(cand_old))
