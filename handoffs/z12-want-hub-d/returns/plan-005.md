@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5g] — the [R5g·…] edit below is commit c9576cfd9aa51bbe5d57fcbb7562fa7987f7fc09 on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11308 + its P426 addendum) — plan-005 EDITED IN PLACE, the LAST small edit [R5g·…]
 #   What: plan-005 edited in place (no new file): le-028 (ROLE B, the single look at [R5f]: NO LAW VIOLATION, ETHOS DRIFT at plan level: 4 MEDIUM G1-G4 + 3 LOW G5-G7 +
 #     4 Executive-to-hear E-1..E-4), folded with the Exec Packet 426 ADDENDUM (docs c3819567; via Chief-003), which CONFIRMED G2 and G4, WORDED E-1 and ACCEPTED
