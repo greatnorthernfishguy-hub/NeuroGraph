@@ -1,6 +1,25 @@
 # tests/test_ng_embed_r5_failover.py
 # ---- Changelog ----
 # [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 C3 (worker-003, delta-LE finding F1).
+# What: require_local is honored by the inference path. With
+#   require_local=True, embed/embed_batch/embed_windows raise
+#   EmbeddingUnavailableError on an environment-class local inference failure
+#   with ZERO remote calls (_hf_post, _hf_remote_call and urllib.request.urlopen
+#   are all counted), _remote_mode unchanged, _model_loaded kept; a bug-class
+#   defect is still raised as the original object; a call arriving when
+#   _remote_mode is already True (NG_EMBED_REMOTE=hf, or a prior failover)
+#   refuses; a mid-call flip of _remote_mode never routes it to the remote arm;
+#   default and explicit require_local=False still fail over bit-identical.
+#   Tool level: reembed_snowflake.main() with local inference failing on batch
+#   2 of 3 exits 1, makes no remote call, never tries batch 3 and leaves the
+#   vectors file byte-identical, with and without --dry-run.
+# Why:  The #763 fix only covered model load; reembed_snowflake still called the
+#   default embed_batch, which would have re-sent a failed batch to the HF API.
+# How:  These tests do not stub _ensure_model, so the real guard is under test.
+#   Each sets/deletes NG_EMBED_REMOTE itself and asserts it before the call.
+# -------------------
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
 #   z11-r5-embed-failover-20260929 — R5 correction pass (worker-002), C2 +
 #   #765 + #763 (Executive Packet 376).
 # What: C2: failover WARNING carries the traceback, logs once, and
@@ -933,4 +952,295 @@ def test_763_reembed_snowflake_aborts_when_local_unavailable_and_never_goes_remo
     assert ei.value.code == 1
     assert posts == [] and urlopens == []
     assert emb._remote_mode is False
+    assert vec_path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# C3 (worker-003, delta-LE finding F1): require_local is honored by the
+# inference path, not only at load. Every test below sets/deletes
+# NG_EMBED_REMOTE itself and asserts it before the call under test; the only
+# NG_EMBED_* name used is NG_EMBED_REMOTE (plus the autouse fixture's deletes
+# of NG_EMBED_ALLOW_HASH_FALLBACK / NG_EMBED_TID_ENDPOINT). These tests do NOT
+# stub _ensure_model: the real require_local guard is what is under test.
+# ---------------------------------------------------------------------------
+
+class _OkSession:
+    """Working stand-in returning the real model's two outputs (the second is the
+    per-row vector). Optionally raises on the Nth run() call."""
+
+    def __init__(self, fail_on_call=None, exc=None):
+        self.calls = 0
+        self.fail_on_call = fail_on_call
+        self.exc = exc
+
+    def run(self, output_names, feed):
+        self.calls += 1
+        if self.fail_on_call is not None and self.calls == self.fail_on_call:
+            raise self.exc
+        n = feed["input_ids"].shape[0]
+        return [np.zeros((n, 768), dtype=np.float32), np.full((n, 768), 0.5, dtype=np.float32)]
+
+
+def _local_ready_instance(monkeypatch, cache_dir, tokenizer_cls, session):
+    """Local model 'loaded' with the REAL _ensure_model; NG_EMBED_REMOTE unset (asserted)."""
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    assert os.environ.get("NG_EMBED_REMOTE") is None
+    monkeypatch.setenv("HF_TOKEN", "tok-test")
+    emb = NGEmbed()
+    emb._config["cache_dir"] = str(cache_dir)
+    emb._model_loaded = True
+    emb._tokenizer = tokenizer_cls()
+    emb._session = session
+    return emb
+
+
+def _spy_remote(monkeypatch, emb):
+    """Count every way a remote call could happen; any nonzero count is a failure."""
+    import urllib.request
+
+    seen = {"post": 0, "call": 0, "urlopen": 0}
+
+    def post(url, payload, timeout=30):
+        seen["post"] += 1
+        return _text_dependent_post(url, payload, timeout)
+
+    orig_call = emb._hf_remote_call
+
+    def call(*a, **k):
+        seen["call"] += 1
+        return orig_call(*a, **k)
+
+    def urlopen(*a, **k):
+        seen["urlopen"] += 1
+        raise AssertionError("network call attempted")
+
+    monkeypatch.setattr(emb, "_hf_post", post)
+    monkeypatch.setattr(emb, "_hf_remote_call", call)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return seen
+
+
+_NO_REMOTE = {"post": 0, "call": 0, "urlopen": 0}
+
+
+def _rl_batch_short(emb):
+    return emb.embed_batch(["alpha beta", "gamma delta"], normalize=True, is_query=True, require_local=True)
+
+
+def _rl_batch_long(emb):
+    return emb.embed_batch([_LONG_TEXT], require_local=True)
+
+
+def _rl_windows_long(emb):
+    return [emb.embed_windows(_LONG_TEXT, require_local=True).pooled]
+
+
+def _rl_windows_short(emb):
+    return [emb.embed_windows("hello world", require_local=True).pooled]
+
+
+def _rl_embed(emb):
+    return [emb.embed("hello world", require_local=True)]
+
+
+_RL_SITES = [
+    pytest.param(_FakeTok, _rl_batch_short, id="embed_batch_short"),
+    pytest.param(_ClsSepTok, _rl_batch_long, id="embed_batch_long"),
+    pytest.param(_ClsSepTok, _rl_windows_long, id="embed_windows_long"),
+    pytest.param(_FakeTok, _rl_windows_short, id="embed_windows_short"),
+    pytest.param(_FakeTok, _rl_embed, id="embed"),
+]
+
+
+@pytest.mark.parametrize("tokenizer_cls, call", _RL_SITES)
+def test_c3_require_local_inference_failure_raises_without_any_remote_call(
+    tokenizer_cls, call, monkeypatch, tmp_path, caplog,
+):
+    """An environment-class local inference failure with require_local=True raises
+    EmbeddingUnavailableError and makes NO remote call of any kind, does not flip
+    _remote_mode, keeps _model_loaded, and logs the traceback once.
+
+    Env: NG_EMBED_REMOTE deleted and asserted unset; HF_TOKEN set (unused)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    session = _BoomSession()
+    emb = _local_ready_instance(monkeypatch, tmp_path, tokenizer_cls, session)
+    remote = _spy_remote(monkeypatch, emb)
+    assert os.environ.get("NG_EMBED_REMOTE") is None
+
+    with pytest.raises(EmbeddingUnavailableError) as ei:
+        call(emb)
+
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    assert session.calls >= 1, "local inference must have been attempted"
+    assert remote == _NO_REMOTE
+    assert emb._remote_mode is False and emb._model_loaded is True and emb._model_failed is True
+    assert not _failover_warnings(caplog)
+    warns = [r for r in _log_records(caplog, logging.WARNING) if "not failing over" in r.getMessage()]
+    assert len(warns) == 1 and warns[0].exc_info[0] is RuntimeError
+    assert not (tmp_path / "failed_embeds.jsonl").exists()
+
+
+@pytest.mark.parametrize("tokenizer_cls, call", _RL_SITES)
+def test_c3_require_local_bug_class_defect_still_raised_as_original(
+    tokenizer_cls, call, monkeypatch, tmp_path, caplog,
+):
+    """A bug-class defect with require_local=True is raised as the original
+    exception object (not wrapped, not masked), logged at ERROR, no remote call.
+
+    Env: NG_EMBED_REMOTE deleted and asserted unset; HF_TOKEN set (unused)."""
+    caplog.set_level(logging.DEBUG, logger="ng_embed")
+    exc = TypeError("simulated defect")
+    emb = _local_ready_instance(monkeypatch, tmp_path, tokenizer_cls, _RaisingSession(exc))
+    remote = _spy_remote(monkeypatch, emb)
+    assert os.environ.get("NG_EMBED_REMOTE") is None
+
+    with pytest.raises(TypeError) as ei:
+        call(emb)
+
+    assert ei.value is exc
+    assert remote == _NO_REMOTE and emb._remote_mode is False
+    errs = _log_records(caplog, logging.ERROR)
+    assert len(errs) == 1 and errs[0].exc_info[1] is exc
+
+
+@pytest.mark.parametrize("state", ["explicit_hf", "after_default_failover"])
+@pytest.mark.parametrize("tokenizer_cls, call", [
+    pytest.param(_FakeTok, _rl_batch_short, id="embed_batch"),
+    pytest.param(_FakeTok, _rl_windows_short, id="embed_windows"),
+    pytest.param(_FakeTok, _rl_embed, id="embed"),
+])
+def test_c3_require_local_refuses_when_already_in_remote_mode(
+    state, tokenizer_cls, call, monkeypatch, tmp_path,
+):
+    """If _remote_mode is already True (NG_EMBED_REMOTE=hf, or an earlier
+    default-caller failover in the same process) a require_local call REFUSES
+    with EmbeddingUnavailableError and makes no further remote call.
+
+    Env: explicit_hf sets NG_EMBED_REMOTE=hf (asserted); after_default_failover
+    deletes it (asserted unset); HF_TOKEN set (unused)."""
+    if state == "explicit_hf":
+        monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+        monkeypatch.setenv("NG_EMBED_REMOTE", "hf")
+        monkeypatch.setenv("HF_TOKEN", "tok-test")
+        assert os.environ.get("NG_EMBED_REMOTE") == "hf"
+        emb = NGEmbed()
+        emb._config["cache_dir"] = str(tmp_path)
+        emb._tokenizer = tokenizer_cls()
+        remote = _spy_remote(monkeypatch, emb)
+    else:
+        emb = _local_ready_instance(monkeypatch, tmp_path, tokenizer_cls, _BoomSession())
+        remote = _spy_remote(monkeypatch, emb)
+        assert os.environ.get("NG_EMBED_REMOTE") is None
+        emb.embed_batch(["warm up"])
+        assert emb._remote_mode is True and remote["post"] == 1
+
+    before = dict(remote)
+    with pytest.raises(EmbeddingUnavailableError):
+        call(emb)
+
+    assert remote == before, "a refused require_local call must not add any remote call"
+
+
+# embed() is excluded here: it guards, then embed_windows() guards again, so a flip
+# between the two makes the second guard refuse (safe, zero remote calls, and
+# covered by the already-in-remote-mode test). embed_windows_short covers its path.
+_RL_RACE_SITES = [p for p in _RL_SITES if p.id != "embed"]
+
+
+@pytest.mark.parametrize("tokenizer_cls, call", _RL_RACE_SITES)
+def test_c3_require_local_never_takes_the_remote_arm_even_if_remote_mode_flips_mid_call(
+    tokenizer_cls, call, monkeypatch, tmp_path,
+):
+    """Race guard: another thread's default-caller failover can set _remote_mode
+    after this call passed the guard. A require_local call must still use the
+    local session, never the remote arm.
+
+    Env: NG_EMBED_REMOTE deleted and asserted unset; HF_TOKEN set (unused)."""
+    session = _OkSession()
+    emb = _local_ready_instance(monkeypatch, tmp_path, tokenizer_cls, session)
+    remote = _spy_remote(monkeypatch, emb)
+    real_guard = emb._require_model
+
+    def guard_then_flip(require_local=False):
+        real_guard(require_local)
+        emb._remote_mode = True
+
+    monkeypatch.setattr(emb, "_require_model", guard_then_flip)
+    assert os.environ.get("NG_EMBED_REMOTE") is None
+
+    out = call(emb)
+
+    assert session.calls >= 1
+    assert remote == _NO_REMOTE
+    assert all(v.shape == (768,) for v in out)
+
+
+def test_c3_default_and_explicit_false_still_fail_over_bit_identical(monkeypatch, tmp_path):
+    """Regression pin: without require_local (omitted, or False) embed_batch keeps
+    the R5 failover, bit-for-bit equal to explicit NG_EMBED_REMOTE=hf.
+
+    Env: NG_EMBED_REMOTE set to hf only in the ground-truth helper, then deleted
+    and asserted unset; HF_TOKEN set (unused)."""
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    texts = ["alpha beta", "gamma delta"]
+    expected = _explicit_remote_result(
+        monkeypatch, tmp_path / "explicit", _FakeTok, lambda e: e.embed_batch(texts),
+    )
+    for style, kwargs in (("omitted", {}), ("explicit False", {"require_local": False})):
+        emb = _local_ready_instance(monkeypatch, tmp_path / style.replace(" ", "_"), _FakeTok, _BoomSession())
+        remote = _spy_remote(monkeypatch, emb)
+        assert os.environ.get("NG_EMBED_REMOTE") is None
+        got = emb.embed_batch(texts, **kwargs)
+        assert remote["post"] == 1 and emb._remote_mode is True, style
+        assert all(np.array_equal(g, e) for g, e in zip(got, expected)), style
+
+
+def _load_reembed_module():
+    import importlib.util
+
+    rs_path = os.path.join(_REPO_ROOT, "reembed_snowflake.py")
+    spec = importlib.util.spec_from_file_location("reembed_snowflake_under_test", rs_path)
+    rs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rs)
+    assert rs.__file__ == rs_path
+    return rs
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry_run", "write_path_enabled"])
+def test_c3_reembed_aborts_when_local_inference_fails_mid_run(dry_run, monkeypatch, tmp_path):
+    """Tool level: local inference succeeds for batch 1 and raises on batch 2 of 3.
+    main() must exit non-zero, make ZERO remote calls, never attempt batch 3, and
+    leave the vectors file byte-identical: the only write is at the very end, so
+    nothing from batch 1 (in memory only), 2 or 3 reaches disk. The write_path_enabled
+    variant omits --dry-run so a regression that swallowed the error and carried
+    on would change the bytes; VECTORS_PATH is a temp file (asserted).
+
+    Env: NG_EMBED_REMOTE deleted and asserted unset; HF_TOKEN set (unused)."""
+    import msgpack
+
+    rs = _load_reembed_module()
+    entries = {
+        f"e{i:03d}": {"content": f"content number {i}", "embedding": np.zeros(4, dtype=np.float32).tobytes()}
+        for i in range(130)
+    }
+    vec_path = tmp_path / "vectors.msgpack"
+    vec_path.write_bytes(msgpack.packb({"entries": entries}))
+    before = vec_path.read_bytes()
+    monkeypatch.setattr(rs, "VECTORS_PATH", str(vec_path))
+    assert rs.VECTORS_PATH == str(vec_path), "must not point at real vectors"
+    monkeypatch.setattr(sys, "argv", ["reembed_snowflake.py"] + (["--dry-run"] if dry_run else []))
+    monkeypatch.setattr(ng_embed_mod.time, "sleep", lambda s: None)
+
+    session = _OkSession(fail_on_call=2, exc=RuntimeError("simulated ORT failure on batch 2"))
+    emb = _local_ready_instance(monkeypatch, tmp_path / "cache", _FakeTok, session)
+    NGEmbed._instance = emb
+    remote = _spy_remote(monkeypatch, emb)
+    assert os.environ.get("NG_EMBED_REMOTE") is None
+
+    with pytest.raises(SystemExit) as ei:
+        rs.main()
+
+    assert ei.value.code == 1
+    assert session.calls == 2, "batch 1 ok, batch 2 failed, batch 3 never attempted"
+    assert remote == _NO_REMOTE and emb._remote_mode is False
     assert vec_path.read_bytes() == before

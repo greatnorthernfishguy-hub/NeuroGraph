@@ -23,6 +23,18 @@ Usage:
 
 # ---- Changelog ----
 # [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 C3 (delta law-enforcer F1).
+# What: the batch loop calls embed_batch(..., require_local=True) and aborts
+#   (exit 1) on EmbeddingUnavailableError, before that batch or any later one
+#   is recorded and before the single end-of-run write.
+# Why:  the #763 fix only covered model load. A local inference failure
+#   mid-run made the default embed_batch fail over and re-issue the batch to
+#   the HF API, and the broad "except Exception" below would have swallowed
+#   any error and still written a half re-embedded file.
+# How:  require_local makes embed_batch raise instead of failing over (no
+#   remote call); the specific clause sits ahead of the generic one.
+# -------------------
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
 #   z11-r5-embed-failover-20260929 — R5 correction pass, #763.
 # What: the model check calls _ensure_model(require_local=True) and aborts
 #   with a clearer message when the local ONNX model is unavailable.
@@ -82,7 +94,7 @@ def main():
 
     # Initialize ng_embed (loads ONNX model)
     logger.info("Initializing ng_embed (snowflake-arctic-embed-m-v1.5)...")
-    from ng_embed import NGEmbed
+    from ng_embed import NGEmbed, EmbeddingUnavailableError
     emb = NGEmbed.get_instance()
     if not emb._ensure_model(require_local=True):
         logger.error(
@@ -124,8 +136,8 @@ def main():
             continue
 
         try:
-            # Batch embed for efficiency
-            new_vecs = emb.embed_batch(batch_texts)
+            # Batch embed for efficiency; local ONNX only, never the network
+            new_vecs = emb.embed_batch(batch_texts, require_local=True)
 
             for k, vec in zip(batch_valid_keys, new_vecs):
                 dim_check.add(vec.shape[0])
@@ -135,6 +147,16 @@ def main():
                     entries[k]["embedding"] = vec.tobytes()
 
                 reembedded += 1
+
+        except EmbeddingUnavailableError as exc:
+            # The only write is at the very end, so nothing has reached disk:
+            # earlier batches live only in memory and are discarded.
+            logger.error(
+                "Local embedding failed at batch %d: %s. Aborting before writing "
+                "anything: this tool never re-embeds Syl's vectors over the network.",
+                batch_start, exc,
+            )
+            sys.exit(1)
 
         except Exception as exc:
             logger.warning("Batch error at %d: %s", batch_start, exc)

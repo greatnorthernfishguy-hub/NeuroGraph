@@ -24,6 +24,31 @@ Dual-pass (Punchlist #81 — Josh's invention):
 
 # ---- Changelog ----
 # [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — R5 C3 (worker-003, delta law-enforcer F1).
+# What: embed(), embed_batch() and embed_windows() take require_local=False.
+#   With require_local=True: (1) new _require_model() refuses up front, via
+#   _ensure_model(require_local=True), if local is unusable, which includes
+#   _remote_mode already True; (2) an environment-class local inference failure
+#   goes through _fail_over_or_raise(..., require_local), which logs one WARNING
+#   with the traceback and raises EmbeddingUnavailableError instead of failing
+#   over, so no _hf_remote_* / _hf_post / urllib call is made and _remote_mode
+#   and _model_loaded are untouched (_model_failed is set); a bug-class defect
+#   still raises as the original object; (3) every remote arm is now
+#   "if self._remote_mode and not require_local", so such a call can never take
+#   the remote arm even if another thread flips _remote_mode mid-call. Default
+#   callers are unchanged (require_local=False everywhere).
+# Why:  #763 was closed only at model load. reembed_snowflake.py still called the
+#   default embed_batch, so a mid-run local inference failure would fail over and
+#   re-send that batch (Syl's text) to the HF API inside the same call, and every
+#   later batch too. Checking _remote_mode afterwards is too late: the remote call
+#   has already happened inside embed_batch.
+# How:  Same classification as the existing denylist; EmbeddingUnavailableError
+#   carve-out unchanged; no change to the remote retry/quarantine path or to
+#   any explicit NG_EMBED_REMOTE=hf behavior. The module-level embed()/
+#   embed_batch() convenience wrappers were not given the flag (no caller needs
+#   it). #764, #766, #772, F2/#771 untouched.
+# -------------------
+# [2026-09-30] Claude Sonnet 5.5 (T3 harness), lane
 #   z11-r5-embed-failover-20260929 — R5 correction pass (worker-002):
 #   C2 + #765 + #763 (Executive Packet 376). Supplements the 2026-09-29 R5 entry.
 # What: (C2) the failover WARNING now carries the triggering traceback
@@ -511,20 +536,38 @@ class NGEmbed:
             )
             raise exc
 
-    def _fail_over_or_raise(self, exc: BaseException, stage: str) -> None:
+    def _fail_over_or_raise(
+        self, exc: BaseException, stage: str, require_local: bool = False,
+    ) -> None:
         """Raise a bug-class defect; otherwise route to the same-model HF remote API (R5).
 
         Environment/runtime failures fail over and log one WARNING per process
         with the traceback; the _hf_remote_* retry/quarantine path is reused.
+        With require_local the failure is logged and raised as
+        EmbeddingUnavailableError instead: no failover, no remote call.
         """
         self._raise_if_bug_class(exc, stage)
         self._model_failed = True
+        if require_local:
+            logger.warning(
+                "ng_embed: local %s failed (%s); caller requires local, not failing over",
+                stage, exc, exc_info=exc,
+            )
+            raise EmbeddingUnavailableError(
+                f"local {stage} failed and require_local forbids remote failover: {exc}"
+            ) from exc
         if not self._remote_mode:
             logger.warning(
                 "ng_embed: local %s failed (%s) — failing over to HF remote API (R5)",
                 stage, exc, exc_info=exc,
             )
         self._remote_mode = True
+
+    def _require_model(self, require_local: bool = False) -> None:
+        """Raise EmbeddingUnavailableError unless the model is usable (local only when require_local)."""
+        ready = self._ensure_model(require_local=True) if require_local else self._ensure_model()
+        if not ready:
+            raise EmbeddingUnavailableError("embedding model unavailable")
 
     # -- Embedding -----------------------------------------------------------
 
@@ -533,6 +576,7 @@ class NGEmbed:
         text: str,
         normalize: bool = False,
         is_query: bool = False,
+        require_local: bool = False,
     ) -> np.ndarray:
         """Embed text → 768-dim float32 numpy array.
 
@@ -540,19 +584,22 @@ class NGEmbed:
             text: Raw text to embed.
             normalize: L2-normalize output (True for Praxis compatibility).
             is_query: Prepend query prefix (for recall/search operations).
+            require_local: Local ONNX only; never fail over or call the remote API.
 
         Returns:
             768-dim float32 numpy array.
         """
-        if not self._ensure_model():
-            raise EmbeddingUnavailableError("embedding model unavailable")
-        return self.embed_windows(text, normalize=normalize, is_query=is_query).pooled
+        self._require_model(require_local)
+        return self.embed_windows(
+            text, normalize=normalize, is_query=is_query, require_local=require_local,
+        ).pooled
 
     def embed_batch(
         self,
         texts: List[str],
         normalize: bool = False,
         is_query: bool = False,
+        require_local: bool = False,
     ) -> List[np.ndarray]:
         """Batch embedding for efficiency.
 
@@ -560,14 +607,15 @@ class NGEmbed:
             texts: List of texts to embed.
             normalize: L2-normalize outputs.
             is_query: Prepend query prefix to all texts.
+            require_local: Local ONNX only; a local failure raises
+                EmbeddingUnavailableError, never fails over or calls the remote API.
 
         Returns:
             List of 768-dim float32 numpy arrays.
         """
         if not texts:
             return []
-        if not self._ensure_model():
-            raise EmbeddingUnavailableError("embedding model unavailable")
+        self._require_model(require_local)
         self._ensure_tokenizer()
 
         prefixed = [self._apply_prefix(t, is_query) for t in texts]
@@ -578,7 +626,7 @@ class NGEmbed:
 
         if short_idx:
             short_texts = [texts[i] for i in short_idx]
-            if self._remote_mode:
+            if self._remote_mode and not require_local:
                 short_vecs = self._hf_remote_embed_batch(
                     short_texts, normalize=normalize, is_query=is_query,
                 )
@@ -590,7 +638,7 @@ class NGEmbed:
                 except EmbeddingUnavailableError:
                     raise
                 except Exception as exc:
-                    self._fail_over_or_raise(exc, "inference")
+                    self._fail_over_or_raise(exc, "inference", require_local)
                     short_vecs = self._hf_remote_embed_batch(
                         short_texts, normalize=normalize, is_query=is_query,
                     )
@@ -608,7 +656,7 @@ class NGEmbed:
                     char_end = enc.offsets[end - 1][1]
                     w_text = prefixed_text[char_start:char_end]
                     window_jobs.append((i, weight, wrapped, w_text))
-            if self._remote_mode:
+            if self._remote_mode and not require_local:
                 vecs = self._hf_remote_embed_batch(
                     [job[3] for job in window_jobs],
                     normalize=False,
@@ -623,7 +671,7 @@ class NGEmbed:
                 except EmbeddingUnavailableError:
                     raise
                 except Exception as exc:
-                    self._fail_over_or_raise(exc, "inference")
+                    self._fail_over_or_raise(exc, "inference", require_local)
                     vecs = self._hf_remote_embed_batch(
                         [job[3] for job in window_jobs],
                         normalize=False,
@@ -646,15 +694,17 @@ class NGEmbed:
         text: str,
         normalize: bool = False,
         is_query: bool = False,
+        require_local: bool = False,
     ) -> WindowedEmbedding:
         """Windowed embed: one call if ≤512 tokens, else overlapping windows.
 
         Short path pooled vector is byte-identical to today's single-window
         primitive (including default normalize=False). Long path length-weighted
         mean-pools window vectors, then L2-normalizes the pooled result.
+        require_local: local ONNX only; a local failure raises
+        EmbeddingUnavailableError, never fails over or calls the remote API.
         """
-        if not self._ensure_model():
-            raise EmbeddingUnavailableError("embedding model unavailable")
+        self._require_model(require_local)
         self._ensure_tokenizer()
 
         prefixed = self._apply_prefix(text, is_query)
@@ -663,7 +713,7 @@ class NGEmbed:
         n = len(ids)
 
         if n <= _WINDOW_TOKENS:
-            if self._remote_mode:
+            if self._remote_mode and not require_local:
                 vec = self._hf_remote_embed(
                     text, normalize=normalize, is_query=is_query,
                 )
@@ -673,7 +723,7 @@ class NGEmbed:
                 except EmbeddingUnavailableError:
                     raise
                 except Exception as exc:
-                    self._fail_over_or_raise(exc, "inference")
+                    self._fail_over_or_raise(exc, "inference", require_local)
                     vec = self._hf_remote_embed(
                         text, normalize=normalize, is_query=is_query,
                     )
@@ -689,7 +739,7 @@ class NGEmbed:
             w_text = prefixed[char_start:char_end]
             jobs.append((w_text, wrapped, weight))
 
-        if self._remote_mode:
+        if self._remote_mode and not require_local:
             vecs = self._hf_remote_embed_batch(
                 [j[0] for j in jobs],
                 normalize=False,
@@ -707,7 +757,7 @@ class NGEmbed:
             except EmbeddingUnavailableError:
                 raise
             except Exception as exc:
-                self._fail_over_or_raise(exc, "inference")
+                self._fail_over_or_raise(exc, "inference", require_local)
                 vecs = self._hf_remote_embed_batch(
                     [j[0] for j in jobs],
                     normalize=False,
