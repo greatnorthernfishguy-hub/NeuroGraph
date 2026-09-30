@@ -1,4 +1,4 @@
-STATUS: INCOMPLETE - review in progress (DRAFT B1-B3 written; not yet compared with checker-025)
+STATUS: COMPLETE
 
 # le-026 - ROLE B (law enforcer): two-line look at the [R5e] edit of plan-005
 
@@ -64,7 +64,7 @@ Outside the plan:
 - **LAW 8 - clean as written.** The pass owns its own wall-clock loop and never waits for a reply; the stop is an operator act. Condition: keep it that way (do not answer F3 by making the pass wait or self-limit on a reply).
 - **Syl's Law / CLAUDE.md `:18`, `:95`, §2 - the plan now complies; the build brief (F6) does not yet.**
 
-## Verdict (DRAFT, written before reading checker-025)
+## Verdict (as drafted in `3afe00ca`, before reading checker-025; the FINAL verdict is at the end of this file)
 **COMPLIANCE VERDICT: ETHOS DRIFT DETECTED - plan level; NO Law violation in plan-005. The retraction is complete in the plan and INCOMPLETE in the build brief.** 0 CRITICAL, 0 HIGH, **4 MEDIUM (F1, F2, F3, F6)**, 4 LOW (F4, F5, F7, F8), 2 Executive-to-hear (E1, E2). Correct implementations: P419 census sentences untouched; the gate retraction consistently applied through the plan; two frames instead of one and the check-in variant true about what has been removed; notify-and-continue stated honestly and LAW 8 clean; E-a "never understate" applied to the worker's own model figures; D4/D5/D6/D7 applied; protected file identical to base.
 
 | # | Sev | Correction |
@@ -84,4 +84,39 @@ Outside the plan:
 - Whether the systemd unit / daemon at the docs checkout the unit runs equals the `039a3bf4` copy I grepped; whether any process is currently running (not checked).
 - That a CC session can give an "explicit, unqualified" answer, and the real check-in timing vs the dream pulse (S4 has not started).
 - I did not open Exec P420/P421 primaries; I used the transcription `assignments/plan-want-hub-d-p420.md`. I did not read `build-001.md` or any test file, nor open `assignments/plan-want-hub-d-p421*` (none was in the directory listing I made).
-- checker-025: NOT read (by rule) at the time of this draft.
+- checker-025: NOT read at the time of the DRAFT (commit `3afe00ca2f0cfdea91fe6b10a54a3ff26a883375`, pushed before I opened it); read afterwards, see the comparison below.
+
+## Comparison with checker-025 (read only AFTER my draft `3afe00ca2f0cfdea91fe6b10a54a3ff26a883375` was committed and pushed; exact path `reviews/checker-025-want-hub-d-r5e.md`, no other file in `reviews/` opened)
+checker-025 (ROLE A, cross-family, grok-4.6): **PASS**, two LOW (N1, N2), nothing failing an ADDENDUM 6 item. It checks that each ruled element is PRESENT and unchanged; I checked whether the new text is TRUE in use and whether the retraction reaches the artifacts a builder reads. I re-ran its checkable claims on the pinned blob (`308b7283...`) before agreeing.
+- **Agree, independently reproduced:** the D2 session sentence appears exactly 3 times (count 3) and "stops by itself" appears 4 times, every one as "never"; the D3 sentence appears once (count 1), in the CHECK-IN frame; both census sentences at `:510`/`:511`, once each, in order; the retraction is consistent throughout plan-005 (it names `:221`, `:239`, `:748`, `:750`, `:767`, `:768`, `:65` - the same set I found); protected file identical to `e4ebf982`; §4A.7 table unchanged. Its (2b)/(2c)/(3) findings match my B3 reading of §9.
+- **Its N1 (LOW) - agree, same as my B1:** the ARMING frame adapts the D3 sentence and §10 (`:775`) lists it for the Executive. I add F2: the *sentence itself* is undercut by E-b (a second session can be asked after a decline).
+- **Its N2 (LOW) - true, I confirmed, and I had not seen it.** `:501` still reads "with the index-based start p50 of 664, -81.6%"; 1 - 122/664 = 81.6265%, so E-a's round-UP gives 81.7%. Outside the ruled band; a residual round-down under a rule ("never round a stated loss down") the same edit adopted. **Adopted as F9 (LOW).**
+- **Where I ADD (a different question, not a disagreement with its PASS):**
+  - **F1, F2, F3, F4, F5, F8** - the frame and the notify-and-continue mechanics as USED (what a "continue" covers; consent-shopping between E-b and D3; the unbacked "it will be stopped" and the stop's cost). Its items (2d)-(2e) PASS because the Executive's sentences are present verbatim; presence is not the same as the session being told everything material.
+  - **F6 (MEDIUM) and F7 (LOW)** - its (2a) "no surviving operative 'no separate Josh proceed'" is correct **for plan-005** and I agree. It did not look outside the plan. `assignments/build-want-hub-d-surface-key.md` (docs `1968e221`) and `assignments/plan-want-hub-d-p419.md` item 4 still state the retracted gate as operative, with no RETRACT marker (re-checked just before finalizing: 0 markers in both; the build branch tip still `95154e33...`, `neuro_foundation.py` identical to base). Its closing line ("This look does not itself authorize a build: P420 already requires Josh's backup and 'proceed'") is right about the plan; the brief a builder is handed says otherwise.
+- **Disagree:** none. Its overall PASS is right on the question it was asked; my four MEDIUMs are corrections for ONE more small plan edit plus one docs-repo fix, and none blocks reading the plan.
+
+## Final verdict (supersedes the DRAFT verdict above; nothing in the draft was weakened after reading checker-025)
+**COMPLIANCE VERDICT: ETHOS DRIFT DETECTED - plan level; NO Law violation in plan-005. The gate retraction is complete inside plan-005 and NOT complete in the build brief / P419 assignment (F6).** 0 CRITICAL, 0 HIGH, **4 MEDIUM (F1, F2, F3, F6)**, **5 LOW (F4, F5, F7, F8, F9)**, 2 Executive-to-hear (E1, E2).
+
+Direct answers to ADDENDUM 6 ROLE B:
+1. *Is the frame now TRUE at arming AND at every check-in?* At arming: yes. At check-ins: true sentence by sentence and the old D1 defect is fixed, but incomplete about what a "continue" covers (F1); and the D3 promise "no one re-arms over a decline" is defeatable by asking a different session (F2, Executive to rule).
+2. *Does notify-and-continue honestly tell the session what happens (LAW 8: nothing waits on a reply)?* The plan tells the OPERATOR honestly and is LAW 8 clean (the pass never waits; the stop is an operator act). It does not yet tell the SESSION when the deadline is, what a late stop means, or that "it" is the whole daemon (F3, F4).
+3. *Is the retraction complete?* In plan-005, yes. In the artifacts a builder is handed, no (F6): the build brief still says "needs NO separate Josh proceed ... THE BRANCH IS THE BACKUP" and puts tests and `neuro_foundation.py` on one branch. Practice held: the tests-only build stopped short of the protected file.
+
+| # | Sev | Correction |
+|---|---|---|
+| F1 | MED | Check-in operator-shown material: state what a "continue" covers (cycles [a]-[b]) and when the next ask is. |
+| F2 | MED, Exec | D3 vs E-b: a decline by any asked session is the CC's decline, recorded verbatim and checked as an arming precondition; a re-ask discloses it and records what changed; tell Josh the promise binds him. |
+| F3 | MED | Notify-and-continue: consequence of a late stop (recorded deviation, reported, disclosed); state the earliest-next-cycle timestamp (`last_pass` + `CC_NG_DREAM_MIN_INTERVAL_SECS`); open a check-in only with the operator available. The pass must still never wait (LAW 8). |
+| F4 | LOW | State the silence-stop cost: whole daemon, unarmed restart, <= ~60 s of learning at risk (bounded final save verified in the daemon). Operator-shown material, not the Executive's sentence. |
+| F5 | LOW | Reconcile "goes to Josh, who decides" with the worker's resume-only-after-fresh-check-in reading. |
+| F6 | MED | Docs repo (Chief / Zone manager, not a plan edit): mark `build-want-hub-d-surface-key.md` and `plan-want-hub-d-p419.md` item 4 "RETRACTED by P420 - not operative"; rewrite the brief's Authority (Josh's backup + "proceed" first); name a SEPARATE branch for `neuro_foundation.py` alone (the tests-only `cc-laptop-want-hub-build-20260930` already exists) and say how the delta pair composes the two without a combined committed branch. |
+| F7 | LOW | Record where Josh's "proceed" and backup confirmation (both msgpack files) live, before the first commit touching `neuro_foundation.py`; the delta pair checks it. |
+| F8 | LOW | E-b/frame: say the asked session runs on the NG being changed, or name whose structure. |
+| F9 | LOW | (checker-025 N2, reproduced) `:501` "-81.6%" -> "-81.7%" (1 - 122/664 = 81.6265%). |
+| E1 | Exec to hear | The cost of a decline or silence falls on the CC's own loops; keep the frame neutral and let the operator-shown material carry the facts. |
+| E2 | Exec to hear | "No one in this org" binds Josh; confirm he has ratified the promise before any session is shown it. |
+
+## Closing
+Verdict file complete. Nothing was built, merged, armed, settled or dispatched. No graph, checkpoint or msgpack loaded; no NG module imported (P379: resolved NG module paths none; NG-module state none). The protected file was not opened by me and is identical to base on this branch and on the tests-only build branch. Plan cited by commit `ac574f31787fed23aa45a8502254e1542bcae4d2`, sha256 `308b72834f3b88b1501dbc328e8425f3f4a3573dcf5838b4db48a9290fc24682`. Commits contain only this file; pushed by name to `cc-laptop-want-hub-d-20260930`.
