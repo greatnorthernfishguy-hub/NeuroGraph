@@ -23,6 +23,36 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-09-29] Claude Sonnet 5 (T3 harness), lane
+#   z11-r5-embed-failover-20260929 — Executive Packet 139 R5.
+# What: With NG_EMBED_REMOTE unset, a local load failure or a local
+#   inference failure now automatically fails over to the same-model HF
+#   remote API instead of raising immediately. _ensure_model()'s except
+#   branch sets _remote_mode=True (in addition to _model_failed=True) and
+#   returns True instead of False, so the caller's already-existing
+#   `if self._remote_mode:` branch routes to _hf_remote_*. The two dead
+#   `if self._model_failed: return False` fast-paths were removed —
+#   unreachable now that a load failure always also sets _model_loaded.
+#   A new _fail_over_to_remote() helper flips _remote_mode (idempotent,
+#   logs once) and is called from the four call sites that reach
+#   _onnx_embed_ids_batch (embed_batch's short and long paths,
+#   embed_windows' short and long paths): each wraps its local ONNX call
+#   in try/except EmbeddingUnavailableError: raise / except Exception,
+#   and on the latter re-issues the identical _hf_remote_* call already
+#   used by the explicit-remote branch immediately above it, so a
+#   failed-over vector is produced by the same code as the explicit
+#   NG_EMBED_REMOTE=hf path (bit-for-bit identical for the same input).
+#   Both failure origins reach the pre-existing _hf_remote_call retry
+#   (3x, 1s/3s/9s) and _log_failed_embed quarantine unchanged.
+# Why:  R5 spec (2026-09-20-ng-embed-dual-pass-nontruncating-design.md,
+#   §R5, acceptance 6a) required local-failure-to-remote-API failover;
+#   none existed — a local failure of either kind raised
+#   EmbeddingUnavailableError straight through with no attempt at the
+#   already-built remote path.
+# How:  See What. No change to the NG_EMBED_REMOTE=hf explicit branch,
+#   windowing/truncation logic, dual-pass code, or the remote retry/
+#   quarantine machinery itself — all reused as-is.
+# -------------------
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-ngembed-cap-roundrobin-20260926 — #666.
 # What: _extract_concepts now builds its concept union by round-robin interleave
@@ -339,17 +369,20 @@ class NGEmbed:
     # -- Model loading -------------------------------------------------------
 
     def _ensure_model(self) -> bool:
-        """Lazy-load ONNX model + tokenizer on first use."""
+        """Lazy-load ONNX model + tokenizer on first use.
+
+        A load failure (NG_EMBED_REMOTE unset) fails over to the same-model
+        HF remote API (R5) rather than returning False — _model_loaded is
+        set True in that case too, so there is no longer a state where
+        _model_loaded is False and _model_failed is True. _model_failed is
+        kept purely as a diagnostic "local has failed at least once" flag.
+        """
         if self._model_loaded:
             return True
-        if self._model_failed:
-            return False
 
         with self._model_lock:
             if self._model_loaded:
                 return True
-            if self._model_failed:
-                return False
 
             remote = os.environ.get("NG_EMBED_REMOTE")
             if remote is not None:
@@ -412,9 +445,28 @@ class NGEmbed:
                 return True
 
             except Exception as exc:
-                logger.warning("ng_embed: model load failed: %s", exc)
                 self._model_failed = True
-                return False
+                self._fail_over_to_remote(exc, "model load")
+                self._model_loaded = True
+                return True
+
+    def _fail_over_to_remote(self, exc: BaseException, stage: str) -> None:
+        """Local ONNX is unusable — route to the same-model HF remote API (R5).
+
+        Called from a load failure (_ensure_model) or an inference failure
+        (the four call sites that reach _onnx_embed_ids_batch). Either origin
+        lands here and then reaches the identical _hf_remote_* retry/
+        quarantine machinery already used by explicit NG_EMBED_REMOTE=hf —
+        no second fallback mechanism. Idempotent: only logs the transition
+        once per process; subsequent calls (local or remote re-failing) are
+        silent here.
+        """
+        if not self._remote_mode:
+            logger.warning(
+                "ng_embed: local %s failed (%s) — failing over to HF remote API (R5)",
+                stage, exc,
+            )
+        self._remote_mode = True
 
     # -- Embedding -----------------------------------------------------------
 
@@ -473,9 +525,17 @@ class NGEmbed:
                     short_texts, normalize=normalize, is_query=is_query,
                 )
             else:
-                short_vecs = self._onnx_embed_batch(
-                    short_texts, normalize=normalize, is_query=is_query,
-                )
+                try:
+                    short_vecs = self._onnx_embed_batch(
+                        short_texts, normalize=normalize, is_query=is_query,
+                    )
+                except EmbeddingUnavailableError:
+                    raise
+                except Exception as exc:
+                    self._fail_over_to_remote(exc, "inference")
+                    short_vecs = self._hf_remote_embed_batch(
+                        short_texts, normalize=normalize, is_query=is_query,
+                    )
             for i, vec in zip(short_idx, short_vecs):
                 results[i] = vec
 
@@ -498,9 +558,20 @@ class NGEmbed:
                     skip_prefix=True,
                 )
             else:
-                vecs = self._onnx_embed_ids_batch(
-                    [job[2] for job in window_jobs], normalize=False,
-                )
+                try:
+                    vecs = self._onnx_embed_ids_batch(
+                        [job[2] for job in window_jobs], normalize=False,
+                    )
+                except EmbeddingUnavailableError:
+                    raise
+                except Exception as exc:
+                    self._fail_over_to_remote(exc, "inference")
+                    vecs = self._hf_remote_embed_batch(
+                        [job[3] for job in window_jobs],
+                        normalize=False,
+                        is_query=False,
+                        skip_prefix=True,
+                    )
             grouped: Dict[int, List[tuple]] = {}
             for (i, weight, _w_ids, _w_text), vec in zip(window_jobs, vecs):
                 grouped.setdefault(i, []).append((weight, vec))
@@ -539,7 +610,15 @@ class NGEmbed:
                     text, normalize=normalize, is_query=is_query,
                 )
             else:
-                vec = self._onnx_embed(text, normalize=normalize, is_query=is_query)
+                try:
+                    vec = self._onnx_embed(text, normalize=normalize, is_query=is_query)
+                except EmbeddingUnavailableError:
+                    raise
+                except Exception as exc:
+                    self._fail_over_to_remote(exc, "inference")
+                    vec = self._hf_remote_embed(
+                        text, normalize=normalize, is_query=is_query,
+                    )
             return WindowedEmbedding(pooled=vec, windows=(), token_count=n)
 
         windows: List[EmbedWindow] = []
@@ -560,12 +639,23 @@ class NGEmbed:
                 skip_prefix=True,
             )
         else:
-            vecs = [
-                self._onnx_embed(
-                    w_text, normalize=False, is_query=False, _ids=w_ids,
+            try:
+                vecs = [
+                    self._onnx_embed(
+                        w_text, normalize=False, is_query=False, _ids=w_ids,
+                    )
+                    for w_text, w_ids, _weight in jobs
+                ]
+            except EmbeddingUnavailableError:
+                raise
+            except Exception as exc:
+                self._fail_over_to_remote(exc, "inference")
+                vecs = self._hf_remote_embed_batch(
+                    [j[0] for j in jobs],
+                    normalize=False,
+                    is_query=False,
+                    skip_prefix=True,
                 )
-                for w_text, w_ids, _weight in jobs
-            ]
 
         for (w_text, _w_ids, weight), vec in zip(jobs, vecs):
             windows.append(EmbedWindow(text=w_text, embedding=vec, token_count=weight))
