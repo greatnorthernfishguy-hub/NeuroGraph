@@ -3130,5 +3130,5 @@ def test_the_streamed_render_view_orders_and_truncates_like_the_canonical_graph(
     g2.restore(p)
     V = tool.stream_graph_nodes(p)
     want = org.render_wants(g2)
-    assert len(want.encode("utf-8")) > 1000 and want.count("\n") == org.WANT_RENDER_LIMIT   # the limit really bit
+    assert len(want.encode("utf-8")) > 1000 and want.count("\n") == org.WANT_RENDER_LIMIT + 1   # the limit really bit (header + LIMIT + the "older" line)
     assert org.render_wants(V["render_graph"]) == want
