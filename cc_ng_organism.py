@@ -447,6 +447,22 @@
 # How:  One argument removed, on the e4ebf982 base. Expected conflict with #813 (84a0968a) at
 #   this call site: see the #812 turn-1 return for the correct merged form.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
+#   TURN 7 (dispatch #11293) -- le-027 N-2/N-4/N-5 (N-1 RECORD ONLY)
+# What: (N-2, MEDIUM) a dead or missing identity guard still FAILS CLOSED (everything pinned, WARNING
+#   once per id) and now ALSO emits ONE count-only WARNING per call on BOTH paths that use the probe
+#   (Stage 3 / Pith-ON and the un-Pithed renderer): "K of N items pinned because the identity guard
+#   failed (<type>); L1 X chars vs budget B" -- counts and exception type only, no text, no ids -- so a
+#   persistent dead guard is not silent while it leaves the L1 far over budget. A working guard emits
+#   nothing. WARNING because a dead identity guard is an operational fault (the drop/reference lines are
+#   INFO because they report designed behaviour). The probe carries the per-call record
+#   (_pinned.guard_failed); _cc_log_guard_pins turns it into the line. (N-4) the coherence vocabulary is
+#   left as five code sites and a TEST asserts they all equal _PITH_COHERENCE_STATES (deriving them
+#   would restructure the ladder / weight dict / order tuple = behaviour, for a LOW note). (N-5) tests only.
+# Why: le-027: fail-closed is right (Duck Ethics) but silent while the L1 stays over budget.
+# How: cc_ng_host.py, surfacing.py, surface_resolver.py untouched. C4 (no drop line for pins) stays the
+#   Exec's open note; the count-only line is now its signal. N-1 (the optimistic-limit band) is recorded
+#   in returns/build-007.md and NOT implemented.
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
 #   TURN 6 (dispatch #11238) -- le-025 C-1..C-5 (Chief ruling docs e19962de)
 # What: (C-2, MEDIUM) _pith_provider_node_limit is now the OPTIMISTIC bound -- measured from the
 #   SMALLEST overhead the renderer can have (one ordinary alert-free line, no sources/anchors/
@@ -7508,13 +7524,17 @@ def cc_deposit_pith_failure(exc: BaseException, tract_path: Optional[str] = None
                                 "cc_gateway", [tract_path or cc_gateway_tract_path()])
 
 
-def _cc_pin_guard_failed(node_id: Any, exc: BaseException) -> bool:
+def _cc_pin_guard_failed(node_id: Any, exc: BaseException, failed: Optional[Dict[Any, str]] = None) -> bool:
     """The identity-pin guard raised (or is missing): FAIL CLOSED -- the item is PINNED.
 
     Identity fails toward KEEPING content (#92 "nothing protected dies"; Duck Ethics): a broken
     guard must never make an identity item budget-droppable.  Loud, not silent: a WARNING naming
     the node id and the exception TYPE only (never node text), the id first-time-seen (bounded,
-    flood-safe -- the same tracker as the drop lines).  Returns True."""
+    flood-safe -- the same tracker as the drop lines).  `failed` is the calling probe's per-call
+    record (node id -> exception type) that _cc_log_guard_pins turns into ONE count-only line.
+    Returns True."""
+    if failed is not None:
+        failed[node_id] = type(exc).__name__
     shown, _already, _more = _pith_note_ids(["pin|%s" % (node_id,)])   # a LIST: a bare str iterates chars
     if shown:
         logger.warning("Pith identity-pin guard failed for node %s (%s); treated as PINNED "
@@ -7531,13 +7551,39 @@ def _cc_pin_probe(ng: Any) -> Any:
     (no `.graph`, no `_is_identity_protected`), the item is treated as PINNED and a WARNING is
     logged (_cc_pin_guard_failed) -- base failed soft to NOT pinned at DEBUG, which let a vanished
     guard make identity items budget-droppable.  The guarded call itself is unchanged from base
-    (a test compares it with e4ebf982's closure)."""
+    (a test compares it with e4ebf982's closure).
+
+    Turn 7 (le-027 N-2): one probe lives for ONE recall call, so it also carries that call's
+    record of which items a FAILED guard pinned (`_pinned.guard_failed`), which the path turns
+    into one count-only line (_cc_log_guard_pins)."""
+    failed: Dict[Any, str] = {}
+
     def _pinned(node_id):
         try:
             return bool(ng.graph._is_identity_protected(node_id))
         except Exception as exc:
-            return _cc_pin_guard_failed(node_id, exc)
+            return _cc_pin_guard_failed(node_id, exc, failed)
+    _pinned.guard_failed = failed
     return _pinned
+
+
+def _cc_log_guard_pins(where: str, pinned: Any, node_ids: List[Any], l1_chars: int, budget: int) -> None:
+    """Turn 7 / le-027 N-2: ONE count-only line PER CALL when any item of this call was pinned
+    BECAUSE the identity guard failed.
+
+    Fail-closed keeps every such item whole and OUTSIDE the budget, so a dead guard can leave the
+    L1 far over its budget with no drop line (drops are the only thing the other lines report).
+    This is the signal that persists for as long as it costs the prompt.  Counts only: how many
+    items, how many in total, the exception type(s), the L1 size vs the budget -- no node text and
+    no ids (the first-seen per-id WARNING already names them once).  WARNING, not INFO: the drop /
+    reference lines report designed behaviour; a dead identity guard is an operational fault."""
+    failed = getattr(pinned, "guard_failed", None) or {}
+    hit = [nid for nid in node_ids if nid in failed]
+    if not hit:
+        return
+    logger.warning("pith %s: %d of %d items pinned because the identity guard failed (%s); "
+                   "L1 %d chars vs budget %d", where, len(hit), len(node_ids),
+                   "/".join(sorted({failed[nid] for nid in hit})), l1_chars, budget)
 
 
 # INTERIM FORK (T1, le-022): _cc_monitor_items_whole + _format_cc_monitor_block below exist only
@@ -7658,6 +7704,9 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
                 sum(len(cl.content or "") for cl in dropped), len(kept_lines), used,
                 [(cl.node_id, len(cl.content or "")) for cl in never_fit])
         kept = {id(origin[id(cl)]) for cl in kept_lines} | pinned_items
+        _cc_log_guard_pins(
+            "recall (un-Pithed)", pinned, [cl.node_id for cl, _item in tagged],
+            sum(len(item.get("content", "") or "") for _cl, item in tagged if id(item) in kept), budget)
     except Exception as exc:
         logger.warning("un-Pithed budget step failed; rendering every item whole and unbudgeted: %s",
                        exc)
@@ -7885,7 +7934,10 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # [lane 812-813-onto-s4] what Stage 3 actually chose from (reference copies
             # included), so on_surfaced's `dropped` never lists an item rendered as its reference.
             _l1_in = survivors
+            _stage3_ids = [cl.node_id for cl in survivors]
             survivors = pith_stage3(survivors, budget_chars=budget)
+            _cc_log_guard_pins("L1 (Pith-ON)", _pinned, _stage3_ids,
+                               sum(len(cl.content or "") for cl in survivors), budget)
             # Pith Stage 5 (eviction): budget-dropped lines fall to the victim buffer.
             try:
                 pith_victim_capture(survivors, _pre_l1)
