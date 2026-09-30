@@ -1,10 +1,10 @@
 # checker-028 ROLE A — delta review of build-tool-007b (streamed content-subset vectors reader + Graph-free analyze())
 
-STATUS: INCOMPLETE - review in progress
+STATUS: COMPLETE
 
 Seat: checker-028 (cross-family, report_only). Dispatch #11899. Lane `z12-s3-restore-bundle-20260929`. Zone manager Z12 session `52d39aba-db92-4bf2-b3b1-0e4c13f77d8c`. Packet ADDENDUM 5 of `review-packet-want-text-repair-118.md` (docs worktree `/home/josh/docs/.claude/worktrees/daemon-recall-756-20260930`, branch `cc-laptop-daemon-recall-756-20260930`; packet read, not edited). Diff pin `09a032c3426baf8307cb968496c65f779894304b` → `3cd271b2a79657afe5a6feeee7454f04b4e479d3` on the tool and test files. Return `handoffs/z12-want-text-repair/returns/build-tool-007b.md` treated as a claim. Output only this file. Scope = the delta only.
 
-Independence: `le-035-want-repair-delta-stream.md` contents have not been opened. Accidental listing: `ls` of `handoffs/z12-want-text-repair/reviews/` showed the filename present, and `git log --oneline` showed the four le-035 commit subjects (`stub`, `first findings`, `ROLE B … COMPLIANT, PASS-WITH-NOTES`, `final status COMPLETE; independence log (checker-028 absent at completion)`). The file body has not been read.
+Independence: own A1–A9 findings were committed and pushed as `02132ba7446ec269c573c9378d1faad5076cf18d` before this file's body was opened. Accidental pre-draft listing: `ls` of `handoffs/z12-want-text-repair/reviews/` showed the filename, and `git log --oneline` showed the four le-035 commit subjects. The body was read only after that draft commit. Comparison is A10.
 
 ## Pins and run evidence
 
@@ -133,27 +133,53 @@ Challenge, small: return section 3's `_streamed` except list is written as the f
 
 ## A10 Independence
 
-**PASS** (pending ROLE B comparison)
+**PASS**
 
-Own findings above were drafted without reading `handoffs/z12-want-text-repair/reviews/le-035-want-repair-delta-stream.md`. Accidental listing of the filename and of four git-log subjects is disclosed at the top. After this draft is committed, that file will be read and a comparison appended.
+Own A1–A9 were committed at `02132ba7446ec269c573c9378d1faad5076cf18d` and pushed to `origin/cc-laptop-want-repair-tool-20260930` before `handoffs/z12-want-text-repair/reviews/le-035-want-repair-delta-stream.md` was opened. Accidental pre-draft listing of the filename and of four git-log subjects is disclosed at the top of this file. After that commit the body was read (STATUS COMPLETE there; ROLE B overall COMPLIANT, PASS-WITH-NOTES).
+
+### Where the two seats agree
+
+- Overall: the delta is acceptable. ROLE A **PASS-WITH-NOTES**; ROLE B **COMPLIANT / PASS-WITH-NOTES**. No Law violation. V11 byte-identical and still a gate. Pin clean. Canonical loaders untouched. Old path gone (one `.restore(`, V11). Pre-flight unedited. Memory table is a `tracemalloc` shape check; nothing lowered. 235 passed on the suite (this seat 100.57s; le-035 84.58s).
+- `_old_analyze` omits the missing-scope `Stop` and adds `before_figures_scope`; it is otherwise the pre-delta `analyze`. Neither seat treats that as a bend of the compared keys.
+- `_streamed` is `except Exception`, broader than the four named types, and still fail-closed (raises `Stop`; never a shorter successful content set).
+- Disclosed (a)/(b)/(c): both seats rule them harmless for Phase-1 outputs, with (b) a real widening versus `SimpleVectorDB.load`.
+- Native non-node synapse corner and real files remain unverified as live data. `synapse_stats` still whole-file `bytes`; classify is not light end-to-end; V11 stays the heavy Phase-1 restore.
+
+### Where this seat disagrees
+
+- Check 1 grading: le-035 marks byte-identity **PASS**; this seat keeps **PASS-WITH-NOTES** because the test-only OLD path omits the missing-scope `Stop`. The facts are the same; the grade is stricter here, not a factual dispute.
+- Duplicate map keys: this seat's draft treated them as a residual on a file the canonical writer cannot emit. le-035 measured a silent `render_len_before` / render-view split on a repeated node id and a merge of two top-level `nodes` keys. That measurement is accepted. It remains a hole on hand-crafted or corrupted input, not a fail of the replacement on a canonically written checkpoint. Elevating it to a numbered correction (below) is agreement-after-read, not a walk-back of A1–A9.
+
+### What le-035 adds that this seat did not run
+
+- An independent world with byte-injected self-loop and ghost-endpoint synapses through the real native store, plus `old.analyze` extracted from `git show 09a032c` (sha256 `cbc38bf4…`). This seat's own world used the Graph API (self-loop refused) and the test-file `_old_analyze`. Their figure-equality on ghost endpoints is accepted as synthetic close of A9's native-store hole; this seat did not reproduce the byte surgery.
+- Vectors/main differential fuzz (BOTH_OK_DIFFER = 0) and the main.msgpack half of the skip-without-validate widening (`strict_map_key=False`; 88/1,200 mutants `Graph.restore` rejects that the tool accepts). Draft A3 named this only on vectors. Agreement: disclose the main-side widening; V11 still canonical-restores the rewrite output.
+- Coverage holes M5/M6: a live `hyperedges` entry whose stored `is_archived` is true, and a non-node-endpoint synapse, would likely survive the worker's extras world. Draft A8 did not name those two extras-world gaps.
+- `skip()` of one huge bin leaf ≈ 2.1× RSS in a clean child (`ru_maxrss`); a map of small leaves stays flat. This seat did not measure RSS; the number is ROLE B's, not re-run here.
+- Stale section banner at tool `:1556` ("analysis-001 loader (canonical readers)") and the superseded header How-sentence. Cosmetic LAW 3 note; agreed as LOW.
 
 ## Overall
 
 **PASS-WITH-NOTES** (ROLE A)
 
-The delta does what ADDENDUM 5 / items 1-8 asked: a tool-local streamed content-subset reader and a Graph-free `analyze()` replace `load_pair` / whole-file `SimpleVectorDB.load` and the live Graph in the classify path; V11 stays canonical and a gate; pin and canonical loaders untouched; byte-identity proven on the extras world and on one independent world; fail-closed on truncated/malformed vectors; old path gone; memory numbers are a shape check; nothing lowered.
+The delta does what ADDENDUM 5 / assignment items 1–8 asked: a tool-local streamed content-subset reader and a Graph-free `analyze()` replace `load_pair` / whole-file `SimpleVectorDB.load` and the live Graph in the classify path; V11 stays canonical and a gate; pin and canonical loaders untouched; byte-identity proven on the extras world and on one independent world; fail-closed on truncated/malformed vectors; old path gone; memory numbers are a shape check; nothing lowered.
 
 ## Numbered corrections
 
-None that block the delta. Optional follow-ups (not required to accept the replacement):
+None that block the delta. Non-blocking, after the le-035 read:
 
-1. Narrow `_streamed`'s `except Exception` to the four named types so a reader bug is not relabelled as a malformed file.
-2. If the pair wants fail-closed vs canonical embedding/metadata well-formedness, decode those fields enough to raise the same errors `SimpleVectorDB.load` raises, still without retaining them.
+1. Duplicate map keys (`nodes` / `entries` repeated inside one map, or two top-level `nodes`/`entries` keys): streaming merges pairs; `msgpack.unpack` last-wins the whole map. le-035 showed a stale want remaining in the streamed render view. Raise `Stop` on a repeated node id and a repeated top-level `nodes`/`entries` key. Canonical writer cannot emit this; it is LAW 7 hygiene for a corrupted file.
+2. Disclose that Phase-1 `analyze()` no longer canonical-validates INPUT `main.msgpack`/`vectors.msgpack` (vectors half was in return section 3(b); main half was not). Later proof of loadability is V11 on the OUTPUT (and Phase-2 restore / G2/G3).
+3. Narrow `_streamed`'s `except Exception` to the four named types so a reader bug is not relabelled as a malformed file.
+4. Equivalence-world gaps: a `hyperedges` row with stored `is_archived` true still in `hyperedges`; a non-node-endpoint synapse / self-loop (inject, Graph API will not write them); two S wants sharing one source; `analyze(frozen_scope=[missing])` raises the same `Stop` before the vectors file is opened.
+5. Stale comments at tool `:1556` and the superseded header How-sentence: one truth (LAW 3, cosmetic).
+6. P3-style probe on the kept COPY should report the largest single skipped leaf, not only peak RSS.
 
 ## Numbered not-verified
 
 1. Real checkpoint files (explicitly out of scope).
-2. Native synapse store behaviour for an endpoint that is not a node, and for a self-loop (Graph API refuses both on the write path).
-3. Unpacker skip-buffer peak on a real `main.msgpack`.
+2. Native synapse store on a real `main.msgpack`. Synthetic ghost-endpoint equality is le-035's measurement, not re-run here.
+3. Unpacker skip-buffer peak on a real `main.msgpack`. The ~2.1× single-leaf RSS figure is le-035's, not re-run here.
 4. Re-execution of the worker's failing-first pytest at `504d892` (git order confirms tests-before-tool; this seat ran the suite once at the delta tip).
-5. ROLE B (`le-035`) comparison — after this draft commit only.
+5. V1–V19 old-vs-new on this seat's own world (the 235-pass run covers the extras world).
+6. Phase-2 apply path's use of `analyze()` on live bytes (out of delta scope).
