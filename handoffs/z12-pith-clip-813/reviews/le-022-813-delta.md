@@ -1,4 +1,5 @@
-STATUS: INCOMPLETE - review in progress (DRAFT B1-B5 committed BEFORE reading checker-022; comparison + final verdict still to come)
+STATUS: COMPLETE
+(B1-B5 were drafted and committed as `f7453bb9d839abcc32b17b7583c4fa90604a6c32` BEFORE I read `checker-022-813-delta.md`; the comparison section at the end is the only text added after reading it.)
 
 <!--
 # ---- Changelog ----
@@ -77,3 +78,20 @@ Verdict for B2: **ETHOS DRIFT DETECTED — no hard violation; one LAW 3/4 tensio
 5. **Record:** complete the #817 record with gaps (a)-(c) above; carry C4 (pins off-budget) as the Exec's open note.
 
 **Not verified:** anything live (no service, socket, tract, checkpoint, real graph; log wording is asserted by tests and my probe, not seen in a running daemon); the 3 `CC_DAEMON_UNDER_TEST` parity tests (skipped in my run); the docs-repo preflight tests (not re-run by me); behaviour on the VPS (cc_ng_host untouched, not deployed); the full repo-wide cap census (the 35-row audit is not one, as the worker says); Rust-side `minitid.rs` beyond the header `compress_history` grep.
+
+## Comparison with checker-022 (read only AFTER the draft was committed)
+checker-022 (ROLE A, grok-4.6) reviewed turns 2+3 (`5a634ca`), one turn before my final head; its C1-C3 are exactly what turn 4 fixed, C4 is left open.
+
+**Agree (independently reached):** D8 — the Stage 3 first-line guard stays REMOVED; turn-3 revert restores `cc_ng_host.py` byte-identical (`e3b568c0…`), `pith_compress_history`, both handlers and the history tests, one remaining `pith_stage2_keyframe` caller with a consistent AST guard; F3a/F3b hold (my copy rehearsal reproduces its result; real `~/.bashrc` prefix `72f2e7133cce652a` = its full hash `72f2e7133cce652a…4255a3` prefix); contract (five exports) + preflight still change together; #818 loud drops; C4 (pins off-budget) is an Exec call, not folded. Its C1 (docstring), C2 (raise → kept the cut snippet) and C3 (leftover trees silent) were real at `5a634ca`; I confirm each is closed at `ed3c103`/`1a347f9c` (B3 i-iv). Test counts reconcile: its 261 passed/3 skipped at turn 3 + the 9 new turn-4 tests = my 270 passed/3 skipped.
+
+**Disagree:** nothing substantive. One nuance: checker-022 A1 treats the un-Pithed path as "admits whole items under THE ONE rule" and stops there; I think the identity/pin consequence on that path (N1) is a real gap — its C4 only considered Stage 3.
+
+**I add (not in checker-022):**
+* **N1** (MEDIUM): `_cc_render_unpithed` has no pin exemption — an identity-protected item is budget-droppable on the default (gate-off) path; probe attached in B2. Not in any D-list.
+* **N2** (MEDIUM/LOW): `_pith_whole_node_reference` ends "so its concepts follow" unconditionally — false for a 0-tree node (probe) and overstated for pre-PASS-2 coverage.
+* **T1** (ruling for Josh/Exec): the `_format_cc_monitor_block` twin + `_cc_monitor_items_whole` re-resolver are a LAW 3/4 consumer-side fork; #812 must record that the source fix deletes both.
+* **N3/N4/N5** (LOW): contract not updated for turn-4 C2/C3 and the `CC_PITH_DROP_LOG_*` knobs; C3 INFO not first-seen-suppressed; `on_monitor_error` not invoked for re-resolve drops and an `ImportError` of `surface_resolver` now drops the whole monitor stream (loudly); `800`/`200` constants.
+* **#817 record gaps** (a) no traffic evidence for the `compress_history` event, (b) AST-guard/docstring update, (c) parity tests — B4.
+* **Carry-forward, not this diff:** checker-022's not-verified list notes `CC_PITH_PREFETCH_LOD_DIST` is still reported as a live resolved setting (`cc_ng_organism.py:~3962`): a phantom-configuration item (LAW 5 ethos) — already on the plan-002 list as #821 (F4); I did not re-verify it.
+
+**Final verdict (unchanged by the comparison): ETHOS DRIFT DETECTED, no blocking Law violation — PASS-WITH-NOTES.** Recommended gate for the merger: rule on N1 (fix or explicit Exec ruling) before NG merges; N2 is a small wording fix that can ride the same change; T1 needs Josh's answer and a #812 record edit, not code here.
