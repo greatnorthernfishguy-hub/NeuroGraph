@@ -1,6 +1,14 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 5 (dispatch #11114): le-022 N1-N3 + LOWs
+# What: N1 the un-Pithed (gate-off / Pith-failure) renderer exempts identity-protected items from
+#   the budget exactly as Stage 3 does (pins outside the budget, rendered whole, never dropped, never
+#   swapped for a reference, and never lost to the strict-prefix stop); N2 the whole-node reference
+#   line tells the truth about what follows (0 / partial / full trees, pre-PASS-2 coverage); N3 the
+#   contract documents C2/C3/the DROP_LOG knobs; LOW the shell allowance is MEASURED, not a constant.
+# Why: Chief ruling docs 3604cfb1 on le-022 (PASS-WITH-NOTES). N1 test was written FIRST and shown failing.
+# How: fake in-memory graph; FakeGraph._is_identity_protected = constitutional or *_authored provenance.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 4 (dispatch #11061): checker-022 C1-C3
 # What: C1 pin the pith_stage3 docstring to what the body does (an over-budget FIRST unpinned line is
 #   skipped, never kept); C2 a monitor item whose whole-content re-resolve RAISES is dropped
@@ -1005,3 +1013,145 @@ def test_c3_no_line_when_every_tree_is_included(caplog):
     with caplog.at_level(logging.INFO, logger=pith.logger.name):
         text = pith._pith_reference_text(g, "cc:conv::big", "B" * 30000, 40000)
     assert text.count("- concept: ") == 2 and _tree_lines(caplog) == []
+
+
+# ====================================================================== TURN 5: N1 (pins in the un-Pithed renderer)
+def _n1_world(third_len=1200):
+    """le-022's probe: a 2500 @9.0, b 2500 @8.0, an identity-protected 1200 @0.1; budget 4000."""
+    g = FakeGraph()
+    _core(g)
+    a, b, ident = "A-ITEM " + "a" * 2493, "B-ITEM " + "b" * 2493, "IDENT-ITEM " + "i" * (third_len - 11)
+    g.node("a", a)
+    g.node("b", b)
+    g.node("ident", ident, provenance="cc_authored")                 # -> _is_identity_protected
+    pat = [{"node_id": "a", "score": 9.0, "content": a, "prefetch_origin": False},
+           {"node_id": "b", "score": 8.0, "content": b, "prefetch_origin": False},
+           {"node_id": "ident", "score": 0.1, "content": ident, "prefetch_origin": False}]
+    return g, a, b, ident, pat
+
+
+def test_n1_identity_protected_item_is_exempt_from_the_gate_off_budget(monkeypatch, caplog):
+    g, a, b, ident, pat = _n1_world()
+    assert g._is_identity_protected("ident") and not g._is_identity_protected("a")
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out, _ = _recall(pith, fake_ng(g, []), pat, False, monkeypatch)
+    assert ident in out                                              # pin: whole, outside the budget
+    assert a in out                                                  # top-ranked unpinned item kept
+    assert b not in out                                              # the ordinary drop still happens ...
+    (record,) = _drop_records(caplog, "whole items")
+    assert "dropping 1 whole items" in record.getMessage()          # ... and counts ONLY b, never the pin
+    assert "kept 1 (2500 chars)" in record.getMessage()             # the pin is outside the kept budget too
+
+
+def test_n1_a_pin_larger_than_the_whole_budget_is_still_rendered_whole_never_referenced(monkeypatch):
+    g, a, b, _ident, pat = _n1_world()
+    huge = "HUGE-PIN " + "h" * 6000                                # > the 4000 budget
+    g.node("hugepin", huge, provenance="cc_authored")
+    pat = pat + [{"node_id": "hugepin", "score": 0.05, "content": huge, "prefetch_origin": False}]
+    out, _ = _recall(pith, fake_ng(g, []), pat, False, monkeypatch)
+    assert huge in out                                               # never dropped, never a reference
+    assert "long node" not in out
+
+
+def test_n1_the_pin_exemption_also_holds_on_the_pith_failure_fallback(monkeypatch):
+    g, a, b, ident, pat = _n1_world()
+    monkeypatch.setattr(pith, "pith_stage1", lambda *a_, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out, _ = _recall(pith, fake_ng(g, []), pat, True, monkeypatch)
+    assert ident in out and a in out and b not in out
+
+
+def test_n1_pith_on_and_gate_off_agree_on_which_items_survive(monkeypatch):
+    g, a, b, ident, pat = _n1_world()
+    on, _ = _recall(pith, fake_ng(g, []), pat, True, monkeypatch)
+    off, _ = _recall(pith, fake_ng(g, []), pat, False, monkeypatch)
+    for text in (a, b, ident):
+        assert (text in on) == (text in off), text[:8]
+
+
+# ====================================================================== TURN 5: N2 (truthful reference) / LOW (measured limit)
+def _ref_world(n_trees):
+    g = FakeGraph()
+    big = g.node("cc:conv::big", "B" * 30000)
+    big.creation_time = 1790000000.0
+    for i in range(n_trees):
+        txt = f"tree{i} " + ("c" * 40)
+        g.node(f"t{i}", txt, _tree_concept=True, _concept=txt)
+        g.synapse(f"f{i}", "cc:conv::big", f"t{i}", 1.0 - i * 0.01)
+    return g
+
+
+def _ref(g, shown=None):
+    return pith._pith_whole_node_reference(g, "cc:conv::big", g.nodes["cc:conv::big"], "B" * 30000, shown=shown)
+
+
+def test_n2_a_node_with_no_trees_does_not_promise_that_concepts_follow():
+    line = _ref(_ref_world(0))
+    assert "0 concept trees" in line and "follow" not in line and "concepts" not in line.split("(")[1].split(")")[1]
+    assert line.endswith("too large to render whole here.")
+    assert "\n" not in line
+
+
+def test_n2_partial_and_full_coverage_are_stated_exactly():
+    g = _ref_world(5)
+    assert "3 of 5 concept trees follow" in _ref(g, shown=3)
+    assert "5 concept trees follow" in _ref(g, shown=5) and "of 5" not in _ref(g, shown=5)
+    assert "None of its concept trees fit here" in _ref(g, shown=0)
+    assert "1 concept tree follows" in _ref(_ref_world(1), shown=1)              # grammar
+    for shown in (3, 5):
+        assert "may cover only part of it" in _ref(g, shown=shown)               # the honest hedge
+
+
+def test_n2_when_the_caller_cannot_know_how_many_fit_it_says_where_they_fit():
+    line = _ref(_ref_world(4))                                                  # provider path: shown=None
+    assert "4 concept trees" in line and "follow where they fit" in line
+    assert "so its concepts follow" not in line
+
+
+def test_n2_the_l1_form_reports_exactly_the_trees_it_placed(caplog):
+    g = _ref_world(5)
+    ref_len = len(pith._pith_whole_node_reference(g, "cc:conv::big", g.nodes["cc:conv::big"], "B" * 30000, shown=2))
+    budget = ref_len + 2 * (len("- concept: ") + 46 + 1) + 3
+    text = pith._pith_reference_text(g, "cc:conv::big", "B" * 30000, budget)
+    assert len(text) <= budget and text.count("- concept: ") == 2
+    assert "2 of 5 concept trees follow" in text
+
+
+def test_n2_the_provider_context_line_carries_no_false_promise_for_a_treeless_giant():
+    g, _t, _ = _giant_world(trees=0)
+    ctx = _run(pith, g, [{"node_id": "cc:conv::bigforest", "score": 1.0}], "go on", budget_chars=4000)["context"]
+    assert "0 concept trees" in ctx and "concepts follow" not in ctx
+
+
+def test_low_the_node_limit_is_measured_from_the_renderer_not_a_constant():
+    assert not hasattr(pith, "_PITH_SHELL_ALLOWANCE")
+    core = pith.render_constitutional_core(_giant_world()[0])
+    limit = pith._pith_provider_node_limit(core, 4000)
+    assert 1 <= limit < 4000 - len(core)
+    # it must really be the room a single assembly has: a node of exactly `limit` chars plus its
+    # own line structure, inside the WORST-CASE shell, still fits the budget
+    line = pith.CacheLine(node_id="n", content="x" * limit, sources=["substrate topology"], stream="connected",
+                          coherence="unknown")
+    worst = pith._pith_provider_sections(core, [line], [pith._pith_render_connected_line(line)])[0]
+    assert len(worst) <= 4000
+    # tiny budgets floor at 1 (never 0, which would silently disable the reference form)
+    assert pith._pith_provider_node_limit(core, 10) == 1
+    # a bigger budget gives a strictly bigger limit, 1:1
+    assert pith._pith_provider_node_limit(core, 8000) - limit == 4000
+
+
+def test_n3_the_contract_states_the_log_knobs_with_the_defaults_and_clamps_the_code_uses():
+    text = open(os.path.join(_ROOT, "docs", "PITH_HOST_CONTRACT.md")).read()
+    assert f"| `CC_PITH_DROP_LOG_IDS_PER_CALL` | `{os.environ.get('CC_PITH_DROP_LOG_IDS_PER_CALL', '8')}` | `[1, 64]` |" in text
+    assert f"| `CC_PITH_DROP_LOG_SEEN_MAX` | `{os.environ.get('CC_PITH_DROP_LOG_SEEN_MAX', '4096')}` | `[16, 65536]` |" in text
+    assert pith._CC_PITH_DROP_LOG_IDS_PER_CALL == 8 and pith._CC_PITH_DROP_LOG_SEEN_MAX == 4096
+    src = open(_ORGANISM_SRC).read()
+    assert 'max(1, min(64, int(os.environ.get("CC_PITH_DROP_LOG_IDS_PER_CALL", "8"))))' in src
+    assert 'max(16, min(65536, int(os.environ.get("CC_PITH_DROP_LOG_SEEN_MAX", "4096"))))' in src
+
+
+def test_n3_the_contract_describes_c2_c3_n1_and_the_truthful_reference():
+    body = open(os.path.join(_ROOT, "docs", "PITH_HOST_CONTRACT.md")).read().split("-->", 1)[1]
+    assert "re-resolve *raises*" in body and "dropped" in body and "WARNING" in body
+    assert "pith reference form" in body and "left out" in body
+    assert "Identity is outside the recall budget" in body
+    assert "so its concepts follow" not in body
