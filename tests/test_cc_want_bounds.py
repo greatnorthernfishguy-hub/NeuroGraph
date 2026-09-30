@@ -1,9 +1,26 @@
-"""Bounds on CC want extraction and rendering (2026-09-16).
+# ---- Changelog ----
+# [2026-09-29] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810, Exec P406/P408)
+# What: the EXTRACTION half of this file no longer encodes the 600-char rule.
+#   test_span_longer_than_cap_creates_no_want -> test_span_longer_than_old_cap_is_captured_whole;
+#   test_nested_marker_is_rejected -> test_nested_outer_opener_is_rejected_and_nearest_pairs.
+#   The render tests (count cap + per-want clamp) are UNCHANGED: render_wants is not touched in
+#   this turn (Exec P408 retires the standing block in a separate turn, which then removes them).
+# Why: Josh (Exec P406): a WANT is the text between a real [WANT] and its paired [/WANT], NO
+#   length limit; legitimacy is structural (tests/test_cc_want_legitimacy_810.py). The 600 cap
+#   silently dropped genuine long wants; the pair-with-the-nearest-opener rule recovers a real
+#   want that follows an unclosed mention where base dropped both.
+# How: two expectations flipped with the reason stated on each test.
+# -------------------
+"""Bounds on CC want extraction and rendering (2026-09-16; extraction half superseded by #810).
 
 Regression cover for the "## What I Want" context bomb: 182 want-nodes, 118 of
 them over 600 chars, largest 136,449, total 2.27 MB injected on every prompt.
 Cause: prose that merely MENTIONS `[WANT]` let the unbounded non-greedy span run
 to the next `[/WANT]` far away, and the swallowed text became a single want.
+
+#810: the extraction bound is now STRUCTURAL legitimacy (no length limit) and is covered
+in tests/test_cc_want_legitimacy_810.py; the mention shapes below still create no want.
+The render bound tests stay until the standing block is retired (Exec P408).
 """
 import threading
 
@@ -67,10 +84,12 @@ def test_code_span_mention_creates_no_want():
     assert org.surface_wants(g, vdb) == []
 
 
-def test_span_longer_than_cap_creates_no_want():
-    content = "[WANT]" + ("x" * (org.WANT_MAX_CHARS + 50)) + "[/WANT]"
-    g, vdb = _graph_with(content)
-    assert org.surface_wants(g, vdb) == []
+def test_span_longer_than_old_cap_is_captured_whole():
+    """#810 (Exec P406): NO length limit. Was test_span_longer_than_cap_creates_no_want
+    (the 600-char cap silently dropped a genuine long want)."""
+    body = "x" * (org.WANT_MAX_CHARS + 50)
+    g, vdb = _graph_with("[WANT]" + body + "[/WANT]")
+    assert _texts(org.surface_wants(g, vdb)) == [body]
 
 
 def test_span_at_cap_is_accepted():
@@ -79,9 +98,12 @@ def test_span_at_cap_is_accepted():
     assert _texts(org.surface_wants(g, vdb)) == [body]
 
 
-def test_nested_marker_is_rejected():
+def test_nested_outer_opener_is_rejected_and_nearest_pairs():
+    """#810: the closer pairs with the NEAREST opener. Was test_nested_marker_is_rejected
+    (base dropped BOTH); the outer opener is still rejected -- never captured as one want
+    containing a marker -- but the inner pair is a real want."""
     g, vdb = _graph_with("[WANT] outer [WANT] inner [/WANT]")
-    assert org.surface_wants(g, vdb) == []
+    assert _texts(org.surface_wants(g, vdb)) == ["inner"]
 
 
 def test_two_real_wants_both_extracted():

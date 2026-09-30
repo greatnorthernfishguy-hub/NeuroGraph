@@ -3,6 +3,27 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-29] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810,
+#   Exec P406/P408) -- WANT extraction is structural LEGITIMACY, not a length limit.
+# What: new pure parse_wants(content) -> WantParse (+ want_id_for_text) is the ONE
+#   implementation of "is this [WANT]...[/WANT] a real want?". A want is the text between
+#   a real [WANT] opener and its paired [/WANT] closer, NO length limit. A marker inside a
+#   fenced block / inline code span / right after a backtick / backslash-escaped / wrapped
+#   in a quote pair is a MENTION; the closer pairs with the NEAREST live opener; a stray
+#   closer, an unclosed opener and an empty pair are skipped. surface_wants calls it and
+#   logs skips at INFO in a flood-bounded form (per-call summary on change + hourly
+#   heartbeat, per-marker detail once per (node, offset, reason), <=50 detail lines per
+#   call, no marker text). _WANT_RE (the 600-char pattern) is removed. WANT_MAX_CHARS stays
+#   DEFINED only because render_wants still clamps with it -- render_wants is NOT touched
+#   here (Exec P408: the standing "## What I Want" block is retired in a separate turn).
+# Why: Josh (Exec P406): "WANTs just need to have the WANT brackets on either side. A parser
+#   just needs to make certain that it's legit, and not just us talking about WANTs." The
+#   2026-09-16 600-char cap silently DROPPED a genuine long want (LAW 7: no truncation of raw
+#   experience) and was a length heuristic standing in for legitimacy. The repaired #801
+#   ids must equal a re-parse's ids, so both must call the same function (LAW 3/4).
+# How: see the plan/return doc handoffs/z12-want-legitimacy-810/returns/build-001.md.
+#   Id derivation, node metadata and synapse are UNCHANGED (cc:want::+sha1(inner)[:16]).
+#   surface_wants_for_graph (host twin, #755), neurograph_rpc.py and cc_ng_host.py untouched.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -1015,8 +1036,10 @@ import re
 import threading
 import time
 import uuid
+from bisect import bisect_right
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("cc_ng_organism")
 
@@ -1503,15 +1526,266 @@ def bootstrap_lenia(graph: Any, vector_db: Any, workspace_dir: str) -> Dict[str,
 # confused with Syl's own wants if the two substrates were ever inspected side by side.
 # "Self-motivated: forms its own forward intents" -- domain-general (Mind-Not-Database doctrine),
 # not Syl-specific content like Reach Teaching was.
-# A want is an UTTERANCE, not a document -- Josh: "always just a sentence or 3
-# long, no more." The captured span is therefore BOUNDED. Unbounded `(.*?)` let a
-# `[WANT]` that was merely *mentioned* (prose about the marker syntax, a code
-# span, a pasted transcript) run all the way to the next `[/WANT]` tens of
-# thousands of characters later: 118 of 182 CC want-nodes were >600 chars, one
-# was 136,449, and "## What I Want" reached 2.27 MB per turn (2026-09-16).
+# A want is the text between a REAL [WANT] opener and its paired [/WANT] closer --
+# NO length limit (Josh, Exec P406: "WANTs just need to have the WANT brackets on either
+# side. A parser just needs to make certain that it's legit, and not just us talking
+# about WANTs."). Legitimacy is STRUCTURAL: parse_wants() below. History: on 2026-09-16
+# prose that merely *mentioned* `[WANT]` let the old unbounded `(.*?)` run to a far
+# `[/WANT]` (118 of 182 CC want-nodes >600 chars, one 136,449; "## What I Want" reached
+# 2.27 MB per turn). The 600-char pattern cap that fixed it was a length heuristic that
+# also silently dropped genuine long wants; it is gone (#810). The render half of that
+# incident is handled by retiring the block (Exec P408), not by this parser.
+#
+# WANT_MAX_CHARS is RENDER-ONLY now: render_wants() still clamps each line with it. It is
+# no longer used by any parser path, and is deleted with the renderer it serves.
 WANT_MAX_CHARS = 600
 WANT_RENDER_LIMIT = 40
-_WANT_RE = re.compile(r"\[WANT\](.{1,%d}?)\[/WANT\]" % WANT_MAX_CHARS, re.DOTALL)
+WANT_OPEN = "[WANT]"
+WANT_CLOSE = "[/WANT]"
+_WANT_MARKER_RE = re.compile(r"\[(/?)WANT\]")
+
+# Why a marker was skipped (a failing marker is DISCUSSION, never a want).
+WANT_SKIP_REASONS = (
+    "in_fence", "in_code_span", "code_adjacent", "escaped", "quoted",
+    "opener_unclosed", "closer_without_opener", "empty_pair",
+)
+
+# Flood bounds for the INFO skip log (surface_wants runs on every autosave pulse).
+WANT_SKIP_SUMMARY_INTERVAL_S = 3600     # heartbeat when nothing changed
+WANT_SKIP_SEEN_MAX = 4096               # bounded FIFO of (node, offset, reason) already detailed
+WANT_SKIP_DETAIL_PER_CALL_MAX = 50      # detail lines per surface_wants call; rest deferred
+
+_WANT_FENCE_LINE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)\r?$", re.MULTILINE)
+_WANT_BLANK_LINE_RE = re.compile(r"\r?\n[ \t]*\r?\n")
+_WANT_BACKTICK_RUN_RE = re.compile(r"`+")
+_WANT_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’", "«": "»"}
+
+
+@dataclass(frozen=True)
+class WantSpan:
+    """One legitimate want: `text` is exactly what surface_wants stores and hashes."""
+    text: str
+    want_id: str
+    open_start: int     # char offset of the real [WANT] in the parsed content
+    close_end: int      # char offset just past the paired [/WANT]
+
+
+@dataclass(frozen=True)
+class SkippedMarker:
+    """One marker that is discussion, not a want (`reason` is in WANT_SKIP_REASONS)."""
+    marker: str         # WANT_OPEN or WANT_CLOSE
+    start: int          # char offset in the parsed content
+    reason: str
+
+
+@dataclass(frozen=True)
+class WantParse:
+    wants: Tuple[WantSpan, ...]
+    skipped: Tuple[SkippedMarker, ...]
+
+
+def want_id_for_text(text: str) -> str:
+    """THE want-node id: "cc:want::" + sha1(text utf-8)[:16]. `text` is the stripped inner
+    text. The #801 repair tool and surface_wants both call this, so repaired ids equal
+    what a re-parse mints."""
+    import hashlib
+    return "cc:want::" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _want_fence_spans(content: str) -> List[Tuple[int, int]]:
+    """Fenced code blocks (CommonMark): ```/~~~ line, closed by >= as long a fence of the
+    same char with only whitespace after. An UNCLOSED fence runs to the end of content --
+    skipping a real want is logged and recoverable; minting a bogus one is permanent."""
+    spans: List[Tuple[int, int]] = []
+    opened: Optional[Tuple[int, str, int]] = None
+    for m in _WANT_FENCE_LINE_RE.finditer(content):
+        run, info = m.group(1), m.group(2)
+        ch, n = run[0], len(run)
+        if opened is None:
+            if ch == "`" and "`" in info:
+                continue            # ```inline``` on one line is a code span, not a fence
+            opened = (m.start(), ch, n)
+        elif ch == opened[1] and n >= opened[2] and not info.strip():
+            spans.append((opened[0], m.end()))
+            opened = None
+    if opened is not None:
+        spans.append((opened[0], len(content)))
+    return spans
+
+
+def _want_code_span_ranges(content: str, fences: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Inline code spans outside fences, per paragraph (never across a blank line or a
+    fence). A backtick run of length n opens a span closed by the next run of exactly n;
+    a run with no closer in its paragraph is literal. Linear in the number of runs."""
+    free: List[Tuple[int, int]] = []
+    pos = 0
+    for f_start, f_end in fences:
+        if f_start > pos:
+            free.append((pos, f_start))
+        pos = max(pos, f_end)
+    if pos < len(content):
+        free.append((pos, len(content)))
+    spans: List[Tuple[int, int]] = []
+    for seg_start, seg_end in free:
+        paragraphs: List[Tuple[int, int]] = []
+        p = seg_start
+        for sep in _WANT_BLANK_LINE_RE.finditer(content, seg_start, seg_end):
+            paragraphs.append((p, sep.start()))
+            p = sep.end()
+        paragraphs.append((p, seg_end))
+        for para_start, para_end in paragraphs:
+            runs = [(m.start(), m.end()) for m in
+                    _WANT_BACKTICK_RUN_RE.finditer(content, para_start, para_end)]
+            if len(runs) < 2:
+                continue
+            next_same: List[Optional[int]] = [None] * len(runs)
+            last_by_len: Dict[int, int] = {}
+            for i in range(len(runs) - 1, -1, -1):
+                length = runs[i][1] - runs[i][0]
+                next_same[i] = last_by_len.get(length)
+                last_by_len[length] = i
+            i = 0
+            while i < len(runs):
+                j = next_same[i]
+                if j is None:
+                    i += 1          # unmatched run: literal backticks, masks nothing
+                    continue
+                spans.append((runs[i][0], runs[j][1]))
+                i = j + 1
+    return spans
+
+
+def _want_marker_mention_reason(content: str, start: int, end: int,
+                                 fences: List[Tuple[int, int]], fence_starts: List[int],
+                                 codes: List[Tuple[int, int]], code_starts: List[int]) -> Optional[str]:
+    """Why the marker at content[start:end] is a mention, or None if it is a real tag."""
+    k = bisect_right(fence_starts, start) - 1
+    if k >= 0 and start < fences[k][1]:
+        return "in_fence"
+    k = bisect_right(code_starts, start) - 1
+    if k >= 0 and start < codes[k][1]:
+        return "in_code_span"
+    if start > 0 and content[start - 1] == "`":
+        return "code_adjacent"      # the pre-#810 guard, kept for runs that cannot be paired
+    n_slash = 0
+    while start - 1 - n_slash >= 0 and content[start - 1 - n_slash] == "\\":
+        n_slash += 1
+    if n_slash % 2 == 1:
+        return "escaped"
+    if start > 0 and end < len(content):
+        close_quote = _WANT_QUOTE_PAIRS.get(content[start - 1])
+        if close_quote is not None and content[end] == close_quote:
+            return "quoted"
+    return None
+
+
+def parse_wants(content: str) -> WantParse:
+    """THE legitimacy test (#810): which [WANT]...[/WANT] pairs in `content` are real wants.
+
+    PURE function of the string: no I/O, no logging, no graph. A want is the text between
+    a real opener and its paired closer, with NO length limit. A marker that is inside a
+    fenced block or inline code span, directly after a backtick, backslash-escaped, or
+    wrapped in a matching quote pair is a mention and is skipped; the closer pairs with the
+    NEAREST live opener, so a returned want contains no live marker; a stray closer, an
+    unclosed opener and an empty pair are skipped. Every skip carries its reason and offset
+    (the caller logs them -- never silent). `wants[i].text` is `.strip()`ped inner text,
+    un-normalised otherwise, exactly what surface_wants stores and hashes.
+    """
+    if not content or "WANT]" not in content:
+        return WantParse((), ())
+    fences = _want_fence_spans(content)
+    codes = sorted(_want_code_span_ranges(content, fences))
+    fence_starts = [s for s, _ in fences]
+    code_starts = [s for s, _ in codes]
+    wants: List[WantSpan] = []
+    skipped: List[SkippedMarker] = []
+    pending: Optional[Tuple[int, int]] = None       # (start, end) of the live opener awaiting a closer
+    for m in _WANT_MARKER_RE.finditer(content):
+        is_close = bool(m.group(1))
+        marker = WANT_CLOSE if is_close else WANT_OPEN
+        reason = _want_marker_mention_reason(content, m.start(), m.end(),
+                                             fences, fence_starts, codes, code_starts)
+        if reason is not None:
+            skipped.append(SkippedMarker(marker, m.start(), reason))
+            continue
+        if not is_close:
+            if pending is not None:     # a nearer opener arrived: the earlier one never closed
+                skipped.append(SkippedMarker(WANT_OPEN, pending[0], "opener_unclosed"))
+            pending = (m.start(), m.end())
+            continue
+        if pending is None:
+            skipped.append(SkippedMarker(WANT_CLOSE, m.start(), "closer_without_opener"))
+            continue
+        inner = content[pending[1]:m.start()].strip()
+        if inner:
+            wants.append(WantSpan(inner, want_id_for_text(inner), pending[0], m.end()))
+        else:
+            skipped.append(SkippedMarker(WANT_OPEN, pending[0], "empty_pair"))
+            skipped.append(SkippedMarker(WANT_CLOSE, m.start(), "empty_pair"))
+        pending = None
+    if pending is not None:
+        skipped.append(SkippedMarker(WANT_OPEN, pending[0], "opener_unclosed"))
+    skipped.sort(key=lambda s: s.start)
+    return WantParse(tuple(wants), tuple(skipped))
+
+
+_WANT_SKIP_LOCK = threading.Lock()
+_WANT_SKIP_SEEN: "OrderedDict[Tuple[str, int, str], None]" = OrderedDict()
+_WANT_SKIP_STATE: Dict[str, Any] = {"last_key": None, "last_emit": None}
+
+
+def _reset_want_skip_log_state() -> None:
+    """Forget what has been logged (process start / tests)."""
+    with _WANT_SKIP_LOCK:
+        _WANT_SKIP_SEEN.clear()
+        _WANT_SKIP_STATE["last_key"] = None
+        _WANT_SKIP_STATE["last_emit"] = None
+
+
+def _log_want_skips(events: List[Tuple[str, SkippedMarker]]) -> None:
+    """INFO-log skipped markers, flood-bounded and never silent. `events` is every skipped
+    marker found by ONE surface_wants call as (node_id, SkippedMarker). Summary line when
+    the per-reason counts changed or WANT_SKIP_SUMMARY_INTERVAL_S elapsed; per-marker detail
+    once per (node, offset, reason) (bounded FIFO, <= WANT_SKIP_DETAIL_PER_CALL_MAX per
+    call, the rest deferred). NEVER logs marker or surrounding text -- id, offset, kind,
+    reason only -- so a pasted secret can never reach the log."""
+    try:
+        with _WANT_SKIP_LOCK:
+            counts = Counter(sk.reason for _, sk in events)
+            key = tuple(sorted(counts.items()))
+            now = time.monotonic()
+            details: List[Tuple[str, SkippedMarker]] = []
+            deferred = 0
+            for nid, sk in events:
+                seen_key = (nid, sk.start, sk.reason)
+                if seen_key in _WANT_SKIP_SEEN:
+                    continue
+                if len(details) >= WANT_SKIP_DETAIL_PER_CALL_MAX:
+                    deferred += 1
+                    continue
+                _WANT_SKIP_SEEN[seen_key] = None
+                if len(_WANT_SKIP_SEEN) > WANT_SKIP_SEEN_MAX:
+                    _WANT_SKIP_SEEN.popitem(last=False)
+                details.append((nid, sk))
+            last_emit = _WANT_SKIP_STATE["last_emit"]
+            emit_summary = bool(events) and (
+                key != _WANT_SKIP_STATE["last_key"]
+                or last_emit is None
+                or now - last_emit >= WANT_SKIP_SUMMARY_INTERVAL_S)
+            _WANT_SKIP_STATE["last_key"] = key
+            if emit_summary:
+                _WANT_SKIP_STATE["last_emit"] = now
+        if emit_summary:
+            logger.info(
+                "surface_wants: skipped %d marker(s) in %d node(s) as mentions, not wants (%s)%s",
+                len(events), len({nid for nid, _ in events}),
+                ", ".join("%s=%d" % (r, c) for r, c in sorted(counts.items())),
+                "; %d more detail line(s) deferred to later pulses" % deferred if deferred else "")
+        for nid, sk in details:
+            logger.info("surface_wants: skipped %s node=%s offset=%d reason=%s",
+                        sk.marker, nid, sk.start, sk.reason)
+    except Exception as exc:  # noqa: BLE001 - logging must never break surfacing
+        logger.debug("want skip log failed (non-fatal): %s", exc)
 
 
 def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -> List[Dict[str, Any]]:
@@ -1523,9 +1797,13 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
     substrate -- not text buried in a conversation node. Classification
     happens HERE at the bucket (LAW 7), never at deposit time. Returns the
     open want dicts.
+
+    Which markers are real wants is decided by parse_wants() (#810) -- structural
+    legitimacy, no length limit. Markers it rejects as mentions are logged at INFO
+    (flood-bounded, after the graph lock is released), never dropped silently.
     """
+    skip_events: List[Tuple[str, SkippedMarker]] = []
     with _cc_mutation_lock(graph):
-        import hashlib
         open_wants: List[Dict[str, Any]] = []
         if graph is None:
             return open_wants
@@ -1540,26 +1818,16 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
             if meta.get("creation_mode") != "conversational":
                 continue
             content = (vector_db.content.get(nid) if vector_db is not None else "") or ""
-            if "[WANT]" not in content:
+            if "WANT]" not in content:
                 continue
-            for m in _WANT_RE.finditer(content):
-                # `[WANT]` inside a code span is documentation ABOUT the marker,
-                # not a want. 83 of the 118 oversized nodes began with the
-                # backtick that closed such a span (2026-09-16).
-                if m.start() > 0 and content[m.start() - 1] == "`":
-                    continue
-                inner = m.group(1).strip()
-                if not inner:
-                    continue
-                # A well-formed want contains no further markers; if it does, the
-                # opening tag was not the one that belongs to this closing tag.
-                if "[WANT]" in inner or "[/WANT]" in inner:
-                    continue
-                want_id = "cc:want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
+            parsed = parse_wants(content)
+            skip_events.extend((nid, sk) for sk in parsed.skipped)
+            for want in parsed.wants:
+                want_id = want.want_id
                 if want_id in graph.nodes:
                     continue
                 graph.create_node(node_id=want_id, metadata={
-                    "kind": "want", "want_text": inner, "want_state": "open",
+                    "kind": "want", "want_text": want.text, "want_state": "open",
                     "provenance": provenance, "source_node": nid,
                     "creation_mode": "conversational",
                 })
@@ -1567,9 +1835,10 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
                     graph.create_synapse(nid, want_id, weight=0.3)
                 except Exception:  # noqa: BLE001
                     pass
-                open_wants.append({"id": want_id, "text": inner,
+                open_wants.append({"id": want_id, "text": want.text,
                                     "provenance": provenance, "state": "open", "source": nid})
-        return open_wants
+    _log_want_skips(skip_events)
+    return open_wants
 
 
 def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -> str:
