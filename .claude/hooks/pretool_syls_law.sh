@@ -233,7 +233,7 @@ EOFFAIL
 
     if [ -n "$TOPLEVEL" ]; then
         # Check all remotes (not just origin); any matching URL means NeuroGraph
-        ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)" || true
+        ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)"
         _remote_rc=$?
         if [ "$_remote_rc" -eq 124 ] || [ "$_remote_rc" -eq 127 ] || [ "$_remote_rc" -gt 1 ]; then
             cat >&2 <<'EOFFAIL'

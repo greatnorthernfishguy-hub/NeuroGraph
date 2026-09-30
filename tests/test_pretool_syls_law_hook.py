@@ -924,3 +924,41 @@ class TestSylsLawHook:
         p_rc, _, _ = self._run_raw(NEW_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
         d_rc, _, _ = self._run_raw(DBL_HOOK, b'{"tool_input":{"file_path":"/x"}}', env=e)
         assert p_rc == d_rc == 2
+
+    @pytest.mark.parametrize("mode", ["hang", "e128", "pass"])
+    def test_config_failure_caught_by_both_hooks(self, mode):
+        """git-config-only failure: hang past timeout or exit 128 → both hooks exit 2
+        with REMOTE FAILURE. Pass-through (real git) → exit 2 without banner."""
+        # Repo outside $HOME/NeuroGraph with NeuroGraph origin + vendored file
+        repo = self._tmp_repo(POS_ORIGINS[0])
+        # Build complete stub with passthrough git that only fails on config
+        stub = self._build_stub_dir(f"stub_cfg_{mode}")
+        real_git = subprocess.check_output(["/usr/bin/which", "git"]).decode().strip()
+        git_stub = os.path.join(stub, "git")
+        with open(git_stub, "w") as f:
+            f.write("#!/usr/bin/env bash\n")
+            if mode == "hang":
+                f.write("case \"$*\" in\n")
+                f.write("  *config*get-regexp*url*) sleep 10 ;;\n")
+                f.write("  *) exec {} \"$@\" ;;\n".format(real_git))
+                f.write("esac\n")
+            elif mode == "e128":
+                f.write("case \"$*\" in\n")
+                f.write("  *config*get-regexp*url*) printf '%s\\n' 'fatal: bad config' >&2; exit 128 ;;\n")
+                f.write("  *) exec {} \"$@\" ;;\n".format(real_git))
+                f.write("esac\n")
+            else:
+                f.write("exec {} \"$@\"\n".format(real_git))
+        os.chmod(git_stub, 0o755)
+        env = {"HOME": self._fake_home, "PATH": stub}
+        path = os.path.join(repo, "ng_lite.py")
+        for hook, label in [(NEW_HOOK, "gate"), (DBL_HOOK, "dbl")]:
+            ti = json.dumps({"tool_input": {"file_path": path}})
+            r = subprocess.run([hook], input=ti.encode(), capture_output=True, timeout=15, start_new_session=True, env=env)
+            if mode in ("hang", "e128"):
+                assert r.returncode == 2, f"{label}/{mode} should exit 2, got {r.returncode}"
+                assert "REMOTE FAILURE" in r.stderr.decode(errors="replace"), f"{label}/{mode} stderr missing REMOTE FAILURE"
+            else:
+                assert r.returncode == 2, f"{label}/pass control should exit 2 (protected file)"
+                assert "REMOTE FAILURE" not in r.stderr.decode(errors="replace"), f"{label}/pass should NOT have REMOTE FAILURE"
+        shutil.rmtree(repo, ignore_errors=True)

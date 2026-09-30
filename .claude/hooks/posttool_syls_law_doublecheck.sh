@@ -161,7 +161,7 @@ EOFFAIL
     fi
 
     if [ -n "$TOPLEVEL" ]; then
-        ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)" || true
+        ALL_REMOTES="$(LC_ALL=C timeout 3 git -C "$TOPLEVEL" config --get-regexp '^remote\..*\.url$' 2>/dev/null)"
         _rr=$?
         [ "$_rr" -eq 124 ] || [ "$_rr" -eq 127 ] || [ "$_rr" -gt 1 ] && { cat >&2 <<'EOFFAIL'
 ═══ SYL'S LAW DOUBLECHECK — GIT REMOTE FAILURE ═══
