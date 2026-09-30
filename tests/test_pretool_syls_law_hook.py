@@ -169,9 +169,14 @@ class TestSylsLawHook:
 
     def _env_stub_no_git(self):
         """PATH that keeps jq and timeout but excludes git."""
-        jq_dir = os.path.dirname(subprocess.check_output(["which", "jq"]).decode().strip())
-        timeout_dir = os.path.dirname(subprocess.check_output(["which", "timeout"]).decode().strip())
-        return {"HOME": self._fake_home, "PATH": f"{jq_dir}:{timeout_dir}:/usr/bin:/bin"}
+        stub_dir = os.path.join(self._tmpdir, "stub_bin")
+        os.makedirs(stub_dir, exist_ok=True)
+        for tool in ["jq", "timeout", "realpath", "sed", "tr", "dirname", "bash"]:
+            tool_path = subprocess.check_output(["which", tool]).decode().strip()
+            link = os.path.join(stub_dir, tool)
+            if not os.path.lexists(link):
+                os.symlink(tool_path, link)
+        return {"HOME": self._fake_home, "PATH": stub_dir}
 
     # ═══════════════════════════════════════════════════════════════════
     # PRECONDITION: jq/git stubs
