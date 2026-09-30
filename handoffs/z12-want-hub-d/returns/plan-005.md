@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5f] — the [R5f·…] edit below is commit 2fba39e873e44ddd092c720c86e8cb17b5b9139c on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11251 + its P424 addendum) — plan-005 EDITED IN PLACE, the ONE small edit [R5f·…]
 #   What: plan-005 edited in place (no new file): le-026 (ROLE B two-line look at [R5e]: NO LAW VIOLATION in plan-005, ETHOS DRIFT at plan level: 4 MEDIUM + 5 LOW
 #     + 2 Executive-to-hear) and checker-025 (ROLE A: PASS, 2 LOW), plus the Exec Packet 424 ADDENDUM (docs de1fc80d; via Chief-003) which RULED F2, E2 and E1 —
