@@ -14,7 +14,7 @@
 Related: [[NeuroGraph]] · [[Pith]] · [[NeuroGraph Is a Mind, Not a Database]] · [[Format-for-Purpose Principle]] · previous: `plan-001-audit.md`, `returns/build-001.md`, reviews `checker-019-813-pith.md`, `le-017-813-pith.md`.
 
 ## 0. Order of commits (each its own commit, pushed by name)
-NG branch: **(0)** this plan → **(1a)** F3a/F3b staged-script hardening → **(1b)** pair corrections + #816 + F2/F6/F8 + the ONE rule → **(1c)** audit/plan corrections (row #7, consequence 4, D7) → **(2a)** #817 retire `pith_compress_history` → **(2b)** #818 loud drops → **(2c)** #819 over-budget node → **(3)** `returns/build-002.md`.
+NG branch: **(0)** this plan → **(1a)** F3a/F3b staged-script hardening → **(1b)** pair corrections + #816 + F2/F6/F8 + the ONE rule → **(1c)** audit/plan corrections (row #7, consequence 4, D7) → **(2a)** #817 retire `pith_compress_history` *(DEFERRED/reverted in turn 3)* → **(2b)** #818 loud drops → **(2c)** #819 over-budget node → **(3)** `returns/build-002.md`.
 docs branch: **(2a')** retire the daemon's `compress_history` handler (same change as #817) → return pointer.
 
 ## 1. Facts I re-verified at head `bc4ae7a` (not taken from the reviews)
@@ -49,6 +49,8 @@ Consequence, decided here so the reviewer can veto it (**D8**): `pith_stage3`'s 
 Audit row #7 corrected (it is budgeted on the Pith-ON path), consequence 4 = "cannot fit `learned_budget`" (C2), D7 names Condensate `origin/cc-laptop-minitid-card7-quest-removal-20260929` (`88ddfec`) and keeps `MAX_QUEST_CHARS` until it and BOTH hosts move together (C5), `PITH_HOST_CONTRACT.md` updated, and the plan-001 amendment.
 
 ### (2a) #817 — retire `pith_compress_history` (LAW 3)
+> **[TURN 3, dispatch #11011] DEFERRED — REVERTED.** **DEFERRED to the post-track VPS/daemon lane: the function + BOTH live Python handlers (`cc_ng_host.py:974`, `cc-ng-daemon.py:1617`) to be removed TOGETHER (LAW 3).** Chief ruling docs `084b4161`; the turn-2 removal was reverted in turn 3 (`82cbbcd` NG, `336954c3` docs). Everything below in this subsection is the turn-2 plan as executed and then reverted; it is kept for the record and is NOT current.
+
 Removed (every reference listed in the return): `pith_compress_history`; `PithMetrics.history_*` fields, `record_history_compression`, their snapshot/reset lines; `cc_ng_host._handle_compress_history` + its dispatch entry; docs `cc-ng-daemon.py` `handle_compress_history` + entry; the contract's `compress_history` section, `history_*` table and healthy/failed-host bullets; `tests/test_cc_host_compress_history.py`, `tests/test_pith_history_metrics.py`. **Kept and flagged (D9):** `pith_stage2_keyframe` (+ `CC_PITH_KEYFRAME_CHARS`) — a pure primitive with **zero** callers afterwards; it is the piece a lossless (keyframe + delta) rebuild would use, and deleting a tested primitive is a decision above this brief. A future caller MUST carry the delta.
 A test pins that the socket now answers `unknown event: compress_history` for both hosts (the failure mode the contract described for a stale host).
 
