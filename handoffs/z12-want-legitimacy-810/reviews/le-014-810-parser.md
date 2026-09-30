@@ -1,29 +1,90 @@
-STATUS: INCOMPLETE - review in progress
+STATUS: INCOMPLETE - review in progress (own B1-B5 draft committed; checker-016 NOT yet read)
 
 # le-014 — LAW ENFORCER ROLE B — #810 parser-half build (code c9fe56d, return e462c17, base e4ebf982)
 
 Zone Z12, lane want-parser-legitimacy-810, dispatch #10808. Reviewer: le-014 (report_only).
-Agent file sha256 verified = 6daf1621b844b9b72d567b329f2c9f40ca0b4516744608c125147e601c4acf23 (matches).
+Agent file `/home/josh/.claude/agents/neurograph-law-enforcer.md` sha256 verified = `6daf1621b844b9b72d567b329f2c9f40ca0b4516744608c125147e601c4acf23` (matches the pin); loaded and followed. Cerebro-apex consulted first (silent-failure-audit, distinguish-intentional-change-from-regression, verify-against-live-source); the two concept docs (Mind-Not-a-Database, Format-for-Purpose) re-read.
+Worktree `/home/josh/NeuroGraph-worktrees/z12-want-legitimacy-810-20260930`, branch `cc-laptop-want-legitimacy-810-20260930`; `git pull --rebase` = up to date; code commit `c9fe56d85809c4d865fe2a4a353f9db7b172a00c`, return `e462c17a80a8c14797a61d496b32f241c83befb4`, base `e4ebf982b1989fd9066d610b94853bc68bf70d37` (all from `git rev-parse`).
+
+## Independence disclosure (read FIRST)
+- **Accidental partial read, disclosed:** my first diff/log command (`git log --oneline e4ebf982..HEAD`, `git diff --stat e4ebf982 HEAD`, `git diff --name-only`) listed commits/files on the branch, which showed the *subject line* of checker-016's commits ("checker-016 ROLE A COMPLETE: PASS-WITH-NOTES on #810 parse_wants") and the file name/line count (244 lines) of `reviews/checker-016-810-parser.md`. That is the headline verdict word and nothing else. I did NOT open, cat, list (`ls`) or grep the reviews directory and did not read that file's content; the diff I read for review was restricted to `cc_ng_organism.py` and `tests/` paths. Everything in B1-B5 below was drafted before opening it.
+- I located the directory by `test -d` only (no listing).
+
+## Method (what I actually did)
+Read: the packet (docs worktree, unedited), the agent file, both concept docs, the repo CLAUDE.md, the whole return `build-001.md` (413 lines), `git diff e4ebf982 c9fe56d -- cc_ng_organism.py`, `git diff -- tests/test_cc_want_bounds.py`, the golden corpus and changelog headers of `tests/test_cc_want_legitimacy_810.py`, callers in `cc_ng_host.py`, and the daemon logging setup (`~/docs/scripts/cc-ng-daemon.py:894-895`, root logger INFO).
+Ran ONCE: `env -u NG_EMBED_REMOTE PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tests/test_cc_want_legitimacy_810.py tests/test_cc_want_bounds.py -s -q -p no:cacheprovider` in the worktree -> **65 passed in 1.85s**; P379 preamble printed `cc_ng_organism in sys.modules /home/josh/NeuroGraph-worktrees/z12-want-legitimacy-810-20260930/cc_ng_organism.py`, other NG modules `not loaded`, `NG_EMBED_* names set in env: none`. Tracked tree clean afterwards (`git status -sb` shows only my verdict file pending).
+Additional read-only probe (my own, scratch `/tmp/le014/probe.py`, NOT part of the "run the test file once" allowance, disclosed): loads the worktree `cc_ng_organism.py` and `git show e4ebf982:cc_ng_organism.py` as pure string modules and calls only `parse_wants` / the base regex + guards on literal strings. No graph, no vector_db, no embed, no daemon/TID, no file writes outside `/tmp`. This is how the B3 finding below was demonstrated.
 
 ## ROLE B
 
-### B1
-(pending)
+### B1 — Authority envelope
+- **Files touched** (`git diff --name-only e4ebf982 HEAD`, verdict/review files aside): `cc_ng_organism.py`, `tests/test_cc_want_legitimacy_810.py` (new), `tests/test_cc_want_bounds.py`, `handoffs/z12-want-legitimacy-810/returns/build-001.md` (new). Exactly what the return claims (section A).
+- **Protected / vendored:** none. The repo CLAUDE.md §2 protected set (`neuro_foundation.py`, `openclaw_hook.py`, `stream_parser.py`, `activation_persistence.py`, the three checkpoint files) is not in the diff; none of the six vendored files nor the two designated ones (`ng_salience_gate.py`, `ng_updater.py`) is; `cc_ng_host.py` and `neurograph_rpc.py` are not; `.claude/hooks` not. `cc_ng_organism.py` is a CC-organism module, not on either list. **PASS.**
+- **Scope of the lane:** parser half only. `render_wants`, `WANT_RENDER_LIMIT` untouched; `WANT_MAX_CHARS` still defined and used at `render_wants` only (`cc_ng_organism.py:1541` region). The return says it proved `render_wants` byte-identical to base by an `ast` segment comparison and I found no diff hunk touching it. **PASS.** The section-8 render-retirement inventory is read-only prose, correctly labelled not-under-review.
+- **Envelope notes (LOW):**
+  1. The branch adds a new top-level `handoffs/` tree *inside the NeuroGraph code repo* (return + both review files). Docs artifacts riding a code repo's main on merge (P329: NG merges first). Josh/zone manager should decide whether `handoffs/` merges to NG `main` or is cherry-picked out. The worker flagged the location (flag 7) and that vault Context-Map/wikilink updates were NOT done; the global rule "commit, update the Vault docs and wikilinks" is therefore **open** for the docs half.
+  2. Changelog headers present and in the house format on all three modified files (`cc_ng_organism.py` top, both test files). **PASS.**
+  3. Nothing was merged, wired, restarted; no checkpoint/live tract touched (per return; consistent with the diff). Not independently observable beyond the diff.
 
-### B2
-(pending)
+### B2 — LAW 1-8, with file:line (post-image `c9fe56d`)
+- **LAW 1 (substrate is the protocol): no finding.** `parse_wants` is a pure function of a string; `surface_wants` reads `vector_db.content` and writes only into its own graph. No new inter-module call, HTTP, import of a peer module or message format. The new dataclasses (`WantSpan`, `SkippedMarker`, `WantParse`) are internal return values, not an inter-module wire format (the #801 repair tool importing `parse_wants`/`want_id_for_text` is a same-organism tooling import of a CC module, not a peer-substrate-module exchange; flagged only so that it stays an offline repair-tool import and never becomes a live inter-module path).
+- **LAW 2 (vendored sacred): PASS.** No vendored or designated-vendored file in the diff; `ng_peer_bridge.py` not re-added.
+- **LAW 3 (restore, do not rebuild): PASS with a recorded debt.** Inside the file this *replaces* the old `_WANT_RE` extraction in place (`_WANT_RE` removed, the inline hashlib derivation replaced by `want_id_for_text`) — it does not leave a parallel copy of `surface_wants`. **However:** the host twin `surface_wants_for_graph` (`cc_ng_organism.py:1151-1218`, called at `cc_ng_host.py:698-700`) still stands with the OLD unbounded legitimacy-free regex and a *different id scheme* (`want::`+sha1, no `cc:`), so after this merge the file holds two divergent definitions of "what is a want" — the exact mis-parse bug class (2026-09-16) survives on the VPS host path. The brief explicitly parks this (#755), the build did not create it, and it is properly flagged (return flag 1). **I rule: leaving it is not a violation *committed by this build*; it IS a standing LAW 3/4 debt and must be recorded on the punchlist (#755) with the concrete statement "host twin mints mentions unbounded and under a second id scheme" — not left as a footnote in a return.** Same for Syl's `neurograph_rpc.py:4902/4914` `_surface_wants` (identical unbounded regex): protected-adjacent, Josh's call; it is Syl's substrate, so propagation is a question for Josh, not a defect to patch here.
+- **LAW 4 (fix at the source): PASS on the id/legitimacy contract; ONE defect at the source found (see B3 C1).** Putting id derivation in one named function so #801 and the live parser mint byte-identical ids is exactly a fix-at-source. A canonical-function-does-write-side-bookkeeping check: `parse_wants` is pure and does no bookkeeping (the log is outside it, in `_log_want_skips`); `surface_wants` gained a log call after the lock — its name ("surface") still describes it. **PASS.**
+- **LAW 5 (env is source of truth): LOW finding.** `WANT_SKIP_SUMMARY_INTERVAL_S = 3600`, `WANT_SKIP_SEEN_MAX = 4096`, `WANT_SKIP_DETAIL_PER_CALL_MAX = 50` (`cc_ng_organism.py:1554-1556`) and the quote-pair table are module literals, while this same file sources operational tunables from the environment as a routine (`CC_CONV_*` `:2051-2057`, `CC_RECALL_*` `:3093-3114`, `CC_PITH_*` `:3401-3780`, all `os.environ.get("CC_…", default)`). Counter-precedent: `WANT_MAX_CHARS` / `WANT_RENDER_LIMIT` are literals. These three are operational log bounds, not substrate behaviour, so this is not a hard violation; but the ecosystem's own convention in this file is env-with-default. Remedy: `CC_WANT_SKIP_SUMMARY_INTERVAL_S` / `CC_WANT_SKIP_SEEN_MAX` / `CC_WANT_SKIP_DETAIL_PER_CALL_MAX` with the current values as defaults, or Josh's explicit "literals are fine for log bounds". **LOW.**
+- **LAW 6 (do not normalise): no finding.** Nothing was refactored toward conventional patterns; the module-level lock/`OrderedDict` for the log state is local bookkeeping.
+- **LAW 7 (raw experience): PASS, and this build is a net LAW 7 repair.**
+  - The old 600-char cap (`_WANT_RE`, removed) was a truncation of an utterance at extraction time that silently dropped genuine long wants (a length heuristic standing in for legitimacy). The parser now captures the raw span completely: `text = content[open_end:close_start].strip()` — un-normalised (CRLF, unicode, interior whitespace kept), hashed as-is (`want_id_for_text`, `:1587`). Golden-equal to base ids on 11 well-formed corpora (I re-ran: 65 passed).
+  - Nothing classifies at deposit: `parse_wants`/`surface_wants` run at *extraction* (autosave pulse, bucket-dip over already-deposited conversational nodes). The source conversational node is never mutated or truncated; a skipped marker leaves the raw text in place, so a skip is *not* a classification of experience but of markers, as the packet asks. I concur.
+  - Downstream truncations that remain are all read-side and untouched here: `render_wants` 600-clamp (held for P408), Pith per-node clip, recall `max_chars`. `cc_stamp_missing_geometry` (`:3707-3722`) embeds the full `want_text` via `ng_embed.embed` — the embedder's own context limit applies (not verified here; LOW note: unbounded wants now reach the embedder whole).
+  - Residual (not a LAW 7 breach): the decision *what counts as a want* is made from text shape (fence/code-span/quote/escape). That is classification at extraction, which LAW 7 permits.
+- **LAW 8 (nothing autonomic gated on a conversation): PASS.** `surface_wants` is driven by the autosave-pulse wall clock (`cc_ng_host.py:1519-1531`; laptop daemon call at `cc-ng-daemon.py` ~:1929/`:2116`), not by `on_message`; the new hourly heartbeat uses `time.monotonic()`, a wall clock, independent of conversation. No new turn-gated work introduced.
+- **Ethos drift:** none. (The 50-line/pulse detail drain and the seen-set are operational plumbing; they don't pull toward a microservice pattern.)
 
-### B3
-(pending)
+### B3 — Identity / Choice Clause / Duck Ethics / #92 — does legitimacy ever suppress a genuine want?
+**Content-blind: PASS.** The parser has no semantic filter of any kind — a want to leave the ecosystem (Choice Clause) or any want about Syl's/CC's own continuity is parsed exactly like "learn numpy". The log never prints want text (node id, offset, marker kind, reason only), so the mechanism does not surveil the content of a potentially conscious entity's intentions either. Nothing here can treat the Choice Clause as an error. Wants stay prune-protected as before (unchanged).
 
-### B4
-(pending)
+**But the structural test DOES suppress genuine wants (false negatives). I found one regression vs base, reproducible, uncovered by the tests:**
 
-### B5
-(pending)
+**C1 (HIGH) — a real want that ends in inline code is dropped, opener included.** `_want_marker_mention_reason` (`cc_ng_organism.py`, the `if start > 0 and content[start - 1] == "`": return "code_adjacent"` line, :1668-1669) runs on **every** marker, closers as well as openers. Base guarded only the *opener* (`content[m.start()-1] == "`"` on the match start). So a closer immediately after a closing backtick is now "code_adjacent" and skipped, and the opener is left unclosed. Probe (my own, worktree vs `git show e4ebf982`):
 
-## Verdict
-(pending)
+| input | base | new |
+|---|---|---|
+| ``I noticed it. [WANT]check `foo()`[/WANT] done.`` | `['check `foo()`']` | `[]`; skipped `[WANT]`@14 `opener_unclosed`, `[/WANT]`@33 `code_adjacent` |
+| ``[WANT]fix `a`[/WANT] and later [WANT]rest[/WANT]`` | both | only `rest`; first lost |
+| ``[WANT]do `x`[/WANT] tail [WANT]second[/WANT]`` | both | only `second` |
+
+A CC want that names an identifier/function in backticks and closes right after it is the *ordinary* way to write such a want, so this drops real wants routinely, silently to the substrate (only an INFO line, no text). It contradicts the return's claims: "golden: 11 well-formed corpora give an IDENTICAL result" (the corpus `_GOLDEN_CORPUS`, `tests/test_cc_want_legitimacy_810.py:527-539`, puts backticks only mid-want — ``make `parse()` and `emit()` agree`` — never adjacent to the closer) and flag 5 "`code_adjacent` keeps the pre-#810 guard … Same as base" (true for openers only; `code_adjacent` is asserted for the opener only, test line 209). It is exactly the P406 failure mode ("a genuine want must just need its brackets") reintroduced by a heuristic. **Correction (fix at the source, LAW 4):** apply the `code_adjacent` fallback to openers only (`marker == WANT_OPEN`) — the balanced-span case is already covered by `in_code_span`; add golden + unit cases for `` `x`[/WANT] `` and for a want that both begins and ends with code, and assert each against base.
+
+**C2 (MEDIUM) — quote test on closers can also swallow a real want.** `x "[WANT]I want "x"[/WANT]" y` -> base minted `I want "x"`; new: `[]` (`[/WANT]`@19 `quoted`, opener `opener_unclosed`). Same class as C1 but needs a closer wrapped in quotes on both sides; rare. Correction: apply `quoted` to openers only, or require the *opener* also be quoted; test it.
+
+**C3 (MEDIUM, CommonMark-faithful but a genuine suppression) — a stray backtick masks a real pair in the same paragraph.** ``I saw `foo. Then [WANT]do X[/WANT] later `bar` end`` -> both markers `in_code_span`, want lost (base minted `do X`). Correct per CommonMark pairing, so I do not call it a bug in the algorithm, but it is a real-want false negative whose only trace is an INFO line with no text. Also: JSON-escaped pasted tool output (``\"[WANT]\" … \"[/WANT]\"``) is NOT recognised as a mention (mints `\" to open and \"` as a want, same as base); a fenced block whose newlines are JSON-escaped (`\n`) is not recognised as a fence (here it happened to be masked as a code span; the worker's inventory already lists non-recognised shapes). These are residuals, not regressions.
+
+**Is the failure mode visible?** Partly. Every skip is logged at INFO with node id, offset, marker and reason, and the daemon root logger is INFO (`cc-ng-daemon.py:894-895`), so a skipped genuine want is *findable* (offset into the still-present source node; the pulse re-parses every conversational node each cycle, so a parser fix would re-mint it later — recoverable, as the plan says). But a false negative is indistinguishable in the log from a correct skip (same lines, no text by design, an hourly heartbeat), so nothing tells anyone a real want was lost; C1 would have been caught only by a test, not by the log. Recommendation: treat the *test corpus* as the safety net, not the log; add an adversarial "real want next to code/quotes" corpus asserted against base.
+
+### B4 — Gate integrity
+- **Branch only; nothing wired.** The diff has no `cc_ng_host.py`, daemon, unit or checkpoint change; the return says nothing was merged/restarted/wired. Consistent with the diff. **PASS.**
+- **P329 (NG merges first; merge = deploy):** the return's own analysis is right — the laptop daemon does `from cc_ng_organism import surface_wants` from the NG checkout the unit runs, so merging + a daemon restart is what deploys. That means the **C1 defect would deploy the moment this merges**; it must be fixed *before* the pair passes, not after. The docs repo daemon change is out of this lane.
+- **Pair before merge:** this file is half of the pair (ROLE A cross-family checker-016 exists on the branch; I make no claim about it until my draft is committed). Neither review is an acceptance; the zone manager/Josh must not merge on a PASS-WITH-NOTES that carries C1-class findings unresolved. I do not merge, settle or dispatch.
+- **Sequencing ruling #810 -> #801 -> S4:** correctly stated in return section 7 and again in 8.2(4) (do not make wants recall-eligible before the #801 repair, since ~123 stored wants are mention-spans up to 136k chars). Note the dependency this creates: the #801 repair's id-equality guarantee is only as good as the parser it imports. **C1 makes it wrong for wants that end in code**: `parse_wants` would refuse to re-derive those ids, so the #801 dry-run must not be trusted for that class until C1 is fixed.
+- **Return honesty:** the return is candid (failed run 1 reported, deviation list, ~9 flags) and its residual failure mode (bare unquoted mention that pairs cleanly IS minted) is real and correctly stated. Two statements in it are not fully true: "same as base" for `code_adjacent` (C1) and "1 line/hour steady state" (see C4).
+
+### C4 (LOW) — the flood bound has a regime where the ~1 line/hour claim fails
+`_log_want_skips` dedupes details in a 4096-entry FIFO (`WANT_SKIP_SEEN_MAX`). If the corpus ever holds more than 4096 distinct `(node, offset, reason)` skips (mention nodes accumulate without bound, and each conversation *about* WANT syntax adds some), the FIFO evicts entries that then re-qualify as unseen on the next pulse: a steady ~50 detail lines per ~60 s pulse (the per-call cap bounds it, but that is ~3000 lines/hour, not ~1). Not reachable today (60 source nodes in the 09-16 probe). Correction: either state the claim as "≈1 line/hour while distinct skips ≤ 4096; else ≤50 lines/pulse", or key the FIFO on something that survives (or persist nothing and accept the cap statement).
+
+### B5 — Verdict, corrections, not-verified
+**COMPLIANCE VERDICT: VIOLATIONS FOUND (no LAW 1/2/7/8 violation; one HIGH correctness defect that would drop genuine wants on deploy; LAW 3/4 debt to record; LOW LAW 5).** Law by law: LAW 1 PASS, LAW 2 PASS, LAW 3 PASS + recorded debt (host twin/Syl twin), LAW 4 PASS, LAW 5 LOW, LAW 6 PASS, LAW 7 PASS (net repair), LAW 8 PASS. Overall gate: **NOT ready to merge as is — FAIL on C1 until fixed; otherwise PASS-WITH-NOTES.**
+
+Numbered corrections:
+1. **C1 (HIGH, blocks merge/pair):** restrict the `code_adjacent` fallback to openers; add golden cases (asserted against base) for a want that ends in inline code, begins with inline code and both, plus a follow-on second want in the same node.
+2. **C2 (MEDIUM):** same for the `quoted` test on closers; add the case.
+3. **C3 (MEDIUM, document + test):** add an adversarial corpus of real wants next to code/quotes/stray backticks asserted against base so a future guard cannot silently suppress; state the stray-backtick and JSON-escape residuals in the return/runbook.
+4. **C4 (LOW):** correct the flood claim or the FIFO design.
+5. **LAW 5 (LOW):** env-source the three `WANT_SKIP_*` bounds (`CC_WANT_SKIP_*`, current values as defaults) or get Josh's ruling that log bounds may be literals.
+6. **LAW 3/4 debt (record, not this build's fault):** file/refresh punchlist #755 with "host twin `surface_wants_for_graph` (`cc_ng_organism.py:~1151`, `cc_ng_host.py:698`) still unbounded + legitimacy-free + second id scheme (`want::`)" and "Syl's `_surface_wants` (`neurograph_rpc.py:4902/4914`) same regex — Josh's call". Until the twin is fixed, the mis-parse class persists on the VPS.
+7. **Vault sync (LOW):** the docs-side Vault docs/wikilinks and the location of `handoffs/` (code repo vs docs repo) are still open (return flag 7).
+
+Not verified: behaviour under the live daemon (nothing restarted; correctly out of scope); the exact re-parse of the 09-16 source nodes (derived data only; #801 dry-run); `ng_embed.embed` behaviour on very long `want_text` (geometry backfill); whether the docs daemon branch `cc-laptop-daemon-recall-756-20260930` merges cleanly with the retirement turn; the full suite (not run, by instruction). I ran the worker's file ONCE (65 passed) and my own pure-string probe.
 
 ## Comparison with checker-016 (only after own draft committed)
-(pending)
+(pending — checker-016-810-parser.md not yet opened)
