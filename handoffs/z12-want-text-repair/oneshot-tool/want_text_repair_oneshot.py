@@ -2056,7 +2056,7 @@ class ProbeError(Exception):
 
 _ACTIVE_WORDS = ("active", "activating", "reloading", "deactivating", "refreshing", "maintenance")
 _DOWN_WORDS = ("inactive", "failed")
-_ENABLED_WORDS = ("enabled", "enabled-runtime", "static", "linked", "linked-runtime", "alias", "indirect", "generated", "transient")
+_ENABLED_WORDS = ("enabled", "enabled-runtime", "static", "linked-runtime", "alias", "indirect", "generated", "transient")   # NOT `linked`: P432 passes it
 _OFF_WORDS = ("linked", "disabled")                # P432: the ONLY is-enabled answers that count as 'off' (never `enabled`)
 _WITNESS_WORDS = ("running", "degraded", "starting", "initializing", "stopping", "maintenance")
 PROBE_TIMEOUT_S = 20
