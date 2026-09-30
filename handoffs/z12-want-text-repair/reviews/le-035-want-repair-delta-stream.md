@@ -1,65 +1,124 @@
-STATUS: INCOMPLETE - review in progress
+STATUS: COMPLETE (own findings; the checker-028 comparison is appended after this draft's commit - see "Independence log")
 
 # le-035 — ROLE B delta review: want-repair delta stream reader (build-tool-007b)
 
-Reviewer: le-035 (fresh LAW ENFORCER, report_only). Zone Z12, lane z12-s3-restore-bundle-20260929, dispatch #11860.
+Reviewer: le-035 (fresh LAW ENFORCER, report_only). Zone Z12, lane z12-s3-restore-bundle-20260929, dispatch #11860. Edited nothing in the tool, tests, pin or plan; this file is the only file I committed.
 Agent definition: /home/josh/.claude/agents/neurograph-law-enforcer.md, sha256 verified = 6daf1621b844b9b72d567b329f2c9f40ca0b4516744608c125147e601c4acf23 (matches the required value).
-Delta: git diff 09a032c3426baf8307cb968496c65f779894304b 3cd271b2a79657afe5a6feeee7454f04b4e479d3 (tool + test files). Tool worktree head at start: 3cd271b2a79657afe5a6feeee7454f04b4e479d3.
+Delta: `git diff 09a032c3426baf8307cb968496c65f779894304b 3cd271b2a79657afe5a6feeee7454f04b4e479d3` (tool + tests). Tool worktree head at start 3cd271b2a79657afe5a6feeee7454f04b4e479d3. Files changed on the branch in that range: the tool, its test file, the return (3 files).
+Tool sha256 at head = 59ed9f827cc8e7b8ea5a71f3b768809c647a0bd7b6f113541d2631c2659a2b56; test file sha256 = 82a243c2663a9df5e92e207a701b2b24bd42adb17a52630a27897441b2a3363e (both equal the return's figures).
+Pin worktree: HEAD ae798b94cb14740d200fc3f4fd8d36eef8b86c6a, `git status --porcelain --ignored` = 0 lines before and after my runs, `cc_ng_organism.py` sha256 8ad0f69ed4a7849c98e97e0f3970bbe4a36c727ef880455e8ddecec14de5a8e2. I never wrote there.
 
-Independence: checker-028 not opened before this draft is committed (see Independence log at the end).
+## COMPLIANCE VERDICT: COMPLIANT (no Law violation; ROLE B overall PASS-WITH-NOTES, six numbered non-blocking corrections)
 
-## COMPLIANCE VERDICT
-(INTERIM - code-read findings committed; own-world run, fail-closed probes and the test run still pending)
+The delta replaces the tool's whole-file vectors load and its live `Graph` with streamed readers. It is byte-equivalent to the pre-delta path on the worker's world AND on a world I built that the worker did not (26/26 differential checks). It fails closed on every truncation, trailing-byte and header-tamper I tried (thousands of cases, zero silent short reads). It leaves V11 and every canonical function untouched, and leaves no old path behind. The defects I found are all on inputs the canonical writer cannot produce (duplicate map keys) or are test-coverage and documentation gaps; none changes a Phase-1 output on a canonically-written checkpoint.
 
-## ROLE B checks (ADDENDUM 5, checks 1-10 with the LAWS)
-Headings from ADDENDUM 5 of review-packet-want-text-repair-118.md. Filled in as the review proceeds.
+## Per-check verdicts (ROLE B checks 1-10)
 
-### Check 1 — Byte-identity (faithful OLD copy? own world)
-(pending)
-### Check 2 — `incident_figures` equivalence (Graph._deserialize reading; V11 'before' figures)
-FIRST FINDINGS (code-read; own-world run follows). **PASS (code-read).**
-- `stream_incident_figures` (tool :1637-1663) vs pin `Graph._deserialize`: `_outgoing/_incoming` come from `for sid in self.synapses.keys(): ref=self.synapses[sid]; _outgoing.setdefault(ref.pre_node_id,set()).add(sid)` (pin neuro_foundation.py:5454-5457); the tool keys each endpoint by the synapse MAP KEY (`eid`) into a per-id set, so counts are distinct synapse ids - same. `_node_hyperedges` is built at :5487 from `data["hyperedges"]` ONLY (`setdefault(nid,set()).add(hid)`), and `archived_hyperedges` (:5495-5517) never touches it; the tool descends `hyperedges`, skips `archived_hyperedges`, and does NOT filter on the stored `is_archived` flag - identical (the canonical also indexes a `hyperedges` entry whose stored flag says archived). `set(val["member_nodes"])` = `set(hd["member_nodes"])` (:5463); a duplicate member id collapses in both. A non-node endpoint / member is ignored by the tool (`& want`, `want = ids & existing_ids`) and by the old `incident_figures` (`if i in g.nodes`) - same.
-- Nothing after :5487 in `_deserialize` (tail :5520+, read) deletes or rewrites synapses or hyperedges or the three indexes (no orphan sweep): the figures are exactly counts of stored fields. `Graph.restore` (:5039-5089) only slices `synapses` and skips `he_prediction_window_fired`; it does not alter either section.
-- V11 reads `A["before_figures"]` in exactly ONE place (tool :2040, `for o, n in m.items()`); `before_fig` is otherwise only assigned into `A` (:1739). The mapping `m` is a subset of the candidates, which are a subset of S, so every key V11 reads is present with the same value; the extra keys (S minus candidates, and the three watch ids) are never consumed (the watch figures were unread before too). Never serialised into any report. Computing them BEFORE classification is independent of `cand_old` - correct.
-- Residual (not a finding against the code, see Check 9): the native `SynapseStore.bulk_load_msgpack` (Rust, not in the pin tree) is assumed to key the store by the map key and expose `pre_node_id/post_node_id` unchanged; only a real-file run can close that.
-### Check 3 — Fail-closed / LAW 7 'raw means complete' (+ disclosed behaviour differences a-c)
-(pending)
-### Check 4 — Old path gone, no shrapnel (LAW 3)
-FIRST FINDINGS. **PASS.**
-- `grep -n "SimpleVectorDB\|load_pair\|vdb\.load\|vdb\.content\|incident_figures(g"` on the tool: hits only on `#` comment lines (changelog header 5, 11, 14, 29); **0 non-comment hits**.
-- `grep -n "\.restore("` in code: exactly ONE, `:2651 g2.restore(out_main)` (V11, `build_outputs`).
-- `git diff -U0 09a032c 3cd271b` on the tool: hunks only in the header and `:1559-1740` (the old loader/figures region and `analyze`); `load_pair` and `incident_figures` are DELETED, not left beside the new readers; no second parser; the tool stays under `oneshot-tool/`; the branch touches only the tool, its test file and the return (3 files: `git diff --stat 09a032c 3cd271b`). LAW 3 holds: modified in place, no shrapnel.
-- LAW 3 note (not a violation): the three new readers are one-shot-tool-local, ~100 lines, with no canonical streaming API in the pin to reuse (I re-read `universal_ingestor.py:548-605`: `msgpack.unpack(f, raw=False)` + per-entry `np.frombuffer`, no iterator; `Graph.restore` :5039 streams the outer map but always builds the Graph) - the builder's "NONE EXISTS" answer to brief item 1 is accurate.
-### Check 5 — V11 untouched and still a GATE
-FIRST FINDINGS. **PASS.**
-- The diff hunks (`git diff -U0`) end at tool line ~1740; V11's verifier block (`# V11 canonical restore`, tool :2033-2055), `build_outputs` (:2545-2651 incl. `g2 = pinned.nf.Graph(); g2.restore(out_main)` :2650-2651) and the verifier list are NOT in the diff: unchanged in behaviour (byte-for-byte untouched).
-- V11 still consumes the canonical `g2` (`_outgoing/_incoming/_node_hyperedges`, dangling sweep, `render_wants(g2)`), compares against `A["before_figures"]`, and is `ok11 = not bad_fig and dangling == 0 and len(g2.nodes) == W["nodes_b"]` - still a GATE. Nothing stubs, weakens or skips it.
-- Consequence worth stating (LAW 7 / gate logic): Phase 1 `analyze()` no longer runs the canonical restore on the INPUT, so an input that canonical `Graph.restore` would reject (e.g. a node missing `voltage`/`threshold`, a bad `activation_mode`) is not detected at analyze time; it is detected at V11 only transitively (the OUTPUT restore of a rewrite of that input fails), and in Phase 2 by the live restore. This is acceptable because V11 remains a blocking gate, but it is a real weakening of early detection - see Check 9 item (ii).
-### Check 6 — LAW 4 / LAW 2 (canonical untouched, pin clean, no vendored/protected, no pre-flight change)
-FIRST FINDINGS. **PASS.**
-- LAW 4: canonical `SimpleVectorDB.load` (pin `universal_ingestor.py:548-605`) and `Graph.restore/_deserialize` (pin `neuro_foundation.py:5039-5089, 5368-5517`) are read-only reference; the tool neither edits nor wraps them (the new readers are independent tool-local code that replaces the tool's call; nothing monkeypatches canonical code).
-- Pin worktree: `git rev-parse HEAD` = ae798b94cb14740d200fc3f4fd8d36eef8b86c6a; `git status --porcelain --ignored` = 0 lines; `sha256sum cc_ng_organism.py` = 8ad0f69ed4a7849c98e97e0f3970bbe4a36c727ef880455e8ddecec14de5a8e2 (matches). I never wrote there.
-- LAW 2 / protected: `git diff --name-only 09a032c 3cd271b` = the tool, its test and the return only; none of ng_lite, ng_tract_bridge, ng_ecosystem, openclaw_adapter, ng_autonomic, ng_embed, ng_salience_gate, ng_updater, neuro_foundation, openclaw_hook, stream_parser, activation_persistence, universal_ingestor is touched; no new vendored file.
-- Pre-flight: `grep -ciE "MemAvailable|loadavg|preflight|MemoryMax|MemorySwap"` on the tool = 0 (the pre-flight is an operator step, not tool code), and the delta has no such hunk.
-- LAW 1/5/8: no inter-module call, no new config mechanism or hardcoded config beyond the existing tool constants (`MAIN_NAME`, `VECTORS_NAME`), no autonomic path. LAW 6: a bespoke reader of a canonical format is the price of the ruling (Chief-003), not a normalisation.
-### Check 7 — Memory evidence honesty (shape check, nothing lowered)
-(pending)
-### Check 8 — Mutation / discrimination
-(pending)
-### Check 9 — Worker's disclosures and what it did NOT verify
-(pending)
-### Check 10 — Independence
-(pending)
+| # | Check | Verdict |
+|---|---|---|
+| 1 | Byte-identity | PASS |
+| 2 | `incident_figures` equivalence | PASS |
+| 3 | Fail-closed / LAW 7 | PASS-WITH-NOTES (corrections 1, 2) |
+| 4 | Old path gone (LAW 3) | PASS (note correction 4) |
+| 5 | V11 untouched, still a GATE | PASS |
+| 6 | LAW 4 / LAW 2 / pre-flight | PASS |
+| 7 | Memory-evidence honesty | PASS |
+| 8 | Mutation / discrimination | PASS-WITH-NOTES (correction 3) |
+| 9 | Disclosures / not verified | PASS-WITH-NOTES (corrections 2, 5) |
+| 10 | Independence | PASS (see log) |
+
+### Check 1 — Byte-identity (faithful OLD copy? own world). PASS
+- **Is the test's OLD path faithful?** I read `_old_load_pair` / `_old_figures` / `_old_analyze` (tests :2834-2880) line by line against `git show 09a032c:...oneshot-tool/want_text_repair_oneshot.py` `load_pair` / `incident_figures` / `analyze`. Faithful: same loader calls (`Graph().restore` + `SimpleVectorDB().load`), same `nodes_meta`/`existing_ids`/`content`, same classify/collision/excerpt/mention-shape sequence, same `cand_old`/`watch`, same `render_before`/`counts`, same `del g, vdb; gc.collect()`, same `synapse_stats`. Two deviations, both harmless: it OMITS the `missing -> Stop("scope: ...")` check (so the scope-error path is not compared by the equivalence test) and it ADDS `before_figures_scope`. The OLD path could not have been bent to agree, because it carries no figure/keep logic of the new path.
+- **My own independent OLD:** I did not rely on the test's copy. I extracted the ACTUAL pre-delta tool from git to `/tmp/le035/old_tool.py` (sha256 cbc38bf4a02adfcab6ae05c5796bb20c818103a71c23ab20570835460e42565b = `git show 09a032c:... | sha256sum`, equal to the return's "was" hash) and ran `old.analyze` vs `new.analyze` on the same directory.
+- **My own world** (`/tmp/le035/own_world.py`, sha256 9cb5a03502187480577285187208fcf3bcc0eac0323d0425d342e87dacfd224f; seed 35; output under `/tmp/le035/world-35`; synthetic filler only): 222 nodes (106 wants; 97 in S; 13 candidates; outcomes SEPARATE 55, NONE 8, GENUINE 24, SOURCE_MISSING 10), 1,109 synapses, 25 hyperedges (7 moved to `archived_hyperedges`, 1 in `hyperedges` whose STORED `is_archived` flag is true, 1 listing a non-node and a duplicate member), main 571,360 B, vectors 148,910 B (300 entries). Shapes the worker's world lacks: **two S wants sharing ONE source with several markers**; a source that is itself a want node; a want with no `source_node`; a source missing from the graph but present in the vdb; 13 wants outside S (emergent / closed / short); a NON-conversational node whose vdb content carries `WANT]`/`[/WANT]`; 200 orphan vdb entries (non-ASCII, empty, `[/WANT]`-only, bare `WANT]`, rich metadata); a 20 KB+ filler source; shuffled node order; creation_time ties on 5 values over 106 wants; hub nodes with ~85 in- and out-edges and duplicate (pre, post) pairs; **a self-loop synapse and two synapses whose other endpoint is NOT a node** (injected by byte surgery into the native synapse sub-map; the canonical restore indexes them, `_outgoing` has the ghost keys) - the exact corner the worker said it could not reach.
+- **Results (all PASS):** `scope`, `scope_derived`, `dropped`, `counts`, `render_len_before`, `syn`, `s_sources`, `marker_nodes`, `histograms`, `marker_bearing`, `residuals`, all `records`, `nodes_meta`, `existing_ids` identical; `before_figures` equal on the old keys (16 old keys, 100 new keys); `content` subset == old content filtered by (keep or `WANT]`) **including key order** (300 old entries -> 141 new, keep 91); `build_reports` 7 artifacts sha256-identical; `write_review_files` bytes identical (2 files, stubbed writer to /tmp); pinned `surface_wants` over the WHOLE graph metadata mints the identical set (17) from old full content vs the subset; `frozen_scope` (Phase-2 path) records/histograms identical and the subset consistent; the scope-missing `Stop` message is identical in old and new; `render_wants` TEXT (not only its length) identical with 41 rendered lines at the limit; node order identical.
+- **Not reproduced by me:** V1-V19 old-vs-new on my world (needs approvals/run dirs); I relied on the worker's equivalence test, which I ran (235 passed, below), for the all-19 comparison on its world.
+
+### Check 2 — `incident_figures` equivalence. PASS
+- `stream_incident_figures` (tool :1637-1663) vs pin `Graph._deserialize`: `_outgoing/_incoming` come from `for sid in self.synapses.keys(): ref = self.synapses[sid]; _outgoing.setdefault(ref.pre_node_id, set()).add(sid)` (pin neuro_foundation.py:5454-5457); the tool keys each endpoint by the synapse MAP KEY into per-id sets - same. `_node_hyperedges` is built at :5487 from `data["hyperedges"]` only; `archived_hyperedges` (:5495-5517) never touches it. The tool descends `hyperedges`, skips `archived_hyperedges`, and does NOT filter on the stored `is_archived` flag - identical to the canonical (which also indexes a flagged entry living in `hyperedges`). `set(val["member_nodes"])` = `set(hd["member_nodes"])` (:5463). Nothing after :5487 in `_deserialize` (tail :5520+ read) prunes synapses, hyperedges or the indexes.
+- **Run:** `stream_incident_figures` == the canonical restore's figures for ALL 222 nodes plus 4 non-node ids in my world (self-loop, ghost-endpoint synapses, duplicate pairs, archived / flagged-archived / non-node / duplicate hyperedge members): PASS. Max figures (86, 85, 1), 83 nodes with all three > 0.
+- **V11 still reads the same 'before' figures:** `A["before_figures"]` is read at exactly one place (tool :2040, `for o, n in m.items()`); `m` (the mapping) is a subset of the candidates, a subset of S, so every key V11 reads has the same value. The extra keys (S minus candidates, the three watch ids) are never consumed (the watch figures were unread before too) and `before_fig` is never serialised into a report (only assigned into `A` at :1739). Computing them before classification is independent of `cand_old`: correct.
+- The hyperedge dimension is thin in my world (max 1 hyperedge per node): a node in several non-archived hyperedges is exercised only by the worker's world.
+
+### Check 3 — Fail-closed / LAW 7 "raw means complete". PASS-WITH-NOTES
+Probe script `/tmp/le035/failclosed.py` (sha256 55e51726dcfca6b2225cd6eafc904000cdcddbc720b1ea6754c2c4790b6b1c25), 24/24 PASS:
+- **Vectors file** (tiny world, 4,890 B): ALL 4,890 proper prefixes raise `Stop`; trailing `\x00`, `\xc0`, `\x80`, `\xa1x` and a whole appended valid map each raise `Stop`; top-level map count -1/+1 and entries-map count -1/+1/-29 each raise `Stop`. **Differential byte-flip fuzz, 6,000 mutated files** against the canonical `SimpleVectorDB().load` (filtered to the same keep rule): BOTH_RAISE 3,711; BOTH_OK_EQUAL 2,231; CANON_RAISE_ONLY 58; **BOTH_OK_DIFFER 0; TOOL_RAISE_ONLY 0; non-`Stop` exception from the tool 0**.
+- **main.msgpack** (tiny world, 261,365 B): intact file streamed == canonical (nodes_meta in order + figures); 2,099 proper prefixes (first 300, last 300, every 174th byte) each raise `Stop`; trailing bytes and top-level count +/-1 raise. **Differential fuzz, 1,200 mutated files** (synapses region excluded so the native bulk loader is never fed corrupt bytes): BOTH_RAISE 560, BOTH_OK_EQUAL 552, CANON_RAISE_ONLY 88, **BOTH_OK_DIFFER 0, non-`Stop` exceptions 0**. 800 flips INSIDE the synapses region (tool only): 432 OK, 368 `Stop`, no other exception.
+- **`_streamed` guard:** the `except` list is actually `except Stop: raise` then `except Exception` (broader than the packet's OutOfData/ValueError/KeyError/TypeError list). It can convert a real defect (e.g. an AttributeError) into a `Stop` whose text says "truncated or malformed (AttributeError)": fail-closed and honest about the type, never a short read. `up.tell() != size` is checked only on normal completion. `max_buffer_size = size + 1` is not a cap that can truncate (it is >= the file); `read_size = min(1 MiB, size + 1)` satisfies the C Unpacker's read_size <= max_buffer_size rule (the bug the worker hit and fixed in 8007904). An empty file raises `Stop`.
+- **Disclosed behaviour differences (return section 3), ruled:** (a) scope check before the vectors open: HARMLESS (an earlier, cheaper STOP with the identical message - verified in my world; note no test exercises that Stop at all, correction 3). (b) `skip()` of embedding/metadata without validation: HARMLESS for Phase-1 outputs (neither is read; the vectors file is never rewritten) but it IS a real widening: 58/6,000 vectors mutants that canonical rejects now pass. (c) `version`/`count` skipped: HARMLESS (canonical never checks either).
+- **Notes (new, not disclosed by the worker):** **(i)** the same widening exists on the main.msgpack side (88/1,200 mutants that `Graph.restore` rejects pass the tool; `strict_map_key=False` vs the canonical default `True`; node fields like `voltage`/`threshold`, `ActivationMode`, delay-buffer and telemetry parsing are no longer checked on the INPUT in Phase 1). It is bounded because V11 canonical-restores the OUTPUT of a rewrite of that same input - an input the canonical restore rejects yields an output it rejects - but the return only discloses the vectors half. **(ii) Duplicate map keys diverge silently** (run, `/tmp/le035/dupkeys.py` sha256 84b5431868794f8f5f82e1a6c94132f3e52348f270968489044cb09e164839bc): a node id repeated inside one `nodes` map (want, then non-want) gives the same `nodes_meta` as canonical but a stale want stays in the render view (canonical `render_wants` = "", streamed view is not), so `render_len_before` could differ; two top-level `nodes` keys: canonical last-wins gives `['b']`, the tool merges to `['a','b']`. Neither can be produced by the canonical writer (a Python dict cannot emit duplicate keys), so the real checkpoint is not exposed; it is still a "raw means complete" hole for a hand-crafted or corrupted file. See correction 1.
+
+### Check 4 — Old path gone, no shrapnel (LAW 3). PASS
+- `grep -n "SimpleVectorDB\|load_pair\|vdb\.load\|vdb\.content\|incident_figures(g"` on the tool: hits only on `#` lines (changelog header 5, 11, 14, 29); **0 non-comment hits**. `grep "\.restore("` in code: exactly ONE, `:2651 g2.restore(out_main)` (V11). The tool diff hunks (`git diff -U0`) are the header and `:1559-1740` only: `load_pair` and `incident_figures` are DELETED, not left beside the new readers; no parallel reader; the tool stays under `oneshot-tool/`; the branch range touches only the tool, its test and the return.
+- Brief item 1 (prefer a canonical streaming API): I re-read `universal_ingestor.py:548-605` (`msgpack.unpack(f, raw=False)` then per-entry `np.frombuffer`; no iterator/per-entry API) and `Graph.restore` :5039 (streams the outer map but always builds the Graph): the builder's "NONE EXISTS" is accurate.
+- Note (correction 4): stale comment text remains: the section banner at tool :1556 still reads "the analysis-001 loader (canonical readers)", and the original header "How" sentence (:28-30, "read with the canonical readers ... Graph.restore + SimpleVectorDB.load") is left in place with only a superseding entry above it. LAW 3 prefers one truth: edit in place. Cosmetic, LOW.
+- Ethos note (accepted price, not a violation): a tool-local second reader of two canonical formats now exists beside the canonical loaders; the drift risk is bounded because the tool is pinned to ae798b9, equivalence-tested against the pin, one-shot and retired after apply (C8), and the Chief's ruling (P437) explicitly asked for it. It must never be reused or promoted (LAW 3/6).
+
+### Check 5 — V11 untouched and still a GATE. PASS
+Diff hunks end at tool line ~1740; the V11 block (`# V11 canonical restore`, :2033-2055), `build_outputs` (:2545-2651 incl. `g2 = pinned.nf.Graph(); g2.restore(out_main)` :2650-2651), `run_verifier`, `prepare_outputs` and the verifier list are not in the diff (byte-for-byte untouched). V11 still consumes the canonical `g2` (`_outgoing/_incoming/_node_hyperedges` figures vs `A["before_figures"]`, the dangling sweep, `render_wants(g2)`) and is `ok11 = not bad_fig and dangling == 0 and len(g2.nodes) == W["nodes_b"]` - still a blocking gate. Nothing stubs, weakens or skips it. The only consequence is the early-detection note in Check 3 (i).
+
+### Check 6 — LAW 4 / LAW 2 / pre-flight. PASS
+- LAW 4: canonical `SimpleVectorDB.load` and `Graph.restore/_deserialize` are read-only references (nothing wraps or monkeypatches them in the tool); pin clean (above). LAW 2 / protected: no vendored file (ng_lite, ng_tract_bridge, ng_ecosystem, openclaw_adapter, ng_autonomic, ng_embed, ng_salience_gate, ng_updater), no protected file (neuro_foundation, openclaw_hook, stream_parser, activation_persistence, universal_ingestor) in `git diff --name-only 09a032c 3cd271b`; no new vendored file. Pre-flight: `grep -ciE "MemAvailable|loadavg|preflight|MemoryMax|MemorySwap"` on the tool = 0; no such hunk.
+- LAW 1 (no inter-module call), LAW 5 (no new config mechanism; only existing tool constants), LAW 6 (a bespoke reader of a canonical format is the price of the ruling, not a normalisation), LAW 7 (Phase 1 is read-only analysis; the raw main bytes are still what the rewriter slices; the content subset is not a "smaller raw" - and no path silently shrinks it, Check 3), LAW 8 (no autonomic path): no violation. Choice Clause / Duck Ethics / H-1: the protected-id deny check is unchanged and still driven by `nodes_meta`; no raw want text appears in any error message (`_streamed` messages carry only a type name and byte counts); the review files are the unchanged 0600 off-repo writers.
+
+### Check 7 — Memory-evidence honesty. PASS
+- The memory test (`test_memory_shape_...`) is `tracemalloc` on 8,000 / 16,000-entry synthetic files. Its docstring and the return section 7 both say "SHAPE check (tracemalloc; NOT the real peak)", and the return explicitly says `tracemalloc` does not count native internals. No real peak is claimed. Nothing is lowered: the return restates the 8 GiB heavy floor, the 3 GiB light floor, the 6 GB cap, `MemorySwapMax=0`, and declines to state a derived 2.5 GiB because it is a static estimate. The "dry run not light end to end; V11's ~3.6 GiB restore remains" statement is accurate and explicitly attributed to plan-004.
+- My independent real-process check (`/tmp/le035/skipmem2.py` sha256 374e8748ea75f7a52cef02b48dce5719f213fcd33c641bfaf0aeca55eff4e9c7; `ru_maxrss` in a clean child. The leaf rows of the earlier `skipmem.py` run were discarded because `ru_maxrss` is inherited from a fat forking parent - disclosed so nobody re-uses them): `stream_graph_nodes` + `stream_incident_figures` over a file whose skipped top-level value is a MAP of small leaves stays FLAT at ~29-30 MB RSS for 57 MB and 153 MB files (`skipmem.py` map rows, valid); over a file with ONE skipped bin leaf, peak RSS rises to 177 MB for a 64 MB leaf and 561 MB for a 256 MB leaf (about 2.1x the leaf, from a 29 MB base). So `skip()` with `max_buffer_size = size + 1` buffers a single huge leaf whole (the worker's disclosed worry) but NOT a huge map of small leaves (the `he_prediction_window_fired` shape). Correction 5.
+
+### Check 8 — Mutation / discrimination. PASS-WITH-NOTES
+- The worker's four mutations (archived-hyperedge indexing, keep set ignoring S sources, creation_time zeroed, reversed node order): I did not re-run them (editing the tool is forbidden and the packet allows the test file ONCE). Read: each is plausibly killed - the extras world holds an archived hyperedge listing an S id and marker-only / no-marker S sources, and the added render test fixes the first-version miss with ties, more than `WANT_RENDER_LIMIT` wants and text over `WANT_MAX_CHARS`. The worker disclosed that its first suite did NOT catch the creation_time mutation - honest.
+- **My own mutants** (copies under `/tmp/le035`, never the tool; `mut.py` sha256 ada0bc640fd86f97e6f15bf5b08a466f885e1a2745c3b2606b287e68b782c3b9... see the hash list at the end), each run through my world's figure comparison: M5 "skip a `hyperedges` entry whose stored `is_archived` flag is true" DETECTED (7/222 node figures differ); M6 "count only node-to-node synapses" DETECTED (1/222); M7 "count distinct (pre, post) pairs instead of synapse ids" DETECTED (105/222). **By reading, NOT by running the worker's tests on them:** the worker's world has no flagged-archived hyperedge inside `hyperedges` (`grep is_archived` in the tests: only `:242`, the move into `archived_hyperedges`), no synapse with a non-node endpoint, no self-loop and no two S wants sharing a source, so M5 and M6 would most likely SURVIVE the worker's suite. Correction 3.
+
+### Check 9 — The worker's disclosures and what it did NOT verify. PASS-WITH-NOTES
+- **Real data (never opened):** ACCEPT as disclosed; unchanged. **Native synapse store corner:** the worker could not synthesise a non-node-endpoint synapse; I did (byte surgery) and the streamed figures equal the canonical restore through the real native store, including the self-loop - this closes the corner on SYNTHETIC data only; a real-file run is still the only proof. **Unpacker skip buffer on the real `main.msgpack`:** CHALLENGED into a measured number - flat for maps of small leaves, ~2.1x for a single leaf (Check 7); the real file's largest single element is unknown and is the quantity the P3-style probe must report (correction 5).
+- **Disclosure gaps:** return section 3 (b) discloses the widening for the vectors file only (Check 3 (i)); the duplicate-key divergence (Check 3 (ii)) and the test-coverage holes (Check 8) are undisclosed.
+- **Return accuracy spot checks:** the return quotes its diff stat at `09a032c..6d12488` (+132/-27 tool, +346/-1 tests); my range to 3cd271b adds only the return file, and the tool/test hashes at 3cd271b equal the return's - consistent. The item-8 consequence statement (Phase 1 not yet light end to end; V11 is a Phase-1 step by plan-004 s.6.6/7; no pre-flight lowered) is accurate and appropriately cautious. The brief's "release the Graph (`del` + `gc.collect()`)" is moot because no Graph is built - stated by the worker.
+
+### Check 10 — Independence. PASS
+I did not open, list or hash `checker-028-want-repair-delta-stream.md`. This draft is committed and pushed before any read of it (log below).
 
 ## Law Violations
-(pending)
+None.
+
 ## Ethos Drift
-(pending)
+None beyond the accepted price noted in Check 4 (a second, tool-local parser of two canonical formats; one-shot, pinned, to be retired).
+
 ## Correct Implementations
-(pending)
-## Remediation Priority
-(pending)
-## Recommended Next Steps
-(pending)
+- Replace-not-add: `load_pair`/`incident_figures` deleted in place; ONE `.restore(` left, exactly V11's; nothing parallel.
+- The keep set is the right semantic unit: S sources (by id) plus every entry containing `WANT]` (which is precisely what `conversational_marker_nodes`, `surface_wants`, `residual_classes` and `marker_bearing_minted` read) - verified by my whole-graph `surface_wants` old-vs-subset comparison.
+- `incident_figures` was correctly recognised as counts of STORED fields and moved ahead of classification without changing any key V11 reads.
+- The `_streamed` guard makes truncation, trailing bytes and header tampering uniformly fatal; the `read_size`/`max_buffer_size` relationship is handled.
+- Failing-first tests pushed before the change, honest disclosure of the missed mutation and of the first-run bug, and a return that states the not-verified list and lowers nothing.
+
+## Remediation Priority (all non-blocking for the DELTA; none a Law violation)
+- MEDIUM (1) duplicate map keys are not refused (silent divergence on non-canonical input).
+- LOW (2) undisclosed widening of input validation on main.msgpack; (3) test-coverage holes that let M5/M6-class mutants through and leave the scope-missing Stop untested; (4) stale loader comments; (5) probe design must measure the largest single element.
+- INFO (6) `tool_sha256` changed with the delta (59ed9f82...); every stamped artifact and the retirement refusal bind to it, so any correction re-stamps.
+
+## Recommended Next Steps (numbered corrections)
+1. In `stream_graph_nodes` raise `Stop` on a repeated node id and on a repeated top-level key (`nodes`/`synapses`/`hyperedges`), and in `load_content_subset` on a repeated top-level `entries` key; add the two duplicate-key cases from `/tmp/le035/dupkeys.py` (shape only, synthetic) as tests. A few lines; LAW 7 "raw means complete" for a non-canonical file.
+2. Disclose in the return (and in the TURN B runbook) that Phase-1 `analyze()` no longer canonical-validates the INPUT `main.msgpack`/`vectors.msgpack`; state which later step does (V11 on the OUTPUT; the Phase-2 canonical restore and G2/G3) so nobody assumes the dry run proved canonical loadability of the input. (Out-of-delta detail: confirm the Phase-2 path restores the live input canonically; I did not read the apply path.)
+3. Add to the equivalence world: a `hyperedges` entry whose stored `is_archived` is true; a synapse with a non-node endpoint and a self-loop (inject as in `/tmp/le035/own_world.py`); two S wants sharing one source; a node in two or more non-archived hyperedges; and a test that `analyze(frozen_scope=[missing])` raises the same `Stop` before the vectors file is opened.
+4. Edit the stale tool comments in place (banner :1556; header "How" :28-30) so there is one truth.
+5. In the P3-style probe on the kept COPY report the LARGEST SINGLE ELEMENT of each streamed section (node entry, synapse entry, vdb entry, and any skipped top-level leaf), not only the peak RSS: `skip()` buffers one leaf whole (~2.1x measured here), a map of small leaves costs nothing.
+6. Expect a re-stamp (tool sha256) after corrections 1 and 4; the test file needs a fresh single run.
+
+## Not verified
+1. Anything on real data (no checkpoint directory, the kept COPY, Syl's directories or the live tract opened, listed or hashed).
+2. The native `SynapseStore` on the real `main.msgpack` (only synthetic, through the real native store, incl. ghost endpoints and a self-loop I injected).
+3. The worker's tests against my mutants M5/M6/M7 and against the worker's four mutants (reasoned from reading, not run).
+4. V1-V19 old-vs-new on MY world (relied on the worker's equivalence test, which passed in my single run).
+5. The Phase-2 apply path's use of `analyze()` and any canonical restore of the live input.
+6. The pure-Python msgpack fallback (this host: msgpack 1.0.3, `_cmsgpack` C extension; `Unpacker.tell()`/`skip()` behaviour on the fallback untested).
+7. The real-file peak memory (no claim made by anyone; the `tracemalloc` figures are shape only).
+8. I did not use a scratch HOME: the test module derives `PIN_ROOT` from `Path.home()` and asserts the pin module's resolved path equals it, and the native `ng_tract` extension lives in the real user site (`~/.local/lib/python3.12/site-packages/ng_tract`), so both the pin import and the tests fail under a scratch HOME (observed on my first probe, before any tool code ran). Everything I executed wrote only under `/tmp/le035` (and pytest's temp under `TMPDIR=/tmp/le035/tmp`); the real `~/.bashrc` was not written.
+
+## Test run (ONCE) — P379 preamble
+Command: `env -u PYTHONPATH -u NG_EMBED_REMOTE PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TMPDIR=/tmp/le035/tmp python3 -B -m pytest tests/test_want_text_repair_oneshot.py -s -q -p no:cacheprovider` at the tool worktree head (my first-findings commit e8cc9129 on top of 3cd271b; tool and test files identical to 3cd271b): **235 passed in 84.58 s**. Printed resolved paths: `sys.executable /usr/bin/python3`; `cc_ng_organism`, `neuro_foundation`, `universal_ingestor`, `checkpoint_guardian` all under `/home/josh/NeuroGraph-worktrees/z12-want-repair-pin-ae798b9/`; `cc_ng_organism` sha256 8ad0f69ed4a7849c98e97e0f3970bbe4a36c727ef880455e8ddecec14de5a8e2; NG-module state: `ng_lite`, `ng_embed`, `neurograph_rpc`, `cc_ng_host`, `activation_persistence` not loaded; `PYTHONPATH None`; `NG_EMBED_*` none. After the run the tool worktree had 0 porcelain lines and the pin 0 (`--ignored`). (The `want_text_repair_oneshot: error: the following arguments are required: --target-dir` line in the output is a CLI-refusal test's argparse text, not a failure.)
+
+My own scripts (all under `/tmp/le035`, none committed): own_world.py sha256 9cb5a03502187480577285187208fcf3bcc0eac0323d0425d342e87dacfd224f; failclosed.py 55e51726dcfca6b2225cd6eafc904000cdcddbc720b1ea6754c2c4790b6b1c25; skipmem.py a4c119d14086072777ad34711de9ac8fe5f1306dd4a3be2071a6991937fc9efe (leaf rows invalid, see Check 7); skipmem2.py 374e8748ea75f7a52cef02b48dce5719f213fcd33c641bfaf0aeca55eff4e9c7; mut.py ada0bc640fd86f97e6f15bf5b08a466f885e1a2745c3b2606b287e68b782c3b9; dupkeys.py 84b5431868794f8f5f82e1a6c94132f3e52348f270968489044cb09e164839bc; old_tool.py cbc38bf4a02adfcab6ae05c5796bb20c818103a71c23ab20570835460e42565b.
+
 ## Independence log
-- Draft not yet committed. checker-028 not opened.
+- Drafted and committed the verdicts above BEFORE opening `handoffs/z12-want-text-repair/reviews/checker-028-want-repair-delta-stream.md`.
+- One early command listed `reviews/` piped through `grep -v checker-028` (to see which other review files exist without displaying the checker's file name); its output showed only checker-026, le-029, le-031, le-034. That is not a read of checker-028 and no content of it was seen. No accidental read.
+- The comparison with checker-028 (agree / disagree / add) is appended below after this draft is committed.
