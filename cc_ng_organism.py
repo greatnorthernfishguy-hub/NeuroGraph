@@ -3,6 +3,35 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813
+#   (dispatch #10841) — remove the Pith per-node clip; the budget is met by fewer
+#   WHOLE items, loudly
+# What: (1) _pith_node_text returns the node's text WHOLE; CC_PITH_PROVIDER_NODE_CHARS
+#   (_CC_PITH_PROVIDER_NODE_CHARS) is deleted; pith_effective_config() reports the
+#   retired name as resolved=None / authority="retired" and it stays in
+#   _PITH_CONFIG_KEYS, because env == resolved == that tuple == the host allow-list
+#   is asserted (tests) and the host is not edited in this change. (2) _pith_fit_statement and the water-filling in
+#   _pith_fit_connected_line are deleted: a connected line is admitted whole or not at
+#   all. (3) _pith_provider_admit keeps its strict rank-order prefix, additionally skips
+#   an assembly that cannot fit even an EMPTY envelope (so one giant top-ranked
+#   assembly cannot blank every other), and logs ONE INFO line -- count and total
+#   rendered size -- whenever it drops anything. (4) pith_stage3 loses its keyframe
+#   fallback for an over-budget line (drop whole instead) and logs the same INFO line
+#   for what it drops; the never-empty-L1 guard is kept. (5) _pith_node_sources no
+#   longer slices labels to 80 chars. (6) cc_pattern_completion_recall gains the
+#   opt-in whole_content=False parameter (default byte-identical); pith_provider_context
+#   passes True so the node-text fallback is not the 300-char snippet. (7) the
+#   prefetch LOD keyframe staging (and the query embed only it used) is removed.
+#   (8) pith_stage2_keyframe's docstring states it applies only WITH its delta.
+# Why: Exec P411/P413 via Chief-003 (Josh: no truncation). A keyframe whose delta is
+#   discarded is a cut with a marker; no budgeted output has room to carry the delta,
+#   so a keyframe never satisfies a binding budget. Audit + reasoning:
+#   handoffs/z12-pith-clip-813/plan-001-audit.md.
+# How: repaired in place (LAW 3, same function names). Untouched on purpose: the
+#   REJECT-LOUDLY guards MAX_INSTRUCTION_CHARS / MAX_QUEST_CHARS (a whole-request
+#   refusal is not a cut), pith_stage2_keyframe itself (pure, still used by the
+#   history-compression handler), the now-unused CC_PITH_PREFETCH_SUMMARY_CHARS /
+#   CC_PITH_PREFETCH_LOD_DIST constants (dead-tunable removal touches host allow-lists).
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -1012,6 +1041,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -2848,7 +2878,8 @@ _CC_RECALL_PROP_STEPS = int(os.environ.get("CC_RECALL_PROP_STEPS", "0"))
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                                     threshold: float = _CC_RECALL_PRIME_THRESHOLD,
                                     state: Optional[Dict[str, Any]] = None,
-                                    preserve_graph_config: bool = False) -> List[Dict[str, Any]]:
+                                    preserve_graph_config: bool = False,
+                                    whole_content: bool = False) -> List[Dict[str, Any]]:
     """Substrate-native pattern-completion recall for CC's hook surfacing
     (#358 rebuild -- replaces the bare ng.recall() cosine search this
     function originally wrapped; LAW 3 rebuild-in-place, same contract).
@@ -2873,6 +2904,11 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
     Returns [{node_id, score, content}] -- same shape as before; content
     substrate-first via resolve_surface_content, degenerate results dropped.
     Fails soft: any exception returns [].
+
+    whole_content (#813, default False = byte-identical for every existing caller):
+    when True the snippet is NOT bounded to 300 chars -- it is the node's whole
+    resolved text.  pith_provider_context passes True: its budget is met by dropping
+    whole assemblies, so an upstream snippet cut would be a truncation it cannot see.
     """
     if not query or ng is None:
         return []
@@ -2961,35 +2997,19 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         # GSG geodesic re-score -- canonical rpc.py:2991-3038
         surfaced = cc_gsg_rescore(surfaced, query, ng.graph)
 
-        # Pith Stage 4 (#55) proximity-keyed LOD (spec sec 4c): a promoted-
-        # but-unsurfaced line beyond the distance threshold is staged as a
-        # keyframe summary rather than full content -- near predictions are
-        # trusted at full resolution, far ones cost less if they turn out
-        # irrelevant. Query direction is only computed when there's a
-        # promoted candidate to stage (no extra embed cost otherwise).
-        query_dir = None
-        if promoted_ids:
-            try:
-                from ng_embed import embed as _embed
-                query_dir = _cc_embed_to_poincare_dir(_embed(query))
-            except Exception as exc:
-                logger.debug("Pith LOD query embed failed (non-fatal): %s", exc)
-                query_dir = None
-
+        # (#813: the Stage 4 proximity-keyed LOD staging -- a far promoted node shown
+        # as a keyframe -- is removed.  It discarded the keyframe's delta, which is a
+        # cut; a promoted node now stays whole at every distance and the budget
+        # decides whether it survives.)
         out = []
         for r in surfaced:
             nid = r.get("node_id") or r.get("id")
             node = ng.graph.nodes.get(nid) if (nid and ng.graph) else None
-            text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)
+            text = resolve_surface_content(
+                node, r, allow_ingested=True,
+                max_chars=(sys.maxsize if whole_content else 300))
             if not text:
                 continue
-            if nid in promoted_ids and query_dir is not None:
-                try:
-                    dist = _cc_node_query_distance(node, query_dir)
-                    if dist is not None and dist > _CC_PITH_PREFETCH_LOD_DIST:
-                        text, _ = pith_stage2_keyframe(text, max_chars=_CC_PITH_PREFETCH_SUMMARY_CHARS, query=query)
-                except Exception as exc:
-                    logger.debug("Pith LOD staging failed for %r (non-fatal): %s", nid, exc)
             # [D5] Carry Stage-4 promotion provenance out of this function so the
             # assembler can stamp it on the CacheLine. Additive key; every existing
             # consumer reads by name and is unaffected.
@@ -3509,7 +3529,9 @@ _CC_PITH_L1_BUDGET = max(500, min(40000, _CC_PITH_L1_BUDGET))
 _CC_PITH_PROVIDER_ROOTS = max(1, min(24, int(os.environ.get("CC_PITH_PROVIDER_ROOTS", "8"))))
 _CC_PITH_PROVIDER_MEMBERS = max(2, min(16, int(os.environ.get("CC_PITH_PROVIDER_MEMBERS", "6"))))
 _CC_PITH_PROVIDER_DEPTH = max(1, min(3, int(os.environ.get("CC_PITH_PROVIDER_DEPTH", "2"))))
-_CC_PITH_PROVIDER_NODE_CHARS = max(120, min(2000, int(os.environ.get("CC_PITH_PROVIDER_NODE_CHARS", "700"))))
+# (#813: there is no per-node character cap -- a node is rendered WHOLE and the
+# budget is met by dropping whole assemblies. The two caps below are REJECT-LOUDLY
+# request guards: they refuse the whole request with a visible closed state.)
 _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS = max(
     500, min(16000, int(os.environ.get("CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS", "8000"))))
 _CC_PITH_PROVIDER_MAX_QUEST_CHARS = max(
@@ -3813,7 +3835,15 @@ _PITH_CONFIG_KEYS = (
     "CC_PITH_ENABLED", "CC_PITH_L1_BUDGET", "CC_PITH_L1_BREATHE",
     "CC_PITH_KEYFRAME_CHARS",
     "CC_PITH_PROVIDER_ROOTS", "CC_PITH_PROVIDER_MEMBERS",
-    "CC_PITH_PROVIDER_DEPTH", "CC_PITH_PROVIDER_NODE_CHARS",
+    "CC_PITH_PROVIDER_DEPTH",
+    # #813: RETIRED knob.  Nothing reads it any more (resolved=None, authority
+    # "retired").  It stays in this tuple because env == resolved == this tuple ==
+    # cc_ng_host.PITH_SNAPSHOT_GATE_KEYS is asserted (tests/test_pith_metrics_concurrency.py,
+    # tests/test_cc_host_pith_telemetry.py) and the host is not edited in this change;
+    # and between the code deploy and the .bashrc removal a stale export is exactly what
+    # an operator wants to see (env set, resolved None).  Remove here, in the resolved
+    # dict, and in the host list together.
+    "CC_PITH_PROVIDER_NODE_CHARS",
     "CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS", "CC_PITH_PROVIDER_MAX_QUEST_CHARS",
     "CC_PITH_PREFETCH_ENABLED", "CC_PITH_PREFETCH_WARM_ENABLED",
     "CC_PITH_PREFETCH_MAX", "CC_PITH_PREFETCH_REPEATS",
@@ -3855,13 +3885,16 @@ def pith_effective_config() -> Dict[str, Dict]:
         "CC_PITH_PROVIDER_ROOTS": _CC_PITH_PROVIDER_ROOTS,
         "CC_PITH_PROVIDER_MEMBERS": _CC_PITH_PROVIDER_MEMBERS,
         "CC_PITH_PROVIDER_DEPTH": _CC_PITH_PROVIDER_DEPTH,
-        "CC_PITH_PROVIDER_NODE_CHARS": _CC_PITH_PROVIDER_NODE_CHARS,
+        # #813: retired -- no per-node cap exists; None = "not a live setting" (same
+        # convention as the tonic_engine-unavailable entries below).
+        "CC_PITH_PROVIDER_NODE_CHARS": None,
         "CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS": _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS,
         "CC_PITH_PROVIDER_MAX_QUEST_CHARS": _CC_PITH_PROVIDER_MAX_QUEST_CHARS,
         "CC_PITH_PREFETCH_ENABLED": _CC_PITH_PREFETCH_ENABLED,
         "CC_PITH_PREFETCH_LOD_DIST": _CC_PITH_PREFETCH_LOD_DIST,
     }
     authority = {k: "cc_ng_organism" for k in resolved}
+    authority["CC_PITH_PROVIDER_NODE_CHARS"] = "retired (#813: nodes render whole)"
 
     # The four warm-prefetch knobs are resolved by tonic_engine, not here -- read
     # them from their owner rather than re-deriving (LAW 4: one source per value).
@@ -4129,6 +4162,14 @@ def pith_stage2_keyframe(content: str, max_chars: Optional[int] = None,
 
     max_chars defaults to CC_PITH_KEYFRAME_CHARS (env, clamped [60, 1000]).
     Never raises.
+
+    #813 (Exec P411/P413, Josh: no truncation) -- A KEYFRAME APPLIES ONLY WITH ITS
+    DELTA.  `keyframe` + `delta` together are a lossless reordering of `content`;
+    `keyframe` alone is a cut with a marker.  Model-facing budgeted output (the
+    provider context, the Stage 3 L1 assembler, recall staging) has no room to carry
+    the delta -- that is exactly what a binding budget refused -- so it never calls
+    this function: an item is rendered whole or dropped whole.  Callers that use the
+    keyframe on its own (today only pith_compress_history) own that loss.
     """
     if max_chars is None:
         max_chars = _CC_PITH_KEYFRAME_CHARS
@@ -4505,9 +4546,9 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
     # would let rank-20 recency junk jump ahead of a dropped rank-8 relevance
     # block, inverting the very ordering Stage 3 exists to enforce. The first
     # line is always kept (even if it alone exceeds the budget) so a large top
-    # item never yields an empty L1. Graceful degradation (Pith Stage 2): a
-    # line that doesn't fit at full fidelity gets one more chance as a
-    # keyframe (compressed head) before being dropped -- terser beats absent.
+    # item never yields an empty L1. #813 (Exec P411/P413, Josh: no truncation): a
+    # line that doesn't fit is dropped WHOLE -- never replaced by a keyframe, which
+    # without its delta is a cut.  The drop is reported at INFO below.
     kept_unpinned: List[CacheLine] = []
     running_total = 0
     for _unified, _idx, cl in scored:
@@ -4517,17 +4558,16 @@ def pith_stage3(cache_lines: List[CacheLine], budget_chars: Optional[int] = None
             running_total += full_len
             continue
 
-        kf, _delta = pith_stage2_keyframe(cl.content)
-        if running_total + len(kf) <= budget_chars and len(kf) < full_len:
-            cl.content = kf
-            kept_unpinned.append(cl)
-            running_total += len(kf)
-            _PITH_METRICS.compressed_count += 1
-            _PITH_METRICS.chars_saved += (full_len - len(kf))
-            continue
-
         break
     dropped = len(scored) - len(kept_unpinned)
+    if dropped:
+        _kept_ids = {id(cl) for cl in kept_unpinned}
+        logger.info(
+            "pith stage3: L1 budget %d chars met by dropping %d whole items (%d chars); "
+            "kept %d (%d chars)",
+            budget_chars, dropped,
+            sum(len(cl.content or "") for _u, _i, cl in scored if id(cl) not in _kept_ids),
+            len(kept_unpinned), running_total)
 
     # [D5] Spec sec 13.3 terms, counted here because this is where the final L1
     # set exists: `pinned_lines + kept_unpinned` is exactly what this function
@@ -4653,20 +4693,18 @@ def _pith_node_raw_text(node: Any, fallback: str = "") -> str:
 
 
 def _pith_node_text(node: Any, fallback: str = "") -> str:
-    """Resolve and bound one node's own meaning for a connected assembly.
+    """Resolve one node's own meaning, WHOLE, for a connected assembly.
+
+    #813 (Exec P411/P413, Josh: no truncation): there is no per-node clip.  The
+    budget is met by admitting fewer whole assemblies (_pith_provider_admit), never
+    by shortening what a node says.
 
     Tree nodes keep their own concept while a forest keeps the lived turn.  This
     differs deliberately from standalone snippet display: an assembly already
     carries the forest keyframe, so repeating that forest for every tree would
     erase the relationships the cache line exists to preserve.
     """
-    text = _pith_node_raw_text(node, fallback)
-    if len(text) <= _CC_PITH_PROVIDER_NODE_CHARS:
-        return text
-    keyframe, _delta = pith_stage2_keyframe(
-        text, max_chars=_CC_PITH_PROVIDER_NODE_CHARS)
-    return keyframe or _pith_cut_at_word_boundary(
-        text, _CC_PITH_PROVIDER_NODE_CHARS)
+    return _pith_node_raw_text(node, fallback)
 
 
 def _pith_node_sources(node: Any) -> list:
@@ -4675,7 +4713,7 @@ def _pith_node_sources(node: Any) -> list:
     for key in ("source", "provenance", "creation_mode"):
         value = meta.get(key)
         if isinstance(value, str) and value.strip():
-            values.append(value.strip()[:80])
+            values.append(value.strip())
     return _pith_unique(values) or ["substrate topology"]
 
 
@@ -4969,110 +5007,66 @@ def _pith_render_connected_line(line: CacheLine) -> str:
     return "\n".join(lines)
 
 
-def _pith_fit_statement(text: str, limit: int) -> Optional[str]:
-    """Bound one statement while keeping it visibly extractive.
-
-    Relationship membership is carried by the CacheLine, not inferred from a
-    shortened sentence.  This helper therefore shortens only the prose payload;
-    it never removes a relation, source, anchor, or coherence label.
-    """
-    value = (text or "").strip()
-    if not value or limit < 1:
-        return None
-    if len(value) <= limit:
-        return value
-    if limit <= 2:
-        return "…"[:limit]
-    if limit < 18:
-        return _pith_cut_at_word_boundary(value, limit - 2) + " …"
-    keyframe, _delta = pith_stage2_keyframe(value, max_chars=limit)
-    if keyframe and len(keyframe) <= limit:
-        return keyframe
-    shortened = _pith_cut_at_word_boundary(value, limit - 2)
-    return (shortened + " …")[:limit]
-
-
 def _pith_fit_connected_line(line: CacheLine, max_chars: int) -> Optional[CacheLine]:
-    """Fit one relationship CacheLine by shortening prose, never structure.
+    """Admit one relationship CacheLine WHOLE, or not at all.
 
-    All member relationships, exact anchors, sources, and epistemic/coherence
-    labels travel together.  If even that fixed structure cannot fit, the
-    entire line is rejected rather than emitting an orphaned fragment.
+    #813 (Exec P411/P413, Josh: no truncation): a line is never shortened to fit.
+    Its prose, every relation, source, exact anchor and coherence/epistemic label
+    travel together exactly as rendered.  If the whole rendering does not fit
+    `max_chars` the line is refused (None) and the caller drops it, loudly.
     """
     if max_chars <= 0:
         return None
     if len(_pith_render_connected_line(line)) <= max_chars:
         return _pith_copy_cache_line(line)
-
-    fitted = _pith_copy_cache_line(line)
-    fields = [line.content] + [str(r.get("content") or "") for r in line.relations]
-    # Render with one visible character per statement to measure structure that
-    # cannot be removed (relation labels, sources, anchors, headings).
-    fitted.content = "…"
-    for relation in fitted.relations:
-        relation["content"] = "…"
-    fixed_cost = len(_pith_render_connected_line(fitted))
-    if fixed_cost > max_chars:
-        return None
-
-    payload_budget = max_chars - fixed_cost + len(fields)  # replace each "…"
-    allocations = [1] * len(fields)
-    remaining = payload_budget - len(fields)
-    active = {i for i, value in enumerate(fields) if len(value) > 1}
-    # Deterministic water-filling preserves every statement while allowing short
-    # statements to finish and donate their unused share to longer ones.
-    while remaining > 0 and active:
-        share = max(1, remaining // len(active))
-        progressed = False
-        for index in tuple(sorted(active)):
-            want = len(fields[index]) - allocations[index]
-            add = min(want, share, remaining)
-            if add > 0:
-                allocations[index] += add
-                remaining -= add
-                progressed = True
-            if allocations[index] >= len(fields[index]):
-                active.discard(index)
-            if remaining <= 0:
-                break
-        if not progressed:
-            break
-
-    rendered_fields = [_pith_fit_statement(value, allowance)
-                       for value, allowance in zip(fields, allocations)]
-    if any(value is None for value in rendered_fields):
-        return None
-    fitted.content = rendered_fields[0]
-    for relation, value in zip(fitted.relations, rendered_fields[1:]):
-        relation["content"] = value
-    # Arithmetic above is exact for the renderer, but retain a closed guard if
-    # future formatting changes add overhead.
-    if len(_pith_render_connected_line(fitted)) > max_chars:
-        return None
-    return fitted
+    return None
 
 
 def _pith_provider_admit(lines: List[CacheLine], budget_chars: int) -> tuple:
-    """Admit a strict ranked prefix as whole relationship cache lines.
+    """Admit a strict ranked prefix as WHOLE relationship cache lines.
 
-    An oversized line may compress its member prose to the remaining envelope,
-    but no relation, source, anchor, or coherence label is removed.  A line
-    whose fixed structure cannot fit stops prefix admission.
+    The budget is met by fewer whole assemblies, never by shortening one (#813).
+    The first line that does not fit the REMAINING envelope ends admission, so a
+    lower-ranked line never jumps a dropped higher-ranked one.  One refinement: a
+    line that could not fit even an EMPTY envelope is skipped instead of ending
+    admission, so one giant top-ranked assembly cannot blank all the others.
+
+    Anything dropped is reported at INFO -- how many whole assemblies and their
+    total rendered size -- so a budget drop is never silent.
     """
     ordered = sorted(lines, key=lambda line: (-line.score, line.node_id))
     kept = []
     rendered = []
+    dropped_chars = 0
+    dropped_count = 0
+    stopped = False
     used = 0
     for line in ordered:
+        if stopped:
+            dropped_count += 1
+            dropped_chars += len(_pith_render_connected_line(line))
+            continue
         separator = 2 if rendered else 0
         fitted = _pith_fit_connected_line(line, budget_chars - used - separator)
         if fitted is None:
-            break
+            whole = len(_pith_render_connected_line(line))
+            dropped_count += 1
+            dropped_chars += whole
+            if whole <= budget_chars:
+                # Would have fit an empty envelope: it lost on rank/space, so the
+                # ranked prefix ends here.  (Otherwise it can never fit -- skip it.)
+                stopped = True
+            continue
         block = _pith_render_connected_line(fitted)
         cost = len(block) + separator
         kept.append(fitted)
         rendered.append(block)
         used += cost
+    if dropped_count:
+        logger.info(
+            "pith provider_context: learned budget %d chars met by dropping %d whole "
+            "assemblies (%d chars rendered); kept %d (%d chars)",
+            budget_chars, dropped_count, dropped_chars, len(kept), used)
     return kept, rendered
 
 
@@ -5182,7 +5176,8 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
         # the conversation state's prefetch set.
         recall_state["primed_nodes"] = {}
         surfaced = cc_pattern_completion_recall(
-            ng, cue, roots, state=recall_state, preserve_graph_config=True)
+            ng, cue, roots, state=recall_state, preserve_graph_config=True,
+            whole_content=True)
         # The budget breathes with arousal and the confidence of the region
         # that just fired for this cue (Shared Graduation, Packet 175a).
         budget = budget_chars if budget_chars is not None else cc_l1_budget(

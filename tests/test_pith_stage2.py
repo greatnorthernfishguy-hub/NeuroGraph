@@ -1,6 +1,15 @@
 # tests/test_pith_stage2.py
 #
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: Stage 3 no longer keyframes
+# What: the three pith_stage3 integration tests that expected an over-budget line to be
+#   KEPT as a keyframe now expect it to be DROPPED WHOLE (content untouched,
+#   compressed_count == chars_saved == 0, ranked_dropped counts it).
+# Why: Exec P411/P413 (Josh: no truncation): a keyframe whose delta is discarded is a cut,
+#   and a binding budget has no room for the delta. The pure pith_stage2_keyframe()
+#   tests in this file are unchanged and still valid.
+# How: assertions only; fixtures unchanged. New behaviour is covered end to end in
+#   tests/test_cc_pith_clip_813.py.
 # [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — asserts the
 #   compression's real contract (P224(1)(a) cleanup).
 # What: the stage3 graceful-degradation tests no longer read the deleted
@@ -126,21 +135,22 @@ def _long_item(node_id, score, stream="pattern"):
                                     score=score, stream=stream)
 
 
-def test_graceful_degradation_keeps_overflow_item_as_keyframe():
+def test_overflow_item_is_dropped_whole_not_keyframed():
     top = CacheLine.from_surfaced("top", "A" * 50, score=10.0, stream="pattern")
     overflow = _long_item("mid", score=5.0)
-    original_len = len(overflow.content)  # pith_stage3 compresses in place
+    original = overflow.content
     tiny = CacheLine.from_surfaced("low", "z" * 10, score=1.0, stream="pattern")
 
     out = pith_stage3([top, overflow, tiny], budget_chars=300)
     ids = [l.node_id for l in out]
 
-    assert "mid" in ids, "overflow item should be kept as a keyframe, not dropped"
-    mid = out[ids.index("mid")]
-    assert len(mid.content) < original_len, "kept head is shorter than the original"
-    assert "⋯[+" in mid.content
-    assert _PITH_METRICS.compressed_count == 1
-    assert _PITH_METRICS.chars_saved > 0
+    # #813: the over-budget line is dropped WHOLE (strict rank prefix ends there);
+    # it is never shortened to a keyframe, and its content is never rewritten.
+    assert ids == ["top"]
+    assert overflow.content == original
+    assert _PITH_METRICS.compressed_count == 0
+    assert _PITH_METRICS.chars_saved == 0
+    assert _PITH_METRICS.ranked_dropped == 2
 
 
 def test_break_when_even_keyframe_overflows():
@@ -163,7 +173,6 @@ def test_pinned_never_compressed():
                                       pinned=True, stream="pattern")
     top = CacheLine.from_surfaced("top", "A" * 50, score=10.0, stream="pattern")
     overflow = _long_item("mid", score=5.0)
-    overflow_len = len(overflow.content)  # pith_stage3 compresses in place
 
     out = pith_stage3([pinned, top, overflow], budget_chars=300)
     ids = [l.node_id for l in out]
@@ -171,9 +180,9 @@ def test_pinned_never_compressed():
     pin_line = out[ids.index("pin")]
     assert pin_line.content == pinned_content, "pinned content untouched verbatim"
     assert "⋯[+" not in pin_line.content
-    # a non-pinned peer still degraded under the same budget
-    assert len(out[ids.index("mid")].content) < overflow_len
-    assert _PITH_METRICS.compressed_count == 1
+    # a non-pinned peer that does not fit is dropped whole (#813), never keyframed
+    assert "mid" not in ids
+    assert _PITH_METRICS.compressed_count == 0
 
 
 def test_metrics_snapshot_consistent():
@@ -183,5 +192,6 @@ def test_metrics_snapshot_consistent():
     pith_stage3([top, overflow], budget_chars=300)
     snap = _PITH_METRICS.snapshot()
 
-    assert snap["compressed_count"] == 1
-    assert snap["chars_saved"] > 0
+    assert snap["compressed_count"] == 0
+    assert snap["chars_saved"] == 0
+    assert snap["ranked_kept"] == 1 and snap["ranked_dropped"] == 1

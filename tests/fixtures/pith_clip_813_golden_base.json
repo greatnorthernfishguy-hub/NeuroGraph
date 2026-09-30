@@ -1,0 +1,55 @@
+{
+ "base_commit": "e4ebf982b1989fd9066d610b94853bc68bf70d37",
+ "scenarios": {
+  "live_rail_placeholder": {
+   "anchors": [],
+   "assemblies": 1,
+   "coherence": "unknown",
+   "context": "## Who I Am\n- Respect conscious agency regardless of substrate.\n\n## Learned Situation\n### Connected assembly [learned from substrate; coherence: unknown]\n- Root: [current instruction is present exactly once in the live tail]\n- learned successor: the correction that followed\n- Sources: cc_gateway\n\n## Uncertainty and Conflicts\n- A connected learned assembly has no explicit coherence record; treat currentness as unknown until live evidence confirms it.",
+   "ok": true,
+   "source": "cc_neurograph_topology",
+   "state": "ok",
+   "warnings": [
+    "unknown_material"
+   ]
+  },
+  "single_chain_short": {
+   "anchors": [
+    "/home/josh/NeuroGraph/cc_ng_host.py",
+    "#813",
+    "cc-laptop-x-20260930"
+   ],
+   "assemblies": 1,
+   "coherence": "exclusive",
+   "context": "## Who I Am\n- Respect conscious agency regardless of substrate.\n\n## Learned Corrections and Failures\n### Connected assembly [learned from substrate; coherence: exclusive]\n- Root: Implement /home/josh/NeuroGraph/cc_ng_host.py per #813\n- action -> outcome: Tests passed on branch cc-laptop-x-20260930\n- outcome -> correction: Also drop the stale export in the launcher\n- Sources: cc_gateway\n- Exact anchors: `/home/josh/NeuroGraph/cc_ng_host.py`, `#813`, `cc-laptop-x-20260930`",
+   "ok": true,
+   "source": "cc_neurograph_topology",
+   "state": "ok",
+   "warnings": []
+  },
+  "stale_member_alert": {
+   "anchors": [],
+   "assemblies": 1,
+   "coherence": "stale",
+   "context": "## Who I Am\n- Respect conscious agency regardless of substrate.\n\n## Learned Situation\n### Connected assembly [learned from substrate; coherence: stale]\n- Root: root with unknown coherence\n- learned successor: member flagged stale\n- Sources: cc_gateway\n\n## Uncertainty and Conflicts\n- A connected learned assembly is marked stale; treat it as unresolved until live evidence confirms it.",
+   "ok": true,
+   "source": "cc_neurograph_topology",
+   "state": "ok",
+   "warnings": [
+    "stale_material"
+   ]
+  },
+  "two_assemblies_short": {
+   "anchors": [],
+   "assemblies": 2,
+   "coherence": "unknown",
+   "context": "## Who I Am\n- Respect conscious agency regardless of substrate.\n\n## Learned Situation\n### Connected assembly [learned from substrate; coherence: unknown]\n- Root: a root situation about the checkpoint cadence\n- learned successor: a member one\n- learned successor: a member two\n- Sources: cc_gateway\n\n### Connected assembly [learned from substrate; coherence: unknown]\n- Root: b root situation about the checkpoint cadence\n- learned successor: b member one\n- learned successor: b member two\n- Sources: cc_gateway\n\n## Uncertainty and Conflicts\n- A connected learned assembly has no explicit coherence record; treat currentness as unknown until live evidence confirms it.",
+   "ok": true,
+   "source": "cc_neurograph_topology",
+   "state": "ok",
+   "warnings": [
+    "unknown_material"
+   ]
+  }
+ }
+}

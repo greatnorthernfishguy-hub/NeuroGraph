@@ -1,4 +1,12 @@
 # ---- Changelog ----
+# [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: no prose shortening
+# What: test_total_context_bound_fits_oversized_connected_line_without_tearing becomes
+#   test_total_context_bound_drops_oversized_connected_line_whole_without_tearing: an
+#   assembly that cannot fit the envelope is left out WHOLE (state empty /
+#   capacity_empty, no torn fragment); with room it renders whole.
+# Why: Exec P411/P413 (Josh: no truncation) -- the old test pinned the shortening
+#   (water-filled member prose) that #813 removes.
+# How: same fixture graph and 700 budget; assertions flipped, plus a roomy-budget case.
 # [2026-09-25] B1 coding worker (GLM 5.3 Flash, OpenCode/T3 Code) — admission
 #   fixtures drop the deleted CacheLine fields.
 # What: test_admission_keeps_cache_lines_whole no longer passes keyframe= or
@@ -316,7 +324,7 @@ def test_exact_live_rail_collision_keeps_relationship_without_echo(monkeypatch):
     assert "Use the corrected topology path" in result["context"]
 
 
-def test_total_context_bound_fits_oversized_connected_line_without_tearing(monkeypatch):
+def test_total_context_bound_drops_oversized_connected_line_whole_without_tearing(monkeypatch):
     graph = _Graph()
     graph.node("core", "Respect conscious agency.", constitutional=True)
     graph.node("n0", "root " + ("long learned situation " * 80))
@@ -327,20 +335,25 @@ def test_total_context_bound_fits_oversized_connected_line_without_tearing(monke
         pith, "cc_pattern_completion_recall",
         lambda *_args, **_kwargs: [{"node_id": "n0", "score": 1.0}],
     )
+    instruction = "Do this exactly " + ("instruction " * 300)
+    quest = "Mission and done condition " + ("quest " * 300)
 
-    result = pith.pith_provider_context(
-        SimpleNamespace(graph=graph),
-        "Do this exactly " + ("instruction " * 300),
-        "Mission and done condition " + ("quest " * 300),
-        budget_chars=700,
-    )
+    tight = pith.pith_provider_context(
+        SimpleNamespace(graph=graph), instruction, quest, budget_chars=700)
+    # #813: the assembly does not fit 700 chars whole, so it is left out whole --
+    # nothing is shortened and no fragment of it is emitted.
+    assert tight["state"] == "empty" and "capacity_empty" in tight["warnings"]
+    assert len(tight["context"]) <= 700
+    assert tight["assemblies"] == 0
+    assert "learned successor" not in tight["context"] and "long learned" not in tight["context"]
 
-    assert result["state"] == "ok"
-    assert len(result["context"]) <= 700
-    assert result["assemblies"] == 1
-    assert result["context"].count("- learned successor:") == 5
-    assert "Do this exactly" not in result["context"]
-    assert "Mission and done condition" not in result["context"]
+    roomy = pith.pith_provider_context(
+        SimpleNamespace(graph=graph), instruction, quest, budget_chars=40000)
+    assert roomy["state"] == "ok" and roomy["assemblies"] == 1
+    assert roomy["context"].count("- learned successor:") == 5
+    assert ("long learned situation " * 80).strip() in roomy["context"]
+    assert "Do this exactly" not in roomy["context"]
+    assert "Mission and done condition" not in roomy["context"]
 
 
 def test_constitutional_core_is_whole_or_closed_unavailable():
