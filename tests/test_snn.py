@@ -190,6 +190,19 @@ class TestSpikePropagation:
 class TestLargeGraphStability:
     """PRD §9 Acceptance: 1K-node graph runs 10K steps without explosion or silent death."""
 
+    # ---- Changelog ----
+    # [2026-09-30] worker-001 (Claude Sonnet 5) — ADDENDUM A / row #754, Executive Packet 373
+    # What: Added @pytest.mark.slow and @pytest.mark.timeout(300). No change to the test body
+    #       or neuro_foundation.py.
+    # Why: This test has run >1.5h without completing and has no marker or timeout, so any
+    #      full-suite run silently stalls at ~86%. Both markers are registered in
+    #      tests/conftest.py's pytest_configure so environments without pytest-timeout
+    #      installed do not warn/error on the timeout marker.
+    # How: Marker-only change; run in isolation with --timeout=300 --timeout-method=signal
+    #      per the assignment, never inside a suite.
+    # -------------------
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
     def test_1k_nodes_10k_steps(self):
         g = Graph({
             "decay_rate": 0.95,

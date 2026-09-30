@@ -25,6 +25,17 @@ Regression guard — lane commons-test-isolation-738 (rows #738/#742).
 #      tract file writes). Real-path safety is asserted both directions: the redirected
 #      tmp file exists and is non-trivial, and the real file's stat/sha256 are unchanged
 #      across the whole test.
+#
+# [2026-09-30] worker-001 (Claude Sonnet 5) — ADDENDUM A, Executive Packet 373 widening
+# What: Added TestRepoWideGuard — exercises tests/conftest.py's A1 persist guard: a persist
+#       to the real path raises and is recorded, a persist to a tmp path still works, and
+#       the session-fail record is provoked then explicitly cleared (reset_blocked_persist_
+#       attempts()) so exercising the guard does not fail this file's own session.
+# Why: #738 recurred from another seat's unguarded pytest after the per-file fixture (b)
+#      landed. A1 moves the guard into tests/conftest.py so it applies repo-wide; this test
+#      proves that guard actually fires and is recorded, not just that it exists.
+# How: Imports the conftest module's test-facing hooks (reset/get_blocked_persist_attempts,
+#      real_commons_path) rather than reaching into pytest internals.
 # -------------------
 """
 
@@ -40,6 +51,7 @@ sys.path.insert(0, REPO_ROOT)
 
 import neurograph_rpc
 import commons as commons_mod
+from tests import conftest as _repo_conftest  # ADDENDUM A guard hooks (tests/conftest.py)
 
 REAL_COMMONS_PATH = os.path.expanduser("~/NeuroGraph/data/checkpoints/commons.msgpack")
 
@@ -290,3 +302,52 @@ class TestNegativeControlAgainstPreFixLine:
         # (these are print-only expression evaluations, but assert it rather than assume it).
         assert not (scratch_home / "NeuroGraph").exists()
         assert _real_file_fingerprint() == real_before
+
+
+class TestRepoWideGuard:
+    """Exercises the A1 guard installed by tests/conftest.py's pytest_configure."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_commons(self):
+        orig = commons_mod._commons
+        commons_mod._commons = None
+        yield
+        commons_mod._commons = orig
+        # Never leave a block recorded past this class's own tests, real session or not.
+        _repo_conftest.reset_blocked_persist_attempts()
+
+    def test_persist_to_tmp_path_still_works(self, tmp_path):
+        target = tmp_path / "guard-sanity-commons.msgpack"
+        c = commons_mod.get_commons()
+        c.persist(str(target))
+        assert target.exists()
+        assert target.stat().st_size > 0
+        assert _repo_conftest.get_blocked_persist_attempts() == []
+
+    def test_persist_to_real_path_raises_and_is_recorded_then_cleared(self):
+        before = _real_file_fingerprint()
+        assert _repo_conftest.real_commons_path() == REAL_COMMONS_PATH == os.path.realpath(
+            REAL_COMMONS_PATH
+        )
+        assert _repo_conftest.get_blocked_persist_attempts() == []
+
+        c = commons_mod.get_commons()
+        with pytest.raises(RuntimeError, match=r"#738"):
+            c.persist(REAL_COMMONS_PATH)
+
+        # Recorded — this is what makes pytest_sessionfinish fail the session if a test
+        # swallows the RuntimeError the way handle_after_turn's bare except does.
+        recorded = _repo_conftest.get_blocked_persist_attempts()
+        assert len(recorded) == 1
+        nodeid, path = recorded[0]
+        assert path == REAL_COMMONS_PATH
+        assert nodeid is not None and self.__class__.__name__ in nodeid
+
+        # Exercise-then-clear: proves the record mechanism works without failing the real
+        # session running this file (the autouse fixture above also clears defensively,
+        # this explicit clear is the point of the test, not a cleanup incidental to it).
+        _repo_conftest.reset_blocked_persist_attempts()
+        assert _repo_conftest.get_blocked_persist_attempts() == []
+
+        # And the real file was never touched by the raise itself.
+        assert _real_file_fingerprint() == before
