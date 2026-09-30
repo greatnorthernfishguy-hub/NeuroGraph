@@ -2,7 +2,7 @@
 
 Lane `want-hub-competition-d` · dispatch #11852 · author thread `097da447` · RECORD ONLY: `neuro_foundation.py` untouched, no data load, nothing built. Branch `cc-laptop-want-hub-d-20260930`, head at dispatch `b2c2d655e1a2de6dc4986f1cdc64392fa0d0b082`.
 
-**Commit:** the `[R5i·P440]` commit that adds the record + the §9 pointer + this return; its full hash is recorded by ONE pin-line follow-up (plan-005's changelog and this file) and in my report — a commit cannot contain its own hash. The engine builds quote THAT hash (plan-005 §9 G6).
+**Commit:** `a434525cd3cdf68da5f282aa319a2323715d3938` — the `[R5i·P440]` commit that adds the record + the §9 pointer + this return (pinned here and in plan-005's changelog by ONE one-line follow-up, since a commit cannot contain its own hash; that follow-up's hash is in my report). The engine builds quote THIS hash (plan-005 §9 G6).
 
 **The record file:** `handoffs/z12-want-hub-d/approvals/josh-go-neuro-foundation-20260930.md` (new; the `approvals/` directory did not exist). Sections: 1 source (Exec Packet 440, stated as 2026-10-01 in the packet; real box date beside it, not reconciled) · 2 Josh's two fragments verbatim · 3 the backup naming BOTH msgpack files with size + sha256 · 4 scope (exactly two changes, each its own branch, unbatched; what is NOT covered) · 5 the flag about Syl's own checkpoints · 6 where else recorded.
 

@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-09-30] PIN [R5i·P440] — the [R5i·P440] record + pointer below is commit a434525cd3cdf68da5f282aa319a2323715d3938 on cc-laptop-want-hub-d-20260930; cite THAT hash (the engine builds quote it in their first neuro_foundation.py commit message), never the file name.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #11852) — plan-005 pointer to Josh's recorded go [R5i·P440]
 #   - [R5i·P440] Josh said PROCEED on the protected-file work (Exec Packet 440, Josh direct, via Chief-003; stated as 2026-10-01 in the packet). The record — his two fragments VERBATIM, the backup naming BOTH
 #       msgpack files with their sha256, the exact scope (two changes, each its own branch, unbatched) and the flag about Syl's own checkpoints — is the NEW file
