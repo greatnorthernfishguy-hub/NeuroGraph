@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13303 — #920: test_signature_hold_on_failure_is_last_and_
+#   defaults_false only: #920 appended max_retries=None after hold_on_failure (by design), so the expected parameter list gains it. The test's
+#   name and intent (hold_on_failure exists, comes after the pre-#794 parameters, defaults False) are unchanged; nothing else in this file changed.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane ingest-tract-swallow-781 — #794
 # What: tests for drain_ingest_tract(hold_on_failure=...) (Chief-003 ruling / Exec P386):
 #   hold semantics, the single hardcoded warning, retry on the next call, and a
@@ -214,7 +217,7 @@ def test_signature_hold_on_failure_is_last_and_defaults_false():
     """FAILS on base: no such parameter (KeyError)."""
     params = list(inspect.signature(cc_ng_organism.drain_ingest_tract).parameters)
     assert params == ["graph", "vector_db", "state", "tract_path", "return_consumed",
-                      "max_entries", "hold_on_failure"]
+                      "max_entries", "hold_on_failure", "max_retries"]   # #920 appended max_retries (default None)
     assert inspect.signature(cc_ng_organism.drain_ingest_tract).parameters[
         "hold_on_failure"].default is False
 

@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13303 — #920: test_signatures_are_pinned only:
+#   hold_on_failure is no longer the LAST drain_ingest_tract parameter (#920 appended max_retries=None after it, by design); the pin now
+#   names the last two. Nothing else in this file changed; every other test here is the #904 test, run unchanged.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13058 — #904 (Exec Packets 487 + 489 + 491)
 # What: tests for (A) the ATOMIC / loud / truthful dual pass, (B) the daemon honouring a held tract entry (real drain, real daemon loop,
 #   real NG), (C) the #805 temp-graph retry-safety PROOF, the Packet 489 addendum (surface_wants / surface_wants_for_graph seed-synapse
@@ -182,7 +185,7 @@ def _forest_id(text):
 def test_signatures_are_pinned():
     import inspect
     assert list(inspect.signature(org.run_conversational_dual_pass).parameters) == ['graph', 'vector_db', 'text', 'embedding', 'state']
-    assert list(inspect.signature(org.drain_ingest_tract).parameters)[-1] == 'hold_on_failure'
+    assert list(inspect.signature(org.drain_ingest_tract).parameters)[-2:] == ['hold_on_failure', 'max_retries']   # #920 appended max_retries
     assert inspect.signature(org.drain_ingest_tract).parameters['hold_on_failure'].default is False
 
 

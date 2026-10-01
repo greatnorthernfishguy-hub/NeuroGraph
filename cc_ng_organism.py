@@ -3,6 +3,31 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13303 — #920 (Exec Packet 497 via Chief-003):
+#   the POISON-TURN POLICY on drain_ingest_tract: bounded retry -> QUARANTINE (never discard) -> LOUD
+# What: drain_ingest_tract gains ONE new LAST keyword, max_retries=None. The quarantine path exists ONLY when hold_on_failure=True AND
+#   max_retries is a positive int; with the default None (or hold_on_failure=False) every path, return value, side effect, log line and
+#   exception is byte-identical to the #904 tip 895a809a. With both set: a held entry that has FAILED max_retries times (the count is
+#   the number of drain calls in which it was the first failure, one per autosave cycle; the max_retries-th failure quarantines it in
+#   that same cycle) is appended WHOLE (the exact raw frame bytes, no extra framing) to a durable APPEND-ONLY file BESIDE the tract,
+#   `<tract path>.quarantine` (opened O_APPEND|O_CREAT, never O_TRUNC; flush + os.fsync of the file, and of the directory when this call
+#   created the file, BEFORE the tract offset advances past the entry; never capped, rotated or truncated), and the tract is truncated
+#   past it so the entries behind it flow again (the drain stops after a quarantine: one poison event per call, the entries behind it
+#   are drained on the next call). A FAILED quarantine write (append / flush / fsync) leaves the entry HELD (not advanced past) and logs
+#   ONE ERROR. One ERROR per quarantined turn: `entry:<first 12 hex of sha256(raw frame bytes)>`, the failure reason code and exception
+#   CLASS name, the failure count, max_retries and the quarantine file's NAME only; never the text, never a path, never an id.
+#   The per-entry failure count lives IN MEMORY in the caller-owned `state` dict (state["drain_retry_counts"], key = the sha256 hex of
+#   the entry's raw bytes, never the text; hard-capped at _DRAIN_RETRY_TABLE_MAX, oldest evicted); a restart resets it, so the bound is
+#   per process lifetime. `state["quarantined_total"]` (int) counts frames newly appended: the caller-owned in-process counter idiom of
+#   #904's state["bind_site_failures"], chosen over a new return value/receipt because return_consumed callers and D24's receipt are on
+#   the stack-merge front. Idempotent across a crash between the quarantine fsync and the tract truncate: an identical frame already
+#   LAST in the quarantine file (compared on the file's last len(frame) bytes) is not appended twice.
+# Why: Exec Packet 497 (row #920; le-050 C4/F1 + C6/F13): with hold_on_failure a turn that can NEVER succeed blocks the whole tract
+#   behind it forever and re-runs its slow dual pass under graph._concurrent_lock every cycle. The flag may not go on without a policy.
+#   LAW 7 (raw experience is never discarded), P370 (loud, never silent), LAW 5 (the caller reads the bound from the environment).
+# How: helpers _drain_quarantine_frame / _drain_bounded_hold / _drain_retry_* sit directly above drain_ingest_tract; the loop gains
+#   `entry_start` (the frame's first byte) and one bounded branch inside the existing hold block. Not done here, stated: NO re-ingest
+#   code; the lock-semantics split needs a change to the VENDORED ng_embed.py (OPEN item, see the return). Tests: tests/test_cc_poison_quarantine_920.py.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13058 — #904 (Exec Packet 487 via Chief-003):
 #   the dual-pass write path is ATOMIC (or loud, with a truthful False), never silently half-written
 # What: run_conversational_dual_pass keeps a write JOURNAL (on _CCConversationalDualPassEco: every node write, plus the
@@ -1079,10 +1104,12 @@ arousal, stats, persist/restore).
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -2572,9 +2599,143 @@ def _apply_gateway_experience(graph, vector_db, state, entry):
         graph, vector_db, entry.content, embed(entry.content), state)
 
 
+# ---- #920 poison-turn policy: bounded retry -> QUARANTINE (never discard) -> LOUD ----
+# Everything below is reachable ONLY from drain_ingest_tract(hold_on_failure=True, max_retries=<positive int>).
+_DRAIN_RETRY_TABLE_MAX = 256          # hard cap on state["drain_retry_counts"] (oldest evicted); normally holds <= 1 key
+_DRAIN_QUARANTINE_SUFFIX = ".quarantine"
+
+
+def _drain_entry_tag(frame: bytes) -> str:
+    """The #907 form for a drain entry that has no node id: `entry:<first 12 hex of sha256(raw frame bytes)>`.
+    A failed turn may fail before any id exists, so this is the only form the drain can print (the shared
+    cc_topology_merge.redact_node_id is slice #905, which is not in this base). Never the text, never the bytes."""
+    return "entry:%s" % hashlib.sha256(frame).hexdigest()[:12]
+
+
+def _drain_retry_bump(state: dict, key: str) -> int:
+    """Count one more failure for `key` (sha256 hex of the entry's raw bytes) in the caller-owned, IN-MEMORY table;
+    returns the new count. Hard-capped: the bumped key is re-inserted last, so eviction (oldest first) never takes it."""
+    counts = state.get("drain_retry_counts")
+    if not isinstance(counts, dict):
+        counts = state["drain_retry_counts"] = {}
+    n = counts.pop(key, 0) + 1
+    counts[key] = n
+    while len(counts) > _DRAIN_RETRY_TABLE_MAX:
+        counts.pop(next(iter(counts)))
+    return n
+
+
+def _drain_retry_forget(state, frame_or_key) -> None:
+    """Drop a finished entry's count (absorbed, or its quarantine was confirmed removed from the tract). Never raises;
+    does no hashing when the table is empty."""
+    try:
+        counts = state.get("drain_retry_counts") if isinstance(state, dict) else None
+        if counts:
+            key = frame_or_key if isinstance(frame_or_key, str) else hashlib.sha256(frame_or_key).hexdigest()
+            counts.pop(key, None)
+    except Exception:  # noqa: BLE001 -- bookkeeping must never break the drain
+        pass
+
+
+def _drain_quarantine_mode(tract_path: str) -> int:
+    """Creation mode for a NEW quarantine file: the tract's DIRECTORY permissions with the execute bits dropped, and never
+    wider than the tract FILE's own mode (the file holds the same raw turn bytes the tract does). 0o600 if either is unreadable."""
+    try:
+        dir_mode = stat.S_IMODE(os.stat(os.path.dirname(os.path.abspath(tract_path))).st_mode)
+        file_mode = stat.S_IMODE(os.stat(tract_path).st_mode)
+        return dir_mode & file_mode & 0o666
+    except OSError:
+        return 0o600
+
+
+def _drain_quarantine_frame(tract_path: str, frame: bytes):
+    """Append `frame` (the exact raw bytes of ONE tract entry) WHOLE to `<tract_path>.quarantine`, durably.
+
+    APPEND-ONLY: opened O_WRONLY|O_APPEND|O_CREAT, never O_TRUNC; nothing is ever read back and rewritten, capped or rotated.
+    One frame per quarantined turn and no extra framing, so the file is itself a flat run of self-describing entries (the same
+    format as the tract). DURABLE before it returns ok, ALWAYS: write, flush, os.fsync(file), os.fsync(directory) -- on EVERY ok
+    return, including 'already_present' (a frame found at the tail may have been written by an earlier attempt whose fsync
+    FAILED, or by a crashed process: its being in the page cache proves nothing about the disk, and the directory entry of a
+    file an earlier failed attempt created was never synced). IDEMPOTENT: if the file's LAST len(frame) bytes already equal
+    `frame` (the crash window between this fsync and the tract truncate re-quarantines the same entry) nothing is appended again
+    and stored is 'already_present'. A frame embeds a per-deposit stamp, so two distinct turns never have identical bytes: the
+    tail test cannot merge two different turns.
+
+    Returns (ok, stored, exc_type): stored is 'appended' | 'already_present' (None on failure); exc_type is the exception CLASS
+    name on failure, '-' otherwise. NEVER raises. A failed write may leave a partial tail (nothing is truncated to hide it)."""
+    qpath = tract_path + _DRAIN_QUARANTINE_SUFFIX
+    try:
+        try:
+            size = os.path.getsize(qpath)
+        except FileNotFoundError:
+            size = None
+        present = False
+        if size is not None and size >= len(frame):
+            with open(qpath, "rb") as f:
+                f.seek(size - len(frame))
+                present = f.read(len(frame)) == frame
+        fd = os.open(qpath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, _drain_quarantine_mode(tract_path))
+        with os.fdopen(fd, "ab") as f:
+            if not present:
+                f.write(frame)
+            f.flush()
+            os.fsync(f.fileno())
+        dfd = os.open(os.path.dirname(os.path.abspath(qpath)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return (True, "already_present" if present else "appended", "-")
+    except Exception as exc:  # noqa: BLE001 -- the caller keeps the entry HELD on any failure
+        return (False, None, type(exc).__name__)
+
+
+def _drain_bounded_hold(tract_path, state, frame, max_retries, hold_reason, hold_exc_type):
+    """One bounded-hold decision for the entry that just failed (hold_on_failure=True, max_retries set). Returns the
+    entry's retry key (sha256 hex) if it was QUARANTINED (the caller then advances the tract past it, then forgets the key
+    once the truncate is confirmed), else None (the entry stays HELD and the tract is not advanced past it).
+    Never raises. Hardcoded text only: the #907 entry tag, fixed reason codes, exception CLASS names, counts, and the
+    quarantine file's NAME (never its path, never str(exc), never the text)."""
+    tag = _drain_entry_tag(frame)
+    try:
+        key = hashlib.sha256(frame).hexdigest()
+        failures = _drain_retry_bump(state, key)
+    except Exception as exc:  # noqa: BLE001 -- cannot count => cannot prove the bound: hold, loudly
+        logger.error(
+            "CC ingest-tract hold: entry=%s reason=%s exc_type=%s -- the retry counter FAILED (%s); the entry stays HELD "
+            "and is NOT quarantined this cycle", tag, hold_reason, hold_exc_type, type(exc).__name__)
+        return None
+    if failures < max_retries:
+        logger.warning(
+            "CC ingest-tract hold: reason=%s exc_type=%s attempt=%d/%d -- failed entry and everything after it kept in the "
+            "tract for the next cycle (quarantined after %d failures)",
+            hold_reason, hold_exc_type, failures, max_retries, max_retries)
+        return None
+    ok, stored, qexc = _drain_quarantine_frame(tract_path, frame)
+    qname = os.path.basename(tract_path) + _DRAIN_QUARANTINE_SUFFIX
+    if not ok:
+        logger.error(
+            "CC ingest-tract QUARANTINE FAILED: entry=%s reason=%s exc_type=%s failures=%d max_retries=%d file=%s "
+            "quarantine_exc_type=%s -- the entry stays HELD, the tract is NOT advanced past it, nothing was discarded; "
+            "retried next cycle (a partial tail may remain in the quarantine file)",
+            tag, hold_reason, hold_exc_type, failures, max_retries, qname, qexc)
+        return None
+    if stored == "appended":
+        try:
+            state["quarantined_total"] = int(state.get("quarantined_total", 0)) + 1
+        except Exception:  # noqa: BLE001 -- the counter is bookkeeping; the frame is already durable
+            pass
+    logger.error(
+        "CC ingest-tract QUARANTINED: entry=%s reason=%s exc_type=%s failures=%d max_retries=%d file=%s stored=%s -- the raw "
+        "frame is durably in the quarantine file (append-only, never truncated) and the tract advances past it; nothing was "
+        "discarded; re-ingest is a deliberate separate act",
+        tag, hold_reason, hold_exc_type, failures, max_retries, qname, stored)
+    return key
+
+
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         return_consumed: bool = False, max_entries: int = 0,
-                        hold_on_failure: bool = False):
+                        hold_on_failure: bool = False, max_retries: int = None):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -2618,6 +2779,20 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     file is not rewritten at all. max_entries still counts entries ATTEMPTED (a
     held entry was attempted). return_consumed still reports exactly the bytes
     this call removed.
+
+    max_retries=None (default) is today's behaviour, byte-identical: a held entry is retried every cycle with no bound (#920).
+    max_retries=<positive int> takes effect ONLY together with hold_on_failure=True (ignored otherwise; a non-positive or
+    non-int value is treated as None with ONE fixed WARNING). The held entry's failures are counted IN MEMORY in the
+    caller-owned `state` (state["drain_retry_counts"], key = sha256 hex of its raw bytes, hard-capped; a restart resets the
+    count, so the bound is per process lifetime), one failure per call. When an entry has FAILED max_retries times (the
+    max_retries-th failure, in that same call; e.g. max_retries=5 is five attempts, one per cycle) it is QUARANTINED, never
+    discarded: its exact raw frame bytes are appended WHOLE to the append-only file `<tract_path>.quarantine` (flush + fsync
+    BEFORE the tract advances past it; never capped, rotated or truncated), the tract is truncated past it, the drain stops
+    there (the entries behind it are drained on the next call), ONE ERROR is logged (the #907 form `entry:<12 hex of
+    sha256(frame)>`, reason code, exception class, counts, the file's name only) and state["quarantined_total"] is
+    incremented. If the quarantine write FAILS the entry stays HELD, the tract is not advanced past it and ONE ERROR is
+    logged. return_consumed's span includes a quarantined frame (it did leave the tract). Re-ingest of a quarantined turn is a
+    deliberate later act, not done here: the quarantine file is a flat run of tract entries (the tract's own format).
 
     Returns the count of entries absorbed (int) by default. If
     return_consumed=True, returns (absorbed, consumed_bytes) instead --
@@ -2674,9 +2849,24 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     # absorbed or legitimately filter-skipped. Unused (and never read) when the
     # flag is off, so the default path is unchanged.
     safe_offset = 0
+    # #920: the retry bound is live ONLY with hold_on_failure=True AND a positive int max_retries; None everywhere else, so the
+    # default path never reaches any quarantine code. quarantined_key = the retry key of an entry moved to quarantine this call
+    # (forgotten once the truncate below is confirmed to have removed it).
+    bounded = None
+    quarantined_key = None
+    if hold_on_failure and max_retries is not None:
+        if isinstance(max_retries, int) and not isinstance(max_retries, bool) and max_retries > 0:
+            bounded = max_retries
+        else:
+            logger.warning(
+                "CC ingest-tract: max_retries is not a positive integer -- the retry bound is OFF for this call "
+                "(a held entry is retried without a bound, as before #920)")
     try:
         reader = ng_tract.TractReader(data)
         for entry in reader:
+            # entry_start = where THIS entry's frame begins (the previous entry's end; consumed_offset is not reassigned to
+            # safe_offset until after the loop). Read only by the #920 bounded branch.
+            entry_start = consumed_offset
             # position() is a bound method on the Rust binding, not a property.
             # Read it BEFORE the filters so `continue` still consumes the entry.
             consumed_offset = reader.position()
@@ -2698,6 +2888,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 if _apply_gateway_experience(graph, vector_db, state, entry):
                     absorbed += 1
                     safe_offset = consumed_offset
+                    if bounded is not None:
+                        _drain_retry_forget(state, data[entry_start:consumed_offset])   # it succeeded: its count ends
                 else:
                     hold_reason = "absorb_returned_false"
             except Exception as exc:
@@ -2705,6 +2897,15 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 hold_reason = "absorb_raised"
                 hold_exc_type = type(exc).__name__
             if hold_on_failure and hold_reason is not None:
+                if bounded is not None:
+                    # #920: count this failure; below the bound the entry stays HELD (one WARNING), at the bound it is
+                    # QUARANTINED (durable append-only write + fsync FIRST, only then safe_offset moves past it) and, if
+                    # that write fails, it stays HELD (one ERROR). One poison event per call: stop either way.
+                    quarantined_key = _drain_bounded_hold(
+                        path, state, data[entry_start:consumed_offset], bounded, hold_reason, hold_exc_type)
+                    if quarantined_key is not None:
+                        safe_offset = consumed_offset
+                    break
                 # #794: stop at the FIRST failed entry. Hardcoded text only: a
                 # fixed reason code and the exception CLASS NAME -- never
                 # str(exc), the entry text, a path or a secret.
@@ -2765,6 +2966,11 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             with open(path, "wb") as f:
                 f.write(remainder)
             consumed_actual = consumed_prefix  # only now -- the write actually succeeded
+            if quarantined_key is not None:
+                # #920: the quarantined frame is confirmed OUT of the tract (and was durable in quarantine before this
+                # truncate started): its count ends. If this step failed instead, the key stays and the next cycle
+                # re-quarantines it idempotently (the tail test in _drain_quarantine_frame).
+                _drain_retry_forget(state, quarantined_key)
         else:
             # Someone else touched the file since our read (not the plain
             # append-only case we can safely trim a known prefix from).
