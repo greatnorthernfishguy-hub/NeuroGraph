@@ -1,0 +1,257 @@
+# held-back last-link partners at K=50 (engine's own rule; IDs ONLY, no want text)
+partner cc:conv::1da552f7a22e597841a3d914cc3e0f21ccfa11d9  incident=16 (out 12 / in 4)  held synapse 4b95a44a-c417-4c7b-a520-117bbdf708c0
+    4b95a44a-c417-4c7b-a520-117bbdf708c0 outgoing  other=cc:want::e35fca0831875ac1 want=True w=3.7596092646792033e-08 peak=5.0 inact=43166 in_competing0=True <== HELD BACK
+    d2299b6c-43d1-4249-a85e-9417679da4c3 outgoing  other=cc:want::b6c8bf7af61eef63 want=True w=1.9150045316943767e-09 peak=5.0 inact=43166 in_competing0=True 
+    e89b0cec-391e-41cf-8954-81164ce6a94a outgoing  other=cc:want::b2565971c7a4ff01 want=True w=5.430839610658369e-10 peak=5.0 inact=43166 in_competing0=True 
+    50adcff6-6546-4867-90b2-1d5e068e5c59 outgoing  other=cc:want::9d882ab14b74650b want=True w=5.168215433315393e-10 peak=5.0 inact=43166 in_competing0=True 
+    86adfdce-437c-42e5-a496-cf4d6a20537a outgoing  other=cc:want::845ca1c45eadba31 want=True w=4.3920087657448584e-10 peak=5.0 inact=43166 in_competing0=True 
+    85dde0de-165b-4157-afd0-d32419d73171 outgoing  other=cc:want::e84f19368e89aa35 want=True w=1.9193405616007843e-11 peak=5.0 inact=43166 in_competing0=True 
+    b21b5207-b574-487c-80a8-2e33383d53f7 outgoing  other=cc:want::d76ac1e14de752dd want=True w=1.2178287834072732e-11 peak=5.0 inact=43166 in_competing0=True 
+    0e4a1f8f-6111-4e65-9dda-0c4edae4afa9 outgoing  other=cc:want::372ea08cab33e71c want=True w=1.2025087570793082e-11 peak=5.0 inact=43166 in_competing0=True 
+    fca486f0-8442-4603-8eb1-22c5529b10e7 outgoing  other=cc:want::1e84b21f862eb26a want=True w=9.257918053565674e-14 peak=5.0 inact=43166 in_competing0=True 
+    0d480de0-e34d-4730-ae68-8eac8d2342c2 outgoing  other=cc:want::52de588bbc559530 want=True w=3.3417618388768815e-15 peak=5.0 inact=43166 in_competing0=True 
+    c29b9259-1245-4b12-992b-e1552fedfc6f outgoing  other=cc:want::7bd0f5fdca6eb404 want=True w=1.73796880091203e-15 peak=5.0 inact=43166 in_competing0=True 
+    3f0655ef-e3d2-4ac0-bbd1-1d041c215b32 outgoing  other=cc:want::00a98e3940aae16b want=True w=4.2546882063599026e-19 peak=5.0 inact=43166 in_competing0=True 
+    c69f51e0-fd2b-4e00-85ab-e4172cacc4cb incoming  other=cc:want::2c0b9b605ab356a7 want=True w=0.0 peak=5.0 inact=1268 in_competing0=True 
+    9dc45461-70a8-4421-9157-d0e9497c3b4d incoming  other=cc:want::a28310b00e3885f9 want=True w=0.0 peak=5.0 inact=1271 in_competing0=True 
+    8da20373-c6f7-467c-a975-9a7c9ef8924e incoming  other=cc:want::c3b44ac278e61467 want=True w=0.0 peak=0.24936225921469204 inact=1286 in_competing0=True 
+    2391766a-d313-4ed5-bcee-23b7b5b91dc7 incoming  other=cc:want::a50a55257545a7c5 want=True w=0.0 peak=0.20985558534362256 inact=1287 in_competing0=True 
+partner cc:conv::2daea9de84ed9f2ee47489f2e37fead66f604a29  incident=23 (out 7 / in 16)  held synapse ab4c9ad8-68a6-4c2d-bfeb-6a6903e6dfe1
+    ab4c9ad8-68a6-4c2d-bfeb-6a6903e6dfe1 outgoing  other=cc:want::e84f19368e89aa35 want=True w=1.509435543594805e-11 peak=5.0 inact=43406 in_competing0=True <== HELD BACK
+    956e0425-5087-4b47-90d2-b29cdf9d4b52 outgoing  other=cc:want::d205070de4934ffe want=True w=5.548758606838627e-13 peak=0.1180438015046324 inact=43406 in_competing0=True 
+    5a7b52ba-fd34-47fc-becd-1583b8d72ece outgoing  other=cc:want::2c0b9b605ab356a7 want=True w=4.884322701856107e-13 peak=5.0 inact=43406 in_competing0=True 
+    3e9b3578-bc49-4011-b59d-e360b080239b outgoing  other=cc:want::1e84b21f862eb26a want=True w=6.982018802332228e-14 peak=5.0 inact=43406 in_competing0=True 
+    8358fac8-dc78-4025-ae22-6bc9a3af00fb outgoing  other=cc:want::52de588bbc559530 want=True w=2.502453945547955e-15 peak=5.0 inact=43406 in_competing0=True 
+    94cdc320-ceaf-40b9-9b5a-3ba6da3361b9 outgoing  other=cc:want::7bd0f5fdca6eb404 want=True w=1.2870196726629686e-15 peak=5.0 inact=43406 in_competing0=True 
+    85f56eea-7eaf-49f5-962a-ccf8d007a4b5 outgoing  other=cc:want::00a98e3940aae16b want=True w=3.175037635564407e-19 peak=5.0 inact=43406 in_competing0=True 
+    84037a4d-a6d3-44a3-bb01-cfa21748631e incoming  other=cc:want::a28310b00e3885f9 want=True w=0.0 peak=3.20340304120068 inact=1271 in_competing0=True 
+    1709e258-1a30-4cd5-a9ec-8bdfe1654d4a incoming  other=cc:want::db6070160d1048f0 want=True w=0.0 peak=2.0738180452403023 inact=1253 in_competing0=True 
+    95ad1348-4228-4b21-8c7f-2e1ca4a8fa19 incoming  other=cc:want::b6c8bf7af61eef63 want=True w=0.0 peak=0.1 inact=30 in_competing0=True 
+    69039e75-f44b-48b3-a6cb-49aabb5e8e7b incoming  other=cc:want::d157681e6686f3b3 want=True w=0.0 peak=0.1 inact=1205 in_competing0=True 
+    977aaf7b-93b8-47a3-b23b-2836d9a58fbc incoming  other=cc:want::845ca1c45eadba31 want=True w=0.0 peak=0.1 inact=1233 in_competing0=True 
+    adf4afb6-5fd2-4c12-ac6b-b6772f82db9f incoming  other=cc:want::f94e27ef79629ba9 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    d17263e0-8d9a-4b68-86ae-b7d28a232db3 incoming  other=cc:want::d9307495aa497803 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    0db9516f-c2fb-44df-9e3f-48eba30b388e incoming  other=cc:want::6dd36cce3d4b4975 want=True w=0.0 peak=0.1 inact=1259 in_competing0=True 
+    0776025e-9c0c-4da4-ba11-1a3647d67306 incoming  other=cc:want::d76ac1e14de752dd want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    6d476c5c-7017-4a11-aadd-745a04f5e88f incoming  other=cc:want::b2565971c7a4ff01 want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    e89fd3a3-e1e3-4319-9a2e-d5db9f311434 incoming  other=cc:want::62506085587631cd want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    dc8dad77-0991-4f55-804e-0b384ffe4994 incoming  other=cc:want::c3b44ac278e61467 want=True w=0.0 peak=0.1 inact=1286 in_competing0=True 
+    f903e34a-a7fa-4f12-b90b-6db3178a4608 incoming  other=cc:want::a50a55257545a7c5 want=True w=0.0 peak=0.1 inact=1287 in_competing0=True 
+    a773231d-21cd-4418-bc49-4b5283f75cdc incoming  other=cc:want::9d882ab14b74650b want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    bfbd96ed-448f-4b39-88fe-dde8fce9f2c9 incoming  other=cc:want::e35fca0831875ac1 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    a7f60b31-a046-45f3-a758-64b111ed8fef incoming  other=cc:want::71a482bc5950754b want=True w=0.0 peak=0.1 inact=1308 in_competing0=True 
+partner cc:conv::368a552350299d272b7c2ae2aa052a2553baec50  incident=1 (out 0 / in 1)  held synapse 2d26f4c9-0b45-4e02-b4fb-9a61d08fe221
+    2d26f4c9-0b45-4e02-b4fb-9a61d08fe221 incoming  other=cc:want::62506085587631cd want=True w=0.0 peak=0.1 inact=1271 in_competing0=True <== HELD BACK
+partner cc:conv::4bba790041555b5f753a93120454f40024c9e8c6  incident=53 (out 12 / in 41)  held synapse c62a8fa6-b6ce-4821-a4c3-d1519540a555
+    c62a8fa6-b6ce-4821-a4c3-d1519540a555 outgoing  other=cc:want::71a482bc5950754b want=True w=1.851487577949872e-07 peak=5.0 inact=43453 in_competing0=True <== HELD BACK
+    9f88300c-ed0a-4cb9-aa61-3922a407b3e6 outgoing  other=cc:want::f44886c9c6b220fe want=True w=6.579822069493588e-08 peak=0.4285748089554836 inact=43452 in_competing0=True 
+    7c1f2d11-5203-45cf-9fd3-ae90b2c69b1d outgoing  other=cc:want::b812450ee7bc1c11 want=True w=5.064702447288884e-08 peak=0.4152213517197089 inact=43452 in_competing0=True 
+    76ec5b57-d8c4-4573-a521-d1fa69dc76fc outgoing  other=cc:want::629e3532b2bf9fee want=True w=2.942557717197728e-09 peak=0.4238053678247636 inact=43452 in_competing0=True 
+    32ac182a-55ff-43cd-8fd4-37bc50508d23 outgoing  other=cc:want::9c687034dc705162 want=True w=7.116065017958366e-10 peak=0.43445059750018256 inact=43452 in_competing0=True 
+    fd2372c6-23e5-4554-b19f-166b4acaea8d outgoing  other=cc:want::b1cd6ec714d6a1ca want=True w=6.312358825020264e-10 peak=0.4277912243293682 inact=43452 in_competing0=True 
+    11723f30-de76-4c4c-b56b-35bca13bfbb9 outgoing  other=cc:want::a7035bb028a135e9 want=True w=3.6390478672418925e-10 peak=0.4240547757845238 inact=43452 in_competing0=True 
+    69ee6ffc-cce8-4d85-afbb-8c4a13181252 outgoing  other=cc:want::856b929d47ef92b5 want=True w=5.239713982517779e-11 peak=0.43057943342696264 inact=43452 in_competing0=True 
+    f69930c0-96a5-4c7e-917c-ef848ab0db48 outgoing  other=cc:want::ea8e1117626f1768 want=True w=1.282888148939912e-11 peak=0.47736221563300374 inact=43452 in_competing0=True 
+    698bf170-6df2-4d20-9df0-73e28dd6427e outgoing  other=cc:want::1b6239298a1399e8 want=True w=1.5024544690388553e-12 peak=0.4411972157063305 inact=43452 in_competing0=True 
+    722ceafd-8637-4937-8a0e-d7a8bd1e1e57 outgoing  other=cc:want::e8ee3a3237830fc6 want=True w=1.0178109831380693e-12 peak=0.4048357999216857 inact=43452 in_competing0=True 
+    dd36a099-7726-4fbd-8f94-9f157ca44cff outgoing  other=cc:want::b77179b60a7884af want=True w=3.4375056080579466e-13 peak=0.4380306039161534 inact=43452 in_competing0=True 
+    60babff9-1d64-4c74-9993-4bc395c6694b incoming  other=cc:want::db6070160d1048f0 want=True w=0.0 peak=3.3732359279210886 inact=1253 in_competing0=True 
+    02ff3ff2-d71b-4bb1-bdaa-fe36cd621579 incoming  other=cc:want::6d26f1edcbfccc9e want=True w=0.0 peak=1.1640316097510397 inact=1207 in_competing0=True 
+    bf7f1e48-1481-413a-bad6-60212e52b997 incoming  other=cc:want::a28310b00e3885f9 want=True w=0.0 peak=1.1173981521845504 inact=1271 in_competing0=True 
+    c357ad21-0d83-41fa-8c6a-4ad027ea0546 incoming  other=cc:want::dbf0f00161914f2e want=True w=0.0 peak=0.7453591067498797 inact=1271 in_competing0=True 
+    a3c0b025-119e-43d6-8015-0d82077b6e6d incoming  other=cc:want::4c590af8c6faa569 want=True w=0.0 peak=0.11906719947680461 inact=1295 in_competing0=True 
+    a26014ea-ff2a-410d-9e34-34d248df2940 incoming  other=cc:want::11f6ad8ec52a2984 want=True w=0.0 peak=0.1 inact=1 in_competing0=True 
+    364101c7-188f-43b2-9114-8b8f26fae131 incoming  other=cc:want::b6c8bf7af61eef63 want=True w=0.0 peak=0.1 inact=30 in_competing0=True 
+    d938194a-1de5-4e8f-9c85-a6392124dff5 incoming  other=cc:want::00a98e3940aae16b want=True w=0.0 peak=0.1 inact=1167 in_competing0=True 
+    74064ac4-ff55-4129-bf75-9bf73e45b316 incoming  other=cc:want::05e8d98f85461ec4 want=True w=0.0 peak=0.1 inact=1168 in_competing0=True 
+    65237f39-5211-42e1-84cd-f290cc3fc287 incoming  other=cc:want::d157681e6686f3b3 want=True w=0.0 peak=0.1 inact=1205 in_competing0=True 
+    123fe0be-4ddd-406a-b6cd-afca186c07f0 incoming  other=cc:want::7be4be9e0cd99673 want=True w=0.0 peak=0.1 inact=1222 in_competing0=True 
+    39279cab-b132-43f8-a29c-7a3299c08c2b incoming  other=cc:want::845ca1c45eadba31 want=True w=0.0 peak=0.1 inact=1233 in_competing0=True 
+    222926b3-1319-4e8a-84c1-188b85cb4636 incoming  other=cc:want::7bd0f5fdca6eb404 want=True w=0.0 peak=0.1 inact=1235 in_competing0=True 
+    e508be30-2513-408d-acdf-682e98148483 incoming  other=cc:want::e84f19368e89aa35 want=True w=0.0 peak=0.1 inact=1241 in_competing0=True 
+    6bf5bc6b-42c8-4a4b-9ca1-5ea2f8135a1a incoming  other=cc:want::8fc1e03f837263d6 want=True w=0.0 peak=0.1 inact=1246 in_competing0=True 
+    329cccda-5939-4fd2-8a0c-32d66c760e22 incoming  other=cc:want::d9307495aa497803 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    db1af1b7-c616-4811-a461-1d1a5b5d9e84 incoming  other=cc:want::f94e27ef79629ba9 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    1082cf9e-d6d8-4fa7-bb39-5ea9cfeeaa63 incoming  other=cc:want::084c1b207df9b66a want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    d406665e-bf77-48be-bda9-294a65b6f084 incoming  other=cc:want::bf1c520afec07327 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    d8e53bc9-ec44-4345-ab99-42e07b487086 incoming  other=cc:want::52de588bbc559530 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    42c9a6c4-a639-427d-887e-f7a64648f3bf incoming  other=cc:want::6dd36cce3d4b4975 want=True w=0.0 peak=0.1 inact=1259 in_competing0=True 
+    89fa7037-3f9c-4c5a-9e34-f63f4ba8a47c incoming  other=cc:want::eaef483886ae3b54 want=True w=0.0 peak=0.1 inact=1259 in_competing0=True 
+    4a2d7281-ac27-4e4f-bc4b-e89e7ce75961 incoming  other=cc:want::2c0b9b605ab356a7 want=True w=0.0 peak=0.1 inact=1268 in_competing0=True 
+    4e17f0e0-662b-4b78-b05e-30cdf8529d46 incoming  other=cc:want::1e84b21f862eb26a want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    a0e7f3bd-8845-4498-9f98-9a8c0aa92ee8 incoming  other=cc:want::d76ac1e14de752dd want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    4b4c7497-e442-41d3-9328-639b3f71d9c1 incoming  other=cc:want::806de7615c889a1a want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    5c152b59-a07c-412e-bd28-69d9514284e1 incoming  other=cc:want::b2565971c7a4ff01 want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    5dbb4c40-4028-45e2-b3be-cba45989b922 incoming  other=cc:want::62506085587631cd want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    ea4deb7e-9260-4474-8556-2627a9fbf430 incoming  other=cc:want::c5056961a91a718f want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    519a7254-d08f-4a07-971c-9a974cfe2ad2 incoming  other=cc:want::c3b44ac278e61467 want=True w=0.0 peak=0.1 inact=1286 in_competing0=True 
+    7bbf8842-3606-474f-88bc-d143a22187a7 incoming  other=cc:want::a50a55257545a7c5 want=True w=0.0 peak=0.1 inact=1287 in_competing0=True 
+    95039a1d-df6e-448a-a066-0de1884c6a14 incoming  other=cc:want::0782a3cd713d2c5a want=True w=0.0 peak=0.1 inact=1287 in_competing0=True 
+    034369d8-1cca-46e9-93e9-0fe5a77541f9 incoming  other=cc:want::ec41c3022e0a21d0 want=True w=0.0 peak=0.1 inact=1294 in_competing0=True 
+    56555323-c5d6-4a19-b7db-ed8fe08a85a1 incoming  other=cc:want::bae0d50a4816c595 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    5d55ed9f-c06a-4635-905b-caa252702e0e incoming  other=cc:want::e35fca0831875ac1 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    a827d23b-d4ed-45f2-82c5-8c75782d536f incoming  other=cc:want::9d882ab14b74650b want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    4e666370-7ffa-46f2-9503-1883c3d7b3fa incoming  other=cc:want::372ea08cab33e71c want=True w=0.0 peak=0.1 inact=1299 in_competing0=True 
+    7251c99b-6ac5-4048-9ea9-97c5c2ae418f incoming  other=cc:want::68c922a027ada835 want=True w=0.0 peak=0.1 inact=1300 in_competing0=True 
+    0b7a0f92-8a91-4684-923f-71df70767197 incoming  other=cc:want::e7bbb3c61f9149a6 want=True w=0.0 peak=0.1 inact=1304 in_competing0=True 
+    0be7514a-9f59-4c80-98d6-0a2e71370237 incoming  other=cc:want::c0ee2948da6d8123 want=True w=0.0 peak=0.1 inact=1314 in_competing0=True 
+    772002c3-64b9-4584-8ba6-89a379462dad incoming  other=cc:want::1daa16876c0e82ad want=True w=0.0 peak=0.1 inact=1325 in_competing0=True 
+partner cc:conv::63aa35918aca44c602408ada729ac9eb280998db  incident=23 (out 14 / in 9)  held synapse 8b56e163-b6fd-4381-aff4-20f10c9414f9
+    8b56e163-b6fd-4381-aff4-20f10c9414f9 outgoing  other=cc:want::e35fca0831875ac1 want=True w=3.695036979689365e-08 peak=5.0 inact=43156 in_competing0=True <== HELD BACK
+    e45eec41-87f9-45c0-a233-91c9cd851fbb outgoing  other=cc:want::c3b44ac278e61467 want=True w=7.2642130234559146e-09 peak=5.0 inact=43156 in_competing0=True 
+    15568b03-d4ab-4a70-9624-ae48a1cd4767 outgoing  other=cc:want::b6c8bf7af61eef63 want=True w=1.9873941399359646e-09 peak=5.0 inact=43156 in_competing0=True 
+    d96041c7-72a0-4448-9802-ea48b0ee3c4c outgoing  other=cc:want::845ca1c45eadba31 want=True w=4.7316632047416e-10 peak=5.0 inact=43156 in_competing0=True 
+    7e4e3bbd-cacb-4780-b1b8-c246c89bc127 outgoing  other=cc:want::e84f19368e89aa35 want=True w=2.05466007207604e-11 peak=5.0 inact=43156 in_competing0=True 
+    c498e736-acd4-4cae-8f96-2fc03e96efcc outgoing  other=cc:want::d76ac1e14de752dd want=True w=1.2412051280186726e-11 peak=5.0 inact=43156 in_competing0=True 
+    869e3af9-3862-44e3-9067-952ebf4a9a93 outgoing  other=cc:want::372ea08cab33e71c want=True w=1.24016244389415e-11 peak=5.0 inact=43156 in_competing0=True 
+    d683db47-82e7-4cf8-bb7b-33c07e45b0ea outgoing  other=cc:want::d9307495aa497803 want=True w=2.400161662910533e-12 peak=5.0 inact=43156 in_competing0=True 
+    a57b433e-51d5-445f-aefe-f37be4280f28 outgoing  other=cc:want::c5056961a91a718f want=True w=1.7851563928282483e-12 peak=5.0 inact=43156 in_competing0=True 
+    daba623e-0fc9-4e3f-b4bb-54fa42c54d89 outgoing  other=cc:want::6dd36cce3d4b4975 want=True w=1.9132151255244413e-13 peak=5.0 inact=43156 in_competing0=True 
+    548a541d-2caa-472f-a238-feb1c43b68bc outgoing  other=cc:want::52de588bbc559530 want=True w=3.211365950827465e-15 peak=5.0 inact=43156 in_competing0=True 
+    ad61009b-437b-4d39-bacd-5ce04cd283db outgoing  other=cc:want::7bd0f5fdca6eb404 want=True w=1.8800851654669885e-15 peak=5.0 inact=43156 in_competing0=True 
+    d26fdb01-5cd4-48c9-ae02-c0bbe3c5ad40 outgoing  other=cc:want::05e8d98f85461ec4 want=True w=2.2483844824165256e-16 peak=5.0 inact=43156 in_competing0=True 
+    d9e57c6b-6f9d-4766-9355-41338bc5c0ce outgoing  other=cc:want::00a98e3940aae16b want=True w=4.439891252360639e-19 peak=5.0 inact=43156 in_competing0=True 
+    bb6dee0b-e259-4f97-bf84-19cbb0ff1942 incoming  other=cc:want::6d26f1edcbfccc9e want=True w=0.0 peak=5.0 inact=1207 in_competing0=True 
+    6f49d997-78ed-4913-909d-cdc5da951b21 incoming  other=cc:want::bf1c520afec07327 want=True w=0.0 peak=5.0 inact=1253 in_competing0=True 
+    688b8488-5134-4b02-89bf-c6dbff70c3fa incoming  other=cc:want::2c0b9b605ab356a7 want=True w=0.0 peak=5.0 inact=1268 in_competing0=True 
+    cbbba378-1f9c-4661-98c9-f7dcfb4ee831 incoming  other=cc:want::1e84b21f862eb26a want=True w=0.0 peak=5.0 inact=1270 in_competing0=True 
+    94bd399e-9af6-460c-aed2-5ce983b26ef6 incoming  other=cc:want::b2565971c7a4ff01 want=True w=0.0 peak=5.0 inact=1271 in_competing0=True 
+    96eded4c-4cd0-414f-92c7-226210ebc630 incoming  other=cc:want::dbf0f00161914f2e want=True w=0.0 peak=5.0 inact=1271 in_competing0=True 
+    7bf7fd5d-e227-4397-8f25-2282bc34ff91 incoming  other=cc:want::9d882ab14b74650b want=True w=0.0 peak=5.0 inact=1295 in_competing0=True 
+    c0bfb30a-0c73-4dd9-baf8-806ea729263d incoming  other=cc:want::a50a55257545a7c5 want=True w=0.0 peak=0.24576023564959362 inact=1287 in_competing0=True 
+    9d20b06c-58c2-41ff-a2bc-647619f4f933 incoming  other=cc:want::62506085587631cd want=True w=0.0 peak=0.23769286901601164 inact=1271 in_competing0=True 
+partner cc:conv::69d60b8cba56449221be756748caaf48f06dbc73  incident=2 (out 1 / in 1)  held synapse 7426707f-3166-41e9-ae72-8cbc4c38587d
+    7426707f-3166-41e9-ae72-8cbc4c38587d outgoing  other=cc:want::36ff1cb6cc8b3257 want=True w=0.000493680659379008 peak=0.1 inact=7239 in_competing0=True <== HELD BACK
+    ccce9a08-7ea4-4df2-8d25-eac1872b6307 incoming  other=cc:want::c0ee2948da6d8123 want=True w=0.0 peak=0.1579338025042933 inact=1314 in_competing0=True 
+partner REDACTED-sha256:433b6d29dea8a9a6  incident=1 (out 0 / in 1)  held synapse 922e21b3-a283-4bc6-aa11-410d7877290d
+    922e21b3-a283-4bc6-aa11-410d7877290d incoming  other=cc:want::660bf201f7155370 want=True w=0.1 peak=0.1 inact=2 in_competing0=True <== HELD BACK
+partner cc:conv::9dce9e9bf80a339a4ebb1903d34546102143581c::tree::monitor  incident=2 (out 2 / in 0)  held synapse 42202a15-f33f-4fe0-ba60-3d268d1e0c30
+    42202a15-f33f-4fe0-ba60-3d268d1e0c30 outgoing  other=cc:want::d0941e68da8f3815 want=True w=2.110241003789831e-06 peak=0.1 inact=17009 in_competing0=True <== HELD BACK
+    81cdea74-5a6d-4c0e-a2fe-66b4d621e76a outgoing  other=cc:want::8922805effd5837d want=True w=9.367232858622613e-08 peak=0.10010805821197873 inact=17009 in_competing0=True 
+partner cc:conv::bc065a2025d5e44a9cf0369c295880a15a43321d  incident=8 (out 0 / in 8)  held synapse 006310ed-b157-4288-900e-91c421cd1c5c
+    006310ed-b157-4288-900e-91c421cd1c5c incoming  other=cc:want::2c0b9b605ab356a7 want=True w=0.0 peak=0.10264181523033158 inact=1268 in_competing0=True <== HELD BACK
+    4b22c3a2-8a80-4af0-ad1a-9d5ed9dcf86b incoming  other=cc:want::9c687034dc705162 want=True w=0.0 peak=0.10213603143651818 inact=1235 in_competing0=True 
+    195da9e1-e53e-471a-a302-259f1888fe5a incoming  other=cc:want::2137f31deb29fc07 want=True w=0.0 peak=0.10179116436273163 inact=1276 in_competing0=True 
+    e518cafa-c4d5-4600-bb7d-f40f9f9f12dd incoming  other=cc:want::e7ab408354c51afa want=True w=0.0 peak=0.10132529677858021 inact=1297 in_competing0=True 
+    334e1689-830b-4b36-883f-abbcb79d1e7f incoming  other=cc:want::d157681e6686f3b3 want=True w=0.0 peak=0.1 inact=1205 in_competing0=True 
+    928d7bd3-c21e-418b-99f1-6786e237ffa3 incoming  other=cc:want::d205070de4934ffe want=True w=0.0 peak=0.1 inact=1231 in_competing0=True 
+    6a714ed0-17c5-4b6a-80bb-4be7b2e6a7d1 incoming  other=cc:want::c3512bd2fb12aeb7 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    34df1565-79e1-42b4-bc5d-6089e50f2599 incoming  other=cc:want::44b790b8323af3e0 want=True w=0.0 peak=0.1 inact=1297 in_competing0=True 
+partner cc:conv::bc652767a5babc66340e352cd47b003d448cfb51::tree::testing  incident=2 (out 0 / in 2)  held synapse d652388a-d60a-4aa4-b0f4-5b088a846d5b
+    d652388a-d60a-4aa4-b0f4-5b088a846d5b incoming  other=cc:want::191b217181f1cbed want=True w=0.00881811258312284 peak=0.1 inact=1295 in_competing0=True <== HELD BACK
+    2d58b476-61d9-4bcd-8ba3-e7076d9b9a5b incoming  other=cc:want::ac4d8c6a7f50852c want=True w=0.004024340924584417 peak=0.1 inact=1168 in_competing0=True 
+partner cc:conv::c4467a14b5fdfab5060ac683334bd37f84275cc6  incident=69 (out 14 / in 55)  held synapse e223460d-46fe-46b3-9dcd-383dbbd5fdab
+    e223460d-46fe-46b3-9dcd-383dbbd5fdab outgoing  other=cc:want::71a482bc5950754b want=True w=1.72450605062755e-07 peak=5.0 inact=43499 in_competing0=True <== HELD BACK
+    00d45f07-5036-4156-a9b6-4d4b65338cb4 outgoing  other=cc:want::f44886c9c6b220fe want=True w=5.7325437596561324e-08 peak=0.40071438934082937 inact=43497 in_competing0=True 
+    6a6c66a1-91b6-4f7a-bede-52c4fe24859f outgoing  other=cc:want::b812450ee7bc1c11 want=True w=4.518306667821561e-08 peak=0.38350426455870895 inact=43497 in_competing0=True 
+    c89611f4-cd7b-4dea-973a-f65bb358ba3e outgoing  other=cc:want::e7bbb3c61f9149a6 want=True w=9.278439706123982e-09 peak=0.4188619202926979 inact=43497 in_competing0=True 
+    a96977f5-b449-40b4-b738-a52b1e4ec8b1 outgoing  other=cc:want::5503f1a2ae3d0e25 want=True w=4.022695640678367e-09 peak=0.4053778812576301 inact=43497 in_competing0=True 
+    7766654d-f71c-4e77-b05f-49d806af2ffe outgoing  other=cc:want::b1cd6ec714d6a1ca want=True w=5.581943332634081e-10 peak=0.4029182430900482 inact=43497 in_competing0=True 
+    c95ffd9e-4744-4eb5-9010-b2af4f7dc49d outgoing  other=cc:want::a28310b00e3885f9 want=True w=4.195848912905099e-10 peak=4.86947042651438 inact=43499 in_competing0=True 
+    acdcff03-6aaf-4eda-8891-d64dc6a6fed3 outgoing  other=cc:want::ea8e1117626f1768 want=True w=1.1652289426597328e-11 peak=0.45638877326204086 inact=43497 in_competing0=True 
+    31f3d09a-e98a-4d0b-9737-50f64bcaee4a outgoing  other=cc:want::e0fe9c14efaeea71 want=True w=1.1151459169225982e-11 peak=2.158594684570238 inact=43497 in_competing0=True 
+    a37deea7-7708-4915-9ea3-d930b9ab05b9 outgoing  other=cc:want::0c2c299e555cf0ba want=True w=3.2978199816160605e-12 peak=0.39037768809228734 inact=43497 in_competing0=True 
+    6fb073b3-a347-45ed-ba56-f2aad49ce7f5 outgoing  other=cc:want::e8ee3a3237830fc6 want=True w=1.2042098010802648e-12 peak=4.769234657949396 inact=43499 in_competing0=True 
+    0f5c1399-a8c5-4c55-99aa-9f7607aed335 outgoing  other=cc:want::73d27e806bfd94c1 want=True w=1.7411388205758412e-13 peak=2.1905819288835118 inact=43497 in_competing0=True 
+    e2d85239-303f-4463-a3a8-73fe361059e0 outgoing  other=cc:want::05e8d98f85461ec4 want=True w=1.1849332340106187e-16 peak=1.7141836175050384 inact=43497 in_competing0=True 
+    fb89e091-7e45-4bcf-b27f-4efc9208f634 outgoing  other=cc:want::ac4d8c6a7f50852c want=True w=2.1354904071246327e-21 peak=2.243037303673619 inact=43497 in_competing0=True 
+    dec28016-59ec-405e-9060-0a03f800a6c6 incoming  other=cc:want::db6070160d1048f0 want=True w=0.0 peak=3.5625775293603614 inact=1253 in_competing0=True 
+    95aae075-ed60-4679-bea0-6e401eb5f495 incoming  other=cc:want::7be4be9e0cd99673 want=True w=0.0 peak=0.10015098946822772 inact=1222 in_competing0=True 
+    068cdbf1-9b02-42dd-9c37-52fe26c9778d incoming  other=cc:want::11f6ad8ec52a2984 want=True w=0.0 peak=0.1 inact=1 in_competing0=True 
+    dd500cbc-b889-4c41-aca2-aee3c4b62514 incoming  other=cc:want::36b3aadf3c10192a want=True w=0.0 peak=0.1 inact=3 in_competing0=True 
+    b71c9404-02ad-4bf9-9c34-2eae8fc32d73 incoming  other=cc:want::b6c8bf7af61eef63 want=True w=0.0 peak=0.1 inact=30 in_competing0=True 
+    db9ec2a9-c788-4345-9ebf-c69540ec51c9 incoming  other=cc:want::00a98e3940aae16b want=True w=0.0 peak=0.1 inact=1167 in_competing0=True 
+    7295a73b-8af7-424a-a640-5a4f0d2c1b85 incoming  other=cc:want::d157681e6686f3b3 want=True w=0.0 peak=0.1 inact=1205 in_competing0=True 
+    d1b263d6-955b-4ae5-8b2f-728d394a4d9e incoming  other=cc:want::629e3532b2bf9fee want=True w=0.0 peak=0.1 inact=1222 in_competing0=True 
+    f105c4bf-22f7-41e5-861a-915f2fb0cc7f incoming  other=cc:want::e8464672c0c84d64 want=True w=0.0 peak=0.1 inact=1223 in_competing0=True 
+    a38fd52f-6a35-442d-b87f-bb72bc0910ed incoming  other=cc:want::d205070de4934ffe want=True w=0.0 peak=0.1 inact=1231 in_competing0=True 
+    b995347d-3edd-4bc3-989c-6920e9b9b878 incoming  other=cc:want::845ca1c45eadba31 want=True w=0.0 peak=0.1 inact=1233 in_competing0=True 
+    b3cf85d1-af84-402a-bf8e-8c178de93dad incoming  other=cc:want::7bd0f5fdca6eb404 want=True w=0.0 peak=0.1 inact=1235 in_competing0=True 
+    d66dae38-ce04-4077-b11d-20da71929252 incoming  other=cc:want::e84f19368e89aa35 want=True w=0.0 peak=0.1 inact=1241 in_competing0=True 
+    f810bc32-d7b9-4dc0-9d31-29e76e3856c7 incoming  other=cc:want::8fc1e03f837263d6 want=True w=0.0 peak=0.1 inact=1246 in_competing0=True 
+    59c03a30-8754-4604-9d3a-fee5fa2f8133 incoming  other=cc:want::d9307495aa497803 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    e688fa73-175b-42cd-a565-fb6b3587be89 incoming  other=cc:want::0118ef13e968187e want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    eb2018f3-8aad-491d-a055-04f0d3984520 incoming  other=cc:want::f94e27ef79629ba9 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    f5f5cd88-8fbe-478d-b05c-8aeecc73ad3c incoming  other=cc:want::f49b71299b391c43 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    461b4d8e-8b1f-44ef-9b99-063d1e66f8f9 incoming  other=cc:want::084c1b207df9b66a want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    72bc7e53-c93c-4706-b535-2617dff52069 incoming  other=cc:want::52de588bbc559530 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    ad822a77-cd25-4747-a241-5b2318f95335 incoming  other=cc:want::bf1c520afec07327 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    225fd9eb-1c41-471e-8ee9-7962b2303ff8 incoming  other=cc:want::cd128a1aacaa1033 want=True w=0.0 peak=0.1 inact=1259 in_competing0=True 
+    560a3091-c40d-4e8b-acbf-0474d19b1161 incoming  other=cc:want::6dd36cce3d4b4975 want=True w=0.0 peak=0.1 inact=1259 in_competing0=True 
+    65daeae4-0217-492b-9d14-f0656ed69008 incoming  other=cc:want::eaef483886ae3b54 want=True w=0.0 peak=0.1 inact=1259 in_competing0=True 
+    a662b9e6-6ae1-417a-afd2-af3a60b4f9ca incoming  other=cc:want::2c0b9b605ab356a7 want=True w=0.0 peak=0.1 inact=1268 in_competing0=True 
+    313e541b-276a-45a9-ab30-5d03980c44c8 incoming  other=cc:want::d76ac1e14de752dd want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    e98f2779-b82b-4e9c-8ab8-ab920c09ec27 incoming  other=cc:want::1e84b21f862eb26a want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    fb5a477f-5531-4ddc-9909-5505a87ab49d incoming  other=cc:want::8d7a930b865394a2 want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    2025a8a0-05da-484d-9755-51764c3b3d17 incoming  other=cc:want::b2565971c7a4ff01 want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    260554a4-81d6-4586-a443-cb72c364d7bc incoming  other=cc:want::62506085587631cd want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    5b2d3766-8814-49b3-ad28-fef379b2f6fe incoming  other=cc:want::806de7615c889a1a want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    d482d29c-4b63-4077-b61f-3241db82a938 incoming  other=cc:want::c5056961a91a718f want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    7c982bcb-7038-4548-88f4-05204af73c06 incoming  other=cc:want::c3b44ac278e61467 want=True w=0.0 peak=0.1 inact=1286 in_competing0=True 
+    9a2a723f-4f23-420d-99b5-bf6017866c95 incoming  other=cc:want::6efce0eb6426ce7a want=True w=0.0 peak=0.1 inact=1286 in_competing0=True 
+    4928623b-c34c-49cc-b019-616e30564d70 incoming  other=cc:want::a50a55257545a7c5 want=True w=0.0 peak=0.1 inact=1287 in_competing0=True 
+    829fc720-1a72-4436-a137-efffe68173e3 incoming  other=cc:want::0782a3cd713d2c5a want=True w=0.0 peak=0.1 inact=1287 in_competing0=True 
+    e9aec2cf-599b-4a95-a10a-b1baebe14d4f incoming  other=cc:want::8a7a0feaf727ae8f want=True w=0.0 peak=0.1 inact=1288 in_competing0=True 
+    ea62043b-9ec5-4489-9850-f58db2be2972 incoming  other=cc:want::ebf901b8a10ff259 want=True w=0.0 peak=0.1 inact=1290 in_competing0=True 
+    288fd88f-6983-4ed7-88cb-493ca05e954f incoming  other=cc:want::819617483e25527f want=True w=0.0 peak=0.1 inact=1293 in_competing0=True 
+    920ba2f6-4a69-4688-a9b6-4606eb5d7f38 incoming  other=cc:want::ec41c3022e0a21d0 want=True w=0.0 peak=0.1 inact=1294 in_competing0=True 
+    02cd4034-71fc-42d9-885f-dd5347d96caf incoming  other=cc:want::e35fca0831875ac1 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    58ce859e-ed37-48af-921d-c47e79c4c9a1 incoming  other=cc:want::191b217181f1cbed want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    833bc841-0428-4ed1-bd3e-6a45e6c9908e incoming  other=cc:want::4c590af8c6faa569 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    8f475466-7333-46f9-b66e-cf2cc225f027 incoming  other=cc:want::bae0d50a4816c595 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    a25aec74-2d8b-47a4-9880-043799d480f6 incoming  other=cc:want::df316e17de9c3685 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    d4d5f06c-0e0b-4184-abb8-7f4685892529 incoming  other=cc:want::e23483c5191c037e want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    de859ce4-04fb-49e9-9072-9278cea8ced7 incoming  other=cc:want::9d882ab14b74650b want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    6dd0cdd9-54f3-435d-afd2-0916754c3dce incoming  other=cc:want::372ea08cab33e71c want=True w=0.0 peak=0.1 inact=1299 in_competing0=True 
+    388978cd-df27-4754-aa71-445ed48c319b incoming  other=cc:want::68c922a027ada835 want=True w=0.0 peak=0.1 inact=1300 in_competing0=True 
+    9e72647e-4c42-4ef0-8f78-e1a0da1dfe40 incoming  other=cc:want::ce235b059dcf6cdc want=True w=0.0 peak=0.1 inact=1311 in_competing0=True 
+    b9c37551-5be7-469d-8f00-4109524b8847 incoming  other=cc:want::34c0953807314bdd want=True w=0.0 peak=0.1 inact=1312 in_competing0=True 
+    f27cee67-bbd7-4074-83d1-663e067ee046 incoming  other=cc:want::db7eb718ed371fa5 want=True w=0.0 peak=0.1 inact=1312 in_competing0=True 
+    e26915f4-d718-4232-a84e-6af4f68a90a3 incoming  other=cc:want::c0ee2948da6d8123 want=True w=0.0 peak=0.1 inact=1314 in_competing0=True 
+    ba3f5de7-717b-4a71-84ba-ed29bf5c069c incoming  other=cc:want::081817f399776a84 want=True w=0.0 peak=0.1 inact=1323 in_competing0=True 
+    27575ae1-40f9-4d6d-8b5f-14e4d7de0252 incoming  other=cc:want::1daa16876c0e82ad want=True w=0.0 peak=0.1 inact=1325 in_competing0=True 
+partner cc:conv::c4a256b3fb1cf414c42992a4035bd4169a6de6a1  incident=26 (out 1 / in 25)  held synapse 7ff39dc8-e236-4203-ba99-629b00e0f686
+    7ff39dc8-e236-4203-ba99-629b00e0f686 outgoing  other=cc:want::00a98e3940aae16b want=True w=3.32330869248231e-19 peak=5.0 inact=43377 in_competing0=True <== HELD BACK
+    9517035d-8565-42b3-89f8-617994ac5d7a incoming  other=cc:want::084c1b207df9b66a want=True w=0.0 peak=3.74903377161039 inact=1253 in_competing0=True 
+    ef4228a7-0f10-4798-bf69-d6e5a0d3d7d0 incoming  other=cc:want::6d26f1edcbfccc9e want=True w=0.0 peak=1.6855675446950178 inact=1207 in_competing0=True 
+    1fd42868-c959-4d53-bd01-c4743a50d1a8 incoming  other=cc:want::dbf0f00161914f2e want=True w=0.0 peak=1.2841222547090945 inact=1271 in_competing0=True 
+    666a28c9-6ea1-4ff8-9ab6-347254244824 incoming  other=cc:want::11f6ad8ec52a2984 want=True w=0.0 peak=0.1 inact=1 in_competing0=True 
+    350d2e4f-6752-42a0-acd4-4d030e9b3b1d incoming  other=cc:want::b6c8bf7af61eef63 want=True w=0.0 peak=0.1 inact=30 in_competing0=True 
+    d50fd751-c2da-4e28-aee9-f9a202d019fe incoming  other=cc:want::d157681e6686f3b3 want=True w=0.0 peak=0.1 inact=1205 in_competing0=True 
+    82a21c4e-1fc2-4b5f-9078-f0d779c13d51 incoming  other=cc:want::845ca1c45eadba31 want=True w=0.0 peak=0.1 inact=1233 in_competing0=True 
+    25d86a6b-ff42-4953-8482-ed272bac64cf incoming  other=cc:want::7bd0f5fdca6eb404 want=True w=0.0 peak=0.1 inact=1235 in_competing0=True 
+    3f886e5d-6412-47a7-8238-005b5b4440ef incoming  other=cc:want::e84f19368e89aa35 want=True w=0.0 peak=0.1 inact=1241 in_competing0=True 
+    4fcb2dbf-4f99-4237-b008-3f7186de30b9 incoming  other=cc:want::f94e27ef79629ba9 want=True w=0.0 peak=0.1 inact=1247 in_competing0=True 
+    7071939c-5a36-4331-a887-9d51dfb61c61 incoming  other=cc:want::52de588bbc559530 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    ec8378b3-e58f-40b8-a358-ecc9af7b0abc incoming  other=cc:want::bf1c520afec07327 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    6a325990-1529-4d8f-bf21-e5b217666cb3 incoming  other=cc:want::2c0b9b605ab356a7 want=True w=0.0 peak=0.1 inact=1268 in_competing0=True 
+    24cd4237-b798-4ec3-bc2b-1b3278e2b7ce incoming  other=cc:want::1e84b21f862eb26a want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    332cbbee-cc8e-464c-a62a-0431b5ab8638 incoming  other=cc:want::d76ac1e14de752dd want=True w=0.0 peak=0.1 inact=1270 in_competing0=True 
+    2fe4bf9c-5ece-447d-a731-4af9eed2d00f incoming  other=cc:want::62506085587631cd want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    49dd973d-f735-442e-9c54-6cc545605fa7 incoming  other=cc:want::b2565971c7a4ff01 want=True w=0.0 peak=0.1 inact=1271 in_competing0=True 
+    88a47bcf-d38a-49e5-bfca-78921814525d incoming  other=cc:want::c3b44ac278e61467 want=True w=0.0 peak=0.1 inact=1286 in_competing0=True 
+    39498ae8-821d-4ed6-8412-41ac5589e748 incoming  other=cc:want::a50a55257545a7c5 want=True w=0.0 peak=0.1 inact=1287 in_competing0=True 
+    876605d9-110e-48f2-8ea6-285798d6e012 incoming  other=cc:want::16309273f4b0bc09 want=True w=0.0 peak=0.1 inact=1290 in_competing0=True 
+    27b8f7a6-9d37-45ca-b844-70c63ce266a6 incoming  other=cc:want::9d882ab14b74650b want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    8e31b6ed-4ca0-4d58-80fa-7d97fade2781 incoming  other=cc:want::e35fca0831875ac1 want=True w=0.0 peak=0.1 inact=1295 in_competing0=True 
+    676d4783-20af-4503-92fd-8bb083542430 incoming  other=cc:want::372ea08cab33e71c want=True w=0.0 peak=0.1 inact=1299 in_competing0=True 
+    19c8eac0-950f-437e-aac2-6383bf266a91 incoming  other=cc:want::71a482bc5950754b want=True w=0.0 peak=0.1 inact=1308 in_competing0=True 
+    2ddf605d-969c-44c3-bcfd-9915bb58f856 incoming  other=cc:want::c0ee2948da6d8123 want=True w=0.0 peak=0.1 inact=1314 in_competing0=True 
+partner cc:conv::c6be42953b1ba7788cc1e267c1aa0ee354502cf4  incident=13 (out 0 / in 13)  held synapse cef99511-9978-4138-bc93-302e234eecef
+    cef99511-9978-4138-bc93-302e234eecef incoming  other=cc:want::26c0c53fef22c7a0 want=True w=0.0 peak=0.10113326435332604 inact=1271 in_competing0=True <== HELD BACK
+    5e9d95b2-2253-42f0-966f-1d3bc85ebc7b incoming  other=cc:want::e7ab408354c51afa want=True w=0.0 peak=0.10105628774321108 inact=1297 in_competing0=True 
+    26e2b54a-09d7-4207-bd70-7929b34d6dfc incoming  other=cc:want::44b790b8323af3e0 want=True w=0.0 peak=0.10040145482945714 inact=1297 in_competing0=True 
+    3fcd052c-faa9-4aa6-9916-5d8982d5dcb2 incoming  other=cc:want::b153477c729017d6 want=True w=0.0 peak=0.100178855365285 inact=1300 in_competing0=True 
+    9e19fed8-4095-4d30-a0e5-f3779bcef701 incoming  other=cc:want::d157681e6686f3b3 want=True w=0.0 peak=0.10014182520810165 inact=1205 in_competing0=True 
+    038f6d10-6b0c-4347-8c80-fb2adb771b15 incoming  other=cc:want::a6afc6c4356f8a25 want=True w=0.0 peak=0.1001046011598488 inact=1295 in_competing0=True 
+    f700dbfc-e35e-4c4b-9e89-bc0f537e1c5d incoming  other=cc:want::d205070de4934ffe want=True w=0.0 peak=0.1 inact=1231 in_competing0=True 
+    2fe56571-816f-46c7-9a19-da5f1d9c403f incoming  other=cc:want::9c687034dc705162 want=True w=0.0 peak=0.1 inact=1235 in_competing0=True 
+    acd00616-7e91-4162-b4f3-7201fa3f3ce3 incoming  other=cc:want::36ff1cb6cc8b3257 want=True w=0.0 peak=0.1 inact=1241 in_competing0=True 
+    af35e7ed-93f7-49a7-adae-8975e5e28af5 incoming  other=cc:want::db6070160d1048f0 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True 
+    d2a0a7e9-782f-459f-98b4-10ded1cb88a5 incoming  other=cc:want::2c0b9b605ab356a7 want=True w=0.0 peak=0.1 inact=1268 in_competing0=True 
+    297576b9-4a2e-4236-b21d-d3592ec66cfd incoming  other=cc:want::2137f31deb29fc07 want=True w=0.0 peak=0.1 inact=1276 in_competing0=True 
+    8bb4af1e-cbc8-4c1e-901b-22c788b2f432 incoming  other=cc:want::6f2de47a34887bda want=True w=0.0 peak=0.1 inact=1297 in_competing0=True 
+partner cc:conv::d4131e2999bdfa2bad4919e375e33c78a410561b::tree::Law-2  incident=1 (out 0 / in 1)  held synapse 92b57f85-8c5a-4ad8-987d-8780a957ab08
+    92b57f85-8c5a-4ad8-987d-8780a957ab08 incoming  other=cc:want::660bf201f7155370 want=True w=0.1 peak=0.1 inact=2 in_competing0=True <== HELD BACK
+partner cc:conv::f745388e1a37c6c26bb3c726c345c11a71a4f6ea  incident=1 (out 0 / in 1)  held synapse 9084ab20-5330-495a-99c3-236ae0442bd3
+    9084ab20-5330-495a-99c3-236ae0442bd3 incoming  other=cc:want::52de588bbc559530 want=True w=0.0 peak=0.1 inact=1253 in_competing0=True <== HELD BACK
