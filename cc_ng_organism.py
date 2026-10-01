@@ -3,8 +3,11 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
-# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane drain-pacing-d24, dispatches #12669/#12731) — D24 (re-scoped):
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane drain-pacing-d24, dispatches #12669/#12731/#12929) — D24 (re-scoped):
 #   pace the ingest-tract drain by NODES; make _cc_callosum_consolidate's failure loud
+#   [D24 FOLD, #12929, Exec Packet 482 / #896: NO code change in this file's behaviour -- the KNOWN LIMIT text below is
+#   REPLACED (the guard now covers the WHOLE unbound population, see the daemon's FOLD entry) and the receipt docstring's
+#   scope sentence is corrected. The real-function seam test is tests/test_cc_drain_pacing_seam.py.]
 # What: (1) drain_ingest_tract gains two OPTIONAL default-None parameters, `batch_nodes` and `receipt`. With
 #   `batch_nodes` set (> 0) the drain takes WHOLE turns until the NODES created in this call reach it (the turn that
 #   crosses it is absorbed whole -- a turn's dual pass is ATOMIC -- then the batch ends; a single turn alone over the
@@ -23,20 +26,29 @@
 #   code (reuse, LAW 3), no dependency on #117/CC_NG_AUTOSTEP. Exec P473/P476: the lock is never held across the idle
 #   steps -- TWO-PHASE: this function stays CALLER-LOCKED and DEPOSIT-ONLY (its lock contract is unchanged, it
 #   acquires and releases nothing, it never steps, it never consolidates); the DAEMON, after its autosave section's
-#   `finally` releases graph._concurrent_lock, runs cc_topology_merge._unbound_nodes(graph, receipt["arrivals"]) and
-#   then _cc_callosum_consolidate (which slices the lock itself). P476(e): the DEBUG swallow is fixed where the drain's
+#   `finally` releases graph._concurrent_lock, runs cc_topology_merge._unbound_nodes -- over the WHOLE graph since the D24
+#   FOLD (#896); it was the receipt's arrivals under P476(d) -- and then _cc_callosum_consolidate (which slices the lock itself). P476(e): the DEBUG swallow is fixed where the drain's
 #   phase 2 reuses the function (P370).
 # How: with both new parameters unset the function is byte-identical to e4ebf982 (proved by a test that loads the
 #   base module from `git show e4ebf982:cc_ng_organism.py`). Syl's process and the VPS host call site
 #   (cc_ng_host.py:1525-1526) pass neither, so they are unchanged.
 #   Two records exist for a failed consolidation, deliberately: _cc_callosum_consolidate logs the CAUSE (exception
 #   class + steps run); the daemon's phase 2 logs the CONSEQUENCE (pacing re-armed, next batch held).
-# KNOWN LIMIT (P476(d), recorded on purpose): the guard the daemon applies is ARRIVAL-SCOPED (this drain's own
-#   arrivals), not whole-graph -- a whole-graph check would find the laptop's PRE-EXISTING unbound nodes
-#   (~806, CC-CALLOSUM-TRUTH.md:310, "cannot self-bind", section 10.4-H) and trip on EVERY batch, stalling the drain
-#   forever. Consequence: the 250 idle steps CAN age a Leg 2 merge's unbound arrivals. Leg 2 is HELD (P416), so none
-#   exist at S4; when Leg 2 resumes, merge and drain consolidation MUST be coordinated (one consolidator at a time,
-#   or a combined arrival set) -- recorded on #876 and the #806 post-track lane.
+# KNOWN LIMIT, replacing P476(d)'s text. F1 (le-044) is RESOLVED by the D24 FOLD (Exec Packet 482 / #896): the guard the
+#   daemon applies covers the WHOLE unbound population, including the laptop's pre-existing unbound cohort (~806,
+#   source=cc_gateway, CC-CALLOSUM-TRUTH.md section 2 :197-201 and 10.4-H :2735-2749: only Leg 2 binds them). While ANY
+#   unbound node exists the 250 idle steps do not run AND no batch is deposited (the daemon skips the drain, the tract
+#   waits), logged loudly every cycle. The earlier justification for an arrival-scoped guard -- that a whole-graph guard would
+#   "stall the drain forever" -- is withdrawn as a reason to ignore the cohort: that stall was the guard doing its job.
+#   F2: an unbound arrival skipped at batch N was NOT protected from batch N+1's steps (the cross-batch case the merge's own
+#   comment names, cc_topology_merge.py:584-591); the whole-graph guard now also blocks batch N+1's steps, and its deposit, for as
+#   long as that arrival stays unbound. Still open: when Leg 2 resumes, merge and drain consolidation MUST be coordinated (one
+#   consolidator at a time, or a combined arrival set), #876 and the #806 post-track lane.
+#   F4: cc_deposit_step's docstring below ("the two drains ... never step at all", P240(3)) and cc_ng_host.py ~:1527 ("raw
+#   experience has no synthetic consolidation cadence") are STALE against D24's cadence on the laptop CC (250 steps after each
+#   batch, run by the daemon -- never inside drain_ingest_tract, which still never steps); the newer ruling wins and reconciling the
+#   two texts is #895. drain_gateway_conduit's inert batch_size/idle_steps arguments coexist with this live path for the other
+#   drain (LAW 3 shrapnel, #895).
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -2422,8 +2434,9 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
       ended_on_size  bool -- the batch ended on the batch_nodes rule
       arrivals       set  -- ids of the nodes this call landed (ids after
                              minus ids before, taken once per call); the
-                             caller's unbound-arrivals guard is scoped to
-                             exactly these, never the whole graph
+                             caller's guard (since the D24 FOLD, #896)
+                             covers the WHOLE graph; these are the subset
+                             that names this batch
       turns_taken    int
       reason         str  -- hardcoded: size_reached | entries_cap_reached |
                              tract_exhausted | parse_failed | no_batch
