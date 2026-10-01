@@ -437,6 +437,15 @@
 # How: see the plan/return doc handoffs/z12-want-legitimacy-810/returns/build-001.md.
 #   Id derivation, node metadata and synapse are UNCHANGED (cc:want::+sha1(inner)[:16]).
 #   surface_wants_for_graph (host twin, #755), neurograph_rpc.py and cc_ng_host.py untouched.
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1:
+#   cc_pattern_completion_recall resolves WHOLE
+# What: the resolve_surface_content call in cc_pattern_completion_recall drops its
+#   max_chars=300 argument (the resolver's new default is NO bound). Nothing else here changes;
+#   the _CC_PITH_* caps, pith_stage2_keyframe and the Pith budget code are untouched (#813).
+# Why:  Exec P468 / Josh "fix stuff correctly, not monkey patch" + Chief-003 ruling (addendum 1):
+#   same lossy-clipping class as the resolver's 240 default; fixed at the source.
+# How:  One argument removed, on the e4ebf982 base. Expected conflict with #813 (84a0968a) at
+#   this call site: see the #812 turn-1 return for the correct merged form.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -4757,7 +4766,8 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         for r in surfaced:
             nid = r.get("node_id") or r.get("id")
             node = ng.graph.nodes.get(nid) if (nid and ng.graph) else None
-            text = resolve_surface_content(node, r, allow_ingested=True, max_chars=300)
+            # Renders WHOLE (#812 / Chief ruling: no max_chars; was max_chars=300).
+            text = resolve_surface_content(node, r, allow_ingested=True)
             if not text:
                 continue
             if nid in promoted_ids and query_dir is not None:

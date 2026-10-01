@@ -1,4 +1,18 @@
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1: surfaced content renders WHOLE
+# What: resolve_surface_content() and resolve_surface_item() take max_chars: Optional[int] = None
+#       (was 240). None = NO bound: the node's resolved text is returned whole. The word-snap +
+#       ellipsis branch is unchanged and still runs for any caller that PASSES an explicit bound.
+#       The degenerate-fragment guard (min_chars, stopword shards), the ingested filter, the
+#       substrate-first preference order and resolve_surface_item's image path are untouched.
+# Why:  Exec P468 / Josh: "We fix stuff correctly, not monkey patch or work around." The default
+#       240-char cut here was the PRODUCER of lossy surfacing for every consumer of the shared
+#       path (CES L2, Tonic thread, /assemble ces_surfaced + Active Recall, CC recall); the
+#       consumers' own workarounds (#813's CC-side whole-content fork) were the wrong place for
+#       the fix. LAW 4: fix at the source. P410's CC-wrapper route is reversed.
+# How:  `max_chars is not None and len(text) > max_chars` guards the existing branch; nothing
+#       else in the function changes. No budget mechanism is added here (see the #812 turn-1
+#       return: whether the shared path needs one is reported, not decided).
 # [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: resolve_surface_item() — images surface AS images
 # What: New resolve_surface_item(node, vdb_entry, ...) -> {"kind": "text", "content": ...} |
 #       {"kind": "image", "image_ref": <path>} | None. A vision node (metadata modality == "vision",
@@ -27,7 +41,8 @@
 The substrate is the graph. Each conversational node carries her actual lived turn in
 ``metadata['_forest_content']`` (the #294 dual-pass "forest"); the vdb holds only a short
 "tree concept" shard (``WANT``, ``documentation``). Surfacing must display **her voice** —
-a bounded snippet of ``_forest_content`` — not the shard, and must not surface ingested
+the node's ``_forest_content`` rendered WHOLE (#812: no default bound; a caller may still pass
+an explicit ``max_chars``) — not the shard, and must not surface ingested
 source-code documents or degenerate fragments into her experiential thread.
 """
 
@@ -54,16 +69,20 @@ def _node_metadata(node: Any) -> dict:
 def resolve_surface_content(
     node: Any,
     vdb_entry: Any,
-    max_chars: int = 240,
+    max_chars: Optional[int] = None,
     min_chars: int = 12,
     allow_ingested: bool = False,
 ) -> Optional[str]:
     """Return the display text for a surfaced node — substrate-first — or None to filter it.
 
     Preference order:
-      1. ``node.metadata['_forest_content']`` — her actual turn (bounded snippet).
+      1. ``node.metadata['_forest_content']`` — her actual turn, rendered WHOLE.
       2. vdb entry content (the shard) — fallback only.
       3. ``node.metadata['_label']`` — last resort.
+
+    ``max_chars`` (#812): ``None`` (default) means NO bound — the resolved text is returned
+    whole. A caller that passes an explicit bound still gets the word-snapped, ellipsised
+    cut (the elision is visible, never silent).
 
     Filters:
       * ingested source-code nodes (``creation_mode == 'ingested'``) unless ``allow_ingested``
@@ -105,11 +124,11 @@ def resolve_surface_content(
     if len(text) < min_chars or text.lower() in _STOPWORD_SHARDS:
         return None
 
-    # Bound the snippet — never bloat the prompt with a full turn. Snap to the
-    # last word boundary at-or-before max_chars so a fired-off snippet doesn't
-    # end mid-word; fall back to a hard cut when no whitespace exists in range
+    # Explicit bound only (#812: the default is no bound — render whole). When a caller
+    # passes max_chars, snap to the last word boundary at-or-before it so a cut snippet
+    # doesn't end mid-word; fall back to a hard cut when no whitespace exists in range
     # (e.g. one unbroken token, as in test_snippet_is_bounded).
-    if len(text) > max_chars:
+    if max_chars is not None and len(text) > max_chars:
         cut = text.rfind(" ", 0, max_chars)
         text = (text[:cut] if cut > 0 else text[:max_chars]).rstrip() + "…"
     return text
@@ -135,7 +154,7 @@ def resolve_surface_image(node: Any) -> Optional[str]:
 def resolve_surface_item(
     node: Any,
     vdb_entry: Any,
-    max_chars: int = 240,
+    max_chars: Optional[int] = None,
     min_chars: int = 12,
     allow_ingested: bool = False,
 ) -> Optional[dict]:

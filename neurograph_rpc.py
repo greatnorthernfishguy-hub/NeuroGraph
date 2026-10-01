@@ -12,6 +12,14 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1: Active Recall renders WHOLE
+# What: handle_assemble's "## Active Recall" resolve_surface_content call drops its
+#   max_chars=300 argument (the resolver's new default is NO bound). Nothing else in this
+#   file changes. SHARED/Syl's code: it rides the rollout, not this build.
+# Why:  Exec P468 / Josh "fix stuff correctly, not monkey patch" + Chief-003 ruling
+#   (addendum 1): the 300 clip is the same lossy-clipping class as the resolver's 240 default.
+# How:  One argument removed. NOT changed (listed in the return as flag (e)):
+#   _format_substrate_context still clips surfaced / ces_surfaced items at 300 chars.
 # [2026-09-21] Grok 4.6 — §7 intra-turn window chains, graph-only
 # What: After a successful conversational dual_record_outcome, long turns deposit
 #       window nodes via _deposit_memory_node(..., index_in_recall=False), delay-chain
@@ -3516,8 +3524,9 @@ def handle_assemble(params: Dict[str, Any]) -> Dict[str, Any]:
                              if (_nid and _memory and _memory.graph) else None)
                     # allow_ingested=True (a query may legitimately recall a document),
                     # but degenerate shards ("o", "want") are still filtered, and her
-                    # _forest_content wins over the vdb tree-concept shard.
-                    _text = resolve_surface_content(_node, _r, allow_ingested=True, max_chars=300)
+                    # _forest_content wins over the vdb tree-concept shard. Renders WHOLE
+                    # (#812 / Chief ruling: no max_chars; was max_chars=300).
+                    _text = resolve_surface_content(_node, _r, allow_ingested=True)
                     if not _text:
                         continue
                     _score = _r.get("similarity", 0.0)
