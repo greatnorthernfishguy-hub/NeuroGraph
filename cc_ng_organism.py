@@ -437,6 +437,22 @@
 # How: see the plan/return doc handoffs/z12-want-legitimacy-810/returns/build-001.md.
 #   Id derivation, node metadata and synapse are UNCHANGED (cc:want::+sha1(inner)[:16]).
 #   surface_wants_for_graph (host twin, #755), neurograph_rpc.py and cc_ng_host.py untouched.
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2, part 2 (h):
+#   the #813 interim fork is DELETED; #813 is re-based onto #812
+# What: (1) _cc_monitor_items_whole and _format_cc_monitor_block (and their pointer comments and
+#   every call site) are deleted; _cc_render_unpithed renders the monitor block through the
+#   shared SurfacingMonitor.format_context, fail-soft. (2) The whole_content parameter of
+#   cc_pattern_completion_recall, its docstring paragraph, and both whole_content=True callers
+#   are deleted: ONE plain resolve_surface_content(node, r, allow_ingested=True). (3) Header text
+#   that pointed at the fork is marked superseded. Nothing else here changes.
+# Why: Exec P468 / Josh: "We fix stuff correctly, not monkey patch or work around." #812 makes the
+#   shared resolver and format_context render whole, so the CC path uses CES directly. What the
+#   fork did (re-resolve each monitor item whole by node_id; DROP with a WARNING an item whose
+#   re-resolve raised, "whole-or-absent") is gone with it and nothing is lost: after_step now
+#   stores the resolver's WHOLE text, so no cut item can reach the CC. The size budget
+#   (_pith_admit_strict_prefix against cc_l1_budget / CC_PITH_L1_BUDGET, one INFO line) is now the
+#   ONLY place items are dropped, whole.
+# How: deletion + one call rewired. Tests that pinned the fork are deleted/rewritten (build-003.md).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1:
 #   cc_pattern_completion_recall resolves WHOLE
 # What: the resolve_surface_content call in cc_pattern_completion_recall drops its
@@ -490,8 +506,8 @@
 #   for a 0-tree node; "K of N concept trees follow" when the L1/un-Pithed path knows; "where they
 #   fit" on the provider path; a hedge that trees may cover only part of it. (LOW) the constants
 #   800/200 are gone: _pith_provider_node_limit MEASURES the renderer's own worst-case shell and
-#   minimum line overhead. (T1) pointer comments: _cc_monitor_items_whole / _format_cc_monitor_block
-#   are an INTERIM fork that the #812 source fix deletes.
+#   minimum line overhead. [(T1) interim-fork pointer comments: superseded 2026-10-01, #812 turn 2 --
+#   the fork was deleted; CES renders whole at the source.]
 # Why: le-022 (law enforcer, final diff): N1 was an identity-continuity regression on the DEFAULT
 #   (gate-off) path -- an identity-protected item was budget-droppable there.
 # How: cc_ng_host.py, surfacing.py, surface_resolver.py untouched.
@@ -499,10 +515,9 @@
 #   TURN 4 (dispatch #11061) -- checker-022 C1/C2/C3 (Chief ruling docs 2a3b5fbf)
 # What: (C1) pith_stage3's docstring step 5 now describes what the body does: an over-budget
 #   line, even the first, is skipped whole-or-absent with the INFO drop line (D8 CONFIRMED: the
-#   first-line overrun guard stays REMOVED). (C2) _cc_monitor_items_whole: an item whose
-#   re-resolve RAISES is dropped (never the shared 240-char snippet), with a WARNING naming the
-#   node id + exception type (no text; id first-time-seen); the pattern-stream dedupe set is
-#   recomputed from the SURVIVING monitor items so the dropped node's whole twin is not lost too.
+#   first-line overrun guard stays REMOVED). [(C2) the monitor re-resolve whole-or-absent drop and
+#   its dedupe recompute: superseded 2026-10-01, #812 turn 2 -- the fork was deleted; the source
+#   now guarantees whole content, so no cut item can reach this path.]
 #   (C3) _pith_reference_text logs ONE INFO line when it leaves concept trees out (included /
 #   total / left out, counts only). (C4) pinned Stage-3 lines sit off-budget: recorded, unchanged.
 # Why: checker-022 PASS-WITH-NOTES on turns 2+3. No behaviour change on the happy path.
@@ -552,12 +567,11 @@
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code), lane pith-clip-removal-813,
 #   TURN 2 (dispatch #10952) step (1b) -- #816 on BOTH Pith-ON streams AND the gate-off path,
 #   plus THE ONE budget rule
-# What: (1) cc_assemble_recall asks recall for whole_content=True (was the 300-char snippet on
-#   the Pith-ON pattern stream AND the gate-off block). (2) The SurfacingMonitor stream -- cut
-#   at 240 chars in SHARED surfacing.py/surface_resolver -- is re-resolved WHOLE by node_id
-#   through a CC-ONLY route (_cc_monitor_items_whole); the shared modules are not edited.
-#   (3) The gate-off / Pith-failure rendering is _cc_render_unpithed: a CC-side monitor block
-#   (_format_cc_monitor_block, layout-identical, no 200-char cut) + the Active Recall block,
+# What: [(1) the whole_content=True recall flag and (2) the CC-ONLY monitor re-resolve route, and the
+#   CC-side monitor formatter of (3): superseded 2026-10-01, #812 turn 2 -- all deleted; the shared
+#   resolver and SurfacingMonitor.format_context render WHOLE at the source.]
+#   (3) The gate-off / Pith-failure rendering is _cc_render_unpithed: the SurfacingMonitor block
+#   + the Active Recall block,
 #   size controlled by HOW MANY items under the existing cc_l1_budget. (4) THE ONE BUDGET RULE
 #   (_pith_admit_strict_prefix + _pith_log_budget_drop) now serves _pith_provider_admit,
 #   pith_stage3 and _cc_render_unpithed: whole or absent; strict rank prefix on the remaining
@@ -587,9 +601,9 @@
 #   rendered size -- whenever it drops anything. (4) pith_stage3 loses its keyframe
 #   fallback for an over-budget line (drop whole instead) and logs the same INFO line
 #   for what it drops; the never-empty-L1 guard is kept. (5) _pith_node_sources no
-#   longer slices labels to 80 chars. (6) cc_pattern_completion_recall gains the
-#   opt-in whole_content=False parameter (default byte-identical); pith_provider_context
-#   passes True so the node-text fallback is not the 300-char snippet. (7) the
+#   longer slices labels to 80 chars. [(6) the whole_content parameter of
+#   cc_pattern_completion_recall: superseded 2026-10-01, #812 turn 2 -- deleted; whole is the
+#   default at the source.] (7) the
 #   prefetch LOD keyframe staging (and the query embed only it used) is removed.
 #   (8) pith_stage2_keyframe's docstring states it applies only WITH its delta.
 # Why: Exec P411/P413 via Chief-003 (Josh: no truncation). A keyframe whose delta is
@@ -4783,8 +4797,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                                     threshold: float = _CC_RECALL_PRIME_THRESHOLD,
                                     state: Optional[Dict[str, Any]] = None,
                                     preserve_graph_config: bool = False,
-                                    on_error: Optional[Any] = None,
-                                    whole_content: bool = False) -> List[Dict[str, Any]]:
+                                    on_error: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Substrate-native pattern-completion recall for CC's hook surfacing
     (#358 rebuild -- replaces the bare ng.recall() cosine search this
     function originally wrapped; LAW 3 rebuild-in-place, same contract).
@@ -4817,10 +4830,8 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
     query / no graph). Guarded: a raising reporter does not change the return.
     Unset (default) = behaviour unchanged.
 
-    whole_content (#813, default False = byte-identical for every existing caller):
-    when True the snippet is NOT bounded to 300 chars -- it is the node's whole
-    resolved text.  pith_provider_context passes True: its budget is met by dropping
-    whole assemblies, so an upstream snippet cut would be a truncation it cannot see.
+    content is the node's WHOLE resolved text (#812: the shared resolver has no default
+    bound; the size budget decides how MANY items a render carries, never how much of one).
     """
     if not query or ng is None:
         return []
@@ -4917,9 +4928,8 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         for r in surfaced:
             nid = r.get("node_id") or r.get("id")
             node = ng.graph.nodes.get(nid) if (nid and ng.graph) else None
-            text = resolve_surface_content(
-                node, r, allow_ingested=True,
-                max_chars=(sys.maxsize if whole_content else 300))
+            # Renders WHOLE (#812 / Chief ruling: no max_chars; was max_chars=300).
+            text = resolve_surface_content(node, r, allow_ingested=True)
             if not text:
                 continue
             # [D5] Carry Stage-4 promotion provenance out of this function so the
@@ -7381,8 +7391,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
         # the conversation state's prefetch set.
         recall_state["primed_nodes"] = {}
         surfaced = cc_pattern_completion_recall(
-            ng, cue, roots, state=recall_state, preserve_graph_config=True,
-            whole_content=True)
+            ng, cue, roots, state=recall_state, preserve_graph_config=True)
         # The budget breathes with arousal and the confidence of the region
         # that just fired for this cue (Shared Graduation, Packet 175a).
         budget = budget_chars if budget_chars is not None else cc_l1_budget(
@@ -7586,75 +7595,6 @@ def _cc_log_guard_pins(where: str, pinned: Any, node_ids: List[Any], l1_chars: i
                    "/".join(sorted({failed[nid] for nid in hit})), l1_chars, budget)
 
 
-# INTERIM FORK (T1, le-022): _cc_monitor_items_whole + _format_cc_monitor_block below exist only
-# because the producer's cut lives in SHARED surfacing.py / surface_resolver.py (Syl's /assemble,
-# P329). The SOURCE fix -- a whole-content option there (#812, Josh's post-track go) -- DELETES both.
-def _cc_monitor_items_whole(ng: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """#816 CC-ONLY route for the SurfacingMonitor stream.
-
-    The shared monitor resolves each fired node with the shared resolver's default 240-char
-    bound (surfacing.py:192 -> surface_resolver.resolve_surface_item) BEFORE we see it.  Editing
-    that default or surfacing.py would change Syl's live /assemble path (P329, #812), so instead
-    this wrapper re-resolves each item's WHOLE content by node_id from the same node + vector-db
-    entry the monitor used (Exec P410(c): the wrapper renders full stored content).  Returns new
-    dicts -- the monitor's own items are never mutated.  Per item: one that is not re-resolvable
-    by design (unknown node, image frame, filtered/empty) keeps what the monitor gave us.  One
-    whose re-resolve RAISES is DROPPED -- whole-or-absent (turn 4 / checker-022 C2): keeping the
-    shared 240-char snippet would leak a cut item.  The drop is a WARNING naming the node id and
-    the exception TYPE (never node text), the id first-time-seen only (flood-safe).
-    """
-    graph = getattr(ng, "graph", None)
-    vdb = getattr(ng, "vector_db", None)
-    out: List[Dict[str, Any]] = []
-    failed: List[tuple] = []
-    for item in items or []:
-        fresh = dict(item)
-        nid = item.get("node_id")
-        try:
-            node = graph.nodes.get(nid) if (graph is not None and nid) else None
-            if node is not None and not item.get("image_ref"):
-                from surface_resolver import resolve_surface_content
-                entry = vdb.get(nid) if vdb is not None else None
-                text = resolve_surface_content(node, entry, max_chars=sys.maxsize)
-                if text:
-                    fresh["content"] = text
-        except Exception as exc:
-            failed.append((nid, type(exc).__name__))
-            continue                         # whole-or-absent: never append the cut snippet
-        out.append(fresh)
-    if failed:
-        shown, already, more = _pith_note_ids("monitor|%s" % nid for nid, _why in failed)
-        why = {"monitor|%s" % nid: w for nid, w in failed}
-        named = ", ".join("%s (%s)" % (k.split("|", 1)[1], why[k]) for k in shown)
-        extra = "".join([" [%d already reported]" % already if already else "",
-                         " [+%d more]" % more if more else ""])
-        logger.warning("CC monitor whole-content re-resolve failed for %d item%s; DROPPED "
-                       "(whole-or-absent -- a cut item is never kept): %s%s",
-                       len(failed), "" if len(failed) == 1 else "s", named or "-", extra)
-    return out
-
-
-# INTERIM FORK (T1): deleted together with _cc_monitor_items_whole by the #812 source fix.
-def _format_cc_monitor_block(items: List[Dict[str, Any]]) -> str:
-    """The CC-side twin of SurfacingMonitor.format_context WITHOUT its 200-char cut.
-
-    The layout is byte-identical for items the shared code would not cut (a parity test pins
-    it against the real shared function): the `[NeuroGraph Surfaced Knowledge]` header is
-    miniTID's rail marker and must not change.  Kept here rather than editing the shared
-    formatter, which also serves Syl's /assemble."""
-    if not items:
-        return ""
-    lines = ["[NeuroGraph Surfaced Knowledge]"]
-    for item in items:
-        content = item.get("content", "")
-        score = item.get("score", 0.0)
-        if not content and item.get("image_ref"):
-            lines.append(f"- [something you saw \u2014 image attached] (salience: {score:.2f})")
-            continue
-        lines.append(f"- {content} (salience: {score:.2f})")
-    return "\n".join(lines)
-
-
 def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
                         pc_results: List[Dict[str, Any]], commons: Any,
                         pc_fired_ids: List[str], on_surfaced: Optional[Any] = None) -> str:
@@ -7711,7 +7651,17 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
         logger.warning("un-Pithed budget step failed; rendering every item whole and unbudgeted: %s",
                        exc)
         kept = {id(i) for i in list(monitor_items) + list(pc_results)}
-    monitor_block = _format_cc_monitor_block([i for i in monitor_items if id(i) in kept])
+    kept_monitor = [i for i in monitor_items if id(i) in kept]
+    monitor = getattr(ng, '_surfacing_monitor', None)
+    # The shared SurfacingMonitor.format_context (#812: renders every item whole) -- the
+    # CC path uses CES directly; no CC-side twin of the formatter exists any more.
+    monitor_block = ''
+    if monitor is not None and kept_monitor:
+        try:
+            monitor_block = monitor.format_context(kept_monitor)
+        except Exception as exc:   # a surfacing pass must never crash or time out the hook
+            logger.warning("monitor block formatting failed (%s); rendering without it",
+                           type(exc).__name__)
     pc_block = _format_cc_recall_block([i for i in pc_results if id(i) in kept])
     if on_surfaced is not None:
         # [lane 812-813-onto-s4] report exactly what this render emitted (the WHOLE kept items,
@@ -7818,13 +7768,6 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                 pass  # the error-reporting hook itself must never break recall
         monitor_node_ids = set()
         monitor_items = []
-    # #816 CC-ONLY ROUTE: the shared SurfacingMonitor cut each item at 240 chars before it
-    # reached us (surfacing.py:192 -> surface_resolver default).  Re-resolve every item's WHOLE
-    # content by node_id here; the shared modules stay untouched (Syl's /assemble, P329).
-    monitor_items = _cc_monitor_items_whole(ng, monitor_items)
-    # An item dropped by the whole-or-absent rule must not also suppress its pattern-stream twin
-    # (which is whole): dedupe against the items that SURVIVED.
-    monitor_node_ids = {item.get('node_id') for item in monitor_items}
 
     pc_results: List[Dict[str, Any]] = []
     # Everything pattern completion fired, before the display dedup against
@@ -7837,11 +7780,10 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                 # Reporting only: lets the swallow INSIDE cc_pattern_completion_recall
                 # be seen. Not passed when unset, so the default call is unchanged.
                 pc_extra['on_error'] = lambda exc: _cc_report(on_degraded, 'pattern_completion_failed', exc)
-            # #816: WHOLE content for BOTH the Pith-ON stream and the gate-off block -- the
-            # budget (Stage 3 / the un-Pithed renderer) decides how MANY items, never how
-            # much of one (a 300-char snippet here was cut before any budget could see it).
-            pc_results = cc_pattern_completion_recall(
-                ng, query, k, state=conv_state, whole_content=True, **pc_extra)
+            # #816 / #812: every item is WHOLE at the source (the shared resolver has no default
+            # bound), so the budget (Stage 3 / the un-Pithed renderer) decides how MANY items,
+            # never how much of one.
+            pc_results = cc_pattern_completion_recall(ng, query, k, state=conv_state, **pc_extra)
             pc_fired_ids = [r.get('node_id') for r in pc_results if r.get('node_id')]
             pc_results = [r for r in pc_results if r.get('node_id') not in monitor_node_ids]
         except Exception as exc:
