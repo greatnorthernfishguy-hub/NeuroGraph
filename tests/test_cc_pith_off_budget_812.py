@@ -1,6 +1,17 @@
 # tests/test_cc_pith_off_budget_812.py
 #
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12861) — #812 N-2 fold: tests
+# What: N-2 (a monitor-formatter failure is reported through on_monitor_error -- the same
+#   hemisphere stat route as a harvest failure, RuntimeError silent as at e4ebf982 -- and the pattern
+#   twins come back; the Pith-ON success path never formats), N-3 (PINS the current dedupe-before-
+#   budget behaviour: a node whose monitor copy the budget drops can vanish whole), N-4 (a second
+#   reference-form shape through the real Pith-OFF path: an over-budget MONITOR item; and the
+#   never-fit qualifier pinned), N-5 (a second budget-binding shape: many small items, tight budget).
+# Why: le-043 N-2..N-5 / checker-034 N8..N11; Chief-003 fold (row #892).
+# How: same in-process fakes; real SurfacingMonitor / cc_pattern_completion_recall / cc_assemble_recall;
+#   the hemisphere stat is proven through the REAL cc_ng_host._recall (and the daemon's _recall when
+#   ~/docs/scripts/cc-ng-daemon.py exists, loaded as the unification test loads it).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2, part 2 (g)(3) + (h)
 # What: PROVES, on the #813-on-#812 branch, that the CC Pith-OFF DEFAULT path is budgeted by the
 #   existing #813 mechanism (_cc_render_unpithed: strict-prefix admit against cc_l1_budget /
@@ -188,3 +199,292 @@ def test_h_the_recall_call_is_one_plain_resolver_call(monkeypatch):
     ng, _m, _p = _world([], [2000])
     out = pith.cc_pattern_completion_recall(ng, "q", 5)
     assert out and len(out[0]["content"]) == 2000 and _no_cut(out[0]["content"])
+
+
+# ======================================================================== #812 N-2 fold ==
+class _Recorder:
+    """on_monitor_error stand-in: records every exception it is handed."""
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, exc):
+        self.calls.append(exc)
+
+
+def _build(spec):
+    """spec: [(node_id, size, monitor_excitability_or_None, pattern_strength_or_None)].
+    A node with BOTH is a node present in both streams (a twin). Returns (ng, texts)."""
+    g = FakeGraph()
+    g.timestep = 1
+    texts, fired, harvest = {}, [], []
+    for nid, size, excit, strength in spec:
+        t = _text(nid, size)
+        node = g.node(nid, t, creation_mode="conversational")
+        node.voltage, node.threshold, node.intrinsic_excitability = 2.0, 1.0, (excit or 1.0)
+        texts[nid] = t
+        if excit is not None:
+            fired.append(nid)
+        if strength is not None:
+            harvest.append({"node_id": nid, "strength": strength})
+    cfg = CESConfig()
+    cfg.surfacing.min_confidence = 0.1
+    monitor = surfacing.SurfacingMonitor(g, FakeVectorDB(), cfg)
+    monitor.after_step(types.SimpleNamespace(fired_node_ids=fired))
+    ng = types.SimpleNamespace(
+        graph=g, vector_db=FakeVectorDB(), _surfacing_monitor=monitor,
+        _harvest_associations=lambda q, novelty=0.5, **kw: [dict(h) for h in harvest])
+    return ng, texts
+
+
+_TWIN_SPEC = [("X", 600, 1.0, 100.0),      # in BOTH streams: the monitor item and its pattern twin
+              ("P0", 700, None, 99.0)]     # pattern-only
+
+
+def _fail_formatter(ng, exc_type=ValueError, only_after=0):
+    """Make the REAL monitor's format_context raise (after `only_after` good calls)."""
+    real = ng._surfacing_monitor.format_context
+    state = {"n": 0, "calls": 0}
+
+    def fmt(items):
+        state["calls"] += 1
+        if state["calls"] > only_after:
+            raise exc_type("SECRET-ITEM-TEXT-DO-NOT-LOG " + items[0]["content"][:12])
+        return real(items)
+    ng._surfacing_monitor.format_context = fmt
+    return state
+
+
+def _pith_failed(monkeypatch):
+    monkeypatch.setattr(pith, "_CC_PITH_ENABLED", True)
+    monkeypatch.setattr(pith, "pith_stage1",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("pith boom")))
+
+
+@pytest.mark.parametrize("entry", ["gate_off", "pith_failed"])
+def test_n2_a_formatter_failure_is_reported_and_the_pattern_twin_survives(monkeypatch, caplog, entry):
+    """N-2 + twin survival. The monitor formatter raises (ValueError): it is reported ONCE through
+    on_monitor_error with the exception, the monitor stream is dropped, and the pattern twin of X
+    (removed by the display dedup because the monitor copy existed) COMES BACK. Both entries to the
+    un-Pithed renderer: the gate OFF, and a Pith failure.
+    FAILS on the pre-fold tip 55d56b9a: no on_monitor_error call, and X vanishes from both streams."""
+    _wire(monkeypatch)
+    if entry == "pith_failed":
+        _pith_failed(monkeypatch)
+    ng, texts = _build(_TWIN_SPEC)
+    _fail_formatter(ng, ValueError)
+    rec = _Recorder()
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        out = pith.cc_assemble_recall(ng, "q", 5, {}, None, on_monitor_error=rec)
+    assert texts["X"] in out and texts["P0"] in out                      # the twin is back
+    assert "[NeuroGraph Surfaced Knowledge]" not in out                  # the monitor block is not
+    assert len(rec.calls) == 1 and isinstance(rec.calls[0], ValueError)
+    warned = [r.getMessage() for r in caplog.records if "monitor block formatting failed" in r.getMessage()]
+    assert warned and "ValueError" in warned[0] and "SECRET" not in warned[0]
+
+
+def test_n2_runtimeerror_stays_silent_as_at_e4ebf982_but_the_twin_still_returns(monkeypatch):
+    """The old guard's RuntimeError branch ('dict mutation race') reset the stream WITHOUT reporting.
+    Mirrored exactly: no on_monitor_error call, twin restored.
+    FAILS on the pre-fold tip: the twin X is missing."""
+    _wire(monkeypatch)
+    ng, texts = _build(_TWIN_SPEC)
+    _fail_formatter(ng, RuntimeError)
+    rec = _Recorder()
+    out = pith.cc_assemble_recall(ng, "q", 5, {}, None, on_monitor_error=rec)
+    assert texts["X"] in out and texts["P0"] in out
+    assert rec.calls == []
+
+
+def test_n2_the_formatter_failure_takes_the_same_route_as_a_harvest_failure(monkeypatch):
+    """Both failure points call the SAME on_monitor_error callback once with the exception.
+    FAILS on the pre-fold tip (the formatter case calls nothing)."""
+    _wire(monkeypatch)
+    routes = {}
+    for point in ("harvest", "format"):
+        ng, _t = _build(_TWIN_SPEC)
+        if point == "harvest":
+            def boom():
+                raise ValueError("harvest exploded")
+            ng._surfacing_monitor.get_surfaced = boom
+        else:
+            _fail_formatter(ng, ValueError)
+        rec = _Recorder()
+        pith.cc_assemble_recall(ng, "q", 5, {}, None, on_monitor_error=rec)
+        routes[point] = rec.calls
+    assert len(routes["harvest"]) == 1 and len(routes["format"]) == 1
+    assert type(routes["harvest"][0]) is type(routes["format"][0]) is ValueError
+
+
+def test_n2_pith_on_success_path_never_formats_so_it_is_unchanged(monkeypatch):
+    """Why the Pith-ON path is unchanged: its CacheLines are built from the monitor ITEMS and it
+    returns before the guard, so the monitor formatter is never called and nothing is reported.
+    Passes before AND after the fold (a pin of 'unchanged')."""
+    _wire(monkeypatch)
+    monkeypatch.setattr(pith, "_CC_PITH_ENABLED", True)
+    ng, texts = _build(_TWIN_SPEC)
+    state = _fail_formatter(ng, ValueError)                              # would raise if it were called
+    rec = _Recorder()
+    out = pith.cc_assemble_recall(ng, "q", 5, {}, None, on_monitor_error=rec)
+    assert state["calls"] == 0 and rec.calls == []
+    assert texts["X"] in out and texts["P0"] in out
+
+
+def test_n2_the_renderers_own_guard_is_the_last_resort(monkeypatch, caplog):
+    """The renderer's guard (a second call on the kept subset) still never crashes the hook: the
+    block is lost, one WARNING naming the type, nothing reported (the first call already passed).
+    FAILS on the pre-fold tip: its single call is the first, so the 'second call' never fails there."""
+    _wire(monkeypatch)
+    ng, texts = _build(_TWIN_SPEC)
+    _fail_formatter(ng, ValueError, only_after=1)
+    rec = _Recorder()
+    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
+        out = pith.cc_assemble_recall(ng, "q", 5, {}, None, on_monitor_error=rec)
+    assert texts["P0"] in out and "[NeuroGraph Surfaced Knowledge]" not in out
+    assert rec.calls == []
+    assert any("monitor block formatting failed" in r.getMessage() for r in caplog.records)
+
+
+def _host_world(monkeypatch):
+    import cc_ng_host
+    _wire(monkeypatch)
+    ng, texts = _build(_TWIN_SPEC)
+    _fail_formatter(ng, ValueError)
+    monkeypatch.setattr(cc_ng_host._STATE, "cc_ng", ng)
+    monkeypatch.setattr(cc_ng_host._STATE, "conv_state", {})
+    monkeypatch.setattr(cc_ng_host._STATE, "commons", None)
+    return cc_ng_host, texts
+
+
+def test_n2_the_host_hemisphere_error_stat_is_bumped_by_a_formatter_failure(monkeypatch):
+    """Through the REAL cc_ng_host._recall + the REAL cc_assemble_recall: a formatter failure bumps
+    _STATE.stats['errors'] exactly as the harvest failure pinned by
+    test_wrappers_bump_error_stat_on_monitor_harvest_failure does, and the twin still renders.
+    FAILS on the pre-fold tip: no bump, twin missing."""
+    host, texts = _host_world(monkeypatch)
+    before = host._STATE.stats["errors"]
+    out = host._recall("q", k=3)
+    assert host._STATE.stats["errors"] == before + 1
+    assert texts["X"] in out and texts["P0"] in out
+
+
+def _load_daemon():
+    import importlib.util
+    path = os.path.expanduser("~/docs/scripts/cc-ng-daemon.py")
+    if not os.path.isfile(path):
+        pytest.skip("~/docs/scripts/cc-ng-daemon.py not present (daemon hemisphere not under test)")
+    spec = importlib.util.spec_from_file_location("cc_ng_daemon_under_test_812", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cc_ng_daemon_under_test_812"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_n2_the_daemon_hemisphere_error_stat_is_bumped_by_a_formatter_failure(monkeypatch):
+    """The laptop daemon's _recall wires the same on_monitor_error=_bump_error. Skipped when the
+    daemon script is not under ~/docs/scripts (the run points $HOME/docs at a daemon worktree).
+    FAILS on the pre-fold tip."""
+    daemon = _load_daemon()
+    _wire(monkeypatch)
+    ng, texts = _build(_TWIN_SPEC)
+    _fail_formatter(ng, ValueError)
+    monkeypatch.setattr(daemon.STATE, "ng", ng)
+    monkeypatch.setattr(daemon.STATE, "conv_state", {})
+    monkeypatch.setattr(daemon.STATE, "commons", None)
+    before = daemon.STATE.stats["errors"]
+    out = daemon._recall("q", 3)
+    assert daemon.STATE.stats["errors"] == before + 1
+    assert texts["X"] in out and texts["P0"] in out
+
+
+def test_n3_pins_dedupe_before_budget_a_node_whose_monitor_copy_is_budget_dropped_can_vanish(
+        monkeypatch, caplog):
+    """N-3 (pre-existing #813; NOT changed by the N-2 fold, so this PINS the CURRENT behaviour).
+    X is in both streams. The display dedup removes X's pattern twin BEFORE the budget runs; the
+    budget then ranks X's monitor copy last (monitor weight 0.6 x min-max 0.0) and drops it: X
+    appears nowhere. (Without the dedup the twin, ranked first, would have survived.) If a later
+    change fixes this, this test must flip deliberately. Passes before AND after the fold."""
+    _wire(monkeypatch)
+    ng, texts = _build([("Y", 1500, 1.5, None),      # monitor-only, higher monitor score
+                        ("X", 1500, 1.0, 100.0),     # monitor copy ranks last; its twin would rank first
+                        ("P0", 1500, None, 99.0)])   # pattern-only
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.cc_assemble_recall(ng, "q", 5, {}, None)
+    assert texts["P0"] in out and texts["Y"] in out
+    assert texts["X"][:20] not in out                                    # X vanished whole: the pin
+    records = _drop_records(caplog)
+    assert len(records) == 1 and "dropping 1 whole items (1500 chars)" in records[0]
+
+
+def test_budget_binds_second_shape_many_small_items_under_a_tight_budget(monkeypatch, caplog):
+    """A second binding shape (count-driven, not size-driven): budget 1000, eight 300-char pattern
+    items. Strict rank prefix keeps the top THREE (900), drops FIVE whole (1500), ONE INFO line,
+    output order = rank order. Passes before AND after (coverage)."""
+    _wire(monkeypatch)
+    monkeypatch.setattr(pith, "_CC_PITH_L1_BUDGET", 1000)
+    spec = [(f"Q{i}", 300, None, 100.0 - i) for i in range(8)]
+    ng, texts = _build(spec)
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.cc_assemble_recall(ng, "q", 8, {}, None)
+    kept = [i for i in range(8) if texts[f"Q{i}"] in out]
+    assert kept == [0, 1, 2]
+    assert [out.index(texts[f"Q{i}"]) for i in kept] == sorted(out.index(texts[f"Q{i}"]) for i in kept)
+    for i in range(3, 8):
+        assert texts[f"Q{i}"][:12] not in out                            # absent whole, never a piece
+    assert _no_cut(out)
+    records = _drop_records(caplog)
+    assert len(records) == 1
+    assert "L1 budget 1000 chars" in records[0]
+    assert "dropping 5 whole items (1500 chars)" in records[0] and "kept 3 (900 chars)" in records[0]
+
+
+def _giant_with_trees(graph, nid, n_trees=3):
+    giant = "GIANT-START " + ("filler words " * 2300) + " GIANT-END"
+    graph.node(nid, giant, creation_mode="conversational")
+    trees = []
+    for i in range(n_trees):
+        tt = f"concept {i}: the checkpoint cadence decision number {i}"
+        trees.append(tt)
+        graph.node(f"{nid}-t{i}", tt, _tree_concept=True, _concept=tt)
+        graph.synapse(f"{nid}-f{i}", nid, f"{nid}-t{i}", 0.2)
+        graph.synapse(f"{nid}-b{i}", f"{nid}-t{i}", nid, 0.15)
+    return giant, trees
+
+
+def test_pith_off_an_over_budget_MONITOR_item_surfaces_as_trees_plus_reference(monkeypatch, caplog):
+    """Reference form, second shape: the over-budget item arrives through the MONITOR stream (whole at
+    the source), not the pattern stream. Real Pith-OFF cc_assemble_recall: it surfaces as its trees,
+    whole, plus the one-line whole-node reference; the giant text is never emitted or cut; the small
+    pattern item is whole. Passes before AND after (coverage of the existing P417 mechanism)."""
+    _wire(monkeypatch)
+    ng, texts = _build([("S0", 500, None, 99.0)])
+    giant, trees = _giant_with_trees(ng.graph, "cc:conv::bigmon")
+    node = ng.graph.nodes["cc:conv::bigmon"]
+    node.voltage, node.threshold, node.intrinsic_excitability = 2.0, 1.0, 1.0
+    ng._surfacing_monitor.after_step(types.SimpleNamespace(fired_node_ids=["cc:conv::bigmon"]))
+    assert ng._surfacing_monitor.get_surfaced()[0]["content"] == giant   # whole at the SOURCE
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.cc_assemble_recall(ng, "q", 5, {}, None)
+    assert "GIANT-START" not in out and "GIANT-END" not in out
+    assert "cc:conv::bigmon" in out and "long node" in out
+    assert all(tt in out for tt in trees)
+    assert texts["S0"] in out
+    assert any("above the reference limit" in r.getMessage() for r in caplog.records)
+
+
+def test_pith_off_an_over_budget_item_with_no_reference_form_is_dropped_loudly_never_cut(
+        monkeypatch, caplog):
+    """N-4 qualifier, PINNED: 'always keep the top item' holds only while the P417 reference form
+    can be built. An over-budget item whose node is unknown to the graph has no reference form
+    (_pith_reference_text -> None): it is a never-fit, dropped whole and LOUDLY (the one INFO line
+    names it), never cut. (cc_l1_budget clamps to 500-40000, so a tiny budget cannot be used to
+    force this.) Passes before AND after (a pin of #813's own record)."""
+    _wire(monkeypatch)
+    ng, texts = _build([("S0", 500, None, 99.0)])
+    ng._surfacing_monitor.get_surfaced = lambda max_items=None: [
+        {"node_id": "ghost", "content": "G" * 6000, "score": 1.5}]
+    with caplog.at_level(logging.INFO, logger=pith.logger.name):
+        out = pith.cc_assemble_recall(ng, "q", 5, {}, None)
+    assert "GGGGGGGG" not in out                                         # not emitted, not cut
+    assert texts["S0"] in out                                            # the rest still renders whole
+    records = _drop_records(caplog)
+    assert len(records) == 1 and "never-fit" in records[0] and "ghost" in records[0]

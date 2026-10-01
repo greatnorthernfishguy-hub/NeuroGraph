@@ -3,6 +3,19 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12861) — #812 N-2 fold:
+#   a monitor-formatter failure is reported and restores the pattern twins again
+# What: cc_assemble_recall calls monitor.format_context(monitor_items) once, immediately before
+#   the single un-Pithed return, as the e4ebf982 guard did: a failure is reported through
+#   on_monitor_error (the hemisphere error stat; RuntimeError stays silent, as before), empties
+#   the monitor stream, and restores the pattern twins from pc_all (the pattern list kept just
+#   before the display dedup). The renderer's own guard stays as the last resort. Pith-ON
+#   success path: unchanged (it returns before this point and never formats).
+# Why: le-043 N-2 / checker-034 N8 (LOW-MEDIUM): the turn-2 fork deletion moved the formatter
+#   into _cc_render_unpithed, after the dedup, losing the on_monitor_error report and the twin
+#   restore. Chief-003: fold approved (row #892).
+# How: ~14 lines in cc_assemble_recall; no signature change. N-3 (dedupe-before-budget) is NOT
+#   changed: recorded and pinned by a test (build-005.md).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2, part 2 (h):
 #   the #813 interim fork is DELETED; #813 is re-based onto #812
 # What: (1) _cc_monitor_items_whole and _format_cc_monitor_block (and their pointer comments and
@@ -5881,7 +5894,8 @@ def _cc_render_unpithed(ng: Any, monitor_items: List[Dict[str, Any]],
     if monitor is not None and kept_monitor:
         try:
             monitor_block = monitor.format_context(kept_monitor)
-        except Exception as exc:   # a surfacing pass must never crash or time out the hook
+        except Exception as exc:   # last resort (cc_assemble_recall already ran this call as the
+            # e4ebf982 guard: report + twin restore); a surfacing pass must never crash the hook
             logger.warning("monitor block formatting failed (%s); rendering without it",
                            type(exc).__name__)
     pc_block = _format_cc_recall_block([i for i in pc_results if id(i) in kept])
@@ -5951,6 +5965,9 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
         monitor_items = []
 
     pc_results: List[Dict[str, Any]] = []
+    # The pattern results BEFORE the display dedup against the monitor, kept so a monitor-
+    # formatter failure (below) can restore the pattern twins the dedup removed (#812 fold, N-2).
+    pc_all: List[Dict[str, Any]] = []
     # Everything pattern completion fired, before the display dedup against
     # the monitor below: the L1 budget's region is what fired, not what is new.
     pc_fired_ids: List[str] = []
@@ -5961,10 +5978,12 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # never how much of one.
             pc_results = cc_pattern_completion_recall(ng, query, k, state=conv_state)
             pc_fired_ids = [r.get('node_id') for r in pc_results if r.get('node_id')]
+            pc_all = list(pc_results)
             pc_results = [r for r in pc_results if r.get('node_id') not in monitor_node_ids]
         except Exception as exc:
             logger.debug('Pattern-completion recall failed (non-fatal): %s', exc)
             pc_results = []
+            pc_all = []
             pc_fired_ids = []
 
     # Read-only instrumentation (CC_RECALL_DEBUG): capture both raw streams
@@ -6083,4 +6102,29 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
 
     # Gate OFF, or the Pith path failed: the un-Pithed rendering -- two blocks, monitor first --
     # now WHOLE per item, size controlled by how MANY (the ONE budget rule, INFO on any drop).
+    #
+    # #812 fold (N-2): the e4ebf982 guard.  At e4ebf982 monitor.format_context ran INSIDE the
+    # get_surfaced try, so a failure there (a) was reported through on_monitor_error -- the same
+    # hemisphere error-stat route as a harvest failure -- except RuntimeError, the benign
+    # concurrent-mutation race, which was silent, and (b) emptied the monitor stream so the
+    # pattern twins the dedup had removed came back.  The fork deletion moved the formatter into
+    # the renderer, after the dedup, and lost both.  This is the same guard in the only place
+    # that reaches the renderer (gate OFF, or a Pith failure -- the Pith-ON success path returns
+    # above and never formats), so the Pith-ON path is unchanged.
+    if monitor_items:
+        monitor = getattr(ng, '_surfacing_monitor', None)
+        try:
+            if monitor is not None:
+                monitor.format_context(monitor_items)
+        except Exception as exc:
+            # Type only: an exception's text can carry item text.
+            logger.warning("monitor block formatting failed (%s); the monitor stream is dropped "
+                           "and its pattern twins are restored", type(exc).__name__)
+            if not isinstance(exc, RuntimeError) and on_monitor_error is not None:
+                try:
+                    on_monitor_error(exc)
+                except Exception:
+                    pass  # the error-reporting hook itself must never break recall
+            monitor_items = []
+            pc_results = pc_all
     return _cc_render_unpithed(ng, monitor_items, pc_results, commons, pc_fired_ids)
