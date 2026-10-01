@@ -11,14 +11,27 @@
 #   #905 behaviour: no file I/O, no log line. SET but missing / unreadable / not a regular file / over the cap / any malformed line / ZERO ids
 #   = fail CLOSED (hold ALL sweep-eligible unbound, as before) with ONE loud ERROR naming the failure CLASS; NEVER fail open.
 # Why: Exec P547/P548 (Josh's ruling; Chief-003 ruling B). The #897/#905 hold counted EVERY sweep-eligible unbound node, so a laptop-own
-#   unbound node (forest:2dfa2d637643, no binding in transit) froze the clock: it could neither wire nor be culled. Josh: "it should be
-#   allowed a chance to wire, just like any other fresh deposit, or be culled correctly for not wiring, and not because something isn't
-#   working right." The hold exists for CC-CALLOSUM-TRUTH §8.12: protect arrivals whose binding is IN TRANSIT -- not to freeze the clock for
-#   a node nothing is delivering a binding for. A laptop-own node gets the NORMAL orphan grace and the real dynamics (co-fire/sprout -> wired
-#   and live; not -> the sweep takes it BY DESIGN). This is NOT an exemption from the sweep and NOT a hold (CC-CALLOSUM-TRUTH §0/§2).
+#   unbound node (forest:2dfa2d637643, no binding in transit) froze the clock: it could neither wire nor be given its window by the sweep
+#   change that is still pending. Josh (P547, refined by P550): it should get a fair window to wire, not a cull at grace. The hold exists for
+#   CC-CALLOSUM-TRUTH §8.12: protect arrivals whose binding is IN TRANSIT -- not to freeze the clock for a node nothing is delivering a
+#   binding for. A laptop-own unbound node (no binding in transit) is NOT held: it no longer freezes the clock. THIS CHANGE DECIDES NOTHING ABOUT ITS
+#   FATE: it adds no exemption of laptop nodes anywhere in this module (CC-CALLOSUM-TRUTH §0/§2 forbid it) and does not touch the orphan sweep.
+#   What protects such a node through a fair window to wire (Exec P550, CC-CALLOSUM-TRUTH §8.13: the firing-keyed arrival exemption, sparing
+#   unbound nodes while probation_remaining > 0) is a SEPARATE change to the sweep (neuro_foundation._collect_orphan_nodes, a PROTECTED
+#   file), pending Josh's ceremony. That window closes on the AUTONOMIC clock, not a conversation: cc_ng_organism.cc_update_probation
+#   decrements probation_remaining once per call, driven by the daemon's _autosave_loop (a 60 s wall-clock pulse). Until the sweep change
+#   lands, the sweep AS IT STANDS applies its existing rule to an unbound node past orphan_node_grace_period.
 # How: held = sweep-eligible unbound ∩ (the static in-transit cohort ∪ this merge's `merge_landed`). The file stays static; once the cohort
 #   is bound the INTERSECTION empties its term and only the merge's own arrivals are held (§8.12 Layer 2). The P499 belt is UNCHANGED.
 #   Stats keys, ERROR text and counter meanings are unchanged; `..._preexisting` now counts HELD cohort nodes not delivered by this merge.
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14536) — #905-DELTA FOLLOW-UP (Exec P550 + ADDENDUM 1/2): wording + read-only accessor
+# What: (ADDENDUM 2) the earlier wording about a laptop-own node's fate at grace is replaced: this change only
+#   narrows what HOLDS THE CLOCK and decides nothing about the node's fate; its protected window is a separate pending sweep change, keyed to the
+#   AUTONOMIC clock (cc_update_probation, once per daemon _autosave_loop pulse). NO exemption of laptop nodes, no sweep change, no code behaviour
+#   change from these edits. (ADDENDUM 1) `in_transit_ids() -> Optional[FrozenSet[str]]`: read-only; the frozenset when VALID, None when UNSET /
+#   CORRUPT; shares the ONE cache and loader of held_unbound_nodes.
+# Why: Exec P550 (Josh refined P547); Chief-003 S4b gate ruling.
+# How: comments/docstrings + one 3-line function over `_in_transit_cohort()`.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13491) — #905 ROUND 2: COMMENTS AND DOCSTRINGS ONLY
 # What: (E.2) the two stale "no production caller yet (Phase 3)" header comments below are corrected: the daemon's handle_merge_topology
 #   (scripts/cc-ng-daemon.py, imports and calls merge_cc_topology) IS a production caller. (E.1) the "pre-existing" wording in the stats
@@ -530,9 +543,10 @@ def merge_cc_topology(
     IN TRANSIT -- in the static in-transit cohort (CC_NG_IN_TRANSIT_IDS_PATH) or one
     of THIS merge's own arrivals (`merge_landed`) that did not bind. A PROTECTED
     unbound node (the sweep spares it) does not block, and since #905-DELTA neither
-    does a laptop-OWN unbound node nothing is delivering a binding for: it takes the
-    normal orphan grace and the real dynamics (NOT an exemption from the sweep, and
-    not a hold; CC-CALLOSUM-TRUTH §8.12). With the variable unset the held set is the
+    does a laptop-OWN unbound node nothing is delivering a binding for (this change
+    decides nothing about its fate and adds no exemption; its protected window is a
+    separate, pending sweep change, see `held_unbound_nodes`; CC-CALLOSUM-TRUTH §8.12,
+    §8.13). With the variable unset the held set is the
     whole sweep-eligible unbound set (#897/#905), and so it is if the file is unusable
     (fail closed). The first guard (#108) asked
     only about this merge's arrivals; it never saw the pre-existing unbound
@@ -931,17 +945,21 @@ def merge_cc_topology(
         # was still to come over Leg 2, and the first tick whose arrivals were all
         # bound would have run 250 steps and let the sweep reap them. That widening
         # over-reached: it also counted a laptop-OWN unbound node, one no binding is
-        # in transit for (forest:2dfa2d637643). Nothing was ever going to wire it and
-        # the hold forbade the clock that could cull it -- under 25/250 Leg 2 stalled
+        # in transit for (forest:2dfa2d637643). Nothing was delivering a binding for it
+        # and the hold forbade the clock regardless -- under 25/250 Leg 2 stalled
         # after its first batch. §8.12 is why the hold exists: protect arrivals whose
         # binding is IN TRANSIT. So the held set is the sweep-eligible unbound nodes
         # that are (a) in the static in-transit cohort (`held_unbound_nodes`; the
         # once-read file CC_NG_IN_TRANSIT_IDS_PATH) or (b) in `merge_landed`. Once the
         # cohort is bound its term of the intersection is empty and only this merge's
-        # arrivals are held. A laptop-own unbound node is NOT held: it takes the NORMAL
-        # orphan grace and the real dynamics (co-firing, sprouting): wired -> live; not
-        # wired -> the sweep takes it BY DESIGN. That is NOT an exemption from the sweep
-        # (CC-CALLOSUM-TRUTH §0/§2 forbid exempting laptop nodes) and NOT a hold. The
+        # arrivals are held. A laptop-own unbound node is NOT held. This change decides
+        # NOTHING about its fate and adds NO exemption of laptop nodes here
+        # (CC-CALLOSUM-TRUTH §0/§2 forbid it): the protected window Josh asked for
+        # (P550, §8.13: spare unbound nodes while probation_remaining > 0) is a SEPARATE
+        # sweep change in neuro_foundation.py, pending his ceremony; that window closes on
+        # the AUTONOMIC clock (cc_ng_organism.cc_update_probation, once per daemon
+        # _autosave_loop pulse), not on a conversation. Until it lands, the sweep as it
+        # stands applies its existing rule to an unbound node past orphan grace. The
         # variable UNSET (the VPS) or unusable keeps the whole-graph hold (fail closed).
         #
         # So: consolidate only when NO held node exists (`_unbound_nodes` leaves out
@@ -1218,7 +1236,7 @@ def _decide_in_transit_state() -> Tuple[str, FrozenSet[str]]:
         logger.info(
             "CC topology in-transit hold: read the in-transit id set (%s): sha256=%s ids=%d. "
             "The whole-graph hold now covers only these ids plus the current merge's arrivals "
-            "(#905-DELTA); a laptop-own unbound node takes the normal orphan grace.",
+            "(#905-DELTA); a laptop-own unbound node is not held.",
             _IN_TRANSIT_ENV, digest, len(ids))
         return (_IN_TRANSIT_VALID, ids)
     logger.error(
@@ -1256,8 +1274,8 @@ def held_unbound_nodes(graph: Any, node_ids: Set[str], merge_landed: Optional[Se
     ruling; Chief-003 ruling B).
 
     `_unbound_nodes` answers "what would the sweep reap". The #897/#905 hold used that
-    answer whole, so a laptop-own unbound node (no binding in transit) froze the clock:
-    it could neither wire nor be culled. CC-CALLOSUM-TRUTH §8.12 is why the hold exists --
+    answer whole, so a laptop-own unbound node (no binding in transit) froze the clock
+    for good. CC-CALLOSUM-TRUTH §8.12 is why the hold exists --
     protect the arrivals whose binding is IN TRANSIT, until it lands. So:
 
         held = _unbound_nodes(graph, node_ids)
@@ -1273,11 +1291,18 @@ def held_unbound_nodes(graph: Any, node_ids: Set[str], merge_landed: Optional[Se
     set, never a union: once the cohort is bound its term is empty (the file stays static;
     the intersection empties it) and only a merge's own arrivals are held (§8.12 Layer 2).
 
-    A node outside that set -- a laptop-own unbound node -- is NOT held. It gets the NORMAL
-    orphan grace (`orphan_node_grace_period`) and the real dynamics: co-firing and
-    sprouting wire it and it lives; if nothing wires it the sweep takes it BY DESIGN. That
-    is NOT an exemption from the sweep (CC-CALLOSUM-TRUTH §0/§2 forbid exempting laptop
-    nodes; the sweep is unchanged) and NOT a hold.
+    A node outside that set -- a laptop-own unbound node -- is NOT held: it no longer freezes
+    the clock. THIS FUNCTION DECIDES NOTHING ABOUT ITS FATE and adds no exemption of laptop
+    nodes (CC-CALLOSUM-TRUTH §0/§2 forbid it); it only narrows what holds the clock. The
+    node's fair window to wire (Exec P550, §8.13: the firing-keyed arrival exemption, sparing
+    unbound nodes while `probation_remaining > 0`) is a SEPARATE change to the orphan sweep
+    (`neuro_foundation._collect_orphan_nodes`, a protected file), pending Josh's ceremony.
+    That window closes on the AUTONOMIC clock, not a conversation:
+    `cc_ng_organism.cc_update_probation` decrements `probation_remaining` per call and the
+    daemon's `_autosave_loop` (a 60 s wall-clock pulse) drives it. Until the sweep change
+    lands, the sweep as it stands applies its existing rule to an unbound node past
+    `orphan_node_grace_period`; co-firing and sprouting (the engine's own dynamics) can
+    still wire the node first.
 
     The variable UNSET, or SET but unusable (missing / unreadable / not a regular file /
     over the cap / any malformed line / zero ids), returns EXACTLY `_unbound_nodes(...)`:
@@ -1291,6 +1316,18 @@ def held_unbound_nodes(graph: Any, node_ids: Set[str], merge_landed: Optional[Se
     if merge_landed is None:
         return {n for n in base if n in cohort}
     return {n for n in base if n in cohort or n in merge_landed}
+
+
+def in_transit_ids() -> Optional[FrozenSet[str]]:
+    """The in-transit id set, READ-ONLY (ADDENDUM 1; the S4b bound-check reads it): the cached
+    frozenset when the source is VALID, `None` when CC_NG_IN_TRANSIT_IDS_PATH is UNSET or the
+    source is CORRUPT. It shares the ONE cache and the ONE loader `held_unbound_nodes` uses
+    (`_in_transit_cohort`: no second reader, no second parse; LAW 3). The first call may perform
+    the once-per-process read (and so emit its single INFO or loud ERROR); later calls never
+    re-read and never log. Never raises on a bad source. Callers must not hold
+    `graph._step_lock` for that first call (it may do file I/O). The ids are data: never log them."""
+    state, cohort = _in_transit_cohort()
+    return cohort if state == _IN_TRANSIT_VALID else None
 
 
 def redact_node_id(nid: Any) -> str:
