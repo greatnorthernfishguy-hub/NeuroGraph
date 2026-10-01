@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918: harness follows the merge; ack = BOUND
+# What: (1) the AST-extracted merge now also needs `_track_reoffers` (extracted) and the re-offer constants/state (namespace).
+#   (2) test_budget_and_unbound_arrival_guard_unchanged: its membership expectation was `[set(graph.nodes)]` -- it encoded "the
+#   ack includes unbound nodes". Under #918 the ack is the nodes held BOUND, so the expectation is now a parameter:
+#   budget 1 (a landed, its edges skipped because b was deferred) -> set(); unbound arrivals -> set(); bound -> {'a','b'}.
+# Why: #918 (Exec Packet 496): the ack means "I hold it BOUND". Nothing else asserted here changed; the first test's
+#   membership assertion ([{'a','b'}], both bound) is untouched and still passes.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905: harness follows the merge
 # What: the AST-extracted merge now references cc_topology_merge.whole_graph_guard and redact_node_id (so they join the
 #   extracted names, and hashlib/re join the namespace) and passes guard=/progress= to the consolidation, so the stub accepts them.
@@ -67,7 +74,7 @@ def load_merge(monkeypatch, graph, vectors, frames):
     source = Path(__file__).parents[1] / 'cc_topology_merge.py'
     tree = ast.parse(source.read_text())
     names = {'merge_cc_topology', 'cc_current_membership', '_unbound_nodes',
-             'whole_graph_guard', 'redact_node_id',
+             'whole_graph_guard', 'redact_node_id', '_track_reoffers',
              '_synapse_exists', '_hyperedge_exists', 'TopologyMergeAbort'}
     selected = ast.Module(body=[n for n in tree.body
                               if getattr(n, 'name', None) in names], type_ignores=[])
@@ -99,6 +106,8 @@ def load_merge(monkeypatch, graph, vectors, frames):
     ns = dict(Any=Any, Dict=Dict, List=List, Optional=Optional, Set=Set,
               os=os, re=re, hashlib=hashlib, np=np, logger=logging.getLogger(__name__),
               _DEFAULT_MAX_NODES_PER_CALL=25,
+              _REOFFER_WARN_STREAK_DEFAULT=5, _REOFFER_WARN_STREAK_ENV='CC_TOPOLOGY_REOFFER_WARN_STREAK',
+              _REOFFER_TABLE_CAP=1024, _reoffer_streaks={},
               _load_membership=lambda p: set(), _write_membership=membership,
               read_topology_frames=decode, is_cc_provenance=lambda nid, meta: True,
               _synapse_type=lambda value: value)
@@ -166,11 +175,13 @@ def test_capture_waits_for_complete_topology_and_vector_batch(monkeypatch, tmp_p
     assert graph.hyperedges['he'].level == 3
 
 
-@pytest.mark.parametrize('budget, bound, expected_nodes, expected_steps', [
-    (1, True, 1, 0), (25, False, 2, 0), (25, True, 2, 250),
+# #918: the ack is the set the receiver holds BOUND, so an unbound arrival (budget 1 leaves `a` without its edges;
+# bound=False carries none) is NOT in it. This column used to be `set(graph.nodes)`.
+@pytest.mark.parametrize('budget, bound, expected_nodes, expected_steps, expected_ack', [
+    (1, True, 1, 0, set()), (25, False, 2, 0, set()), (25, True, 2, 250, {'a', 'b'}),
 ])
 def test_budget_and_unbound_arrival_guard_unchanged(
-        monkeypatch, tmp_path, budget, bound, expected_nodes, expected_steps):
+        monkeypatch, tmp_path, budget, bound, expected_nodes, expected_steps, expected_ack):
     graph, vectors = FakeGraph(), {}
     merge, calls = load_merge(monkeypatch, graph, vectors, frames(bound))
     path = tmp_path / 'conduit'
@@ -179,5 +190,5 @@ def test_budget_and_unbound_arrival_guard_unchanged(
     assert result['absorbed_nodes'] == expected_nodes
     assert result['consolidation_steps'] == expected_steps
     assert calls['decode'] == 1
-    assert calls['membership'] == [set(graph.nodes)]
+    assert calls['membership'] == [expected_ack]
     assert result['deferred_by_budget'] == 2 - expected_nodes

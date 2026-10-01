@@ -14,6 +14,23 @@
 # Why: the #905 pair (checker-041 + le-054) found these two brief items not delivered by build-001 (ee94f7d2); Chief-003 ROUND 2 + AMENDMENTS 1/2.
 # How: NO code change. Every non-comment, non-docstring token is identical to ee94f7d2 (tokenize + ast.dump proof in returns/build-002.md).
 #   The :694 ERROR format string is BYTE-IDENTICAL; its loose parenthetical is REPORTED, not changed (AMENDMENT 2). No test file edited.
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918: the ack means "I hold it BOUND"
+# What: (1) `cc_current_membership` (the snapshot the sender reads as exclude_ids) is now the CC-provenance nodes MINUS
+#   the #905 sweep-eligible-unbound set (`_unbound_nodes`, called, never copied). Same name, signature and return type;
+#   still a PURE QUERY. (2) `merge_cc_topology` now counts, IN MEMORY ONLY, how many consecutive merge calls re-sent a
+#   node the receiver already held while it STAYED sweep-eligible-unbound (`_track_reoffers`, a separate function: the
+#   query stays pure) and logs ONE redacted WARNING per node when the streak reaches N
+#   (`_REOFFER_WARN_STREAK_DEFAULT` = 5, env CC_TOPOLOGY_REOFFER_WARN_STREAK). New stats keys `reoffered_unbound`,
+#   `reoffer_streak_warnings`, `reoffer_streak_nodes_at_or_over`. Nothing else in the merge changed (Tier 1/2/3,
+#   budget, guards, `_load_membership`, `_write_membership`).
+# Why: Exec Packet 496 via Chief-003 (RULED ADOPT, S4b-GATING). The #110 snapshot counted nodes the receiver holds
+#   UNBOUND, so after the first merge+push none of the laptop's 147 unbound cohort nodes was ever re-offered
+#   (exclude_ids): the #897/#905 clock hold forbids the cull and the #110 ack forbade the re-send -- a deadlock. A
+#   held-UNBOUND node still needs its binding; counting it acked was the defect. No deletion, no absence window and no
+#   per-node ack state: the ack is just recomputed from the same two live facts (CC provenance, bound-ness).
+# How: see the docstrings of `cc_current_membership` and `_track_reoffers`. RECEIVER-SIDE ONLY: the sender
+#   (cc_topology_export.py) is untouched. Cost: one whole-graph pass per merge call (the #897 guard measured ~9 ms at
+#   16k nodes). The one new env variable is CC_TOPOLOGY_REOFFER_WARN_STREAK (LAW 5).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 parts B, C, D (merge side)
 # What: (B) `_unbound_nodes` is now unbound AND sweep-eligible: a node the orphan sweep would never reap
 #   (graph._is_identity_protected: constitutional / '*_authored') no longer blocks the clock. Its signature is
@@ -207,6 +224,20 @@ logger = logging.getLogger(__name__)
 # pass -- a silent 2x bulk-dump against the exact Finding this guards.
 _DEFAULT_MAX_NODES_PER_CALL = int(os.environ.get("CC_TOPOLOGY_MERGE_MAX_NODES", "25"))
 
+# #918 receiver-side starvation alarm (see `_track_reoffers`). The sender re-offers a
+# node the receiver holds UNBOUND, oldest-first by VPS creation_time; a node that can
+# never bind could occupy frame budget every tick. The receiver cannot prevent that
+# (it is sender-side) but it must SEE and SAY it: one WARNING per node when it has been
+# re-offered `N` consecutive merge calls and is STILL sweep-eligible-unbound.
+# `N` = _REOFFER_WARN_STREAK_DEFAULT unless the env variable below (LAW 5; the ONLY new
+# one) overrides it. The table is IN MEMORY only (process lifetime): never persisted,
+# keyed by the redacted 12-hex sha256 form (never the raw id), HARD-CAPPED at
+# _REOFFER_TABLE_CAP entries and replaced -- never mutated -- on every call.
+_REOFFER_WARN_STREAK_DEFAULT = 5
+_REOFFER_WARN_STREAK_ENV = "CC_TOPOLOGY_REOFFER_WARN_STREAK"
+_REOFFER_TABLE_CAP = 1024
+_reoffer_streaks: Dict[str, int] = {}
+
 
 class TopologyMergeAbort(RuntimeError):
     """Raised when the conduit must not be absorbed at all (model mismatch,
@@ -215,26 +246,108 @@ class TopologyMergeAbort(RuntimeError):
 
 
 def cc_current_membership(graph: Any) -> Set[str]:
-    """The CC node IDs the receiver currently holds -- the authoritative source
-    for the SENDER's exclude_ids (#110).
+    """The CC node IDs the receiver holds BOUND -- the authoritative source for
+    the SENDER's exclude_ids (#110, narrowed by #918).
 
-    It is `graph.nodes` intersected with CC provenance, read live. Because it is
-    regenerated from the graph rather than appended to, a node culled locally
-    (#104 sweep, orphan collection, a rolled-back checkpoint) DROPS OUT of it --
-    so the exporter re-sends that node and #106's receive-side re-admission has
-    something to re-admit. The append-only journal this replaces could only grow,
-    so a culled id stayed excluded forever and the node was permanently
-    un-resendable: the §3 poison-pill, merely relocated to the send side. After
-    #110, presence in the graph is the authority on BOTH sides -- receive
-    admission (#106) and send exclusion.
+    THE ACK MEANS "I HOLD IT BOUND (not sweep-eligible)". It is the CC-provenance
+    nodes of `graph.nodes`, read live, MINUS `_unbound_nodes` of them -- the
+    #905 sweep-eligible-unbound set (no synapse, no hyperedge, not
+    identity-protected), the SAME function the #897/#905 clock hold and the
+    daemon's #896 rule 1 use (LAW 3: called, never copied). So a bound node is in;
+    a PROTECTED unbound node (constitutional / '*_authored') is in too -- it is
+    "held", exactly as the guard treats it; an unprotected unbound node is OUT.
+
+    WHY THE UNBOUND ONES MUST NOT BE IN (#918, Exec Packet 496). The snapshot
+    used to be `graph.nodes` intersected with CC provenance, bound or not. A node
+    the receiver holds UNBOUND then counted as acked and was never a sender
+    candidate again, while the clock hold (#897/#905) forbids the cull that would
+    have dropped it out of the snapshot (#110's recovery) -- a deadlock: the
+    cull-and-resend recovery and the hold forbid each other, and the 147-node
+    unbound cohort could never be re-offered with the hyperedges that bind it. A
+    held-UNBOUND node still needs its binding; "I hold it bound" is the only
+    reading of an ack under which the sender keeps offering it. No deletion, no
+    absence window and no per-node ack state is involved: the snapshot is
+    recomputed from the live graph on every call.
+
+    What #110 established is unchanged. Because it is regenerated from the graph
+    rather than appended to, a node culled locally (#104 sweep, orphan
+    collection, a rolled-back checkpoint) DROPS OUT of it -- so the exporter
+    re-sends that node and #106's receive-side re-admission has something to
+    re-admit. The append-only journal this replaces could only grow, so a culled
+    id stayed excluded forever: the §3 poison-pill, merely relocated to the send
+    side. Presence in the graph stays the authority on both sides -- receive
+    admission (#106) and send exclusion -- and now BOUND presence for send.
 
     Uses the same predicate the exporter classifies with (is_cc_provenance, via
     cc_topology_export._is_cc_node), so what the receiver advertises as held and
     what the sender considers CC-exportable cannot drift apart.
+
+    PURE QUERY (LAW 4): no counter, no log, no state, no write. The re-offer
+    starvation counter lives in `_track_reoffers`, called from the merge, never
+    here. Cost: one whole-graph pass per call (the `_unbound_nodes` walk; the
+    #897 guard measured ~9 ms at 16k nodes) -- once per merge call.
     """
     with graph._step_lock:
-        return {nid for nid, node in graph.nodes.items()
-                if is_cc_provenance(nid, getattr(node, "metadata", None) or {})}
+        cc = {nid for nid, node in graph.nodes.items()
+              if is_cc_provenance(nid, getattr(node, "metadata", None) or {})}
+        return cc - _unbound_nodes(graph, cc)
+
+
+def _track_reoffers(graph: Any, reoffered: Set[str]) -> Dict[str, int]:
+    """The #918 receiver-side re-offer counter (bounded and LOUD). Bookkeeping, so
+    it lives HERE and not in `cc_current_membership` (LAW 4: the query stays pure).
+
+    `reoffered` = the ids this merge call's frames carried that the receiver
+    already held. Of those, the ones STILL sweep-eligible-unbound after the call
+    (`_unbound_nodes`, the one shared predicate) extend their streak by one; every
+    other entry is dropped -- a node that became bound, was not re-sent in this call,
+    or is protected resets to zero. When a node's streak reaches `N` consecutive
+    merge calls (`_REOFFER_WARN_STREAK_DEFAULT`, overridable by
+    CC_TOPOLOGY_REOFFER_WARN_STREAK) ONE WARNING is logged for it; it is not logged
+    again unless the streak resets and climbs back to `N`.
+
+    Privacy (LAW 7): the table key and the record carry ONLY the redacted
+    `<kind>:<12 hex of sha256(id)>` form from `redact_node_id` -- never the id and
+    never text; tree ids embed the user's own words. The table is in memory only (no
+    persisted per-node state, nothing in the ack), hard-capped at
+    `_REOFFER_TABLE_CAP`: when more nodes than that qualify in one call the longest
+    streaks are kept (the ones nearest to / past the alarm) and the rest start over.
+    The table is rebuilt and swapped as a whole, so a concurrent reader never sees a
+    half-updated one.
+
+    Returns {"still_unbound", "warnings", "at_or_over"} for the stats dict.
+    """
+    global _reoffer_streaks
+    try:
+        n = int(os.environ.get(_REOFFER_WARN_STREAK_ENV, _REOFFER_WARN_STREAK_DEFAULT))
+    except (TypeError, ValueError):
+        n = _REOFFER_WARN_STREAK_DEFAULT
+    n = max(1, n)
+    with graph._step_lock:
+        still = _unbound_nodes(graph, set(reoffered))
+    prior = _reoffer_streaks
+    streaks = {}
+    for nid in still:
+        key = redact_node_id(nid)
+        streaks[key] = prior.get(key, 0) + 1
+    if len(streaks) > _REOFFER_TABLE_CAP:
+        keep = sorted(streaks, key=lambda k: (-streaks[k], k))[:_REOFFER_TABLE_CAP]
+        streaks = {k: streaks[k] for k in keep}
+    _reoffer_streaks = streaks
+    at_or_over = sum(1 for s in streaks.values() if s >= n)
+    warnings = 0
+    for key in sorted(streaks):
+        if streaks[key] == n:
+            warnings += 1
+            logger.warning(
+                "CC topology: node %s has been re-offered by the sender in %d consecutive "
+                "merge call(s) and is STILL unbound and sweep-eligible (alarm threshold "
+                "N=%d, %s; %d node(s) now at/over it). A node that cannot bind and is "
+                "re-offered every tick can occupy the sender's frame budget (candidates "
+                "are ordered oldest-first by creation_time): #918 receiver-side "
+                "starvation alarm. The id is redacted (kind:sha256-prefix).",
+                key, streaks[key], n, _REOFFER_WARN_STREAK_ENV, at_or_over)
+    return {"still_unbound": len(still), "warnings": warnings, "at_or_over": at_or_over}
 
 
 def _load_membership(membership_path: Optional[str]) -> Set[str]:
@@ -359,6 +472,17 @@ def merge_cc_topology(
     through the rest of the 250 steps. A pass held that way is counted in
     `consolidation_held_midpass`, never in `consolidation_passes` /
     `consolidation_steps`.
+
+    THE ACK MEANS "I HOLD IT BOUND" (#918). The membership snapshot written at the
+    end of every call (the sender's exclude_ids) is `cc_current_membership`: the
+    CC nodes MINUS the sweep-eligible-unbound set, so a node this call left
+    unbound is NOT acked and the sender re-offers it. A re-offered node the
+    receiver already holds is `skipped_present` in Tier 1 and is a usable
+    endpoint, so Tier 2 lands the frame's synapses onto it and Tier 3 its
+    hyperedge (a bound node then enters the next ack). A node that stays
+    unbound across `N` consecutive calls is reported, once, by `_track_reoffers`
+    (stats `reoffered_unbound`, `reoffer_streak_warnings`,
+    `reoffer_streak_nodes_at_or_over`).
     """
     from cc_ng_organism import _cc_deposit_memory_node, _cc_callosum_consolidate
 
@@ -372,7 +496,9 @@ def merge_cc_topology(
         raise TopologyMergeAbort(
             "MACHINE_ID unset -- cannot verify this conduit is not our own export")
 
+    global _reoffer_streaks
     if not os.path.exists(conduit_path):
+        _reoffer_streaks = {}   # #918: a call that re-sent nothing resets every streak
         return {"status": "no_conduit", "path": conduit_path, "absorbed_nodes": 0}
 
     with open(conduit_path, "rb") as fh:
@@ -380,6 +506,7 @@ def merge_cc_topology(
 
     frames = list(read_topology_frames(raw))
     if not frames:
+        _reoffer_streaks = {}   # #918: same -- nothing was re-sent in this call
         return {"status": "empty", "path": conduit_path, "absorbed_nodes": 0}
 
     header = frames[0]
@@ -433,6 +560,13 @@ def merge_cc_topology(
         # stopped part-way (a node became unbound between slices). NOT counted in
         # consolidation_passes / consolidation_steps: held, not done.
         "consolidation_held_midpass": 0,
+        # #918 receiver-side starvation alarm (`_track_reoffers`): nodes the frames
+        # re-sent that the receiver already held and that are STILL sweep-eligible-
+        # unbound after this call; the WARNINGs logged this call (a node's streak just
+        # reached N); and the nodes at/over N in the in-memory table.
+        "reoffered_unbound": 0,
+        "reoffer_streak_warnings": 0,
+        "reoffer_streak_nodes_at_or_over": 0,
     }
 
     budget = max_nodes_per_call
@@ -451,6 +585,9 @@ def merge_cc_topology(
     # receiver already held is counted under "from this merge" /
     # `consolidation_skipped_unbound_arrivals`. (#905 round 2: wording only.)
     merge_landed: Set[str] = set()
+    # #918: ids the frames carried that the receiver ALREADY held (Tier 1's
+    # `skipped_present`), across all batches of this call. Fed to `_track_reoffers`.
+    reoffered_present: Set[str] = set()
 
     for frame in frames[1:]:
         if frame.get("kind") != "batch":
@@ -479,6 +616,7 @@ def merge_cc_topology(
                 if nid in graph.nodes:
                     stats["skipped_present"] += 1
                     batch_landed.add(nid)   # present == usable as an endpoint
+                    reoffered_present.add(nid)   # #918: counted by `_track_reoffers`
                     continue
                 if nid in held:
                     # NO `continue` HERE -- #106. Falling through is the fix.
@@ -755,12 +893,28 @@ def merge_cc_topology(
                 elif progress.get("held"):
                     stats["consolidation_held_midpass"] += 1
 
+    # #918: the receiver-side starvation alarm. Evaluated AFTER every batch (and its
+    # Tier 2/3) has run, so "still unbound" means still unbound once this call's
+    # frames have bound what they could. Bookkeeping in its own function (the
+    # membership query below stays pure). One WARNING per node when its streak of
+    # consecutive re-offers reaches N; in-memory only; never in the ack.
+    track = _track_reoffers(graph, reoffered_present)
+    stats["reoffered_unbound"] = track["still_unbound"]
+    stats["reoffer_streak_warnings"] = track["warnings"]
+    stats["reoffer_streak_nodes_at_or_over"] = track["at_or_over"]
+
     # #110: overwrite the membership snapshot with the receiver's CURRENT CC
     # membership -- what the sender reads as exclude_ids. Full overwrite, not an
     # append of `landed_ids`: a node culled since the last pass must DROP OUT so
     # the sender re-sends it (the send-side counterpart of #106's receive-side
     # re-admission). Sourced from graph.nodes, so re-admitted nodes reappear and
     # culled ones vanish without any per-pass dedup bookkeeping.
+    #
+    # #918: THE ACK MEANS "I HOLD IT BOUND". `cc_current_membership` is the CC
+    # nodes MINUS the #905 sweep-eligible-unbound set, so a node this call left
+    # unbound is NOT acked and the sender keeps re-offering it (with the hyperedge
+    # that binds it). Counting a held-unbound node as acked deadlocked against the
+    # #897/#905 clock hold: the hold forbids the cull, the ack forbade the re-send.
     _write_membership(membership_path, cc_current_membership(graph))
 
     stats["completed"] = stats["deferred_by_budget"] == 0

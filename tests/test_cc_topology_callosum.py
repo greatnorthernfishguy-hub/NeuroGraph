@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918 expectation updates (2 tests)
+# What: test_membership_snapshot_feeds_sender_exclude_ids and test_culled_node_drops_out_of_exclude_ids_and_is_resent encoded
+#   "the ack includes UNBOUND nodes": their sender fixture holds an isolated forest turn (f2: no synapse, no hyperedge) that lands
+#   UNBOUND on the receiver, and they asserted it was acked and never re-sent (held == all four ids; exported_nodes == 0 /
+#   {t1} alone). Under #918 the ack means "I hold it BOUND", so f2 is not acked and IS re-offered: held == the three bound ids,
+#   the re-send is {f2} (and {t1, f2} after the cull). New helper _resent_ids.
+# Why: #918 (Exec Packet 496): a held-UNBOUND node still needs its binding; counting it acked deadlocked against the #897/#905
+#   clock hold. The intent of both tests (the receiver's CURRENT membership is exclude_ids; a culled node drops out and is re-sent)
+#   is unchanged and still asserted. No other test in this file changed.
+# -------------------
 """Callosum Leg 2 -- topology export/merge round-trip tests.
 
 Deliberately exercises a REAL neuro_foundation.Graph and a REAL SimpleVectorDB
@@ -656,6 +667,11 @@ def test_readmitted_node_restores_full_hyperedge_membership(tmp_path):
         "the culled member was re-absorbed but left unbound"
 
 
+def _resent_ids(path):
+    return {rec["id"] for frame in tex.read_topology_frames(open(path, "rb").read())
+            for rec in (frame.get("nodes") or ())}
+
+
 def test_membership_snapshot_feeds_sender_exclude_ids(tmp_path):
     """The snapshot's real job is sender-side: the receiver's current membership
     becomes the exporter's exclude_ids so the sender stops re-transmitting what
@@ -668,12 +684,15 @@ def test_membership_snapshot_feeds_sender_exclude_ids(tmp_path):
     _merge(rg, rv, path, tmp_path)
 
     held = set((tmp_path / "membership.txt").read_text().split())
-    assert held == set(ids.values())
+    # #918: the ack is what the receiver holds BOUND. f2 is an isolated forest turn (no synapse, no hyperedge): the receiver
+    # holds it UNBOUND, so it is not acked. (Was: `held == set(ids.values())` and `exported_nodes == 0`.)
+    assert held == set(ids.values()) - {ids["f2"]}
     assert held == tmg.cc_current_membership(rg)   # the file IS the live membership
 
-    _, est = _export(sg, sv, tmp_path, exclude_ids=held)
-    assert est["exported_nodes"] == 0, \
-        "sender kept re-sending nodes the receiver already holds"
+    path2, est = _export(sg, sv, tmp_path, exclude_ids=held)
+    # the sender stopped re-transmitting what the receiver holds BOUND; the held-UNBOUND node is re-offered
+    assert est["exported_nodes"] == 1 and _resent_ids(path2) == {ids["f2"]}, \
+        "sender kept re-sending nodes the receiver already holds bound (or stopped re-offering the unbound one)"
 
 
 def test_culled_node_drops_out_of_exclude_ids_and_is_resent(tmp_path):
@@ -690,10 +709,11 @@ def test_culled_node_drops_out_of_exclude_ids_and_is_resent(tmp_path):
     rg, rv = _receiver()
     _merge(rg, rv, path, tmp_path)
 
-    # Before the cull: given current membership, the exporter re-sends nothing.
+    # Before the cull: given current membership, the exporter re-sends nothing BOUND. (#918: f2, the isolated forest turn the
+    # receiver holds UNBOUND, is not acked, so it alone is re-offered; this used to assert exported_nodes == 0.)
     held = tmg.cc_current_membership(rg)
-    _, e0 = _export(sg, sv, tmp_path, exclude_ids=held)
-    assert e0["exported_nodes"] == 0
+    p0, e0 = _export(sg, sv, tmp_path, exclude_ids=held)
+    assert e0["exported_nodes"] == 1 and _resent_ids(p0) == {ids["f2"]}
 
     # The #104 cull takes t1 locally.
     rg.remove_node(ids["t1"])
@@ -702,10 +722,11 @@ def test_culled_node_drops_out_of_exclude_ids_and_is_resent(tmp_path):
     held = tmg.cc_current_membership(rg)
     assert ids["t1"] not in held
     resent_path, e1 = _export(sg, sv, tmp_path, exclude_ids=held)
-    assert e1["exported_nodes"] == 1
+    assert e1["exported_nodes"] == 2
     resent = {rec["id"] for frame in tex.read_topology_frames(open(resent_path, "rb").read())
               for rec in (frame.get("nodes") or ())}
-    assert resent == {ids["t1"]}, "the culled node -- and only it -- must be re-sent"
+    # #918: the culled bound node -- plus the held-unbound f2 that was never acked (was: {t1} alone)
+    assert resent == {ids["t1"], ids["f2"]}, "the culled node must be re-sent (and no other BOUND node)"
 
 
 def test_readmit_counter_not_incremented_when_deposit_fails(tmp_path, monkeypatch):
