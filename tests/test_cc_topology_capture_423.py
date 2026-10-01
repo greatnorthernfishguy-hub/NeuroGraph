@@ -1,12 +1,19 @@
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905: harness follows the merge
+# What: the AST-extracted merge now references cc_topology_merge.whole_graph_guard and redact_node_id (so they join the
+#   extracted names, and hashlib/re join the namespace) and passes guard=/progress= to the consolidation, so the stub accepts them.
+# Why: Part D (the merge passes the per-slice guard) and Part C (the ERROR sample is redacted). Nothing the tests assert changed;
+#   `_unbound_nodes` keeps its (graph, node_ids) arity, which is the pin this file exists for.
 # [2026-09-11] Codex — #423 topology capture interleaving regression tests
 # What: execute canonical merge AST with fake graphs and in-memory conduit frames.
 # Why: capture must observe completed node/vector/binding batches, with I/O outside.
 # How: deterministic thread barriers; no Graph, model or checkpoint constructors.
 # -------------------
 import ast
+import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 import sys
 import threading
@@ -60,6 +67,7 @@ def load_merge(monkeypatch, graph, vectors, frames):
     source = Path(__file__).parents[1] / 'cc_topology_merge.py'
     tree = ast.parse(source.read_text())
     names = {'merge_cc_topology', 'cc_current_membership', '_unbound_nodes',
+             'whole_graph_guard', 'redact_node_id',
              '_synapse_exists', '_hyperedge_exists', 'TopologyMergeAbort'}
     selected = ast.Module(body=[n for n in tree.body
                               if getattr(n, 'name', None) in names], type_ignores=[])
@@ -70,7 +78,7 @@ def load_merge(monkeypatch, graph, vectors, frames):
         assert g._step_lock._is_owned()
         v[nid] = emb.copy()
 
-    def consolidate(g, steps):
+    def consolidate(g, steps, *, guard=None, progress=None):
         assert not g._step_lock._is_owned(), 'step -> concurrent inversion'
         calls['consolidation'].append(steps)
         return True
@@ -89,7 +97,7 @@ def load_merge(monkeypatch, graph, vectors, frames):
     organism._cc_callosum_consolidate = consolidate
     monkeypatch.setitem(sys.modules, 'cc_ng_organism', organism)
     ns = dict(Any=Any, Dict=Dict, List=List, Optional=Optional, Set=Set,
-              os=os, np=np, logger=logging.getLogger(__name__),
+              os=os, re=re, hashlib=hashlib, np=np, logger=logging.getLogger(__name__),
               _DEFAULT_MAX_NODES_PER_CALL=25,
               _load_membership=lambda p: set(), _write_membership=membership,
               read_topology_frames=decode, is_cc_provenance=lambda nid, meta: True,

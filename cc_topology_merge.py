@@ -3,6 +3,19 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 parts B, C, D (merge side)
+# What: (B) `_unbound_nodes` is now unbound AND sweep-eligible: a node the orphan sweep would never reap
+#   (graph._is_identity_protected: constitutional / '*_authored') no longer blocks the clock. Its signature is
+#   unchanged. The sweep's AGE term is left out ON PURPOSE (see the docstring). (C) `redact_node_id`, the ONE
+#   redaction rule for any unbound-id sample: '<kind>:<12 hex of sha256(id)>', never the id; applied to the #897
+#   per-batch ERROR sample (tree ids embed the user's concept text). (D) `whole_graph_guard(graph)`, the ONE
+#   constructor of the per-slice guard both _cc_callosum_consolidate callers use; the merge now PASSES it plus a
+#   `progress` dict, and reports a pass held mid-way as `consolidation_held_midpass` (not counted as consolidated).
+#   #897's batch-end check stays as the OUTER check (does the pass start at all).
+# Why: Exec Packets 489/490 (Chief-003), le-047 C3 / le-048. A protected unbound node blocked consolidation forever
+#   although the sweep spares it; a raw id sample printed the user's words; a node that became unbound BETWEEN the
+#   25-step slices aged against orphan grace 25 through the rest of the 250 (the guard was evaluated once).
+# How: see the docstrings of `_unbound_nodes`, `redact_node_id`, `whole_graph_guard`. No env variable, no knob.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane merge-guard-897, dispatch #12973) — #897: the consolidation guard covers the WHOLE graph
 # What: the between-batch consolidation guard no longer asks `_unbound_nodes(graph, merge_landed)`
 #   (this merge's arrivals only); it asks `_unbound_nodes(graph, set(graph.nodes))` -- the SAME
@@ -157,9 +170,11 @@
 #   wired correct now so #88's first live run inherits it.
 # -------------------
 
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Set
 
@@ -305,8 +320,10 @@ def merge_cc_topology(
 
     THE GUARD COVERS THE WHOLE GRAPH (#897). The steps are skipped -- counted
     and logged at ERROR, once per blocked batch -- while ANY node in the graph
-    is unbound (no synapse, no hyperedge): one of this merge's own arrivals that
-    did not bind, OR one that was already there. The first guard (#108) asked
+    is unbound AND sweep-eligible (`_unbound_nodes`: no synapse, no hyperedge,
+    not identity-protected; #905): one of this merge's own arrivals that
+    did not bind, OR one that was already there. A PROTECTED unbound node (the
+    sweep spares it) does not block. The first guard (#108) asked
     only about this merge's arrivals; it never saw the pre-existing unbound
     conversational cohort, so the first merge whose arrivals were all bound
     would have run 250 steps against orphan grace 25 and handed the cohort to
@@ -317,6 +334,14 @@ def merge_cc_topology(
     merge's arrivals still unbound at a skip) and
     `consolidation_skipped_unbound_preexisting` (the rest, summed per blocked
     batch). Same predicate as the daemon's #896 rule 1.
+
+    THE GUARD IS ALSO PER SLICE (#905 part D). The check above decides whether a
+    pass STARTS. The pass itself (`_cc_callosum_consolidate`) re-checks the same
+    predicate (`whole_graph_guard`) before EACH lock slice, so a node that becomes
+    unbound between slices stops the pass at the slice boundary instead of aging
+    through the rest of the 250 steps. A pass held that way is counted in
+    `consolidation_held_midpass`, never in `consolidation_passes` /
+    `consolidation_steps`.
     """
     from cc_ng_organism import _cc_deposit_memory_node, _cc_callosum_consolidate
 
@@ -380,6 +405,10 @@ def merge_cc_topology(
         # `consolidation_blocked_batches` is +1 per blocked batch.
         "consolidation_skipped_unbound_preexisting": 0,
         "consolidation_blocked_batches": 0,
+        # #905 part D: passes the batch-end guard let START but the per-slice guard
+        # stopped part-way (a node became unbound between slices). NOT counted in
+        # consolidation_passes / consolidation_steps: held, not done.
+        "consolidation_held_midpass": 0,
     }
 
     budget = max_nodes_per_call
@@ -667,13 +696,27 @@ def merge_cc_topology(
                     "because orphan grace is denominated in the clock consolidation "
                     "would advance, and the pre-existing cohort binds only over Leg 2 "
                     "(CC-CALLOSUM-TRUTH §2/§10.4-H). Consolidation stays blocked "
-                    "until every one of them is bound (#897).",
+                    "until every one of them is bound (#897). Sample ids are redacted "
+                    "(kind:sha256-prefix, #905): tree ids embed the user's own words.",
                     idle_steps, stats["batches_read"], len(unbound),
                     len(preexisting), len(from_merge), len(merge_landed),
-                    sorted(unbound)[:3])
-            elif _cc_callosum_consolidate(graph, idle_steps):
-                stats["consolidation_passes"] += 1
-                stats["consolidation_steps"] += idle_steps
+                    [redact_node_id(n) for n in sorted(unbound)[:3]])
+            else:
+                # #905 part D: the per-slice guard re-checks the whole graph before
+                # EACH 25-step slice, inside the shared _cc_callosum_consolidate
+                # (the daemon's drain builds the SAME guard from
+                # whole_graph_guard). The check above is the OUTER one: it decides
+                # whether the pass starts; the per-slice one decides whether it
+                # continues. A pass held part-way is reported, not counted as
+                # consolidated; the function already logged its own loud record.
+                progress: Dict[str, Any] = {}
+                if _cc_callosum_consolidate(
+                        graph, idle_steps,
+                        guard=whole_graph_guard(graph), progress=progress):
+                    stats["consolidation_passes"] += 1
+                    stats["consolidation_steps"] += idle_steps
+                elif progress.get("held"):
+                    stats["consolidation_held_midpass"] += 1
 
     # #110: overwrite the membership snapshot with the receiver's CURRENT CC
     # membership -- what the sender reads as exclude_ids. Full overwrite, not an
@@ -694,29 +737,109 @@ def merge_cc_topology(
 
 
 def _unbound_nodes(graph: Any, node_ids: Set[str]) -> Set[str]:
-    """Which of `node_ids` are anchored by nothing the orphan sweep respects.
+    """Which of `node_ids` would the orphan sweep reap once the clock moves.
 
-    Mirrors the sweep's own predicate (neuro_foundation.py:3487): a node is
-    reap-eligible only when it has no outgoing synapse, no incoming synapse AND
-    no hyperedge membership. Hyperedge membership is an independent, equally
-    sufficient anchor -- counting synapse degree alone reports catastrophic
-    false positives (CC-CALLOSUM-TRUTH.md §1.1, and note synapses key on
-    pre_node_id/post_node_id, not source_id/target_id).
+    #905 / Exec Packet 489 (class ruling, both guards): the guard asks "would
+    advancing the clock make the sweep reap this node", so a node counts when it
+    has NO outgoing synapse, NO incoming synapse, NO hyperedge membership AND is
+    NOT identity-protected. That is the sweep's own test
+    (neuro_foundation._collect_orphan_nodes, ~:3595-3603) MINUS ONE TERM -- see
+    the age exclusion below. The protection leg is `graph._is_identity_protected`
+    itself (constitutional / '*_authored'), CALLED, never copied: one definition
+    (LAW 3), so the guard and the sweep cannot drift apart. A protected unbound
+    node is spared by the sweep for reasons unrelated to binding, so it must not
+    hold the clock forever; an unprotected one (e.g. a '*_emergent' want, a
+    conversational forest/tree) is exactly what the clock would reap, so it does.
+    This is NOT an exemption FROM the sweep (the sweep is unchanged); it is the
+    guard reading its rule by what it protects. Hyperedge membership stays an
+    independent, equally sufficient anchor -- counting synapse degree alone
+    reports catastrophic false positives (CC-CALLOSUM-TRUTH.md §1.1, and note
+    synapses key on pre_node_id/post_node_id, not source_id/target_id).
 
-    Identity protection is deliberately NOT consulted: this asks "would
-    advancing the clock endanger this arrival", and a protected node is spared
-    for reasons unrelated to whether the batch bound it. Treating protection as
-    boundness would let a half-bound batch consolidate.
+    THE AGE TERM IS EXCLUDED ON PURPOSE -- do not "fix" it back in. The sweep
+    also requires `timestep - creation_time > orphan_node_grace_period`. This
+    guard exists to stop the CLOCK from aging a node PAST that grace. At the
+    moment the guard decides, an unbound unprotected node is typically age 0
+    (just minted or just landed), so an age term would say "not reap-eligible
+    yet" and let the clock run -- defeating the guard on the very case it exists
+    for. Intended consequence: an unprotected node that cannot bind HOLDS THE
+    CLOCK until it is ruled on by class. The "bounded observation window" the S4
+    plan gives for nodes that CAN bind is a WAIT-THEN-ESCALATE window: its expiry
+    puts those nodes on the #909 list to Josh for a decision per class. It NEVER
+    releases the clock hold, and nothing in this code has an expiry or an early
+    release.
+
+    A graph object without `_is_identity_protected` (an incomplete test double)
+    is NOT exempted: its unbound nodes still count -- fail toward holding the
+    clock. Pure query: no write, no lock (callers hold what they need).
+    Signature is pinned by the daemon (arity) -- do not change it.
     """
     outgoing = getattr(graph, "_outgoing", {}) or {}
     incoming = getattr(graph, "_incoming", {}) or {}
     node_hyperedges = getattr(graph, "_node_hyperedges", {}) or {}
+    is_protected = getattr(graph, "_is_identity_protected", None)
     return {
         nid for nid in node_ids
         if not outgoing.get(nid)
         and not incoming.get(nid)
         and not node_hyperedges.get(nid)
+        # NO AGE TERM, ON PURPOSE (Exec P490; see the docstring): the sweep's
+        # `age > orphan_node_grace_period` is the one term left out. This guard
+        # stops the clock from aging a node past grace, and a node unbound at the
+        # moment of the decision is typically age 0 -- an age term would let the
+        # clock run on the very case the guard exists for. Do not add it back.
+        # Evaluated last: only structurally-unbound candidates reach the lookup.
+        and not (is_protected is not None and is_protected(nid))
     }
+
+
+def redact_node_id(nid: Any) -> str:
+    """The ONE redaction rule for any unbound-node-id sample that reaches a log
+    (#905 part C / Exec Packet 489 / #907): `<kind>:<first 12 hex of sha256(id)>`.
+
+    Never the id and never any substring of it: tree ids are
+    f"{target_id}::tree::{concept}" (ng_embed.py ~:1062), so the id embeds the
+    user's own concept words (LAW 7 / privacy). `<kind>` comes ONLY from
+    structural markers, never from free text: `tree` if the id contains
+    '::tree::', `window` if it contains '::window::', `want` if it starts with
+    'cc:want::' or 'want::', `forest` if it is exactly 'cc:conv::<40 hex>',
+    otherwise `node`. Pure, deterministic (the same id always gives the same
+    string) and cheap: only stdlib hashlib/re, already imported at module load.
+
+    Callers that cannot import this (the D24 daemon imports it lazily) must print
+    NO ids at all rather than fall back to the raw id.
+    """
+    s = nid if isinstance(nid, str) else str(nid)
+    if "::tree::" in s:
+        kind = "tree"
+    elif "::window::" in s:
+        kind = "window"
+    elif s.startswith("cc:want::") or s.startswith("want::"):
+        kind = "want"
+    elif re.fullmatch(r"cc:conv::[0-9a-f]{40}", s):
+        kind = "forest"
+    else:
+        kind = "node"
+    # surrogatepass: a lone surrogate must not raise inside a logging call.
+    return "%s:%s" % (kind, hashlib.sha256(s.encode("utf-8", "surrogatepass")).hexdigest()[:12])
+
+
+def whole_graph_guard(graph: Any):
+    """The ONE constructor of the per-slice consolidation guard (#905 part D;
+    LAW 3 / LAW 4: no per-caller copy of the predicate).
+
+    Returns a zero-argument callable that evaluates
+    `_unbound_nodes(graph, set(graph.nodes))` -- the same sweep-eligible,
+    whole-graph predicate as the merge's batch-end check and the daemon's
+    #896 rule 1 -- under `graph._step_lock` (an RLock), taken ONLY for the read.
+    The result is a set of currently blocking node ids (empty = clear). The ids
+    are for COUNTING ONLY by the consumer, `cc_ng_organism._cc_callosum_consolidate`,
+    which never logs them. The callable holds no lock between calls.
+    """
+    def _guard() -> Set[str]:
+        with graph._step_lock:
+            return _unbound_nodes(graph, set(graph.nodes))
+    return _guard
 
 
 def _hyperedge_exists(graph: Any, members: Set[str]) -> bool:

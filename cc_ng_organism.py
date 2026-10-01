@@ -3,6 +3,9 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4) -- TRIAL-branch hand-resolution of cherry-pick ee94f7d (#905)
+#   onto D24+#794..#897: _cc_callosum_consolidate's except block keeps D24's loud logger.error (it replaced the logger.debug line) AND
+#   #905's _fill(done, failed=True) before `return False`; the guard/progress signature and loop merged without conflict; no new behaviour.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4) -- TRIAL-branch hand-resolution of cherry-pick c625623 (#794)
 #   onto D24: drain_ingest_tract keeps D24's batch_nodes/receipt AND #794's hold_on_failure (LAST); the loop keeps both rules
 #   (the hold break, then D24's size check, then the entries cap); both changelog entries below kept; no new behaviour.
@@ -192,6 +195,24 @@
 #   ROLLOUT: this must merge BEFORE the daemon wiring slice -- a daemon passing the
 #   new kwargs to an older organism raises TypeError. Tests:
 #   tests/test_cc_recall_reporting.py.
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 parts A and D
+# What: (A) generate_emergent_want writes the new want BORN BOUND: in the SAME _step_lock block as create_node it
+#   writes one synapse seed -> want (weight 0.3, the surface_wants pattern) per existing, de-duplicated seed. If NO
+#   seed can be bound the new node is rolled back (graph.remove_node, same lock) and the function returns None with
+#   ONE WARNING (fixed reason code, counts, exception CLASS name only); if SOME bind the want stays and the
+#   shortfall is counted in ONE WARNING. The success return dict is byte-identical. (D) _cc_callosum_consolidate takes
+#   keyword-only `guard=None, progress=None`: before EACH slice (incl. the first) a given guard is called WITHOUT
+#   _concurrent_lock; a non-empty result stops the pass at the slice boundary (ONE logger.error, fixed reason code,
+#   steps done/remaining, COUNT of blockers, NO ids, NO str(exc)), returns False with progress held=True; a raising
+#   guard fails CLOSED (class name only, held and failed True). `progress` is filled on every return path. With
+#   guard=None the pass is byte-identical to before.
+# Why: Exec Packets 488 (C1) / 489 / 490. The emergent want was created with NO synapse: the whole-graph guards counted
+#   it as blocking and the orphan sweep reaps '*_emergent' (not identity-protected) after grace 25. And the "is it
+#   safe to advance the clock" check ran ONCE before 250 steps, so a node that became unbound between 25-step slices
+#   (a hook deposit) aged against grace through the rest of the pass (le-047 C3, le-048 note 3a; row #906 / C10).
+# How: the guard is built in ONE place, cc_topology_merge.whole_graph_guard, and both callers (the Leg 2 merge, the
+#   daemon's drain) pass it; this function holds no predicate of its own (LAW 3 / LAW 4). Slice size, lock slicing,
+#   success return value and what the steps do are unchanged.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -2013,6 +2034,47 @@ def generate_emergent_want(
                 "kind": "want", "want_text": want_text, "want_state": "open",
                 "provenance": provenance, "creation_mode": "emergent", "concept_key": concept_key,
             })
+            # #905 part A (Exec P488 C1): the want is BORN BOUND, in this same
+            # lock block -- one synapse seed -> want (weight 0.3, source -> want:
+            # the surface_wants pattern) per EXISTING, de-duplicated seed. A node
+            # with no synapse and no hyperedge is what the whole-graph guards
+            # count as blocking and what the orphan sweep reaps ('*_emergent' is
+            # not identity-protected, by design), so an unbindable want is never
+            # minted: if no seed binds, the node is rolled back below.
+            unique_seeds = list(dict.fromkeys(seed_ids))
+            bound = missing = failed = 0
+            fail_class = ""
+            for seed_id in unique_seeds:
+                if seed_id == want_id or seed_id not in graph.nodes:
+                    missing += 1
+                    continue
+                try:
+                    graph.create_synapse(seed_id, want_id, weight=0.3)
+                    bound += 1
+                except Exception as exc:  # noqa: BLE001 - counted and logged below, never silent (P370)
+                    failed += 1
+                    fail_class = type(exc).__name__
+            if bound == 0:
+                rolled_back = True
+                try:
+                    graph.remove_node(want_id)
+                except Exception as exc:  # noqa: BLE001
+                    rolled_back = False
+                    fail_class = type(exc).__name__
+                # ONE record: fixed reason code, counts, exception CLASS only
+                # (never str(exc), never the want text or any id).
+                logger.log(
+                    logging.WARNING if rolled_back else logging.ERROR,
+                    "CC emergent want NOT materialized: reason=%s seeds=%d bound=0 "
+                    "missing=%d failed=%d exc_class=%s rolled_back=%s",
+                    "no_bindable_seed" if rolled_back else "rollback_failed",
+                    len(unique_seeds), missing, failed, fail_class or "-", rolled_back)
+                return None
+            if missing or failed:
+                logger.warning(
+                    "CC emergent want partially bound: reason=seed_shortfall seeds=%d "
+                    "bound=%d missing=%d failed=%d exc_class=%s",
+                    len(unique_seeds), bound, missing, failed, fail_class or "-")
             logger.info("CC emergent want materialized: %s", want_text)
             return {"id": want_id, "text": want_text, "provenance": provenance, "state": "open"}
     except Exception as exc:
@@ -3181,7 +3243,7 @@ def trickle_gateway_conduit(data: bytes, conduit_dir: str = None) -> Optional[st
         return None
 
 
-def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
+def _cc_callosum_consolidate(graph, idle_steps: int, *, guard=None, progress=None) -> bool:
     """FatherGraph Finding 3 sleep consolidation: run idle_steps of pure
     graph.step() with NO new input, so homeostatic regulation (threshold
     adaptation, synaptic scaling, excitability) can catch up before the next
@@ -3189,8 +3251,37 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
     FatherGraph training; the report calls it "not optional -- it's what
     makes merge work". Mirrors _handle_import (cc_ng_host.py) and
     import_trickle (cc-ng-sync.py), which already do exactly this.
-    Returns True if the steps ran. Fails soft."""
+    Returns True if the steps ran. Fails soft.
+
+    PER-SLICE GUARD (#905 part D, Exec P490 -- both callers, the Leg 2 merge
+    and the daemon's drain, get it from here, at the source):
+      guard    zero-argument callable returning an iterable/set of the node ids
+               that currently BLOCK the clock (empty = clear). Build it with
+               cc_topology_merge.whole_graph_guard -- there is no predicate in
+               this function. It is called BEFORE EACH slice (including the
+               first), WITHOUT holding _concurrent_lock (it takes _step_lock only;
+               the established order is _concurrent_lock -> _step_lock). Ids are
+               used for COUNTING only and are NEVER logged. A non-empty result
+               STOPS the pass at the slice boundary: ONE logger.error (fixed
+               reason code, steps done/remaining, COUNT of blockers), progress
+               held=True, return False ("held, not done"). A raising guard fails
+               CLOSED (stop; same record with the exception CLASS name only;
+               held=True, failed=True). A node that became unbound between
+               slices is therefore never aged through the rest of the pass.
+      progress a dict the CALLER owns; filled on every return path:
+               {"done": steps run, "remaining": idle_steps - done,
+                "held": bool, "failed": bool} (success: held/failed False,
+               remaining 0). A step that raises: held False, failed True.
+    guard=None / progress=None (the positional (graph, idle_steps) call) behaves
+    exactly as before."""
+    prog = progress if progress is not None else {}
+
+    def _fill(done_steps: int, held: bool = False, failed: bool = False) -> None:
+        prog.update(done=done_steps, remaining=max(0, idle_steps - done_steps),
+                    held=held, failed=failed)
+
     if idle_steps <= 0 or graph is None:
+        _fill(0)
         return False
     # Take the lock in SLICES, not for the whole 250 steps. cc_ng_host.py's
     # changelog records real hook timeouts caused by _recall() blocking on a
@@ -3204,6 +3295,30 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
     try:
         lock = getattr(graph, "_concurrent_lock", None)
         while done < idle_steps:
+            if guard is not None:
+                # Outside every lock this function takes: the guard needs
+                # _step_lock, and nothing may be held across a slice that it needs.
+                try:
+                    blockers = len(tuple(guard()))
+                except Exception as exc:  # noqa: BLE001 - fail CLOSED, loud, class only
+                    logger.error(
+                        "CC callosum consolidation HELD at a slice boundary: "
+                        "reason=guard_raised exc_class=%s steps_done=%d steps_remaining=%d. "
+                        "The clock is not advanced further (fail closed); no node ids "
+                        "are logged.", type(exc).__name__, done, idle_steps - done)
+                    _fill(done, held=True, failed=True)
+                    return False
+                if blockers:
+                    logger.error(
+                        "CC callosum consolidation HELD at a slice boundary: "
+                        "reason=unbound_nodes_present blocking_nodes=%d steps_done=%d "
+                        "steps_remaining=%d. The clock is not advanced further: orphan "
+                        "grace is denominated in it and a node that became unbound "
+                        "between slices must not age through the rest of the pass "
+                        "(#905); no node ids are logged.",
+                        blockers, done, idle_steps - done)
+                    _fill(done, held=True)
+                    return False
             n = min(slice_n, idle_steps - done)
             if lock is not None:
                 with lock:
@@ -3213,6 +3328,7 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
                 for _ in range(n):
                     graph.step()
             done += n
+        _fill(done)
         return True
     except Exception as exc:
         # D24 / Exec P476(e) (P370: fixed where the drain's phase 2 reuses it): this used to be logger.debug --
@@ -3222,6 +3338,7 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
         logger.error("CC callosum consolidation FAILED after %d of %d step(s) (%s); "
                      "this is the CAUSE record -- the caller logs what it did about it",
                      done, idle_steps, type(exc).__name__)
+        _fill(done, failed=True)
         return False
 
 
