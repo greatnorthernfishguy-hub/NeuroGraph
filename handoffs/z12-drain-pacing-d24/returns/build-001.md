@@ -10,6 +10,8 @@
 
 # build-001 — D24 drain pacing: READ, and STOP (e)
 
+> **Superseded by [[build-002]] (turn 2, dispatch #12731):** Exec P476 accepted this STOP and ruled the lock case; D24 is BUILT there. This record is kept intact as the accepted turn-1 READ.
+
 Lane `drain-pacing-d24` (Z12), dispatch #12669. Builder: Claude Sonnet 5.5. Related: [[NeuroGraph]], [[The River]], [[Dual-Pass Embedding]], [[FatherGraph]].
 
 **Outcome: STOP (e). Nothing was built.** No code commit in either repo. The docs daemon worktree is untouched (tip still `e60524154f9cfd6a1be34d28d97afc174b61accb`). The owner of the ruling is the Executive (Exec P473: this is "the ONLY lock case that goes back to the Executive").
