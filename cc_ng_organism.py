@@ -52,6 +52,53 @@
 #   batch, run by the daemon -- never inside drain_ingest_tract, which still never steps); the newer ruling wins and reconciling the
 #   two texts is #895. drain_gateway_conduit's inert batch_size/idle_steps arguments coexist with this live path for the other
 #   drain (LAW 3 shrapnel, #895).
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13058 — #904 (Exec Packet 487 via Chief-003):
+#   the dual-pass write path is ATOMIC (or loud, with a truthful False), never silently half-written
+# What: run_conversational_dual_pass keeps a write JOURNAL (on _CCConversationalDualPassEco: every node write, plus the
+#   synapses and the hyperedge the bind creates) and, on ANY exception after the first write, ROLLS BACK exactly what this
+#   call created (synapses, then the hyperedge, then the nodes it created, then the vdb entries it inserted fresh), restores
+#   state["last_forest_id"] / state["primed_nodes"], logs at WARNING (ERROR if the rollback itself failed): hardcoded text,
+#   stage, counts, exception CLASS NAME only (never str(exc), never node ids/text), and returns False. A failure BEFORE the
+#   first write (nothing to roll back) is unchanged: debug line, False. _cc_bind_conversational_topology no longer swallows
+#   its own failures (synapse loops, hyperedge, delay chain, previous-forest link) and no longer returns silently when the
+#   forest is absent: they raise, so the dual pass can fail truthfully (it used to return True after a hyperedge failure).
+#   It takes one optional keyword, journal=None; with None it is byte-identical on every success path.
+# Why: #898 found the 147 conversational nodes were NEVER bound: forest/trees/windows were written in separate locks, the
+#   bind was a later step, and any exception after the forest write skipped it at logger.debug and returned False (or, for a
+#   failure inside the bind, returned True), while every caller ignored the result and the drain truncated the turn's bytes.
+#   P370 (no silent swallow), LAW 4 (fix at the source), LAW 7 (raw experience is never destroyed), #805 (retry-safety).
+# How: ATOMIC, not LOUD: a retry re-extracts a DIFFERENT concept set (LLM output) and binds only that attempt's tree_ids, so a
+#   kept partial write leaves stragglers (#898 bucket 5) on every retry; rolling back makes a retry equal one clean pass.
+#   Rollback never touches a node that existed before the call (only nodes this call created are removed; a pre-existing
+#   node's idempotent re-stamp, which a successful repeat of the same turn performs anyway, is the one effect not undone) and
+#   needs no edit to ng_embed.py (vendored) or any protected file: it uses the public Graph.remove_synapse /
+#   remove_hyperedge / remove_node and SimpleVectorDB.delete. The journal lives on the eco class (not a new module-level
+#   helper) so tests/test_cc_capture_mutations_423.py's AST extraction of those functions still works. _cc_deposit_memory_node
+#   is UNCHANGED (its "no fabricated rollback" contract is pinned by that file). Tests: tests/test_cc_bind_atomic_904.py.
+#   ADDENDUM (Exec Packet 489, class member (c)): surface_wants and surface_wants_for_graph wrote the want's seed synapse
+#   (graph.create_synapse(source_node, want, weight=0.3)) inside `except Exception: pass`, which can leave a PROTECTED
+#   (*_authored) want with no synapse and no hyperedge: a node that cannot bind, made silently. A failed seed synapse is now
+#   counted per call (attempted / failed / distinct exception CLASS names) and reported by ONE WARNING per call
+#   (_cc_report_want_synapse_failures: fixed reason code want_source_synapse_failed, the function name, the counts, class names
+#   only: never str(exc), want text or ids). The EXISTING contract is unchanged: a want whose synapse failed is still created
+#   and still returned in the list (that is what both functions did); weights (0.3), direction (source -> want) and sources are
+#   untouched; authored wants are NEVER rolled back, edited or re-tagged (H-1). generate_emergent_want is NOT touched (#905).
+#   Not changed, only noted: surface_wants_for_graph's outer `except Exception: logger.debug("Failed to create want node")`
+#   (a failed create_node) and surface_wants' unguarded create_node remain as they were.
+#   ADDENDUM 2 (Exec Packet 491, #257 write-path family; item (i), persisting last_forest_id, is in the docs daemon):
+#   (ii) EVERY write site in _cc_bind_conversational_topology is loud and truthful: the five sites (tree_synapse, window_synapse,
+#   hyperedge, window_chain, sequence_link) plus forest_absent are tagged as they are written (journal["site"], journal["attempts"]);
+#   the ONE failure record now also carries site=<code> site_attempted=<n> site_failed=1; each failure is COUNTED in the caller-owned
+#   state["bind_site_failures"][site] (in-process; it survives the rollback); the bind returns a small STATUS dict (trees, tree_pairs,
+#   window_pairs, hyperedge, window_chain, sequence, has_trees, has_windows). TRUTH RULE (chosen and justified): a turn that HAS trees must
+#   come out with EVERY forest<->tree synapse pair AND its hyperedge, else run_conversational_dual_pass raises inside its own try (site
+#   bind_postcondition), rolls the turn back and returns False with its own loud record: all-or-nothing, because with the rollback a partial
+#   bind is never kept (a retry equals one clean pass), and "any one tree pair" would let a bind that dropped most of the trees pass.
+#   Fail-fast, not continue-and-count, for the same reason: after the first failed write the turn is rolled back anyway. (iii) a forest this
+#   call CREATED, with NO predecessor (state pointer None / absent / itself) and NO trees and NO windows, logs ONE WARNING at birth (reason
+#   forest_born_unbound, the three booleans, no id/text). Expected volume once (i) is in place: one per true first forest ever (or a pointer
+#   to a vanished forest), not one per restart. Success-path return value and graph are byte-identical (golden); weights, directions,
+#   delays, links and what a successful bind creates are unchanged; nothing existing is retro-wired.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane ingest-tract-swallow-781 — #794:
 #   opt-in hold_on_failure on drain_ingest_tract (Chief-003 ruling / Exec P386)
 # What: drain_ingest_tract gains ONE new LAST keyword, hold_on_failure=False. With
@@ -1198,6 +1245,22 @@ def deposit_cc_experience(text: str, target_id: str, workspace_dir: str,
         return None
 
 
+def _cc_report_want_synapse_failures(fn_name, attempted, failed, exc_types):
+    """#904 / Exec P489: ONE WARNING per surface_wants* call whose want seed-synapse(s) failed.
+    Hardcoded reason code + the function name + counts + exception CLASS NAMES only: never
+    str(exc), a want's text, a node id or a path. A want whose synapse failed IS created and IS
+    reported (the existing contract, unchanged) but is UNBOUND; authored wants are never rolled
+    back (H-1). Volume: a want that exists is skipped on later pulses, so each failure is
+    reported once, not per autosave."""
+    if not failed:
+        return
+    logger.warning(
+        "CC want seed synapse FAILED: reason=want_source_synapse_failed fn=%s attempted=%d failed=%d "
+        "exc_types=%s -- the want node(s) exist and are reported as before but are UNBOUND (no synapse "
+        "from the source node); wants are not rolled back",
+        fn_name, attempted, failed, ",".join(exc_types[:3]))
+
+
 def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Cricket want-bucket: extract [WANT]s from CC's raw conversational nodes and
     materialize each as a FIRST-CLASS WANT NODE in the topology.
@@ -1216,6 +1279,8 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
         if graph is None:
             return []
         open_wants = []
+        syn_attempted = syn_failed = 0
+        syn_exc_types = []
         for nid, node in list(graph.nodes.items()):
             meta = getattr(node, "metadata", None) or {}
             if meta.get("kind") == "want":
@@ -1253,9 +1318,13 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
                         }
                     )
                     try:
+                        syn_attempted += 1
                         graph.create_synapse(nid, want_id, weight=0.3)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as syn_exc:  # noqa: BLE001
+                        # #904 / P489: LOUD, not silent. The want stays (authored, H-1) and is still reported.
+                        syn_failed += 1
+                        if type(syn_exc).__name__ not in syn_exc_types:
+                            syn_exc_types.append(type(syn_exc).__name__)
                     open_wants.append({
                         "id": want_id,
                         "text": inner,
@@ -1265,6 +1334,7 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
                     })
                 except Exception as exc:
                     logger.debug("Failed to create want node: %s", exc)
+        _cc_report_want_synapse_failures("surface_wants_for_graph", syn_attempted, syn_failed, syn_exc_types)
         return open_wants
 
 
@@ -1602,6 +1672,8 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
         open_wants: List[Dict[str, Any]] = []
         if graph is None:
             return open_wants
+        syn_attempted = syn_failed = 0
+        syn_exc_types: List[str] = []
         for nid, node in list(graph.nodes.items()):
             meta = getattr(node, "metadata", None) or {}
             if meta.get("kind") == "want":
@@ -1637,11 +1709,16 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
                     "creation_mode": "conversational",
                 })
                 try:
+                    syn_attempted += 1
                     graph.create_synapse(nid, want_id, weight=0.3)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as syn_exc:  # noqa: BLE001
+                    # #904 / P489: LOUD, not silent. The want stays (authored, H-1) and is still reported.
+                    syn_failed += 1
+                    if type(syn_exc).__name__ not in syn_exc_types:
+                        syn_exc_types.append(type(syn_exc).__name__)
                 open_wants.append({"id": want_id, "text": inner,
                                     "provenance": provenance, "state": "open", "source": nid})
+        _cc_report_want_synapse_failures("surface_wants", syn_attempted, syn_failed, syn_exc_types)
         return open_wants
 
 
@@ -2014,6 +2091,72 @@ class _CCConversationalDualPassEco:
     def __init__(self, graph, vector_db):
         self._graph = graph
         self._vector_db = vector_db
+        # #904 write journal. `writes`: one (node_id, kind, node_was_new, vdb_fresh) per node write
+        # this call attempted, appended BEFORE the write so a write that raises midway is still
+        # journalled. `topology`: the ids of the synapses / hyperedges the bind created.
+        self.writes = []
+        self.topology = {"synapses": [], "hyperedges": []}
+
+    def deposit(self, node_id, embedding, content, meta, index_in_recall=True, kind="forest"):
+        """_cc_deposit_memory_node, journalled. Same arguments, same effects, same raise."""
+        with _cc_mutation_lock(self._graph):
+            node_was_new = node_id not in self._graph.nodes
+            vdb_fresh = False
+            if index_in_recall:
+                try:
+                    vdb_fresh = self._vector_db.get(node_id) is None
+                except Exception:
+                    # Cannot prove this call created the entry: never delete it on rollback.
+                    vdb_fresh = False
+            self.writes.append((node_id, kind, node_was_new, vdb_fresh))
+            return _cc_deposit_memory_node(self._graph, self._vector_db, node_id, embedding,
+                                            content, meta, index_in_recall=index_in_recall)
+
+    def counts(self):
+        """(forest, trees, windows, synapses, hyperedges) this call wrote so far."""
+        n = {"forest": 0, "tree": 0, "window": 0}
+        for _nid, kind, _new, _fresh in self.writes:
+            n[kind] = n.get(kind, 0) + 1
+        return (n["forest"], n["tree"], n["window"],
+                len(self.topology["synapses"]), len(self.topology["hyperedges"]))
+
+    def rollback(self):
+        """Undo exactly what this call wrote (#904): synapses, then the hyperedge(s), then the
+        nodes it CREATED, then the vdb entries it inserted fresh. A node that existed before the
+        call is never removed. Each step is isolated so one failure cannot stop the rest; returns
+        True only if every step succeeded (False means a partial write REMAINS)."""
+        graph, vdb = self._graph, self._vector_db
+        ok = True
+        with _cc_mutation_lock(graph):
+            for sid in reversed(self.topology["synapses"]):
+                if sid is None:
+                    continue
+                try:
+                    if sid in graph.synapses:
+                        graph.remove_synapse(sid)
+                except Exception:
+                    ok = False
+            for hid in reversed(self.topology["hyperedges"]):
+                if hid is None:
+                    continue
+                try:
+                    if hid in graph.hyperedges:
+                        graph.remove_hyperedge(hid)
+                except Exception:
+                    ok = False
+            for node_id, _kind, node_was_new, vdb_fresh in reversed(self.writes):
+                if node_was_new:
+                    try:
+                        if node_id in graph.nodes:
+                            graph.remove_node(node_id)
+                    except Exception:
+                        ok = False
+                if vdb_fresh:
+                    try:
+                        vdb.delete(node_id)
+                    except Exception:
+                        ok = False
+        return ok
 
     def record_outcome(self, embedding, target_id, success, strength=1.0, metadata=None):
         meta = dict(metadata or {})
@@ -2024,70 +2167,114 @@ class _CCConversationalDualPassEco:
             if not _cc_concept_passes_floor(meta["_concept"]):
                 logger.debug("Tree concept below floor, not indexed: %r", meta["_concept"][:40])
                 return {"deposited": False, "reason": "concept_below_floor"}
-            _cc_deposit_memory_node(self._graph, self._vector_db, target_id, embedding,
-                                     meta["_concept"], meta, index_in_recall=True)
+            self.deposit(target_id, embedding, meta["_concept"], meta,
+                         index_in_recall=True, kind="tree")
         else:
-            _cc_deposit_memory_node(self._graph, self._vector_db, target_id, embedding,
-                                     meta.get("_forest_content", ""), meta, index_in_recall=True)
+            self.deposit(target_id, embedding, meta.get("_forest_content", ""), meta,
+                         index_in_recall=True, kind="forest")
         return {"deposited": True}
 
     def record_outcome_broadcast(self, embedding, target_id, success, strength=1.0, metadata=None):
         return self.record_outcome(embedding, target_id, success, strength, metadata)
 
 
-def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding, state, window_ids=None):
+def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding, state, window_ids=None,
+                                      journal=None):
     """Wire forest<->tree synapses, intra-turn window delay-chains (#257
     polychrony), a binding hyperedge, and a delayed prev->current forest
     link. `state` is a plain dict the caller owns (holds "last_forest_id")
     -- replaces canonical's module-level _last_conv_forest_id global, since
     each CC daemon needs its own, not one shared across Syl and CC.
+
+    #904: nothing in here is swallowed any more. A failed synapse, hyperedge,
+    delay-chain link or previous-forest link RAISES (and a forest that is absent
+    when the bind runs raises too, instead of returning silently), so
+    run_conversational_dual_pass can fail truthfully and roll the turn back. The
+    real graph only raises for a missing node / a self-connection, both excluded
+    below, so no success path changes. `journal` (default None, optional) is the
+    dual pass's write journal: every synapse / hyperedge id this call creates is
+    appended (to undo it), and the SITE being written is recorded in
+    journal["site"] / journal["attempts"] (so the failure record can name which
+    of the five sites failed and how many writes of it were attempted).
+
+    Returns a small STATUS dict (what was written, per kind), so the caller can
+    be truthful about a bind that wrote less than a turn with trees needs:
+    trees (how many it was handed), tree_pairs / window_pairs (forest<->member synapse PAIRS
+    written), hyperedge (bool), window_chain (links), sequence ("written" | "no_predecessor"), plus
+    has_trees / has_windows. Existing nodes and synapses are never touched: this
+    only ever ADDS this turn's topology.
     """
+    status = {"trees": 0, "tree_pairs": 0, "window_pairs": 0, "hyperedge": False, "window_chain": 0,
+              "sequence": "no_predecessor", "has_trees": False, "has_windows": False}
+
+    def _site(name):
+        if journal is not None:
+            journal["site"] = name
+            attempts = journal.setdefault("attempts", {})
+            attempts[name] = attempts.get(name, 0) + 1
+
+    def _syn(site, pre, post, weight, delay=None):
+        _site(site)
+        if delay is None:
+            syn = graph.create_synapse(pre, post, weight=weight)
+        else:
+            syn = graph.create_synapse(pre, post, weight=weight, delay=delay)
+        if journal is not None:
+            journal["synapses"].append(getattr(syn, "synapse_id", None))
+
     with _cc_mutation_lock(graph):
         if forest_id not in graph.nodes:
-            return
+            _site("forest_absent")
+            raise RuntimeError("forest node absent at bind")
         tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
         window_ids = [w for w in (window_ids or []) if w in graph.nodes and w != forest_id]
+        status["trees"] = len(tree_ids)
+        status["has_trees"] = bool(tree_ids)
+        status["has_windows"] = bool(window_ids)
         for tid in tree_ids:
-            try:
-                graph.create_synapse(forest_id, tid, weight=0.2)
-                graph.create_synapse(tid, forest_id, weight=0.15)
-            except Exception:
-                pass
+            _syn("tree_synapse", forest_id, tid, 0.2)
+            _syn("tree_synapse", tid, forest_id, 0.15)
+            status["tree_pairs"] += 1
         for wid in window_ids:
-            try:
-                graph.create_synapse(forest_id, wid, weight=0.2)
-                graph.create_synapse(wid, forest_id, weight=0.15)
-            except Exception:
-                pass
+            _syn("window_synapse", forest_id, wid, 0.2)
+            _syn("window_synapse", wid, forest_id, 0.15)
+            status["window_pairs"] += 1
         if tree_ids or window_ids:
-            try:
-                graph.create_hyperedge(
-                    member_node_ids=set([forest_id] + tree_ids + window_ids),
-                    metadata={"creation_mode": "conversational", "cc": True},
-                )
-            except Exception as exc:
-                logger.debug("CC conversational hyperedge failed (non-fatal): %s", exc)
+            _site("hyperedge")
+            he = graph.create_hyperedge(
+                member_node_ids=set([forest_id] + tree_ids + window_ids),
+                metadata={"creation_mode": "conversational", "cc": True},
+            )
+            if journal is not None:
+                journal["hyperedges"].append(getattr(he, "hyperedge_id", None))
+            status["hyperedge"] = True
         if len(window_ids) >= 2:
-            try:
-                import random as _rnd
-                for i in range(len(window_ids) - 1):
-                    d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
-                    graph.create_synapse(window_ids[i], window_ids[i + 1], weight=0.2, delay=d)
-            except Exception:
-                pass
+            import random as _rnd
+            for i in range(len(window_ids) - 1):
+                d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
+                _syn("window_chain", window_ids[i], window_ids[i + 1], 0.2, delay=d)
+                status["window_chain"] += 1
         last_id = state.get("last_forest_id")
         if last_id and last_id in graph.nodes and last_id != forest_id:
-            try:
-                import random as _rnd
-                d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
-                graph.create_synapse(last_id, forest_id, weight=0.2, delay=d)
-            except Exception:
-                pass
+            import random as _rnd
+            d = _rnd.randint(2, max(2, _CC_CONV_SYNAPSE_DELAY_MAX))
+            _syn("sequence_link", last_id, forest_id, 0.2, delay=d)
+            status["sequence"] = "written"
+        # #904 (iii): a forest born with NO predecessor, NO trees and NO windows has nothing binding it to anything
+        # (#900's unbound_status counts it as NEW). ONE WARNING at birth: a fixed reason code and the three booleans,
+        # never an id or text. Only for a forest this call CREATED (a repeat of an existing turn is not "born").
+        if (not tree_ids and not window_ids and status["sequence"] != "written"
+                and (journal is None or journal.get("forest_new", True))):
+            logger.warning(
+                "CC forest born UNBOUND: reason=forest_born_unbound has_predecessor=%s has_trees=%s has_windows=%s "
+                "-- nothing links this forest to the rest of the graph",
+                False, False, False)
         state["last_forest_id"] = forest_id
         # Anticipatory pre-activation (#256 port): this turn's forest+trees are
         # CC's "just fired" set — prime their synaptic neighborhood for the next
         # recall. state carries primed_nodes to the daemons' _recall(). (#358)
         cc_anticipate(graph, [forest_id] + tree_ids, state)
+        return status
 
 
 def _cc_has_ever_fired(node) -> bool:
@@ -2210,15 +2397,35 @@ def cc_update_probation(graph) -> list:
 def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict) -> bool:
     """Core dual-pass on one turn's text. Returns True on success, False on
     failure -- caller decides retry policy (this function does not enqueue).
-    Mirrors canonical's _run_conversational_dual_pass exactly, parameterized.
+    Mirrors canonical's _run_conversational_dual_pass, parameterized, EXCEPT that
+    this one is atomic (below): the canonical (neurograph_rpc.py, Syl's) has no
+    rollback and was not touched by #904.
     Every turn deposits raw (LAW 7) -- no redundancy check, dedup, or
     threshold runs at deposit; `target_id` is content-hashed (see below), so
     an exact-repeat turn's deposit naturally lands on the same node instead
     of creating a duplicate.
+
+    ATOMIC (#904): the turn is written in separate lock acquisitions (forest,
+    each tree, each window, then the bind). If anything raises AFTER the first
+    write, everything this call wrote is rolled back (see
+    _CCConversationalDualPassEco.rollback), state["last_forest_id"] /
+    state["primed_nodes"] are restored, ONE WARNING is logged (ERROR if the
+    rollback itself failed and a partial write REMAINS) with hardcoded text,
+    the stage, the counts written and the exception CLASS NAME only (never
+    str(exc), a node id or text), and False is returned: a retry then lands on
+    a clean graph, so it equals one clean pass. False is never returned for a
+    success and True is never returned after a partial write. A failure before
+    the first write (nothing to undo) logs at debug, as before, and returns False.
     """
     if graph is None or embedding is None:
         return False
+    eco = None
+    stage = "setup"
+    _absent = object()
+    prior_last = prior_primed = _absent
     try:
+        prior_last = state.get("last_forest_id", _absent)
+        prior_primed = state.get("primed_nodes", _absent)
         from ng_embed import NGEmbed
         import hashlib
         target_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
@@ -2231,6 +2438,7 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
         meta = {"source": "cc_gateway", "creation_mode": "conversational",
                 "_forest_content": text}
         eco = _CCConversationalDualPassEco(graph, vector_db)
+        stage = "dual_record"
         _result = embedder.dual_record_outcome(
             ecosystem=eco,
             content=text,
@@ -2241,24 +2449,68 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
             metadata=meta,
         )
         window_ids = []
+        stage = "windows"
         if windows:
             for i, w in enumerate(windows):
                 wid = f"{target_id}::window::{i}"
-                _cc_deposit_memory_node(
-                    graph, vector_db, wid, w.embedding, w.text,
+                eco.deposit(
+                    wid, w.embedding, w.text,
                     {**meta, "_window": True, "_window_index": i, "_forest_id": target_id},
-                    index_in_recall=False,
+                    index_in_recall=False, kind="window",
                 )
                 window_ids.append(wid)
         # dual_record_outcome raises DualPassIncompleteError on pass-2 failure
         # (R3 atomicity: no forest-only deposit). A return means forest+pass-2
         # completed (legitimate empty concepts produce extraction_failed=False).
-        _cc_bind_conversational_topology(
+        stage = "bind"
+        eco.topology["forest_new"] = any(kind == "forest" and new for _nid, kind, new, _f in eco.writes)
+        _bound = _cc_bind_conversational_topology(
             graph, target_id, _result or {}, embedding, state, window_ids=window_ids,
+            journal=eco.topology,
         )
+        # TRUTH RULE (#904 / Exec P491 (ii)): a turn that HAS trees must come out with EVERY forest<->tree synapse pair
+        # AND its binding hyperedge. The bind raises on any failed write, so this can only trip if a write returned
+        # without writing (or a swallow is ever restored): then the turn is NOT bound and True would be a lie. It is
+        # all-or-nothing on purpose: with the rollback, a partial bind is never kept, so a retry equals one clean pass.
+        if _bound and _bound.get("trees") and not (
+                _bound.get("tree_pairs", 0) >= _bound["trees"] and _bound.get("hyperedge")):
+            eco.topology["site"] = "bind_postcondition"
+            raise RuntimeError("bind wrote less than a turn with trees needs")
         return True
     except Exception as exc:
-        logger.debug("CC conversational dual-pass failed (non-fatal): %s", exc)
+        if eco is None or not eco.writes:
+            # Nothing was written (e.g. pass-2 extraction failed before any deposit): nothing to undo.
+            logger.debug("CC conversational dual-pass failed (non-fatal): %s", exc)
+            return False
+        n_forest, n_tree, n_window, n_syn, n_he = eco.counts()
+        site = eco.topology.get("site") if stage == "bind" else None
+        site_attempted = (eco.topology.get("attempts") or {}).get(site, 0) if site else 0
+        try:
+            rolled_back = eco.rollback()
+        except Exception:  # noqa: BLE001 — the rollback must not mask the failure report
+            rolled_back = False
+        try:
+            if prior_last is _absent:
+                state.pop("last_forest_id", None)
+            else:
+                state["last_forest_id"] = prior_last
+            if prior_primed is _absent:
+                state.pop("primed_nodes", None)
+            else:
+                state["primed_nodes"] = prior_primed
+            if site:   # COUNTED (caller-owned, in-process): failures per bind site, survives the rollback
+                _failures = state.setdefault("bind_site_failures", {})
+                _failures[site] = _failures.get(site, 0) + 1
+        except Exception:  # noqa: BLE001
+            rolled_back = False
+        (logger.warning if rolled_back else logger.error)(
+            "CC conversational dual-pass FAILED after the first write: stage=%s site=%s site_attempted=%d site_failed=%d "
+            "exc_type=%s written forest=%d trees=%d windows=%d synapses=%d hyperedges=%d; %s; the turn is NOT bound",
+            stage, site or "-", site_attempted, 1 if site else 0, type(exc).__name__,
+            n_forest, n_tree, n_window, n_syn, n_he,
+            "rolled back, nothing of this turn remains" if rolled_back
+            else "ROLLBACK FAILED, a partial write REMAINS",
+        )
         return False
 
 
