@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4, dispatch #14658) — N8 (TRIAL branch, test-only): F-B, the stale cross-change pin.
+#   test_generate_emergent_want_is_untouched compared generate_emergent_want to the PRE-#905 base (c5684334), which cannot hold once #905 part A is in the
+#   same tree (either merge order). RE-BASED (not retired) to compare against #905's own version (ee94f7d2) through the same `git show` mechanism, so it
+#   still pins that #904 itself adds nothing to that function; the 'new' side is now the module under test (org.__file__), which is the worktree file in
+#   a normal run and lets the existing Z12_904_ORG_UNDER_TEST hook feed a scratch mutant. A failed `git show` is now a loud, explained assert. No other test changed.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13437 — #904 ROUND 2: le-053 F1-1 (the verdict sentence says what was
 #   KEPT), F1-2 (a probation sweep between the snapshot and the rollback is NOT erased; a key added by the call is deleted), F1-3 (the restore's
 #   field list is tied to the deposit's write-set by AST), F1-4 (the unrestorable count is printed).
@@ -1189,14 +1194,21 @@ def test_want_success_path_is_golden_identical_and_quiet(fn_name, prefix, caplog
 
 
 def test_generate_emergent_want_is_untouched():
-    """#905 owns it: its source must be byte-identical to the base."""
+    """#905 owns it: #904 must not alter generate_emergent_want. Its source must be byte-identical to #905's.
+
+    N8 (NG trial integration): this used to compare against the PRE-#905 base (c5684334), which cannot hold once #905
+    part A (the born-bound want) is in the same tree, in either merge order. RE-BASED, not retired: the function is now
+    compared against #905's own version (ee94f7d2, read via the same `git show` mechanism), so what #904 owed is still
+    pinned -- #904 itself adds nothing to this function beyond what #905 made. The 'new' side is the MODULE UNDER TEST
+    (org.__file__; the worktree file unless Z12_904_ORG_UNDER_TEST points at a scratch copy)."""
     import subprocess
-    new = (_WORKTREE / 'cc_ng_organism.py').read_text()
+    new = Path(org.__file__).read_text()
 
     def body(src):
         start = src.index('def generate_emergent_want(')
         end = src.index('\ndef ', start + 10)
         return src[start:end]
-    base = subprocess.run(['git', '-C', str(_WORKTREE), 'show', 'c568433434a99154b9f7652b77cbe43752d34324:cc_ng_organism.py'],
-                          capture_output=True, text=True).stdout
-    assert body(new) == body(base)
+    ref = subprocess.run(['git', '-C', str(_WORKTREE), 'show', 'ee94f7d2c516cce40ff81bd32e4febb9781e8e04:cc_ng_organism.py'],
+                         capture_output=True, text=True)
+    assert ref.returncode == 0 and ref.stdout, 'cannot read #905 (ee94f7d2) cc_ng_organism.py: %s' % ref.stderr.strip()
+    assert body(new) == body(ref.stdout)

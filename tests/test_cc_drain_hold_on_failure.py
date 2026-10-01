@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4, dispatch #14658) — N8 (TRIAL branch, test-only): F-A, the stale
+#   cross-change pin. test_signature_hold_on_failure_is_last_and_defaults_false pinned the exact pre-D24 signature; with D24 in the same tree
+#   the signature is [..., max_entries, batch_nodes, receipt, hold_on_failure]. UPDATED to assert the prefix list (now with batch_nodes,
+#   receipt), `params[-1] == "hold_on_failure"` and `default is False`: same protection, true on the integrated tree. No other test changed.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane ingest-tract-swallow-781 — #794
 # What: tests for drain_ingest_tract(hold_on_failure=...) (Chief-003 ruling / Exec P386):
 #   hold semantics, the single hardcoded warning, retry on the next call, and a
@@ -211,12 +215,20 @@ def _split(result, rc):
 
 # ------------------------------------------------- signature / call-shape guards
 def test_signature_hold_on_failure_is_last_and_defaults_false():
-    """FAILS on base: no such parameter (KeyError)."""
-    params = list(inspect.signature(cc_ng_organism.drain_ingest_tract).parameters)
-    assert params == ["graph", "vector_db", "state", "tract_path", "return_consumed",
-                      "max_entries", "hold_on_failure"]
-    assert inspect.signature(cc_ng_organism.drain_ingest_tract).parameters[
-        "hold_on_failure"].default is False
+    """FAILS on base: no such parameter (KeyError).
+
+    N8 (NG trial integration): on a tree that also carries D24 the two D24 keyword
+    parameters `batch_nodes, receipt` sit between `max_entries` and `hold_on_failure`.
+    What this pins is unchanged: every parameter the old pin listed is still there, in
+    order, and `hold_on_failure` is the LAST one and defaults to False. The prefix is
+    therefore asserted explicitly (a dropped or reordered parameter fails), then the
+    last-ness, then the default."""
+    sig = inspect.signature(cc_ng_organism.drain_ingest_tract)
+    params = list(sig.parameters)
+    assert params[:-1] == ["graph", "vector_db", "state", "tract_path", "return_consumed",
+                           "max_entries", "batch_nodes", "receipt"]
+    assert params[-1] == "hold_on_failure"
+    assert sig.parameters["hold_on_failure"].default is False
 
 
 def test_existing_caller_shapes_still_bind():
