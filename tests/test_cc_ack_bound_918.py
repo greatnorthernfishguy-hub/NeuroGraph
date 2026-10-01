@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #14258) — N3 docstring corrected (COMMENT-ONLY)
+# What: the docstring of test_n3_small_max_nodes_per_call_... no longer claims that a mutant whose ack includes the unbound set
+#   (G7) fails it. DISCREPANCY: build-003 and the earlier docstring said such a mutant "never re-offers X and ends in the exhausted
+#   branch with X unbound: both fail"; build-004 (dispatch #14238) showed G7 SURVIVES `-k n3` (3 passed) because the sender's
+#   whole-hyperedge closure re-adds acked members, so N3's frame is identical under the over-wide ack, and that G7 is killed by 12
+#   whole-file ack-semantics tests (not N3). The N3 test kills G2 (budget ignored); it pins the budget, not the ack semantics.
+# Why: Chief ASK E (a docstring must not overclaim); the filed build-003 sentence is history and stays.
+# How: docstring text only; `ast.dump` with docstrings stripped is IDENTICAL to the file at b1949155. No test, assertion or code changed.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #14104) — #918 fold-up 2 tests (F1 + P534 wording)
 # What: (F1, le-056, MEDIUM) the N3 test was HASH-SEED DEPENDENT (KeyError 'frame_node_ids' under PYTHONHASHSEED=7): the node
 #   order inside the sender's frame follows a hyperedge member-SET iteration, and once everything is acked the sender returns the
@@ -860,8 +868,14 @@ def test_n3_small_max_nodes_per_call_a_held_unbound_node_is_bound_across_ticks_a
     lost: X is bound by the 2nd call in every position, and `completed` is True once nothing is deferred. Once everything is
     acked the sender returns the `exhausted` shape WITHOUT `frame_node_ids`; the receiver then re-merges the conduit left on disk
     (as `cc-ng-sync.py` does), and that branch asserts X is actually BOUND and acked, so the loop cannot end vacuously.
-    A mutant that ignores the budget lands both new nodes on call 1 and binds X there; one whose ack includes the unbound set
-    never re-offers X and ends in the exhausted branch with X unbound: both fail."""
+    WHAT IT KILLS: a mutant that ignores the budget (G2) lands both new nodes on call 1 and binds X there, so it fails this test
+    in all three orderings (the per-call cap `absorbed_nodes <= 1`). It does NOT kill a mutant whose ack includes the unbound set
+    (G7): here the hyperedge {C1, C2, X} still has an un-acked member (C2 is not held until call 2), so the sender's
+    whole-hyperedge closure RE-ADDS the already-acked members and the frame is the same under the over-wide ack (shown: `-k n3`
+    passes with G7 active). The ack semantics are pinned by the ack tests instead, e.g.
+    `test_membership_bound_in_unprotected_unbound_out_protected_unbound_in_non_cc_out`,
+    `test_the_ack_file_the_merge_writes_is_the_bound_membership`, the Q2 pin, the composition spies and the loop tests; the two
+    acks diverge only in the all-acked-but-unbound cohort shape (#909) that those tests cover."""
     X, C1, C2 = "cc:conv::n3-held", "cc:conv::n3-c1", "cc:conv::n3-c2"
     order = {"first": [X, C1, C2], "middle": [C1, X, C2], "last": [C1, C2, X]}[x_position]
     vg, vv = Graph(), SimpleVectorDB()
