@@ -3,6 +3,22 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14460/#14474) — #905-DELTA: the whole-graph hold covers ONLY nodes whose binding is IN TRANSIT
+# What: a NEW `held_unbound_nodes(graph, node_ids, merge_landed=None)` and a once-read, fail-closed in-transit id set read from the NEW LAW 5
+#   path variable CC_NG_IN_TRANSIT_IDS_PATH. The merge's batch-end check and `whole_graph_guard` (which gains an ADDITIVE keyword
+#   `merge_landed=None`; the daemon's one-argument call is unchanged) route through it. `_unbound_nodes` is BYTE-IDENTICAL (it still answers
+#   "what would the sweep reap"; the daemon pins its arity). Variable UNSET (the VPS / Syl's process never sets it) = byte-identical to the
+#   #905 behaviour: no file I/O, no log line. SET but missing / unreadable / not a regular file / over the cap / any malformed line / ZERO ids
+#   = fail CLOSED (hold ALL sweep-eligible unbound, as before) with ONE loud ERROR naming the failure CLASS; NEVER fail open.
+# Why: Exec P547/P548 (Josh's ruling; Chief-003 ruling B). The #897/#905 hold counted EVERY sweep-eligible unbound node, so a laptop-own
+#   unbound node (forest:2dfa2d637643, no binding in transit) froze the clock: it could neither wire nor be culled. Josh: "it should be
+#   allowed a chance to wire, just like any other fresh deposit, or be culled correctly for not wiring, and not because something isn't
+#   working right." The hold exists for CC-CALLOSUM-TRUTH §8.12: protect arrivals whose binding is IN TRANSIT -- not to freeze the clock for
+#   a node nothing is delivering a binding for. A laptop-own node gets the NORMAL orphan grace and the real dynamics (co-fire/sprout -> wired
+#   and live; not -> the sweep takes it BY DESIGN). This is NOT an exemption from the sweep and NOT a hold (CC-CALLOSUM-TRUTH §0/§2).
+# How: held = sweep-eligible unbound ∩ (the static in-transit cohort ∪ this merge's `merge_landed`). The file stays static; once the cohort
+#   is bound the INTERSECTION empties its term and only the merge's own arrivals are held (§8.12 Layer 2). The P499 belt is UNCHANGED.
+#   Stats keys, ERROR text and counter meanings are unchanged; `..._preexisting` now counts HELD cohort nodes not delivered by this merge.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13491) — #905 ROUND 2: COMMENTS AND DOCSTRINGS ONLY
 # What: (E.2) the two stale "no production caller yet (Phase 3)" header comments below are corrected: the daemon's handle_merge_topology
 #   (scripts/cc-ng-daemon.py, imports and calls merge_cc_topology) IS a production caller. (E.1) the "pre-existing" wording in the stats
@@ -233,8 +249,10 @@ import json
 import logging
 import os
 import re
+import stat
+import threading
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -505,32 +523,39 @@ def merge_cc_topology(
     existing mechanism rather than write a second one. Default 250 via
     CC_NG_IDLE_STEPS, the same env the nightly cron already exports.
 
-    THE GUARD COVERS THE WHOLE GRAPH (#897). The steps are skipped -- counted
-    and logged at ERROR, once per blocked batch -- while ANY node in the graph
-    is unbound AND sweep-eligible (`_unbound_nodes`: no synapse, no hyperedge,
-    not identity-protected; #905): one of this merge's own arrivals that
-    did not bind, OR one that was already there. A PROTECTED unbound node (the
-    sweep spares it) does not block. The first guard (#108) asked
+    THE GUARD COVERS THE HELD SET (#897, narrowed by #905-DELTA). The steps are
+    skipped -- counted and logged at ERROR, once per blocked batch -- while ANY
+    node is HELD (`held_unbound_nodes`): sweep-eligible and unbound (`_unbound_nodes`:
+    no synapse, no hyperedge, not identity-protected; #905) AND whose binding is
+    IN TRANSIT -- in the static in-transit cohort (CC_NG_IN_TRANSIT_IDS_PATH) or one
+    of THIS merge's own arrivals (`merge_landed`) that did not bind. A PROTECTED
+    unbound node (the sweep spares it) does not block, and since #905-DELTA neither
+    does a laptop-OWN unbound node nothing is delivering a binding for: it takes the
+    normal orphan grace and the real dynamics (NOT an exemption from the sweep, and
+    not a hold; CC-CALLOSUM-TRUTH §8.12). With the variable unset the held set is the
+    whole sweep-eligible unbound set (#897/#905), and so it is if the file is unusable
+    (fail closed). The first guard (#108) asked
     only about this merge's arrivals; it never saw the pre-existing unbound
     conversational cohort, so the first merge whose arrivals were all bound
     would have run 250 steps against orphan grace 25 and handed the cohort to
     the orphan sweep. Leg 2 frames still merge and bind (that is how the cohort
-    gets bound); only the clock is held. A node that cannot bind blocks
+    gets bound); only the clock is held. A held node that cannot bind blocks
     consolidation, loudly, until it does. Stats: `consolidation_blocked_batches`
     (+1 per blocked batch), `consolidation_skipped_unbound_arrivals` (this
     merge's arrivals still unbound at a skip) and
-    `consolidation_skipped_unbound_preexisting` (the rest, summed per blocked
-    batch). Same predicate as the daemon's #896 rule 1. Wording note (#905 round 2):
+    `consolidation_skipped_unbound_preexisting` (the held cohort nodes not delivered
+    by this merge, summed per blocked batch). Same hold as the daemon's drain
+    (`held_unbound_nodes`, no `merge_landed`). Wording note (#905 round 2):
     "pre-existing" means NOT in `merge_landed` (not delivered by this merge). A node
     the conduit re-sent that the receiver already held IS in `merge_landed`, so it is
     counted under "from this merge" / `consolidation_skipped_unbound_arrivals`.
 
     THE GUARD IS ALSO PER SLICE (#905 part D). The check above decides whether a
     pass STARTS. The pass itself (`_cc_callosum_consolidate`) re-checks the same
-    predicate (`whole_graph_guard`) before EACH lock slice, so a node that becomes
-    unbound between slices stops the pass at the slice boundary instead of aging
-    through the rest of the 250 steps. A pass held that way is counted in
-    `consolidation_held_midpass`, never in `consolidation_passes` /
+    held set (`whole_graph_guard(graph, merge_landed=...)`) before EACH lock slice, so
+    a node that becomes unbound between slices stops the pass at the slice boundary
+    instead of aging through the rest of the 250 steps. A pass held that way is
+    counted in `consolidation_held_midpass`, never in `consolidation_passes` /
     `consolidation_steps`.
 
     THE ACK MEANS "I HOLD IT BOUND" (#918). The membership snapshot written at the
@@ -610,13 +635,19 @@ def merge_cc_topology(
         # are in `merge_landed`: every node this conduit delivered, INCLUDING a node it
         # re-sent that the receiver ALREADY held (the skipped_present branch adds it to
         # `batch_landed` too: "present == usable as an endpoint"); that is its original
-        # meaning. `..._preexisting` counts the unbound nodes NOT in `merge_landed`,
+        # meaning. `..._preexisting` counts the HELD unbound nodes NOT in `merge_landed`,
         # summed per blocked batch. "Pre-existing" is a loose label: it means "not
         # delivered by this merge", NOT "was in the graph before it" -- a re-sent
         # already-present unbound node lands in the OTHER bucket (arrivals).
         # `consolidation_blocked_batches` is +1 per blocked batch. The decision
-        # (whole graph, sweep-eligible) is unaffected by the split.
+        # (held set) is unaffected by the split.
         # (#905 round 2: wording only; keys and counting unchanged.)
+        # #905-DELTA: the decision is the HELD set (`held_unbound_nodes`): sweep-eligible
+        # unbound nodes in the in-transit cohort or in `merge_landed`. So `..._preexisting`
+        # now counts the HELD COHORT nodes not delivered by this merge; a laptop-own unbound
+        # node is not held and is counted in neither bucket. With CC_NG_IN_TRANSIT_IDS_PATH
+        # unset (or unusable) the held set is the whole sweep-eligible unbound set: as before.
+        # Keys and their meaning of "not delivered by this merge" are unchanged.
         "consolidation_skipped_unbound_preexisting": 0,
         "consolidation_blocked_batches": 0,
         # #905 part D: passes the batch-end guard let START but the per-slice guard
@@ -868,10 +899,12 @@ def merge_cc_topology(
                     stats["skipped_hyperedges"] += 1
 
             merge_landed |= batch_landed
-            # #897: the WHOLE graph, not `merge_landed` -- the same call the daemon's
-            # #896 rule 1 makes. Evaluated here, under the lock and only when the
-            # guard will be consulted, exactly where the merge-scoped one was.
-            unbound = (_unbound_nodes(graph, set(graph.nodes))
+            # #897 widened this to the WHOLE graph; #905-DELTA (Exec P547/P548) narrows
+            # what is HELD: the sweep-eligible unbound nodes whose binding is IN TRANSIT
+            # (the static cohort named by CC_NG_IN_TRANSIT_IDS_PATH) plus THIS merge's
+            # own arrivals (`merge_landed`). Evaluated here, under the lock and only when
+            # the guard will be consulted. Variable UNSET = the #905 whole-graph answer.
+            unbound = (held_unbound_nodes(graph, set(graph.nodes), merge_landed)
                        if idle_steps > 0 and merge_landed else set())
 
         # --- Consolidation: sleep on this batch before taking the next ------
@@ -883,35 +916,41 @@ def merge_cc_topology(
         # GUARDED, and the guard is the whole reason this is not a two-line
         # change. Consolidation advances graph.timestep, and
         # orphan_node_grace_period is denominated in exactly that clock (default
-        # 25). idle_steps defaults to 250. So running the steps while ANY node
-        # in the graph is still unbound would march it straight past grace and
-        # hand it to the orphan sweep (neuro_foundation._collect_orphan_nodes) --
+        # 25). idle_steps defaults to 250. So running the steps while a node whose
+        # binding is still ON ITS WAY is unbound would march it straight past grace
+        # and hand it to the orphan sweep (neuro_foundation._collect_orphan_nodes) --
         # authoring CC-CALLOSUM-TRUTH.md §8.2's cohort cliff into the merge path,
         # in the name of a fix for it.
         #
-        # THE PREDICATE IS WHOLE-GRAPH (#897). What the first guard did (#108):
-        # it asked only about THIS merge's arrivals (`merge_landed`, accumulated
-        # across batches because binding splits across them, so a batch-scoped
-        # check would let a later whole batch age an earlier arrival past grace).
-        # That was right about batch-vs-merge and wrong about merge-vs-graph:
-        # the laptop CC graph holds 147 PRE-EXISTING unbound conversational nodes
-        # (15 forests + 132 trees, source=cc_gateway) that are in nobody's
-        # `merge_landed`, so the first Leg 2 tick whose arrivals were all bound
-        # passed the guard, ran 250 steps against grace 25, and the sweep reaped
-        # every still-unbound one of them in that one tick. The pre-existing
-        # cohort binds only OVER Leg 2 (CALLOSUM-TRUTH §2, §10.4-H: the clock
-        # stays gated until the backlog is wired -- do not 'fix' the cull by
-        # disabling, host-scoping or exempting), so the clock must not move
-        # until it has. Same predicate as the daemon's #896 rule 1.
+        # WHAT IS HELD NOW (#905-DELTA, Exec P547/P548; CC-CALLOSUM-TRUTH §8.12).
+        # History: the first guard (#108) asked only about THIS merge's arrivals
+        # (`merge_landed`, accumulated across batches because binding splits across
+        # them, so a batch-scoped check would let a later whole batch age an earlier
+        # arrival past grace); #897 widened it to the WHOLE graph because the laptop
+        # CC graph held 147 pre-existing unbound conversational nodes whose binding
+        # was still to come over Leg 2, and the first tick whose arrivals were all
+        # bound would have run 250 steps and let the sweep reap them. That widening
+        # over-reached: it also counted a laptop-OWN unbound node, one no binding is
+        # in transit for (forest:2dfa2d637643). Nothing was ever going to wire it and
+        # the hold forbade the clock that could cull it -- under 25/250 Leg 2 stalled
+        # after its first batch. §8.12 is why the hold exists: protect arrivals whose
+        # binding is IN TRANSIT. So the held set is the sweep-eligible unbound nodes
+        # that are (a) in the static in-transit cohort (`held_unbound_nodes`; the
+        # once-read file CC_NG_IN_TRANSIT_IDS_PATH) or (b) in `merge_landed`. Once the
+        # cohort is bound its term of the intersection is empty and only this merge's
+        # arrivals are held. A laptop-own unbound node is NOT held: it takes the NORMAL
+        # orphan grace and the real dynamics (co-firing, sprouting): wired -> live; not
+        # wired -> the sweep takes it BY DESIGN. That is NOT an exemption from the sweep
+        # (CC-CALLOSUM-TRUTH §0/§2 forbid exempting laptop nodes) and NOT a hold. The
+        # variable UNSET (the VPS) or unusable keeps the whole-graph hold (fail closed).
         #
-        # So: consolidate only when NO node in the graph is unbound AND sweep-eligible
-        # (#905: `_unbound_nodes` leaves out identity-protected nodes, which the sweep
-        # never reaps, and deliberately has no age term). Otherwise
-        # skip, count, and log loudly (one ERROR per blocked batch, never
-        # rate-limited). Frames still merge and bind -- Tier 3 is untouched; only
-        # the clock is held. An unbound node that cannot bind blocks
-        # consolidation, loudly, until it does: deferring consolidation costs
-        # only integration quality, whereas running it costs the node.
+        # So: consolidate only when NO held node exists (`_unbound_nodes` leaves out
+        # identity-protected nodes, which the sweep never reaps, and deliberately has no
+        # age term). Otherwise skip, count, and log loudly (one ERROR per blocked batch,
+        # never rate-limited). Frames still merge and bind -- Tier 3 is untouched; only
+        # the clock is held. A held node that cannot bind blocks consolidation, loudly,
+        # until it does: deferring consolidation costs only integration quality, whereas
+        # running it costs the node.
         if idle_steps > 0 and merge_landed:
             if unbound:
                 from_merge = unbound & merge_landed
@@ -926,6 +965,9 @@ def merge_cc_topology(
                 # merge; a node the conduit re-sent that the receiver already held is in
                 # `merge_landed` and is counted in the "from this merge" figure. The
                 # accurate wording is "not delivered by this merge" (stats comment above).
+                # Since #905-DELTA `unbound` is the HELD set, so `preexisting` is the HELD
+                # in-transit cohort nodes not delivered by this merge (or, with the variable
+                # unset / unusable, every sweep-eligible unbound node, as before).
                 logger.error(
                     "CC topology: skipping %d consolidation step(s) after batch %d -- "
                     "%d node(s) in the graph are still unbound (no synapse, no "
@@ -940,17 +982,20 @@ def merge_cc_topology(
                     len(preexisting), len(from_merge), len(merge_landed),
                     [redact_node_id(n) for n in sorted(unbound)[:3]])
             else:
-                # #905 part D: the per-slice guard re-checks the whole graph before
+                # #905 part D: the per-slice guard re-checks the held set before
                 # EACH 25-step slice, inside the shared _cc_callosum_consolidate
                 # (the daemon's drain builds the SAME guard from
                 # whole_graph_guard). The check above is the OUTER one: it decides
                 # whether the pass starts; the per-slice one decides whether it
                 # continues. A pass held part-way is reported, not counted as
                 # consolidated; the function already logged its own loud record.
+                # #905-DELTA: this merge's own `merge_landed` is passed so the per-slice
+                # guard holds the same set the batch-end check does.
                 progress: Dict[str, Any] = {}
                 if _cc_callosum_consolidate(
                         graph, idle_steps,
-                        guard=whole_graph_guard(graph), progress=progress):
+                        guard=whole_graph_guard(graph, merge_landed=merge_landed),
+                        progress=progress):
                     stats["consolidation_passes"] += 1
                     stats["consolidation_steps"] += idle_steps
                 elif progress.get("held"):
@@ -1066,6 +1111,188 @@ def _unbound_nodes(graph: Any, node_ids: Set[str]) -> Set[str]:
     }
 
 
+# --- #905-DELTA: the in-transit set (a LAW 5 path; the IDS are data, the path is the knob) ---
+# CC_NG_IN_TRANSIT_IDS_PATH names a JSONL file, one JSON object per line, each with a
+# non-empty `str` `id`: the nodes whose binding is IN TRANSIT. It is read ONCE per
+# process (decided once, cached under a lock, reloaded only on process restart).
+#   UNSET   -> the feature is OFF: `held_unbound_nodes` == `_unbound_nodes`, no file I/O,
+#              no log line. An unset knob must not add a permanent ERROR to every other
+#              consumer of this shared module (the VPS / Syl's process never sets it).
+#   VALID   -> a frozenset of ids; ONE INFO line at the read (file sha256 + count).
+#   CORRUPT -> SET but missing / unreadable / not a regular file / over the cap / ANY
+#              malformed line / ZERO ids (an empty snapshot is corrupt: it is a fixed
+#              artifact, never legitimately empty): fail CLOSED -- `held_unbound_nodes`
+#              == `_unbound_nodes` (hold ALL) -- with ONE loud ERROR naming the failure
+#              CLASS (never `str(exc)`, never a line of the file). NEVER fail open.
+# Ids are never logged (logging of ids anywhere uses `redact_node_id`).
+_IN_TRANSIT_ENV = "CC_NG_IN_TRANSIT_IDS_PATH"
+_IN_TRANSIT_MAX_BYTES = 1 << 20
+_IN_TRANSIT_UNSET = "unset"
+_IN_TRANSIT_VALID = "valid"
+_IN_TRANSIT_CORRUPT = "corrupt"
+_in_transit_lock = threading.Lock()
+_in_transit_state: Optional[Tuple[str, FrozenSet[str]]] = None
+
+
+class _InTransitCorrupt(Exception):
+    """Carries ONLY a failure class name; the message of the underlying error is never kept or logged."""
+
+    def __init__(self, cls: str) -> None:
+        super().__init__(cls)
+        self.cls = cls
+
+
+def _read_in_transit_ids(path: str) -> Tuple[str, FrozenSet[str]]:
+    """(sha256 hex of the file, ids) or raise `_InTransitCorrupt(<class>)`.
+
+    ONE file descriptor is opened (O_NONBLOCK, so a FIFO swapped in cannot block the caller, which may hold
+    `graph._step_lock`), then `fstat` and the read use THAT descriptor: the regular-file and size checks
+    cannot be raced by a swap between a stat and an open."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except (FileNotFoundError, NotADirectoryError):
+        raise _InTransitCorrupt("not_found") from None
+    except (OSError, ValueError):
+        raise _InTransitCorrupt("unreadable") from None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            raise _InTransitCorrupt("unreadable") from None
+        if not stat.S_ISREG(st.st_mode):
+            raise _InTransitCorrupt("not_regular_file")
+        cap = _IN_TRANSIT_MAX_BYTES
+        if st.st_size > cap:
+            raise _InTransitCorrupt("oversize")
+        chunks: List[bytes] = []
+        total = 0
+        try:
+            while total <= cap:
+                chunk = os.read(fd, cap + 1 - total)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        except OSError:
+            raise _InTransitCorrupt("unreadable") from None
+        if total > cap:
+            raise _InTransitCorrupt("oversize")
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _InTransitCorrupt("not_utf8") from None
+    ids: Set[str] = set()
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            raise _InTransitCorrupt("malformed_line") from None
+        if not isinstance(obj, dict):
+            raise _InTransitCorrupt("not_an_object")
+        nid = obj.get("id")
+        if not isinstance(nid, str) or not nid:
+            raise _InTransitCorrupt("bad_id")
+        ids.add(nid)
+    if not ids:
+        raise _InTransitCorrupt("zero_ids")
+    return digest, frozenset(ids)
+
+
+def _decide_in_transit_state() -> Tuple[str, FrozenSet[str]]:
+    path = os.environ.get(_IN_TRANSIT_ENV)
+    if path is None:
+        return (_IN_TRANSIT_UNSET, frozenset())
+    try:
+        digest, ids = _read_in_transit_ids(path)
+    except _InTransitCorrupt as exc:
+        cls = exc.cls
+    except Exception as exc:  # noqa: BLE001 - fail CLOSED whatever it was; the class name only, never the message
+        cls = "unexpected_" + type(exc).__name__
+    else:
+        logger.info(
+            "CC topology in-transit hold: read the in-transit id set (%s): sha256=%s ids=%d. "
+            "The whole-graph hold now covers only these ids plus the current merge's arrivals "
+            "(#905-DELTA); a laptop-own unbound node takes the normal orphan grace.",
+            _IN_TRANSIT_ENV, digest, len(ids))
+        return (_IN_TRANSIT_VALID, ids)
+    logger.error(
+        "CC topology in-transit hold: %s is set but its id set is unusable (class=%s): FAILING "
+        "CLOSED -- the hold covers EVERY sweep-eligible unbound node (the #905 whole-graph hold), "
+        "so the clock may freeze but nothing is released early. Fix the file or the variable and "
+        "restart the process: this failure is cached for the life of the process.",
+        _IN_TRANSIT_ENV, cls)
+    return (_IN_TRANSIT_CORRUPT, frozenset())
+
+
+def _in_transit_cohort() -> Tuple[str, FrozenSet[str]]:
+    """The process-wide in-transit state, decided ONCE (lock-protected) and cached."""
+    global _in_transit_state
+    state = _in_transit_state
+    if state is not None:
+        return state
+    with _in_transit_lock:
+        if _in_transit_state is None:
+            _in_transit_state = _decide_in_transit_state()
+        return _in_transit_state
+
+
+def _reset_in_transit_cache_for_tests() -> None:
+    """TEST-ONLY: forget the cached in-transit state. Production code never calls this
+    (a process restart is the only reload)."""
+    global _in_transit_state
+    with _in_transit_lock:
+        _in_transit_state = None
+
+
+def held_unbound_nodes(graph: Any, node_ids: Set[str], merge_landed: Optional[Set[str]] = None) -> Set[str]:
+    """Which of `node_ids` the consolidation clock must be HELD for: the sweep-eligible
+    unbound nodes whose binding is IN TRANSIT (#905-DELTA; Exec P547/P548, Josh's
+    ruling; Chief-003 ruling B).
+
+    `_unbound_nodes` answers "what would the sweep reap". The #897/#905 hold used that
+    answer whole, so a laptop-own unbound node (no binding in transit) froze the clock:
+    it could neither wire nor be culled. CC-CALLOSUM-TRUTH §8.12 is why the hold exists --
+    protect the arrivals whose binding is IN TRANSIT, until it lands. So:
+
+        held = _unbound_nodes(graph, node_ids)
+               ∩ ( the in-transit cohort  ∪  this merge's `merge_landed` )
+
+    The cohort is the once-read static id set named by CC_NG_IN_TRANSIT_IDS_PATH (see the
+    block above); `merge_landed` is the arrival set of the merge whose consolidation is asking
+    (None when the caller has no such set: the daemon's drain passes none and so holds the
+    cohort only). KNOWN EXPOSURE, flagged for ruling (not solved here): a merge's arrivals that
+    await a LATER batch's binding are protected only from THAT merge's own consolidation; a
+    drain pass running concurrently in the same process does not see them (it has no
+    `merge_landed`). It is an INTERSECTION with the unbound
+    set, never a union: once the cohort is bound its term is empty (the file stays static;
+    the intersection empties it) and only a merge's own arrivals are held (§8.12 Layer 2).
+
+    A node outside that set -- a laptop-own unbound node -- is NOT held. It gets the NORMAL
+    orphan grace (`orphan_node_grace_period`) and the real dynamics: co-firing and
+    sprouting wire it and it lives; if nothing wires it the sweep takes it BY DESIGN. That
+    is NOT an exemption from the sweep (CC-CALLOSUM-TRUTH §0/§2 forbid exempting laptop
+    nodes; the sweep is unchanged) and NOT a hold.
+
+    The variable UNSET, or SET but unusable (missing / unreadable / not a regular file /
+    over the cap / any malformed line / zero ids), returns EXACTLY `_unbound_nodes(...)`:
+    UNSET is today's behaviour byte for byte (no I/O, no log); unusable fails CLOSED and
+    loudly, never open. Pure query: no write, no lock beyond the cache's own.
+    """
+    base = _unbound_nodes(graph, node_ids)
+    state, cohort = _in_transit_cohort()
+    if state != _IN_TRANSIT_VALID:
+        return base
+    if merge_landed is None:
+        return {n for n in base if n in cohort}
+    return {n for n in base if n in cohort or n in merge_landed}
+
+
 def redact_node_id(nid: Any) -> str:
     """The ONE redaction rule for any unbound-node-id sample that reaches a log
     (#905 part C / Exec Packet 489 / #907): `<kind>:<first 12 hex of sha256(id)>`.
@@ -1097,21 +1324,25 @@ def redact_node_id(nid: Any) -> str:
     return "%s:%s" % (kind, hashlib.sha256(s.encode("utf-8", "surrogatepass")).hexdigest()[:12])
 
 
-def whole_graph_guard(graph: Any):
+def whole_graph_guard(graph: Any, merge_landed: Optional[Set[str]] = None):
     """The ONE constructor of the per-slice consolidation guard (#905 part D;
     LAW 3 / LAW 4: no per-caller copy of the predicate).
 
     Returns a zero-argument callable that evaluates
-    `_unbound_nodes(graph, set(graph.nodes))` -- the same sweep-eligible,
-    whole-graph predicate as the merge's batch-end check and the daemon's
-    #896 rule 1 -- under `graph._step_lock` (an RLock), taken ONLY for the read.
+    `held_unbound_nodes(graph, set(graph.nodes), merge_landed)` -- the same held set
+    as the merge's batch-end check and the daemon's drain (#905-DELTA: the sweep-eligible
+    unbound nodes whose binding is IN TRANSIT; with CC_NG_IN_TRANSIT_IDS_PATH unset, or
+    unusable, exactly `_unbound_nodes(graph, set(graph.nodes))`: the whole-graph hold of
+    #897/#905) -- under `graph._step_lock` (an RLock), taken ONLY for the read.
+    `merge_landed` is an ADDITIVE keyword: the merge passes its own arrivals; the daemon's
+    existing `whole_graph_guard(graph)` call keeps working and holds the cohort only.
     The result is a set of currently blocking node ids (empty = clear). The ids
     are for COUNTING ONLY by the consumer, `cc_ng_organism._cc_callosum_consolidate`,
     which never logs them. The callable holds no lock between calls.
     """
     def _guard() -> Set[str]:
         with graph._step_lock:
-            return _unbound_nodes(graph, set(graph.nodes))
+            return held_unbound_nodes(graph, set(graph.nodes), merge_landed)
     return _guard
 
 
