@@ -86,6 +86,16 @@
 #   dual_record_outcome in the middle of extraction, so deferring it would mean editing or duplicating that function. The snapshot lives
 #   on the eco class (same reason as the journal). The success path is unchanged (a successful exact repeat still re-stamps, as before).
 #   Tests: tests/test_cc_bind_atomic_904.py (fold-up section).
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane held-clock-visible-901, dispatch #13433 (Exec P501 / le-052 #4) — the want-create failure counter is READABLE
+#   and its WARNING is rate-limited
+# What: (a) new public accessor cc_want_create_failure_count() (the total of _CC_WANT_CREATE_FAILURES) so a caller (the docs daemon's autosave section)
+#   can read the counter without reaching for a private name; the counter itself and the per-call WARNING text are unchanged. (b) the want-create
+#   WARNING is rate-limited per function with the module's EXISTING interval, _PITH_WARN_INTERVAL_S (env CC_PITH_WARN_INTERVAL_S, default 60 s; no new
+#   variable), keyed per fn_name in _cc_want_create_warn_last: the FIRST failure always warns, further failures inside the interval are COUNTED but not
+#   re-logged. The counter is always bumped. Why: surface_wants_for_graph runs per deposit call (cc_ng_host.py ~:698), so an unthrottled WARNING could
+#   fire per message while a want keeps failing (its id never lands in the graph, so every pulse retries it). (c) the daemon side (docs repo) reads this
+#   counter's delta around its surface_wants call, because the per-want guard now absorbs the raise and the autosave section's except no longer sees it.
+# How: logging / counting only; the success path (return value, graph, vdb, synapses) is byte-identical. Tests: tests/test_cc_swallows_915.py.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane held-clock-visible-901, dispatch #13220 — #915 (Exec Packet 495): three swallows made
 #   loud, class-name only (the NG half; the daemon half is in the docs repo)
 # What: (a) _cc_deposit_memory_node's recall-insert WARNING no longer prints str(exc) (a tree node's id/exception text can carry the user's
@@ -1361,16 +1371,29 @@ def deposit_cc_experience(text: str, target_id: str, workspace_dir: str,
 
 
 _CC_WANT_CREATE_FAILURES = {"surface_wants": 0, "surface_wants_for_graph": 0}   # #915: failed want creates, per function, in-process
+_cc_want_create_warn_last: Dict[str, float] = {}    # fn_name -> monotonic time of its last want-create WARNING (rate limit, #P501)
+
+
+def cc_want_create_failure_count() -> int:
+    """The TOTAL number of want creates that failed in this process (both surface_wants and surface_wants_for_graph). Read-only:
+    a caller that wants to notice a failure the per-want guard absorbed reads it before and after the call (its delta)."""
+    return int(sum(_CC_WANT_CREATE_FAILURES.values()))
 
 
 def _cc_report_want_create_failures(fn_name, attempted, failed, exc_types):
-    """#915 / Exec P495: COUNT and report ONE WARNING per surface_wants* call in which a want's create_node raised.
+    """#915 / Exec P495: COUNT and report at most ONE WARNING per surface_wants* call (rate-limited per function by the module's
+    existing _PITH_WARN_INTERVAL_S, Exec P501) in which a want's create_node raised.
     Hardcoded reason code + the function name + counts + exception CLASS NAMES only: never str(exc), a want's text, a
     node id or a path. The failed want is NOT created (nothing is half-rolled-back, H-1) and the loop went on to the
     next want; it is retried on the next pulse because its id is not in the graph."""
     if not failed:
         return
-    _CC_WANT_CREATE_FAILURES[fn_name] = _CC_WANT_CREATE_FAILURES.get(fn_name, 0) + failed
+    _CC_WANT_CREATE_FAILURES[fn_name] = _CC_WANT_CREATE_FAILURES.get(fn_name, 0) + failed       # ALWAYS counted
+    now = time.monotonic()
+    last = _cc_want_create_warn_last.get(fn_name)
+    if last is not None and (now - last) < _PITH_WARN_INTERVAL_S:
+        return              # rate-limited (the module's existing interval): counted above, not re-logged
+    _cc_want_create_warn_last[fn_name] = now
     logger.warning(
         "CC want create FAILED: reason=want_create_failed fn=%s attempted=%d failed=%d exc_types=%s -- the loop "
         "continued with the remaining wants; no authored want was deleted, re-tagged or edited",

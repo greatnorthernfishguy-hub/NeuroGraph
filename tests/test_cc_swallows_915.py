@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane held-clock-visible-901, dispatch #13433 (Exec P501 / le-052 #4) — tests for the READABLE counter and the
+#   rate-limited want-create WARNING: cc_want_create_failure_count() totals both functions and rises by the failures; a second failure inside the interval is
+#   COUNTED but not re-logged (per function); the first failure always warns; the warning returns after the interval; the success path is still quiet and
+#   byte-identical; no str(exc) / id. An autouse fixture clears the limiter state so the earlier one-WARNING-per-call tests stay independent.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane held-clock-visible-901, dispatch #13220 — #915 (Exec Packet 495): tests for the three
 #   NG swallows made loud
 # What: (a) _cc_deposit_memory_node's recall-insert WARNING is class-name only (the function still re-raises, still no rollback);
@@ -282,3 +286,84 @@ def test_generate_emergent_want_is_untouched():
                           capture_output=True, text=True).stdout
     assert base, 'cannot read the base; a pin must FAIL, not skip'
     assert body(new) == body(base)
+
+
+# ------------------------------------------------------------------ Exec P501 / le-052 #4: the counter is READABLE, the WARNING is RATE-LIMITED
+
+@pytest.fixture(autouse=True)
+def _reset_want_create_limiter():
+    """The limiter keeps module-level state; clear it (when it exists: the base has none) so each test starts un-throttled."""
+    getattr(org, '_cc_want_create_warn_last', {}).clear()
+    yield
+    getattr(org, '_cc_want_create_warn_last', {}).clear()
+
+
+def _fail_all_wants(g, prefix):
+    _fail_creates(g, lambda nid: nid.startswith(prefix))
+
+
+@pytest.mark.parametrize('fn_name,prefix', WANT_FNS)
+def test_the_accessor_totals_both_functions_and_rises_by_the_failures(fn_name, prefix):
+    """FAILS on 78810c1b (no accessor)."""
+    before = org.cc_want_create_failure_count()
+    g, v = _stores()
+    _two_wants(g, v)
+    _fail_all_wants(g, prefix)
+    _run(fn_name, g, v)
+    assert org.cc_want_create_failure_count() == before + 2
+    assert org.cc_want_create_failure_count() == sum(org._CC_WANT_CREATE_FAILURES.values())
+
+
+@pytest.mark.parametrize('fn_name,prefix', WANT_FNS)
+def test_a_second_failing_call_inside_the_interval_is_counted_but_not_relogged(fn_name, prefix, caplog, monkeypatch):
+    """FAILS on 78810c1b (the WARNING was unthrottled: one per call)."""
+    monkeypatch.setattr(org, '_PITH_WARN_INTERVAL_S', 3600.0)
+    g, v = _stores()
+    _two_wants(g, v)
+    _fail_all_wants(g, prefix)
+    before = org.cc_want_create_failure_count()
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        for _ in range(3):
+            _run(fn_name, g, v)
+    warns = [r for r in _org_records(caplog) if r.levelno >= logging.WARNING]
+    assert len(warns) == 1                                                   # the FIRST failure always warns
+    assert 'reason=want_create_failed' in warns[0].getMessage() and 'attempted=2' in warns[0].getMessage()
+    assert org.cc_want_create_failure_count() == before + 6                  # 3 calls x 2 failures, ALL counted
+    _assert_no_leak(_all_text(caplog))
+
+
+@pytest.mark.parametrize('fn_name,prefix', WANT_FNS)
+def test_the_warning_returns_after_the_interval_has_elapsed(fn_name, prefix, caplog, monkeypatch):
+    monkeypatch.setattr(org, '_PITH_WARN_INTERVAL_S', 0.0)
+    g, v = _stores()
+    _two_wants(g, v)
+    _fail_all_wants(g, prefix)
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        _run(fn_name, g, v)
+        _run(fn_name, g, v)
+    assert len([r for r in _org_records(caplog) if r.levelno >= logging.WARNING]) == 2
+
+
+def test_the_limiter_is_per_function_each_one_warns_once(caplog, monkeypatch):
+    monkeypatch.setattr(org, '_PITH_WARN_INTERVAL_S', 3600.0)
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        for fn_name, prefix in WANT_FNS:
+            g, v = _stores()
+            _two_wants(g, v)
+            _fail_all_wants(g, prefix)
+            _run(fn_name, g, v)
+            _run(fn_name, g, v)
+    msgs = [r.getMessage() for r in _org_records(caplog) if r.levelno >= logging.WARNING]
+    assert len(msgs) == 2 and any('fn=surface_wants ' in m for m in msgs) and any('fn=surface_wants_for_graph ' in m for m in msgs)
+
+
+@pytest.mark.parametrize('fn_name,prefix', WANT_FNS)
+def test_a_success_path_moves_no_counter_and_stays_quiet(fn_name, prefix, caplog):
+    before = org.cc_want_create_failure_count()
+    g, v = _stores()
+    _seed_source(g, v, 'cc:conv::src', 'turn [WANT]%s[/WANT] tail' % WANT_A)
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        out = _run(fn_name, g, v)
+    assert len(out) == 1
+    assert org.cc_want_create_failure_count() == before
+    assert [r for r in _org_records(caplog) if r.levelno >= logging.WARNING] == []
