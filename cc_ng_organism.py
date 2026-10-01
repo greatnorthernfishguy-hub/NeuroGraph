@@ -86,6 +86,23 @@
 #   dual_record_outcome in the middle of extraction, so deferring it would mean editing or duplicating that function. The snapshot lives
 #   on the eco class (same reason as the journal). The success path is unchanged (a successful exact repeat still re-stamps, as before).
 #   Tests: tests/test_cc_bind_atomic_904.py (fold-up section).
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane held-clock-visible-901, dispatch #13220 — #915 (Exec Packet 495): three swallows made
+#   loud, class-name only (the NG half; the daemon half is in the docs repo)
+# What: (a) _cc_deposit_memory_node's recall-insert WARNING no longer prints str(exc) (a tree node's id/exception text can carry the user's
+#   concept words): it logs a fixed reason code and the exception CLASS NAME. The function is otherwise UNCHANGED: it still re-raises and
+#   still fabricates no rollback (pinned by tests/test_cc_capture_mutations_423.py, which passes unmodified). (b) surface_wants: the
+#   graph.create_node(...) for a want was UNGUARDED, so one raise aborted the whole loop and the later wants were not materialized that
+#   pulse. It is now guarded PER WANT: a failed create is counted, the loop CONTINUES with the next want, and ONE WARNING per call
+#   reports it (_cc_report_want_create_failures: fixed reason code want_create_failed, the function name, counts, exception CLASS names
+#   only). (c) surface_wants_for_graph: the outer `except Exception: logger.debug("Failed to create want node: %s", exc)` is the same
+#   report (counter + ONE WARNING per call, class names only) instead of a DEBUG with str(exc); it was already non-fatal per want.
+# Why: the autosave section swallows are what made a want/drain failure invisible; P370 (no silent swallow); the ONE RULE (Packet 494):
+#   exception text that can name a node never goes into a log.
+# How: comments / logging / guarding ONLY. Every success path is byte-identical (return value, graph, vdb, synapses). H-1: nothing about
+#   the 182 cc_authored wants or the constitutional node is deleted, re-tagged, edited or de-flagged: a want whose create raised is not
+#   created and is retried on the next pulse (its id is not in the graph); a partially-created node is NOT removed (no fabricated
+#   rollback). Counters: the module-level _CC_WANT_CREATE_FAILURES (per function, in-process). Volume: a want that keeps failing is
+#   reported once per call (per autosave pulse) while it keeps failing. generate_emergent_want is NOT touched (#905).
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13058 — #904 (Exec Packet 487 via Chief-003):
 #   the dual-pass write path is ATOMIC (or loud, with a truthful False), never silently half-written
 # What: run_conversational_dual_pass keeps a write JOURNAL (on _CCConversationalDualPassEco: every node write, plus the
@@ -1343,6 +1360,23 @@ def deposit_cc_experience(text: str, target_id: str, workspace_dir: str,
         return None
 
 
+_CC_WANT_CREATE_FAILURES = {"surface_wants": 0, "surface_wants_for_graph": 0}   # #915: failed want creates, per function, in-process
+
+
+def _cc_report_want_create_failures(fn_name, attempted, failed, exc_types):
+    """#915 / Exec P495: COUNT and report ONE WARNING per surface_wants* call in which a want's create_node raised.
+    Hardcoded reason code + the function name + counts + exception CLASS NAMES only: never str(exc), a want's text, a
+    node id or a path. The failed want is NOT created (nothing is half-rolled-back, H-1) and the loop went on to the
+    next want; it is retried on the next pulse because its id is not in the graph."""
+    if not failed:
+        return
+    _CC_WANT_CREATE_FAILURES[fn_name] = _CC_WANT_CREATE_FAILURES.get(fn_name, 0) + failed
+    logger.warning(
+        "CC want create FAILED: reason=want_create_failed fn=%s attempted=%d failed=%d exc_types=%s -- the loop "
+        "continued with the remaining wants; no authored want was deleted, re-tagged or edited",
+        fn_name, attempted, failed, ",".join(exc_types[:3]))
+
+
 def _cc_report_want_synapse_failures(fn_name, attempted, failed, exc_types):
     """#904 / Exec P489: ONE WARNING per surface_wants* call whose want seed-synapse(s) failed.
     Hardcoded reason code + the function name + counts + exception CLASS NAMES only: never
@@ -1379,6 +1413,8 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
         open_wants = []
         syn_attempted = syn_failed = 0
         syn_exc_types = []
+        create_attempted = create_failed = 0
+        create_exc_types = []
         for nid, node in list(graph.nodes.items()):
             meta = getattr(node, "metadata", None) or {}
             if meta.get("kind") == "want":
@@ -1404,6 +1440,7 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
                 if want_id in graph.nodes:
                     continue
                 try:
+                    create_attempted += 1
                     graph.create_node(
                         node_id=want_id,
                         metadata={
@@ -1430,8 +1467,12 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
                         "state": "open",
                         "source": nid,
                     })
-                except Exception as exc:
-                    logger.debug("Failed to create want node: %s", exc)
+                except Exception as exc:  # noqa: BLE001
+                    # #915: LOUD, not a DEBUG with str(exc). Non-fatal per want; counted; class name only.
+                    create_failed += 1
+                    if type(exc).__name__ not in create_exc_types:
+                        create_exc_types.append(type(exc).__name__)
+        _cc_report_want_create_failures("surface_wants_for_graph", create_attempted, create_failed, create_exc_types)
         _cc_report_want_synapse_failures("surface_wants_for_graph", syn_attempted, syn_failed, syn_exc_types)
         return open_wants
 
@@ -1772,6 +1813,8 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
             return open_wants
         syn_attempted = syn_failed = 0
         syn_exc_types: List[str] = []
+        create_attempted = create_failed = 0
+        create_exc_types: List[str] = []
         for nid, node in list(graph.nodes.items()):
             meta = getattr(node, "metadata", None) or {}
             if meta.get("kind") == "want":
@@ -1801,11 +1844,20 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
                 want_id = "cc:want::" + hashlib.sha1(inner.encode("utf-8")).hexdigest()[:16]
                 if want_id in graph.nodes:
                     continue
-                graph.create_node(node_id=want_id, metadata={
-                    "kind": "want", "want_text": inner, "want_state": "open",
-                    "provenance": provenance, "source_node": nid,
-                    "creation_mode": "conversational",
-                })
+                try:
+                    create_attempted += 1
+                    graph.create_node(node_id=want_id, metadata={
+                        "kind": "want", "want_text": inner, "want_state": "open",
+                        "provenance": provenance, "source_node": nid,
+                        "creation_mode": "conversational",
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    # #915: guarded PER WANT -- one raise no longer aborts the loop. Counted, class name only, never
+                    # str(exc); no rollback and no edit of any existing want (H-1); retried next pulse.
+                    create_failed += 1
+                    if type(exc).__name__ not in create_exc_types:
+                        create_exc_types.append(type(exc).__name__)
+                    continue
                 try:
                     syn_attempted += 1
                     graph.create_synapse(nid, want_id, weight=0.3)
@@ -1816,6 +1868,7 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
                         syn_exc_types.append(type(syn_exc).__name__)
                 open_wants.append({"id": want_id, "text": inner,
                                     "provenance": provenance, "state": "open", "source": nid})
+        _cc_report_want_create_failures("surface_wants", create_attempted, create_failed, create_exc_types)
         _cc_report_want_synapse_failures("surface_wants", syn_attempted, syn_failed, syn_exc_types)
         return open_wants
 
@@ -2181,7 +2234,8 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
                 vector_db.insert(id=node_id, embedding=embedding, content=content,
                                   metadata=node.metadata)
             except Exception as exc:
-                logger.warning("CC recall insert failed: %s", exc)
+                # #915: fixed reason code + the exception CLASS name only -- str(exc) / the node id can carry user words.
+                logger.warning("CC recall insert failed: reason=recall_insert_failed exc_type=%s", type(exc).__name__)
                 raise
         return node
 
