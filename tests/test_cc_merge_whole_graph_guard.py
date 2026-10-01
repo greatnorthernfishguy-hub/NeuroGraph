@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 expectation updates
+# What: only where #905 changes a thing these tests pinned: (1) the per-batch ERROR sample is REDACTED (Part C: kind:sha256-12,
+#   never the id) -- test_a_preexisting..., test_c_an_arrival..., test_c_arrival_scope..., test_c_mixed..., test_c_the_id_sample...;
+#   (2) the merge now passes guard=/progress= to _cc_callosum_consolidate and the guard predicate is also called once per slice
+#   (Part D) -- test_d_the_guard_is_asked_about_every_node... (spy signature; 2 asks, both under _step_lock, steps still unlocked);
+#   (3) one new stats key, consolidation_held_midpass -- test_d_every_existing_stat_key... (set difference).
+#   NO test here pinned 'protection is not consulted': none was changed for Part B.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane merge-guard-897, dispatch #12973) — #897 whole-graph consolidation guard tests
 # What: drives the REAL cc_topology_merge.merge_cc_topology (real conduit frames written by the real exporter, real
 #   cc_ng_organism._cc_callosum_consolidate, real neuro_foundation.Graph.step() and orphan sweep) into a REAL in-memory
@@ -179,7 +186,7 @@ def test_a_preexisting_unbound_node_blocks_the_steps_even_when_every_arrival_bin
     assert "after batch 1" in msg and "skipping %d consolidation" % IDLE in msg
     assert "1 node(s) in the graph are still unbound" in msg
     assert "1 pre-existing (not landed by this merge), 0 from this merge" in msg
-    assert ORPHAN in msg                                                   # the id sample
+    assert tmg.redact_node_id(ORPHAN) in msg and ORPHAN not in msg         # the sample is REDACTED (#905 C), never the id
     assert "TEXT-MUST-NEVER-BE-LOGGED" not in msg and "content for" not in msg     # ids only, never node text
     assert "orphan grace" in msg and "CC-CALLOSUM-TRUTH" in msg           # says WHY the clock is held
     assert [r.levelno for r in caplog.records if "consolidation step" in r.getMessage()] == [logging.ERROR]
@@ -256,7 +263,8 @@ def test_c_an_arrival_that_does_not_bind_still_blocks_and_keeps_its_original_sta
     assert st["consolidation_skipped_unbound_preexisting"] == 0
     assert st["consolidation_blocked_batches"] == 1
     recs = _blocked_records(caplog)
-    assert len(recs) == 1 and "0 pre-existing (not landed by this merge), 1 from this merge" in recs[0] and lone in recs[0]
+    assert len(recs) == 1 and "0 pre-existing (not landed by this merge), 1 from this merge" in recs[0]
+    assert tmg.redact_node_id(lone) in recs[0] and lone not in recs[0]     # redacted sample (#905 C)
 
 
 def test_c_arrival_scope_holds_across_batches_and_the_blocked_batch_count_is_per_batch(tmp_path, caplog):
@@ -278,7 +286,8 @@ def test_c_arrival_scope_holds_across_batches_and_the_blocked_batch_count_is_per
     assert st["consolidation_skipped_unbound_arrivals"] == 7
     assert st["consolidation_skipped_unbound_preexisting"] == 0
     recs = _blocked_records(caplog)
-    assert len(recs) == 5 and all(lone in m for m in recs)                 # the lone arrival is named in every record
+    assert len(recs) == 5                                                  # the lone arrival is in every record, redacted (#905 C)
+    assert all(tmg.redact_node_id(lone) in m and lone not in m for m in recs)
 
 
 def test_c_mixed_a_preexisting_and_an_arrival_both_unbound_are_split_in_the_stats_and_the_record(tmp_path, caplog):
@@ -298,7 +307,9 @@ def test_c_mixed_a_preexisting_and_an_arrival_both_unbound_are_split_in_the_stat
     (msg,) = _blocked_records(caplog)
     assert "2 node(s) in the graph are still unbound" in msg
     assert "1 pre-existing (not landed by this merge), 1 from this merge" in msg
-    assert "Sample: ['%s', '%s']" % tuple(sorted((ORPHAN, lone))) in msg   # a sorted id sample
+    # a sample sorted on the ids, printed REDACTED (#905 C)
+    assert "Sample: ['%s', '%s']" % tuple(tmg.redact_node_id(n) for n in sorted((ORPHAN, lone))) in msg
+    assert ORPHAN not in msg and lone not in msg
 
 
 def test_c_the_id_sample_is_bounded_to_three_sorted_ids(tmp_path, caplog):
@@ -315,8 +326,9 @@ def test_c_the_id_sample_is_bounded_to_three_sorted_ids(tmp_path, caplog):
 
     assert st["consolidation_skipped_unbound_preexisting"] == 5
     (msg,) = _blocked_records(caplog)
-    assert "Sample: %s." % sorted(names)[:3] in msg
-    assert "cc:conv::o7" not in msg and "cc:conv::o9" not in msg           # the 4th and 5th sorted ids are not sampled
+    assert "Sample: %s." % [tmg.redact_node_id(n) for n in sorted(names)[:3]] in msg   # sorted on ids, printed redacted
+    assert not any(n in msg for n in names)                                # no raw id at all (#905 C)
+    assert tmg.redact_node_id("cc:conv::o7") not in msg and tmg.redact_node_id("cc:conv::o9") not in msg   # 4th/5th not sampled
 
 
 # ---------------------------------------------------------------- (d) baseline: nothing unbound
@@ -394,9 +406,9 @@ def test_d_the_guard_is_asked_about_every_node_in_the_graph_under_the_step_lock(
 
     real_cons = cno._cc_callosum_consolidate
 
-    def spy_cons(g, n):
+    def spy_cons(g, n, **kw):                                              # #905 D: the merge now passes guard=/progress=
         owned_at_steps.append(g._step_lock._is_owned())
-        return real_cons(g, n)
+        return real_cons(g, n, **kw)
 
     monkeypatch.setattr(tmg, "_unbound_nodes", spy_guard)
     monkeypatch.setattr(cno, "_cc_callosum_consolidate", spy_cons)
@@ -404,9 +416,10 @@ def test_d_the_guard_is_asked_about_every_node_in_the_graph_under_the_step_lock(
     st = _merge(rg, rv, path, tmp_path)
 
     assert st["consolidation_passes"] == 1
-    assert len(asked) == 1 and asked[0][0] == asked[0][1] == set(rg.nodes)   # ALL nodes, not merge_landed
+    # #905 D: TWO asks now -- the OUTER batch-end check, then the per-slice guard before the one slice (IDLE < 25)
+    assert len(asked) == 2 and all(a[0] == a[1] == set(rg.nodes) for a in asked)   # ALL nodes, not merge_landed
     assert len(asked[0][0]) == 4                                           # 2 pre-existing + 2 arrivals
-    assert owned_at_guard == [True] and owned_at_steps == [False]
+    assert owned_at_guard == [True, True] and owned_at_steps == [False]    # both reads under _step_lock; steps unlocked
 
 
 def test_d_idle_steps_from_the_env_default_path_is_unchanged(tmp_path, monkeypatch):
@@ -447,7 +460,8 @@ def test_d_every_existing_stat_key_and_the_timestep_are_identical_to_the_base_mo
     assert b_ts == n_ts
     for k, v in b_st.items():
         assert n_st[k] == v, (k, v, n_st[k])
-    assert set(n_st) - set(b_st) == {"consolidation_skipped_unbound_preexisting", "consolidation_blocked_batches"}
+    assert set(n_st) - set(b_st) == {"consolidation_skipped_unbound_preexisting", "consolidation_blocked_batches",
+                                     "consolidation_held_midpass"}
 
 
 # ---------------------------------------------------------------- (e) the real consequence (proves the tests are not vacuous)
