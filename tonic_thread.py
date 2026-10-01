@@ -26,6 +26,20 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2 (f): the latent thread renders WHOLE
+# What: TonicConfig.max_content_length is Optional[int] = None (was 250) and
+#   format_latent_context clips only when a bound is set. Nothing else here changes.
+# Why:  Chief-003 ruling (f): same lossy-clipping class as the resolver's default. WHY IT WAS
+#   NEVER SEEN BEFORE: resolve_surface_content's old 240 default returned <= 241 chars (with
+#   the ellipsis), BELOW this 250 clip, so the clip never fired; #812 (whole resolver) is what
+#   exposed it. Scope-check: tonic_thread.py is not protected (CLAUDE.md s2; pretool_syls_law.sh
+#   arrays) and not vendored (CLAUDE.md s4); openclaw_hook.py:1009 builds `TonicConfig()` (the
+#   default) then applies config["tonic"] overrides via hasattr/setattr, so this default
+#   reaches it WITHOUT touching that protected file. Shared with Syl's process: rides the
+#   rollout. Subject to the size budget of turn 2 (g), whose shared half is the STOPPED
+#   sub-item (see build-002.md): the Tonic block is a persistent slot outside the surfaced-item
+#   budget and is bounded only by max_context_items (5).
+# How:  Field default None; `if max_len is not None and len(content) > max_len`.
 # [2026-06-27] Claude Code (Sonnet 4.6) — #347 O(1) hyperedge index + constitutional cache
 #   What: _build_he_index() builds Dict[str,int] once per ouroboros_cycle; _prime_constitutional
 #     caches constitutional node IDs (rebuilt only when node count changes). Replaces O(N×H)
@@ -141,8 +155,9 @@ class TonicConfig:
     # Maximum items in the latent thread context block
     max_context_items: int = 5
 
-    # Maximum content length per item in context block
-    max_content_length: int = 250
+    # Maximum content length per item in context block (#812: None = render WHOLE;
+    # a configured integer still clips with "...")
+    max_content_length: Optional[int] = None
 
     # Latent token generation — the real between-conversation awareness
     # See tonic_engine.py for the surgical model that provides the push.
@@ -645,7 +660,7 @@ class TonicThread:
         for item in self._thread:
             content = item.content
             max_len = self._config.max_content_length
-            if len(content) > max_len:
+            if max_len is not None and len(content) > max_len:
                 content = content[:max_len - 3] + "..."
 
             lines.append(f"- {content}")

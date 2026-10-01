@@ -3,6 +3,16 @@
 # #812 turn 1 — the shared CES surfacing path renders WHOLE (LAW 4: fix at the source).
 #
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2, part 1
+# What: (e) the strict xfail for the Substrate Context 300-clip now PASSES (asserted whole) and
+#   gains a `surfaced`-group twin; (f) Tonic latent thread renders whole (end-to-end through
+#   _update_thread -> format_latent_context) and an explicit max_content_length still clips;
+#   (g) two strict-xfail SPECS for the STOPPED shared size budget (NG_SURFACE_BUDGET_CHARS,
+#   ruled Exec P474) -- Active Recall and _format_substrate_context -- so the gap is visible in
+#   every run and flips loudly when the Executive's design lands. tonic_thread joins the
+#   printed-path preamble.
+# Why:  Chief-003 rulings (e)/(f)/(g) on the turn-1 flags.
+# How:  same in-process fakes as turn 1; no daemon, graph load, network or embedding model.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — new file
 # What: Pins the #812 contract. (1) surface_resolver.resolve_surface_content / _item return a
 #   node's text WHOLE by default (no 240-char cut, no ellipsis); an explicit max_chars bound
@@ -41,6 +51,7 @@ import surface_resolver  # noqa: E402
 import surfacing  # noqa: E402
 import neurograph_rpc as rpc  # noqa: E402
 import cc_ng_organism as cc  # noqa: E402
+import tonic_thread  # noqa: E402
 
 sys.path.insert(0, str(_ROOT))  # undo neurograph_rpc's sys.path[0] = ~/NeuroGraph
 
@@ -48,7 +59,8 @@ from ces_config import CESConfig  # noqa: E402
 from surface_resolver import resolve_surface_content, resolve_surface_item  # noqa: E402
 from surfacing import SurfacingMonitor  # noqa: E402
 
-_CORE_MODULES = ("surface_resolver", "surfacing", "neurograph_rpc", "cc_ng_organism", "ces_config")
+_CORE_MODULES = ("surface_resolver", "surfacing", "neurograph_rpc", "cc_ng_organism", "ces_config",
+                 "tonic_thread")
 _ROOT_PY_NAMES = {p.name for p in _ROOT.glob("*.py")}
 
 
@@ -325,16 +337,17 @@ class _RpcMemory:
     """Minimal in-process stand-in for NeuroGraphMemory — exactly what handle_assemble reads.
     No graph load, no checkpoint, no daemon."""
 
-    def __init__(self, nodes, recalled, surfaced_monitor=None):
+    def __init__(self, nodes, recalled, surfaced_monitor=None, harvested=None):
         self.graph = types.SimpleNamespace(nodes=nodes)
         self.vector_db = _FakeVdb()
         self._surfacing_monitor = surfaced_monitor
         self._tonic_thread = None
         self._recalled = recalled
+        self._harvested = harvested or []
         self._substrate_novelty_ema = 0.5
 
     def _harvest_associations(self, text, novelty=0.5, **kw):
-        return []
+        return [dict(i) for i in self._harvested]
 
     def recall(self, text, k=5, threshold=0.4):
         return self._recalled
@@ -402,13 +415,103 @@ def test_cc_pattern_completion_recall_renders_whole(monkeypatch, label, text):
     assert out[0]["content"] == text and _no_ellipsis(out[0]["content"])
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "flag (e), NOT fixed in #812 turn 1 (listed, per the brief): neurograph_rpc._format_substrate_context "
-    "re-clips surfaced / ces_surfaced items to 300 chars (content[:297] + '...') AFTER the resolver, so "
-    "Syl's Substrate Context block is still lossy even though the resolver is now whole. strict=True: "
-    "when that clip is removed this XPASSes and fails, forcing this marker's removal."))
-def test_flag_e_ces_surfaced_whole_through_substrate_context(monkeypatch):
+@pytest.mark.parametrize("label,text", [("over300", OVER_240), ("over1000", OVER_1000)])
+def test_ces_surfaced_whole_through_substrate_context(monkeypatch, label, text):
+    """(e) was flag (e): _format_substrate_context re-clipped ces_surfaced at 300 (297 + '...').
+    FAILS on the turn-1 tip 1618a886 (the clip); passes now. Real handle_assemble, fake memory."""
     mon = _FakeMonitor([{"node_id": "n1", "score": 1.0, "content": "shard"}])
-    mem = _RpcMemory({"n1": _forest_node(OVER_1000)}, [], surfaced_monitor=mon)
+    mem = _RpcMemory({"n1": _forest_node(text)}, [], surfaced_monitor=mon)
     block = _assemble(monkeypatch, mem)
-    assert f"- [CES] {OVER_1000}" in block
+    assert f"- [CES] {text}" in block, label
+    assert _no_ellipsis(block)
+
+
+@pytest.mark.parametrize("label,text", [("over300", OVER_240), ("over1000", OVER_1000)])
+def test_surfaced_group_whole_through_substrate_context(monkeypatch, label, text):
+    """(e) the OTHER clip site in _format_substrate_context: the spreading-activation `surfaced`
+    group ('- [strength] content'). FAILS on 1618a886 (297 + '...'); passes now."""
+    mem = _RpcMemory({"n1": _forest_node(text)}, [],
+                     harvested=[{"node_id": "n1", "strength": 0.5, "content": "shard"}])
+    block = _assemble(monkeypatch, mem)
+    assert f"- [0.50] {text}" in block, label
+    assert _no_ellipsis(block)
+
+
+# ── (f) Tonic latent thread: WHOLE ───────────────────────────────────────────
+
+def _tonic(config=None):
+    cfg = config or tonic_thread.TonicConfig(valence_enabled=False)
+    graph = types.SimpleNamespace(
+        nodes={}, timestep=1, hyperedges={},
+        config={})
+    return tonic_thread.TonicThread(graph, _FakeVdb(), cfg), graph
+
+
+def _tonic_render(thread, graph, text):
+    graph.nodes["n1"] = types.SimpleNamespace(
+        metadata={"creation_mode": "conversational", "_forest_content": text},
+        last_spike_time=float("-inf"), voltage=0.5)
+    thread._update_thread([("n1", 1.0)], None, {})
+    return thread.format_latent_context() or ""
+
+
+@pytest.mark.parametrize("label,text", WHOLE_CASES)
+def test_tonic_latent_thread_renders_whole(label, text):
+    """(f) FAILS on 1618a886: TonicConfig.max_content_length=250 clipped to 247 + '...' (it was
+    hidden before #812 because the resolver's old 240 default arrived below 250)."""
+    thread, graph = _tonic()
+    rendered = _tonic_render(thread, graph, text)
+    assert f"- {text}" in rendered, label
+    assert _no_ellipsis(rendered)
+
+
+def test_tonic_explicit_bound_still_clips():
+    """(f) Passes on both: a configured max_content_length still clips with '...' (unchanged)."""
+    thread, graph = _tonic(tonic_thread.TonicConfig(valence_enabled=False, max_content_length=250))
+    rendered = _tonic_render(thread, graph, OVER_1000)
+    assert f"- {OVER_1000[:247]}..." in rendered
+
+
+def test_tonic_default_config_has_no_bound():
+    """(f) The default reaches openclaw_hook (it builds a bare TonicConfig() then setattr
+    overrides) without touching that protected file."""
+    assert tonic_thread.TonicConfig().max_content_length is None
+
+
+# ── (g) STOPPED sub-item: the shared size budget (SPEC, strict xfail) ────────
+# Exec P474 ruled: NG_SURFACE_BUDGET_CHARS, default 3000, clamp 500-40000. The mechanism for the
+# shared (neurograph_rpc.py) path is the STOPPED sub-item of turn 2 (reuse of the #813
+# machinery would import cc_ng_organism into neurograph_rpc.py; a new module is forbidden):
+# see build-002.md's design note. These specs pin the ruled BEHAVIOUR so the gap is visible.
+
+_BUDGET_REASON = ("(g) STOPPED sub-item: the shared NG_SURFACE_BUDGET_CHARS budget is not implemented "
+                  "pending the Executive's design ruling (build-002.md). strict=True: when it lands "
+                  "this XPASSes and fails, forcing the marker's removal.")
+
+
+def _three(prefix):
+    return [f"{prefix}{k} " + OVER_240 for k in "ABC"]  # ~401 chars each
+
+
+@pytest.mark.xfail(strict=True, reason=_BUDGET_REASON)
+def test_spec_active_recall_drops_whole_lowest_similarity_over_budget(monkeypatch):
+    monkeypatch.setenv("NG_SURFACE_BUDGET_CHARS", "500")
+    a, b, c = _three("recall")
+    nodes = {"a": _forest_node(a), "b": _forest_node(b), "c": _forest_node(c)}
+    recalled = [{"node_id": "a", "similarity": 0.95, "content": "s"},
+                {"node_id": "b", "similarity": 0.80, "content": "s"},
+                {"node_id": "c", "similarity": 0.60, "content": "s"}]
+    block = _assemble(monkeypatch, _RpcMemory(nodes, recalled))
+    assert a in block and b not in block and c not in block   # top kept WHOLE; the rest dropped WHOLE
+
+
+@pytest.mark.xfail(strict=True, reason=_BUDGET_REASON)
+def test_spec_substrate_context_drops_whole_lowest_salience_over_budget(monkeypatch):
+    monkeypatch.setenv("NG_SURFACE_BUDGET_CHARS", "500")
+    a, b, c = _three("ces")
+    nodes = {"a": _forest_node(a), "b": _forest_node(b), "c": _forest_node(c)}
+    mon = _FakeMonitor([{"node_id": "a", "score": 1.7, "content": "s"},
+                        {"node_id": "b", "score": 1.2, "content": "s"},
+                        {"node_id": "c", "score": 0.9, "content": "s"}])
+    block = _assemble(monkeypatch, _RpcMemory(nodes, [], surfaced_monitor=mon))
+    assert a in block and b not in block and c not in block

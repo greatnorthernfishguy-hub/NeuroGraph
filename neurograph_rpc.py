@@ -12,6 +12,15 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2 (e): Substrate Context renders WHOLE
+# What: _format_substrate_context no longer re-clips `surfaced` / `ces_surfaced` items to 300
+#   chars (content[:297] + "..."). Nothing else in this file changes.
+# Why:  Chief-003 ruling (e): the same lossy-clipping class as the resolver's 240 default,
+#   applied AFTER the resolver, so turn 1's whole resolver never reached Syl's Substrate
+#   Context block. SHARED/Syl's code: rides the rollout. NOT ROLLOUT-SAFE ALONE: the size
+#   budget that must bound this block (NG_SURFACE_BUDGET_CHARS) is the STOPPED sub-item of
+#   turn 2 (g) -- see build-002.md's design note; the Executive decides.
+# How:  Two three-line clip branches deleted.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1: Active Recall renders WHOLE
 # What: handle_assemble's "## Active Recall" resolve_surface_content call drops its
 #   max_chars=300 argument (the resolver's new default is NO bound). Nothing else in this
@@ -5432,17 +5441,14 @@ def _format_substrate_context(
                 content = item.get("content", "")
                 strength = item.get("strength", 0)
                 if content:
-                    # Truncate very long content
-                    if len(content) > 300:
-                        content = content[:297] + "..."
+                    # Renders WHOLE (#812 turn 2 / Chief ruling (e): the 300-char clip that
+                    # sat here re-cut every item AFTER the resolver; it is gone).
                     lines.append(f"- [{strength:.2f}] {content}")
 
         if ces_surfaced:
             for item in ces_surfaced[:3]:
                 content = item.get("content", "")
                 if content:
-                    if len(content) > 300:
-                        content = content[:297] + "..."
                     lines.append(f"- [CES] {content}")
 
     return "\n".join(lines)
