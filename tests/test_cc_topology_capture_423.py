@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14474) — #905-DELTA: harness follows the merge, NO assertion changed
+# What: the AST-extracted merge now calls cc_topology_merge.held_unbound_nodes (the batch-end check and whole_graph_guard route through it),
+#   so it joins the extracted names, and the namespace gets `_in_transit_cohort` / `_IN_TRANSIT_VALID`: the harness runs the merge with the
+#   in-transit variable UNSET (the real function's UNSET state: held == _unbound_nodes), which is exactly the behaviour these tests pin.
+# Why: Exec P547/P548. Without it the extracted merge raises NameError('held_unbound_nodes'): a harness gap, not a behaviour change.
+# How: names += held_unbound_nodes; ns += the UNSET answer. `_unbound_nodes` keeps its (graph, node_ids) arity: still the pin this file is for.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905: harness follows the merge
 # What: the AST-extracted merge now references cc_topology_merge.whole_graph_guard and redact_node_id (so they join the
 #   extracted names, and hashlib/re join the namespace) and passes guard=/progress= to the consolidation, so the stub accepts them.
@@ -67,7 +73,7 @@ def load_merge(monkeypatch, graph, vectors, frames):
     source = Path(__file__).parents[1] / 'cc_topology_merge.py'
     tree = ast.parse(source.read_text())
     names = {'merge_cc_topology', 'cc_current_membership', '_unbound_nodes',
-             'whole_graph_guard', 'redact_node_id',
+             'whole_graph_guard', 'redact_node_id', 'held_unbound_nodes',
              '_synapse_exists', '_hyperedge_exists', 'TopologyMergeAbort'}
     selected = ast.Module(body=[n for n in tree.body
                               if getattr(n, 'name', None) in names], type_ignores=[])
@@ -101,7 +107,8 @@ def load_merge(monkeypatch, graph, vectors, frames):
               _DEFAULT_MAX_NODES_PER_CALL=25,
               _load_membership=lambda p: set(), _write_membership=membership,
               read_topology_frames=decode, is_cc_provenance=lambda nid, meta: True,
-              _synapse_type=lambda value: value)
+              _synapse_type=lambda value: value,
+              _in_transit_cohort=lambda: ('unset', frozenset()), _IN_TRANSIT_VALID='valid')   # #905-DELTA: variable UNSET
     exec(compile(selected, str(source), 'exec'), ns)
     return ns['merge_cc_topology'], calls
 
