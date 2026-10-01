@@ -3,6 +3,44 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-30] Claude Code (Sonnet 5.5), Z12 worker seat, lane
+#   daemon-recall-organism-756b (punchlist rows #756 / #779 / #780; slice B of the
+#   #756 daemon recall-swallow chain; Chief-003 Decision 2 = YES with constraints,
+#   decision B = pith_fallback is in this slice) — optional recall-failure REPORTERS
+# What: four optional, default-None reporting kwargs. Nothing else changes.
+#   cc_assemble_recall(..., on_degraded=None): on_degraded(code, exc), code one of
+#   'monitor_race' (the `except RuntimeError` around the SurfacingMonitor harvest,
+#   which had no log, no callback and no counter), 'pattern_completion_failed'
+#   (the swallow INSIDE cc_pattern_completion_recall, reached through its on_error,
+#   and the outer `except` around that call) and 'pith_fallback' (the un-Pithed
+#   fallback branch, reported AFTER the existing on_pith_failure call). exc is the
+#   exception object: a caller may log its class; its message can carry the prompt,
+#   paths or secrets and must never go on a wire.
+#   cc_pattern_completion_recall(..., on_error=None): on_error(exc) from its
+#   `except Exception`; still returns [].
+#   render_constitutional_core(graph, on_error=None) and render_wants(graph,
+#   provenance=..., on_error=None): on_error(exc) from their own `except`; still
+#   return "" -- so a caller can tell "raised" from the legitimate "nothing to
+#   render" (both are ""). One private helper, _cc_report(callback, *args), calls a
+#   reporter and swallows anything it raises.
+# Why: Josh P361/P370 (LAW 4, fix at the source): the hook cannot tell a FAILED
+#   recall from an EMPTY one because this origin swallows the failure.
+#   plan-001.md rev 1 sections 1 A3/A5/A8, 3, 7, 9 I6/I7 and ruling #780. The
+#   daemon (a later slice) counts, logs and puts the reason on the wire; this file
+#   only REPORTS, exactly like on_monitor_error / on_pith_failure (no new logging,
+#   no counters here).
+# How: every reporter defaults to None and is appended LAST. With every new kwarg
+#   unset the returns, side effects, log records and exceptions are byte-identical
+#   to e4ebf982 (the call cc_assemble_recall makes to cc_pattern_completion_recall
+#   carries no new kwarg unless on_degraded is set), so the VPS half (Path B,
+#   cc_ng_host.py in Syl's process, which passes none) and pith_provider_context
+#   (calls both with no reporter) are unchanged. Reporters are called after the
+#   existing statements of each handler, so existing order is untouched; a raising
+#   reporter never changes a return. NOT touched: pith_provider_context (sibling
+#   silent failure B6 is listed for later), any vendored or protected file.
+#   ROLLOUT: this must merge BEFORE the daemon wiring slice -- a daemon passing the
+#   new kwargs to an older organism raises TypeError. Tests:
+#   tests/test_cc_recall_reporting.py.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -1572,7 +1610,21 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
         return open_wants
 
 
-def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -> str:
+def _cc_report(callback: Optional[Any], *args: Any) -> None:
+    """Call an optional reporting callback; never raises. The organism only
+    REPORTS a swallowed failure (the caller counts/logs -- LAW 4), and a bug in
+    a reporter must not change what the pipeline returns. Same guard
+    cc_assemble_recall already applies to on_monitor_error."""
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:  # noqa: BLE001
+        pass  # the error-reporting hook itself must never break the pipeline
+
+
+def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent"),
+                 on_error: Optional[Any] = None) -> str:
     """Render CC's own open want-nodes as a '## What I Want' block, newest
     first -- read LIVE every call (not a snapshot), so a want noted this
     session shows up immediately. Returns "" if none exist (graceful).
@@ -1580,6 +1632,12 @@ def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -
     provenance accepts a single string or an iterable -- default covers both
     text-marker wants (surface_wants, "cc_authored") and substrate-native
     curiosity wants (generate_emergent_want, "cc_emergent") in one block.
+
+    on_error: optional reporter, on_error(exc), called when rendering RAISED
+    (the swallowed exception, after the existing debug log). The return is
+    still "" -- which is also the legitimate "no wants" value -- so this is the
+    only way a caller can tell the two apart. Guarded: a raising reporter does
+    not change the return. Unset (default) = behaviour unchanged.
     """
     if graph is None:
         return ""
@@ -1607,10 +1665,11 @@ def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent")) -
         return "## What I Want\n" + "\n".join(lines)
     except Exception as exc:  # noqa: BLE001
         logger.debug("CC want-render error (non-fatal): %s", exc)
+        _cc_report(on_error, exc)
         return ""
 
 
-def render_constitutional_core(graph: Any) -> str:
+def render_constitutional_core(graph: Any, on_error: Optional[Any] = None) -> str:
     """Render CC's constitutional core (`constitutional=True` nodes) as a
     "## Who I Am" block -- ALWAYS, query-independent, same as render_wants()
     is query-independent for wants. Extracted verbatim from the "Who I Am"
@@ -1626,6 +1685,13 @@ def render_constitutional_core(graph: Any) -> str:
     gets assembled each turn, a constitutional=True node is just inert
     metadata -- protected from pruning, but never surfaced. This is the
     piece that makes it load-bearing.
+
+    on_error: optional reporter, on_error(exc), called when rendering RAISED
+    (the swallowed exception, after the existing debug log). The return is
+    still "" -- which is also the legitimate "no constitutional nodes" value --
+    so this is the only way a caller can tell the two apart. Guarded: a
+    raising reporter does not change the return. Unset (default) = behaviour
+    unchanged.
     """
     try:
         core = []
@@ -1641,6 +1707,7 @@ def render_constitutional_core(graph: Any) -> str:
         return "## Who I Am\n" + "\n".join(f"- {t}" for _, t in core)
     except Exception as exc:  # noqa: BLE001
         logger.debug("CC constitutional-core render error (non-fatal): %s", exc)
+        _cc_report(on_error, exc)
         return ""
 
 
@@ -2848,7 +2915,8 @@ _CC_RECALL_PROP_STEPS = int(os.environ.get("CC_RECALL_PROP_STEPS", "0"))
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                                     threshold: float = _CC_RECALL_PRIME_THRESHOLD,
                                     state: Optional[Dict[str, Any]] = None,
-                                    preserve_graph_config: bool = False) -> List[Dict[str, Any]]:
+                                    preserve_graph_config: bool = False,
+                                    on_error: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Substrate-native pattern-completion recall for CC's hook surfacing
     (#358 rebuild -- replaces the bare ng.recall() cosine search this
     function originally wrapped; LAW 3 rebuild-in-place, same contract).
@@ -2873,6 +2941,13 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
     Returns [{node_id, score, content}] -- same shape as before; content
     substrate-first via resolve_surface_content, degenerate results dropped.
     Fails soft: any exception returns [].
+
+    on_error: optional reporter, on_error(exc), called with the swallowed
+    exception (after the existing debug log) just before the fail-soft [] is
+    returned, so a caller can tell "Active Recall failed" from "nothing
+    matched" (both are []). Not called for the legitimate empty returns (empty
+    query / no graph). Guarded: a raising reporter does not change the return.
+    Unset (default) = behaviour unchanged.
     """
     if not query or ng is None:
         return []
@@ -3026,6 +3101,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         return final
     except Exception as exc:
         logger.debug("cc_pattern_completion_recall failed (non-fatal): %s", exc)
+        _cc_report(on_error, exc)
         return []
 
 
@@ -5326,7 +5402,8 @@ def cc_deposit_pith_failure(exc: BaseException, tract_path: Optional[str] = None
 def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: Any,
                         allow_pattern_completion: bool = True,
                         on_monitor_error: Optional[Any] = None,
-                        on_pith_failure: Optional[Any] = None) -> str:
+                        on_pith_failure: Optional[Any] = None,
+                        on_degraded: Optional[Any] = None) -> str:
     """Return surfacing context for CC hook injection -- THE shared recall
     pipeline for both hemispheres (laptop cc-ng-daemon.py, VPS cc_ng_host.py).
 
@@ -5359,6 +5436,24 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     query function does no write-side work itself, LAW 4). It never raises:
     a surfacing pass must not crash or time out the hook.
 
+    on_degraded: optional reporter, on_degraded(code, exc), for the three
+    swallowed failures that leave the returned text valid but INCOMPLETE; the
+    wrapper (daemon / host) decides what to count, log or put on a wire.
+    code is one of 'monitor_race' (the SurfacingMonitor harvest hit a dict-
+    mutation race; the monitor block is missing), 'pattern_completion_failed'
+    (Active Recall raised, either inside cc_pattern_completion_recall or at the
+    call; the Active Recall block is missing) and 'pith_fallback' (the Pith
+    pipeline raised and the un-Pithed text above was returned; reported AFTER
+    on_pith_failure, which is still called exactly as before). exc is the
+    exception object: log its class at most -- its message can carry the
+    prompt, paths or secrets. Calls arrive in pipeline order (monitor, Active
+    Recall, Pith) and one request can report several; 'pattern_completion_failed'
+    may arrive twice only if the failure is reported below AND a later step of
+    the same block raises. Guarded: a raising reporter changes neither the
+    returned text, the existing callbacks, their order, nor the rate-limited
+    WARNING/metrics. Unset (default) = behaviour byte-identical, and the call
+    to cc_pattern_completion_recall carries no new kwarg.
+
     Params only (ng/conv_state/commons) -- no module-global STATE access,
     so this function is process-agnostic (Syl's-Law) and safe to call from
     either hemisphere with its own isolated instances.
@@ -5372,10 +5467,11 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             monitor_items = monitor.get_surfaced()
             monitor_node_ids = {item.get('node_id') for item in monitor_items}
             monitor_ctx = monitor.format_context(monitor_items)
-    except RuntimeError:
+    except RuntimeError as exc:
         monitor_ctx = ''  # dict mutation race during concurrent deposit
         monitor_node_ids = set()
         monitor_items = []
+        _cc_report(on_degraded, 'monitor_race', exc)
     except Exception as exc:
         logger.debug('Recall failed: %s', exc)
         if on_monitor_error is not None:
@@ -5394,7 +5490,12 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     pc_fired_ids: List[str] = []
     if allow_pattern_completion:
         try:
-            pc_results = cc_pattern_completion_recall(ng, query, k, state=conv_state)
+            pc_extra: Dict[str, Any] = {}
+            if on_degraded is not None:
+                # Reporting only: lets the swallow INSIDE cc_pattern_completion_recall
+                # be seen. Not passed when unset, so the default call is unchanged.
+                pc_extra['on_error'] = lambda exc: _cc_report(on_degraded, 'pattern_completion_failed', exc)
+            pc_results = cc_pattern_completion_recall(ng, query, k, state=conv_state, **pc_extra)
             pc_fired_ids = [r.get('node_id') for r in pc_results if r.get('node_id')]
             pc_results = [r for r in pc_results if r.get('node_id') not in monitor_node_ids]
             pc_block = _format_cc_recall_block(pc_results)
@@ -5403,6 +5504,7 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             pc_block = ''
             pc_results = []
             pc_fired_ids = []
+            _cc_report(on_degraded, 'pattern_completion_failed', exc)
 
     # Read-only instrumentation (CC_RECALL_DEBUG): capture both raw streams
     # BEFORE Pith merges them, to measure where the query signal is lost.
@@ -5518,6 +5620,9 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                     # The deposit hook must never break recall -- but a lost
                     # failure deposit is logged, not swallowed.
                     logger.warning('Pith failure deposit failed: %s', cb_exc)
+            # Report the fallback AFTER the existing callback so its order and
+            # the WARNING/metrics above are untouched (guarded: never raises).
+            _cc_report(on_degraded, 'pith_fallback', exc)
 
     if monitor_ctx and pc_block:
         return monitor_ctx + "\n\n" + pc_block
