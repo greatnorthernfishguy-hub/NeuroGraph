@@ -127,3 +127,6 @@ Mean validation CPU: FIRST 1.288 s, FOLD 1.961 s → fold-minus-first **+0.673 s
 
 ## 7. NOT verified here
 Real arming behaviour; the daemon slice and its dream-loop wiring; #825 (pruned links staying pruned across save AND restore — PG-1 never calls `save()` and does not restore the checkpoint it writes); concurrency (no other thread contends for `_step_lock` in these runs, so the table is an uncontended hold); the post-merge dry run (items 1–12); a repeat of Part 2 for run-to-run variance (the brief asked for one process per variant); the uuid4 SHAPE of real ids; that Syl's own graph is never loaded (copy (b) is a staged VPS-bundle copy named by the plan; nothing from `~/NeuroGraph/data/checkpoints` was opened).
+
+
+> **Z12 erratum (PG-1 delta pair, 2026-10-01):** the sentence on the fold-minus-first wall difference above is over-stated. Corrected wording: `acceptance-record-notes.md` note 3 (fold adds at least +0.67 s CPU in validation; the remaining wall, up to +1.9 s, is unexplained, not shown to be noise).

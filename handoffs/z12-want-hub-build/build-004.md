@@ -72,3 +72,6 @@ Real arming behaviour; the daemon slice and its dream-loop wiring; **#825** (PG-
 
 ## 10. Next (not mine)
 The fresh law-enforcer ACCEPTOR verifies `pg1-artifact.md` against `pg1/records/` and records PASS or FAIL (plan §4A.5: in `handoffs/z12-want-hub-d/returns/pg1/` + `reviews/pg1-accept.md` per the plan's designation, or the paths the Chief names); then the delta pair reviews the procedure; the Executive rules on the hold (C8) and routes observation 6.1.
+
+
+> **Z12 erratum (PG-1 delta pair, 2026-10-01):** the sentence "the wall difference is the same size as the observed spread, so I do not read a steady fold cost from it" is over-stated. See `pg1/acceptance-record-notes.md` note 3.
