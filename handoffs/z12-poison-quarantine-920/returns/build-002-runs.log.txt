@@ -1,0 +1,14 @@
+02:08:57 | NG tests/test_cc_poison_quarantine_920.py (fix, daemon env set) | START LOAD 8.73 | REFUSED (load >= 6): NOT RUN
+02:10:38 | NG tests/test_cc_poison_quarantine_920.py (fix, daemon env set) | START LOAD 6.41 | REFUSED (load >= 6): NOT RUN
+02:29:53 | NG tests/test_cc_poison_quarantine_920.py (fix, daemon env set) | START LOAD 5.62 | 53 passed in 6.77s
+02:30:13 | NG tests/test_cc_bind_atomic_904.py (fix) | START LOAD 5.93 | 44 passed in 6.08s
+02:30:23 | NG tests/test_cc_drain_hold_on_failure.py (fix) | START LOAD 6.26 | REFUSED (load >= 6): NOT RUN
+04:22:37 | NG tests/test_cc_drain_hold_on_failure.py (fix) | START LOAD 1.47/2.32 (1m/5m) | 49 passed in 3.61s
+04:22:51 | docs scripts/tests/test_cc_ng_daemon_poison_quarantine_920.py (fix) | START LOAD 1.64/2.32 (1m/5m) | 1 failed, 58 passed in 8.55s
+04:23:17 | docs scripts/tests/test_cc_ng_daemon_poison_quarantine_920.py (fix, 2nd run after a test-only fix) | START LOAD 2.67/2.53 (1m/5m) | 59 passed in 5.87s
+04:23:31 | docs test_cc_ng_daemon_deposit_904.py [pacing UNSET] | START LOAD 2.71/2.54 (1m/5m) | 62 passed in 5.13s
+04:23:39 | docs test_cc_ng_daemon_drain_pacing.py [pacing UNSET] | START LOAD 2.97/2.61 (1m/5m) | 46 passed in 1.56s
+04:23:42 | docs test_cc_ng_daemon_recall_status.py [pacing UNSET] | START LOAD 2.89/2.60 (1m/5m) | 41 passed in 0.53s
+04:23:44 | docs test_cc_ng_daemon_deposit_904.py [pacing SET 25/250] | START LOAD 2.89/2.60 (1m/5m) | 62 passed in 5.04s
+04:23:51 | docs test_cc_ng_daemon_drain_pacing.py [pacing SET 25/250] | START LOAD 2.90/2.60 (1m/5m) | 46 passed in 1.65s
+04:23:54 | docs test_cc_ng_daemon_recall_status.py [pacing SET 25/250] | START LOAD 3.31/2.69 (1m/5m) | 41 passed in 0.76s
