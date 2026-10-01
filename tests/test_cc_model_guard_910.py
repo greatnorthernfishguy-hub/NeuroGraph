@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13848) — #949: the resolver READS, it never CREATES
+# What: new section (f): two FRESH-PROCESS tests (a resolver call leaves NGEmbed._instance None; a later non-default config is not
+#   pinned out by a header read), an existing-instance test, an id-unchanged test (== what get_instance() would report), a
+#   no-get_instance/no-reset_instance tripwire, and a raising path with no instance. Four existing tests encoded "the resolver
+#   builds the singleton" (they patched NGEmbed.get_instance / NGEmbed.stats) and were re-pointed at `NGEmbed._instance` with the
+#   same intent and the same or stronger assertions: test_unresolvable_local_id_via_the_real_resolver_aborts,
+#   test_sender_refuses_when_the_real_resolver_fails, test_resolver_never_returns_unknown_or_blank (now also covers the no-instance
+#   default constant), test_resolver_is_none_not_unknown_when_the_embedder_cannot_be_built (renamed ..._cannot_be_read).
+# Why: Exec P518 / le-055 O1 / row #949: get_instance() created the process-wide singleton as a side effect of a header read.
+# How: the fresh-process tests load the cc_topology_export UNDER TEST by path (so Z12_EXPORT_UNDER_TEST drives them against the
+#   5df0fb7a copy for the fail-first). No assertion was weakened.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13145) — #910 embedding-model guard tests
 # What: drives the REAL cc_topology_export (both exporters) and the REAL cc_topology_merge.merge_cc_topology into a REAL
 #   neuro_foundation.Graph + SimpleVectorDB, with the REAL ng_embed.NGEmbed singleton as the model-id source. Cases:
@@ -22,10 +33,13 @@
 """Which cases FAIL on the BASE copies and on each mutant: see the return file."""
 import hashlib
 import importlib.util
+import json
 import logging
 import os
 import socket
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +104,26 @@ def _fresh_embedder():
 
 
 _SEED = [0]
+
+
+class _BrokenInstance:
+    """Stands in for an existing NGEmbed instance whose `stats` read raises (#949: the resolver READS `_instance`, it
+    never calls get_instance(), so this is how the real resolver is made to fail)."""
+
+    @property
+    def stats(self):
+        raise RuntimeError("SECRET-DETAIL-must-not-reach-the-log")
+
+
+class _StatsInstance:
+    """Stands in for an existing NGEmbed instance that reports a given (possibly unusable) model_id."""
+
+    def __init__(self, model_id):
+        self._model_id = model_id
+
+    @property
+    def stats(self):
+        return {"model_id": self._model_id}
 
 
 def _emb():
@@ -278,14 +312,12 @@ def test_unresolvable_local_id_aborts_even_with_a_valid_wire_id(tmp_path, monkey
 
 
 def test_unresolvable_local_id_via_the_real_resolver_aborts(tmp_path, monkeypatch):
-    """No patching of the receiver: the REAL resolver fails because the embedder singleton cannot be built."""
+    """No patching of the receiver: the REAL resolver fails because the existing embedder instance cannot report its id.
+    (#949: was a `get_instance` patch -- it encoded "the resolver builds the singleton"; the resolver now READS `_instance`.)"""
     sg, sv = _sender()
     path = _export(sg, sv, tmp_path, embedding_model="model-A")
 
-    def boom(cls, config=None):
-        raise RuntimeError("SECRET-DETAIL-must-not-reach-the-log")
-
-    monkeypatch.setattr(NGEmbed, "get_instance", classmethod(boom))
+    monkeypatch.setattr(NGEmbed, "_instance", _BrokenInstance())
     rg, rv = Graph(), SimpleVectorDB()
     with pytest.raises(tmg.TopologyMergeAbort, match="local_model_unresolvable"):
         _merge(rg, rv, path, tmp_path)
@@ -331,12 +363,9 @@ def test_sender_refuses_frame_export_when_the_model_id_is_unresolvable(tmp_path,
 
 
 def test_sender_refuses_when_the_real_resolver_fails(tmp_path, monkeypatch):
+    # #949: was a `get_instance` patch (encoded "the resolver builds the singleton"); the resolver now READS `_instance`.
     sg, sv = _sender()
-
-    def boom(cls, config=None):
-        raise RuntimeError("SECRET-DETAIL-must-not-reach-the-error")
-
-    monkeypatch.setattr(NGEmbed, "get_instance", classmethod(boom))
+    monkeypatch.setattr(NGEmbed, "_instance", _BrokenInstance())
     out = str(tmp_path / "x.conduit")
     with pytest.raises(ValueError) as ei:
         tex.export_cc_topology(sg, sv, out, machine_id="vps")
@@ -396,16 +425,18 @@ def test_resolver_loads_no_model_and_touches_no_network(monkeypatch):
 
 @pytest.mark.parametrize("bad", ["unknown", "UNKNOWN", "", "   ", None, 7])
 def test_resolver_never_returns_unknown_or_blank(monkeypatch, bad):
-    """Whatever the instance reports, an unusable id is None -- never the string "unknown"."""
-    monkeypatch.setattr(NGEmbed, "stats", property(lambda self: {"model_id": bad}))
+    """Whatever the embedder reports, an unusable id is None -- never the string "unknown". Both sources: an existing
+    instance's stats, and (no instance) the class default constant. (#949: the old version patched `NGEmbed.stats`, which
+    only mattered because the resolver used to create the instance.)"""
+    monkeypatch.setattr(NGEmbed, "_instance", _StatsInstance(bad))
+    assert tex.resolve_embedding_model() is None
+    monkeypatch.setattr(NGEmbed, "_instance", None)
+    monkeypatch.setitem(ng_embed._DEFAULT_CONFIG, "model_id", bad)
     assert tex.resolve_embedding_model() is None
 
 
-def test_resolver_is_none_not_unknown_when_the_embedder_cannot_be_built(monkeypatch, caplog):
-    def boom(cls, config=None):
-        raise RuntimeError("SECRET-DETAIL-must-not-reach-the-log")
-
-    monkeypatch.setattr(NGEmbed, "get_instance", classmethod(boom))
+def test_resolver_is_none_not_unknown_when_the_embedder_cannot_be_read(monkeypatch, caplog):
+    monkeypatch.setattr(NGEmbed, "_instance", _BrokenInstance())
     with caplog.at_level(logging.DEBUG):
         got = tex.resolve_embedding_model()
     assert got is None
@@ -469,3 +500,105 @@ def test_the_abort_message_caps_an_untrusted_wire_id(tmp_path):
     with pytest.raises(tmg.TopologyMergeAbort) as ei:
         _merge(rg, rv, path, tmp_path, expected_embedding_model="model-B")
     assert len(str(ei.value)) < 600, "an untrusted wire id was interpolated unbounded"
+
+
+# ================================================================ (f) #949: the resolver READS, it never CREATES
+
+def _fresh_process(tmp_path, body):
+    """Run `body` in a FRESH python process (PYTHONPATH = the worktree, a scratch HOME, HF_HUB_OFFLINE=1) with the
+    cc_topology_export under test loaded by path as `tex` and ng_embed imported; `body` fills the dict `out`, which is
+    returned. A fresh process is the only honest place to ask "did the resolver leave NGEmbed._instance unset?": in this
+    pytest process the autouse fixture has already touched the singleton."""
+    code = textwrap.dedent("""
+        import importlib.util, json, sys
+        spec = importlib.util.spec_from_file_location("cc_topology_export", sys.argv[1])
+        tex = importlib.util.module_from_spec(spec)
+        sys.modules["cc_topology_export"] = tex
+        spec.loader.exec_module(tex)
+        import ng_embed
+        out = {}
+    """) + textwrap.dedent(body) + "\nprint('RESULT=' + json.dumps(out))\n"
+    home = tmp_path / "fresh-home"
+    home.mkdir(exist_ok=True)
+    env = dict(os.environ, PYTHONPATH=str(_WORKTREE), HOME=str(home), HF_HUB_OFFLINE="1")
+    proc = subprocess.run([sys.executable, "-c", code, str(Path(tex.__file__).resolve())],
+                          env=env, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, "fresh process failed: " + proc.stderr[-800:]
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT=")][-1]
+    return json.loads(line[len("RESULT="):])
+
+
+def test_FRESH_PROCESS_a_resolver_call_leaves_the_singleton_uncreated(tmp_path):
+    """The #949 defect, in a process where nothing else has touched NGEmbed: on 5df0fb7a the resolver's get_instance()
+    CREATES the instance (this fails); on the fix `NGEmbed._instance` is still None and the default id is reported."""
+    out = _fresh_process(tmp_path, """
+        out["before"] = ng_embed.NGEmbed._instance is None
+        out["resolved"] = tex.resolve_embedding_model()
+        out["instance_is_none_after"] = ng_embed.NGEmbed._instance is None
+    """)
+    assert out["before"] is True, "the fresh process was not fresh"
+    assert out["resolved"] == DEFAULT_ID
+    assert out["instance_is_none_after"] is True, "the resolver CREATED the process-wide NGEmbed singleton"
+
+
+def test_FRESH_PROCESS_a_later_non_default_config_is_not_pinned_out_by_a_header_read(tmp_path):
+    """The consequence of the same defect: a header read first, then a non-default config passed to get_instance(). On
+    5df0fb7a the resolver already created the singleton with the DEFAULT config (first-creation-wins), so the later config
+    is silently ignored; on the fix it takes effect."""
+    out = _fresh_process(tmp_path, """
+        tex.resolve_embedding_model()
+        out["later"] = ng_embed.NGEmbed.get_instance({"model_id": "later/non-default"}).stats["model_id"]
+    """)
+    assert out["later"] == "later/non-default", "a header read pinned the default config (first-creation-wins)"
+
+
+def test_resolver_in_process_leaves_no_instance_behind():
+    assert NGEmbed._instance is None            # the autouse fixture reset it
+    assert tex.resolve_embedding_model() == DEFAULT_ID
+    assert NGEmbed._instance is None, "the resolver created the singleton"
+
+
+def test_resolver_reports_an_existing_instances_configured_id_and_leaves_it_alone():
+    inst = NGEmbed.get_instance({"model_id": "acme/other-embedder-x"})
+    assert tex.resolve_embedding_model() == "acme/other-embedder-x"
+    assert NGEmbed._instance is inst, "the resolver replaced or reset the existing instance"
+    assert inst.stats["model_id"] == "acme/other-embedder-x"
+
+
+def test_resolver_returns_the_same_id_get_instance_would_have_reported():
+    """The returned model_id is UNCHANGED by #949: for the default config it is exactly what get_instance() would create
+    and report; for an existing non-default instance it is that instance's id."""
+    no_instance = tex.resolve_embedding_model()
+    assert NGEmbed._instance is None
+    assert no_instance == ng_embed._DEFAULT_CONFIG["model_id"] == DEFAULT_ID
+    assert no_instance == NGEmbed().stats["model_id"], "differs from a default-config NGEmbed (direct, non-singleton)"
+    assert no_instance == NGEmbed.get_instance().stats["model_id"], "differs from what get_instance() would have reported"
+    assert tex.resolve_embedding_model() == no_instance                      # same answer once the instance exists
+    NGEmbed.reset_instance()
+    NGEmbed.get_instance({"model_id": "acme/other-embedder-x"})
+    assert tex.resolve_embedding_model() == NGEmbed.get_instance().stats["model_id"] == "acme/other-embedder-x"
+
+
+def test_resolver_never_calls_get_instance_or_reset_instance(monkeypatch):
+    """No create and no reset, whether or not an instance exists (tripwires, both states)."""
+    def no_get(cls, config=None):
+        raise AssertionError("resolver called NGEmbed.get_instance() (a CREATE)")
+
+    def no_reset(cls):
+        raise AssertionError("resolver called NGEmbed.reset_instance()")
+
+    monkeypatch.setattr(NGEmbed, "get_instance", classmethod(no_get))
+    monkeypatch.setattr(NGEmbed, "reset_instance", classmethod(no_reset))
+    assert tex.resolve_embedding_model() == DEFAULT_ID                       # no instance
+    monkeypatch.setattr(NGEmbed, "_instance", _StatsInstance("acme/other-embedder-x"))
+    assert tex.resolve_embedding_model() == "acme/other-embedder-x"          # an instance
+
+
+def test_resolver_returns_none_when_the_default_constant_cannot_be_read(monkeypatch, caplog):
+    """A raising path with NO instance: the class default constant is missing -> None, class name only in the log."""
+    monkeypatch.delitem(ng_embed._DEFAULT_CONFIG, "model_id")
+    with caplog.at_level(logging.DEBUG):
+        got = tex.resolve_embedding_model()
+    assert got is None
+    assert "KeyError" in caplog.text and "unknown" not in caplog.text.lower()
+
