@@ -2,7 +2,7 @@
 
 Lane `want-hub-competition-d` · dispatch #12532 · author thread `097da447` · PLAN ONLY: `neuro_foundation.py` untouched, no data load, no probe rerun. Plan head at dispatch `24bcd335a9c1e265f4c9d562c5b9c68a7bd92711` (branch `cc-laptop-want-hub-d-20260930`).
 
-**Commits:** the `[R5k·#867]` commit (plan-005.md + this file) and ONE pin-line follow-up; a commit cannot contain its own hash, so both full hashes are in plan-005's changelog pin line and in my report. Cite the hash, never the file name.
+**Commits:** `01545fe866a34ec3fe6a184ba886209d2ffa9456` — the `[R5k·#867]` commit (plan-005.md + this file), pinned here and in plan-005's changelog by ONE one-line follow-up (a commit cannot contain its own hash, so that follow-up's hash is in my report). Cite the hash, never the file name.
 
 **A repo note, stated as fact:** at the start of this turn `git pull --rebase` (the branch tracked `origin/main`) rebased the local branch onto a moved `main` (20 new commits). I checked the local plan file was identical to the pushed one, then restored the local branch to the pushed head `24bcd335` (`git reset --hard origin/cc-laptop-want-hub-d-20260930`) and pointed its upstream at its own remote branch. Nothing was pushed from the rebased state; the remote branch was never rewritten.
 

@@ -1,5 +1,6 @@
 <!--
 # ---- Changelog ----
+# [2026-10-01] PIN [R5k·#867] — the [R5k·#867] plan-sync below is commit 01545fe866a34ec3fe6a184ba886209d2ffa9456 on cc-laptop-want-hub-d-20260930; cite THAT hash, never the file name (changelog-only follow-up: a commit cannot contain its own hash).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 worker, lane want-hub-competition-d, dispatch #12532) — plan-sync: the probe model's "16" -> the engine's 15 [R5k·#867]
 #   What: Chief-003 GO on Exec P459: the #867 determination (build-005, verdict A, ruled MET) found the engine's 15 held-back last-link partners is the rule applied to its own guaranteed set G; the plan's 16
 #     came from the plan's probe model (weights rounded to 6 d.p. + a probe-index tie-break). The code stands; the PLAN TEXT is the drift (same shape as #852). ONE small wording fold; no engine, test or data change.
