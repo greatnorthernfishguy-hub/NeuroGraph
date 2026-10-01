@@ -3,6 +3,31 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane merge-guard-897, dispatch #12973) — #897: the consolidation guard covers the WHOLE graph
+# What: the between-batch consolidation guard no longer asks `_unbound_nodes(graph, merge_landed)`
+#   (this merge's arrivals only); it asks `_unbound_nodes(graph, set(graph.nodes))` -- the SAME
+#   predicate the daemon's #896 rule 1 uses. If ANY unbound node exists (a pre-existing one OR an
+#   arrival that did not bind) the batch's idle steps are skipped, counted and logged LOUD (one
+#   ERROR per blocked batch); once none exists they run exactly as before. New stats keys:
+#   consolidation_skipped_unbound_preexisting, consolidation_blocked_batches;
+#   consolidation_skipped_unbound_arrivals keeps its meaning (this merge's arrivals still unbound
+#   at a skip). `_unbound_nodes` itself, `_cc_callosum_consolidate`, Tier 1/2/3 and the membership
+#   snapshot are untouched. No env variable, no knob, no default change.
+# Why: S4 step-source run-down (Exec Packet 484, Finding 1, HIGH; Chief-003 ruled GO, Packet 485 /
+#   #897). The merge-scoped guard never saw the laptop CC graph's 147 PRE-EXISTING unbound
+#   conversational nodes (15 forests + 132 trees, source=cc_gateway). The first Leg 2 tick whose
+#   arrivals were all bound would have run 250 steps against orphan_node_grace_period 25 and the
+#   orphan sweep (neuro_foundation.py _collect_orphan_nodes) would have reaped every still-unbound
+#   one of them in that single tick -- the defect Packet 482 (#896 rule 1) reversed on the daemon's
+#   drain side (CC-CALLOSUM-TRUTH.md §2, §10.4-H: the clock stays gated until the backlog is wired;
+#   do not 'fix' the cull by disabling, host-scoping or exempting). The merge's OWN copy of the
+#   guard had never been widened. This SUPERSEDES the "Guard scope: MERGE-scoped" paragraph of the
+#   2026-08-02 (#108) entry below: that scope was right about batch-vs-merge, and wrong about
+#   merge-vs-graph.
+# How: the predicate is evaluated where it was (inside graph._step_lock, only when idle_steps > 0
+#   and the merge landed something); nothing is held across the steps. A node that cannot bind now
+#   blocks consolidation loudly until it does -- deferring consolidation costs integration
+#   quality; running it costs the node.
 # [2026-09-11] Codex — #423 completed topology batches are capture boundaries
 # What: serialize in-memory Tier 1/2/3 apply and membership reads on _step_lock.
 # Why: graph/vector capture must not observe nodes before their binding arrives.
@@ -277,6 +302,21 @@ def merge_cc_topology(
     (cc_ng_organism.py:1856), which already slices the lock -- LAW 3, restore the
     existing mechanism rather than write a second one. Default 250 via
     CC_NG_IDLE_STEPS, the same env the nightly cron already exports.
+
+    THE GUARD COVERS THE WHOLE GRAPH (#897). The steps are skipped -- counted
+    and logged at ERROR, once per blocked batch -- while ANY node in the graph
+    is unbound (no synapse, no hyperedge): one of this merge's own arrivals that
+    did not bind, OR one that was already there. The first guard (#108) asked
+    only about this merge's arrivals; it never saw the pre-existing unbound
+    conversational cohort, so the first merge whose arrivals were all bound
+    would have run 250 steps against orphan grace 25 and handed the cohort to
+    the orphan sweep. Leg 2 frames still merge and bind (that is how the cohort
+    gets bound); only the clock is held. A node that cannot bind blocks
+    consolidation, loudly, until it does. Stats: `consolidation_blocked_batches`
+    (+1 per blocked batch), `consolidation_skipped_unbound_arrivals` (this
+    merge's arrivals still unbound at a skip) and
+    `consolidation_skipped_unbound_preexisting` (the rest, summed per blocked
+    batch). Same predicate as the daemon's #896 rule 1.
     """
     from cc_ng_organism import _cc_deposit_memory_node, _cc_callosum_consolidate
 
@@ -334,16 +374,25 @@ def merge_cc_topology(
         "batches_read": 0, "deferred_by_budget": 0,
         "consolidation_passes": 0, "consolidation_steps": 0,
         "consolidation_skipped_unbound_arrivals": 0,
+        # #897: the whole-graph guard. `..._arrivals` is THIS merge's arrivals still
+        # unbound at a skip (its original meaning); `..._preexisting` is every other
+        # unbound node in the graph at a skip, summed per blocked batch;
+        # `consolidation_blocked_batches` is +1 per blocked batch.
+        "consolidation_skipped_unbound_preexisting": 0,
+        "consolidation_blocked_batches": 0,
     }
 
     budget = max_nodes_per_call
     landed_ids: List[str] = []
-    # Merge-scoped arrival set for the consolidation guard below. Deliberately
-    # NOT `batch_landed` and NOT `landed_ids`: the guard has to see every node
-    # this merge has put in play, across all batches. See the guard at the
-    # bottom of the loop for why batch scope is unsafe. `landed_ids` feeds the
-    # membership snapshot and excludes already-present nodes (:249), which are
-    # legitimate endpoints and can be left unbound by a split batch too.
+    # Merge-scoped arrival set. Deliberately NOT `batch_landed` and NOT
+    # `landed_ids`: it is every node this merge has put in play, across all
+    # batches. Since #897 the consolidation guard asks about the WHOLE graph, so
+    # this set no longer bounds the guard; it (a) keeps the guard's trigger
+    # (the merge landed something) and (b) splits a skip's unbound nodes into
+    # "from this merge" vs "pre-existing" for the stats and the ERROR record.
+    # `landed_ids` feeds the membership snapshot and excludes already-present
+    # nodes (:249), which are legitimate endpoints and can be left unbound by a
+    # split batch too -- `merge_landed` includes them.
     merge_landed: Set[str] = set()
 
     for frame in frames[1:]:
@@ -561,7 +610,10 @@ def merge_cc_topology(
                     stats["skipped_hyperedges"] += 1
 
             merge_landed |= batch_landed
-            unbound = (_unbound_nodes(graph, merge_landed)
+            # #897: the WHOLE graph, not `merge_landed` -- the same call the daemon's
+            # #896 rule 1 makes. Evaluated here, under the lock and only when the
+            # guard will be consulted, exactly where the merge-scoped one was.
+            unbound = (_unbound_nodes(graph, set(graph.nodes))
                        if idle_steps > 0 and merge_landed else set())
 
         # --- Consolidation: sleep on this batch before taking the next ------
@@ -573,38 +625,51 @@ def merge_cc_topology(
         # GUARDED, and the guard is the whole reason this is not a two-line
         # change. Consolidation advances graph.timestep, and
         # orphan_node_grace_period is denominated in exactly that clock (default
-        # 25). idle_steps defaults to 250. So running the steps while any node
-        # that landed in THIS merge is still unbound would march it straight
-        # past grace and hand it to the orphan sweep -- authoring
-        # CC-CALLOSUM-TRUTH.md §8.2's cohort cliff into the merge path, in the
-        # name of a fix for it. A node is left unbound here when its binding
-        # structure was split across batches or skipped (skipped_synapses /
-        # skipped_hyperedges), which whole-containment permits.
+        # 25). idle_steps defaults to 250. So running the steps while ANY node
+        # in the graph is still unbound would march it straight past grace and
+        # hand it to the orphan sweep (neuro_foundation._collect_orphan_nodes) --
+        # authoring CC-CALLOSUM-TRUTH.md §8.2's cohort cliff into the merge path,
+        # in the name of a fix for it.
         #
-        # THE PREDICATE IS MERGE-SCOPED, NOT BATCH-SCOPED, and that is the
-        # whole point. Binding splits ACROSS batches (the comment above), so a
-        # batch-scoped check cannot see the node it needs to protect: batch 1
-        # lands X unbound and correctly skips; batch 2 lands whole, X is not in
-        # batch 2's set, the guard passes, and 250 steps age X from 0 to 250
-        # against a grace of 25. The merge kills the arrival the guard exists
-        # to protect, one batch later. `merge_landed` accumulates every arrival
-        # this call has put in play so the guard stays honest for all of them.
+        # THE PREDICATE IS WHOLE-GRAPH (#897). What the first guard did (#108):
+        # it asked only about THIS merge's arrivals (`merge_landed`, accumulated
+        # across batches because binding splits across them, so a batch-scoped
+        # check would let a later whole batch age an earlier arrival past grace).
+        # That was right about batch-vs-merge and wrong about merge-vs-graph:
+        # the laptop CC graph holds 147 PRE-EXISTING unbound conversational nodes
+        # (15 forests + 132 trees, source=cc_gateway) that are in nobody's
+        # `merge_landed`, so the first Leg 2 tick whose arrivals were all bound
+        # passed the guard, ran 250 steps against grace 25, and the sweep reaped
+        # every still-unbound one of them in that one tick. The pre-existing
+        # cohort binds only OVER Leg 2 (CALLOSUM-TRUTH §2, §10.4-H: the clock
+        # stays gated until the backlog is wired -- do not 'fix' the cull by
+        # disabling, host-scoping or exempting), so the clock must not move
+        # until it has. Same predicate as the daemon's #896 rule 1.
         #
-        # So: consolidate only when everything this merge has landed is bound.
-        # Otherwise skip, count, and log loudly -- an unbound arrival is a real
-        # defect worth seeing, and deferring its consolidation costs only
-        # integration quality, whereas running it costs the node.
+        # So: consolidate only when NO node in the graph is unbound. Otherwise
+        # skip, count, and log loudly (one ERROR per blocked batch, never
+        # rate-limited). Frames still merge and bind -- Tier 3 is untouched; only
+        # the clock is held. An unbound node that cannot bind blocks
+        # consolidation, loudly, until it does: deferring consolidation costs
+        # only integration quality, whereas running it costs the node.
         if idle_steps > 0 and merge_landed:
             if unbound:
-                stats["consolidation_skipped_unbound_arrivals"] += len(unbound)
+                from_merge = unbound & merge_landed
+                preexisting = unbound - merge_landed
+                stats["consolidation_skipped_unbound_arrivals"] += len(from_merge)
+                stats["consolidation_skipped_unbound_preexisting"] += len(preexisting)
+                stats["consolidation_blocked_batches"] += 1
                 logger.error(
                     "CC topology: skipping %d consolidation step(s) after batch %d -- "
-                    "%d of %d arrival(s) so far this merge are still unbound (no "
-                    "synapse, no hyperedge) and grace is denominated in the clock "
-                    "consolidation would advance. Sample: %s. This is a "
-                    "whole-containment gap upstream, not a consolidation problem "
-                    "(#108/#107).",
-                    idle_steps, stats["batches_read"], len(unbound), len(merge_landed),
+                    "%d node(s) in the graph are still unbound (no synapse, no "
+                    "hyperedge): %d pre-existing (not landed by this merge), %d from "
+                    "this merge (%d landed so far). Sample: %s. The clock is held "
+                    "because orphan grace is denominated in the clock consolidation "
+                    "would advance, and the pre-existing cohort binds only over Leg 2 "
+                    "(CC-CALLOSUM-TRUTH §2/§10.4-H). Consolidation stays blocked "
+                    "until every one of them is bound (#897).",
+                    idle_steps, stats["batches_read"], len(unbound),
+                    len(preexisting), len(from_merge), len(merge_landed),
                     sorted(unbound)[:3])
             elif _cc_callosum_consolidate(graph, idle_steps):
                 stats["consolidation_passes"] += 1
