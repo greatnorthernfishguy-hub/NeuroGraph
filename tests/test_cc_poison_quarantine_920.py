@@ -1,4 +1,12 @@
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13417 (+ ADDENDUM 2 / Exec P501: the ERROR text and the
+#   docstring state `attempts = max_retries + 1` in words; test_the_quarantine_error_states_attempts_equal_retries_plus_one asserts it)
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13417 — #920 build-002 (Chief-003 RULINGS, ADDENDUM 1):
+#   COUNT SEMANTICS = THE LITERAL NAME: max_retries is the number of RETRIES AFTER THE FIRST FAILED ATTEMPT, so an entry gets max_retries + 1
+#   attempts (_attempts(n) below) and the (max_retries + 1)-th consecutive failure is quarantined in that cycle. Every test that encoded the old
+#   boundary (the Nth failure quarantines) moved to the new one; none was weakened (the max_retries=1 special case of the first test is gone
+#   because the boundary no longer lets T1 and the quarantine share a call, so its assertion is now uniform); NEW: the boundary pin, the
+#   N-failures-then-success pin, the literal WARNING / ERROR number pins, the docstring pin (formula + the RAISE-the-variable lever).
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13303 — #920 (Exec Packet 497 via Chief-003)
 # What: tests for the POISON-TURN POLICY on drain_ingest_tract (bounded retry -> QUARANTINE, never discard -> LOUD): a turn that fails
 #   every cycle is retried exactly max_retries times and then quarantined WHOLE (exact raw frame bytes) to the append-only
@@ -211,6 +219,11 @@ class Tract:
         return os.path.exists(self.qpath)
 
 
+def _attempts(max_retries):
+    """max_retries = RETRIES AFTER the first failed attempt (the literal name): an entry gets this many attempts in total."""
+    return max_retries + 1
+
+
 def _drain(w, tr, max_retries=None, hold=True, **kw):
     return org.drain_ingest_tract(w.graph, w.vdb, w.state, tract_path=tr.path, return_consumed=True,
                                   hold_on_failure=hold, max_retries=max_retries, **kw)
@@ -249,44 +262,44 @@ def test_vendored_and_protected_files_are_unedited():
 
 @pytest.mark.parametrize('max_retries', [1, 3, 5])
 def test_a_turn_that_fails_every_cycle_is_retried_max_retries_times_then_quarantined_whole(world, tmp_path, caplog, max_retries):
-    """T1 ok, TP poison (its dual pass fails partway EVERY cycle, then rolls back), T3 ok. Cycles 1..max_retries-1 hold TP (tract
-    byte-identical, one hold WARNING each, nothing quarantined); the max_retries-th failure quarantines it in that same cycle: the
-    quarantine file is EXACTLY TP's raw frame, the tract no longer holds it, one ERROR, the counter is 1, no node/synapse of TP is in
-    the graph. The next cycle drains T3. Nothing is discarded."""
+    """T1 ok, TP poison (its dual pass fails partway EVERY cycle, then rolls back), T3 ok. max_retries = RETRIES after the first failed
+    attempt, so TP gets max_retries + 1 attempts: cycles 1..max_retries hold it (tract byte-identical, one hold WARNING each, nothing
+    quarantined); the (max_retries + 1)-th failure quarantines it in that same cycle: the quarantine file is EXACTLY TP's raw frame, the
+    tract no longer holds it, one ERROR, the counter is 1, no node/synapse of TP is in the graph. The next cycle drains T3. Nothing is
+    discarded."""
     w = world
     tr = _setup(w, tmp_path)
     total = b''.join(tr.frames)
     removed = b''
     graph_after_t1 = None
-    for cycle in range(1, max_retries + 1):
+    attempts = _attempts(max_retries)
+    for cycle in range(1, attempts + 1):
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger=org.logger.name):
             absorbed, consumed = _drain(w, tr, max_retries)
         removed += consumed
-        if cycle < max_retries:
+        if cycle < attempts:
             held = (tr.frames[1] + tr.frames[2])
             assert tr.read() == held, 'cycle %d: the held entry and everything behind it stay byte-identical' % cycle
             assert not tr.qexists()
             assert len(_recs(caplog, HOLD_PREFIX)) == 1 and _recs(caplog, QUAR_MARK) == []
-            assert 'attempt=%d/%d' % (cycle, max_retries) in _recs(caplog, HOLD_PREFIX)[0].getMessage()
+            assert 'attempt=%d of %d (max_retries=%d)' % (cycle, attempts, max_retries) in _recs(caplog, HOLD_PREFIX)[0].getMessage()
             assert w.state['drain_retry_counts'] == {hashlib.sha256(tr.frames[1]).hexdigest(): cycle}
             assert w.state.get('quarantined_total', 0) == 0
             assert absorbed == (1 if cycle == 1 else 0) and consumed == (tr.frames[0] if cycle == 1 else b'')
             if graph_after_t1 is None:
                 graph_after_t1 = snap(w)
             assert snap(w) == graph_after_t1, 'the failing turn leaked into the graph on cycle %d' % cycle
-    # the max_retries-th failure: quarantined in that same call
+    # the (max_retries + 1)-th failure: quarantined in that same call
     assert tr.qread() == tr.frames[1], 'the quarantine file holds the EXACT raw frame bytes, nothing else'
     assert tr.read() == tr.frames[2], 'the tract advanced past the quarantined entry; the entry behind it is still there'
-    if max_retries == 1:
-        assert (absorbed, consumed) == (1, tr.frames[0] + tr.frames[1])
-    else:
-        assert (absorbed, consumed) == (0, tr.frames[1])
+    assert (absorbed, consumed) == (0, tr.frames[1])
     errs = _recs(caplog, QUAR_MARK)
     assert len(errs) == 1 and errs[0].levelno == logging.ERROR and _recs(caplog, QFAIL_MARK) == []
     assert _recs(caplog, HOLD_PREFIX) == []                                   # the quarantining cycle logs the ERROR, not a hold WARNING
     msg = errs[0].getMessage()
-    assert _tag(tr.frames[1]) in msg and 'failures=%d' % max_retries in msg and 'max_retries=%d' % max_retries in msg
+    assert _tag(tr.frames[1]) in msg and 'failures=%d' % attempts in msg and 'max_retries=%d' % max_retries in msg
+    assert 'quarantining after %d attempts (= max_retries + 1), max_retries=%d' % (attempts, max_retries) in msg, 'BOTH numbers + the relation'
     assert 'reason=absorb_returned_false' in msg and 'turns.tract.quarantine' in msg and 'stored=appended' in msg
     assert w.state['quarantined_total'] == 1 and w.state['drain_retry_counts'] == {}
     assert snap(w) == snap(w.clean_pass([T1])), 'no node/synapse of the poison turn remains (the #904 rollback)'
@@ -307,7 +320,7 @@ def test_the_quarantine_error_carries_only_the_hash_form_class_counts_and_file_n
     w = world
     tr = _setup(w, tmp_path)
     with caplog.at_level(logging.DEBUG, logger=org.logger.name):
-        for _ in range(2):
+        for _ in range(_attempts(2)):
             _drain(w, tr, 2)
     errs = _recs(caplog, QUAR_MARK)
     assert len(errs) == 1
@@ -333,8 +346,8 @@ def test_a_raising_dual_pass_is_quarantined_with_its_exception_class_name(world,
 
     monkeypatch.setattr(org, 'run_conversational_dual_pass', boom)
     with caplog.at_level(logging.DEBUG, logger=org.logger.name):
-        _drain(w, tr, 2)
-        _drain(w, tr, 2)
+        for _ in range(_attempts(2)):
+            _drain(w, tr, 2)
     msg = _recs(caplog, QUAR_MARK)[0].getMessage()
     assert 'reason=absorb_raised' in msg and 'exc_type=ValueError' in msg
     assert SECRET not in msg and TEXT_CANARY not in msg
@@ -346,12 +359,13 @@ def test_poison_as_the_very_first_entry_is_quarantined_and_the_tract_advances(wo
     w = world
     tr = _setup(w, tmp_path, texts=(TP, T3))
     with caplog.at_level(logging.DEBUG, logger=org.logger.name):
-        a1, c1 = _drain(w, tr, 2)
-        assert (a1, c1) == (0, b'') and tr.read() == b''.join(tr.frames)
-        a2, c2 = _drain(w, tr, 2)
-    assert (a2, c2) == (0, tr.frames[0]) and tr.read() == tr.frames[1] and tr.qread() == tr.frames[0]
-    a3, c3 = _drain(w, tr, 2)
-    assert (a3, c3) == (1, tr.frames[1]) and tr.read() == b''
+        for _ in range(2):                                           # max_retries=2: attempts 1 and 2 are held
+            a, c = _drain(w, tr, 2)
+            assert (a, c) == (0, b'') and tr.read() == b''.join(tr.frames)
+        a3, c3 = _drain(w, tr, 2)                                    # the 3rd (= max_retries + 1) failure quarantines it
+    assert (a3, c3) == (0, tr.frames[0]) and tr.read() == tr.frames[1] and tr.qread() == tr.frames[0]
+    a4, c4 = _drain(w, tr, 2)
+    assert (a4, c4) == (1, tr.frames[1]) and tr.read() == b''
 
 
 def test_fsync_happens_before_the_tract_is_truncated(world, tmp_path, monkeypatch):
@@ -367,9 +381,10 @@ def test_fsync_happens_before_the_tract_is_truncated(world, tmp_path, monkeypatc
                      'q': tr.qread() if tr.qexists() else None})
         return real_fsync(fd)
 
-    _drain(w, tr, 2)
+    for _ in range(2):                                              # max_retries=2: attempts 1 and 2 are held (no fsync spied yet)
+        _drain(w, tr, 2)
     monkeypatch.setattr(os, 'fsync', spy)
-    _drain(w, tr, 2)
+    _drain(w, tr, 2)                                                # the 3rd attempt quarantines
     assert seen, 'the quarantine step never called os.fsync'
     assert all(s['tract_has_poison'] for s in seen), 'the tract was truncated BEFORE an fsync of the quarantine step'
     assert seen[0]['q'] == tr.frames[1], 'the frame was flushed into the quarantine file before its fsync'
@@ -436,7 +451,8 @@ FAULTS = ['qpath_is_a_directory', 'open_raises', 'fsync_raises']
 def test_a_failed_quarantine_write_keeps_the_entry_held_and_is_one_error(world, tmp_path, caplog, monkeypatch, how):
     w = world
     tr = _setup(w, tmp_path)
-    _drain(w, tr, 2)
+    for _ in range(2):                                              # max_retries=2: attempts 1 and 2 are held; the 3rd would quarantine
+        _drain(w, tr, 2)
     held = tr.frames[1] + tr.frames[2]
     assert tr.read() == held
     _break_quarantine(how, tr, monkeypatch)
@@ -464,14 +480,16 @@ def test_a_frame_found_at_the_tail_is_fsynced_again_before_the_tract_advances(wo
     w = world
     tr = _setup(w, tmp_path, texts=(TP, T3))
     real_fsync = os.fsync
+    _drain(w, tr, 1)                                   # max_retries=1: attempt 1 is held (nothing quarantined yet)
+    assert not tr.qexists()
     monkeypatch.setattr(os, 'fsync', lambda fd: (_ for _ in ()).throw(OSError(SECRET)))
-    _drain(w, tr, 1)                                   # appended, fsync fails -> held
+    _drain(w, tr, 1)                                   # attempt 2 quarantines: appended, fsync fails -> held
     assert tr.qread() == tr.frames[0] and tr.read() == b''.join(tr.frames)
-    _drain(w, tr, 1)                                   # frame already at the tail, fsync STILL fails -> still held
+    _drain(w, tr, 1)                                   # attempt 3: frame already at the tail, fsync STILL fails -> still held
     assert tr.qread() == tr.frames[0] and tr.read() == b''.join(tr.frames)
     calls = []
     monkeypatch.setattr(os, 'fsync', lambda fd: (calls.append(fd), real_fsync(fd))[1])
-    _drain(w, tr, 1)                                   # fsync works: it is called (file + directory) BEFORE the tract advances
+    _drain(w, tr, 1)                                   # attempt 4: fsync works: it is called (file + directory) BEFORE the tract advances
     assert len(calls) == 2, 'the already_present path fsynced the file and the directory'
     assert tr.read() == tr.frames[1] and tr.qread() == tr.frames[0]
 
@@ -480,9 +498,10 @@ def test_a_frame_found_at_the_tail_is_fsynced_again_before_the_tract_advances(wo
 def test_recovery_after_a_failed_quarantine_write_quarantines_exactly_once(world, tmp_path, caplog, monkeypatch, how):
     w = world
     tr = _setup(w, tmp_path)
-    _drain(w, tr, 2)
+    for _ in range(2):                                              # attempts 1 and 2 held
+        _drain(w, tr, 2)
     restore = _break_quarantine(how, tr, monkeypatch)
-    _drain(w, tr, 2)
+    _drain(w, tr, 2)                                                # the 3rd attempt: the quarantine write fails -> held
     assert tr.read() == tr.frames[1] + tr.frames[2]
     restore()
     caplog.clear()
@@ -516,25 +535,30 @@ class _TruncateFault:
 def test_crash_between_the_quarantine_fsync_and_the_truncate_neither_duplicates_nor_loses(world, tmp_path, caplog, monkeypatch):
     w = world
     tr = _setup(w, tmp_path)
-    original = tr.read()
     fault = _TruncateFault(monkeypatch, tr, _Crash())
+    fault.armed = False                                # disarmed for attempt 1: its prefix truncate (T1) must succeed normally
+    _drain(w, tr, 1)                                   # max_retries=1: absorbs T1, attempt 1 of TP is held
+    original = tr.read()
+    assert original == tr.frames[1] + tr.frames[2] and not tr.qexists()
+    fault.armed = True
     with pytest.raises(_Crash):
-        _drain(w, tr, 1)                               # absorbs T1, quarantines TP durably, then 'dies' at the truncate
+        _drain(w, tr, 1)                               # attempt 2 quarantines TP durably, then 'dies' at the truncate
     assert tr.qread() == tr.frames[1], 'the frame was durable BEFORE the crash'
     assert tr.read() == original, 'the crash left the tract untouched: the entry is NOT lost'
     fault.armed = False
-    # the restart: fresh process memory (new graph, new state), same files. The entry is re-quarantined idempotently.
+    # the restart: fresh process memory (new graph, new state), same files. The count restarts, so the entry takes its
+    # attempts again (1 held, 2 quarantines) and is re-quarantined idempotently.
     w2 = types.SimpleNamespace()
     w2.graph, w2.vdb, w2.state = _new_stores()
     _poison(w2.vdb, POISON_TREE_WORD)
     caplog.clear()
     with caplog.at_level(logging.DEBUG, logger=org.logger.name):
-        _drain(w2, tr, 1)
+        _drain(w2, tr, 1)                              # attempt 1 after the restart: held
+        assert tr.read() == original and tr.qread() == tr.frames[1]
+        _drain(w2, tr, 1)                              # attempt 2: quarantined again, idempotently
     assert tr.qread() == tr.frames[1], 'no duplicate: the identical frame already LAST in the file is not appended twice'
     assert 'stored=already_present' in _recs(caplog, QUAR_MARK)[0].getMessage()
     assert w2.state.get('quarantined_total', 0) == 0, 'not newly appended by this process'
-    # T1's bytes were still in the tract after the crash, so it is re-absorbed here, idempotently by its content-hashed ids:
-    # the tract's at-least-once contract, unchanged by #920.
     assert tr.read() == tr.frames[2]
 
 
@@ -542,7 +566,9 @@ def test_a_soft_truncate_failure_requarantines_idempotently_and_does_not_inflate
     w = world
     tr = _setup(w, tmp_path, texts=(TP, T3))
     fault = _TruncateFault(monkeypatch, tr, PermissionError(SECRET))
-    for _ in range(3):
+    _drain(w, tr, 1)                                   # max_retries=1: attempt 1 is held (poison first: nothing to truncate)
+    assert not tr.qexists() and tr.read() == b''.join(tr.frames)
+    for _ in range(3):                                 # attempts 2, 3, 4: each (re-)quarantines, each truncate is refused
         _drain(w, tr, 1)
         assert tr.read() == b''.join(tr.frames), 'the tract could not be advanced, so it is untouched'
         assert tr.qread() == tr.frames[0], 'and the quarantine still holds exactly one copy'
@@ -551,6 +577,88 @@ def test_a_soft_truncate_failure_requarantines_idempotently_and_does_not_inflate
     _drain(w, tr, 1)
     assert tr.read() == tr.frames[1] and tr.qread() == tr.frames[0]
     assert w.state['drain_retry_counts'] == {}, 'the count ends once the removal is confirmed'
+
+
+# ------------------------------------------------------------------ THE BOUNDARY, pinned (build-002: the literal name wins)
+
+@pytest.mark.parametrize('max_retries', [1, 2, 5])
+def test_boundary_attempt_n_still_held_attempt_n_plus_1_is_quarantined_in_that_cycle(world, tmp_path, caplog, max_retries):
+    """max_retries = RETRIES AFTER the first failed attempt. After exactly max_retries failing attempts the entry is STILL HELD (the tract
+    is byte-identical, no quarantine file, the count is max_retries); the very next attempt (number max_retries + 1) quarantines it IN
+    that cycle. max_retries=1 -> 2 attempts; the default 5 -> 6 attempts."""
+    w = world
+    tr = _setup(w, tmp_path, texts=(TP,))
+    key = hashlib.sha256(tr.frames[0]).hexdigest()
+    for attempt in range(1, max_retries + 1):
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+            assert _drain(w, tr, max_retries) == (0, b'')
+        assert tr.read() == tr.frames[0] and not tr.qexists(), 'attempt %d of %d must still be HELD' % (attempt, max_retries + 1)
+        assert w.state['drain_retry_counts'] == {key: attempt} and w.state.get('quarantined_total', 0) == 0
+        assert _recs(caplog, QUAR_MARK) == []
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert _drain(w, tr, max_retries) == (0, tr.frames[0])          # attempt max_retries + 1: quarantined IN this cycle
+    assert tr.read() == b'' and tr.qread() == tr.frames[0]
+    assert len(_recs(caplog, QUAR_MARK)) == 1 and w.state['quarantined_total'] == 1
+    assert 'failures=%d' % (max_retries + 1) in _recs(caplog, QUAR_MARK)[0].getMessage()
+
+
+@pytest.mark.parametrize('max_retries', [1, 2, 5])
+def test_boundary_max_retries_failures_then_a_success_on_the_last_attempt_is_absorbed_not_quarantined(world, tmp_path, caplog, max_retries):
+    """The other side of the boundary: the entry fails max_retries times and the (max_retries + 1)-th attempt, its LAST allowed one,
+    succeeds: it is absorbed, never quarantined, the count leaves, the graph equals one clean pass."""
+    w = world
+    tr = _setup(w, tmp_path, texts=(T1, TP, T3))
+    for _ in range(max_retries):
+        _drain(w, tr, max_retries)
+    assert not tr.qexists() and tr.read() == tr.frames[1] + tr.frames[2]
+    w.vdb.fail_ids = lambda i: False                                   # the fault clears before the last allowed attempt
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        a, c = _drain(w, tr, max_retries)
+    assert (a, c) == (2, tr.frames[1] + tr.frames[2]) and tr.read() == b'' and not tr.qexists()
+    assert w.state['drain_retry_counts'] == {} and w.state.get('quarantined_total', 0) == 0
+    assert _recs(caplog, QUAR_MARK) == [] and snap(w) == snap(w.clean_pass([T1, TP, T3]))
+
+
+def test_the_hold_warning_and_the_quarantine_error_state_the_numbers_literally(world, tmp_path, caplog):
+    """Default-sized bound (5): the first hold WARNING reads 'attempt=1 of 6'; the 6th attempt's ERROR reads 'quarantining after 6 attempts,
+    max_retries=5'. (No other text or id: the existing no-leak assertions stay in their own tests.)"""
+    w = world
+    tr = _setup(w, tmp_path, texts=(TP,))
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        for _ in range(6):
+            _drain(w, tr, 5)
+    holds = [r.getMessage() for r in _recs(caplog, HOLD_PREFIX)]
+    assert len(holds) == 5 and 'attempt=1 of 6 (max_retries=5)' in holds[0] and 'attempt=5 of 6 (max_retries=5)' in holds[4]
+    (err,) = _recs(caplog, QUAR_MARK)
+    assert 'quarantining after 6 attempts (= max_retries + 1), max_retries=5' in err.getMessage()
+
+
+@pytest.mark.parametrize('max_retries', [1, 5])
+def test_the_quarantine_error_states_attempts_equal_retries_plus_one(world, tmp_path, caplog, max_retries):
+    """Exec P501's ONE condition on the literal count: the quarantine ERROR carries the relation IN WORDS, with the numbers it
+    relates: `quarantining after <attempts> attempts (= max_retries + 1), max_retries=<N>`, where attempts is exactly N + 1."""
+    w = world
+    tr = _setup(w, tmp_path, texts=(TP,))
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        for _ in range(_attempts(max_retries)):
+            _drain(w, tr, max_retries)
+    (err,) = _recs(caplog, QUAR_MARK)
+    m = re.search(r'quarantining after (\d+) attempts \(= max_retries \+ 1\), max_retries=(\d+)', err.getMessage())
+    assert m, err.getMessage()
+    assert (int(m.group(1)), int(m.group(2))) == (max_retries + 1, max_retries) and int(m.group(1)) == int(m.group(2)) + 1
+
+
+def test_the_docstring_states_the_formula_and_the_operator_lever():
+    """Docstring only (no behaviour): the count formula and the lever (RAISE CC_NG_DRAIN_MAX_RETRIES while TID is flaky) are written down,
+    and the infra-vs-data split is named as not built (#928)."""
+    doc = ' '.join(org.drain_ingest_tract.__doc__.split())
+    assert 'RETRIES AFTER THE FIRST FAILED ATTEMPT' in doc and 'max_retries + 1 attempts' in doc
+    assert 'attempts = max_retries + 1' in doc, 'Exec P501: the relation is stated in words in the docstring'
+    assert 'max_retries=5 means up to 6 attempts' in doc and 'max_retries=1 means 2 attempts' in doc
+    assert 'RAISE CC_NG_DRAIN_MAX_RETRIES' in doc and '#928' in doc
 
 
 # ------------------------------------------------------------------ never created, never truncated, append-only
@@ -599,7 +707,7 @@ def test_the_quarantine_file_is_created_no_wider_than_the_tract_directory_and_fi
     os.chmod(tr.path, 0o640)
     os.chmod(str(tmp_path), 0o750)
     try:
-        for _ in range(2):
+        for _ in range(_attempts(2)):
             _drain(w, tr, 2)
         mode = os.stat(tr.qpath).st_mode & 0o777
         assert mode & ~0o640 == 0 and mode & ~0o750 == 0 and mode & 0o111 == 0, oct(mode)
@@ -672,7 +780,9 @@ def test_max_retries_without_hold_on_failure_is_ignored(world, tmp_path, caplog)
 def test_max_entries_still_counts_the_poison_attempt(world, tmp_path):
     w = world
     tr = _setup(w, tmp_path, texts=(TP, T3))
-    a, c = _drain(w, tr, 1, max_entries=1)
+    a, c = _drain(w, tr, 1, max_entries=1)             # max_retries=1: attempt 1 is held
+    assert (a, c) == (0, b'') and not tr.qexists() and tr.read() == b''.join(tr.frames)
+    a, c = _drain(w, tr, 1, max_entries=1)             # attempt 2 quarantines
     assert (a, c) == (0, tr.frames[0]) and tr.qread() == tr.frames[0] and tr.read() == tr.frames[1]
     a, c = _drain(w, tr, 1, max_entries=1)
     assert (a, c) == (1, tr.frames[1]) and tr.read() == b''
@@ -807,11 +917,11 @@ def test_daemon_loop_quarantines_a_poison_turn_after_the_bound_and_counts_it(dae
     r.d.DRAIN_HOLD_ON_FAILURE = True
     r.d.DRAIN_MAX_RETRIES = 3
     with caplog.at_level(logging.DEBUG):
-        r.run(3)                                                     # three autosave cycles = three attempts
-    assert r.drain_calls == [{'return_consumed': True, 'hold_on_failure': True, 'max_retries': 3}] * 3
+        r.run(_attempts(3))                                          # max_retries=3: four autosave cycles = four attempts
+    assert r.drain_calls == [{'return_consumed': True, 'hold_on_failure': True, 'max_retries': 3}] * 4
     assert r.tract.qread() == r.tract.frames[1] and r.tract.read() == r.tract.frames[2]
     assert r.d.STATE.stats['quarantined_total'] == 1
-    assert r.trickled[0] == r.tract.frames[0] and r.trickled[1] == b'' and r.trickled[2] == r.tract.frames[1]
+    assert r.trickled[0] == r.tract.frames[0] and r.trickled[1:3] == [b'', b''] and r.trickled[3] == r.tract.frames[1]
     errs = [x for x in caplog.records if x.getMessage().startswith(QUAR_MARK)]
     assert len(errs) == 1
     r.run(1)                                                         # the entry behind it flows

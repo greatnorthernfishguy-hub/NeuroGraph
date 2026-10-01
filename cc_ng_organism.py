@@ -3,6 +3,18 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13417 — #920 build-002 (Chief-003 RULINGS, ADDENDUM 1):
+#   COUNT SEMANTICS = THE LITERAL NAME. max_retries is the number of RETRIES AFTER THE FIRST FAILED ATTEMPT: up to max_retries + 1
+#   attempts (default 5 => 6); the (max_retries + 1)-th consecutive failure is quarantined in that same cycle; max_retries=1 => 2 attempts.
+# What: ONE boundary change in _drain_bounded_hold (`failures < max_retries` became `failures <= max_retries`) and NO other behaviour change.
+#   The below-bound hold WARNING now reads `attempt=n of <max_retries+1> (max_retries=N)` (truthful under the new reading); the QUARANTINED
+#   ERROR keeps its fields and states BOTH numbers: `quarantining after <attempts> attempts, max_retries=<N>`. The drain docstring states the
+#   formula, in words ("attempts = max_retries + 1", Exec P501's one condition: the ERROR line carries the same words) and the OPERATOR LEVER (docstring only): during a flaky TID the lever is to RAISE CC_NG_DRAIN_MAX_RETRIES, because a TID/embed
+#   outage is indistinguishable at the drain from a poison turn. The infra-vs-data split and a documented re-ingest path are row #928: NOT built.
+# Why: Chief-003 ruling on build-001: the literal name wins; my build-001 built "N attempts". This SUPERSEDES the count sentence of the entry
+#   below ("the max_retries-th failure quarantines it"): it is the (max_retries + 1)-th.
+# How: tests/test_cc_poison_quarantine_920.py: every test that encoded the old boundary moved to the new one (listed in build-002.md); a boundary
+#   pin test and a docstring pin were added. The retry key, the table cap, the quarantine write, the counter and every default path are untouched.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane poison-quarantine-920, dispatch #13303 — #920 (Exec Packet 497 via Chief-003):
 #   the POISON-TURN POLICY on drain_ingest_tract: bounded retry -> QUARANTINE (never discard) -> LOUD
 # What: drain_ingest_tract gains ONE new LAST keyword, max_retries=None. The quarantine path exists ONLY when hold_on_failure=True AND
@@ -2705,11 +2717,13 @@ def _drain_bounded_hold(tract_path, state, frame, max_retries, hold_reason, hold
             "CC ingest-tract hold: entry=%s reason=%s exc_type=%s -- the retry counter FAILED (%s); the entry stays HELD "
             "and is NOT quarantined this cycle", tag, hold_reason, hold_exc_type, type(exc).__name__)
         return None
-    if failures < max_retries:
+    # max_retries = RETRIES AFTER the first failed attempt: up to max_retries + 1 attempts, one per cycle. Failures 1..max_retries
+    # are held (retried next cycle); the (max_retries + 1)-th consecutive failure is quarantined in THIS cycle.
+    if failures <= max_retries:
         logger.warning(
-            "CC ingest-tract hold: reason=%s exc_type=%s attempt=%d/%d -- failed entry and everything after it kept in the "
-            "tract for the next cycle (quarantined after %d failures)",
-            hold_reason, hold_exc_type, failures, max_retries, max_retries)
+            "CC ingest-tract hold: reason=%s exc_type=%s attempt=%d of %d (max_retries=%d) -- failed entry and everything after "
+            "it kept in the tract for the next cycle",
+            hold_reason, hold_exc_type, failures, max_retries + 1, max_retries)
         return None
     ok, stored, qexc = _drain_quarantine_frame(tract_path, frame)
     qname = os.path.basename(tract_path) + _DRAIN_QUARANTINE_SUFFIX
@@ -2726,10 +2740,10 @@ def _drain_bounded_hold(tract_path, state, frame, max_retries, hold_reason, hold
         except Exception:  # noqa: BLE001 -- the counter is bookkeeping; the frame is already durable
             pass
     logger.error(
-        "CC ingest-tract QUARANTINED: entry=%s reason=%s exc_type=%s failures=%d max_retries=%d file=%s stored=%s -- the raw "
-        "frame is durably in the quarantine file (append-only, never truncated) and the tract advances past it; nothing was "
-        "discarded; re-ingest is a deliberate separate act",
-        tag, hold_reason, hold_exc_type, failures, max_retries, qname, stored)
+        "CC ingest-tract QUARANTINED: entry=%s reason=%s exc_type=%s failures=%d max_retries=%d file=%s stored=%s -- "
+        "quarantining after %d attempts (= max_retries + 1), max_retries=%d: the raw frame is durably in the quarantine file (append-only, never "
+        "truncated) and the tract advances past it; nothing was discarded; re-ingest is a deliberate separate act",
+        tag, hold_reason, hold_exc_type, failures, max_retries, qname, stored, failures, max_retries)
     return key
 
 
@@ -2784,10 +2798,17 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     max_retries=<positive int> takes effect ONLY together with hold_on_failure=True (ignored otherwise; a non-positive or
     non-int value is treated as None with ONE fixed WARNING). The held entry's failures are counted IN MEMORY in the
     caller-owned `state` (state["drain_retry_counts"], key = sha256 hex of its raw bytes, hard-capped; a restart resets the
-    count, so the bound is per process lifetime), one failure per call. When an entry has FAILED max_retries times (the
-    max_retries-th failure, in that same call; e.g. max_retries=5 is five attempts, one per cycle) it is QUARANTINED, never
-    discarded: its exact raw frame bytes are appended WHOLE to the append-only file `<tract_path>.quarantine` (flush + fsync
-    BEFORE the tract advances past it; never capped, rotated or truncated), the tract is truncated past it, the drain stops
+    count, so the bound is per process lifetime), one failure per call.
+    COUNT FORMULA (the literal name wins): max_retries = the number of RETRIES AFTER THE FIRST FAILED ATTEMPT, so
+    attempts = max_retries + 1 (attempts = retries + 1): an entry gets up to max_retries + 1 attempts, one per call/cycle: max_retries=5 means up to 6 attempts, and the 6th consecutive failure
+    is quarantined IN that same call; max_retries=1 means 2 attempts. Failures 1..max_retries are held and retried.
+    OPERATOR LEVER: a TID/embed/socket outage is indistinguishable here from a poison turn (a failed turn is just False), so
+    every max_retries + 1 failing cycles parks one good turn in the quarantine file (nothing is lost; re-ingest is a deliberate
+    later act). While TID is flaky the lever is to RAISE CC_NG_DRAIN_MAX_RETRIES (the daemon's read of this argument). Telling
+    infra failures (TID/embed/socket) from poison data, and a documented re-ingest path, are row #928: not built here.
+    When an entry has FAILED max_retries + 1 times it is QUARANTINED, never discarded: its exact raw frame bytes are appended
+    WHOLE to the append-only file `<tract_path>.quarantine` (flush + fsync BEFORE the tract advances past it; never capped,
+    rotated or truncated), the tract is truncated past it, the drain stops
     there (the entries behind it are drained on the next call), ONE ERROR is logged (the #907 form `entry:<12 hex of
     sha256(frame)>`, reason code, exception class, counts, the file's name only) and state["quarantined_total"] is
     incremented. If the quarantine write FAILS the entry stays HELD, the tract is not advanced past it and ONE ERROR is
