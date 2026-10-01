@@ -28,6 +28,11 @@
 #   extracted names, and hashlib/re join the namespace) and passes guard=/progress= to the consolidation, so the stub accepts them.
 # Why: Part D (the merge passes the per-slice guard) and Part C (the ERROR sample is redacted). Nothing the tests assert changed;
 #   `_unbound_nodes` keeps its (graph, node_ids) arity, which is the pin this file exists for.
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13145) — #910: harness namespace
+# What: load_merge() injects the two new names merge_cc_topology references (is_resolved_model_id -- the REAL predicate --
+#   and a resolve_embedding_model stub that fails if reached). No assertion changed.
+# Why: the harness exec()s only AST-selected names, so a new module-level dependency of merge_cc_topology is a NameError
+#   here. This test did NOT encode the dead guard: it always passes expected_embedding_model='test' and a 'test' header.
 # [2026-09-11] Codex — #423 topology capture interleaving regression tests
 # What: execute canonical merge AST with fake graphs and in-memory conduit frames.
 # Why: capture must observe completed node/vector/binding batches, with I/O outside.
@@ -46,6 +51,15 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
 import pytest
+
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from cc_topology_export import is_resolved_model_id  # noqa: E402
+
+
+def _resolver_must_not_run():
+    raise AssertionError('resolve_embedding_model reached: expected_embedding_model was not honoured')
 
 
 class FakeGraph:
@@ -129,6 +143,11 @@ def load_merge(monkeypatch, graph, vectors, frames):
               _REOFFER_TABLE_CAP=1024, _reoffer_streaks={},
               _load_membership=lambda p: set(), _write_membership=membership,
               read_topology_frames=decode, is_cc_provenance=lambda nid, meta: True,
+              # #910: merge_cc_topology now calls the shared model-id predicate/resolver.
+              # The REAL predicate; the resolver is never reached (every caller here passes
+              # expected_embedding_model) so a stub that fails loudly if it is.
+              is_resolved_model_id=is_resolved_model_id,
+              resolve_embedding_model=_resolver_must_not_run,
               _synapse_type=lambda value: value,
               _in_transit_cohort=lambda: ('unset', frozenset()), _IN_TRANSIT_VALID='valid')   # #905-DELTA: variable UNSET
     exec(compile(selected, str(source), 'exec'), ns)
