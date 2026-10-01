@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13259 — #904 FOLD-UP: tests for C3/F11 (a failed EXACT-REPEAT
+#   turn failing after the hyperedge create: kills M20), C4/F1 (a failed attempt leaves NO trace on a pre-existing node, over N held cycles),
+#   checker-038 corrections 2 (a raising vdb.get() must not orphan what the call inserted) and 3 (the bind COMPLETES, a LATER stage fails).
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13058 — #904 (Exec Packets 487 + 489 + 491)
 # What: tests for (A) the ATOMIC / loud / truthful dual pass, (B) the daemon honouring a held tract entry (real drain, real daemon loop,
 #   real NG), (C) the #805 temp-graph retry-safety PROOF, the Packet 489 addendum (surface_wants / surface_wants_for_graph seed-synapse
@@ -41,7 +44,7 @@ import neuro_foundation  # noqa: E402
 from neuro_foundation import Graph  # noqa: E402
 from universal_ingestor import SimpleVectorDB  # noqa: E402
 
-_SCRATCH_ROOT = Path('/tmp/z12-904-scratch').resolve()
+_SCRATCH_ROOTS = ('/tmp/z12-904-scratch', '/tmp/z12-904-fold-scratch')   # scratch copies of the organism (base / mutants) live here
 _ORG_ALT = os.environ.get('Z12_904_ORG_UNDER_TEST')
 if _ORG_ALT:
     _spec = importlib.util.spec_from_file_location('cc_ng_organism', _ORG_ALT)
@@ -70,8 +73,8 @@ for _m in (ng_embed, neuro_foundation):
     if not _inside_worktree(_m):
         raise RuntimeError('P379/#770 FAIL: %s resolves outside the worktree %s' % (_m.__name__, _WORKTREE))
 if _ORG_ALT:
-    if _SCRATCH_ROOT not in Path(org.__file__).resolve().parents:
-        raise RuntimeError('P379/#770 FAIL: a scratch org must live under %s, got %s' % (_SCRATCH_ROOT, org.__file__))
+    if not any(Path(r).resolve() in Path(org.__file__).resolve().parents for r in _SCRATCH_ROOTS):
+        raise RuntimeError('P379/#770 FAIL: a scratch org must live under one of %s, got %s' % (_SCRATCH_ROOTS, org.__file__))
 elif not _inside_worktree(org):
     raise RuntimeError('P379/#770 FAIL: cc_ng_organism resolves outside the worktree %s' % _WORKTREE)
 
@@ -779,6 +782,199 @@ def test_a_rolled_back_turn_never_moves_the_persisted_pointer(restart_rig, monke
     _inject(w, 'bind_hyperedge', monkeypatch)
     assert w.run(TURN_B) is False
     assert w.state['last_forest_id'] == _forest_id(TURN_A)
+    assert d._guarded_save('test') is True
+    assert json.loads((r.ckpt / '.cc_conv_last_forest').read_text())['last_forest_id'] == _forest_id(TURN_A)
+
+
+# ------------------------------------------------------------------ #904 FOLD-UP (dispatch #13259)
+
+class GetRaisesVDB(FaultyVDB):
+    """A REAL SimpleVectorDB whose get() raises for chosen ids (the probe the rollback's fresh-entry tracking relies on)."""
+
+    def __init__(self):
+        super().__init__()
+        self.get_raises = lambda _id: False
+
+    def get(self, id):
+        if self.get_raises(id):
+            raise OSError(SECRET)
+        return super().get(id)
+
+
+def _node_state(w):
+    return {n: (repr(node.metadata), node.threshold, node.intrinsic_excitability) for n, node in sorted(w.graph.nodes.items())}
+
+
+def _vdb_state(w):
+    return {i: (w.vdb.embeddings[i].tobytes(), w.vdb.content[i], repr(w.vdb.metadata[i])) for i in sorted(w.vdb.all_ids())}
+
+
+def _age_every_node(w):
+    """Make the stamp observable: an aged state (probation almost done, graduated, non-default threshold/excitability)."""
+    for i, node in enumerate(w.graph.nodes.values()):
+        node.metadata['probation_remaining'] = 2
+        node.metadata['graduated'] = True
+        node.threshold = 0.5 + i / 100.0
+        node.intrinsic_excitability = 0.9 - i / 100.0
+
+
+# ---- C3 / F11: the failed EXACT-REPEAT turn failing AFTER the hyperedge create (kills M20)
+
+def test_a_failed_exact_repeat_failing_after_the_hyperedge_create_removes_that_hyperedge_and_every_synapse_it_created(world, monkeypatch, caplog):
+    """Every member PRE-EXISTS (so remove_node's cascade can never mask a stray hyperedge: the existing cases all use a NEW forest).
+    The call creates its hyperedge and then fails at the window chain: the rollback must remove that hyperedge and every synapse the
+    call created, and leave every pre-existing node intact. KILLS M20 (rollback leaves the hyperedge)."""
+    w = world
+    assert w.run(TURN_A) is True
+    before = snap(w)
+    n_he_before, n_syn_before = len(w.graph.hyperedges), len(w.graph.synapses)
+    created = []
+    real_he, real_syn = w.graph.create_hyperedge, w.graph.create_synapse
+
+    def create_hyperedge(*a, **k):
+        he = real_he(*a, **k)
+        created.append(he.hyperedge_id)
+        return he
+
+    def create_synapse(pre, post, *a, **k):
+        if '::window::' in pre and '::window::' in post:
+            raise RuntimeError(SECRET)
+        return real_syn(pre, post, *a, **k)
+    w.graph.create_hyperedge, w.graph.create_synapse = create_hyperedge, create_synapse
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_A) is False                     # the SAME turn again: forest, trees and windows all pre-exist
+    assert len(created) == 1, 'the hyperedge was created BEFORE the failure (so the test can see a stray one)'
+    assert created[0] not in w.graph.hyperedges           # the rollback removed it
+    assert len(w.graph.hyperedges) == n_he_before and len(w.graph.synapses) == n_syn_before
+    assert snap(w) == before
+    assert 'site=window_chain ' in _loud(caplog)[0].getMessage()
+
+
+# ---- C4 / F1: a failed attempt leaves NO trace on a PRE-EXISTING node
+
+@pytest.mark.parametrize('fault', ['bind_hyperedge', 'new_tree_vdb_insert'])
+def test_a_held_exact_repeat_poison_turn_leaves_the_pre_existing_nodes_byte_identical_for_N_cycles(world, tmp_path, monkeypatch, caplog, fault):
+    """FAILS on build-001 (the probation re-stamp of the forest and its trees happened every cycle). A held exact-repeat turn is retried
+    each autosave cycle: after EVERY cycle the pre-existing nodes' full metadata (repr, so key ORDER too), threshold, excitability and
+    their vdb entries (embedding bytes, content, metadata) are identical to before the first attempt; the tract stays byte-identical."""
+    w = world
+    assert w.run(TURN_A) is True
+    _age_every_node(w)
+    nodes_before, vdb_before, graph_before = _node_state(w), _vdb_state(w), snap(w)
+    w.concepts[TURN_A] = [CONCEPTS_A[0], 'alpha concept three']       # a retry extracts DIFFERENT concepts: one new tree
+    if fault == 'bind_hyperedge':
+        w.graph.create_hyperedge = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(SECRET))
+    else:
+        w.vdb.fail_ids = lambda i: i.endswith('::tree::alpha concept three')   # forest + tree 1 re-stamped, the new tree fails midway
+    tr = Tract(tmp_path, [TURN_A])
+    for cycle in range(4):
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+            absorbed, consumed = _drain(w, tr, True)
+        assert (absorbed, consumed) == (0, b'') and tr.read() == b''.join(tr.frames), 'cycle %d' % cycle
+        assert len(_hold_records(caplog)) == 1 and len(_loud(caplog)) == 1
+        assert _node_state(w) == nodes_before, 'a pre-existing node was re-stamped by a FAILED attempt (cycle %d)' % cycle
+        assert _vdb_state(w) == vdb_before, 'a pre-existing vdb entry was changed by a FAILED attempt (cycle %d)' % cycle
+        assert snap(w) == graph_before
+
+
+def test_a_pre_existing_vdb_entry_that_DIFFERS_from_what_the_deposit_writes_is_put_back_exactly(world):
+    """Kills F4/F6 (the vdb-entry restore). A checkpoint-loaded entry has its OWN metadata dict, older content and a non-unit embedding;
+    a failed repeat re-writes all three. The rollback must put back the ORIGINAL objects: the same metadata dict, the same content, the
+    embedding array bit-for-bit (SimpleVectorDB.insert re-normalises, so a plain re-insert is NOT enough)."""
+    w = world
+    assert w.run(TURN_A) is True
+    fid = _forest_id(TURN_A)
+    old_emb = (np.arange(16, dtype=np.float32) + 3.0)            # NOT unit length: a re-insert would normalise it
+    old_meta = {'loaded': 'from-checkpoint', 'cc': True}
+    w.vdb.embeddings[fid], w.vdb.content[fid], w.vdb.metadata[fid] = old_emb, 'OLDER CONTENT', old_meta
+    before = (w.vdb.embeddings[fid].tobytes(), w.vdb.content[fid], repr(w.vdb.metadata[fid]))
+    w.graph.create_hyperedge = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(SECRET))
+    assert w.run(TURN_A) is False
+    assert (w.vdb.embeddings[fid].tobytes(), w.vdb.content[fid], repr(w.vdb.metadata[fid])) == before
+    assert w.vdb.embeddings[fid] is old_emb and w.vdb.metadata[fid] is old_meta   # the ORIGINAL objects, not copies
+
+
+def test_a_successful_exact_repeat_still_restamps_as_before(world):
+    """The success path is UNCHANGED (passes on build-001 and on base): a SUCCESSFUL repeat re-stamps the probation exactly as always."""
+    w = world
+    assert w.run(TURN_A) is True
+    _age_every_node(w)
+    assert w.run(TURN_A) is True
+    forest = w.graph.nodes[_forest_id(TURN_A)]
+    assert forest.metadata['probation_remaining'] == org._CC_CONV_PROBATION_PERIOD
+    assert forest.threshold == w.graph.config.get('default_threshold', 1.0) + org._CC_CONV_THRESHOLD_BOOST
+
+
+def test_restore_covers_a_node_deposited_twice_in_one_call(world, monkeypatch):
+    """The same node written twice in one call (a duplicated concept): last-in-first-out restores the ORIGINAL state, not the
+    first re-stamp."""
+    w = world
+    assert w.run(TURN_A) is True
+    _age_every_node(w)
+    nodes_before = _node_state(w)
+    w.concepts[TURN_A] = [CONCEPTS_A[0], CONCEPTS_A[0]]               # the same tree twice
+    w.graph.create_hyperedge = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(SECRET))
+    assert w.run(TURN_A) is False
+    assert _node_state(w) == nodes_before
+
+
+# ---- checker-038 correction 2: a raising vdb.get() must not orphan what the call inserted
+
+def test_a_raising_vdb_get_for_a_NEW_node_leaves_no_orphan_after_the_rollback(world, monkeypatch, caplog):
+    w = world
+    w.vdb = GetRaisesVDB()
+    w.vdb.get_raises = lambda i: True
+    _inject(w, 'bind_hyperedge', monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_B) is False
+    assert w.vdb.all_ids() == [] and w.graph.nodes == {}              # BUILD-001: the forest and tree entries stay as ORPHANS
+    assert 'vdb_kept_unprovable=0' in _loud(caplog)[0].getMessage()
+
+
+def test_a_raising_vdb_get_for_a_PRE_EXISTING_node_never_deletes_what_may_pre_exist_and_says_so(world, monkeypatch, caplog):
+    w = world
+    w.vdb = GetRaisesVDB()
+    assert w.run(TURN_A) is True
+    before = snap(w)
+    w.vdb.get_raises = lambda i: True                                  # now the probe raises for a node that PRE-EXISTS
+    w.graph.create_hyperedge = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(SECRET))
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_A) is False
+    assert snap(w) == before                                           # nothing of the earlier success was deleted
+    assert 'vdb_kept_unprovable=3;' in _loud(caplog)[0].getMessage()   # the forest and its two trees (windows are not indexed)
+
+
+# ---- checker-038 correction 3: the bind COMPLETES, a LATER stage fails
+
+def test_when_the_bind_completes_and_a_later_stage_fails_the_pointer_is_restored(world, monkeypatch, caplog):
+    """The nine partial-write cases all raise BEFORE the bind assigns state['last_forest_id']. Here the REAL bind completes (the
+    pointer is moved to the new forest and primed_nodes replaced) and the post-condition then fails: both are restored."""
+    w = world
+    assert w.run(TURN_A) is True
+    primed_before = w.state.get('primed_nodes')
+    moved = []
+    real = org._cc_bind_conversational_topology
+
+    def bind(graph, forest_id, result, emb, state, window_ids=None, journal=None):
+        status = real(graph, forest_id, result, emb, state, window_ids=window_ids, journal=journal)
+        moved.append((state['last_forest_id'], state.get('primed_nodes') is not primed_before))
+        return {**status, 'hyperedge': False}
+    monkeypatch.setattr(org, '_cc_bind_conversational_topology', bind)
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_B) is False
+    assert moved == [(_forest_id(TURN_B), True)]                       # the bind really moved the pointer first
+    assert w.state['last_forest_id'] == _forest_id(TURN_A) and w.state.get('primed_nodes') is primed_before
+
+
+@needs_daemon
+def test_when_the_bind_completes_and_a_later_stage_fails_the_persisted_sidecar_is_not_advanced(restart_rig, monkeypatch):
+    r, w, d = restart_rig, restart_rig.w, restart_rig.d
+    assert w.run(TURN_A) is True and d._guarded_save('test') is True
+    real = org._cc_bind_conversational_topology
+    monkeypatch.setattr(org, '_cc_bind_conversational_topology',
+                        lambda *a, **k: {**real(*a, **k), 'hyperedge': False})
+    assert w.run(TURN_B) is False
     assert d._guarded_save('test') is True
     assert json.loads((r.ckpt / '.cc_conv_last_forest').read_text())['last_forest_id'] == _forest_id(TURN_A)
 
