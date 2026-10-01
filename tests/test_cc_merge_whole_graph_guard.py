@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up (Q1): the second ack caller of the
+#   one predicate is now named `cc_ack_membership` (the ack writer's function; `cc_current_membership` no longer calls
+#   `_unbound_nodes`): test_d_the_guard_is_asked_about_every_node... pins `("cc_ack_membership", True)` instead of
+#   `("cc_current_membership", True)`. Nothing about the GUARD's asks changed.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918 expectation updates (spy scope only)
 # What: test_d_idle_steps_zero_never_evaluates_the_guard... and test_d_the_guard_is_asked_about_every_node...: their spy on
 #   `tmg._unbound_nodes` now counts only the GUARD's asks (callers `merge_cc_topology` = the batch-end check, `_guard` = the
@@ -42,7 +46,7 @@ import pytest
 _WORKTREE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_WORKTREE))
 # #918: the merge's GUARD asks `_unbound_nodes` from these two frames only (the batch-end check in merge_cc_topology and the
-# per-slice closure from whole_graph_guard); cc_current_membership and _track_reoffers are the other two callers.
+# per-slice closure from whole_graph_guard); cc_ack_membership and _track_reoffers are the other two callers.
 _GUARD_CALLERS = ("merge_cc_topology", "_guard")
 
 from neuro_foundation import Graph  # noqa: E402
@@ -442,7 +446,7 @@ def test_d_the_guard_is_asked_about_every_node_in_the_graph_under_the_step_lock(
     assert len(asked[0][0]) == 4                                           # 2 pre-existing + 2 arrivals
     assert owned_at_guard == [True, True] and owned_at_steps == [False]    # both reads under _step_lock; steps unlocked
     # #918: the ack and the re-offer counter each ask once, after the batches, also under _step_lock
-    assert sorted(others) == [("_track_reoffers", True), ("cc_current_membership", True)]
+    assert sorted(others) == [("_track_reoffers", True), ("cc_ack_membership", True)]
 
 
 def test_d_idle_steps_from_the_env_default_path_is_unchanged(tmp_path, monkeypatch):

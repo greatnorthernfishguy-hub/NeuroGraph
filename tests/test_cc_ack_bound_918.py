@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up tests (Q1, Q2, N3, N4, T1)
+# What: (Q1) the tests that pin the ACK contents now target `cc_ack_membership` (every `tmg.cc_ack_membership(` in this file
+#   became `tmg.cc_ack_membership(`; the in-file CONTROL now patches `cc_ack_membership` back to the old "every CC node held");
+#   NEW: `cc_current_membership` is back to "every CC-provenance node currently held" (equal to the base formula on a graph with
+#   unbound + bound + protected + non-CC nodes), `cc_ack_membership` = that set minus the sweep-eligible-unbound set (composition
+#   spy), the purity and signature tests run for BOTH, and a spy test that the ack writer calls `cc_ack_membership`. (Q2) a
+#   protected unbound CC node is IN the ack and NOT in any frame's candidates while an unprotected unbound one is out of the ack
+#   and IS the candidate. (N3) a held-unbound re-offer under max_nodes_per_call=1. (N4) the re-offer streak is reset by a
+#   TopologyMergeAbort (4 abort sites) and kept without one. (T1) the tautology `ack <= membership | ack` in the ack-after-every-
+#   tick test is replaced by `ack <= set(lg.nodes)` and a monotone-growth check.
+# Why: Exec P522 Q1/Q2, le-056 N3/N4/T1.
+# How: same rig (REAL Graph, REAL exporter -> REAL merge), same Z12_MERGE_UNDER_TEST swap.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918 tests: the ack means "I hold it BOUND"
 # What: a REAL neuro_foundation.Graph + real SimpleVectorDB + the REAL exporter (export_cc_topology_frame) feeding the REAL
 #   merge (merge_cc_topology), for:
@@ -158,7 +170,7 @@ def _bound_pair_conduit(tmp_path, tag="unrelated"):
     return out
 
 
-# ============================================================== (1) cc_current_membership
+# ============================================================== (1) cc_ack_membership (+ cc_current_membership, Q1)
 
 def _membership_graph():
     g = Graph()
@@ -187,7 +199,7 @@ _MEMBERS = {"cc:conv::b1", "cc:conv::b1::tree::x", "cc:conv::h1", "cc:conv::h2",
 
 def test_membership_bound_in_unprotected_unbound_out_protected_unbound_in_non_cc_out():
     g = _membership_graph()
-    m = tmg.cc_current_membership(g)
+    m = tmg.cc_ack_membership(g)
     assert m == _MEMBERS
     # the two unprotected unbound ones are OUT, including the one that is age 0 (NO age term, by design)
     for nid in ("cc:conv::fresh-unbound", "cc:conv::old-unbound", "cc:want::emergent"):
@@ -208,22 +220,24 @@ def test_membership_is_byte_identical_to_the_base_on_a_graph_with_no_unbound_nod
     _he(g, ["cc:conv::c", "cc:conv::d"])
     g.create_node(node_id="cc:want::authored", metadata=_meta(provenance="cc_authored"))     # protected unbound: still IN
     base = {nid for nid, node in g.nodes.items() if tex.is_cc_provenance(nid, node.metadata)}   # the base definition
-    assert tmg.cc_current_membership(g) == base
+    assert tmg.cc_ack_membership(g) == base
     p_new, p_base = tmg_path = tmp_path / "new.txt", tmp_path / "base.txt"
-    tmg._write_membership(str(p_new), tmg.cc_current_membership(g))
+    tmg._write_membership(str(p_new), tmg.cc_ack_membership(g))
     tmg._write_membership(str(p_base), base)
     assert p_new.read_bytes() == p_base.read_bytes()
 
 
-def test_membership_is_a_pure_query_graph_counters_and_logs_unchanged(caplog):
+@pytest.mark.parametrize("fn_name", ["cc_current_membership", "cc_ack_membership"])
+def test_membership_is_a_pure_query_graph_counters_and_logs_unchanged(caplog, fn_name):
+    fn = getattr(tmg, fn_name)
     g = _membership_graph()
     caplog.set_level(logging.DEBUG)
     before = (set(g.nodes), len(g.synapses), len(g.hyperedges), g.timestep,
               {k: set(v) for k, v in g._outgoing.items()}, {k: set(v) for k, v in g._incoming.items()},
               {k: set(v) for k, v in g._node_hyperedges.items()})
     streaks_before = dict(getattr(tmg, "_reoffer_streaks", {}))
-    first = tmg.cc_current_membership(g)
-    second = tmg.cc_current_membership(g)
+    first = fn(g)
+    second = fn(g)
     after = (set(g.nodes), len(g.synapses), len(g.hyperedges), g.timestep,
              {k: set(v) for k, v in g._outgoing.items()}, {k: set(v) for k, v in g._incoming.items()},
              {k: set(v) for k, v in g._node_hyperedges.items()})
@@ -233,8 +247,9 @@ def test_membership_is_a_pure_query_graph_counters_and_logs_unchanged(caplog):
     assert [r for r in caplog.records if r.name == tmg.logger.name] == []   # no logging side effect
 
 
-def test_membership_signature_and_return_type_are_unchanged():
-    sig = inspect.signature(tmg.cc_current_membership)
+@pytest.mark.parametrize("fn_name", ["cc_current_membership", "cc_ack_membership"])
+def test_membership_signature_and_return_type_are_unchanged(fn_name):
+    sig = inspect.signature(getattr(tmg, fn_name))
     assert list(sig.parameters) == ["graph"]
     assert sig.return_annotation == Set[str]
 
@@ -249,7 +264,7 @@ def test_membership_USES_the_imported_unbound_predicate_not_a_copy(monkeypatch):
         return {"cc:conv::b1"}                       # a (wrong) 'unbound' set only the real predicate would not give
 
     monkeypatch.setattr(tmg, "_unbound_nodes", spy)
-    m = tmg.cc_current_membership(g)
+    m = tmg.cc_ack_membership(g)
     assert len(calls) == 1 and calls[0][0] is g
     assert calls[0][1] == {n for n in g.nodes if not n.startswith("syl:")}        # exactly the CC-provenance node set
     assert "cc:conv::b1" not in m                    # the spy's answer decided
@@ -262,7 +277,7 @@ def test_membership_a_double_without_is_identity_protected_is_not_exempted_unbou
     dbl = SimpleNamespace(_step_lock=threading.RLock(),
                           nodes={"cc:conv::a": SimpleNamespace(metadata={}), "cc:conv::b": SimpleNamespace(metadata={})},
                           _outgoing={"cc:conv::b": {"s"}}, _incoming={}, _node_hyperedges={})
-    assert tmg.cc_current_membership(dbl) == {"cc:conv::b"}
+    assert tmg.cc_ack_membership(dbl) == {"cc:conv::b"}
 
 
 def test_the_ack_file_the_merge_writes_is_the_bound_membership(tmp_path):
@@ -271,8 +286,87 @@ def test_the_ack_file_the_merge_writes_is_the_bound_membership(tmp_path):
     ack = tmp_path / "ack.txt"
     st = _merge(rg, rv, _bound_pair_conduit(tmp_path), ack)
     assert st["absorbed_nodes"] == 2
-    assert _ack(ack) == tmg.cc_current_membership(rg) == {"cc:conv::unrelated", "cc:conv::unrelated::tree::x"}
+    assert _ack(ack) == tmg.cc_ack_membership(rg) == {"cc:conv::unrelated", "cc:conv::unrelated::tree::x"}
     assert "cc:conv::held-unbound" in rg.nodes and "cc:conv::held-unbound" not in _ack(ack)
+
+
+def test_cc_current_membership_is_back_to_every_cc_node_currently_held_bound_or_not_protected_or_not():
+    """Q1 (LAW 4, the NAME): the base meaning -- `graph.nodes` filtered ONLY by CC provenance -- on a graph with unbound,
+    bound, protected and non-CC nodes. The old formula is inlined (it is the base `ee94f7d2` body)."""
+    g = _membership_graph()
+    assert tmg.cc_current_membership(g) == _old_membership(g)
+    held = tmg.cc_current_membership(g)
+    # unbound unprotected, unbound protected, bound: ALL in; non-CC: out
+    for nid in ("cc:conv::fresh-unbound", "cc:conv::old-unbound", "cc:want::emergent", "cc:want::authored",
+                "cc:conv::constitutional", "cc:conv::b1", "cc:conv::h1"):
+        assert nid in held, nid
+    assert not any(n.startswith("syl:") for n in held)
+    assert "_unbound_nodes" not in inspect.getsource(tmg.cc_current_membership)       # nothing narrower hides in it
+
+
+def test_cc_ack_membership_is_cc_current_membership_minus_the_sweep_eligible_unbound_set():
+    g = _membership_graph()
+    assert tmg.cc_ack_membership(g) == tmg.cc_current_membership(g) - _all_unbound(g) == _MEMBERS
+
+
+def test_cc_ack_membership_composes_the_two_imported_functions_not_copies(monkeypatch):
+    """The ack = `cc_current_membership(graph)` minus `_unbound_nodes(graph, that set)`: both are looked up by NAME at call
+    time, so a stand-in for either is OBEYED (a copy of either would ignore it)."""
+    g = _membership_graph()
+    seen = []
+    monkeypatch.setattr(tmg, "cc_current_membership", lambda graph: {"x1", "x2", "x3"})
+    monkeypatch.setattr(tmg, "_unbound_nodes", lambda graph, ids: seen.append(set(ids)) or {"x2"})
+    assert tmg.cc_ack_membership(g) == {"x1", "x3"}
+    assert seen == [{"x1", "x2", "x3"}]
+
+
+def test_the_ack_writer_calls_cc_ack_membership_not_the_old_name(tmp_path, monkeypatch):
+    rg, rv = _receiver()
+    _held(rg, rv, "cc:conv::held-unbound")
+    ack = tmp_path / "ack.txt"
+    calls = []
+    monkeypatch.setattr(tmg, "cc_ack_membership", lambda graph: calls.append(graph) or {"cc:conv::sentinel-ack"})
+    monkeypatch.setattr(tmg, "cc_current_membership", lambda graph: {"cc:conv::WRONG-the-old-name"})
+    _merge(rg, rv, _bound_pair_conduit(tmp_path), ack)
+    assert calls == [rg]
+    assert _ack(ack) == {"cc:conv::sentinel-ack"}
+
+
+def test_q2_a_protected_unbound_cc_node_is_acked_and_never_re_offered_an_unprotected_one_is_not_acked_and_is(tmp_path):
+    """Exec P522 Q2 (CONFIRMED INTENDED): protected nodes are deliberately excluded from re-offer (not sweep-eligible; H-1: Leg 2
+    never writes to identity nodes). The real exporter reads the ack as exclude_ids: only the unprotected unbound node is a
+    candidate. Every node here IS connected on the VPS (so 'not a candidate' is the ack's doing, not disconnection)."""
+    PC, PW, U = "cc:conv::protected-constitutional", "cc:want::protected-authored", "cc:conv::unprotected-unbound"
+    anchors = {PC: "cc:conv::anchor-c", PW: "cc:conv::anchor-w", U: "cc:conv::anchor-u"}
+    vg, vv = Graph(), SimpleVectorDB()
+    rg, rv = _receiver()
+    for k, (n, extra) in enumerate(((PC, {"constitutional": True}), (PW, {"kind": "want", "provenance": "cc_authored"}), (U, {}))):
+        a = anchors[n]
+        _vps(vg, vv, n, 100 + k, **extra)
+        _vps(vg, vv, a, 10 + k)
+        vg.create_synapse(a, n, weight=0.3, delay=1)                    # connected on the VPS
+        _held(rg, rv, n, **extra)                                       # the laptop holds it UNBOUND ...
+        _held(rg, rv, a)
+        _held(rg, rv, a + "-b")
+        rg.create_synapse(a, a + "-b", weight=0.4)                      # ... and its anchor BOUND (so the anchor is acked)
+        rg.create_synapse(a + "-b", a, weight=0.4)
+    assert not rg._outgoing.get(PC) and not rg._incoming.get(PC) and not rg._outgoing.get(PW) and not rg._incoming.get(PW)
+    assert PC not in _all_unbound(rg) and PW not in _all_unbound(rg) and U in _all_unbound(rg)   # protected: not sweep-eligible
+
+    ack = tmg.cc_ack_membership(rg)
+    assert PC in ack and PW in ack                                      # protected unbound: ACKED
+    assert U not in ack                                                 # unprotected unbound: not acked
+    assert all(a in ack for a in anchors.values())
+
+    out = tmp_path / "frame.conduit"
+    st = _export_frame(vg, vv, out, ack)
+    assert st["candidates"] == 1 and set(st["frame_node_ids"]) == {U}   # U, and ONLY U, is a candidate; PC/PW never are
+    _merge(rg, rv, out, tmp_path / "ack.txt")
+    assert U not in _all_unbound(rg) and U in tmg.cc_ack_membership(rg)  # bound by the re-offer, now acked
+    st = _export_frame(vg, vv, out, tmg.cc_ack_membership(rg))           # the next tick: nothing is left to offer
+    assert st["candidates"] == 0 and st["exhausted"] and not st.get("frame_node_ids")
+    # nothing was written onto the identity nodes by Leg 2
+    assert not rg._outgoing.get(PC) and not rg._incoming.get(PC) and not rg._outgoing.get(PW) and not rg._incoming.get(PW)
 
 
 # ============================================================== (2) the merge lands edges onto a re-offered, present node
@@ -303,7 +397,7 @@ def test_one_merge_binds_a_held_unbound_node_via_a_reoffered_hyperedge_and_the_a
     assert X not in _all_unbound(rg)                                    # BOUND after ONE merge call
     assert any(he.member_nodes == {X, C1, C2} for he in rg.hyperedges.values())
     assert X in _ack(ack)                                               # the ack of THAT call includes it (it is bound)
-    assert _ack(ack) == tmg.cc_current_membership(rg)
+    assert _ack(ack) == tmg.cc_ack_membership(rg)
 
 
 def test_one_merge_binds_a_held_unbound_node_via_a_reoffered_synapse_only(tmp_path):
@@ -431,7 +525,7 @@ def _world():
 def _run_loop(tmp_path, ticks=8):
     vg, vv, lg, lv, ids = _world()
     ack, out = tmp_path / "laptop_cc_membership.json", tmp_path / "vps_topology.conduit"
-    tmg._write_membership(str(ack), tmg.cc_current_membership(lg))        # the ack a PRIOR merge call left on the laptop
+    tmg._write_membership(str(ack), tmg.cc_ack_membership(lg))        # the ack a PRIOR merge call left on the laptop
     frames, acks, exhausted = [], [], False
     for _ in range(ticks):
         st = _export_frame(vg, vv, out, tmg._load_membership(str(ack)))  # exactly the sender's read: _load_membership -> exclude_ids
@@ -473,10 +567,12 @@ def test_the_ack_after_every_tick_contains_only_bound_nodes(tmp_path):
     assert acks
     final_unbound = _all_unbound(lg)
     for tick, ack in enumerate(acks):
-        assert ack <= tmg.cc_current_membership(lg) | ack          # (shape guard)
+        assert ack <= set(lg.nodes), tick     # T1: the ack lists only nodes the receiver HOLDS (a phantom id fails this)
         assert not any(n in ack for n in ids["vi"] + ids["iv"]), tick
     assert not (acks[-1] & final_unbound)
-    assert acks[-1] == tmg.cc_current_membership(lg)
+    for earlier, later in zip(acks, acks[1:]):
+        assert earlier <= later           # T1: nothing is culled in this world, so a bound node never drops out of the ack
+    assert acks[-1] == tmg.cc_ack_membership(lg)
     # and the ack GROWS only as nodes bind: every held-unbound case joins it only after it is bound
     for case in ("cohort", "pair", "iii", "v"):
         assert set(ids[case]) <= acks[-1]
@@ -486,7 +582,7 @@ def test_CONTROL_with_the_old_ack_the_same_loop_never_re_offers_the_held_unbound
     """The #909 deadlock, reproduced in-file: patch the membership back to 'every CC node'. The cohort, the pair and the (iii)
     nodes are held UNBOUND, in the ack, so never a candidate; they stay unbound forever. (This control passes on the base AND
     the new file: it replaces the function under test with the old definition.)"""
-    monkeypatch.setattr(tmg, "cc_current_membership", _old_membership)
+    monkeypatch.setattr(tmg, "cc_ack_membership", _old_membership)
     lg, ids, frames, acks, exhausted = _run_loop(tmp_path)
     unbound = _all_unbound(lg)
     offered = set().union(*frames)
@@ -696,7 +792,7 @@ def test_the_counter_never_touches_the_ack_or_any_file(tmp_path):
     for _ in range(6):
         _merge(rg, rv, out, ack)
     assert set(os.listdir(tmp_path)) - before <= {"ack.txt"}            # nothing persisted for the counter
-    assert _ack(ack) == tmg.cc_current_membership(rg)
+    assert _ack(ack) == tmg.cc_ack_membership(rg)
     assert not any(tmg.redact_node_id(n) in ack.read_text() for n in nodes)
 
 
@@ -710,3 +806,104 @@ def test_the_streak_table_is_a_replaced_not_mutated_dict():
     snapshot = dict(held_ref)
     tmg._track_reoffers(g, {"cc:conv::z"})
     assert held_ref == snapshot and tmg._reoffer_streaks is not held_ref
+
+
+# ============================================================== (N3) a re-offered held-unbound node under a SMALL receiver budget
+
+def test_n3_small_max_nodes_per_call_a_held_unbound_node_is_bound_across_ticks_and_the_budget_only_defers_new_nodes(tmp_path):
+    """le-056 N3, REPORTED (not papered over). Real exporter -> real merge, `max_nodes_per_call=1`, a frame with one held-UNBOUND
+    node X and two NEW nodes C1, C2 in one VPS hyperedge. What the budget does (order-independent facts; the order of the nodes
+    inside the frame follows the hyperedge's member-set iteration order and so varies with the hash seed):
+      * only NEW nodes spend budget; a PRESENT node costs none, but the per-node budget check runs BEFORE the present check, so a
+        present X that comes after the spent budget is counted in `deferred_by_budget` (an accounting artefact: `completed` is
+        False) -- yet Tier 2/3 test `graph.nodes`, not the deferral, so X's edges are NOT lost;
+      * tick 1: only one new node lands, the other is deferred, the hyperedge needs all three in the graph => skipped, X UNBOUND;
+      * tick 2 (the sender re-offers the same candidates: nothing is acked yet): the second new node lands, all three are in the
+        graph, the hyperedge LANDS: X is BOUND after the 2nd call;
+      * by the 3rd call everything is present, nothing is deferred, `completed` is True, and the ack holds all three.
+    A mutant that ignores the budget lands both new nodes on tick 1 and binds X there: it fails the tick-1 assertions."""
+    X, C1, C2 = "cc:conv::n3-held", "cc:conv::n3-c1", "cc:conv::n3-c2"
+    vg, vv = Graph(), SimpleVectorDB()
+    _vps(vg, vv, C1, 10)
+    _vps(vg, vv, C2, 11)
+    _vps(vg, vv, X, 200)
+    _he(vg, [C1, C2, X])
+    rg, rv = _receiver()
+    _held(rg, rv, X)
+    ack, out = tmp_path / "ack.txt", tmp_path / "frame.conduit"
+    bound_after, stats = [], []
+    for tick in range(1, 6):
+        st = _export_frame(vg, vv, out, tmg._load_membership(str(ack)))
+        assert set(st["frame_node_ids"]) == {C1, C2, X}, tick           # the SAME candidates are re-offered until all are bound
+        ms = _merge(rg, rv, out, ack, max_nodes_per_call=1)
+        stats.append(ms)
+        bound_after.append(X not in _all_unbound(rg))
+        assert ms["absorbed_nodes"] <= 1, tick                           # the budget caps NEW nodes per call
+        if ms["completed"] and bound_after[-1]:
+            break
+    t1, t2 = stats[0], stats[1]
+    assert bound_after[0] is False                                      # tick 1: a new member is deferred, the hyperedge cannot land
+    assert t1["absorbed_nodes"] == 1 and t1["deferred_by_budget"] >= 1 and t1["completed"] is False
+    assert t1["absorbed_hyperedges"] == 0
+    assert bound_after[1] is True and t2["absorbed_hyperedges"] == 1    # tick 2: X BOUND although the budget is still 1
+    assert len(stats) <= 3 and stats[-1]["completed"] and stats[-1]["deferred_by_budget"] == 0
+    assert any(he.member_nodes == {C1, C2, X} for he in rg.hyperedges.values())
+    assert _ack(ack) == {C1, C2, X}                                      # all bound and acked at the end
+
+
+# ============================================================== (N4) the streak is reset by a TopologyMergeAbort
+
+def _no_header_conduit(tmp_path):
+    p = tmp_path / "noheader.conduit"
+    p.write_bytes(tex._frame({"kind": "batch", "seq": 1, "nodes": [], "synapses": [], "hyperedges": []}))
+    return p
+
+
+_ABORTS = ["machine_id_unset", "no_header", "own_export", "model_mismatch"]
+
+
+def _aborted_call(kind, rg, rv, out, tmp_path, monkeypatch):
+    """One merge call that raises TopologyMergeAbort at the named abort site (the sites that exist at this base)."""
+    ack = tmp_path / "ack.txt"
+    with pytest.raises(tmg.TopologyMergeAbort):
+        if kind == "machine_id_unset":
+            monkeypatch.delenv("MACHINE_ID", raising=False)
+            _merge(rg, rv, out, ack, local_machine_id=None)
+        elif kind == "no_header":
+            _merge(rg, rv, _no_header_conduit(tmp_path), ack)
+        elif kind == "own_export":
+            _merge(rg, rv, out, ack, local_machine_id="vps")             # the conduit's header machine_id is "vps"
+        elif kind == "model_mismatch":
+            _merge(rg, rv, out, ack, expected_embedding_model="another-model")
+
+
+@pytest.mark.parametrize("kind", _ABORTS)
+def test_n4_an_aborted_call_resets_the_streak_so_no_spurious_warning_after_it(tmp_path, caplog, monkeypatch, kind):
+    """N-1 consecutive re-offers, then an ABORTED call, then one more re-offer. Without the reset (86cf5afd) the streak carried
+    across the abort reaches N on that last call and WARNs for a node that was not re-offered N consecutive calls; with the
+    reset it restarts at 1."""
+    rg, rv, out, nodes = _stuck_world(tmp_path)
+    ack = tmp_path / "ack.txt"
+    N = tmg._REOFFER_WARN_STREAK_DEFAULT
+    for _ in range(N - 1):
+        _merge(rg, rv, out, ack)
+    assert set(tmg._reoffer_streaks.values()) == {N - 1}
+    _aborted_call(kind, rg, rv, out, tmp_path, monkeypatch)
+    assert tmg._reoffer_streaks == {}, "an aborted merge call must reset every streak"
+    monkeypatch.setenv("MACHINE_ID", "laptop")
+    caplog.clear()
+    _merge(rg, rv, out, ack)                                             # one re-offer after the abort
+    assert _warns(caplog) == [], "a streak carried across an aborted call produced a spurious WARNING"
+    assert set(tmg._reoffer_streaks.values()) == {1}
+
+
+def test_n4_control_without_an_abort_the_same_sequence_keeps_its_streak_and_warns_at_N(tmp_path, caplog):
+    rg, rv, out, nodes = _stuck_world(tmp_path)
+    ack = tmp_path / "ack.txt"
+    N = tmg._REOFFER_WARN_STREAK_DEFAULT
+    for _ in range(N - 1):
+        _merge(rg, rv, out, ack)
+    caplog.clear()
+    _merge(rg, rv, out, ack)                                             # the Nth consecutive call: unchanged behaviour
+    assert len(_warns(caplog)) == 2
+    assert set(tmg._reoffer_streaks.values()) == {N}

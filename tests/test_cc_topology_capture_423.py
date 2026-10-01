@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up: harness follows the merge
+# What: the AST-extracted names now also include `cc_ack_membership` (the ack writer's new function; it calls the extracted
+#   `cc_current_membership`) and `_reset_reoffer_streaks` (the one streak reset, N4). No assertion changed.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918: harness follows the merge; ack = BOUND
 # What: (1) the AST-extracted merge now also needs `_track_reoffers` (extracted) and the re-offer constants/state (namespace).
 #   (2) test_budget_and_unbound_arrival_guard_unchanged: its membership expectation was `[set(graph.nodes)]` -- it encoded "the
@@ -73,7 +76,7 @@ class FakeGraph:
 def load_merge(monkeypatch, graph, vectors, frames):
     source = Path(__file__).parents[1] / 'cc_topology_merge.py'
     tree = ast.parse(source.read_text())
-    names = {'merge_cc_topology', 'cc_current_membership', '_unbound_nodes',
+    names = {'merge_cc_topology', 'cc_current_membership', 'cc_ack_membership', '_reset_reoffer_streaks', '_unbound_nodes',
              'whole_graph_guard', 'redact_node_id', '_track_reoffers',
              '_synapse_exists', '_hyperedge_exists', 'TopologyMergeAbort'}
     selected = ast.Module(body=[n for n in tree.body
