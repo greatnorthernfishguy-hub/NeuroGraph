@@ -3,16 +3,18 @@
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14460/#14474) — #905-DELTA tests: the whole-graph hold covers ONLY nodes whose binding is IN TRANSIT
 # What: tests for the NEW cc_topology_merge.held_unbound_nodes + the once-read, fail-closed in-transit id set (CC_NG_IN_TRANSIT_IDS_PATH),
 #   and for the two NG consumers routed through it (the merge's batch-end check, whole_graph_guard(graph, merge_landed=None)).
-#   Cases (a)-(j) of the brief: (a) a laptop-own unbound node is NOT held and the REAL sweep culls it after grace; (b) a cohort node and a
+#   Cases (a)-(j) of the brief: (a) a laptop-own unbound node is NOT held (both guards; the clock runs; NO claim about its fate); (b) a cohort node and a
 #   merge_landed arrival ARE held (and the result is the INTERSECTION, never a union); (c) every corrupt-file class holds EVERYTHING with
 #   ONE loud ERROR naming the class, UNSET is byte-identical to _unbound_nodes with no I/O and no log; (d) a laptop-own node that co-fires
 #   and sprouts through the engine's OWN dynamics survives; (e) a cohort node that binds drops out with the file unchanged and the clock
 #   runs; (f) read-once; (g) the INFO line carries sha256 + count and no id; (h) `_unbound_nodes` is byte-identical (source-hash pin);
 #   (i) merge_cc_topology end to end with the VALID set and with UNSET; (j) whole_graph_guard(graph) without merge_landed still works.
 # Why: Exec P547/P548 (Josh's ruling; Chief-003 ruling B). The #897/#905 hold counted EVERY sweep-eligible unbound node, so the laptop-own
-#   forest:2dfa2d637643 (no binding in transit) froze the clock: it could neither wire nor be culled. The hold now covers only nodes whose
-#   binding is IN TRANSIT (CC-CALLOSUM-TRUTH §8.12); a laptop-own node gets the normal orphan grace and the real dynamics.
-# How: REAL neuro_foundation.Graph (import only), REAL step() and orphan sweep, REAL exporter + merge for (i); scratch files in tmp_path only
+#   forest:2dfa2d637643 (no binding in transit) froze the clock. The hold now covers only nodes whose binding is IN TRANSIT
+#   (CC-CALLOSUM-TRUTH §8.12). EXEC P550 (follow-up, dispatch #14536): this change only narrows what HOLDS THE CLOCK and decides NOTHING about
+#   a laptop-own node's fate, so NO test here asserts that such a node is, or is not, culled; its protected window is a separate, pending sweep
+#   change (neuro_foundation.py is protected), closing on the AUTONOMIC clock (cc_update_probation / the daemon _autosave_loop).
+# How: REAL neuro_foundation.Graph (import only), REAL step(), REAL exporter + merge for (i); scratch files in tmp_path only
 #   (the real in-transit-146.jsonl is NEVER read). Z12_MERGE_UNDER_TEST (a path) loads a different cc_topology_merge.py as the module under
 #   test so this SAME file runs unchanged against a scratch MUTANT copy of the committed file. P379/#770: the printed preamble names it.
 #   Follow-up in the same commit (review): the file is read through ONE O_NONBLOCK fd + fstat (a FIFO swapped in cannot block a caller
@@ -168,38 +170,29 @@ def test_h_the_test_only_reset_helper_is_never_called_by_production_code():
     assert offenders == []
 
 
-# ---------------------------------------------------------------- (a) a laptop-own node is NOT held, and the real sweep takes it
+# ---------------------------------------------------------------- (a) a laptop-own node is NOT held (the hold narrowing ONLY: no claim about its fate)
 
 def test_a_a_laptop_own_unbound_node_does_not_hold_either_guard(tmp_path, monkeypatch):
     g = Graph()
     _node(g, OWN)
     _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))
-    assert tmg._unbound_nodes(g, set(g.nodes)) == {OWN}                 # the sweep WOULD reap it: the question _unbound_nodes answers
+    assert tmg._unbound_nodes(g, set(g.nodes)) == {OWN}                 # sweep-eligible and unbound: what _unbound_nodes answers
     assert _held(g) == set()                                            # ...but its binding is not in transit: not held (batch-end path)
     assert _held(g, merge_landed={ARR}) == set()
     assert tmg.whole_graph_guard(g)() == set()                          # per-slice guard
     assert tmg.whole_graph_guard(g, merge_landed=set())() == set()
 
 
-def test_a_the_real_sweep_culls_it_after_grace_when_it_never_wires(tmp_path, monkeypatch):
-    """Deterministic: REAL Graph, REAL step(), orphan_node_grace_period as configured (25). Not held -> the clock runs -> the sweep takes it BY DESIGN."""
+def test_a_the_clock_runs_when_the_only_unbound_node_is_laptop_own(tmp_path, monkeypatch):
+    """The hold narrowing ONLY: with a laptop-own unbound node present (and no cohort/arrival node), the per-slice guard is clear, the
+    pass runs every step, and nothing reports held. NO assertion about whether that node is or is not culled: not decided by this change."""
     g = Graph()
-    assert g.config["orphan_node_grace_period"] == GRACE
     _node(g, OWN)
     _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))
     progress = {}
-    ran = cno._cc_callosum_consolidate(g, GRACE + 5, guard=tmg.whole_graph_guard(g), progress=progress)
+    ran = cno._cc_callosum_consolidate(g, IDLE, guard=tmg.whole_graph_guard(g), progress=progress)
     assert ran is True and progress["held"] is False and progress["failed"] is False
-    assert g.timestep == GRACE + 5
-    assert OWN not in g.nodes                                           # culled once age > grace, not "because something isn't working right"
-
-
-def test_a_inside_grace_it_is_still_alive_the_normal_grace_applies(tmp_path, monkeypatch):
-    g = Graph()
-    _node(g, OWN)
-    _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))
-    assert cno._cc_callosum_consolidate(g, GRACE, guard=tmg.whole_graph_guard(g)) is True
-    assert g.timestep == GRACE and OWN in g.nodes                       # age 25 is not > 25: the NORMAL grace, neither held nor exempt
+    assert progress["done"] == IDLE and g.timestep == IDLE
 
 
 def test_a_contrast_with_the_variable_unset_the_same_node_still_freezes_the_clock(monkeypatch):
@@ -208,7 +201,7 @@ def test_a_contrast_with_the_variable_unset_the_same_node_still_freezes_the_cloc
     _node(g, OWN)
     progress = {}
     assert cno._cc_callosum_consolidate(g, GRACE + 5, guard=tmg.whole_graph_guard(g), progress=progress) is False
-    assert progress["held"] is True and g.timestep == 0 and OWN in g.nodes
+    assert progress["held"] is True and g.timestep == 0
 
 
 # ---------------------------------------------------------------- (b) cohort / merge_landed hold; intersection, not union
@@ -436,17 +429,7 @@ def test_d_a_laptop_own_node_that_cofires_and_sprouts_survives_through_the_engin
     progress = {}
     assert cno._cc_callosum_consolidate(g, 40, guard=tmg.whole_graph_guard(g), progress=progress) is True
     assert g.timestep == 42 > GRACE + 2 and progress["held"] is False
-    assert OWN in g.nodes and OTHER in g.nodes                           # wire -> live: well past grace and the sweep spared it
-
-
-def test_d_control_the_same_pair_without_co_firing_is_culled_after_grace(tmp_path, monkeypatch):
-    random.seed(1234)
-    g = Graph()
-    _node(g, OWN)
-    _node(g, OTHER)
-    _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))
-    assert cno._cc_callosum_consolidate(g, 40, guard=tmg.whole_graph_guard(g)) is True
-    assert OWN not in g.nodes and OTHER not in g.nodes                   # not wired -> the sweep takes them BY DESIGN
+    assert OWN in g.nodes and OTHER in g.nodes                           # bound by the engine's own dynamics: they survive (true regardless of any sweep change)
 
 
 # ---------------------------------------------------------------- (e) a cohort node that binds drops out while the file is unchanged
@@ -603,7 +586,7 @@ def _bound_pair_conduit(tmp_path, tag="A", extra_lone=None):
     return _export(sg, sv, tmp_path, "conduit-%s.conduit" % tag)
 
 
-def test_i_valid_a_laptop_own_orphan_does_not_block_and_the_real_sweep_takes_it(tmp_path, monkeypatch, caplog):
+def test_i_valid_a_laptop_own_orphan_does_not_block_the_clock(tmp_path, monkeypatch, caplog):
     _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))                  # ORPHAN is NOT in transit
     rg, rv = _receiver_with_orphan()
     with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
@@ -611,8 +594,7 @@ def test_i_valid_a_laptop_own_orphan_does_not_block_and_the_real_sweep_takes_it(
     assert st["absorbed_nodes"] == 2 and st["absorbed_synapses"] == 1
     assert st["consolidation_blocked_batches"] == 0 and st["consolidation_skipped_unbound_preexisting"] == 0
     assert st["consolidation_passes"] == 1 and st["consolidation_steps"] == IDLE and st["consolidation_held_midpass"] == 0
-    assert rg.timestep == OLD + IDLE                                    # the clock ran
-    assert ORPHAN not in rg.nodes                                       # aged out and the REAL sweep took it, by design
+    assert rg.timestep == OLD + IDLE                                    # the clock ran (NO claim about the orphan's fate)
     assert "cc:conv::A" in rg.nodes and "cc:conv::A::tree::x" in rg.nodes
     assert _blocked(caplog) == []
 
@@ -698,3 +680,76 @@ def test_j_whole_graph_guard_called_the_way_the_daemon_calls_it_still_works(tmp_
     _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))
     assert tmg.whole_graph_guard(g)() == {COH_A}                        # VALID, no merge_landed: the cohort only
     assert cno._cc_callosum_consolidate(g, 3, guard=tmg.whole_graph_guard(g)) is False
+
+
+# ---------------------------------------------------------------- ADDENDUM 1: the read-only accessor in_transit_ids()
+
+def test_accessor_valid_returns_the_cached_frozenset(tmp_path, monkeypatch):
+    _use(monkeypatch, _cohort_file(tmp_path, [COH_A, COH_B, COH_A]))
+    got = tmg.in_transit_ids()
+    assert isinstance(got, frozenset) and got == frozenset({COH_A, COH_B})
+    assert tmg.in_transit_ids() is got                                   # the same cached object, never rebuilt
+
+
+def test_accessor_unset_is_none_with_no_file_io_and_no_log(monkeypatch, caplog):
+    def _boom(*a, **k):
+        raise AssertionError("UNSET must do NO file I/O")
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        with monkeypatch.context() as m:
+            for target, fn in ((builtins, "open"), (io, "open"), (os, "open"), (os, "stat"), (os, "lstat"), (os, "fstat"), (os, "read")):
+                m.setattr(target, fn, _boom)
+            assert tmg.in_transit_ids() is None
+            assert tmg.in_transit_ids() is None
+    assert _tmg_records(caplog) == []
+
+
+@pytest.mark.parametrize("content", ["", "SECRETWORDS-not-json{\n", '{"id": ""}\n', '["x"]\n'], ids=["empty", "malformed", "empty_id", "non_object"])
+def test_accessor_corrupt_is_none_and_the_first_call_logs_one_error_never_a_line(tmp_path, monkeypatch, caplog, content):
+    p = tmp_path / "bad.jsonl"
+    p.write_text(content)
+    _use(monkeypatch, p)
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        assert tmg.in_transit_ids() is None
+        assert tmg.in_transit_ids() is None                              # later calls: no re-read, no log
+    assert len(_tmg_records(caplog, logging.ERROR)) == 1 and len(_tmg_records(caplog)) == 1
+    assert "SECRETWORDS" not in caplog.text
+
+
+def test_accessor_missing_file_is_none(tmp_path, monkeypatch):
+    _use(monkeypatch, tmp_path / "nope.jsonl")
+    assert tmg.in_transit_ids() is None
+
+
+def test_accessor_and_held_unbound_nodes_share_the_one_cache_a_spy_proves_one_read(tmp_path, monkeypatch, caplog):
+    real, reads = tmg._read_in_transit_ids, []
+
+    def _spy(path):
+        reads.append(path)
+        return real(path)
+
+    monkeypatch.setattr(tmg, "_read_in_transit_ids", _spy)
+    g = Graph()
+    _node(g, COH_A)
+    _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        assert tmg.in_transit_ids() == frozenset({COH_A})                # first reader: the accessor
+        assert _held(g) == {COH_A}                                       # second reader: held_unbound_nodes
+        assert tmg.whole_graph_guard(g)() == {COH_A}
+        assert tmg.in_transit_ids() == frozenset({COH_A})
+    assert len(reads) == 1                                               # ONE read for all of them (no second reader, no second parse)
+    assert len(_tmg_records(caplog, logging.INFO)) == 1                  # and ONE INFO line
+
+
+def test_accessor_held_first_then_accessor_is_also_one_read(tmp_path, monkeypatch):
+    real, reads = tmg._read_in_transit_ids, []
+    monkeypatch.setattr(tmg, "_read_in_transit_ids", lambda path: (reads.append(path), real(path))[1])
+    g = Graph()
+    _node(g, COH_A)
+    _use(monkeypatch, _cohort_file(tmp_path, [COH_A]))
+    assert _held(g) == {COH_A}
+    assert tmg.in_transit_ids() == frozenset({COH_A})
+    assert len(reads) == 1
+
+
+def test_accessor_has_no_parameters_and_reads_no_graph():
+    assert list(inspect.signature(tmg.in_transit_ids).parameters) == []
