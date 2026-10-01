@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918 expectation updates (spy scope only)
+# What: test_d_idle_steps_zero_never_evaluates_the_guard... and test_d_the_guard_is_asked_about_every_node...: their spy on
+#   `tmg._unbound_nodes` now counts only the GUARD's asks (callers `merge_cc_topology` = the batch-end check, `_guard` = the
+#   per-slice guard). #918 makes two MORE callers of the ONE predicate -- `cc_current_membership` (the ack = CC nodes minus the
+#   sweep-eligible-unbound set) and `_track_reoffers` (the re-offer counter) -- and they run after the batches, even at
+#   idle_steps=0. The second test also pins those two other callers (names, and that both read under _step_lock).
+# Why: #918 (Exec Packet 496). Nothing the tests assert about the GUARD changed (still 0 asks at idle_steps=0; still exactly 2
+#   whole-graph asks under the lock, steps unlocked); the spy used to see every call to the predicate, and there are now more.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 expectation updates
 # What: only where #905 changes a thing these tests pinned: (1) the per-batch ERROR sample is REDACTED (Part C: kind:sha256-12,
 #   never the id) -- test_a_preexisting..., test_c_an_arrival..., test_c_arrival_scope..., test_c_mixed..., test_c_the_id_sample...;
@@ -33,6 +41,9 @@ import pytest
 
 _WORKTREE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_WORKTREE))
+# #918: the merge's GUARD asks `_unbound_nodes` from these two frames only (the batch-end check in merge_cc_topology and the
+# per-slice closure from whole_graph_guard); cc_current_membership and _track_reoffers are the other two callers.
+_GUARD_CALLERS = ("merge_cc_topology", "_guard")
 
 from neuro_foundation import Graph  # noqa: E402
 from universal_ingestor import SimpleVectorDB  # noqa: E402
@@ -376,7 +387,13 @@ def test_d_idle_steps_zero_never_evaluates_the_guard_and_never_blocks(tmp_path, 
     rg, rv = _receiver_with_orphan()
     calls = []
     real = tmg._unbound_nodes
-    monkeypatch.setattr(tmg, "_unbound_nodes", lambda g, ids: calls.append(set(ids)) or real(g, ids))
+
+    def spy(g, ids):
+        if sys._getframe(1).f_code.co_name in _GUARD_CALLERS:              # #918: only the GUARD's asks
+            calls.append(set(ids))
+        return real(g, ids)
+
+    monkeypatch.setattr(tmg, "_unbound_nodes", spy)
 
     with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
         st = _merge(rg, rv, path, tmp_path, idle_steps=0)
@@ -396,12 +413,16 @@ def test_d_the_guard_is_asked_about_every_node_in_the_graph_under_the_step_lock(
     path = _export(sg, sv, tmp_path)
     rg, rv = Graph(), SimpleVectorDB()
     _pair(rg, rv, "already-here", 0)
-    asked, owned_at_guard, owned_at_steps = [], [], []
+    asked, owned_at_guard, owned_at_steps, others = [], [], [], []
     real = tmg._unbound_nodes
 
     def spy_guard(g, ids):
-        asked.append((set(ids), set(g.nodes)))
-        owned_at_guard.append(g._step_lock._is_owned())
+        caller = sys._getframe(1).f_code.co_name
+        if caller in _GUARD_CALLERS:
+            asked.append((set(ids), set(g.nodes)))
+            owned_at_guard.append(g._step_lock._is_owned())
+        else:                                                              # #918: the other two callers of the one predicate
+            others.append((caller, g._step_lock._is_owned()))
         return real(g, ids)
 
     real_cons = cno._cc_callosum_consolidate
@@ -420,6 +441,8 @@ def test_d_the_guard_is_asked_about_every_node_in_the_graph_under_the_step_lock(
     assert len(asked) == 2 and all(a[0] == a[1] == set(rg.nodes) for a in asked)   # ALL nodes, not merge_landed
     assert len(asked[0][0]) == 4                                           # 2 pre-existing + 2 arrivals
     assert owned_at_guard == [True, True] and owned_at_steps == [False]    # both reads under _step_lock; steps unlocked
+    # #918: the ack and the re-offer counter each ask once, after the batches, also under _step_lock
+    assert sorted(others) == [("_track_reoffers", True), ("cc_current_membership", True)]
 
 
 def test_d_idle_steps_from_the_env_default_path_is_unchanged(tmp_path, monkeypatch):
