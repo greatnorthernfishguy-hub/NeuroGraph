@@ -17,6 +17,17 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1: format_context renders WHOLE
+# What: SurfacingMonitor.format_context() no longer cuts an item at 200 chars (word-snap +
+#       "..."). The header marker "[NeuroGraph Surfaced Knowledge]" (miniTID's rail marker),
+#       the image-item line and the "(salience: x.xx)" label are byte-identical.
+# Why:  Exec P468 / Josh: "We fix stuff correctly, not monkey patch or work around." This was
+#       the second of the two shared-path cuts (the other is surface_resolver's default 240);
+#       together they clipped every CES-surfaced item for every consumer (CC recall block,
+#       etc.). LAW 4: fix at the source, not in a consumer-side whole-render fork.
+# How:  Deleted the `len(content) > 200` branch. Nothing replaces it: whether the shared path
+#       needs a size budget is a Chief/Executive ruling (reported in the #812 turn-1 return),
+#       and the max_surfaced queue bound already caps the item COUNT.
 # [2026-09-06] DudeMan CC (Fable 5.1) — #82 Inc 2 / #410: L2 migrated to substrate-first + image-aware
 # What: after_step() resolves each fired node through surface_resolver.resolve_surface_item()
 #       instead of reading the vdb directly. Text items: content = her _forest_content (vdb shard
@@ -287,12 +298,9 @@ class SurfacingMonitor:
                 # never what is in it (LAW 7). The image itself rides in the messages.
                 lines.append(f"- [something you saw — image attached] (salience: {score:.2f})")
                 continue
-            # Truncate long content for context blocks. Snap to the last word
-            # boundary at-or-before the cutoff so it doesn't end mid-word; fall
-            # back to a hard cut when no whitespace exists in range.
-            if len(content) > 200:
-                cut = content.rfind(" ", 0, 197)
-                content = (content[:cut] if cut > 0 else content[:197]) + "..."
+            # Items render WHOLE (#812): no length cut here. Whatever the resolver
+            # produced is what the context block carries; if a size budget is ever
+            # needed it drops whole lowest-salience items, it does not clip one.
             # Salience, NOT a probability: _score_node()'s designed range is
             # ~[0.8, 1.8] (floored >=0.8 for any fired node -- see its
             # docstring). The old "(confidence: {score:.0%})" rendering

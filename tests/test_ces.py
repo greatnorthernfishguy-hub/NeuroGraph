@@ -10,6 +10,11 @@ Covers:
 - Integration: CES wired into NeuroGraphMemory
 
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1
+# What: the two TestSurfacingFormatting cases that pinned format_context's removed 200-char
+#   word-snap / hard cut now pin the new contract (long content renders WHOLE, no ellipsis),
+#   and are renamed to say so. No other test in this file changes.
+# Why:  Exec P468 / Josh: surfaced items render whole at the source.
 # [2026-03-26] Claude Code Opus — Punchlist #102: Fix stale tests from embedding migration
 # What: Updated test dimensions from 384→768 to match current embedding pipeline
 # Why: Punchlist #102 — tests obsoleted by snowflake-arctic-embed-m-v1.5 migration
@@ -824,8 +829,9 @@ class TestSurfacingFormatting:
         context = monitor.format_context()
         assert context == ""
 
-    def test_format_context_truncates_at_word_boundary(self, graph, vector_db, ces_config):
-        """Truncation must snap to the last word boundary, not cut mid-word."""
+    def test_format_context_renders_long_content_whole(self, graph, vector_db, ces_config):
+        """#812: format_context no longer cuts an item at 200 chars — it renders WHOLE.
+        (Was test_format_context_truncates_at_word_boundary, which pinned the removed cut.)"""
         from surfacing import SurfacingMonitor
 
         ces_config.surfacing.voltage_threshold = 0.1
@@ -840,16 +846,13 @@ class TestSurfacingFormatting:
 
         context = monitor.format_context()
         rendered = context.split("- ", 1)[1].rsplit(" (salience:", 1)[0]
-        assert rendered.endswith("...")
-        body = rendered[:-3]
-        assert long_content.startswith(body)
-        # the char in the source immediately after the kept prefix must be a
-        # word boundary (space) -- proves the cut wasn't made mid-token
-        assert long_content[len(body):len(body) + 1] == " "
+        assert rendered == long_content
+        assert "..." not in rendered and "…" not in rendered
 
-    def test_format_context_falls_back_to_hard_cut_when_no_word_boundary(self, graph, vector_db, ces_config):
-        """A single unbroken token has no space to snap to — hard-cut it
-        instead of dropping the whole snippet."""
+    def test_format_context_renders_unbroken_token_whole(self, graph, vector_db, ces_config):
+        """#812: a single unbroken token longer than the old 200-char cut renders whole.
+        (Was test_format_context_falls_back_to_hard_cut_when_no_word_boundary, which pinned
+        the removed hard cut.)"""
         from surfacing import SurfacingMonitor
 
         ces_config.surfacing.voltage_threshold = 0.1
@@ -863,7 +866,7 @@ class TestSurfacingFormatting:
 
         context = monitor.format_context()
         rendered = context.split("- ", 1)[1].rsplit(" (salience:", 1)[0]
-        assert rendered == "x" * 197 + "..."
+        assert rendered == "x" * 250
 
 
 class TestSurfacingStats:
