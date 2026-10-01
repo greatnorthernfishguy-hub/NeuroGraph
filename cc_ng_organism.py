@@ -52,6 +52,22 @@
 #   batch, run by the daemon -- never inside drain_ingest_tract, which still never steps); the newer ruling wins and reconciling the
 #   two texts is #895. drain_gateway_conduit's inert batch_size/idle_steps arguments coexist with this live path for the other
 #   drain (LAW 3 shrapnel, #895).
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13259 — #904 FOLD-UP (Chief-003 + Exec Packet 497 (e))
+# What: (C4/F1, a DEFECT) a failed attempt now leaves NO trace on a PRE-EXISTING node. _cc_deposit_memory_node re-stamps a pre-existing
+#   node's threshold, intrinsic_excitability, probation/novelty metadata and poincare_dir and re-writes its vdb entry on EVERY deposit,
+#   so a held exact-repeat poison turn re-stamped it every autosave cycle, forever. The eco now SNAPSHOTS such a node (threshold,
+#   excitability, a copy of its metadata in key order, the references of its vdb entry) BEFORE delegating to the deposit, and rollback
+#   RESTORES them last-in-first-out (metadata cleared and re-filled IN PLACE, because the vdb entry shares that dict; the original
+#   embedding array put back exactly). A snapshot that cannot be taken makes the rollback report "a partial write REMAINS". (checker-038
+#   correction 2) a vdb.get() that RAISES for a node that is NEW this call no longer orphans the entry the call inserted (a new node's
+#   entry cannot belong to a node that existed, so it is deleted); for a PRE-EXISTING node whose probe raised the entry is kept and the
+#   failure record counts it (vdb_kept_unprovable=<n>).
+# Why: le-050 F1 / C4 (Exec Packet 497 (e): the re-stamp is a defect signal, a failed attempt must leave no trace); checker-038 C2.
+# How: STAMP SNAPSHOT + RESTORE, not "move the stamp to commit time": the stamp is inside _cc_deposit_memory_node, which
+#   tests/test_cc_capture_mutations_423.py extracts by AST and pins (it is UNCHANGED and that file passes UNMODIFIED), and it is called by
+#   dual_record_outcome in the middle of extraction, so deferring it would mean editing or duplicating that function. The snapshot lives
+#   on the eco class (same reason as the journal). The success path is unchanged (a successful exact repeat still re-stamps, as before).
+#   Tests: tests/test_cc_bind_atomic_904.py (fold-up section).
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13058 — #904 (Exec Packet 487 via Chief-003):
 #   the dual-pass write path is ATOMIC (or loud, with a truthful False), never silently half-written
 # What: run_conversational_dual_pass keeps a write JOURNAL (on _CCConversationalDualPassEco: every node write, plus the
@@ -2096,21 +2112,52 @@ class _CCConversationalDualPassEco:
         # journalled. `topology`: the ids of the synapses / hyperedges the bind created.
         self.writes = []
         self.topology = {"synapses": [], "hyperedges": []}
+        # #904 fold-up (C4/F1): what a PRE-EXISTING node looked like before this call's deposit re-stamped it
+        # (_cc_deposit_memory_node resets its threshold, excitability and probation metadata and re-writes its vdb
+        # entry on EVERY deposit). Restored by rollback so a failed attempt leaves NO trace on it. `unrestorable`
+        # counts snapshots that could not be taken (the rollback then reports a partial write REMAINS);
+        # `vdb_unprovable` counts vdb probes that raised for a pre-existing node (entry kept, never deleted).
+        self.restores = []
+        self.unrestorable = 0
+        self.vdb_unprovable = 0
 
     def deposit(self, node_id, embedding, content, meta, index_in_recall=True, kind="forest"):
         """_cc_deposit_memory_node, journalled. Same arguments, same effects, same raise."""
         with _cc_mutation_lock(self._graph):
             node_was_new = node_id not in self._graph.nodes
             vdb_fresh = False
+            entry = None
             if index_in_recall:
                 try:
-                    vdb_fresh = self._vector_db.get(node_id) is None
+                    entry = self._vector_db.get(node_id)
+                    vdb_fresh = entry is None
                 except Exception:
-                    # Cannot prove this call created the entry: never delete it on rollback.
-                    vdb_fresh = False
+                    if node_was_new:
+                        # A NEW node's recall entry cannot belong to a node that existed: whatever this call inserts
+                        # is its own, so the rollback deletes it even though the probe could not say (#904 fold-up).
+                        vdb_fresh = True
+                    else:
+                        # A pre-existing node: cannot prove this call creates the entry, never delete it (counted).
+                        self.vdb_unprovable += 1
+            if not node_was_new:
+                self._snapshot_existing(node_id, entry)
             self.writes.append((node_id, kind, node_was_new, vdb_fresh))
             return _cc_deposit_memory_node(self._graph, self._vector_db, node_id, embedding,
                                             content, meta, index_in_recall=index_in_recall)
+
+    def _snapshot_existing(self, node_id, vdb_entry):
+        """Snapshot a pre-existing node (threshold, excitability, a copy of its metadata in order, and the references of its
+        vdb entry) BEFORE the deposit re-stamps it. Called under the mutation lock."""
+        try:
+            node = self._graph.nodes[node_id]
+            self.restores.append({
+                "id": node_id, "node": node, "threshold": node.threshold,
+                "excitability": node.intrinsic_excitability, "meta": dict(node.metadata),
+                "vdb": ((vdb_entry["embedding"], vdb_entry["content"], vdb_entry["metadata"])
+                        if vdb_entry else None),
+            })
+        except Exception:
+            self.unrestorable += 1
 
     def counts(self):
         """(forest, trees, windows, synapses, hyperedges) this call wrote so far."""
@@ -2124,7 +2171,8 @@ class _CCConversationalDualPassEco:
         """Undo exactly what this call wrote (#904): synapses, then the hyperedge(s), then the
         nodes it CREATED, then the vdb entries it inserted fresh. A node that existed before the
         call is never removed. Each step is isolated so one failure cannot stop the rest; returns
-        True only if every step succeeded (False means a partial write REMAINS)."""
+        True only if every step succeeded (False means a partial write REMAINS). Also restores what the deposit
+        re-stamped on a PRE-EXISTING node (#904 fold-up)."""
         graph, vdb = self._graph, self._vector_db
         ok = True
         with _cc_mutation_lock(graph):
@@ -2156,6 +2204,27 @@ class _CCConversationalDualPassEco:
                         vdb.delete(node_id)
                     except Exception:
                         ok = False
+            # A pre-existing node's re-stamp is undone LAST-IN-FIRST-OUT (a node deposited twice in one call ends at its
+            # original state): threshold, excitability and the metadata dict in its original key order, IN PLACE (the vdb
+            # entry shares that dict), then its vdb entry's original embedding / content / metadata references.
+            for snap in reversed(self.restores):
+                try:
+                    node = snap["node"]
+                    if graph.nodes.get(snap["id"]) is node:
+                        node.threshold = snap["threshold"]
+                        node.intrinsic_excitability = snap["excitability"]
+                        node.metadata.clear()
+                        node.metadata.update(snap["meta"])
+                    if snap["vdb"] is not None:
+                        emb, content, meta = snap["vdb"]
+                        vdb.insert(id=snap["id"], embedding=emb, content=content, metadata=meta)
+                        store = getattr(vdb, "embeddings", None)
+                        if isinstance(store, dict):   # insert re-normalises: put the ORIGINAL array back, exactly
+                            store[snap["id"]] = emb
+                except Exception:
+                    ok = False
+            if self.unrestorable:
+                ok = False
         return ok
 
     def record_outcome(self, embedding, target_id, success, strength=1.0, metadata=None):
@@ -2505,9 +2574,9 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
             rolled_back = False
         (logger.warning if rolled_back else logger.error)(
             "CC conversational dual-pass FAILED after the first write: stage=%s site=%s site_attempted=%d site_failed=%d "
-            "exc_type=%s written forest=%d trees=%d windows=%d synapses=%d hyperedges=%d; %s; the turn is NOT bound",
+            "exc_type=%s written forest=%d trees=%d windows=%d synapses=%d hyperedges=%d vdb_kept_unprovable=%d; %s; the turn is NOT bound",
             stage, site or "-", site_attempted, 1 if site else 0, type(exc).__name__,
-            n_forest, n_tree, n_window, n_syn, n_he,
+            n_forest, n_tree, n_window, n_syn, n_he, eco.vdb_unprovable,
             "rolled back, nothing of this turn remains" if rolled_back
             else "ROLLBACK FAILED, a partial write REMAINS",
         )
