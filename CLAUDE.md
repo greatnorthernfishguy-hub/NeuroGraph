@@ -340,6 +340,13 @@ This has been "discovered," escalated as a catastrophe, investigated from scratc
 
 **Genuinely open, and not a reason to reopen the above:** only 18 of 16,190 nodes are protected (1 constitutional + 17 `syl_authored`). Whether that spine is too thin is a scope question about what earns protection. It is not a defect in the culling.
 
+**CORRECTION (2026-09-30, punchlist #748 — append-only; the text above is left as written for the record).** The protection rule stated above is stale. `_is_identity_protected()` is now at `neuro_foundation.py:3551-3572` and returns True when `metadata['constitutional']` is truthy **or** `metadata['provenance']` is a string that **ends in `_authored`** — generalized from `== 'syl_authored'` on 2026-07-18 (Josh-approved, per the function's own docstring at `:3560`). What that changes:
+- The CC's own want-nodes (`provenance: 'cc_authored'`, created at `cc_ng_organism.py:1177` and `:1189`) are protected exactly like Syl's. `*_emergent` (Tonic curiosities) stays prunable by design.
+- The "17 `syl_authored`" count above predates the generalization and does not count `cc_authored` nodes, so it under-states the protected set on any graph that carries them.
+- The `:3409` / `:3443` references above are stale. `_prune_synapses()` is at `:3500` and calls the guard at `:3517`; `_collect_orphan_nodes()` is at `:3574` with its guard at `:3602`.
+- **Do not copy either prose description of this rule — call `_is_identity_protected()`.** Any tool that must decide "would this node survive" (a restore, a merge, a re-run) asks the function; it does not re-implement the test.
+- Not corrected here because `neuro_foundation.py` is a PROTECTED file: its own header/inline comments at `:78`, `:162`, `:194` and `:3286` still say `syl_authored`. Reported to the punchlist, not edited.
+
 ---
 
 ## 9. The `.claude/` Hooks
