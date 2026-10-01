@@ -3,6 +3,19 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13848) — #949: resolve_embedding_model() READS the embedder, it never CREATES it
+# What: the resolver no longer calls NGEmbed.get_instance(). It reads NGEmbed._instance.stats["model_id"] when an instance
+#   exists, else the class default ng_embed._DEFAULT_CONFIG["model_id"] as a constant. No get_instance(), no reset_instance(),
+#   no new attribute (ng_embed.py vendored, byte-identical). Everything else is unchanged: None (never "unknown") on any
+#   exception (class name only logged) or an unusable id; the callers and is_resolved_model_id are untouched; the id returned
+#   is the same one get_instance() would have reported (default config) or the existing instance's configured id.
+# Why: le-055 O1 / Exec P518 (row #949, the Exec's own P492 design defect). get_instance() CREATES the process-wide singleton
+#   with the default config (first-creation-wins), so a header read on either end of the callosum could pin a default config
+#   before a non-default one was passed. A read path must not have a create side effect.
+# How: STATED LIMIT (also in the docstring): with no instance the id reported is the class default; an instance first-created
+#   LATER with a non-default config would differ. A non-default model_id must be passed to NGEmbed.get_instance(config) before
+#   the first header read (created at startup). Nothing in this repo reads NGEmbed._instance or relies on the resolver having
+#   created it: cc_ng_organism.py:2152 and embed() (cc_ng_host.py:653) each call get_instance() themselves.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13145) — #910: the embedding-model guard must actually guard (ONE resolver, fail closed)
 # What: new `resolve_embedding_model()` (the configured model id of the live NGEmbed instance, or None -- NEVER the
 #   string "unknown") and `is_resolved_model_id()` (the one predicate for "this is a usable model id"), both
@@ -529,23 +542,45 @@ def is_resolved_model_id(value: Any) -> bool:
 
 
 def resolve_embedding_model() -> Optional[str]:
-    """The CONFIGURED embedding-model id of this process's live NGEmbed instance,
-    or None when it cannot be resolved. NEVER the string "unknown" (#910).
+    """The embedding-model id of this process, or None when it cannot be resolved.
+    NEVER the string "unknown" (#910).
 
     Used by BOTH ends of the callosum -- the sender stamps the header with it, the
     receiver compares the wire id against it -- so the two cannot disagree about
-    where the id comes from. `NGEmbed.get_instance().stats["model_id"]` is a public
-    read of the instance's configured id (which can differ from _DEFAULT_CONFIG if a
-    config was passed). get_instance()/__init__ only build a config dict; the ONNX
-    session, tokenizer and any download are lazy in _ensure_model, which is never
-    called here -- a header read stays cheap and offline.
+    where the id comes from.
+
+    READ-ONLY (#949): this never CREATES the process-wide NGEmbed singleton.
+    NGEmbed.get_instance() builds it with the DEFAULT config if none exists
+    (first-creation-wins), so a header read through it could pin a default config
+    before a non-default one was ever passed. Instead:
+      * an instance already exists -> its CONFIGURED id, `NGEmbed._instance.stats
+        ["model_id"]` (the public `stats` property; `_instance` is only READ);
+      * none exists yet         -> the class DEFAULT, `ng_embed._DEFAULT_CONFIG
+        ["model_id"]`, read as a constant -- exactly what a no-config get_instance()
+        would create (NGEmbed.__init__ copies _DEFAULT_CONFIG and overrides only the
+        keys of a passed config; the only env override is tid_endpoint, never the id).
+    No get_instance(), no reset_instance(), no new attribute (ng_embed.py is
+    vendored and untouched). Nothing here calls _ensure_model, so the ONNX session,
+    tokenizer and any download stay lazy: a header read is cheap and offline.
+
+    STATED LIMIT: with no instance, the id reported is the class default, not a
+    configured id. If an instance is LATER first-created with a non-default config,
+    it will differ from the id this call reported. The id is the process's
+    CONFIGURED id only once an instance exists. A future non-default model_id must
+    therefore be passed to NGEmbed.get_instance(config) BEFORE the first header
+    read (i.e. created at process startup), or the sender's stamp / the receiver's
+    comparison would name a model the process does not end up using.
 
     Failure is logged by exception CLASS only (never str(exc)) and returns None; the
     caller decides what an unresolvable id means (both ends fail closed).
     """
     try:
-        from ng_embed import NGEmbed
-        model_id = NGEmbed.get_instance().stats["model_id"]
+        import ng_embed
+        inst = ng_embed.NGEmbed._instance
+        if inst is not None:
+            model_id = inst.stats["model_id"]
+        else:
+            model_id = ng_embed._DEFAULT_CONFIG["model_id"]
     except Exception as exc:
         logger.error("CC topology: embedding model id unresolvable (%s)", type(exc).__name__)
         return None
