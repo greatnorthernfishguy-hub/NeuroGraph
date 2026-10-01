@@ -97,3 +97,8 @@ a7ceca21b69776d180a8c28c1dc0476f19cfacc8f75baf5599e37c4e4756794d  z12-pg1-accept
 6e0a36a565bbec1e57280478b2af9a5a42ea781dc28c3e4a4a12337b122b2a9d  z12-pg1-accept-20261001T025235Z/scratch/b-base.msgpack
 6e0a36a565bbec1e57280478b2af9a5a42ea781dc28c3e4a4a12337b122b2a9d  z12-pg1-accept-20261001T025235Z/scratch/b-fold.msgpack
 ```
+
+## Disposal record (#872, Exec 465 item 4) — appended after the lane close
+- Lane closed met at Quest event #12524; builder thread ee0547f2 settled (settled_at 2026-10-01T03:55:23Z).
+- TIME CORRECTION: the hashes above were taken ~03:50-03:56Z (not the "~04:10Z" in the section header text); the originals were re-hashed at 03:56Z immediately before disposal and are byte-identical to the first pass.
+- Deleted 2026-10-01 03:56Z: `/home/josh/backups/z12-pg1-20261001T021808Z` (1.2 GB) and `/home/josh/backups/z12-pg1-accept-20261001T025235Z` (1.4 GB), 64 files, hashes in the manifest above (no symlinks inside). NOT touched: the ceremony backup `pre-placement-laptop-cc/`, the staged bundle `vps-pull-staged/`, Syl's `~/NeuroGraph/data/checkpoints`, the live CC checkpoint. The #867 scratch `z12-867-20261001T031047Z` (640 KB) is kept (small; its harness and record hashes are in build-005).
