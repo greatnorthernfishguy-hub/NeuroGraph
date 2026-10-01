@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #14031) — #910 M8: the no-model-load tripwire RECORDS its hits
+# What: test_resolver_loads_no_model_and_touches_no_network: the _ensure_model tripwire and the socket.connect block now append to
+#   a `hits` list BEFORE raising, and the test asserts `hits == []` after the resolver call (in addition to every assertion it
+#   already made). TEST-ONLY: no source file, no other test, and no other assertion changed; the test count is unchanged (53).
+# Why: build-002-addendum-001 caveat 2 (Chief-003 ruling #14031): the resolver's own `except Exception` swallows the tripwire's
+#   AssertionError, so a resolver that loaded the model inside its OWN inner try/except, discarded the failure and still
+#   returned the id (M8b) would have survived this test; the old M8 was killed only because its failure made the resolver
+#   return None.
+# How: record-then-raise; the list is inspected by the test, which a swallowing `except` cannot hide.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13848) — #949: the resolver READS, it never CREATES
 # What: new section (f): two FRESH-PROCESS tests (a resolver call leaves NGEmbed._instance None; a later non-default config is not
 #   pinned out by a header read), an existing-instance test, an id-unchanged test (== what get_instance() would report), a
@@ -410,16 +419,26 @@ def test_resolver_returns_the_instances_configured_id():
 
 def test_resolver_loads_no_model_and_touches_no_network(monkeypatch):
     """How "no model load" is shown, not asserted: _ensure_model (the ONLY place ng_embed loads ONNX / the tokenizer / hits
-    the hub) is replaced with a tripwire, socket.connect is blocked, and the instance must still report model_loaded False."""
+    the hub) is replaced with a tripwire, socket.connect is blocked, and the instance must still report model_loaded False.
+
+    The tripwires RECORD each hit in `hits` BEFORE they raise, and the test asserts `hits == []` afterwards. The raise alone is
+    not enough: the resolver wraps its work in `try/except Exception`, which would swallow the tripwire's AssertionError, so a
+    resolver that attempted a load inside its OWN inner try/except, discarded the failure and still returned the id would
+    otherwise pass this test (build-002-addendum-001 caveat 2, mutant M8b)."""
+    hits = []
+
     def tripwire(self, *a, **k):
+        hits.append("NGEmbed._ensure_model")
         raise AssertionError("resolver reached NGEmbed._ensure_model (a model load)")
 
     def no_net(self, *a, **k):
+        hits.append("socket.socket.connect")
         raise AssertionError("resolver touched the network")
 
     monkeypatch.setattr(NGEmbed, "_ensure_model", tripwire)
     monkeypatch.setattr(socket.socket, "connect", no_net)
     assert tex.resolve_embedding_model() == DEFAULT_ID
+    assert hits == [], "the resolver reached a model load / the network (swallowed or not): %r" % (hits,)
     assert NGEmbed.get_instance().stats["model_loaded"] is False
 
 
