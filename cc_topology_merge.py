@@ -14,13 +14,24 @@
 # Why: the #905 pair (checker-041 + le-054) found these two brief items not delivered by build-001 (ee94f7d2); Chief-003 ROUND 2 + AMENDMENTS 1/2.
 # How: NO code change. Every non-comment, non-docstring token is identical to ee94f7d2 (tokenize + ast.dump proof in returns/build-002.md).
 #   The :694 ERROR format string is BYTE-IDENTICAL; its loose parenthetical is REPORTED, not changed (AMENDMENT 2). No test file edited.
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #14104) — #918 fold-up 2: D1 + Exec P534 wording (comments/docstrings ONLY)
+# What: (D1) the `cc_current_membership` docstring is rewritten TRUE and non-contradictory: it is every CC node currently held;
+#   the ACK / exclude_ids source is `cc_ack_membership` (its old opening sentence said the opposite of its own pointer paragraph).
+#   (P534) the superseded P522 "H-1" clause (a blanket no-write-to-identity-nodes rule) is DROPPED everywhere it was live in this file
+#   (the entry below, the `cc_ack_membership` docstring, the end-of-call comment) and replaced with: "Protected nodes are excluded
+#   from re-offer because they are not sweep-eligible (they survive at any degree). Identity-touching binding structure still
+#   crosses per #147 (identity crosses the callosum)."
+# Why: le-056 D1; Exec P534 (via Chief-003): Q3 answered NOT a breach (the sender's synapse to an already-acked protected node is
+#   by design, #147); H-1 as ruled gates deletion/re-tag/de-flag/edit/re-text/placement, not additive cross-hemisphere structure.
+# How: NO code change: `ast.dump` of this module with docstrings stripped is IDENTICAL before and after (proved in build-003).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up: Q1 (the NAME), Q2, N4
 # What: (Q1, Exec P522, LAW 4) `cc_current_membership` is BACK to exactly its original meaning, byte-equivalent in behaviour to
-#   base ee94f7d2 (the CC-provenance nodes currently held; its docstring is the base text plus one pointer paragraph). The ack
+#   base ee94f7d2 (the CC-provenance nodes currently held; its docstring was rewritten by the fold-up 2 entry above). The ack
 #   the sender reads as exclude_ids is a NEW pure function `cc_ack_membership` = `cc_current_membership` minus `_unbound_nodes`
 #   (the #905 predicate, called, never copied). The ack writer at the end of `merge_cc_topology` calls the NEW function.
-#   (Q2, confirmed intended) protected unbound CC nodes stay in the ack and are never re-offered: not sweep-eligible, and H-1
-#   (Leg 2 never writes to identity nodes). (N4) the re-offer streak table is now ALSO reset when the merge raises
+#   (Q2, confirmed intended) protected unbound CC nodes stay in the ack and are never re-offered. Protected nodes are excluded
+#   from re-offer because they are not sweep-eligible (they survive at any degree). Identity-touching binding structure still
+#   crosses per #147 (identity crosses the callosum). (N4) the re-offer streak table is now ALSO reset when the merge raises
 #   TopologyMergeAbort (MACHINE_ID unset, no header, own export, embedding-model mismatch): ONE helper
 #   `_reset_reoffer_streaks`, used by the two early returns (no_conduit / empty) and the four abort sites; the two inline
 #   copies the early returns used are gone.
@@ -262,26 +273,27 @@ class TopologyMergeAbort(RuntimeError):
 
 
 def cc_current_membership(graph: Any) -> Set[str]:
-    """The CC node IDs the receiver currently holds -- the authoritative source
-    for the SENDER's exclude_ids (#110).
+    """The CC node IDs the receiver currently HOLDS: every CC-provenance node in
+    `graph.nodes`, bound or not, protected or not. It is "what is held" and
+    nothing narrower.
 
-    It is `graph.nodes` intersected with CC provenance, read live. Because it is
+    It is NOT the ack. The ACK the sender reads as exclude_ids (#110, narrowed by
+    #918) is `cc_ack_membership` -- this set minus the sweep-eligible-unbound set;
+    the ack writer calls that, not this.
+
+    Read live from `graph.nodes` intersected with CC provenance. Because it is
     regenerated from the graph rather than appended to, a node culled locally
     (#104 sweep, orphan collection, a rolled-back checkpoint) DROPS OUT of it --
-    so the exporter re-sends that node and #106's receive-side re-admission has
-    something to re-admit. The append-only journal this replaces could only grow,
-    so a culled id stayed excluded forever and the node was permanently
-    un-resendable: the §3 poison-pill, merely relocated to the send side. After
-    #110, presence in the graph is the authority on BOTH sides -- receive
-    admission (#106) and send exclusion.
+    and so out of the ack built from it -- so the exporter re-sends that node and
+    #106's receive-side re-admission has something to re-admit. The append-only
+    journal this replaces could only grow, so a culled id stayed excluded forever
+    and the node was permanently un-resendable: the §3 poison-pill, merely
+    relocated to the send side. After #110, presence in the graph is the
+    authority on BOTH sides -- receive admission (#106) and send exclusion.
 
     Uses the same predicate the exporter classifies with (is_cc_provenance, via
     cc_topology_export._is_cc_node), so what the receiver advertises as held and
     what the sender considers CC-exportable cannot drift apart.
-
-    #918: this is "what is currently held", nothing narrower. The ACK the sender
-    reads as exclude_ids is `cc_ack_membership` (this set minus the sweep-eligible-
-    unbound set); the ack writer calls that, not this.
     """
     with graph._step_lock:
         return {nid for nid, node in graph.nodes.items()
@@ -299,9 +311,10 @@ def cc_ack_membership(graph: Any) -> Set[str]:
     the SAME function the #897/#905 clock hold and the daemon's #896 rule 1 use
     (LAW 3: called, never copied). So a bound node is in; a PROTECTED unbound node
     (constitutional / '*_authored') is in too -- it is "held", exactly as the guard
-    treats it; an unprotected unbound node is OUT. Protected nodes are deliberately
-    excluded from re-offer (not sweep-eligible; H-1: Leg 2 never writes to identity
-    nodes).
+    treats it; an unprotected unbound node is OUT. Protected nodes are excluded from
+    re-offer because they are not sweep-eligible (they survive at any degree).
+    Identity-touching binding structure still crosses per #147 (identity crosses the
+    callosum).
 
     WHY THE UNBOUND ONES MUST NOT BE IN. The snapshot used to be every CC node
     held, bound or not. A node the receiver holds UNBOUND then counted as acked and
@@ -966,8 +979,9 @@ def merge_cc_topology(
     # acked and the sender keeps re-offering it (with the hyperedge that binds it).
     # Counting a held-unbound node as acked deadlocked against the #897/#905 clock
     # hold: the hold forbids the cull, the ack forbade the re-send. Protected nodes
-    # are deliberately excluded from re-offer (not sweep-eligible; H-1: Leg 2 never
-    # writes to identity nodes).
+    # are excluded from re-offer because they are not sweep-eligible (they survive at
+    # any degree). Identity-touching binding structure still crosses per #147
+    # (identity crosses the callosum).
     _write_membership(membership_path, cc_ack_membership(graph))
 
     stats["completed"] = stats["deferred_by_budget"] == 0

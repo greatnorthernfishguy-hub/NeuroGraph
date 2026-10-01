@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #14104) — #918 fold-up 2 tests (F1 + P534 wording)
+# What: (F1, le-056, MEDIUM) the N3 test was HASH-SEED DEPENDENT (KeyError 'frame_node_ids' under PYTHONHASHSEED=7): the node
+#   order inside the sender's frame follows a hyperedge member-SET iteration, and once everything is acked the sender returns the
+#   `exhausted` shape WITHOUT `frame_node_ids`. It is now DETERMINISTIC and ORDER-INDEPENDENT BY CONSTRUCTION: the test rewrites
+#   the real conduit's node order itself (`_reorder_conduit_nodes`) to each of three explicit positions of the held node X
+#   (first / middle / last, parametrized), pins the exact per-call outcome for each, and handles the legitimate `exhausted` /
+#   no-frame shape explicitly (the receiver re-merges the conduit left on disk, as `cc-ng-sync.py` does) with assertions that
+#   X is actually BOUND and acked, so it cannot pass vacuously. (P534) the Q2 pin test's docstring no longer states the dropped
+#   P522 "H-1" invariant; it states the scenario facts only. Every Q2 assertion is kept.
+# Why: le-056 F1 (reproduced at PYTHONHASHSEED=7); Exec P534 (via Chief-003): seed or sort, not just a sweep; Q3 answered NOT a
+#   breach (identity-touching binding structure crosses per #147).
+# How: test text only; the production code is untouched (its `ast.dump` with docstrings stripped is identical).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up tests (Q1, Q2, N3, N4, T1)
-# What: (Q1) the tests that pin the ACK contents now target `cc_ack_membership` (every `tmg.cc_ack_membership(` in this file
+# What: (Q1) the tests that pin the ACK contents now target `cc_ack_membership` (every `tmg.cc_current_membership(` in this file
 #   became `tmg.cc_ack_membership(`; the in-file CONTROL now patches `cc_ack_membership` back to the old "every CC node held");
 #   NEW: `cc_current_membership` is back to "every CC-provenance node currently held" (equal to the base formula on a graph with
 #   unbound + bound + protected + non-CC nodes), `cc_ack_membership` = that set minus the sweep-eligible-unbound set (composition
@@ -333,9 +345,12 @@ def test_the_ack_writer_calls_cc_ack_membership_not_the_old_name(tmp_path, monke
 
 
 def test_q2_a_protected_unbound_cc_node_is_acked_and_never_re_offered_an_unprotected_one_is_not_acked_and_is(tmp_path):
-    """Exec P522 Q2 (CONFIRMED INTENDED): protected nodes are deliberately excluded from re-offer (not sweep-eligible; H-1: Leg 2
-    never writes to identity nodes). The real exporter reads the ack as exclude_ids: only the unprotected unbound node is a
-    candidate. Every node here IS connected on the VPS (so 'not a candidate' is the ack's doing, not disconnection)."""
+    """Exec P522 Q2 (CONFIRMED INTENDED), wording per P534: protected nodes are excluded from re-offer because they are not
+    sweep-eligible (they survive at any degree); identity-touching binding structure still crosses per #147 (identity crosses the
+    callosum). The real exporter reads the ack as exclude_ids: only the unprotected unbound node is a candidate. Every node here
+    IS connected on the VPS (so 'not a candidate' is the ack's doing, not disconnection). The closing 'no edge on the protected
+    nodes' assertions are a fact of THIS SCENARIO (the one frame node has a synapse only from its own acked anchor; no frame node
+    has a synapse to a protected node), NOT an invariant: such a synapse would cross by design (#147)."""
     PC, PW, U = "cc:conv::protected-constitutional", "cc:want::protected-authored", "cc:conv::unprotected-unbound"
     anchors = {PC: "cc:conv::anchor-c", PW: "cc:conv::anchor-w", U: "cc:conv::anchor-u"}
     vg, vv = Graph(), SimpleVectorDB()
@@ -365,7 +380,7 @@ def test_q2_a_protected_unbound_cc_node_is_acked_and_never_re_offered_an_unprote
     assert U not in _all_unbound(rg) and U in tmg.cc_ack_membership(rg)  # bound by the re-offer, now acked
     st = _export_frame(vg, vv, out, tmg.cc_ack_membership(rg))           # the next tick: nothing is left to offer
     assert st["candidates"] == 0 and st["exhausted"] and not st.get("frame_node_ids")
-    # nothing was written onto the identity nodes by Leg 2
+    # scenario fact (see the docstring): no synapse from the frame node to a protected node, so none was written here
     assert not rg._outgoing.get(PC) and not rg._incoming.get(PC) and not rg._outgoing.get(PW) and not rg._incoming.get(PW)
 
 
@@ -810,19 +825,45 @@ def test_the_streak_table_is_a_replaced_not_mutated_dict():
 
 # ============================================================== (N3) a re-offered held-unbound node under a SMALL receiver budget
 
-def test_n3_small_max_nodes_per_call_a_held_unbound_node_is_bound_across_ticks_and_the_budget_only_defers_new_nodes(tmp_path):
-    """le-056 N3, REPORTED (not papered over). Real exporter -> real merge, `max_nodes_per_call=1`, a frame with one held-UNBOUND
-    node X and two NEW nodes C1, C2 in one VPS hyperedge. What the budget does (order-independent facts; the order of the nodes
-    inside the frame follows the hyperedge's member-set iteration order and so varies with the hash seed):
-      * only NEW nodes spend budget; a PRESENT node costs none, but the per-node budget check runs BEFORE the present check, so a
-        present X that comes after the spent budget is counted in `deferred_by_budget` (an accounting artefact: `completed` is
-        False) -- yet Tier 2/3 test `graph.nodes`, not the deferral, so X's edges are NOT lost;
-      * tick 1: only one new node lands, the other is deferred, the hyperedge needs all three in the graph => skipped, X UNBOUND;
-      * tick 2 (the sender re-offers the same candidates: nothing is acked yet): the second new node lands, all three are in the
-        graph, the hyperedge LANDS: X is BOUND after the 2nd call;
-      * by the 3rd call everything is present, nothing is deferred, `completed` is True, and the ack holds all three.
-    A mutant that ignores the budget lands both new nodes on tick 1 and binds X there: it fails the tick-1 assertions."""
+def _reorder_conduit_nodes(path, order):
+    """Rewrite the real conduit's batch so its node records follow `order` (a list of ids). The sender builds the frame order from a
+    hyperedge member-SET iteration (hash-seed dependent); the receiver processes nodes in file order, so the test fixes the order
+    itself instead of inheriting it."""
+    frames = list(tex.read_topology_frames(Path(path).read_bytes()))
+    rank = {nid: i for i, nid in enumerate(order)}
+    for fr in frames:
+        if fr.get("kind") == "batch":
+            fr["nodes"] = sorted(fr["nodes"], key=lambda r: rank[r["id"]])
+    tmp = str(path) + ".partial"
+    Path(tmp).write_bytes(b"".join(tex._frame(fr) for fr in frames))
+    os.replace(tmp, str(path))
+
+
+# Per position of the held node X in the frame: [(call, absorbed_nodes, deferred_by_budget, completed, X bound after the call)].
+# Only NEW nodes spend budget; the per-node budget check runs BEFORE the present check, so a present X placed after the spent
+# budget is counted deferred, yet its edges are not lost (Tier 2/3 test graph.nodes, not the deferral).
+_N3_EXPECTED = {
+    "first":  [(1, 1, 1, False, False), (2, 1, 0, True, True)],
+    "middle": [(1, 1, 2, False, False), (2, 1, 0, True, True)],
+    "last":   [(1, 1, 2, False, False), (2, 1, 1, False, True), (3, 0, 0, True, True)],
+}
+
+
+@pytest.mark.parametrize("x_position", ["first", "middle", "last"])
+def test_n3_small_max_nodes_per_call_a_held_unbound_node_is_bound_across_ticks_and_the_budget_only_defers_new_nodes(
+        tmp_path, x_position):
+    """le-056 N3 + F1. Real exporter -> real merge, `max_nodes_per_call=1`, a frame with one held-UNBOUND node X and two NEW nodes
+    C1, C2 in one VPS hyperedge. DETERMINISTIC and ORDER-INDEPENDENT BY CONSTRUCTION: the node order inside the frame is fixed by
+    the test (`_reorder_conduit_nodes`) to X first / middle / last, so no seed, set order or sender pick decides anything.
+    What the budget does: only NEW nodes spend budget (each call absorbs at most 1); X (present) costs none but is counted in
+    `deferred_by_budget` when it sits after the spent budget (an accounting artefact, `completed` False) while its edges are NOT
+    lost: X is bound by the 2nd call in every position, and `completed` is True once nothing is deferred. Once everything is
+    acked the sender returns the `exhausted` shape WITHOUT `frame_node_ids`; the receiver then re-merges the conduit left on disk
+    (as `cc-ng-sync.py` does), and that branch asserts X is actually BOUND and acked, so the loop cannot end vacuously.
+    A mutant that ignores the budget lands both new nodes on call 1 and binds X there; one whose ack includes the unbound set
+    never re-offers X and ends in the exhausted branch with X unbound: both fail."""
     X, C1, C2 = "cc:conv::n3-held", "cc:conv::n3-c1", "cc:conv::n3-c2"
+    order = {"first": [X, C1, C2], "middle": [C1, X, C2], "last": [C1, C2, X]}[x_position]
     vg, vv = Graph(), SimpleVectorDB()
     _vps(vg, vv, C1, 10)
     _vps(vg, vv, C2, 11)
@@ -831,24 +872,27 @@ def test_n3_small_max_nodes_per_call_a_held_unbound_node_is_bound_across_ticks_a
     rg, rv = _receiver()
     _held(rg, rv, X)
     ack, out = tmp_path / "ack.txt", tmp_path / "frame.conduit"
-    bound_after, stats = [], []
-    for tick in range(1, 6):
+    log, exhausted_seen = [], False
+    for call in range(1, 6):
         st = _export_frame(vg, vv, out, tmg._load_membership(str(ack)))
-        assert set(st["frame_node_ids"]) == {C1, C2, X}, tick           # the SAME candidates are re-offered until all are bound
-        ms = _merge(rg, rv, out, ack, max_nodes_per_call=1)
-        stats.append(ms)
-        bound_after.append(X not in _all_unbound(rg))
-        assert ms["absorbed_nodes"] <= 1, tick                           # the budget caps NEW nodes per call
-        if ms["completed"] and bound_after[-1]:
+        if st.get("frame_node_ids"):
+            assert set(st["frame_node_ids"]) == {C1, C2, X}, call        # the SAME candidates are re-offered until all are bound
+            _reorder_conduit_nodes(out, order)
+        else:
+            # the legitimate 'nothing left to offer' shape: it may ONLY appear once everything is bound and acked
+            exhausted_seen = True
+            assert st["exhausted"] is True, st
+            assert X not in _all_unbound(rg) and _ack(ack) == {C1, C2, X}, (call, "exhausted while X is not bound")
+        ms = _merge(rg, rv, out, ack, max_nodes_per_call=1)               # (an exhausted call re-merges the file on disk)
+        assert ms["absorbed_nodes"] <= 1, call                           # the budget caps NEW nodes per call
+        log.append((call, ms["absorbed_nodes"], ms["deferred_by_budget"], ms["completed"], X not in _all_unbound(rg)))
+        if ms["completed"] and X not in _all_unbound(rg):
             break
-    t1, t2 = stats[0], stats[1]
-    assert bound_after[0] is False                                      # tick 1: a new member is deferred, the hyperedge cannot land
-    assert t1["absorbed_nodes"] == 1 and t1["deferred_by_budget"] >= 1 and t1["completed"] is False
-    assert t1["absorbed_hyperedges"] == 0
-    assert bound_after[1] is True and t2["absorbed_hyperedges"] == 1    # tick 2: X BOUND although the budget is still 1
-    assert len(stats) <= 3 and stats[-1]["completed"] and stats[-1]["deferred_by_budget"] == 0
+    assert log == _N3_EXPECTED[x_position], log
+    assert log[0][4] is False                                           # call 1: a new member is still absent, X is NOT yet bound
     assert any(he.member_nodes == {C1, C2, X} for he in rg.hyperedges.values())
-    assert _ack(ack) == {C1, C2, X}                                      # all bound and acked at the end
+    assert X not in _all_unbound(rg) and _ack(ack) == {C1, C2, X}       # the OUTCOME: X bound, everything acked
+    assert exhausted_seen == (x_position == "last")                     # only the 3-call ordering reaches the exhausted branch
 
 
 # ============================================================== (N4) the streak is reset by a TopologyMergeAbort

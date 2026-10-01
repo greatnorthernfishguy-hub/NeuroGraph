@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #14104) — #918 fold-up 2 (comment text only): two comments
+#   that said "current CC membership" over `cc_ack_membership` now say it is the ACK (the CC nodes held BOUND); the fold-up header
+#   below names `test_journaled_but_culled_node_is_readmitted` correctly (it said `test_readmitted...`). No assertion changed.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up (Q1): the 5 uses of
 #   `tmg.cc_current_membership(` became `tmg.cc_ack_membership(`: every one of them pins the ACK (the membership FILE the merge writes,
 #   or the sender's exclude_ids), which is now `cc_ack_membership`; `cc_current_membership` is "every CC node currently held" again
-#   (tests: test_readmitted..., test_membership_snapshot_feeds_sender_exclude_ids, test_culled_node_drops_out...). Nothing else changed.
+#   (tests: test_journaled_but_culled_node_is_readmitted, test_membership_snapshot_feeds_sender_exclude_ids,
+#   test_culled_node_drops_out_of_exclude_ids_and_is_resent). Nothing else changed.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13352) — #918 expectation updates (2 tests)
 # What: test_membership_snapshot_feeds_sender_exclude_ids and test_culled_node_drops_out_of_exclude_ids_and_is_resent encoded
 #   "the ack includes UNBOUND nodes": their sender fixture holds an isolated forest turn (f2: no synapse, no hyperedge) that lands
@@ -640,7 +644,7 @@ def test_journaled_but_culled_node_is_readmitted(tmp_path):
     assert st2["skipped_present"] == 3
 
     # #110: merge2 REWROTE the snapshot from the (now whole again) graph, so it
-    # equals current CC membership -- t1 included, because it was re-admitted.
+    # equals the ACK, `cc_ack_membership` (the CC nodes held BOUND) -- t1 included, because it was re-admitted and is bound again.
     assert set((tmp_path / "membership.txt").read_text().split()) == tmg.cc_ack_membership(rg)
     assert ids["t1"] in tmg.cc_ack_membership(rg)
 
@@ -691,7 +695,7 @@ def test_membership_snapshot_feeds_sender_exclude_ids(tmp_path):
     # #918: the ack is what the receiver holds BOUND. f2 is an isolated forest turn (no synapse, no hyperedge): the receiver
     # holds it UNBOUND, so it is not acked. (Was: `held == set(ids.values())` and `exported_nodes == 0`.)
     assert held == set(ids.values()) - {ids["f2"]}
-    assert held == tmg.cc_ack_membership(rg)   # the file IS the live membership
+    assert held == tmg.cc_ack_membership(rg)   # the file IS the ack (the CC nodes held BOUND), recomputed live
 
     path2, est = _export(sg, sv, tmp_path, exclude_ids=held)
     # the sender stopped re-transmitting what the receiver holds BOUND; the held-UNBOUND node is re-offered
