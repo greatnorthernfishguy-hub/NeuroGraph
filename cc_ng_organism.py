@@ -195,6 +195,11 @@
 #   ROLLOUT: this must merge BEFORE the daemon wiring slice -- a daemon passing the
 #   new kwargs to an older organism raises TypeError. Tests:
 #   tests/test_cc_recall_reporting.py.
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13491) — #905 ROUND 2: DOCSTRING ONLY
+# What: the _cc_callosum_consolidate docstring's `guard` paragraph now says what "blocks" / "bound" means (defined once, in
+#   cc_topology_merge._unbound_nodes: bound = NOT sweep-eligible, NOT "a complete turn"; turn completeness is not a gate condition).
+# Why: Chief-003 ROUND 2 AMENDMENT item 2 (the P493 R1 sentence was absent from this file too). No code change; every non-comment,
+#   non-docstring token is identical to ee94f7d2 (proof in returns/build-002.md).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 parts A and D
 # What: (A) generate_emergent_want writes the new want BORN BOUND: in the SAME _step_lock block as create_node it
 #   writes one synapse seed -> want (weight 0.3, the surface_wants pattern) per existing, de-duplicated seed. If NO
@@ -3258,7 +3263,10 @@ def _cc_callosum_consolidate(graph, idle_steps: int, *, guard=None, progress=Non
       guard    zero-argument callable returning an iterable/set of the node ids
                that currently BLOCK the clock (empty = clear). Build it with
                cc_topology_merge.whole_graph_guard -- there is no predicate in
-               this function. It is called BEFORE EACH slice (including the
+               this function. What "blocks" (and so what "bound" means) is defined
+               ONCE, in cc_topology_merge._unbound_nodes: bound = NOT sweep-eligible
+               (Exec P493 R1), NOT "a complete turn"; turn completeness is not a gate
+               condition and nothing here tests it. It is called BEFORE EACH slice (including the
                first), WITHOUT holding _concurrent_lock (it takes _step_lock only;
                the established order is _concurrent_lock -> _step_lock). Ids are
                used for COUNTING only and are NEVER logged. A non-empty result
