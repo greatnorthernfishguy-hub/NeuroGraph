@@ -3,6 +3,17 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13491) — #905 ROUND 2: COMMENTS AND DOCSTRINGS ONLY
+# What: (E.2) the two stale "no production caller yet (Phase 3)" header comments below are corrected: the daemon's handle_merge_topology
+#   (scripts/cc-ng-daemon.py, imports and calls merge_cc_topology) IS a production caller. (E.1) the "pre-existing" wording in the stats
+#   comment, the merge_landed comment, the merge_cc_topology docstring and a NOTE above the ERROR now says what is true: "pre-existing" =
+#   NOT in merge_landed (not delivered by this merge); a node the conduit re-sent that the receiver already held IS in merge_landed and counts
+#   under "from this merge" / ..._arrivals. (P493 R1) the _unbound_nodes docstring and the comment at its predicate now state what "bound" means
+#   for these guards (NOT sweep-eligible; NOT "a complete turn"; turn completeness is not a gate condition), next to the age exclusion and the
+#   P492 wait-then-escalate sentence that were already there.
+# Why: the #905 pair (checker-041 + le-054) found these two brief items not delivered by build-001 (ee94f7d2); Chief-003 ROUND 2 + AMENDMENTS 1/2.
+# How: NO code change. Every non-comment, non-docstring token is identical to ee94f7d2 (tokenize + ast.dump proof in returns/build-002.md).
+#   The :694 ERROR format string is BYTE-IDENTICAL; its loose parenthetical is REPORTED, not changed (AMENDMENT 2). No test file edited.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 parts B, C, D (merge side)
 # What: (B) `_unbound_nodes` is now unbound AND sweep-eligible: a node the orphan sweep would never reap
 #   (graph._is_identity_protected: constitutional / '*_authored') no longer blocks the clock. Its signature is
@@ -66,7 +77,9 @@
 #       at the top of the node loop still scopes admission to CC's own mind (no Syl
 #       node, no foreign path). Josh-directed (identity crosses the callosum);
 #       reviewed by neurograph-law-enforcer, which caught the missing receiver half.
-#       merge_cc_topology has no production caller yet (Phase 3), so blast radius is 0.
+#       [Corrected 2026-10-01, #905 round 2: the original sentence here -- "merge_cc_topology has no production caller yet (Phase 3), so
+#       blast radius is 0" -- is STALE. merge_cc_topology HAS a production caller: the daemon's handle_merge_topology
+#       (scripts/cc-ng-daemon.py, which imports it and calls it), so a change to this function is NOT blast-radius 0.]
 # [2026-08-12] Claude Code (DudeMan CC, Opus 4.8) — #88 §10.4-C: receiver budget pinned 50->25
 # What: _DEFAULT_MAX_NODES_PER_CALL default 50 -> 25 (env CC_TOPOLOGY_MERGE_MAX_NODES).
 # Why: FatherGraph Finding 1 + Finding 3 (25/250). The driver ships BATCH_SIZE=25; a
@@ -166,8 +179,9 @@
 #   snapshot SHRINKS when a node is culled, closing the loop: culled -> drops out
 #   of exclude_ids -> re-sent -> re-admitted (#106). Presence in the graph is now
 #   the single authority on BOTH sides. Doc: CC-CALLOSUM-TRUTH.md §4 caveat, §10
-#   Phase 3. Not yet load-bearing (merge_cc_topology has no production caller);
-#   wired correct now so #88's first live run inherits it.
+#   Phase 3. [Corrected 2026-10-01, #905 round 2: the original "Not yet load-bearing (merge_cc_topology has no production caller)" is
+#   STALE -- the daemon's handle_merge_topology (scripts/cc-ng-daemon.py) IS a production caller, so this is load-bearing.]
+#   Wired correct so #88's first live run inherits it.
 # -------------------
 
 import hashlib
@@ -333,7 +347,10 @@ def merge_cc_topology(
     (+1 per blocked batch), `consolidation_skipped_unbound_arrivals` (this
     merge's arrivals still unbound at a skip) and
     `consolidation_skipped_unbound_preexisting` (the rest, summed per blocked
-    batch). Same predicate as the daemon's #896 rule 1.
+    batch). Same predicate as the daemon's #896 rule 1. Wording note (#905 round 2):
+    "pre-existing" means NOT in `merge_landed` (not delivered by this merge). A node
+    the conduit re-sent that the receiver already held IS in `merge_landed`, so it is
+    counted under "from this merge" / `consolidation_skipped_unbound_arrivals`.
 
     THE GUARD IS ALSO PER SLICE (#905 part D). The check above decides whether a
     pass STARTS. The pass itself (`_cc_callosum_consolidate`) re-checks the same
@@ -399,10 +416,17 @@ def merge_cc_topology(
         "batches_read": 0, "deferred_by_budget": 0,
         "consolidation_passes": 0, "consolidation_steps": 0,
         "consolidation_skipped_unbound_arrivals": 0,
-        # #897: the whole-graph guard. `..._arrivals` is THIS merge's arrivals still
-        # unbound at a skip (its original meaning); `..._preexisting` is every other
-        # unbound node in the graph at a skip, summed per blocked batch;
-        # `consolidation_blocked_batches` is +1 per blocked batch.
+        # #897: the whole-graph guard. `..._arrivals` counts the unbound nodes that
+        # are in `merge_landed`: every node this conduit delivered, INCLUDING a node it
+        # re-sent that the receiver ALREADY held (the skipped_present branch adds it to
+        # `batch_landed` too: "present == usable as an endpoint"); that is its original
+        # meaning. `..._preexisting` counts the unbound nodes NOT in `merge_landed`,
+        # summed per blocked batch. "Pre-existing" is a loose label: it means "not
+        # delivered by this merge", NOT "was in the graph before it" -- a re-sent
+        # already-present unbound node lands in the OTHER bucket (arrivals).
+        # `consolidation_blocked_batches` is +1 per blocked batch. The decision
+        # (whole graph, sweep-eligible) is unaffected by the split.
+        # (#905 round 2: wording only; keys and counting unchanged.)
         "consolidation_skipped_unbound_preexisting": 0,
         "consolidation_blocked_batches": 0,
         # #905 part D: passes the batch-end guard let START but the per-slice guard
@@ -421,7 +445,11 @@ def merge_cc_topology(
     # "from this merge" vs "pre-existing" for the stats and the ERROR record.
     # `landed_ids` feeds the membership snapshot and excludes already-present
     # nodes (:249), which are legitimate endpoints and can be left unbound by a
-    # split batch too -- `merge_landed` includes them.
+    # split batch too -- `merge_landed` includes them. So "pre-existing" in the
+    # stats and the ERROR means "NOT in `merge_landed`" (not delivered by this
+    # merge), NOT "was already in the graph": a node the conduit re-sent that the
+    # receiver already held is counted under "from this merge" /
+    # `consolidation_skipped_unbound_arrivals`. (#905 round 2: wording only.)
     merge_landed: Set[str] = set()
 
     for frame in frames[1:]:
@@ -675,7 +703,9 @@ def merge_cc_topology(
         # disabling, host-scoping or exempting), so the clock must not move
         # until it has. Same predicate as the daemon's #896 rule 1.
         #
-        # So: consolidate only when NO node in the graph is unbound. Otherwise
+        # So: consolidate only when NO node in the graph is unbound AND sweep-eligible
+        # (#905: `_unbound_nodes` leaves out identity-protected nodes, which the sweep
+        # never reaps, and deliberately has no age term). Otherwise
         # skip, count, and log loudly (one ERROR per blocked batch, never
         # rate-limited). Frames still merge and bind -- Tier 3 is untouched; only
         # the clock is held. An unbound node that cannot bind blocks
@@ -688,6 +718,13 @@ def merge_cc_topology(
                 stats["consolidation_skipped_unbound_arrivals"] += len(from_merge)
                 stats["consolidation_skipped_unbound_preexisting"] += len(preexisting)
                 stats["consolidation_blocked_batches"] += 1
+                # NOTE (#905 round 2; a comment ONLY -- the format string below is
+                # BYTE-IDENTICAL, a log string whose change is its own look): its
+                # parenthetical "pre-existing (not landed by this merge)" is loose.
+                # `preexisting` is `unbound - merge_landed`, i.e. NOT delivered by this
+                # merge; a node the conduit re-sent that the receiver already held is in
+                # `merge_landed` and is counted in the "from this merge" figure. The
+                # accurate wording is "not delivered by this merge" (stats comment above).
                 logger.error(
                     "CC topology: skipping %d consolidation step(s) after batch %d -- "
                     "%d node(s) in the graph are still unbound (no synapse, no "
@@ -756,6 +793,14 @@ def _unbound_nodes(graph: Any, node_ids: Set[str]) -> Set[str]:
     reports catastrophic false positives (CC-CALLOSUM-TRUTH.md §1.1, and note
     synapses key on pre_node_id/post_node_id, not source_id/target_id).
 
+    WHAT "BOUND" MEANS FOR THESE GUARDS (Exec P493 ruling 1): hyperedge-bound =
+    BOUND. "Bound" = NOT SWEEP-ELIGIBLE, i.e. the sweep's own predicate
+    (`_collect_orphan_nodes`: a node with an outgoing synapse, an incoming
+    synapse, OR hyperedge membership via `_node_hyperedges` is not reaped;
+    identity-protected nodes are not reaped either), and it is NOT "a complete
+    turn". Turn completeness (a tree with its forest, a forest with its trees) is
+    NOT a gate condition -- not an S4b gate condition -- and no guard here tests it.
+
     THE AGE TERM IS EXCLUDED ON PURPOSE -- do not "fix" it back in. The sweep
     also requires `timestep - creation_time > orphan_node_grace_period`. This
     guard exists to stop the CLOCK from aging a node PAST that grace. At the
@@ -788,6 +833,13 @@ def _unbound_nodes(graph: Any, node_ids: Set[str]) -> Set[str]:
         # stops the clock from aging a node past grace, and a node unbound at the
         # moment of the decision is typically age 0 -- an age term would let the
         # clock run on the very case the guard exists for. Do not add it back.
+        # Also (Exec P493 R1): hyperedge-bound = BOUND; "bound" = NOT sweep-eligible
+        # (the sweep's own predicate: an outgoing synapse, an incoming synapse OR
+        # hyperedge membership is not reaped; protected nodes are not reaped), and NOT
+        # "a complete turn" -- turn completeness is NOT a gate condition and no guard
+        # here tests it. And (Exec P492): the "bounded observation window" for nodes
+        # that CAN bind is WAIT-THEN-ESCALATE (expiry -> the #909 list to Josh); it
+        # NEVER releases the clock hold, and nothing here has an expiry or early release.
         # Evaluated last: only structurally-unbound candidates reach the lookup.
         and not (is_protected is not None and is_protected(nid))
     }
