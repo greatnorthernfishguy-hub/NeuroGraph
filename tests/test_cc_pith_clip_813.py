@@ -1,6 +1,19 @@
 # tests/test_cc_pith_clip_813.py
 #
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2, part 2 (h)
+# What: the tests that pinned the INTERIM FORK or the whole_content flag are deleted/rewritten:
+#   DELETED test_provider_context_asks_recall_for_whole_content, test_816_shared_surfacing_and_
+#   resolver_are_not_edited (false by design now), test_cc_monitor_block_is_layout_identical_to_
+#   the_shared_format_context (the parity test), test_monitor_items_are_re_resolved_whole_by_
+#   node_id_and_fail_soft, test_cc_assemble_recall_asks_recall_for_whole_content_by_literal_true,
+#   the three test_c2_* monitor re-resolve tests and their helpers (_Boom, _raising_resolver);
+#   REWRITTEN test_recall_default_still_bounds_the_snippet_and_whole_content_does_not ->
+#   test_recall_default_is_whole; _honest_recall and _long_world now model the real (whole)
+#   behaviour; the AST cap guard needs >= 1 resolver call (the CC monitor route is gone).
+#   Every #813 test not about the fork still passes unchanged.
+# Why: Exec P468: #812 makes whole the default at the source; no flag or CC-side twin survives.
+# How: removal by name with a script that asserts each target exists.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813 TURN 7 (dispatch #11293): le-027 N-2/N-4/N-5
 # What: N-2 a dead or missing identity guard (which FAILS CLOSED and pins everything) now also emits ONE
 #   count-only WARNING per call -- "K of N items pinned because the identity guard failed (<type>); L1 X
@@ -304,27 +317,13 @@ def _fake_ng(text):
     return ng
 
 
-def test_recall_default_still_bounds_the_snippet_and_whole_content_does_not(monkeypatch):
+def test_recall_default_is_whole(monkeypatch):
+    """#812: the shared resolver has no default bound, so the recall snippet is the node's whole
+    resolved text with no flag (was: 300-char snippet unless whole_content=True)."""
     monkeypatch.setattr(pith, "cc_gsg_rescore", lambda surfaced, *_a, **_k: surfaced)
     text = "sentence " * 150                                          # 1350 chars
-    default = pith.cc_pattern_completion_recall(_fake_ng(text), "q", 5)
-    whole = pith.cc_pattern_completion_recall(_fake_ng(text), "q", 5, whole_content=True)
-    assert default[0]["content"].endswith("…") and len(default[0]["content"]) <= 301
-    assert whole[0]["content"] == text.strip()
-
-
-def test_provider_context_asks_recall_for_whole_content(monkeypatch):
-    seen = {}
-
-    def fake_recall(*_args, **kwargs):
-        seen.update(kwargs)
-        return []
-
-    monkeypatch.setattr(pith, "cc_pattern_completion_recall", fake_recall)
-    g = FakeGraph()
-    _core(g)
-    pith.pith_provider_context(SimpleNamespace(graph=g), "hello")
-    assert seen.get("whole_content") is True
+    out = pith.cc_pattern_completion_recall(_fake_ng(text), "q", 5)
+    assert out[0]["content"] == text.strip() and "…" not in out[0]["content"]
 
 
 # ------------------------------------------------ structural (turn 2: complete-caller-set tests below)
@@ -468,23 +467,16 @@ def test_bashrc_script_apply_prints_the_s4_checklist_reminder(tmp_path):
 
 
 # =================================================================== TURN 2 (1b): #816 + ONE rule
-import surfacing as _shared_surfacing                                   # the REAL shared module
 from pith_clip_813_scenarios import FakeVectorDB, fake_ng, run_recall, build_recall_scenarios
 
 
 def _honest_recall(items_by_full):
-    """A recall fake that behaves like the real one: 300-char cut unless whole_content=True."""
+    """A recall fake that behaves like the real one: WHOLE content (#812: no default bound)."""
     seen = {}
 
     def fake(_ng, _query, _k, *_a, **kwargs):
         seen.update(kwargs)
-        out = []
-        for item in items_by_full:
-            item = dict(item)
-            if not kwargs.get("whole_content") and len(item["content"]) > 300:
-                item["content"] = item["content"][:299].rstrip() + "…"
-            out.append(item)
-        return out
+        return [dict(item) for item in items_by_full]
     return fake, seen
 
 
@@ -501,13 +493,13 @@ def _recall(pith, ng, pc_items, pith_on, monkeypatch, commons=None):
 
 
 def _long_world(long_len=900, count=1):
-    """A graph whose monitor node and pattern node are LONG; the fake monitor hands out the
-    240-char-cut text the SHARED surfacing.py produces."""
+    """A graph whose monitor node and pattern node are LONG; the monitor hands out the WHOLE text
+    (#812: the shared surfacing.py / resolver render whole at the source)."""
     g = FakeGraph()
     _core(g)
     mon_full = "MONITOR-" + ("m" * (long_len - 8))
     g.node("mon", mon_full)
-    monitor_items = [{"node_id": "mon", "content": mon_full[:239].rstrip() + "…", "score": 1.5}]
+    monitor_items = [{"node_id": "mon", "content": mon_full, "score": 1.5}]
     pc_full = []
     pat = []
     for i in range(count):
@@ -523,7 +515,6 @@ def _long_world(long_len=900, count=1):
 def test_816_long_pattern_and_monitor_items_are_rendered_whole(monkeypatch, pith_on):
     g, mon_full, monitor_items, pat = _long_world(900)
     out, seen = _recall(pith, fake_ng(g, monitor_items), pat, pith_on, monkeypatch)
-    assert seen.get("whole_content") is True, "the caller must ask recall for whole content"
     assert pat[0]["content"] in out                                   # >300-char pattern item whole
     assert mon_full in out                                            # >240-char monitor item whole
     assert "…" not in out and "..." not in out
@@ -558,40 +549,6 @@ def test_816_failure_fallback_is_also_whole_and_budgeted(monkeypatch, caplog):
     assert any(f in out for f in fulls) and not all(f in out for f in fulls)
     assert "…" not in out
     assert _drop_records(caplog, "whole items")
-
-
-def test_816_shared_surfacing_and_resolver_are_not_edited():
-    changed = subprocess.run(
-        ["git", "-C", _ROOT, "diff", "--name-only", "e4ebf982b1989fd9066d610b94853bc68bf70d37"],
-        capture_output=True, text=True, check=True).stdout.split()
-    for shared in ("surfacing.py", "surface_resolver.py", "neurograph_rpc.py", "kiss_filter.py",
-                   "tonic_thread.py"):
-        assert shared not in changed, shared
-
-
-def test_cc_monitor_block_is_layout_identical_to_the_shared_format_context():
-    items = [{"node_id": "a", "content": "short one", "score": 1.7321},
-             {"node_id": "b", "content": "", "score": 1.1, "image_ref": "/tmp/x.png"},
-             {"node_id": "c", "content": "x" * 200, "score": 0.8}]              # exactly at the shared cut
-    shared = _shared_surfacing.SurfacingMonitor.format_context(SimpleNamespace(), items)
-    assert pith._format_cc_monitor_block(items) == shared
-    assert pith._format_cc_monitor_block([]) == ""
-
-
-def test_monitor_items_are_re_resolved_whole_by_node_id_and_fail_soft():
-    g = FakeGraph()
-    full = "z" * 700
-    g.node("a", full)
-    ng = fake_ng(g, [], vdb=FakeVectorDB({"v": {"content": "from the vdb " + "q" * 400}}))
-    g.node("v", "")                                                   # substrate empty -> vdb fallback
-    items = [{"node_id": "a", "content": full[:239] + "…", "score": 1.0},
-             {"node_id": "v", "content": "cut…", "score": 0.9},
-             {"node_id": "gone", "content": "kept as-is", "score": 0.5}]
-    out = pith._cc_monitor_items_whole(ng, items)
-    assert out[0]["content"] == full
-    assert out[1]["content"] == "from the vdb " + "q" * 400
-    assert out[2]["content"] == "kept as-is"                          # unknown node: never dropped
-    assert [o["score"] for o in out] == [1.0, 0.9, 0.5]
 
 
 def test_recall_short_items_render_exactly_as_base():
@@ -693,16 +650,7 @@ def test_no_resolve_surface_content_call_passes_a_literal_character_cap():
                 for kw in node.keywords:
                     if kw.arg == "max_chars":
                         assert not isinstance(kw.value, ast.Constant), ast.dump(kw.value)
-    assert seen >= 2                                                  # recall + the CC monitor route
-
-
-def test_cc_assemble_recall_asks_recall_for_whole_content_by_literal_true():
-    tree = ast.parse(open(_ORGANISM_SRC).read())
-    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "cc_assemble_recall")
-    hits = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
-            and getattr(c.func, "id", None) == "cc_pattern_completion_recall"]
-    assert hits and all(any(k.arg == "whole_content" and isinstance(k.value, ast.Constant)
-                            and k.value.value is True for k in c.keywords) for c in hits)
+    assert seen >= 1                                                  # the recall site (#812: the CC monitor route is gone)
 
 
 def test_unpithed_renderer_fails_open_loudly_when_its_own_budget_step_breaks(monkeypatch, caplog):
@@ -925,70 +873,6 @@ def test_c1_a_first_unpinned_line_longer_than_the_budget_is_absent_with_the_info
     assert [l.node_id for l in out] == ["pin", "small"]              # rank-1 giant absent, pin untouched
     (record,) = _drop_records(caplog, "whole items")
     assert "FIRST-GIANT" in record.getMessage() and "900" in record.getMessage()
-
-
-class _Boom(Exception):
-    pass
-
-
-def _raising_resolver(bad_ids, secret="SECRET-NODE-TEXT-DO-NOT-LOG"):
-    import surface_resolver
-    real = surface_resolver.resolve_surface_content
-
-    def fake(node, entry, *a, **k):
-        if getattr(node, "node_id", None) in bad_ids:
-            raise _Boom(secret)
-        return real(node, entry, *a, **k)
-    return fake
-
-
-def test_c2_a_monitor_item_whose_re_resolve_raises_is_dropped_and_warned_without_text(monkeypatch, caplog):
-    import surface_resolver
-    pith._PITH_DROP_SEEN.clear()
-    g = FakeGraph()
-    g.node("ok", "fine " * 100)
-    g.node("bad", "BAD-NODE-BODY " * 40)
-    monkeypatch.setattr(surface_resolver, "resolve_surface_content", _raising_resolver({"bad"}))
-    ng = fake_ng(g, [])
-    items = [{"node_id": "ok", "content": "cut…", "score": 1.0},
-             {"node_id": "bad", "content": "the shared 240-char snippet…", "score": 0.9}]
-    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
-        out = pith._cc_monitor_items_whole(ng, items)
-    assert [o["node_id"] for o in out] == ["ok"]                     # whole-or-ABSENT: no cut item kept
-    assert out[0]["content"] == ("fine " * 100).strip()
-    (record,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    msg = record.getMessage()
-    assert "bad" in msg and "_Boom" in msg and "1 item" in msg
-    assert "SECRET-NODE-TEXT-DO-NOT-LOG" not in msg and "BAD-NODE-BODY" not in msg
-    assert "shared 240-char snippet" not in msg
-
-
-def test_c2_repeated_failures_still_warn_but_name_the_id_once(monkeypatch, caplog):
-    import surface_resolver
-    pith._PITH_DROP_SEEN.clear()
-    g = FakeGraph()
-    g.node("bad", "x" * 300)
-    monkeypatch.setattr(surface_resolver, "resolve_surface_content", _raising_resolver({"bad"}))
-    with caplog.at_level(logging.WARNING, logger=pith.logger.name):
-        pith._cc_monitor_items_whole(fake_ng(g, []), [{"node_id": "bad", "content": "c…", "score": 1.0}])
-        pith._cc_monitor_items_whole(fake_ng(g, []), [{"node_id": "bad", "content": "c…", "score": 1.0}])
-    first, second = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert "bad" in first and "bad" not in second and "already reported" in second
-
-
-@pytest.mark.parametrize("pith_on", [True, False], ids=["pith_on", "gate_off"])
-def test_c2_a_dropped_monitor_item_does_not_take_its_pattern_twin_with_it(monkeypatch, pith_on):
-    import surface_resolver
-    g = FakeGraph()
-    _core(g)
-    full = "TWIN-WHOLE-TEXT " + ("t" * 500)
-    g.node("twin", full)
-    monkeypatch.setattr(surface_resolver, "resolve_surface_content", _raising_resolver({"twin"}))
-    monitor_items = [{"node_id": "twin", "content": full[:239] + "…", "score": 1.5}]
-    pat = [{"node_id": "twin", "score": 90.0, "content": full, "prefetch_origin": False}]
-    out, _ = _recall(pith, fake_ng(g, monitor_items), pat, pith_on, monkeypatch)
-    assert out.count(full) == 1                                      # present once, via the pattern stream
-    assert "…" not in out
 
 
 def _tree_world(n_trees, tree_len=200):
