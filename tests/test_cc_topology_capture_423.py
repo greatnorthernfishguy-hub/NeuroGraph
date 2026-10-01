@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13145) — #910: harness namespace
+# What: load_merge() injects the two new names merge_cc_topology references (is_resolved_model_id -- the REAL predicate --
+#   and a resolve_embedding_model stub that fails if reached). No assertion changed.
+# Why: the harness exec()s only AST-selected names, so a new module-level dependency of merge_cc_topology is a NameError
+#   here. This test did NOT encode the dead guard: it always passes expected_embedding_model='test' and a 'test' header.
 # [2026-09-11] Codex — #423 topology capture interleaving regression tests
 # What: execute canonical merge AST with fake graphs and in-memory conduit frames.
 # Why: capture must observe completed node/vector/binding batches, with I/O outside.
@@ -15,6 +20,15 @@ from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pytest
+
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from cc_topology_export import is_resolved_model_id  # noqa: E402
+
+
+def _resolver_must_not_run():
+    raise AssertionError('resolve_embedding_model reached: expected_embedding_model was not honoured')
 
 
 class FakeGraph:
@@ -93,6 +107,11 @@ def load_merge(monkeypatch, graph, vectors, frames):
               _DEFAULT_MAX_NODES_PER_CALL=25,
               _load_membership=lambda p: set(), _write_membership=membership,
               read_topology_frames=decode, is_cc_provenance=lambda nid, meta: True,
+              # #910: merge_cc_topology now calls the shared model-id predicate/resolver.
+              # The REAL predicate; the resolver is never reached (every caller here passes
+              # expected_embedding_model) so a stub that fails loudly if it is.
+              is_resolved_model_id=is_resolved_model_id,
+              resolve_embedding_model=_resolver_must_not_run,
               _synapse_type=lambda value: value)
     exec(compile(selected, str(source), 'exec'), ns)
     return ns['merge_cc_topology'], calls

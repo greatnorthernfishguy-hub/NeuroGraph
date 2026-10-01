@@ -3,6 +3,22 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13145) — #910: the embedding-model guard must actually guard (ONE resolver, fail closed)
+# What: new `resolve_embedding_model()` (the configured model id of the live NGEmbed instance, or None -- NEVER the
+#   string "unknown") and `is_resolved_model_id()` (the one predicate for "this is a usable model id"), both
+#   consumed by the sender here AND by the receiver (cc_topology_merge imports them; no per-side copy). Both
+#   exporters now stamp through `_require_embedding_model()`, which REFUSES (ValueError, hardcoded message) rather
+#   than write a conduit whose header cannot name its embedder. The `getattr(ng_embed, "MODEL_NAME"/"_MODEL_NAME")
+#   ... or "unknown"` blocks (export_cc_topology, export_cc_topology_frame) are gone. Wire format, header field
+#   name, frame/budget logic and every other check are unchanged.
+# Why: Exec Packet 492 / #910 (F5 of #899). ng_embed defines NEITHER MODEL_NAME nor _MODEL_NAME (the id lives in
+#   _DEFAULT_CONFIG["model_id"] and on the instance's `stats["model_id"]`), so both ends always resolved "unknown"
+#   and the receiver's `"unknown" not in (wire, local)` waiver made FatherGraph Finding 6 (unverifiable embedding
+#   geometry must not land) dead code on the real wire.
+# How: `NGEmbed.get_instance().stats["model_id"]` is a PUBLIC read of the CONFIGURED id. get_instance()/__init__
+#   only build a config dict and locks; the ONNX/tokenizer/network work is lazy in _ensure_model, which the
+#   resolver never calls, so a header read stays cheap and offline. ng_embed.py (vendored, LAW 2) is untouched.
+#   Any resolution failure logs the exception CLASS name only and yields None.
 # [2026-08-28] Claude Code (DudeMan CC, Opus 4.8) — #147 amendment: in-frame HE completeness + identity crosses the callosum
 # What: (1) HE closure no longer leans on the ack ledger. _closeable_he now requires
 #       EVERY member of a hyperedge to be eligible, and counts a member as "already
@@ -500,6 +516,66 @@ def _frame(payload: Dict[str, Any]) -> bytes:
     return struct.pack(_LEN_PREFIX, len(body)) + body
 
 
+def is_resolved_model_id(value: Any) -> bool:
+    """True iff `value` is a usable embedding-model id: a non-blank string that is
+    not the literal "unknown" (the sentinel the dead guard used to stamp and waive).
+
+    The ONE predicate for both ends of the callosum (#910): the sender refuses to
+    stamp anything that fails it, the receiver aborts on a wire or local id that
+    fails it. A wire header is untrusted -- a non-string value fails.
+    """
+    return (isinstance(value, str) and value.strip() != ""
+            and value.strip().lower() != "unknown")
+
+
+def resolve_embedding_model() -> Optional[str]:
+    """The CONFIGURED embedding-model id of this process's live NGEmbed instance,
+    or None when it cannot be resolved. NEVER the string "unknown" (#910).
+
+    Used by BOTH ends of the callosum -- the sender stamps the header with it, the
+    receiver compares the wire id against it -- so the two cannot disagree about
+    where the id comes from. `NGEmbed.get_instance().stats["model_id"]` is a public
+    read of the instance's configured id (which can differ from _DEFAULT_CONFIG if a
+    config was passed). get_instance()/__init__ only build a config dict; the ONNX
+    session, tokenizer and any download are lazy in _ensure_model, which is never
+    called here -- a header read stays cheap and offline.
+
+    Failure is logged by exception CLASS only (never str(exc)) and returns None; the
+    caller decides what an unresolvable id means (both ends fail closed).
+    """
+    try:
+        from ng_embed import NGEmbed
+        model_id = NGEmbed.get_instance().stats["model_id"]
+    except Exception as exc:
+        logger.error("CC topology: embedding model id unresolvable (%s)", type(exc).__name__)
+        return None
+    if not is_resolved_model_id(model_id):
+        logger.error("CC topology: live embedder reports no usable model id (type %s)",
+                     type(model_id).__name__)
+        return None
+    return model_id
+
+
+def _require_embedding_model(embedding_model: Optional[str]) -> str:
+    """The id the sender stamps in the header, or a refusal (#910).
+
+    None -> resolve from the live embedder. An explicit id is honoured, but an
+    explicit blank / "unknown" is no better than an unresolvable one. An unstamped
+    frame is exactly what must never be sent: the receiver cannot verify its
+    geometry (FatherGraph Finding 6) and would have to abort it, so it is not
+    written at all.
+    """
+    if embedding_model is None:
+        embedding_model = resolve_embedding_model()
+    if not is_resolved_model_id(embedding_model):
+        logger.error("CC topology export REFUSED: reason=embedding_model_unresolved")
+        raise ValueError(
+            "embedding model id unresolvable -- refusing to write a topology conduit "
+            "whose header cannot name the embedder that produced its vectors"
+        )
+    return embedding_model
+
+
 def export_cc_topology(
     graph: Any,
     vector_db: Any,
@@ -523,7 +599,9 @@ def export_cc_topology(
 
     The embedding-model stamp in the header is FatherGraph Finding 6: both ends
     must share the embedder or cosine similarity is noise. The receiver asserts
-    on it and aborts rather than absorbing mismatched geometry.
+    on it and aborts rather than absorbing mismatched geometry. A sender that
+    cannot resolve its model id (#910) REFUSES to export (ValueError) -- it never
+    writes an unstamped / "unknown" header.
     """
     machine_id = machine_id or os.environ.get("MACHINE_ID")
     if not machine_id:
@@ -534,13 +612,7 @@ def export_cc_topology(
             "than guess which hemisphere authored it"
         )
 
-    if embedding_model is None:
-        try:
-            import ng_embed
-            embedding_model = getattr(ng_embed, "MODEL_NAME", None) or getattr(
-                ng_embed, "_MODEL_NAME", None) or "unknown"
-        except Exception:
-            embedding_model = "unknown"
+    embedding_model = _require_embedding_model(embedding_model)
 
     nodes, stats = collect_cc_topology(graph, vector_db, exclude_ids=exclude_ids)
 
@@ -751,13 +823,7 @@ def export_cc_topology_frame(
             logger.info("CC topology frame: deferring -- resource gate: %s", reason)
             return stats
 
-    if embedding_model is None:
-        try:
-            import ng_embed
-            embedding_model = getattr(ng_embed, "MODEL_NAME", None) or getattr(
-                ng_embed, "_MODEL_NAME", None) or "unknown"
-        except Exception:
-            embedding_model = "unknown"
+    embedding_model = _require_embedding_model(embedding_model)
     stats["embedding_model"] = embedding_model
 
     hard_cap = max(frame_size, frame_size * max(1, overflow_factor))

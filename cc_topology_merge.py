@@ -3,6 +3,21 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane model-guard-910, dispatch #13145) — #910: the embedding-model guard actually guards (fail closed, no "unknown" waiver)
+# What: the FatherGraph Finding 6 check no longer waives "unknown". The receiver ABORTS (TopologyMergeAbort, logged at
+#   ERROR first with a fixed reason code, hardcoded message, never str(exc)) when the wire id is missing / None /
+#   blank / "unknown" (wire_model_unverifiable), when the local id cannot be resolved (local_model_unresolvable), or
+#   when they differ (model_mismatch -- message text unchanged: "embedding model mismatch: conduit=... local=...").
+#   `_local_embedding_model()` is REMOVED (it read ng_embed.MODEL_NAME/_MODEL_NAME, which do not exist, and returned
+#   "unknown"; nothing in either repo referenced it): the local id now comes from the ONE shared resolver,
+#   cc_topology_export.resolve_embedding_model, the same function the sender stamps with. `expected_embedding_model`
+#   keeps its meaning (an explicit expectation overrides the local resolve; an explicit "unknown" is unusable and
+#   aborts). No other check, no wire format, no stats key, no #897 guard/clock logic changed.
+# Why: Exec Packet 492 / #910 (F5 of #899). Both ends resolved "unknown" and the waiver
+#   `wire != local and "unknown" not in (wire, local)` could therefore never abort: a frame from ANY model landed.
+# How: the abort is raised before any node / synapse / hyperedge lands and before _write_membership, and this module
+#   never deletes the conduit, so an aborted conduit stays in place unconsumed and the membership ack (the sender's
+#   cursor) does not advance -- Leg 2 holds, loudly, until both ends name the same model.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane merge-guard-897, dispatch #12973) — #897: the consolidation guard covers the WHOLE graph
 # What: the between-batch consolidation guard no longer asks `_unbound_nodes(graph, merge_landed)`
 #   (this merge's arrivals only); it asks `_unbound_nodes(graph, set(graph.nodes))` -- the SAME
@@ -165,7 +180,9 @@ from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
-from cc_topology_export import read_topology_frames, is_cc_provenance
+from cc_topology_export import (
+    read_topology_frames, is_cc_provenance, resolve_embedding_model, is_resolved_model_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,15 +276,6 @@ def _write_membership(membership_path: Optional[str], node_ids: Set[str]) -> Non
         logger.warning("CC topology membership snapshot write failed (non-fatal): %s", exc)
 
 
-def _local_embedding_model() -> str:
-    try:
-        import ng_embed
-        return (getattr(ng_embed, "MODEL_NAME", None)
-                or getattr(ng_embed, "_MODEL_NAME", None) or "unknown")
-    except Exception:
-        return "unknown"
-
-
 def _synapse_type(name: Optional[str]):
     from neuro_foundation import SynapseType
     if not name:
@@ -353,13 +361,41 @@ def merge_cc_topology(
             "re-absorb our own export")
 
     wire_model = header.get("embedding_model")
-    local_model = expected_embedding_model or _local_embedding_model()
-    if wire_model != local_model and "unknown" not in (wire_model, local_model):
-        # FatherGraph Finding 6. Not degradable -- see module header.
+    local_model = expected_embedding_model or resolve_embedding_model()
+    # FatherGraph Finding 6. Not degradable -- see module header. FAIL CLOSED (#910):
+    # a missing / blank / "unknown" wire id, a local id that cannot be resolved, and a
+    # mismatch ALL abort. There is deliberately no waiver: "unknown" used to be
+    # waived on either side, which (with both ends always resolving "unknown") meant
+    # the guard never fired. Unverifiable geometry never lands. This raises before
+    # any node / synapse / hyperedge lands and before _write_membership, and the
+    # merge never deletes the conduit, so the file stays in place unconsumed and the
+    # membership ack (the sender's cursor) does not advance.
+    if not is_resolved_model_id(wire_model):
+        abort_reason = "wire_model_unverifiable"
+    elif not is_resolved_model_id(local_model):
+        abort_reason = "local_model_unresolvable"
+    elif wire_model != local_model:
+        abort_reason = "model_mismatch"
+    else:
+        abort_reason = None
+    if abort_reason is not None:
+        # Model ids are identifiers, not text -- but the wire id is untrusted, so
+        # it is shown repr()'d and capped, never interpolated raw or via str(exc).
+        logger.error(
+            "CC topology merge ABORT: reason=%s conduit=%s local=%s -- conduit left "
+            "in place, unconsumed; nothing landed, ack not advanced",
+            abort_reason, repr(wire_model)[:80], repr(local_model)[:80])
+        if abort_reason == "model_mismatch":
+            raise TopologyMergeAbort(
+                f"embedding model mismatch: conduit={repr(wire_model)[:80]} "
+                f"local={repr(local_model)[:80]}. "
+                "Cosine similarity between differently-embedded vectors is noise; "
+                "refusing to absorb rather than silently corrupt recall geometry")
         raise TopologyMergeAbort(
-            f"embedding model mismatch: conduit={wire_model!r} local={local_model!r}. "
-            "Cosine similarity between differently-embedded vectors is noise; "
-            "refusing to absorb rather than silently corrupt recall geometry")
+            f"embedding model unverifiable [{abort_reason}]: "
+            f"conduit={repr(wire_model)[:80]} local={repr(local_model)[:80]}. "
+            "Unverifiable embedding geometry must not land (FatherGraph Finding 6); "
+            "refusing to absorb, conduit left in place")
 
     held = _load_membership(membership_path)
     stats = {
