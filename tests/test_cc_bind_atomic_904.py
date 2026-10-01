@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13437 — #904 ROUND 2: le-053 F1-1 (the verdict sentence says what was
+#   KEPT), F1-2 (a probation sweep between the snapshot and the rollback is NOT erased; a key added by the call is deleted), F1-3 (the restore's
+#   field list is tied to the deposit's write-set by AST), F1-4 (the unrestorable count is printed).
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13259 — #904 FOLD-UP: tests for C3/F11 (a failed EXACT-REPEAT
 #   turn failing after the hyperedge create: kills M20), C4/F1 (a failed attempt leaves NO trace on a pre-existing node, over N held cycles),
 #   checker-038 corrections 2 (a raising vdb.get() must not orphan what the call inserted) and 3 (the bind COMPLETES, a LATER stage fails).
@@ -20,8 +23,10 @@
 #   a mutation) so the same file can be run against the base and against each mutation. P379/#770: a preamble prints every module's path and
 #   the session FAILS if an NG module (other than a scratch org under /tmp/z12-904-scratch) resolves outside this worktree.
 # -------------------
+import ast
 import hashlib
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -977,6 +982,124 @@ def test_when_the_bind_completes_and_a_later_stage_fails_the_persisted_sidecar_i
     assert w.run(TURN_B) is False
     assert d._guarded_save('test') is True
     assert json.loads((r.ckpt / '.cc_conv_last_forest').read_text())['last_forest_id'] == _forest_id(TURN_A)
+
+
+# ------------------------------------------------------------------ #904 ROUND 2 (dispatch #13437): le-053 F1-1..F1-4
+
+# ---- F1-2: the restore is NARROW (exactly what the failed call wrote), and conditional
+
+def test_a_probation_sweep_between_the_snapshot_and_the_rollback_is_not_erased(world):
+    """FAILS on build-002 (the whole-dict restore erased the sweep's changes). The sweep (cc_update_probation) takes the same lock
+    on the autosave pulse and rewrites these fields on a node the dual pass does not own at that moment. Simulated INSIDE the failing
+    call, after every deposit and before the rollback: the rollback must leave the sweep's changes and every key the deposit never
+    wrote, and still restore the fields the deposit wrote and nobody touched since."""
+    w = world
+    assert w.run(TURN_A) is True
+    _age_every_node(w)
+    fid = _forest_id(TURN_A)
+    f = w.graph.nodes[fid]
+    f.metadata['probation_total'], f.metadata['novelty_dampening'], f.metadata['poincare_dir'] = 99, 0.77, b'ORIGINAL-POINCARE'
+
+    def sweep_then_fail(*a, **k):
+        with w.graph._step_lock:                                   # what the sweep does, under the same lock
+            f.threshold, f.intrinsic_excitability = 0.123, 0.456
+            f.metadata['probation_remaining'] = 7
+            f.metadata['graduated'] = False                        # a key the deposit NEVER writes
+            f.metadata['probation_expired_unfired'] = True         # a key that did not exist before
+        raise RuntimeError(SECRET)
+    w.graph.create_hyperedge = sweep_then_fail
+    assert w.run(TURN_A) is False
+    assert (f.threshold, f.intrinsic_excitability, f.metadata['probation_remaining']) == (0.123, 0.456, 7)   # the sweep's, kept
+    assert f.metadata['graduated'] is False and f.metadata['probation_expired_unfired'] is True
+    assert f.metadata['probation_total'] == 99 and f.metadata['novelty_dampening'] == 0.77        # the call's writes, nobody touched: restored
+    assert f.metadata['poincare_dir'] == b'ORIGINAL-POINCARE'
+
+
+def test_a_key_the_failed_call_added_is_deleted_and_the_key_order_is_preserved(world):
+    w = world
+    assert w.run(TURN_A) is True
+    f = w.graph.nodes[_forest_id(TURN_A)]
+    del f.metadata['novelty_dampening'], f.metadata['probation_total']        # absent BEFORE the call
+    before = repr(f.metadata)
+    w.graph.create_hyperedge = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(SECRET))
+    assert w.run(TURN_A) is False
+    assert 'novelty_dampening' not in f.metadata and 'probation_total' not in f.metadata
+    assert repr(f.metadata) == before                                          # byte-identical, order included
+
+
+# ---- F1-3: the restore's field list is TIED to _cc_deposit_memory_node's write-set
+
+def test_the_restores_field_list_is_tied_to_the_deposits_write_set():
+    """Fails if _cc_deposit_memory_node starts writing an attribute or a metadata key the restore does not cover (or any write form
+    this test cannot classify). `metadata.update(meta)` is covered generically (every key of the call's meta is snapshotted)."""
+    tree = ast.parse(inspect.getsource(org._cc_deposit_memory_node).lstrip())
+    attrs, keys, unknown = set(), set(), []
+    for n in ast.walk(tree):
+        targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+        for t in targets:
+            if isinstance(t, ast.Name):
+                continue                                                      # a local
+            if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == 'node':
+                attrs.add(t.attr)
+            elif isinstance(t, ast.Subscript) and ast.unparse(t.value) == 'node.metadata' and isinstance(t.slice, ast.Constant):
+                keys.add(t.slice.value)
+            else:
+                unknown.append(ast.unparse(t))
+    calls = [ast.unparse(c) for c in ast.walk(tree) if isinstance(c, ast.Call) and ast.unparse(c.func).startswith('node.')]
+    assert calls == ['node.metadata.update(meta)'], calls
+    assert unknown == [], unknown
+    eco = org._CCConversationalDualPassEco
+    assert attrs == set(eco._STAMPED_ATTRS), (attrs, eco._STAMPED_ATTRS)
+    assert keys == set(eco._STAMPED_META_KEYS), (keys, eco._STAMPED_META_KEYS)
+
+
+# ---- F1-1: the verdict sentence must not contradict vdb_kept_unprovable
+
+@pytest.mark.parametrize('concepts,windows,n,noun', [(CONCEPTS_A, ['A window one', 'A window two'], 3, 'entries'),
+                                                      ([], ['S window one'], 1, 'entry')])
+def test_the_rolled_back_sentence_says_what_was_KEPT_when_a_vdb_entry_could_not_be_proven(world, caplog, concepts, windows, n, noun):
+    """FAILS on build-002 (it said "rolled back, nothing of this turn remains" beside vdb_kept_unprovable=n>0)."""
+    w = world
+    w.vdb = GetRaisesVDB()
+    w.concepts[TURN_A], w.windows[TURN_A] = list(concepts), list(windows)
+    assert w.run(TURN_A) is True
+    w.vdb.get_raises = lambda i: True
+    w.graph.create_hyperedge = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(SECRET))
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_A) is False
+    rec = _loud(caplog)[0]
+    msg = rec.getMessage()
+    assert rec.levelno == logging.WARNING                                    # the rollback itself succeeded
+    assert 'rolled back; kept: %d pre-existing vdb %s that could not be proven' % (n, noun) in msg
+    assert 'nothing of this turn remains' not in msg
+    assert 'vdb_kept_unprovable=%d;' % n in msg                              # the earlier substring is unchanged
+
+
+def test_the_nothing_remains_sentence_is_kept_when_nothing_was_kept(world, monkeypatch, caplog):
+    w = world
+    _inject(w, 'bind_hyperedge', monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_B) is False
+    msg = _loud(caplog)[0].getMessage()
+    assert 'rolled back, nothing of this turn remains' in msg and 'kept:' not in msg
+
+
+# ---- F1-4: the unrestorable count is printed
+
+def test_the_unrestorable_count_is_printed_and_a_snapshot_that_cannot_be_taken_is_an_error(world, monkeypatch, caplog):
+    w = world
+    assert w.run(TURN_A) is True
+    w.graph.create_hyperedge = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(SECRET))
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_A) is False
+    assert 'unrestorable=0;' in _loud(caplog)[0].getMessage()                # printed even when 0
+    monkeypatch.setattr(org._CCConversationalDualPassEco, '_STAMPED_ATTRS', ('threshold', 'no_such_attribute'))
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=org.logger.name):
+        assert w.run(TURN_A) is False
+    rec = _loud(caplog)[0]
+    assert rec.levelno == logging.ERROR and 'ROLLBACK FAILED' in rec.getMessage()
+    assert 'unrestorable=5;' in rec.getMessage()                             # the forest, 2 trees and 2 windows: 5 pre-existing nodes
 
 
 # ------------------------------------------------------------------ Exec Packet 489: the want seed-synapse swallow is LOUD

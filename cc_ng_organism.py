@@ -52,6 +52,21 @@
 #   batch, run by the daemon -- never inside drain_ingest_tract, which still never steps); the newer ruling wins and reconciling the
 #   two texts is #895. drain_gateway_conduit's inert batch_size/idle_steps arguments coexist with this live path for the other
 #   drain (LAW 3 shrapnel, #895).
+# [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13437 — #904 ROUND 2 (le-053 F1-1..F1-4)
+# What: (F1-2) the rollback of a PRE-EXISTING node's re-stamp is NARROWED to exactly what the failed call wrote. It no longer clears and
+#   refills the node's whole metadata dict and resets threshold / excitability unconditionally (that could erase a change the probation
+#   sweep, which rewrites those fields under the same lock on the autosave pulse, made between the snapshot and the rollback). The eco
+#   snapshots only the deposit's write-set (_STAMPED_ATTRS, _STAMPED_META_KEYS and every key of the call's own `meta`; a key absent
+#   before is remembered as absent), records after the deposit what it wrote, and the rollback restores a field ONLY while it still holds
+#   that value (a key absent before is deleted); a field another writer changed since, and every key the deposit never wrote, are left alone.
+#   (F1-1) the failure record no longer says "rolled back, nothing of this turn remains" when vdb_kept_unprovable > 0: it says what was
+#   KEPT ("kept: <n> pre-existing vdb entr(y/ies) that could not be proven"). (F1-4) the unrestorable count is printed
+#   ("unrestorable=<n>;" after the existing vdb_kept_unprovable field; every earlier substring is unchanged).
+# Why: le-053 corrections F1-1 / F1-2 / F1-4; #904's own principle "rollback exactly what the call wrote".
+# How: _cc_deposit_memory_node is UNCHANGED (AST-pinned; tests/test_cc_capture_mutations_423.py passes unmodified): the narrowing lives on the
+#   eco class. (F1-3) tests/test_cc_bind_atomic_904.py ties the restore's field list to the deposit's write-set by AST.
+#   Known limit of a conditional restore: a field the sweep rewrote in between is left as the sweep left it (e.g. probation_remaining one
+#   lower than the call's reset), so a failed attempt's reset can survive in that field; that is the price of never erasing another writer.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane dual-pass-atomic-904, dispatch #13259 — #904 FOLD-UP (Chief-003 + Exec Packet 497 (e))
 # What: (C4/F1, a DEFECT) a failed attempt now leaves NO trace on a PRE-EXISTING node. _cc_deposit_memory_node re-stamps a pre-existing
 #   node's threshold, intrinsic_excitability, probation/novelty metadata and poincare_dir and re-writes its vdb entry on EVERY deposit,
@@ -2104,6 +2119,13 @@ class _CCConversationalDualPassEco:
     two substrates' memories are never confused if ever inspected together.
     """
 
+    # What _cc_deposit_memory_node stamps on a node, besides every key of the call's own `meta` (its metadata.update(meta)):
+    # the rollback restores EXACTLY these fields and nothing else (#904 round 2, F1-2). A test (F1-3) ties these two tuples to
+    # the deposit's write-set by AST, so a new stamped field cannot be added to the deposit without failing it.
+    _STAMPED_ATTRS = ("threshold", "intrinsic_excitability")
+    _STAMPED_META_KEYS = ("probation_remaining", "probation_total", "novelty_dampening", "poincare_dir")
+    _ABSENT = object()
+
     def __init__(self, graph, vector_db):
         self._graph = graph
         self._vector_db = vector_db
@@ -2139,23 +2161,48 @@ class _CCConversationalDualPassEco:
                     else:
                         # A pre-existing node: cannot prove this call creates the entry, never delete it (counted).
                         self.vdb_unprovable += 1
+            snap = None
             if not node_was_new:
-                self._snapshot_existing(node_id, entry)
+                snap = self._snapshot_existing(node_id, entry, meta)
             self.writes.append((node_id, kind, node_was_new, vdb_fresh))
-            return _cc_deposit_memory_node(self._graph, self._vector_db, node_id, embedding,
-                                            content, meta, index_in_recall=index_in_recall)
+            try:
+                return _cc_deposit_memory_node(self._graph, self._vector_db, node_id, embedding,
+                                                content, meta, index_in_recall=index_in_recall)
+            finally:
+                if snap is not None:
+                    self._record_written(snap)
 
-    def _snapshot_existing(self, node_id, vdb_entry):
-        """Snapshot a pre-existing node (threshold, excitability, a copy of its metadata in order, and the references of its
-        vdb entry) BEFORE the deposit re-stamps it. Called under the mutation lock."""
+    def _snapshot_existing(self, node_id, vdb_entry, meta):
+        """Snapshot, BEFORE the deposit re-stamps a PRE-EXISTING node, only the fields the deposit writes: the two stamped
+        attributes and the stamped metadata keys plus every key of this call's `meta` (a key ABSENT before is remembered as
+        absent, so the rollback deletes it), and the references of the node's vdb entry. Called under the mutation lock.
+        Returns the snapshot (or None when it could not be taken: counted `unrestorable`)."""
         try:
             node = self._graph.nodes[node_id]
-            self.restores.append({
-                "id": node_id, "node": node, "threshold": node.threshold,
-                "excitability": node.intrinsic_excitability, "meta": dict(node.metadata),
+            absent = self._ABSENT
+            keys = list(dict.fromkeys(list(meta) + list(self._STAMPED_META_KEYS)))
+            snap = {
+                "id": node_id, "node": node, "keys": keys,
+                "attrs_before": {a: getattr(node, a) for a in self._STAMPED_ATTRS},
+                "meta_before": {k: (node.metadata[k] if k in node.metadata else absent) for k in keys},
+                "attrs_wrote": None, "meta_wrote": None,
                 "vdb": ((vdb_entry["embedding"], vdb_entry["content"], vdb_entry["metadata"])
                         if vdb_entry else None),
-            })
+            }
+            self.restores.append(snap)
+            return snap
+        except Exception:
+            self.unrestorable += 1
+            return None
+
+    def _record_written(self, snap):
+        """After the deposit (also when it raised): the value of each field NOW, i.e. what THIS call wrote. The rollback
+        restores a field only while it still holds that value, so a change another writer (the probation sweep) made in
+        between is never erased."""
+        try:
+            node, absent = snap["node"], self._ABSENT
+            snap["attrs_wrote"] = {a: getattr(node, a) for a in self._STAMPED_ATTRS}
+            snap["meta_wrote"] = {k: (node.metadata[k] if k in node.metadata else absent) for k in snap["keys"]}
         except Exception:
             self.unrestorable += 1
 
@@ -2205,16 +2252,29 @@ class _CCConversationalDualPassEco:
                     except Exception:
                         ok = False
             # A pre-existing node's re-stamp is undone LAST-IN-FIRST-OUT (a node deposited twice in one call ends at its
-            # original state): threshold, excitability and the metadata dict in its original key order, IN PLACE (the vdb
-            # entry shares that dict), then its vdb entry's original embedding / content / metadata references.
+            # original state), and ONLY what this call wrote: the stamped attributes and the metadata keys the deposit wrote,
+            # each put back (a key absent before is deleted) while it STILL holds the value this call wrote; a field another
+            # writer changed since (the probation sweep) is left alone, as is every key the deposit never wrote. Then the
+            # node's vdb entry gets its original embedding / content / metadata references back.
+            def same(a, b):
+                try:
+                    return a is b or (type(a) is type(b) and bool(a == b))
+                except Exception:
+                    return False
             for snap in reversed(self.restores):
                 try:
-                    node = snap["node"]
-                    if graph.nodes.get(snap["id"]) is node:
-                        node.threshold = snap["threshold"]
-                        node.intrinsic_excitability = snap["excitability"]
-                        node.metadata.clear()
-                        node.metadata.update(snap["meta"])
+                    node, absent = snap["node"], self._ABSENT
+                    if graph.nodes.get(snap["id"]) is node and snap["meta_wrote"] is not None:
+                        for a, before in snap["attrs_before"].items():
+                            if same(getattr(node, a), snap["attrs_wrote"][a]):
+                                setattr(node, a, before)
+                        for k in snap["keys"]:
+                            cur = node.metadata[k] if k in node.metadata else absent
+                            if same(cur, snap["meta_wrote"][k]):
+                                if snap["meta_before"][k] is absent:
+                                    node.metadata.pop(k, None)
+                                else:
+                                    node.metadata[k] = snap["meta_before"][k]
                     if snap["vdb"] is not None:
                         emb, content, meta = snap["vdb"]
                         vdb.insert(id=snap["id"], embedding=emb, content=content, metadata=meta)
@@ -2574,10 +2634,13 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
             rolled_back = False
         (logger.warning if rolled_back else logger.error)(
             "CC conversational dual-pass FAILED after the first write: stage=%s site=%s site_attempted=%d site_failed=%d "
-            "exc_type=%s written forest=%d trees=%d windows=%d synapses=%d hyperedges=%d vdb_kept_unprovable=%d; %s; the turn is NOT bound",
+            "exc_type=%s written forest=%d trees=%d windows=%d synapses=%d hyperedges=%d vdb_kept_unprovable=%d; "
+            "unrestorable=%d; %s; the turn is NOT bound",
             stage, site or "-", site_attempted, 1 if site else 0, type(exc).__name__,
-            n_forest, n_tree, n_window, n_syn, n_he, eco.vdb_unprovable,
-            "rolled back, nothing of this turn remains" if rolled_back
+            n_forest, n_tree, n_window, n_syn, n_he, eco.vdb_unprovable, eco.unrestorable,
+            ("rolled back, nothing of this turn remains" if not eco.vdb_unprovable
+             else "rolled back; kept: %d pre-existing vdb entr%s that could not be proven (re-written by this call, not restored)"
+             % (eco.vdb_unprovable, "y" if eco.vdb_unprovable == 1 else "ies")) if rolled_back
             else "ROLLBACK FAILED, a partial write REMAINS",
         )
         return False
