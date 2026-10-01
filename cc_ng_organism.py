@@ -3,6 +3,40 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane drain-pacing-d24, dispatches #12669/#12731) — D24 (re-scoped):
+#   pace the ingest-tract drain by NODES; make _cc_callosum_consolidate's failure loud
+# What: (1) drain_ingest_tract gains two OPTIONAL default-None parameters, `batch_nodes` and `receipt`. With
+#   `batch_nodes` set (> 0) the drain takes WHOLE turns until the NODES created in this call reach it (the turn that
+#   crosses it is absorbed whole -- a turn's dual pass is ATOMIC -- then the batch ends; a single turn alone over the
+#   size is ONE batch); the remainder stays in the tract file through the EXISTING partial-truncate (the same
+#   mechanism max_entries uses; no second one). `receipt` is an OUT-PARAMETER dict the caller reads afterwards:
+#   {nodes_created, ended_on_size, arrivals (set of node ids: graph.nodes ids after minus before, taken once per
+#   call), turns_taken, reason}. `reason` is a hardcoded constant: size_reached | entries_cap_reached |
+#   tract_exhausted | parse_failed | no_batch. Receipt writes are guarded (756b-reporter style: never raises, logs
+#   the exception CLASS NAME only, never str(exc), never entry text). Nodes are counted as the len(graph.nodes)
+#   delta around the atomic call, so the dual pass is untouched; an exact-repeat turn (content-hashed ids) creates 0.
+#   (2) _cc_callosum_consolidate's failure was logged at DEBUG (return False, nothing else): the silent class
+#   (plan-002 7A item 5c). It is now logged at ERROR with the exception CLASS NAME only. Return value, steps, slicing
+#   and the success path are byte-identical.
+# Why: Exec P471 (Josh): the first-drain cap is 25 NODES (FatherGraph 25/250: batches of 25 nodes, 250 idle steps
+#   between), not 25 turns. Exec P472: the idle steps are the DRAIN PATH's own, through the Leg 2 merge's step-and-guard
+#   code (reuse, LAW 3), no dependency on #117/CC_NG_AUTOSTEP. Exec P473/P476: the lock is never held across the idle
+#   steps -- TWO-PHASE: this function stays CALLER-LOCKED and DEPOSIT-ONLY (its lock contract is unchanged, it
+#   acquires and releases nothing, it never steps, it never consolidates); the DAEMON, after its autosave section's
+#   `finally` releases graph._concurrent_lock, runs cc_topology_merge._unbound_nodes(graph, receipt["arrivals"]) and
+#   then _cc_callosum_consolidate (which slices the lock itself). P476(e): the DEBUG swallow is fixed where the drain's
+#   phase 2 reuses the function (P370).
+# How: with both new parameters unset the function is byte-identical to e4ebf982 (proved by a test that loads the
+#   base module from `git show e4ebf982:cc_ng_organism.py`). Syl's process and the VPS host call site
+#   (cc_ng_host.py:1525-1526) pass neither, so they are unchanged.
+#   Two records exist for a failed consolidation, deliberately: _cc_callosum_consolidate logs the CAUSE (exception
+#   class + steps run); the daemon's phase 2 logs the CONSEQUENCE (pacing re-armed, next batch held).
+# KNOWN LIMIT (P476(d), recorded on purpose): the guard the daemon applies is ARRIVAL-SCOPED (this drain's own
+#   arrivals), not whole-graph -- a whole-graph check would find the laptop's PRE-EXISTING unbound nodes
+#   (~806, CC-CALLOSUM-TRUTH.md:310, "cannot self-bind", section 10.4-H) and trip on EVERY batch, stalling the drain
+#   forever. Consequence: the 250 idle steps CAN age a Leg 2 merge's unbound arrivals. Leg 2 is HELD (P416), so none
+#   exist at S4; when Leg 2 resumes, merge and drain consolidation MUST be coordinated (one consolidator at a time,
+#   or a combined arrival set) -- recorded on #876 and the #806 post-track lane.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -2296,8 +2330,34 @@ def _apply_gateway_experience(graph, vector_db, state, entry):
         graph, vector_db, entry.content, embed(entry.content), state)
 
 
+def _cc_drain_size_cap(batch_nodes) -> int:
+    """Normalise drain_ingest_tract's `batch_nodes`: a positive int enables node-count pacing; None, <= 0 or
+    anything non-integer means unpaced (0). The caller owns the loud warning for a bad value (the daemon names
+    both env variables once); this stays a pure normaliser."""
+    try:
+        n = int(batch_nodes) if batch_nodes is not None else 0
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _cc_drain_receipt_write(receipt, **fields) -> None:
+    """Guarded write of drain_ingest_tract's out-parameter receipt (756b-reporter style). Replaces the receipt's
+    contents wholesale so a caller can never read a stale one. A receipt that raises changes NOTHING about the
+    drain: the failure is logged with a hardcoded message and the exception CLASS NAME only -- never str(exc),
+    never entry text."""
+    if receipt is None:
+        return
+    try:
+        receipt.clear()
+        receipt.update(fields)
+    except Exception as exc:  # noqa: BLE001 -- a reporter must never break the drain
+        logger.warning("CC drain receipt write failed (ignored, drain unchanged): %s", type(exc).__name__)
+
+
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
-                        return_consumed: bool = False, max_entries: int = 0):
+                        return_consumed: bool = False, max_entries: int = 0,
+                        batch_nodes: int = None, receipt: dict = None):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -2343,13 +2403,57 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
 
     Locking: the caller holds graph._concurrent_lock (punchlist #643, the
     autosave-loop caller) for the whole call -- that lock is what makes the
-    dual pass's mutation of the graph safe.
+    dual pass's mutation of the graph safe. UNCHANGED by D24: this function
+    acquires and releases nothing, never steps and never consolidates.
+
+    batch_nodes (D24, Exec P471/P476; default None = unpaced, byte-identical to
+    the previous behaviour): a positive int paces the drain by NODES, the
+    FatherGraph 25/250 rule. WHOLE turns are taken until the nodes created in
+    this call (the len(graph.nodes) delta around each atomic dual pass) reach
+    it; the turn that crosses it is absorbed whole and the batch ends, and a
+    single turn alone over the size is ONE batch. The remainder stays in the
+    file through the same partial truncate max_entries uses. Both caps may be
+    set; whichever is reached first ends the call.
+
+    receipt (D24; default None): an OUT-PARAMETER dict the caller reads after
+    the call -- chosen over changing the return so the default return (int /
+    (int, bytes)) stays byte-identical. Replaced wholesale on every call:
+      nodes_created  int  -- len(graph.nodes) delta over the call
+      ended_on_size  bool -- the batch ended on the batch_nodes rule
+      arrivals       set  -- ids of the nodes this call landed (ids after
+                             minus ids before, taken once per call); the
+                             caller's unbound-arrivals guard is scoped to
+                             exactly these, never the whole graph
+      turns_taken    int
+      reason         str  -- hardcoded: size_reached | entries_cap_reached |
+                             tract_exhausted | parse_failed | no_batch
+    Writes are guarded (a raising receipt changes nothing; class name only).
+    The idle steps are NOT run here -- see the 2026-10-01 changelog entry:
+    the caller releases its lock, then consolidates.
 
     Fails soft -- an ingest-tract drain failure must never break the
     daemon's autosave pulse.
     """
     def _ret(absorbed_n: int, consumed: bytes = b""):
         return (absorbed_n, consumed) if return_consumed else absorbed_n
+
+    size_cap = _cc_drain_size_cap(batch_nodes)
+    # A fresh, empty-batch receipt BEFORE any early return, so a caller never reads a stale one.
+    _cc_drain_receipt_write(receipt, nodes_created=0, ended_on_size=False, arrivals=set(),
+                            turns_taken=0, reason="no_batch")
+    ids_before = None   # set only when pacing or a receipt asked us to track arrivals
+    ended = "tract_exhausted"
+
+    def _fill_receipt(reason: str, taken_n: int) -> None:
+        if receipt is None:
+            return
+        try:
+            arrivals = (set(graph.nodes) - ids_before) if ids_before is not None else set()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CC drain receipt arrivals unavailable (receipt left empty): %s", type(exc).__name__)
+            arrivals = set()
+        _cc_drain_receipt_write(receipt, nodes_created=len(arrivals), ended_on_size=(reason == "size_reached"),
+                                arrivals=arrivals, turns_taken=taken_n, reason=reason)
 
     path = tract_path or cc_gateway_tract_path()
     if not os.path.exists(path):
@@ -2378,6 +2482,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     # it forever. 0 means we never got past the first entry.
     consumed_offset = 0
     try:
+        if size_cap or receipt is not None:
+            ids_before = set(graph.nodes)
         reader = ng_tract.TractReader(data)
         for entry in reader:
             # position() is a bound method on the Rust binding, not a property.
@@ -2397,7 +2503,13 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                     absorbed += 1
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
+            # D24: the node-count rule is checked AFTER the atomic dual pass returned, so the turn that crosses
+            # the size is absorbed whole and only then does the batch end. Unset (0) -> never true.
+            if size_cap and (len(graph.nodes) - len(ids_before)) >= size_cap:
+                ended = "size_reached"
+                break
             if max_entries and taken >= max_entries:
+                ended = "entries_cap_reached"
                 break
     except Exception as exc:
         # Parse failure -- truncate below never runs, so nothing was actually
@@ -2405,8 +2517,10 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
         # the default level, this is exactly how a laptop/VPS ng_tract format
         # skew would look -- every file failing the same way, invisibly.
         logger.warning("CC ingest-tract parse failed (non-fatal, file untouched): %s", exc)
+        _fill_receipt("parse_failed", taken)
         return _ret(absorbed)  # consumed=b"" -- nothing was truncated
 
+    _fill_receipt(ended, taken)
     # Truncate only the bytes we actually consumed. miniTID is a separate
     # process that only appends; if it appends between our initial read and
     # this truncation, a blind `open(path, "wb")` would erase those new bytes
@@ -2551,9 +2665,9 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
     # a waiting recall/deposit interleave. Homeostasis does not care whether
     # the steps were contiguous; the hooks care a great deal.
     slice_n = max(1, int(os.environ.get("CC_CALLOSUM_LOCK_SLICE_STEPS", "25")))
+    done = 0
     try:
         lock = getattr(graph, "_concurrent_lock", None)
-        done = 0
         while done < idle_steps:
             n = min(slice_n, idle_steps - done)
             if lock is not None:
@@ -2566,7 +2680,13 @@ def _cc_callosum_consolidate(graph, idle_steps: int) -> bool:
             done += n
         return True
     except Exception as exc:
-        logger.debug("CC callosum Leg1 consolidation failed (non-fatal): %s", exc)
+        # D24 / Exec P476(e) (P370: fixed where the drain's phase 2 reuses it): this used to be logger.debug --
+        # the silent class (plan-002 7A item 5c): a failed consolidation looked identical to a skipped one.
+        # Loud now, hardcoded message, the exception CLASS NAME only (never str(exc)). The RETURN VALUE (False)
+        # and every other behaviour are unchanged; the merge and Syl's process share this function.
+        logger.error("CC callosum consolidation FAILED after %d of %d step(s) (%s); "
+                     "this is the CAUSE record -- the caller logs what it did about it",
+                     done, idle_steps, type(exc).__name__)
         return False
 
 
