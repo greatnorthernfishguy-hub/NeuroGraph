@@ -1,0 +1,66 @@
+{
+ "a": {
+  "all_compared_fields_identical_and_preconditions_hold": true,
+  "facts": {
+   "all_sidecars_equal_before_after (base, fold)": true,
+   "base_path_is_own_checkout": true,
+   "different_code_under_test (blob differs, new_api False vs True)": true,
+   "fold_path_is_own_checkout": true,
+   "no_oom (cgroup oom_kill 0, base and fold)": true,
+   "only_write_mode_open_was_the_scratch_checkpoint (base, fold)": true,
+   "removal_order_differs_from_id_sorted_order (an unconditional sort-by-id would be visible)": false,
+   "removal_set_non_empty (the removal comparison is NOT vacuous)": false,
+   "same_ng_tract_wheel": true,
+   "same_pythonhashseed_pinned": true,
+   "source_main_sha256_equal_before_after (base, fold)": true
+  },
+  "field_equal": {
+   "checkpoint_sha256": true,
+   "checkpoint_size": true,
+   "counts_after_restore": true,
+   "counts_final": true,
+   "pre_state_digest": true,
+   "pruned_events": true,
+   "removed_count": true,
+   "removed_ids_sha256_in_order": true,
+   "removed_ids_sha256_sorted": true,
+   "return": true,
+   "state_digest": true,
+   "state_digest_before_checkpoint": true,
+   "synapses_after": true,
+   "synapses_before": true
+  }
+ },
+ "b": {
+  "all_compared_fields_identical_and_preconditions_hold": true,
+  "facts": {
+   "all_sidecars_equal_before_after (base, fold)": true,
+   "base_path_is_own_checkout": true,
+   "different_code_under_test (blob differs, new_api False vs True)": true,
+   "fold_path_is_own_checkout": true,
+   "no_oom (cgroup oom_kill 0, base and fold)": true,
+   "only_write_mode_open_was_the_scratch_checkpoint (base, fold)": true,
+   "removal_order_differs_from_id_sorted_order (an unconditional sort-by-id would be visible)": true,
+   "removal_set_non_empty (the removal comparison is NOT vacuous)": true,
+   "same_ng_tract_wheel": true,
+   "same_pythonhashseed_pinned": true,
+   "source_main_sha256_equal_before_after (base, fold)": true
+  },
+  "field_equal": {
+   "checkpoint_sha256": true,
+   "checkpoint_size": true,
+   "counts_after_restore": true,
+   "counts_final": true,
+   "pre_state_digest": true,
+   "pruned_events": true,
+   "removed_count": true,
+   "removed_ids_sha256_in_order": true,
+   "removed_ids_sha256_sorted": true,
+   "return": true,
+   "state_digest": true,
+   "state_digest_before_checkpoint": true,
+   "synapses_after": true,
+   "synapses_before": true
+  }
+ }
+}

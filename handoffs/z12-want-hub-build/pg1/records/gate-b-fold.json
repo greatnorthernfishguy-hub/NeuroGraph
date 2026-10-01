@@ -1,0 +1,16 @@
+{
+ "daemon_processes_found": 0,
+ "daemon_unit_state": "inactive",
+ "gate_met": true,
+ "gate_name": "b-fold",
+ "load_1_5_15": [
+  "2.96",
+  "2.95",
+  "3.55"
+ ],
+ "max_load": 6.0,
+ "mem_available_gib": 9.218,
+ "mem_available_kb": 9665676,
+ "min_mem_gib": 3.08,
+ "utc": "2026-10-01T02:23:44Z"
+}

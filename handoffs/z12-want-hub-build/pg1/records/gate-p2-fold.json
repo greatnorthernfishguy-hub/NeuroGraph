@@ -1,0 +1,16 @@
+{
+ "daemon_processes_found": 0,
+ "daemon_unit_state": "inactive",
+ "gate_met": true,
+ "gate_name": "p2-fold",
+ "load_1_5_15": [
+  "3.66",
+  "3.29",
+  "3.61"
+ ],
+ "max_load": 6.0,
+ "mem_available_gib": 9.329,
+ "mem_available_kb": 9782180,
+ "min_mem_gib": 6.0,
+ "utc": "2026-10-01T02:25:26Z"
+}

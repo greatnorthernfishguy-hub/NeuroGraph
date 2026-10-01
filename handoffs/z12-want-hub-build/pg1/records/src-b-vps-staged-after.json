@@ -1,0 +1,30 @@
+{
+ "dir": "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/vps-pull-staged",
+ "files": {
+  "main.msgpack": {
+   "inode": 22159007,
+   "mtime_ns": 1790722940786858428,
+   "sha256": "8cf6ef22f0e75756fc0d0a7e706258ef390ca030c9f24c0bbc80f6203d3d90a1",
+   "size": 141784662
+  },
+  "main.msgpack.activations.json": {
+   "inode": 22158961,
+   "mtime_ns": 1790722899705781828,
+   "sha256": "5fc6f7d9456a915cb03cac79098b79a1e1635c6af49731e70f102102053ea947",
+   "size": 423378
+  },
+  "main.msgpack.manifest.json": {
+   "inode": 22158977,
+   "mtime_ns": 1790722903854789710,
+   "sha256": "3c00aee4c3c39fb05350f46ebe145b60bffdc833d406b2a9a18797d755d96d9f",
+   "size": 219
+  },
+  "vectors.msgpack": {
+   "inode": 22159142,
+   "mtime_ns": 1790723235179182873,
+   "sha256": "bb3479b4e2b3795f4777b39292269e664fcd216f4a8816921449170b2ad4b019",
+   "size": 376141985
+  }
+ },
+ "utc": "2026-10-01T02:28:50Z"
+}

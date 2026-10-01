@@ -1,0 +1,237 @@
+{
+ "audit": {
+  "mutating_calls": [],
+  "non_library_read_opens": [
+   "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/main.msgpack",
+   "fd:3",
+   "fd:5"
+  ],
+  "spawned_programs": [
+   "git",
+   "pgrep",
+   "systemctl"
+  ],
+  "write_mode_opens": []
+ },
+ "calls": [
+  {
+   "F_links": 4127,
+   "call": 1,
+   "conducting_links_removed": 0,
+   "cpu_s": 13.654,
+   "eligible": 102145,
+   "floors_ok": true,
+   "held_back_last_link": 15,
+   "inner_prune_wall_s": 4.5015,
+   "load_1_after": "2.97",
+   "outside_prune_wall_s": 10.3196,
+   "protected_nodes": 183,
+   "removed": 5000,
+   "ru_maxrss_gib_after": 0.9951,
+   "synapses_after": 133753,
+   "wall_s": 14.8211,
+   "wants_with_removals": 166,
+   "wants_zero": 16
+  },
+  {
+   "F_links": 4127,
+   "call": 2,
+   "conducting_links_removed": 220,
+   "cpu_s": 13.3146,
+   "eligible": 97145,
+   "floors_ok": true,
+   "held_back_last_link": 15,
+   "inner_prune_wall_s": 3.8209,
+   "load_1_after": "3.24",
+   "outside_prune_wall_s": 10.3738,
+   "protected_nodes": 183,
+   "removed": 5000,
+   "ru_maxrss_gib_after": 0.9951,
+   "synapses_after": 128753,
+   "wall_s": 14.1947,
+   "wants_with_removals": 174,
+   "wants_zero": 8
+  },
+  {
+   "F_links": 4127,
+   "call": 3,
+   "conducting_links_removed": 484,
+   "cpu_s": 11.7133,
+   "eligible": 92145,
+   "floors_ok": true,
+   "held_back_last_link": 15,
+   "inner_prune_wall_s": 2.8182,
+   "load_1_after": "3.28",
+   "outside_prune_wall_s": 9.2465,
+   "protected_nodes": 183,
+   "removed": 5000,
+   "ru_maxrss_gib_after": 0.9951,
+   "synapses_after": 123753,
+   "wall_s": 12.0647,
+   "wants_with_removals": 173,
+   "wants_zero": 9
+  }
+ ],
+ "cgroup": {
+  "memory.max": "6442450944",
+  "memory.swap.max": "0",
+  "path": "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u77927.scope"
+ },
+ "competing_ids": 106825,
+ "counts_after_restore": {
+  "hyperedges": 517,
+  "nodes": 7253,
+  "synapses": 138753,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 33637
+ },
+ "counts_final": {
+  "hyperedges": 517,
+  "nodes": 7253,
+  "synapses": 123753,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 33637
+ },
+ "end_utc": "2026-10-01T02:26:36Z",
+ "excluded_ids": 21534,
+ "gate_reading_at_load_start": {
+  "daemon_processes_found": 0,
+  "daemon_unit_state": "inactive",
+  "load_1_5_15": [
+   "3.66",
+   "3.29",
+   "3.61"
+  ],
+  "mem_available_gib": 9.329,
+  "mem_available_kb": 9782404,
+  "utc": "2026-10-01T02:25:26Z"
+ },
+ "header": {
+  "checkout": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-29f47f65",
+  "env": {
+   "HF_HUB_OFFLINE": "1",
+   "NG_EMBED_REMOTE": null,
+   "PYTHONDONTWRITEBYTECODE": "1",
+   "PYTHONPATH": null
+  },
+  "git_rev": "29f47f65058790240b2f9c6a0a5bc4d82171b42d",
+  "neuro_foundation_blob": "5e8945accb476b0727bf07a3ab2890dccc87f650",
+  "neuro_foundation_file": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-29f47f65/neuro_foundation.py",
+  "new_api_present": true,
+  "ng_tract_file": "/home/josh/.local/lib/python3.12/site-packages/ng_tract/__init__.py",
+  "ng_tract_version": "0.1.0",
+  "pid": 3412286,
+  "python": "3.12.3",
+  "pythonhashseed": "0",
+  "sys_path_0": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-29f47f65",
+  "sys_path_1": "/home/josh/NeuroGraph-worktrees/z12-want-hub-build-20260930/handoffs/z12-want-hub-build/pg1",
+  "void": false
+ },
+ "label": "p2-fold-29f47f65",
+ "max_removals_passed": 5000,
+ "memory": {
+  "cgroup_memory_events": "low 0 | high 0 | max 0 | oom 0 | oom_kill 0 | oom_group_kill 0",
+  "cgroup_memory_peak_bytes": "1053130752",
+  "cgroup_memory_peak_gib": 0.9808,
+  "heap_for_gate_gib": 0.9951,
+  "ru_maxrss_gib": 0.9951,
+  "ru_maxrss_kb": 1043420,
+  "sampled_anon_peak_gib": 0.977,
+  "sampled_rss_peak_gib": 0.9945,
+  "stages": [
+   {
+    "rss_anon_now_gib": 0.7006,
+    "rss_now_gib": 0.718,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_restore",
+    "utc": "2026-10-01T02:25:35Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7287,
+    "rss_now_gib": 0.7462,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_plan_capture",
+    "utc": "2026-10-01T02:25:46Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7278,
+    "rss_now_gib": 0.7452,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_validation_isolated",
+    "utc": "2026-10-01T02:25:53Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7483,
+    "rss_now_gib": 0.7657,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_call_1",
+    "utc": "2026-10-01T02:26:08Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7542,
+    "rss_now_gib": 0.7716,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_call_2",
+    "utc": "2026-10-01T02:26:22Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7542,
+    "rss_now_gib": 0.7717,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_call_3",
+    "utc": "2026-10-01T02:26:34Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7542,
+    "rss_now_gib": 0.7717,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "final",
+    "utc": "2026-10-01T02:26:36Z"
+   }
+  ]
+ },
+ "mode": "part2",
+ "orchestrator_pre_prune_cpu_s": 10.5091,
+ "orchestrator_pre_prune_wall_s": 11.2918,
+ "order_key_entries": 106825,
+ "source": {
+  "copy_dir": "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc",
+  "main_equal_before_after": true,
+  "main_sha256_after": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+  "main_sha256_before": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+  "stat_before": {
+   "inode": 22158576,
+   "mtime_ns": 1790160317000000000,
+   "size": 230539966
+  }
+ },
+ "start_utc": "2026-10-01T02:25:26Z",
+ "validation_isolated": {
+  "includes": "sorted(set(competing_ids)) + the per-id checks of this checkout's pre-loop validation, up to the last id",
+  "runs": [
+   {
+    "cpu_s": 1.9342,
+    "raised_at_the_absent_id": true,
+    "wall_s": 1.9235
+   },
+   {
+    "cpu_s": 1.9788,
+    "raised_at_the_absent_id": true,
+    "wall_s": 1.9848
+   },
+   {
+    "cpu_s": 1.9706,
+    "raised_at_the_absent_id": true,
+    "wall_s": 1.9764
+   }
+  ],
+  "state_fingerprint_unchanged": true
+ }
+}

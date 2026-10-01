@@ -1,0 +1,214 @@
+{
+ "audit": {
+  "mutating_calls": [],
+  "non_library_read_opens": [
+   "/home/josh/backups/z12-pg1-20261001T021808Z/bundle-copy/main.msgpack",
+   "/home/josh/backups/z12-pg1-20261001T021808Z/bundle-copy/main.msgpack.activations.json",
+   "/home/josh/backups/z12-pg1-20261001T021808Z/bundle-copy/main.msgpack.manifest.json",
+   "/home/josh/backups/z12-pg1-20261001T021808Z/scratch/b-fold.msgpack",
+   "fd:3",
+   "fd:5"
+  ],
+  "spawned_programs": [
+   "git",
+   "pgrep",
+   "systemctl"
+  ],
+  "write_mode_opens": [
+   "/home/josh/backups/z12-pg1-20261001T021808Z/scratch/b-fold.msgpack"
+  ]
+ },
+ "cgroup": {
+  "memory.max": "6442450944",
+  "memory.swap.max": "0",
+  "path": "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u77893.scope"
+ },
+ "checkpoint_path": "/home/josh/backups/z12-pg1-20261001T021808Z/scratch/b-fold.msgpack",
+ "checkpoint_sha256": "6e0a36a565bbec1e57280478b2af9a5a42ea781dc28c3e4a4a12337b122b2a9d",
+ "checkpoint_size": 137365123,
+ "counts_after_restore": {
+  "hyperedges": 2179,
+  "nodes": 19224,
+  "synapses": 19390,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 80259
+ },
+ "counts_final": {
+  "hyperedges": 2179,
+  "nodes": 19224,
+  "synapses": 8957,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 80259
+ },
+ "end_utc": "2026-10-01T02:24:06Z",
+ "gate_reading_at_load_start": {
+  "daemon_processes_found": 0,
+  "daemon_unit_state": "inactive",
+  "load_1_5_15": [
+   "2.96",
+   "2.95",
+   "3.55"
+  ],
+  "mem_available_gib": 9.215,
+  "mem_available_kb": 9662324,
+  "utc": "2026-10-01T02:23:44Z"
+ },
+ "header": {
+  "checkout": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-29f47f65",
+  "env": {
+   "HF_HUB_OFFLINE": "1",
+   "NG_EMBED_REMOTE": null,
+   "PYTHONDONTWRITEBYTECODE": "1",
+   "PYTHONPATH": null
+  },
+  "git_rev": "29f47f65058790240b2f9c6a0a5bc4d82171b42d",
+  "neuro_foundation_blob": "5e8945accb476b0727bf07a3ab2890dccc87f650",
+  "neuro_foundation_file": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-29f47f65/neuro_foundation.py",
+  "new_api_present": true,
+  "ng_tract_file": "/home/josh/.local/lib/python3.12/site-packages/ng_tract/__init__.py",
+  "ng_tract_version": "0.1.0",
+  "pid": 3398839,
+  "python": "3.12.3",
+  "pythonhashseed": "0",
+  "sys_path_0": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-29f47f65",
+  "sys_path_1": "/home/josh/NeuroGraph-worktrees/z12-want-hub-build-20260930/handoffs/z12-want-hub-build/pg1",
+  "void": false
+ },
+ "label": "b-fold",
+ "memory": {
+  "cgroup_memory_events": "low 0 | high 0 | max 0 | oom 0 | oom_kill 0 | oom_group_kill 0",
+  "cgroup_memory_peak_bytes": "869208064",
+  "cgroup_memory_peak_gib": 0.8095,
+  "heap_for_gate_gib": 0.589,
+  "ru_maxrss_gib": 0.589,
+  "ru_maxrss_kb": 617612,
+  "sampled_anon_peak_gib": 0.5719,
+  "sampled_rss_peak_gib": 0.5892,
+  "stages": [
+   {
+    "rss_anon_now_gib": 0.0288,
+    "rss_now_gib": 0.046,
+    "ru_maxrss_gib": 0.0457,
+    "sampled_anon_peak_gib": 0.0288,
+    "stage": "after_import",
+    "utc": "2026-10-01T02:23:45Z"
+   },
+   {
+    "rss_anon_now_gib": 0.3197,
+    "rss_now_gib": 0.3371,
+    "ru_maxrss_gib": 0.5094,
+    "sampled_anon_peak_gib": 0.4687,
+    "stage": "after_restore",
+    "utc": "2026-10-01T02:23:50Z"
+   },
+   {
+    "rss_anon_now_gib": 0.324,
+    "rss_now_gib": 0.3414,
+    "ru_maxrss_gib": 0.5094,
+    "sampled_anon_peak_gib": 0.4687,
+    "stage": "after_pre_digest",
+    "utc": "2026-10-01T02:23:51Z"
+   },
+   {
+    "rss_anon_now_gib": 0.3231,
+    "rss_now_gib": 0.3404,
+    "ru_maxrss_gib": 0.5094,
+    "sampled_anon_peak_gib": 0.4687,
+    "stage": "after_prune",
+    "utc": "2026-10-01T02:23:51Z"
+   },
+   {
+    "rss_anon_now_gib": 0.3457,
+    "rss_now_gib": 0.3631,
+    "ru_maxrss_gib": 0.589,
+    "sampled_anon_peak_gib": 0.5719,
+    "stage": "after_checkpoint",
+    "utc": "2026-10-01T02:24:03Z"
+   },
+   {
+    "rss_anon_now_gib": 0.3559,
+    "rss_now_gib": 0.3733,
+    "ru_maxrss_gib": 0.589,
+    "sampled_anon_peak_gib": 0.5719,
+    "stage": "final",
+    "utc": "2026-10-01T02:24:06Z"
+   }
+  ]
+ },
+ "mode": "part1",
+ "pre_state_digest": "fe57b0dfdaa79125f3021b33a52da8004dfa3f405bf9b73b8cbea3bf6fd5c782",
+ "prune_default_path_wall_s": 0.5834,
+ "pruned_events": [
+  [
+   10433,
+   80259
+  ]
+ ],
+ "removed_count": 10433,
+ "removed_ids_sha256_in_order": "e0df6abbc1c4e7ea5fa051613d31476e08b93dbb40144d8af7c6cd25e7d40c49",
+ "removed_ids_sha256_sorted": "6078096850405870ba93de87e1e3f9eafb0f874802bd0ca29f31f7d7441c1645",
+ "return": 10433,
+ "source": {
+  "all_sidecars_equal_before_after": true,
+  "copy_dir": "/home/josh/backups/z12-pg1-20261001T021808Z/bundle-copy",
+  "main_equal_before_after": true,
+  "main_msgpack": "/home/josh/backups/z12-pg1-20261001T021808Z/bundle-copy/main.msgpack",
+  "main_sha256_after": "8cf6ef22f0e75756fc0d0a7e706258ef390ca030c9f24c0bbc80f6203d3d90a1",
+  "main_sha256_before": "8cf6ef22f0e75756fc0d0a7e706258ef390ca030c9f24c0bbc80f6203d3d90a1",
+  "sidecars_after": {
+   "main.msgpack": {
+    "inode": 22170345,
+    "mtime_ns": 1790821373481237721,
+    "sha256": "8cf6ef22f0e75756fc0d0a7e706258ef390ca030c9f24c0bbc80f6203d3d90a1",
+    "size": 141784662
+   },
+   "main.msgpack.activations.json": {
+    "inode": 22170346,
+    "mtime_ns": 1790821373486237919,
+    "sha256": "5fc6f7d9456a915cb03cac79098b79a1e1635c6af49731e70f102102053ea947",
+    "size": 423378
+   },
+   "main.msgpack.manifest.json": {
+    "inode": 22170347,
+    "mtime_ns": 1790821373487237958,
+    "sha256": "3c00aee4c3c39fb05350f46ebe145b60bffdc833d406b2a9a18797d755d96d9f",
+    "size": 219
+   },
+   "vectors.msgpack": {
+    "inode": 22170348,
+    "mtime_ns": 1790821376719365251,
+    "size": 376141985
+   }
+  },
+  "sidecars_before": {
+   "main.msgpack": {
+    "inode": 22170345,
+    "mtime_ns": 1790821373481237721,
+    "sha256": "8cf6ef22f0e75756fc0d0a7e706258ef390ca030c9f24c0bbc80f6203d3d90a1",
+    "size": 141784662
+   },
+   "main.msgpack.activations.json": {
+    "inode": 22170346,
+    "mtime_ns": 1790821373486237919,
+    "sha256": "5fc6f7d9456a915cb03cac79098b79a1e1635c6af49731e70f102102053ea947",
+    "size": 423378
+   },
+   "main.msgpack.manifest.json": {
+    "inode": 22170347,
+    "mtime_ns": 1790821373487237958,
+    "sha256": "3c00aee4c3c39fb05350f46ebe145b60bffdc833d406b2a9a18797d755d96d9f",
+    "size": 219
+   },
+   "vectors.msgpack": {
+    "inode": 22170348,
+    "mtime_ns": 1790821376719365251,
+    "size": 376141985
+   }
+  }
+ },
+ "start_utc": "2026-10-01T02:23:44Z",
+ "state_digest": "9a96ef480a2ec592d3d2f648590ad93381129d6092551428298401c818674fa9",
+ "state_digest_before_checkpoint": "9a96ef480a2ec592d3d2f648590ad93381129d6092551428298401c818674fa9",
+ "synapses_after": 8957,
+ "synapses_before": 19390
+}

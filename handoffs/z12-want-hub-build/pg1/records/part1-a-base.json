@@ -1,0 +1,235 @@
+{
+ "audit": {
+  "mutating_calls": [],
+  "non_library_read_opens": [
+   "/home/josh/backups/z12-pg1-20261001T021808Z/scratch/a-base.msgpack",
+   "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/commons.msgpack",
+   "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/main.msgpack",
+   "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/main.msgpack.activations.json",
+   "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/main.msgpack.guard_state.json",
+   "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/main.msgpack.manifest.json",
+   "fd:3",
+   "fd:5"
+  ],
+  "spawned_programs": [
+   "git",
+   "pgrep",
+   "systemctl"
+  ],
+  "write_mode_opens": [
+   "/home/josh/backups/z12-pg1-20261001T021808Z/scratch/a-base.msgpack"
+  ]
+ },
+ "cgroup": {
+  "memory.max": "6442450944",
+  "memory.swap.max": "0",
+  "path": "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u77827.scope"
+ },
+ "checkpoint_path": "/home/josh/backups/z12-pg1-20261001T021808Z/scratch/a-base.msgpack",
+ "checkpoint_sha256": "902ad15a532ae0ec214dd50516c487b5dd9e0eee1691554967619cd7f90470ce",
+ "checkpoint_size": 230539966,
+ "counts_after_restore": {
+  "hyperedges": 517,
+  "nodes": 7253,
+  "synapses": 138753,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 33637
+ },
+ "counts_final": {
+  "hyperedges": 517,
+  "nodes": 7253,
+  "synapses": 138753,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 33637
+ },
+ "end_utc": "2026-10-01T02:21:17Z",
+ "gate_reading_at_load_start": {
+  "daemon_processes_found": 0,
+  "daemon_unit_state": "inactive",
+  "load_1_5_15": [
+   "3.60",
+   "3.02",
+   "3.70"
+  ],
+  "mem_available_gib": 9.155,
+  "mem_available_kb": 9599364,
+  "utc": "2026-10-01T02:20:41Z"
+ },
+ "header": {
+  "checkout": "/home/josh/NeuroGraph-worktrees/z12-want-hub-base-e4ebf982",
+  "env": {
+   "HF_HUB_OFFLINE": "1",
+   "NG_EMBED_REMOTE": null,
+   "PYTHONDONTWRITEBYTECODE": "1",
+   "PYTHONPATH": null
+  },
+  "git_rev": "e4ebf982b1989fd9066d610b94853bc68bf70d37",
+  "neuro_foundation_blob": "53494b7c56896d25040f3e7fd7c4046da7d0ab05",
+  "neuro_foundation_file": "/home/josh/NeuroGraph-worktrees/z12-want-hub-base-e4ebf982/neuro_foundation.py",
+  "new_api_present": false,
+  "ng_tract_file": "/home/josh/.local/lib/python3.12/site-packages/ng_tract/__init__.py",
+  "ng_tract_version": "0.1.0",
+  "pid": 3371677,
+  "python": "3.12.3",
+  "pythonhashseed": "0",
+  "sys_path_0": "/home/josh/NeuroGraph-worktrees/z12-want-hub-base-e4ebf982",
+  "sys_path_1": "/home/josh/NeuroGraph-worktrees/z12-want-hub-build-20260930/handoffs/z12-want-hub-build/pg1",
+  "void": false
+ },
+ "label": "a-base",
+ "memory": {
+  "cgroup_memory_events": "low 0 | high 0 | max 0 | oom 0 | oom_kill 0 | oom_group_kill 0",
+  "cgroup_memory_peak_bytes": "1903120384",
+  "cgroup_memory_peak_gib": 1.7724,
+  "heap_for_gate_gib": 1.0734,
+  "ru_maxrss_gib": 1.0734,
+  "ru_maxrss_kb": 1125576,
+  "sampled_anon_peak_gib": 1.0564,
+  "sampled_rss_peak_gib": 1.0738,
+  "stages": [
+   {
+    "rss_anon_now_gib": 0.0277,
+    "rss_now_gib": 0.045,
+    "ru_maxrss_gib": 0.0448,
+    "sampled_anon_peak_gib": 0.0277,
+    "stage": "after_import",
+    "utc": "2026-10-01T02:20:42Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7005,
+    "rss_now_gib": 0.7179,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.9774,
+    "stage": "after_restore",
+    "utc": "2026-10-01T02:20:52Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7276,
+    "rss_now_gib": 0.745,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.9774,
+    "stage": "after_pre_digest",
+    "utc": "2026-10-01T02:20:55Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7285,
+    "rss_now_gib": 0.7459,
+    "ru_maxrss_gib": 0.9951,
+    "sampled_anon_peak_gib": 0.9774,
+    "stage": "after_prune",
+    "utc": "2026-10-01T02:20:56Z"
+   },
+   {
+    "rss_anon_now_gib": 0.746,
+    "rss_now_gib": 0.7634,
+    "ru_maxrss_gib": 1.0734,
+    "sampled_anon_peak_gib": 1.0564,
+    "stage": "after_checkpoint",
+    "utc": "2026-10-01T02:21:09Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7639,
+    "rss_now_gib": 0.7813,
+    "ru_maxrss_gib": 1.0734,
+    "sampled_anon_peak_gib": 1.0564,
+    "stage": "final",
+    "utc": "2026-10-01T02:21:17Z"
+   }
+  ]
+ },
+ "mode": "part1",
+ "pre_state_digest": "ba6a6fcf1187a07e6879690fbfbaf3d8ee6b86a9948e04994b1a80f6747faed3",
+ "prune_default_path_wall_s": 0.8571,
+ "pruned_events": [],
+ "removed_count": 0,
+ "removed_ids_sha256_in_order": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+ "removed_ids_sha256_sorted": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+ "return": 0,
+ "source": {
+  "all_sidecars_equal_before_after": true,
+  "copy_dir": "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc",
+  "main_equal_before_after": true,
+  "main_msgpack": "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/main.msgpack",
+  "main_sha256_after": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+  "main_sha256_before": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+  "sidecars_after": {
+   "commons.msgpack": {
+    "inode": 22158583,
+    "mtime_ns": 1790220238000000000,
+    "sha256": "986c8e93670e6d47d8db2cc18836abc0ea6df0e8cf97feba59bf8fea53495918",
+    "size": 115754
+   },
+   "main.msgpack": {
+    "inode": 22158576,
+    "mtime_ns": 1790160317000000000,
+    "sha256": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+    "size": 230539966
+   },
+   "main.msgpack.activations.json": {
+    "inode": 22158578,
+    "mtime_ns": 1790160374000000000,
+    "sha256": "0b6fe94e5266ff5eccf412731275b089117fac2cdcad0567c2a62647c9ed3bdb",
+    "size": 754451
+   },
+   "main.msgpack.guard_state.json": {
+    "inode": 22158579,
+    "mtime_ns": 1790160295000000000,
+    "sha256": "c3520eff093687b8a73a2d93b3859b8d233c97b47aea34b5db4050d60acb3932",
+    "size": 191
+   },
+   "main.msgpack.manifest.json": {
+    "inode": 22158580,
+    "mtime_ns": 1790160374000000000,
+    "sha256": "6e7a2ed8a7889d8bb232cb7fe4e2cc91a541532b1f4f59cc2bf96f14dce69325",
+    "size": 217
+   },
+   "vectors.msgpack": {
+    "inode": 22158577,
+    "mtime_ns": 1790160372000000000,
+    "size": 1000876671
+   }
+  },
+  "sidecars_before": {
+   "commons.msgpack": {
+    "inode": 22158583,
+    "mtime_ns": 1790220238000000000,
+    "sha256": "986c8e93670e6d47d8db2cc18836abc0ea6df0e8cf97feba59bf8fea53495918",
+    "size": 115754
+   },
+   "main.msgpack": {
+    "inode": 22158576,
+    "mtime_ns": 1790160317000000000,
+    "sha256": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+    "size": 230539966
+   },
+   "main.msgpack.activations.json": {
+    "inode": 22158578,
+    "mtime_ns": 1790160374000000000,
+    "sha256": "0b6fe94e5266ff5eccf412731275b089117fac2cdcad0567c2a62647c9ed3bdb",
+    "size": 754451
+   },
+   "main.msgpack.guard_state.json": {
+    "inode": 22158579,
+    "mtime_ns": 1790160295000000000,
+    "sha256": "c3520eff093687b8a73a2d93b3859b8d233c97b47aea34b5db4050d60acb3932",
+    "size": 191
+   },
+   "main.msgpack.manifest.json": {
+    "inode": 22158580,
+    "mtime_ns": 1790160374000000000,
+    "sha256": "6e7a2ed8a7889d8bb232cb7fe4e2cc91a541532b1f4f59cc2bf96f14dce69325",
+    "size": 217
+   },
+   "vectors.msgpack": {
+    "inode": 22158577,
+    "mtime_ns": 1790160372000000000,
+    "size": 1000876671
+   }
+  }
+ },
+ "start_utc": "2026-10-01T02:20:41Z",
+ "state_digest": "4626743e2ccbcf7070c3dc3126a51a96c0eedd4bbb41a9f4d401661166eec9a0",
+ "state_digest_before_checkpoint": "4626743e2ccbcf7070c3dc3126a51a96c0eedd4bbb41a9f4d401661166eec9a0",
+ "synapses_after": 138753,
+ "synapses_before": 138753
+}

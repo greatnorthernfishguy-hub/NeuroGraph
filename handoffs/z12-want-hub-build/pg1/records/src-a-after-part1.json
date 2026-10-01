@@ -1,0 +1,42 @@
+{
+ "dir": "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc",
+ "files": {
+  "commons.msgpack": {
+   "inode": 22158583,
+   "mtime_ns": 1790220238000000000,
+   "sha256": "986c8e93670e6d47d8db2cc18836abc0ea6df0e8cf97feba59bf8fea53495918",
+   "size": 115754
+  },
+  "main.msgpack": {
+   "inode": 22158576,
+   "mtime_ns": 1790160317000000000,
+   "sha256": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+   "size": 230539966
+  },
+  "main.msgpack.activations.json": {
+   "inode": 22158578,
+   "mtime_ns": 1790160374000000000,
+   "sha256": "0b6fe94e5266ff5eccf412731275b089117fac2cdcad0567c2a62647c9ed3bdb",
+   "size": 754451
+  },
+  "main.msgpack.guard_state.json": {
+   "inode": 22158579,
+   "mtime_ns": 1790160295000000000,
+   "sha256": "c3520eff093687b8a73a2d93b3859b8d233c97b47aea34b5db4050d60acb3932",
+   "size": 191
+  },
+  "main.msgpack.manifest.json": {
+   "inode": 22158580,
+   "mtime_ns": 1790160374000000000,
+   "sha256": "6e7a2ed8a7889d8bb232cb7fe4e2cc91a541532b1f4f59cc2bf96f14dce69325",
+   "size": 217
+  },
+  "vectors.msgpack": {
+   "inode": 22158577,
+   "mtime_ns": 1790160372000000000,
+   "sha256": "93ed891fa2a0812382dbb7da8b287108fbc54fdb1560c169c683244f43bcb05e",
+   "size": 1000876671
+  }
+ },
+ "utc": "2026-10-01T02:22:41Z"
+}

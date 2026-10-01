@@ -1,0 +1,237 @@
+{
+ "audit": {
+  "mutating_calls": [],
+  "non_library_read_opens": [
+   "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc/main.msgpack",
+   "fd:3",
+   "fd:5"
+  ],
+  "spawned_programs": [
+   "git",
+   "pgrep",
+   "systemctl"
+  ],
+  "write_mode_opens": []
+ },
+ "calls": [
+  {
+   "F_links": 4127,
+   "call": 1,
+   "conducting_links_removed": 0,
+   "cpu_s": 12.9422,
+   "eligible": 102145,
+   "floors_ok": true,
+   "held_back_last_link": 15,
+   "inner_prune_wall_s": 2.6529,
+   "load_1_after": "4.24",
+   "outside_prune_wall_s": 10.3324,
+   "protected_nodes": 183,
+   "removed": 5000,
+   "ru_maxrss_gib_after": 0.995,
+   "synapses_after": 133753,
+   "wall_s": 12.9853,
+   "wants_with_removals": 166,
+   "wants_zero": 16
+  },
+  {
+   "F_links": 4127,
+   "call": 2,
+   "conducting_links_removed": 220,
+   "cpu_s": 12.2654,
+   "eligible": 97145,
+   "floors_ok": true,
+   "held_back_last_link": 15,
+   "inner_prune_wall_s": 2.5596,
+   "load_1_after": "3.98",
+   "outside_prune_wall_s": 9.7018,
+   "protected_nodes": 183,
+   "removed": 5000,
+   "ru_maxrss_gib_after": 0.995,
+   "synapses_after": 128753,
+   "wall_s": 12.2614,
+   "wants_with_removals": 174,
+   "wants_zero": 8
+  },
+  {
+   "F_links": 4127,
+   "call": 3,
+   "conducting_links_removed": 484,
+   "cpu_s": 11.8073,
+   "eligible": 92145,
+   "floors_ok": true,
+   "held_back_last_link": 15,
+   "inner_prune_wall_s": 2.4599,
+   "load_1_after": "4.15",
+   "outside_prune_wall_s": 9.8092,
+   "protected_nodes": 183,
+   "removed": 5000,
+   "ru_maxrss_gib_after": 0.995,
+   "synapses_after": 123753,
+   "wall_s": 12.2691,
+   "wants_with_removals": 173,
+   "wants_zero": 9
+  }
+ ],
+ "cgroup": {
+  "memory.max": "6442450944",
+  "memory.swap.max": "0",
+  "path": "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u77903.scope"
+ },
+ "competing_ids": 106825,
+ "counts_after_restore": {
+  "hyperedges": 517,
+  "nodes": 7253,
+  "synapses": 138753,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 33637
+ },
+ "counts_final": {
+  "hyperedges": 517,
+  "nodes": 7253,
+  "synapses": 123753,
+  "synapses_type": "builtins.SynapseStore",
+  "timestep": 33637
+ },
+ "end_utc": "2026-10-01T02:25:20Z",
+ "excluded_ids": 21534,
+ "gate_reading_at_load_start": {
+  "daemon_processes_found": 0,
+  "daemon_unit_state": "inactive",
+  "load_1_5_15": [
+   "3.72",
+   "3.13",
+   "3.58"
+  ],
+  "mem_available_gib": 9.271,
+  "mem_available_kb": 9721340,
+  "utc": "2026-10-01T02:24:15Z"
+ },
+ "header": {
+  "checkout": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-first-8e578532",
+  "env": {
+   "HF_HUB_OFFLINE": "1",
+   "NG_EMBED_REMOTE": null,
+   "PYTHONDONTWRITEBYTECODE": "1",
+   "PYTHONPATH": null
+  },
+  "git_rev": "8e5785322f910aefaf781fa3525bea2831fedd31",
+  "neuro_foundation_blob": "96d12f507746ce168fffe6feba56e097c8832353",
+  "neuro_foundation_file": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-first-8e578532/neuro_foundation.py",
+  "new_api_present": true,
+  "ng_tract_file": "/home/josh/.local/lib/python3.12/site-packages/ng_tract/__init__.py",
+  "ng_tract_version": "0.1.0",
+  "pid": 3403532,
+  "python": "3.12.3",
+  "pythonhashseed": "0",
+  "sys_path_0": "/home/josh/NeuroGraph-worktrees/z12-pg1-engine-first-8e578532",
+  "sys_path_1": "/home/josh/NeuroGraph-worktrees/z12-want-hub-build-20260930/handoffs/z12-want-hub-build/pg1",
+  "void": false
+ },
+ "label": "p2-first-8e578532",
+ "max_removals_passed": 5000,
+ "memory": {
+  "cgroup_memory_events": "low 0 | high 0 | max 0 | oom 0 | oom_kill 0 | oom_group_kill 0",
+  "cgroup_memory_peak_bytes": "1053257728",
+  "cgroup_memory_peak_gib": 0.9809,
+  "heap_for_gate_gib": 0.995,
+  "ru_maxrss_gib": 0.995,
+  "ru_maxrss_kb": 1043376,
+  "sampled_anon_peak_gib": 0.977,
+  "sampled_rss_peak_gib": 0.9944,
+  "stages": [
+   {
+    "rss_anon_now_gib": 0.6997,
+    "rss_now_gib": 0.717,
+    "ru_maxrss_gib": 0.995,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_restore",
+    "utc": "2026-10-01T02:24:25Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7268,
+    "rss_now_gib": 0.7442,
+    "ru_maxrss_gib": 0.995,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_plan_capture",
+    "utc": "2026-10-01T02:24:35Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7249,
+    "rss_now_gib": 0.7423,
+    "ru_maxrss_gib": 0.995,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_validation_isolated",
+    "utc": "2026-10-01T02:24:40Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7472,
+    "rss_now_gib": 0.7646,
+    "ru_maxrss_gib": 0.995,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_call_1",
+    "utc": "2026-10-01T02:24:53Z"
+   },
+   {
+    "rss_anon_now_gib": 0.755,
+    "rss_now_gib": 0.7723,
+    "ru_maxrss_gib": 0.995,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_call_2",
+    "utc": "2026-10-01T02:25:06Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7532,
+    "rss_now_gib": 0.7705,
+    "ru_maxrss_gib": 0.995,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "after_call_3",
+    "utc": "2026-10-01T02:25:18Z"
+   },
+   {
+    "rss_anon_now_gib": 0.7513,
+    "rss_now_gib": 0.7686,
+    "ru_maxrss_gib": 0.995,
+    "sampled_anon_peak_gib": 0.977,
+    "stage": "final",
+    "utc": "2026-10-01T02:25:20Z"
+   }
+  ]
+ },
+ "mode": "part2",
+ "orchestrator_pre_prune_cpu_s": 10.1261,
+ "orchestrator_pre_prune_wall_s": 10.1941,
+ "order_key_entries": 106825,
+ "source": {
+  "copy_dir": "/home/josh/backups/z12-s3-restore-bundle-20260929T222529Z/pre-placement-laptop-cc",
+  "main_equal_before_after": true,
+  "main_sha256_after": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+  "main_sha256_before": "7e4577868631de4389e5a6ef994f8b97d447690d0d1621e27f944189042c3a77",
+  "stat_before": {
+   "inode": 22158576,
+   "mtime_ns": 1790160317000000000,
+   "size": 230539966
+  }
+ },
+ "start_utc": "2026-10-01T02:24:15Z",
+ "validation_isolated": {
+  "includes": "sorted(set(competing_ids)) + the per-id checks of this checkout's pre-loop validation, up to the last id",
+  "runs": [
+   {
+    "cpu_s": 1.2501,
+    "raised_at_the_absent_id": true,
+    "wall_s": 1.3174
+   },
+   {
+    "cpu_s": 1.2965,
+    "raised_at_the_absent_id": true,
+    "wall_s": 1.8592
+   },
+   {
+    "cpu_s": 1.3173,
+    "raised_at_the_absent_id": true,
+    "wall_s": 1.6865
+   }
+  ],
+  "state_fingerprint_unchanged": true
+ }
+}
