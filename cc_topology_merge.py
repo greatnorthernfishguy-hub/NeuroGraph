@@ -281,7 +281,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import numpy as np
 
-from cc_topology_export import read_topology_frames, is_cc_provenance
+from cc_topology_export import _BANNED_META, read_topology_frames, is_cc_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +313,20 @@ class TopologyMergeAbort(RuntimeError):
     """Raised when the conduit must not be absorbed at all (model mismatch,
     self-absorption, malformed header). Distinct from per-item skips, which are
     counted and logged but never abort the pass."""
+
+
+def _drop_banned_meta(meta: Dict[str, Any]) -> int:
+    banned = sorted(k for k in meta if k in _BANNED_META)
+    if not banned:
+        return 0
+    for key in banned:
+        meta.pop(key, None)
+    logger.warning(
+        "CC topology merge: stripped banned local-only metadata from inbound "
+        "node before install (sender defect): %s",
+        ", ".join(banned),
+    )
+    return len(banned)
 
 
 def cc_current_membership(graph: Any) -> Set[str]:
@@ -654,6 +668,7 @@ def merge_cc_topology(
         "absorbed_without_embedding_DEFECT": 0,
         "skipped_synapses": 0, "skipped_hyperedges": 0,
         "hyperedge_id_reminted": 0,
+        "banned_meta_dropped": 0,
         "batches_read": 0, "deferred_by_budget": 0,
         "consolidation_passes": 0, "consolidation_steps": 0,
         "consolidation_skipped_unbound_arrivals": 0,
@@ -770,6 +785,7 @@ def merge_cc_topology(
                 if not is_cc_provenance(nid, meta):
                     stats["skipped_not_cc"] += 1
                     continue
+                stats["banned_meta_dropped"] += _drop_banned_meta(meta)
                 # #147 amendment (2026-08-28): identity CROSSES the callosum. The gate
                 # that used to reject constitutional / *_authored nodes here has been
                 # removed -- walling identity out of the callosum is a split-brain
