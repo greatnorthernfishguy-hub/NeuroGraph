@@ -4341,41 +4341,74 @@ _LOOP_MUST_PROPAGATE = (KeyboardInterrupt, SystemExit, GeneratorExit)
 # ---- No-advance alarm (row #117, LAW 8 family) ------------------------------
 # ---- Changelog ----
 # [2026-09-29] Claude Code (Sonnet 5.5) — no-advance alarm for frozen NG step counter
-# What: A READ-ONLY watchdog, hosted in the existing scan-drain pulse, that notices
-#       when graph.timestep stops advancing (paused or not) and when the autonomous
-#       step() call raises every tick, and makes both loud at default log level.
+# [2026-10-01] Claude Code (Sonnet 5.5) — CORRECTION (worker-002, dispatch #15002),
+#              post two independent reviews (Grok-4.6 + neurograph-law-enforcer).
+# What: A READ-ONLY watchdog, hosted in the existing scan-drain pulse, that alarms
+#       when EITHER the raw graph.timestep counter stops advancing OR no autonomous
+#       graph.step() has SUCCEEDED for a while — two independently-tracked clocks,
+#       not one.
 # Why:  Executive Packet 370 row #117 — both graphs' step counters were found frozen
-#       with nothing reporting it (laptop unchanged 17 days, VPS >=25h). The step
-#       failure was swallowed at logger.debug only, and nothing anywhere watched the
-#       counter itself, so a stuck Rust panic or a long pause was invisible at
-#       default log level. This lane builds the alarm, not the cure — curing the
-#       freeze itself is #117 / S7, a separate lane.
-# How:  _no_advance_tick() is a pure, unit-testable helper driven every pulse tick
-#       from _scan_drain_pulse_loop with the observed timestep + wall clock + pause
-#       state; it never calls graph.step() or otherwise mutates the graph or loop
-#       state. Module-global state (mirrors the file's other loop-state globals,
-#       e.g. _tonic_idle_*). Surfaced additively in handle_stats(). Threshold is
-#       LAW 5 env-driven (NG_NO_ADVANCE_ALARM_SECS, default 300s = one full
-#       _SAVE_INTERVAL_SECS cadence: the pulse ticks every 2s, so a healthy
-#       substrate steps ~150 times within one save interval — going a whole save
-#       interval without a single successful step is already anomalous and worth
-#       paging, while still tolerant of a brief SYMPATHETIC-driven pause). Set to
-#       0 to disable. Re-emit/failure-warn cadences are separately env-tunable for
-#       the same LAW 5 reason, defaulting to the assignment's suggested values.
+#       with nothing reporting it. CORRECTED (was wrong in the first cut): the raw
+#       counter is NOT a reliable proxy for "the autonomous step is healthy", for
+#       two verified reasons. (1) neuro_foundation.py Graph.step() does
+#       `self.timestep += 1` as its FIRST statement under _step_lock — a step that
+#       panics partway through STILL advances the counter, so a watchdog keyed only
+#       on the raw counter never sees a step that reliably fails after incrementing.
+#       (2) handle_after_turn() also calls graph.step() on every conversational
+#       turn, on the SAME counter — exactly the LAW 8 condition this alarm exists
+#       for (autonomic stepping paused/dead while a conversation keeps the shared
+#       counter moving) would read as healthy under counter-only tracking. The
+#       original changelog's claim that the ERROR alarm covered "the autonomous
+#       step() call raises every tick" was false; it only covered a step that
+#       raises so early the increment doesn't happen, which per (1) cannot occur.
+# How:  Two clocks, tracked independently in _no_advance_state: last_change_ts
+#       (wall-clock the raw counter last changed, any driver) and
+#       last_autonomous_success_ts (wall-clock of the last graph.step() call that
+#       completed without raising, set ONLY by _no_advance_note_step_success(),
+#       which the autonomous call site in this loop reaches — handle_after_turn's
+#       call is untouched and does not feed this clock). Alarm fires when EITHER
+#       clock is stale past NG_NO_ADVANCE_ALARM_SECS (default 300s = one full
+#       _SAVE_INTERVAL_SECS cadence — see prior changelog entry for the reasoning);
+#       recovers only once BOTH have cleared. `kind` on the ERROR/INFO lines and in
+#       the handle_stats() block says which condition(s) held. A full-interval
+#       PAUSE is NOT exempted from the raw-counter condition (a paused autonomic
+#       clock is frozen by definition) and does not itself feed the
+#       autonomous-success clock either — only a step that actually completes does.
+#       _no_advance_tick() remains a pure, unit-testable helper (bare timestep
+#       value in, never a graph reference) and still never calls graph.step() or
+#       mutates graph/loop state. C2: last_tick_ts/tick_age_secs additively expose
+#       the watchdog's OWN liveness in handle_stats() (a dead or never-started
+#       pulse thread previously read as a clean "timestep=None, alarm=False").
+#       C3: the tick call site (neurograph_rpc.py, inside _scan_drain_pulse_loop)
+#       is wrapped in its own try/except Exception so a watchdog bug can never
+#       starve the time-based auto-save below it; _no_advance_note_step_success/
+#       _failure are internally exception-safe for the same reason (they run
+#       inside/adjacent to the step()'s own except handler — a raise there would
+#       otherwise be mis-attributed as a second step failure by that same handler).
+#       NG_NO_ADVANCE_FAILURE_WARN_EVERY<=0 means "warn on the first failure only"
+#       (no modulo — raw `%` by 0 raised ZeroDivisionError inside the step's except
+#       handler, silently skipping the scoop/tick/auto-save for that tick every
+#       single failing tick). NG_NO_ADVANCE_REEMIT_SECS<=0 means "never re-emit"
+#       (one ERROR per episode) rather than firing every 2s. Module-level state
+#       (mirrors the file's other loop-state globals, e.g. _tonic_idle_*).
 # -------------------
 _NO_ADVANCE_ALARM_SECS: float = float(os.environ.get("NG_NO_ADVANCE_ALARM_SECS", "300"))
 _NO_ADVANCE_REEMIT_SECS: float = float(os.environ.get("NG_NO_ADVANCE_REEMIT_SECS", "900"))
 _NO_ADVANCE_FAILURE_WARN_EVERY: int = int(os.environ.get("NG_NO_ADVANCE_FAILURE_WARN_EVERY", "30"))
 
 _no_advance_state: Dict[str, Any] = {
-    "last_timestep": None,        # last observed graph.timestep
-    "last_change_ts": None,       # wall-clock time timestep last changed
-    "alarm": False,               # currently latched in the alarm state
-    "last_emit_ts": 0.0,          # wall-clock time of the last ERROR emit (entry or re-emit)
-    "paused": False,              # pause state as of the last tick
-    "paused_by": None,            # "sentinel" | "autonomic" | "sentinel+autonomic" | None
+    "last_timestep": None,               # last observed graph.timestep (raw counter)
+    "last_change_ts": None,              # wall-clock time the raw counter last changed
+    "last_autonomous_success_ts": None,  # wall-clock of the last graph.step() that SUCCEEDED
+    "alarm": False,                      # currently latched in the alarm state
+    "kind": None,                        # "counter_frozen" | "no_successful_autonomous_step" |
+                                          # "counter_frozen+no_successful_autonomous_step" | None
+    "last_emit_ts": 0.0,                 # wall-clock time of the last ERROR emit (entry or re-emit)
+    "last_tick_ts": None,                # C2: wall-clock of the watchdog's own last tick
+    "paused": False,                     # pause state as of the last tick
+    "paused_by": None,                   # "sentinel" | "autonomic" | "sentinel+autonomic" | None
     "consecutive_step_failures": 0,
-    "last_step_error": None,      # repr() of the most recent graph.step() exception
+    "last_step_error": None,             # repr() of the most recent graph.step() exception
 }
 
 
@@ -4383,95 +4416,167 @@ def _no_advance_note_step_failure(exc: BaseException) -> None:
     """Count a failed autonomous graph.step() call and surface it at WARNING.
 
     Was silent at default log level (logger.debug only) — a step that raises every
-    tick left the timestep frozen with no visible trace. Does not change what
-    happens to the failure itself (the pulse loop still swallows it and continues).
+    tick left no visible trace. Does not change what happens to the failure itself
+    (the pulse loop still swallows it and continues).
+
+    C3: exception-safe by construction. This runs INSIDE the step()'s own
+    `except BaseException` handler in _scan_drain_pulse_loop — a raise escaping
+    this function would propagate out of that handler, which the loop's outer
+    guard would then catch and log as a second, misleading failure (or, if the
+    modulo-by-zero bug this replaces recurs, escape further and silently skip the
+    scoop/tick/auto-save for that tick). It must never raise into its caller.
     """
-    st = _no_advance_state
-    st["consecutive_step_failures"] += 1
-    st["last_step_error"] = repr(exc)
-    n = st["consecutive_step_failures"]
-    if n == 1 or n % _NO_ADVANCE_FAILURE_WARN_EVERY == 0:
-        logger.warning(
-            "Autonomous substrate step failed (consecutive=%d): %s", n, st["last_step_error"],
-        )
+    try:
+        st = _no_advance_state
+        st["consecutive_step_failures"] += 1
+        st["last_step_error"] = repr(exc)
+        n = st["consecutive_step_failures"]
+        warn_every = _NO_ADVANCE_FAILURE_WARN_EVERY
+        # <=0 means "first failure only" — the bare `n % warn_every` below would
+        # ZeroDivisionError on 0, and a negative modulus is meaningless here.
+        should_warn = (n == 1) if warn_every <= 0 else (n == 1 or n % warn_every == 0)
+        if should_warn:
+            logger.warning(
+                "Autonomous substrate step failed (consecutive=%d): %s", n, st["last_step_error"],
+            )
+    except Exception as _inner_exc:  # noqa: BLE001 - must never raise into the step() except handler
+        logger.warning("No-advance watchdog: _no_advance_note_step_failure failed: %r", _inner_exc)
 
 
-def _no_advance_note_step_success() -> None:
-    """Reset the consecutive-failure count after a graph.step() call succeeds."""
-    _no_advance_state["consecutive_step_failures"] = 0
-    _no_advance_state["last_step_error"] = None
+def _no_advance_note_step_success(now: Optional[float] = None) -> None:
+    """Reset the consecutive-failure count and record the wall-clock time of this
+    SUCCESSFUL autonomous graph.step() — the autonomous-step clock C1 adds,
+    distinct from the raw timestep counter (which handle_after_turn's
+    conversational step() call can also advance, masking a dead autonomous clock).
+
+    `now` is injectable (tests pass a fake clock); defaults to time.time().
+
+    C3: exception-safe for the same reason as _no_advance_note_step_failure — this
+    runs inside the step()'s own `try` block, so a raise here would otherwise be
+    caught by that same try's `except BaseException` and mis-logged as a step
+    failure.
+    """
+    try:
+        st = _no_advance_state
+        st["consecutive_step_failures"] = 0
+        st["last_step_error"] = None
+        st["last_autonomous_success_ts"] = now if now is not None else time.time()
+    except Exception as _exc:  # noqa: BLE001 - must never raise into the step() try block
+        logger.warning("No-advance watchdog: _no_advance_note_step_success failed: %r", _exc)
 
 
 def _no_advance_tick(timestep: Any, now: float, paused: bool, paused_by: Optional[str]) -> None:
     """One READ-ONLY watchdog tick — never calls graph.step() or mutates any graph/loop state.
 
-    Records whether `timestep` changed since the last tick. Once it has been frozen
-    past _NO_ADVANCE_ALARM_SECS, latches an alarm and logs one ERROR on entry, then
-    re-emits at _NO_ADVANCE_REEMIT_SECS while it stays frozen so a long freeze stays
-    visible. Logs one INFO line on recovery. Runs every pulse tick — including
-    paused ticks and ticks where the autonomous step() raised.
+    Tracks TWO independent clocks (C1): the raw `timestep` counter (changed by
+    EITHER the autonomous step here or a conversational step in handle_after_turn)
+    and the autonomous-success clock (advanced ONLY by _no_advance_note_step_success,
+    i.e. only when the autonomous call site in this loop actually completes a step).
+    Alarms when either has been stale for >= _NO_ADVANCE_ALARM_SECS; `kind` says
+    which. Recovers (one INFO, alarm cleared) only once BOTH have cleared — a raw
+    counter advanced solely by a conversational turn does NOT, by itself, clear an
+    autonomous-step alarm. A paused tick is NOT exempt from the raw-counter check
+    (a full pause interval is itself a frozen autonomic clock) and cannot advance
+    the autonomous-success clock either, since no step is attempted while paused.
+    Runs every pulse tick — including paused ticks and ticks where the autonomous
+    step raised.
     """
     st = _no_advance_state
     st["paused"] = paused
     st["paused_by"] = paused_by
+    st["last_tick_ts"] = now  # C2: watchdog's own liveness, tracked regardless of alarm config
+
+    if st["last_autonomous_success_ts"] is None:
+        # Bootstrap: a fresh process has had zero chances to succeed yet. Anchor
+        # the clock at the first tick rather than treating "never" as infinitely
+        # stale, so process start doesn't immediately false-alarm.
+        st["last_autonomous_success_ts"] = now
 
     if st["last_timestep"] is None or timestep != st["last_timestep"]:
-        was_alarmed = st["alarm"]
-        frozen_secs = (now - st["last_change_ts"]) if st["last_change_ts"] is not None else 0.0
         st["last_timestep"] = timestep
         st["last_change_ts"] = now
-        if was_alarmed:
-            st["alarm"] = False
-            logger.info(
-                "No-advance alarm resumed: timestep advancing again after %.0fs frozen",
-                frozen_secs,
-            )
-        return
-
-    if st["last_change_ts"] is None:
+    elif st["last_change_ts"] is None:
         st["last_change_ts"] = now
-        return
 
     if _NO_ADVANCE_ALARM_SECS <= 0:
-        return  # disabled via NG_NO_ADVANCE_ALARM_SECS=0
+        st["alarm"] = False  # disabled via NG_NO_ADVANCE_ALARM_SECS<=0: bookkeeping above still
+        return               # runs (so stats stay meaningful), but never latches an alarm.
 
     frozen_secs = now - st["last_change_ts"]
-    if frozen_secs < _NO_ADVANCE_ALARM_SECS:
-        return
+    autonomous_stale_secs = now - st["last_autonomous_success_ts"]
+    counter_frozen = frozen_secs >= _NO_ADVANCE_ALARM_SECS
+    no_success = autonomous_stale_secs >= _NO_ADVANCE_ALARM_SECS
+    should_alarm = counter_frozen or no_success
 
-    if not st["alarm"]:
-        st["alarm"] = True
-        st["last_emit_ts"] = now
-        logger.error(
-            "No-advance alarm: timestep=%s frozen for %.0fs (paused=%s paused_by=%s "
-            "consecutive_step_failures=%d last_step_error=%s)",
-            timestep, frozen_secs, paused, paused_by,
-            st["consecutive_step_failures"], st["last_step_error"],
-        )
-    elif (now - st["last_emit_ts"]) >= _NO_ADVANCE_REEMIT_SECS:
-        st["last_emit_ts"] = now
-        logger.error(
-            "No-advance alarm (still frozen): timestep=%s frozen for %.0fs (paused=%s "
-            "paused_by=%s consecutive_step_failures=%d last_step_error=%s)",
-            timestep, frozen_secs, paused, paused_by,
-            st["consecutive_step_failures"], st["last_step_error"],
+    if counter_frozen and no_success:
+        kind = "counter_frozen+no_successful_autonomous_step"
+    elif counter_frozen:
+        kind = "counter_frozen"
+    elif no_success:
+        kind = "no_successful_autonomous_step"
+    else:
+        kind = None
+
+    if should_alarm:
+        st["kind"] = kind
+        if not st["alarm"]:
+            st["alarm"] = True
+            st["last_emit_ts"] = now
+            logger.error(
+                "No-advance alarm (%s): timestep=%s frozen_secs=%.0f autonomous_stale_secs=%.0f "
+                "paused=%s paused_by=%s consecutive_step_failures=%d last_step_error=%s",
+                kind, timestep, frozen_secs, autonomous_stale_secs, paused, paused_by,
+                st["consecutive_step_failures"], st["last_step_error"],
+            )
+        elif _NO_ADVANCE_REEMIT_SECS > 0 and (now - st["last_emit_ts"]) >= _NO_ADVANCE_REEMIT_SECS:
+            st["last_emit_ts"] = now
+            logger.error(
+                "No-advance alarm (still %s): timestep=%s frozen_secs=%.0f "
+                "autonomous_stale_secs=%.0f paused=%s paused_by=%s "
+                "consecutive_step_failures=%d last_step_error=%s",
+                kind, timestep, frozen_secs, autonomous_stale_secs, paused, paused_by,
+                st["consecutive_step_failures"], st["last_step_error"],
+            )
+            # _NO_ADVANCE_REEMIT_SECS<=0 falls through here forever: one ERROR per episode.
+    elif st["alarm"]:
+        prior_kind = st.get("kind")
+        st["alarm"] = False
+        st["kind"] = None
+        logger.info(
+            "No-advance alarm resumed (%s cleared): frozen_secs=%.0f autonomous_stale_secs=%.0f",
+            prior_kind, frozen_secs, autonomous_stale_secs,
         )
 
 
 def _no_advance_stats_block() -> Dict[str, Any]:
-    """Additive handle_stats() block — a read-only snapshot of the current alarm state."""
+    """Additive handle_stats() block — a read-only snapshot of the current alarm state.
+
+    C2: last_tick_ts/tick_age_secs expose the watchdog's OWN liveness — a dead or
+    never-started pulse thread previously read as a clean "timestep=None,
+    frozen_secs=0.0, alarm=False" here, which looks healthy but isn't observed.
+    `tick_age_secs` is None (not 0) when the watchdog has never ticked at all.
+    """
     st = _no_advance_state
     now = time.time()
     frozen_secs = (now - st["last_change_ts"]) if st["last_change_ts"] is not None else 0.0
+    autonomous_stale_secs = (
+        (now - st["last_autonomous_success_ts"])
+        if st["last_autonomous_success_ts"] is not None else 0.0
+    )
+    tick_age_secs = (now - st["last_tick_ts"]) if st["last_tick_ts"] is not None else None
     return {
         "alarm": st["alarm"],
+        "kind": st["kind"],
         "timestep": st["last_timestep"],
         "frozen_secs": frozen_secs,
+        "autonomous_stale_secs": autonomous_stale_secs,
         "paused": st["paused"],
         "paused_by": st["paused_by"],
         "consecutive_step_failures": st["consecutive_step_failures"],
         "last_step_error": st["last_step_error"],
         "threshold_secs": _NO_ADVANCE_ALARM_SECS,
+        "last_tick_ts": st["last_tick_ts"],
+        "tick_age_secs": tick_age_secs,
     }
 
 
@@ -4489,6 +4594,10 @@ def _scan_drain_pulse_loop() -> None:
     was_paused = False
     while not _scan_drain_shutdown.is_set():
         try:
+            # Single wall-clock read, reused for the whole iteration (success-note,
+            # watchdog tick, auto-save check) — keeps all three self-consistent and
+            # makes the loop deterministically testable against a fake clock (C4).
+            _tick_now = time.time()
             # Two pause sources: sentinel file (manual) + autonomic state (automatic).
             # Either one pauses draining. Both must be clear to resume.
             sentinel_paused = os.path.exists(_SCAN_DRAIN_PAUSE_FILE)
@@ -4530,7 +4639,7 @@ def _scan_drain_pulse_loop() -> None:
                         # Bunyan/THC/Immunis health-monitor the substrate while idle, no conversation
                         # needed ([[feedback_no_conversation_dependency]]).
                         _deposit_substrate_metrics(_auto_step, to_jsonl=False)
-                        _no_advance_note_step_success()
+                        _no_advance_note_step_success(now=_tick_now)
                     except BaseException as _exc:  # noqa: BLE001 - see _LOOP_MUST_PROPAGATE
                         if isinstance(_exc, _LOOP_MUST_PROPAGATE):
                             raise
@@ -4552,26 +4661,29 @@ def _scan_drain_pulse_loop() -> None:
             # #117: no-advance watchdog — READ-ONLY, runs every tick including paused ticks
             # and ticks where the step above raised (LAW 8: must not depend on a conversation,
             # so it lives here in the wall-clock pulse, not on-message/afterTurn). Never calls
-            # graph.step() or otherwise mutates state.
+            # graph.step() or otherwise mutates state. C3: wrapped in its own try/except —
+            # a watchdog bug must never starve the time-based auto-save below it.
             if _memory is not None:
-                if sentinel_paused and autonomic_paused:
-                    _paused_by = "sentinel+autonomic"
-                elif sentinel_paused:
-                    _paused_by = "sentinel"
-                elif autonomic_paused:
-                    _paused_by = "autonomic"
-                else:
-                    _paused_by = None
-                _no_advance_tick(_memory.graph.timestep, time.time(), paused, _paused_by)
+                try:
+                    if sentinel_paused and autonomic_paused:
+                        _paused_by = "sentinel+autonomic"
+                    elif sentinel_paused:
+                        _paused_by = "sentinel"
+                    elif autonomic_paused:
+                        _paused_by = "autonomic"
+                    else:
+                        _paused_by = None
+                    _no_advance_tick(_memory.graph.timestep, _tick_now, paused, _paused_by)
+                except Exception as _exc:  # noqa: BLE001 - watchdog must never break the pulse
+                    logger.warning("No-advance watchdog tick failed (non-fatal): %r", _exc)
             # Time-based auto-save — fires on every tick, paused or not.
             # Shared _last_save_time with the afterTurn save path; whichever
             # fires first resets the clock so we don't double-save.
             global _last_save_time
-            _now = time.time()
-            if _memory is not None and (_now - _last_save_time) >= _SAVE_INTERVAL_SECS:
+            if _memory is not None and (_tick_now - _last_save_time) >= _SAVE_INTERVAL_SECS:
                 try:
                     _memory.save()
-                    _last_save_time = _now
+                    _last_save_time = _tick_now
                     logger.info("Auto-save: checkpoint written (scan-drain loop)")
                 except Exception:
                     logger.exception("Auto-save failed in scan-drain loop")
