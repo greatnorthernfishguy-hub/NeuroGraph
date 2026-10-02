@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 F1 builder; Exec P577 repair of the P575 (a) finding)
+# What: the note call's handler in the sweep is no longer a silent swallow: it logs ONE WARNING naming the exception TYPE only. The raising-clock test now
+#   expects both WARNINGs (the note's + the per-node check's), each type-only; a new test pins the case that made the old comment false (every orphan EXCLUDED,
+#   so only the note reads the clock); a new static test pins the handler's shape (logger.warning, the exception used only as type(exc), never str/repr).
+# Why: a swallowed raise hid a stalled-heartbeat signal when the per-node check never read the clock.
+# How: same helpers; no change to the other tests.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 F1 builder; Exec P571 (b) F1 + F3 / Exec P574)
 # What: re-pin the stale-episode tests on the NEW site. `_fair_chance_heartbeat_fresh` is now a PURE query and `_note_fair_chance_stale` (called once per
 #   sweep by `_collect_orphan_nodes`) owns the latch + the ONE WARNING per episode: the episode / registering-again tests now drive the SWEEP; a new test pins
@@ -467,7 +473,7 @@ def test_the_window_query_is_pure_for_every_node_shape_and_the_sweep_is_what_war
         assert "x" not in g.nodes and len(_warnings(caplog)) == 1
 
 
-def test_a_clock_that_raises_never_escapes_the_sweep_and_the_node_is_swept_with_one_raise_warning(caplog):
+def test_a_clock_that_raises_never_escapes_the_sweep_and_the_node_is_swept_with_two_warnings_each_naming_a_type_only(caplog):
     state = {"boom": False}
 
     def clock():
@@ -481,9 +487,33 @@ def test_a_clock_that_raises_never_escapes_the_sweep_and_the_node_is_swept_with_
         removed = g._collect_orphan_nodes()                          # the note's clock read must not escape the sweep
     assert removed == 1 and "a" not in g.nodes                       # fail toward today's sweep
     ws = [r for r in caplog.records if r.name == "neuro_foundation" and r.levelno == logging.WARNING]
-    assert len(ws) == 1                                              # the per-node check reports it, ONE per sweep
+    assert len(ws) == 2                                              # P577: the note's own WARNING, plus the per-node check's ONE per sweep
+    note = [r for r in ws if "fair-chance stale note" in r.getMessage()]
+    node = [r for r in ws if "orphan sweep" in r.getMessage()]
+    assert len(note) == 1 and len(node) == 1
+    assert "RuntimeError" in note[0].getMessage() and "1 node" in node[0].getMessage() and "RuntimeError" in node[0].getMessage()
+    assert _SECRET not in "".join(r.getMessage() + str(r.args) for r in ws)       # the TYPE NAME only, never the exception text
+
+
+def test_an_unreadable_clock_is_never_silent_even_when_every_orphan_is_excluded(caplog):
+    """P577 (the P575 (a) finding): an EXCLUDED orphan never reaches the per-node heartbeat read, so the note's own handler is the only signal."""
+    state = {"boom": False}
+
+    def clock():
+        if state["boom"]:
+            raise RuntimeError(_SECRET)
+        return 1000.0
+    g = _graph(max_age=300, clock=clock)
+    _node(g, "ing", {"creation_mode": "ingested"})                   # excluded: only the note ever reads the clock
+    state["boom"] = True
+    with caplog.at_level(logging.DEBUG, logger="neuro_foundation"):
+        removed = g._collect_orphan_nodes()                          # no escape
+    assert removed == 1 and "ing" not in g.nodes                     # an excluded node is swept as always
+    ws = [r for r in caplog.records if r.name == "neuro_foundation" and r.levelno == logging.WARNING]
+    assert len(ws) == 1                                              # observable: exactly the note's WARNING, no per-node raise to report
     msg = ws[0].getMessage()
-    assert "1 node" in msg and "RuntimeError" in msg and _SECRET not in msg
+    assert "fair-chance stale note" in msg and "RuntimeError" in msg and "was not emitted" in msg
+    assert _SECRET not in msg and _SECRET not in str(ws[0].args)
 
 
 def test_the_stamp_is_the_hosts_completion_signal_and_a_pass_that_never_happens_leaves_the_old_stamp():
@@ -879,6 +909,25 @@ def test_static_the_heartbeat_query_is_pure_and_the_note_is_called_once_per_swee
     elsewhere = [k for k, f in fns.items() if not k.endswith("#class") and k != "Graph._collect_orphan_nodes"
                  and any(isinstance(c, ast.Attribute) and c.attr == "_note_fair_chance_stale" for c in ast.walk(f))]
     assert elsewhere == [], elsewhere
+
+
+def test_static_the_notes_handler_in_the_sweep_logs_the_type_name_only_and_never_swallows_silently():
+    """P577: the handler around the note call catches Exception, calls logger.warning, and uses the caught exception ONLY as the argument of `type(...)`
+    (so `type(exc).__name__` is logged and `str(exc)` / `repr(exc)` / f-string / `%s` of the exception itself never is); its body is not a bare `pass`."""
+    sweep = _funcs(_new_tree())["Graph._collect_orphan_nodes"]
+    tries = [t for t in ast.walk(sweep) if isinstance(t, ast.Try)
+             and any(isinstance(c, ast.Call) and getattr(c.func, "attr", None) == "_note_fair_chance_stale" for s in t.body for c in ast.walk(s))]
+    assert len(tries) == 1 and len(tries[0].handlers) == 1
+    h = tries[0].handlers[0]
+    assert isinstance(h.type, ast.Name) and h.type.id == "Exception" and h.name
+    assert not all(isinstance(s, ast.Pass) for s in h.body)
+    warns = [c for s in h.body for c in ast.walk(s) if isinstance(c, ast.Call) and getattr(c.func, "attr", None) == "warning"
+             and getattr(c.func.value, "id", None) == "logger"]
+    assert len(warns) == 1
+    type_args = {id(a) for c in ast.walk(h) if isinstance(c, ast.Call) and getattr(c.func, "id", None) == "type" for a in c.args}
+    uses = [n for s in h.body for n in ast.walk(s) if isinstance(n, ast.Name) and n.id == h.name]
+    assert uses and all(id(n) in type_args for n in uses), "the caught exception may appear ONLY as type(<exc>)"
+    assert any(isinstance(n, ast.Attribute) and n.attr == "__name__" for s in h.body for n in ast.walk(s))
 
 
 def test_static_the_docstrings_carry_the_framing_and_the_host_contract():

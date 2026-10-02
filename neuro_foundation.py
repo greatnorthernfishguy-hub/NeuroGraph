@@ -3775,8 +3775,10 @@ class Graph:
         — LAW 4: `_fair_chance_heartbeat_fresh` is now a PURE boolean query (no latch write, no log). The
         stale latch and its ONE WARNING per stale episode MOVED to the named `_note_fair_chance_stale`,
         which this sweep calls ONCE before its per-node loop whenever a registered graph has orphans to
-        consider. An unreadable clock in that call is left to the per-node check, which already counts it
-        and keeps the node swept (fail toward today). The recovery re-arm + ONE INFO stay in
+        consider. An unreadable clock in that call never escapes the sweep: it is logged as ONE WARNING
+        naming the exception's TYPE only (never its text); the per-node check below still counts a clock
+        raise for every non-excluded node and keeps that node swept (fail toward today). [2026-10-02, P577
+        repair of the P575 (a) finding: this call used to swallow the raise silently.] The recovery re-arm + ONE INFO stay in
         `fair_chance_heartbeat_stamp` (unchanged). F3: `enable_fair_chance_window` now states the real
         heartbeat contract (optional; None = not enforced; a host with an autonomic advancer MUST pass a
         finite max age and a clock); the default is unchanged.
@@ -3796,8 +3798,10 @@ class Graph:
         if getattr(self, "_fair_chance_cfg", None) is not None and orphans:
             try:
                 self._note_fair_chance_stale(self._fair_chance_cfg)  # ONCE per sweep: the stale latch + its one WARNING
-            except Exception:
-                pass  # an unreadable clock is counted and warned by the per-node check below (the node stays swept)
+            except Exception as exc:
+                # the raise must not escape step(); it is NOT silent: the per-node check below does not read the clock for an
+                # excluded node, so this WARNING (TYPE NAME only, never str(exc)) is the only signal when every orphan is excluded
+                logger.warning("fair-chance stale note: the heartbeat clock raised (%s); the stale WARNING was not emitted this sweep", type(exc).__name__)
             swept = []
             window_failures = 0
             window_errors = set()
