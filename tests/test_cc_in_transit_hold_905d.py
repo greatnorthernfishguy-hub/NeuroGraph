@@ -20,6 +20,11 @@
 #   Follow-up in the same commit (review): the file is read through ONE O_NONBLOCK fd + fstat (a FIFO swapped in cannot block a caller
 #   holding graph._step_lock; the regular-file/size checks cannot be raced), so the no-I/O patches cover os.open/os.fstat/os.read and a
 #   FIFO case is added to the corrupt matrix.
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14776) — #976 shape-guard tests
+#   (1) 146 scratch ids SHAPED like the real ones (132 tree + 14 forest; NEVER the real file) are VALID; (2) an all-redacted-shape file is corrupt
+#   (class redacted_id_shape, no id/line in caplog, in_transit_ids() None); (3) a mixed file (146 good + ONE redacted id first/middle/last) is corrupt;
+#   (4) boundary shapes that must NOT trip it; (5) the empty-intersection case stays quiet (guard 1); (6) 1 id and 500 ids are both VALID (guard 2:
+#   no count pinned); (7) reported through in_transit_ids / held_unbound_nodes / whole_graph_guard like bad_id (one read, one ERROR, cached).
 # -------------------
 """#905-DELTA: the hold covers only nodes whose binding is in transit."""
 import builtins
@@ -753,3 +758,146 @@ def test_accessor_held_first_then_accessor_is_also_one_read(tmp_path, monkeypatc
 
 def test_accessor_has_no_parameters_and_reads_no_graph():
     assert list(inspect.signature(tmg.in_transit_ids).parameters) == []
+
+
+# ---------------------------------------------------------------- #976: the redacted-id SHAPE guard
+
+def _raw_ids(n_trees=132, n_forests=14, seed=976):
+    """Scratch ids SHAPED like the real in-transit ones (never the real file): `cc:conv::<40 hex>::tree::<concept words>` (the concept
+    carries spaces, colons and non-ASCII) and `cc:conv::<40 hex>`; seeded random hex."""
+    rnd = random.Random(seed)
+    hexs = lambda n: "".join(rnd.choice("0123456789abcdef") for _ in range(n))
+    words = ["quarterly salary: negotiation", "naïve café plan", "日本語 のメモ", "x y  z", "colon:inside:word", "a/b\\c"]
+    trees = ["cc:conv::%s::tree::%s %d" % (hexs(40), rnd.choice(words), i) for i in range(n_trees)]
+    forests = ["cc:conv::%s" % hexs(40) for _ in range(n_forests)]
+    return trees + forests
+
+
+REDACTED = ["forest:2dfa2d637643", "tree:0123456789ab", "want:abcdef012345", "window:ffffffffffff", "node:000000000000"]
+
+
+def test_976_1_the_real_raw_id_shapes_pass_and_hold_as_before(tmp_path, monkeypatch, caplog):
+    ids = _raw_ids()
+    assert len(ids) == 146 and sum("::tree::" in i for i in ids) == 132
+    g = Graph()
+    for i in ids[:3]:
+        _node(g, i)
+    _node(g, OWN)
+    _use(monkeypatch, _cohort_file(tmp_path, ids))
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        got = tmg.in_transit_ids()
+        held = _held(g)
+    assert got == frozenset(ids) and len(got) == 146                      # VALID: the whole cohort of 146
+    assert held == set(ids[:3])                                           # holds as before: the cohort's unbound nodes, not OWN
+    assert _tmg_records(caplog, logging.ERROR) == [] and len(_tmg_records(caplog, logging.INFO)) == 1
+
+
+def _corrupt_976_assertions(g, caplog, secret_fragments):
+    ids = set(g.nodes)
+    base = tmg._unbound_nodes(g, ids)
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        assert tmg.in_transit_ids() is None
+        assert tmg.held_unbound_nodes(g, ids) == base                     # hold ALL, fail CLOSED
+        assert tmg.held_unbound_nodes(g, ids, merge_landed={ARR}) == base
+        assert tmg.whole_graph_guard(g)() == base
+        assert tmg.in_transit_ids() is None
+    errs = _tmg_records(caplog, logging.ERROR)
+    assert len(errs) == 1 and "class=redacted_id_shape" in errs[0].getMessage()      # ONE loud ERROR naming the class
+    assert _tmg_records(caplog, logging.INFO) == []
+    for frag in secret_fragments:
+        assert frag not in caplog.text                                    # never the id, never a line
+
+
+def test_976_2_an_all_redacted_shape_file_is_corrupt(tmp_path, monkeypatch, caplog):
+    g = Graph()
+    for i in (OWN, COH_A, "forest:2dfa2d637643"):
+        _node(g, i)
+    _use(monkeypatch, _cohort_file(tmp_path, REDACTED))
+    _corrupt_976_assertions(g, caplog, ["2dfa2d637643", "0123456789ab", "abcdef012345", "ffffffffffff", "000000000000", "SECRETSOURCE"])
+    assert tmg._unbound_nodes(g, set(g.nodes)) == {OWN, COH_A, "forest:2dfa2d637643"}
+
+
+@pytest.mark.parametrize("where", ["first", "middle", "last"])
+def test_976_3_one_redacted_id_poisons_a_file_of_146_good_ones(tmp_path, monkeypatch, caplog, where):
+    good = _raw_ids()
+    ids = {"first": ["forest:2dfa2d637643"] + good, "middle": good[:73] + ["forest:2dfa2d637643"] + good[73:],
+           "last": good + ["forest:2dfa2d637643"]}[where]
+    g = Graph()
+    for i in good[:2] + [OWN]:
+        _node(g, i)
+    _use(monkeypatch, _cohort_file(tmp_path, ids))
+    _corrupt_976_assertions(g, caplog, ["2dfa2d637643", "SECRETSOURCE"])
+    assert tmg._unbound_nodes(g, set(g.nodes)) == set(g.nodes)            # every sweep-eligible unbound node held (the whole-graph hold)
+
+
+@pytest.mark.parametrize("nid", [
+    "forest:2dfa2d63764",          # 11 hex
+    "forest:2dfa2d6376431",        # 13 hex
+    "forest:2DFA2D637643",         # uppercase hex
+    "for3st:2dfa2d637643",         # a digit in the kind
+    "for_est:2dfa2d637643",        # an underscore in the kind
+    "cc:want::2dfa2d637643",       # a raw want id with `::`
+    "cc:conv::2dfa2d637643",       # a raw-looking forest prefix with 12 hex
+    "forest:2dfa2d637643x",        # a trailing char
+    "forest:2dfa2d637643\n",       # a trailing NEWLINE inside the id (`$` would let re.match/search through; fullmatch must not)
+    " forest:2dfa2d637643",        # a leading space
+], ids=["hex11", "hex13", "upper", "digit_kind", "underscore_kind", "want_double_colon", "conv_prefix", "trailing_char", "trailing_newline", "leading_space"])
+def test_976_4_boundary_shapes_do_not_trip_the_guard(tmp_path, monkeypatch, caplog, nid):
+    _use(monkeypatch, _cohort_file(tmp_path, [COH_A, nid]))
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        assert tmg.in_transit_ids() == frozenset({COH_A, nid})
+    assert _tmg_records(caplog, logging.ERROR) == []
+
+
+def test_976_5_an_empty_intersection_is_not_corrupt_the_hold_goes_quiet_and_the_clock_runs(tmp_path, monkeypatch, caplog):
+    """GUARD 1: every cohort id bound or absent => held empty, NO error, the pass runs every step."""
+    ids = _raw_ids(5, 1)
+    g = Graph()
+    for i in ids[:3]:
+        _node(g, i)
+    _bind(g, ids[0], ids[1])
+    _bind(g, ids[1], ids[2])                                              # 3 present AND bound; the other 3 are absent from the graph
+    _use(monkeypatch, _cohort_file(tmp_path, ids))
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        assert _held(g) == set() and tmg.whole_graph_guard(g)() == set()
+        progress = {}
+        assert cno._cc_callosum_consolidate(g, IDLE, guard=tmg.whole_graph_guard(g), progress=progress) is True
+    assert progress["held"] is False and g.timestep == IDLE
+    assert _tmg_records(caplog, logging.ERROR) == []                      # quiet
+    assert tmg.in_transit_ids() == frozenset(ids)                         # still VALID, the file is static
+    g2 = Graph()                                                          # a graph holding NONE of the cohort: intersection empty too
+    assert tmg.held_unbound_nodes(g2, set(g2.nodes)) == set() and _tmg_records(caplog, logging.ERROR) == []
+
+
+@pytest.mark.parametrize("n", [1, 2, 500])
+def test_976_6_no_count_is_pinned_one_id_and_five_hundred_are_both_valid(tmp_path, monkeypatch, caplog, n):
+    ids = _raw_ids(n, 0)
+    _use(monkeypatch, _cohort_file(tmp_path, ids))
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        got = tmg.in_transit_ids()
+    assert got == frozenset(ids) and len(got) == n != 146
+    assert _tmg_records(caplog, logging.ERROR) == []
+
+
+def test_976_7_reported_like_bad_id_one_read_one_error_cached(tmp_path, monkeypatch, caplog):
+    real, reads = tmg._read_in_transit_ids, []
+    monkeypatch.setattr(tmg, "_read_in_transit_ids", lambda path: (reads.append(path), real(path))[1])
+    g = Graph()
+    _node(g, OWN)
+    _use(monkeypatch, _cohort_file(tmp_path, _raw_ids(3, 1) + ["tree:0123456789ab"]))
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        assert tmg.in_transit_ids() is None
+        assert _held(g) == {OWN} == tmg._unbound_nodes(g, set(g.nodes))
+        assert tmg.whole_graph_guard(g, merge_landed={ARR})() == {OWN}
+        (tmp_path / "in-transit.jsonl").write_text(_rows(_raw_ids(3, 1)))   # fixed later: NOT re-read (cached until a restart)
+        assert tmg.in_transit_ids() is None
+    assert len(reads) == 1 and len(_tmg_records(caplog, logging.ERROR)) == 1 and len(_tmg_records(caplog)) == 1
+
+
+def test_976_the_constant_is_the_shape_redact_node_id_produces():
+    """The guard's shape is exactly redact_node_id's output shape (one rule): every redacted form it can make matches, no raw form does."""
+    for raw in ("cc:conv::" + "ab" * 20, "cc:conv::" + "ab" * 20 + "::tree::some words", "cc:want::x", "x::window::y", "plain"):
+        red = tmg.redact_node_id(raw)
+        assert tmg._IN_TRANSIT_REDACTED_SHAPE.fullmatch(red), red
+        assert not tmg._IN_TRANSIT_REDACTED_SHAPE.fullmatch(raw), raw
+    assert tmg._IN_TRANSIT_REDACTED_SHAPE.pattern == r"^[a-z]+:[0-9a-f]{12}$"
