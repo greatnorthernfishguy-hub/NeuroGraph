@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-4' / round 2) — Exec P563 (the window is canonical and host-neutral)
+# What: ONE test corrected: `test_neuro_foundation_is_unaware_of_the_heartbeat_and_imports_no_cc_module` pinned the Addendum-1 shape (the protected file knows nothing of
+#   a heartbeat); it is now `test_neuro_foundation_imports_no_cc_module` (the half that stays true). Everything else in this file is unchanged here and is REWORKED by the
+#   organism commit that follows (the predicate / heartbeat / step logic these tests cover moves into canonical neuro_foundation).
+# Why: each commit must be green on its own; this assertion could not survive the canonical heartbeat.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3b / round 2) — Chief-003 Addendum 2 (the step window is a DEDICATED knob)
 # What: the fixture now patches the STEP window (`_CC_PROBATION_STEP_WINDOW`) and the GRADUATION period (`_CC_CONV_PROBATION_PERIOD`) to two DIFFERENT
 #   values (so any coupling shows up in every test); the graduation-count assertions follow the graduation value. NEW: the two knobs are pinned INDEPENDENT
@@ -886,21 +891,16 @@ def test_the_ingested_literal_lives_only_in_probation_population_within_cc_ng_or
     assert holders == ["probation_population"], holders
 
 
-def test_neuro_foundation_is_unaware_of_the_heartbeat_and_imports_no_cc_module():
+def test_neuro_foundation_imports_no_cc_module():
+    """Corrected by NG-4' (Exec P563): the Addendum-1 shape pinned `neuro_foundation.py` as UNAWARE of the heartbeat. The window logic, heartbeat
+    included, is now canonical and host-neutral inside it (its own tests: tests/test_fair_chance_window.py); what stays true is that the protected
+    file imports no CC host module."""
     tree = _parse(os.path.join(_REPO, "neuro_foundation.py"))
     for n in ast.walk(tree):
-        if isinstance(n, ast.Name):
-            assert "heartbeat" not in n.id.lower() and not n.id.startswith("cc_")
-        elif isinstance(n, ast.Attribute):
-            assert "heartbeat" not in n.attr.lower() and not n.attr.startswith("cc_")
-        elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
-            assert "heartbeat" not in n.name.lower()
-        elif isinstance(n, ast.Import):
+        if isinstance(n, ast.Import):
             assert not any(a.name.startswith("cc_") for a in n.names)
         elif isinstance(n, ast.ImportFrom):
             assert not (n.module or "").startswith("cc_")
-        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 60:
-            assert "heartbeat" not in n.value.lower() and n.value != "ingested"
 
 
 def _code_tokens(path):
