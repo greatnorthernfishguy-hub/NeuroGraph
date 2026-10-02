@@ -3,6 +3,14 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — Josh's ruling (Exec P550 / P552; Exec P561 P1)
+# What: _BANNED_META gains `probation_steps_remaining` and `probation_last_timestep`, the two fields that carry the STEP-keyed
+#       fair-chance window (cc_ng_organism.fair_chance_window_open). Neither may cross the wire.
+# Why: CC-CALLOSUM-TRUTH §8.13. `probation_last_timestep` is a LOCAL counter exactly like `creation_time` (already banned): it is the
+#       SENDER's graph.timestep and means nothing on the receiver. The count is re-stamped by the receiver's own
+#       `_cc_deposit_memory_node` on landing (an arrival WITH an embedding gets a fresh window; the no-embedding structural install
+#       gets none, as before). This module does not decide who is covered; it only keeps the sender's counters off the wire.
+# How: two entries in the frozenset. Test: tests/test_cc_fair_chance_window_p561.py (membership AND a wire round-trip).
 # [2026-08-28] Claude Code (DudeMan CC, Opus 4.8) — #147 amendment: in-frame HE completeness + identity crosses the callosum
 # What: (1) HE closure no longer leans on the ack ledger. _closeable_he now requires
 #       EVERY member of a hyperedge to be eligible, and counts a member as "already
@@ -278,6 +286,8 @@ _BANNED_META = frozenset({
     "creation_time",       # int(self.timestep) -- a LOCAL counter
     "probation_remaining",  # receiver runs its own probation window
     "probation_total",
+    "probation_steps_remaining",  # P561: the step-keyed fair-chance window count: the receiver re-stamps it on landing
+    "probation_last_timestep",    # P561: a LOCAL counter exactly like creation_time (the receiver's own graph.timestep)
 })
 
 

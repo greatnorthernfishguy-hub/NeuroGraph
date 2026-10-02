@@ -1,5 +1,17 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — Josh's ruling (Exec P550 / P552; Exec P561; Exec P562 Addendum 1)
+# What: harness-only; NO assertion changed or weakened. (1) test_probation_keeps_existing_clock_semantics: `functions('probation_advances',
+#       'cc_update_probation')` -> `functions('probation_population','fair_chance_window_open','cc_update_probation')` (the round-1 predicate was
+#       renamed with no alias). (2) This harness AST-extracts ONLY named functions into a bare namespace, so the bare namespace now also needs what
+#       cc_update_probation / _cc_deposit_memory_node call and read: `functions()` ALWAYS extracts `_probation_finite_number`, `_probation_clock`,
+#       `_probation_heartbeat_stamp`, `_probation_heartbeat_fresh`, `_probation_step_window_tick` beside `_cc_mutation_lock`, and its namespace gains
+#       the module-level names those use that an AST extract of FUNCTIONS cannot carry: `threading`, `_PROBATION_HEARTBEAT` (a fresh unarmed dict per
+#       call) and `_PROBATION_HEARTBEAT_LOCK` (a fresh lock). `time` and `logger` were already provided.
+# Why: P561 P1 + P2 (the step-keyed window and the completion heartbeat live in the organism). The Graph double in this file has no `timestep`:
+#       cc_update_probation reads it with getattr and skips the step block, so graduation still does not need or advance the clock, which is
+#       exactly what this test asserts and still passes UNCHANGED.
+# How: see What. The test and the assertion `not hasattr(g,'timestep')` are untouched.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-1) — Josh's ruling (Exec P550 / P552, P556)
 # What: test_probation_keeps_existing_clock_semantics extracts the real `probation_advances` together with
 #       `cc_update_probation`. No assertion changed or weakened.
@@ -51,14 +63,18 @@ SOURCE = Path(__file__).parents[1] / 'cc_ng_organism.py'
 
 def functions(*names):
     tree = ast.parse(SOURCE.read_text())
-    wanted = {'_cc_mutation_lock', *names}
+    wanted = {'_cc_mutation_lock', '_probation_finite_number', '_probation_clock', '_probation_heartbeat_stamp',
+              '_probation_heartbeat_fresh', '_probation_step_window_tick', *names}
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
     ns = dict(logger=logging.getLogger('test'), time=time, Optional=object,
               _CC_CONV_THRESHOLD_BOOST=2, _CC_CONV_NOVELTY_DAMPENING=.5,
               _CC_CONV_PROBATION_PERIOD=4, _CC_CONV_PROBATION_REQUIRE_SPIKE=False,
               _CC_CONV_SYNAPSE_DELAY_MAX=3,
               _cc_embed_to_poincare_dir=lambda x:x, _cc_has_ever_fired=lambda n:False,
-              cc_anticipate=lambda *a:None)
+              cc_anticipate=lambda *a:None,
+              threading=threading,
+              _PROBATION_HEARTBEAT=dict(armed=False, max_age_s=None, stamp=None, stale_logged=False),
+              _PROBATION_HEARTBEAT_LOCK=threading.Lock())
     exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*nodes],type_ignores=[])),str(SOURCE),'exec'),ns)
     return ns
 
@@ -121,7 +137,7 @@ def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_in
     assert ns['run_conversational_dual_pass'](g,VDB(g,fail_insert),'text',[1],{}) is (not fail_insert and not raise_dual_pass_incomplete)
 
 def test_probation_keeps_existing_clock_semantics():
-    ns=functions('probation_advances','cc_update_probation')
+    ns=functions('probation_population','fair_chance_window_open','cc_update_probation')
     g=Graph()
     class Metadata(dict):
         def __setitem__(self,k,v):

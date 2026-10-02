@@ -1,5 +1,12 @@
 # ---- Changelog ----
-# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-2) — tests (1)-(12) for the
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — Josh's ruling (Exec P550 / P552; Exec P561; Exec P562)
+# What: RE-KEYED ONLY, no assertion changed or weakened. The round-1 predicate `cc_ng_organism.probation_advances` no longer exists (renamed
+#   with no alias: its population test is now `probation_population`, its window logic is `fair_chance_window_open`). The three places that
+#   registered the REAL round-1 predicate now register `org.probation_population`, which is byte-for-byte the same test, so every round-1
+#   expectation holds unchanged against the round-1 sweep body that is still committed at NG-3. The sweep body and this file are re-keyed
+#   again, with a change of meaning, in NG-4 (the protected body becomes host-agnostic).
+# Why: each commit must be GREEN on its own and the rename rule is one name everywhere.
+# [2026-10-02] (round 1, NG-2) Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-2) — tests (1)-(12) for the
 #   orphan sweep's probation exemption (neuro_foundation.Graph._collect_orphan_nodes)
 # What: a REAL small Graph, the real step() / real _collect_orphan_nodes / real cc_update_probation / the REAL
 #   cc_ng_organism.probation_advances registered as graph._probation_advances. (1) an unbound node past grace with
@@ -96,7 +103,7 @@ def _graph(timestep=10_000, register=True):
     g = Graph()
     g.timestep = timestep
     if register:
-        g._probation_advances = org.probation_advances
+        g._probation_advances = org.probation_population
     return g
 
 
@@ -119,8 +126,8 @@ def test_graph_accepts_a_plain_attribute_and_has_none_by_default():
     assert "__slots__" not in Graph.__dict__
     assert not isinstance(getattr(Graph, "_probation_advances", None), property)
     g = Graph()
-    g._probation_advances = org.probation_advances
-    assert g._probation_advances is org.probation_advances              # the function object ITSELF
+    g._probation_advances = org.probation_population
+    assert g._probation_advances is org.probation_population            # the function object ITSELF
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +388,7 @@ def test_10_conversational_node_in_the_same_state_is_spared():
     _node(g, "bare", {"probation_remaining": 10, "probation_total": 10})   # no creation_mode: still decremented => spared
     g._collect_orphan_nodes()
     assert "conv" in g.nodes and "bare" in g.nodes
-    assert g._probation_advances is org.probation_advances                 # the REAL predicate, not a stub
+    assert g._probation_advances is org.probation_population               # the REAL (population) predicate, not a stub
 
 
 # ---------------------------------------------------------------------------

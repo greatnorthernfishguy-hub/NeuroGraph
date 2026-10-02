@@ -248,6 +248,33 @@
 # How: the guard is built in ONE place, cc_topology_merge.whole_graph_guard, and both callers (the Leg 2 merge, the
 #   daemon's drain) pass it; this function holds no predicate of its own (LAW 3 / LAW 4). Slice size, lock slicing,
 #   success return value and what the steps do are unchanged.
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — the fair-chance window is counted in
+#   GRAPH STEPS and closes when the advancer stalls (Josh's ruling Exec P550 / P552; Exec P561 P1 + P2; Exec P562 Addendum 1;
+#   CC-CALLOSUM-TRUTH §8.13)
+# What: (1) the predicate the host registers is RENAMED to say what it returns: `probation_advances` -> `fair_chance_window_open(node)`
+#   (no alias; one name everywhere). It is now the whole window logic, owned by the HOST layer: `probation_population(node)` (the old pure
+#   test, `creation_mode != "ingested"`, defined ONCE, also `cc_update_probation`'s own skip) AND the completion HEARTBEAT is fresh (P2)
+#   AND the step-keyed window is open (`probation_steps_remaining` a finite number, not bool, `0 < v < inf`; every other shape => False).
+#   (2) P1: two NEW metadata fields, read ONLY by that predicate: `probation_steps_remaining` (the step-keyed window count) and
+#   `probation_last_timestep` (the `graph.timestep` seen at this node's last decrement / stamp / seed). A decrement counts only if
+#   `graph.timestep` advanced since THAT node's last one; many steps in one pulse count ONCE; a clock that goes BACKWARDS (restore from an
+#   older checkpoint) resets `last` and never decrements. `_cc_deposit_memory_node` stamps both (an exact repeat RESETS both, as it resets
+#   the old count); `cc_update_probation` seeds them fresh for any population node that lacks `probation_steps_remaining` (Z12 design call
+#   A: this protects nodes that predate this build; a ONE-TIME bounded fresh window of at most CC_CONV_PROBATION_PERIOD stepped pulses).
+#   (3) P2: `probation_heartbeat_arm(max_age_s)` (the host calls it once, BEFORE it registers the predicate) and a completion stamp written
+#   at the END of a NON-RAISING `cc_update_probation`; armed and older than `max_age_s` => the predicate is False for EVERY node (today's
+#   sweep) and logs ONE WARNING per stale episode; the next completion re-arms the latch. NOT armed (the VPS host, any host that does not
+#   arm) => the heartbeat is not enforced. The window SIZE is the EXISTING `CC_CONV_PROBATION_PERIOD` (LAW 5): no second knob, no new literal.
+# Why: §8.13 keys the fair chance to firing/wiring opportunities, which only happen when STEPS run (`Graph.timestep` is advanced only by
+#   `step()`, neuro_foundation.py:2185; the age-on-write Tonic cycle explicitly does not advance it, :102-115), so ten autosave pulses with the
+#   clock held used to expire a window with ZERO opportunities (le-062 E-1). And "spared only while ACTUALLY advanced" is only true if the
+#   exemption closes when the pulse stalls (le-062 L1-L5). The GRADUATION FINDING: `probation_remaining` also drives the dampening ramp, the
+#   unconditional release at 0, the `graduated` stamp (#93) and late graduation, and mirrors Syl's `_update_probation` on purpose, so it is NOT
+#   step-keyed: the step count lives on the separate fields and graduation/ramp/release/`probation_total`/`novelty_dampening` are BYTE-
+#   IDENTICAL to the base (tests/test_cc_fair_chance_window_p561.py runs the BASE function against the new one over 1000 seeded graphs).
+# How: the sweep (neuro_foundation.py, protected) stays host-agnostic: NG-4 reduces its body to `getattr(self, "_fair_chance_window_open",
+#   None)` and parses nothing. Corrected here, from the round-1 text: callosum arrivals WITH an embedding DO get a window (cc_topology_merge.py:450
+#   -> `_cc_deposit_memory_node`); only the no-embedding structural install has no key. Who is covered is unchanged by this build.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-1) —
 #   probation_advances(node): the ONE definition of "this node's probation is actually
 #   advanced by cc_update_probation" (Josh's ruling Exec P550 / P552, amended Exec P554,
@@ -2267,6 +2294,12 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
         node.metadata["probation_remaining"] = _CC_CONV_PROBATION_PERIOD
         node.metadata["probation_total"] = _CC_CONV_PROBATION_PERIOD
         node.metadata["novelty_dampening"] = _CC_CONV_NOVELTY_DAMPENING
+        # P561 P1: the STEP-keyed window, on SEPARATE fields read only by fair_chance_window_open (graduation / the
+        # dampening ramp stay on probation_remaining). An exact repeat resets both, as it resets the old count.
+        # A graph with no readable clock (an incomplete double) stamps 0: it can never raise here.
+        _t = getattr(graph, "timestep", None)
+        node.metadata["probation_steps_remaining"] = _CC_CONV_PROBATION_PERIOD
+        node.metadata["probation_last_timestep"] = int(_t) if _probation_finite_number(_t) else 0
         try:
             # #400: compact float32 bytes, not a boxed 768-float list (~24 KB -> 3 KB
             # per node). Every reader below goes through poincare_dir_array().
@@ -2677,22 +2710,140 @@ def _cc_has_ever_fired(node) -> bool:
         return False
 
 
-def probation_advances(node) -> bool:
-    """True iff cc_update_probation decrements this node's probation (the population).
+# ------------------------------------------------------------------------------------------------------
+# THE FAIR-CHANCE WINDOW (Josh's ruling Exec P550 / P552; Exec P561 P1 + P2; Exec P562; CC-CALLOSUM-TRUTH
+# §8.13). The orphan sweep (neuro_foundation, protected, host-agnostic) asks ONE host-registered predicate,
+# fair_chance_window_open(node), whether an unbound node is still inside its fair chance to wire. ALL of the
+# window logic lives here, in the host layer: the population, the heartbeat, and the step-keyed count.
+# ------------------------------------------------------------------------------------------------------
 
-    The ONE definition (LAW 4). cc_update_probation's own skip below consults it, and the
-    host registers this very function on its graph (graph._probation_advances) so the orphan
-    sweep spares an unbound node only while its probation is actually being advanced
-    (CC-CALLOSUM-TRUTH §8.13). False for creation_mode == "ingested": the Ingestor's own sweep
-    (universal_ingestor.py Registrar.update_probation) owns those, and on the laptop it runs
-    only inside on_message, never on the autonomic pulse. Deliberately an EXCLUSION, not
-    `== "conversational"`: nodes with no creation_mode (older checkpoints, seeds) are still
-    decremented here, so they are still in this population.
+# The completion heartbeat (P2). `armed` stays False until the host calls probation_heartbeat_arm(): a host
+# that never arms (the VPS host, tests) gets no heartbeat enforcement, exactly as before this existed.
+_PROBATION_HEARTBEAT = {"armed": False, "max_age_s": None, "stamp": None, "stale_logged": False}
+_PROBATION_HEARTBEAT_LOCK = threading.Lock()   # a LEAF lock: nothing else is acquired while it is held
 
-    This is the population only. Whether a given node still has an open window (a numeric
-    probation_remaining > 0) is the sweep's own test.
+
+def _probation_clock():
+    """The ONE clock the heartbeat reads: a module-level indirection so a test patches exactly one name."""
+    return time.monotonic()
+
+
+def _probation_finite_number(v) -> bool:
+    """A real finite number: int/float, NOT bool, not NaN, not +/-inf. Never raises."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and -float("inf") < v < float("inf")
+
+
+def probation_population(node) -> bool:
+    """True iff cc_update_probation advances this node's window (the POPULATION).
+
+    The ONE definition (LAW 4): cc_update_probation's OWN skip consults it (the advancer must never skip
+    itself because of the heartbeat), and fair_chance_window_open starts from it. False for
+    creation_mode == "ingested": the Ingestor's own sweep (universal_ingestor.py NodeRegistrar.update_probation)
+    owns those, and on the laptop it runs only inside on_message, never on the autonomic pulse. Deliberately an
+    EXCLUSION, not `== "conversational"`: nodes with no creation_mode (older checkpoints, seeds) are still
+    advanced here, so they are still in this population. Byte-identical to the round-1 skip, including that a
+    truthy non-dict metadata raises (a pre-existing shape the advancer's differential pins).
     """
     return (node.metadata or {}).get("creation_mode") != "ingested"
+
+
+def probation_heartbeat_arm(max_age_s) -> None:
+    """The host's ONE call, made BEFORE it registers fair_chance_window_open: stamp NOW and record the largest
+    age (seconds) a completion stamp may reach before the exemption closes. A value that is not a finite
+    number > 0 raises ValueError, so a host that cannot arm properly registers NOTHING (a registered predicate
+    with no heartbeat is the unsafe state)."""
+    if not (_probation_finite_number(max_age_s) and max_age_s > 0):
+        raise ValueError("max_age_s must be a finite number > 0")
+    with _PROBATION_HEARTBEAT_LOCK:
+        _PROBATION_HEARTBEAT.update(armed=True, max_age_s=float(max_age_s), stamp=_probation_clock(),
+                                    stale_logged=False)
+
+
+def _probation_heartbeat_stamp() -> None:
+    """Record a COMPLETION of cc_update_probation. Called ONLY at the end of a non-raising pass (never from a
+    `finally`, never before the loop): a raise anywhere in the pass, or the pass never being called, leaves the
+    old stamp, and that staleness IS the stall signal. Re-arms the stale latch (one INFO on recovery)."""
+    recovered = False
+    with _PROBATION_HEARTBEAT_LOCK:
+        _PROBATION_HEARTBEAT["stamp"] = _probation_clock()
+        if _PROBATION_HEARTBEAT["stale_logged"]:
+            _PROBATION_HEARTBEAT["stale_logged"] = False
+            recovered = True
+    if recovered:
+        logger.info("fair-chance window: the probation advancer completed a cycle again; the orphan-sweep "
+                    "exemption is back on")
+
+
+def _probation_heartbeat_fresh() -> bool:
+    """True unless the heartbeat is armed AND its stamp is older than the armed max age (strictly greater).
+    Stale => logs ONE WARNING per stale EPISODE (the age and the limit only, never an exception string); the
+    next completion stamp re-arms the latch."""
+    warn = None
+    with _PROBATION_HEARTBEAT_LOCK:
+        if not _PROBATION_HEARTBEAT["armed"]:
+            return True
+        age = _probation_clock() - _PROBATION_HEARTBEAT["stamp"]
+        limit = _PROBATION_HEARTBEAT["max_age_s"]
+        fresh = not (age > limit)
+        if not fresh and not _PROBATION_HEARTBEAT["stale_logged"]:
+            _PROBATION_HEARTBEAT["stale_logged"] = True
+            warn = (age, limit)
+    if warn is not None:
+        logger.warning("fair-chance window: the probation advancer has not completed a cycle for %.0f s (limit %.0f s); "
+                       "the orphan-sweep exemption is OFF (today's sweep) until the advancer completes a cycle",
+                       warn[0], warn[1])
+    return fresh
+
+
+def fair_chance_window_open(node) -> bool:
+    """The ONE predicate the host registers on its graph (graph._fair_chance_window_open): True iff this unbound
+    node is still inside its fair chance to wire. Named for what it RETURNS (LAW 4). All three must hold:
+      1. the node is in the advanced population (probation_population: not `ingested`);
+      2. the completion heartbeat is fresh (P2; not armed => not enforced);
+      3. its STEP-keyed window is open: `probation_steps_remaining` is a finite number, not bool, with
+         0 < v < inf (P1: the unit is graph STEPS), AND `probation_last_timestep` is a finite number.
+         (Every writer stamps both; a count > 0 with no usable `last` could NEVER be decremented, so it
+         must read as closed, not as a window that stays open forever.)
+    EVERYTHING else (no key, None, str, negative, zero, NaN, +/-inf, bool, a None / non-dict metadata) is False,
+    which is today's sweep (fail toward today, never toward protecting forever). It never raises on those shapes."""
+    meta = node.metadata
+    if not isinstance(meta, dict):
+        return False
+    if not probation_population(node):
+        return False
+    if not _probation_heartbeat_fresh():
+        return False
+    steps = meta.get("probation_steps_remaining")
+    return (_probation_finite_number(steps) and steps > 0
+            and _probation_finite_number(meta.get("probation_last_timestep")))
+
+
+def _probation_step_window_tick(node, t) -> None:
+    """P1, one node, once per advancer pass; `t` is the pass's single read of graph.timestep. NEVER raises, never
+    aborts the pass, and touches ONLY the two step fields (graduation / the ramp / probation_remaining stay with
+    the caller's old logic, byte-identical).
+      * `probation_steps_remaining` ABSENT: SEED it fresh (CC_CONV_PROBATION_PERIOD stepped pulses) with
+        `probation_last_timestep = t`: this is what protects a node that predates this build (Z12 design call A).
+      * a finite number > 0 with a finite `last`: t > last => one decrement (never below 0), last = t;
+        t == last => nothing (no steps ran since this node's last decrement); t < last (the clock went BACKWARDS:
+        a restore from an older checkpoint) => last = t and NO decrement.
+      * any other shape, a non-dict metadata, or an unreadable clock: left untouched."""
+    meta = node.metadata
+    if not isinstance(meta, dict) or not _probation_finite_number(t):
+        return
+    if "probation_steps_remaining" not in meta:
+        meta["probation_steps_remaining"] = _CC_CONV_PROBATION_PERIOD
+        meta["probation_last_timestep"] = t
+        return
+    steps = meta["probation_steps_remaining"]
+    last = meta.get("probation_last_timestep")
+    if not (_probation_finite_number(steps) and steps > 0 and _probation_finite_number(last)):
+        return
+    if t > last:
+        meta["probation_steps_remaining"] = max(0, steps - 1)
+        meta["probation_last_timestep"] = t
+    elif t < last:
+        meta["probation_last_timestep"] = t
 
 
 def cc_update_probation(graph) -> list:
@@ -2707,10 +2858,22 @@ def cc_update_probation(graph) -> list:
     Novelty-dampening release is ALWAYS on the timer. Only the "graduated" stamp is
     gated on evidence of firing (#93) -- see the comment at the graduation branch for
     why those two must not be gated together.
+
+    [P561] Graduation, the dampening ramp, the release at 0, `probation_remaining` and
+    `probation_total` are BYTE-IDENTICAL to before: they stay on the per-pulse
+    `probation_remaining` count, because step-keying THAT count would stall the ramp and
+    graduation whenever the clock is held. The fair-chance window the orphan sweep honours
+    is counted in graph STEPS on SEPARATE fields (`probation_steps_remaining`,
+    `probation_last_timestep`; see _probation_step_window_tick), and a COMPLETION
+    heartbeat is stamped at the end of a non-raising pass (see _probation_heartbeat_stamp).
     """
     with _cc_mutation_lock(graph):
         graduated = []
         base_threshold = graph.config.get("default_threshold", 1.0)
+        # P561 P1: ONE read of the clock per pass (many steps between two passes count once).
+        # A graph with no readable clock simply gets no step-window progress; graduation does
+        # not need the clock and never advances it.
+        _t = getattr(graph, "timestep", None)
         for nid, node in list(graph.nodes.items()):
             # #111 -- document nodes belong to the Ingestor's probation sweep
             # (universal_ingestor.py, now scoped to creation_mode == "ingested").
@@ -2730,10 +2893,16 @@ def cc_update_probation(graph) -> list:
             # them. CC-first, back-propagate later: expect these two to differ
             # until canonical is brought over.
             #
-            # [P552] The exclusion is now probation_advances(node) -- the one definition the
-            # orphan sweep also reads (via graph._probation_advances), same population.
-            if not probation_advances(node):
+            # [P552/P561] The exclusion is probation_population(node): the ONE population
+            # definition. It is deliberately NOT the heartbeat-aware predicate the host
+            # registers (fair_chance_window_open): the advancer must never skip itself
+            # because its own heartbeat went stale (that would be a deadlock).
+            if not probation_population(node):
                 continue
+            # P561 P1: the step-keyed window, BEFORE any `continue` below so it is seeded /
+            # advanced for every population node (even one whose old count is already 0 or
+            # absent). Never raises, touches only the two step fields.
+            _probation_step_window_tick(node, _t)
             prob = node.metadata.get("probation_remaining")
             if prob is None:
                 continue
@@ -2777,6 +2946,9 @@ def cc_update_probation(graph) -> list:
                 total = float(node.metadata.get("probation_total", _CC_CONV_PROBATION_PERIOD)) or float(_CC_CONV_PROBATION_PERIOD)
                 frac = max(0.0, min(1.0, 1.0 - prob / total))
                 node.intrinsic_excitability = damp + (1.0 - damp) * frac
+        # P561 P2: the COMPLETION heartbeat. Reached ONLY if the whole loop above ran without raising (a raise
+        # anywhere, or this function never being called, leaves the old stamp: that staleness IS the signal).
+        _probation_heartbeat_stamp()
         return graduated
 
 
