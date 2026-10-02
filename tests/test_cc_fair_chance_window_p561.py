@@ -1,4 +1,14 @@
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3b / round 2) — Chief-003 Addendum 2 (the step window is a DEDICATED knob)
+# What: the fixture now patches the STEP window (`_CC_PROBATION_STEP_WINDOW`) and the GRADUATION period (`_CC_CONV_PROBATION_PERIOD`) to two DIFFERENT
+#   values (so any coupling shows up in every test); the graduation-count assertions follow the graduation value. NEW: the two knobs are pinned INDEPENDENT
+#   in BOTH directions and under a SWAP (the step window follows `CC_PROBATION_STEP_WINDOW` at stamp / seed / exact-repeat reset while probation_total /
+#   probation_remaining / the ramp's default total follow `CC_CONV_PROBATION_PERIOD`, and vice versa); the env reader's matrix (absent / valid / zero /
+#   negative / non-int / empty / bool-ish); IMPORT-TIME subprocess checks that an invalid value logs exactly ONE WARNING naming the variable and the failed
+#   rule and that both knobs set independently reach their constants; static checks that no step-window stamp reads the graduation constant and no
+#   graduation line reads the step constant, and that the single `10` literal in the new code is the default constant. No literal 10 in this file.
+# Why: P1 decouples the window (graph STEPS) from graduation (pulses); sharing one variable would re-couple them at the tuning level.
+# How: monkeypatch the module constants (or set the env in a subprocess); values are derived or small distinct numbers, never today's default.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — Josh's ruling (Exec P550 / P552; Exec P561 P1 + P2;
 #   Exec P562 Addendum 1); CC-CALLOSUM-TRUTH §8.13
 # What: replaces tests/test_cc_probation_advances_p552.py (the round-1 NG-1 file; renamed: its subject `probation_advances` is now
@@ -36,7 +46,8 @@ from neuro_foundation import Graph
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_REV = "b5e476863cc069a29ec482959b4f9465f2ea4ccf"
 NEW_FIELDS = ("probation_steps_remaining", "probation_last_timestep")
-PERIOD = 3     # the test window size: set by monkeypatching the EXISTING constant (never a new literal in the code under test)
+PERIOD = 3     # the STEP-window size under test: set by monkeypatching `_CC_PROBATION_STEP_WINDOW`
+GRAD = 5       # the GRADUATION period under test: `_CC_CONV_PROBATION_PERIOD`, deliberately a DIFFERENT number
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +55,8 @@ def clock(monkeypatch):
     """The heartbeat's ONE clock, patched; the heartbeat state is reset before and after every test."""
     now = [1000.0]
     monkeypatch.setattr(org, "_probation_clock", lambda: now[0])
-    monkeypatch.setattr(org, "_CC_CONV_PROBATION_PERIOD", PERIOD)
+    monkeypatch.setattr(org, "_CC_PROBATION_STEP_WINDOW", PERIOD)
+    monkeypatch.setattr(org, "_CC_CONV_PROBATION_PERIOD", GRAD)
     saved = dict(org._PROBATION_HEARTBEAT)
     org._PROBATION_HEARTBEAT.update(armed=False, max_age_s=None, stamp=None, stale_logged=False)
     yield now
@@ -64,7 +76,7 @@ def _graph(timestep=0):
     g.timestep = timestep
     # These tests are about the FIELDS. A real step() runs the orphan sweep, which (with no predicate registered, or in NG-4's integration
     # group with one) is the sweep's own business: keep grace out of the way so no node is culled while a field is under test.
-    g.config["orphan_node_grace_period"] = 10 ** 6
+    g.config["orphan_node_grace_period"] = 2 ** 20
     return g
 
 
@@ -116,14 +128,14 @@ def test_cc_update_probation_consults_probation_population_and_never_the_heartbe
     _deposit(g, "conv")
     _deposit(g, "ing", mode="ingested")
     org.cc_update_probation(g)
-    assert g.nodes["conv"].metadata["probation_remaining"] == PERIOD - 1
-    assert g.nodes["ing"].metadata["probation_remaining"] == PERIOD               # ingested: not advanced
+    assert g.nodes["conv"].metadata["probation_remaining"] == GRAD - 1
+    assert g.nodes["ing"].metadata["probation_remaining"] == GRAD                 # ingested: not advanced
     monkeypatch.setattr(org, "probation_population", lambda node: True)
     org.cc_update_probation(g)
-    assert g.nodes["ing"].metadata["probation_remaining"] == PERIOD - 1           # population True => advanced
+    assert g.nodes["ing"].metadata["probation_remaining"] == GRAD - 1             # population True => advanced
     monkeypatch.setattr(org, "probation_population", lambda node: False)
     org.cc_update_probation(g)
-    assert g.nodes["conv"].metadata["probation_remaining"] == PERIOD - 2          # advanced? no: skipped
+    assert g.nodes["conv"].metadata["probation_remaining"] == GRAD - 2            # population False: skipped, so unchanged
     # ... and a predicate that says False for everything (a stale heartbeat) changes NOTHING about the advancer:
     monkeypatch.setattr(org, "probation_population", lambda node: True)
     monkeypatch.setattr(org, "fair_chance_window_open", lambda node: False)
@@ -143,7 +155,7 @@ def _open_meta(steps, **extra):
     return meta
 
 
-@pytest.mark.parametrize("steps", [1, 2, 3, 0.5, 2.5, 10 ** 12, 2 ** 70, np.float64(5.0), np.float64(0.25)])
+@pytest.mark.parametrize("steps", [1, 2, 3, 0.5, 2.5, 2 ** 40, 2 ** 70, np.float64(5.0), np.float64(0.25)])
 def test_window_open_for_a_finite_number_greater_than_zero(steps):
     assert org.fair_chance_window_open(_N(_open_meta(steps))) is True
 
@@ -298,14 +310,14 @@ def test_the_deposit_stamps_both_fields_beside_the_old_three_and_an_exact_repeat
     g = _graph(timestep=11)
     n = _deposit(g)
     assert n.metadata["probation_steps_remaining"] == PERIOD and n.metadata["probation_last_timestep"] == 11
-    assert n.metadata["probation_remaining"] == PERIOD and n.metadata["probation_total"] == PERIOD
+    assert n.metadata["probation_remaining"] == GRAD and n.metadata["probation_total"] == GRAD
     for _ in range(2):
         _pulse(g)
     assert _steps(g) == PERIOD - 2
     _deposit(g)                                                      # the exact-repeat path
     md = g.nodes["n"].metadata
     assert md["probation_steps_remaining"] == PERIOD and md["probation_last_timestep"] == g.timestep
-    assert md["probation_remaining"] == PERIOD
+    assert md["probation_remaining"] == GRAD
 
 
 def test_the_deposit_never_raises_on_a_graph_with_no_clock():
@@ -325,25 +337,28 @@ def test_the_deposit_never_raises_on_a_graph_with_no_clock():
     assert n.metadata["probation_last_timestep"] == 0 and n.metadata["probation_steps_remaining"] == PERIOD
 
 
-def test_the_window_size_is_the_existing_knob_and_no_new_literal(monkeypatch):
-    monkeypatch.setattr(org, "_CC_CONV_PROBATION_PERIOD", 7)
+def test_the_window_size_is_the_dedicated_knob_and_the_only_literal_is_its_default(monkeypatch):
+    monkeypatch.setattr(org, "_CC_PROBATION_STEP_WINDOW", PERIOD + 4)
     g = _graph(timestep=4)
     _deposit(g, "dep")
     g.create_node(node_id="seeded", metadata={"creation_mode": "conversational"})
     org.cc_update_probation(g)
-    assert g.nodes["dep"].metadata["probation_steps_remaining"] == 7
-    assert g.nodes["seeded"].metadata["probation_steps_remaining"] == 7
+    assert g.nodes["dep"].metadata["probation_steps_remaining"] == PERIOD + 4
+    assert g.nodes["seeded"].metadata["probation_steps_remaining"] == PERIOD + 4
     tree = ast.parse(open(os.path.join(_REPO, "cc_ng_organism.py"), encoding="utf-8").read())
     new_fns = {"_probation_clock", "_probation_finite_number", "probation_population", "probation_heartbeat_arm",
                "_probation_heartbeat_stamp", "_probation_heartbeat_fresh", "fair_chance_window_open",
-               "_probation_step_window_tick"}
+               "_probation_step_window_tick", "_read_probation_step_window_env"}
     found = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
     assert new_fns <= found
     for n in tree.body:
         if isinstance(n, ast.FunctionDef) and n.name in new_fns:
             for c in ast.walk(n):
                 assert not (isinstance(c, ast.Constant) and type(c.value) is int and c.value == 10), \
-                    "a literal 10 in %s: the window size is the env knob CC_CONV_PROBATION_PERIOD" % n.name
+                    "an int literal 10 in %s: the window size is the env knob CC_PROBATION_STEP_WINDOW" % n.name
+    tens = [t.targets[0].id for t in tree.body if isinstance(t, ast.Assign) and isinstance(t.targets[0], ast.Name)
+            and isinstance(t.value, ast.Constant) and type(t.value.value) is int and t.value.value == 10]
+    assert tens == ["_CC_PROBATION_STEP_WINDOW_DEFAULT"], tens             # the ONE int-10 literal in the new module-level code
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +562,7 @@ def test_arm_stamps_now_so_a_fresh_arm_is_fresh(clock):
 def test_11_not_armed_means_the_heartbeat_is_not_enforced_however_old(clock):
     g = _graph()
     _deposit(g)
-    clock[0] += 10 ** 9                                              # a billion seconds: irrelevant while unarmed
+    clock[0] += 2 ** 30                                              # a billion seconds: irrelevant while unarmed
     assert org.fair_chance_window_open(g.nodes["n"]) is True
     assert org._PROBATION_HEARTBEAT["armed"] is False
 
@@ -587,8 +602,8 @@ def test_9b_stale_closes_the_exemption_for_EVERY_node_with_one_warning_per_episo
 
 
 def test_stale_is_false_for_a_node_with_no_window_too_and_ingested_never_reaches_the_heartbeat(clock, caplog):
-    org.probation_heartbeat_arm(10)
-    clock[0] += 11
+    org.probation_heartbeat_arm(20)
+    clock[0] += 21
     with caplog.at_level(logging.DEBUG, logger="cc_ng_organism"):
         assert org.fair_chance_window_open(_N(_open_meta(5, creation_mode="ingested"))) is False
         assert _warnings(caplog) == []                               # not in the population: the heartbeat was not consulted
@@ -621,13 +636,13 @@ def test_a_pass_that_is_never_called_leaves_the_old_stamp(clock):
 
 
 def test_arm_again_resets_the_stale_latch(clock, caplog):
-    org.probation_heartbeat_arm(10)
-    clock[0] += 11
+    org.probation_heartbeat_arm(20)
+    clock[0] += 21
     with caplog.at_level(logging.DEBUG, logger="cc_ng_organism"):
         org.fair_chance_window_open(_N(_open_meta(3)))
         assert len(_warnings(caplog)) == 1
-        org.probation_heartbeat_arm(10)
-        clock[0] += 11
+        org.probation_heartbeat_arm(20)
+        clock[0] += 21
         org.fair_chance_window_open(_N(_open_meta(3)))
         assert len(_warnings(caplog)) == 2
 
@@ -662,6 +677,148 @@ def test_8b_a_wire_round_trip_never_carries_them_and_the_receiver_restamps_with_
         md = n.metadata
         assert md["probation_steps_remaining"] == PERIOD
         assert md["probation_last_timestep"] == 31 != 999           # the RECEIVER's clock, never the sender's
+
+
+# ---------------------------------------------------------------------------
+# Chief-003 Addendum 2: the TWO knobs are INDEPENDENT (step window vs graduation period), in BOTH directions
+# ---------------------------------------------------------------------------
+
+STEP_X, GRAD_Y = 4, 6          # distinct, neither is today's default; the second parametrization SWAPS them
+
+
+@pytest.mark.parametrize("step,grad", [(STEP_X, GRAD_Y), (GRAD_Y, STEP_X)], ids=["step=X,grad=Y", "SWAPPED step=Y,grad=X"])
+def test_the_two_knobs_are_independent_in_both_directions_and_under_a_swap(monkeypatch, step, grad):
+    monkeypatch.setattr(org, "_CC_PROBATION_STEP_WINDOW", step)
+    monkeypatch.setattr(org, "_CC_CONV_PROBATION_PERIOD", grad)
+    g = _graph(timestep=3)
+    # STAMP: the step window follows the STEP knob, probation_total / probation_remaining follow the GRADUATION knob
+    md = _deposit(g, "dep").metadata
+    assert md["probation_steps_remaining"] == step
+    assert md["probation_remaining"] == grad and md["probation_total"] == grad
+    # SEED: a legacy node's step window follows the step knob; it has no graduation fields and gets none
+    g.create_node(node_id="legacy", metadata={"creation_mode": "conversational"})
+    # the RAMP's default total (a node with probation_remaining and NO probation_total) follows the graduation knob
+    g.create_node(node_id="ramp", metadata={"creation_mode": "conversational", "probation_remaining": grad, "novelty_dampening": 0.3})
+    g.nodes["ramp"].intrinsic_excitability = 0.3
+    _pulse(g)                                                          # one stepped pulse: every counter moves exactly once
+    assert g.nodes["legacy"].metadata["probation_steps_remaining"] == step
+    assert "probation_remaining" not in g.nodes["legacy"].metadata
+    assert g.nodes["dep"].metadata["probation_steps_remaining"] == step - 1
+    assert g.nodes["dep"].metadata["probation_remaining"] == grad - 1
+    frac = max(0.0, min(1.0, 1.0 - (grad - 1) / grad))                 # total defaults to the GRADUATION period
+    assert g.nodes["ramp"].intrinsic_excitability == pytest.approx(0.3 + 0.7 * frac)
+    # EXACT-REPEAT RESET: both counters return to THEIR OWN knob
+    _pulse(g)
+    _deposit(g, "dep")
+    md = g.nodes["dep"].metadata
+    assert md["probation_steps_remaining"] == step and md["probation_remaining"] == grad and md["probation_total"] == grad
+    # and the windows CLOSE on their own schedules: `step` stepped pulses close the step window, `grad` pulses graduate
+    g2 = _graph(timestep=0)
+    _deposit(g2, "n")
+    for k in range(1, max(step, grad) + 1):
+        _pulse(g2)
+        assert g2.nodes["n"].metadata["probation_steps_remaining"] == max(0, step - k)
+        assert g2.nodes["n"].metadata["probation_remaining"] == max(0, grad - k)
+
+
+def test_the_step_window_follows_its_knob_even_when_the_graduation_period_is_not_a_clean_multiple(monkeypatch):
+    monkeypatch.setattr(org, "_CC_PROBATION_STEP_WINDOW", STEP_X + 1)
+    monkeypatch.setattr(org, "_CC_CONV_PROBATION_PERIOD", STEP_X + 100)
+    md = _deposit(_graph(), "n").metadata
+    assert md["probation_steps_remaining"] == STEP_X + 1 and md["probation_remaining"] == STEP_X + 100
+
+
+# --- the env reader (pure) and the IMPORT-TIME behaviour ---------------------
+
+_ENV = "CC_PROBATION_STEP_WINDOW"
+
+
+def test_the_default_equals_todays_effective_window_derived_from_the_graduation_knobs_own_default():
+    tree = ast.parse(open(os.path.join(_REPO, "cc_ng_organism.py"), encoding="utf-8").read())
+    grad_default = None
+    for t in tree.body:
+        if isinstance(t, ast.Assign) and isinstance(t.targets[0], ast.Name) and t.targets[0].id == "_CC_CONV_PROBATION_PERIOD":
+            call = t.value.args[0]                                      # int(os.environ.get("CC_CONV_PROBATION_PERIOD", "<default>"))
+            grad_default = int(call.args[1].value)
+    assert grad_default is not None and org._CC_PROBATION_STEP_WINDOW_DEFAULT == grad_default
+
+
+def test_the_reader_absent_means_the_default_silently():
+    assert org._read_probation_step_window_env({}) == (org._CC_PROBATION_STEP_WINDOW_DEFAULT, None)
+    assert org._read_probation_step_window_env({"CC_CONV_PROBATION_PERIOD": str(GRAD_Y)}) == (org._CC_PROBATION_STEP_WINDOW_DEFAULT, None)
+
+
+@pytest.mark.parametrize("raw,value", [("7", 7), (" 7 ", 7), ("007", 7), ("+3", 3), ("1", 1), ("100000", 100000)])
+def test_the_reader_accepts_a_positive_integer(raw, value):
+    assert org._read_probation_step_window_env({_ENV: raw}) == (value, None)
+
+
+@pytest.mark.parametrize("raw,rule", [
+    ("0", "<= 0"), ("-3", "<= 0"), ("-0", "<= 0"),
+    ("abc", "not an integer"), ("", "not an integer"), ("   ", "not an integer"), ("3.5", "not an integer"), ("1e1", "not an integer"), ("7x", "not an integer"),
+    ("true", "bool-ish"), ("False", "bool-ish"), ("YES", "bool-ish"), ("no", "bool-ish"), ("on", "bool-ish"), ("OFF", "bool-ish"),
+])
+def test_the_reader_rejects_everything_else_with_the_default_and_names_which_rule_failed(raw, rule):
+    value, problem = org._read_probation_step_window_env({_ENV: raw})
+    assert value == org._CC_PROBATION_STEP_WINDOW_DEFAULT
+    assert problem and rule in problem
+
+
+def _import_organism(env_extra):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CC_")}
+    env.update({"PYTHONPATH": "", "PYTHONDONTWRITEBYTECODE": "1"})
+    env.update(env_extra)
+    code = ("import logging; logging.basicConfig(level=logging.INFO, format='%(name)s|%(levelname)s|%(message)s'); "
+            "import cc_ng_organism as o; print('RESULT', o._CC_PROBATION_STEP_WINDOW, o._CC_CONV_PROBATION_PERIOD)")
+    out = subprocess.run([sys.executable, "-c", code], cwd=_REPO, env=env, capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-600:]
+    result = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT")]
+    assert len(result) == 1
+    _, step, grad = result[0].split()
+    warns = [ln for ln in (out.stderr + out.stdout).splitlines() if "|WARNING|" in ln and "CC_PROBATION_STEP_WINDOW" in ln]
+    return int(step), int(grad), warns
+
+
+def test_import_time_absent_and_valid_values_log_nothing_and_each_knob_reaches_its_own_constant():
+    step, grad, warns = _import_organism({})
+    assert step == org._CC_PROBATION_STEP_WINDOW_DEFAULT and warns == []
+    step, grad, warns = _import_organism({_ENV: str(STEP_X), "CC_CONV_PROBATION_PERIOD": str(GRAD_Y)})
+    assert (step, grad) == (STEP_X, GRAD_Y) and warns == []
+    step, grad, warns = _import_organism({_ENV: str(GRAD_Y), "CC_CONV_PROBATION_PERIOD": str(STEP_X)})   # SWAPPED at the process boundary too
+    assert (step, grad) == (GRAD_Y, STEP_X) and warns == []
+    step, grad, warns = _import_organism({"CC_CONV_PROBATION_PERIOD": str(GRAD_Y)})                       # only graduation set: the step window is untouched
+    assert step == org._CC_PROBATION_STEP_WINDOW_DEFAULT and grad == GRAD_Y and warns == []
+
+
+@pytest.mark.parametrize("raw,rule", [("abc", "not an integer"), ("0", "<= 0"), ("-4", "<= 0"), ("true", "bool-ish"), ("", "not an integer")])
+def test_import_time_an_invalid_value_gives_the_default_and_exactly_one_warning_naming_the_variable_and_the_rule(raw, rule):
+    step, grad, warns = _import_organism({_ENV: raw})
+    assert step == org._CC_PROBATION_STEP_WINDOW_DEFAULT
+    assert len(warns) == 1 and rule in warns[0]
+    assert str(org._CC_PROBATION_STEP_WINDOW_DEFAULT) in warns[0]       # it names the default it fell back to
+
+
+def test_static_no_step_window_stamp_reads_the_graduation_constant_and_no_graduation_line_reads_the_step_constant():
+    tree = ast.parse(open(os.path.join(_REPO, "cc_ng_organism.py"), encoding="utf-8").read())
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    def stamps(fn, key):
+        out = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Subscript) \
+                    and isinstance(n.targets[0].slice, ast.Constant) and n.targets[0].slice.value == key:
+                if isinstance(n.value, ast.Name):          # a stamp of a CONSTANT; the decrement (`max(0, steps - 1)`) is not one
+                    out.append(n.value.id)
+        return out
+    dep = fns["_cc_deposit_memory_node"]
+    assert stamps(dep, "probation_steps_remaining") == ["_CC_PROBATION_STEP_WINDOW"]
+    assert stamps(dep, "probation_remaining") == ["_CC_CONV_PROBATION_PERIOD"]
+    assert stamps(dep, "probation_total") == ["_CC_CONV_PROBATION_PERIOD"]
+    assert stamps(fns["_probation_step_window_tick"], "probation_steps_remaining") == ["_CC_PROBATION_STEP_WINDOW"]
+    tick_names = {n.id for n in ast.walk(fns["_probation_step_window_tick"]) if isinstance(n, ast.Name)}
+    assert "_CC_CONV_PROBATION_PERIOD" not in tick_names
+    adv_names = {n.id for n in ast.walk(fns["cc_update_probation"]) if isinstance(n, ast.Name)}
+    assert "_CC_PROBATION_STEP_WINDOW" not in adv_names and "_CC_CONV_PROBATION_PERIOD" in adv_names   # graduation stays graduation-only
 
 
 # ---------------------------------------------------------------------------

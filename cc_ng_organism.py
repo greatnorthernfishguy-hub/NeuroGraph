@@ -3,6 +3,19 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3b / round 2) — the step window's size is a DEDICATED knob
+#   (Josh's ruling Exec P550 / P552; Exec P561 P1; Chief-003 Addendum 2; CC-CALLOSUM-TRUTH §8.13)
+# What: new `CC_PROBATION_STEP_WINDOW` (a positive integer, default `_CC_PROBATION_STEP_WINDOW_DEFAULT` = 10, today's effective window), read ONCE at
+#   import into `_CC_PROBATION_STEP_WINDOW` by the pure `_read_probation_step_window_env`: absent => the default silently; set but invalid (empty /
+#   non-integer / a bool-ish word / <= 0) => the default and ONE WARNING naming the variable and which rule failed. EVERY place the step window is
+#   stamped, reset or seeded (`_cc_deposit_memory_node`, which an exact repeat re-runs, and `_probation_step_window_tick`'s seeding) now reads the new
+#   constant. `CC_CONV_PROBATION_PERIOD` stays GRADUATION-ONLY and is untouched (probation_remaining, probation_total, the ramp, the release, #93).
+# Why: P1 exists to DECOUPLE the fair-chance window (graph STEPS) from the graduation timer (pulses); sharing one variable would re-couple them at the
+#   tuning level (raising the graduation period would silently lengthen the window). NG-3 (3ccc749) reused the graduation constant; this is its
+#   correction commit (never amended).
+# How: logging choice: IMPORT-TIME read (the same pattern as CC_CONV_PROBATION_PERIOD). In the laptop daemon main() configures logging before the
+#   organism is first imported (lazily, from init_ng), so the WARNING lands in the daemon log; in any other host Python's last-resort handler prints
+#   it to stderr, so it is not lost. Tests: tests/test_cc_fair_chance_window_p561.py pins the two knobs INDEPENDENT in both directions.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — the fair-chance window is counted in
 #   GRAPH STEPS and closes when the advancer stalls (Josh's ruling Exec P550 / P552; Exec P561 P1 + P2; Exec P562 Addendum 1;
 #   CC-CALLOSUM-TRUTH §8.13)
@@ -15,11 +28,11 @@
 #   `graph.timestep` advanced since THAT node's last one; many steps in one pulse count ONCE; a clock that goes BACKWARDS (restore from an
 #   older checkpoint) resets `last` and never decrements. `_cc_deposit_memory_node` stamps both (an exact repeat RESETS both, as it resets
 #   the old count); `cc_update_probation` seeds them fresh for any population node that lacks `probation_steps_remaining` (Z12 design call
-#   A: this protects nodes that predate this build; a ONE-TIME bounded fresh window of at most CC_CONV_PROBATION_PERIOD stepped pulses).
+#   A: this protects nodes that predate this build; a ONE-TIME bounded fresh window of at most CC_PROBATION_STEP_WINDOW stepped pulses).
 #   (3) P2: `probation_heartbeat_arm(max_age_s)` (the host calls it once, BEFORE it registers the predicate) and a completion stamp written
 #   at the END of a NON-RAISING `cc_update_probation`; armed and older than `max_age_s` => the predicate is False for EVERY node (today's
 #   sweep) and logs ONE WARNING per stale episode; the next completion re-arms the latch. NOT armed (the VPS host, any host that does not
-#   arm) => the heartbeat is not enforced. The window SIZE is the EXISTING `CC_CONV_PROBATION_PERIOD` (LAW 5): no second knob, no new literal.
+#   arm) => the heartbeat is not enforced. The window SIZE is its own knob `CC_PROBATION_STEP_WINDOW` (LAW 5; set in NG-3b, which superseded NG-3's reuse of CC_CONV_PROBATION_PERIOD).
 # Why: §8.13 keys the fair chance to firing/wiring opportunities, which only happen when STEPS run (`Graph.timestep` is advanced only by
 #   `step()`, neuro_foundation.py:2185; the age-on-write Tonic cycle explicitly does not advance it, :102-115), so ten autosave pulses with the
 #   clock held used to expire a window with ZERO opportunities (le-062 E-1). And "spared only while ACTUALLY advanced" is only true if the
@@ -1830,6 +1843,40 @@ def generate_emergent_want(
 # bare on_message() does NOT do this (it only runs graph.step() + CES).
 _CC_CONV_NOVELTY_DAMPENING = float(os.environ.get("CC_CONV_NOVELTY_DAMPENING", "0.3"))
 _CC_CONV_PROBATION_PERIOD = int(os.environ.get("CC_CONV_PROBATION_PERIOD", "10"))
+# P561 / Chief-003 (Addendum 2): the size of the STEP-keyed fair-chance window is its OWN knob. P1 exists to DECOUPLE the window (counted in
+# graph STEPS) from the graduation timer (counted in pulses): re-using one variable for both would re-couple them at the tuning level (raising
+# it would silently lengthen the graduation window too). So CC_CONV_PROBATION_PERIOD, the line above, stays GRADUATION-ONLY (probation_remaining,
+# probation_total, the dampening ramp, the release at 0, #93) and is NOT touched; the step window reads CC_PROBATION_STEP_WINDOW. Same channel as
+# every CC_ knob (LAW 5: `export` in ~/.bashrc, read by canonical_exports). This default is the ONLY literal window size in the new code; it
+# equals today's effective window, so a host that sets neither variable behaves as before.
+_CC_PROBATION_STEP_WINDOW_DEFAULT = 10
+
+
+def _read_probation_step_window_env(environ=None):
+    """(window, problem) from CC_PROBATION_STEP_WINDOW (a positive integer, in graph STEPS). Absent => (default, None), silently. Set but invalid
+    (empty / non-integer / a bool-ish word / <= 0) => (default, a short statement of WHICH rule failed). Pure: never raises, never logs; the
+    caller logs ONE WARNING naming the variable."""
+    env = os.environ if environ is None else environ
+    if "CC_PROBATION_STEP_WINDOW" not in env:
+        return _CC_PROBATION_STEP_WINDOW_DEFAULT, None
+    raw = str(env["CC_PROBATION_STEP_WINDOW"]).strip()
+    if raw.lower() in ("true", "false", "yes", "no", "on", "off"):
+        return _CC_PROBATION_STEP_WINDOW_DEFAULT, "a bool-ish word, not an integer"
+    try:
+        value = int(raw)
+    except ValueError:
+        return _CC_PROBATION_STEP_WINDOW_DEFAULT, "not an integer"
+    if value <= 0:
+        return _CC_PROBATION_STEP_WINDOW_DEFAULT, "not a positive integer (<= 0)"
+    return value, None
+
+
+# Read ONCE, at import (the same pattern as the constant above). In the laptop daemon logging is configured in main() before the organism is
+# first imported (lazily, from init_ng), so the WARNING below lands in the daemon log; in any other host Python's last-resort handler prints it.
+_CC_PROBATION_STEP_WINDOW, _CC_PROBATION_STEP_WINDOW_PROBLEM = _read_probation_step_window_env()
+if _CC_PROBATION_STEP_WINDOW_PROBLEM:
+    logger.warning("CC_PROBATION_STEP_WINDOW is invalid (%s): using the default of %d graph steps",
+                   _CC_PROBATION_STEP_WINDOW_PROBLEM, _CC_PROBATION_STEP_WINDOW_DEFAULT)
 _CC_CONV_THRESHOLD_BOOST = float(os.environ.get("CC_CONV_THRESHOLD_BOOST", "0.2"))
 _CC_CONV_SYNAPSE_DELAY_MAX = int(os.environ.get("CC_CONV_SYNAPSE_DELAY_MAX", "5"))
 # #93 — gate the "graduated" stamp on evidence the node actually fired, rather than
@@ -1904,7 +1951,7 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
         # dampening ramp stay on probation_remaining). An exact repeat resets both, as it resets the old count.
         # A graph with no readable clock (an incomplete double) stamps 0: it can never raise here.
         _t = getattr(graph, "timestep", None)
-        node.metadata["probation_steps_remaining"] = _CC_CONV_PROBATION_PERIOD
+        node.metadata["probation_steps_remaining"] = _CC_PROBATION_STEP_WINDOW
         node.metadata["probation_last_timestep"] = int(_t) if _probation_finite_number(_t) else 0
         try:
             # #400: compact float32 bytes, not a boxed 768-float list (~24 KB -> 3 KB
@@ -2219,7 +2266,7 @@ def _probation_step_window_tick(node, t) -> None:
     """P1, one node, once per advancer pass; `t` is the pass's single read of graph.timestep. NEVER raises, never
     aborts the pass, and touches ONLY the two step fields (graduation / the ramp / probation_remaining stay with
     the caller's old logic, byte-identical).
-      * `probation_steps_remaining` ABSENT: SEED it fresh (CC_CONV_PROBATION_PERIOD stepped pulses) with
+      * `probation_steps_remaining` ABSENT: SEED it fresh (CC_PROBATION_STEP_WINDOW stepped pulses) with
         `probation_last_timestep = t`: this is what protects a node that predates this build (Z12 design call A).
       * a finite number > 0 with a finite `last`: t > last => one decrement (never below 0), last = t;
         t == last => nothing (no steps ran since this node's last decrement); t < last (the clock went BACKWARDS:
@@ -2229,7 +2276,7 @@ def _probation_step_window_tick(node, t) -> None:
     if not isinstance(meta, dict) or not _probation_finite_number(t):
         return
     if "probation_steps_remaining" not in meta:
-        meta["probation_steps_remaining"] = _CC_CONV_PROBATION_PERIOD
+        meta["probation_steps_remaining"] = _CC_PROBATION_STEP_WINDOW
         meta["probation_last_timestep"] = t
         return
     steps = meta["probation_steps_remaining"]

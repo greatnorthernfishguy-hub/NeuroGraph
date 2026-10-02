@@ -1,5 +1,10 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3b / round 2) — Chief-003 Addendum 2
+# What: harness-only; NO assertion changed. The bare namespace built by `functions()` gains ONE more module-level constant, `_CC_PROBATION_STEP_WINDOW=4`
+#       (beside `_CC_CONV_PROBATION_PERIOD=4`): the deposit and the step-window tick now read the dedicated step-window knob, and an AST extract of
+#       FUNCTIONS cannot carry a module-level constant.
+# Why: the step window's size is its own knob (CC_PROBATION_STEP_WINDOW), no longer the graduation period.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — Josh's ruling (Exec P550 / P552; Exec P561; Exec P562 Addendum 1)
 # What: harness-only; NO assertion changed or weakened. (1) test_probation_keeps_existing_clock_semantics: `functions('probation_advances',
 #       'cc_update_probation')` -> `functions('probation_population','fair_chance_window_open','cc_update_probation')` (the round-1 predicate was
@@ -68,7 +73,7 @@ def functions(*names):
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
     ns = dict(logger=logging.getLogger('test'), time=time, Optional=object,
               _CC_CONV_THRESHOLD_BOOST=2, _CC_CONV_NOVELTY_DAMPENING=.5,
-              _CC_CONV_PROBATION_PERIOD=4, _CC_CONV_PROBATION_REQUIRE_SPIKE=False,
+              _CC_CONV_PROBATION_PERIOD=4, _CC_PROBATION_STEP_WINDOW=4, _CC_CONV_PROBATION_REQUIRE_SPIKE=False,
               _CC_CONV_SYNAPSE_DELAY_MAX=3,
               _cc_embed_to_poincare_dir=lambda x:x, _cc_has_ever_fired=lambda n:False,
               cc_anticipate=lambda *a:None,
