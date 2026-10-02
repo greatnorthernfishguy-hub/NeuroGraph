@@ -25,6 +25,10 @@
 #   (class redacted_id_shape, no id/line in caplog, in_transit_ids() None); (3) a mixed file (146 good + ONE redacted id first/middle/last) is corrupt;
 #   (4) boundary shapes that must NOT trip it; (5) the empty-intersection case stays quiet (guard 1); (6) 1 id and 500 ids are both VALID (guard 2:
 #   no count pinned); (7) reported through in_transit_ids / held_unbound_nodes / whole_graph_guard like bad_id (one read, one ERROR, cached).
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14946) — DL-1 (#987) tests: padded redacted ids trip the guard
+#   The two #976 boundary params the pinned old behaviour (a trailing-newline id and a leading-space id 'do NOT trip') are FLIPPED: they are the
+#   padded redacted form and now trip `redacted_id_shape`; padded variants (space, \n, \r\n, tab, NBSP; first/middle/last line of 146 good ids) are
+#   added; and the NEGATIVE side: raw tree ids with internal spaces/colons and padded concept parts stay VALID and are stored UNSTRIPPED.
 # -------------------
 """#905-DELTA: the hold covers only nodes whose binding is in transit."""
 import builtins
@@ -839,9 +843,8 @@ def test_976_3_one_redacted_id_poisons_a_file_of_146_good_ones(tmp_path, monkeyp
     "cc:want::2dfa2d637643",       # a raw want id with `::`
     "cc:conv::2dfa2d637643",       # a raw-looking forest prefix with 12 hex
     "forest:2dfa2d637643x",        # a trailing char
-    "forest:2dfa2d637643\n",       # a trailing NEWLINE inside the id (`$` would let re.match/search through; fullmatch must not)
-    " forest:2dfa2d637643",        # a leading space
-], ids=["hex11", "hex13", "upper", "digit_kind", "underscore_kind", "want_double_colon", "conv_prefix", "trailing_char", "trailing_newline", "leading_space"])
+    "forest: 2dfa2d637643",        # an INTERNAL space (strip() does not touch it; not the shape)
+], ids=["hex11", "hex13", "upper", "digit_kind", "underscore_kind", "want_double_colon", "conv_prefix", "trailing_char", "internal_space"])
 def test_976_4_boundary_shapes_do_not_trip_the_guard(tmp_path, monkeypatch, caplog, nid):
     _use(monkeypatch, _cohort_file(tmp_path, [COH_A, nid]))
     with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
@@ -901,3 +904,63 @@ def test_976_the_constant_is_the_shape_redact_node_id_produces():
         assert tmg._IN_TRANSIT_REDACTED_SHAPE.fullmatch(red), red
         assert not tmg._IN_TRANSIT_REDACTED_SHAPE.fullmatch(raw), raw
     assert tmg._IN_TRANSIT_REDACTED_SHAPE.pattern == r"^[a-z]+:[0-9a-f]{12}$"
+
+
+# ---------------------------------------------------------------- DL-1 (#987): padded redacted ids
+
+_PADDED = [" forest:2dfa2d637643", "forest:2dfa2d637643 ", "forest:2dfa2d637643\n", "forest:2dfa2d637643\r\n", "\tforest:2dfa2d637643",
+           "forest:2dfa2d637643\t", "\xa0forest:2dfa2d637643", "forest:2dfa2d637643\xa0", "  \ttree:0123456789ab \r\n"]
+_PADDED_IDS = ["lead_space", "trail_space", "trail_newline", "trail_crlf", "lead_tab", "trail_tab", "lead_nbsp", "trail_nbsp", "mixed"]
+
+
+@pytest.mark.parametrize("nid", _PADDED, ids=_PADDED_IDS)
+def test_987_a_padded_redacted_id_trips_the_guard(tmp_path, monkeypatch, caplog, nid):
+    g = Graph()
+    for i in (OWN, COH_A):
+        _node(g, i)
+    _use(monkeypatch, _cohort_file(tmp_path, [COH_A, nid]))
+    _corrupt_976_assertions(g, caplog, ["2dfa2d637643", "0123456789ab", "SECRETSOURCE"])        # class, hold ALL, no id/line, cached
+
+
+@pytest.mark.parametrize("where", ["first", "middle", "last"])
+def test_987_a_padded_redacted_id_poisons_146_good_ones_at_any_position(tmp_path, monkeypatch, caplog, where):
+    good = _raw_ids()
+    bad = " forest:2dfa2d637643\r\n"
+    ids = {"first": [bad] + good, "middle": good[:73] + [bad] + good[73:], "last": good + [bad]}[where]
+    g = Graph()
+    for i in good[:2] + [OWN]:
+        _node(g, i)
+    _use(monkeypatch, _cohort_file(tmp_path, ids))
+    _corrupt_976_assertions(g, caplog, ["2dfa2d637643", "SECRETSOURCE"])
+    assert tmg._unbound_nodes(g, set(g.nodes)) == set(g.nodes)
+
+
+def test_987_the_two_formerly_pinned_boundary_ids_now_trip_the_guard(tmp_path, monkeypatch, caplog):
+    """The two #976 boundary params le-061 named ('forest:...\\n' and ' forest:...') were pinned as 'does NOT trip': that pinned the bug."""
+    for nid in ("forest:2dfa2d637643\n", " forest:2dfa2d637643"):
+        tmg._reset_in_transit_cache_for_tests()
+        caplog.clear()
+        _use(monkeypatch, _cohort_file(tmp_path, [COH_A, nid], name="p-%d.jsonl" % len(nid)))
+        with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+            assert tmg.in_transit_ids() is None
+        assert any("class=redacted_id_shape" in r.getMessage() for r in _tmg_records(caplog, logging.ERROR))
+
+
+_RAW_NEGATIVES = [
+    "cc:conv::%s::tree::two  words : and colons" % ("ab" * 20),
+    "cc:conv::%s::tree:: padded concept " % ("cd" * 20),                        # leading/trailing spaces in the CONCEPT part
+    "cc:conv::%s::tree::\tconcept\twith tabs\n" % ("ef" * 20),                  # tabs and a trailing newline INSIDE the id
+    " cc:conv::%s" % ("01" * 20),                                               # a padded RAW forest id is still not the redacted shape
+    "cc:conv::%s " % ("23" * 20),
+]
+
+
+@pytest.mark.parametrize("nid", _RAW_NEGATIVES, ids=["internal_spaces_colons", "padded_concept", "tabs_newline_in_concept", "lead_pad_forest", "trail_pad_forest"])
+def test_987_raw_ids_with_spaces_stay_valid_and_are_stored_unstripped(tmp_path, monkeypatch, caplog, nid):
+    _use(monkeypatch, _cohort_file(tmp_path, [COH_A, nid]))
+    with caplog.at_level(logging.DEBUG, logger=tmg.logger.name):
+        got = tmg.in_transit_ids()
+    assert got == frozenset({COH_A, nid})                                     # the cohort holds the ORIGINAL string...
+    if nid.strip() != nid:
+        assert nid.strip() not in got                                         # ...and NOT its stripped form
+    assert _tmg_records(caplog, logging.ERROR) == []
