@@ -24,6 +24,13 @@
 # How: held = sweep-eligible unbound ∩ (the static in-transit cohort ∪ this merge's `merge_landed`). The file stays static; once the cohort
 #   is bound the INTERSECTION empties its term and only the merge's own arrivals are held (§8.12 Layer 2). The P499 belt is UNCHANGED.
 #   Stats keys, ERROR text and counter meanings are unchanged; `..._preexisting` now counts HELD cohort nodes not delivered by this merge.
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14776) — #976 redacted-id SHAPE guard (Chief-003 RE-RULED ADOPT; checker-048 F3 HIGH)
+# What: `_read_in_transit_ids` treats an id that re.fullmatch-es ^[a-z]+:[0-9a-f]{12}$ (the shape `redact_node_id` prints) as a NEW corrupt class
+#   `redacted_id_shape`: the WHOLE file is corrupt, fail CLOSED (hold ALL; in_transit_ids() = None; ONE loud ERROR naming the class, never the id).
+# Why: the file holds RAW ids; a file built from the REDACTED log form (forest:2dfa2d637643) would be VALID-looking, match no node, and silently
+#   EMPTY the hold. Real ids measured: 146 (132 tree + 14 forest), none match the shape.
+# How: one module-level compiled constant + one check next to `bad_id`. NOT a count pin and NOT an "empty intersection" check (both are legitimate
+#   steady states: the hold goes quiet as the 146 bind). Nothing else changes; `_unbound_nodes` byte-identical.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14536) — #905-DELTA FOLLOW-UP (Exec P550 + ADDENDUM 1/2): wording + read-only accessor
 # What: (ADDENDUM 2) the earlier wording about a laptop-own node's fate at grace is replaced: this change only
 #   narrows what HOLDS THE CLOCK and decides nothing about the node's fate; its protected window is a separate pending sweep change, keyed to the
@@ -1138,13 +1145,23 @@ def _unbound_nodes(graph: Any, node_ids: Set[str]) -> Set[str]:
 #              consumer of this shared module (the VPS / Syl's process never sets it).
 #   VALID   -> a frozenset of ids; ONE INFO line at the read (file sha256 + count).
 #   CORRUPT -> SET but missing / unreadable / not a regular file / over the cap / ANY
-#              malformed line / ZERO ids (an empty snapshot is corrupt: it is a fixed
-#              artifact, never legitimately empty): fail CLOSED -- `held_unbound_nodes`
+#              malformed line / ANY id shaped like a REDACTED log name (`kind:12hex`, the
+#              form `redact_node_id` prints: class `redacted_id_shape`) / ZERO ids (an
+#              empty snapshot is corrupt: it is a fixed artifact, never legitimately
+#              empty): fail CLOSED -- `held_unbound_nodes`
 #              == `_unbound_nodes` (hold ALL) -- with ONE loud ERROR naming the failure
 #              CLASS (never `str(exc)`, never a line of the file). NEVER fail open.
 # Ids are never logged (logging of ids anywhere uses `redact_node_id`).
 _IN_TRANSIT_ENV = "CC_NG_IN_TRANSIT_IDS_PATH"
 _IN_TRANSIT_MAX_BYTES = 1 << 20
+# #976 (Exec / Chief-003 RE-RULED ADOPT): the shape `redact_node_id` (below) produces for a log line,
+# `<kind>:<first 12 hex of sha256(id)>`. The in-transit file holds RAW ids (`cc:conv::<40 hex>[::tree::<concept>]`),
+# never this form: an id shaped like it means the file was built from a REDACTED log, and a VALID-looking file of
+# such ids would match no node and silently EMPTY the hold. Used with `re.fullmatch`; ONE such id makes the WHOLE
+# file corrupt (class `redacted_id_shape`, fail CLOSED), like `bad_id`. NOT a count check and NOT an
+# "intersection is empty" check: both are legitimate steady states (the set shrinks and the hold goes quiet as
+# bindings land; the file stays static).
+_IN_TRANSIT_REDACTED_SHAPE = re.compile(r"^[a-z]+:[0-9a-f]{12}$")
 _IN_TRANSIT_UNSET = "unset"
 _IN_TRANSIT_VALID = "valid"
 _IN_TRANSIT_CORRUPT = "corrupt"
@@ -1216,6 +1233,8 @@ def _read_in_transit_ids(path: str) -> Tuple[str, FrozenSet[str]]:
         nid = obj.get("id")
         if not isinstance(nid, str) or not nid:
             raise _InTransitCorrupt("bad_id")
+        if _IN_TRANSIT_REDACTED_SHAPE.fullmatch(nid):
+            raise _InTransitCorrupt("redacted_id_shape")        # the class only: the id is never kept or logged
         ids.add(nid)
     if not ids:
         raise _InTransitCorrupt("zero_ids")
@@ -1305,7 +1324,8 @@ def held_unbound_nodes(graph: Any, node_ids: Set[str], merge_landed: Optional[Se
     still wire the node first.
 
     The variable UNSET, or SET but unusable (missing / unreadable / not a regular file /
-    over the cap / any malformed line / zero ids), returns EXACTLY `_unbound_nodes(...)`:
+    over the cap / any malformed line / an id shaped like a redacted log name / zero ids),
+    returns EXACTLY `_unbound_nodes(...)`:
     UNSET is today's behaviour byte for byte (no I/O, no log); unusable fails CLOSED and
     loudly, never open. Pure query: no write, no lock beyond the cache's own.
     """
