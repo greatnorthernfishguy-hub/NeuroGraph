@@ -3,6 +3,11 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3c / round 2) — Exec P563 (the window is canonical machinery, tested first on the CC)
+# What: the two banned window fields are renamed to their FINAL generic names, `fair_chance_steps_remaining` and `fair_chance_last_timestep` (NG-3 `3ccc749` banned
+#       `probation_steps_remaining` / `probation_last_timestep`: SUPERSEDED, those names no longer exist anywhere).
+# Why: the fields belong to the canonical fair-chance window (neuro_foundation.Graph), not to the graduation timer `probation_*`; they are local counters and never cross.
+# How: two frozenset entries. Test: tests/test_cc_fair_chance_host.py (membership AND a wire round-trip).
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3 / round 2) — Josh's ruling (Exec P550 / P552; Exec P561 P1)
 # What: _BANNED_META gains `probation_steps_remaining` and `probation_last_timestep`, the two fields that carry the STEP-keyed
 #       fair-chance window (cc_ng_organism.fair_chance_window_open). Neither may cross the wire.
@@ -286,8 +291,8 @@ _BANNED_META = frozenset({
     "creation_time",       # int(self.timestep) -- a LOCAL counter
     "probation_remaining",  # receiver runs its own probation window
     "probation_total",
-    "probation_steps_remaining",  # P561: the step-keyed fair-chance window count: the receiver re-stamps it on landing
-    "probation_last_timestep",    # P561: a LOCAL counter exactly like creation_time (the receiver's own graph.timestep)
+    "fair_chance_steps_remaining",  # P561/P563: the step-keyed fair-chance window count: the receiver re-stamps it on landing
+    "fair_chance_last_timestep",    # P561/P563: a LOCAL counter exactly like creation_time (the receiver's own graph.timestep)
 })
 
 

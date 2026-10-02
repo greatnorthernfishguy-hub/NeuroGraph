@@ -1,5 +1,12 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3c / round 2) — Exec P563 (the window logic is canonical); harness-only, NO assertion changed
+# What: the NG-3 / NG-3b additions to this harness are SUPERSEDED and removed: `functions()` again always extracts only `_cc_mutation_lock`, and its namespace drops `threading`,
+#       `_PROBATION_HEARTBEAT`, `_PROBATION_HEARTBEAT_LOCK` and `_CC_PROBATION_STEP_WINDOW` (none of those exist in the organism any more). The one new namespace entry is
+#       `PROBATION_UNADVANCED_CREATION_MODES=('ingested',)`, the constant `probation_population` reads (an AST extract of FUNCTIONS cannot carry a module-level constant), and
+#       the probation test extracts `functions('probation_population','cc_update_probation')`.
+# Why: the deposit and the advancer reach the canonical window helpers through getattr; this file's Graph double has none (and no `timestep`), so they are skipped and
+#       graduation still needs no clock: the test and its `not hasattr(g,'timestep')` assertion are UNTOUCHED and pass.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3b / round 2) — Chief-003 Addendum 2
 # What: harness-only; NO assertion changed. The bare namespace built by `functions()` gains ONE more module-level constant, `_CC_PROBATION_STEP_WINDOW=4`
 #       (beside `_CC_CONV_PROBATION_PERIOD=4`): the deposit and the step-window tick now read the dedicated step-window knob, and an AST extract of
@@ -68,18 +75,15 @@ SOURCE = Path(__file__).parents[1] / 'cc_ng_organism.py'
 
 def functions(*names):
     tree = ast.parse(SOURCE.read_text())
-    wanted = {'_cc_mutation_lock', '_probation_finite_number', '_probation_clock', '_probation_heartbeat_stamp',
-              '_probation_heartbeat_fresh', '_probation_step_window_tick', *names}
+    wanted = {'_cc_mutation_lock', *names}
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
     ns = dict(logger=logging.getLogger('test'), time=time, Optional=object,
               _CC_CONV_THRESHOLD_BOOST=2, _CC_CONV_NOVELTY_DAMPENING=.5,
-              _CC_CONV_PROBATION_PERIOD=4, _CC_PROBATION_STEP_WINDOW=4, _CC_CONV_PROBATION_REQUIRE_SPIKE=False,
+              _CC_CONV_PROBATION_PERIOD=4, _CC_CONV_PROBATION_REQUIRE_SPIKE=False,
               _CC_CONV_SYNAPSE_DELAY_MAX=3,
               _cc_embed_to_poincare_dir=lambda x:x, _cc_has_ever_fired=lambda n:False,
               cc_anticipate=lambda *a:None,
-              threading=threading,
-              _PROBATION_HEARTBEAT=dict(armed=False, max_age_s=None, stamp=None, stale_logged=False),
-              _PROBATION_HEARTBEAT_LOCK=threading.Lock())
+              PROBATION_UNADVANCED_CREATION_MODES=('ingested',))
     exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*nodes],type_ignores=[])),str(SOURCE),'exec'),ns)
     return ns
 
@@ -142,7 +146,7 @@ def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_in
     assert ns['run_conversational_dual_pass'](g,VDB(g,fail_insert),'text',[1],{}) is (not fail_insert and not raise_dual_pass_incomplete)
 
 def test_probation_keeps_existing_clock_semantics():
-    ns=functions('probation_population','fair_chance_window_open','cc_update_probation')
+    ns=functions('probation_population','cc_update_probation')
     g=Graph()
     class Metadata(dict):
         def __setitem__(self,k,v):
