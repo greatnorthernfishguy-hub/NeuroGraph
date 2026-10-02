@@ -3592,23 +3592,25 @@ class Graph:
         and thus age = full current timestep, well past grace — same
         sweep behavior as before this patch.
 
-        [2026-10-02] P552 (Josh's ruling, Exec P550 / P552; CC-CALLOSUM-TRUTH §8.13) — an unbound
-        node is NOT swept while its probation window is open: the protection window is the node's
-        own probation window (probation_remaining), the firing-keyed arrival exemption of §8.13,
-        not the timestep grace. It closes on the AUTONOMIC clock because
-        cc_ng_organism.cc_update_probation decrements per call from the CC daemon's
-        _autosave_loop, a 60 s wall-clock pulse that is not conversation-gated (LAW 8). The node
-        is spared only while that probation is ACTUALLY advanced: the HOST registers a predicate
-        on the graph (graph._probation_advances; defined once in cc_ng_organism.probation_advances)
-        and this sweep spares iff pred(node) is truthy AND probation_remaining is a finite number
-        > 0. No registration (the attribute absent) => exactly the sweep as it was before this
-        change, which is Syl's case: her host registers nothing. Anything odd (no key, None, str,
-        bool, NaN, inf, <= 0, a non-dict metadata) or a predicate that raises => swept as before
-        (fail toward the unexempted sweep, never toward protecting forever); a raising predicate
-        is counted and logged at WARNING once per sweep (exception class names only). Grace,
-        identity protection and every structural term are unchanged and are evaluated first.
-        Written for the laptop trial: canonical code, so it ALSO changes Syl's sweep if her host
-        ever registers; that rollout is Josh's call, not this trial's.
+        [2026-10-02] P552 / P561 / P562 (Josh's ruling, Exec P550 / P552; Exec P561; Exec P562;
+        CC-CALLOSUM-TRUTH §8.13) — an unbound node is NOT swept while the HOST says its fair chance
+        to wire is still open. HOST-AGNOSTIC BY DESIGN (P556 / P562): this body holds no window
+        logic and parses no node field. It reads ONE host-registered predicate,
+        graph._fair_chance_window_open (defined once in the host module as
+        cc_ng_organism.fair_chance_window_open), and spares a node iff pred(node) is truthy.
+        THIS IS THE LAST PROTECTED EDIT: every refinement of the window lives in the host
+        predicate: the unit (graph STEPS, counted on the host's two fields
+        probation_steps_remaining and probation_last_timestep), the population, the completion
+        heartbeat that closes the exemption when the host's advancer stalls, and the window size
+        (the existing CC_CONV_PROBATION_PERIOD). No registration (the attribute absent) =>
+        exactly the sweep as it was before any of this, which is Syl's case: her host registers
+        nothing. A predicate that raises => that node is NOT spared (fail toward the unexempted
+        sweep) and ONE WARNING per sweep carries a count and the exception class names only. The
+        predicate is consulted LAST, only for structural orphans past grace that are not
+        identity-protected (grace, identity protection and every structural term are unchanged
+        and evaluated first). A registrant must not block or take a graph lock: this runs under
+        the graph's step lock. Written for the laptop trial: canonical code, so it ALSO changes
+        Syl's sweep if her host ever registers; that rollout is Josh's call, not this trial's.
         """
         grace = self.config.get("orphan_node_grace_period", 0)
         orphans = [
@@ -3619,28 +3621,23 @@ class Graph:
             and (self.timestep - self.nodes[nid].creation_time) > grace
             and not self._is_identity_protected(nid)  # #spine: never sweep her authored self
         ]
-        pred = getattr(self, "_probation_advances", None)
+        pred = getattr(self, "_fair_chance_window_open", None)
         if pred is not None and orphans:
             swept = []
             pred_failures = 0
             pred_errors = set()
             for nid in orphans:
-                node = self.nodes[nid]
-                meta = node.metadata
-                prob = meta.get("probation_remaining") if isinstance(meta, dict) else None
-                if (isinstance(prob, (int, float)) and not isinstance(prob, bool)
-                        and 0 < prob < float("inf")):
-                    try:
-                        if pred(node):
-                            continue  # spared: its probation window is open and advancing
-                    except Exception as exc:  # fail toward today's sweep
-                        pred_failures += 1
-                        pred_errors.add(type(exc).__name__)
+                try:
+                    if pred(self.nodes[nid]):
+                        continue  # spared: the host says this node's fair chance to wire is still open
+                except Exception as exc:  # fail toward today's sweep
+                    pred_failures += 1
+                    pred_errors.add(type(exc).__name__)
                 swept.append(nid)
             orphans = swept
             if pred_failures:
                 logger.warning(
-                    "orphan sweep: the host's probation predicate raised for %d node(s) (%s); "
+                    "orphan sweep: the host's fair-chance-window predicate raised for %d node(s) (%s); "
                     "they were NOT spared (swept as without the exemption)",
                     pred_failures, ", ".join(sorted(pred_errors)),
                 )
