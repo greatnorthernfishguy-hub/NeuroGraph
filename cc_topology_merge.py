@@ -24,6 +24,11 @@
 # How: held = sweep-eligible unbound ∩ (the static in-transit cohort ∪ this merge's `merge_landed`). The file stays static; once the cohort
 #   is bound the INTERSECTION empties its term and only the merge's own arrivals are held (§8.12 Layer 2). The P499 belt is UNCHANGED.
 #   Stats keys, ERROR text and counter meanings are unchanged; `..._preexisting` now counts HELD cohort nodes not delivered by this merge.
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14946) — DL-1 (#987): the shape guard tests `nid.strip()`
+# What: `_IN_TRANSIT_REDACTED_SHAPE.fullmatch(nid.strip())`; the ORIGINAL `nid` is still what is stored. Why: le-061 DL-1: a whitespace-padded redacted
+#   id (` forest:2dfa2d637643`, a trailing `\n`/`\r\n`/tab/NBSP: the copy-paste-a-log-line variant of the exact error #976 exists for) did not match the
+#   un-stripped shape, so the file was VALID and the hold EMPTIED. How: one `.strip()`; raw tree ids with internal spaces are unaffected; `bad_id`/
+#   `zero_ids` and both Chief guards (empty intersection is NOT corrupt; no count pinned) unchanged.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14776) — #976 redacted-id SHAPE guard (Chief-003 RE-RULED ADOPT; checker-048 F3 HIGH)
 # What: `_read_in_transit_ids` treats an id that re.fullmatch-es ^[a-z]+:[0-9a-f]{12}$ (the shape `redact_node_id` prints) as a NEW corrupt class
 #   `redacted_id_shape`: the WHOLE file is corrupt, fail CLOSED (hold ALL; in_transit_ids() = None; ONE loud ERROR naming the class, never the id).
@@ -1157,7 +1162,8 @@ _IN_TRANSIT_MAX_BYTES = 1 << 20
 # #976 (Exec / Chief-003 RE-RULED ADOPT): the shape `redact_node_id` (below) produces for a log line,
 # `<kind>:<first 12 hex of sha256(id)>`. The in-transit file holds RAW ids (`cc:conv::<40 hex>[::tree::<concept>]`),
 # never this form: an id shaped like it means the file was built from a REDACTED log, and a VALID-looking file of
-# such ids would match no node and silently EMPTY the hold. Used with `re.fullmatch`; ONE such id makes the WHOLE
+# such ids would match no node and silently EMPTY the hold. Used with `re.fullmatch` on `nid.strip()` (a copy-pasted
+# log line carries padding: DL-1, #987; the id that is STORED stays the original, raw tree ids contain internal spaces); ONE such id makes the WHOLE
 # file corrupt (class `redacted_id_shape`, fail CLOSED), like `bad_id`. NOT a count check and NOT an
 # "intersection is empty" check: both are legitimate steady states (the set shrinks and the hold goes quiet as
 # bindings land; the file stays static).
@@ -1233,9 +1239,9 @@ def _read_in_transit_ids(path: str) -> Tuple[str, FrozenSet[str]]:
         nid = obj.get("id")
         if not isinstance(nid, str) or not nid:
             raise _InTransitCorrupt("bad_id")
-        if _IN_TRANSIT_REDACTED_SHAPE.fullmatch(nid):
+        if _IN_TRANSIT_REDACTED_SHAPE.fullmatch(nid.strip()):   # DL-1 (#987): a copy-pasted log line carries padding (space, \n, \r\n, tab, NBSP)
             raise _InTransitCorrupt("redacted_id_shape")        # the class only: the id is never kept or logged
-        ids.add(nid)
+        ids.add(nid)                                            # the ORIGINAL id is stored, never the stripped one
     if not ids:
         raise _InTransitCorrupt("zero_ids")
     return digest, frozenset(ids)
