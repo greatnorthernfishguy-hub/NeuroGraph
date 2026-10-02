@@ -19,9 +19,11 @@ import ast
 import importlib
 import io
 import logging
+import msgpack
 import os
 import random
 import subprocess
+import struct
 import sys
 import tokenize
 
@@ -610,6 +612,43 @@ def test_a_wire_round_trip_never_carries_the_fields_and_a_registered_receiver_re
     rg2, rv2 = tc._receiver()                                                           # an UNREGISTERED receiver: no window field at all
     tc._merge(rg2, rv2, path, tmp_path)
     assert all(STEPS not in n.metadata and LAST not in n.metadata for n in rg2.nodes.values())
+
+
+def test_receiver_drops_forged_fair_chance_meta_on_structural_no_embedding_landing(tmp_path):
+    tc = importlib.import_module("tests.test_cc_topology_callosum")
+    forged_id = "cc:conv::forged-structural-window"
+    payload = [
+        {"kind": "header", "version": 1, "machine_id": "vps",
+         "embedding_model": "test-model", "created": 0.0, "node_count": 1},
+        {"kind": "batch", "seq": 1, "synapses": [], "hyperedges": [], "nodes": [
+            {"id": forged_id, "content": "forged local-only state", "metadata": {
+                "cc": True,
+                "creation_mode": "conversational",
+                STEPS: 1e308,
+                LAST: 7,
+            }},
+        ]},
+    ]
+    path = str(tmp_path / "forged-no-embedding.conduit")
+    with open(path, "wb") as fh:
+        for frame in payload:
+            body = msgpack.packb(frame, use_bin_type=True)
+            fh.write(struct.pack(">I", len(body)) + body)
+
+    rg, rv = tc._receiver()
+    rg.enable_fair_chance_window(WINDOW, excluded_creation_modes=org.PROBATION_UNADVANCED_CREATION_MODES)
+    stats = tc._merge(rg, rv, path, tmp_path, idle_steps=0)
+
+    node = rg.nodes[forged_id]
+    assert stats["absorbed_without_embedding_DEFECT"] == 1
+    assert stats["banned_meta_dropped"] >= 1
+    assert STEPS not in node.metadata and LAST not in node.metadata
+    assert rg._in_fair_chance_window(node) is False
+
+    node.creation_time = 0
+    rg.timestep = rg.config.get("orphan_node_grace_period", 0) + 1
+    rg._collect_orphan_nodes()
+    assert forged_id not in rg.nodes
 
 
 # ---------------------------------------------------------------------------
