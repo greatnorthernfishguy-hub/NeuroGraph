@@ -3571,6 +3571,153 @@ class Graph:
         prov = meta.get("provenance")
         return isinstance(prov, str) and prov.endswith("_authored")
 
+    # ------------------------------------------------------------------
+    # The fair-chance window: arrival protection for an UNBOUND node (CC-CALLOSUM-TRUTH §8.13).
+    #
+    # FRAMING (Josh, Exec P563): this is SHARED MACHINERY being TESTED FIRST on the CC, not
+    # CC-specific code. It is the PIONEER implementation of canonical §8.13 arrival protection;
+    # rolling it out to other NeuroGraphs (Syl's) is Josh's call, with a LAW 8 gate per host.
+    # It is HOST-NEUTRAL: the host decides WHEN to turn it on (enable_fair_chance_window), and its
+    # own advancer keeps the per-node counters and the completion heartbeat current. A graph whose
+    # host never calls enable_fair_chance_window sweeps EXACTLY as it always did.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_finite_number(v) -> bool:
+        """A real finite number: int/float, NOT bool, not NaN, not +/-inf. Never raises."""
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and -float("inf") < v < float("inf")
+
+    def enable_fair_chance_window(self, window_steps, heartbeat_max_age_s=None, excluded_creation_modes=(), clock=None) -> None:
+        """HOST REGISTRATION: turn the fair-chance window ON for this graph (the one switch a host sets).
+
+        A host calls this ONLY once its own probation advance runs on its OWN AUTONOMIC clock (LAW 8,
+        P555, #971): a window that advances only when someone speaks would be a conversation-gated
+        exemption. Syl's sidecar does not (her `_update_probation` is conversation-gated), so she
+        registers nothing and her sweep is unchanged.
+
+        window_steps: the size of a node's window, in graph STEPS (a positive int; the HOST reads its own
+            environment and passes it, so this module reads none).
+        heartbeat_max_age_s: None (no heartbeat is enforced), or a finite number > 0: the largest age, in
+            seconds of `clock`, that the host advancer's last completion stamp may reach before the
+            exemption closes for EVERY node (today's sweep) until the advancer completes a cycle again.
+        excluded_creation_modes: `creation_mode` values whose probation the host's advancer does NOT
+            advance (e.g. nodes another sweep owns); they are never stamped, advanced or protected.
+        clock: a callable returning monotonic seconds; REQUIRED when a heartbeat is requested.
+
+        Validation happens FIRST and the heartbeat is stamped NOW; the registration is attached LAST, so
+        anything invalid (or a clock that raises) leaves the graph unregistered: a registered window with
+        no usable heartbeat is the unsafe state and cannot exist. Raises ValueError; never partially applies.
+        """
+        if not (isinstance(window_steps, int) and not isinstance(window_steps, bool) and window_steps > 0):
+            raise ValueError("window_steps must be a positive integer")
+        if heartbeat_max_age_s is not None:
+            if not (self._is_finite_number(heartbeat_max_age_s) and heartbeat_max_age_s > 0):
+                raise ValueError("heartbeat_max_age_s must be None or a finite number > 0")
+            if not callable(clock):
+                raise ValueError("a heartbeat needs a callable clock")
+        if isinstance(excluded_creation_modes, (str, bytes)):
+            raise ValueError("excluded_creation_modes must be a collection of values, not a string")
+        cfg = {
+            "window_steps": window_steps,
+            "max_age_s": None if heartbeat_max_age_s is None else float(heartbeat_max_age_s),
+            "excluded": tuple(excluded_creation_modes),
+            "clock": clock,
+            "stamp": None,
+            "stale_logged": False,
+        }
+        if cfg["max_age_s"] is not None:
+            cfg["stamp"] = clock()
+        self._fair_chance_cfg = cfg
+
+    def fair_chance_stamp(self, node) -> None:
+        """HOST DEPOSIT HELPER: open (or re-open, for an exact repeat) this node's window: both counters
+        are stamped, the step count at the full window and `last` at this graph's timestep. A no-op on an
+        unregistered graph, for an excluded creation_mode, or for a non-dict metadata."""
+        cfg = getattr(self, "_fair_chance_cfg", None)
+        meta = getattr(node, "metadata", None)
+        if cfg is None or not isinstance(meta, dict) or meta.get("creation_mode") in cfg["excluded"]:
+            return
+        t = self.timestep
+        meta["fair_chance_steps_remaining"] = cfg["window_steps"]
+        meta["fair_chance_last_timestep"] = int(t) if self._is_finite_number(t) else 0
+
+    def fair_chance_advance(self, node) -> None:
+        """HOST ADVANCER HELPER, once per node per advancer pass. The unit of the window is graph STEPS:
+          * counter ABSENT: SEED it fresh (this is what protects a node that predates registration);
+          * a finite number > 0 with a finite `last`: timestep > last => ONE decrement (never below 0)
+            and last = timestep; timestep == last => nothing (no step ran since this node's last
+            decrement, however many pulses passed); timestep < last (the clock went BACKWARDS, e.g. a
+            restore from an older checkpoint) => last = timestep and NO decrement;
+          * any other shape, a non-dict metadata, an excluded creation_mode, an unregistered graph or an
+            unreadable clock: left untouched.
+        NEVER raises, and touches only the two window fields."""
+        cfg = getattr(self, "_fair_chance_cfg", None)
+        meta = getattr(node, "metadata", None)
+        if cfg is None or not isinstance(meta, dict) or meta.get("creation_mode") in cfg["excluded"]:
+            return
+        t = self.timestep
+        if not self._is_finite_number(t):
+            return
+        if "fair_chance_steps_remaining" not in meta:
+            meta["fair_chance_steps_remaining"] = cfg["window_steps"]
+            meta["fair_chance_last_timestep"] = t
+            return
+        steps = meta["fair_chance_steps_remaining"]
+        last = meta.get("fair_chance_last_timestep")
+        if not (self._is_finite_number(steps) and steps > 0 and self._is_finite_number(last)):
+            return
+        if t > last:
+            meta["fair_chance_steps_remaining"] = max(0, steps - 1)
+            meta["fair_chance_last_timestep"] = t
+        elif t < last:
+            meta["fair_chance_last_timestep"] = t
+
+    def fair_chance_heartbeat_stamp(self) -> None:
+        """HOST ADVANCER HELPER: record a COMPLETION of the advancer's pass. The host calls it ONLY at the end
+        of a NON-RAISING pass (never from a `finally`, never before the loop): a raise anywhere in the pass,
+        or the pass never being called, leaves the old stamp, and that staleness IS the stall signal. Re-opens
+        the stale latch (one INFO on recovery). A no-op unless a heartbeat was requested at registration."""
+        cfg = getattr(self, "_fair_chance_cfg", None)
+        if cfg is None or cfg["max_age_s"] is None:
+            return
+        cfg["stamp"] = cfg["clock"]()
+        if cfg["stale_logged"]:
+            cfg["stale_logged"] = False
+            logger.info("fair-chance window: the host's advancer completed a cycle again; the orphan-sweep exemption is back on")
+
+    def _fair_chance_heartbeat_fresh(self, cfg) -> bool:
+        """True unless a heartbeat is armed AND its last completion stamp is older than its max age (strictly
+        greater). Stale => ONE WARNING per stale EPISODE (the age and the limit only); the next completion
+        stamp re-opens the latch. Runs under the graph's step lock (the sweep and the advancer both hold it)."""
+        if cfg["max_age_s"] is None:
+            return True
+        age = cfg["clock"]() - cfg["stamp"]
+        fresh = not (age > cfg["max_age_s"])
+        if not fresh and not cfg["stale_logged"]:
+            cfg["stale_logged"] = True
+            logger.warning("fair-chance window: the host's advancer has not completed a cycle for %.0f s (limit %.0f s); "
+                           "the orphan-sweep exemption is OFF (today's sweep) until the advancer completes a cycle",
+                           age, cfg["max_age_s"])
+        return fresh
+
+    def _in_fair_chance_window(self, node) -> bool:
+        """True iff this (unbound) node is still inside its fair chance to wire: the graph is registered, the
+        node's creation_mode is not excluded, the heartbeat is fresh, and its step counter is a finite number
+        > 0 with a finite `last`. EVERYTHING else (no key, None, str, negative, zero, NaN, +/-inf, bool, a
+        None / non-dict metadata) is False, which is today's sweep: fail toward today, never toward protecting
+        forever. Never raises on those shapes."""
+        cfg = getattr(self, "_fair_chance_cfg", None)
+        if cfg is None:
+            return False
+        meta = node.metadata
+        if not isinstance(meta, dict) or meta.get("creation_mode") in cfg["excluded"]:
+            return False
+        if not self._fair_chance_heartbeat_fresh(cfg):
+            return False
+        steps = meta.get("fair_chance_steps_remaining")
+        return (self._is_finite_number(steps) and steps > 0
+                and self._is_finite_number(meta.get("fair_chance_last_timestep")))
+
     def _collect_orphan_nodes(self) -> int:
         """Remove nodes with no synapses and no hyperedge membership.
 
@@ -3592,25 +3739,26 @@ class Graph:
         and thus age = full current timestep, well past grace — same
         sweep behavior as before this patch.
 
-        [2026-10-02] P552 / P561 / P562 (Josh's ruling, Exec P550 / P552; Exec P561; Exec P562;
-        CC-CALLOSUM-TRUTH §8.13) — an unbound node is NOT swept while the HOST says its fair chance
-        to wire is still open. HOST-AGNOSTIC BY DESIGN (P556 / P562): this body holds no window
-        logic and parses no node field. It reads ONE host-registered predicate,
-        graph._fair_chance_window_open (defined once in the host module as
-        cc_ng_organism.fair_chance_window_open), and spares a node iff pred(node) is truthy.
-        THIS IS THE LAST PROTECTED EDIT: every refinement of the window lives in the host
-        predicate: the unit (graph STEPS, counted on the host's two fields
-        probation_steps_remaining and probation_last_timestep), the population, the completion
-        heartbeat that closes the exemption when the host's advancer stalls, and the window size
-        (the existing CC_CONV_PROBATION_PERIOD). No registration (the attribute absent) =>
-        exactly the sweep as it was before any of this, which is Syl's case: her host registers
-        nothing. A predicate that raises => that node is NOT spared (fail toward the unexempted
-        sweep) and ONE WARNING per sweep carries a count and the exception class names only. The
-        predicate is consulted LAST, only for structural orphans past grace that are not
-        identity-protected (grace, identity protection and every structural term are unchanged
-        and evaluated first). A registrant must not block or take a graph lock: this runs under
-        the graph's step lock. Written for the laptop trial: canonical code, so it ALSO changes
-        Syl's sweep if her host ever registers; that rollout is Josh's call, not this trial's.
+        [2026-10-02] P552 / P561 / P563 (Josh's ruling, Exec P550 / P552; Exec P561; Exec P563;
+        Chief-003 Addenda 3-4; CC-CALLOSUM-TRUTH §8.13) — an unbound node is NOT swept while it is
+        inside its FAIR-CHANCE WINDOW. FRAMING (Josh): this is shared machinery being TESTED FIRST on
+        the CC, not CC-specific code; it is the pioneer implementation of canonical §8.13 arrival
+        protection, and rolling it out to other NeuroGraphs (Syl's) is Josh's call, with a LAW 8 gate
+        per host. HOST-NEUTRAL: all of the window logic lives beside this sweep (the fair-chance
+        helpers above: the unit is graph STEPS, counted on the node fields fair_chance_steps_remaining
+        and fair_chance_last_timestep; the population exclusion; the completion heartbeat that closes
+        the exemption when the host's advancer stalls), driven by what the HOST sets through
+        enable_fair_chance_window and maintains through fair_chance_stamp / fair_chance_advance /
+        fair_chance_heartbeat_stamp. This module reads NO environment: the host reads its own
+        configuration (LAW 5) and hands it over. A graph whose host never registered
+        (`_fair_chance_cfg` absent) sweeps EXACTLY as before any of this, which is Syl's case. A
+        window check that raises => that node is NOT spared (fail toward the unexempted sweep) and ONE
+        WARNING per sweep carries a count and the exception class names only. The window is
+        consulted LAST, only for structural orphans past grace that are not identity-protected
+        (grace, identity protection and every structural term are unchanged and evaluated first).
+        The sweep runs under the graph's step lock, which is also what serialises the heartbeat.
+        Written for the laptop trial: canonical code, so it ALSO changes Syl's sweep if her host ever
+        registers; that rollout is Josh's call, not this trial's.
         """
         grace = self.config.get("orphan_node_grace_period", 0)
         orphans = [
@@ -3621,25 +3769,24 @@ class Graph:
             and (self.timestep - self.nodes[nid].creation_time) > grace
             and not self._is_identity_protected(nid)  # #spine: never sweep her authored self
         ]
-        pred = getattr(self, "_fair_chance_window_open", None)
-        if pred is not None and orphans:
+        if getattr(self, "_fair_chance_cfg", None) is not None and orphans:
             swept = []
-            pred_failures = 0
-            pred_errors = set()
+            window_failures = 0
+            window_errors = set()
             for nid in orphans:
                 try:
-                    if pred(self.nodes[nid]):
-                        continue  # spared: the host says this node's fair chance to wire is still open
+                    if self._in_fair_chance_window(self.nodes[nid]):
+                        continue  # spared: this node's fair chance to wire is still open
                 except Exception as exc:  # fail toward today's sweep
-                    pred_failures += 1
-                    pred_errors.add(type(exc).__name__)
+                    window_failures += 1
+                    window_errors.add(type(exc).__name__)
                 swept.append(nid)
             orphans = swept
-            if pred_failures:
+            if window_failures:
                 logger.warning(
-                    "orphan sweep: the host's fair-chance-window predicate raised for %d node(s) (%s); "
+                    "orphan sweep: the fair-chance window check raised for %d node(s) (%s); "
                     "they were NOT spared (swept as without the exemption)",
-                    pred_failures, ", ".join(sorted(pred_errors)),
+                    window_failures, ", ".join(sorted(window_errors)),
                 )
         removed = 0
         for nid in orphans:
