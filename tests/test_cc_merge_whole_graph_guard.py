@@ -12,6 +12,10 @@
 #   idle_steps=0. The second test also pins those two other callers (names, and that both read under _step_lock).
 # Why: #918 (Exec Packet 496). Nothing the tests assert about the GUARD changed (still 0 asks at idle_steps=0; still exactly 2
 #   whole-graph asks under the lock, steps unlocked); the spy used to see every call to the predicate, and there are now more.
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14809) — #981 (C6): knob isolation, FIXTURE ONLY, no assertion changed
+# What: an autouse fixture deletes CC_NG_IN_TRANSIT_IDS_PATH and resets the in-transit cache (cc_topology_merge._reset_in_transit_cache_for_tests)
+#   before and after every test. Why: le-061 measured 16 tests in the two files test_cc_merge_whole_graph_guard.py (x7) and
+#   test_cc_emergent_want_bound_905.py (x9) failing with the variable exported, because their laptop-own orphan is then no longer held.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 expectation updates
 # What: only where #905 changes a thing these tests pinned: (1) the per-batch ERROR sample is REDACTED (Part C: kind:sha256-12,
 #   never the id) -- test_a_preexisting..., test_c_an_arrival..., test_c_arrival_scope..., test_c_mixed..., test_c_the_id_sample...;
@@ -53,6 +57,21 @@ from neuro_foundation import Graph  # noqa: E402
 from universal_ingestor import SimpleVectorDB  # noqa: E402
 import cc_ng_organism as cno  # noqa: E402
 import cc_topology_export as tex  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_in_transit_knob_981(monkeypatch):
+    """#981 (Chief-003 C6, Exec P559): this file's expectations are the whole-graph hold's (CC_NG_IN_TRANSIT_IDS_PATH UNSET). With that variable
+    exported in the ambient environment (a `.bashrc` export reaches every interactive-shell run) the merge's held set narrows to the in-transit
+    cohort and a laptop-own orphan is no longer held, so tests written for the whole-graph hold would go red. Remove the variable for the test
+    AND reset the once-read cache through the private test helper, before AND after (the cache is process-wide)."""
+    monkeypatch.delenv("CC_NG_IN_TRANSIT_IDS_PATH", raising=False)
+    reset = getattr(tmg, "_reset_in_transit_cache_for_tests", None)       # absent on an older module copy (BASE_REF / mutant runs)
+    if reset is not None:
+        reset()
+    yield
+    if reset is not None:
+        reset()
 
 
 def _load_by_path(path, name):

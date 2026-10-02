@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14809) — #981 (C6): knob isolation, FIXTURE ONLY, no assertion changed
+# What: an autouse fixture deletes CC_NG_IN_TRANSIT_IDS_PATH and resets the in-transit cache (cc_topology_merge._reset_in_transit_cache_for_tests)
+#   before and after every test. Why: le-061 measured 16 tests in the two files test_cc_merge_whole_graph_guard.py (x7) and
+#   test_cc_emergent_want_bound_905.py (x9) failing with the variable exported, because their laptop-own orphan is then no longer held.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane emergent-want-bound-905, dispatch #13138) — #905 tests (parts A, B, C, D)
 # What: a REAL neuro_foundation.Graph (real step(), real orphan sweep, real _is_identity_protected) + the REAL
 #   cc_topology_merge.merge_cc_topology driven by conduit frames from the REAL exporter, for:
@@ -35,6 +39,21 @@ sys.path.insert(0, str(_WORKTREE))
 from neuro_foundation import Graph, Prediction  # noqa: E402
 from universal_ingestor import SimpleVectorDB  # noqa: E402
 import cc_topology_export as tex  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_in_transit_knob_981(monkeypatch):
+    """#981 (Chief-003 C6, Exec P559): this file's expectations are the whole-graph hold's (CC_NG_IN_TRANSIT_IDS_PATH UNSET). With that variable
+    exported in the ambient environment (a `.bashrc` export reaches every interactive-shell run) the merge's held set narrows to the in-transit
+    cohort and a laptop-own orphan is no longer held, so tests written for the whole-graph hold would go red. Remove the variable for the test
+    AND reset the once-read cache through the private test helper, before AND after (the cache is process-wide)."""
+    monkeypatch.delenv("CC_NG_IN_TRANSIT_IDS_PATH", raising=False)
+    reset = getattr(tmg, "_reset_in_transit_cache_for_tests", None)       # absent on an older module copy (BASE_REF / mutant runs)
+    if reset is not None:
+        reset()
+    yield
+    if reset is not None:
+        reset()
 
 
 def _load_by_path(path, name):
