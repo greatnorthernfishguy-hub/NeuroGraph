@@ -3600,13 +3600,18 @@ class Graph:
         heartbeat_max_age_s: None (no heartbeat is enforced), or a finite number > 0: the largest age, in
             seconds of `clock`, that the host advancer's last completion stamp may reach before the
             exemption closes for EVERY node (today's sweep) until the advancer completes a cycle again.
+            The heartbeat is OPTIONAL: None registers cleanly and the heartbeat is then never stale
+            ("not armed => not enforced"), which is right for tests and for a host with no autonomic
+            advancer. A host that DOES run an autonomic advancer MUST pass a finite max age and a clock,
+            or a stalled advancer can never close the exemption. The default is None and is unchanged.
         excluded_creation_modes: `creation_mode` values whose probation the host's advancer does NOT
             advance (e.g. nodes another sweep owns); they are never stamped, advanced or protected.
         clock: a callable returning monotonic seconds; REQUIRED when a heartbeat is requested.
 
         Validation happens FIRST and the heartbeat is stamped NOW; the registration is attached LAST, so
-        anything invalid (or a clock that raises) leaves the graph unregistered: a registered window with
-        no usable heartbeat is the unsafe state and cannot exist. Raises ValueError; never partially applies.
+        anything invalid (or a clock that raises) leaves the graph unregistered, and a heartbeat that IS
+        requested can never be registered half-armed (a max age without a callable clock, or a clock that
+        raises on the first stamp, registers nothing). Raises ValueError; never partially applies.
         """
         if not (isinstance(window_steps, int) and not isinstance(window_steps, bool) and window_steps > 0):
             raise ValueError("window_steps must be a positive integer")
@@ -3686,19 +3691,27 @@ class Graph:
             logger.info("fair-chance window: the host's advancer completed a cycle again; the orphan-sweep exemption is back on")
 
     def _fair_chance_heartbeat_fresh(self, cfg) -> bool:
-        """True unless a heartbeat is armed AND its last completion stamp is older than its max age (strictly
-        greater). Stale => ONE WARNING per stale EPISODE (the age and the limit only); the next completion
-        stamp re-opens the latch. Runs under the graph's step lock (the sweep and the advancer both hold it)."""
+        """PURE QUERY (LAW 4): True unless a heartbeat is armed AND its last completion stamp is older than its
+        max age (strictly greater). Writes nothing and logs nothing: the stale latch and the stale WARNING
+        belong to `_note_fair_chance_stale`, called once per sweep by the sweep body."""
         if cfg["max_age_s"] is None:
             return True
+        return not (cfg["clock"]() - cfg["stamp"] > cfg["max_age_s"])
+
+    def _note_fair_chance_stale(self, cfg) -> None:
+        """Owns the stale latch and the ONE WARNING per stale EPISODE (the age and the limit only). Called ONCE
+        per sweep by `_collect_orphan_nodes`, never per node and never from the window query. A no-op unless
+        a heartbeat is armed, it is stale and the latch is open; the host's next completion stamp
+        (`fair_chance_heartbeat_stamp`) re-opens the latch and logs the one recovery INFO. Runs under the
+        graph's step lock (the sweep and the advancer both hold it)."""
+        if cfg["max_age_s"] is None or cfg["stale_logged"]:
+            return
         age = cfg["clock"]() - cfg["stamp"]
-        fresh = not (age > cfg["max_age_s"])
-        if not fresh and not cfg["stale_logged"]:
+        if age > cfg["max_age_s"]:
             cfg["stale_logged"] = True
             logger.warning("fair-chance window: the host's advancer has not completed a cycle for %.0f s (limit %.0f s); "
                            "the orphan-sweep exemption is OFF (today's sweep) until the advancer completes a cycle",
                            age, cfg["max_age_s"])
-        return fresh
 
     def _in_fair_chance_window(self, node) -> bool:
         """True iff this (unbound) node is still inside its fair chance to wire: the graph is registered, the
@@ -3756,6 +3769,17 @@ class Graph:
         WARNING per sweep carries a count and the exception class names only. The window is
         consulted LAST, only for structural orphans past grace that are not identity-protected
         (grace, identity protection and every structural term are unchanged and evaluated first).
+        [2026-10-02] P571 (b) F1 + F3 / P574 (Claude Sonnet 5.5, Z12 F1 builder; PROTECTED CHANGE under
+        CLAUDE.md §2 protected-FILE inventory; the SAME approved behaviour and surface as P563 / P564 / P550,
+        still unmerged; no new ceremony; offline source change, no live checkpoint, graph or daemon operation)
+        — LAW 4: `_fair_chance_heartbeat_fresh` is now a PURE boolean query (no latch write, no log). The
+        stale latch and its ONE WARNING per stale episode MOVED to the named `_note_fair_chance_stale`,
+        which this sweep calls ONCE before its per-node loop whenever a registered graph has orphans to
+        consider. An unreadable clock in that call is left to the per-node check, which already counts it
+        and keeps the node swept (fail toward today). The recovery re-arm + ONE INFO stay in
+        `fair_chance_heartbeat_stamp` (unchanged). F3: `enable_fair_chance_window` now states the real
+        heartbeat contract (optional; None = not enforced; a host with an autonomic advancer MUST pass a
+        finite max age and a clock); the default is unchanged.
         The sweep runs under the graph's step lock, which is also what serialises the heartbeat.
         Written for the laptop trial: canonical code, so it ALSO changes Syl's sweep if her host ever
         registers; that rollout is Josh's call, not this trial's.
@@ -3770,6 +3794,10 @@ class Graph:
             and not self._is_identity_protected(nid)  # #spine: never sweep her authored self
         ]
         if getattr(self, "_fair_chance_cfg", None) is not None and orphans:
+            try:
+                self._note_fair_chance_stale(self._fair_chance_cfg)  # ONCE per sweep: the stale latch + its one WARNING
+            except Exception:
+                pass  # an unreadable clock is counted and warned by the per-node check below (the node stays swept)
             swept = []
             window_failures = 0
             window_errors = set()

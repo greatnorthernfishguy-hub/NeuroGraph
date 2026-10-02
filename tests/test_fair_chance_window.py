@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 F1 builder; Exec P571 (b) F1 + F3 / Exec P574)
+# What: re-pin the stale-episode tests on the NEW site. `_fair_chance_heartbeat_fresh` is now a PURE query and `_note_fair_chance_stale` (called once per
+#   sweep by `_collect_orphan_nodes`) owns the latch + the ONE WARNING per episode: the episode / registering-again tests now drive the SWEEP; a new test pins
+#   that the query is silent for every node shape; a new test pins that a raising clock never escapes the sweep; a new static test pins purity of the
+#   query and once-per-sweep, sweep-only calling of the note; `_note_fair_chance_stale` joins NEW_METHODS.
+# Why: LAW 4 (a function named for its query does what its name says). Same approved behaviour; the pinned site moved.
+# How: same helpers and the same miniature host; the old assertions that the QUERY warned are inverted (the query must NOT warn or latch).
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-4' / round 2) — Josh's ruling (Exec P550 / P552; Exec P561 P1 + P2; Exec P563;
 #   Chief-003 Addenda 3-4); CC-CALLOSUM-TRUTH §8.13
 # FRAMING (Josh): the fair-chance window is SHARED MACHINERY being TESTED FIRST on the CC, not CC-specific code: the pioneer implementation of canonical §8.13
@@ -412,6 +419,7 @@ def test_fresh_means_the_window_applies_and_staleness_is_a_strict_greater_than()
 
 
 def test_stale_closes_the_window_for_EVERY_node_with_one_warning_per_episode_and_a_completed_pass_recovers(caplog):
+    # P571 F1 (LAW 4): the window QUERY is pure; the stale latch + the ONE WARNING per episode belong to the sweep (`_note_fair_chance_stale`)
     clock = Clock(1000.0)
     g = _graph(max_age=300, clock=clock)
     for nid in ("a", "b", "c"):
@@ -420,29 +428,62 @@ def test_stale_closes_the_window_for_EVERY_node_with_one_warning_per_episode_and
     with caplog.at_level(logging.DEBUG, logger="neuro_foundation"):
         for _ in range(5):
             for nid in ("a", "b", "c"):
-                assert g._in_fair_chance_window(g.nodes[nid]) is False
+                assert g._in_fair_chance_window(g.nodes[nid]) is False       # stale closes the exemption for EVERY node
+        assert _warnings(caplog) == [] and g._fair_chance_cfg["stale_logged"] is False   # ...and the query alone writes and logs NOTHING
+        for rnd in range(5):                                         # the SWEEP owns the episode: 5 sweeps, ONE WARNING in all
+            if rnd:
+                for nid in ("a", "b", "c"):
+                    _deposit(g, "%s%d" % (nid, rnd))
+            g._collect_orphan_nodes()
+            assert not g.nodes                                       # stale: every old unwired node went, none was spared
         ws = _warnings(caplog)
-        assert len(ws) == 1                                          # ONE per stale EPISODE, not per call
+        assert len(ws) == 1 and g._fair_chance_cfg["stale_logged"] is True   # ONE per stale EPISODE, not per sweep
         msg = ws[0].getMessage()
         assert "301" in msg and "300" in msg and "OFF" in msg
         g.fair_chance_heartbeat_stamp()                              # the host's advancer completes a cycle: recovery
         infos = [r for r in caplog.records if r.name == "neuro_foundation" and r.levelno == logging.INFO and "back on" in r.getMessage()]
-        assert len(infos) == 1
-        assert all(g._in_fair_chance_window(g.nodes[n]) for n in ("a", "b", "c"))
+        assert len(infos) == 1 and g._fair_chance_cfg["stale_logged"] is False
+        for nid in ("a", "b", "c"):
+            _deposit(g, nid)
+        g._collect_orphan_nodes()
+        assert {"a", "b", "c"} <= set(g.nodes)                       # the exemption is back on
         clock.t += 301                                               # a SECOND episode warns again (the latch re-opened)
-        assert g._in_fair_chance_window(g.nodes["a"]) is False
+        g._collect_orphan_nodes()
+        assert not g.nodes
         assert len(_warnings(caplog)) == 2
 
 
-def test_an_excluded_node_never_reaches_the_heartbeat_and_a_node_with_no_window_still_trips_it(caplog):
+def test_the_window_query_is_pure_for_every_node_shape_and_the_sweep_is_what_warns(caplog):
     clock = Clock()
     g = _graph(max_age=20, clock=clock)
     clock.t += 21
     with caplog.at_level(logging.DEBUG, logger="neuro_foundation"):
-        assert _check(g, _open(5, creation_mode="ingested")) is False
-        assert _warnings(caplog) == []                               # excluded: the heartbeat was not consulted
-        assert _check(g, {"creation_mode": "conversational"}) is False
-        assert len(_warnings(caplog)) == 1
+        assert _check(g, _open(5, creation_mode="ingested")) is False        # excluded
+        assert _check(g, {"creation_mode": "conversational"}) is False       # no window, stale heartbeat
+        assert _check(g, _open(5)) is False                                  # an open counter, stale heartbeat
+        assert _warnings(caplog) == [] and g._fair_chance_cfg["stale_logged"] is False
+        _node(g, "x", {"creation_mode": "conversational"})
+        g._collect_orphan_nodes()
+        assert "x" not in g.nodes and len(_warnings(caplog)) == 1
+
+
+def test_a_clock_that_raises_never_escapes_the_sweep_and_the_node_is_swept_with_one_raise_warning(caplog):
+    state = {"boom": False}
+
+    def clock():
+        if state["boom"]:
+            raise RuntimeError(_SECRET)
+        return 1000.0
+    g = _graph(max_age=300, clock=clock)
+    _deposit(g, "a")
+    state["boom"] = True
+    with caplog.at_level(logging.DEBUG, logger="neuro_foundation"):
+        removed = g._collect_orphan_nodes()                          # the note's clock read must not escape the sweep
+    assert removed == 1 and "a" not in g.nodes                       # fail toward today's sweep
+    ws = [r for r in caplog.records if r.name == "neuro_foundation" and r.levelno == logging.WARNING]
+    assert len(ws) == 1                                              # the per-node check reports it, ONE per sweep
+    msg = ws[0].getMessage()
+    assert "1 node" in msg and "RuntimeError" in msg and _SECRET not in msg
 
 
 def test_the_stamp_is_the_hosts_completion_signal_and_a_pass_that_never_happens_leaves_the_old_stamp():
@@ -461,11 +502,13 @@ def test_registering_again_resets_the_stale_latch(caplog):
     g = _graph(max_age=20, clock=clock)
     clock.t += 21
     with caplog.at_level(logging.DEBUG, logger="neuro_foundation"):
-        g._in_fair_chance_window(_node(g, "x", _open(3)))
+        _node(g, "x", _open(3))
+        g._collect_orphan_nodes()
         assert len(_warnings(caplog)) == 1
         g.enable_fair_chance_window(WINDOW, heartbeat_max_age_s=20, clock=clock)
         clock.t += 21
-        g._in_fair_chance_window(g.nodes["x"])
+        _node(g, "y", _open(3))
+        g._collect_orphan_nodes()
         assert len(_warnings(caplog)) == 2
 
 
@@ -700,7 +743,7 @@ def test_a_stale_heartbeat_makes_the_REAL_sweep_cull_as_today_and_a_completed_pa
 # ===========================================================================
 
 NEW_METHODS = ["Graph._in_fair_chance_window", "Graph._fair_chance_heartbeat_fresh", "Graph._is_finite_number", "Graph.enable_fair_chance_window",
-               "Graph.fair_chance_advance", "Graph.fair_chance_heartbeat_stamp", "Graph.fair_chance_stamp"]
+               "Graph._note_fair_chance_stale", "Graph.fair_chance_advance", "Graph.fair_chance_heartbeat_stamp", "Graph.fair_chance_stamp"]
 CHANGED = ["Graph._collect_orphan_nodes"]
 
 
@@ -817,6 +860,25 @@ def test_static_the_diff_adds_no_environment_read_even_in_prose_code_lines():
     for lineno, code in added:
         if lineno not in doc_lines and not code.strip().startswith("#"):
             assert not re.search(r"environ|getenv|\bos\.", code), (lineno, code)
+
+
+def test_static_the_heartbeat_query_is_pure_and_the_note_is_called_once_per_sweep_from_the_sweep_only():
+    """P571 F1 (LAW 4): `_fair_chance_heartbeat_fresh` writes nothing and logs nothing; `_in_fair_chance_window` never calls the note; the sweep
+    body calls `_note_fair_chance_stale` exactly once, outside any loop; no other function in the module calls it."""
+    fns = _funcs(_new_tree())
+    for c in ast.walk(fns["Graph._fair_chance_heartbeat_fresh"]):
+        assert not isinstance(c, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)), ast.dump(c)[:80]
+        assert (getattr(c, "id", None) or getattr(c, "attr", None)) not in ("logger", "warning", "info", "stale_logged", "_note_fair_chance_stale")
+        assert not (isinstance(c, ast.Constant) and c.value == "stale_logged")
+    assert not any(getattr(c, "attr", None) == "_note_fair_chance_stale" for c in ast.walk(fns["Graph._in_fair_chance_window"]))
+    sweep = fns["Graph._collect_orphan_nodes"]
+    calls = [c for c in ast.walk(sweep) if isinstance(c, ast.Call) and getattr(c.func, "attr", None) == "_note_fair_chance_stale"]
+    assert len(calls) == 1
+    for loop in (n for n in ast.walk(sweep) if isinstance(n, (ast.For, ast.While, ast.ListComp, ast.comprehension))):
+        assert not any(c is calls[0] for c in ast.walk(loop))        # once per SWEEP, never per node
+    elsewhere = [k for k, f in fns.items() if not k.endswith("#class") and k != "Graph._collect_orphan_nodes"
+                 and any(isinstance(c, ast.Attribute) and c.attr == "_note_fair_chance_stale" for c in ast.walk(f))]
+    assert elsewhere == [], elsewhere
 
 
 def test_static_the_docstrings_carry_the_framing_and_the_host_contract():
