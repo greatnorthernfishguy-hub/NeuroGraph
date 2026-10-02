@@ -1,5 +1,13 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-1) — Josh's ruling (Exec P550 / P552, P556)
+# What: test_probation_keeps_existing_clock_semantics extracts the real `probation_advances` together with
+#       `cc_update_probation`. No assertion changed or weakened.
+# Why:  cc_update_probation's inline `creation_mode == "ingested"` skip is now `probation_advances(node)`
+#       (the one definition the orphan sweep also reads; CC-CALLOSUM-TRUTH §8.13). This harness AST-extracts
+#       ONLY the named functions into a bare namespace, so the new dependency must be extracted with it
+#       (observed pre-fix: NameError: name 'probation_advances' is not defined).
+# How:  functions('cc_update_probation') -> functions('probation_advances', 'cc_update_probation').
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code), lane z2-dualpass-reconcile-20260926 — P264(2) land corrections
 # What: (a) records the Addendum-1 deletion of the merge-orphan
 #       `if extract_failed: raise RuntimeError(...)` stub lines (commit 3670dba);
@@ -113,7 +121,7 @@ def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_in
     assert ns['run_conversational_dual_pass'](g,VDB(g,fail_insert),'text',[1],{}) is (not fail_insert and not raise_dual_pass_incomplete)
 
 def test_probation_keeps_existing_clock_semantics():
-    ns=functions('cc_update_probation')
+    ns=functions('probation_advances','cc_update_probation')
     g=Graph()
     class Metadata(dict):
         def __setitem__(self,k,v):

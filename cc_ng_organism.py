@@ -248,6 +248,28 @@
 # How: the guard is built in ONE place, cc_topology_merge.whole_graph_guard, and both callers (the Leg 2 merge, the
 #   daemon's drain) pass it; this function holds no predicate of its own (LAW 3 / LAW 4). Slice size, lock slicing,
 #   success return value and what the steps do are unchanged.
+# [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-1) —
+#   probation_advances(node): the ONE definition of "this node's probation is actually
+#   advanced by cc_update_probation" (Josh's ruling Exec P550 / P552, amended Exec P554,
+#   placement fixed Exec P556; CC-CALLOSUM-TRUTH §8.13)
+# What: new module-level predicate probation_advances(node). cc_update_probation's inline
+#   `creation_mode == "ingested"` skip is REPLACED by `if not probation_advances(node):
+#   continue`; behaviour is byte-identical to the base (proved by the seeded base-vs-new
+#   comparison in tests/test_cc_probation_advances_p552.py).
+# Why: the orphan sweep (neuro_foundation.Graph._collect_orphan_nodes, NG-2) spares an unbound
+#   node while its probation window is open (§8.13's firing-keyed arrival exemption). A node is
+#   only protected while its window is ACTUALLY being advanced, so the sweep must read the SAME
+#   predicate as the thing that advances it (LAW 4: defined once, consulted, never duplicated).
+#   Without it an `ingested` node (decremented only by the Ingestor's sweep, which on the laptop
+#   runs only inside on_message <- handle_import) would be spared forever: an unbounded leak.
+# How: the host registers this function on its graph (graph._probation_advances = ...; the
+#   laptop daemon's init_ng does; Syl's host registers NOTHING, so her sweep is unchanged).
+#   No cc_-named module is imported by canonical neuro_foundation.py (Exec P556).
+#   CANONICAL SCOPE NOTE (recorded, NOT acted on): on Syl's process
+#   neurograph_rpc._update_probation is conversation-gated (handle_after_turn) and decrements
+#   EVERY node with the key INCLUDING `ingested` ones (this mirror skips them), so her window
+#   does not advance on the autonomic clock (LAW 8). Whether and when she registers is Josh's
+#   rollout decision, not this trial's.
 # [2026-09-26] Z2 worker (openrouter/deepseek/deepseek-v4.1-flash, OpenCode/T3 Code),
 #   lane z2-ng-recall-passthrough-restore-001 — restore the un-Pithed recall
 #   fallback in cc_assemble_recall (LAW 3, pre-46f9cf8 behavior)
@@ -2655,6 +2677,24 @@ def _cc_has_ever_fired(node) -> bool:
         return False
 
 
+def probation_advances(node) -> bool:
+    """True iff cc_update_probation decrements this node's probation (the population).
+
+    The ONE definition (LAW 4). cc_update_probation's own skip below consults it, and the
+    host registers this very function on its graph (graph._probation_advances) so the orphan
+    sweep spares an unbound node only while its probation is actually being advanced
+    (CC-CALLOSUM-TRUTH §8.13). False for creation_mode == "ingested": the Ingestor's own sweep
+    (universal_ingestor.py Registrar.update_probation) owns those, and on the laptop it runs
+    only inside on_message, never on the autonomic pulse. Deliberately an EXCLUSION, not
+    `== "conversational"`: nodes with no creation_mode (older checkpoints, seeds) are still
+    decremented here, so they are still in this population.
+
+    This is the population only. Whether a given node still has an open window (a numeric
+    probation_remaining > 0) is the sweep's own test.
+    """
+    return (node.metadata or {}).get("creation_mode") != "ingested"
+
+
 def cc_update_probation(graph) -> list:
     """Substrate-level probation graduation -- fades novelty-dampening over
     the probation window and graduates nodes to full excitability. Mirrors
@@ -2689,7 +2729,10 @@ def cc_update_probation(graph) -> list:
             # the ONLY thing graduating her document nodes and must keep sweeping
             # them. CC-first, back-propagate later: expect these two to differ
             # until canonical is brought over.
-            if (node.metadata or {}).get("creation_mode") == "ingested":
+            #
+            # [P552] The exclusion is now probation_advances(node) -- the one definition the
+            # orphan sweep also reads (via graph._probation_advances), same population.
+            if not probation_advances(node):
                 continue
             prob = node.metadata.get("probation_remaining")
             if prob is None:
