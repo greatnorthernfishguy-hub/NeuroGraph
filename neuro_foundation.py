@@ -2690,7 +2690,8 @@ class Graph:
                 # outgoing edges: each reached node keeps the FIRST hop level that reaches
                 # it (same values as the per-synapse frontier loop; `distances` is only
                 # ever read with .get, so its insertion order is immaterial).
-                distances.update(self.synapses.bfs_hop_distances(node_ids, steps))
+                if steps >= 1:  # steps < 1: the per-synapse loop never ran (and never read the store)
+                    distances.update(self.synapses.bfs_hop_distances(node_ids, steps))
 
                 # Collect current prediction targets for was_predicted tagging
                 predicted_targets: Set[str] = set()
