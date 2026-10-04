@@ -1,3 +1,4 @@
+# [2026-10-04] Claude (overnight Rust review) — _extract_graph_features_for_model reads native column copies instead of list(g.synapses.values()) / why: ~0.2-0.3 s of SynapseRef churn per Tonic tick; unmerged review branch
 """
 The Tonic — Latent Token Engine
 
@@ -26,6 +27,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-10-04] Claude (overnight Rust review, unmerged branch cc-laptop-rust-hotpaths-20261004)
+#   What: _extract_graph_features_for_model reads synapses.weights_copy()/creation_time_copy()[:200]
+#         and len(synapses) instead of list(g.synapses.values()).
+#   Why:  that list built ~193K SynapseRef objects every Tonic tick to use 200 of them (~0.2-0.3 s).
+#   How:  native column copies, same row order and values (bench/compare_timings.py asserts equality).
 # [2026-10-03] Claude Opus 5.5 (Executive, laptop trial, Josh) — the graph "busy" signal is held only while the
 #   tick touches the graph (feature reads, propagate + ouroboros), not across the body-lock wait and transformer
 #   forward. What: new _graph_busy() (the same non-blocking trylock, #109: the Tonic still never waits); the
@@ -1079,19 +1085,24 @@ class TonicEngine:
             return None
 
         nodes = list(g.nodes.values())
-        synapses = list(g.synapses.values())
+        # [2026-10-04] Was list(g.synapses.values()): ~193K SynapseRef allocations per Tonic
+        # tick to read the first 200 rows. Native column copies give the same first-200 rows
+        # in the same (row) order; n_syn is the same count len(list) gave.
+        _syn_w = g.synapses.weights_copy()[:200]
+        _syn_ct = g.synapses.creation_time_copy()[:200]
+        n_syn = len(g.synapses)
 
         return GraphFeatures(
             node_voltages=torch.tensor([n.voltage for n in nodes[:100]], dtype=torch.float32),
             node_firing_rates=torch.tensor([n.firing_rate_ema for n in nodes[:100]], dtype=torch.float32),
             node_excitability=torch.tensor([n.intrinsic_excitability for n in nodes[:100]], dtype=torch.float32),
-            synapse_weights=torch.tensor([s.weight for s in synapses[:200]], dtype=torch.float32),
-            synapse_ages=torch.tensor([float(g.timestep - s.creation_time) for s in synapses[:200]], dtype=torch.float32),
-            density=torch.tensor([len(synapses) / max(1, len(nodes) * (len(nodes) - 1))], dtype=torch.float32),
+            synapse_weights=torch.tensor([float(w) for w in _syn_w], dtype=torch.float32),
+            synapse_ages=torch.tensor([float(g.timestep - float(ct)) for ct in _syn_ct], dtype=torch.float32),
+            density=torch.tensor([n_syn / max(1, len(nodes) * (len(nodes) - 1))], dtype=torch.float32),
             clustering=torch.tensor([0.0], dtype=torch.float32),  # expensive to compute, approximate
             n_components=torch.tensor([1.0], dtype=torch.float32),
             n_nodes=torch.tensor([float(len(nodes))], dtype=torch.float32),
-            n_synapses=torch.tensor([float(len(synapses))], dtype=torch.float32),
+            n_synapses=torch.tensor([float(n_syn)], dtype=torch.float32),
             n_hyperedges=torch.tensor([float(len(g.hyperedges))], dtype=torch.float32),
             recent_firings=torch.zeros(15, dtype=torch.float32),  # TODO: track per-step
             stdp_delta_mean=torch.tensor([0.0], dtype=torch.float32),

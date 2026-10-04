@@ -1,3 +1,4 @@
+# [2026-10-04] Claude (overnight Rust review) — _deposit_substrate_metrics reads synapses.weights_copy() instead of a per-SynapseRef list / why: ~0.3-0.5 s per afterTurn; unmerged review branch
 """
 NeuroGraph JSON-RPC Bridge — OpenClaw ContextEngine integration.
 
@@ -12,6 +13,10 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-04] Claude (overnight Rust review, unmerged branch cc-laptop-rust-hotpaths-20261004)
+#   What: _deposit_substrate_metrics takes synapse weights from synapses.weights_copy().
+#   Why:  the per-SynapseRef list cost ~0.3-0.5 s per afterTurn on a 193K-synapse graph.
+#   How:  same values, same order -> identical np.mean/np.std.
 # [2026-09-21] Grok 4.6 — §7 intra-turn window chains, graph-only
 # What: After a successful conversational dual_record_outcome, long turns deposit
 #       window nodes via _deposit_memory_node(..., index_in_recall=False), delay-chain
@@ -1102,8 +1107,8 @@ def _deposit_substrate_metrics(step_result, to_jsonl: bool = True) -> None:
     _weight_mean = _weight_std = _firing_rate_mean = _firing_rate_std = 0.0
     try:
         import numpy as _np
-        _weights = [s.weight for s in _memory.graph.synapses.values()]
-        if _weights:
+        _weights = _memory.graph.synapses.weights_copy()  # [2026-10-04] native column copy, same order/values
+        if len(_weights):
             _weight_mean = float(_np.mean(_weights))
             _weight_std = float(_np.std(_weights))
         _rates = [n.firing_rate_ema for n in _memory.graph.nodes.values()]
