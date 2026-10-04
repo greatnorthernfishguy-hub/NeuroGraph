@@ -482,9 +482,12 @@ def test_over_budget_log_includes_stages_only_when_over(loader, monkeypatch, cap
 
 
 def test_graph_try_lock_stays_nonblocking_and_body_lock_order_unchanged():
+    # 2026-10-03: the non-blocking trylock moved into _graph_busy(), held only around graph work.
     gen_src = inspect.getsource(te.TonicEngine._generate_latent_token)
-    assert "lock.acquire(blocking=False)" in gen_src
-    assert gen_src.count(".acquire(") == 1
+    assert ".acquire(" not in gen_src
+    busy_src = inspect.getsource(te.TonicEngine._graph_busy)
+    assert "lock.acquire(blocking=False)" in busy_src
+    assert busy_src.count(".acquire(") == 1
     ctx_src = inspect.getsource(te.TonicEngine._body_lock_context)
     assert ctx_src.index("if self._body_lock is not None") < ctx_src.index("if self._lock_file_path is not None")
     model_src = inspect.getsource(te.TonicEngine._model_inference)

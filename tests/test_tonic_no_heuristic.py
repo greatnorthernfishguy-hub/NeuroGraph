@@ -612,3 +612,54 @@ def test_g2_offer_recovers_inference_path(monkeypatch, loader):
     assert wrapper.forward_calls == 1
     assert out["activated"] > 0
     assert captured["ids"]
+
+# ---------------------------------------------------------------------------
+# 2026-10-03 (laptop trial, Josh): the graph "busy" signal covers only the graph work.
+# ---------------------------------------------------------------------------
+
+def test_graph_lock_is_free_during_the_body_wait_and_held_for_graph_work(loader, monkeypatch):
+    import contextlib
+    import threading
+    engine = _engine(require_shared_body=True)
+    assert engine.offer_shared_body(_FakeBody()) is True
+    lock = threading.Lock()   # plain Lock: locked() tells us whether the tick holds it
+    engine._graph._concurrent_lock = lock
+    seen = {}
+
+    def feats():
+        seen["model_features"] = lock.locked()
+        return object()
+    monkeypatch.setattr(engine, "_extract_graph_features_for_model", feats)
+    monkeypatch.setattr(engine, "_get_activation_candidates", lambda features: [("A", 1.0)])
+    real_ctx = engine._body_lock_context
+
+    @contextlib.contextmanager
+    def body_ctx(**kw):
+        seen["body_wait"] = lock.locked()
+        with real_ctx(**kw):
+            yield
+    monkeypatch.setattr(engine, "_body_lock_context", body_ctx)
+    for nid in ("A", "B", "C"):
+        engine._graph.nodes[nid].voltage = 0.1
+        engine._graph.nodes[nid].last_spike_time = 0.0
+
+    def prime(node_ids, currents, steps, write_mode):
+        seen["propagate"] = lock.locked()
+        return types.SimpleNamespace(fired_entries=["A"])
+    engine._graph.prime_and_propagate = prime
+
+    engine._generate_latent_token()
+    assert seen == {"model_features": True, "body_wait": False, "propagate": True}
+    assert not lock.locked()   # released after the tick
+
+
+def test_tonic_never_waits_for_the_graph_lock(loader, monkeypatch):
+    import threading
+    engine = _engine(require_shared_body=True)
+    lock = threading.Lock()
+    engine._graph._concurrent_lock = lock
+    lock.acquire()   # someone else holds it: the tick still runs and returns (#109)
+    try:
+        engine._generate_latent_token()
+    finally:
+        lock.release()

@@ -26,6 +26,12 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-10-03] Claude Opus 5.5 (Executive, laptop trial, Josh) — the graph "busy" signal is held only while the
+#   tick touches the graph (feature reads, propagate + ouroboros), not across the body-lock wait and transformer
+#   forward. What: new _graph_busy() (the same non-blocking trylock, #109: the Tonic still never waits); the
+#   whole-tick acquire in _generate_latent_token is gone. Why: ticks reached 146 s, ~31 s of it waiting on
+#   ProtoUniBrain's body, all under _concurrent_lock -- autosave and drain consolidation were starved ("graph
+#   stayed busy for 300 s"). How: three short holds per tick instead of one long one.
 # [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — silent-zero coverage for G1 + G2,
 #   fix misleading log text, update class docstring (chief-003 follow-up to Packet 086(2)).
 #   Two additional silent-zero shapes the initial collapse left un-logged:
@@ -859,16 +865,26 @@ class TonicEngine:
         """
         self._reset_stage_samples()
         t_latent = time.perf_counter()
-        lock = getattr(self._graph, '_concurrent_lock', None)
-        acquired = False
-        if lock is not None:
-            acquired = lock.acquire(blocking=False)
         try:
             return self._generate_latent_token_inner()
         finally:
+            self._record_stage("latent", t_latent)
+
+    @contextlib.contextmanager
+    def _graph_busy(self):
+        """Raise the "I'm working" signal (#109) only while this tick touches the graph.
+
+        Same non-blocking trylock as before -- the Tonic never waits; if another holder has
+        the lock the Tonic simply proceeds without it, exactly as the whole-tick acquire did.
+        Not held across the body-lock wait or the transformer forward (2026-10-03).
+        """
+        lock = getattr(self._graph, '_concurrent_lock', None)
+        acquired = lock.acquire(blocking=False) if lock is not None else False
+        try:
+            yield
+        finally:
             if acquired:
                 lock.release()
-            self._record_stage("latent", t_latent)
 
     def _generate_latent_token_inner(self) -> Dict[str, Any]:
         """Inner implementation — actual latent token generation."""
@@ -882,10 +898,11 @@ class TonicEngine:
             return {"fired": 0, "activated": 0, "waiting_for_shared_body": True}
         t_feat = time.perf_counter()
         try:
-            features = _extract_tonic_features(
-                self._graph, self._tonic_thread,
-                node_budget=self._config.node_sample_budget,
-            )
+            with self._graph_busy():
+                features = _extract_tonic_features(
+                    self._graph, self._tonic_thread,
+                    node_budget=self._config.node_sample_budget,
+                )
         finally:
             self._record_stage("feature_extract", t_feat)
         if features is None:
@@ -906,24 +923,25 @@ class TonicEngine:
         node_ids = [nid for nid, _ in activations]
         currents = [strength for _, strength in activations]
 
-        t_prop = time.perf_counter()
-        try:
-            result = self._graph.prime_and_propagate(
-                node_ids=node_ids,
-                currents=currents,
-                steps=self._config.propagation_steps,
-                write_mode=True,
-            )
-        finally:
-            self._record_stage("propagate", t_prop)
-
-        # Update the tonic thread with the result
-        if self._tonic_thread is not None:
-            t_ou = time.perf_counter()
+        with self._graph_busy():
+            t_prop = time.perf_counter()
             try:
-                self._tonic_thread.ouroboros_cycle()
+                result = self._graph.prime_and_propagate(
+                    node_ids=node_ids,
+                    currents=currents,
+                    steps=self._config.propagation_steps,
+                    write_mode=True,
+                )
             finally:
-                self._record_stage("ouroboros", t_ou)
+                self._record_stage("propagate", t_prop)
+
+            # Update the tonic thread with the result
+            if self._tonic_thread is not None:
+                t_ou = time.perf_counter()
+                try:
+                    self._tonic_thread.ouroboros_cycle()
+                finally:
+                    self._record_stage("ouroboros", t_ou)
 
         self._tokens_generated += 1
         self._total_activations += len(activations)
@@ -967,7 +985,8 @@ class TonicEngine:
         # so keep its cost distinct from both lock wait and transformer work.
         t_model_feat = time.perf_counter()
         try:
-            graph_features = self._extract_graph_features_for_model()
+            with self._graph_busy():
+                graph_features = self._extract_graph_features_for_model()
         finally:
             self._record_stage("model_feature_extract", t_model_feat)
         if graph_features is None:
