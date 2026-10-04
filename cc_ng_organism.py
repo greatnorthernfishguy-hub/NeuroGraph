@@ -3,6 +3,14 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 812-813-onto-s4) — rebased #812/#813 onto trial s4; adaptations (all at the cherry-pick
+#   resolutions): cc_pattern_completion_recall keeps the trial's on_error kwarg and loses #813's whole_content (b129558);
+#   cc_assemble_recall keeps on_degraded/pc_extra and the 'monitor_race' report; the trial's on_surfaced(rendered, dropped)
+#   moves INTO _cc_render_unpithed (new optional on_surfaced kwarg) because only the renderer knows which WHOLE items the
+#   ONE budget rule kept, which it swapped for the P417 reference form (reported as rendered) and which it dropped
+#   (reported in `dropped`, no longer always [] there); Pith-ON `dropped` is computed against the post-#819 Stage-3 input
+#   (_l1_in) so a reference-swapped item is never reported both rendered and dropped; the #812 N-2 formatter guard reports
+#   a RuntimeError as on_degraded('monitor_race') (the trial's contract when format_context ran in the harvest try).
 # [2026-10-04] Claude (lane 810-onto-s4) — rebased #810 WANT legitimacy onto trial s4; surface_wants keeps the trial's
 #   per-want guarded create_node (#915) and loud synapse reporting (#904/P489) and takes parse_wants()/want.text from #810,
 #   with _log_want_skips after the lock; no change to parse_wants or any helper (byte-identical to d8f99c3).

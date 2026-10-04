@@ -1,6 +1,9 @@
 # tests/test_cc_pith_off_budget_812.py
 #
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 812-813-onto-s4) — rebased onto trial s4: tests for the trial's on_surfaced reporter on the
+#   #813 budgeted un-Pithed path (whole kept / whole dropped / reference form) and the Pith-ON reference swap, plus the
+#   N-2 guard's RuntimeError -> on_degraded('monitor_race') contract. Both adapted behaviours fail without the adaptation.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12861) — #812 N-2 fold: tests
 # What: N-2 (a monitor-formatter failure is reported through on_monitor_error -- the same
 #   hemisphere stat route as a harvest failure, RuntimeError silent as at e4ebf982 -- and the pattern
@@ -488,3 +491,89 @@ def test_pith_off_an_over_budget_item_with_no_reference_form_is_dropped_loudly_n
     assert texts["S0"] in out                                            # the rest still renders whole
     records = _drop_records(caplog)
     assert len(records) == 1 and "never-fit" in records[0] and "ghost" in records[0]
+
+
+# ---- [2026-10-04] lane 812-813-onto-s4: the trial's on_surfaced(rendered, dropped) reporter -----------
+# On the trial base the un-Pithed path had no budget (dropped was always []); after #813 the ONE budget
+# rule drops WHOLE items there and P417 swaps an over-budget item for its trees + reference form.  The
+# reporter must name exactly the WHOLE text that was rendered, and only what was really dropped.
+
+class _Surfaced:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, rendered, dropped):
+        self.calls.append((rendered, dropped))
+
+
+def test_on_surfaced_pith_off_reports_the_whole_kept_items_and_the_whole_budget_drops(monkeypatch):
+    _wire(monkeypatch)
+    ng, (mon,), (p0, p1, p2) = _world([1500], [1500, 1500, 1500])
+    rep = _Surfaced()
+    out = pith.cc_assemble_recall(ng, "what next", 5, {}, None, on_surfaced=rep)
+    assert len(rep.calls) == 1
+    rendered, dropped = rep.calls[0]
+    assert sorted((r["stream"], r["content"]) for r in rendered) == \
+        sorted([("monitor", mon), ("pattern", p0)])
+    assert all(r["content"] in out for r in rendered)                    # WHOLE, and really rendered
+    assert sorted(r["content"] for r in dropped) == sorted([p1, p2])     # dropped WHOLE
+    assert all(r["content"][:20] not in out for r in dropped)
+
+
+def test_on_surfaced_pith_off_reports_the_reference_form_not_the_giant_text(monkeypatch):
+    _wire(monkeypatch)
+    ng, texts = _build([("S0", 500, None, 99.0)])
+    giant, trees = _giant_with_trees(ng.graph, "cc:conv::bigpat")
+    harvest = ng._harvest_associations
+    ng._harvest_associations = lambda q, novelty=0.5, **kw: (
+        harvest(q, novelty=novelty, **kw) + [{"node_id": "cc:conv::bigpat", "strength": 1.0}])
+    rep = _Surfaced()
+    out = pith.cc_assemble_recall(ng, "q", 5, {}, None, on_surfaced=rep)
+    rendered, dropped = rep.calls[0]
+    big = [r for r in rendered if r["node_id"] == "cc:conv::bigpat"]
+    assert len(big) == 1 and big[0]["content"] in out                    # the form actually rendered
+    assert "GIANT-START" not in big[0]["content"] and all(tt in big[0]["content"] for tt in trees)
+    assert all(r["content"] in out for r in rendered)
+    assert dropped == []
+
+
+def test_on_surfaced_pith_off_a_formatter_failure_reports_no_monitor_item_and_the_restored_twin(
+        monkeypatch):
+    _wire(monkeypatch)
+    ng, texts = _build(_TWIN_SPEC)
+    _fail_formatter(ng, ValueError)
+    rep = _Surfaced()
+    out = pith.cc_assemble_recall(ng, "q", 5, {}, None, on_surfaced=rep)
+    rendered, _dropped = rep.calls[0]
+    assert rendered and all(r["stream"] == "pattern" for r in rendered)
+    assert all(r["content"] in out for r in rendered)
+    assert texts["X"] in [r["content"] for r in rendered]                # the twin came back
+
+
+def test_on_surfaced_pith_on_reference_swap_is_rendered_not_dropped(monkeypatch):
+    _wire(monkeypatch)
+    monkeypatch.setattr(pith, "_CC_PITH_ENABLED", True)
+    ng, (mon,), _p = _world([600], [])
+    giant, trees = _giant_with_trees(ng.graph, "cc:conv::bigon")
+    ng._harvest_associations = lambda q, novelty=0.5, **kw: [{"node_id": "cc:conv::bigon", "strength": 50.0}]
+    rep = _Surfaced()
+    out = pith.cc_assemble_recall(ng, "what next", 5, {}, None, on_surfaced=rep)
+    rendered, dropped = rep.calls[0]
+    assert "GIANT-START" not in out
+    assert all(r["content"] in out for r in rendered)
+    assert [r for r in rendered if r["node_id"] == "cc:conv::bigon"]
+    assert not [r for r in dropped if r["node_id"] == "cc:conv::bigon"]  # never both rendered and dropped
+
+
+def test_n2_runtimeerror_in_the_formatter_is_the_trials_monitor_race_on_degraded(monkeypatch):
+    """[lane 812-813-onto-s4] On the trial base a RuntimeError from format_context (then inside the
+    harvest try) was reported as on_degraded('monitor_race'); the N-2 guard keeps that contract and
+    still does not call on_monitor_error for it."""
+    _wire(monkeypatch)
+    ng, texts = _build(_TWIN_SPEC)
+    _fail_formatter(ng, RuntimeError)
+    rec, degraded = _Recorder(), []
+    out = pith.cc_assemble_recall(ng, "q", 5, {}, None, on_monitor_error=rec,
+                                  on_degraded=lambda code, exc: degraded.append((code, type(exc))))
+    assert rec.calls == [] and degraded == [("monitor_race", RuntimeError)]
+    assert texts["X"] in out
