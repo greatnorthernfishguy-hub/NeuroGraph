@@ -3,6 +3,7 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-03] Claude Opus 5.5 (Executive, MVP) — drain_ingest_tract gains max_seconds (keyword): ends a pass by wall time; the rest stays in the tract.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4) -- TRIAL-branch hand-resolution of cherry-pick ee94f7d (#905)
 #   onto D24+#794..#897: _cc_callosum_consolidate's except block keeps D24's loud logger.error (it replaced the logger.debug line) AND
 #   #905's _fill(done, failed=True) before `return False`; the guard/progress signature and loop merged without conflict; no new behaviour.
@@ -3133,7 +3134,7 @@ def _cc_drain_receipt_write(receipt, **fields) -> None:
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         return_consumed: bool = False, max_entries: int = 0,
                         batch_nodes: int = None, receipt: dict = None,
-                        hold_on_failure: bool = False):
+                        max_seconds: float = 0, hold_on_failure: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -3281,6 +3282,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     try:
         if size_cap or receipt is not None:
             ids_before = set(graph.nodes)
+        _t_start = time.monotonic()
         reader = ng_tract.TractReader(data)
         for entry in reader:
             # position() is a bound method on the Rust binding, not a property.
@@ -3326,6 +3328,9 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 break
             if max_entries and taken >= max_entries:
                 ended = "entries_cap_reached"
+                break
+            if max_seconds and (time.monotonic() - _t_start) >= max_seconds:
+                ended = "time_cap_reached"   # MVP 2026-10-03: bound one drain pass; the rest stays in the tract
                 break
         if hold_on_failure:
             # Truncate only what precedes the first failed entry (or the whole

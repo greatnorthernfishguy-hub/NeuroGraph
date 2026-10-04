@@ -226,7 +226,8 @@ def test_signature_hold_on_failure_is_last_and_defaults_false():
     sig = inspect.signature(cc_ng_organism.drain_ingest_tract)
     params = list(sig.parameters)
     assert params[:-1] == ["graph", "vector_db", "state", "tract_path", "return_consumed",
-                           "max_entries", "batch_nodes", "receipt"]
+                           "max_entries", "batch_nodes", "receipt",
+                           "max_seconds"]   # MVP 2026-10-03: the wall-time cap per pass
     assert params[-1] == "hold_on_failure"
     assert sig.parameters["hold_on_failure"].default is False
 
