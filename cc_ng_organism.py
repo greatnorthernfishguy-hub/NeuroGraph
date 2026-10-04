@@ -4,6 +4,7 @@
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP) — cc_assemble_recall gains on_surfaced(rendered, dropped): reports what one pass surfaced (and what the Pith budget cut) so a host can log it; unset = unchanged.
+# [2026-10-03] Claude Opus 5.5 (Executive, MVP, overnight under Josh's tweak authority) — drain_ingest_tract gains defer_tract_path/defer_over_bytes: oversize turns move whole to a deferred tract.
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP, Josh) — drain_ingest_tract gains retry_tract_path: a failed turn moves whole to a retry tract; the pass continues.
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP) — drain_ingest_tract gains max_seconds (keyword): ends a pass by wall time; the rest stays in the tract.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4) -- TRIAL-branch hand-resolution of cherry-pick ee94f7d (#905)
@@ -3146,6 +3147,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         return_consumed: bool = False, max_entries: int = 0,
                         batch_nodes: int = None, receipt: dict = None,
                         max_seconds: float = 0, retry_tract_path: str = None,
+                        defer_tract_path: str = None, defer_over_bytes: int = 0,
                         hold_on_failure: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
@@ -3246,6 +3248,12 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     there whole. If the append itself fails, the pass holds exactly as before.
     Passing tract_path itself rotates a failed retry to the end of its own
     tract. None (default) = unchanged.
+
+    defer_tract_path + defer_over_bytes (MVP 2026-10-03, overnight): a turn whose
+    text is longer than defer_over_bytes is moved whole, unattempted, to this tract
+    (not drained automatically) -- one atomic dual pass over a 120 KB turn ran ~40
+    sequential extractions and held the pass (and every save) for 40+ minutes.
+    Scheduling by size only; nothing dropped, nothing labelled. Unset = unchanged.
     """
     def _ret(absorbed_n: int, consumed: bytes = b""):
         return (absorbed_n, consumed) if return_consumed else absorbed_n
@@ -3319,6 +3327,15 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             if not text or not text.strip():
                 safe_offset = consumed_offset
                 continue
+            if defer_tract_path and defer_over_bytes and len(text) > defer_over_bytes:
+                try:
+                    with open(defer_tract_path, "ab") as dfh:
+                        dfh.write(data[entry_start:consumed_offset])
+                    safe_offset = consumed_offset
+                    logger.info("CC ingest-tract defer: a %d-char turn moved whole to the deferred tract", len(text))
+                    continue
+                except Exception as dexc:  # noqa: BLE001 - attempt it normally instead
+                    logger.warning("CC ingest-tract defer append failed (%s); attempting the turn", type(dexc).__name__)
             taken += 1
             hold_reason = None
             hold_exc_type = "-"

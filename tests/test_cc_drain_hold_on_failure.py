@@ -228,7 +228,8 @@ def test_signature_hold_on_failure_is_last_and_defaults_false():
     assert params[:-1] == ["graph", "vector_db", "state", "tract_path", "return_consumed",
                            "max_entries", "batch_nodes", "receipt",
                            "max_seconds",   # MVP 2026-10-03: the wall-time cap per pass
-                           "retry_tract_path"]   # MVP 2026-10-03: failed turns move aside, nothing dropped
+                           "retry_tract_path",   # MVP 2026-10-03: failed turns move aside, nothing dropped
+                           "defer_tract_path", "defer_over_bytes"]   # MVP 2026-10-03: oversize turns wait aside
     assert params[-1] == "hold_on_failure"
     assert sig.parameters["hold_on_failure"].default is False
 
@@ -454,3 +455,15 @@ def test_retry_append_failure_falls_back_to_the_hold(env):
     absorbed, _ = _drain(env, path, hold_on_failure=True, retry_tract_path=bad)
     assert absorbed == 1
     assert _read(path) == frames[1] + frames[2]   # held exactly as without a retry tract
+
+
+def test_defer_moves_an_oversize_turn_whole_unattempted_and_the_rest_flow(env):
+    frames = [_frame(env.tmp, "ok", 1), _frame(env.tmp, "false", 2), _frame(env.tmp, "ok", 3)]
+    path = _write(env, "defer", frames)
+    deferred = _check_safe(env.tmp / "defer.deferred.tract")
+    # threshold just under the entry text length ("FALSE <mark>-2" is longer than "OK <mark>-1")
+    th = len("OK %s-1" % ENTRY_MARK)
+    absorbed, _ = _drain(env, path, hold_on_failure=True, defer_tract_path=deferred, defer_over_bytes=th)
+    assert absorbed == 2
+    assert _read(path) == b""
+    assert _read(deferred) == frames[1]   # moved whole; never attempted (it would have failed)
