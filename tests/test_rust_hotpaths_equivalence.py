@@ -318,6 +318,21 @@ def test_checkpoint_copy_twins():
         hr._steps_since_scaling = hr.scaling_interval
         hr.apply(g, rng.sample(list(g.nodes), 50), g.timestep)
         res["tel"] = (g.get_telemetry().mean_weight, g.get_telemetry().std_weight)
+        # a short live-like workload on the real topology: step() + Tonic write-mode
+        # propagation (incl. its prune) + a read-mode recall
+        g.config["tonic_ages_substrate"] = 1
+        trace = []
+        for _ in range(int(os.environ.get("NG_HOTPATH_CKPT_TICKS", "3"))):
+            for nid in rng.sample(list(g.nodes), 30):
+                g.stimulate(nid, 2.0)
+            r = g.step()
+            trace.append((len(r.fired_node_ids), r.synapses_pruned, r.synapses_sprouted))
+            ids = rng.sample(list(g.nodes), 12)
+            p = g.prime_and_propagate(ids, [1.5] * 12, steps=3, write_mode=True)
+            q = g.prime_and_propagate(ids[:6], [1.0] * 6, steps=3, write_mode=False)
+            trace.append([(e.node_id, e.firing_step, e.source_distance) for e in p.fired_entries])
+            trace.append([(e.node_id, e.firing_step, e.source_distance) for e in q.fired_entries])
+        res["trace"] = trace
         return res
     (a, ra, ga), (b, rb, gb) = run_twins(base, act, 7)
     assert ra["adj"] is True and rb["adj"] is True
