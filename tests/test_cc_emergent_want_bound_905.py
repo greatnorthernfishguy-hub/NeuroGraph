@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-04] Claude (lane emergent-want-labels) — fixture nodes carry their OWN words; shown text split from identity
+# What: _seeded_graph gives each seed `_forest_content` "words of <sid>" (label stays = sid); _want_text() is now the SHOWN
+#   text (built from the nodes' words, absent target nodes left out) and _identity_text() the unchanged id-based string the
+#   label-less branch still hashes, so _want_id(_identity_text(...)) pins the SAME ids as before. The two race tests add
+#   target nodes with words (else the seeds' removal leaves nothing readable and the new no_readable_text gate, not the
+#   bind loop, would answer); the all-missing node-count assertion counts those targets. The golden metadata gains the
+#   provenance id keys. Why: generate_emergent_want no longer puts node ids in want_text; a label equal to the node id is
+#   not text, so the old fixture (label=sid only) would mint nothing. No #905 assertion about binding/rollback/logging changed.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14809) — #981 (C6): knob isolation, FIXTURE ONLY, no assertion changed
 # What: an autouse fixture deletes CC_NG_IN_TRANSIT_IDS_PATH and resets the in-transit cache (cc_topology_merge._reset_in_transit_cache_for_tests)
 #   before and after every test. Why: le-061 measured 16 tests in the two files test_cc_merge_whole_graph_guard.py (x7) and
@@ -176,7 +184,7 @@ def _seeded_graph(seed_ids=("s1", "s2"), t=OLD):
     g = Graph()
     g.timestep = t
     for sid in seed_ids:
-        _node(g, sid, label=sid)
+        _node(g, sid, label=sid, _forest_content="words of %s" % sid)
     return g
 
 
@@ -185,8 +193,19 @@ def _predict(g, *pairs, conf=0.9):
         g.active_predictions["p%d" % i] = Prediction(source_node_id=src, target_node_id=tgt, confidence=conf - 0.01 * i)
 
 
-def _want_text(*pairs):
+def _identity_text(*pairs):
+    """The id-based string the label-less branch hashes into want_id (unchanged; never shown)."""
     return "tonic-triggered: (unknown) -- open questions: " + ", ".join("%s→%s" % p for p in pairs)
+
+
+def _want_text(g, *pairs):
+    """The SHOWN text: each node's own words (_forest_content); a node absent from `g` is left out."""
+    qs = []
+    for p in pairs:
+        q = "→".join(g.nodes[n].metadata["_forest_content"] for n in p if n in g.nodes)
+        if q and q not in qs:
+            qs.append(q)
+    return "tonic-triggered -- open questions: " + ", ".join(qs)
 
 
 def _want_id(text):
@@ -202,8 +221,9 @@ def test_a_the_want_is_born_bound_counted_bound_and_survives_the_real_sweep():
     _predict(g, ("s1", "t1"), ("s2", "t2"))
     res = cno.generate_emergent_want(g, None)
 
-    text = _want_text(("s1", "t1"), ("s2", "t2"))
-    assert res is not None and res["id"] == _want_id(text)
+    text = _want_text(g, ("s1", "t1"), ("s2", "t2"))
+    assert res is not None and res["id"] == _want_id(_identity_text(("s1", "t1"), ("s2", "t2")))
+    assert res["text"] == text == "tonic-triggered -- open questions: words of s1, words of s2"
     wid = res["id"]
     assert wid in g.nodes and _degree(g, wid) >= 1                          # born bound
     assert not g._is_identity_protected(wid)                                # '*_emergent' is NOT protected: only the binding can save it
@@ -218,7 +238,7 @@ def test_a_control_the_unbound_want_the_base_minted_is_counted_unbound_and_reape
     """Executable statement of the defect (the base created the want with NO synapse): counted unbound, then really reaped.
     Run against the BASE organism, test_a_the_want_is_born_bound... fails for exactly this reason."""
     g = _seeded_graph()
-    wid = _want_id(_want_text(("s1", "t1")))
+    wid = _want_id(_identity_text(("s1", "t1")))
     _node(g, wid, kind="want", want_state="open", provenance="cc_emergent", creation_mode="emergent")
     assert wid in tmg._unbound_nodes(g, set(g.nodes))
     for _ in range(40):
@@ -251,6 +271,8 @@ def _race_remove(g, *gone):
 
 def test_a_a_missing_seed_is_skipped_and_counted_and_the_want_stays_bound_by_the_others(caplog):
     g = _seeded_graph(("s1", "s2"))
+    for tid in ("t1", "t2"):
+        _node(g, tid, _forest_content="words of %s" % tid)
     _predict(g, ("s1", "t1"), ("s2", "t2"))
     _race_remove(g, "s2")
     with caplog.at_level(logging.DEBUG, logger="cc_ng_organism"):
@@ -265,12 +287,14 @@ def test_a_a_missing_seed_is_skipped_and_counted_and_the_want_stays_bound_by_the
 
 def test_a_all_seeds_missing_leaves_no_node_returns_none_with_one_warning(caplog):
     g = _seeded_graph(("s1", "s2"))
+    for tid in ("t1", "t2"):
+        _node(g, tid, _forest_content="words of %s" % tid)
     _predict(g, ("s1", "t1"), ("s2", "t2"))
     _race_remove(g, "s1", "s2")
     with caplog.at_level(logging.DEBUG, logger="cc_ng_organism"):
         res = cno.generate_emergent_want(g, None)
     assert res is None
-    assert len(g.nodes) == 0                                                # both seeds were reaped by the race; the want was NOT left behind
+    assert set(g.nodes) == {"t1", "t2"}                                     # both seeds were reaped by the race; the want was NOT left behind
     assert not any(n.startswith("cc:want::") for n in g._dirty_nodes)
     assert not g.synapses
     warns = _recs(caplog, "cc_ng_organism", logging.WARNING)
@@ -349,12 +373,15 @@ def test_a_a_failed_rollback_is_loud_not_silent(caplog):
 def test_a_the_success_return_dict_is_byte_identical_to_the_base():
     g = _seeded_graph(("s1",))
     _predict(g, ("s1", "t1"))
-    text = _want_text(("s1", "t1"))
+    text = _want_text(g, ("s1", "t1"))
+    wid = _want_id(_identity_text(("s1", "t1")))
     assert cno.generate_emergent_want(g, None) == {
-        "id": _want_id(text), "text": text, "provenance": "cc_emergent", "state": "open"}
-    assert g.nodes[_want_id(text)].metadata == {
+        "id": wid, "text": text, "provenance": "cc_emergent", "state": "open"}
+    assert g.nodes[wid].metadata == {
         "kind": "want", "want_text": text, "want_state": "open", "provenance": "cc_emergent",
-        "creation_mode": "emergent", "concept_key": None}                  # the node's metadata is unchanged too
+        "creation_mode": "emergent", "concept_key": None,                  # unchanged keys
+        "emergent_concept_node_id": None, "emergent_seed_ids": ["s1"],      # + provenance ids (2026-10-04, ids out of the text)
+        "emergent_open_question_ids": [["s1", "t1"]]}
 
 
 def test_a_idempotent_branch_unchanged_second_call_returns_none_and_adds_no_synapse():

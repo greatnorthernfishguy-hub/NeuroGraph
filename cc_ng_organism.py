@@ -3,6 +3,19 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-04] Claude (lane emergent-want-labels) — generate_emergent_want's want_text is built from the referenced nodes'
+#   OWN words, never raw node ids. What: new _cc_emergent_want_label(node, vdb_entry, node_id): a tree speaks with its own
+#   _concept (tree-first, the _pith_node_raw_text rule; must pass _cc_concept_passes_floor), everything else through the
+#   shared surface_resolver.resolve_surface_content bounded to CC_EMERGENT_WANT_LABEL_CHARS (default 80, word-snap +
+#   ellipsis), then the legacy `label` key; text equal to the node id, and emergent wants (no nesting), count as none.
+#   A node without words is left out of the text; nothing readable -> no want (debug reason=no_readable_text).
+#   Why: want nodes now surface as want_text (P408, cb6ad82), and the id-built text ("tonic-triggered: cc:conv::<40hex>::
+#   tree::Python -- open questions: cc:conv::...") meant nothing there; the Tonic-bridge spec
+#   (docs/superpowers/specs/2026-05-15-syl-tonic-bridge.md) intended {label}→{label}. How: dedup key (concept_key /
+#   tonic-concept::<label-or-id>) and the label-less branch's want_id hash (over the unchanged id-based identity string,
+#   never shown) are unchanged, so existing wants keep their ids; ids move to metadata (emergent_concept_node_id,
+#   emergent_seed_ids, emergent_open_question_ids; refreshed on reinforcement). #905 born-bound binding, thresholds,
+#   provenance untouched. Syl's twin (neurograph_rpc.py TonicBridge._compose_seed) is NOT changed here.
 # [2026-10-04] Claude (lane 812-813-onto-s4) — rebased #812/#813 onto trial s4; adaptations (all at the cherry-pick
 #   resolutions): cc_pattern_completion_recall keeps the trial's on_error kwarg and loses #813's whole_content (b129558);
 #   cc_assemble_recall keeps on_degraded/pc_extra and the 'monitor_race' report; the trial's on_surfaced(rendered, dropped)
@@ -3000,6 +3013,51 @@ def render_constitutional_core(graph: Any, on_error: Optional[Any] = None) -> st
         return ""
 
 
+_CC_EMERGENT_WANT_LABEL_CHARS = int(os.environ.get("CC_EMERGENT_WANT_LABEL_CHARS", "80"))
+
+
+def _cc_emergent_want_label(node: Any, vdb_entry: Any = None, node_id: Optional[str] = None) -> str:
+    """One referenced node's own words for an emergent want's text, or "".
+
+    A tree node speaks with its own `_concept` (the tree-first rule of
+    _pith_node_raw_text: its `_forest_content` is the PARENT turn, shared by
+    every sibling tree); it must pass the same degenerate floor a concept needs
+    to be indexed (a tree with no passing concept has no text). Everything else goes through the shared surfacing resolver
+    (surface_resolver.resolve_surface_content: forest content, vdb shard, then
+    `_label`; ingested source and stopword shards filtered) bounded to the start
+    of the text with its word-snap + ellipsis, then the legacy `label` key. An
+    EMERGENT want contributes nothing (its text is itself a composed want --
+    nesting it would grow the text every pulse). Never returns a node id: text
+    equal to `node_id` (a label that is just the id) counts as no text.
+    """
+    meta = getattr(node, "metadata", None) if node is not None else None
+    if not isinstance(meta, dict):
+        return ""
+    if meta.get("kind") == "want" and meta.get("creation_mode") == "emergent":
+        return ""
+    limit = _CC_EMERGENT_WANT_LABEL_CHARS
+    if meta.get("_tree_concept"):
+        c = meta.get("_concept")
+        c = c.strip() if isinstance(c, str) else ""
+        if c and _cc_concept_passes_floor(c):
+            if len(c) > limit:
+                cut = c.rfind(" ", 0, limit)
+                c = (c[:cut] if cut > 0 else c[:limit]).rstrip() + "…"
+            return c
+        return ""   # a tree's only own words are its concept -- never borrow the parent turn
+    try:
+        from surface_resolver import resolve_surface_content
+        text = resolve_surface_content(node, vdb_entry, max_chars=limit,
+                                       min_chars=_CC_CONCEPT_FLOOR_MIN_CHARS)
+    except Exception:  # noqa: BLE001 - no readable text is the fail-soft answer
+        text = None
+    text = " ".join(text.split()) if text else ""
+    if not text:
+        lbl = meta.get("label")
+        text = lbl.strip() if isinstance(lbl, str) else ""
+    return "" if (node_id is not None and text == str(node_id)) else text
+
+
 def generate_emergent_want(
     graph: Any, vector_db: Any, *,
     confidence_threshold: float = 0.6, max_seeds: int = 3, attractor_steps: int = 5,
@@ -3058,7 +3116,8 @@ def generate_emergent_want(
                 implied.update(member_ids - fired)
 
         node_ids = fired | implied
-        concept_label = None
+        concept_label = None   # the structural dedup key (unchanged: label, else the node id)
+        concept_nid = None
         if node_ids and vector_db is not None:
             import numpy as _np
             pairs = []
@@ -3080,16 +3139,50 @@ def generate_emergent_want(
                     if score > best_score:
                         best_score, best_nid = score, nid
                 if best_nid is not None:
+                    concept_nid = best_nid
                     concept_label = graph.nodes[best_nid].metadata.get("label", best_nid)
 
         def _label(nid: str) -> str:
             node = graph.nodes.get(nid)
             return node.metadata.get("label", nid) if node is not None else nid
 
-        open_questions = [f"{_label(p.source_node_id)}→{_label(p.target_node_id)}" for p in seeds]
-        want_text = f"tonic-triggered: {concept_label or '(unknown)'}"
+        # IDENTITY (unchanged): the per-want_text identity of the label-less branch is still
+        # the id-based string this function always hashed, so existing wants keep their ids
+        # and distinct curiosities stay distinct. It is NEVER shown -- only hashed.
+        id_questions = [f"{_label(p.source_node_id)}→{_label(p.target_node_id)}" for p in seeds]
+        identity_text = f"tonic-triggered: {concept_label or '(unknown)'}"
+        if id_questions:
+            identity_text += " -- open questions: " + ", ".join(id_questions)
+
+        # TEXT (2026-10-04, lane emergent-want-labels): what surfaces is built from the
+        # referenced nodes' OWN words (_cc_emergent_want_label); a node with none is left
+        # out. Node ids live in metadata (provenance), never in want_text.
+        def _words(nid):
+            node = graph.nodes.get(nid) if nid is not None else None
+            try:
+                vdb_entry = vector_db.get(nid) if (vector_db is not None and nid is not None) else None
+            except Exception:  # noqa: BLE001 - a vdb miss only means no shard fallback
+                vdb_entry = None
+            return _cc_emergent_want_label(node, vdb_entry, nid)
+
+        concept_text = _words(concept_nid)
+        open_questions: List[str] = []
+        for p in seeds:
+            side = [w for w in (_words(p.source_node_id), _words(p.target_node_id)) if w]
+            q = "→".join(side)
+            if q and q not in open_questions:
+                open_questions.append(q)
+        if not concept_text and not open_questions:
+            logger.debug("CC emergent want NOT materialized: reason=no_readable_text seeds=%d", len(seeds))
+            return None
+        want_text = f"tonic-triggered: {concept_text}" if concept_text else "tonic-triggered"
         if open_questions:
             want_text += " -- open questions: " + ", ".join(open_questions)
+        provenance_ids = {
+            "emergent_concept_node_id": concept_nid,
+            "emergent_seed_ids": list(dict.fromkeys(seed_ids)),
+            "emergent_open_question_ids": [[p.source_node_id, p.target_node_id] for p in seeds],
+        }
 
         # KISS dedup only when the concept RESOLVES -- a resolved concept_label is a
         # substrate-produced structural key, so recurring curiosity about the same
@@ -3108,18 +3201,20 @@ def generate_emergent_want(
                     existing.metadata["kiss_reinforcement_count"] = int(existing.metadata.get("kiss_reinforcement_count", 0)) + 1
                     existing.metadata["kiss_last_reinforced_ts"] = time.time()
                     existing.metadata["want_text"] = want_text
+                    existing.metadata.update(provenance_ids)
                     logger.info("CC emergent want reinforced (concept recurred): %s", want_text)
                     return {"id": want_id, "text": want_text, "provenance": provenance,
                             "state": existing.metadata.get("want_state", "open"), "reinforced": True}
                 concept_key = want_key
             else:
-                want_id = "cc:want::" + hashlib.sha1(want_text.encode("utf-8")).hexdigest()[:16]
+                want_id = "cc:want::" + hashlib.sha1(identity_text.encode("utf-8")).hexdigest()[:16]
                 if want_id in graph.nodes:
                     return None  # already materialized this exact curiosity, idempotent
                 concept_key = None
             graph.create_node(node_id=want_id, metadata={
                 "kind": "want", "want_text": want_text, "want_state": "open",
                 "provenance": provenance, "creation_mode": "emergent", "concept_key": concept_key,
+                **provenance_ids,
             })
             # #905 part A (Exec P488 C1): the want is BORN BOUND, in this same
             # lock block -- one synapse seed -> want (weight 0.3, source -> want:
