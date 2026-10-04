@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-10-04] Claude (lane want-hub-engine-onto-s4) — golden base re-pinned to the trial-s4 tip 26a0a11 (the commit the engine now sits on);
+#   BASE_REV gains a WANT_HUB_BASE_REV env override (default 26a0a11), BASE_CHECKOUT default -> /home/josh/worktrees/ng-want-hub-base-26a0a11. No assertion changed.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, dispatch #12011, ADDENDUM 3 tests fold — le-036 / checker-029) — tests-first for the engine fold:
 #   C1 a Test G variant with SEEDED RANDOM uuid-shaped ids (id order != creation order; kills mutant M07a, an unconditional default-path sort
 #   by id, which passed all 27 tests because the counter ids made a sort a no-op); C4 the `conducting` boundary (weight == weight_threshold,
@@ -46,9 +48,11 @@ if Path(nf.__file__).resolve().parent != REPO:
 
 import want_hub_golden_driver as drv  # noqa: E402
 
-BASE_REV = "e4ebf982b1989fd9066d610b94853bc68bf70d37"
-# Read-only BASE checkout (never commit there). Env override per LAW 5; the default is the path the brief names.
-BASE_CHECKOUT = Path(os.environ.get("WANT_HUB_BASE_CHECKOUT", "/home/josh/NeuroGraph-worktrees/z12-want-hub-base-e4ebf982"))
+# [2026-10-04] rebased onto trial s4: the golden BASE is now the trial tip the engine sits on (26a0a11), not e4ebf982.
+# Both pins stay env-overridable (LAW 5) so the original e4ebf982 golden can still be re-run.
+BASE_REV = os.environ.get("WANT_HUB_BASE_REV", "26a0a11123ed7daf81621e92316baaf911a28e30")
+# Read-only BASE checkout (never commit there). Env override per LAW 5.
+BASE_CHECKOUT = Path(os.environ.get("WANT_HUB_BASE_CHECKOUT", "/home/josh/worktrees/ng-want-hub-base-26a0a11"))
 K = 3          # guaranteed links per direction in the small synthetic graphs
 B_SMALL = 12   # budget that binds (fewer than the eligible count)
 _NG_MODULES = ("neuro_foundation", "ng_lite", "ng_tract_bridge", "ng_ecosystem", "ng_autonomic", "ng_embed",
