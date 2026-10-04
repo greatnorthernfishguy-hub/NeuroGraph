@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 810-onto-s4) — rebased onto trial s4 (040be4d): render_wants is compared to the trial base
+#   (_RENDER_BASE_COMMIT; the trial added an on_error reporter to it, #810 still leaves it untouched); the two
+#   changelog-claim tests read the WHOLE header (the trial header grew past the old 40,000-char slice).
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5), lane want-parser-legitimacy-810 (#810 turn 2, #815)
 # What: tests for in_json_string / in_url / in_link_target: checker-016's exact examples (incl.
 #   a backtick-fence variant and its independence from the inline-code coincidence) rejected with
@@ -53,6 +56,9 @@ import cc_ng_organism as org
 
 _WORKTREE = Path(__file__).resolve().parents[1]
 _BASE_COMMIT = "e4ebf982b1989fd9066d610b94853bc68bf70d37"
+# Trial base #810 was rebased onto (lane 810-onto-s4): render_wants is compared to THIS, because the trial
+# itself changed render_wants (on_error reporter) after e4ebf982; #810 still must not touch it.
+_RENDER_BASE_COMMIT = "040be4df68b6b4924d0a598cfaaf967119fce708"
 _NG_MODULES = ("cc_ng_organism", "neurograph_rpc", "neuro_foundation", "ng_lite", "ng_embed",
                "ng_ecosystem", "ng_tract_bridge", "ng_autonomic", "openclaw_adapter",
                "surface_resolver", "surfacing", "cc_ng_host")
@@ -512,7 +518,12 @@ def _function_source(source_text, name):
 
 def test_render_wants_source_is_byte_identical_to_base(base_org):
     current = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8")
-    assert _function_source(current, "render_wants") == _function_source(base_org._base_source, "render_wants")
+    proc = subprocess.run(["git", "-C", str(_WORKTREE), "show", "%s:cc_ng_organism.py" % _RENDER_BASE_COMMIT],
+                          capture_output=True)
+    if proc.returncode != 0:
+        pytest.fail("cannot read render base %s via git show (must not be skipped): %s"
+                    % (_RENDER_BASE_COMMIT, proc.stderr.decode(errors="replace")[:300]))
+    assert _function_source(current, "render_wants") == _function_source(proc.stdout.decode("utf-8"), "render_wants")
     assert org.WANT_RENDER_LIMIT == base_org.WANT_RENDER_LIMIT == 40
     assert org.WANT_MAX_CHARS == base_org.WANT_MAX_CHARS == 600      # still defined: the renderer uses it
 
@@ -1239,7 +1250,7 @@ def test_t3_named_residual_unclosed_fence_glued_to_a_closer_swallows_later_wants
 
 # --- (5) the changelog no longer over-claims ---
 def test_t3_changelog_claim_is_qualified_to_the_tested_grammar():
-    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0][:40000]
+    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0]
     assert "TESTED grammar" in header and "NOT for every string" in header
 
 
@@ -1488,6 +1499,6 @@ def test_t4_f4_named_residual_a_json_container_with_a_very_long_element_is_not_r
 
 # --- F5: doc ---
 def test_t4_f5_turn2_url_terminator_rule_is_marked_superseded_and_turn4_entry_exists():
-    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0][:40000]
+    header = (_WORKTREE / "cc_ng_organism.py").read_text(encoding="utf-8").split("# -------------------")[0]
     assert "SUPERSEDED BY TURN 3" in header
     assert "#810 turn 4" in header and "NEW FINAL FUNCTION" in header

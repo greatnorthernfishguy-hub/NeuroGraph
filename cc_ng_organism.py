@@ -3,6 +3,9 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 810-onto-s4) — rebased #810 WANT legitimacy onto trial s4; surface_wants keeps the trial's
+#   per-want guarded create_node (#915) and loud synapse reporting (#904/P489) and takes parse_wants()/want.text from #810,
+#   with _log_want_skips after the lock; no change to parse_wants or any helper (byte-identical to d8f99c3).
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP) — cc_assemble_recall gains on_surfaced(rendered, dropped): reports what one pass surfaced (and what the Pith budget cut) so a host can log it; unset = unchanged.
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP, overnight under Josh's tweak authority) — drain_ingest_tract gains defer_tract_path/defer_over_bytes: oversize turns move whole to a deferred tract.
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP, Josh) — drain_ingest_tract gains retry_tract_path: a failed turn moves whole to a retry tract; the pass continues.
