@@ -19,6 +19,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane strength-budget) — per-node strength budget + sleep downscaling (spec 2026-10-04-synapse-growth-by-competition-design; Josh ruling (a))
+# (PROTECTED CHANGE on review branch cc-laptop-strength-budget-20261004 ONLY; reaches no running graph until Josh's backup confirmation + "proceed")
+# What: NEW StrengthBudgetRule (registered in Graph.__init__ and the restore re-init, OFF unless config strength_budget_enabled);
+#       NEW Graph.apply_strength_budget(budget_out, budget_in), Graph.sleep_downscale(factor), Graph._strength_protected_ids();
+#       module-level pure-Python fallbacks _strength_budget_python / _scale_all_python (+ guard helpers). Checkpoint gains
+#       'strength_budget_steps_since' ONLY when that counter is non-zero (never while the rule is off).
+# Why:  protected nodes are exempt from every prune rule and grow without bound (Choice Clause node 4,132 out-links / 6,615
+#       out-strength); outgoing strength is bounded by nothing. Synapses now compete for a per-node budget (divisive
+#       normalization, no count cap), and sleep scales everything down; the EXISTING prune rules remove what falls below
+#       weight_threshold. Protected nodes, constitutional included, keep their strongest in/out link >= 2*weight_threshold.
+# How:  settings read live from graph.config with absent-key defaults (NOT added to DEFAULT_CONFIG, so the saved config and
+#       the checkpoint are byte-identical while off). Native SynapseStore.normalize_strength / scale_all used when the
+#       installed ng_tract has them (hasattr), else the identical Python fallback. Protection probe fails closed.
+#       sleep_downscale has no caller here (a host dream loop wires it on its own autonomic clock — LAW 8).
 # [2026-10-04] Claude (lane want-hub-engine-onto-s4) — rebased want-hub competition engine onto trial s4; no adaptations: 8e57853 + 29f47f6 cherry-picked cleanly onto 26a0a11 (no conflicts; the +/- patch lines are identical to e4ebf982..29f47f6); trial's fair-chance/orphan-sweep code, _is_identity_protected and the default _prune_synapses path untouched; this changelog line is the only other edit
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane want-hub-engine-d-build-20260930, dispatch #12011) — want-hub (d) ENGINE FOLD: two error-path hardenings
 # (PROTECTED CHANGE; the SAME (d) change as the entry below, per le-036 C2/C3 + checker-029; Josh's go recorded in
@@ -1412,6 +1426,139 @@ class HomeostaticRule(PlasticityRule):
                 )
 
 
+# ---------------------------------------------------------------------------
+# Strength budget + sleep downscaling (heterosynaptic competition, 2026-10-04 spec
+# "Bounding synapse growth by competition, not caps"). Pure-Python FALLBACKS for an
+# ng_tract wheel without SynapseStore.normalize_strength / scale_all. The native
+# methods implement the SAME algorithm (same per-node summation order: ascending
+# synapse_id; same tie-break; same clamp), so the two agree bit-for-bit in practice
+# (the equivalence test allows rel 1e-12).
+#
+# Strongest-link guarantee (READING, stated once here for both passes): for every
+# protected node p and each direction that has links, the link that was p's strongest
+# BEFORE the pass (weight desc, synapse_id asc) ends the pass at >= min(w_before, floor)
+# with floor = 2 * weight_threshold. It is a guard against SCALING, never a booster:
+# a link is never raised above its own pre-pass weight.
+# ---------------------------------------------------------------------------
+
+def _strength_guard_targets(get_w, outgoing, incoming, protected, floor) -> Dict[str, float]:
+    """sid -> minimum weight it must keep (the strongest-link guarantee), from PRE-pass weights."""
+    guard: Dict[str, float] = {}
+    for p in protected:
+        for idx in (outgoing, incoming):
+            ids = idx.get(p)
+            if ids:
+                best = min(ids, key=lambda s: (-get_w(s), s))
+                guard[best] = min(get_w(best), floor)
+    return guard
+
+
+def _strength_guard_apply(get_w, set_w, guard: Dict[str, float]) -> int:
+    clamped = 0
+    for sid in sorted(guard):
+        if get_w(sid) < guard[sid]:
+            set_w(sid, guard[sid])
+            clamped += 1
+    return clamped
+
+
+def _strength_budget_python(store, outgoing, incoming, budget_out, budget_in, protected, floor) -> Dict[str, int]:
+    """Fallback of SynapseStore.normalize_strength (divisive per-node normalization)."""
+    gw, sw = store.get_weight, store.set_weight
+    guard = _strength_guard_targets(gw, outgoing, incoming, protected, floor)
+    scaled: Set[str] = set()
+    nodes_scaled = [0, 0]
+    for d, (budget, idx) in enumerate(((budget_out, outgoing), (budget_in, incoming))):
+        if budget is None:
+            continue
+        for _nid, ids in idx.items():
+            if not ids:
+                continue
+            order = sorted(ids)
+            total = 0.0
+            for sid in order:
+                total += gw(sid)
+            if total > budget:
+                f = budget / total
+                nodes_scaled[d] += 1
+                for sid in order:
+                    w = gw(sid)
+                    nw = w * f
+                    if nw != w:
+                        sw(sid, nw)
+                        scaled.add(sid)
+    clamped = _strength_guard_apply(gw, sw, guard)
+    return {"synapses_scaled": len(scaled), "nodes_scaled_out": nodes_scaled[0],
+            "nodes_scaled_in": nodes_scaled[1], "clamped": clamped}
+
+
+def _scale_all_python(store, outgoing, incoming, factor, protected, floor) -> Dict[str, int]:
+    """Fallback of SynapseStore.scale_all (uniform multiplicative downscaling)."""
+    gw, sw = store.get_weight, store.set_weight
+    guard = _strength_guard_targets(gw, outgoing, incoming, protected, floor)
+    scaled = 0
+    for sid in list(store.keys()):
+        w = gw(sid)
+        nw = w * factor
+        if nw != w:
+            sw(sid, nw)
+            scaled += 1
+    clamped = _strength_guard_apply(gw, sw, guard)
+    return {"synapses_scaled": scaled, "clamped": clamped}
+
+
+class StrengthBudgetRule(PlasticityRule):
+    """Per-node strength budget — heterosynaptic competition (2026-10-04 spec, piece 1).
+
+    Every ``interval`` plasticity applications (the HomeostaticRule cadence: the rule runs
+    only on steps where something fired, like HomeostaticRule), each node whose OUTGOING
+    weight sum exceeds ``strength_budget_out`` has those weights multiplied by
+    budget/sum; then the same for INCOMING with ``strength_budget_in``. No count cap and
+    no prune of its own: what falls under ``weight_threshold`` is left to the EXISTING
+    prune rules. Protected nodes (constitutional included — Josh ruling (a)) get the
+    strongest-link guarantee (see Graph.apply_strength_budget).
+
+    OFF by default. Settings are read LIVE from ``graph.config`` on every application
+    (a host that flips them after construction/restore takes effect at once), with
+    absent-key defaults that keep the rule a no-op — they are deliberately NOT in
+    DEFAULT_CONFIG, so a graph that never sets them checkpoints byte-identically:
+        strength_budget_enabled   False
+        strength_budget_out       None  (direction skipped)
+        strength_budget_in        None  (direction skipped)
+        strength_budget_interval  config["scaling_interval"]
+    """
+
+    def __init__(self) -> None:
+        self._steps_since_budget = 0
+        self.last_result: Optional[Dict[str, int]] = None
+
+    def apply(
+        self,
+        graph: "Graph",
+        fired_node_ids: List[str],
+        timestep: int,
+    ) -> None:
+        cfg = graph.config
+        if not cfg.get("strength_budget_enabled", False):
+            return
+        interval = cfg.get("strength_budget_interval")
+        if interval is None:
+            interval = cfg.get("scaling_interval", 25)
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+            logger.warning("StrengthBudgetRule: invalid strength_budget_interval %r (int >= 1), pass skipped", interval)
+            return
+        self._steps_since_budget += 1
+        if self._steps_since_budget < interval:
+            return
+        self._steps_since_budget = 0
+        try:
+            self.last_result = graph.apply_strength_budget(
+                cfg.get("strength_budget_out"), cfg.get("strength_budget_in"))
+        except ValueError as exc:
+            # A bad setting must not kill the step loop; it is loud, and nothing is touched.
+            logger.warning("StrengthBudgetRule: invalid setting, pass skipped: %s", exc)
+
+
 class HyperedgePlasticityRule(PlasticityRule):
     """Hyperedge-level plasticity (PRD §4.3).
 
@@ -1710,6 +1857,8 @@ class Graph:
                 scaling_interval=self.config["scaling_interval"],
                 degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
             ),
+            # 2026-10-04 strength budget — OFF unless config strength_budget_enabled (no-op otherwise)
+            StrengthBudgetRule(),
             HyperedgePlasticityRule(
                 member_weight_lr=self.config["he_member_weight_lr"],
                 threshold_lr=self.config["he_threshold_lr"],
@@ -3827,6 +3976,94 @@ class Graph:
         )
         return record
 
+    # ------------------------------------------------------------------
+    # 2026-10-04 strength budget + sleep downscaling (spec "Bounding synapse growth by
+    # competition, not caps"). Both scale weights DOWN only and never prune: what falls
+    # under weight_threshold is left to the existing prune rules on their normal clock.
+    # ------------------------------------------------------------------
+
+    def _strength_protected_ids(self) -> List[str]:
+        """Every identity-protected node id (constitutional INCLUDED — Josh ruling (a)), sorted.
+        Fail closed: a node whose protection probe raises is treated as protected."""
+        out: List[str] = []
+        for nid in list(self.nodes):
+            try:
+                prot = self._is_identity_protected(nid)
+            except Exception:
+                prot = True
+            if prot:
+                out.append(nid)
+        out.sort()
+        return out
+
+    @staticmethod
+    def _strength_check_budget(label: str, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0.0 < float(v) < float("inf")):
+            raise ValueError("%s must be a finite number > 0 or None (got %r)" % (label, v))
+        return float(v)
+
+    def apply_strength_budget(self, budget_out: Optional[float], budget_in: Optional[float]) -> Dict[str, Any]:
+        """ONE per-node strength-budget pass (divisive normalization). Called by StrengthBudgetRule
+        on its interval; callable directly (dry runs). None for a budget skips that direction.
+
+        OUT pass first: for each node whose outgoing weight sum (summed in ascending synapse_id
+        order) exceeds budget_out, every outgoing weight *= budget_out/sum. Then the IN pass on the
+        post-OUT weights. Then the strongest-link guarantee for every protected node (fail-closed
+        probe): its pre-pass strongest outgoing and strongest incoming link (weight desc, id asc)
+        end at >= min(pre-pass weight, 2 * weight_threshold). No pruning here.
+
+        Uses the native SynapseStore.normalize_strength when the installed ng_tract has it, else
+        the pure-Python fallback (identical algorithm). Returns counts.
+        """
+        bo = self._strength_check_budget("strength_budget_out", budget_out)
+        bi = self._strength_check_budget("strength_budget_in", budget_in)
+        with self._step_lock:
+            protected = self._strength_protected_ids()
+            floor = 2.0 * float(self.config["weight_threshold"])
+            native = getattr(self.synapses, "normalize_strength", None)
+            if native is not None:
+                res = dict(native(bo, bi, protected, floor))
+            else:
+                res = _strength_budget_python(self.synapses, self._outgoing, self._incoming, bo, bi, protected, floor)
+            res["native"] = native is not None
+            res["protected_nodes"] = len(protected)
+            res["timestep"] = self.timestep
+        logger.info("strength_budget: t=%s out=%s in=%s scaled=%d nodes_out=%d nodes_in=%d clamped=%d protected=%d native=%s",
+                    res["timestep"], bo, bi, res["synapses_scaled"], res["nodes_scaled_out"], res["nodes_scaled_in"],
+                    res["clamped"], res["protected_nodes"], res["native"])
+        return res
+
+    def sleep_downscale(self, factor: float) -> Dict[str, Any]:
+        """Sleep downscaling (spec piece 2, Tononi & Cirelli): every synapse weight *= factor
+        (0 < factor <= 1), relative strengths preserved, with the same strongest-link guarantee
+        for every protected node (constitutional included). Does NOT prune — the normal prune
+        rules take what fell under weight_threshold on their own clock.
+
+        Not called by anything in this module. The intended caller is a host's dream loop on its
+        OWN autonomic clock (LAW 8 — never conversation-gated), reading `factor` from its env (LAW 5).
+        Returns counts.
+        """
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)) or not (0.0 < float(factor) <= 1.0):
+            raise ValueError("sleep_downscale: factor must be a number in (0, 1] (got %r)" % (factor,))
+        factor = float(factor)
+        with self._step_lock:
+            protected = self._strength_protected_ids()
+            floor = 2.0 * float(self.config["weight_threshold"])
+            native = getattr(self.synapses, "scale_all", None)
+            if native is not None:
+                res = dict(native(factor, protected, floor))
+            else:
+                res = _scale_all_python(self.synapses, self._outgoing, self._incoming, factor, protected, floor)
+            res["native"] = native is not None
+            res["protected_nodes"] = len(protected)
+            res["factor"] = factor
+            res["timestep"] = self.timestep
+        logger.info("sleep_downscale: t=%s factor=%s scaled=%d clamped=%d protected=%d native=%s",
+                    res["timestep"], factor, res["synapses_scaled"], res["clamped"], res["protected_nodes"], res["native"])
+        return res
+
     def _is_identity_protected(self, nid: str) -> bool:
         """#spine — never prune a mind's self-authored identity nodes.
 
@@ -5780,6 +6017,12 @@ class Graph:
                  if isinstance(r, HomeostaticRule)),
                 0,
             ),
+            # 2026-10-04 strength budget interval counter — emitted ONLY when non-zero (it is
+            # always 0 while the rule is off), so a graph that never enables the budget writes
+            # the exact pre-existing key set (byte-identical checkpoint).
+            **({"strength_budget_steps_since": _sb_steps} if (_sb_steps := next(
+                (r._steps_since_budget for r in self._plasticity_rules
+                 if isinstance(r, StrengthBudgetRule)), 0)) else {}),
         }
 
     def _serialize_incremental(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
@@ -6169,6 +6412,8 @@ class Graph:
                 scaling_interval=self.config["scaling_interval"],
                 degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
             ),
+            # 2026-10-04 strength budget — OFF unless config strength_budget_enabled (no-op otherwise)
+            StrengthBudgetRule(),
             HyperedgePlasticityRule(
                 member_weight_lr=self.config["he_member_weight_lr"],
                 threshold_lr=self.config["he_threshold_lr"],
@@ -6191,6 +6436,11 @@ class Graph:
         for rule in self._plasticity_rules:
             if isinstance(rule, HomeostaticRule):
                 rule._steps_since_scaling = homeostatic_steps
+                break
+        # 2026-10-04 strength budget interval counter (absent key == 0).
+        for rule in self._plasticity_rules:
+            if isinstance(rule, StrengthBudgetRule):
+                rule._steps_since_budget = data.get("strength_budget_steps_since", 0)
                 break
 
         self._dirty_nodes.clear()
