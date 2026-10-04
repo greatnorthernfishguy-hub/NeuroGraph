@@ -1115,20 +1115,13 @@ class STDPRule(PlasticityRule):
         self.A_minus = A_minus
         self.learning_rate = learning_rate
 
-    def _apply_dw(self, syn: Synapse, dw: float, timestep: int,
-                  three_factor: bool) -> None:
-        """Apply weight change directly or via eligibility trace.
-
-        In three-factor mode (PRD §5.2), STDP creates the eligibility trace
-        but weight change only commits when reward arrives via inject_reward.
-        """
-        if three_factor:
-            syn.eligibility_trace += dw
-        else:
-            syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
-            if syn.weight > syn.peak_weight:
-                syn.peak_weight = syn.weight
-        syn.last_update_time = float(timestep)
+    # [2026-10-04] _apply_dw (weight change directly, or via the eligibility trace in
+    # three-factor mode, PRD §5.2) moved whole into ng_tract SynapseStore.apply_stdp_dw,
+    # which apply() calls once per pass with the pass's (synapse_id, dw) pairs:
+    #   three_factor: trace += dw;  else: weight = max(0, min(weight + dw, max_weight)),
+    #   peak tracks it;  always: last_update_time = float(timestep).
+    # STDP creates the trace; the weight change commits only when reward arrives
+    # via inject_reward. (LAW 3: one implementation, not two.)
 
     def apply(
         self,
@@ -1149,12 +1142,17 @@ class STDPRule(PlasticityRule):
             t_post = float(timestep)
 
             # Iterate over all incoming synapses to this post node
-            incoming_syn_ids = graph._incoming.get(post_id, set())
-            for syn_id in list(incoming_syn_ids):
-                syn = graph.synapses.get(syn_id)
-                if syn is None:
+            # [2026-10-04] one native read (pre_id, weight, max_weight) per synapse, then
+            # one native commit of the computed dw's (former _apply_dw), per pass.
+            incoming_syn_ids = list(graph._incoming.get(post_id, set()))
+            _dw_ids: List[str] = []
+            _dw_vals: List[float] = []
+            for syn_id, _row in zip(incoming_syn_ids,
+                                    graph.synapses.stdp_reads(incoming_syn_ids, True)):
+                if _row is None:
                     continue
-                pre_node = graph.nodes.get(syn.pre_node_id)
+                _pre_id, _syn_w, _syn_mw = _row
+                pre_node = graph.nodes.get(_pre_id)
                 if pre_node is None:
                     continue
 
@@ -1168,7 +1166,7 @@ class STDPRule(PlasticityRule):
                     # LTP: pre fired before post (causal)
                     raw_dw = self.A_plus * math.exp(-dt / self.tau_plus)
                     # Weight-dependent scaling (PRD §3.1.2)
-                    scale = (syn.max_weight - syn.weight) / syn.max_weight
+                    scale = (_syn_mw - _syn_w) / _syn_mw
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
                 elif dt < 0:
                     # LTD: pre fired after post (acausal)
@@ -1177,23 +1175,29 @@ class STDPRule(PlasticityRule):
                 else:
                     # Temporal aliasing: Δt=0 → weak LTP at half strength (PRD §3.1.2)
                     raw_dw = self.A_plus * 0.5
-                    scale = (syn.max_weight - syn.weight) / syn.max_weight
+                    scale = (_syn_mw - _syn_w) / _syn_mw
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
 
                 # GSG Phase 2: amplify dw by Poincaré curvature of pre/post layer
                 _pre_l = getattr(pre_node, "diffpc_layer", 2)
                 _post_l = getattr(post_node, "diffpc_layer", 2)
                 dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
-                self._apply_dw(syn, dw, timestep, three_factor)
+                _dw_ids.append(syn_id)
+                _dw_vals.append(dw)
+            if _dw_ids:
+                graph.synapses.apply_stdp_dw(_dw_ids, _dw_vals, float(timestep), three_factor)
 
             # Also handle outgoing synapses (post-before-pre → LTD from
             # perspective of those synapses where this node is pre)
-            outgoing_syn_ids = graph._outgoing.get(post_id, set())
-            for syn_id in list(outgoing_syn_ids):
-                syn = graph.synapses.get(syn_id)
-                if syn is None:
+            outgoing_syn_ids = list(graph._outgoing.get(post_id, set()))
+            _dw_ids = []
+            _dw_vals = []
+            for syn_id, _row in zip(outgoing_syn_ids,
+                                    graph.synapses.stdp_reads(outgoing_syn_ids, False)):
+                if _row is None:
                     continue
-                other_node = graph.nodes.get(syn.post_node_id)
+                _other_id, _syn_w, _syn_mw = _row
+                other_node = graph.nodes.get(_other_id)
                 if other_node is None:
                     continue
 
@@ -1209,7 +1213,7 @@ class STDPRule(PlasticityRule):
                 if dt > 0:
                     # other fired after this node → LTP
                     raw_dw = self.A_plus * math.exp(-dt / self.tau_plus)
-                    scale = (syn.max_weight - syn.weight) / syn.max_weight
+                    scale = (_syn_mw - _syn_w) / _syn_mw
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
                 elif dt < 0:
                     # other fired before this node → LTD
@@ -1222,7 +1226,10 @@ class STDPRule(PlasticityRule):
                 _pre_l = getattr(post_node, "diffpc_layer", 2)
                 _post_l = getattr(other_node, "diffpc_layer", 2)
                 dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
-                self._apply_dw(syn, dw, timestep, three_factor)
+                _dw_ids.append(syn_id)
+                _dw_vals.append(dw)
+            if _dw_ids:
+                graph.synapses.apply_stdp_dw(_dw_ids, _dw_vals, float(timestep), three_factor)
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2679,18 +2686,11 @@ class Graph:
                 # Compute approximate distances from primed nodes
                 primed_set = set(node_ids)
                 distances: Dict[str, int] = {nid: 0 for nid in node_ids}
-                # BFS to compute distances
-                frontier = set(node_ids)
-                for dist in range(1, steps + 1):
-                    next_frontier: Set[str] = set()
-                    for nid in frontier:
-                        # [2026-10-04] one native post-id lookup per frontier node
-                        for _post_id in self.synapses.post_ids_of(
-                                list(self._outgoing.get(nid, ()))):
-                            if _post_id is not None and _post_id not in distances:
-                                distances[_post_id] = dist
-                                next_frontier.add(_post_id)
-                    frontier = next_frontier
+                # BFS to compute distances — [2026-10-04] native level-by-level walk of the
+                # outgoing edges: each reached node keeps the FIRST hop level that reaches
+                # it (same values as the per-synapse frontier loop; `distances` is only
+                # ever read with .get, so its insertion order is immaterial).
+                distances.update(self.synapses.bfs_hop_distances(node_ids, steps))
 
                 # Collect current prediction targets for was_predicted tagging
                 predicted_targets: Set[str] = set()
