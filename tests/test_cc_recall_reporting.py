@@ -582,18 +582,19 @@ def _params(fn):
 def test_new_kwargs_are_appended_default_none_and_nothing_else_changed():
     # FAILS on base: the new parameter is absent there.
     cases = [
-        ('cc_assemble_recall', 'on_degraded'),
-        ('cc_pattern_completion_recall', 'on_error'),
-        ('render_constitutional_core', 'on_error'),
-        ('render_wants', 'on_error'),
+        ('cc_assemble_recall', ('on_degraded', 'on_surfaced')),  # on_surfaced: 2026-10-03 MVP surfacing log
+        ('cc_pattern_completion_recall', ('on_error',)),
+        ('render_constitutional_core', ('on_error',)),
+        ('render_wants', ('on_error',)),
     ]
     for name, new in cases:
         old_params, new_params = _params(getattr(_base, name)), _params(getattr(_org, name))
-        assert new not in [p.name for p in old_params], name
-        assert [(p.name, p.kind, p.default) for p in new_params[:-1]] == \
+        assert not set(new) & {p.name for p in old_params}, name
+        n = len(new)
+        assert [(p.name, p.kind, p.default) for p in new_params[:-n]] == \
             [(p.name, p.kind, p.default) for p in old_params], name  # every existing param untouched, in order
-        last = new_params[-1]
-        assert (last.name, last.kind, last.default) == (new, inspect.Parameter.POSITIONAL_OR_KEYWORD, None), name
+        assert [(p.name, p.kind, p.default) for p in new_params[-n:]] == \
+            [(x, inspect.Parameter.POSITIONAL_OR_KEYWORD, None) for x in new], name
 
 
 def test_base_rejects_every_new_kwarg():
@@ -854,3 +855,34 @@ def test_module_under_test_is_this_worktrees_file_and_the_base_is_not():
     assert _base is not _org and _base.cc_assemble_recall is not _org.cc_assemble_recall
     lines, problems = _ng_module_report()
     assert problems == [], problems
+
+
+# ---------------------------------------------------------------- 6. cc_assemble_recall(on_surfaced=)
+
+def test_assemble_on_surfaced_reports_what_rendered_on_both_paths():
+    # [2026-10-03] MVP surfacing log. Gate off: both blocks, tagged by stream, nothing
+    # dropped. Gate on: the real Pith pipeline's survivors, with the same text returned.
+    for gate in (False, True):
+        surfaced = _Reports()
+        ng = _Ng(monitor=_Monitor([_LONG_MONITOR_ITEM]))
+        with mock.patch.object(_org, '_CC_PITH_ENABLED', gate), \
+                mock.patch.object(_org, 'cc_pattern_completion_recall', _loose_pc([_LONG_PATTERN_ITEM])):
+            out = _org.cc_assemble_recall(ng, 'query text', 5, {}, None, on_surfaced=surfaced)
+            ng2 = _Ng(monitor=_Monitor([_LONG_MONITOR_ITEM]))
+            plain = _org.cc_assemble_recall(ng2, 'query text', 5, {}, None)
+        assert out == plain, gate  # reporting never changes the text
+        assert len(surfaced.calls) == 1, gate
+        rendered, dropped = surfaced.calls[0]
+        assert sorted((r['stream'], r['node_id']) for r in rendered) == \
+            [('monitor', 'recent'), ('pattern', 'novel')], gate
+        assert all(r['content'] in out for r in rendered), gate
+        assert dropped == [], gate
+
+
+def test_assemble_on_surfaced_reporter_that_raises_changes_nothing():
+    ng = _Ng(monitor=_Monitor([_LONG_MONITOR_ITEM]))
+    with mock.patch.object(_org, '_CC_PITH_ENABLED', False), \
+            mock.patch.object(_org, 'cc_pattern_completion_recall', _loose_pc([_LONG_PATTERN_ITEM])):
+        out = _org.cc_assemble_recall(ng, 'q', 5, {}, None,
+                                      on_surfaced=_raiser(lambda: RuntimeError('BAD')))
+    assert 'distinct monitor hit' in out and 'distinct pattern-completion hit' in out

@@ -3,6 +3,7 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-03] Claude Opus 5.5 (Executive, MVP) — cc_assemble_recall gains on_surfaced(rendered, dropped): reports what one pass surfaced (and what the Pith budget cut) so a host can log it; unset = unchanged.
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP) — drain_ingest_tract gains max_seconds (keyword): ends a pass by wall time; the rest stays in the tract.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4) -- TRIAL-branch hand-resolution of cherry-pick ee94f7d (#905)
 #   onto D24+#794..#897: _cc_callosum_consolidate's except block keeps D24's loud logger.error (it replaced the logger.debug line) AND
@@ -1985,6 +1986,15 @@ def _cc_report(callback: Optional[Any], *args: Any) -> None:
         callback(*args)
     except Exception:  # noqa: BLE001
         pass  # the error-reporting hook itself must never break the pipeline
+
+
+def _cc_surfaced_item(item: Any, stream: str = '') -> Dict[str, Any]:
+    """One on_surfaced entry from a CacheLine or a raw surfaced/recall dict."""
+    if isinstance(item, dict):
+        return {'stream': stream, 'node_id': item.get('node_id') or '',
+                'score': float(item.get('score', 0.0) or 0.0), 'content': item.get('content', '') or ''}
+    return {'stream': item.stream, 'node_id': item.node_id,
+            'score': float(item.score), 'content': item.content}
 
 
 def render_wants(graph: Any, provenance: Any = ("cc_authored", "cc_emergent"),
@@ -6343,7 +6353,8 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                         allow_pattern_completion: bool = True,
                         on_monitor_error: Optional[Any] = None,
                         on_pith_failure: Optional[Any] = None,
-                        on_degraded: Optional[Any] = None) -> str:
+                        on_degraded: Optional[Any] = None,
+                        on_surfaced: Optional[Any] = None) -> str:
     """Return surfacing context for CC hook injection -- THE shared recall
     pipeline for both hemispheres (laptop cc-ng-daemon.py, VPS cc_ng_host.py).
 
@@ -6393,6 +6404,13 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
     returned text, the existing callbacks, their order, nor the rate-limited
     WARNING/metrics. Unset (default) = behaviour byte-identical, and the call
     to cc_pattern_completion_recall carries no new kwarg.
+
+    on_surfaced: optional reporter, on_surfaced(rendered, dropped), called once
+    just before the return with what this pass actually surfaced. Each list
+    holds {'stream', 'node_id', 'score', 'content'} dicts in render order;
+    `dropped` is what the Pith budget cut (always [] on the un-Pithed path).
+    Reporting only -- the caller decides where it goes (LAW 4). Guarded like
+    on_degraded; unset (default) = behaviour byte-identical.
 
     Params only (ng/conv_state/commons) -- no module-global STATE access,
     so this function is process-agnostic (Syl's-Law) and safe to call from
@@ -6539,6 +6557,10 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
                 logger.debug('Pith victim capture failed (non-fatal): %s', exc)
             _stage = 'render'
             survivor_results = [{'score': cl.score, 'content': cl.content} for cl in survivors]
+            if on_surfaced is not None:
+                _kept = {id(cl) for cl in survivors}
+                _cc_report(on_surfaced, [_cc_surfaced_item(cl) for cl in survivors],
+                           [_cc_surfaced_item(cl) for cl in _pre_l1 if id(cl) not in _kept])
             return _format_cc_recall_block(survivor_results)
         except Exception as exc:
             # Fail-soft: fall back to the un-Pithed monitor_ctx/pc_block
@@ -6564,6 +6586,11 @@ def cc_assemble_recall(ng: Any, query: str, k: int, conv_state: dict, commons: A
             # the WARNING/metrics above are untouched (guarded: never raises).
             _cc_report(on_degraded, 'pith_fallback', exc)
 
+    if on_surfaced is not None:
+        _cc_report(on_surfaced,
+                   [_cc_surfaced_item(it, 'monitor') for it in (monitor_items if monitor_ctx else [])]
+                   + [_cc_surfaced_item(it, 'pattern') for it in (pc_results if pc_block else [])],
+                   [])
     if monitor_ctx and pc_block:
         return monitor_ctx + "\n\n" + pc_block
     return monitor_ctx or pc_block
