@@ -19,6 +19,7 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane want-hub-engine-onto-s4) — rebased want-hub competition engine onto trial s4; no adaptations: 8e57853 + 29f47f6 cherry-picked cleanly onto 26a0a11 (no conflicts; the +/- patch lines are identical to e4ebf982..29f47f6); trial's fair-chance/orphan-sweep code, _is_identity_protected and the default _prune_synapses path untouched; this changelog line is the only other edit
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, lane want-hub-engine-d-build-20260930, dispatch #12011) — want-hub (d) ENGINE FOLD: two error-path hardenings
 # (PROTECTED CHANGE; the SAME (d) change as the entry below, per le-036 C2/C3 + checker-029; Josh's go recorded in
 #  a434525cd3cdf68da5f282aa319a2323715d3938 [Exec Packet 440] still governs; branch build, synthetic graphs only, nothing merged or armed)
