@@ -138,3 +138,28 @@ def test_tonic_thread_filters_ingested_code_node():
     thread._update_thread([(nid, 1.0)], _Res())
     rendered = thread.format_latent_context() or ""
     assert "NeuroGraph Foundation" not in rendered, f"ingested code surfaced: {rendered!r}"
+
+
+# [2026-10-04] P408: want nodes surface as their own text, only while open.
+def _want(text, state="open"):
+    return _FakeNode({"kind": "want", "want_text": text, "want_state": state,
+                      "provenance": "cc_authored", "creation_mode": "conversational"})
+
+
+def test_open_want_resolves_to_its_text_whole():
+    t = "Watch hub-degree trajectory over the next few sessions " * 20
+    assert resolve_surface_content(_want(t), None) == t.strip()
+
+
+def test_short_open_want_is_not_dropped_as_a_fragment():
+    assert resolve_surface_content(_want("rest"), None) == "rest"
+
+
+def test_closed_or_empty_want_never_surfaces():
+    assert resolve_surface_content(_want("learn STDP", state="closed"), None) is None
+    assert resolve_surface_content(_want("   "), None) is None
+
+
+def test_explicit_bound_still_applies_to_a_want():
+    out = resolve_surface_content(_want("alpha beta gamma delta"), None, max_chars=11)
+    assert out == "alpha beta…"

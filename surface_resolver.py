@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-10-04] Claude Opus 5.5 (Executive, laptop trial, Josh P408) — want nodes resolve to their own text
+# What: a node with metadata kind == "want" resolves to its want_text (whole) when want_state == "open", and
+#       to None (never surfaces) otherwise. Before this a want had no _forest_content/vdb entry/_label, so every
+#       consumer dropped it as empty and the only way a want reached awareness was the standing
+#       "## What I Want" block. Why: Josh (P408): wants "surface like other relevant context" -- when something
+#       triggers one -- not as an always-on block. Host-neutral: any NG's want nodes behave the same.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1: surfaced content renders WHOLE
 # What: resolve_surface_content() and resolve_surface_item() take max_chars: Optional[int] = None
 #       (was 240). None = NO bound: the node's resolved text is returned whole. The word-snap +
@@ -75,6 +81,9 @@ def resolve_surface_content(
 ) -> Optional[str]:
     """Return the display text for a surfaced node — substrate-first — or None to filter it.
 
+    A want node (``kind == 'want'``) resolves to its ``want_text`` when ``want_state == 'open'``
+    and to None otherwise (P408) -- it has no forest/vdb/label of its own.
+
     Preference order:
       1. ``node.metadata['_forest_content']`` — her actual turn, rendered WHOLE.
       2. vdb entry content (the shard) — fallback only.
@@ -96,6 +105,19 @@ def resolve_surface_content(
     # Filter ingested source documents out of experiential surfacing.
     if not allow_ingested and meta.get("creation_mode") == "ingested":
         return None
+
+    # Want nodes (P408): an OPEN want surfaces as its own text, whole; a closed one never does.
+    if meta.get("kind") == "want":
+        if meta.get("want_state") != "open":
+            return None
+        wt = meta.get("want_text")
+        wt = wt.strip() if isinstance(wt, str) else ""
+        if not wt:
+            return None
+        if max_chars is not None and len(wt) > max_chars:
+            cut = wt.rfind(" ", 0, max_chars)
+            wt = (wt[:cut] if cut > 0 else wt[:max_chars]).rstrip() + "…"
+        return wt
 
     # 1. Substrate-first — her own conversational turn.
     forest = meta.get("_forest_content")
