@@ -227,7 +227,8 @@ def test_signature_hold_on_failure_is_last_and_defaults_false():
     params = list(sig.parameters)
     assert params[:-1] == ["graph", "vector_db", "state", "tract_path", "return_consumed",
                            "max_entries", "batch_nodes", "receipt",
-                           "max_seconds"]   # MVP 2026-10-03: the wall-time cap per pass
+                           "max_seconds",   # MVP 2026-10-03: the wall-time cap per pass
+                           "retry_tract_path"]   # MVP 2026-10-03: failed turns move aside, nothing dropped
     assert params[-1] == "hold_on_failure"
     assert sig.parameters["hold_on_failure"].default is False
 
@@ -418,3 +419,38 @@ def test_default_is_byte_identical_to_the_base_module(env, name, rc):
     assert c_new == c_old
     assert l_new == l_old
     assert [m for m in w_new] == [m for m in w_old]
+
+
+# ------------------------------------------------- retry tract (MVP 2026-10-03, Josh)
+def _drain(env, path, **kw):
+    return cc_ng_organism.drain_ingest_tract(object(), None, {"last_forest_id": None},
+                                             tract_path=path, return_consumed=True, **kw)
+
+
+@pytest.mark.parametrize("kind", ["false", "raise"])
+def test_retry_tract_moves_the_failed_entry_whole_and_the_pass_continues(env, kind):
+    frames = [_frame(env.tmp, "ok", 1), _frame(env.tmp, kind, 2), _frame(env.tmp, "ok", 3)]
+    path = _write(env, "retry_" + kind, frames)
+    retry = _check_safe(env.tmp / ("retry_" + kind + ".retry.tract"))
+    absorbed, consumed = _drain(env, path, hold_on_failure=True, retry_tract_path=retry)
+    assert absorbed == 2                      # both good turns landed; nothing held behind the failure
+    assert _read(path) == b""                 # the main tract is fully drained
+    assert _read(retry) == frames[1]          # the failed turn, byte-for-byte, nothing else
+    assert consumed == b"".join(frames)
+
+
+def test_retry_tract_rotates_a_failing_retry_to_its_own_end(env):
+    frames = [_frame(env.tmp, "false", 1), _frame(env.tmp, "ok", 2)]
+    path = _write(env, "retry_rotate", frames)
+    absorbed, _ = _drain(env, path, hold_on_failure=True, retry_tract_path=path)
+    assert absorbed == 1
+    assert _read(path) == frames[0]           # the failure went round to the end; still there, whole
+
+
+def test_retry_append_failure_falls_back_to_the_hold(env):
+    frames = [_frame(env.tmp, "ok", 1), _frame(env.tmp, "false", 2), _frame(env.tmp, "ok", 3)]
+    path = _write(env, "retry_unwritable", frames)
+    bad = str(env.tmp / "no-such-dir" / "retry.tract")
+    absorbed, _ = _drain(env, path, hold_on_failure=True, retry_tract_path=bad)
+    assert absorbed == 1
+    assert _read(path) == frames[1] + frames[2]   # held exactly as without a retry tract

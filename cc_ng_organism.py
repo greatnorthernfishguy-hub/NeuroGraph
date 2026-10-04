@@ -4,6 +4,7 @@
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP) — cc_assemble_recall gains on_surfaced(rendered, dropped): reports what one pass surfaced (and what the Pith budget cut) so a host can log it; unset = unchanged.
+# [2026-10-03] Claude Opus 5.5 (Executive, MVP, Josh) — drain_ingest_tract gains retry_tract_path: a failed turn moves whole to a retry tract; the pass continues.
 # [2026-10-03] Claude Opus 5.5 (Executive, MVP) — drain_ingest_tract gains max_seconds (keyword): ends a pass by wall time; the rest stays in the tract.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4) -- TRIAL-branch hand-resolution of cherry-pick ee94f7d (#905)
 #   onto D24+#794..#897: _cc_callosum_consolidate's except block keeps D24's loud logger.error (it replaced the logger.debug line) AND
@@ -3144,7 +3145,8 @@ def _cc_drain_receipt_write(receipt, **fields) -> None:
 def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         return_consumed: bool = False, max_entries: int = 0,
                         batch_nodes: int = None, receipt: dict = None,
-                        max_seconds: float = 0, hold_on_failure: bool = False):
+                        max_seconds: float = 0, retry_tract_path: str = None,
+                        hold_on_failure: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -3237,6 +3239,13 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
 
     Fails soft -- an ingest-tract drain failure must never break the
     daemon's autosave pulse.
+
+    retry_tract_path (MVP 2026-10-03, Josh): with hold_on_failure, a failed
+    entry's exact bytes are APPENDED to this tract and the pass moves on,
+    instead of holding everything behind it. Nothing is dropped: the turn waits
+    there whole. If the append itself fails, the pass holds exactly as before.
+    Passing tract_path itself rotates a failed retry to the end of its own
+    tract. None (default) = unchanged.
     """
     def _ret(absorbed_n: int, consumed: bytes = b""):
         return (absorbed_n, consumed) if return_consumed else absorbed_n
@@ -3295,6 +3304,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
         _t_start = time.monotonic()
         reader = ng_tract.TractReader(data)
         for entry in reader:
+            entry_start = consumed_offset
             # position() is a bound method on the Rust binding, not a property.
             # Read it BEFORE the filters so `continue` still consumes the entry.
             consumed_offset = reader.position()
@@ -3322,6 +3332,18 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
                 hold_reason = "absorb_raised"
                 hold_exc_type = type(exc).__name__
+            if hold_on_failure and hold_reason is not None and retry_tract_path:
+                try:
+                    with open(retry_tract_path, "ab") as rf:
+                        rf.write(data[entry_start:consumed_offset])
+                    safe_offset = consumed_offset
+                    logger.warning(
+                        "CC ingest-tract retry: reason=%s exc_type=%s -- failed entry moved whole "
+                        "to the retry tract; the pass continues", hold_reason, hold_exc_type)
+                    hold_reason = None
+                except Exception as rexc:  # noqa: BLE001 - falls through to the hold below
+                    logger.warning("CC ingest-tract retry append failed (%s); holding instead",
+                                   type(rexc).__name__)
             if hold_on_failure and hold_reason is not None:
                 # #794: stop at the FIRST failed entry. Hardcoded text only: a
                 # fixed reason code and the exception CLASS NAME -- never
