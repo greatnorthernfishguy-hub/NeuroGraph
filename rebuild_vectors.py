@@ -18,6 +18,11 @@ Default paths:
 """
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — vector-store reads go through SimpleVectorDB's locked accessors (#270)
+# What: reindex_conv reads the existing id set via vdb.all_ids().
+# Why:  SimpleVectorDB is now guarded by its own leaf lock; direct reads of its embeddings/content/metadata
+#       dicts from outside the class bypassed it and could race concurrent add/delete (orphan sweep, deposits).
+# How:  Same values, read under the store's lock; no behaviour change.
 # [2026-06-14] Claude Code (Opus 4.8) — #294-B conv re-index mode (re-light her recall)
 # What: add select_conv_reindex_targets(), _reindex_content(), _content_is_sane(),
 #   _load_held_ids(), _load_graph(), reindex_conv(), and a `--conv-only` CLI mode
@@ -176,7 +181,7 @@ def reindex_conv(checkpoint_path, vdb_path, dry_run=False, held_file=None,
         vdb.load(vdb_path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not load existing vdb (%s); index starts empty: %s", vdb_path, exc)
-    already = set(vdb.embeddings.keys())
+    already = set(vdb.all_ids())  # locked accessor (#270)
     skip_ids = _load_held_ids(held_file, graph.nodes)
 
     targets = select_conv_reindex_targets(

@@ -42,6 +42,11 @@
 #   entity -> hyperedge-id-set map once instead of a per-pair scan —
 #   fixes the race AND turns an O(pairs * hyperedges) cost into
 #   O(hyperedges + pairs).
+# [2026-10-04] Claude (lane vdb-lock-leak) — vector-store reads go through SimpleVectorDB's locked accessors (#270)
+# What: embedding-matrix build reads vector_db.get_embedding / get_metadata.
+# Why:  SimpleVectorDB is now guarded by its own leaf lock; direct reads of its embeddings/content/metadata
+#       dicts from outside the class bypassed it and could race concurrent add/delete (orphan sweep, deposits).
+# How:  Same values, read under the store's lock; no behaviour change.
 # -------------------
 
 """NeuroGraph-specific implementation of the LeniaSubstrate interface.
@@ -200,7 +205,7 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         # Determine embedding dimension from first available entry
         dim = None
         for eid in self._entity_list:
-            emb = self._vector_db.embeddings.get(eid)
+            emb = self._vector_db.get_embedding(eid)  # locked accessor (#270)
             if emb is not None:
                 dim = len(emb)
                 break
@@ -215,13 +220,13 @@ class NeuroGraphSubstrate(LeniaSubstrate):
 
         found = 0
         for i, eid in enumerate(self._entity_list):
-            emb = self._vector_db.embeddings.get(eid)
+            emb = self._vector_db.get_embedding(eid)  # locked accessor (#270)
             if emb is not None:
                 self._embedding_matrix[i] = emb
                 found += 1
 
             # Check metadata for tree/forest distinction
-            meta = self._vector_db.metadata.get(eid, {})
+            meta = self._vector_db.get_metadata(eid, {})  # locked accessor (#270)
             if meta.get("_tree_concept", False):
                 self._is_tree_node[i] = True
 

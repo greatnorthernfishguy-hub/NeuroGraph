@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — vector-store reads go through SimpleVectorDB's locked accessors (#270)
+# What: find_tool_noise uses vdb.get_content; find_orphan_vdb_tool_noise iterates vdb.items_snapshot().
+# Why:  SimpleVectorDB is now guarded by its own leaf lock; direct reads of its embeddings/content/metadata
+#       dicts from outside the class bypassed it and could race concurrent add/delete (orphan sweep, deposits).
+# How:  Same values, read under the store's lock; no behaviour change.
 # [2026-07-11] Claude Code (Fable 5) — #379: atomic write + manifest refresh
 # What: the apply-path checkpoint write goes through checkpoint_guardian.atomic_file_write
 #   (tmp + os.replace) and refreshes the manifest sidecar with post-pass counts.
@@ -66,7 +71,7 @@ def find_tool_noise(graph, vdb) -> list:
         meta = getattr(node, "metadata", None) or {}
         if meta.get("creation_mode") != "ingested":
             continue
-        content = vdb.content.get(node_id, "")
+        content = vdb.get_content(node_id, "")  # locked accessor (#270)
         if content.startswith(_TOOL_PREFIXES):
             matches.append(node_id)
     return matches
@@ -77,7 +82,7 @@ def find_orphan_vdb_tool_noise(graph, vdb, already_matched: set) -> list:
     content -- content orphaned by graph pruning (#237) before the first cleanup ran,
     invisible to find_tool_noise()'s graph-driven scan."""
     matches = []
-    for node_id, content in vdb.content.items():
+    for node_id, content, _meta in vdb.items_snapshot():  # locked atomic snapshot (#270)
         if node_id in already_matched or node_id in graph.nodes:
             continue
         if content.startswith(_TOOL_PREFIXES):
