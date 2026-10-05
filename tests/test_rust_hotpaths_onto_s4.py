@@ -185,16 +185,19 @@ def build_random_graph(seed, n_nodes=120, n_syn=900):
     return g
 
 
+_OFF = {"prune_protected_faint_links": False, "strength_budget_enabled": False}
+_BUDGET = {"strength_budget_enabled": True, "strength_budget_out": 2.0,
+           "strength_budget_in": 2.5, "strength_budget_interval": 2}
+# Every named combination sets BOTH switches explicitly (a real checkpoint carries its own
+# config; the live CC graph has both ON). "absent" leaves the restored config as it is.
 FLAGS = {
-    "off": {},
-    "lifeline": {"prune_protected_faint_links": True},
-    "lifeline_grace3": {"prune_protected_faint_links": True, "last_link_grace_steps": 3},
-    "lifeline_grace0": {"prune_protected_faint_links": True, "last_link_grace_steps": 0},
-    "budget": {"strength_budget_enabled": True, "strength_budget_out": 2.0,
-               "strength_budget_in": 2.5, "strength_budget_interval": 2},
-    "lifeline_budget": {"prune_protected_faint_links": True, "last_link_grace_steps": 4,
-                        "strength_budget_enabled": True, "strength_budget_out": 2.0,
-                        "strength_budget_in": 2.5, "strength_budget_interval": 2},
+    "absent": {},
+    "off": dict(_OFF),
+    "lifeline": dict(_OFF, prune_protected_faint_links=True),
+    "lifeline_grace3": dict(_OFF, prune_protected_faint_links=True, last_link_grace_steps=3),
+    "lifeline_grace0": dict(_OFF, prune_protected_faint_links=True, last_link_grace_steps=0),
+    "budget": dict(_OFF, **_BUDGET),
+    "lifeline_budget": dict(_BUDGET, prune_protected_faint_links=True, last_link_grace_steps=4),
 }
 
 SEEDS = list(range(8))
@@ -233,7 +236,7 @@ def test_prune_site(seed, flags, fallback):
     assert a == b
 
 
-@pytest.mark.parametrize("flags", ["off", "lifeline"])
+@pytest.mark.parametrize("flags", ["absent", "lifeline"])
 @pytest.mark.parametrize("seed", SEEDS)
 def test_competing_mode_unchanged(seed, flags):
     def act(mod, g, rng):
@@ -388,7 +391,7 @@ def _workload(rounds):
 
 
 @pytest.mark.parametrize("fallback", [False, True])
-@pytest.mark.parametrize("flags", ["off", "lifeline", "budget", "lifeline_budget"])
+@pytest.mark.parametrize("flags", ["absent", "off", "lifeline", "budget", "lifeline_budget"])
 @pytest.mark.parametrize("seed", SEEDS[:6])
 def test_whole_run(seed, flags, fallback):
     act0 = _workload(30)
@@ -410,7 +413,7 @@ CKPT = os.environ.get("NG_ONTO_S4_CKPT")
 
 
 @pytest.mark.skipif(not CKPT, reason="set NG_ONTO_S4_CKPT to a checkpoint COPY")
-@pytest.mark.parametrize("flags", os.environ.get("NG_ONTO_S4_CKPT_FLAGS", "off").split(","))
+@pytest.mark.parametrize("flags", os.environ.get("NG_ONTO_S4_CKPT_FLAGS", "absent").split(","))
 def test_checkpoint_copy(flags):
     assert LIVE_DIR not in os.path.abspath(CKPT), "refusing the live checkpoint"
     with open(CKPT, "rb") as f:
@@ -445,6 +448,19 @@ def test_checkpoint_copy(flags):
     gc.collect()
     b, rb = run_one(NF, raw, act, 7)
     gc.collect()
+    rep_path = os.environ.get("NG_ONTO_S4_CKPT_REPORT")
+    if rep_path:   # evidence for the review doc (sizes, digests, what the run actually did)
+        import hashlib
+        import json
+        with open(rep_path, "a") as f:
+            f.write(json.dumps({
+                "flags": flags, "ticks": ticks, "ckpt_sha256": hashlib.sha256(raw).hexdigest(),
+                "base_out_sha256": hashlib.sha256(a).hexdigest(), "branch_out_sha256": hashlib.sha256(b).hexdigest(),
+                "out_bytes": [len(a), len(b)], "prune": ra["prune"], "tel": ra["tel"],
+                "steps": [t for t in ra["trace"] if isinstance(t, tuple) and len(t) == 3 and isinstance(t[1], int)
+                          for t in [(len(t[0]), t[1], t[2])]],
+                "fired_entries_per_pp": [len(t) for t in ra["trace"] if isinstance(t, list)],
+                "identical": a == b and ra == rb}) + "\n")
     assert ra == rb
     assert a == b
 
