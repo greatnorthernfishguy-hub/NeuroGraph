@@ -28,6 +28,16 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — swept nodes' vectors are deleted by their owner
+# (PROTECTED CHANGE on review branch cc-laptop-vdb-lock-leak-20261004 ONLY; merges only after Josh's protected-file "proceed")
+# What: NeuroGraphMemory.__init__ registers _drop_collected_vectors on the graph's "nodes_collected" event (public
+#       register_event_handler) right after the vector store is restored; the handler deletes each node_ids entry
+#       through the now-locked SimpleVectorDB.delete. Fail-soft: one WARNING (count + exception class) per sweep with
+#       failures, never raises into step().
+# Why:  The orphan sweep removed nodes but their vectors stayed forever (5,849 dead vectors cleaned 2026-10-04). This
+#       object owns both stores, so the fix lives here (LAW 4), not in the graph and not in consumers.
+# How:  Runs inside the sweep under the graph's _step_lock: lock order graph -> vdb; the vdb lock is a leaf, so no
+#       deadlock. The graph is restored in place (never replaced), so the single registration persists.
 # [2026-09-11] Codex — Flush verified receipt artifacts before durable acknowledgment.
 # What: opt-in fsync barriers for files and publication directories.
 # Why: SQLite acceptance must not outlive buffered checkpoint writes.
@@ -898,6 +908,12 @@ class NeuroGraphMemory:
             except Exception as exc:
                 logger.warning("Failed to restore vector DB: %s", exc)
 
+        # [2026-10-04] lane vdb-lock-leak — this object owns BOTH the graph and the vector
+        # store, so it is where a swept node's vector is dropped (LAW 4). The graph is
+        # restored IN PLACE above (never replaced), and Graph.restore() does not touch
+        # _event_handlers, so one registration here lives as long as self.graph.
+        self.graph.register_event_handler("nodes_collected", self._drop_collected_vectors)
+
 
         # Ingestor with OpenClaw project config, respecting embedding_device
         ingestor_config = get_ingestor_config("openclaw")
@@ -1447,6 +1463,39 @@ class NeuroGraphMemory:
         for _ in range(n):
             results.append(self.graph.step())
         return results
+
+    def _drop_collected_vectors(self, node_ids=None, **_kwargs) -> None:
+        """``nodes_collected`` handler: delete each swept node's vector.
+
+        Runs INSIDE the orphan sweep while the graph holds ``_step_lock``; lock
+        order graph -> vdb is safe because SimpleVectorDB's lock is a leaf.
+        Fail-soft: a delete error is logged once per sweep at WARNING (count +
+        exception class names, never the message) and never raised into step().
+        An emit without ``node_ids`` (older engine) is a no-op.
+        """
+        if not node_ids:
+            return
+        total = 0
+        failed = 0
+        errors = set()
+        try:
+            vdb = self.vector_db
+            for nid in node_ids:
+                total += 1
+                try:
+                    vdb.delete(nid)
+                except Exception as exc:  # noqa: BLE001 - never escape into step()
+                    failed += 1
+                    errors.add(type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 - e.g. vector_db missing: the unattempted rest failed too
+            failed += max(len(node_ids) - total, 1)
+            errors.add(type(exc).__name__)
+        if failed:
+            logger.warning(
+                "orphan sweep: vector delete failed for %d of %d collected node(s) (%s); "
+                "those vectors remain",
+                failed, len(node_ids), ", ".join(sorted(errors)),
+            )
 
     def _guardian_meaningful_nodes(self) -> int:
         """#wire-explosion Guardian metric: count only nodes that represent Syl's

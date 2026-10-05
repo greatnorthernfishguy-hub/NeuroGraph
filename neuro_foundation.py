@@ -19,6 +19,13 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — orphan sweep names what it collected
+# (PROTECTED CHANGE on review branch cc-laptop-vdb-lock-leak-20261004 ONLY; merges only after Josh's protected-file "proceed")
+# What: _collect_orphan_nodes adds node_ids=<list of removed ids> to its existing "nodes_collected" emit (additive kwarg;
+#       count/timestep unchanged; every known listener takes **kwargs).
+# Why:  The graph has no reference to the vector store, so every swept node's vector leaked forever (5,849 dead vectors
+#       found 2026-10-04). LAW 4: the owner of the store (NeuroGraphMemory) must learn WHICH nodes went.
+# How:  removed ids collected in the existing removal loop; remove_node unchanged; no vector deletion happens here.
 # [2026-10-04] Claude (lane prune-lifeline, turn 2) — last-link fair-chance grace (Josh ruling 2026-10-04: "the very last link is also subject to the normal link decay ... the exact right balance")
 # (PROTECTED CHANGE on review branch cc-laptop-prune-lifeline-20261004 ONLY; active ONLY when prune_protected_faint_links is truthy)
 # What: _prune_synapses (default path, flag on) — after the three rules pick their removals, any NON-protected node that this
@@ -4505,12 +4512,16 @@ class Graph:
                     window_failures, ", ".join(sorted(window_errors)),
                 )
         removed = 0
+        removed_ids: List[str] = []
         for nid in orphans:
             if nid in self.nodes:
                 self.remove_node(nid)
                 removed += 1
+                removed_ids.append(nid)
         if removed:
-            self._emit("nodes_collected", count=removed, timestep=self.timestep)
+            # [2026-10-04] lane vdb-lock-leak: node_ids is ADDITIVE (count/timestep unchanged) so the
+            # owner of the vector store can drop exactly the collected nodes' vectors (LAW 4).
+            self._emit("nodes_collected", count=removed, timestep=self.timestep, node_ids=removed_ids)
         return removed
 
     def _sprout_synapses(self, fired_ids: List[str]) -> int:
