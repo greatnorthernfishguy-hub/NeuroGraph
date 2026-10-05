@@ -20,6 +20,19 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-05] Claude (lane nodestore-p1) — Graph.nodes may be backed by the native ng_tract.NodeStore (P1), OFF by default
+#   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p1-20261005 ONLY; Josh's 2026-10-05 go for this phase; merges only
+#    after his protected-file "proceed"; P1 merges switched OFF per D7)
+# What: Graph(config, *, native_node_store=None). The native store is used only when the installed ng_tract has NodeStore AND
+#       the opt-in is set: the keyword, or (keyword None) the NG_NATIVE_NODE_STORE environment variable (LAW 5; "1/true/yes/on").
+#       Otherwise self.nodes is today's dict of Node, and every line of the dict path runs exactly as before.
+#       When on: create_node returns the live NodeRef; _serialize_full emits the nodes sub-map as native msgpack bytes;
+#       write_checkpoint splices pre-packed bytes for "nodes" as it does for "synapses"; restore slices the raw nodes bytes
+#       and _deserialize hands them to NodeStore.bulk_load_msgpack (dict-form nodes, e.g. legacy JSON, take the existing loop).
+# Why:  spec superpowers/specs/2026-10-05-native-node-store-design.md P1 (D1 order-preserving removal, D3 KeyError on a
+#       removed NodeRef, D6 abi3-py38, D7). The opt-in is NOT a config key: config is saved inside the checkpoint, so a key
+#       would make ON and OFF checkpoints differ (and every OFF checkpoint differ from the trial tip).
+# How:  the checkpoint bytes are identical in both modes (tests/test_nodestore_p1.py); no other file changes.
 # [2026-10-05] Claude Opus 5.5 (Executive; native node store design P4a; PROTECTED CHANGE — merges only after Josh's
 #   protected-file go, given 2026-10-05: "Looks good. You are a go.") — restore shares identical large metadata texts.
 # What: _deserialize routes each node's string metadata values of >= _SHARE_TEXT_MIN chars through one per-restore pool,
@@ -637,6 +650,7 @@ import copy
 import json
 import logging
 import math
+import os
 import random
 import threading
 import uuid
@@ -757,6 +771,17 @@ class RingBuffer:
 # ---------------------------------------------------------------------------
 
 _SHARE_TEXT_MIN = 256   # P4a: only texts this long are worth pooling
+
+
+def _native_node_store_wanted(explicit: Optional[bool] = None) -> bool:
+    """P1 native node store opt-in (2026-10-05, lane nodestore-p1): the installed ng_tract must have NodeStore,
+    AND the caller must opt in — `explicit` when given, else the NG_NATIVE_NODE_STORE environment variable (LAW 5).
+    Default OFF: Graph.nodes stays a dict of Node."""
+    if not hasattr(ng_tract, "NodeStore"):
+        return False
+    if explicit is not None:
+        return bool(explicit)
+    return os.environ.get("NG_NATIVE_NODE_STORE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _share_metadata_texts(meta: Any, pool: Dict[str, str]) -> Any:
@@ -2004,11 +2029,19 @@ class Graph:
         config: Override any key from ``DEFAULT_CONFIG``.
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, *, native_node_store: Optional[bool] = None):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
 
         # --- Core collections (sparse) ---
-        self.nodes: Dict[str, Node] = {}
+        # [2026-10-05] P1 native node store: ng_tract.NodeStore (same mapping API; values are write-through
+        # NodeRef views) only when the wheel has it AND the opt-in is set — see _native_node_store_wanted.
+        self._native_nodes: bool = _native_node_store_wanted(native_node_store)
+        if self._native_nodes:
+            self.nodes = ng_tract.NodeStore()
+            self.nodes.set_node_class(Node)
+            self.nodes.set_ring_buffer_class(RingBuffer)
+        else:
+            self.nodes: Dict[str, Node] = {}
         # Native (Rust) columnar synapse store — replaces the former
         # Dict[str, Synapse].  Drops per-synapse Python object inflation; the
         # engine reads/writes via the Mapping facade (SynapseRef live proxies).
@@ -2341,6 +2374,8 @@ class Graph:
                 creation_time=int(self.timestep),
             )
             self.nodes[nid] = node
+            if self._native_nodes:
+                node = self.nodes[nid]   # [2026-10-05] P1: hand back the live NodeRef (the Node was copied in)
             self._outgoing[nid] = set()
             self._incoming[nid] = set()
             self._node_hyperedges[nid] = set()
@@ -6148,8 +6183,9 @@ class Graph:
             f.write(packer.pack_map_header(len(captured)))
             for key, value in captured.items():
                 f.write(packer.pack(key))
-                if key == "synapses" and isinstance(value, (bytes, bytearray)):
-                    f.write(value)  # verbatim pre-packed {sid: {15-key}} map
+                # [2026-10-05] P1: "nodes" is pre-packed bytes too when the native node store is on
+                if key in ("synapses", "nodes") and isinstance(value, (bytes, bytearray)):
+                    f.write(value)  # verbatim pre-packed {sid: {15-key}} / {nid: {19-key}} map
                 else:
                     f.write(packer.pack(value))
 
@@ -6188,7 +6224,7 @@ class Graph:
             n_pairs = unpacker.read_map_header()
             for _ in range(n_pairs):
                 key = unpacker.unpack()
-                if key == "synapses":
+                if key == "synapses" or (key == "nodes" and self._native_nodes):   # [2026-10-05] P1: nodes too, when native
                     start = unpacker.tell()
                     unpacker.skip()  # advance past the value WITHOUT inflating it
                     data[key] = raw[start:unpacker.tell()]  # raw sub-map bytes
@@ -6301,7 +6337,8 @@ class Graph:
         # every new row a second time. None preserves the legacy serializer's
         # aliasing contract. capture_checkpoint holds _step_lock throughout;
         # list(items()) alone would not provide a coherent mutation boundary.
-        _nodes      = list(self.nodes.items())
+        # [2026-10-05] P1: the native node store packs its own {nid: {19-key}} bytes (detached by construction)
+        _nodes      = None if self._native_nodes else list(self.nodes.items())
         _hyperedges = list(self.hyperedges.items())
         _archived   = list(self._archived_hyperedges.items())
         _act_preds  = list(self.active_predictions.items())
@@ -6318,7 +6355,8 @@ class Graph:
             "version": "0.4.2",
             "timestep": self.timestep,
             "config": copy.deepcopy(self.config, _memo) if _memo is not None else self.config,
-            "nodes": {nid: self._serialize_node(n, _memo=_memo) for nid, n in _nodes},
+            "nodes": (self.nodes.to_checkpoint_msgpack() if _nodes is None
+                      else {nid: self._serialize_node(n, _memo=_memo) for nid, n in _nodes}),
             # Native pre-packed synapses map (#RAM footprint): to_checkpoint_msgpack
             # emits the {synapse_id: {15-key}} MessagePack bytes directly from the Rust
             # columns — byte-identical to packb(to_checkpoint_dict()) but WITHOUT
@@ -6525,8 +6563,19 @@ class Graph:
         self._archived_hyperedges.clear()
 
         # Restore nodes
+        _nodes_data = data.get("nodes", {})
+        if self._native_nodes and isinstance(_nodes_data, (bytes, bytearray)):
+            # [2026-10-05] P1: raw nodes sub-map (sliced by restore) -> native bulk load. Same field defaults and
+            # P4a text sharing as the loop below; then the same per-node index setup, in the same order.
+            self.nodes.bulk_load_msgpack(_nodes_data)
+            for nid in self.nodes:
+                self._outgoing[nid] = set()
+                self._incoming[nid] = set()
+                self._node_hyperedges[nid] = set()
+                self._recent_spikes[nid] = deque(maxlen=20)
+            _nodes_data = {}
         _text_pool: Dict[str, str] = {}   # P4a: one object per distinct large metadata text (restore-local)
-        for nid, nd in data.get("nodes", {}).items():
+        for nid, nd in _nodes_data.items():
             lst = nd.get("last_spike_time")
             node = Node(
                 node_id=nid,
