@@ -33,6 +33,8 @@ Design principles (PRD §2.1):
 #       removed NodeRef, D6 abi3-py38, D7). The opt-in is NOT a config key: config is saved inside the checkpoint, so a key
 #       would make ON and OFF checkpoints differ (and every OFF checkpoint differ from the trial tip).
 # How:  the checkpoint bytes are identical in both modes (tests/test_nodestore_p1.py); no other file changes.
+#       Every read outside __init__ is getattr(self, "_native_nodes", False): duck-typed fakes that call Graph methods
+#       with their own `self` (tests' SerializerFake etc.) take the dict path exactly as before (spec §10.6).
 # [2026-10-05] Claude Opus 5.5 (Executive; native node store design P4a; PROTECTED CHANGE — merges only after Josh's
 #   protected-file go, given 2026-10-05: "Looks good. You are a go.") — restore shares identical large metadata texts.
 # What: _deserialize routes each node's string metadata values of >= _SHARE_TEXT_MIN chars through one per-restore pool,
@@ -2374,7 +2376,7 @@ class Graph:
                 creation_time=int(self.timestep),
             )
             self.nodes[nid] = node
-            if self._native_nodes:
+            if getattr(self, "_native_nodes", False):
                 node = self.nodes[nid]   # [2026-10-05] P1: hand back the live NodeRef (the Node was copied in)
             self._outgoing[nid] = set()
             self._incoming[nid] = set()
@@ -6224,7 +6226,7 @@ class Graph:
             n_pairs = unpacker.read_map_header()
             for _ in range(n_pairs):
                 key = unpacker.unpack()
-                if key == "synapses" or (key == "nodes" and self._native_nodes):   # [2026-10-05] P1: nodes too, when native
+                if key == "synapses" or (key == "nodes" and getattr(self, "_native_nodes", False)):   # [2026-10-05] P1: nodes too, when native
                     start = unpacker.tell()
                     unpacker.skip()  # advance past the value WITHOUT inflating it
                     data[key] = raw[start:unpacker.tell()]  # raw sub-map bytes
@@ -6338,7 +6340,7 @@ class Graph:
         # aliasing contract. capture_checkpoint holds _step_lock throughout;
         # list(items()) alone would not provide a coherent mutation boundary.
         # [2026-10-05] P1: the native node store packs its own {nid: {19-key}} bytes (detached by construction)
-        _nodes      = None if self._native_nodes else list(self.nodes.items())
+        _nodes      = None if getattr(self, "_native_nodes", False) else list(self.nodes.items())
         _hyperedges = list(self.hyperedges.items())
         _archived   = list(self._archived_hyperedges.items())
         _act_preds  = list(self.active_predictions.items())
@@ -6564,7 +6566,7 @@ class Graph:
 
         # Restore nodes
         _nodes_data = data.get("nodes", {})
-        if self._native_nodes and isinstance(_nodes_data, (bytes, bytearray)):
+        if getattr(self, "_native_nodes", False) and isinstance(_nodes_data, (bytes, bytearray)):
             # [2026-10-05] P1: raw nodes sub-map (sliced by restore) -> native bulk load. Same field defaults and
             # P4a text sharing as the loop below; then the same per-node index setup, in the same order.
             self.nodes.bulk_load_msgpack(_nodes_data)
