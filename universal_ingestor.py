@@ -46,6 +46,23 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — SimpleVectorDB gets its own leaf RLock (#270)
+#   What: SimpleVectorDB._lock (threading.RLock) guards embeddings/metadata/content in EVERY
+#         method (insert, search, get, delete, count, all_ids, capture_state, load) plus new
+#         locked accessors get_embedding / get_content / get_metadata / items_snapshot
+#         (deliberately NO __len__: it would make an empty store falsy for `if vdb` callers).
+#         __getstate__/__setstate__ drop and re-create the lock. load() decodes
+#         outside the lock and swaps the state in under it. search() copies (id, array)
+#         refs under the lock, scores outside it, re-validates under it.
+#   Why:  Recall searched the store with no lock while deposits, admin cleanups and (now)
+#         every orphan sweep add/delete from other threads -> "dictionary changed size during
+#         iteration" or half-updated entries. Josh: the fix must make concurrent access
+#         CORRECT, not merely less likely to fail.
+#   How:  The lock is a LEAF (documented in the class docstring): nothing under it calls the
+#         graph or takes a graph lock, so graph -> vdb ordering is deadlock-free. On-disk
+#         format unchanged (capture_state output byte-identical). Two legacy single-key
+#         dict.get reads (neuro_foundation seam split, neurograph_rpc) are left as-is and named
+#         in the class docstring: protected / Syl's RPC files, and a lone dict.get is GIL-atomic.
 # [2026-09-24b] Z12 CC (Sonnet 5) — Fix two stale hash-fallback docstring/changelog leftovers
 #   What: EmbeddingEngine's model_name config docstring and the Grok Review Changelog (v0.7.1)
 #         block below still described the now-deleted hash fallback as current behavior.
@@ -212,6 +229,7 @@ import os
 import re
 import tempfile
 import textwrap
+import threading
 import uuid
 import zipfile
 from pathlib import Path
@@ -352,6 +370,34 @@ class SimpleVectorDB:
     Provides cosine-similarity search over normalized vectors with
     content and metadata storage.
 
+    THREAD SAFETY (#270, [2026-10-04] lane vdb-lock-leak): the three parallel
+    dicts ``embeddings`` / ``metadata`` / ``content`` are guarded by ``self._lock``
+    (a ``threading.RLock``). EVERY method of this class that reads or writes them
+    does so under that lock, so a delete during a search, a capture during an
+    insert, etc. can never observe a half-updated entry or raise "dictionary
+    changed size during iteration". Code OUTSIDE this class must not iterate,
+    write, or combine reads across the dicts directly — use the locked accessors
+    (``get``, ``get_embedding``, ``get_content``, ``get_metadata``,
+    ``items_snapshot``, ``all_ids``, ``count``) or, for a multi-step read that
+    must be atomic, hold ``with db._lock:``. Two legacy single-key reads were
+    deliberately left as-is because their files are protected / Syl's RPC and a
+    lone ``dict.get(key)`` is atomic in CPython (it cannot raise or tear):
+    ``neuro_foundation.Graph._seam_cluster_periphery`` (``embeddings.get``) and
+    ``neurograph_rpc._gsg_backfill_existing_nodes`` / ``_surface_wants``
+    (``embeddings.get`` / ``content.get``). Convert them when those files are
+    next touched; do not add new ones.
+
+    LEAF LOCK CONTRACT: ``_lock`` is a leaf in the lock order. No method of this
+    class calls into the graph, invokes a callback, or acquires any graph lock
+    (``_step_lock``, ``_concurrent_lock``, ...) while holding it, and no caller
+    may do so either. Callers that already hold a graph lock may take this lock
+    (graph -> vdb, e.g. the ``nodes_collected`` handler inside the orphan sweep);
+    the reverse order is forbidden, which is what makes graph -> vdb deadlock-free.
+
+    The lock is never serialized: ``__getstate__`` drops it and ``__setstate__``
+    re-creates it, and the on-disk format (``capture_state``/``write_state``) is
+    unchanged.
+
     Example::
 
         db = SimpleVectorDB()
@@ -360,9 +406,25 @@ class SimpleVectorDB:
     """
 
     def __init__(self) -> None:
+        self._lock = self._make_lock()
         self.embeddings: Dict[str, np.ndarray] = {}
         self.metadata: Dict[str, Dict[str, Any]] = {}
         self.content: Dict[str, str] = {}
+
+    @staticmethod
+    def _make_lock() -> Any:
+        """The store's leaf lock. A seam only so tests can prove the lock is load-bearing."""
+        return threading.RLock()
+
+    def __getstate__(self) -> Dict[str, Any]:
+        with self._lock:
+            state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = self._make_lock()
 
     def insert(
         self,
@@ -379,9 +441,10 @@ class SimpleVectorDB:
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm
-        self.embeddings[id] = embedding
-        self.content[id] = content
-        self.metadata[id] = metadata or {}
+        with self._lock:
+            self.embeddings[id] = embedding
+            self.content[id] = content
+            self.metadata[id] = metadata or {}
 
     def search(
         self,
@@ -391,52 +454,113 @@ class SimpleVectorDB:
     ) -> List[Tuple[str, float]]:
         """Cosine similarity search, return top-k above threshold.
 
+        Locking: the (id, array) references are copied under the lock, the
+        dot products are computed OUTSIDE it (stored arrays are never mutated
+        in place — insert/load replace them — so the copied references stay
+        valid), and the ranked candidates are re-validated under the lock
+        before returning: an id deleted meanwhile is dropped, an id re-inserted
+        meanwhile is re-scored against its current vector. Every returned id
+        therefore exists, with that similarity, at the moment the lock is
+        released. Measured on 9k x 768-d entries the dot-product loop costs
+        ~18x the reference copy, so this keeps the lock (which the orphan sweep
+        takes while holding the graph step lock) held only briefly.
+
         Returns:
             List of (id, similarity) tuples sorted by descending similarity.
         """
-        if not self.embeddings:
-            return []
+        with self._lock:
+            if not self.embeddings:
+                return []
+            snapshot = list(self.embeddings.items())
 
         norm = np.linalg.norm(query_vector)
         if norm > 0:
             query_vector = query_vector / norm
 
-        results: List[Tuple[str, float]] = []
-        for id, emb in self.embeddings.items():
+        scored: List[Tuple[str, np.ndarray, float]] = []
+        for id, emb in snapshot:
             sim = float(np.dot(query_vector, emb))
             if sim >= threshold:
-                results.append((id, sim))
+                scored.append((id, emb, sim))
+        scored.sort(key=lambda x: x[2], reverse=True)
 
+        results: List[Tuple[str, float]] = []
+        rescored = False
+        with self._lock:
+            for id, emb, sim in scored:
+                if len(results) >= k and not rescored:
+                    break  # remaining candidates all rank below the k already kept
+                current = self.embeddings.get(id)
+                if current is None:
+                    continue  # deleted since the snapshot
+                if current is not emb:  # re-inserted since the snapshot
+                    rescored = True
+                    sim = float(np.dot(query_vector, current))
+                    if sim < threshold:
+                        continue
+                results.append((id, sim))
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:k]
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
         """Retrieve embedding, content, and metadata by ID."""
-        if id not in self.embeddings:
-            return None
-        return {
-            "id": id,
-            "embedding": self.embeddings[id],
-            "content": self.content[id],
-            "metadata": self.metadata[id],
-        }
+        with self._lock:
+            if id not in self.embeddings:
+                return None
+            return {
+                "id": id,
+                "embedding": self.embeddings[id],
+                "content": self.content[id],
+                "metadata": self.metadata[id],
+            }
+
+    def get_embedding(self, id: str) -> Optional[np.ndarray]:
+        """Return the stored (normalized) embedding for ``id``, or None."""
+        with self._lock:
+            return self.embeddings.get(id)
+
+    def get_content(self, id: str, default: Any = None) -> Any:
+        """Return the stored content for ``id``, or ``default``."""
+        with self._lock:
+            return self.content.get(id, default)
+
+    def get_metadata(self, id: str, default: Any = None) -> Any:
+        """Return the stored metadata dict for ``id`` (the live object), or ``default``."""
+        with self._lock:
+            return self.metadata.get(id, default)
+
+    def items_snapshot(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """Atomic snapshot of every entry as ``(id, content, metadata)``.
+
+        Taken under the lock in one pass, so the three fields of each row are
+        mutually consistent and the id set is the store's at one instant.
+        ``metadata`` values are the live dicts (same aliasing as :meth:`get`).
+        """
+        with self._lock:
+            return [
+                (id, self.content.get(id, ""), self.metadata.get(id, {}))
+                for id in self.embeddings
+            ]
 
     def delete(self, id: str) -> bool:
         """Remove an entry by ID. Returns True if found and deleted."""
-        if id not in self.embeddings:
-            return False
-        del self.embeddings[id]
-        del self.content[id]
-        del self.metadata[id]
-        return True
+        with self._lock:
+            if id not in self.embeddings:
+                return False
+            del self.embeddings[id]
+            del self.content[id]
+            del self.metadata[id]
+            return True
 
     def count(self) -> int:
         """Return number of stored entries."""
-        return len(self.embeddings)
+        with self._lock:
+            return len(self.embeddings)
 
     def all_ids(self) -> List[str]:
         """Return all stored IDs."""
-        return list(self.embeddings.keys())
+        with self._lock:
+            return list(self.embeddings.keys())
 
     # ---- Changelog ----
     # [2026-09-11] Claude (Sonnet 5) — #423: capture/write split
@@ -448,13 +572,20 @@ class SimpleVectorDB:
     # How:  Entry construction moved into capture_state (iterating a list() snapshot of
     #       the id set so a concurrent add/delete cannot mutate it mid-traversal);
     #       format dispatch + file write moved into write_state.
+    # [2026-10-04] Claude (lane vdb-lock-leak) — the entry references are taken under
+    #       self._lock in one pass, so the id set, embeddings, content and metadata are one
+    #       consistent instant (the list() snapshot alone could not prevent a mid-capture
+    #       delete); serialization runs after release. Format and bytes unchanged.
+    #       Ids are listed first and each embedding read by key, so the #423 KeyError refusal on an
+    #       uncoordinated (lock-bypassing) disappearance is preserved.
     # -------------------
     def capture_state(self, detach: bool = True) -> Dict[str, Any]:
         """Capture vector DB state in RAM — performs NO disk I/O.
 
         Embeddings are copied out as float32 ``bytes`` (already detached from the live
         arrays). ``content`` values are immutable strings. ``metadata`` dicts are the
-        LIVE objects unless ``detach=True``.
+        LIVE objects unless ``detach=True``. The entry references are taken under
+        ``self._lock`` (one consistent instant); serialization happens after release.
 
         Args:
             detach: When True, deep-copy each entry's metadata so no live mutable dict
@@ -466,17 +597,26 @@ class SimpleVectorDB:
         """
         import numpy as np
 
+        # The consistent instant is taken under the lock: the (id, array, content,
+        # metadata) references of every entry. Serialization runs after release —
+        # safe because nothing in this class mutates a stored value in place (insert /
+        # load REPLACE the array, string and metadata objects), so the references
+        # captured here cannot change underneath the copy. Measured on 9k x 768-d
+        # entries this cuts the lock hold from ~350 ms CPU to a few ms, so recall is
+        # not stalled behind a checkpoint capture.
+        # The #423 refusal is kept: ids are listed first and each embedding is read by
+        # key, so an entry that disappears through an UNCOORDINATED (lock-bypassing)
+        # mutation still raises KeyError instead of silently publishing a smaller set.
+        with self._lock:
+            refs = [
+                (id, self.embeddings[id], self.content.get(id, ""), self.metadata.get(id, {}))
+                for id in list(self.embeddings.keys())
+            ]
         entries: Dict[str, Any] = {}
-        # list() the ids first: a concurrent add/delete during the traversal would
-        # otherwise raise "dictionary changed size during iteration" mid-capture.
-        for id in list(self.embeddings.keys()):
-            # Disappearing entries indicate an uncoordinated mutation. Refuse
-            # the capture rather than silently publishing a smaller vector set.
-            emb = self.embeddings[id]
-            meta = self.metadata.get(id, {})
+        for id, emb, content, meta in refs:
             entries[id] = {
                 "embedding": emb.astype(np.float32).tobytes(),
-                "content": self.content.get(id, ""),
+                "content": content,
                 "metadata": copy.deepcopy(meta) if detach else meta,
             }
         # Key order matches the pre-split save() exactly, so the packed bytes are
@@ -584,12 +724,12 @@ class SimpleVectorDB:
                     "metadata": entry.get("metadata", {}),
                 }
 
-        # Clear existing state
-        self.embeddings.clear()
-        self.content.clear()
-        self.metadata.clear()
-
-        # Restore entries
+        # Decode every entry OUTSIDE the lock, then swap the whole state in under
+        # it ([2026-10-04] lane vdb-lock-leak) — readers see either the old store
+        # or the fully loaded one, never a cleared/half-filled one.
+        new_embeddings: Dict[str, np.ndarray] = {}
+        new_content: Dict[str, str] = {}
+        new_metadata: Dict[str, Dict[str, Any]] = {}
         for id, entry in data.get("entries", {}).items():
             embedding_bytes = entry["embedding"]
             vec = np.frombuffer(embedding_bytes, dtype=np.float32).copy()
@@ -598,11 +738,20 @@ class SimpleVectorDB:
             norm = np.linalg.norm(vec)
             if norm > 0:
                 vec = vec / norm
-            self.embeddings[id] = vec
-            self.content[id] = entry.get("content", "")
-            self.metadata[id] = entry.get("metadata", {})
+            new_embeddings[id] = vec
+            new_content[id] = entry.get("content", "")
+            new_metadata[id] = entry.get("metadata", {})
 
-        return len(self.embeddings)
+        with self._lock:
+            # Clear existing state (same dict objects, so any holder of a reference
+            # to these dicts keeps seeing the live store)
+            self.embeddings.clear()
+            self.content.clear()
+            self.metadata.clear()
+            self.embeddings.update(new_embeddings)
+            self.content.update(new_content)
+            self.metadata.update(new_metadata)
+            return len(self.embeddings)
 
 
 

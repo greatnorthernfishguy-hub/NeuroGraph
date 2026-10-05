@@ -3,6 +3,8 @@
 # [2026-09-11] Codex — replace constructor-based native draft with isolated tests.
 # What: exercise real persistence methods without importing Graph or embedding modules.
 # Why: offline repair must not instantiate NG/models or touch live state.
+# [2026-10-04] Claude (lane vdb-lock-leak) — VectorFake carries a _lock: the transplanted
+#   SimpleVectorDB methods now take the store's own leaf RLock (#270). Assertions unchanged.
 # How: AST extraction; detached mutable payloads, independent msgpack decoding, barriers.
 # -------------------
 import ast
@@ -59,6 +61,7 @@ class VectorFake:
         self.embeddings = {'n': np.array([1.,2.], dtype=np.float32)}
         self.content = {'n': 'raw experience'}
         self.metadata = {'n': {'nested': [1]}}
+        self._lock = threading.RLock()  # [2026-10-04] lane vdb-lock-leak: SimpleVectorDB's own leaf lock (#270)
 for name, fn in methods('universal_ingestor.py', 'SimpleVectorDB', {'capture_state','write_state','save'}).items():
     setattr(VectorFake, name, fn)
 

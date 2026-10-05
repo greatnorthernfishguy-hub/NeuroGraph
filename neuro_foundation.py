@@ -20,6 +20,13 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — orphan sweep names what it collected
+# (PROTECTED CHANGE on review branch cc-laptop-vdb-lock-leak-20261004 ONLY; merges only after Josh's protected-file "proceed")
+# What: _collect_orphan_nodes adds node_ids=<list of removed ids> to its existing "nodes_collected" emit (additive kwarg;
+#       count/timestep unchanged; every known listener takes **kwargs).
+# Why:  The graph has no reference to the vector store, so every swept node's vector leaked forever (5,849 dead vectors
+#       found 2026-10-04). LAW 4: the owner of the store (NeuroGraphMemory) must learn WHICH nodes went.
+# How:  removed ids collected in the existing removal loop; remove_node unchanged; no vector deletion happens here.
 # [2026-10-05] Claude (lane rust-hotpaths-onto-s4) — the overnight native hot-path conversion, rebased onto trial s4
 # (PROTECTED CHANGE; Josh 2026-10-05: "you have my approval for the overnight Rust review as soon as resources permit it";
 #  REVIEW branch cc-laptop-rust-hotpaths-onto-s4-20261005 only — not merged, not deployed)
@@ -4701,12 +4708,16 @@ class Graph:
                     window_failures, ", ".join(sorted(window_errors)),
                 )
         removed = 0
+        removed_ids: List[str] = []
         for nid in orphans:
             if nid in self.nodes:
                 self.remove_node(nid)
                 removed += 1
+                removed_ids.append(nid)
         if removed:
-            self._emit("nodes_collected", count=removed, timestep=self.timestep)
+            # [2026-10-04] lane vdb-lock-leak: node_ids is ADDITIVE (count/timestep unchanged) so the
+            # owner of the vector store can drop exactly the collected nodes' vectors (LAW 4).
+            self._emit("nodes_collected", count=removed, timestep=self.timestep, node_ids=removed_ids)
         return removed
 
     def _sprout_synapses(self, fired_ids: List[str]) -> int:

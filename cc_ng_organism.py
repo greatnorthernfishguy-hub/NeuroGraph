@@ -3,6 +3,11 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — vector-store reads go through SimpleVectorDB's locked accessors (#270)
+# What: surface_wants_for_graph / surface_wants read content via vdb.get_content(nid).
+# Why:  SimpleVectorDB is now guarded by its own leaf lock; direct reads of its embeddings/content/metadata
+#       dicts from outside the class bypassed it and could race concurrent add/delete (orphan sweep, deposits).
+# How:  Same values, read under the store's lock; no behaviour change.
 # [2026-10-04] Claude (lane 922) — no embedding runs while the provider_context caller holds the graph lock (#922).
 #   What: new CCRecallEmbeddings + cc_recall_prepare(ng, query) (lock-free: the harvest embedder's embed_text(query),
 #   which its own LRU cache keeps, and ng_embed.embed(query) for GSG) and pith_provider_context_prepare(ng, **kwargs)
@@ -1867,7 +1872,7 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
                 continue
             if meta.get("creation_mode") != "conversational":
                 continue
-            content = (vdb.content.get(nid) if vdb is not None else "") or ""
+            content = (vdb.get_content(nid) if vdb is not None else "") or ""  # locked accessor (#270)
             if "[WANT]" not in content:
                 continue
             for m in re.finditer(r'\[WANT\](.*?)\[/WANT\]', content, re.DOTALL):
@@ -2875,7 +2880,7 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
                 continue
             if meta.get("creation_mode") != "conversational":
                 continue
-            content = (vector_db.content.get(nid) if vector_db is not None else "") or ""
+            content = (vector_db.get_content(nid) if vector_db is not None else "") or ""  # locked accessor (#270)
             if "WANT]" not in content:
                 continue
             parsed = parse_wants(content)
