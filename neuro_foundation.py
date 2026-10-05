@@ -1307,16 +1307,15 @@ class STDPRule(PlasticityRule):
         self.A_minus = A_minus
         self.learning_rate = learning_rate
 
+    # [2026-10-05] apply() commits each pass with ONE native SynapseStore.apply_stdp_dw call
+    # (this body, batched); _apply_dw stays as the fallback for an ng_tract without it
+    # (_apply_stdp_dw_python). Unchanged from the trial.
     def _apply_dw(self, syn: Synapse, dw: float, timestep: int,
                   three_factor: bool) -> None:
         """Apply weight change directly or via eligibility trace.
 
         In three-factor mode (PRD §5.2), STDP creates the eligibility trace
         but weight change only commits when reward arrives via inject_reward.
-
-        [2026-10-05] apply() now commits each pass with ONE native
-        SynapseStore.apply_stdp_dw call (the same body, batched); this method is the
-        fallback for an ng_tract without it (_apply_stdp_dw_python).
         """
         if three_factor:
             syn.eligibility_trace += dw
