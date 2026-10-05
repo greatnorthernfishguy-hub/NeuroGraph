@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 922) — host/daemon parity covers the lock-free prepare (#922).
+# What: the fake _Lock gains acquire/release (the laptop daemon's bounded wait, daa7d2cf, made the
+#   parity test raise AttributeError); both wrappers must call pith_provider_context_prepare with
+#   the request kwargs OUTSIDE the lock and pass its result as prepared= to the graph step inside it.
+# Why: punchlist #922 -- no embedding while the graph lock is held; the two wrappers must not drift.
+# How: fake prepare asserts lock depth 0 and returns a token the fake graph step must receive.
 # [2026-09-30] Z12 worker (Claude Sonnet 5.5, Claude Code) — #813: no prose shortening
 # What: test_total_context_bound_fits_oversized_connected_line_without_tearing becomes
 #   test_total_context_bound_drops_oversized_connected_line_whole_without_tearing: an
@@ -47,6 +53,14 @@ class _Lock:
         return self
 
     def __exit__(self, *_args):
+        self.depth -= 1
+
+    # The laptop daemon takes the lock with a bounded wait (daa7d2cf); the VPS host uses `with`.
+    def acquire(self, blocking=True, timeout=-1):
+        self.depth += 1
+        return True
+
+    def release(self):
         self.depth -= 1
 
 
@@ -508,12 +522,21 @@ def test_vps_host_and_laptop_daemon_have_identical_closed_contract(monkeypatch, 
         "anchors": [], "warnings": [], "assemblies": int(state == "ok"),
     }
     seen = []
+    prepared_token = object()
+    prepared_calls = []
+
+    def fake_prepare(got_ng, **kwargs):
+        # #922: the embeddings are computed BEFORE the lock, with the same kwargs.
+        assert graph._concurrent_lock.depth == 0
+        prepared_calls.append((got_ng, kwargs))
+        return prepared_token
 
     def fake_provider(got_ng, **kwargs):
         assert graph._concurrent_lock.depth == 1
         seen.append((got_ng, kwargs))
         return dict(sentinel)
 
+    monkeypatch.setattr(pith, "pith_provider_context_prepare", fake_prepare)
     monkeypatch.setattr(pith, "pith_provider_context", fake_provider)
     monkeypatch.setattr(cc_ng_host._STATE, "cc_ng", ng)
     monkeypatch.setattr(cc_ng_host._STATE, "conv_state", conv)
@@ -532,14 +555,18 @@ def test_vps_host_and_laptop_daemon_have_identical_closed_contract(monkeypatch, 
     assert host_result == daemon_result == sentinel
     assert cc_ng_host._DISPATCH["provider_context"] is cc_ng_host._handle_provider_context
     assert daemon.DISPATCH["provider_context"] is daemon.handle_provider_context
-    assert len(seen) == 2
+    assert len(seen) == 2 and len(prepared_calls) == 2
+    request = {
+        "current_instruction": "continue", "quest_focus": "quest",
+        "conv_state": conv, "commons": commons,
+        "budget_chars": 1000, "root_count": 4,
+    }
+    for got_ng, kwargs in prepared_calls:
+        assert got_ng is ng
+        assert kwargs == request
     for got_ng, kwargs in seen:
         assert got_ng is ng
-        assert kwargs == {
-            "current_instruction": "continue", "quest_focus": "quest",
-            "conv_state": conv, "commons": commons,
-            "budget_chars": 1000, "root_count": 4,
-        }
+        assert kwargs == {**request, "prepared": prepared_token}
 
 
 def test_same_graph_context_is_model_agnostic_without_transcript_replay(monkeypatch):

@@ -27,6 +27,12 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 922) — _handle_provider_context embeds the cue BEFORE taking _concurrent_lock.
+# What: cc_ng_organism.pith_provider_context_prepare(ng, **kwargs) runs lock-free; pith_provider_context(..., prepared=)
+#   runs under the lock, so no ONNX embedding happens while the graph lock is held.
+# Why: punchlist #922 (laptop SIGUSR1 dump: 66+ provider_context requests queued behind a GSG ONNX embed under the
+#   lock). Kept in step with the laptop daemon's wrapper (the host/daemon closed-contract parity test).
+# How: prepare is optional (ImportError -> the old single call); results identical; not deployed by this lane.
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 r2 — #643 comment wording (P187 finding 2)
 # What: the _autosave_loop #643 comment is reworded comment-only — the dual pass
@@ -1030,6 +1036,16 @@ def _handle_provider_context(data):
         "budget_chars": data.get("budget_chars"),
         "root_count": data.get("root_count"),
     }
+    # #922: the cue's embeddings (ONNX) are computed HERE, before the lock; under the
+    # lock only the graph step runs.  Same shape as the laptop daemon's wrapper.
+    try:
+        from cc_ng_organism import pith_provider_context_prepare
+    except Exception:
+        pith_provider_context_prepare = None
+    if pith_provider_context_prepare is not None:
+        prepared = pith_provider_context_prepare(ng, **kwargs)
+        if prepared is not None:
+            kwargs["prepared"] = prepared
     lock = getattr(graph, "_concurrent_lock", None) if graph is not None else None
     if lock is not None:
         with lock:

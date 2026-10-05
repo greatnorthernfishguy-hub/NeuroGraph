@@ -3,6 +3,17 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 922) — no embedding runs while the provider_context caller holds the graph lock (#922).
+#   What: new CCRecallEmbeddings + cc_recall_prepare(ng, query) (lock-free: the harvest embedder's embed_text(query),
+#   which its own LRU cache keeps, and ng_embed.embed(query) for GSG) and pith_provider_context_prepare(ng, **kwargs)
+#   (same kwargs as the graph step; one cue builder, _pith_provider_cue, shared by both). cc_pattern_completion_recall,
+#   pith_provider_context gain prepared=None and cc_gsg_rescore gains query_emb=None; with them the graph step computes
+#   no embedding (the harvest's embed_text is a cache hit -- _cc_hold_harvest_vector re-inserts the same vector if it
+#   was evicted -- a failed prepare is treated exactly as the in-lock embed failing would have been).
+#   Why: SIGUSR1 dump 2026-10-04 15:00: 66+ provider_context requests queued on _concurrent_lock while the holder ran
+#   cc_gsg_rescore -> ng_embed.embed -> ONNX (and _harvest_associations' embed_text before it) on #812's whole-text cues.
+#   How: LAW 4 split -- prepare (no graph state) / graph step (no embedding); defaults keep every existing call
+#   byte-identical; ng_embed.py, openclaw_hook.py and every protected file are untouched. Results identical (tests).
 # [2026-10-04] Claude (lane emergent-want-labels) — generate_emergent_want's want_text is built from the referenced nodes'
 #   OWN words, never raw node ids. What: new _cc_emergent_want_label(node, vdb_entry, node_id): a tree speaks with its own
 #   _concept (tree-first, the _pith_node_raw_text rule; must pass _cc_concept_passes_floor), everything else through the
@@ -4913,7 +4924,8 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                                     threshold: float = _CC_RECALL_PRIME_THRESHOLD,
                                     state: Optional[Dict[str, Any]] = None,
                                     preserve_graph_config: bool = False,
-                                    on_error: Optional[Any] = None) -> List[Dict[str, Any]]:
+                                    on_error: Optional[Any] = None,
+                                    prepared: Optional["CCRecallEmbeddings"] = None) -> List[Dict[str, Any]]:
     """Substrate-native pattern-completion recall for CC's hook surfacing
     (#358 rebuild -- replaces the bare ng.recall() cosine search this
     function originally wrapped; LAW 3 rebuild-in-place, same contract).
@@ -4948,11 +4960,23 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
 
     content is the node's WHOLE resolved text (#812: the shared resolver has no default
     bound; the size budget decides how MANY items a render carries, never how much of one).
+
+    prepared (#922): the query's embeddings from cc_recall_prepare(ng, query), computed
+    BEFORE the caller took the graph lock. With it this function computes no embedding:
+    the harvest's embed is a cache hit on the prepared vector, a 'failed' prepare means
+    the harvest yields nothing (what _harvest_associations returns when its own embed
+    raises), and GSG uses the prepared vector (or is skipped, as its fail-soft would).
+    A prepared for a different query is ignored. None (default) = behaviour unchanged.
     """
     if not query or ng is None:
         return []
+    if prepared is not None and getattr(prepared, "query", None) != query:
+        prepared = None
     try:
         from surface_resolver import resolve_surface_content
+        harvest_skip = prepared is not None and prepared.harvest_status == "failed"
+        if prepared is not None and prepared.harvest_status == "warm":
+            _cc_hold_harvest_vector(ng, prepared)
         novelty = cc_novelty(state, ng.graph) if state is not None else 0.5
         cfg = ng.graph.config
         old_max = cfg.get("max_surfaced", 10)
@@ -4967,7 +4991,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             # prime_and_propagate read mode disables plasticity and restores
             # transient voltages/refractory state after observational ignition;
             # it exposes current learned topology without teaching the graph.
-            surfaced = ng._harvest_associations(
+            surfaced = [] if harvest_skip else ng._harvest_associations(
                 query,
                 novelty=novelty,
                 max_surfaced_override=harvest_max,
@@ -4984,7 +5008,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             if _CC_RECALL_PROP_STEPS > 0:
                 cfg["propagation_steps"] = _CC_RECALL_PROP_STEPS
             try:
-                surfaced = ng._harvest_associations(query, novelty=novelty)
+                surfaced = [] if harvest_skip else ng._harvest_associations(query, novelty=novelty)
             finally:
                 cfg["max_surfaced"] = old_max
                 cfg["prime_threshold"] = old_thresh
@@ -5034,7 +5058,11 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                 surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
 
         # GSG geodesic re-score -- canonical rpc.py:2991-3038
-        surfaced = cc_gsg_rescore(surfaced, query, ng.graph)
+        if prepared is None:
+            surfaced = cc_gsg_rescore(surfaced, query, ng.graph)
+        elif not prepared.gsg_failed:
+            surfaced = cc_gsg_rescore(surfaced, query, ng.graph, query_emb=prepared.gsg_emb)
+        # (a prepared whose GSG embed failed: un-rescored, as cc_gsg_rescore's fail-soft returns it)
 
         # (#813: the Stage 4 proximity-keyed LOD staging -- a far promoted node shown
         # as a keyframe -- is removed.  It discarded the keyframe's delta, which is a
@@ -5398,21 +5426,113 @@ def cc_novelty(state: dict, graph) -> float:
         return state.get("novelty_ema", 0.5) if isinstance(state, dict) else 0.5
 
 
-def cc_gsg_rescore(surfaced, query_text: str, graph):
+@dataclass(frozen=True)
+class CCRecallEmbeddings:
+    """The query embeddings one recall needs, computed BEFORE the graph lock (#922).
+
+    Produced only by cc_recall_prepare(); consumed by cc_pattern_completion_recall(prepared=).
+    It holds no graph state: every field is a pure function of `query` and the embedder.
+
+    harvest_status: 'warm' (the harvest embedder's own embed_text(query) ran and its vector is
+    harvest_vec), 'failed' (that call raised -- the graph step then treats the harvest exactly
+    as _harvest_associations treats its own embed failure: nothing surfaces from it), or
+    'absent' (ng exposes no ingestor.embedder; the harvest runs as it always did).
+    gsg_emb: ng_embed.embed(query), or None with gsg_failed=True when that raised (the graph
+    step then skips the GSG re-score, exactly as cc_gsg_rescore's own fail-soft does).
+    """
+    query: str
+    harvest_status: str
+    harvest_vec: Any = None
+    gsg_emb: Any = None
+    gsg_failed: bool = False
+
+
+def _cc_harvest_embedder(ng: Any) -> Any:
+    """The embedder ng._harvest_associations embeds its query with (self.ingestor.embedder)."""
+    embedder = getattr(getattr(ng, "ingestor", None), "embedder", None)
+    return embedder if callable(getattr(embedder, "embed_text", None)) else None
+
+
+def cc_recall_prepare(ng: Any, query: str) -> Optional[CCRecallEmbeddings]:
+    """LOCK-FREE half of pattern-completion recall (#922): compute the query's embeddings.
+
+    Call WITHOUT holding graph._concurrent_lock / _step_lock. Reads no graph state; touches
+    only the embedders. Never raises: None when there is nothing to prepare (empty query, no
+    ng) or on an unexpected error -- the graph step then runs exactly as before.
+    Two embeddings, the same two the graph step would otherwise compute under the lock:
+    (1) the harvest embedder's embed_text(query) -- its own LRU cache keeps the vector, so
+    the harvest's identical call inside the lock is a cache hit, not an ONNX run;
+    (2) ng_embed.embed(query) for the GSG geodesic re-score.
+    """
+    if not query or ng is None:
+        return None
+    try:
+        harvest_status, harvest_vec = "absent", None
+        embedder = _cc_harvest_embedder(ng)
+        if embedder is not None:
+            try:
+                harvest_vec = embedder.embed_text(query)
+                harvest_status = "warm"
+            except Exception as exc:
+                logger.debug("cc_recall_prepare: harvest embed failed (non-fatal): %s", exc)
+                harvest_status = "failed"
+        gsg_emb, gsg_failed = None, False
+        try:
+            from ng_embed import embed as _embed
+            gsg_emb = _embed(query)
+        except Exception as exc:
+            logger.debug("cc_recall_prepare: GSG embed failed (non-fatal): %s", exc)
+            gsg_failed = True
+        return CCRecallEmbeddings(query=query, harvest_status=harvest_status,
+                                  harvest_vec=harvest_vec, gsg_emb=gsg_emb,
+                                  gsg_failed=gsg_failed)
+    except Exception as exc:
+        logger.debug("cc_recall_prepare failed (non-fatal): %s", exc)
+        return None
+
+
+def _cc_hold_harvest_vector(ng: Any, prepared: CCRecallEmbeddings) -> None:
+    """Keep the prepared harvest vector in the harvest embedder's LRU cache (#922).
+
+    Between cc_recall_prepare and the lock another thread's embeds can evict it; re-inserting
+    the SAME vector makes the harvest's embed_text a cache hit, i.e. what it returns is what
+    it would have computed, with no ONNX run while the lock is held. Uses the engine's own
+    cache helpers when present (universal_ingestor.EmbeddingEngine); a different embedder is
+    left alone. Never raises.
+    """
+    try:
+        embedder = _cc_harvest_embedder(ng)
+        key_of = getattr(embedder, "_cache_key", None)
+        cache = getattr(embedder, "_cache", None)
+        put = getattr(embedder, "_update_cache", None)
+        if not (callable(key_of) and callable(put)) or cache is None:
+            return
+        key = key_of(prepared.query)
+        if key not in cache:
+            put(key, prepared.harvest_vec)
+    except Exception as exc:
+        logger.debug("cc harvest vector hold skipped (non-fatal): %s", exc)
+
+
+def cc_gsg_rescore(surfaced, query_text: str, graph, query_emb=None):
     """GSG geodesic re-scoring for CC's surfacing (#358) — port of canonical
     handle_assemble()'s GSG block (neurograph_rpc.py:2991-3038), parameterized
     on graph (C1). Nodes geometrically close to the query in Poincaré-ball /
     spherical space get a strength bonus (max _CC_GSG_SCORE_BONUS as dist->0);
     list re-sorted once if any bonus applied. Fails soft: any error returns
     the list un-rescored (canonical wraps identically).
+
+    query_emb (#922): the query's embedding, precomputed OUTSIDE the graph lock
+    (cc_recall_prepare). None (the default) = embed query_text here, as before.
     """
     try:
         if not surfaced or not query_text or graph is None:
             return surfaced
         import numpy as _np
         import math as _math
-        from ng_embed import embed as _embed
-        query_emb = _embed(query_text)
+        if query_emb is None:
+            from ng_embed import embed as _embed
+            query_emb = _embed(query_text)
         query_dir = _cc_embed_to_poincare_dir(query_emb)
         query_pt = query_dir * _CC_GSG_LAYER_NORMS[0]      # fresh query = Layer 0
         applied = 0
@@ -7452,11 +7572,53 @@ def _pith_provider_unavailable(reason: str) -> Dict[str, Any]:
     }
 
 
+def _pith_provider_cue(current_instruction: Any, quest_focus: Any) -> Optional[str]:
+    """The recall cue pith_provider_context builds from a VALID request, else None.
+
+    One definition shared by pith_provider_context and pith_provider_context_prepare so
+    the prepared embeddings are always for the exact cue the graph step recalls with."""
+    if not isinstance(current_instruction, str) or not current_instruction.strip():
+        return None
+    if len(current_instruction) > _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS:
+        return None
+    if quest_focus is None:
+        quest_focus = ""
+    if not isinstance(quest_focus, str) or len(quest_focus) > _CC_PITH_PROVIDER_MAX_QUEST_CHARS:
+        return None
+    cue = current_instruction.strip()
+    if quest_focus.strip():
+        cue += "\n\n" + quest_focus.strip()
+    return cue
+
+
+def pith_provider_context_prepare(ng: Any, current_instruction: Any = None,
+                                  quest_focus: Any = "", **_graph_step_kwargs: Any
+                                  ) -> Optional["CCRecallEmbeddings"]:
+    """LOCK-FREE half of pith_provider_context (#922): the cue's embeddings.
+
+    Call WITHOUT holding graph._concurrent_lock, then pass the result to
+    pith_provider_context(..., prepared=) under the lock. Accepts the same keyword
+    arguments as pith_provider_context (the graph-step ones are ignored) so a wrapper
+    can hand both the same kwargs. Reads no graph state. Never raises: None for a
+    request pith_provider_context will refuse anyway, or on any error -- the graph
+    step then runs exactly as it always did.
+    """
+    try:
+        cue = _pith_provider_cue(current_instruction, quest_focus)
+        if cue is None or getattr(ng, "graph", None) is None:
+            return None
+        return cc_recall_prepare(ng, cue)
+    except Exception as exc:
+        logger.debug("pith_provider_context_prepare failed (non-fatal): %s", exc)
+        return None
+
+
 def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = "",
                           conv_state: Optional[Dict[str, Any]] = None,
                           commons: Any = None,
                           budget_chars: Optional[int] = None,
-                          root_count: Optional[int] = None) -> Dict[str, Any]:
+                          root_count: Optional[int] = None,
+                          prepared: Optional["CCRecallEmbeddings"] = None) -> Dict[str, Any]:
     """Construct a fresh provider-ready situational model from CC's live SNN.
 
     `current_instruction` and the already-rendered `quest_focus` orient attention
@@ -7468,6 +7630,10 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
 
     Closed result states are ``ok``, ``empty``, and ``unavailable``.  There is no
     heuristic, faux, transcript-replay, or raw-history fallback.
+
+    prepared (#922): pith_provider_context_prepare()'s result, computed before the
+    caller took graph._concurrent_lock; with it no embedding runs inside this call.
+    None (default) = behaviour unchanged.  Results are identical either way.
     """
     if not isinstance(current_instruction, str) or not current_instruction.strip():
         return _pith_provider_unavailable("invalid_instruction")
@@ -7489,9 +7655,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
             or not 1 <= roots <= 24):
         return _pith_provider_unavailable("invalid_root_count")
 
-    cue = current_instruction.strip()
-    if quest_focus.strip():
-        cue += "\n\n" + quest_focus.strip()
+    cue = _pith_provider_cue(current_instruction, quest_focus)  # validated above: never None here
     try:
         core = render_constitutional_core(graph)
         if not core:
@@ -7506,8 +7670,11 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
         # prediction cannot become a situational root merely because it was in
         # the conversation state's prefetch set.
         recall_state["primed_nodes"] = {}
+        pc_extra: Dict[str, Any] = {}
+        if prepared is not None:
+            pc_extra["prepared"] = prepared   # the default call stays byte-identical
         surfaced = cc_pattern_completion_recall(
-            ng, cue, roots, state=recall_state, preserve_graph_config=True)
+            ng, cue, roots, state=recall_state, preserve_graph_config=True, **pc_extra)
         # The budget breathes with arousal and the confidence of the region
         # that just fired for this cue (Shared Graduation, Packet 175a).
         budget = budget_chars if budget_chars is not None else cc_l1_budget(
