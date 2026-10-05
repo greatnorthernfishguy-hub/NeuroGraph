@@ -1,3 +1,4 @@
+# [2026-10-05] Claude (lane rust-hotpaths-onto-s4) — _deposit_substrate_metrics reads synapses.weights_copy() (overnight d0e3a40 rebased onto trial s4) / why: ~0.3-0.5 s per afterTurn of per-SynapseRef churn; review branch
 """
 NeuroGraph JSON-RPC Bridge — OpenClaw ContextEngine integration.
 
@@ -12,6 +13,14 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-05] Claude (lane rust-hotpaths-onto-s4, review branch cc-laptop-rust-hotpaths-onto-s4-20261005)
+#   What: carries the overnight lane's change below (d0e3a40) onto trial s4 unchanged.
+#   Why:  Josh approved integrating the overnight Rust hot-path review (2026-10-05).
+#   How:  weights_copy() has been on SynapseStore since the store landed (no fallback needed).
+# [2026-10-04] Claude (overnight Rust review, unmerged branch cc-laptop-rust-hotpaths-20261004)
+#   What: _deposit_substrate_metrics takes synapse weights from synapses.weights_copy().
+#   Why:  the per-SynapseRef list cost ~0.3-0.5 s per afterTurn on a 193K-synapse graph.
+#   How:  same values, same order -> identical np.mean/np.std.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2 (e): Substrate Context renders WHOLE
 # What: _format_substrate_context no longer re-clips `surfaced` / `ces_surfaced` items to 300
 #   chars (content[:297] + "..."). Nothing else in this file changes.
@@ -1119,8 +1128,8 @@ def _deposit_substrate_metrics(step_result, to_jsonl: bool = True) -> None:
     _weight_mean = _weight_std = _firing_rate_mean = _firing_rate_std = 0.0
     try:
         import numpy as _np
-        _weights = [s.weight for s in _memory.graph.synapses.values()]
-        if _weights:
+        _weights = _memory.graph.synapses.weights_copy()  # [2026-10-04] native column copy, same order/values
+        if len(_weights):
             _weight_mean = float(_np.mean(_weights))
             _weight_std = float(_np.std(_weights))
         _rates = [n.firing_rate_ema for n in _memory.graph.nodes.values()]
