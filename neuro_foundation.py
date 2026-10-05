@@ -20,6 +20,14 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-05] Claude Opus 5.5 (Executive; native node store design P4a; PROTECTED CHANGE — merges only after Josh's
+#   protected-file go, given 2026-10-05: "Looks good. You are a go.") — restore shares identical large metadata texts.
+# What: _deserialize routes each node's string metadata values of >= _SHARE_TEXT_MIN chars through one per-restore pool,
+#       so identical texts (a turn's _forest_content copied onto every tree of that turn: 2,472 distinct texts across
+#       10,103 nodes, 339 MB) become ONE str object instead of one per node. Values are equal, so checkpoint bytes,
+#       equality and every reader are unchanged; msgpack's per-str UTF-8 cache is also built once per distinct text.
+# Why:  spec superpowers/specs/2026-10-05-native-node-store-design.md P4a: ~-92 MB, Python-only, format unchanged.
+# How:  a dict pool local to the restore call (freed afterwards); only top-level str values of a node's metadata dict.
 # [2026-10-04] Claude (lane vdb-lock-leak) — orphan sweep names what it collected
 # (PROTECTED CHANGE on review branch cc-laptop-vdb-lock-leak-20261004 ONLY; merges only after Josh's protected-file "proceed")
 # What: _collect_orphan_nodes adds node_ids=<list of removed ids> to its existing "nodes_collected" emit (additive kwarg;
@@ -747,6 +755,19 @@ class RingBuffer:
 # ---------------------------------------------------------------------------
 # Core Data Structures (PRD §2.2)
 # ---------------------------------------------------------------------------
+
+_SHARE_TEXT_MIN = 256   # P4a: only texts this long are worth pooling
+
+
+def _share_metadata_texts(meta: Any, pool: Dict[str, str]) -> Any:
+    """P4a: replace each large top-level str value of a node's metadata dict with the pooled equal object.
+    Equal values only -> no behaviour or byte change; the dict itself is the same object, edited in place."""
+    if isinstance(meta, dict):
+        for k, v in meta.items():
+            if type(v) is str and len(v) >= _SHARE_TEXT_MIN:
+                meta[k] = pool.setdefault(v, v)
+    return meta
+
 
 @dataclass(slots=True)
 class Node:
@@ -6504,6 +6525,7 @@ class Graph:
         self._archived_hyperedges.clear()
 
         # Restore nodes
+        _text_pool: Dict[str, str] = {}   # P4a: one object per distinct large metadata text (restore-local)
         for nid, nd in data.get("nodes", {}).items():
             lst = nd.get("last_spike_time")
             node = Node(
@@ -6520,7 +6542,7 @@ class Graph:
                 ),
                 firing_rate_ema=nd.get("firing_rate_ema", 0.0),
                 intrinsic_excitability=nd.get("intrinsic_excitability", 1.0),
-                metadata=nd.get("metadata", {}),
+                metadata=_share_metadata_texts(nd.get("metadata", {}), _text_pool),
                 is_inhibitory=nd.get("is_inhibitory", False),
                 Ca_i=nd.get("Ca_i", 0.0),
                 diffpc_layer=nd.get("diffpc_layer", 0),
