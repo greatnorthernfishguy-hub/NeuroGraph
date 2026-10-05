@@ -19,6 +19,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane prune-lifeline) — normal pruning may remove FAINT links touching protected nodes; each protected node keeps its strongest in/out link as a lifeline (Josh ruling 2026-10-04 "yes")
+# (PROTECTED CHANGE on review branch cc-laptop-prune-lifeline-20261004 ONLY; OFF by default; reaches no running graph until Josh's "proceed")
+# What: _prune_synapses (default path) — when config prune_protected_faint_links is truthy, the #92 blanket skip of every synapse
+#       touching an identity-protected node is replaced by: skip only LIFELINES (each protected node's single strongest outgoing
+#       and single strongest incoming synapse; a lifeline of either endpoint is exempt); every other such synapse faces the
+#       normal weight / activity / age rules. NEW Graph._protected_lifelines() (pure query, computed once per prune call).
+#       compete_protected_links — with the flag on, the lifelines inside its arena join its guaranteed set G (never competitors).
+# Why:  "protect existence, not unlimited wiring": #92's real guarantee is that no mechanism may permanently erase her access to a
+#       thought; the blanket skip let protected nodes keep unbounded faint wiring the strength budget can weaken but never remove
+#       (Choice Clause node 4,132 out-links). Spec 2026-10-04-synapse-growth-by-competition-design.
+# How:  flag read live with an absent-key default (NOT in DEFAULT_CONFIG): off = byte-identical code path and checkpoint. Protected
+#       set = _strength_protected_ids (constitutional included, a raising probe = protected); pick = _strength_guard_targets (weight
+#       desc, synapse_id asc) — the strength budget's guard ranking, on current weights. Weights via native SynapseStore.get_weight, Python fallback.
+#       Competing mode untouched; the engine's constitutional freeze (F) untouched.
 # [2026-10-04] Claude (lane strength-budget) — per-node strength budget + sleep downscaling (spec 2026-10-04-synapse-growth-by-competition-design; Josh ruling (a))
 # (PROTECTED CHANGE on review branch cc-laptop-strength-budget-20261004 ONLY; reaches no running graph until Josh's backup confirmation + "proceed")
 # What: NEW StrengthBudgetRule (registered in Graph.__init__ and the restore re-init, OFF unless config strength_budget_enabled);
@@ -3713,6 +3727,13 @@ class Graph:
                 position) so the sort can never raise; REFUSED (ValueError) on the default path.
             report: dict; filled with report['eligible'] (count before truncation) and
                 report['removed_ids'] (list, removal order).
+
+        Config prune_protected_faint_links (2026-10-04 prune-lifeline, Josh ruling; read live, absent = False, NOT
+        in DEFAULT_CONFIG): on the DEFAULT path only, a synapse touching an identity-protected node is exempt only
+        if it is a LIFELINE (see _protected_lifelines) of either endpoint; all others face the rules above. #92's
+        guarantee becomes "no protected node is ever cut off" instead of "no protected link is ever pruned".
+        Competing mode is unaffected (its caller supplies the sets; compete_protected_links adds the lifelines
+        to its guaranteed set when the flag is on).
         """
         wt = self.config["weight_threshold"]
         grace = self.config["grace_period"]
@@ -3774,12 +3795,24 @@ class Graph:
         else:
             candidates = self.synapses.items()
 
+        # 2026-10-04 prune-lifeline (Josh: "protect existence, not unlimited wiring"). Default path ONLY, and ONLY
+        # when config prune_protected_faint_links is set (absent key = False = the #92 blanket skip below, unchanged):
+        # the exemption for identity-protected endpoints narrows to each protected node's LIFELINES (its single
+        # strongest outgoing and single strongest incoming link, computed ONCE here, fail-closed probe). Every other
+        # synapse touching a protected node goes through the three rules below like any other synapse.
+        lifelines: Optional[Set[str]] = None
+        if not competing_mode and self.config.get("prune_protected_faint_links", False):
+            lifelines = self._protected_lifelines()
+
         to_prune: List[str] = []
         for sid, syn in candidates:
+            if lifelines is not None:
+                if sid in lifelines:
+                    continue
             # Cricket rim (#92): never prune synapses touching identity-protected nodes.
             # Protected nodes survive orphan collection but were being silenced here.
             # (Competing mode lifts this for the caller's competing ids ONLY.)
-            if not competing_mode and (self._is_identity_protected(syn.pre_node_id) or
+            elif not competing_mode and (self._is_identity_protected(syn.pre_node_id) or
                     self._is_identity_protected(syn.post_node_id)):
                 continue
 
@@ -3882,6 +3915,10 @@ class Graph:
                     ids = [sid for sid in idx.get(w, ()) if sid not in F]
                     G.update(sorted(ids, key=_rank)[:topk])
                     need[(w, d)] = min(topk, len(ids))
+            if self.config.get("prune_protected_faint_links", False):
+                # prune-lifeline: the wake-path lifelines are never competitors either (same set, same tie-break),
+                # so both paths agree on which link keeps each protected node attached. Flag off: no change.
+                G.update(self._protected_lifelines() & arena)
             competing0 = arena - G
             partners: Set[str] = set()
             for sid in competing0:
@@ -3995,6 +4032,23 @@ class Graph:
                 out.append(nid)
         out.sort()
         return out
+
+    def _protected_lifelines(self) -> Set[str]:
+        """2026-10-04 prune-lifeline: the synapse ids that keep each identity-protected node attached.
+
+        For every protected node (constitutional INCLUDED, Josh ruling (a); fail-closed probe via
+        _strength_protected_ids), its single strongest OUTGOING and single strongest INCOMING synapse,
+        ranked weight desc then synapse_id asc — the SAME ranking (same helper) as the strength budget's
+        strongest-link guarantee, applied to the CURRENT weights (a budget pass's per-target IN scaling can
+        reorder a node's out-links, so the lifeline follows whichever link is strongest now). A direction
+        with no links contributes nothing. One pass over the protected nodes' in/out sets; weights are
+        read through the native SynapseStore.get_weight when present (no per-synapse Ref object), else
+        through the Python Synapse object. A pure query: writes nothing.
+        """
+        gw = getattr(self.synapses, "get_weight", None)
+        if gw is None:
+            gw = lambda s: self.synapses[s].weight  # noqa: E731
+        return set(_strength_guard_targets(gw, self._outgoing, self._incoming, self._strength_protected_ids(), 0.0))
 
     @staticmethod
     def _strength_check_budget(label: str, v: Any) -> Optional[float]:
