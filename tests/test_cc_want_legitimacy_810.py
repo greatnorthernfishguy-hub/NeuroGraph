@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — _FakeVDB gains get_content(): cc_ng_organism now reads content
+#   through SimpleVectorDB's locked accessor (#270). Assertions unchanged.
 # [2026-10-04] Claude (lane 810-onto-s4) — rebased onto trial s4 (040be4d): render_wants is compared to the trial base
 #   (_RENDER_BASE_COMMIT; the trial added an on_error reporter to it, #810 still leaves it untouched); the two
 #   changelog-claim tests read the WHOLE header (the trial header grew past the old 40,000-char slice).
@@ -139,6 +141,9 @@ class _FakeGraph:
 class _FakeVDB:
     def __init__(self, content):
         self.content = content
+
+    def get_content(self, id, default=None):  # [2026-10-04] lane vdb-lock-leak: production reads go through the #270 accessor
+        return self.content.get(id, default)
 
 
 def _graph_with(*contents):

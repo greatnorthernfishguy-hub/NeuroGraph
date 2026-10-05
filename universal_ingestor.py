@@ -576,6 +576,8 @@ class SimpleVectorDB:
     #       self._lock in one pass, so the id set, embeddings, content and metadata are one
     #       consistent instant (the list() snapshot alone could not prevent a mid-capture
     #       delete); serialization runs after release. Format and bytes unchanged.
+    #       Ids are listed first and each embedding read by key, so the #423 KeyError refusal on an
+    #       uncoordinated (lock-bypassing) disappearance is preserved.
     # -------------------
     def capture_state(self, detach: bool = True) -> Dict[str, Any]:
         """Capture vector DB state in RAM — performs NO disk I/O.
@@ -602,10 +604,13 @@ class SimpleVectorDB:
         # captured here cannot change underneath the copy. Measured on 9k x 768-d
         # entries this cuts the lock hold from ~350 ms CPU to a few ms, so recall is
         # not stalled behind a checkpoint capture.
+        # The #423 refusal is kept: ids are listed first and each embedding is read by
+        # key, so an entry that disappears through an UNCOORDINATED (lock-bypassing)
+        # mutation still raises KeyError instead of silently publishing a smaller set.
         with self._lock:
             refs = [
-                (id, emb, self.content.get(id, ""), self.metadata.get(id, {}))
-                for id, emb in self.embeddings.items()
+                (id, self.embeddings[id], self.content.get(id, ""), self.metadata.get(id, {}))
+                for id in list(self.embeddings.keys())
             ]
         entries: Dict[str, Any] = {}
         for id, emb, content, meta in refs:

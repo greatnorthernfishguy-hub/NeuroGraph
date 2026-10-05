@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-10-04] Claude (lane vdb-lock-leak) — _FakeVDB gains get_content(): cc_ng_organism now reads content
+#   through SimpleVectorDB's locked accessor (#270). Assertions unchanged.
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 — Exec P240(3)/P242: the flag is gone
 # What: the host fixture's _CC_NG_DEPOSIT_STEP=False pin is removed; test A (the
@@ -89,6 +91,9 @@ class _FakeGraph:
 class _FakeVDB:
     def __init__(self, content):
         self.content = content
+
+    def get_content(self, id, default=None):  # [2026-10-04] lane vdb-lock-leak: production reads go through the #270 accessor
+        return self.content.get(id, default)
 
     def insert(self, id, embedding, content, metadata):
         self.content[id] = content
