@@ -1,6 +1,10 @@
 # tests/test_cc_recall_reporting.py
 #
 # ---- Changelog ----
+# [2026-10-04] Claude (lane 922) — cc_pattern_completion_recall's appended kwargs now include prepared (#922).
+# What: the signature pin lists ('on_error', 'prepared'); both appended, default None, existing params untouched.
+# Why: #922 adds prepared=None (embeddings computed before the graph lock); the default path is unchanged.
+# How: one tuple in test_new_kwargs_are_appended_default_none_and_nothing_else_changed.
 # [2026-09-30] Claude Code (Sonnet 5.5), Z12 worker seat, lane
 #   daemon-recall-organism-756b (punchlist rows #756 / #779 / #780; slice B of the
 #   #756 daemon recall-swallow chain) -- NEW file.
@@ -583,7 +587,7 @@ def test_new_kwargs_are_appended_default_none_and_nothing_else_changed():
     # FAILS on base: the new parameter is absent there.
     cases = [
         ('cc_assemble_recall', ('on_degraded', 'on_surfaced')),  # on_surfaced: 2026-10-03 MVP surfacing log
-        ('cc_pattern_completion_recall', ('on_error',)),
+        ('cc_pattern_completion_recall', ('on_error', 'prepared')),  # prepared: #922 lock-free embeddings
         ('render_constitutional_core', ('on_error',)),
         ('render_wants', ('on_error',)),
     ]
