@@ -1,3 +1,4 @@
+# [2026-10-05] Claude (lane rust-hotpaths-onto-s4) — per-synapse hot loops call native SynapseStore batch methods (overnight lane 0f76205/29c5f87/5e380a5 rebased onto trial s4; Josh approved 2026-10-05), Python fallback kept per site / why: 1.5-2 s per call on 193K synapses; bit-identical to the trial tip (tests/test_rust_hotpaths_onto_s4.py)
 """
 NeuroGraph Foundation - Core Cognitive Architecture (Phase 1 + 2 + 3)
 
@@ -19,6 +20,21 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-05] Claude (lane rust-hotpaths-onto-s4) — the overnight native hot-path conversion, rebased onto trial s4
+# (PROTECTED CHANGE; Josh 2026-10-05: "you have my approval for the overnight Rust review as soon as resources permit it";
+#  REVIEW branch cc-laptop-rust-hotpaths-onto-s4-20261005 only — not merged, not deployed)
+# What: the 12 call sites of the overnight lane (entry below) on top of the trial's want-hub / strength-budget /
+#       prune-lifeline / last-link code. _prune_synapses hand-ported: DEFAULT path, lifeline flag OFF -> one native
+#       advance_low_weight_and_collect_prune with the protected node list; flag ON -> the same native sweep with no
+#       protected nodes, then each lifeline's low_weight_steps is put back and the lifelines are dropped from the
+#       result (the loop never touched a lifeline), stamps read from metadata exactly as the loop did; COMPETING mode
+#       keeps the per-SynapseRef loop (its ids are a caller subset in sorted order — no native method visits a subset).
+#       Every site keeps a Python fallback (getattr, the existing normalize_strength pattern) = the trial's original
+#       loop, reshaped as module helpers _stdp_reads_python ... _apply_eligibility_reward_python; STDPRule._apply_dw is
+#       KEPT (the overnight lane removed it) as the fallback commit.
+# Why: same measurements as below; Josh approved integrating the conversion.
+# How: no Rust change; methods are in the canonical wheel (ng-tract-rs 79be810). Equivalence: base code loaded from
+#       git at the trial tip vs this branch, byte-identical checkpoints per site and whole-run, every flag combination.
 # [2026-10-04] Claude (lane prune-lifeline, turn 2) — last-link fair-chance grace (Josh ruling 2026-10-04: "the very last link is also subject to the normal link decay ... the exact right balance")
 # (PROTECTED CHANGE on review branch cc-laptop-prune-lifeline-20261004 ONLY; active ONLY when prune_protected_faint_links is truthy)
 # What: _prune_synapses (default path, flag on) — after the three rules pick their removals, any NON-protected node that this
@@ -98,6 +114,18 @@ Design principles (PRD §2.1):
 #       compete_protected_links — no predicate copy, no _remove_synapse_internal call, no removal loop, no _collect_orphan_nodes call; builds its
 #       sets twice and refuses (RuntimeError) if they differ; captures id -> (pre, post, conducting) BEFORE the call; holds graph._step_lock
 #       (re-entrant, so harmless under the daemon's own hold).
+# [2026-10-04] Claude (overnight Rust review) — native whole-loop hot paths
+# (PROTECTED-FILE DRAFT on unmerged branch cc-laptop-rust-hotpaths-20261004; NOT approved;
+#  needs Josh's backup + literal "proceed" before it goes anywhere; offline only)
+# What: _prune_synapses, inject_reward, HomeostaticRule scaling, the _deserialize adjacency
+#       rebuild, extract_subgraph's synapse filter and get_telemetry's weight list now call
+#       one native SynapseStore method each instead of walking ~193K SynapseRefs in Python.
+# Why: measured on a checkpoint copy: prune 1.5-1.8 s per call (runs every Tonic write tick
+#      and every step), inject_reward 1.6 s, homeostatic scaling 1.5 s, restore rebuild 2 s.
+# How: ng-tract-rs branch cc-laptop-rust-hotpaths-20261004 (store.rs). Identity protection
+#      is still decided ONLY by _is_identity_protected (called once per node, not twice per
+#      synapse). Results are bit-identical to the old loops (ng-tract-rs tests/test_hotpaths.py
+#      and tests/test_rust_hotpaths_equivalence.py here). See RUST_HOTPATHS_REVIEW.md.
 # [2026-09-13] Codex — Make observational propagation exception-safe
 # (PROTECTED CHANGE; Josh authorized offline source repair; no live checkpoint operation)
 # What: Read-mode prime_and_propagate restores node voltage/refractory and hyperedge
@@ -1149,6 +1177,104 @@ def poincare_dir_array(metadata: Optional[Dict[str, Any]]) -> Optional["np.ndarr
     return np.asarray(pd, dtype=np.float32)
 
 
+# ---------------------------------------------------------------------------
+# [2026-10-05] Python fallbacks for the native SynapseStore batch methods the hot loops
+# call (ng_tract 0.1.0 canonical wheel line, ng-tract-rs 79be810). Used ONLY when the
+# installed ng_tract lacks the method (an older wheel, or a dict-backed fake graph in a
+# test). Each is the trial's ORIGINAL per-SynapseRef loop, reshaped to return what the
+# native method returns, in the GIVEN order; the native methods hold the same body.
+# ---------------------------------------------------------------------------
+
+def _stdp_reads_python(store, synapse_ids, other_end_is_pre: bool):
+    out = []
+    for sid in synapse_ids:
+        syn = store.get(sid)
+        if syn is None:
+            out.append(None)
+        else:
+            out.append((syn.pre_node_id if other_end_is_pre else syn.post_node_id,
+                        syn.weight, syn.max_weight))
+    return out
+
+
+def _apply_stdp_dw_python(rule, store, synapse_ids, dws, timestep, three_factor: bool) -> None:
+    for sid, dw in zip(synapse_ids, dws):
+        rule._apply_dw(store[sid], dw, timestep, three_factor)
+
+
+def _scale_weights_by_post_node_python(store, incoming, node_scales) -> None:
+    for nid, scale in node_scales.items():
+        for syn_id in incoming.get(nid, set()):
+            syn = store.get(syn_id)
+            if syn is None:
+                continue
+            syn.weight = max(
+                0.0,
+                min(syn.weight * scale, syn.max_weight),
+            )
+
+
+def _propagation_rows_python(store, synapse_ids, reset_inactive: bool):
+    out = []
+    for sid in synapse_ids:
+        syn = store.get(sid)
+        if syn is None:
+            out.append(None)
+            continue
+        if reset_inactive:
+            syn.inactive_steps = 0
+        out.append((syn.post_node_id, syn.weight,
+                    syn.synapse_type == SynapseType.INHIBITORY, syn.delay))
+    return out
+
+
+def _bfs_hop_distances_python(store, outgoing, seeds, max_hops: int):
+    distances = {nid: 0 for nid in seeds}
+    out = []
+    frontier = set(seeds)
+    for dist in range(1, max_hops + 1):
+        next_frontier: Set[str] = set()
+        for nid in frontier:
+            for syn_id in outgoing.get(nid, set()):
+                syn = store.get(syn_id)
+                if syn and syn.post_node_id not in distances:
+                    distances[syn.post_node_id] = dist
+                    out.append((syn.post_node_id, dist))
+                    next_frontier.add(syn.post_node_id)
+        frontier = next_frontier
+    return out
+
+
+def _endpoint_ids_python(store, synapse_ids, pre: bool):
+    out = []
+    for sid in synapse_ids:
+        syn = store.get(sid)
+        out.append((syn.pre_node_id if pre else syn.post_node_id) if syn else None)
+    return out
+
+
+def _endpoint_triples_python(store):
+    return [(sid, ref.pre_node_id, ref.post_node_id)
+            for sid, ref in ((k, store[k]) for k in list(store.keys()))]
+
+
+def _apply_eligibility_reward_python(store, strength, learning_rate, scope=None) -> None:
+    for syn in store.values():
+        if abs(syn.eligibility_trace) < 1e-9:
+            continue
+
+        # Apply scope filter
+        if scope is not None:
+            if syn.pre_node_id not in scope and syn.post_node_id not in scope:
+                continue
+
+        dw = syn.eligibility_trace * strength * learning_rate
+        syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
+        syn.eligibility_trace *= 0.9  # Decay trace after use
+        if syn.weight > syn.peak_weight:
+            syn.peak_weight = syn.weight
+
+
 class STDPRule(PlasticityRule):
     """Spike-Timing-Dependent Plasticity (PRD §3.1).
 
@@ -1187,6 +1313,10 @@ class STDPRule(PlasticityRule):
 
         In three-factor mode (PRD §5.2), STDP creates the eligibility trace
         but weight change only commits when reward arrives via inject_reward.
+
+        [2026-10-05] apply() now commits each pass with ONE native
+        SynapseStore.apply_stdp_dw call (the same body, batched); this method is the
+        fallback for an ng_tract without it (_apply_stdp_dw_python).
         """
         if three_factor:
             syn.eligibility_trace += dw
@@ -1209,18 +1339,32 @@ class STDPRule(PlasticityRule):
         (PRD §5.2 Three-Factor Learning).
         """
         three_factor = graph.config.get("three_factor_enabled", False)
+        # [2026-10-05] native batch read/commit when the installed ng_tract has them, else the
+        # identical per-SynapseRef fallbacks (module helpers below).
+        _store = graph.synapses
+        _reads = getattr(_store, "stdp_reads", None)
+        if _reads is None:
+            _reads = lambda ids, pre: _stdp_reads_python(_store, ids, pre)  # noqa: E731
+        _commit = getattr(_store, "apply_stdp_dw", None)
+        if _commit is None:
+            _commit = lambda ids, dws, ts, tf: _apply_stdp_dw_python(self, _store, ids, dws, ts, tf)  # noqa: E731
 
         for post_id in fired_node_ids:
             post_node = graph.nodes[post_id]
             t_post = float(timestep)
 
             # Iterate over all incoming synapses to this post node
-            incoming_syn_ids = graph._incoming.get(post_id, set())
-            for syn_id in list(incoming_syn_ids):
-                syn = graph.synapses.get(syn_id)
-                if syn is None:
+            # [2026-10-04] one native read (pre_id, weight, max_weight) per synapse, then
+            # one native commit of the computed dw's (former _apply_dw), per pass.
+            incoming_syn_ids = list(graph._incoming.get(post_id, set()))
+            _dw_ids: List[str] = []
+            _dw_vals: List[float] = []
+            for syn_id, _row in zip(incoming_syn_ids,
+                                    _reads(incoming_syn_ids, True)):
+                if _row is None:
                     continue
-                pre_node = graph.nodes.get(syn.pre_node_id)
+                _pre_id, _syn_w, _syn_mw = _row
+                pre_node = graph.nodes.get(_pre_id)
                 if pre_node is None:
                     continue
 
@@ -1234,7 +1378,7 @@ class STDPRule(PlasticityRule):
                     # LTP: pre fired before post (causal)
                     raw_dw = self.A_plus * math.exp(-dt / self.tau_plus)
                     # Weight-dependent scaling (PRD §3.1.2)
-                    scale = (syn.max_weight - syn.weight) / syn.max_weight
+                    scale = (_syn_mw - _syn_w) / _syn_mw
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
                 elif dt < 0:
                     # LTD: pre fired after post (acausal)
@@ -1243,23 +1387,29 @@ class STDPRule(PlasticityRule):
                 else:
                     # Temporal aliasing: Δt=0 → weak LTP at half strength (PRD §3.1.2)
                     raw_dw = self.A_plus * 0.5
-                    scale = (syn.max_weight - syn.weight) / syn.max_weight
+                    scale = (_syn_mw - _syn_w) / _syn_mw
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
 
                 # GSG Phase 2: amplify dw by Poincaré curvature of pre/post layer
                 _pre_l = getattr(pre_node, "diffpc_layer", 2)
                 _post_l = getattr(post_node, "diffpc_layer", 2)
                 dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
-                self._apply_dw(syn, dw, timestep, three_factor)
+                _dw_ids.append(syn_id)
+                _dw_vals.append(dw)
+            if _dw_ids:
+                _commit(_dw_ids, _dw_vals, float(timestep), three_factor)
 
             # Also handle outgoing synapses (post-before-pre → LTD from
             # perspective of those synapses where this node is pre)
-            outgoing_syn_ids = graph._outgoing.get(post_id, set())
-            for syn_id in list(outgoing_syn_ids):
-                syn = graph.synapses.get(syn_id)
-                if syn is None:
+            outgoing_syn_ids = list(graph._outgoing.get(post_id, set()))
+            _dw_ids = []
+            _dw_vals = []
+            for syn_id, _row in zip(outgoing_syn_ids,
+                                    _reads(outgoing_syn_ids, False)):
+                if _row is None:
                     continue
-                other_node = graph.nodes.get(syn.post_node_id)
+                _other_id, _syn_w, _syn_mw = _row
+                other_node = graph.nodes.get(_other_id)
                 if other_node is None:
                     continue
 
@@ -1275,7 +1425,7 @@ class STDPRule(PlasticityRule):
                 if dt > 0:
                     # other fired after this node → LTP
                     raw_dw = self.A_plus * math.exp(-dt / self.tau_plus)
-                    scale = (syn.max_weight - syn.weight) / syn.max_weight
+                    scale = (_syn_mw - _syn_w) / _syn_mw
                     dw = raw_dw * self.learning_rate * max(scale, 0.0)
                 elif dt < 0:
                     # other fired before this node → LTD
@@ -1288,7 +1438,10 @@ class STDPRule(PlasticityRule):
                 _pre_l = getattr(post_node, "diffpc_layer", 2)
                 _post_l = getattr(other_node, "diffpc_layer", 2)
                 dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
-                self._apply_dw(syn, dw, timestep, three_factor)
+                _dw_ids.append(syn_id)
+                _dw_vals.append(dw)
+            if _dw_ids:
+                _commit(_dw_ids, _dw_vals, float(timestep), three_factor)
 
 
 class HomeostaticRule(PlasticityRule):
@@ -1417,6 +1570,7 @@ class HomeostaticRule(PlasticityRule):
         self._refresh_degree_targets(graph)
 
         # Synaptic scaling & intrinsic excitability (every N steps)
+        node_scales: Dict[str, float] = {}
         for nid, node in graph.nodes.items():
             rate = node.firing_rate_ema
             node_target = self._degree_targets.get(nid, self.target_firing_rate)
@@ -1444,16 +1598,17 @@ class HomeostaticRule(PlasticityRule):
 
             # Multiplicative synaptic scaling (PRD §3.2.1)
             # Scale incoming weights by (target/actual)^factor
-            scale = ratio ** self.scaling_factor
-            incoming_syn_ids = graph._incoming.get(nid, set())
-            for syn_id in incoming_syn_ids:
-                syn = graph.synapses.get(syn_id)
-                if syn is None:
-                    continue
-                syn.weight = max(
-                    0.0,
-                    min(syn.weight * scale, syn.max_weight),
-                )
+            node_scales[nid] = ratio ** self.scaling_factor
+
+        # [2026-10-04] One native pass applies every node's scale to its incoming
+        # synapses: weight = max(0, min(weight * scale, max_weight)). Each synapse has
+        # one post node, so it is scaled at most once, exactly as the per-node loop did.
+        if node_scales:
+            _scale = getattr(graph.synapses, "scale_weights_by_post_node", None)
+            if _scale is not None:
+                _scale(node_scales)
+            else:
+                _scale_weights_by_post_node_python(graph.synapses, graph._incoming, node_scales)
 
 
 # ---------------------------------------------------------------------------
@@ -2481,26 +2636,34 @@ class Graph:
                     _l_ = max(0, min(2, getattr(nd_, "diffpc_layer", 2)))
                     _gsg_cache[nid_] = (_arr * _GSG_LAYER_NORMS_NF[_l_], "hyperbolic")
 
+            # [2026-10-05] native when the installed ng_tract has it, else the per-SynapseRef fallback
+            _prop_rows = getattr(self.synapses, "propagation_rows", None)
+            if _prop_rows is None:
+                _prop_rows = lambda ids, reset: _propagation_rows_python(self.synapses, ids, reset)  # noqa: E731
             for nid in fired_ids:
                 node = self.nodes[nid]
                 sign = -1.0 if node.is_inhibitory else 1.0
                 _gsg_resolve(nid, node)
                 _pre_entry = _gsg_cache[nid]
-                for syn_id in self._outgoing.get(nid, set()):
-                    syn = self.synapses.get(syn_id)
-                    if syn is None:
+                # [2026-10-04] One native read per fired node: (post, weight, is_inhib, delay)
+                # per outgoing synapse in this set's iteration order, and inactive_steps = 0
+                # on each (was `syn.inactive_steps = 0` at the end of every iteration).
+                _out_ids = list(self._outgoing.get(nid, ()))
+                for syn_id, _row in zip(_out_ids, _prop_rows(_out_ids, True)):
+                    if _row is None:
                         logger.debug("Stale synapse ref %s in outgoing[%s]", syn_id, nid)
                         continue
+                    _syn_post, _syn_w, _syn_inhib, _syn_delay = _row
                     effective_type_sign = sign
-                    if syn.synapse_type == SynapseType.INHIBITORY:
+                    if _syn_inhib:
                         effective_type_sign = -1.0
-                    current = syn.weight * effective_type_sign
+                    current = _syn_w * effective_type_sign
                     # GSG Phase 3+4: manifold-aware propagation attenuation
                     if _pre_entry is not None:
-                        _post_node = self.nodes.get(syn.post_node_id)
+                        _post_node = self.nodes.get(_syn_post)
                         if _post_node is not None:
-                            _gsg_resolve(syn.post_node_id, _post_node)
-                            _post_entry = _gsg_cache[syn.post_node_id]
+                            _gsg_resolve(_syn_post, _post_node)
+                            _post_entry = _gsg_cache[_syn_post]
                             if _post_entry is not None:
                                 _pre_pos, _pre_mt = _pre_entry
                                 _post_pos, _post_mt = _post_entry
@@ -2520,11 +2683,11 @@ class Graph:
                                     _kappa_norm = (1.0 / max(1.0 - _nx2, 1e-6)) / _GSG_KAPPA_L2
                                     current *= math.exp(-_GSG_MSG_DECAY * _kappa_norm * _hdist)
                                 # cross-manifold: no modulation (neutral ground)
-                    arrival = self.timestep + syn.delay
+                    arrival = self.timestep + _syn_delay
                     self._delay_buffer.setdefault(arrival, []).append(
-                        (syn.post_node_id, current)
+                        (_syn_post, current)
                     )
-                    syn.inactive_steps = 0  # Reset inactivity
+                    # (inactive_steps reset done by propagation_rows above)
 
             # 6. Evaluate hyperedges (PRD §4.2) — with dynamic pattern completion
             fired_set = set(fired_ids)
@@ -2877,17 +3040,17 @@ class Graph:
                 # Compute approximate distances from primed nodes
                 primed_set = set(node_ids)
                 distances: Dict[str, int] = {nid: 0 for nid in node_ids}
-                # BFS to compute distances
-                frontier = set(node_ids)
-                for dist in range(1, steps + 1):
-                    next_frontier: Set[str] = set()
-                    for nid in frontier:
-                        for syn_id in self._outgoing.get(nid, set()):
-                            syn = self.synapses.get(syn_id)
-                            if syn and syn.post_node_id not in distances:
-                                distances[syn.post_node_id] = dist
-                                next_frontier.add(syn.post_node_id)
-                    frontier = next_frontier
+                # BFS to compute distances — [2026-10-04] native level-by-level walk of the
+                # outgoing edges: each reached node keeps the FIRST hop level that reaches
+                # it (same values as the per-synapse frontier loop; `distances` is only
+                # ever read with .get, so its insertion order is immaterial).
+                if steps >= 1:  # steps < 1: the per-synapse loop never ran (and never read the store)
+                    _bfs = getattr(self.synapses, "bfs_hop_distances", None)
+                    if _bfs is not None:
+                        distances.update(_bfs(node_ids, steps))
+                    else:  # [2026-10-05] fallback: the per-SynapseRef frontier loop
+                        distances.update(_bfs_hop_distances_python(
+                            self.synapses, self._outgoing, node_ids, steps))
 
                 # Collect current prediction targets for was_predicted tagging
                 predicted_targets: Set[str] = set()
@@ -2977,24 +3140,27 @@ class Graph:
 
                     # 5. Propagate spikes through outgoing synapses
                     fired_set = set(fired_ids)
+                    _pp_rows = getattr(self.synapses, "propagation_rows", None)  # [2026-10-05] else fallback
+                    if _pp_rows is None:
+                        _pp_rows = lambda ids, reset: _propagation_rows_python(self.synapses, ids, reset)  # noqa: E731
                     for nid in fired_ids:
                         node = self.nodes[nid]
                         sign = -1.0 if node.is_inhibitory else 1.0
-                        for syn_id in self._outgoing.get(nid, set()):
-                            syn = self.synapses.get(syn_id)
-                            if syn is None:
+                        # [2026-10-04] one native read per fired node. reset_inactive=_age_on:
+                        # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
+                        # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
+                        _out_ids = list(self._outgoing.get(nid, ()))
+                        for _row in _pp_rows(_out_ids, _age_on):
+                            if _row is None:
                                 continue
-                            if _age_on:
-                                # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
-                                # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
-                                syn.inactive_steps = 0
+                            _syn_post, _syn_w, _syn_inhib, _syn_delay = _row
                             effective_type_sign = sign
-                            if syn.synapse_type == SynapseType.INHIBITORY:
+                            if _syn_inhib:
                                 effective_type_sign = -1.0
-                            current = syn.weight * effective_type_sign
-                            arrival = prop_timestep + syn.delay
+                            current = _syn_w * effective_type_sign
+                            arrival = prop_timestep + _syn_delay
                             prop_delay_buffer.setdefault(arrival, []).append(
-                                (syn.post_node_id, current)
+                                (_syn_post, current)
                             )
 
                     # 6. Evaluate hyperedges (pattern completion, output injection)
@@ -3806,9 +3972,14 @@ class Graph:
                     raise ValueError("_prune_synapses: order_key entries are not mutually comparable "
                                      "(%r has element kinds %r, expected %r)" % (sid, kinds, key_kinds))
 
+        # [2026-10-05] the default path runs the rules in ONE native column sweep when the installed
+        # ng_tract has it (below); competing mode (a few hundred ids, once per dream cycle) and an
+        # ng_tract without it keep the per-SynapseRef loop.
+        _native_prune = None if competing_mode else getattr(
+            self.synapses, "advance_low_weight_and_collect_prune", None)
         if competing_mode:
             candidates = ((sid, self.synapses[sid]) for sid in competing)
-        else:
+        elif _native_prune is None:
             candidates = self.synapses.items()
 
         # 2026-10-04 prune-lifeline (Josh: "protect existence, not unlimited wiring"). Default path ONLY, and ONLY
@@ -3825,7 +3996,33 @@ class Graph:
             lifelines = self._protected_lifelines(_prot)
 
         to_prune: List[str] = []
-        for sid, syn in candidates:
+        if _native_prune is not None:
+            # [2026-10-05] Native rule pass (one column sweep, row order == items() order) — the SAME three rules
+            # as the loop below:  weight < wt -> low_weight_steps += 1, prune once it exceeds grace (else
+            # low_weight_steps = 0);  inactive_steps > inactivity * salience -> prune;  age > grace and
+            # peak_weight < 2 * initial_w -> prune.  It advances the counters and returns the ids; removal stays here.
+            if lifelines is None:
+                # Cricket rim (#92): never prune synapses touching identity-protected nodes.
+                # _is_identity_protected stays the ONE authority; asked once per node here instead of twice per
+                # synapse (a non-node id was never protected, and the probe is a pure read).
+                protected = [nid for nid in self.nodes if self._is_identity_protected(nid)]
+                to_prune = _native_prune(self.timestep, wt, grace, inactivity, initial_w, protected)
+            else:
+                # prune-lifeline ON: no blanket skip; only the LIFELINES are exempt. The native sweep runs on every
+                # row (no protected nodes), then each lifeline gets back the low_weight_steps it had before (the loop
+                # below never touches a lifeline) and is dropped from the result (order of the rest unchanged).
+                # The last-link stamps have no native accessor: read them from the metadata exactly as the loop
+                # below does (same per-synapse metadata access).
+                for sid, syn in self.synapses.items():
+                    _md = syn.metadata
+                    if _md and "last_link_since" in _md:
+                        stamped[sid] = _md["last_link_since"]
+                _ll_steps = [(sid, self.synapses[sid].low_weight_steps) for sid in sorted(lifelines)]
+                to_prune = _native_prune(self.timestep, wt, grace, inactivity, initial_w, ())
+                for sid, _lws in _ll_steps:
+                    self.synapses[sid].low_weight_steps = _lws
+                to_prune = [sid for sid in to_prune if sid not in lifelines]
+        for sid, syn in (candidates if _native_prune is None else ()):
             if lifelines is not None:
                 _md = syn.metadata
                 if _md and "last_link_since" in _md:
@@ -4547,15 +4744,19 @@ class Graph:
 
         # Build a fast edge-existence index for fired nodes
         existing_pairs: Set[Tuple[str, str]] = set()
+        _posts_of = getattr(self.synapses, "post_ids_of", None)
+        _pres_of = getattr(self.synapses, "pre_ids_of", None)
+        if _posts_of is None or _pres_of is None:  # [2026-10-05] per-SynapseRef fallback
+            _posts_of = lambda ids: _endpoint_ids_python(self.synapses, ids, False)  # noqa: E731
+            _pres_of = lambda ids: _endpoint_ids_python(self.synapses, ids, True)  # noqa: E731
         for nid in fired_ids:
-            for sid in self._outgoing.get(nid, set()):
-                syn = self.synapses.get(sid)
-                if syn:
-                    existing_pairs.add((nid, syn.post_node_id))
-            for sid in self._incoming.get(nid, set()):
-                syn = self.synapses.get(sid)
-                if syn:
-                    existing_pairs.add((syn.pre_node_id, nid))
+            # [2026-10-04] native endpoint lookups, same set iteration order
+            for _post_id in _posts_of(list(self._outgoing.get(nid, ()))):
+                if _post_id is not None:
+                    existing_pairs.add((nid, _post_id))
+            for _pre_id in _pres_of(list(self._incoming.get(nid, ()))):
+                if _pre_id is not None:
+                    existing_pairs.add((_pre_id, nid))
 
         # #59 degree-gated synaptogenesis: co-firing sprouting is otherwise
         # degree-blind, so always-active nodes accrete edges without bound
@@ -4693,7 +4894,9 @@ class Graph:
         # iterating the live .values() raced → "dictionary changed size during iteration" (fired on
         # every /stats GET during substrate activity). list() takes a cheap snapshot. Read-only; no
         # checkpoint/format/step change. Same class as #270 (SimpleVectorDB).
-        weights = [s.weight for s in list(self.synapses.values())]
+        # [2026-10-04] native column copy (row order == values() order; atomic under the GIL)
+        _wc = getattr(self.synapses, "weights_copy", None)
+        weights = _wc() if _wc is not None else [s.weight for s in list(self.synapses.values())]
         rates = [n.firing_rate_ema for n in list(self.nodes.values())]
         he_counts = [he.activation_count for he in list(self.hyperedges.values())]
 
@@ -4729,8 +4932,8 @@ class Graph:
             total_synapses=len(self.synapses),
             total_hyperedges=len(self.hyperedges),
             global_firing_rate=float(np.mean(rates)) if rates else 0.0,
-            mean_weight=float(np.mean(weights)) if weights else 0.0,
-            std_weight=float(np.std(weights)) if weights else 0.0,
+            mean_weight=float(np.mean(weights)) if len(weights) else 0.0,
+            std_weight=float(np.std(weights)) if len(weights) else 0.0,
             total_pruned=self._total_pruned,
             total_sprouted=self._total_sprouted,
             total_he_discovered=self._total_he_discovered,
@@ -4800,20 +5003,16 @@ class Graph:
             if len(self._reward_history) > 1000:
                 self._reward_history = self._reward_history[-500:]
 
-            for syn in self.synapses.values():
-                if abs(syn.eligibility_trace) < 1e-9:
-                    continue
-
-                # Apply scope filter
-                if scope is not None:
-                    if syn.pre_node_id not in scope and syn.post_node_id not in scope:
-                        continue
-
-                dw = syn.eligibility_trace * strength * self.config["learning_rate"]
-                syn.weight = max(0.0, min(syn.weight + dw, syn.max_weight))
-                syn.eligibility_trace *= 0.9  # Decay trace after use
-                if syn.weight > syn.peak_weight:
-                    syn.peak_weight = syn.weight
+            # [2026-10-04] Native sweep: every synapse with |trace| >= 1e-9 (and, with a
+            # scope, pre OR post in scope): dw = trace * strength * learning_rate;
+            # weight = max(0, min(weight + dw, max_weight)); trace *= 0.9 (decay after
+            # use); peak_weight tracks the new max.
+            _reward = getattr(self.synapses, "apply_eligibility_reward", None)
+            if _reward is not None:
+                _reward(strength, self.config["learning_rate"], scope)
+            else:  # [2026-10-05] per-SynapseRef fallback (the original loop)
+                _apply_eligibility_reward_python(
+                    self.synapses, strength, self.config["learning_rate"], scope)
 
             # Hyperedge threshold learning (PRD §4.3)
             for he in self.hyperedges.values():
@@ -6247,8 +6446,10 @@ class Graph:
 
         # Filter synapses — both endpoints must be in the extracted set
         extracted_synapses = {}
-        for sid, syn in self.synapses.items():
-            if syn.pre_node_id in node_ids and syn.post_node_id in node_ids:
+        _triples = getattr(self.synapses, "endpoint_triples", None)  # [2026-10-04] native; [2026-10-05] else fallback
+        for sid, pre_id, post_id in (_triples() if _triples is not None
+                                     else _endpoint_triples_python(self.synapses)):
+            if pre_id in node_ids and post_id in node_ids:
                 extracted_synapses[sid] = self.synapses.serialize_one(sid)
 
         # Filter hyperedges — all members must be in the extracted set
@@ -6360,10 +6561,13 @@ class Graph:
             self.synapses.bulk_load_msgpack(bytes(_syn))
         else:
             self.synapses.bulk_load(_syn)
-        for sid in self.synapses.keys():
-            ref = self.synapses[sid]
-            self._outgoing.setdefault(ref.pre_node_id, set()).add(sid)
-            self._incoming.setdefault(ref.post_node_id, set()).add(sid)
+        # [2026-10-04] one native call returns (sid, pre, post) in row order — the same
+        # insertion order the per-SynapseRef loop used, so the sets come out identical.
+        _triples = getattr(self.synapses, "endpoint_triples", None)  # [2026-10-05] else fallback
+        for sid, pre_id, post_id in (_triples() if _triples is not None
+                                     else _endpoint_triples_python(self.synapses)):
+            self._outgoing.setdefault(pre_id, set()).add(sid)
+            self._incoming.setdefault(post_id, set()).add(sid)
 
         # Restore hyperedges
         for hid, hd in data.get("hyperedges", {}).items():
