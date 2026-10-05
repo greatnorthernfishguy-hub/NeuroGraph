@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-10-04] Claude (lane prune-lifeline, turn 2) — last-link grace numbers
+# What: simulate_hold() mirrors _last_link_grace on a fresh copy (no stamps yet => every stranded node's strongest link is
+#   held); reports, for ALL non-protected nodes and for partners of protected nodes: links held on the next prune, nodes
+#   stranded inside the grace (must be 0), and, once dwell + grace elapse (static weights), nodes left with no synapse and
+#   no hyperedge (orphan-sweep removable). The real prune's report (last_link_held / stamped) is checked against it.
+# Why:  Josh ruling 2026-10-04 (last-link fair chance); PRUNE_LIFELINE_DRYRUN.md turn-2 section.
+# How:  unchanged safety: copies only, never checkpoints.
 # [2026-10-04] Claude (lane prune-lifeline) — NEW dry-run tool: what normal pruning would take from protected nodes
 # What: loads a COPY of a checkpoint, applies the laptop's CC_SNN_CONFIG prune settings (weight_threshold, grace_period,
 #   inactivity_threshold, initial_sprouting_weight — passed on the command line), runs ONE apply_strength_budget(out, in)
@@ -111,6 +118,47 @@ def stranded_partners(g, prot, gone):
     return {"partners": len(cand), "left_with_zero_synapses": n, "of_which_in_a_hyperedge": hyper}
 
 
+def simulate_hold(g, prot, gone):
+    """Mirror of Graph._last_link_grace on a graph with NO stamps: returns (held ids, nodes the pass would strand anyway)."""
+    removing = set(gone)
+    nodes = set()
+    for sid in gone:
+        s = g.synapses[sid]
+        nodes.add(s.pre_node_id)
+        nodes.add(s.post_node_id)
+    held = set()
+    for n in sorted(nodes - prot):
+        inc = set(g._outgoing.get(n) or ()) | set(g._incoming.get(n) or ())
+        if inc and inc <= removing:
+            last = min(inc, key=lambda x: (-g.synapses.get_weight(x), x))
+            removing.discard(last)
+            held.add(last)
+    return held, removing
+
+
+def zero_nodes(g, prot, gone, only=None):
+    """Non-protected nodes with >=1 synapse now and none once `gone` leaves; split by hyperedge membership."""
+    n = hyper = 0
+    for c in (only if only is not None else g.nodes):
+        if c in prot:
+            continue
+        inc = set(g._outgoing.get(c) or ()) | set(g._incoming.get(c) or ())
+        if inc and inc <= gone:
+            n += 1
+            if g._node_hyperedges.get(c):
+                hyper += 1
+    return {"left_with_zero_synapses": n, "in_a_hyperedge": hyper, "orphan_sweep_removable": n - hyper}
+
+
+def partner_ids(g, prot):
+    cand = set()
+    for p in prot:
+        for idx, end in ((g._outgoing, "post_node_id"), (g._incoming, "pre_node_id")):
+            for sid in idx.get(p) or ():
+                cand.add(getattr(g.synapses[sid], end))
+    return cand - prot
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, help="a COPY of a checkpoint (never the live file)")
@@ -154,14 +202,40 @@ def main():
     proj_dwell = projected_degrees(g, prot0, now_ids | dwell_ids)
     strand_now = stranded_partners(g, prot, now_ids)
     strand_dwell = stranded_partners(g, prot, now_ids | dwell_ids)
+    # turn 2: last-link grace
+    stamps_before = sum(1 for _, s in g.synapses.items() if "last_link_since" in (s.metadata or {}))
+    partners = partner_ids(g, prot)
+    held_now, gone_now = simulate_hold(g, prot, now_ids)
+    held_dwell, gone_dwell = simulate_hold(g, prot, now_ids | dwell_ids)
+    deg_all_before = {n: len(set(g._outgoing.get(n) or ()) | set(g._incoming.get(n) or ())) for n in g.nodes}
+    grace_rec = {
+        "llg_steps": g.config.get("last_link_grace_steps", 2000), "stamps_on_copy_before": stamps_before,
+        "next_prune": {"held_links": len(held_now),
+                       "held_links_touching_protected": sum(1 for x in held_now if g.synapses[x].pre_node_id in prot or g.synapses[x].post_node_id in prot),
+                       "stranded_inside_grace_all": zero_nodes(g, prot, gone_now),
+                       "stranded_inside_grace_partners": zero_nodes(g, prot, gone_now, partners),
+                       "without_grace_all": zero_nodes(g, prot, now_ids),
+                       "without_grace_partners": zero_nodes(g, prot, now_ids, partners)},
+        "at_dwell_elapse": {"held_links": len(held_dwell),
+                            "stranded_inside_grace_all": zero_nodes(g, prot, gone_dwell)},
+        "after_dwell_plus_grace": {"all": zero_nodes(g, prot, now_ids | dwell_ids),
+                                   "partners": zero_nodes(g, prot, now_ids | dwell_ids, partners)},
+    }
     t0 = time.perf_counter()
     life_seconds = None
     t1 = time.perf_counter()
     g._protected_lifelines()
     life_seconds = round(time.perf_counter() - t1, 4)
     t0 = time.perf_counter()
-    pruned_on = g._prune_synapses()
+    prep = {}
+    pruned_on = g._prune_synapses(report=prep)
     t_prune = time.perf_counter() - t0
+    stranded_real = sorted(n for n, d in deg_all_before.items() if d and n not in prot and n in g.nodes
+                           and not g._outgoing.get(n) and not g._incoming.get(n))
+    grace_rec["real_prune_report"] = {k: v for k, v in prep.items() if k != "removed_ids"}
+    grace_rec["real_prune_held_matches_simulation"] = prep.get("last_link_held") == len(held_now)
+    grace_rec["real_stranded_nonprotected_nodes"] = len(stranded_real)
+    grace_rec["stamps_after"] = sum(1 for _, s in g.synapses.items() if "last_link_since" in (s.metadata or {}))
     deg_after = degrees(g, prot0)
     missing_life = sorted(s for s in life if s not in g.synapses)
     lifeline_violations = []
@@ -177,7 +251,8 @@ def main():
         "lifelines": len(life), "lifeline_query_seconds": life_seconds,
         "predicted_now_total": len(now_ids), "predicted_dwell_total": len(dwell_ids),
         "pruned_flag_on": pruned_on, "prune_seconds": round(t_prune, 3),
-        "prediction_matches": pruned_on == len(now_ids),
+        "prediction_matches": pruned_on == len(now_ids) - len(held_now),
+        "last_link_grace": grace_rec,
         "lifelines_missing_after_prune": missing_life, "lifeline_violations": lifeline_violations,
         "stranded_partners_now": strand_now, "stranded_partners_after_dwell": strand_dwell,
         "zero_degree_nodes_after_prune_before_orphan_sweep": orphans_before,

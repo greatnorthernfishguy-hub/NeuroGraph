@@ -77,3 +77,61 @@ This is normal pruning doing what it does to any node. It is listed here because
 - The ruling does what it says. The Choice Clause node's fan-out (4,151 out) and want `4625…`'s (4,076 out) fall to their used links plus 1 lifeline each. Today, the budget only weakens them.
 - Nothing protected is ever cut off.
 - The Choice Clause itself (the right to exit) is untouched. Only its node's wiring shrinks.
+
+---
+
+## Turn 2: the last-link fair chance
+
+*2026-10-04 · Claude (lane prune-lifeline, turn 2) · Josh ruling 2026-10-04: "the very last link is also subject to the normal link decay ... the exact right balance"*
+
+### The rule
+
+It is only active when `prune_protected_faint_links` is on, and only on the default (wake) prune path.
+
+1. The three normal rules choose their removals, exactly as before. Their counters (`low_weight_steps` and the others) advance as usual.
+2. Some NON-protected nodes would be left with **zero** synapses (in and out combined) by those removals. Each of them keeps ONE link, its **last link**. That is a link that already carries a stamp, else its strongest (weight desc, then synapse_id asc).
+   - If the last link has no stamp, it is stamped with synapse metadata `last_link_since = timestep` and held.
+   - It is held while `timestep - last_link_since < last_link_grace_steps`. That config key is read live, defaults to 2000 when absent, and is NOT in `DEFAULT_CONFIG`. A value of 0 or less turns the hold off.
+   - After the grace, nothing is exempt. The link goes if a normal rule wants it gone, and stays if none does (for example, if it was used and strengthened).
+3. A surviving stamp is cleared lazily when none of its non-protected endpoints is left with 1 synapse or fewer. In other words, the node wired elsewhere, so a later last-link episode starts a fresh grace.
+4. One held link counts for both of its endpoints. This holds for any non-protected node, not only partners of protected nodes. On this graph, every node it applies to is such a partner (see below).
+
+**Where the stamp lives.** It is stored in the synapse's own `metadata` dict. The native `SynapseStore` already carries `metadata` in its checkpoint row, so the stamp is saved and restored with no checkpoint format change. A stamp also disappears when its synapse is pruned, so dead ids never need cleaning up. Writes go through `syn.metadata = new_dict`, and the synapse is marked dirty for incremental checkpoints. With the flag off, no code path reads or writes the stamp.
+
+**The engine (`compete_protected_links`).** The engine already never takes an unprotected partner's last link in its pass. It keeps that stricter, permanent hold. The engine is competition, not decay, and a last link it holds still faces the wake prune's normal rules once the grace ends, so a node that never wires is still forgotten. With the flag on, its hold now prefers the stamped link. Both paths therefore hold the SAME link for a node.
+
+### Dry run (fresh copy)
+
+- **Source:** a fresh byte copy of `~/.claude/plugins/neurograph/checkpoints/main.msgpack` (live mtime 16:59:47, copied 17:04:18), at `~/scratch/prune-lifeline-20261004/main.turn2.copy.msgpack`, chmod 444. sha256 `803cf6d7…275d`, 238,220,568 bytes, unchanged after the run.
+- **Graph:** timestep 53,371, 54,835 synapses. It had no `last_link_since` stamps before the run.
+- **Method:** same tool, settings and budget pass as above, and the same venv. Raw output is in `dryrun.turn2.jsonl`.
+
+| | count |
+|---|---|
+| eligible on the next prune by the normal rules (touching a protected node; unprotected-only: 0) | 1,532 |
+| **last links held under grace on the next prune** (all are links to a protected node) | **68**. Without the grace, those 68 nodes would have had 0 synapses: 14 are hyperedge members, and 54 would be orphan-sweep candidates. |
+| actually removed by the one real `_prune_synapses()` | 1,464 = 1,532 − 68. The prediction matched exactly. |
+| real prune report | `last_link_held` 68, `stamped` 68, `expired` 0, `cleared` 0. This matches the simulation. |
+| **non-protected nodes left with 0 synapses by the real prune** | **0** |
+| lifelines lost / protected nodes losing their last link in a direction | **0 / 0** (6 lifelines) |
+| when the weight rule's 5,000-call dwell elapses: last links held under grace (static weights) | 2,405 nodes. 0 stranded inside the grace. |
+| **removable once dwell + grace elapse, if those nodes never wire** (static weights; nodes with 0 synapses and no hyperedge) | **860** (of 2,405 left with 0 synapses; 1,545 are hyperedge members, which the orphan sweep keeps) |
+| prune call time, flag on, grace included | 0.45 s (the flag-OFF control took 0.60 s) |
+
+**Reading the numbers.** The grace does not change where a node that never wires ends up. It changes when it gets there. Every stranded node gets `last_link_grace_steps` more steps, plus the full 5,000-call dwell its link was already on, to wire to a related memory through ordinary learning. The 860 figure is the floor if nothing is ever used again. It is comparable to the 889 reported on the earlier copy: the same kind of count, on a graph that moved between copies. The two runs were not reconciled id by id. On this copy, every node the rule applies to is a partner of a protected node. No node whose links are all unprotected is stranded by the next prune, or by the dwell projection.
+
+**The per-protected-node projections moved since the first run.** On this copy the budget pass scaled 27 synapses, against 6,835 before, and the dwell projection leaves the Choice Clause node at 23 out / 1 in (was 1 / 1) and want `4625…` at 22 / 9. The graph changed between copies. Turn 2 does not affect protected-node degrees.
+
+### Turn-2 tests (`tests/test_prune_lifeline.py`, section T)
+
+- The grace holds the last link and stamps it once. The default grace is 2,000 and the key is not in `DEFAULT_CONFIG`.
+- After the grace, the normal rules remove the link and the orphan sweep forgets the node. A link that has since become healthy stays.
+- A node that gains a second link is unaffected, and its stamp clears.
+- When all of a node's links are eligible at once, exactly one stays: the strongest.
+- One held link serves both of its endpoints.
+- The stamp survives a checkpoint and restore, and the grace continues afterwards.
+- A grace of 0, or the flag off, means no hold and no stamp.
+- On a random graph, no non-protected node is stranded inside the grace.
+- The engine holds the stamped link, ignores stamps when the flag is off, and never takes a last link; the wake prune expires it.
+- The (L) lifeline tests now run with a grace of 0. Their partner nodes deliberately have no other link, so this isolates the lifeline rule.
+- The (G) byte-identity proofs, for the step driver and the engine driver against the base `39c0422`, with the flag absent and with it explicitly False, still pass.

@@ -19,6 +19,22 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-04] Claude (lane prune-lifeline, turn 2) — last-link fair-chance grace (Josh ruling 2026-10-04: "the very last link is also subject to the normal link decay ... the exact right balance")
+# (PROTECTED CHANGE on review branch cc-laptop-prune-lifeline-20261004 ONLY; active ONLY when prune_protected_faint_links is truthy)
+# What: _prune_synapses (default path, flag on) — after the three rules pick their removals, any NON-protected node that this
+#       pass would leave with ZERO synapses keeps ONE of them (its "last link": a link already carrying a last-link stamp first,
+#       else the strongest, synapse_id asc) while that link is inside its grace: synapse metadata "last_link_since" = the
+#       timestep at which the rules first wanted to remove it (stamped then), exempt while timestep - since < config
+#       last_link_grace_steps (read live, absent = 2000, NOT in DEFAULT_CONFIG). After the grace it is removed by the normal
+#       rules like any other link (the counters were advanced as usual throughout). A surviving stamp is cleared lazily when
+#       none of its non-protected endpoints is left with <= 1 synapse. report['last_link_held'] when a report is given.
+#       compete_protected_links (flag on) — its never-a-partner's-last-link hold now prefers the stamped link, so both paths
+#       hold the SAME link; the engine keeps its stricter permanent hold (it is competition, not decay; expiry is the wake path's).
+#       _protected_lifelines() takes an optional precomputed protected-id list (same result).
+# Why:  the lifeline change strands ordinary partner nodes whose only link goes to a protected hub (dry run: 889 on the CC
+#       graph with no hyperedge); a node gets a fair chance to wire through ordinary learning and is forgotten by disuse if not.
+# How:  stamp lives in the synapse's own metadata dict (native SynapseStore persists it in the checkpoint's 15-key row and
+#       drops it with the synapse). Flag off: no code path reads or writes it (byte-identical to 39c0422).
 # [2026-10-04] Claude (lane prune-lifeline) — normal pruning may remove FAINT links touching protected nodes; each protected node keeps its strongest in/out link as a lifeline (Josh ruling 2026-10-04 "yes")
 # (PROTECTED CHANGE on review branch cc-laptop-prune-lifeline-20261004 ONLY; OFF by default; reaches no running graph until Josh's "proceed")
 # What: _prune_synapses (default path) — when config prune_protected_faint_links is truthy, the #92 blanket skip of every synapse
@@ -3801,12 +3817,19 @@ class Graph:
         # strongest outgoing and single strongest incoming link, computed ONCE here, fail-closed probe). Every other
         # synapse touching a protected node goes through the three rules below like any other synapse.
         lifelines: Optional[Set[str]] = None
+        protected_set: Set[str] = set()
+        stamped: Dict[str, Any] = {}          # 2026-10-04 last-link grace: sid -> last_link_since, collected in the loop
         if not competing_mode and self.config.get("prune_protected_faint_links", False):
-            lifelines = self._protected_lifelines()
+            _prot = self._strength_protected_ids()
+            protected_set = set(_prot)
+            lifelines = self._protected_lifelines(_prot)
 
         to_prune: List[str] = []
         for sid, syn in candidates:
             if lifelines is not None:
+                _md = syn.metadata
+                if _md and "last_link_since" in _md:
+                    stamped[sid] = _md["last_link_since"]
                 if sid in lifelines:
                     continue
             # Cricket rim (#92): never prune synapses touching identity-protected nodes.
@@ -3837,6 +3860,9 @@ class Graph:
             # Age-based pruning: speculative connections that never strengthened
             if age > grace and syn.peak_weight < 2.0 * initial_w:
                 to_prune.append(sid)
+
+        if lifelines is not None:
+            to_prune = self._last_link_grace(to_prune, protected_set, stamped, report)
 
         # want-hub (d): report / order / budget — each ONLY when its parameter is given (default path: none of these run).
         if report is not None:
@@ -3927,10 +3953,18 @@ class Graph:
                     if not self._is_identity_protected(nid):
                         partners.add(nid)
             last: Set[str] = set()
+            if self.config.get("prune_protected_faint_links", False):
+                # last-link grace (turn 2): hold the link the wake prune is already graceing, if any, so both paths
+                # agree on WHICH link is the node's last; otherwise the same strongest pick as before.
+                def _last_key(sid):
+                    md = self.synapses[sid].metadata
+                    return (0 if (md and "last_link_since" in md) else 1,) + _rank(sid)
+            else:
+                _last_key = _rank
             for nid in partners:
                 inc = set(self._outgoing.get(nid, ())) | set(self._incoming.get(nid, ()))
                 if inc and inc <= competing0:
-                    last.add(min(inc, key=_rank))
+                    last.add(min(inc, key=_last_key))
             competing = competing0 - last
             by_want: Dict[str, List[str]] = {}
             for sid in competing:
@@ -4033,7 +4067,7 @@ class Graph:
         out.sort()
         return out
 
-    def _protected_lifelines(self) -> Set[str]:
+    def _protected_lifelines(self, protected_ids: Optional[List[str]] = None) -> Set[str]:
         """2026-10-04 prune-lifeline: the synapse ids that keep each identity-protected node attached.
 
         For every protected node (constitutional INCLUDED, Josh ruling (a); fail-closed probe via
@@ -4043,12 +4077,92 @@ class Graph:
         reorder a node's out-links, so the lifeline follows whichever link is strongest now). A direction
         with no links contributes nothing. One pass over the protected nodes' in/out sets; weights are
         read through the native SynapseStore.get_weight when present (no per-synapse Ref object), else
-        through the Python Synapse object. A pure query: writes nothing.
+        through the Python Synapse object. A pure query: writes nothing. protected_ids: an already computed
+        _strength_protected_ids() result (the prune pass computes it once and reuses it); None = compute here.
         """
         gw = getattr(self.synapses, "get_weight", None)
         if gw is None:
             gw = lambda s: self.synapses[s].weight  # noqa: E731
-        return set(_strength_guard_targets(gw, self._outgoing, self._incoming, self._strength_protected_ids(), 0.0))
+        if protected_ids is None:
+            protected_ids = self._strength_protected_ids()
+        return set(_strength_guard_targets(gw, self._outgoing, self._incoming, protected_ids, 0.0))
+
+    def _last_link_grace(self, to_prune: List[str], protected: Set[str], stamped: Dict[str, Any],
+                         report: Optional[Dict[str, Any]]) -> List[str]:
+        """2026-10-04 prune-lifeline turn 2 — the last-link fair chance (Josh ruling). Called ONLY by the default
+        _prune_synapses path with prune_protected_faint_links on, after the three rules chose `to_prune`.
+
+        For every NON-protected endpoint of a synapse in `to_prune` that the pass would leave with ZERO synapses
+        (in + out, as a set of ids), in sorted node-id order and re-checked live so one held link serves both of its
+        endpoints: its last link = a stamped link first, else the strongest (weight desc, synapse_id asc).
+            no stamp                                  -> stamp metadata last_link_since = timestep; hold it
+            timestep - since < last_link_grace_steps  -> hold it
+            otherwise                                 -> removed by the normal rules like any other link
+        Every surviving stamp none of whose non-protected endpoints is left with <= 1 synapse is cleared (the node
+        has wired elsewhere; a later last-link episode starts a fresh grace). Returns the reduced removal list.
+        report['last_link_held'] / ['last_link_stamped'] / ['last_link_expired'] / ['last_link_cleared'] when a
+        report dict is given. Grace: config last_link_grace_steps, read live, absent = 2000 (NOT in DEFAULT_CONFIG);
+        <= 0 disables the hold entirely (returns `to_prune` unchanged, no report keys, nothing stamped or cleared).
+        """
+        grace = self.config.get("last_link_grace_steps", 2000)
+        if not grace or grace <= 0:
+            return to_prune          # grace 0 = no fair chance: the normal rules alone (nothing stamped or cleared)
+        now = self.timestep
+        removing = set(to_prune)
+        out_i, in_i = self._outgoing, self._incoming
+
+        def _inc(n):
+            return set(out_i.get(n, ())) | set(in_i.get(n, ()))
+
+        gw = getattr(self.synapses, "get_weight", None)
+        if gw is None:
+            gw = lambda s: self.synapses[s].weight  # noqa: E731
+
+        nodes: Set[str] = set()
+        for sid in to_prune:
+            syn = self.synapses[sid]
+            nodes.add(syn.pre_node_id)
+            nodes.add(syn.post_node_id)
+        held = fresh = expired = 0
+        for n in sorted(nodes - protected):
+            inc = _inc(n)
+            if not inc or not inc <= removing:
+                continue
+            last = min(inc, key=lambda s: (0 if s in stamped else 1, -gw(s), s))
+            since = stamped.get(last)
+            if since is None:
+                syn = self.synapses[last]
+                md = dict(syn.metadata or {})
+                md["last_link_since"] = now
+                syn.metadata = md
+                self._dirty_synapses.add(last)
+                stamped[last] = now
+                fresh += 1
+            elif now - since >= grace:
+                expired += 1
+                continue
+            removing.discard(last)
+            held += 1
+
+        cleared = 0
+        for sid in sorted(stamped):
+            if sid in removing or sid not in self.synapses:
+                continue
+            syn = self.synapses[sid]
+            ends = {syn.pre_node_id, syn.post_node_id} - protected
+            if all(len(_inc(n) - removing) > 1 for n in ends):
+                md = dict(syn.metadata or {})
+                md.pop("last_link_since", None)
+                syn.metadata = md
+                self._dirty_synapses.add(sid)
+                cleared += 1
+
+        if report is not None:
+            report["last_link_held"] = held
+            report["last_link_stamped"] = fresh
+            report["last_link_expired"] = expired
+            report["last_link_cleared"] = cleared
+        return [sid for sid in to_prune if sid in removing]
 
     @staticmethod
     def _strength_check_budget(label: str, v: Any) -> Optional[float]:

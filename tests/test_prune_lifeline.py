@@ -1,4 +1,12 @@
 # ---- Changelog ----
+# [2026-10-04] Claude (lane prune-lifeline, turn 2) — (T) last-link fair-chance grace tests; (L) lifeline tests pinned to grace 0
+# What: (T) a non-protected node's last link is held for last_link_grace_steps (stamped once, default 2000, not in DEFAULT_CONFIG),
+#   then faces the normal rules; a node that gains a link is unaffected and its stamp clears; all-eligible keeps the strongest;
+#   one held link serves both endpoints; the stamp round-trips a checkpoint and the grace continues; grace 0 / flag off = no
+#   hold and no stamp; random graph: no non-protected node stranded inside the grace; engine holds the stamped link, ignores
+#   stamps when off, never takes a last link (the wake prune expires it). (L) tests isolate the lifeline rule with grace 0.
+# Why:  Josh ruling 2026-10-04 (last-link fair chance).
+# How:  synthetic graphs only.
 # [2026-10-04] Claude (lane prune-lifeline) — NEW tests: normal pruning of FAINT links touching protected nodes, lifelines kept
 # What: (G) flag OFF (absent, or explicit False) is byte-identical to the base checkout — step() driver AND engine driver,
 #   outputs + checkpoint bytes, separate processes; flag ON changes the run (non-vacuity). (L) flag ON: faint links touching
@@ -33,6 +41,10 @@ BASE_CHECKOUT = Path(os.environ.get("PRUNE_LIFELINE_BASE_CHECKOUT", "/home/josh/
 FLAG = "prune_protected_faint_links"
 CC = "constitutional::rim::choice_clause"
 GRACE = nf.DEFAULT_CONFIG["grace_period"]
+LLG = "last_link_grace_steps"
+# The (L) lifeline tests isolate the LIFELINE rule: their partner nodes are deliberately left with no other link, so the
+# turn-2 last-link grace (which would hold each partner's last link) is switched off for them with a grace of 0.
+ON0 = {FLAG: True, LLG: 0}
 WT = nf.DEFAULT_CONFIG["weight_threshold"]
 
 
@@ -52,7 +64,7 @@ def _syn(g, a, b, w, *, lws=0, inactive=0, peak=None, age=0):
 def _hub(flag):
     """A constitutional broadcaster and an authored want, each with one strong link per direction and faint siblings
     already at the weight rule's dwell boundary (one more call below threshold => eligible)."""
-    g = nf.Graph({FLAG: True} if flag else {})
+    g = nf.Graph(dict(ON0) if flag else {})
     g.timestep = 100
     g.create_node(node_id=CC, metadata={"constitutional": True})
     g.create_node(node_id="want", metadata={"provenance": "cc_authored"})
@@ -178,7 +190,7 @@ def test_L_flag_on_prunes_faint_links_and_keeps_every_lifeline_constitutional_in
 
 
 def test_L_activity_and_age_rules_also_apply_and_a_lifeline_is_spared_by_both():
-    g = nf.Graph({FLAG: True})
+    g = nf.Graph(dict(ON0))
     g.timestep = 20_000
     g.create_node(node_id="want", metadata={"provenance": "syl_authored"})
     for i in range(4):
@@ -206,7 +218,7 @@ def test_L_a_lifeline_of_either_endpoint_is_exempt():
 
 
 def test_L_tie_break_is_weight_desc_then_synapse_id_asc():
-    g = nf.Graph({FLAG: True})
+    g = nf.Graph(dict(ON0))
     g.create_node(node_id="w", metadata={"provenance": "cc_authored"})
     for i in range(5):
         g.create_node(node_id="t%d" % i)
@@ -228,7 +240,7 @@ def test_L_lifelines_are_the_strength_budget_guarded_pick_and_the_query_is_pure(
 
 
 def test_L_raising_probe_fails_closed_node_is_treated_as_protected(monkeypatch):
-    g = nf.Graph({FLAG: True})
+    g = nf.Graph(dict(ON0))
     for n in ("odd", "y", "z"):
         g.create_node(node_id=n)
     only_out = _syn(g, "odd", "y", 0.002, lws=GRACE)     # unprotected node: would be pruned if the probe said False
@@ -332,3 +344,234 @@ def test_E_after_engine_and_wake_prune_every_protected_node_keeps_its_lifelines(
     for n, d in had:
         idx = g._outgoing if d == "out" else g._incoming
         assert n in g.nodes and idx.get(n), "%s lost every %s link" % (n, d)
+
+
+# ---------------------------------------------------------------------------
+# (T) turn 2 — the last-link fair-chance grace (Josh ruling 2026-10-04: a non-protected node's last link is held for
+# last_link_grace_steps, then faces the normal rules like any other link)
+# ---------------------------------------------------------------------------
+STAMP = "last_link_since"
+
+
+def _lonely(grace=10, t=1000):
+    """A want with a strong lifeline pair, and partner `x` whose ONLY link is a faint, weight-rule-eligible want->x."""
+    g = nf.Graph({FLAG: True, LLG: grace})
+    g.timestep = t
+    g.create_node(node_id="want", metadata={"provenance": "cc_authored"})
+    for n in ("a", "x"):
+        g.create_node(node_id=n)
+    _syn(g, "want", "a", 1.5)
+    _syn(g, "a", "want", 1.5)
+    lone = _syn(g, "want", "x", 0.002, lws=GRACE)
+    return g, lone
+
+
+def test_T_default_grace_is_2000_and_not_in_default_config():
+    assert LLG not in nf.DEFAULT_CONFIG and LLG not in nf.Graph().config
+    g, lone = _lonely()
+    del g.config[LLG]
+    g._prune_synapses()
+    g.timestep += 1999
+    g._prune_synapses()
+    assert lone in g.synapses
+    g.timestep += 1
+    g._prune_synapses()
+    assert lone not in g.synapses
+
+
+def test_T_grace_holds_the_last_link_and_stamps_it_once():
+    g, lone = _lonely(grace=10, t=1000)
+    rep = {}
+    assert g._prune_synapses(report=rep) == 0
+    assert lone in g.synapses and g.synapses[lone].metadata[STAMP] == 1000
+    assert rep["last_link_held"] == 1 and rep["last_link_stamped"] == 1 and rep["last_link_expired"] == 0
+    g.timestep = 1009                       # still inside the grace: held, NOT re-stamped
+    rep = {}
+    assert g._prune_synapses(report=rep) == 0
+    assert g.synapses[lone].metadata[STAMP] == 1000 and rep["last_link_stamped"] == 0 and rep["last_link_held"] == 1
+    # the normal counters kept advancing underneath the hold
+    assert g.synapses[lone].low_weight_steps == GRACE + 2
+
+
+def test_T_after_the_grace_the_normal_rules_remove_it_and_the_node_can_be_forgotten():
+    g, lone = _lonely(grace=10, t=1000)
+    g._prune_synapses()
+    g.timestep = 1010
+    rep = {}
+    assert g._prune_synapses(report=rep) == 1
+    assert lone not in g.synapses and rep["last_link_expired"] == 1 and rep["last_link_held"] == 0
+    g.timestep += 10 ** 4
+    g._collect_orphan_nodes()
+    assert "x" not in g.nodes and "want" in g.nodes
+
+
+def test_T_after_the_grace_a_link_no_rule_wants_is_simply_kept():
+    """Expiry removes nothing by itself: a stamped last link that is (now) healthy stays — the normal rules decide."""
+    g, lone = _lonely(grace=10, t=1000)
+    g._prune_synapses()
+    g.synapses[lone].weight = 0.5          # x's link got used / strengthened
+    g.timestep = 5000
+    assert g._prune_synapses() == 0 and lone in g.synapses
+
+
+def test_T_a_node_that_gains_a_second_synapse_is_unaffected_and_its_stamp_clears():
+    g, lone = _lonely(grace=10, t=1000)
+    g._prune_synapses()
+    assert STAMP in g.synapses[lone].metadata
+    g.create_node(node_id="y")
+    _syn(g, "x", "y", 0.9)                 # x wired to a related memory
+    _syn(g, "y", "a", 0.9)                 # y is not left with a single link either
+    rep = {}
+    assert g._prune_synapses(report=rep) == 1       # x is not stranded, so its faint link faces the normal rules
+    assert lone not in g.synapses and rep["last_link_held"] == 0
+    # a surviving stamp clears lazily once the node has another link
+    g2, lone2 = _lonely(grace=10, t=1000)
+    g2._prune_synapses()
+    g2.synapses[lone2].weight = 0.5        # now healthy: it survives the next pass on its own
+    g2.create_node(node_id="y")
+    _syn(g2, "x", "y", 0.9)
+    _syn(g2, "y", "a", 0.9)
+    rep = {}
+    g2._prune_synapses(report=rep)
+    assert rep["last_link_cleared"] == 1 and STAMP not in g2.synapses[lone2].metadata
+
+
+def test_T_all_links_eligible_at_once_keeps_exactly_one_the_strongest():
+    g = nf.Graph({FLAG: True, LLG: 10})
+    g.timestep = 1000
+    g.create_node(node_id="want", metadata={"provenance": "cc_authored"})
+    for n in ("a", "x"):
+        g.create_node(node_id=n)
+    _syn(g, "want", "a", 1.5)
+    _syn(g, "a", "want", 1.5)
+    weak = _syn(g, "want", "x", 0.002, lws=GRACE)
+    strong = _syn(g, "x", "want", 0.004, lws=GRACE)
+    assert g._prune_synapses() == 1
+    assert strong in g.synapses and weak not in g.synapses
+    assert _degrees(g, "x") == (1, 0)
+
+
+def test_T_one_held_link_serves_both_unprotected_endpoints_and_unprotected_links_get_it_too():
+    g = nf.Graph({FLAG: True, LLG: 10})
+    g.timestep = 1000
+    for n in ("u", "v"):
+        g.create_node(node_id=n)
+    uv = _syn(g, "u", "v", 0.002, lws=GRACE)
+    rep = {}
+    assert g._prune_synapses(report=rep) == 0 and rep["last_link_held"] == 1 and rep["last_link_stamped"] == 1
+    assert uv in g.synapses
+
+
+def test_T_stamp_survives_checkpoint_and_restore_and_the_grace_continues(tmp_path):
+    g, lone = _lonely(grace=10, t=1000)
+    g._prune_synapses()
+    g.timestep = 1005
+    p = str(tmp_path / "g.msgpack")
+    g.checkpoint(p)
+    h = nf.Graph()
+    h.restore(p)
+    h.config.update({FLAG: True, LLG: 10})
+    assert h.synapses[lone].metadata[STAMP] == 1000
+    h.timestep = 1009
+    assert h._prune_synapses() == 0 and lone in h.synapses
+    h.timestep = 1010
+    assert h._prune_synapses() == 1 and lone not in h.synapses
+
+
+def test_T_grace_zero_disables_the_hold_and_writes_nothing():
+    g, lone = _lonely(grace=0)
+    rep = {}
+    assert g._prune_synapses(report=rep) == 1 and lone not in g.synapses
+    assert "last_link_held" not in rep
+
+
+def test_T_flag_off_never_reads_or_writes_a_stamp():
+    g = nf.Graph({LLG: 10})
+    g.timestep = 1000
+    for n in ("u", "v"):
+        g.create_node(node_id=n)
+    uv = _syn(g, "u", "v", 0.002, lws=GRACE)
+    rep = {}
+    assert g._prune_synapses(report=rep) == 1 and uv not in g.synapses and "last_link_held" not in rep
+
+
+def test_T_no_unprotected_node_is_stranded_inside_the_grace_random_graph():
+    import random
+    rnd = random.Random(7)
+    g = nf.Graph({FLAG: True, LLG: 50})
+    g.timestep = 10_000
+    g.create_node(node_id="want", metadata={"provenance": "cc_authored"})
+    g.create_node(node_id=CC, metadata={"constitutional": True})
+    nodes = ["n%d" % i for i in range(60)]
+    for n in nodes:
+        g.create_node(node_id=n)
+    for _ in range(150):
+        a, b = rnd.sample(nodes + ["want", CC], 2)
+        if g._find_synapse(a, b) is None:
+            _syn(g, a, b, rnd.choice([0.002, 0.004, 0.5]), lws=rnd.choice([0, GRACE]),
+                 inactive=rnd.choice([0, 10 ** 6]))
+    prot = set(g._strength_protected_ids())
+    first_held: dict = {}
+    for k in range(120):
+        before = {n: sum(_degrees(g, n)) for n in g.nodes}
+        g._prune_synapses()
+        for n, d in before.items():
+            if n in prot or d == 0:
+                continue
+            if sum(_degrees(g, n)) == 0:
+                # only allowed once the node's held last link has been graced for the full window
+                assert n in first_held and g.timestep - first_held[n] >= 50, "node %s stranded inside the grace" % n
+        for sid, s in g.synapses.items():
+            if STAMP in (s.metadata or {}):
+                for n in (s.pre_node_id, s.post_node_id):
+                    first_held.setdefault(n, s.metadata[STAMP])
+        g.timestep += 1
+    assert any(sum(_degrees(g, n)) == 0 for n in nodes), "vacuous: nothing was ever forgotten"
+    for p in prot:
+        assert sum(_degrees(g, p)) >= 1
+
+
+def _engine_partner_graph(flag, stamp_weak):
+    """A want with K=1 floor links, and partner `x` whose only TWO links both go to the want and both compete."""
+    cfg = {FLAG: True, LLG: 10} if flag else {}
+    g = nf.Graph(cfg)
+    g.timestep = 1000
+    g.create_node(node_id="want", metadata={"provenance": "cc_authored"})
+    for n in ("a", "b", "x"):
+        g.create_node(node_id=n)
+    _syn(g, "want", "a", 1.5)
+    _syn(g, "b", "want", 1.5)
+    _syn(g, "a", "b", 1.0)
+    weak = _syn(g, "want", "x", 0.3, inactive=10 ** 6)
+    strong = _syn(g, "x", "want", 0.4, inactive=10 ** 6)
+    if stamp_weak:
+        g.synapses[weak].metadata = {STAMP: 995}
+    return g, weak, strong
+
+
+def test_T_engine_holds_the_same_link_the_wake_path_is_graceing():
+    g, weak, strong = _engine_partner_graph(flag=True, stamp_weak=True)
+    rec = g.compete_protected_links(1, 10)
+    assert rec["held_back_last_link"] == 1
+    assert weak in g.synapses and strong not in g.synapses           # the stamped one is the held one
+    g, weak, strong = _engine_partner_graph(flag=True, stamp_weak=False)
+    g.compete_protected_links(1, 10)
+    assert strong in g.synapses and weak not in g.synapses           # no stamp: the engine's own strongest pick
+
+
+def test_T_flag_off_engine_ignores_stamps():
+    g, weak, strong = _engine_partner_graph(flag=False, stamp_weak=True)
+    g.compete_protected_links(1, 10)
+    assert strong in g.synapses and weak not in g.synapses
+
+
+def test_T_engine_never_takes_a_last_link_and_the_wake_prune_expires_it():
+    """Engine = competition, not decay: it never takes a partner's last link even after the grace; the wake prune's
+    normal rules are what eventually forget the node."""
+    g, weak, strong = _engine_partner_graph(flag=True, stamp_weak=True)
+    g.timestep = 5000                                                 # stamp 995: grace long expired
+    g.compete_protected_links(1, 10)
+    assert weak in g.synapses
+    g.compete_protected_links(1, 10)
+    assert weak in g.synapses and sum(_degrees(g, "x")) == 1
+    assert g._prune_synapses() >= 1 and weak not in g.synapses        # activity rule, grace expired
