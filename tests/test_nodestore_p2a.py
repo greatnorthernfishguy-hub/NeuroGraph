@@ -612,11 +612,20 @@ def run(mode, start_bytes, act, seed):
 RUN_FLAGS = list(FLAGS) + ["prefire"]
 
 
+_FALLBACKS = ("_decay_voltages_python", "_calcium_currents_python", "_detect_fired_python", "_fire_python",
+              "_decrement_refractory_python", "_update_firing_ema_python", "_adapt_thresholds_python",
+              "_adapt_excitability_python")
+
+
 @pytest.mark.parametrize("flags", RUN_FLAGS)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("mode", MODES)
-def test_whole_run(mode, seed, flags):
+def test_whole_run(mode, seed, flags, monkeypatch):
     prefire = flags == "prefire"
+    fallback_calls = {}
+    for name in _FALLBACKS:     # count (and still run) every fallback the BRANCH takes
+        monkeypatch.setattr(NF, name, (lambda nm, o: (lambda *a, **k: (
+            fallback_calls.__setitem__(nm, fallback_calls.get(nm, 0) + 1), o(*a, **k))[1]))(name, getattr(NF, name)))
     cfg = FLAGS["off"] if prefire else FLAGS[flags]
 
     def mk(tt_mod, ap_mod):
@@ -634,6 +643,10 @@ def test_whole_run(mode, seed, flags):
         assert x == y, f"log entry {i} differs"
     assert sa == sb
     assert a == b
+    if mode == "on" and HAVE_P2A:   # the native passes really ran: no fallback but the pre_fire-handler one
+        assert fallback_calls == ({"_detect_fired_python": 30} if prefire else {}), fallback_calls
+    elif mode == "off":
+        assert fallback_calls.get("_decay_voltages_python") == 30
 
 
 @needs_p2a
