@@ -341,19 +341,21 @@ def test_engine_noderef_contract():
     with pytest.raises(KeyError):                       # never follows a re-created id
         held.voltage
     assert list(g.nodes) == ["b", "a"]                  # D1: re-added id goes to the end
-    assert NF.Graph().nodes.__class__ is dict or os.environ.get("NG_NATIVE_NODE_STORE")
 
 
-def test_opt_in_resolution(monkeypatch):
-    monkeypatch.delenv("NG_NATIVE_NODE_STORE", raising=False)
-    assert isinstance(NF.Graph().nodes, dict)                               # default OFF
-    assert isinstance(NF.Graph(native_node_store=False).nodes, dict)
-    monkeypatch.setenv("NG_NATIVE_NODE_STORE", "1")
-    assert isinstance(NF.Graph().nodes, dict) == (not HAVE_NATIVE)          # env opt-in needs the wheel
-    assert isinstance(NF.Graph(native_node_store=False).nodes, dict)        # explicit keyword wins
-    monkeypatch.setenv("NG_NATIVE_NODE_STORE", "0")
-    assert isinstance(NF.Graph().nodes, dict)
-    assert "native_node_store" not in NF.Graph(native_node_store=True).config   # never saved in the checkpoint
+def test_opt_in_resolution():
+    prev = NF.set_native_node_store_default(False)
+    try:
+        assert isinstance(NF.Graph().nodes, dict)                                  # default OFF
+        assert isinstance(NF.Graph(native_node_store=False).nodes, dict)
+        assert NF.set_native_node_store_default(True) is False                    # host switch; returns previous
+        assert isinstance(NF.Graph().nodes, dict) == (not HAVE_NATIVE)             # needs the wheel
+        assert isinstance(NF.Graph(native_node_store=False).nodes, dict)           # explicit keyword wins
+        NF.set_native_node_store_default(False)
+        assert isinstance(NF.Graph().nodes, dict)
+        assert "native_node_store" not in NF.Graph(native_node_store=True).config  # never saved in the checkpoint
+    finally:
+        NF.set_native_node_store_default(prev)
 
 
 # ---------------------------------------------------------------------------
