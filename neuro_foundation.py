@@ -20,6 +20,23 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-06] Claude (lane nodestore-p2a) — the whole-population node passes call native NodeStore batch methods (P2a)
+#   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p2a-20261006 ONLY; Josh approved starting the P2a lane
+#    2026-10-05 "Go ahead and start now"; merges only after his protected-file "proceed"; the native store stays OFF by default)
+# What: step() 1 voltage decay, 3a Ca currents, 3 fire detection (only with NO pre_fire handler), 4 fired-node writes
+#       (_recent_spikes stays Python), 9 refractory decrement; HomeostaticRule.apply firing-rate EMA, threshold
+#       adaptation and the scaling pass's excitability (`ratio ** scaling_factor` stays Python); get_telemetry's
+#       firing-rate read (NodeStore.columns). Each site: getattr(graph.nodes, "<method>", None); when absent (the dict
+#       of Node — the default — an older wheel, a duck-typed test graph) or when the native method declines (False /
+#       None, nothing touched), the module-level _<pass>_python fallback runs: the trial's original loop, verbatim.
+# Why:  spec superpowers/specs/2026-10-05-native-node-store-design.md §4 P2a / §9: ~28 ms of per-node Python loops per
+#       firing step, more through P1's NodeRef proxies; this removes most of P1's proxy regression on these paths.
+# How:  the native methods (ng-tract-rs cc-laptop-nodestore-p2a-rs-20261006) keep the loops' float expressions in
+#       their operand order (no FMA), Python's min/max semantics, node (insertion) order; they decline on a non-float
+#       parameter or a node holding a non-canonical value in a touched field. Bit-identical to the trial tip 6a85357
+#       (tests/test_nodestore_p2a.py). Known non-identity only on an exception path: if `ratio ** scaling_factor`
+#       raises (OverflowError; needs scaling_factor >> 1), the native path has already updated every node's
+#       excitability where the loop stopped at that node. Checkpoint format unchanged.
 # [2026-10-05] Claude (lane nodestore-p1) — Graph.nodes may be backed by the native ng_tract.NodeStore (P1), OFF by default
 #   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p1-20261005 ONLY; Josh's 2026-10-05 go for this phase; merges only
 #    after his protected-file "proceed"; P1 merges switched OFF per D7)
@@ -1340,6 +1357,114 @@ def _apply_eligibility_reward_python(store, strength, learning_rate, scope=None)
             syn.peak_weight = syn.weight
 
 
+# ---------------------------------------------------------------------------
+# [2026-10-06] P2a (native node store): Python fallbacks for the NodeStore whole-population
+# node passes. Each is the trial's ORIGINAL loop from step() / HomeostaticRule.apply, moved
+# here verbatim. Used when graph.nodes has no such method (the dict of Node — the default —
+# an older wheel, or a duck-typed test graph) AND when the native method declines (returns
+# False / None, having touched nothing: a non-float parameter, or a node holding a value of a
+# non-canonical type in a field the pass touches). The native methods hold the same body.
+# ---------------------------------------------------------------------------
+
+def _decay_voltages_python(nodes, decay) -> None:
+    for node in nodes.values():
+        node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
+
+
+def _calcium_currents_python(nodes, _g_net, _Ca_decay) -> None:
+    for _nid, _node in nodes.items():
+        if _node.Ca_i > 1e-9:
+            _node.voltage += _g_net * _node.Ca_i
+            _node.Ca_i *= _Ca_decay
+
+
+def _detect_fired_python(nodes, event_handlers) -> List[str]:
+    fired_ids: List[str] = []
+    for nid, node in nodes.items():
+        if node.refractory_remaining > 0:
+            continue
+        effective_threshold = node.threshold
+        if event_handlers.get("pre_fire"):
+            for cb in event_handlers["pre_fire"]:
+                effective_threshold += cb(node_id=nid)
+        if node.voltage >= effective_threshold:
+            fired_ids.append(nid)
+    return fired_ids
+
+
+def _fire_python(nodes, recent_spikes, fired_ids, timestep, _delta_Ca) -> None:
+    for nid in fired_ids:
+        node = nodes[nid]
+        node.voltage = node.resting_potential
+        node.refractory_remaining = node.refractory_period
+        node.last_spike_time = float(timestep)
+        node.spike_history.append(float(timestep))
+        # Track recent spikes for sprouting
+        recent_spikes.setdefault(nid, deque(maxlen=20)).append(timestep)
+        if _delta_Ca:  # IcaN/IK-AHP calcium influx on spike (#254)
+            node.Ca_i = min(node.Ca_i + _delta_Ca, 5.0)  # cap at 5 to prevent runaway
+
+
+def _decrement_refractory_python(nodes, fired_this_step) -> None:
+    for nid, node in nodes.items():
+        if node.refractory_remaining > 0 and nid not in fired_this_step:
+            node.refractory_remaining -= 1
+
+
+def _update_firing_ema_python(nodes, fired_set, ema_alpha) -> None:
+    for nid, node in nodes.items():
+        fired = 1.0 if nid in fired_set else 0.0
+        node.firing_rate_ema = (
+            (1.0 - ema_alpha) * node.firing_rate_ema
+            + ema_alpha * fired
+        )
+
+
+def _adapt_thresholds_python(nodes, degree_targets, target_firing_rate, threshold_rate, threshold_ceiling) -> None:
+    for nid, node in nodes.items():
+        rate = node.firing_rate_ema
+        node_target = degree_targets.get(nid, target_firing_rate)
+        if rate > node_target * 1.2:
+            node.threshold = min(node.threshold + threshold_rate, threshold_ceiling)
+        elif rate < node_target * 0.8:
+            node.threshold = max(0.01, node.threshold - threshold_rate)
+
+
+def _adapt_excitability_python(nodes, degree_targets, target_firing_rate, excitability_rate,
+                               scaling_factor) -> Dict[str, float]:
+    """Returns node_scales {nid: ratio ** scaling_factor} (the native method returns the ratios)."""
+    node_scales: Dict[str, float] = {}
+    for nid, node in nodes.items():
+        rate = node.firing_rate_ema
+        node_target = degree_targets.get(nid, target_firing_rate)
+        if rate < 1e-9:
+            # Silent node → boost excitability (PRD §3.1.2 Silent Death mitigation)
+            node.intrinsic_excitability = min(
+                node.intrinsic_excitability * (1.0 + excitability_rate * 5),
+                5.0,
+            )
+            continue
+
+        ratio = node_target / rate
+
+        # Intrinsic excitability adjustment
+        if ratio > 1.0:
+            node.intrinsic_excitability = min(
+                node.intrinsic_excitability * (1.0 + excitability_rate),
+                5.0,
+            )
+        else:
+            node.intrinsic_excitability = max(
+                node.intrinsic_excitability * (1.0 - excitability_rate),
+                0.1,
+            )
+
+        # Multiplicative synaptic scaling (PRD §3.2.1)
+        # Scale incoming weights by (target/actual)^factor
+        node_scales[nid] = ratio ** scaling_factor
+    return node_scales
+
+
 class STDPRule(PlasticityRule):
     """Spike-Timing-Dependent Plasticity (PRD §3.1).
 
@@ -1610,22 +1735,18 @@ class HomeostaticRule(PlasticityRule):
         fired_set = set(fired_node_ids)
 
         # Update firing rate EMA for every node
-        for nid, node in graph.nodes.items():
-            fired = 1.0 if nid in fired_set else 0.0
-            node.firing_rate_ema = (
-                (1.0 - self.ema_alpha) * node.firing_rate_ema
-                + self.ema_alpha * fired
-            )
+        # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
+        _native = getattr(graph.nodes, "update_firing_ema", None)
+        if _native is None or not _native(fired_set, self.ema_alpha):
+            _update_firing_ema_python(graph.nodes, fired_set, self.ema_alpha)
 
         # Threshold adaptation: continuous, 0.001/step (PRD §3.2.1)
         threshold_ceiling = graph.config.get("threshold_ceiling", 5.0)
-        for nid, node in graph.nodes.items():
-            rate = node.firing_rate_ema
-            node_target = self._degree_targets.get(nid, self.target_firing_rate)
-            if rate > node_target * 1.2:
-                node.threshold = min(node.threshold + self.threshold_rate, threshold_ceiling)
-            elif rate < node_target * 0.8:
-                node.threshold = max(0.01, node.threshold - self.threshold_rate)
+        _native = getattr(graph.nodes, "adapt_thresholds", None)
+        if _native is None or not _native(self._degree_targets, self.target_firing_rate,
+                                          self.threshold_rate, threshold_ceiling):
+            _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
+                                     self.threshold_rate, threshold_ceiling)
 
         self._steps_since_scaling += 1
         if self._steps_since_scaling < self.scaling_interval:
@@ -1634,35 +1755,19 @@ class HomeostaticRule(PlasticityRule):
         self._refresh_degree_targets(graph)
 
         # Synaptic scaling & intrinsic excitability (every N steps)
-        node_scales: Dict[str, float] = {}
-        for nid, node in graph.nodes.items():
-            rate = node.firing_rate_ema
-            node_target = self._degree_targets.get(nid, self.target_firing_rate)
-            if rate < 1e-9:
-                # Silent node → boost excitability (PRD §3.1.2 Silent Death mitigation)
-                node.intrinsic_excitability = min(
-                    node.intrinsic_excitability * (1.0 + self.excitability_rate * 5),
-                    5.0,
-                )
-                continue
-
-            ratio = node_target / rate
-
-            # Intrinsic excitability adjustment
-            if ratio > 1.0:
-                node.intrinsic_excitability = min(
-                    node.intrinsic_excitability * (1.0 + self.excitability_rate),
-                    5.0,
-                )
-            else:
-                node.intrinsic_excitability = max(
-                    node.intrinsic_excitability * (1.0 - self.excitability_rate),
-                    0.1,
-                )
-
-            # Multiplicative synaptic scaling (PRD §3.2.1)
-            # Scale incoming weights by (target/actual)^factor
-            node_scales[nid] = ratio ** self.scaling_factor
+        # [2026-10-06] P2a: the native pass updates every node's excitability and returns
+        # {nid: target / rate} for the non-silent nodes in node order; `ratio ** scaling_factor`
+        # stays in Python (libm pow is not proven bit-identical to CPython's float.__pow__).
+        _native = getattr(graph.nodes, "adapt_excitability", None)
+        _ratios = (_native(self._degree_targets, self.target_firing_rate, self.excitability_rate)
+                   if _native is not None else None)
+        if _ratios is None:
+            node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
+                                                     self.excitability_rate, self.scaling_factor)
+        else:
+            node_scales: Dict[str, float] = {}
+            for nid, ratio in _ratios.items():
+                node_scales[nid] = ratio ** self.scaling_factor
 
         # [2026-10-04] One native pass applies every node's scale to its incoming
         # synapses: weight = max(0, min(weight * scale, max_weight)). Each synapse has
@@ -2629,9 +2734,11 @@ class Graph:
             result = StepResult(timestep=self.timestep)
 
             # 1. Voltage decay: v = v * decay_rate + (1-decay) * resting  (PRD §2.2.4)
+            # [2026-10-06] P2a: native NodeStore pass when available (declines -> the original loop)
             decay = self.config["decay_rate"]
-            for node in self.nodes.values():
-                node.voltage = node.voltage * decay + (1.0 - decay) * node.resting_potential
+            _native = getattr(self.nodes, "decay_voltages", None)
+            if _native is None or not _native(decay):
+                _decay_voltages_python(self.nodes, decay)
 
             # 2. Deliver delayed spikes arriving this timestep
             arrivals = self._delay_buffer.pop(self.timestep, [])
@@ -2653,23 +2760,21 @@ class Graph:
             if _delta_Ca:
                 _Ca_decay = self.config.get("Ca_decay", 0.9)
                 _g_net = self.config.get("g_CaN", 0.0) - self.config.get("g_AHP", 0.0)
-                for _nid, _node in self.nodes.items():
-                    if _node.Ca_i > 1e-9:
-                        _node.voltage += _g_net * _node.Ca_i
-                        _node.Ca_i *= _Ca_decay
+                _native = getattr(self.nodes, "calcium_currents", None)
+                if _native is None or not _native(_g_net, _Ca_decay):
+                    _calcium_currents_python(self.nodes, _g_net, _Ca_decay)
 
             # 3. Detect firing nodes
             #    Lenia FlowGraph: pre_fire handlers can adjust thresholds.
-            fired_ids: List[str] = []
-            for nid, node in self.nodes.items():
-                if node.refractory_remaining > 0:
-                    continue
-                effective_threshold = node.threshold
-                if self._event_handlers.get("pre_fire"):
-                    for cb in self._event_handlers["pre_fire"]:
-                        effective_threshold += cb(node_id=nid)
-                if node.voltage >= effective_threshold:
-                    fired_ids.append(nid)
+            #    [2026-10-06] P2a: native only when NO pre_fire handler is registered (a handler is a
+            #    Python call per node); the native pass returns the ids in node order, or None.
+            fired_ids = None
+            if not self._event_handlers.get("pre_fire"):
+                _native = getattr(self.nodes, "detect_fired", None)
+                if _native is not None:
+                    fired_ids = _native()
+            if fired_ids is None:
+                fired_ids = _detect_fired_python(self.nodes, self._event_handlers)
 
             # 3b. Zero-firing circuit breaker tracking
             if fired_ids:
@@ -2678,16 +2783,14 @@ class Graph:
                 self._steps_since_last_fire += 1
 
             # 4. Reset fired nodes and set refractory
-            for nid in fired_ids:
-                node = self.nodes[nid]
-                node.voltage = node.resting_potential
-                node.refractory_remaining = node.refractory_period
-                node.last_spike_time = float(self.timestep)
-                node.spike_history.append(float(self.timestep))
-                # Track recent spikes for sprouting
-                self._recent_spikes.setdefault(nid, deque(maxlen=20)).append(self.timestep)
-                if _delta_Ca:  # IcaN/IK-AHP calcium influx on spike (#254)
-                    node.Ca_i = min(node.Ca_i + _delta_Ca, 5.0)  # cap at 5 to prevent runaway
+            #    [2026-10-06] P2a: the native pass does the node writes; _recent_spikes stays Python (P3)
+            _native = getattr(self.nodes, "fire", None)
+            if _native is not None and _native(fired_ids, self.timestep, _delta_Ca if _delta_Ca else None):
+                for nid in fired_ids:
+                    # Track recent spikes for sprouting
+                    self._recent_spikes.setdefault(nid, deque(maxlen=20)).append(self.timestep)
+            else:
+                _fire_python(self.nodes, self._recent_spikes, fired_ids, self.timestep, _delta_Ca)
 
             result.fired_node_ids = fired_ids
 
@@ -2989,9 +3092,9 @@ class Graph:
             #    Skip nodes that just fired this step — their full refractory
             #    period starts on the NEXT step (PRD §3.2.1: mandatory N-step rest).
             fired_this_step = set(fired_ids)
-            for nid, node in self.nodes.items():
-                if node.refractory_remaining > 0 and nid not in fired_this_step:
-                    node.refractory_remaining -= 1
+            _native = getattr(self.nodes, "decrement_refractory", None)   # [2026-10-06] P2a
+            if _native is None or not _native(fired_this_step):
+                _decrement_refractory_python(self.nodes, fired_this_step)
 
             # 10. Track synapse inactivity + decay salience armor (Phase 4).
             salience_decay = self.config["he_salience_decay_rate"]
@@ -4975,7 +5078,10 @@ class Graph:
         # [2026-10-04] native column copy (row order == values() order; atomic under the GIL)
         _wc = getattr(self.synapses, "weights_copy", None)
         weights = _wc() if _wc is not None else [s.weight for s in list(self.synapses.values())]
-        rates = [n.firing_rate_ema for n in list(self.nodes.values())]
+        # [2026-10-06] P2a: native column copy of firing_rate_ema (node order; one atomic snapshot)
+        _cols = getattr(self.nodes, "columns", None)
+        _rc = _cols(["firing_rate_ema"], with_ids=False) if _cols is not None else None
+        rates = _rc[1].tolist() if isinstance(_rc, tuple) else [n.firing_rate_ema for n in list(self.nodes.values())]
         he_counts = [he.activation_count for he in list(self.hyperedges.values())]
 
         # Phase 2.5: Experience distribution buckets

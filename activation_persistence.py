@@ -15,6 +15,15 @@ Usage::
     ap.restore(graph, "/path/to/checkpoint.msgpack")
 
 # ---- Changelog ----
+# [2026-10-06] Claude (lane nodestore-p2a) — capture() reads a native column snapshot when graph.nodes has one
+#   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p2a-20261006 ONLY; merges only after Josh's "proceed")
+#   What: when graph.nodes is an ng_tract.NodeStore with columns(), capture() reads voltage / resting_potential /
+#         last_spike_time / intrinsic_excitability from one native copy (node order) instead of one NodeRef per
+#         node; otherwise (dict of Node, older wheel, fake graph, or the store declines) the original loop runs.
+#   Why:  spec superpowers/specs/2026-10-05-native-node-store-design.md §4 P2a: ~33 ms per capture through the
+#         node objects; the snapshot is also atomic, so a node removed meanwhile cannot raise KeyError (D3) here.
+#   How:  same filter, same entry dict, same order, plain Python floats (.tolist()); sidecar format unchanged
+#         (tests/test_nodestore_p2a.py compares captures with the trial tip's file).
 # [2026-02-22] Claude (Opus 4.6) — Initial implementation.
 #   What: ActivationPersistence with capture/save/restore, exponential
 #         temporal decay, max_entries bounding, and auto-save timer.
@@ -75,17 +84,36 @@ class ActivationPersistence:
         now = time.time()
         entries: Dict[str, Dict[str, Any]] = {}
 
-        # list() the items first: node creation by a concurrent writer would
-        # otherwise raise "dictionary changed size during iteration" mid-capture.
-        for node_id, node in list(graph.nodes.items()):
-            if node.voltage == 0.0 or node.voltage == node.resting_potential:
-                continue
-            entries[node_id] = {
-                "voltage": node.voltage,
-                "last_spike_time": node.last_spike_time,
-                "excitability": node.intrinsic_excitability,
-                "timestamp": now,
-            }
+        # [2026-10-06] P2a: a native NodeStore hands one atomic column snapshot (node order) of the
+        # four fields; None (no such method: a dict of Node, an older wheel, a fake graph; or the store
+        # declined: a non-float value in one of these fields) -> the node loop below, unchanged.
+        _cols = getattr(graph.nodes, "columns", None)
+        _snap = (_cols(["voltage", "resting_potential", "last_spike_time", "intrinsic_excitability"])
+                 if _cols is not None else None)
+        if isinstance(_snap, tuple):   # (None, or a test double's auto-attribute -> the node loop)
+            _ids, _v, _rest, _lst, _exc = _snap
+            for node_id, voltage, resting, last_spike, excit in zip(
+                    _ids, _v.tolist(), _rest.tolist(), _lst.tolist(), _exc.tolist()):
+                if voltage == 0.0 or voltage == resting:
+                    continue
+                entries[node_id] = {
+                    "voltage": voltage,
+                    "last_spike_time": last_spike,
+                    "excitability": excit,
+                    "timestamp": now,
+                }
+        else:
+            # list() the items first: node creation by a concurrent writer would
+            # otherwise raise "dictionary changed size during iteration" mid-capture.
+            for node_id, node in list(graph.nodes.items()):
+                if node.voltage == 0.0 or node.voltage == node.resting_potential:
+                    continue
+                entries[node_id] = {
+                    "voltage": node.voltage,
+                    "last_spike_time": node.last_spike_time,
+                    "excitability": node.intrinsic_excitability,
+                    "timestamp": now,
+                }
 
         # Bound to max_entries by descending absolute voltage
         max_entries = self._cfg.max_entries
