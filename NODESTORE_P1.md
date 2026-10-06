@@ -124,7 +124,7 @@ sha256 `a0d495280a8bb6d9d681ef88e284b50b93563dd78a4e79586abbcb3b32a17170` (abi3,
 - **Both directions**: a checkpoint written ON is restored by the trial-tip module, by OFF and by ON, and each
   re-saves identical bytes; OFF/base-written files restored ON re-save identically (6 seeds).
 - NodeRef contract inside the engine: `create_node` returns a live view, D3 `KeyError` after `remove_node` and after
-  re-creating the id, D1 order (re-added id at the end), opt-in resolution (env needs the wheel; keyword wins;
+  re-creating the id, D1 order (re-added id at the end), opt-in resolution (the host switch needs the wheel; keyword wins;
   nothing lands in `config`).
 
 ### 2.3 Checkpoint COPY (`/tmp/rhs4/ckpt/main.msgpack`, mode 444, sha256 `3c2b6995…`, 251,948,729 bytes, 10,158 nodes)
