@@ -293,7 +293,8 @@ def test_declines_touch_nothing_and_fallback_matches():
     assert g.nodes.fire([b"bytes-id"], 5, None) is False
     assert g.nodes.update_firing_ema(set(), 0) is False
     assert g.nodes.adapt_thresholds({}, 0.05, 0.001, 5) is False
-    assert g.nodes.adapt_thresholds({"x": 1}, 0.05, 0.001, 5.0) is False
+    assert g.nodes.adapt_thresholds({list(g.nodes)[0]: 1}, 0.05, 0.001, 5.0) is False   # an int target of a node
+    # (an int under a key that names no node is never read — by the loop either — so that pass proceeds)
     assert g.nodes.adapt_thresholds(types.MappingProxyType({}), 0.05, 0.001, 5.0) is False
     assert g.nodes.adapt_excitability({}, 0.05, 1) is None
     assert node_state(g) == before
@@ -669,3 +670,28 @@ def test_native_methods_actually_engage(monkeypatch):
             g.stimulate(nid, 2.0)
     assert fired > 0
     assert calls == [], calls
+
+
+@needs_p2a
+def test_degree_target_lookup_revalidates_layout():
+    """The per-row dict lookups run with no borrow held; Python code they trigger (a key's __eq__) may
+    change the store. Then the pass must decline (touch nothing) — the caller runs the Python loop."""
+    g, _, _ = edge_pair(5)
+    victim = list(g.nodes)[3]
+
+    class Collider:
+        def __hash__(self):
+            return hash(victim)
+
+        def __eq__(self, other):
+            if "made-in-eq" not in g.nodes:
+                g.create_node(node_id="made-in-eq")
+            return False
+
+    d = {Collider(): 0.3}
+    d.update({nid: 0.05 for nid in list(g.nodes)[::2]})
+    before = node_state(g)
+    assert g.nodes.adapt_thresholds(d, 0.05, 0.001, 5.0) is False
+    assert "made-in-eq" in g.nodes
+    assert node_state(g)[:-1] == before                       # nothing touched but the node __eq__ made
+    assert g.nodes.adapt_excitability(d, 0.05, 0.01) is not None   # no layout change this time: proceeds
