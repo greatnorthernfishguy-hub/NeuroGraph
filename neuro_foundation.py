@@ -20,6 +20,21 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-06] Claude (lane nodestore-p2b) — STDPRule.apply runs as ONE native SynapseStore.stdp_pass per step (P2b)
+#   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p2b-20261006 ONLY; Josh approved the P2b lane 2026-10-06
+#    ("Let's stick with your proposed order ... Proceed."); merges only after his protected-file "proceed"; the native
+#    node store stays OFF by default)
+# What: STDPRule.apply calls graph.synapses.stdp_pass(graph.nodes, fired, timestep, A+, A-, tau+, tau-, lr,
+#       three_factor, _GSG_CURVATURE_TABLE, graph._incoming, graph._outgoing): the incoming + outgoing passes of every
+#       fired node, reading last_spike_time / diffpc_layer from the NodeStore columns. When absent (dict of Node, the
+#       default; an older wheel; a duck-typed graph) or when it declines (anything the loop would raise on or treat
+#       differently), the module-level _stdp_python runs: the trial's loop, moved verbatim.
+# Why:  spec superpowers/specs/2026-10-05-native-node-store-design.md §4 P2b / §1.5 / §9: ~0.77 s/step of per-synapse
+#       Python node reads; the first phase where the native store should make step() net faster.
+# How:  ng-tract-rs cc-laptop-nodestore-p2b-rs-20261006. Same float expressions and operand order; `math.exp` ->
+#       f64::exp, both glibc `exp@GLIBC_2.29` (exactness gate: 4,587,520 results bitwise equal, ~/.cache/p2b/exp_gate.py).
+#       The graph's own adjacency sets are passed (their iteration order), not the store's native index. Bit-identical
+#       to the trial tip ef78c67 (tests/test_nodestore_p2b.py). Checkpoint format unchanged.
 # [2026-10-06] Claude (lane nodestore-p2a) — the whole-population node passes call native NodeStore batch methods (P2a)
 #   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p2a-20261006 ONLY; Josh approved starting the P2a lane
 #    2026-10-05 "Go ahead and start now"; merges only after his protected-file "proceed"; the native store stays OFF by default)
@@ -1465,6 +1480,116 @@ def _adapt_excitability_python(nodes, degree_targets, target_firing_rate, excita
     return node_scales
 
 
+# [2026-10-06] P2b (native node store): the Python fallback for SynapseStore.stdp_pass — STDPRule.apply's loop as it
+# stood at the trial tip ef78c67, moved verbatim (`self` -> `rule`). Runs when the native pass is absent or declines.
+def _stdp_python(rule: "STDPRule", graph: "Graph", fired_node_ids: List[str], timestep: int) -> None:
+    three_factor = graph.config.get("three_factor_enabled", False)
+    # [2026-10-05] native batch read/commit when the installed ng_tract has them, else the
+    # identical per-SynapseRef fallbacks (module helpers below).
+    _store = graph.synapses
+    _reads = getattr(_store, "stdp_reads", None)
+    if _reads is None:
+        _reads = lambda ids, pre: _stdp_reads_python(_store, ids, pre)  # noqa: E731
+    _commit = getattr(_store, "apply_stdp_dw", None)
+    if _commit is None:
+        _commit = lambda ids, dws, ts, tf: _apply_stdp_dw_python(rule, _store, ids, dws, ts, tf)  # noqa: E731
+
+    for post_id in fired_node_ids:
+        post_node = graph.nodes[post_id]
+        t_post = float(timestep)
+
+        # Iterate over all incoming synapses to this post node
+        # [2026-10-04] one native read (pre_id, weight, max_weight) per synapse, then
+        # one native commit of the computed dw's (former _apply_dw), per pass.
+        incoming_syn_ids = list(graph._incoming.get(post_id, set()))
+        _dw_ids: List[str] = []
+        _dw_vals: List[float] = []
+        for syn_id, _row in zip(incoming_syn_ids,
+                                _reads(incoming_syn_ids, True)):
+            if _row is None:
+                continue
+            _pre_id, _syn_w, _syn_mw = _row
+            pre_node = graph.nodes.get(_pre_id)
+            if pre_node is None:
+                continue
+
+            t_pre = pre_node.last_spike_time
+            if t_pre == -math.inf:
+                continue
+
+            dt = t_post - t_pre
+
+            if dt > 0:
+                # LTP: pre fired before post (causal)
+                raw_dw = rule.A_plus * math.exp(-dt / rule.tau_plus)
+                # Weight-dependent scaling (PRD §3.1.2)
+                scale = (_syn_mw - _syn_w) / _syn_mw
+                dw = raw_dw * rule.learning_rate * max(scale, 0.0)
+            elif dt < 0:
+                # LTD: pre fired after post (acausal)
+                raw_dw = -rule.A_minus * math.exp(dt / rule.tau_minus)
+                dw = raw_dw * rule.learning_rate
+            else:
+                # Temporal aliasing: Δt=0 → weak LTP at half strength (PRD §3.1.2)
+                raw_dw = rule.A_plus * 0.5
+                scale = (_syn_mw - _syn_w) / _syn_mw
+                dw = raw_dw * rule.learning_rate * max(scale, 0.0)
+
+            # GSG Phase 2: amplify dw by Poincaré curvature of pre/post layer
+            _pre_l = getattr(pre_node, "diffpc_layer", 2)
+            _post_l = getattr(post_node, "diffpc_layer", 2)
+            dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
+            _dw_ids.append(syn_id)
+            _dw_vals.append(dw)
+        if _dw_ids:
+            _commit(_dw_ids, _dw_vals, float(timestep), three_factor)
+
+        # Also handle outgoing synapses (post-before-pre → LTD from
+        # perspective of those synapses where this node is pre)
+        outgoing_syn_ids = list(graph._outgoing.get(post_id, set()))
+        _dw_ids = []
+        _dw_vals = []
+        for syn_id, _row in zip(outgoing_syn_ids,
+                                _reads(outgoing_syn_ids, False)):
+            if _row is None:
+                continue
+            _other_id, _syn_w, _syn_mw = _row
+            other_node = graph.nodes.get(_other_id)
+            if other_node is None:
+                continue
+
+            t_other = other_node.last_spike_time
+            if t_other == -math.inf:
+                continue
+
+            # From this synapse's perspective: pre (post_id) just fired,
+            # and post (other_node) fired at t_other.
+            # dt = t_other - t_post (post_node time relative to pre_node)
+            dt = t_other - t_post
+
+            if dt > 0:
+                # other fired after this node → LTP
+                raw_dw = rule.A_plus * math.exp(-dt / rule.tau_plus)
+                scale = (_syn_mw - _syn_w) / _syn_mw
+                dw = raw_dw * rule.learning_rate * max(scale, 0.0)
+            elif dt < 0:
+                # other fired before this node → LTD
+                raw_dw = -rule.A_minus * math.exp(dt / rule.tau_minus)
+                dw = raw_dw * rule.learning_rate
+            else:
+                continue  # already handled in incoming pass
+
+            # GSG Phase 2: post_node is pre here (outgoing from it); other_node is post
+            _pre_l = getattr(post_node, "diffpc_layer", 2)
+            _post_l = getattr(other_node, "diffpc_layer", 2)
+            dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
+            _dw_ids.append(syn_id)
+            _dw_vals.append(dw)
+        if _dw_ids:
+            _commit(_dw_ids, _dw_vals, float(timestep), three_factor)
+
+
+
 class STDPRule(PlasticityRule):
     """Spike-Timing-Dependent Plasticity (PRD §3.1).
 
@@ -1527,111 +1652,18 @@ class STDPRule(PlasticityRule):
         accumulate in eligibility_trace instead of being applied directly
         (PRD §5.2 Three-Factor Learning).
         """
-        three_factor = graph.config.get("three_factor_enabled", False)
-        # [2026-10-05] native batch read/commit when the installed ng_tract has them, else the
-        # identical per-SynapseRef fallbacks (module helpers below).
-        _store = graph.synapses
-        _reads = getattr(_store, "stdp_reads", None)
-        if _reads is None:
-            _reads = lambda ids, pre: _stdp_reads_python(_store, ids, pre)  # noqa: E731
-        _commit = getattr(_store, "apply_stdp_dw", None)
-        if _commit is None:
-            _commit = lambda ids, dws, ts, tf: _apply_stdp_dw_python(self, _store, ids, dws, ts, tf)  # noqa: E731
-
-        for post_id in fired_node_ids:
-            post_node = graph.nodes[post_id]
-            t_post = float(timestep)
-
-            # Iterate over all incoming synapses to this post node
-            # [2026-10-04] one native read (pre_id, weight, max_weight) per synapse, then
-            # one native commit of the computed dw's (former _apply_dw), per pass.
-            incoming_syn_ids = list(graph._incoming.get(post_id, set()))
-            _dw_ids: List[str] = []
-            _dw_vals: List[float] = []
-            for syn_id, _row in zip(incoming_syn_ids,
-                                    _reads(incoming_syn_ids, True)):
-                if _row is None:
-                    continue
-                _pre_id, _syn_w, _syn_mw = _row
-                pre_node = graph.nodes.get(_pre_id)
-                if pre_node is None:
-                    continue
-
-                t_pre = pre_node.last_spike_time
-                if t_pre == -math.inf:
-                    continue
-
-                dt = t_post - t_pre
-
-                if dt > 0:
-                    # LTP: pre fired before post (causal)
-                    raw_dw = self.A_plus * math.exp(-dt / self.tau_plus)
-                    # Weight-dependent scaling (PRD §3.1.2)
-                    scale = (_syn_mw - _syn_w) / _syn_mw
-                    dw = raw_dw * self.learning_rate * max(scale, 0.0)
-                elif dt < 0:
-                    # LTD: pre fired after post (acausal)
-                    raw_dw = -self.A_minus * math.exp(dt / self.tau_minus)
-                    dw = raw_dw * self.learning_rate
-                else:
-                    # Temporal aliasing: Δt=0 → weak LTP at half strength (PRD §3.1.2)
-                    raw_dw = self.A_plus * 0.5
-                    scale = (_syn_mw - _syn_w) / _syn_mw
-                    dw = raw_dw * self.learning_rate * max(scale, 0.0)
-
-                # GSG Phase 2: amplify dw by Poincaré curvature of pre/post layer
-                _pre_l = getattr(pre_node, "diffpc_layer", 2)
-                _post_l = getattr(post_node, "diffpc_layer", 2)
-                dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
-                _dw_ids.append(syn_id)
-                _dw_vals.append(dw)
-            if _dw_ids:
-                _commit(_dw_ids, _dw_vals, float(timestep), three_factor)
-
-            # Also handle outgoing synapses (post-before-pre → LTD from
-            # perspective of those synapses where this node is pre)
-            outgoing_syn_ids = list(graph._outgoing.get(post_id, set()))
-            _dw_ids = []
-            _dw_vals = []
-            for syn_id, _row in zip(outgoing_syn_ids,
-                                    _reads(outgoing_syn_ids, False)):
-                if _row is None:
-                    continue
-                _other_id, _syn_w, _syn_mw = _row
-                other_node = graph.nodes.get(_other_id)
-                if other_node is None:
-                    continue
-
-                t_other = other_node.last_spike_time
-                if t_other == -math.inf:
-                    continue
-
-                # From this synapse's perspective: pre (post_id) just fired,
-                # and post (other_node) fired at t_other.
-                # dt = t_other - t_post (post_node time relative to pre_node)
-                dt = t_other - t_post
-
-                if dt > 0:
-                    # other fired after this node → LTP
-                    raw_dw = self.A_plus * math.exp(-dt / self.tau_plus)
-                    scale = (_syn_mw - _syn_w) / _syn_mw
-                    dw = raw_dw * self.learning_rate * max(scale, 0.0)
-                elif dt < 0:
-                    # other fired before this node → LTD
-                    raw_dw = -self.A_minus * math.exp(dt / self.tau_minus)
-                    dw = raw_dw * self.learning_rate
-                else:
-                    continue  # already handled in incoming pass
-
-                # GSG Phase 2: post_node is pre here (outgoing from it); other_node is post
-                _pre_l = getattr(post_node, "diffpc_layer", 2)
-                _post_l = getattr(other_node, "diffpc_layer", 2)
-                dw *= _GSG_CURVATURE_TABLE[max(0, min(2, _pre_l))][max(0, min(2, _post_l))]
-                _dw_ids.append(syn_id)
-                _dw_vals.append(dw)
-            if _dw_ids:
-                _commit(_dw_ids, _dw_vals, float(timestep), three_factor)
-
+        # [2026-10-06] P2b: the whole pass in ONE native SynapseStore.stdp_pass when the installed ng_tract has it and
+        # graph.nodes is the native NodeStore; it reads last_spike_time / diffpc_layer natively and returns True when
+        # done. Anything else (the dict of Node — the default —, an older wheel, a duck-typed graph, or a decline:
+        # False, nothing touched) runs _stdp_python, the trial's original loop moved verbatim. `is True`, so a mock's
+        # truthy auto-return never skips the loop.
+        _native = getattr(graph.synapses, "stdp_pass", None)
+        if _native is not None and _native(
+                graph.nodes, fired_node_ids, timestep, self.A_plus, self.A_minus, self.tau_plus, self.tau_minus,
+                self.learning_rate, graph.config.get("three_factor_enabled", False), _GSG_CURVATURE_TABLE,
+                getattr(graph, "_incoming", None), getattr(graph, "_outgoing", None)) is True:
+            return
+        _stdp_python(self, graph, fired_node_ids, timestep)
 
 class HomeostaticRule(PlasticityRule):
     """Homeostatic plasticity (PRD §3.2).
