@@ -20,6 +20,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-06] Claude (lane sleep-p1) — sleep phase P1: structural removal can run in a sleep cycle instead of every step
+#   (PROTECTED CHANGE on review branch cc-laptop-sleep-p1-20261006 ONLY; Josh approved the sleep-phase design as
+#    recommended 2026-10-06 ("OK, sounds good"); merges only after his protected-file "proceed")
+# What: (1) NEW Graph.sleep_cycle(): the EXISTING _prune_synapses() (default path) + _collect_orphan_nodes(), run once
+#       under _step_lock; adds the pruned count to _total_pruned; emits one "sleep_cycle" event + one INFO line with the
+#       counts and returns them. (2) NEW config key structural_plasticity_in_sleep (read live, absent = False, NOT in
+#       DEFAULT_CONFIG): when truthy, _structural_plasticity (step 8) skips _prune_synapses + _collect_orphan_nodes
+#       (sprouting stays) and the Tonic write-mode aging tail skips the same two calls (its age_and_decay_salience
+#       stays; it retires with the inactivity rule, D10/§6). (3) _prune_synapses docstring marks the activity and age
+#       rules as retiring (#1049). No rule, predicate, counter or default changes.
+# Why:  spec superpowers/specs/2026-10-06-sleep-phase-design.md §2, §8 P1 (#1046): pruning bookkeeping is ~0.9 s of a
+#       ~2.1 s step on the CC copy; removal belongs on the sleep clock; the Tonic tail is the second prune clock (#1052).
+# How:  key absent = the exact code path before this change (golden checkpoint-copy trace + checkpoint sha equal to
+#       de8b214, SLEEP_P1.md). The caller is a host dream loop on its own wall clock (LAW 8) behind its own env (LAW 5).
 # [2026-10-06] Claude (lane nodestore-p2b) — STDPRule.apply runs as ONE native SynapseStore.stdp_pass per step (P2b)
 #   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p2b-20261006 ONLY; Josh approved the P2b lane 2026-10-06
 #    ("Let's stick with your proposed order ... Proceed."); merges only after his protected-file "proceed"; the native
@@ -3477,8 +3491,11 @@ class Graph:
                         # sweep: inactive_steps += 1 for every row, and salience > 1.0
                         # relaxes by 1 + (s-1)*(1-decay) (a no-op when decay == 0).
                         self.synapses.age_and_decay_salience(_sal_decay)
-                        self._prune_synapses()
-                        self._collect_orphan_nodes()
+                        # [2026-10-06] sleep phase P1: the second prune clock (#1052) stops when removal has
+                        # moved to sleep_cycle (config structural_plasticity_in_sleep; absent = unchanged).
+                        if not self.config.get("structural_plasticity_in_sleep", False):
+                            self._prune_synapses()
+                            self._collect_orphan_nodes()
 
             return result
 
@@ -4078,13 +4095,60 @@ class Graph:
     def _structural_plasticity(self, fired_ids: List[str]) -> Tuple[int, int]:
         """Apply pruning and sprouting rules (PRD §3.3).
 
+        [2026-10-06] sleep phase P1: when config `structural_plasticity_in_sleep` is truthy (read live, absent =
+        False, NOT in DEFAULT_CONFIG), removal (`_prune_synapses` + `_collect_orphan_nodes`) is skipped here and
+        runs only in `sleep_cycle`, called by a host on its own clock. Sprouting (wake growth) always stays.
+        Key absent: exactly the code path before this change.
+
         Returns:
             (num_pruned, num_sprouted)
         """
+        if self.config.get("structural_plasticity_in_sleep", False):
+            return 0, self._sprout_synapses(fired_ids)
         pruned = self._prune_synapses()
         self._collect_orphan_nodes()
         sprouted = self._sprout_synapses(fired_ids)
         return pruned, sprouted
+
+    def sleep_cycle(self) -> Dict[str, Any]:
+        """Sleep phase P1 (spec superpowers/specs/2026-10-06-sleep-phase-design.md §2, §8 P1): the structural
+        removal that `step()` runs every step — the EXISTING `_prune_synapses()` (default path: same three rules,
+        same lifelines, same last-link grace) and then the EXISTING `_collect_orphan_nodes()` — run ONCE, under
+        `_step_lock`. No rule changes here (P2 changes the rules).
+
+        Intended caller: a host's dream loop on its OWN wall clock (LAW 8), switched by the host's env (LAW 5),
+        which also sets config `structural_plasticity_in_sleep` so `step()` and the Tonic write-mode tail stop
+        removing. With that key absent this method still runs the same two calls (one extra removal pass); it is
+        never called by anything in this module.
+
+        Emits one "sleep_cycle" event and logs one INFO line (never silent), and returns the record:
+        pruned, nodes_collected, synapses / nodes before and after, timestep, seconds, in_sleep_mode.
+        The existing "pruned" / "nodes_collected" events fire from the two calls as before.
+        """
+        import time as _time   # local: the module namespace stays as it was
+        t0 = _time.perf_counter()
+        with self._step_lock:
+            syn_before = len(self.synapses)
+            nodes_before = len(self.nodes)
+            pruned = self._prune_synapses()
+            collected = self._collect_orphan_nodes()
+            self._total_pruned += pruned
+            record = {
+                "timestep": self.timestep,
+                "pruned": pruned,
+                "nodes_collected": collected,
+                "synapses_before": syn_before,
+                "synapses_after": len(self.synapses),
+                "nodes_before": nodes_before,
+                "nodes_after": len(self.nodes),
+                "in_sleep_mode": bool(self.config.get("structural_plasticity_in_sleep", False)),
+                "seconds": _time.perf_counter() - t0,
+            }
+            self._emit("sleep_cycle", **record)
+        logger.info("sleep_cycle: t=%s pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d in_sleep_mode=%s %.3fs",
+                    record["timestep"], pruned, collected, syn_before, record["synapses_after"], nodes_before,
+                    record["nodes_after"], record["in_sleep_mode"], record["seconds"])
+        return record
 
     def _prune_synapses(
         self,
@@ -4101,6 +4165,8 @@ class Graph:
             Weight-based: weight < threshold for > grace_period steps → remove.
             Activity-based: unused for > inactivity_threshold steps → remove.
             Age-based: age > grace_period AND peak_weight < 2× initial → remove.
+        [2026-10-06] The activity and age rules (step deadlines) are RETIRING: punchlist #1049, spec
+        superpowers/specs/2026-10-06-sleep-phase-design.md §6 (D2, D9). Unchanged until P4.
 
         Keyword-only parameters (want-hub (d), plan-005 §4.2) — ALL default None, and with
         all of them None this is exactly the function above (both wake-time callers):
