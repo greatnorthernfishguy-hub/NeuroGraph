@@ -27,6 +27,13 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-10-06] Claude (lane nodestore-p2a, review branch cc-laptop-nodestore-p2a-20261006)
+#   What: _extract_graph_features_for_model reads the first 100 nodes' voltage / firing_rate_ema /
+#         intrinsic_excitability from one NodeStore.columns() copy when graph.nodes is a native store,
+#         else the original list(g.nodes.values()); n_nodes = the same count.
+#   Why:  spec 2026-10-05-native-node-store-design.md §4 P2a (Tonic features [:100]): ~10K NodeRef objects
+#         built per Tonic tick to read 100 of them.
+#   How:  same values in the same order, same tensors (tests/test_nodestore_p2a.py vs the trial tip's file).
 # [2026-10-05] Claude (lane rust-hotpaths-onto-s4, review branch cc-laptop-rust-hotpaths-onto-s4-20261005)
 #   What: carries the overnight change below onto trial s4, plus a fallback to the old per-SynapseRef
 #         list when the installed ng_tract has no creation_time_copy (the existing getattr pattern).
@@ -1089,7 +1096,21 @@ class TonicEngine:
         if not g.nodes:
             return None
 
-        nodes = list(g.nodes.values())
+        # [2026-10-06] P2a: the first 100 nodes' voltage / firing rate / excitability from one native
+        # column copy (node order == values() order) when graph.nodes is an ng_tract.NodeStore; else the
+        # original list of node objects. n_nodes is the same count either way.
+        _cols = getattr(g.nodes, "columns", None)
+        _nc = (_cols(["voltage", "firing_rate_ema", "intrinsic_excitability"], with_ids=False)
+               if _cols is not None else None)
+        if isinstance(_nc, tuple):
+            _nv, _nf, _ne = (a[:100].tolist() for a in _nc[1:])
+            n_nodes = len(_nc[1])
+        else:
+            nodes = list(g.nodes.values())
+            _nv = [n.voltage for n in nodes[:100]]
+            _nf = [n.firing_rate_ema for n in nodes[:100]]
+            _ne = [n.intrinsic_excitability for n in nodes[:100]]
+            n_nodes = len(nodes)
         # [2026-10-04] Was list(g.synapses.values()): ~193K SynapseRef allocations per Tonic
         # tick to read the first 200 rows. Native column copies give the same first-200 rows
         # in the same (row) order; n_syn is the same count len(list) gave.
@@ -1104,15 +1125,15 @@ class TonicEngine:
             n_syn = len(_syns)
 
         return GraphFeatures(
-            node_voltages=torch.tensor([n.voltage for n in nodes[:100]], dtype=torch.float32),
-            node_firing_rates=torch.tensor([n.firing_rate_ema for n in nodes[:100]], dtype=torch.float32),
-            node_excitability=torch.tensor([n.intrinsic_excitability for n in nodes[:100]], dtype=torch.float32),
+            node_voltages=torch.tensor(_nv, dtype=torch.float32),
+            node_firing_rates=torch.tensor(_nf, dtype=torch.float32),
+            node_excitability=torch.tensor(_ne, dtype=torch.float32),
             synapse_weights=torch.tensor([float(w) for w in _syn_w], dtype=torch.float32),
             synapse_ages=torch.tensor([float(g.timestep - float(ct)) for ct in _syn_ct], dtype=torch.float32),
-            density=torch.tensor([n_syn / max(1, len(nodes) * (len(nodes) - 1))], dtype=torch.float32),
+            density=torch.tensor([n_syn / max(1, n_nodes * (n_nodes - 1))], dtype=torch.float32),
             clustering=torch.tensor([0.0], dtype=torch.float32),  # expensive to compute, approximate
             n_components=torch.tensor([1.0], dtype=torch.float32),
-            n_nodes=torch.tensor([float(len(nodes))], dtype=torch.float32),
+            n_nodes=torch.tensor([float(n_nodes)], dtype=torch.float32),
             n_synapses=torch.tensor([float(n_syn)], dtype=torch.float32),
             n_hyperedges=torch.tensor([float(len(g.hyperedges))], dtype=torch.float32),
             recent_firings=torch.zeros(15, dtype=torch.float32),  # TODO: track per-step

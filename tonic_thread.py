@@ -26,6 +26,14 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-10-06] Claude (lane nodestore-p2a) — the activity / recency scans read native node columns when available
+# What: _read_active_nodes and _read_recent_spikes iterate _node_scan_rows(graph, fields): one NodeStore.columns()
+#   copy (node order) when graph.nodes is a native ng_tract.NodeStore, else each node's attributes (unchanged reads).
+# Why:  spec superpowers/specs/2026-10-05-native-node-store-design.md §4 P2a: the scans cost ~12 ms through node
+#   objects (more through P1 NodeRefs); a column copy is also one atomic snapshot, so a node removed by a concurrent
+#   writer cannot raise KeyError (D3) mid-scan. Not protected, not vendored; the arithmetic is the same lines.
+# How:  same per-node expressions on the same float values, same order; tests/test_nodestore_p2a.py compares the
+#   scans with this file at the trial tip.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2 (f): the latent thread renders WHOLE
 # What: TonicConfig.max_content_length is Optional[int] = None (was 250) and
 #   format_latent_context clips only when a bound is set. Nothing else here changes.
@@ -118,6 +126,22 @@ logger = logging.getLogger("neurograph.tonic")
 _SPINE_PRIME_BOOTSTRAP = 0.20     # sub-threshold (firing threshold ~0.85) — charge while unwired
 _SPINE_PRIME_STEADY = 0.05        # gentle whisper once wired into the topology
 _SPINE_WIRE_SCALE = 8.0           # synapse-count scale over which bootstrap decays to steady
+
+
+def _node_scan_rows(graph: Any, names: Tuple[str, ...]) -> List[Tuple[Any, ...]]:
+    """[2026-10-06] P2a: (nid, *fields) for every node of `graph`, in node (iteration) order.
+
+    A native ng_tract.NodeStore hands one atomic column copy (NodeStore.columns); otherwise
+    (a dict of Node, an older wheel, a duck-typed test graph, or the store declined because
+    a requested field holds a non-float value) each node's attributes are read, as the scan
+    loops always did. Values are plain Python floats either way.
+    """
+    _cols = getattr(graph.nodes, "columns", None)
+    snap = _cols(list(names)) if _cols is not None else None
+    if not isinstance(snap, tuple):   # None, or a test double's auto-attribute: read the nodes
+        return [(nid, *[getattr(node, a) for a in names]) for nid, node in graph.nodes.items()]
+    ids, *arrays = snap
+    return list(zip(ids, *[a.tolist() for a in arrays]))
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +477,15 @@ class TonicThread:
         """
         scored: List[Tuple[str, float]] = []
 
-        for nid, node in self._graph.nodes.items():
-            activity = node.voltage - node.resting_potential
+        # [2026-10-06] P2a: (nid, voltage, resting_potential, last_spike_time) per node, in node order —
+        # one native column copy when the store has it, else read from each node (the original reads).
+        for nid, voltage, resting_potential, last_spike_time in _node_scan_rows(
+                self._graph, ("voltage", "resting_potential", "last_spike_time")):
+            activity = voltage - resting_potential
 
             # Spike recency bonus
-            if node.last_spike_time != -math.inf:
-                steps_since = max(0, self._graph.timestep - node.last_spike_time)
+            if last_spike_time != -math.inf:
+                steps_since = max(0, self._graph.timestep - last_spike_time)
                 recency = 1.0 / (1.0 + steps_since)
                 activity += recency * 0.3
 
@@ -565,9 +592,9 @@ class TonicThread:
         """
         spiked: List[Tuple[str, float]] = []
 
-        for nid, node in self._graph.nodes.items():
-            if node.last_spike_time != -math.inf:
-                recency = 1.0 / (1.0 + max(0, self._graph.timestep - node.last_spike_time))
+        for nid, last_spike_time in _node_scan_rows(self._graph, ("last_spike_time",)):   # [2026-10-06] P2a
+            if last_spike_time != -math.inf:
+                recency = 1.0 / (1.0 + max(0, self._graph.timestep - last_spike_time))
                 spiked.append((nid, recency))
 
         spiked.sort(key=lambda x: -x[1])
