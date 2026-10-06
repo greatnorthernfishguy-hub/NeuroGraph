@@ -20,6 +20,19 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-06] Claude (lane sleep-p1) — D15: removal keeps DiffPC pred_weights consistent + a named one-time purge
+#   (PROTECTED CHANGE on review branch cc-laptop-sleep-p1-20261006 ONLY, its own commit; Josh approved D15 "fix at
+#    source + purge" with the sleep-phase design 2026-10-06 ("OK, sounds good"); this reaches Syl's code path, so it
+#    merges only on his separate protected-file "proceed")
+# What: (1) _remove_synapse_internal drops pre.pred_weights[post] when no other pre->post synapse remains
+#       (scans the smaller of pre's out-set / post's in-set). remove_node gets it through its cascade (docstring says so). (2) NEW
+#       Graph.purge_dangling_pred_weights(): drops every pred_weights key with no pre->key synapse or no key node;
+#       returns + logs counts; never called automatically.
+# Why:  spec superpowers/specs/2026-10-06-sleep-phase-design.md §1A (DiffPC row, hazard (d)), §3.3, D15, §8 P1: the
+#       removal functions never touched pred_weights; 58,049 of 62,408 entries dangle on the CC copy, a re-sprouted
+#       pair inherits a stale prediction instead of the 0.5 prior, and dead entries ride every checkpoint. LAW 4.
+# How:  the check runs only when the pre node holds an entry for the post node (cheap otherwise). Intended trace
+#       change: DiffPC on a re-created pre->post pair now starts from the 0.5 prior (tests/test_sleep_p1.py names it).
 # [2026-10-06] Claude (lane sleep-p1) — sleep phase P1: structural removal can run in a sleep cycle instead of every step
 #   (PROTECTED CHANGE on review branch cc-laptop-sleep-p1-20261006 ONLY; Josh approved the sleep-phase design as
 #    recommended 2026-10-06 ("OK, sounds good"); merges only after his protected-file "proceed")
@@ -2547,7 +2560,12 @@ class Graph:
             return node
 
     def remove_node(self, node_id: str) -> None:
-        """Remove node and all connected synapses; update hyperedges (PRD §8 remove_node)."""
+        """Remove node and all connected synapses; update hyperedges (PRD §8 remove_node).
+
+        [2026-10-06] D15: every in-neighbour's DiffPC `pred_weights[node_id]` goes with its last synapse to this
+        node (the cascade below runs through `_remove_synapse_internal`); the node's own `pred_weights` goes with it.
+        Entries that were ALREADY dangling before this fix are `purge_dangling_pred_weights`' job.
+        """
         with self._step_lock:
             if node_id not in self.nodes:
                 raise KeyError(f"Node {node_id} not found")
@@ -2634,14 +2652,36 @@ class Graph:
             return self.synapses[syn.synapse_id]
 
     def _remove_synapse_internal(self, synapse_id: str) -> None:
-        """Remove a synapse and clean up indices (no KeyError on missing)."""
+        """Remove a synapse and clean up indices (no KeyError on missing).
+
+        [2026-10-06] D15 (sleep-phase spec §1A, §3.3): also keeps DiffPC consistent — the pre node's
+        `pred_weights` entry for the post node is dropped when no other pre→post synapse remains (DiffPC
+        only ever writes that entry while walking such a synapse, so it has no meaning without one).
+        `remove_node` is covered by this: it removes every incident synapse through here first.
+        """
         syn = self.synapses.pop(synapse_id, None)
         if syn is None:
             return
-        self._outgoing.get(syn.pre_node_id, set()).discard(synapse_id)
-        self._incoming.get(syn.post_node_id, set()).discard(synapse_id)
+        pre_id, post_id = syn.pre_node_id, syn.post_node_id
+        self._outgoing.get(pre_id, set()).discard(synapse_id)
+        self._incoming.get(post_id, set()).discard(synapse_id)
         self._dirty_synapses.discard(synapse_id)
         self._synapse_confirmation_history.pop(synapse_id, None)
+        pre = self.nodes.get(pre_id)
+        if pre is not None:
+            pw = pre.pred_weights
+            if pw and post_id in pw:
+                # Is another pre->post synapse left? Scan the SMALLER of pre's out-set and post's in-set (a parallel
+                # synapse is in both): a hub's out-set is ~1,900 on the CC copy, so _find_synapse (out-set only) made a
+                # 16K-link clearance ~7x slower than the removal itself; the target's in-set is usually tiny.
+                out_ids = self._outgoing.get(pre_id, ())
+                in_ids = self._incoming.get(post_id, ())
+                for sid in (in_ids if len(in_ids) < len(out_ids) else out_ids):
+                    other = self.synapses.get(sid)
+                    if other is not None and other.pre_node_id == pre_id and other.post_node_id == post_id:
+                        break
+                else:
+                    del pw[post_id]
 
     def remove_synapse(self, synapse_id: str) -> None:
         """Remove a synapse (public API)."""
@@ -2649,6 +2689,49 @@ class Graph:
             if synapse_id not in self.synapses:
                 raise KeyError(f"Synapse {synapse_id} not found")
             self._remove_synapse_internal(synapse_id)
+
+    def purge_dangling_pred_weights(self) -> Dict[str, Any]:
+        """D15 one-time purge (sleep-phase spec §1A, §3.3): drop every DiffPC `pred_weights` entry whose key has no
+        pre→key synapse, or names a node that no longer exists. These were left by removals before
+        `_remove_synapse_internal` kept `pred_weights` consistent (58,049 of 62,408 on the CC copy, 2026-10-06), and by
+        imports that carry `pred_weights` without the synapses. Values of the entries that stay are untouched.
+
+        NOT called by anything in this module, and never automatically: a host calls it once, on its own decision
+        (the spec puts it at the first armed sleep). Runs under `_step_lock`. Returns and logs (INFO) the counts.
+        """
+        with self._step_lock:
+            nodes_with = 0
+            before = 0
+            removed = 0
+            removed_missing_node = 0
+            nodes_touched = 0
+            for nid, node in self.nodes.items():
+                pw = node.pred_weights
+                if not pw:
+                    continue
+                nodes_with += 1
+                before += len(pw)
+                targets = set()
+                for sid in self._outgoing.get(nid, ()):
+                    syn = self.synapses.get(sid)
+                    if syn is not None:
+                        targets.add(syn.post_node_id)
+                drop = [k for k in pw if k not in targets or k not in self.nodes]
+                if drop:
+                    nodes_touched += 1
+                    for k in drop:
+                        if k not in self.nodes:
+                            removed_missing_node += 1
+                        del pw[k]
+                    removed += len(drop)
+                    self._dirty_nodes.add(nid)
+            record = {"timestep": self.timestep, "nodes_with_pred_weights": nodes_with, "entries_before": before,
+                      "entries_removed": removed, "removed_key_node_missing": removed_missing_node,
+                      "entries_after": before - removed, "nodes_touched": nodes_touched}
+        logger.info("purge_dangling_pred_weights: t=%s entries %d -> %d (removed %d, of which key node missing %d) "
+                    "nodes_touched=%d", record["timestep"], before, record["entries_after"], removed,
+                    removed_missing_node, nodes_touched)
+        return record
 
     def create_hyperedge(
         self,
