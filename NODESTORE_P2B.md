@@ -246,5 +246,5 @@ compare script `~/.cache/p2b/compare_suites.py`.
    it can know, so an exception-path step pays for both (only on malformed state).
 7. Vault docs (`~/docs/modules/NeuroGraph.md`, the spec's progress log) are not updated from this lane — for the
    Executive at integration.
-8. Off-task, noticed: the P2a harness left ~500 `~/.cache/p2a-home.*` scratch HOMEs (and this lane's
-   `~/.cache/p2b-home.*`); harmless, but worth a cleanup line in the harness.
+8. Off-task, noticed: the P2a harness left ~500 `~/.cache/p2a-home.*` scratch HOMEs (this lane removed its
+   own 490 `~/.cache/p2b-home.*` at the end); harmless, but worth a cleanup line in the harness.
