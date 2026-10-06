@@ -24,7 +24,8 @@ Design principles (PRD §2.1):
 #   (PROTECTED CHANGE on review branch cc-laptop-nodestore-p1-20261005 ONLY; Josh's 2026-10-05 go for this phase; merges only
 #    after his protected-file "proceed"; P1 merges switched OFF per D7)
 # What: Graph(config, *, native_node_store=None). The native store is used only when the installed ng_tract has NodeStore AND
-#       the opt-in is set: the keyword, or (keyword None) the NG_NATIVE_NODE_STORE environment variable (LAW 5; "1/true/yes/on").
+#       the opt-in is set: the keyword, or (keyword None) the host-set default (set_native_node_store_default; this module
+#       reads no environment — the host reads its own, e.g. NG_NATIVE_NODE_STORE, per LAW 5; no host calls it yet).
 #       Otherwise self.nodes is today's dict of Node, and every line of the dict path runs exactly as before.
 #       When on: create_node returns the live NodeRef; _serialize_full emits the nodes sub-map as native msgpack bytes;
 #       write_checkpoint splices pre-packed bytes for "nodes" as it does for "synapses"; restore slices the raw nodes bytes
@@ -652,7 +653,6 @@ import copy
 import json
 import logging
 import math
-import os
 import random
 import threading
 import uuid
@@ -775,15 +775,25 @@ class RingBuffer:
 _SHARE_TEXT_MIN = 256   # P4a: only texts this long are worth pooling
 
 
+_NATIVE_NODE_STORE_DEFAULT = False   # P1: set ONLY by a host, via set_native_node_store_default (this module reads no env)
+
+
+def set_native_node_store_default(enabled: bool) -> bool:
+    """P1 native node store (2026-10-05, lane nodestore-p1): the HOST's switch. A host that reads its own configuration
+    (LAW 5, e.g. NG_NATIVE_NODE_STORE) calls this before constructing its Graph; Graphs created while it is True use
+    ng_tract.NodeStore when the installed wheel has it. Process-wide: a host sharing its process with another graph
+    should set it, construct, and restore the returned previous value. Returns the previous value."""
+    global _NATIVE_NODE_STORE_DEFAULT
+    prev, _NATIVE_NODE_STORE_DEFAULT = _NATIVE_NODE_STORE_DEFAULT, bool(enabled)
+    return prev
+
+
 def _native_node_store_wanted(explicit: Optional[bool] = None) -> bool:
-    """P1 native node store opt-in (2026-10-05, lane nodestore-p1): the installed ng_tract must have NodeStore,
-    AND the caller must opt in — `explicit` when given, else the NG_NATIVE_NODE_STORE environment variable (LAW 5).
-    Default OFF: Graph.nodes stays a dict of Node."""
+    """P1 opt-in: the installed ng_tract must have NodeStore AND the caller opts in — the Graph keyword when given,
+    else the host-set default (OFF unless a host called set_native_node_store_default(True))."""
     if not hasattr(ng_tract, "NodeStore"):
         return False
-    if explicit is not None:
-        return bool(explicit)
-    return os.environ.get("NG_NATIVE_NODE_STORE", "").strip().lower() in ("1", "true", "yes", "on")
+    return bool(_NATIVE_NODE_STORE_DEFAULT if explicit is None else explicit)
 
 
 def _share_metadata_texts(meta: Any, pool: Dict[str, str]) -> Any:
