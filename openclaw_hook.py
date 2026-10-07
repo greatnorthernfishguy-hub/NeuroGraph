@@ -28,6 +28,21 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-10-07] Claude Opus 5.5 (lane guardian-1051) — #1051 reconciled synapse gate: host wiring
+# (PROTECTED CHANGE on review branch cc-laptop-guardian-1051-20261007 ONLY; merges only after Josh's protected-file "proceed")
+# What: four small additions, all inert unless NG_GUARDIAN_RECONCILE is on (then checkpoint_guardian arms them):
+#       (1) __init__: self._removal_ledger = SaveGate.attach_removal_ledger(self.graph), right after the boot restore
+#       and before any step (None when off); (2) _capture_checkpoint_state: counts["removals"] = ledger.snapshot()
+#       INSIDE the same _step_lock hold that captures the counts; (3) save(): permit(..., removals=...) only when a
+#       snapshot exists; (4) save(): SaveGate.record_accepted(counts) right after the manifest of a PRIMARY save was
+#       written (never on quarantine / failure).
+# Why:  #1051 (Josh 2026-10-06, design agreed): the guardian must tell plasticity (removals the engine logged) from
+#       damage (loss nothing explains) and reference the median of the last N accepted saves, not the last one. The
+#       counts and the removal ledger must be read at the SAME instant or a removal racing the save is miscounted;
+#       only this file owns that instant (#423 capture).
+# How:  no decision logic here (it is in non-protected checkpoint_guardian.py, as for #83/#105); no new writer, no
+#       format change, no engine change. NG_GUARDIAN_RECONCILE unset (Syl's host): attach returns None, counts carry
+#       no "removals", permit() is called exactly as before and record_accepted() is not called.
 # [2026-10-04] Claude (lane vdb-lock-leak) — swept nodes' vectors are deleted by their owner
 # (PROTECTED CHANGE on review branch cc-laptop-vdb-lock-leak-20261004 ONLY; merges only after Josh's protected-file "proceed")
 # What: NeuroGraphMemory.__init__ registers _drop_collected_vectors on the graph's "nodes_collected" event (public
@@ -886,6 +901,11 @@ class NeuroGraphMemory:
         self._save_gate = SaveGate(self._checkpoint_path) if _GUARDIAN_AVAILABLE else None
         if self._save_gate is not None:
             self._save_gate.record_restore(_restore_outcome, self._guardian_meaningful_nodes())
+        # #1051: the engine's own logged removals since this restore (None unless NG_GUARDIAN_RECONCILE is on).
+        # Armed before any step so nothing removed after the restored state goes uncounted.
+        self._removal_ledger = (self._save_gate.attach_removal_ledger(self.graph)
+                                if self._save_gate is not None
+                                and hasattr(self._save_gate, "attach_removal_ledger") else None)
 
         # Vector DB for semantic search
         self.vector_db = SimpleVectorDB()
@@ -1542,6 +1562,10 @@ class NeuroGraphMemory:
                     "timestep": self.graph.timestep,
                     "vdb_count": captured["vectors"]["count"],
                 }
+                # #1051: same lock hold as the counts above, so a removal racing this save is in both or neither.
+                _ledger = getattr(self, "_removal_ledger", None)
+                if _ledger is not None:
+                    captured["counts"]["removals"] = _ledger.snapshot()
             return captured
         except Exception as exc:
             failure = RuntimeError(f"{stage} checkpoint capture failed: {exc}")
@@ -1702,9 +1726,13 @@ class NeuroGraphMemory:
                     _wires_own_deposits = None
                 else:
                     _wires_own_deposits = _wires.strip().lower() in ("1", "true", "yes", "on")
+                # #1051: the removal snapshot is passed only when the ledger is armed, so an
+                # unarmed host calls permit() exactly as before.
+                _recon_kw = ({"removals": counts["removals"]}
+                             if counts.get("removals") is not None else {})
                 _ok, _reason = self._save_gate.permit(
                     guardian_nodes, live_synapses=_live_syn, live_hyperedges=_live_he,
-                    wires_own_deposits=_wires_own_deposits,
+                    wires_own_deposits=_wires_own_deposits, **_recon_kw,
                 )
                 if not _ok:
                     captured.pop("activations", None)
@@ -1890,6 +1918,10 @@ class NeuroGraphMemory:
                         "vdb_count": counts["vdb_count"],
                         "git": best_effort_git_hash(os.path.dirname(os.path.abspath(__file__))),
                     })
+                    # #1051: this PRIMARY save is now the newest accepted one (refused / failed saves never
+                    # reach here). Never raises; a no-op unless the ledger is armed.
+                    if counts.get("removals") is not None:
+                        self._save_gate.record_accepted(counts)
                     if with_receipt:
                         manifest_identity = _file_identity(_mpath)
                         _mark("manifest",
