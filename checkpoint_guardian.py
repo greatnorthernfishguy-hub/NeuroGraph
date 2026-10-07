@@ -21,7 +21,9 @@
 #   save never advances the history or the ledger baseline. Knobs: NG_GUARDIAN_RECONCILE (default 0 = today's
 #   behaviour exactly, Syl's path), NG_GUARDIAN_HISTORY_N, NG_GUARDIAN_HISTORY_MIN, NG_GUARDIAN_TOL_K,
 #   NG_GUARDIAN_TOL_MIN, NG_GUARDIAN_TOL_MAX, NG_GUARDIAN_TOL_MIN_ABS, NG_GUARDIAN_BOOTSTRAP_TOLERANCE,
-#   NG_GUARDIAN_MIN_SYNAPSE_RETENTION, NG_GUARDIAN_CHURN_K, NG_GUARDIAN_CHURN_MIN, NG_GUARDIAN_CHURN_BOOTSTRAP (LAW 5).
+#   NG_GUARDIAN_MIN_SYNAPSE_RETENTION, NG_GUARDIAN_LAST_SAVE_FLOOR, NG_GUARDIAN_CHURN_K, NG_GUARDIAN_CHURN_MIN,
+#   NG_GUARDIAN_CHURN_BOOTSTRAP (LAW 5). Lane addition beyond the agreed text (review finding, Josh to rule): the
+#   reference is max(median, newest save minus logged removals) because the median alone lags a growing graph.
 #   Report: GUARDIAN_1051.md.
 # -------------------
 # ---- Changelog ----
@@ -540,6 +542,7 @@ def _recon_cfg() -> Dict[str, float]:
         "tol_min_abs": _env_float("NG_GUARDIAN_TOL_MIN_ABS", 50),
         "bootstrap_tol": _env_float("NG_GUARDIAN_BOOTSTRAP_TOLERANCE", 0.10),
         "min_retention": _env_float("NG_GUARDIAN_MIN_SYNAPSE_RETENTION", 0.10),
+        "last_save_floor": _env_flag("NG_GUARDIAN_LAST_SAVE_FLOOR", "1"),
         "min_ref_syn": _env_int("NG_GUARDIAN_MIN_REF_SYNAPSES", 100),
         "churn_k": _env_float("NG_GUARDIAN_CHURN_K", 6.0),
         "churn_min": _env_float("NG_GUARDIAN_CHURN_MIN", 0.10),
@@ -574,6 +577,11 @@ def evaluate_synapse_reconciliation(live_synapses: int,
     never below tol_min_abs synapses. Fewer than history_min residuals => the
     bootstrap tolerance.
 
+    The reference is the higher of that median and A_last (the newest save minus the
+    removals logged since it): the median lags a growing graph, and sprouting only
+    adds, so A_last is an exact floor for a healthy graph (NG_GUARDIAN_LAST_SAVE_FLOOR,
+    default on; 0 = the median alone).
+
     Refuse when unexplained loss (reference - live) > tolerance, or when live keeps
     less than min_retention of the last save (the near-empty clobber shape; holds even
     if "explained"). Also returns the non-blocking churn alarm: |net change| vs the
@@ -603,7 +611,15 @@ def evaluate_synapse_reconciliation(live_synapses: int,
         if ex is None:
             break  # removals before this entry are unknown: the window starts here
         since += int(ex)
-    ref = float(statistics.median(adjusted))
+    ref_median = float(statistics.median(adjusted))
+    ref_last = float(adjusted[0])     # the newest accepted save minus everything logged since it
+    # The median lags a growing graph (10 saves of +5% put it ~0.8 of the last save), so on its own it lets ONE
+    # sudden unexplained loss of ~20% through. Sprouting only adds, so the newest save minus the logged removals is
+    # an exact floor for a healthy graph: the reference is the higher of the two (NG_GUARDIAN_LAST_SAVE_FLOOR=0 = the
+    # median alone). A pruned-back sprout burst does not trip it -- its pruning is logged.
+    use_last = bool(c.get("last_save_floor", True)) and ref_last > ref_median
+    ref = ref_last if use_last else ref_median
+    ref_kind = "newest accepted save" if use_last else f"median of the last {len(adjusted)} accepted saves"
 
     residuals: List[float] = []
     changes: List[float] = []
@@ -628,6 +644,7 @@ def evaluate_synapse_reconciliation(live_synapses: int,
     net_frac = net / s_last
 
     out.update({"applicable": True, "reference": ref, "reference_n": len(adjusted), "last": s_last,
+                "reference_median": ref_median, "reference_last": ref_last, "reference_kind": ref_kind,
                 "tolerance": tol_abs, "tolerance_frac": tol_frac, "tolerance_basis": tol_basis,
                 "unexplained": unexplained, "net": net, "net_frac": net_frac})
 
@@ -639,8 +656,8 @@ def evaluate_synapse_reconciliation(live_synapses: int,
     elif unexplained > tol_abs:
         out["permit"] = False
         out["reason"] = (f"unexplained synapse loss: {s_last} -> {live_synapses} with {explained_synapses} "
-                         f"removals logged by the engine since the last accepted save; median reference "
-                         f"(last {len(adjusted)} accepted saves, adjusted for logged removals) {ref:.0f}, "
+                         f"removals logged by the engine since the last accepted save; reference {ref:.0f} "
+                         f"({ref_kind}, adjusted for logged removals; median {ref_median:.0f}), "
                          f"unexplained {unexplained:.0f} > tolerance {tol_abs:.0f} ({tol_frac:.1%}; {tol_basis})")
     else:
         out["reason"] = (f"reconciled: {s_last} -> {live_synapses}, explained {explained_synapses}, "
@@ -679,11 +696,12 @@ class SaveGate:
         self.provisional_reason: Optional[str] = None
         self._reference_nodes: Optional[int] = None
         # #1051 (inert unless attach_removal_ledger() armed it): the ledger snapshot
-        # at the last ACCEPTED save of this process (None = since boot), and the
-        # verdict of the last permit() awaiting record_accepted().
+        # at the last ACCEPTED save of this process (None = since boot); the history
+        # view the last permit() judged against (persisted by record_accepted()); and
+        # last_reconciliation, that permit()'s verdict dict, kept for inspection.
         self._ledger: Optional[RemovalLedger] = None
         self._ledger_baseline: Optional[Dict[str, int]] = None
-        self._pending_recon: Optional[Dict[str, Any]] = None
+        self.last_reconciliation: Optional[Dict[str, Any]] = None
         self._pending_history: Optional[List[Dict[str, Any]]] = None
 
     def record_restore(self, outcome: str, restored_nodes: int) -> None:
@@ -731,16 +749,34 @@ class SaveGate:
         since the restored state is counted."""
         if not reconcile_enabled():
             return None
-        self._ledger = RemovalLedger().attach(graph)
         try:
+            ledger = RemovalLedger().attach(graph)
+        except Exception as exc:  # noqa: BLE001 - the guardian must never stop a boot
+            logger.error("Guardian #1051: removal ledger could NOT be attached (%s); this process keeps the "
+                         "pre-#1051 synapse rule", type(exc).__name__)
+            return None
+        self._ledger = ledger
+        try:
+            # What the next save will be measured against: the newest accepted save, unless the manifest was
+            # written outside the save path since (then _current_history re-seeds from the manifest).
             restored = len(graph.synapses)
             history = read_guard_history(self._checkpoint_path)
-            tail = history[-1].get("synapses") if history else None
-            if tail is not None and tail != restored:
-                logger.warning(
-                    "Guardian #1051: the restored graph has %d synapses but the last accepted save in the "
-                    "guard history recorded %d; the difference is NOT explained by any logged removal and "
-                    "counts against the next save", restored, tail)
+            manifest = read_manifest(self._checkpoint_path)
+            if manifest and isinstance(manifest.get("synapses"), int) and (
+                    not history or history[-1].get("saved_at") != manifest.get("saved_at")):
+                expected, what = manifest["synapses"], "the checkpoint manifest"
+            elif history:
+                expected, what = history[-1].get("synapses"), "the last accepted save in the guard history"
+            else:
+                expected, what = None, None
+            if isinstance(expected, int) and expected != restored:
+                lvl = logging.ERROR if restored < expected else logging.WARNING
+                logger.log(lvl,
+                    "Guardian #1051: the restored graph has %d synapses but %s recorded %d. No logged removal "
+                    "explains the difference.%s", restored, what, expected,
+                    (" Saves that keep it beyond tolerance will be REFUSED and quarantined until an operator "
+                     "checks the on-disk checkpoint and records it with a truthful write_manifest (the "
+                     "quarantine-promotion procedure)." if restored < expected else ""))
         except Exception as exc:  # noqa: BLE001 - a diagnostic only
             logger.debug("Guardian #1051: boot comparison skipped (%s)", type(exc).__name__)
         logger.info("Guardian #1051: reconciled synapse gate ARMED (median of the last %d accepted saves; "
@@ -805,7 +841,6 @@ class SaveGate:
             logger.warning("Guardian #1051: accepted save not recorded in the history (%s); the next save "
                            "reconciles against the previous entry", type(exc).__name__)
         finally:
-            self._pending_recon = None
             self._pending_history = None
 
     def permit(self, live_nodes: int,
@@ -838,7 +873,7 @@ class SaveGate:
         so a stuck-collapsed process can never walk the reference down to meet
         itself.
         """
-        self._pending_recon = self._pending_history = None  # #1051: never carry a previous attempt's view
+        self.last_reconciliation = self._pending_history = None  # #1051: never carry a previous attempt's view
         if not _env_flag("NG_GUARDIAN_ENABLED", "1"):
             return True, "guardian disabled"
         if self.provisional:
@@ -860,7 +895,7 @@ class SaveGate:
             recon["explained_nodes"] = delta.get("nodes", 0)
             recon["sleep_cycles"] = delta.get("sleep_cycles", 0)
             recon["sleep_synapses"] = delta.get("sleep_synapses", 0)
-            self._pending_recon = recon
+            self.last_reconciliation = recon
 
         ok, reason = evaluate_save_health(
             live_nodes=live_nodes,
@@ -900,9 +935,10 @@ class SaveGate:
         sleep = (f"; {r.get('sleep_cycles', 0)} sleep_cycle(s) removed {r.get('sleep_synapses', 0)}"
                  if r.get("sleep_cycles") else "")
         logger.info("Guardian #1051 reconcile: synapses %d -> %d (%+.1f%%), explained %d synapses + %d nodes "
-                    "logged by the engine%s, median reference %.0f (n=%d), unexplained %.0f, tolerance %.0f "
+                    "logged by the engine%s, reference %.0f (%s; median %.0f), unexplained %.0f, tolerance %.0f "
                     "(%.1f%%) -> %s", r["last"], r["live"], 100 * r["net_frac"], r["explained"],
-                    r.get("explained_nodes", 0), sleep, r["reference"], r["reference_n"], r["unexplained"],
+                    r.get("explained_nodes", 0), sleep, r["reference"], r["reference_kind"],
+                    r["reference_median"], r["unexplained"],
                     r["tolerance"], 100 * r["tolerance_frac"], "permit" if ok else "REFUSE")
         if r.get("alarm"):
             logger.warning("Guardian #1051 UNUSUAL CHURN (does not block the save; save %s): synapses %d -> %d "

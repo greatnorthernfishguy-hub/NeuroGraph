@@ -5,6 +5,8 @@
 #   matching logged removals; 2026-10-04 unexplained 86% loss; a slow unexplained walk; a sleep-sized explained
 #   clearance; empty/near-empty graphs; restart mid-history; an out-of-band manifest (promoted quarantine); the save
 #   history extracted from the CC daemon log (tests/fixtures/guardian_1051_daemon_log_saves.json) replayed as is.
+#   Plus (2026-10-07 law review): sudden unexplained loss during growth (newest-save floor), boot check against the
+#   manifest, attach failure never stops a boot.
 #   (B) the real NeuroGraphMemory + real Graph: default-off parity, removals racing saves (exact residual 0), a save
 #   requested mid-sleep_cycle, removals between the detached capture and the permit, a corrupt-restore boot, restart.
 # Why: punch list #1051 proof bar (lane brief 2026-10-07).
@@ -100,7 +102,7 @@ class Sim:
             counts["removals"] = self.ledger.snapshot()
         kw = {"removals": counts["removals"]} if "removals" in counts else {}
         ok, reason = self.gate.permit(self.nodes, live_synapses=synapses, live_hyperedges=0, **kw)
-        recon = self.gate._pending_recon
+        recon = self.gate.last_reconciliation
         if ok:
             write_manifest(self.ckpt, {k: v for k, v in counts.items() if k != "removals"})
             time.sleep(0.001)   # distinct saved_at stamps
@@ -271,9 +273,47 @@ def test_boot_mismatch_is_warned_not_laundered(on, ckpt, caplog):
     _feed(Sim(ckpt), PRE_1006)
     with caplog.at_level(logging.WARNING, logger="checkpoint_guardian"):
         b = Sim(ckpt, boot_synapses=20000)           # the restore came back short and nothing explains it
-    assert any("NOT explained" in x.getMessage() for x in caplog.records)
+    msg = [x for x in caplog.records if "restored graph" in x.getMessage()]
+    assert msg and msg[0].levelno == logging.ERROR and "operator" in msg[0].getMessage()
     ok, reason, _ = b.save(20000)
     assert not ok and "unexplained" in reason
+
+
+def test_sudden_unexplained_loss_during_growth(on, ckpt, monkeypatch):
+    """Review finding (law-enforcer, 2026-10-07): the median lags a growing graph (+5% per save puts it ~0.8 of the
+    newest save), so the median alone lets one sudden unexplained ~20% loss through. The newest-save floor refuses it;
+    NG_GUARDIAN_LAST_SAVE_FLOOR=0 restores the median alone (permitted, churn alarm only)."""
+    seq = [(int(40000 * 1.05 ** i), 0) for i in range(11)]
+    sim = Sim(ckpt)
+    _feed(sim, seq)
+    last = seq[-1][0]
+    ok, reason, r = sim.save(int(last * 0.78))
+    assert not ok and "newest accepted save" in reason and r["reference"] == last
+    monkeypatch.setenv("NG_GUARDIAN_LAST_SAVE_FLOOR", "0")
+    ok, _, r = sim.save(int(last * 0.78))
+    assert ok and r["alarm"] and r["reference"] < 0.82 * last
+
+
+def test_boot_check_reads_the_manifest_after_an_offline_rewrite(on, ckpt, caplog):
+    """An offline tool rewrote the checkpoint and its manifest truthfully: the restored graph matches the manifest, so
+    no warning (the history re-seeds from the manifest at the next save)."""
+    _feed(Sim(ckpt), PRE_1006)
+    write_manifest(ckpt, {"nodes": 11281, "guardian_nodes": 11281, "synapses": 50000, "hyperedges": 0})
+    with caplog.at_level(logging.WARNING, logger="checkpoint_guardian"):
+        b = Sim(ckpt, boot_synapses=50000)
+    assert not [x for x in caplog.records if "restored graph" in x.getMessage()]
+    ok, _, _ = b.save(50010)
+    assert ok
+
+
+def test_attach_failure_never_stops_a_boot(on, ckpt, caplog):
+    class Broken:
+        def register_event_handler(self, *a):
+            raise RuntimeError("no events here")
+    gate = SaveGate(ckpt)
+    with caplog.at_level(logging.ERROR, logger="checkpoint_guardian"):
+        assert gate.attach_removal_ledger(Broken()) is None
+    assert any("could NOT be attached" in x.getMessage() for x in caplog.records)
 
 
 def test_out_of_band_manifest_reseeds_history(on, ckpt, caplog):
@@ -367,10 +407,18 @@ def test_ledger_handler_error_never_raises_and_errs_strict(caplog):
     assert sum("UNDER-counted" in x.getMessage() for x in caplog.records) == 1
 
 
-def test_median_reference_vs_a_sprout_burst():
-    """Josh rejected a max-graph anchor: an overnight sprout burst would inflate it. The median follows the majority of
-    the window: a burst in 3 of 10 saves does not move it; a burst that has lasted 6 of 10 saves has become the norm."""
+def test_median_reference_vs_a_sprout_burst(monkeypatch):
+    """Josh rejected a max-graph anchor: an overnight sprout burst would inflate it and normal pruning would then trip
+    it. Here a burst in the newest 3 of 10 saves is PRUNED BACK (logged): permitted -- the reference is adjusted for the
+    logged removals. The same burst VANISHING with nothing logged is unexplained loss: refused by the newest-save
+    floor. With the floor off, the median follows the majority of the window (burst in 3 of 10: not moved; 6 of 10:
+    it has become the norm)."""
     minority = [{"synapses": 30000, "explained_synapses": 50}] * 7 + [{"synapses": 60000, "explained_synapses": 50}] * 3
+    r = evaluate_synapse_reconciliation(30500, minority, explained_synapses=29600)
+    assert r["permit"] and r["reference"] <= 30500
+    r = evaluate_synapse_reconciliation(30500, minority, explained_synapses=0)
+    assert not r["permit"] and r["reference_kind"] == "newest accepted save"
+    monkeypatch.setenv("NG_GUARDIAN_LAST_SAVE_FLOOR", "0")
     r = evaluate_synapse_reconciliation(30500, minority, explained_synapses=0)
     assert r["permit"] and r["reference"] < 30500
     majority = [{"synapses": 30000, "explained_synapses": 50}] * 4 + [{"synapses": 60000, "explained_synapses": 50}] * 6
