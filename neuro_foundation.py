@@ -20,6 +20,16 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-07] Claude (lane sleep-prearm) — #1066: compete_protected_links refuses while the disuse sleep owns
+#   low_weight_steps (PROTECTED CHANGE on review branch cc-laptop-sleep-prearm-20261007 ONLY, its own commit; merges only
+#    after Josh's protected-file "proceed". Keys absent = unchanged.)
+# What: compete_protected_links raises ValueError (before touching anything) when config sleep_disuse_enabled is truthy or
+#       sleep_low_weight_unit == "sleeps". Its _prune_synapses call advances low_weight_steps against grace_period
+#       (STEPS) and its last-link pick reads the step stamp; under disuse the counter is in SLEEPS (advanced once per
+#       sleep by the clearance) and the stamp key is last_link_since_sleep, so sharing a sleep would count a competing
+#       link twice and in the wrong unit. A port of the competition to sleep units is its own design + ruling.
+# Why:  punch list #1066 (SLEEP_P2.md §8 item 7). No host calls compete_protected_links today (grep: NG, daemon, Elmer).
+# How:  one guard after the argument checks; tests/test_sleep_prearm.py; the P2 disuse whole runs assert the refusal.
 # [2026-10-07] Claude (lane sleep-prearm) — the disuse sleep in bounded _step_lock holds (sleep phase §8 P3 "Before arming")
 #   (PROTECTED CHANGE on review branch cc-laptop-sleep-prearm-20261007 ONLY, its own commit; Josh approved the lane
 #    2026-10-07 ("Yeah, fold it in, please"); merges only after his protected-file "proceed". Every new key absent =
@@ -4948,6 +4958,16 @@ class Graph:
         for label, val in (("topk", topk), ("budget", budget)):
             if isinstance(val, bool) or not isinstance(val, int) or val < 1:
                 raise ValueError("compete_protected_links: %s must be an int >= 1 (got %r)" % (label, val))
+        # [2026-10-07] #1066 (pre-arming): this competition counts in STEP units — its _prune_synapses call advances
+        # low_weight_steps against grace_period (steps) and its last-link pick reads the step stamp "last_link_since".
+        # Under the disuse sleep that counter is in SLEEPS (advanced once per sleep by the clearance) and the stamps are
+        # "last_link_since_sleep", so running both would count a competing link twice per sleep and against the wrong
+        # unit. Until the competition is ported to sleep units (its own design + ruling), it REFUSES while disuse is on
+        # (config sleep_disuse_enabled truthy) or the counters are marked as sleeps (sleep_low_weight_unit == "sleeps").
+        # Both keys absent = unchanged.
+        if self.config.get("sleep_disuse_enabled", False) or self.config.get("sleep_low_weight_unit") == "sleeps":
+            raise ValueError("compete_protected_links: refused while the disuse sleep owns low_weight_steps (counted in "
+                             "sleeps; this competition counts steps) -- punchlist #1066")
 
         def _rank(sid):
             s = self.synapses[sid]
