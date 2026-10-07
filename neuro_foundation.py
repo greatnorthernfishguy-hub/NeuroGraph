@@ -20,6 +20,23 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-07] Claude (lane sleep-prearm) — the disuse sleep in bounded _step_lock holds (sleep phase §8 P3 "Before arming")
+#   (PROTECTED CHANGE on review branch cc-laptop-sleep-prearm-20261007 ONLY, its own commit; Josh approved the lane
+#    2026-10-07 ("Yeah, fold it in, please"); merges only after his protected-file "proceed". Every new key absent =
+#    byte-identical to fe6538b, so Syl is unchanged.)
+# What: (1) NEW config sleep_clearance_chunk_seconds + sleep_clearance_chunk_gap_seconds (read live, absent = the one-hold
+#       disuse sleep, NOT in DEFAULT_CONFIG; both validated before anything is touched). Set: _sleep_cycle_disuse_chunked
+#       runs the SAME decisions with the lock released between holds: the migration over a keys() snapshot in holds of
+#       <= ~chunk s; ONE hold for the downscale + the clearance DECISION + sleep_cycles_completed; the decided ids removed
+#       in holds of <= ~chunk s, one "pruned" event per hold under the lock (#1051's ledger stays exact); ONE hold for
+#       the orphan collection + record / event / INFO line (+ lock_holds, decided, chunked). (2) _prune_synapses gains
+#       keyword-only defer_removal (sleep-unit clearance only, report required): decide everything, remove nothing,
+#       return the ids in report['deferred_ids']. (3) _sleep_migrate_counters goes through the new per-row helper
+#       _sleep_migrate_row (same rows, same order, same writes).
+# Why:  SLEEP_P2.md §6: the first clearance held _step_lock 2-16 s and the migration 0.4-5.6 s; a turn waits that long.
+# How:  _sleep_chunked_rows (time-bounded holds, clock checked every 32 rows, gap with the lock released);
+#       tests/test_sleep_prearm.py (keys absent == fe6538b; chunked == one hold, whole runs + built graph; holds bounded,
+#       the lock really released; ledger exact; steps between holds never remove).
 # [2026-10-07] Claude (lane sleep-p2) — sleep phase P2: disuse in sleep (strength-aware downscale + clearance in sleeps)
 #   (PROTECTED CHANGE on review branch cc-laptop-sleep-p2-20261007 ONLY, its own commit; Josh approved the sleep-phase
 #    design as recommended 2026-10-06 and said to start P2 ("Let's do both"); merges only after his protected-file
@@ -4329,22 +4346,12 @@ class Graph:
         stamp (step "last_link_since" and sleep "last_link_since_sleep"; a held last link gets a fresh grace in
         sleeps), so the first disuse sleep only tags. Then config sleep_low_weight_unit = "sleeps",
         sleep_cycles_completed = 0. Weights, traces and every other field untouched. Caller holds _step_lock."""
-        lws_reset = stamps = 0
-        for sid, syn in self.synapses.items():
-            if syn.low_weight_steps:
-                syn.low_weight_steps = 0
-                lws_reset += 1
-            md = syn.metadata
-            if md and ("last_link_since" in md or "last_link_since_sleep" in md):
-                md = dict(md)
-                md.pop("last_link_since", None)
-                md.pop("last_link_since_sleep", None)
-                syn.metadata = md
-                self._dirty_synapses.add(sid)
-                stamps += 1
+        acc = {"lws_reset": 0, "stamps_cleared": 0}
+        for sid in list(self.synapses.keys()):     # [2026-10-07] pre-arming: one row = _sleep_migrate_row (shared with
+            self._sleep_migrate_row(sid, acc)      # the chunked migration); same row order and writes as before
         self.config["sleep_low_weight_unit"] = "sleeps"
         self.config["sleep_cycles_completed"] = 0
-        return {"lws_reset": lws_reset, "stamps_cleared": stamps}
+        return acc
 
     def sleep_downscale_strength_aware(self, d0: float, h: float) -> Dict[str, Any]:
         """Sleep phase P2 downscale (spec §3.1, D1 strength-aware, D11 salience armor). Every synapse:
@@ -4370,10 +4377,195 @@ class Graph:
             res["protected_nodes"] = len(protected)
         return res
 
+    def _sleep_chunk_params(self) -> Optional[Dict[str, float]]:
+        """[2026-10-07] pre-arming (spec §8 P3, risk row "_step_lock hold"): config `sleep_clearance_chunk_seconds` (read live,
+        absent / None = NOT chunked = the P2 path exactly; NOT in DEFAULT_CONFIG) bounds each _step_lock hold of the
+        migration and the removal phase; `sleep_clearance_chunk_gap_seconds` is the pause with the lock released between two
+        holds (REQUIRED when chunking is on). Raises ValueError before anything is touched; None when chunking is off."""
+        cfg = self.config
+        hold = cfg.get("sleep_clearance_chunk_seconds")
+        if hold is None:
+            return None
+        gap = cfg.get("sleep_clearance_chunk_gap_seconds")
+        for k, v, lo_open in (("sleep_clearance_chunk_seconds", hold, True), ("sleep_clearance_chunk_gap_seconds", gap, False)):
+            if v is None or isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) or \
+                    (float(v) <= 0.0 if lo_open else float(v) < 0.0):
+                raise ValueError("sleep_cycle: config %s out of range (got %r)" % (k, v))
+        return {"hold": float(hold), "gap": float(gap)}
+
+    def _sleep_chunked_rows(self, ids: List[str], fn, hold: float, gap: float, holds: List[float],
+                            on_hold_end=None) -> int:
+        """Run fn(sid) for every id that still exists, under _step_lock, in holds of at most ~`hold` seconds (checked every
+        32 rows) with the lock RELEASED for `gap` seconds between two holds. Row order = `ids` order. Appends each hold's
+        wall time to `holds`; returns how many ids fn was called for. fn (and on_hold_end(count of this hold), when given)
+        run with the lock held."""
+        import time as _time
+        n = len(ids)
+        i = done = 0
+        while i < n:
+            with self._step_lock:
+                t = _time.perf_counter()
+                k = 0
+                while i < n:
+                    sid = ids[i]
+                    i += 1
+                    if sid in self.synapses:
+                        fn(sid)
+                        k += 1
+                    if not (i & 31) and _time.perf_counter() - t >= hold:
+                        break
+                if on_hold_end is not None:
+                    on_hold_end(k)
+                done += k
+                holds.append(_time.perf_counter() - t)
+            if i < n and gap > 0.0:
+                _time.sleep(gap)
+        return done
+
+    def _sleep_migrate_row(self, sid: str, acc: Dict[str, int]) -> None:
+        """One synapse of the P2 migration (see _sleep_migrate_counters; the same two writes). Caller holds _step_lock."""
+        syn = self.synapses[sid]
+        if syn.low_weight_steps:
+            syn.low_weight_steps = 0
+            acc["lws_reset"] += 1
+        md = syn.metadata
+        if md and ("last_link_since" in md or "last_link_since_sleep" in md):
+            md = dict(md)
+            md.pop("last_link_since", None)
+            md.pop("last_link_since_sleep", None)
+            syn.metadata = md
+            self._dirty_synapses.add(sid)
+            acc["stamps_cleared"] += 1
+
+    def _sleep_cycle_disuse_chunked(self, t0: float, prm: Dict[str, Any], ch: Dict[str, float]) -> Dict[str, Any]:
+        """[2026-10-07] pre-arming: the P2 disuse sleep with bounded _step_lock holds (config sleep_clearance_chunk_seconds).
+        The SAME decisions as the one-hold cycle; only the lock is released between holds:
+          A. migration (first disuse sleep only): every synapse's two writes (_sleep_migrate_row) over a keys() snapshot
+             (row order), in holds of <= ~hold s; then, under the lock, the unit marker + sleep_cycles_completed = 0.
+             Between holds nothing can advance low_weight_steps: step() and the Tonic tail do not prune with
+             structural_plasticity_in_sleep on (required), and compete_protected_links refuses under disuse (#1066).
+          B. ONE hold: the downscale and the clearance DECISION (_prune_synapses with defer_removal: the native sweep,
+             lifelines, the D14 shield, the last-link grace, each exactly as the one-hold cycle) and sleep_cycles_completed
+             (the counters and the sleep index advance in the same hold, so a save between holds is consistent).
+          C. the decided ids are removed in holds of <= ~hold s (_remove_synapse_internal, as the one-hold cycle; an id
+             already gone is skipped and not counted); one "pruned" event per hold with that hold's count, under the lock
+             (a save between holds counts exactly what it captured: #1051's ledger).
+          D. ONE hold: the existing orphan collection, then the record / "sleep_cycle" event / INFO line.
+        A step or a Tonic tick may run between holds; it can sprout or re-weight, never remove. The removal SET is the one
+        decided in B (a link wake re-strengthened between holds is still removed: decided at the sleep, as one hold
+        would have). Do not call this while holding _step_lock: the RLock would stay held and the holds would merge."""
+        import time as _time
+        holds_a: List[float] = []
+        holds_c: List[float] = []
+        if getattr(self._step_lock, "_is_owned", lambda: False)():
+            logger.warning("sleep_cycle(disuse, chunked): called with _step_lock already held by this thread -- the lock "
+                           "is NOT released between chunks (the caller's hold encloses them)")
+        with self._step_lock:
+            syn_before = len(self.synapses)
+            nodes_before = len(self.nodes)
+            migrated = self.config.get("sleep_low_weight_unit") != "sleeps"
+            ids = list(self.synapses.keys()) if migrated else []
+        mig = {"lws_reset": 0, "stamps_cleared": 0}
+        t_a = _time.perf_counter()
+        if migrated:
+            self._sleep_chunked_rows(ids, lambda sid: self._sleep_migrate_row(sid, mig), ch["hold"], ch["gap"], holds_a)
+            with self._step_lock:
+                self.config["sleep_low_weight_unit"] = "sleeps"
+                self.config["sleep_cycles_completed"] = 0
+            if ch["gap"] > 0.0:
+                _time.sleep(ch["gap"])
+        ids = []
+        t_b = _time.perf_counter()
+        with self._step_lock:
+            tb0 = _time.perf_counter()
+            sleep_index = int(self.config.get("sleep_cycles_completed", 0)) + 1
+            ds = {"synapses_scaled": 0, "clamped": 0, "native": None}
+            if prm["d0"] > 0.0:
+                ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
+            t_c = _time.perf_counter()
+            rep: Dict[str, Any] = {}
+            self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
+                                 last_link_grace_sleeps=prm["LL"], credit_shield_kappa=prm["kappa"], defer_removal=True)
+            decided = list(rep["deferred_ids"])
+            self.config["sleep_cycles_completed"] = sleep_index
+            hold_b = _time.perf_counter() - tb0
+            t_d0 = _time.perf_counter()
+        if decided and ch["gap"] > 0.0:
+            _time.sleep(ch["gap"])
+        tc0 = _time.perf_counter()
+
+        def _emit_hold(k):
+            if k:
+                self._emit("pruned", count=k, timestep=self.timestep)
+
+        n = len(decided)
+        pruned = self._sleep_chunked_rows(decided, self._remove_synapse_internal, ch["hold"], ch["gap"], holds_c,
+                                          on_hold_end=_emit_hold)
+        t_d = _time.perf_counter()
+        with self._step_lock:
+            td0 = _time.perf_counter()
+            collected = self._collect_orphan_nodes()
+            t_e = _time.perf_counter()
+            self._total_pruned += pruned
+            wt = float(self.config["weight_threshold"])
+            wc = getattr(self.synapses, "weights_copy", None)
+            if wc is not None:
+                below = int((wc() < wt).sum())
+            else:
+                below = sum(1 for sid in self.synapses.keys() if self.synapses.get_weight(sid) < wt)
+            held_ids = list(rep.get("shield_held_ids", []))
+            hold_d = _time.perf_counter() - td0
+            record = {
+                "timestep": self.timestep,
+                "pruned": pruned,
+                "nodes_collected": collected,
+                "synapses_before": syn_before,
+                "synapses_after": len(self.synapses),
+                "nodes_before": nodes_before,
+                "nodes_after": len(self.nodes),
+                "in_sleep_mode": bool(self.config.get("structural_plasticity_in_sleep", False)),
+                "disuse": True,
+                "sleep_index": sleep_index,
+                "params": dict(prm),
+                "migrated": migrated,
+                "lws_reset": mig["lws_reset"],
+                "stamps_cleared": mig["stamps_cleared"],
+                "downscaled": ds["synapses_scaled"],
+                "downscale_clamped": ds["clamped"],
+                "downscale_native": ds["native"],
+                "eligible": rep.get("rule_chosen", 0),
+                "shield_held": len(held_ids),
+                "shield_held_ids": held_ids,
+                "last_link_held": rep.get("last_link_held", 0),
+                "below_threshold_after": below,
+                "decided": n,
+                "chunked": True,
+                "chunk": dict(ch),
+                "lock_holds": {"migrate": holds_a, "decide": hold_b, "remove": holds_c, "orphans": hold_d,
+                               "max": max(holds_a + holds_c + [hold_b, hold_d])},
+                "seconds_parts": {"migrate": t_b - t_a, "downscale": t_c - tb0, "clearance": (t_d0 - t_c) + (t_d - tc0),
+                                  "orphans": t_e - td0},
+                "seconds": _time.perf_counter() - t0,
+            }
+            self._emit("sleep_cycle", **record)
+        logger.info("sleep_cycle(disuse, chunked): t=%s sleep=%d migrated=%s downscaled=%d clamped=%d eligible=%d "
+                    "shield_held=%d last_link_held=%d pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d "
+                    "below_wt=%d %.3fs; lock holds: %d (max %.3fs, decide %.3fs)",
+                    record["timestep"], sleep_index, migrated, record["downscaled"], record["downscale_clamped"],
+                    record["eligible"], record["shield_held"], record["last_link_held"], pruned, collected, syn_before,
+                    record["synapses_after"], nodes_before, record["nodes_after"], below, record["seconds"],
+                    len(holds_a) + len(holds_c) + 2, record["lock_holds"]["max"], hold_b)
+        return record
+
     def _sleep_cycle_disuse(self, t0: float) -> Dict[str, Any]:
-        """The P2 disuse sleep (see sleep_cycle). Validates first; one _step_lock hold for the whole cycle."""
+        """The P2 disuse sleep (see sleep_cycle). Validates first; one _step_lock hold for the whole cycle.
+        [2026-10-07] pre-arming: with config sleep_clearance_chunk_seconds set, _sleep_cycle_disuse_chunked instead
+        (bounded holds, the same decisions); absent = this one-hold path, unchanged."""
         import time as _time
         prm = self._sleep_disuse_params()            # raises before anything is touched
+        ch = self._sleep_chunk_params()              # raises before anything is touched; None = not chunked
+        if ch is not None:
+            return self._sleep_cycle_disuse_chunked(t0, prm, ch)
         with self._step_lock:
             syn_before = len(self.synapses)
             nodes_before = len(self.nodes)
@@ -4450,6 +4642,7 @@ class Graph:
         sleep_now: Optional[int] = None,
         last_link_grace_sleeps: Optional[int] = None,
         credit_shield_kappa: Optional[float] = None,
+        defer_removal: bool = False,
     ) -> int:
         """Prune weak/inactive synapses (PRD §3.3.1).
 
@@ -4497,6 +4690,11 @@ class Graph:
                 after the lifeline filter, before the last-link grace. 0 = no shield. report['shield_held_ids'].
         Every default-path call (no sleep-unit arguments) drops config 'sleep_low_weight_unit' if present: the counter
         is then no longer in sleep units, so the next disuse sleep re-migrates it (sleep_cycle).
+
+        [2026-10-07] pre-arming — defer_removal (keyword-only, default False; sleep-unit clearance ONLY, the chunked disuse
+        sleep's decision hold): everything above runs exactly as without it (counters, lifelines, shield, last-link
+        stamps), but the chosen ids are NOT removed and no "pruned" event is emitted here: they are returned in
+        report['deferred_ids'] (report REQUIRED) for the caller to remove; the return value is then 0 (nothing removed).
         """
         wt = self.config["weight_threshold"]
         grace = self.config["grace_period"]
@@ -4508,13 +4706,16 @@ class Graph:
             raise ValueError("_prune_synapses: competing_ids and excluded_ids must be supplied together")
         sleep_units = grace_sleeps is not None
         _su_args = (grace_sleeps, sleep_now, last_link_grace_sleeps, credit_shield_kappa)
-        if not sleep_units and any(a is not None for a in _su_args):
-            raise ValueError("_prune_synapses: sleep_now / last_link_grace_sleeps / credit_shield_kappa need grace_sleeps")
+        if not sleep_units and (any(a is not None for a in _su_args) or defer_removal):
+            raise ValueError("_prune_synapses: sleep_now / last_link_grace_sleeps / credit_shield_kappa / defer_removal "
+                             "need grace_sleeps")
         if sleep_units:
             if competing_mode:
                 raise ValueError("_prune_synapses: the sleep-unit clearance is not valid in competing mode")
             if order_key is not None or max_removals is not None:
                 raise ValueError("_prune_synapses: the sleep-unit clearance takes no order_key / max_removals")
+            if defer_removal and not isinstance(report, dict):
+                raise ValueError("_prune_synapses: defer_removal needs a report dict (the deferred ids go there)")
             for _lbl, _v in (("grace_sleeps", grace_sleeps), ("sleep_now", sleep_now),
                              ("last_link_grace_sleeps", last_link_grace_sleeps)):
                 if isinstance(_v, bool) or not isinstance(_v, int) or _v < 0:
@@ -4699,6 +4900,11 @@ class Graph:
             to_prune.sort(key=lambda s: order_key[s])
         if max_removals is not None:
             to_prune = to_prune[:max_removals]
+
+        if defer_removal:      # [2026-10-07] pre-arming: the chunked disuse sleep removes these itself (sleep-unit only)
+            report["deferred_ids"] = list(to_prune)
+            report["removed_ids"] = []
+            return 0
 
         for sid in to_prune:
             self._remove_synapse_internal(sid)
