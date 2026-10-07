@@ -1,0 +1,1580 @@
+[
+ {
+  "boot_line": 619918,
+  "boot_synapses": 58721,
+  "saves": [
+   {
+    "line": 619985,
+    "ts": "2026-10-05 12:40:16",
+    "synapses": 58711,
+    "pruned_since_prev": 10
+   },
+   {
+    "line": 620298,
+    "ts": "2026-10-05 12:51:08",
+    "synapses": 58123,
+    "pruned_since_prev": 3527
+   },
+   {
+    "line": 620662,
+    "ts": "2026-10-05 12:57:34",
+    "synapses": 57567,
+    "pruned_since_prev": 3586
+   },
+   {
+    "line": 621001,
+    "ts": "2026-10-05 13:05:21",
+    "synapses": 56636,
+    "pruned_since_prev": 2913
+   },
+   {
+    "line": 621284,
+    "ts": "2026-10-05 13:10:27",
+    "synapses": 54003,
+    "pruned_since_prev": 2861
+   },
+   {
+    "line": 621614,
+    "ts": "2026-10-05 13:18:03",
+    "synapses": 53910,
+    "pruned_since_prev": 3015
+   },
+   {
+    "line": 621926,
+    "ts": "2026-10-05 13:28:44",
+    "synapses": 52749,
+    "pruned_since_prev": 4119
+   }
+  ]
+ },
+ {
+  "boot_line": 621963,
+  "boot_synapses": 52759,
+  "saves": [
+   {
+    "line": 622026,
+    "ts": "2026-10-05 13:30:59",
+    "synapses": 52749,
+    "pruned_since_prev": 10
+   },
+   {
+    "line": 622377,
+    "ts": "2026-10-05 13:40:25",
+    "synapses": 52954,
+    "pruned_since_prev": 2859
+   },
+   {
+    "line": 622612,
+    "ts": "2026-10-05 13:49:08",
+    "synapses": 54232,
+    "pruned_since_prev": 2022
+   },
+   {
+    "line": 622721,
+    "ts": "2026-10-05 13:58:13",
+    "synapses": 56998,
+    "pruned_since_prev": 484
+   },
+   {
+    "line": 622823,
+    "ts": "2026-10-05 14:07:50",
+    "synapses": 57509,
+    "pruned_since_prev": 74
+   },
+   {
+    "line": 622907,
+    "ts": "2026-10-05 14:15:31",
+    "synapses": 57950,
+    "pruned_since_prev": 36
+   },
+   {
+    "line": 622991,
+    "ts": "2026-10-05 14:24:20",
+    "synapses": 58127,
+    "pruned_since_prev": 93
+   },
+   {
+    "line": 623072,
+    "ts": "2026-10-05 14:32:05",
+    "synapses": 58770,
+    "pruned_since_prev": 63
+   },
+   {
+    "line": 623181,
+    "ts": "2026-10-05 14:42:43",
+    "synapses": 58987,
+    "pruned_since_prev": 131
+   },
+   {
+    "line": 623528,
+    "ts": "2026-10-05 14:54:21",
+    "synapses": 59297,
+    "pruned_since_prev": 2891
+   },
+   {
+    "line": 623606,
+    "ts": "2026-10-05 15:02:28",
+    "synapses": 59624,
+    "pruned_since_prev": 210
+   },
+   {
+    "line": 623691,
+    "ts": "2026-10-05 15:08:41",
+    "synapses": 59775,
+    "pruned_since_prev": 94
+   },
+   {
+    "line": 624036,
+    "ts": "2026-10-05 15:19:21",
+    "synapses": 59736,
+    "pruned_since_prev": 3170
+   },
+   {
+    "line": 624118,
+    "ts": "2026-10-05 15:26:58",
+    "synapses": 59785,
+    "pruned_since_prev": 311
+   },
+   {
+    "line": 624316,
+    "ts": "2026-10-05 15:38:25",
+    "synapses": 59853,
+    "pruned_since_prev": 1578
+   },
+   {
+    "line": 624471,
+    "ts": "2026-10-05 15:43:38",
+    "synapses": 59739,
+    "pruned_since_prev": 1789
+   },
+   {
+    "line": 624810,
+    "ts": "2026-10-05 15:55:01",
+    "synapses": 60026,
+    "pruned_since_prev": 2801
+   },
+   {
+    "line": 624841,
+    "ts": "2026-10-05 16:05:12",
+    "synapses": 60366,
+    "pruned_since_prev": 10
+   },
+   {
+    "line": 624865,
+    "ts": "2026-10-05 16:15:03",
+    "synapses": 60393,
+    "pruned_since_prev": 73
+   },
+   {
+    "line": 624889,
+    "ts": "2026-10-05 16:23:48",
+    "synapses": 60896,
+    "pruned_since_prev": 24
+   },
+   {
+    "line": 624921,
+    "ts": "2026-10-05 16:30:39",
+    "synapses": 60896,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 624938,
+    "ts": "2026-10-05 16:38:06",
+    "synapses": 60896,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 624956,
+    "ts": "2026-10-05 16:45:28",
+    "synapses": 61643,
+    "pruned_since_prev": 84
+   },
+   {
+    "line": 624978,
+    "ts": "2026-10-05 16:51:56",
+    "synapses": 61857,
+    "pruned_since_prev": 57
+   },
+   {
+    "line": 625129,
+    "ts": "2026-10-05 17:02:58",
+    "synapses": 62330,
+    "pruned_since_prev": 1314
+   },
+   {
+    "line": 625261,
+    "ts": "2026-10-05 17:06:45",
+    "synapses": 61534,
+    "pruned_since_prev": 2274
+   },
+   {
+    "line": 625537,
+    "ts": "2026-10-05 17:17:28",
+    "synapses": 60314,
+    "pruned_since_prev": 2572
+   },
+   {
+    "line": 625557,
+    "ts": "2026-10-05 17:24:59",
+    "synapses": 60696,
+    "pruned_since_prev": 46
+   },
+   {
+    "line": 625578,
+    "ts": "2026-10-05 17:31:30",
+    "synapses": 61052,
+    "pruned_since_prev": 30
+   },
+   {
+    "line": 625598,
+    "ts": "2026-10-05 17:39:03",
+    "synapses": 61528,
+    "pruned_since_prev": 50
+   },
+   {
+    "line": 625632,
+    "ts": "2026-10-05 17:47:50",
+    "synapses": 61666,
+    "pruned_since_prev": 82
+   }
+  ]
+ },
+ {
+  "boot_line": 625658,
+  "boot_synapses": 61915,
+  "saves": [
+   {
+    "line": 625747,
+    "ts": "2026-10-05 18:37:12",
+    "synapses": 61905,
+    "pruned_since_prev": 10
+   },
+   {
+    "line": 625860,
+    "ts": "2026-10-05 18:48:23",
+    "synapses": 61957,
+    "pruned_since_prev": 80
+   }
+  ]
+ },
+ {
+  "boot_line": 625899,
+  "boot_synapses": 62119,
+  "saves": [
+   {
+    "line": 625962,
+    "ts": "2026-10-05 19:03:11",
+    "synapses": 61815,
+    "pruned_since_prev": 304
+   },
+   {
+    "line": 626061,
+    "ts": "2026-10-05 19:10:46",
+    "synapses": 61995,
+    "pruned_since_prev": 74
+   },
+   {
+    "line": 626128,
+    "ts": "2026-10-05 19:17:56",
+    "synapses": 62447,
+    "pruned_since_prev": 33
+   },
+   {
+    "line": 626201,
+    "ts": "2026-10-05 19:25:39",
+    "synapses": 62759,
+    "pruned_since_prev": 99
+   },
+   {
+    "line": 626270,
+    "ts": "2026-10-05 19:32:52",
+    "synapses": 63054,
+    "pruned_since_prev": 78
+   },
+   {
+    "line": 626341,
+    "ts": "2026-10-05 19:39:36",
+    "synapses": 63434,
+    "pruned_since_prev": 29
+   },
+   {
+    "line": 626415,
+    "ts": "2026-10-05 19:47:24",
+    "synapses": 63685,
+    "pruned_since_prev": 93
+   },
+   {
+    "line": 626486,
+    "ts": "2026-10-05 19:54:51",
+    "synapses": 63932,
+    "pruned_since_prev": 74
+   },
+   {
+    "line": 626577,
+    "ts": "2026-10-05 20:03:07",
+    "synapses": 63849,
+    "pruned_since_prev": 503
+   },
+   {
+    "line": 626674,
+    "ts": "2026-10-05 20:09:44",
+    "synapses": 56043,
+    "pruned_since_prev": 8280
+   },
+   {
+    "line": 626785,
+    "ts": "2026-10-05 20:17:17",
+    "synapses": 45039,
+    "pruned_since_prev": 11463
+   },
+   {
+    "line": 627006,
+    "ts": "2026-10-05 20:24:07",
+    "synapses": 33737,
+    "pruned_since_prev": 14466
+   },
+   {
+    "line": 627221,
+    "ts": "2026-10-05 20:35:02",
+    "synapses": 34958,
+    "pruned_since_prev": 1334
+   },
+   {
+    "line": 627302,
+    "ts": "2026-10-05 20:46:41",
+    "synapses": 35320,
+    "pruned_since_prev": 83
+   },
+   {
+    "line": 627391,
+    "ts": "2026-10-05 20:55:15",
+    "synapses": 35609,
+    "pruned_since_prev": 103
+   }
+  ]
+ },
+ {
+  "boot_line": 627464,
+  "boot_synapses": 35750,
+  "saves": [
+   {
+    "line": 627526,
+    "ts": "2026-10-05 20:57:23",
+    "synapses": 35750,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 627624,
+    "ts": "2026-10-05 21:04:14",
+    "synapses": 36052,
+    "pruned_since_prev": 4
+   },
+   {
+    "line": 627711,
+    "ts": "2026-10-05 21:12:35",
+    "synapses": 36529,
+    "pruned_since_prev": 146
+   },
+   {
+    "line": 627825,
+    "ts": "2026-10-05 21:17:38",
+    "synapses": 39779,
+    "pruned_since_prev": 604
+   },
+   {
+    "line": 627897,
+    "ts": "2026-10-05 21:24:19",
+    "synapses": 40114,
+    "pruned_since_prev": 130
+   },
+   {
+    "line": 627973,
+    "ts": "2026-10-05 21:31:09",
+    "synapses": 40364,
+    "pruned_since_prev": 131
+   },
+   {
+    "line": 628045,
+    "ts": "2026-10-05 21:37:22",
+    "synapses": 40515,
+    "pruned_since_prev": 203
+   },
+   {
+    "line": 628111,
+    "ts": "2026-10-05 21:43:47",
+    "synapses": 40763,
+    "pruned_since_prev": 11
+   },
+   {
+    "line": 628183,
+    "ts": "2026-10-05 21:49:53",
+    "synapses": 41121,
+    "pruned_since_prev": 198
+   },
+   {
+    "line": 628253,
+    "ts": "2026-10-05 21:55:41",
+    "synapses": 41140,
+    "pruned_since_prev": 404
+   },
+   {
+    "line": 628388,
+    "ts": "2026-10-05 22:05:03",
+    "synapses": 43145,
+    "pruned_since_prev": 1692
+   },
+   {
+    "line": 628458,
+    "ts": "2026-10-05 22:10:50",
+    "synapses": 43493,
+    "pruned_since_prev": 75
+   },
+   {
+    "line": 628683,
+    "ts": "2026-10-05 22:18:25",
+    "synapses": 44920,
+    "pruned_since_prev": 1548
+   },
+   {
+    "line": 628750,
+    "ts": "2026-10-05 22:24:19",
+    "synapses": 45252,
+    "pruned_since_prev": 3
+   },
+   {
+    "line": 628939,
+    "ts": "2026-10-05 22:32:55",
+    "synapses": 47504,
+    "pruned_since_prev": 1226
+   },
+   {
+    "line": 629132,
+    "ts": "2026-10-05 22:40:19",
+    "synapses": 49083,
+    "pruned_since_prev": 1068
+   },
+   {
+    "line": 629156,
+    "ts": "2026-10-05 22:46:10",
+    "synapses": 49527,
+    "pruned_since_prev": 36
+   },
+   {
+    "line": 629178,
+    "ts": "2026-10-05 22:51:46",
+    "synapses": 49814,
+    "pruned_since_prev": 82
+   },
+   {
+    "line": 629197,
+    "ts": "2026-10-05 22:57:31",
+    "synapses": 50073,
+    "pruned_since_prev": 86
+   },
+   {
+    "line": 629286,
+    "ts": "2026-10-05 23:07:33",
+    "synapses": 52232,
+    "pruned_since_prev": 551
+   },
+   {
+    "line": 629305,
+    "ts": "2026-10-05 23:13:21",
+    "synapses": 52593,
+    "pruned_since_prev": 23
+   },
+   {
+    "line": 629328,
+    "ts": "2026-10-05 23:19:24",
+    "synapses": 52968,
+    "pruned_since_prev": 58
+   },
+   {
+    "line": 629345,
+    "ts": "2026-10-05 23:25:18",
+    "synapses": 53191,
+    "pruned_since_prev": 170
+   },
+   {
+    "line": 629400,
+    "ts": "2026-10-05 23:34:34",
+    "synapses": 53455,
+    "pruned_since_prev": 210
+   },
+   {
+    "line": 629478,
+    "ts": "2026-10-05 23:41:04",
+    "synapses": 55778,
+    "pruned_since_prev": 419
+   },
+   {
+    "line": 629544,
+    "ts": "2026-10-05 23:54:37",
+    "synapses": 56072,
+    "pruned_since_prev": 17
+   },
+   {
+    "line": 629594,
+    "ts": "2026-10-06 00:08:18",
+    "synapses": 56399,
+    "pruned_since_prev": 17
+   },
+   {
+    "line": 629632,
+    "ts": "2026-10-06 00:19:10",
+    "synapses": 56680,
+    "pruned_since_prev": 2
+   },
+   {
+    "line": 629665,
+    "ts": "2026-10-06 00:30:59",
+    "synapses": 57382,
+    "pruned_since_prev": 21
+   },
+   {
+    "line": 629795,
+    "ts": "2026-10-06 00:38:22",
+    "synapses": 59451,
+    "pruned_since_prev": 1346
+   },
+   {
+    "line": 629825,
+    "ts": "2026-10-06 00:48:49",
+    "synapses": 59421,
+    "pruned_since_prev": 207
+   },
+   {
+    "line": 629872,
+    "ts": "2026-10-06 00:57:22",
+    "synapses": 59652,
+    "pruned_since_prev": 163
+   },
+   {
+    "line": 630007,
+    "ts": "2026-10-06 01:08:09",
+    "synapses": 62023,
+    "pruned_since_prev": 697
+   },
+   {
+    "line": 630164,
+    "ts": "2026-10-06 01:16:50",
+    "synapses": 64252,
+    "pruned_since_prev": 883
+   },
+   {
+    "line": 630175,
+    "ts": "2026-10-06 01:20:57",
+    "synapses": 64252,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 630324,
+    "ts": "2026-10-06 01:31:40",
+    "synapses": 66215,
+    "pruned_since_prev": 747
+   },
+   {
+    "line": 630356,
+    "ts": "2026-10-06 01:33:57",
+    "synapses": 66431,
+    "pruned_since_prev": 264
+   },
+   {
+    "line": 630471,
+    "ts": "2026-10-06 01:41:19",
+    "synapses": 68095,
+    "pruned_since_prev": 1360
+   },
+   {
+    "line": 630629,
+    "ts": "2026-10-06 01:52:28",
+    "synapses": 69276,
+    "pruned_since_prev": 385
+   },
+   {
+    "line": 630793,
+    "ts": "2026-10-06 01:57:44",
+    "synapses": 69937,
+    "pruned_since_prev": 686
+   },
+   {
+    "line": 630945,
+    "ts": "2026-10-06 02:08:14",
+    "synapses": 69150,
+    "pruned_since_prev": 1156
+   },
+   {
+    "line": 631064,
+    "ts": "2026-10-06 02:18:56",
+    "synapses": 70767,
+    "pruned_since_prev": 674
+   },
+   {
+    "line": 631116,
+    "ts": "2026-10-06 02:21:53",
+    "synapses": 71157,
+    "pruned_since_prev": 350
+   },
+   {
+    "line": 631136,
+    "ts": "2026-10-06 02:30:32",
+    "synapses": 71381,
+    "pruned_since_prev": 6
+   },
+   {
+    "line": 631345,
+    "ts": "2026-10-06 02:42:31",
+    "synapses": 70390,
+    "pruned_since_prev": 3735
+   },
+   {
+    "line": 631583,
+    "ts": "2026-10-06 02:54:11",
+    "synapses": 71212,
+    "pruned_since_prev": 2113
+   },
+   {
+    "line": 631611,
+    "ts": "2026-10-06 03:02:14",
+    "synapses": 71373,
+    "pruned_since_prev": 128
+   },
+   {
+    "line": 631696,
+    "ts": "2026-10-06 03:13:34",
+    "synapses": 72212,
+    "pruned_since_prev": 676
+   },
+   {
+    "line": 631746,
+    "ts": "2026-10-06 03:17:13",
+    "synapses": 69312,
+    "pruned_since_prev": 4445
+   },
+   {
+    "line": 631770,
+    "ts": "2026-10-06 03:24:38",
+    "synapses": 69523,
+    "pruned_since_prev": 165
+   },
+   {
+    "line": 631799,
+    "ts": "2026-10-06 03:31:44",
+    "synapses": 69640,
+    "pruned_since_prev": 118
+   },
+   {
+    "line": 632075,
+    "ts": "2026-10-06 03:42:57",
+    "synapses": 70157,
+    "pruned_since_prev": 2875
+   },
+   {
+    "line": 632104,
+    "ts": "2026-10-06 03:51:47",
+    "synapses": 70564,
+    "pruned_since_prev": 65
+   },
+   {
+    "line": 632290,
+    "ts": "2026-10-06 04:02:22",
+    "synapses": 71458,
+    "pruned_since_prev": 1684
+   },
+   {
+    "line": 632335,
+    "ts": "2026-10-06 04:04:27",
+    "synapses": 69980,
+    "pruned_since_prev": 1768
+   },
+   {
+    "line": 632353,
+    "ts": "2026-10-06 04:10:49",
+    "synapses": 70251,
+    "pruned_since_prev": 28
+   },
+   {
+    "line": 632375,
+    "ts": "2026-10-06 04:17:23",
+    "synapses": 70413,
+    "pruned_since_prev": 367
+   },
+   {
+    "line": 632653,
+    "ts": "2026-10-06 04:25:52",
+    "synapses": 64999,
+    "pruned_since_prev": 5753
+   },
+   {
+    "line": 632914,
+    "ts": "2026-10-06 04:35:17",
+    "synapses": 64797,
+    "pruned_since_prev": 3404
+   },
+   {
+    "line": 632932,
+    "ts": "2026-10-06 04:41:49",
+    "synapses": 64934,
+    "pruned_since_prev": 76
+   },
+   {
+    "line": 633205,
+    "ts": "2026-10-06 04:51:12",
+    "synapses": 63346,
+    "pruned_since_prev": 4905
+   },
+   {
+    "line": 633226,
+    "ts": "2026-10-06 04:57:31",
+    "synapses": 63636,
+    "pruned_since_prev": 80
+   },
+   {
+    "line": 633434,
+    "ts": "2026-10-06 05:08:09",
+    "synapses": 63372,
+    "pruned_since_prev": 2815
+   },
+   {
+    "line": 633494,
+    "ts": "2026-10-06 05:10:14",
+    "synapses": 63249,
+    "pruned_since_prev": 858
+   },
+   {
+    "line": 633512,
+    "ts": "2026-10-06 05:16:29",
+    "synapses": 63551,
+    "pruned_since_prev": 123
+   },
+   {
+    "line": 633539,
+    "ts": "2026-10-06 05:23:05",
+    "synapses": 63959,
+    "pruned_since_prev": 101
+   },
+   {
+    "line": 633567,
+    "ts": "2026-10-06 05:29:30",
+    "synapses": 64344,
+    "pruned_since_prev": 97
+   },
+   {
+    "line": 633589,
+    "ts": "2026-10-06 05:36:04",
+    "synapses": 64796,
+    "pruned_since_prev": 54
+   },
+   {
+    "line": 633609,
+    "ts": "2026-10-06 05:42:28",
+    "synapses": 65176,
+    "pruned_since_prev": 21
+   },
+   {
+    "line": 633631,
+    "ts": "2026-10-06 05:49:13",
+    "synapses": 65546,
+    "pruned_since_prev": 85
+   },
+   {
+    "line": 633890,
+    "ts": "2026-10-06 05:58:52",
+    "synapses": 64220,
+    "pruned_since_prev": 4434
+   },
+   {
+    "line": 633921,
+    "ts": "2026-10-06 06:07:03",
+    "synapses": 64514,
+    "pruned_since_prev": 10
+   },
+   {
+    "line": 633941,
+    "ts": "2026-10-06 06:13:34",
+    "synapses": 64897,
+    "pruned_since_prev": 54
+   },
+   {
+    "line": 633964,
+    "ts": "2026-10-06 06:20:13",
+    "synapses": 65153,
+    "pruned_since_prev": 119
+   },
+   {
+    "line": 634199,
+    "ts": "2026-10-06 06:30:39",
+    "synapses": 64227,
+    "pruned_since_prev": 3956
+   },
+   {
+    "line": 634220,
+    "ts": "2026-10-06 06:37:20",
+    "synapses": 64343,
+    "pruned_since_prev": 164
+   },
+   {
+    "line": 634242,
+    "ts": "2026-10-06 06:44:09",
+    "synapses": 64683,
+    "pruned_since_prev": 245
+   },
+   {
+    "line": 634285,
+    "ts": "2026-10-06 06:52:08",
+    "synapses": 64875,
+    "pruned_since_prev": 286
+   },
+   {
+    "line": 634334,
+    "ts": "2026-10-06 07:02:27",
+    "synapses": 64928,
+    "pruned_since_prev": 76
+   }
+  ]
+ },
+ {
+  "boot_line": 634361,
+  "boot_synapses": 65222,
+  "saves": [
+   {
+    "line": 634427,
+    "ts": "2026-10-06 07:06:53",
+    "synapses": 65213,
+    "pruned_since_prev": 9
+   },
+   {
+    "line": 634545,
+    "ts": "2026-10-06 07:17:21",
+    "synapses": 65208,
+    "pruned_since_prev": 75
+   },
+   {
+    "line": 634641,
+    "ts": "2026-10-06 07:26:57",
+    "synapses": 65483,
+    "pruned_since_prev": 86
+   },
+   {
+    "line": 634750,
+    "ts": "2026-10-06 07:36:33",
+    "synapses": 65881,
+    "pruned_since_prev": 87
+   },
+   {
+    "line": 634838,
+    "ts": "2026-10-06 07:46:52",
+    "synapses": 66308,
+    "pruned_since_prev": 1
+   },
+   {
+    "line": 634913,
+    "ts": "2026-10-06 07:55:47",
+    "synapses": 66616,
+    "pruned_since_prev": 281
+   },
+   {
+    "line": 634996,
+    "ts": "2026-10-06 08:03:06",
+    "synapses": 66616,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 635083,
+    "ts": "2026-10-06 08:11:26",
+    "synapses": 65771,
+    "pruned_since_prev": 1474
+   },
+   {
+    "line": 635155,
+    "ts": "2026-10-06 08:19:29",
+    "synapses": 65881,
+    "pruned_since_prev": 173
+   },
+   {
+    "line": 635240,
+    "ts": "2026-10-06 08:25:33",
+    "synapses": 66042,
+    "pruned_since_prev": 133
+   },
+   {
+    "line": 635310,
+    "ts": "2026-10-06 08:31:42",
+    "synapses": 66009,
+    "pruned_since_prev": 214
+   },
+   {
+    "line": 635389,
+    "ts": "2026-10-06 08:39:49",
+    "synapses": 66117,
+    "pruned_since_prev": 255
+   },
+   {
+    "line": 635460,
+    "ts": "2026-10-06 08:45:45",
+    "synapses": 66225,
+    "pruned_since_prev": 113
+   },
+   {
+    "line": 635530,
+    "ts": "2026-10-06 08:53:32",
+    "synapses": 66256,
+    "pruned_since_prev": 126
+   },
+   {
+    "line": 635635,
+    "ts": "2026-10-06 09:04:38",
+    "synapses": 63995,
+    "pruned_since_prev": 2608
+   }
+  ]
+ },
+ {
+  "boot_line": 635968,
+  "boot_synapses": 64326,
+  "saves": [
+   {
+    "line": 636057,
+    "ts": "2026-10-06 09:49:17",
+    "synapses": 64317,
+    "pruned_since_prev": 9
+   }
+  ]
+ },
+ {
+  "boot_line": 636083,
+  "boot_synapses": 64327,
+  "saves": [
+   {
+    "line": 636139,
+    "ts": "2026-10-06 09:52:39",
+    "synapses": 64029,
+    "pruned_since_prev": 298
+   },
+   {
+    "line": 636277,
+    "ts": "2026-10-06 10:03:03",
+    "synapses": 55260,
+    "pruned_since_prev": 8970
+   },
+   {
+    "line": 636390,
+    "ts": "2026-10-06 10:11:32",
+    "synapses": 28691,
+    "pruned_since_prev": 26976
+   },
+   {
+    "line": 636537,
+    "ts": "2026-10-06 10:23:50",
+    "synapses": 21274,
+    "pruned_since_prev": 7871
+   }
+  ]
+ },
+ {
+  "boot_line": 636566,
+  "boot_synapses": 21618,
+  "saves": [
+   {
+    "line": 636642,
+    "ts": "2026-10-06 10:27:22",
+    "synapses": 21618,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 636743,
+    "ts": "2026-10-06 10:38:59",
+    "synapses": 21943,
+    "pruned_since_prev": 22
+   },
+   {
+    "line": 636817,
+    "ts": "2026-10-06 10:47:42",
+    "synapses": 22152,
+    "pruned_since_prev": 53
+   },
+   {
+    "line": 636902,
+    "ts": "2026-10-06 10:56:24",
+    "synapses": 22500,
+    "pruned_since_prev": 101
+   },
+   {
+    "line": 636970,
+    "ts": "2026-10-06 11:05:22",
+    "synapses": 22500,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 637040,
+    "ts": "2026-10-06 11:12:28",
+    "synapses": 22500,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 637105,
+    "ts": "2026-10-06 11:19:25",
+    "synapses": 22500,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 637177,
+    "ts": "2026-10-06 11:25:46",
+    "synapses": 23650,
+    "pruned_since_prev": 8
+   },
+   {
+    "line": 637248,
+    "ts": "2026-10-06 11:34:06",
+    "synapses": 23929,
+    "pruned_since_prev": 31
+   },
+   {
+    "line": 637325,
+    "ts": "2026-10-06 11:41:18",
+    "synapses": 24277,
+    "pruned_since_prev": 22
+   },
+   {
+    "line": 637400,
+    "ts": "2026-10-06 11:49:58",
+    "synapses": 24462,
+    "pruned_since_prev": 11
+   },
+   {
+    "line": 637478,
+    "ts": "2026-10-06 11:57:49",
+    "synapses": 24806,
+    "pruned_since_prev": 53
+   },
+   {
+    "line": 637553,
+    "ts": "2026-10-06 12:07:01",
+    "synapses": 24918,
+    "pruned_since_prev": 9
+   },
+   {
+    "line": 637622,
+    "ts": "2026-10-06 12:13:41",
+    "synapses": 24918,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 637706,
+    "ts": "2026-10-06 12:22:31",
+    "synapses": 25368,
+    "pruned_since_prev": 39
+   },
+   {
+    "line": 637795,
+    "ts": "2026-10-06 12:34:39",
+    "synapses": 25824,
+    "pruned_since_prev": 80
+   },
+   {
+    "line": 637890,
+    "ts": "2026-10-06 12:40:51",
+    "synapses": 28365,
+    "pruned_since_prev": 560
+   }
+  ]
+ },
+ {
+  "boot_line": 637916,
+  "boot_synapses": 28385,
+  "saves": [
+   {
+    "line": 637979,
+    "ts": "2026-10-06 12:43:06",
+    "synapses": 28375,
+    "pruned_since_prev": 10
+   },
+   {
+    "line": 638074,
+    "ts": "2026-10-06 12:51:11",
+    "synapses": 28375,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 638223,
+    "ts": "2026-10-06 13:00:24",
+    "synapses": 31281,
+    "pruned_since_prev": 554
+   },
+   {
+    "line": 638290,
+    "ts": "2026-10-06 13:07:49",
+    "synapses": 31281,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 638376,
+    "ts": "2026-10-06 13:17:42",
+    "synapses": 32159,
+    "pruned_since_prev": 20
+   },
+   {
+    "line": 638502,
+    "ts": "2026-10-06 13:34:51",
+    "synapses": 32688,
+    "pruned_since_prev": 94
+   },
+   {
+    "line": 638615,
+    "ts": "2026-10-06 13:45:50",
+    "synapses": 32397,
+    "pruned_since_prev": 644
+   },
+   {
+    "line": 638720,
+    "ts": "2026-10-06 13:56:40",
+    "synapses": 32572,
+    "pruned_since_prev": 262
+   },
+   {
+    "line": 638841,
+    "ts": "2026-10-06 14:11:57",
+    "synapses": 33080,
+    "pruned_since_prev": 83
+   },
+   {
+    "line": 638937,
+    "ts": "2026-10-06 14:21:35",
+    "synapses": 33385,
+    "pruned_since_prev": 5
+   },
+   {
+    "line": 639016,
+    "ts": "2026-10-06 14:31:27",
+    "synapses": 34211,
+    "pruned_since_prev": 2
+   },
+   {
+    "line": 639092,
+    "ts": "2026-10-06 14:40:17",
+    "synapses": 34670,
+    "pruned_since_prev": 1
+   },
+   {
+    "line": 639177,
+    "ts": "2026-10-06 14:50:24",
+    "synapses": 34670,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 639252,
+    "ts": "2026-10-06 15:01:35",
+    "synapses": 34670,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 639327,
+    "ts": "2026-10-06 15:10:44",
+    "synapses": 35859,
+    "pruned_since_prev": 1
+   },
+   {
+    "line": 639395,
+    "ts": "2026-10-06 15:19:22",
+    "synapses": 35859,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 639415,
+    "ts": "2026-10-06 15:28:50",
+    "synapses": 36707,
+    "pruned_since_prev": 1
+   },
+   {
+    "line": 639437,
+    "ts": "2026-10-06 15:37:29",
+    "synapses": 36707,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 639459,
+    "ts": "2026-10-06 15:45:27",
+    "synapses": 37863,
+    "pruned_since_prev": 4
+   },
+   {
+    "line": 639486,
+    "ts": "2026-10-06 15:53:04",
+    "synapses": 38140,
+    "pruned_since_prev": 53
+   },
+   {
+    "line": 639561,
+    "ts": "2026-10-06 16:00:16",
+    "synapses": 40934,
+    "pruned_since_prev": 361
+   },
+   {
+    "line": 639613,
+    "ts": "2026-10-06 16:11:26",
+    "synapses": 42182,
+    "pruned_since_prev": 158
+   },
+   {
+    "line": 639696,
+    "ts": "2026-10-06 16:17:40",
+    "synapses": 43815,
+    "pruned_since_prev": 338
+   },
+   {
+    "line": 639790,
+    "ts": "2026-10-06 16:29:38",
+    "synapses": 46631,
+    "pruned_since_prev": 384
+   },
+   {
+    "line": 639813,
+    "ts": "2026-10-06 16:37:34",
+    "synapses": 46767,
+    "pruned_since_prev": 84
+   },
+   {
+    "line": 639847,
+    "ts": "2026-10-06 16:45:23",
+    "synapses": 46767,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 639872,
+    "ts": "2026-10-06 16:53:35",
+    "synapses": 46767,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 639908,
+    "ts": "2026-10-06 17:04:20",
+    "synapses": 48882,
+    "pruned_since_prev": 37
+   },
+   {
+    "line": 639978,
+    "ts": "2026-10-06 17:10:37",
+    "synapses": 50363,
+    "pruned_since_prev": 289
+   },
+   {
+    "line": 640001,
+    "ts": "2026-10-06 17:17:47",
+    "synapses": 50557,
+    "pruned_since_prev": 46
+   },
+   {
+    "line": 640032,
+    "ts": "2026-10-06 17:26:27",
+    "synapses": 50952,
+    "pruned_since_prev": 75
+   },
+   {
+    "line": 640085,
+    "ts": "2026-10-06 17:37:05",
+    "synapses": 52275,
+    "pruned_since_prev": 116
+   },
+   {
+    "line": 640102,
+    "ts": "2026-10-06 17:37:49",
+    "synapses": 52530,
+    "pruned_since_prev": 35
+   }
+  ]
+ },
+ {
+  "boot_line": 640124,
+  "boot_synapses": 52550,
+  "saves": [
+   {
+    "line": 640189,
+    "ts": "2026-10-06 18:53:38",
+    "synapses": 52550,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 640306,
+    "ts": "2026-10-06 19:04:49",
+    "synapses": 53716,
+    "pruned_since_prev": 128
+   },
+   {
+    "line": 640346,
+    "ts": "2026-10-06 19:08:30",
+    "synapses": 55018,
+    "pruned_since_prev": 283
+   },
+   {
+    "line": 640421,
+    "ts": "2026-10-06 19:15:25",
+    "synapses": 55463,
+    "pruned_since_prev": 14
+   },
+   {
+    "line": 640504,
+    "ts": "2026-10-06 19:23:35",
+    "synapses": 55655,
+    "pruned_since_prev": 11
+   },
+   {
+    "line": 640656,
+    "ts": "2026-10-06 19:33:20",
+    "synapses": 58407,
+    "pruned_since_prev": 218
+   },
+   {
+    "line": 640812,
+    "ts": "2026-10-06 19:44:32",
+    "synapses": 60123,
+    "pruned_since_prev": 161
+   },
+   {
+    "line": 641173,
+    "ts": "2026-10-06 19:49:32",
+    "synapses": 61648,
+    "pruned_since_prev": 197
+   },
+   {
+    "line": 641313,
+    "ts": "2026-10-06 19:58:52",
+    "synapses": 64898,
+    "pruned_since_prev": 234
+   },
+   {
+    "line": 641376,
+    "ts": "2026-10-06 20:03:27",
+    "synapses": 64898,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 641479,
+    "ts": "2026-10-06 20:14:19",
+    "synapses": 66502,
+    "pruned_since_prev": 220
+   },
+   {
+    "line": 641523,
+    "ts": "2026-10-06 20:18:26",
+    "synapses": 67996,
+    "pruned_since_prev": 76
+   },
+   {
+    "line": 641678,
+    "ts": "2026-10-06 20:28:39",
+    "synapses": 70980,
+    "pruned_since_prev": 334
+   },
+   {
+    "line": 641746,
+    "ts": "2026-10-06 20:35:23",
+    "synapses": 70980,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 641815,
+    "ts": "2026-10-06 20:42:03",
+    "synapses": 70980,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 641882,
+    "ts": "2026-10-06 20:48:19",
+    "synapses": 72187,
+    "pruned_since_prev": 26
+   },
+   {
+    "line": 641952,
+    "ts": "2026-10-06 20:54:15",
+    "synapses": 72570,
+    "pruned_since_prev": 11
+   },
+   {
+    "line": 642026,
+    "ts": "2026-10-06 21:00:01",
+    "synapses": 72808,
+    "pruned_since_prev": 31
+   },
+   {
+    "line": 642087,
+    "ts": "2026-10-06 21:06:20",
+    "synapses": 73137,
+    "pruned_since_prev": 42
+   },
+   {
+    "line": 642110,
+    "ts": "2026-10-06 21:13:15",
+    "synapses": 73632,
+    "pruned_since_prev": 34
+   },
+   {
+    "line": 642237,
+    "ts": "2026-10-06 21:23:30",
+    "synapses": 75992,
+    "pruned_since_prev": 823
+   },
+   {
+    "line": 642264,
+    "ts": "2026-10-06 21:31:55",
+    "synapses": 76179,
+    "pruned_since_prev": 105
+   },
+   {
+    "line": 642286,
+    "ts": "2026-10-06 21:37:51",
+    "synapses": 76513,
+    "pruned_since_prev": 61
+   },
+   {
+    "line": 642335,
+    "ts": "2026-10-06 21:48:34",
+    "synapses": 78263,
+    "pruned_since_prev": 81
+   },
+   {
+    "line": 642355,
+    "ts": "2026-10-06 21:55:28",
+    "synapses": 78263,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 642372,
+    "ts": "2026-10-06 22:01:11",
+    "synapses": 78263,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 642382,
+    "ts": "2026-10-06 22:04:53",
+    "synapses": 78263,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 642463,
+    "ts": "2026-10-06 22:12:13",
+    "synapses": 82387,
+    "pruned_since_prev": 282
+   },
+   {
+    "line": 642573,
+    "ts": "2026-10-06 22:21:26",
+    "synapses": 84715,
+    "pruned_since_prev": 712
+   },
+   {
+    "line": 642596,
+    "ts": "2026-10-06 22:27:04",
+    "synapses": 84978,
+    "pruned_since_prev": 75
+   },
+   {
+    "line": 642622,
+    "ts": "2026-10-06 22:33:11",
+    "synapses": 85352,
+    "pruned_since_prev": 114
+   },
+   {
+    "line": 642639,
+    "ts": "2026-10-06 22:39:18",
+    "synapses": 85398,
+    "pruned_since_prev": 54
+   },
+   {
+    "line": 642653,
+    "ts": "2026-10-06 22:43:08",
+    "synapses": 86024,
+    "pruned_since_prev": 9
+   },
+   {
+    "line": 642668,
+    "ts": "2026-10-06 22:46:51",
+    "synapses": 86273,
+    "pruned_since_prev": 86
+   },
+   {
+    "line": 642785,
+    "ts": "2026-10-06 22:56:19",
+    "synapses": 87915,
+    "pruned_since_prev": 1483
+   },
+   {
+    "line": 642875,
+    "ts": "2026-10-06 23:03:41",
+    "synapses": 89834,
+    "pruned_since_prev": 921
+   },
+   {
+    "line": 642897,
+    "ts": "2026-10-06 23:07:46",
+    "synapses": 89834,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 642918,
+    "ts": "2026-10-06 23:11:57",
+    "synapses": 89834,
+    "pruned_since_prev": 0
+   }
+  ]
+ },
+ {
+  "boot_line": 642945,
+  "boot_synapses": 90535,
+  "saves": [
+   {
+    "line": 643010,
+    "ts": "2026-10-06 23:14:24",
+    "synapses": 90535,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 643103,
+    "ts": "2026-10-06 23:18:52",
+    "synapses": 90535,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 643166,
+    "ts": "2026-10-06 23:23:10",
+    "synapses": 90535,
+    "pruned_since_prev": 0
+   },
+   {
+    "line": 643231,
+    "ts": "2026-10-06 23:27:07",
+    "synapses": 91169,
+    "pruned_since_prev": 11
+   },
+   {
+    "line": 643300,
+    "ts": "2026-10-06 23:31:03",
+    "synapses": 91377,
+    "pruned_since_prev": 54
+   },
+   {
+    "line": 643365,
+    "ts": "2026-10-06 23:34:54",
+    "synapses": 91609,
+    "pruned_since_prev": 33
+   },
+   {
+    "line": 643594,
+    "ts": "2026-10-06 23:43:10",
+    "synapses": 92264,
+    "pruned_since_prev": 2361
+   },
+   {
+    "line": 643655,
+    "ts": "2026-10-06 23:47:09",
+    "synapses": 92349,
+    "pruned_since_prev": 5
+   },
+   {
+    "line": 643725,
+    "ts": "2026-10-06 23:52:27",
+    "synapses": 92349,
+    "pruned_since_prev": 0
+   }
+  ]
+ }
+]
