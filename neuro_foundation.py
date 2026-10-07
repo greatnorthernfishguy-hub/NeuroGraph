@@ -20,6 +20,26 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-07] Claude (lane sleep-p2) — sleep phase P2: disuse in sleep (strength-aware downscale + clearance in sleeps)
+#   (PROTECTED CHANGE on review branch cc-laptop-sleep-p2-20261007 ONLY, its own commit; Josh approved the sleep-phase
+#    design as recommended 2026-10-06 and said to start P2 ("Let's do both"); merges only after his protected-file
+#    "proceed". Keys absent = byte-identical to 149fa1f, so Syl is unchanged.)
+# What: (1) NEW config switch sleep_disuse_enabled (read live, absent = False, NOT in DEFAULT_CONFIG) + five required
+#       parameters (sleep_downscale_d0, sleep_downscale_h, sleep_weight_grace_sleeps, sleep_last_link_grace_sleeps,
+#       sleep_credit_shield_kappa). When on (and structural_plasticity_in_sleep on), Graph.sleep_cycle runs
+#       _sleep_cycle_disuse: migration on the first disuse sleep (low_weight_steps -> 0, last-link stamps dropped;
+#       config sleep_low_weight_unit = "sleeps", sleep_cycles_completed); NEW sleep_downscale_strength_aware
+#       (w *= 1 - d0*h/(h+w)/max(salience,1), weight only, protected strongest-link floor; native
+#       SynapseStore.scale_strength_aware or the bit-identical _scale_strength_aware_python); the clearance through
+#       the EXISTING _prune_synapses with NEW keyword-only sleep-unit arguments (grace in sleeps, activity + age
+#       clauses off by argument, last-link grace in sleeps under metadata last_link_since_sleep, the D14
+#       pending-credit shield w + kappa*max(trace,0) >= wt); the EXISTING orphan collection. One record / event /
+#       INFO line. (2) _last_link_grace takes keyword-only now / grace / stamp_key (defaults = the step clock).
+#       (3) a default-path (step-unit) _prune_synapses drops config sleep_low_weight_unit if present, so the next
+#       disuse sleep re-migrates a counter that step() advanced.
+# Why:  spec superpowers/specs/2026-10-06-sleep-phase-design.md §3, §8 P2, D1-D4, D11, D14 (#1049).
+# How:  reuse, not rebuild (LAW 3): the native rule sweep, lifelines, last-link grace and orphan collection are the
+#       existing code driven by arguments. Proof: tests/test_sleep_p2.py; SLEEP_P2.md (golden copy run, sweep).
 # [2026-10-06] Claude (lane sleep-p1) — D15: removal keeps DiffPC pred_weights consistent + a named one-time purge
 #   (PROTECTED CHANGE on review branch cc-laptop-sleep-p1-20261006 ONLY, its own commit; Josh approved D15 "fix at
 #    source + purge" with the sleep-phase design 2026-10-06 ("OK, sounds good"); this reaches Syl's code path, so it
@@ -1913,6 +1933,29 @@ def _scale_all_python(store, outgoing, incoming, factor, protected, floor) -> Di
     for sid in list(store.keys()):
         w = gw(sid)
         nw = w * factor
+        if nw != w:
+            sw(sid, nw)
+            scaled += 1
+    clamped = _strength_guard_apply(gw, sw, guard)
+    return {"synapses_scaled": scaled, "clamped": clamped}
+
+
+def _scale_strength_aware_python(store, outgoing, incoming, d0, h, protected, floor) -> Dict[str, int]:
+    """Fallback of SynapseStore.scale_strength_aware (sleep phase P2, spec 2026-10-06 §3.1, D1 + D11).
+
+    For every synapse: s = salience if salience > 1.0 else 1.0; d = d0 * h / (h + w) / s; w <- w * (1.0 - d).
+    Weight only (eligibility trace, salience, peak, counters untouched). Then the strongest-link guarantee for
+    every protected node, from PRE-pass weights (the same helper as scale_all). Float operand order is the native
+    method's, so the two are bit-identical. Never prunes."""
+    gw, sw = store.get_weight, store.set_weight
+    guard = _strength_guard_targets(gw, outgoing, incoming, protected, floor)
+    scaled = 0
+    for sid in list(store.keys()):
+        w = gw(sid)
+        sal = store[sid].salience
+        s = sal if sal > 1.0 else 1.0
+        d = d0 * h / (h + w) / s
+        nw = w * (1.0 - d)
         if nw != w:
             sw(sid, nw)
             scaled += 1
@@ -4207,9 +4250,26 @@ class Graph:
         Emits one "sleep_cycle" event and logs one INFO line (never silent), and returns the record:
         pruned, nodes_collected, synapses / nodes before and after, timestep, seconds, in_sleep_mode.
         The existing "pruned" / "nodes_collected" events fire from the two calls as before.
+
+        [2026-10-07] Sleep phase P2 (disuse; spec §3, §8 P2, D1-D4, D11, D14): when config `sleep_disuse_enabled` is
+        truthy (read live, absent = False, NOT in DEFAULT_CONFIG; key absent = the P1 cycle above, unchanged), the cycle
+        is instead: (0) on the first disuse sleep — or the first after any step-unit prune ran — the counters are
+        migrated (`_sleep_migrate_counters`: every low_weight_steps -> 0, every last-link stamp dropped), so that sleep
+        only tags; (1) the strength-aware, salience-armored downscale (`sleep_downscale_strength_aware`, d0 = config
+        `sleep_downscale_d0`, h = `sleep_downscale_h`; d0 = 0 skips it); (2) the clearance: `_prune_synapses` in sleep
+        units (G = `sleep_weight_grace_sleeps`, last-link grace = `sleep_last_link_grace_sleeps`, the D14 shield with
+        kappa = `sleep_credit_shield_kappa`); (3) the existing orphan collection. All four parameters are REQUIRED
+        when the switch is on, and `structural_plasticity_in_sleep` must be on (else step() would keep advancing the
+        counter per step): a missing / invalid one raises ValueError BEFORE anything is touched. The sleep index is
+        config `sleep_cycles_completed` (+1 per disuse sleep; the last-link clock); config `sleep_low_weight_unit` =
+        "sleeps" marks a migrated counter. The record adds: disuse True, sleep_index, migrated, lws_reset,
+        stamps_cleared, downscaled, downscale_clamped, downscale_native, eligible, shield_held, shield_held_ids,
+        last_link_held, below_threshold_after.
         """
         import time as _time   # local: the module namespace stays as it was
         t0 = _time.perf_counter()
+        if self.config.get("sleep_disuse_enabled", False):
+            return self._sleep_cycle_disuse(t0)
         with self._step_lock:
             syn_before = len(self.synapses)
             nodes_before = len(self.nodes)
@@ -4233,6 +4293,151 @@ class Graph:
                     record["nodes_after"], record["in_sleep_mode"], record["seconds"])
         return record
 
+    _SLEEP_DISUSE_KEYS = ("sleep_downscale_d0", "sleep_downscale_h", "sleep_weight_grace_sleeps",
+                          "sleep_last_link_grace_sleeps", "sleep_credit_shield_kappa")
+
+    def _sleep_disuse_params(self) -> Dict[str, Any]:
+        """Read + validate the P2 disuse parameters from config (all required). Raises ValueError, touches nothing."""
+        cfg = self.config
+        missing = [k for k in self._SLEEP_DISUSE_KEYS if cfg.get(k) is None]
+        if missing:
+            raise ValueError("sleep_cycle: sleep_disuse_enabled needs config %s" % ", ".join(missing))
+        if not cfg.get("structural_plasticity_in_sleep", False):
+            raise ValueError("sleep_cycle: sleep_disuse_enabled needs structural_plasticity_in_sleep (otherwise step() "
+                             "keeps advancing low_weight_steps per step and the grace is no longer in sleeps)")
+
+        def _num(k, lo, lo_open, hi=None):
+            v = cfg[k]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) or \
+                    (float(v) <= lo if lo_open else float(v) < lo) or (hi is not None and float(v) > hi):
+                raise ValueError("sleep_cycle: config %s out of range (got %r)" % (k, v))
+            return float(v)
+
+        def _int(k):
+            v = cfg[k]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError("sleep_cycle: config %s must be an int >= 0 (got %r)" % (k, v))
+            return v
+
+        return {"d0": _num("sleep_downscale_d0", 0.0, False, 1.0), "h": _num("sleep_downscale_h", 0.0, True),
+                "G": _int("sleep_weight_grace_sleeps"), "LL": _int("sleep_last_link_grace_sleeps"),
+                "kappa": _num("sleep_credit_shield_kappa", 0.0, False)}
+
+    def _sleep_migrate_counters(self) -> Dict[str, int]:
+        """Sleep phase P2 migration (spec §8 P2): low_weight_steps was counted in STEPS (and Tonic ticks, §1.4); the
+        disuse clearance counts it in SLEEPS. Reset every synapse's low_weight_steps to 0 and drop every last-link
+        stamp (step "last_link_since" and sleep "last_link_since_sleep"; a held last link gets a fresh grace in
+        sleeps), so the first disuse sleep only tags. Then config sleep_low_weight_unit = "sleeps",
+        sleep_cycles_completed = 0. Weights, traces and every other field untouched. Caller holds _step_lock."""
+        lws_reset = stamps = 0
+        for sid, syn in self.synapses.items():
+            if syn.low_weight_steps:
+                syn.low_weight_steps = 0
+                lws_reset += 1
+            md = syn.metadata
+            if md and ("last_link_since" in md or "last_link_since_sleep" in md):
+                md = dict(md)
+                md.pop("last_link_since", None)
+                md.pop("last_link_since_sleep", None)
+                syn.metadata = md
+                self._dirty_synapses.add(sid)
+                stamps += 1
+        self.config["sleep_low_weight_unit"] = "sleeps"
+        self.config["sleep_cycles_completed"] = 0
+        return {"lws_reset": lws_reset, "stamps_cleared": stamps}
+
+    def sleep_downscale_strength_aware(self, d0: float, h: float) -> Dict[str, Any]:
+        """Sleep phase P2 downscale (spec §3.1, D1 strength-aware, D11 salience armor). Every synapse:
+        d = d0 * h / (h + w) / max(salience, 1); w <- w * (1 - d). Faint links (w << h) lose ~d0 per sleep, established
+        ones (w >> h) ~d0*h/w; surprise-salient links proportionally less. Weight ONLY (eligibility trace, salience,
+        peak_weight, counters, delay untouched). Then the strongest-link guarantee of every protected node: its
+        PRE-pass strongest out / in link ends >= min(pre-pass weight, 2 * weight_threshold) (as sleep_downscale).
+        Never prunes. Native SynapseStore.scale_strength_aware when the installed ng_tract has it, else the
+        bit-identical Python fallback. d0 in [0, 1], h > 0. Returns counts."""
+        for lbl, v, ok in (("d0", d0, lambda x: 0.0 <= x <= 1.0), ("h", h, lambda x: 0.0 < x < float("inf"))):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not ok(float(v)):
+                raise ValueError("sleep_downscale_strength_aware: %s out of range (got %r)" % (lbl, v))
+        d0, h = float(d0), float(h)
+        with self._step_lock:
+            protected = self._strength_protected_ids()
+            floor = 2.0 * float(self.config["weight_threshold"])
+            native = getattr(self.synapses, "scale_strength_aware", None)
+            if native is not None:
+                res = dict(native(d0, h, protected, floor))
+            else:
+                res = _scale_strength_aware_python(self.synapses, self._outgoing, self._incoming, d0, h, protected, floor)
+            res["native"] = native is not None
+            res["protected_nodes"] = len(protected)
+        return res
+
+    def _sleep_cycle_disuse(self, t0: float) -> Dict[str, Any]:
+        """The P2 disuse sleep (see sleep_cycle). Validates first; one _step_lock hold for the whole cycle."""
+        import time as _time
+        prm = self._sleep_disuse_params()            # raises before anything is touched
+        with self._step_lock:
+            syn_before = len(self.synapses)
+            nodes_before = len(self.nodes)
+            mig = {"lws_reset": 0, "stamps_cleared": 0}
+            migrated = self.config.get("sleep_low_weight_unit") != "sleeps"
+            t_a = _time.perf_counter()
+            if migrated:
+                mig = self._sleep_migrate_counters()
+            sleep_index = int(self.config.get("sleep_cycles_completed", 0)) + 1
+            ds = {"synapses_scaled": 0, "clamped": 0, "native": None}
+            t_b = _time.perf_counter()
+            if prm["d0"] > 0.0:
+                ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
+            rep: Dict[str, Any] = {}
+            t_c = _time.perf_counter()
+            pruned = self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
+                                          last_link_grace_sleeps=prm["LL"], credit_shield_kappa=prm["kappa"])
+            t_d = _time.perf_counter()
+            collected = self._collect_orphan_nodes()
+            t_e = _time.perf_counter()
+            self._total_pruned += pruned
+            self.config["sleep_cycles_completed"] = sleep_index
+            wt = float(self.config["weight_threshold"])
+            wc = getattr(self.synapses, "weights_copy", None)
+            if wc is not None:
+                below = int((wc() < wt).sum())
+            else:
+                below = sum(1 for sid in self.synapses.keys() if self.synapses.get_weight(sid) < wt)
+            held_ids = list(rep.get("shield_held_ids", []))
+            record = {
+                "timestep": self.timestep,
+                "pruned": pruned,
+                "nodes_collected": collected,
+                "synapses_before": syn_before,
+                "synapses_after": len(self.synapses),
+                "nodes_before": nodes_before,
+                "nodes_after": len(self.nodes),
+                "in_sleep_mode": bool(self.config.get("structural_plasticity_in_sleep", False)),
+                "disuse": True,
+                "sleep_index": sleep_index,
+                "params": dict(prm),
+                "migrated": migrated,
+                "lws_reset": mig["lws_reset"],
+                "stamps_cleared": mig["stamps_cleared"],
+                "downscaled": ds["synapses_scaled"],
+                "downscale_clamped": ds["clamped"],
+                "downscale_native": ds["native"],
+                "eligible": rep.get("rule_chosen", 0),
+                "shield_held": len(held_ids),
+                "shield_held_ids": held_ids,
+                "last_link_held": rep.get("last_link_held", 0),
+                "below_threshold_after": below,
+                "seconds_parts": {"migrate": t_b - t_a, "downscale": t_c - t_b, "clearance": t_d - t_c,
+                                  "orphans": t_e - t_d},
+                "seconds": _time.perf_counter() - t0,
+            }
+            self._emit("sleep_cycle", **record)
+        logger.info("sleep_cycle(disuse): t=%s sleep=%d migrated=%s downscaled=%d clamped=%d eligible=%d shield_held=%d "
+                    "last_link_held=%d pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d below_wt=%d %.3fs",
+                    record["timestep"], sleep_index, migrated, record["downscaled"], record["downscale_clamped"],
+                    record["eligible"], record["shield_held"], record["last_link_held"], pruned, collected, syn_before,
+                    record["synapses_after"], nodes_before, record["nodes_after"], below, record["seconds"])
+        return record
+
     def _prune_synapses(
         self,
         *,
@@ -4241,6 +4446,10 @@ class Graph:
         max_removals: Optional[int] = None,
         order_key: Optional[Any] = None,
         report: Optional[Dict[str, Any]] = None,
+        grace_sleeps: Optional[int] = None,
+        sleep_now: Optional[int] = None,
+        last_link_grace_sleeps: Optional[int] = None,
+        credit_shield_kappa: Optional[float] = None,
     ) -> int:
         """Prune weak/inactive synapses (PRD §3.3.1).
 
@@ -4274,6 +4483,20 @@ class Graph:
         guarantee becomes "no protected node is ever cut off" instead of "no protected link is ever pruned".
         Competing mode is unaffected (its caller supplies the sets; compete_protected_links adds the lifelines
         to its guaranteed set when the flag is on).
+
+        [2026-10-07] Sleep-unit clearance (sleep phase P2, spec 2026-10-06 §3.3, D2-D4, D14) — keyword-only, ALL default
+        None; the ONLY caller is sleep_cycle's disuse path. grace_sleeps / sleep_now / last_link_grace_sleeps are given
+        TOGETHER (credit_shield_kappa with them), never in competing mode:
+            grace_sleeps: the weight rule's grace, counted in SLEEPS (low_weight_steps advances once per call, i.e.
+                once per sleep); the activity clause is off (inactivity = inf) and the age clause is off
+                (initial_w = 0, so peak_weight < 0 is never true) — by argument, the rules themselves unchanged.
+            sleep_now / last_link_grace_sleeps: the last-link fair chance on the sleep clock, stamped under metadata
+                "last_link_since_sleep" (step stamps "last_link_since" are not read).
+            credit_shield_kappa (D14): a rule-chosen id is NOT removed while w + kappa * max(trace, 0) >= wt
+                (pending reward credit could still lift it); it keeps its count and is re-tested next sleep. Applied
+                after the lifeline filter, before the last-link grace. 0 = no shield. report['shield_held_ids'].
+        Every default-path call (no sleep-unit arguments) drops config 'sleep_low_weight_unit' if present: the counter
+        is then no longer in sleep units, so the next disuse sleep re-migrates it (sleep_cycle).
         """
         wt = self.config["weight_threshold"]
         grace = self.config["grace_period"]
@@ -4283,6 +4506,31 @@ class Graph:
         competing_mode = competing_ids is not None
         if competing_mode != (excluded_ids is not None):
             raise ValueError("_prune_synapses: competing_ids and excluded_ids must be supplied together")
+        sleep_units = grace_sleeps is not None
+        _su_args = (grace_sleeps, sleep_now, last_link_grace_sleeps, credit_shield_kappa)
+        if not sleep_units and any(a is not None for a in _su_args):
+            raise ValueError("_prune_synapses: sleep_now / last_link_grace_sleeps / credit_shield_kappa need grace_sleeps")
+        if sleep_units:
+            if competing_mode:
+                raise ValueError("_prune_synapses: the sleep-unit clearance is not valid in competing mode")
+            if order_key is not None or max_removals is not None:
+                raise ValueError("_prune_synapses: the sleep-unit clearance takes no order_key / max_removals")
+            for _lbl, _v in (("grace_sleeps", grace_sleeps), ("sleep_now", sleep_now),
+                             ("last_link_grace_sleeps", last_link_grace_sleeps)):
+                if isinstance(_v, bool) or not isinstance(_v, int) or _v < 0:
+                    raise ValueError("_prune_synapses: %s must be an int >= 0 (got %r)" % (_lbl, _v))
+            if credit_shield_kappa is None or isinstance(credit_shield_kappa, bool) or \
+                    not isinstance(credit_shield_kappa, (int, float)) or not (0.0 <= float(credit_shield_kappa) < float("inf")):
+                raise ValueError("_prune_synapses: credit_shield_kappa must be a finite number >= 0 (got %r)"
+                                 % (credit_shield_kappa,))
+            grace = grace_sleeps
+            inactivity = float("inf")      # D2/§6: the activity clause off, by argument
+            initial_w = 0.0                # D2: the age clause off (peak_weight < 0.0 is never true)
+            _ll_key = "last_link_since_sleep"
+        else:
+            _ll_key = "last_link_since"
+            if not competing_mode and "sleep_low_weight_unit" in self.config:
+                del self.config["sleep_low_weight_unit"]   # counters advance per step again: no longer sleep units
         if max_removals is not None and (
                 isinstance(max_removals, bool) or not isinstance(max_removals, int) or max_removals < 1):
             raise ValueError("_prune_synapses: max_removals must be an int >= 1 (got %r)" % (max_removals,))
@@ -4373,8 +4621,8 @@ class Graph:
                 # below does (same per-synapse metadata access).
                 for sid, syn in self.synapses.items():
                     _md = syn.metadata
-                    if _md and "last_link_since" in _md:
-                        stamped[sid] = _md["last_link_since"]
+                    if _md and _ll_key in _md:
+                        stamped[sid] = _md[_ll_key]
                 _ll_steps = [(sid, self.synapses[sid].low_weight_steps) for sid in sorted(lifelines)]
                 to_prune = _native_prune(self.timestep, wt, grace, inactivity, initial_w, ())
                 for sid, _lws in _ll_steps:
@@ -4383,8 +4631,8 @@ class Graph:
         for sid, syn in (candidates if _native_prune is None else ()):
             if lifelines is not None:
                 _md = syn.metadata
-                if _md and "last_link_since" in _md:
-                    stamped[sid] = _md["last_link_since"]
+                if _md and _ll_key in _md:
+                    stamped[sid] = _md[_ll_key]
                 if sid in lifelines:
                     continue
             # Cricket rim (#92): never prune synapses touching identity-protected nodes.
@@ -4416,8 +4664,32 @@ class Graph:
             if age > grace and syn.peak_weight < 2.0 * initial_w:
                 to_prune.append(sid)
 
+        if sleep_units and report is not None:
+            report["rule_chosen"] = len(to_prune)      # after the lifeline filter, before the shield / last-link grace
+        if sleep_units and credit_shield_kappa > 0.0 and to_prune:
+            # D14 pending-credit shield: an open positive eligibility trace could still commit w + kappa*trace.
+            _k = float(credit_shield_kappa)
+            _held: List[str] = []
+            _kept: List[str] = []
+            for sid in to_prune:
+                _syn = self.synapses[sid]
+                _tr = _syn.eligibility_trace
+                if _syn.weight + _k * (_tr if _tr > 0.0 else 0.0) >= wt:
+                    _held.append(sid)
+                else:
+                    _kept.append(sid)
+            to_prune = _kept
+            if report is not None:
+                report["shield_held_ids"] = _held
+        elif sleep_units and report is not None:
+            report["shield_held_ids"] = []
+
         if lifelines is not None:
-            to_prune = self._last_link_grace(to_prune, protected_set, stamped, report)
+            if sleep_units:
+                to_prune = self._last_link_grace(to_prune, protected_set, stamped, report, now=sleep_now,
+                                                 grace=last_link_grace_sleeps, stamp_key=_ll_key)
+            else:
+                to_prune = self._last_link_grace(to_prune, protected_set, stamped, report)
 
         # want-hub (d): report / order / budget — each ONLY when its parameter is given (default path: none of these run).
         if report is not None:
@@ -4643,7 +4915,8 @@ class Graph:
         return set(_strength_guard_targets(gw, self._outgoing, self._incoming, protected_ids, 0.0))
 
     def _last_link_grace(self, to_prune: List[str], protected: Set[str], stamped: Dict[str, Any],
-                         report: Optional[Dict[str, Any]]) -> List[str]:
+                         report: Optional[Dict[str, Any]], *, now: Optional[int] = None,
+                         grace: Optional[int] = None, stamp_key: str = "last_link_since") -> List[str]:
         """2026-10-04 prune-lifeline turn 2 — the last-link fair chance (Josh ruling). Called ONLY by the default
         _prune_synapses path with prune_protected_faint_links on, after the three rules chose `to_prune`.
 
@@ -4658,11 +4931,17 @@ class Graph:
         report['last_link_held'] / ['last_link_stamped'] / ['last_link_expired'] / ['last_link_cleared'] when a
         report dict is given. Grace: config last_link_grace_steps, read live, absent = 2000 (NOT in DEFAULT_CONFIG);
         <= 0 disables the hold entirely (returns `to_prune` unchanged, no report keys, nothing stamped or cleared).
+
+        [2026-10-07] sleep phase P2 (D4): keyword-only `now` / `grace` / `stamp_key`, all defaulting to the step clock
+        above (timestep, last_link_grace_steps, "last_link_since"). The sleep-unit clearance passes its sleep index,
+        the grace in SLEEPS and the stamp key "last_link_since_sleep", so step stamps and sleep stamps never mix.
         """
-        grace = self.config.get("last_link_grace_steps", 2000)
+        if grace is None:
+            grace = self.config.get("last_link_grace_steps", 2000)
         if not grace or grace <= 0:
             return to_prune          # grace 0 = no fair chance: the normal rules alone (nothing stamped or cleared)
-        now = self.timestep
+        if now is None:
+            now = self.timestep
         removing = set(to_prune)
         out_i, in_i = self._outgoing, self._incoming
 
@@ -4688,7 +4967,7 @@ class Graph:
             if since is None:
                 syn = self.synapses[last]
                 md = dict(syn.metadata or {})
-                md["last_link_since"] = now
+                md[stamp_key] = now
                 syn.metadata = md
                 self._dirty_synapses.add(last)
                 stamped[last] = now
@@ -4707,7 +4986,7 @@ class Graph:
             ends = {syn.pre_node_id, syn.post_node_id} - protected
             if all(len(_inc(n) - removing) > 1 for n in ends):
                 md = dict(syn.metadata or {})
-                md.pop("last_link_since", None)
+                md.pop(stamp_key, None)
                 syn.metadata = md
                 self._dirty_synapses.add(sid)
                 cleared += 1
