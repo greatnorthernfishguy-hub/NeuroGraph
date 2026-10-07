@@ -1,3 +1,6 @@
+# [2026-10-06] Claude (lane sleep-p1) — D15 (sleep-phase spec): the BASE engine gets D15's one named intended change
+#   (tests/d15_intended.apply_d15_rule: drop pre.pred_weights[post] with the last pre->post synapse) so this file keeps checking
+#   everything else bitwise; with D15 switched off the file passes unchanged (SLEEP_P1.md §6).
 # [2026-10-05] Claude (lane nodestore-p1) — equivalence: native node store (P1) ON / OFF vs the TRIAL TIP's code
 """P1 native node store: byte- and trace-equivalence against the trial tip.
 
@@ -52,6 +55,8 @@ def _load_base():
 
 
 BASE = _load_base()
+from tests.d15_intended import apply_d15_rule  # noqa: E402  [2026-10-06] sleep-p1: D15's named intended change
+apply_d15_rule(BASE)
 MODES = ["off", "on"] if HAVE_NATIVE else ["off"]
 
 

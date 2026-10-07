@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-06] Claude (lane sleep-p1) — D15 (sleep-phase spec): the BASE engine gets D15's one named intended change
+#   (tests/d15_intended.apply_d15_rule: drop pre.pred_weights[post] with the last pre->post synapse) so this file keeps checking
+#   everything else bitwise; with D15 switched off the file passes unchanged (SLEEP_P1.md §6).
 # [2026-10-06] Claude (lane nodestore-p2a) — CREATE: P2a equivalence (native NodeStore node passes vs fallback vs trial tip)
 # What: (1) per-method: every P2a NodeStore method against its module-level Python fallback run over the SAME store's
 #       NodeRefs and over a dict of Node, bitwise (struct.pack('<d') per float, so NaN / ±0.0 / ±inf compare exactly),
@@ -57,6 +60,8 @@ def _load_base(fname, modname):
 
 
 BASE = _load_base("neuro_foundation.py", "nf_base_p2a")
+from tests.d15_intended import apply_d15_rule  # noqa: E402  [2026-10-06] sleep-p1: D15's named intended change
+apply_d15_rule(BASE)
 BASE_TT = _load_base("tonic_thread.py", "tonic_thread_base_p2a")
 BASE_AP = _load_base("activation_persistence.py", "activation_persistence_base_p2a")
 MODES = ["off", "on"] if HAVE_STORE else ["off"]

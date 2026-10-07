@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-06] Claude (lane sleep-p1) — D15 (sleep-phase spec): the BASE engine gets D15's one named intended change
+#   (tests/d15_intended.apply_d15_rule: drop pre.pred_weights[post] with the last pre->post synapse) so this file keeps checking
+#   everything else bitwise; with D15 switched off the file passes unchanged (SLEEP_P1.md §6).
 # [2026-10-06] Claude (lane nodestore-p2b) — CREATE: P2b equivalence (native SynapseStore.stdp_pass vs fallback vs trial tip)
 # What: (1) exp exactness through the shipped binary: stdp_pass dw == the loop's math.exp expression, bitwise, over
 #       every integer dt in a range past exp's underflow for each configured tau (the full 4.6M-result gate is
@@ -59,6 +62,8 @@ def _load_base(fname, modname):
 
 
 BASE = _load_base("neuro_foundation.py", "nf_base_p2b")
+from tests.d15_intended import apply_d15_rule  # noqa: E402  [2026-10-06] sleep-p1: D15's named intended change
+apply_d15_rule(BASE)
 BASE_TT = _load_base("tonic_thread.py", "tonic_thread_base_p2b")
 BASE_AP = _load_base("activation_persistence.py", "activation_persistence_base_p2b")
 MODES = ["off", "on"] if HAVE_STORE else ["off"]
