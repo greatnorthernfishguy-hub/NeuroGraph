@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-10-07] Claude (lane sleep-prearm) — by intent (#1066): the whole runs with disuse ON no longer call
+#   compete_protected_links (the engine refuses it under disuse); they assert the refusal instead (P1.workload compete=).
 # [2026-10-07] Claude (lane sleep-p2) — CREATE: sleep phase P2 (disuse) equivalence, rules and invariants
 # What: (1) keys ABSENT: the branch == the P1 tip 149fa1f exactly over the P1 whole-run workload (step, Tonic ticks
 #       with aging, recall, node churn, rewards, want-hub competition, sleep_downscale, snapshots; per-step synapse
@@ -441,6 +443,13 @@ def test_disuse_clearance_keeps_pred_weights_consistent():
 # (3) whole runs with disuse on
 # ---------------------------------------------------------------------------
 
+def compete_refused(g):
+    """#1066 (sleep-prearm): under the disuse sleep the want-hub competition refuses before touching anything."""
+    with pytest.raises(ValueError, match="#1066"):
+        g.compete_protected_links(2, 10)
+    return "compete-refused"
+
+
 def disuse_sleep(record_into):
     def fn(g):
         prot = g._strength_protected_ids()
@@ -465,8 +474,8 @@ def test_whole_run_disuse_on_lifelines_and_determinism(mode, seed):
     def prep(g):                     # the builder seeds pre-existing dangling entries (old removals): purge them first
         g.config.update(cfg)
         g.purge_dangling_pred_weights()
-    a, (la, sa) = run(mode, start, P1.workload(30, 3, disuse_sleep(rec1)), seed, prep)
-    b, (lb, sb) = run(mode, start, P1.workload(30, 3, disuse_sleep(rec2)), seed, prep)
+    a, (la, sa) = run(mode, start, P1.workload(30, 3, disuse_sleep(rec1), compete=compete_refused), seed, prep)
+    b, (lb, sb) = run(mode, start, P1.workload(30, 3, disuse_sleep(rec2), compete=compete_refused), seed, prep)
     P1.compare(la, lb, sa, sb, a, b)
     assert len(rec1) == 10
     g = restore(mode, a)
@@ -484,6 +493,7 @@ def test_whole_run_disuse_removes_and_is_not_vacuous(seed):
     start = P1.built_bytes(seed)
     cfg = dict(P1.FLAGS["lifeline"], **DISUSE)
     out = []
-    run("off", start, P1.workload(30, 3, lambda g: out.append(g.sleep_cycle()) or 0), seed, _prep(cfg))
+    run("off", start, P1.workload(30, 3, lambda g: out.append(g.sleep_cycle()) or 0, compete=compete_refused), seed,
+        _prep(cfg))
     assert sum(r["pruned"] for r in out) > 0 and sum(r["downscaled"] for r in out) > 0
     assert out[0]["migrated"] and not any(r["migrated"] for r in out[1:])

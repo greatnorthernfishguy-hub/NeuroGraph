@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-10-07] Claude (lane sleep-prearm) — workload(..., compete=True): the want-hub competition call every 10 rounds can
+#   be switched off (compete=False) or replaced (a callable), for whole runs with the disuse sleep on, where the engine now
+#   REFUSES compete_protected_links (#1066). Default unchanged: every existing caller runs the same workload as before.
 # [2026-10-06] Claude (lane sleep-p1) — CREATE: sleep phase P1 + D15 equivalence and invariants
 # What: (1) flag ABSENT whole runs vs the trial tip de8b214 (P2b workload: step, write-mode Tonic ticks with aging,
 #       recall, node churn, rewards, the want-hub competition, sleep_downscale, snapshots; per-step synapse state
@@ -203,8 +206,10 @@ def fe(entries):
             for e in entries]
 
 
-def workload(rounds, sleep_every=0, sleep_fn=None):
-    """sleep_fn(g) -> comparable record of one sleep; called every `sleep_every` rounds when given."""
+def workload(rounds, sleep_every=0, sleep_fn=None, compete=True):
+    """sleep_fn(g) -> comparable record of one sleep; called every `sleep_every` rounds when given.
+    compete: True = g.compete_protected_links(2, 10) every 10 rounds (the default, unchanged); False = skipped; a callable
+    = called instead (its return value is logged)."""
     def act(g, rng):
         log, snaps = [], []
         for k in range(rounds):
@@ -251,7 +256,10 @@ def workload(rounds, sleep_every=0, sleep_fn=None):
             if sleep_fn is not None and sleep_every and k % sleep_every == sleep_every - 1:
                 log.append(sleep_fn(g))
             if k % 10 == 9:
-                log.append(g.compete_protected_links(2, 10))
+                if compete is True:
+                    log.append(g.compete_protected_links(2, 10))
+                elif callable(compete):
+                    log.append(compete(g))
                 log.append(sorted(g.sleep_downscale(0.9).items()))
                 snaps.append(ckpt_bytes(g))
         log.append(list(g.nodes))
