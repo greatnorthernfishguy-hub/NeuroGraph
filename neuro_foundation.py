@@ -20,6 +20,27 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-07] Claude (lane sleep-observe) — sleep phase P3 OBSERVE mode: Graph.sleep_observe (what the sleep WOULD do, with
+#   nothing written) (PROTECTED CHANGE on review branch cc-laptop-sleep-observe-20261007 ONLY, its own commit; Josh approved
+#    the lane 2026-10-07 ("yep"); merges only after his protected-file "proceed". Observe never called = byte-identical to
+#    1cb9706, so Syl is unchanged.)
+# What: (1) NEW Graph.sleep_observe(sleeps=None, config_overrides=None, sample=20, detail=False): ONE short _step_lock hold
+#       captures a private SHADOW of everything sleep_cycle reads or writes (_sleep_observe_shadow_graph: the synapse store
+#       via its own checkpoint bytes, node metadata, small maps, config); then the UNCHANGED Graph.sleep_cycle runs on the
+#       shadow 1..16 times (auto: to the first clearance while the counters are not yet in sleep units, else 1) with the
+#       live lock free. The shadow has its own lock, NO event handlers, no instance-level method patches, and its sleep log
+#       line is DEBUG. Returns a JSON-able report per projected sleep: the engine record, would-remove / would-collect,
+#       weight bands before / after, removals by weight and peak band, peak >= 0.5 and w >= 0.5 removals, the strongest
+#       would-be-forgotten links (ids + numbers, never content), shield-held, weak-link counters after, every protected
+#       node's degree + lifelines before / after; detail=True adds the full removal order, collected ids, shield ids and
+#       every synapse's post-downscale weight (proofs). One INFO line. (2) The three sleep_cycle INFO lines go through
+#       _sleep_log_level() (INFO; DEBUG only on an observe shadow). No predicate, rule, default or checkpoint field changes.
+# Why:  spec superpowers/specs/2026-10-06-sleep-phase-design.md §8 P3 ("observe mode first: downscale + clearance computed
+#       and logged, nothing written"); Josh accepted the P2 established-links result on condition it is confirmed live in
+#       this mode; no earlier lane built it.
+# How:  drift-proof by construction: the projection IS the real sleep (no predicate re-implemented). Proof:
+#       tests/test_sleep_observe.py (observe never called == 1cb9706; writes nothing; projection == the real sleep that
+#       follows, over wake/sleep cycles, chunked and one-hold, both node stores); SLEEP_OBSERVE.md (checkpoint copy).
 # [2026-10-07] Claude (lane sleep-prearm) — #1066: compete_protected_links refuses while the disuse sleep owns
 #   low_weight_steps (PROTECTED CHANGE on review branch cc-laptop-sleep-prearm-20261007 ONLY, its own commit; merges only
 #    after Josh's protected-file "proceed". Keys absent = unchanged.)
@@ -4315,7 +4336,8 @@ class Graph:
                 "seconds": _time.perf_counter() - t0,
             }
             self._emit("sleep_cycle", **record)
-        logger.info("sleep_cycle: t=%s pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d in_sleep_mode=%s %.3fs",
+        logger.log(self._sleep_log_level(),   # [2026-10-07] observe: DEBUG on an observe shadow (sleep_observe), else INFO
+                   "sleep_cycle: t=%s pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d in_sleep_mode=%s %.3fs",
                     record["timestep"], pruned, collected, syn_before, record["synapses_after"], nodes_before,
                     record["nodes_after"], record["in_sleep_mode"], record["seconds"])
         return record
@@ -4558,7 +4580,8 @@ class Graph:
                 "seconds": _time.perf_counter() - t0,
             }
             self._emit("sleep_cycle", **record)
-        logger.info("sleep_cycle(disuse, chunked): t=%s sleep=%d migrated=%s downscaled=%d clamped=%d eligible=%d "
+        logger.log(self._sleep_log_level(),   # [2026-10-07] observe: DEBUG on an observe shadow (sleep_observe), else INFO
+                   "sleep_cycle(disuse, chunked): t=%s sleep=%d migrated=%s downscaled=%d clamped=%d eligible=%d "
                     "shield_held=%d last_link_held=%d pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d "
                     "below_wt=%d %.3fs; lock holds: %d (max %.3fs, decide %.3fs)",
                     record["timestep"], sleep_index, migrated, record["downscaled"], record["downscale_clamped"],
@@ -4633,11 +4656,338 @@ class Graph:
                 "seconds": _time.perf_counter() - t0,
             }
             self._emit("sleep_cycle", **record)
-        logger.info("sleep_cycle(disuse): t=%s sleep=%d migrated=%s downscaled=%d clamped=%d eligible=%d shield_held=%d "
+        logger.log(self._sleep_log_level(),   # [2026-10-07] observe: DEBUG on an observe shadow (sleep_observe), else INFO
+                   "sleep_cycle(disuse): t=%s sleep=%d migrated=%s downscaled=%d clamped=%d eligible=%d shield_held=%d "
                     "last_link_held=%d pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d below_wt=%d %.3fs",
                     record["timestep"], sleep_index, migrated, record["downscaled"], record["downscale_clamped"],
                     record["eligible"], record["shield_held"], record["last_link_held"], pruned, collected, syn_before,
                     record["synapses_after"], nodes_before, record["nodes_after"], below, record["seconds"])
+        return record
+
+    # ------------------------------------------------------------------
+    # [2026-10-07] Sleep phase P3 OBSERVE mode (spec superpowers/specs/2026-10-06-sleep-phase-design.md §8 P3: "observe mode
+    # first (downscale + clearance computed and logged, nothing written)"). The observe pass runs the REAL sleep
+    # (sleep_cycle, unchanged) on a private SHADOW of the sleep-relevant state, so its decisions cannot drift from the
+    # real path (no predicate is re-implemented), and the live graph is only READ, in one short _step_lock hold.
+    # ------------------------------------------------------------------
+
+    _OBSERVE_BANDS = (0.0, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0, float("inf"))
+    _OBSERVE_MAX_SLEEPS = 16
+
+    def _sleep_log_level(self) -> int:
+        """INFO for a real sleep; DEBUG when this graph is a sleep_observe shadow (its sleep is a projection, and an INFO
+        "sleep_cycle" line in the host's log would read as a real sleep). Only the log level differs."""
+        return logging.DEBUG if getattr(self, "_sleep_observe_shadow", False) else logging.INFO
+
+    def _sleep_observe_shadow_graph(self, config_overrides: Optional[Dict[str, Any]]):
+        """The observe pass's private copy of everything Graph.sleep_cycle reads or writes (caller: sleep_observe).
+
+        ONE _step_lock hold on the live graph captures only what must be read consistently, by the cheapest copy that
+        exists: the synapse store as its checkpoint bytes (native to_checkpoint_msgpack, the save path's own capture;
+        every column the sleep reads: weight, salience, low_weight_steps, peak, trace, creation time, metadata stamps,
+        endpoints), every node's metadata contents (copied dicts: the protection flags and the fair-chance counters the
+        orphan sweep reads), the native node store's checkpoint bytes when it is on, and C-level shallow copies of the
+        small maps (hyperedge membership, recent spikes, confirmation history, hyperedges, dirty sets, config, the
+        fair-chance registration), plus a shallow copy of the Graph object (timestep etc.). After the hold, with the
+        live lock free: the shadow synapse store is loaded from those bytes; the Node shells are copied (creation_time,
+        the only other node field the sleep reads, never changes after creation) with the captured metadata and an
+        EMPTY pred_weights (the sleep's only use of pred_weights is the D15 deletion on removal, which decides nothing;
+        with the native node store the shadow's own store carries them);
+        the adjacency is rebuilt from the shadow store's own endpoints (as restore() does; every sleep decision that
+        walks it is order-independent: ties are broken by synapse id).
+
+        The shadow has a fresh _step_lock and NO event handlers (the live handlers -- the #1051 guardian ledger, the
+        vector-store drop on nodes_collected, Lenia -- never see it). Everything the sleep writes (synapse rows,
+        adjacency, nodes, config, the dirty sets, the confirmation history, the fair-chance latch, _total_pruned) is the
+        shadow's own; it reads the shared hyperedge-membership sets and never writes them (an orphan has none). An
+        instance attribute that overrides a Graph method (bound to the live graph) is dropped from the shadow, so it
+        runs the class's methods. Returns (shadow, lock_hold_seconds)."""
+        import time as _time
+        native_nodes = bool(getattr(self, "_native_nodes", False))
+        node_cap = nodes_packed = None
+        with self._step_lock:
+            t = _time.perf_counter()
+            syn_packed = self.synapses.to_checkpoint_msgpack()
+            if native_nodes:
+                nodes_packed = self.nodes.to_checkpoint_msgpack()
+            else:
+                node_cap = [(nid, node, dict(node.metadata) if isinstance(node.metadata, dict) else node.metadata)
+                            for nid, node in self.nodes.items()]
+            nhe_copy = dict(self._node_hyperedges)
+            rs_copy = dict(self._recent_spikes)
+            hist_copy = dict(self._synapse_confirmation_history)
+            dirty = (set(self._dirty_nodes), set(self._dirty_synapses), set(self._dirty_hyperedges))
+            hyperedges_copy = dict(self.hyperedges)
+            cfg_copy = dict(self.config)
+            fc = getattr(self, "_fair_chance_cfg", None)
+            fc_copy = dict(fc) if isinstance(fc, dict) else fc
+            shadow = copy.copy(self)
+            hold = _time.perf_counter() - t
+        store = type(self.synapses)()
+        store.set_synapse_type_class(SynapseType)
+        store.set_synapse_class(Synapse)
+        store.bulk_load_msgpack(bytes(syn_packed))
+        del syn_packed
+        if native_nodes:
+            nodes_copy = ng_tract.NodeStore()
+            nodes_copy.set_node_class(Node)
+            nodes_copy.set_ring_buffer_class(RingBuffer)
+            nodes_copy.bulk_load_msgpack(bytes(nodes_packed))
+            del nodes_packed                  # its own copy: the D15 pred_weights deletion writes the shadow only
+        else:
+            nodes_copy = {}
+            for nid, node, md in node_cap:
+                c = copy.copy(node)
+                c.metadata = md
+                c.pred_weights = {}
+                nodes_copy[nid] = c
+            del node_cap
+        out_copy: Dict[str, Set[str]] = {nid: set() for nid in nodes_copy.keys()}
+        in_copy: Dict[str, Set[str]] = {nid: set() for nid in nodes_copy.keys()}
+        _triples = getattr(store, "endpoint_triples", None)
+        for sid, pre_id, post_id in (_triples() if _triples is not None else _endpoint_triples_python(store)):
+            out_copy.setdefault(pre_id, set()).add(sid)
+            in_copy.setdefault(post_id, set()).add(sid)
+        if config_overrides:
+            cfg_copy.update(config_overrides)
+        if cfg_copy.get("sleep_clearance_chunk_seconds") is not None:
+            cfg_copy["sleep_clearance_chunk_gap_seconds"] = 0.0   # private lock: nothing waits on it, so no pause
+        if isinstance(fc_copy, dict):
+            fc_copy["stale_logged"] = True    # the stale WARNING belongs to the live sweep (decisions never read it)
+        shadow.synapses = store
+        shadow.nodes = nodes_copy
+        shadow._outgoing = out_copy
+        shadow._incoming = in_copy
+        shadow._node_hyperedges = nhe_copy
+        shadow._recent_spikes = rs_copy
+        shadow._synapse_confirmation_history = hist_copy
+        shadow._dirty_nodes, shadow._dirty_synapses, shadow._dirty_hyperedges = dirty
+        shadow.hyperedges = hyperedges_copy
+        shadow.config = cfg_copy
+        if fc is not None or hasattr(self, "_fair_chance_cfg"):
+            shadow._fair_chance_cfg = fc_copy
+        shadow._event_handlers = {}
+        shadow._step_lock = threading.RLock()
+        # An INSTANCE attribute that overrides a Graph method (a host / test patch, e.g. a wrapped
+        # _remove_synapse_internal) is bound to the LIVE graph: the shadow would call it and write the live graph.
+        # Drop every such override on the shadow; it runs the class's own methods.
+        cls_ = type(self)
+        dropped = sorted(n for n in list(vars(shadow)) if callable(getattr(cls_, n, None)))
+        for n in dropped:
+            del vars(shadow)[n]
+        shadow._sleep_observe_shadow = True
+        shadow._sleep_observe_dropped_overrides = dropped
+        return shadow, hold
+
+    @classmethod
+    def _observe_band_counts(cls, weights) -> List[int]:
+        """Counts per weight band [0, .001), [.001, .01), [.01, .05), [.05, .1), [.1, .5), [.5, 1), [1, inf)."""
+        edges = cls._OBSERVE_BANDS
+        w = np.asarray(weights, dtype=np.float64)
+        idx = np.searchsorted(np.asarray(edges[1:-1]), w, side="right")
+        return [int(x) for x in np.bincount(idx, minlength=len(edges) - 1)]
+
+    def sleep_observe(self, *, sleeps: Optional[int] = None, config_overrides: Optional[Dict[str, Any]] = None,
+                      sample: int = 20, detail: bool = False) -> Dict[str, Any]:
+        """Sleep phase P3 OBSERVE (spec §8 P3): what the sleep WOULD do from the current state, with NOTHING written.
+
+        A private shadow of the sleep-relevant state is taken in ONE short _step_lock hold (_sleep_observe_shadow_graph);
+        then the REAL Graph.sleep_cycle -- the same method, the same config-driven path (P1, or the P2 disuse sleep,
+        chunked or not), the same native sweep / lifelines / D14 shield / last-link grace / orphan collection -- runs on
+        the shadow, with the live _step_lock NOT held. No live weight, counter, stamp, metadata, adjacency, node, config
+        key or dirty set changes; no event reaches the live handlers (no "pruned" / "nodes_collected" / "sleep_cycle":
+        the #1051 ledger and the vector store never see it); the shadow's own sleep log line is DEBUG.
+
+        sleeps: how many CONSECUTIVE sleeps to project (no wake between them, so later ones are an upper bound on
+            forgetting); int 1..16. None = auto: on the disuse path, while the live counters are not yet in sleep units
+            (no disuse sleep has run), sleep_weight_grace_sleeps + 1 (the migration sleep only tags; a tagged link clears
+            when its count exceeds G, so this reaches the first clearance); else 1 (= exactly the next real sleep).
+        config_overrides: keys applied to the SHADOW's config only (a host previewing an unarmed sleep passes the keys
+            it would arm, e.g. structural_plasticity_in_sleep / sleep_disuse_enabled / the disuse parameters). The live
+            config is never touched. A chunked config runs chunked on the shadow with no pause between holds.
+        sample: how many of the strongest links each sleep would remove are listed (ids + numbers, never content).
+        detail: also return every projected sleep's full removal order, collected ids, shield-held ids and the
+            post-downscale weight of EVERY synapse (proof harnesses; large).
+
+        Projection 1 is exactly what Graph.sleep_cycle would do now. Raises ValueError for bad arguments or when the
+        shadow's sleep refuses its config (the same validation as a real sleep), with the live graph untouched.
+        Returns a JSON-serialisable record; logs one INFO line (counts only).
+        """
+        import hashlib as _hashlib
+        import time as _time
+        if sleeps is not None and (isinstance(sleeps, bool) or not isinstance(sleeps, int)
+                                   or not 1 <= sleeps <= self._OBSERVE_MAX_SLEEPS):
+            raise ValueError("sleep_observe: sleeps must be None or an int in 1..%d (got %r)"
+                             % (self._OBSERVE_MAX_SLEEPS, sleeps))
+        if isinstance(sample, bool) or not isinstance(sample, int) or sample < 0:
+            raise ValueError("sleep_observe: sample must be an int >= 0 (got %r)" % (sample,))
+        if config_overrides is not None and (not isinstance(config_overrides, dict)
+                                             or not all(isinstance(k, str) for k in config_overrides)):
+            raise ValueError("sleep_observe: config_overrides must be a dict with str keys or None")
+        t0 = _time.perf_counter()
+        if getattr(self._step_lock, "_is_owned", lambda: False)():
+            logger.warning("sleep_observe: called with _step_lock already held by this thread -- the caller's hold encloses "
+                           "the whole projection")
+        shadow, hold = self._sleep_observe_shadow_graph(config_overrides)
+        t_shadow = _time.perf_counter() - t0
+        cfg = shadow.config
+        disuse = bool(cfg.get("sleep_disuse_enabled", False))
+        migrated_before = cfg.get("sleep_low_weight_unit") == "sleeps"
+        if disuse:
+            prm = shadow._sleep_disuse_params()          # the real validation; raises before any projection
+            shadow._sleep_chunk_params()
+        if sleeps is None:
+            sleeps = (int(prm["G"]) + 1) if (disuse and not migrated_before) else 1
+            sleeps = min(sleeps, self._OBSERVE_MAX_SLEEPS)
+
+        removed_log: List[Tuple[str, str, str, float, float, float]] = []
+        _real_remove = Graph._remove_synapse_internal
+
+        def _capture_remove(synapse_id: str, _g=shadow) -> None:
+            syn = _g.synapses.get(synapse_id)
+            if syn is not None:
+                removed_log.append((synapse_id, syn.pre_node_id, syn.post_node_id, float(syn.weight),
+                                    float(syn.peak_weight), float(syn.eligibility_trace)))
+            _real_remove(_g, synapse_id)
+
+        shadow._remove_synapse_internal = _capture_remove    # an instance attribute on the SHADOW only: records, then
+        #                                                      the unchanged removal function runs
+        protected = shadow._strength_protected_ids()
+        prot_set = set(protected)
+
+        def _degrees():
+            return {n: (len(shadow._outgoing.get(n, ())), len(shadow._incoming.get(n, ()))) for n in protected}
+
+        def _lifelines():
+            ll = shadow._protected_lifelines(protected)
+            out: Dict[str, List[str]] = {n: [] for n in protected}
+            for sid in sorted(ll):
+                s = shadow.synapses[sid]
+                for end in (s.pre_node_id, s.post_node_id):
+                    if end in out and sid not in out[end]:
+                        out[end].append(sid)
+            return ll, out
+
+        def _weights():
+            keys = list(shadow.synapses.keys())
+            wc = getattr(shadow.synapses, "weights_copy", None)
+            w = wc() if wc is not None else np.asarray([shadow.synapses.get_weight(s) for s in keys], dtype=np.float64)
+            return keys, np.asarray(w, dtype=np.float64)
+
+        def _lws_counts():
+            c: Dict[str, int] = {}
+            for _sid, _s in shadow.synapses.items():
+                v = _s.low_weight_steps
+                if v:
+                    c[str(v)] = c.get(str(v), 0) + 1
+            return dict(sorted(c.items(), key=lambda kv: int(kv[0])))
+
+        def _established(keys):
+            return sum(1 for s in keys if shadow.synapses[s].peak_weight >= 0.5)
+
+        ll0, ll0_by = _lifelines()
+        deg0 = _degrees()
+        keys0, w0 = _weights()
+        start = {"timestep": shadow.timestep, "synapses": len(keys0),
+                 "nodes": len(shadow.nodes), "weight_bands": self._observe_band_counts(w0),
+                 "established_peak_ge_0_5": _established(keys0), "w_ge_0_5": int((w0 >= 0.5).sum()),
+                 "migrated_before": migrated_before}
+        projections: List[Dict[str, Any]] = []
+        digest = _hashlib.sha256()
+        for k in range(1, sleeps + 1):
+            keys_b, w_b = _weights()
+            w_before = dict(zip(keys_b, w_b.tolist()))
+            nodes_before = set(shadow.nodes.keys())
+            ll_b, ll_b_by = _lifelines()
+            deg_b = _degrees()
+            del removed_log[:]
+            ts = _time.perf_counter()
+            rec = shadow.sleep_cycle()
+            secs = _time.perf_counter() - ts
+            keys_a, w_a = _weights()
+            ll_a, ll_a_by = _lifelines()
+            deg_a = _degrees()
+            collected = sorted(nodes_before - set(shadow.nodes.keys()))
+            removed = list(removed_log)
+            rem_wb = [w_before.get(r[0], float("nan")) for r in removed]
+            strongest = sorted(zip(removed, rem_wb), key=lambda x: (-x[1], -x[0][4], x[0][0]))[:sample]
+            held_ids = list(rec.get("shield_held_ids", []) or [])
+            proj = {
+                "projection": k,
+                "record": {kk: vv for kk, vv in rec.items()
+                           if kk not in ("shield_held_ids", "lock_holds", "seconds_parts", "chunk")},
+                "seconds": secs,
+                "would_remove": len(removed),
+                "would_collect": len(collected),
+                "collected_node_ids": collected[:500],
+                "removed_by_weight_band_before": self._observe_band_counts(rem_wb) if removed else
+                    [0] * (len(self._OBSERVE_BANDS) - 1),
+                "removed_by_weight_band_at_removal": self._observe_band_counts([r[3] for r in removed]) if removed else
+                    [0] * (len(self._OBSERVE_BANDS) - 1),
+                "removed_by_peak_band": self._observe_band_counts([r[4] for r in removed]) if removed else
+                    [0] * (len(self._OBSERVE_BANDS) - 1),
+                "removed_peak_ge_0_5": sum(1 for r in removed if r[4] >= 0.5),
+                "removed_w_before_ge_0_5": sum(1 for x in rem_wb if x >= 0.5),
+                "removed_touching_protected": sum(1 for r in removed if r[1] in prot_set or r[2] in prot_set),
+                "weight_bands_before": self._observe_band_counts(w_b),
+                "weight_bands_after": self._observe_band_counts(w_a),
+                "established_peak_ge_0_5_after": _established(keys_a),
+                # weak-link counters after this sleep (disuse: sleeps spent below weight_threshold; a link clears once
+                # its count exceeds G): {count: synapses}, zero left out
+                "low_weight_counts_after": _lws_counts() if disuse else None,
+                "shield_held": len(held_ids),
+                "shield_held_sample": held_ids[:sample],
+                "strongest_removed": [{"synapse_id": r[0], "pre": r[1], "post": r[2], "w_before": wb,
+                                       "w_at_removal": r[3], "peak": r[4], "trace": r[5]} for r, wb in strongest],
+                "protected": [{"node_id": n, "out_before": deg_b[n][0], "in_before": deg_b[n][1],
+                               "out_after": deg_a[n][0], "in_after": deg_a[n][1],
+                               "lifelines_before": ll_b_by[n], "lifelines_after": ll_a_by[n],
+                               "lifelines_intact": all(s in shadow.synapses for s in ll_b_by[n])} for n in protected],
+                "lifelines_removed": sorted(s for s in ll_b if s not in shadow.synapses),
+            }
+            digest.update(repr((k, [r[0] for r in removed], collected)).encode())
+            if detail:
+                post = dict(zip(keys_a, w_a.tolist()))
+                for r in removed:
+                    post[r[0]] = r[3]
+                proj["removed_ids"] = [r[0] for r in removed]
+                proj["shield_held_ids"] = held_ids
+                proj["collected_ids_all"] = collected
+                proj["post_downscale_weights"] = post
+            projections.append(proj)
+        first = projections[0]
+        record = {
+            "observe": True,
+            "timestep": shadow.timestep,
+            "sleeps_projected": sleeps,
+            "no_wake_between_projections": True,
+            "path": ("disuse" if disuse else "p1"),
+            "chunked": cfg.get("sleep_clearance_chunk_seconds") is not None if disuse else False,
+            "params": (dict(prm) if disuse else None),
+            "config_overrides": sorted(config_overrides) if config_overrides else [],
+            "instance_overrides_not_used": list(shadow._sleep_observe_dropped_overrides),
+            "start": start,
+            "protected_nodes": len(protected),
+            "lifelines_at_start": len(ll0),
+            "projections": projections,
+            "would_remove_total": sum(p["would_remove"] for p in projections),
+            "would_collect_total": sum(p["would_collect"] for p in projections),
+            "first_clearance": next((p["projection"] for p in projections if p["would_remove"]), None),
+            "removal_digest": digest.hexdigest(),
+            "lock_holds": {"snapshot": hold, "max": hold, "count": 1},
+            "seconds_parts": {"shadow": t_shadow, "projections": sum(p["seconds"] for p in projections)},
+            "seconds": _time.perf_counter() - t0,
+        }
+        del shadow._remove_synapse_internal    # break the shadow <-> wrapper cycle so the copy is freed now
+        del shadow
+        logger.info("sleep_observe: t=%s projected %d sleep(s) (%s, nothing written): next sleep would remove %d, collect %d, "
+                    "shield %d; over the projection remove %d (peak>=0.5: %d), collect %d, first clearance at projection "
+                    "%s; protected lifelines removed %d; lock hold %.3fs, %.2fs total",
+                    record["timestep"], sleeps, record["path"], first["would_remove"], first["would_collect"],
+                    first["shield_held"], record["would_remove_total"],
+                    sum(p["removed_peak_ge_0_5"] for p in projections), record["would_collect_total"],
+                    record["first_clearance"], sum(len(p["lifelines_removed"]) for p in projections), hold,
+                    record["seconds"])
         return record
 
     def _prune_synapses(
