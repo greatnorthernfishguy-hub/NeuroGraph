@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-10-07] Claude (lane sleep-observe) — test_purge_is_never_called_by_the_engine: by intent, the engine's one
+#   sleep_cycle call is sleep_observe's shadow.sleep_cycle() (the real sleep on a private copy; never the live graph).
 # [2026-10-07] Claude (lane sleep-prearm) — workload(..., compete=True): the want-hub competition call every 10 rounds can
 #   be switched off (compete=False) or replaced (a callable), for whole runs with the disuse sleep on, where the engine now
 #   REFUSES compete_protected_links (#1066). Default unchanged: every existing caller runs the same workload as before.
@@ -609,5 +611,9 @@ def test_purge_is_never_called_by_the_engine():
     import re
     src = open(os.path.join(_REPO, "neuro_foundation.py")).read()
     assert set(re.findall(r"(\w+)\.purge_dangling_pred_weights\(", src)) <= {"Graph"}   # changelog mention only
-    assert set(re.findall(r"(\w+)\.sleep_cycle\(", src)) <= {"Graph"}
+    # [2026-10-07] by intent (lane sleep-observe): Graph.sleep_observe runs the real sleep on its private SHADOW copy
+    # (shadow.sleep_cycle()); the engine still never calls sleep_cycle on a live graph.
+    assert set(re.findall(r"(\w+)\.sleep_cycle\(", src)) <= {"Graph", "shadow"}
+    for m in re.finditer(r"shadow\.sleep_cycle\(", src):
+        assert re.findall(r"^    def (\w+)\(", src[:m.start()], re.M)[-1] == "sleep_observe"
     assert len(re.findall(r"def purge_dangling_pred_weights\(", src)) == 1
