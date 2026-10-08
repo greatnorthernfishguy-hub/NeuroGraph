@@ -11,7 +11,7 @@ established-links result on condition it is confirmed live in this mode.
 
 | Repo | Branch | Base | Commits |
 |---|---|---|---|
-| NeuroGraph | `cc-laptop-sleep-observe-20261007` | trial tip `1cb9706` | **PROTECTED** `0050f4b` (`neuro_foundation.py`) · tests `545ec4a` · this doc |
+| NeuroGraph | `cc-laptop-sleep-observe-20261007` | trial tip `1cb9706` | **PROTECTED** `0050f4b` (`neuro_foundation.py`) · tests `545ec4a` · this doc `8fe8663` · P1 source pin by intent `62694b4` · this update |
 | docs (daemon) | `cc-laptop-sleep-observe-daemon-20261007` | trial tip `3f015f07` | `cdbb4d58` daemon + tests + env pin |
 
 No vendored file is touched (LAW 2). `neuro_foundation.py` is PROTECTED: its change is one commit of its own; merging
@@ -278,8 +278,19 @@ That is what Josh asked to see before the announced clearance. **These are the f
   - the identical 75 failures (diffed), the known 75. The +17 passed / +1 skipped are the new file. Its real-engine test
     skips inside the whole suite, because `ng_tract` cannot be re-imported in one process, the same as the pre-arming
     test. Alone, the new file is **18/18 passed**.
-- **Engine:** `tests/test_sleep_observe.py` **65/65 passed** (571 s). Full suite, per file, branch vs base `1cb9706` on
-  the branch's failing files: *running at the time of this commit; the result is added in a follow-up commit.*
+- **Engine:** `tests/test_sleep_observe.py` **65/65 passed** with the final code (113 s inside the suite run).
+  - **Full suite**, one isolated process per file (160 files, 10,055 s), against the **1cb9706 reference**: the
+    pre-arming lane's `branch-off` run of the same 160 files on worktree `ng-sleep-prearm-20261007` at `1cb9706`, with
+    the same wheel (`~/.cache/prearm/suite/branch-off/`, 2026-10-07 14:00). I compared failing test ids per file.
+  - **The only new failure:** `test_sleep_p1.py::test_purge_is_never_called_by_the_engine`. Its source pin allowed only
+    `Graph.sleep_cycle(`; `sleep_observe` calls `shadow.sleep_cycle()`.
+    - **Fixed by intent** in `62694b4`: the pin now allows only that one call and checks that it sits inside
+      `sleep_observe`; `self.sleep_cycle(` still fails. That test passes now.
+    - Re-run note: that 11 s single-test run overlapped the suite (the only time two test processes ran at once).
+  - **Everything else is identical:** the same 37 files fail with the same test ids. Five files time out at 600 s on
+    both sides (`test_auto_knowledge`, `test_ces`, `test_coordinator`, `test_et_modules`, `test_openclaw_hook`; no result
+    either side), plus `test_tonic_no_heuristic` (killed on both sides).
+  - Per-file logs: `~/.cache/sleep-observe/suite/branch/`.
 
 ---
 
@@ -294,7 +305,7 @@ That is what Josh asked to see before the announced clearance. **These are the f
 | lock hold ≤ ~0.7 s | **partial**: one hold, median 0.65 s, 5 of 11 above (max 1.70 s) under load 6-11 (real sleep max holds 0.31-0.72 s, save capture 4.2-9.9 s) |
 | daemon: switch, pacing, report file, admin command (18 tests) | **PASS** |
 | daemon suite vs `3f015f07` | **PASS** (same 75) |
-| NG suite vs `1cb9706` | pending (follow-up commit) |
+| NG suite vs `1cb9706` | **PASS**: no new failure except the intended source pin, fixed by intent (`62694b4`) |
 
 ## 6. Risks and open items
 
