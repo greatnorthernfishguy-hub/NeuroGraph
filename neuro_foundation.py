@@ -20,6 +20,32 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-08] Claude (lane sprout-1050) — #1050: sprouting from repeated co-firing (the co-firing tally) (PROTECTED CHANGE
+#   on review branch cc-laptop-sprout-1050-20261008 ONLY, its own commit; Josh approved starting #1050 2026-10-08; merges
+#   only after his protected-file "proceed". Keys absent = byte-identical to 4de1166, so Syl is unchanged.)
+# What: (1) with config `sprout_tally_enabled` truthy (read live, absent = False, NOT in DEFAULT_CONFIG) _sprout_synapses
+#       runs _sprout_from_tally instead of today's one-coincidence rule: every fired node keeps a bounded partner table
+#       (K = `sprout_tally_slots`) of (partner, score, last_t); a candidate (today's set: a spike 1..co_activation_window
+#       steps ago, not firing now; most recent first) is reinforced, score = score * lam^dt + 1 when the touch starts a
+#       new co-firing EPISODE (dt > co_activation_window; inside one burst + 0), lam = exp(-1 / `sprout_tally_horizon_
+#       steps`), applied lazily; newcomers take empty or retracted slots (decayed score < e^-1); connected pairs never
+#       take a slot. A pair sprouts when its score reaches `sprout_tally_theta`, in the STDP direction (earlier node ->
+#       node firing now), through today's rails (10 per call, sprout_degree_cap with identity-protected nodes exempt, no
+#       pair twice, today's delay rule and initial_sprouting_weight). The Tonic's write-mode tail calls _sprout_synapses,
+#       so its firings feed the same tally. (2) surprise-driven sprouting under the key feeds the tally too (source ->
+#       each node that fired instead; born as today's surprise sprout when it crosses). (3) a sleep_cycle under the key
+#       empties the tally (unconsolidated filopodia retract; the record gains tally_retracted). (4) the tally lives in
+#       the native SynapseStore (ng-tract-rs cc-laptop-sprout-1050-rs-20261008, cofire_tally_update) or, on an older
+#       wheel, in the bit-identical Python fallback _cofire_tally_update_python; in memory only (a restore starts cold;
+#       nothing new in the checkpoint). (5) _sprout_synapses' delay computation moved verbatim into _sprout_delay.
+# Why:  spec superpowers/specs/2026-10-06-sleep-phase-design.md §7 / D12 (Josh: "links should sprout naturally, to
+#       wherever it wants to go. Not some shotgun like scatter approach"; "no 'just because' sprouting"; bounded by
+#       competition, not a cap). Measured on the checkpoint copy: today's rule saturates its 10-per-step cap on every step
+#       (2,500 + 200 Tonic sprouts per 250-step wake) and wires later -> earlier (anti-STDP); counting steps instead of
+#       episodes barely changes that because bursts repeat co-firing on consecutive steps (SPROUT_1050.md §2).
+# How:  keys absent: one dict lookup in _sprout_synapses / _surprise_exploration / sleep_cycle / _deserialize, otherwise
+#       the 4de1166 path. Proof: tests/test_sprout_1050.py (keys absent == 4de1166 over the P1 whole-run workload with no /
+#       P1 / P2 sleep; the rules; native == fallback bit for bit) and SPROUT_1050.md (checkpoint copy).
 # [2026-10-07] Claude (lane sleep-observe) — sleep phase P3 OBSERVE mode: Graph.sleep_observe (what the sleep WOULD do, with
 #   nothing written) (PROTECTED CHANGE on review branch cc-laptop-sleep-observe-20261007 ONLY, its own commit; Josh approved
 #    the lane 2026-10-07 ("yep"); merges only after his protected-file "proceed". Observe never called = byte-identical to
@@ -1370,6 +1396,86 @@ def poincare_dir_array(metadata: Optional[Dict[str, Any]]) -> Optional["np.ndarr
 
 
 # ---------------------------------------------------------------------------
+# [2026-10-08] #1050 co-firing tally (spec superpowers/specs/2026-10-06-sleep-phase-design.md §7). The Python
+# fallback of SynapseStore.cofire_tally_update (ng-tract-rs cc-laptop-sprout-1050-rs-20261008), bit-identical by
+# construction: same slot rule, same iteration order, same float expression (score * pow(lam, dt) + inc, dt =
+# max(t - last_t, 0), inc = 1.0 when the touch starts a new episode (dt > gap) else 0.0). Used only when the installed ng_tract lacks the method (an older wheel). `tally` is
+# {"k": int, "tables": {owner: [None | [partner, score, last_t]] * k}}; `connected(owner, partner)` answers
+# "a synapse exists in either direction". Returns the crossings [(pre = partner, post = owner)] in discovery order.
+# ---------------------------------------------------------------------------
+
+def _cofire_tally_native(store):
+    """The native tally entry point of `store`, or None (older wheel). Module-level so a test can force the fallback."""
+    return getattr(store, "cofire_tally_update", None)
+
+
+def _cofire_tally_update_python(tally, fired, cands, t, k, theta, lam, floor, gap, connected):
+    if k != tally["k"]:
+        tally["tables"] = {}
+        tally["k"] = k
+    tables = tally["tables"]
+    cand_set = set(cands)
+    crossings = []
+    _pow = math.pow
+    for a in fired:
+        crossed = []
+        tbl = tables.get(a)
+        free = k
+        if tbl is not None:
+            free = 0
+            for j in range(k):
+                sl = tbl[j]
+                if sl is not None and sl[0] in cand_set:
+                    dt = t - sl[2] if t > sl[2] else 0
+                    sc = sl[1] * _pow(lam, float(dt)) + (1.0 if dt > gap else 0.0)
+                    if sc >= theta:
+                        crossings.append((sl[0], a))
+                        crossed.append(sl[0])
+                        tbl[j] = None
+                    else:
+                        sl[1] = sc
+                        sl[2] = t
+            for sl in tbl:
+                if sl is None:
+                    free += 1
+                else:
+                    dt = t - sl[2] if t > sl[2] else 0
+                    if sl[1] * _pow(lam, float(dt)) < floor:
+                        free += 1
+        if free == 0:
+            continue
+        for b in cands:
+            if b == a or b in crossed:
+                continue
+            if tbl is not None and any(sl is not None and sl[0] == b for sl in tbl):
+                continue
+            if connected(a, b):
+                continue
+            if tbl is None:
+                tbl = tables[a] = [None] * k
+            pick = None
+            for j in range(k):
+                if tbl[j] is None:
+                    pick = j
+                    break
+            if pick is None:
+                best = math.inf
+                for j in range(k):
+                    sl = tbl[j]
+                    dt = t - sl[2] if t > sl[2] else 0
+                    d = sl[1] * _pow(lam, float(dt))
+                    if d < floor and d < best:
+                        best = d
+                        pick = j
+            if pick is None:
+                break
+            tbl[pick] = [b, 1.0, t]
+            free -= 1
+            if free == 0:
+                break
+    return crossings
+
+
 # [2026-10-05] Python fallbacks for the native SynapseStore batch methods the hot loops
 # call (ng_tract 0.1.0 canonical wheel line, ng-tract-rs 79be810). Used ONLY when the
 # installed ng_tract lacks the method (an older wheel, or a dict-backed fake graph in a
@@ -4047,6 +4153,9 @@ class Graph:
         alternative_nodes = recent_fired - {expected_id}
 
         sprouted_count = 0
+        _tally = bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
+        if _tally:
+            sprouted_count = self._surprise_exploration_tally(pred, alternative_nodes)
         # #59: cap the surprise-driven feeder too. The degree cap only guarded co-firing
         # sprouts (_sprout_synapses); measured, THIS path became the dominant hub feeder —
         # the blob's own chaotic churn reads as "surprise", so it wires ever more edges into
@@ -4057,7 +4166,7 @@ class Graph:
         def _deg(x: str) -> int:
             return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ()))
 
-        for alt_id in alternative_nodes:
+        for alt_id in (() if _tally else alternative_nodes):
             if alt_id == source_id:
                 continue
             if alt_id not in self.nodes:
@@ -4317,7 +4426,11 @@ class Graph:
         import time as _time   # local: the module namespace stays as it was
         t0 = _time.perf_counter()
         if self.config.get("sleep_disuse_enabled", False):
-            return self._sleep_cycle_disuse(t0)
+            record = self._sleep_cycle_disuse(t0)
+            if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = unchanged)
+                with self._step_lock:
+                    record["tally_retracted"] = self._sprout_tally_sleep_retract()
+            return record
         with self._step_lock:
             syn_before = len(self.synapses)
             nodes_before = len(self.nodes)
@@ -4335,6 +4448,8 @@ class Graph:
                 "in_sleep_mode": bool(self.config.get("structural_plasticity_in_sleep", False)),
                 "seconds": _time.perf_counter() - t0,
             }
+            if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = unchanged)
+                record["tally_retracted"] = self._sprout_tally_sleep_retract()
             self._emit("sleep_cycle", **record)
         logger.log(self._sleep_log_level(),   # [2026-10-07] observe: DEBUG on an observe shadow (sleep_observe), else INFO
                    "sleep_cycle: t=%s pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d in_sleep_mode=%s %.3fs",
@@ -5935,9 +6050,15 @@ class Graph:
 
         Performance: capped at 10 new synapses per step to prevent
         explosive growth in highly active networks.
+
+        [2026-10-08] #1050: with config `sprout_tally_enabled` truthy (read live, absent = False, NOT in
+        DEFAULT_CONFIG) the co-firing tally decides instead (`_sprout_from_tally`): a pair sprouts only after
+        repeated co-firing. Key absent: exactly this path.
         """
         if not fired_ids:
             return 0
+        if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = this path, unchanged)
+            return self._sprout_from_tally(fired_ids)
 
         window = self.config["co_activation_window"]
         initial_w = self.config["initial_sprouting_weight"]
@@ -6003,37 +6124,7 @@ class Graph:
                     continue
                 if _deg_cap and _sprout_degree(other_id) >= _deg_cap and not self._is_identity_protected(other_id):
                     continue  # saturated ordinary hub — no new incoming sprouts
-                _d_min = self.config.get("d_min", 1)
-                _d_max = self.config.get("d_max", 5)
-                _delay = random.randint(_d_min, _d_max)  # fallback
-                # GSG: geometry-informed delay — geodesic distance → travel time
-                _pn = self.nodes.get(nid)
-                _on = self.nodes.get(other_id)
-                if _pn and _on:
-                    _a = poincare_dir_array(_pn.metadata)  # #119: compact bytes-aware read
-                    _b = poincare_dir_array(_on.metadata)
-                    if _a is not None and _b is not None:
-                        _mt1 = getattr(_pn, "manifold_type", "hyperbolic")
-                        _mt2 = getattr(_on, "manifold_type", "hyperbolic")
-                        _gdist = None
-                        if _mt1 == "spherical" and _mt2 == "spherical":
-                            _cos = max(-1.0+1e-7, min(1.0-1e-7, float(np.dot(_a, _b))))
-                            _gdist = math.acos(_cos)
-                        elif _mt1 == "hyperbolic" and _mt2 == "hyperbolic":
-                            _l1 = max(0, min(2, getattr(_pn, "diffpc_layer", 2)))
-                            _l2 = max(0, min(2, getattr(_on, "diffpc_layer", 2)))
-                            _pa = _a * _GSG_LAYER_NORMS_NF[_l1]
-                            _pb = _b * _GSG_LAYER_NORMS_NF[_l2]
-                            _nx2 = min(float(np.dot(_pa, _pa)), 0.9999)
-                            _ny2 = min(float(np.dot(_pb, _pb)), 0.9999)
-                            _dv = _pa - _pb
-                            _gdist = math.acosh(max(1.0, 1.0 + 2.0 *
-                                float(np.dot(_dv, _dv)) /
-                                max((1.0 - _nx2) * (1.0 - _ny2), 1e-9)))
-                        if _gdist is not None:
-                            _t = 1.0 - math.exp(-_GSG_MSG_DECAY * _gdist)
-                            _delay = max(_d_min, min(_d_max,
-                                         round(_d_min + (_d_max - _d_min) * _t)))
+                _delay = self._sprout_delay(nid, other_id)   # [2026-10-08] #1050: body moved verbatim
                 self.create_synapse(nid, other_id, weight=initial_w, delay=_delay)
                 existing_pairs.add((nid, other_id))
                 count += 1
@@ -6042,6 +6133,242 @@ class Graph:
             self._emit("sprouted", count=count, timestep=self.timestep)
 
         return count
+
+    def _sprout_delay(self, nid: str, other_id: str) -> int:
+        """Delay of a new sprout nid -> other_id (moved verbatim out of _sprout_synapses' loop, [2026-10-08] #1050, so
+        the tally path uses the same rule): a d_min..d_max random draw (always drawn, as before), replaced by the GSG
+        geodesic travel time when both nodes carry a Poincare direction on the same manifold type."""
+        _d_min = self.config.get("d_min", 1)
+        _d_max = self.config.get("d_max", 5)
+        _delay = random.randint(_d_min, _d_max)  # fallback
+        # GSG: geometry-informed delay — geodesic distance → travel time
+        _pn = self.nodes.get(nid)
+        _on = self.nodes.get(other_id)
+        if _pn and _on:
+            _a = poincare_dir_array(_pn.metadata)  # #119: compact bytes-aware read
+            _b = poincare_dir_array(_on.metadata)
+            if _a is not None and _b is not None:
+                _mt1 = getattr(_pn, "manifold_type", "hyperbolic")
+                _mt2 = getattr(_on, "manifold_type", "hyperbolic")
+                _gdist = None
+                if _mt1 == "spherical" and _mt2 == "spherical":
+                    _cos = max(-1.0+1e-7, min(1.0-1e-7, float(np.dot(_a, _b))))
+                    _gdist = math.acos(_cos)
+                elif _mt1 == "hyperbolic" and _mt2 == "hyperbolic":
+                    _l1 = max(0, min(2, getattr(_pn, "diffpc_layer", 2)))
+                    _l2 = max(0, min(2, getattr(_on, "diffpc_layer", 2)))
+                    _pa = _a * _GSG_LAYER_NORMS_NF[_l1]
+                    _pb = _b * _GSG_LAYER_NORMS_NF[_l2]
+                    _nx2 = min(float(np.dot(_pa, _pa)), 0.9999)
+                    _ny2 = min(float(np.dot(_pb, _pb)), 0.9999)
+                    _dv = _pa - _pb
+                    _gdist = math.acosh(max(1.0, 1.0 + 2.0 *
+                        float(np.dot(_dv, _dv)) /
+                        max((1.0 - _nx2) * (1.0 - _ny2), 1e-9)))
+                if _gdist is not None:
+                    _t = 1.0 - math.exp(-_GSG_MSG_DECAY * _gdist)
+                    _delay = max(_d_min, min(_d_max,
+                                 round(_d_min + (_d_max - _d_min) * _t)))
+        return _delay
+
+    # ---- [2026-10-08] #1050 co-firing tally (spec 2026-10-06-sleep-phase-design.md §7, D12) ----------------------
+    _SPROUT_TALLY_KEYS = ("sprout_tally_slots", "sprout_tally_theta", "sprout_tally_horizon_steps")
+
+    def _sprout_tally_params(self) -> Dict[str, Any]:
+        """Read + validate the tally parameters (all REQUIRED when `sprout_tally_enabled` is on): K slots per node
+        (int >= 1), the bar theta (> 1: a first meeting scores 1, so theta <= 1 would sprout on one coincidence), the
+        decay horizon H in steps (> 0; lam = exp(-1/H) per step, applied lazily). A slot whose decayed score falls
+        under exp(-1) (one meeting, H steps ago) has retracted and may be taken by a newcomer. A touch counts +1 only
+        when it starts a new co-firing EPISODE: more than co_activation_window steps since the pair's last touch (a
+        burst of consecutive co-firings is one occasion, measured on the checkpoint copy: SPROUT_1050.md §2). Raises
+        ValueError."""
+        cfg = self.config
+        missing = [k for k in self._SPROUT_TALLY_KEYS if cfg.get(k) is None]
+        if missing:
+            raise ValueError("sprout tally: sprout_tally_enabled needs config %s" % ", ".join(missing))
+        K = cfg["sprout_tally_slots"]
+        if isinstance(K, bool) or not isinstance(K, int) or K < 1:
+            raise ValueError("sprout tally: config sprout_tally_slots must be an int >= 1 (got %r)" % (K,))
+        th, H = cfg["sprout_tally_theta"], cfg["sprout_tally_horizon_steps"]
+        for name, v in (("sprout_tally_theta", th), ("sprout_tally_horizon_steps", H)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                raise ValueError("sprout tally: config %s must be a finite number (got %r)" % (name, v))
+        if float(th) <= 1.0:
+            raise ValueError("sprout tally: config sprout_tally_theta must be > 1 (got %r)" % (th,))
+        if float(H) <= 0.0:
+            raise ValueError("sprout tally: config sprout_tally_horizon_steps must be > 0 (got %r)" % (H,))
+        gap = cfg.get("co_activation_window", 5)
+        if isinstance(gap, bool) or not isinstance(gap, int) or gap < 0:
+            raise ValueError("sprout tally: config co_activation_window must be an int >= 0 (got %r)" % (gap,))
+        return {"k": K, "theta": float(th), "lam": math.exp(-1.0 / float(H)), "floor": math.exp(-1.0), "gap": gap}
+
+    def _sprout_tally_feed(self, fired: List[str], cands: List[str], prm: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """One tally call: native SynapseStore.cofire_tally_update when the installed ng_tract has it, else the
+        bit-identical _cofire_tally_update_python over self._cofire_tally (connectedness from the graph's own
+        _outgoing / _incoming). Returns the crossings [(pre, post)] in order."""
+        _native = _cofire_tally_native(self.synapses)
+        if _native is not None:
+            return [tuple(x) for x in _native(fired, cands, self.timestep, prm["k"], prm["theta"], prm["lam"],
+                                              prm["floor"], prm["gap"])]
+        tally = self.__dict__.get("_cofire_tally")
+        if tally is None:
+            tally = self._cofire_tally = {"k": 0, "tables": {}}
+        _posts_of = getattr(self.synapses, "post_ids_of", None)
+        _pres_of = getattr(self.synapses, "pre_ids_of", None)
+        if _posts_of is None or _pres_of is None:
+            _posts_of = lambda ids: _endpoint_ids_python(self.synapses, ids, False)  # noqa: E731
+            _pres_of = lambda ids: _endpoint_ids_python(self.synapses, ids, True)  # noqa: E731
+        nbrs: Dict[str, Set[str]] = {}
+
+        def connected(a: str, b: str) -> bool:
+            n = nbrs.get(a)
+            if n is None:
+                n = {x for x in _posts_of(list(self._outgoing.get(a, ()))) if x is not None}
+                n.update(x for x in _pres_of(list(self._incoming.get(a, ()))) if x is not None)
+                nbrs[a] = n
+            return b in n
+
+        return _cofire_tally_update_python(tally, list(fired), list(cands), self.timestep, prm["k"], prm["theta"],
+                                           prm["lam"], prm["floor"], prm["gap"], connected)
+
+    def _sprout_from_tally(self, fired_ids: List[str]) -> int:
+        """#1050 sprouting (config `sprout_tally_enabled`): co-firing feeds a bounded per-node partner table; a link
+        sprouts only when a pair's decayed co-firing score reaches theta. Candidates are today's set (a node with a
+        spike 1..co_activation_window steps ago that did not fire now), ordered most recent first (stable). Direction
+        follows timing: the earlier node is pre, the node firing now is post (the STDP direction). Every crossing then
+        meets today's rails, in order: the 10-per-call cap, both nodes present, no synapse in either direction,
+        sprout_degree_cap (identity-protected nodes exempt), and today's delay rule and initial_sprouting_weight. A
+        crossing a rail stops is dropped (the slot is already empty: the filopodium retracts). Called by step() and by
+        the Tonic's write-mode tail through _sprout_synapses, so Tonic firings feed the same tally."""
+        prm = self._sprout_tally_params()
+        window = self.config["co_activation_window"]
+        initial_w = self.config["initial_sprouting_weight"]
+        st = self._sprout_tally_stats_dict()
+        fired_set = set(fired_ids)
+        now = self.timestep
+        recent: List[Tuple[int, str]] = []
+        for nid, spikes in self._recent_spikes.items():
+            if nid in fired_set:
+                continue
+            best = 0
+            for t in spikes:
+                dt = now - t
+                if 0 < dt <= window and (best == 0 or dt < best):
+                    best = dt
+            if best:
+                recent.append((best, nid))
+        if not recent:
+            return 0
+        recent.sort(key=lambda x: x[0])    # most recent first; stable within a step (dict order)
+        st["calls"] += 1
+        crossings = self._sprout_tally_feed(list(fired_ids), [nid for _, nid in recent], prm)
+        made = self._sprout_tally_rails(crossings, st)
+        for pre, post in made:
+            self.create_synapse(pre, post, weight=initial_w, delay=self._sprout_delay(pre, post))
+        count = len(made)
+        st["sprouted"] += count
+        if count > 0:
+            self._emit("sprouted", count=count, timestep=self.timestep)
+        return count
+
+    def _sprout_tally_rails(self, crossings: List[Tuple[str, str]], st: Dict[str, int]) -> List[Tuple[str, str]]:
+        """#1050: today's sprouting rails over the tally's crossings, in order: at most 10 per call, both nodes present,
+        no synapse in either direction (also among the pairs accepted earlier in this call), sprout_degree_cap with
+        identity-protected nodes exempt (degree counts the pairs accepted earlier in this call, as today's live count
+        did). Returns the accepted (pre, post) pairs; the caller creates them. Counts every stop in `st`."""
+        _deg_cap = self.config.get("sprout_degree_cap", 0)
+        extra: Dict[str, int] = {}
+
+        def _sprout_degree(x: str) -> int:
+            return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ())) + extra.get(x, 0)
+
+        made: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for pre, post in crossings:
+            st["crossings"] += 1
+            if len(made) >= 10:
+                st["blocked_cap"] += 1
+                continue
+            if pre not in self.nodes or post not in self.nodes or pre == post:
+                st["blocked_missing"] += 1
+                continue
+            if (pre, post) in seen or (post, pre) in seen or self._find_synapse(pre, post) is not None \
+                    or self._find_synapse(post, pre) is not None:
+                st["blocked_existing"] += 1
+                continue
+            if _deg_cap and any(_sprout_degree(x) >= _deg_cap and not self._is_identity_protected(x)
+                                for x in (pre, post)):
+                st["blocked_degree"] += 1
+                continue
+            made.append((pre, post))
+            seen.add((pre, post))
+            extra[pre] = extra.get(pre, 0) + 1
+            extra[post] = extra.get(post, 0) + 1
+        return made
+
+    def _sprout_tally_stats_dict(self) -> Dict[str, int]:
+        st = self.__dict__.get("_sprout_tally_stats")
+        if st is None:
+            st = self._sprout_tally_stats = {"calls": 0, "crossings": 0, "sprouted": 0, "blocked_cap": 0,
+                                             "blocked_missing": 0, "blocked_existing": 0, "blocked_degree": 0,
+                                             "retracted_in_sleep": 0, "surprise_calls": 0, "surprise_sprouted": 0}
+        return st
+
+    def _surprise_exploration_tally(self, pred: "Prediction", alternative_nodes: Set[str]) -> int:
+        """#1050: surprise-driven sprouting under the co-firing tally (config `sprout_tally_enabled`). Each node that
+        fired instead of the expected target (C) gets one tally touch for the pair source -> C (the predicted
+        direction), in sorted order; a pair sprouts only when its score reaches theta -- the same bar as co-firing,
+        whose touches it shares, so a single surprising coincidence never sprouts (theta > 2). A sprout made by this
+        call is born exactly as today's surprise sprout: surprise_sprouting_weight, creation_mode "surprise_driven"
+        metadata and the salience armor of this prediction. Today's rails apply. Returns the count."""
+        prm = self._sprout_tally_params()
+        st = self._sprout_tally_stats_dict()
+        source_id = pred.source_node_id
+        alts = sorted(a for a in alternative_nodes if a != source_id and a in self.nodes)
+        if not alts or source_id not in self.nodes:
+            return 0
+        st["surprise_calls"] += 1
+        crossings = self._sprout_tally_feed(alts, [source_id], prm)
+        made = self._sprout_tally_rails(crossings, st)
+        sprout_weight = self.config["surprise_sprouting_weight"]
+        surprise_magnitude = pred.strength * pred.confidence
+        for pre, post in made:
+            syn = self.create_synapse(pre, post, weight=sprout_weight)
+            syn.metadata = {"creation_mode": "surprise_driven", "expected_target": pred.target_node_id,
+                            "timestep": self.timestep}
+            syn.salience = min(1.0 + (surprise_magnitude * 4.0), self.config["he_salience_max"])
+            self._total_sprouted += 1
+        st["surprise_sprouted"] += len(made)
+        return len(made)
+
+    def cofire_tally_state(self) -> List[Tuple[str, List[Optional[Tuple[str, float, int]]]]]:
+        """#1050: a snapshot of the co-firing tally, [(owner, [None | (partner, score, last_t)] * K)] sorted by owner
+        (the native store's, else the Python fallback's). For tests and reports; read only."""
+        _native = getattr(self.synapses, "cofire_tally_state", None)
+        if _native is not None and _cofire_tally_native(self.synapses) is not None:
+            return [(o, [tuple(x) if x is not None else None for x in tbl]) for o, tbl in _native()]
+        tally = self.__dict__.get("_cofire_tally") or {"tables": {}}
+        return [(o, [tuple(x) if x is not None else None for x in tbl]) for o, tbl in sorted(tally["tables"].items())]
+
+    def _sprout_tally_sleep_retract(self) -> int:
+        """#1050 (spec §2 step 6, §7): at a sleep, unconsolidated filopodia retract -- the whole tally is emptied
+        (a pair must reach theta within one wake). The Python fallback's table is REBOUND, not cleared in place, so a
+        sleep_observe shadow (which shares the attribute) never empties the live tally. Returns the slots dropped.
+        Caller holds _step_lock; only called with sprout_tally_enabled on."""
+        _native = getattr(self.synapses, "cofire_tally_clear", None)
+        if _native is not None and _cofire_tally_native(self.synapses) is not None:
+            n = int(_native())
+        else:
+            tally = self.__dict__.get("_cofire_tally")
+            n = 0
+            if tally is not None:
+                n = sum(1 for tbl in tally["tables"].values() for x in tbl if x is not None)
+                self._cofire_tally = {"k": tally["k"], "tables": {}}
+        st = self.__dict__.get("_sprout_tally_stats")
+        if st is not None:
+            st["retracted_in_sleep"] += n
+        logger.log(self._sleep_log_level(), "sprout tally: sleep retracted %d held slots", n)
+        return n
 
     # -----------------------------------------------------------------------
     # Query Methods (PRD §8)
@@ -7711,6 +8038,8 @@ class Graph:
         self._incoming.clear()
         self._node_hyperedges.clear()
         self._recent_spikes.clear()
+        if "_cofire_tally" in self.__dict__:   # [2026-10-08] #1050 Python-fallback tally: cold after a restore
+            self._cofire_tally = {"k": 0, "tables": {}}   # (the native one is emptied by synapses.clear())
         self._delay_buffer.clear()
         self._active_predictions.clear()
         self._prediction_window_fired.clear()
