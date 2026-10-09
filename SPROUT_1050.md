@@ -88,7 +88,7 @@ departs from the spec's literal text.
 
 ### 2.2 The closed-loop sweep (4 wake/sleep cycles each, the real engine with the tally on, native wheel)
 
-Same copy, seeds and stimulus as m0 (wake 1 identical up to the first sprout). `out/sw-K*-th*-H50.json`.
+Same copy, seeds and stimulus as m0 (wake 1 identical up to the first sprout). `out/sw-K*-th*-H*.json`.
 
 | run | sprouted per wake: co-firing (+ Tonic, surprise) | sum | wake-1 cohort potentiated | wake-2 cohort potentiated | potentiated links at the end (all cohorts) | rested recall relevance, wakes 1-4 |
 |---|---|---:|---:|---:|---:|---|
@@ -97,16 +97,29 @@ Same copy, seeds and stimulus as m0 (wake 1 identical up to the first sprout). `
 | K 4, θ 3 | 1,060 / 406 / 1,234 / 1,043 (+ 84, 0) | 3,827 | 140 / 1,078 (13.0%) | 16 / 417 (3.8%) | 156 | (not measured) |
 | **K 8, θ 4** | **887 / 268 / 604 / 593 (+ 65, 0)** | **2,417** | **122 / 898 (13.6%)** | **201 / 278 (72%)** | **343** | 0.597 / 0.596 / 0.612 / 0.639 |
 | K 4, θ 4 | 569 / 130 / 201 / 491 (+ 17, 0) | 1,408 | 113 / 575 (19.7%) | 34 / 130 (26%) | 150 | 0.592 / 0.608 / 0.587 / 0.595 |
+| K 8, θ 4, **H 100** | 1,479 / 322 / 1,254 / 1,208 (+ 147, 0) | 4,410 | 77 / 1,537 (5.0%) | 85 / 324 (26%) | 188 | 0.606 / 0.601 / 0.598 / 0.620 |
+| K 8, θ 4, **H 25** | 16 / 44 / 19 / 23 (+ 0, 0) | 102 | 11 / 16 | 16 / 44 | 27 | 0.580 / 0.584 / 0.602 / 0.602 |
 
-(Rested-recall start value 0.604; §5 defines it.) Horizon: the open-loop grid (H 50 / 100 / 250) moved sprouts per
-batch by ±25-50% in both directions with no consistent gain, so H stayed at the design's 50 (not swept closed-loop; the
-hardware budget went to K and θ).
+(H = 50 unless named. Rested-recall start value 0.604; §5 defines it. The first two sweep runs predate the rested
+metric.)
 
-**Chosen: K = 8, θ = 4, H = 50 steps** (gap = `co_activation_window` 5). It sprouts 80% less than today yet ends with
-**more** potentiated links than today (343 vs 237), i.e. what it grows is used; θ 3 at either K roughly halves sprouting
-with no gain in use; K 4 / θ 4 sprouts least but ends with fewer used links than today (150), the starvation side. D12
-recommended θ = 3; θ = 4 here means "four separate co-firing occasions within ~50 steps" (with the decay, the 4th
-occasion must come within ~20-35 steps of the 1st). Single seed, 4 cycles: the sweep resolves θ clearly, K less so.
+**What θ and H mean together.** Because a pair's score decays between occasions, it saturates at 1 / (1 − λ^d) for
+occasions d steps apart, so θ also sets the *rhythm* a pair must keep, not just a count (gap 5, so d ≥ 6):
+
+| θ, H | occasions needed at d = 6 / 10 / 15 / 25 steps apart | slowest rhythm that can ever sprout |
+|---|---|---:|
+| 3, 50 (D12's recommendation) | 4 / 4 / 6 / never | every 20 steps |
+| **4, 50 (chosen)** | **6 / 7 / never / never** | **every 14 steps** |
+| 4, 100 | 5 / 5 / 6 / 9 | every 29 steps |
+| 4, 25 | 9 / never / never / never | every 7 steps |
+
+**Chosen: K = 8, θ = 4, H = 50 steps** (gap = `co_activation_window` 5). Versus today it sprouts **80% less** (2,417 vs
+12,198 over the 4 wakes) yet ends with **more potentiated links** (343 vs 237): what it grows gets used. θ 3 roughly
+halves sprouting with no gain in use; K 4 / θ 4 and H 25 sprout least but end with fewer used links than today (150, 27):
+the starvation side; H 100 doubles the sprouts of H 50 for fewer used links (188). D12 recommended θ = 3; in words,
+θ = 4 / H = 50 means **"a pair must co-fire on at least six separate occasions, each within about 14 steps of the last"**
+(a 250-step drain batch is ~2 minutes; at the 900 s autostep, 14 steps is ~3.5 hours). Single seed, 4 cycles per run:
+θ and H are resolved clearly, K less so.
 
 ## 3. What changed
 
@@ -239,7 +252,101 @@ checkpoint bytes) × 2 flag sets × 3 seeds × dict / native node store × no / 
 
 ### 6.3 Wake/sleep dry run: today's sprouting vs the tally
 
-DRYRUN-PENDING
+10 wake/sleep cycles per arm (2,500 wake steps + 100 Tonic-like ticks + 10 sleeps), same copy, seeds, cues and
+Tonic stimulus; the disuse sleep on as armed (chosen P2 parameters, one hold); native wheel; `scripts/proof.sh`,
+`out/proof-today.json` (3,607 s) and `out/proof-tally.json` (3,263 s, K 8, θ 4, H 50). Wake 1 is identical in both
+arms up to the first sprout; the today arm reproduces m0's first 4 cycles exactly (determinism check).
+
+**Summary (the bar's items):**
+
+| measure | today | tally | change |
+|---|---:|---:|---|
+| synapses sprouted per 250-step batch (mean; co-firing + Tonic + surprise) | **2,969** (2,500 + 200 + 269) | **668** (649 + 13 + 6) | **−77%** |
+| … total over the run | 29,689 | 6,683 | |
+| potentiated sprouts at the end (peak ≥ 2 × 0.1), all cohorts | 785 (2.6%) | **1,460 (21.8%)** | **1.9× more links used, from 4.4× fewer sprouts** |
+| … cohorts with ≥ 3 later wakes (wakes 1-7) | 747 / 20,710 (3.6%) | 1,399 / 5,504 (25.4%) | |
+| recall, rested (primary), mean over the 10 cycles: relevance / precision@10 | 0.6056 / 0.0206 | **0.6051 / 0.0227** | equal / +10% (per-cycle range 0.585-0.643 vs 0.588-0.633) |
+| recall, live state, mean relevance | 0.604 | 0.564 | lower (see risk 3) |
+| synapses after sleeps 3-10 (min - max); at the end | 57,312 - 63,749; 57,780 | 45,555 - 56,187; 45,555 | the tally graph is ~12K smaller; see "steady state" |
+| hubs at the end: top out-degrees; nodes with out-degree ≥ 100 (58 at start) | 275, 195, 194; **34** | 231, 195, 194; **12** | fewer hubs |
+| Choice Clause node out-degree (start 1,731; lifeline kept in both) | 1,911 after wake 1 → 275 | 1,778 after wake 1 → 231 | the shotgun fed it 180 links in wake 1, the tally 47 |
+| protected lifelines (8) | 8 every cycle | 8 every cycle | none lost |
+| `_sprout_synapses` wall time per call, median of the per-wake medians | 87 ms | **32 ms** | −63% (the mechanism's own cost) |
+| `step()` wall time, median of per-wake medians / mean of per-wake means | 0.641 / 0.934 s | 0.347 / 0.830 s | faster, but the arms fire differently (load 6-11): not a clean delta |
+| `sleep_cycle` wall time per sleep (range) | 0.29-5.43 s | 0.46-2.74 s | |
+
+**Steady state.** Today's arm holds 57-61K after the backlog clearance (sleep 3) with 2,969 sprouts per batch balanced
+by clearance. The tally arm settles lower: 48.5K / 48.6K / 48.5K over sleeps 6-8, then 46.7K and 45.6K after sleeps 9-10
+(the clearance still slightly exceeds the much smaller sprouting at the end of this window). Ten cycles do not show
+whether it levels off near ~45K or keeps drifting; observe mode / a longer run would (risk 1).
+
+**Per cycle:**
+
+**today** (`out/proof-today.json`), start: 77,106 synapses
+
+| cycle | sprouted co-fire / Tonic / surprise | synapses after sleep | cleared by sleep | w >= 0.5 | top out-degree | nodes out >= 100 | Choice Clause out | step median s | sprout call median ms | recall rested: relevance / precision@10 / breadth | recall live: relevance / breadth |
+|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---|---|
+| 1 | 2,500 / 200 / 0 | 79,806 | 0 | 922 | [1921, 1911, 317] | 65 | 1911 | 0.359 | 54.44 | 0.588 / 0.027 / 10.88 | 0.550 / 191.15 |
+| 2 | 2,500 / 200 / 41 | 82,547 | 0 | 596 | [1951, 1911, 317] | 77 | 1911 | 1.016 | 105.26 | 0.606 / 0.032 / 3.73 | 0.595 / 5.65 |
+| 3 | 2,500 / 200 / 1167 | 63,749 | 22,665 | 740 | [1285, 273, 266] | 58 | 250 | 1.065 | 122.85 | 0.605 / 0.023 / 3.88 | 0.616 / 8.87 |
+| 4 | 2,500 / 200 / 190 | 61,403 | 5,236 | 1379 | [1221, 271, 264] | 56 | 238 | 0.326 | 58.66 | 0.592 / 0.012 / 8.85 | 0.571 / 382.94 |
+| 5 | 2,500 / 200 / 27 | 59,814 | 4,316 | 646 | [586, 271, 264] | 53 | 586 | 1.048 | 121.76 | 0.612 / 0.032 / 3.51 | 0.617 / 14.72 |
+| 6 | 2,500 / 200 / 214 | 60,374 | 2,354 | 1445 | [580, 264, 242] | 55 | 580 | 0.435 | 66.4 | 0.591 / 0.013 / 6.66 | 0.617 / 9.97 |
+| 7 | 2,500 / 200 / 171 | 58,667 | 4,578 | 778 | [369, 264, 213] | 46 | 369 | 0.846 | 106.56 | 0.633 / 0.022 / 3.79 | 0.620 / 4.7 |
+| 8 | 2,500 / 200 / 104 | 60,007 | 1,464 | 1244 | [340, 213, 205] | 47 | 340 | 0.394 | 68.8 | 0.611 / 0.011 / 5.7 | 0.608 / 7.97 |
+| 9 | 2,500 / 200 / 687 | 57,312 | 6,082 | 1026 | [381, 195, 194] | 28 | 381 | 0.897 | 114.97 | 0.615 / 0.019 / 4.96 | 0.658 / 44.41 |
+| 10 | 2,500 / 200 / 88 | 57,780 | 2,320 | 1614 | [275, 195, 194] | 34 | 275 | 0.304 | 57.52 | 0.602 / 0.014 / 6.64 | 0.589 / 10.83 |
+
+**tally** (`out/proof-tally.json`), start: 77,106 synapses
+
+| cycle | sprouted co-fire / Tonic / surprise | synapses after sleep | cleared by sleep | w >= 0.5 | top out-degree | nodes out >= 100 | Choice Clause out | step median s | sprout call median ms | recall rested: relevance / precision@10 / breadth | recall live: relevance / breadth |
+|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---|---|
+| 1 | 887 / 11 / 0 | 78,004 | 0 | 765 | [1921, 1778, 317] | 59 | 1778 | 0.339 | 24.68 | 0.597 / 0.025 / 7.78 | 0.500 / 111.75 |
+| 2 | 268 / 10 / 0 | 78,282 | 0 | 1032 | [1921, 1778, 317] | 59 | 1778 | 0.273 | 23.11 | 0.596 / 0.010 / 6.31 | 0.659 / 14.07 |
+| 3 | 604 / 11 / 0 | 56,187 | 22,710 | 805 | [292, 273, 264] | 34 | 245 | 1.655 | 54.98 | 0.612 / 0.033 / 4.37 | 0.542 / 211.03 |
+| 4 | 593 / 33 / 0 | 53,019 | 3,794 | 682 | [292, 271, 264] | 30 | 236 | 0.245 | 27.95 | 0.639 / 0.036 / 4.83 | 0.639 / 4.83 |
+| 5 | 1,798 / 17 / 63 | 49,515 | 5,382 | 927 | [312, 271, 264] | 25 | 312 | 0.632 | 44.28 | 0.600 / 0.018 / 3.44 | 0.482 / 106.57 |
+| 6 | 32 / 0 / 0 | 48,482 | 1,065 | 1826 | [292, 264, 240] | 23 | 292 | 0.28 | 29.62 | 0.587 / 0.008 / 9.96 | 0.586 / 10.13 |
+| 7 | 1,154 / 23 / 0 | 48,570 | 1,089 | 1182 | [264, 263, 240] | 20 | 263 | 1.745 | 52.05 | 0.597 / 0.024 / 3.94 | 0.533 / 318.12 |
+| 8 | 360 / 9 / 0 | 48,521 | 418 | 701 | [254, 213, 206] | 20 | 254 | 0.503 | 44.1 | 0.643 / 0.047 / 1.98 | 0.516 / 26.2 |
+| 9 | 302 / 7 / 0 | 46,671 | 2,159 | 1655 | [219, 195, 194] | 17 | 219 | 0.22 | 28.83 | 0.594 / 0.012 / 5.47 | 0.600 / 42.07 |
+| 10 | 493 / 8 / 0 | 45,555 | 1,617 | 1505 | [231, 195, 194] | 12 | 231 | 0.355 | 35.29 | 0.585 / 0.014 / 5.82 | 0.588 / 5.96 |
+
+**today: sprout cohorts at the end of the run** (potentiated = peak_weight >= 2 x initial 0.1)
+
+| born in wake | co-fire | Tonic | surprise |
+|---:|---|---|---|
+| 1 | 2,500 -> 766 alive, 228 pot. (9.1%) | 200 -> 35 alive, 7 pot. (3.5%) | - |
+| 2 | 2,500 -> 695 alive, 65 pot. (2.6%) | 200 -> 21 alive, 4 pot. (2.0%) | 41 -> 1 alive, 0 pot. (0.0%) |
+| 3 | 2,500 -> 786 alive, 209 pot. (8.4%) | 200 -> 9 alive, 0 pot. (0.0%) | 1,167 -> 134 alive, 34 pot. (2.9%) |
+| 4 | 2,500 -> 901 alive, 83 pot. (3.3%) | 200 -> 54 alive, 0 pot. (0.0%) | 190 -> 112 alive, 12 pot. (6.3%) |
+| 5 | 2,500 -> 750 alive, 61 pot. (2.4%) | 200 -> 50 alive, 1 pot. (0.5%) | 27 -> 7 alive, 0 pot. (0.0%) |
+| 6 | 2,500 -> 1,115 alive, 27 pot. (1.1%) | 200 -> 81 alive, 0 pot. (0.0%) | 214 -> 115 alive, 11 pot. (5.1%) |
+| 7 | 2,500 -> 1,760 alive, 5 pot. (0.2%) | 200 -> 135 alive, 0 pot. (0.0%) | 171 -> 125 alive, 0 pot. (0.0%) |
+| 8 | 2,500 -> 2,496 alive, 25 pot. (1.0%) | 200 -> 198 alive, 0 pot. (0.0%) | 104 -> 104 alive, 3 pot. (2.9%) |
+| 9 | 2,500 -> 2,500 alive, 6 pot. (0.2%) | 200 -> 200 alive, 0 pot. (0.0%) | 687 -> 687 alive, 4 pot. (0.6%) |
+| 10 | 2,500 -> 2,500 alive, 0 pot. (0.0%) | 200 -> 200 alive, 0 pot. (0.0%) | 88 -> 88 alive, 0 pot. (0.0%) |
+
+**tally: sprout cohorts at the end of the run** (potentiated = peak_weight >= 2 x initial 0.1)
+
+| born in wake | co-fire | Tonic | surprise |
+|---:|---|---|---|
+| 1 | 887 -> 644 alive, 267 pot. (30.1%) | 11 -> 7 alive, 3 pot. (27.3%) | - |
+| 2 | 268 -> 186 alive, 163 pot. (60.8%) | 10 -> 8 alive, 8 pot. (80.0%) | - |
+| 3 | 604 -> 517 alive, 230 pot. (38.1%) | 11 -> 6 alive, 3 pot. (27.3%) | - |
+| 4 | 593 -> 542 alive, 162 pot. (27.3%) | 33 -> 31 alive, 20 pot. (60.6%) | - |
+| 5 | 1,798 -> 1,624 alive, 300 pot. (16.7%) | 17 -> 16 alive, 3 pot. (17.6%) | 63 -> 59 alive, 5 pot. (7.9%) |
+| 6 | 32 -> 32 alive, 0 pot. (0.0%) | - | - |
+| 7 | 1,154 -> 1,122 alive, 232 pot. (20.1%) | 23 -> 22 alive, 3 pot. (13.0%) | - |
+| 8 | 360 -> 360 alive, 61 pot. (16.9%) | 9 -> 9 alive, 0 pot. (0.0%) | - |
+| 9 | 302 -> 302 alive, 0 pot. (0.0%) | 7 -> 7 alive, 0 pot. (0.0%) | - |
+| 10 | 493 -> 493 alive, 0 pot. (0.0%) | 8 -> 8 alive, 0 pot. (0.0%) | - |
+
+Reading the cohorts: today's sprouts mostly die unused (wake-1 cohort: 2,500 → 766 alive, 9.1% potentiated) and its
+surprise sprouts scatter (2,689 born, 64 potentiated). The tally's sprouts are mostly kept and used (wake-1 cohort 887 →
+644 alive, **30%** potentiated; wake-2 61%; wake-3 38%). Wakes 9-10 cohorts are 0% in both arms only because they had
+no time.
+
 
 ### 6.4 Suites
 
