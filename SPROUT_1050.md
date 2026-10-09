@@ -20,7 +20,17 @@ Wheel (throwaway venv only): `~/.cache/sprout-1050/wheel/ng_tract-0.1.0-cp38-abi
 sha256 `8ede89c5a770769db805afa55a77e51d3d285b27cb7f850a4405b2e29f203c52` (`.so` `b28eddf2…`), built from `20f9a42`
 with `cargo -j 1`.
 
-VERDICT-PENDING
+**Verdict in one paragraph.** With every new key absent the engine is byte-identical to `4de1166` on the checkpoint copy
+with both the live wheel and the new one (Syl unchanged). The tally counts co-firing **episodes** — the step-counted rule
+of §7 was measured first and barely reduced today's sprouting, because bursts repeat co-firing on consecutive steps —
+and the closed-loop sweep chose **K = 8, θ = 4, H = 50 steps** (θ differs from D12's 3). Over 10 wake/sleep cycles with
+the disuse sleep on as armed, it sprouted **77% less** than today (668 vs 2,969 per 250-step batch) and ended with
+**1.9× more potentiated sprouts** (1,460 vs 785; 21.8% vs 2.6% of what was sprouted), recall on the rested probe metric
+equal (0.605 vs 0.606), far fewer hubs (12 vs 34 nodes with out-degree ≥ 100), every protected lifeline intact, and the
+sprouting call 63% cheaper. Native and Python fallback are bit-identical on the copy. Not proven: that the smaller graph
+(45.6K vs 57.8K at the end) has reached a steady state, and the live-state recall metric is lower (0.564 vs 0.604, a
+noisy metric). Surprise-driven sprouting goes through the tally too; the tally is not persisted. Suites: 0 new failures.
+Nothing is armed; merging needs Josh's protected-file "proceed".
 
 ---
 
@@ -350,12 +360,73 @@ no time.
 
 ### 6.4 Suites
 
-SUITES-PENDING
+- **`tests/test_sprout_1050.py`: 84 passed** (whole file, new wheel, isolated, 136 s; on the live wheel the native-only
+  cases skip and the rest pass). It holds the 36 keys-absent whole runs vs `4de1166`, the rule tests on both
+  implementations, the native == fallback cases and the whole runs with the tally on.
+- **NG suite** (all 161 `tests/test_*.py`, one isolated pytest process per file, 600 s cap, one at a time, venv-new;
+  `~/.cache/sprout-1050/suite/branch/`): 121 files pass outright, 40 do not. **0 new failures**: every one of the 31 files
+  that failed on the branch was re-run on the base worktree `4de1166` (same venv, same harness, the same evening;
+  `suite/base/`) and fails with the **identical FAILED / ERROR id set** (`scripts/compare_suites.py`: 0 ids only on the
+  branch, 0 only on the base; e.g. `test_cc_dual_pass` 10 / 10, `test_ng_tract_bridge` 17 / 17 — TID-dependent and
+  wheel-API tests that fail the same way on the base). 9 files hit the 600 s cap under load: 8 of them
+  (`test_auto_knowledge`, `test_ces`, `test_coordinator`, `test_et_modules`, `test_openclaw_hook`, `test_snn`,
+  `test_tonic_prefetch`, `test_tonic_no_heuristic`) also time out in the observe lane's run of the same base code
+  (`~/.cache/sleep-observe/suite/branch/`); the 9th, **`test_sleep_p1.py`, run alone with a 3,000 s cap: 184 passed**.
+  `test_sleep_p2.py` 127 passed, `test_rust_hotpaths_onto_s4.py` 313 passed / 1 skipped, `test_sleep_observe.py` and
+  `test_want_hub_competition.py` pass.
+- **Daemon suite** (docs `scripts/tests`, one process per side, venv-new): base `cdbb4d58` **75 failed, 1,065 passed,
+  4 skipped**; branch **75 failed, 1,075 passed, 6 skipped**. The FAILED / ERROR id sets are **identical** (only a
+  logged line number shifts with the added lines). +10 passed / +2 skipped = the new file: its two real-engine tests skip
+  inside the full suite because an earlier test drops `ng_tract` from `sys.modules` (PyO3: one init per process, the
+  known pattern); run alone the file is **12 passed**, and the env-name pin passes alone.
+
 
 ## 7. Pass / fail against the bar (spec §7 + the brief)
 
-PASSFAIL-PENDING
+| bar item | result |
+|---|---|
+| Step 0: measure first (fired per step, candidates, sprouts per batch + fraction potentiated, tally cost Python vs native), then sweep K / θ / horizon on the P2-style harness | **DONE** (§1, §2: m0 trace, open-loop replay of 36 + 27 grid points, 6 closed-loop sweep runs; chosen K 8, θ 4, H 50) |
+| Keys absent: byte-identical golden run vs `4de1166` on the copy, both wheels | **PASS** (§6.1: 8 runs, trace + checkpoint sha equal per mode; 36 whole-run tests) |
+| Native == fallback bit-exact (tally state, sprout set and order) | **PASS** (§6.2: copy run, 2 wake/sleep cycles, digests equal; random-sequence + 8 whole-run tests) |
+| Dry run: synapses sprouted per 250-step batch and fraction later potentiated | **PASS** — 668 vs 2,969 per batch (−77%); 21.8% vs 2.6% potentiated (1,460 vs 785 links) |
+| Dry run: recall on a fixed probe set must not degrade (probe set + metric defined first, §5) | **PASS on the primary (rested) metric** — relevance 0.605 vs 0.606, precision@10 0.0227 vs 0.0206; **the live-state relevance is lower (0.564 vs 0.604)**, a noisy metric (risk 3) |
+| Dry run: hub degree trajectory | **DONE** — nodes with out-degree ≥ 100: 58 → 12 (tally) vs 58 → 34 (today); top out-degree 231 vs 275 |
+| Dry run: step-time delta | **MEASURED** — sprouting call 32 vs 87 ms median (−63%); whole `step()` 0.35 vs 0.64 s median-of-medians, confounded by different firing and load |
+| Dry run: steady-state synapse count | **PARTIAL** — today 57-61K; tally 48.5K over sleeps 6-8, then 46.7K / 45.6K: not shown to have levelled off in 10 cycles (risk 1) |
+| Lifelines (sleep invariant, kept rails) | **PASS** — 8 / 8 protected lifelines in every cycle of both arms |
+| Full NG suite base vs branch; daemon suite base (75 known) vs branch: new failures only | **PASS** — 0 new failures in either (§6.4) |
+| Daemon: LAW 5 env names, default off, pin test; not armed | **DONE** (`CC_NG_SPROUT_TALLY*`) |
+| Changelog headers; no vendored-file edits | **DONE** (branch diffs: `neuro_foundation.py`, `tests/test_sprout_1050.py`, this file; `src/store.rs`; `scripts/cc-ng-daemon.py` + 2 test files) |
+
 
 ## 8. Risks and what is not proven
 
-RISKS-PENDING
+1. **Steady state not proven.** The tally arm's synapse count was still drifting down at cycle 10 (48.5K → 45.6K over
+   the last 2 sleeps) while today's held 57-61K. A smaller graph is the intended direction (fewer unused links), but
+   whether it levels off is not shown in 10 cycles. Live observe mode can show it before arming; nothing here arms it.
+2. **θ = 4 and the episode rule differ from the spec's text** (D12 recommended θ = 3; §7 counted every co-firing). Both
+   were chosen from measurements (§2); Josh should confirm or overrule. The rule also means a pair whose occasions are
+   more than ~14 steps apart can never sprout, however often it recurs (§2.2 table); in idle hours that is ~3.5 h at the
+   900 s autostep. Whether some slower, still meaningful co-activity is now excluded is not measured (the harness's
+   deposits are 25 steps apart, so cross-deposit repetition alone never sprouts at H 50; within-deposit and Tonic-driven
+   repetition does).
+3. **Live-state recall relevance was lower in the tally arm (0.564 vs 0.604).** The primary, rested metric (defined
+   before the proof runs, §5) is equal (0.605 vs 0.606, precision +10%). The live metric swings with the transient
+   activation each wake leaves (live breadth 5-383 between cycles), so it cannot separate the arms; but it is
+   the state the daemon's recall actually meets. A live A/B in observe mode would settle it.
+4. **Single seed, single copy, no real deposit pipeline.** Like P2: kNN of real deposit embeddings + stimulation, not
+   `run_conversational_dual_pass`; a Tonic-like tick, not the real Tonic thread; no Leg 2 / callosum arrivals; HE
+   consolidation off. The step-time comparison is confounded by different firing (the arms diverge after wake 1) and
+   load 6-11; the mechanism's own cost (32 vs 87 ms per call) is the clean number.
+5. **The rails still bind.** In the tally arm 7,746 crossings were dropped by the 10-per-call cap and 17,994 by the
+   degree cap (vs 6,620 sprouted). The cap matters mainly in bursts (hundreds of nodes firing), where many pairs repeat
+   together; the dropped pair loses its evidence and must earn it again. Not a correctness problem, but it means the
+   rails, not only the tally, still shape growth during bursts.
+6. **Identity-protected nodes are exempt from the degree cap** (unchanged rule): the tally fed the Choice Clause node 47
+   links in wake 1 instead of 180. Its lifelines are untouched in every sleep of both arms.
+7. **The Python fallback runs on today's live wheel** (`cba74b1` has no `cofire_tally_update`). It is bit-identical and
+   only ~30% slower per call on the copy (33 vs 25 ms), so arming does not require the new wheel; installing it is the
+   Executive's separate step with Josh's "proceed".
+8. **Not tested here:** the daemon's sleep tick logs no tally line of its own (the engine logs one per sleep); Lenia's
+   distance cache sees the new links like any sprout (pre-existing gap, §1A); `compete_protected_links` untouched.
+
