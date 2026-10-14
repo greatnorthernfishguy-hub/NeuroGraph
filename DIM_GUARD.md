@@ -8,7 +8,7 @@ sweep, (2) a structural guard, (3) a check of who relied on NG-Lite queries crea
 
 | repo | branch | from | commits |
 |---|---|---|---|
-| NeuroGraph | `cc-laptop-dim-guard-20261014` | `04e6c42` (trial line `cc-laptop-trial-s4-20261002`) | `84e55c3` guard + tests, `a424608` `dim_reembed.py`, then this doc |
+| NeuroGraph | `cc-laptop-dim-guard-20261014` | `04e6c42` (trial line `cc-laptop-trial-s4-20261002`) | `84e55c3` guard + `test_dim_guard.py`, `a424608` `dim_reembed.py`, `51c3026` + `4a7d773` 384→768 test literals, `1c0cd90` + this doc |
 | ng-tract-rs | — (no branch: not needed, §5.3) | | |
 
 Scratch (tools, state copies, proofs): `~/.cache/dim-guard/` (`tools/`, `state/`, `state/proof/`).
