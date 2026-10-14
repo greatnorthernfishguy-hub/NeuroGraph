@@ -8,9 +8,9 @@ the rollout; **fix the three quirks in the Rust core**.
 
 | repo | branch | from | commit |
 |---|---|---|---|
-| ng-tract-rs | `cc-laptop-nglitecore-quirks-20261013` | `04fc211` | `fef26f5` |
-| NeuroGraph | `cc-laptop-nglite-rustcore-20261013` | `88576dc` (the live trial root) | see `git log` (this doc is the tip) |
-| Elmer | `cc-laptop-nglite-rustcore-20261013` | `13dde60` (live) | `52aaec5` |
+| ng-tract-rs | `cc-laptop-nglitecore-quirks-20261013` | `04fc211` | `fef26f5` (quirks + accessors), `a2673f6` (`list_synapses` newest_first / limit; the wheel is built from this) |
+| NeuroGraph | `cc-laptop-nglite-rustcore-20261013` | `88576dc` (the live trial root) | `6d76b9c` (code), `0e8a6a9` (newest-rows bucket_recent + test), then this doc |
+| Elmer | `cc-laptop-nglite-rustcore-20261013` | `13dde60` (live) | `52aaec5`, `cae7288` (vendored `ng_lite.py` = NG `0e8a6a9`, sha256 `63b250a8…`) |
 
 ## 0. TL;DR
 
@@ -28,7 +28,12 @@ the rollout; **fix the three quirks in the Rust core**.
 - **Switch on:** the CC Commons (through `cc_ng_organism`) and the hosted Elmer NGEcosystem work end to end on copies,
   across a restart. `bucket_recent` returns the same rows as the Python core (276 records, 0 diffs, time masked;
   unmasked on the loaded state). Metric eviction works, the autonomic drop works, and saves go through msgpack.
-  116 Commons tests pass on the Rust core.
+  118 Commons tests pass on the Rust core.
+- **Suites vs bases (switch off):** 0 new failures in the NG suite (163 files, per file, isolated) or the daemon suite
+  (1,093 passed; identical FAILED/ERROR id sets). Elmer: 115 passed; one test there is flaky on base too.
+- **Install trap found (§7.2):** Elmer's `elmer_hook.py` runs `ng_updater.auto_update()` on import. That re-syncs
+  `ng_lite.py` / `ng_ecosystem.py` from `~/NeuroGraph` on every hosted start, which would silently undo the Elmer
+  re-vendor unless the canonical source it reads is the new one.
 
 ## 1. What was added
 
@@ -39,7 +44,7 @@ the rollout; **fix the three quirks in the Rust core**.
 | `node_count()` / `synapse_count()` | int | `len(ng.nodes)` / `len(ng.synapses)` |
 | `list_nodes(with_embedding=True)` | `[NGLiteNode]` in storage order (embedding = float32 copy or None) | `ng.nodes.values()` |
 | `get_node(node_id)` | `NGLiteNode` or None (by `node_id`, i.e. a synapse's `source_id`) | the node_id→node scans |
-| `list_synapses(*, source_id, target_id, target_prefix, since, with_metadata=True)` | `[NGLiteSynapse]` in storage order; filters AND; `since` = `last_updated > since`; `with_metadata=False` → `metadata={}` | `ng.synapses.values()` / `.items()` |
+| `list_synapses(*, source_id, target_id, target_prefix, since, with_metadata=True, newest_first=False, limit=None)` | `[NGLiteSynapse]` in storage order; filters AND; `since` = `last_updated > since`; `with_metadata=False` → `metadata={}`; `newest_first` = stable sort by `last_updated` desc; `limit` = only that many rows are built | `ng.synapses.values()` / `.items()` |
 | `get_synapse(source_id, target_id)` | `NGLiteSynapse` or None | `ng.synapses[(s, t)]` |
 | `remove_synapses(keys)` | count removed (dict `del` order semantics) | `del ng.synapses[k]` (the only write: Commons windows / autonomic drop) |
 | `get_history()` | list copy | `ng._history` |
@@ -70,6 +75,7 @@ Mutating a returned row does not touch the substrate (tested on both cores).
 
 `list_synapses(source_id=None, target_id=None, target_prefix=None, since=None, with_metadata=True)`,
 `get_synapse(source_id, target_id)`, `list_nodes(with_embedding=True)`, `get_node(node_id)`, `remove_synapses(keys)`,
+(`list_synapses` also takes `newest_first=False, limit=None`),
 `get_config()`, `get_module_id()`, `counts()`.
 
 They follow the same three-phase pattern as every other method: Python → Rust values, then `detach` + lock + pure
@@ -121,8 +127,10 @@ Rust, then Rust → Python. Rows are tuples in dataclass field order, and `ng_li
 - **`commons.py`:**
   - The metric / error / wire windows share one `_evict_to_recent_window`: `list_synapses(target_prefix)`, a stable
     sort by `last_updated`, then `remove_synapses`. The evictions are the same as before.
-  - `bucket_recent` takes a no-metadata snapshot, then a stable sort, then fetches metadata (`get_synapse`) and the
-    embedding (`get_node`) only for the rows it returns. The rows and order are the same as before.
+  - `bucket_recent` asks for the newest rows only (`newest_first` + `limit`). It widens the window when dedup or
+    suppression needs more rows, and fetches metadata (`get_synapse`) and the embedding (`get_node`) only for the
+    rows it returns. The rows and order are the same as before (tested with 300 duplicates + a suppression on both
+    cores).
   - `arousal` uses `list_synapses(target_id=...)`; `_drop_autonomic_synapses` uses `remove_synapses`.
   - `persist` now writes msgpack (#1098).
   - Every read is a snapshot, which also closes #1093's iterate-while-mutated window.
@@ -154,26 +162,69 @@ Rust, then Rust → Python. Rows are tuples in dataclass field order, and `ng_li
 
 | item | result |
 |---|---|
-| crate `cargo test --lib` | **67 passed** (64 + 3 new quirk unit tests) |
-| crate pytests `tests/` (with `NGLITE_PY` = the NG branch `ng_lite.py`) | **394 passed** (372 existing + 22 in `test_ng_lite_core.py`: 15 updated + 7 new: quirks a/b/c, public reads on both cores, Python msgpack bytes == `save_binary`, legacy JSON migration, switch-set-but-missing warning) |
-| **switch OFF golden** (`drive.py`, old trial root vs NG branch, Python core, fake clock, real-state copies: NG-Lite workloads on the Commons + Elmer states, then a Commons workload: restore, 260 mixed deposits, 230 metric deposits, all `bucket_recent` modes, arousal, persist, restore) | **1,400 records, 6 differ, all expected:** the saved-file first byte (`7b` JSON → `88` msgpack) ×3 and the directory listings (`.msgpack` + `.legacy-json`) ×3. Every result, every state (timestamps included) and every reload is identical. |
+| crate `cargo test --lib` | **67 passed** (64 + 3 new quirk unit tests), on both builds |
+| crate pytests `tests/` (with `NGLITE_PY` = the NG branch `ng_lite.py`; run on both builds, last on the `a2673f6` wheel) | **394 passed** (372 existing + 22 in `test_ng_lite_core.py`: 15 updated + 7 new: quirks a/b/c, public reads on both cores, Python msgpack bytes == `save_binary`, legacy JSON migration, switch-set-but-missing warning) |
+| **switch OFF golden** (`drive.py`, old trial root vs NG branch, Python core, fake clock, real-state copies: NG-Lite workloads on the Commons + Elmer states, then a Commons workload: restore, 260 mixed deposits, 230 metric deposits, all `bucket_recent` modes, arousal, persist, restore) | **1,400 records, 6 differ, all expected** (run on both builds, same result): the saved-file first byte (`7b` JSON → `88` msgpack) ×3 and the directory listings (`.msgpack` + `.legacy-json`) ×3. Every result, every state (timestamps included) and every reload is identical. |
 | **switch ON Commons rows** (`drive.py` NG branch: Python core vs Rust core, real clock) | Commons workload: **276 records, 0 differ** (time masked). The loaded-state `bucket_recent` (all modes), stats and arousal are equal **unmasked**. The NG-Lite workloads diverge by design: quirk (c) means a query no longer creates a node, so node ids shift. That equivalence is proven against `RefNGLite` instead. |
-| **switch ON end to end** (`e2e.py`, two processes = a restart; CC Commons via `cc_ng_organism.get_cc_commons` / `persist_cc_commons`; hosted Elmer via Elmer's own `ng_ecosystem.NGEcosystem` with its rim) | **19/19 + 18/18 checks pass.** Commons JSON converted once; `bucket_recent` incl. embeddings; metric window = 200; arousal; persist = msgpack; reload after restart; autonomic dropped on restore. Elmer `ng_lite_state.json` migrated to `.msgpack`; 22 rim nodes; 384-d record works; queries create 0 nodes; tunable survives save → reload. The same e2e with the switch OFF also passes (19/18 checks; queries create 5 nodes there). |
-| Commons tests on the Rust core (16 files incl. legs 1–3, bunyan stage 1, ng_commons_eco, cc_commons_persist, the new file) | **116 passed** with `NG_LITE_RUST_CORE=1` |
+| **switch ON end to end** (`e2e.py`, two processes = a restart; re-run on the final code; CC Commons via `cc_ng_organism.get_cc_commons` / `persist_cc_commons`; hosted Elmer via Elmer's own `ng_ecosystem.NGEcosystem` with its rim) | **19/19 + 18/18 checks pass.** Commons JSON converted once; `bucket_recent` incl. embeddings; metric window = 200; arousal; persist = msgpack; reload after restart; autonomic dropped on restore. Elmer `ng_lite_state.json` migrated to `.msgpack`; 22 rim nodes; 384-d record works; queries create 0 nodes; tunable survives save → reload. The same e2e with the switch OFF also passes (19/18 checks; queries create 5 nodes there). |
+| Commons tests on the Rust core (16 files incl. legs 1–3, bunyan stage 1, ng_commons_eco, cc_commons_persist, the new file) | **118 passed** with `NG_LITE_RUST_CORE=1`. Switch off, the same files + `test_ng_lite.py` + `test_constitutional.py`: 198 passed, plus the 2 `test_ng_lite.py` NGSaaSBridge failures that also fail on base |
 | NG suite / daemon suite / Elmer tests vs bases | §5.1 |
 | wheel surface vs the live wheel (`.so` `6f03dca0…`) | `only-live: []`, `only-new: ['_NGLiteCore']`, no changed member; with the switch set, `NGLiteCore` is added too. Against the 10-12 lane wheel: the 8 methods above are additions, and the deliberate change is `get_recommendations` being read-only. |
 
 ### 5.1 Suites vs bases (switch OFF)
 
-(running at the time of this commit — results are filled in by the next commit on this branch)
+Same venv and harness for both sides. The bases are detached worktrees at the branch points:
+`~/worktrees/neurograph-base-88576dc-20261013`, `~/worktrees/elmer-base-13dde60-20261013`, and
+`~/worktrees/docs-base-trial-s4a-20261013` (the daemon's scripts at `e4d5dc40`).
+
+- **NG suite** (`~/.cache/nglite-rustcore/suite/`): every `tests/test_*.py` on the branch, one isolated pytest per file,
+  600 s cap. Each of the 39 files that did not pass was re-run on the base. **2 ids were only on the branch:**
+  - `test_constitutional::test_load_old_state_without_constitutional_field`: it json-loaded the save. The test was
+    updated to the msgpack contract and now passes.
+  - `test_graph_substrate_race::test_build_adjacency_no_race_under_concurrent_step_mutation`: flaky on the base too.
+    Re-runs went branch fail/fail, base fail/pass. It is a Graph race test that does not touch NG-Lite.
+  - `test_tonic_no_heuristic` was killed (rc 143) under load on the first branch run. On re-run: 18 passed, like the
+    base.
+  - Every other failing id is identical on both sides. Examples: `test_ng_tract_bridge` 17/17, `test_cc_dual_pass`
+    10/10, `test_migration` 6/6, and `test_ng_lite` 2/2 (the NGSaaSBridge `_sync_count` failures). The
+    `test_auto_knowledge` / `test_ces` / `test_coordinator` / `test_et_modules` / `test_openclaw_hook` / `test_snn`
+    timeouts happen on both sides.
+  - After the final `ng_lite.py` / `commons.py` change, the 42 test files that touch `commons` / NG-Lite /
+    `ng_ecosystem` were re-run on the branch: **0 ids beyond the base**.
+- **Daemon suite** (docs trial `scripts/tests` + `test_cc_ng_daemon_guard.py`, `CC_NG_PYTHONPATH` = NG base vs NG branch):
+  - base: 75 failed / 1,093 passed / 6 skipped
+  - branch: 75 failed / 1,093 passed / 6 skipped
+  - **identical FAILED/ERROR id sets (77 ids)**
+- **Elmer tests:**
+  - base: 115 passed in one run; `test_hook::test_start_stop` failed in 2 of 3 runs (flaky: `already_started`)
+  - branch: 115 passed in one run; the same test failed in 2 of 4 runs
+  - branch with the switch ON: 114 passed + the same flaky test
+  - one branch run aborted at interpreter exit ("terminate called without an active exception", after 115 passed).
+    It did not recur in 2 re-runs.
+  - The Elmer branch runs set `NEUROGRAPH_CANONICAL_PATH` to the NG branch (§7.2). Without it the suite itself
+    reverted the worktree's vendored files, which is how the trap was found.
+
+### 5.2 Timings (real CC Commons copy, 4,615 synapses; interleaved Python / Rust in one process, load ~6, nice 10; medians)
+
+| | old code (Python) | new code, Python core | new code, Rust core |
+|---|---|---|---|
+| `bucket_recent(limit=50)` | ~35 ms | ~7 ms | ~3–4 ms |
+| `bucket_recent(limit=20, with_metadata=True)` | ~35 ms | ~7 ms | ~2–3 ms |
+| `arousal()` | ~30 ms | ~2.3 ms | ~0.03 ms |
+| metric deposit (incl. its window) | ~4.5 ms | ~4.5 ms | ~0.5–0.9 ms |
+| `persist` | 7.9 s (7.76 MB JSON) | 0.6–0.7 s (5.99 MB msgpack) | 0.1–0.4 s (same bytes) |
+
+A full `list_synapses()` of 4,615 rows costs ~30 ms (Python) / ~50 ms (Rust: 15 ms in the core, the rest building
+Python objects). That is why `bucket_recent` asks only for its newest rows.
 
 ## 6. Wheel
 
 `/home/josh/.cache/nglite-rustcore/wheel/ng_tract-0.1.0-cp38-abi3-manylinux_2_34_x86_64.whl`
 
-- sha256 `f9df966a14f648a55c97755942a15e989a648000ea757cc76c5a946808ea23d9`
-- inner `ng_tract/ng_tract.abi3.so` sha256 `4a19e8ad0c739b2371a992b55fcda16dd15d376b59b9d9d300da91eb42afb522`
-- Built from `ng-tract-rs` `fef26f5` `src/` with `~/.cache/nglite-rustcore/build.sh` (`cargo test --lib` +
+- sha256 `0c4c59f2aae36ec45bdb3c5fc544c85b2d6d752737522a3317f058b38c59c14d`
+- inner `ng_tract/ng_tract.abi3.so` sha256 `5b058be61692e031f147e9f3382c9e08fb5ab51d6b10cb284a12e6d7e6dbd520`
+- The first build of this lane (`fef26f5`, `.so` `4a19e8ad…`) is superseded; it is kept in `wheel-prev/`.
+- Built from `ng-tract-rs` `a2673f6` `src/` with `~/.cache/nglite-rustcore/build.sh` (`cargo test --lib` +
   `maturin build --release`, abi3-py38, `-j 1`, offline).
 - **Rollback wheel = the live one:**
   `/home/josh/.cache/flow-lenia-f1/wheel/ng_tract-0.1.0-cp38-abi3-manylinux_2_34_x86_64.whl`
@@ -195,10 +246,33 @@ Back up both states while the daemon is stopped or between saves:
    (or check the branch out there).
 2. **Elmer code (the laptop re-vendor).** `~/Elmer` is on `cc-revendor-ng-20260921` @ `13dde60`:
    `git -C ~/Elmer fetch && git -C ~/Elmer merge --ff-only origin/cc-laptop-nglite-rustcore-20261013`
+   - **TRAP, decide before restarting.** `elmer_hook.py:160` runs `ng_updater.auto_update()` on import: a
+     `git pull --ff-only` in `~/Elmer`, plus copying `ng_lite.py`, `ng_ecosystem.py`, `ng_autonomic.py`,
+     `openclaw_adapter.py` and `ng_updater.py` from the canonical source over any copy that differs.
+   - The canonical source is `$NEUROGRAPH_CANONICAL_PATH`, else `~/NeuroGraph`.
+   - `~/NeuroGraph` main still has the old `ng_lite.py` (`b477c1cf`). So the first hosted Elmer start would put the
+     old file back. The lane's own Elmer suite did exactly that to the branch worktree.
+   - Pick one:
+     - **(B, recommended for "laptop first")** Add `"env": {"NEUROGRAPH_CANONICAL_PATH":
+       "~/NeuroGraph-worktrees/trial-s4-20261002"}` to the `elmer` entry of the CC registry
+       `~/.claude/plugins/neurograph/et_modules/registry.json`.
+       - `cc_ng_organism.bootstrap_cc_modules` applies a module's `env` before loading its hook. Elmer then syncs from
+         the daemon's own NG root, which has the new files.
+       - Tested: with the variable set, the Elmer suite left the vendored files byte-identical.
+       - The other three synced files (`ng_autonomic.py`, `openclaw_adapter.py`, `ng_updater.py`) are byte-identical
+         across `~/NeuroGraph`, the trial root and `~/Elmer`, so B changes nothing else.
+       - Caveat: the registry is JSON config outside `.bashrc` (LAW 5 reading is Josh's call), and `os.environ` is set
+         process-wide in the daemon.
+     - **(A)** Put the new `ng_lite.py` + `ng_ecosystem.py` on `~/NeuroGraph` main as well. Cherry-pick only those two
+       files: main is not on the trial line, and its copies are byte-identical to `88576dc`'s.
+       - **This starts the ecosystem re-vendor on the laptop.** TID (live; `app.py` runs `auto_update()`), TrollGuard,
+         Immunis, THC and Bunyan copy the new files at their next start.
+       - TID would then migrate `/home/josh/The-Inference-Difference/ng_lite_state.json` to msgpack.
+       - TID's `reset_receptor_prototypes.py`, `install.sh` and tests expect the `.json` (§8).
 3. **Wheel:** `~/NeuroGraph/.venv/bin/pip install --no-deps --force-reinstall <wheel above>`
 4. **Confirm:**
    - `~/NeuroGraph/.venv/bin/python -I -c "import ng_tract; print(hasattr(ng_tract,'_NGLiteCore'), hasattr(ng_tract,'NGLiteCore'))"` → `True False`
-   - `sha256sum` of the `.so` → `4a19e8ad…`
+   - `sha256sum` of the `.so` → `5b058be6…`
 5. **Restart `cc-ng-daemon`** under the sidecar procedure: every previous daemon PID dead first.
 6. **What happens on that first start, even with the switch OFF:**
    - `get_cc_commons` restore converts the JSON inside `commons.msgpack` to real msgpack and keeps
@@ -232,8 +306,9 @@ Back up both states while the daemon is stopped or between saves:
   is needed.
 - **Wheel:** `pip install --no-deps --force-reinstall` the F1 wheel above. With the switch off the new `ng_lite.py`
   never touches `ng_tract`.
-- **Code:** reset the trial worktree and `~/Elmer` back to `88576dc` / `13dde60`. **This needs a state conversion
-  first.** The old code reads only JSON:
+- **Code:** reset the trial worktree and `~/Elmer` back to `88576dc` / `13dde60`, and remove the registry `env`
+  (option B). `auto_update` then keeps Elmer on main's old copy. **This needs a state conversion first.** The old code
+  reads only JSON:
   - the old Commons would fail to parse the msgpack and start fresh
   - the old Elmer would find no `.json` and start with only its rim
 
@@ -296,7 +371,11 @@ carry over there, though the Rust core is deterministic).
     Python `matmul … mismatch`.
   - The fix is re-embedding `~/Elmer/data/constitutional_embeddings.json` with the 768-d model (+ a rim migration).
     That is not trivial, so it is out of scope.
-- **New, found here, not fixed:** `Elmer/runtime/engine.py:380-381, 501-502, 654-656` read `self._ecosystem._graph`,
+- **`auto_update` re-vendors from `~/NeuroGraph` on every module start** (Elmer, TID, TrollGuard, Immunis, THC,
+  Bunyan). Whatever lands on `~/NeuroGraph` main reaches those modules at their next start, with no per-module gate.
+  That is the real re-vendor mechanism on this laptop (§7.2).
+- **New, found here, not fixed (punch list #1106):** `Elmer/runtime/engine.py:380-381, 501-502, 654-656` read
+  `self._ecosystem._graph`,
   but NGEcosystem has no `_graph` (it is `_ng`).
   - So the TuningSocket is never wired to NG-Lite, and `context["live_graph"]` is always None. The `hasattr` checks
     hide this.
@@ -304,8 +383,9 @@ carry over there, though the Rust core is deterministic).
 - **Queries no longer write (quirk c).** With the switch on, `Commons.bucket()` / `get_recommendations()` stop creating
   nodes and bumping activation counts. That is the ruling, but the medium's node-LRU now sees only deposits.
 - **Bitwise "same rows"** is against the laptop's numpy / OpenBLAS (NGLITECORE.md §3), as before.
-- **`list_synapses` cost.** `bucket_recent` builds one row object per synapse newer than the watermark (≤ 5,000) on
-  either core, then fetches metadata only for the returned rows.
+- **`list_synapses` cost.** A full listing builds one Python object per synapse (~30–50 ms at 4,615). The Commons
+  now asks only for the rows it needs (§5.2). Other future consumers should use `newest_first` / `limit` / the filters
+  the same way.
 - Still open from NGLITECORE.md §8: #1093 (now mitigated by snapshot reads), #1099 (Morphogenesis state is a Graph),
   #1100 (ng_ecosystem swallows load errors: a corrupt msgpack still leaves `_ng = None`), #1101 (dead drafts),
   #1102 (drifted vendored copies).
