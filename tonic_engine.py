@@ -27,6 +27,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: comment only
+# What: _identity_embedding_tensor's docstring said "the encoder truncates to 384 for now"; with Elmer
+#   cc-laptop-mean-centre-20261014 graph_io the encoder takes the 768-d identity at full width (a 384-wide trained
+#   identity_proj migrates on load, outputs unchanged). No code change here.
+# Why/How: #1108; docstring.
 # [2026-10-06] Claude (lane nodestore-p2a, review branch cc-laptop-nodestore-p2a-20261006)
 #   What: _extract_graph_features_for_model reads the first 100 nodes' voltage / firing_rate_ema /
 #         intrinsic_excitability from one NodeStore.columns() copy when graph.nodes is a native store,
@@ -1071,8 +1076,9 @@ class TonicEngine:
     def _identity_embedding_tensor(self):
         """#329 seam C: her constitutional self as the identity-conditioning vector.
 
-        768-d (the encoder truncates to 384 for now). Zeros when no spine exists,
-        preserving prior behavior.
+        768-d, taken at full width by the encoder (Elmer graph_io IDENTITY_DIM, #1108; a pre-#1108 checkpoint's
+        384-wide identity_proj migrates on load with zero weights for dims 384..767 until retrained). Zeros when no
+        spine exists, preserving prior behavior.
         """
         import torch
         try:
