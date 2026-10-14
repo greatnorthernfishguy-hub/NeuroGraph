@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
+# What: DistanceCache.save() fsyncs the temp .npz before os.replace and the directory after.
+# Why: it was already tmp + os.replace (#261), which survives a process kill; without the fsync a power loss / hard hang right after the rename could leave a zero-length or partial distance_cache.npz (multi-hour rebuild).
+# How: np.savez_compressed into an open file object (same archive bytes), fsync, replace; reader unchanged.
 # [2026-08-27] Claude Code (Opus 4.8) — #147 borrow-safe DistanceCache.populate()
 # What: populate()'s synapse-endpoint loop and hyperedge-member loop now
 #   snapshot proxy PRIMITIVES (pre/post ids; member-id lists) INSIDE the
@@ -352,8 +356,19 @@ class DistanceCache:
         final = path if path.endswith(".npz") else path + ".npz"
         tmp = final + ".tmp.npz"
         try:
-            np.savez_compressed(tmp, **data)
+            with open(tmp, "wb") as fh:
+                np.savez_compressed(fh, **data)
+                fh.flush()
+                os.fsync(fh.fileno())   # the bytes are on disk before the rename publishes them
             os.replace(tmp, final)
+            try:
+                _dfd = os.open(os.path.dirname(os.path.abspath(final)), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(_dfd)
+                finally:
+                    os.close(_dfd)
+            except OSError as _exc:
+                logger.debug("distance cache: directory fsync failed (%s)", _exc)
         except Exception:
             # Never leave a half-written temp behind to be mistaken for a
             # real cache or to waste disk.
