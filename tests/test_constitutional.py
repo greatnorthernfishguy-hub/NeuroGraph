@@ -7,6 +7,10 @@ semantic space. Synapses are frozen, nodes survive pruning, and the
 bucket comes up empty.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: test vectors are 768-d (the substrate's embedding_dim)
+#   What: _make_embedding defaults to 768 and the semantic-matching noise is 768-d (were 384).
+#   Why: these tests fed 384-d vectors to a 768-d NG-Lite — exactly the mismatch the dimension guard now refuses.
+#   How: two literals; assertions unchanged.
 # [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: persistence tests follow msgpack-only saves
 #   What: the old-state test reads the msgpack save, strips the field and feeds it back as a legacy JSON state
 #   (migrated once on load); cleanup removes the .json / .msgpack / .legacy-json trio.
@@ -44,7 +48,7 @@ def _cleanup(filepath):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_embedding(seed: int = 0, dim: int = 384) -> np.ndarray:
+def _make_embedding(seed: int = 0, dim: int = 768) -> np.ndarray:
     """Generate a deterministic normalized embedding."""
     rng = np.random.RandomState(seed)
     emb = rng.randn(dim).astype(np.float32)
@@ -340,7 +344,7 @@ class TestSemanticMatching:
         """An embedding close to a constitutional node should match it."""
         base_emb = _make_embedding(10)
         # Create a slightly perturbed version (still very similar)
-        noise = np.random.RandomState(999).randn(384).astype(np.float32) * 0.05
+        noise = np.random.RandomState(999).randn(768).astype(np.float32) * 0.05
         similar_emb = base_emb + noise
         similar_emb /= np.linalg.norm(similar_emb)
 
