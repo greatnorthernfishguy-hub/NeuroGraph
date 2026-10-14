@@ -69,6 +69,30 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: mean-centred comparisons; the rim threshold; space tag
+# What: (1) Every similarity comparison subtracts the embedding model's fixed centre (ng_embed.embedding_centre(),
+#   versioned ng_embed.CENTRE_VERSION) from both sides and re-normalises before the cosine: node matching
+#   (_find_similar_node), novelty (detect_novelty), the receptor snap (_snap_to_prototype) and its k-means assignment
+#   (_init_prototypes). Stored vectors stay RAW (node embeddings, prototypes, hashes, saves): centring happens only at
+#   the comparison, so the substrate keeps the raw experience (LAW 7) and a new centre version needs no re-embedding.
+#   Applies when embedding_dim == ng_embed.EMBEDDING_DIM and config "mean_centre" is true (default); other dims (test
+#   fixtures) compare raw. (2) Thresholds re-calibrated on centred real data (MEAN_CENTRE.md §3):
+#   novelty_threshold 0.7 -> 0.40 (match at centred cosine >= 0.60; tunable bounds 0.30-0.95 -> 0.20-0.60),
+#   receptor_prototype_threshold stays 0.75 (now centred), and a separate constitutional_threshold 0.55 (not runtime-tunable — the rim is immutable): a constitutional node catches an
+#   input only at centred cosine >= constitutional_threshold, and when it does it takes priority over ordinary nodes;
+#   ordinary nodes match at >= 1 - novelty_threshold as before. (3) Saves carry "embedding_space" = {model, dim,
+#   centre_version}; load() refuses a state recorded under another model (EmbeddingSpaceError, ERROR once), refuses an
+#   untagged state or a rim whose vectors are off the model's manifold (cosine to the centre direction), and resets
+#   the space-dependent thresholds to this instance's values when the state was calibrated under another centre
+#   version (incl. untagged = raw-cosine era).
+# Why: Josh 2026-10-14 "Mean center" (#1107). Snowflake vectors share a common direction: unrelated texts sit at
+#   ~0.69 raw cosine, so the 0.30 snap matched nearly everything — the CC Commons put 4,767 synapses on 4 nodes
+#   (#1094), TID's NG-Lite had 2 nodes, and a 768-d Elmer rim would have caught 100% of inputs. The rim is immutable
+#   ("Running without the Rim defeats the entire point"), so it needs a threshold that catches rim-relevant inputs
+#   and not ordinary ones. The dimension guard could not see same-dim foreign vectors (DIM_GUARD.md §11).
+# How: _centre_vec / _centre_rows (the Rust core mirrors them bit for bit, ng-tract-rs
+#   cc-laptop-mean-centre-rs-20261014); _resolve_space at construction; _space_check before import (both cores);
+#   _space_migrate_config after import. No change for non-model dims beyond the rim threshold rule.
 # [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: fail loud on a wrong embedding dimension
 # What: Every vector that enters NG-Lite is checked against ``embedding_dim`` (the active embedding
 #   model's dimension; ng_embed's 768 by default, pinned by tests/test_dim_guard.py):
@@ -316,6 +340,71 @@ def _dim_error(module_id: str, where: str, got: Any, expected: int, source: str 
     return EmbeddingDimensionError(msg)
 
 
+class EmbeddingSpaceError(ValueError):
+    """Vectors of the right dimension but from another embedding model / space (#1107).
+
+    Raised when a saved state records another model, or when an untagged state or a constitutional rim is off the
+    active model's manifold (its vectors do not share the model's common direction). Same contract as
+    EmbeddingDimensionError: re-embed from the source text with the active model; never load them as they are.
+    """
+
+
+# A vector of the active model has cosine >= this to the model's centre direction (measured on 18,675 live CC
+# Snowflake vectors: p0.1 = 0.363, 2 below 0.30, none below 0.20; bge-base rim 0.19-0.27; hash noise ~0.00).
+MANIFOLD_MIN_COS = 0.30
+
+# Config keys whose values are calibrated for one embedding space + centre version (MEAN_CENTRE.md §3).
+SPACE_KEYS = ("novelty_threshold", "receptor_prototype_threshold", "constitutional_threshold")
+
+_SPACE_ERRORS_LOGGED: Set[Tuple[str, str, str]] = set()
+
+
+def _space_error(module_id: str, where: str, detail: str) -> EmbeddingSpaceError:
+    """Build (and log at ERROR, once per distinct case) the loud embedding-space error."""
+    msg = (f"NG-Lite [{module_id}]: {where} is not in this substrate's embedding space ({detail}). "
+           "Vectors from another model cannot be compared even at the same dimension; re-embed them from their "
+           "source text with the active model (NeuroGraph MEAN_CENTRE.md / DIM_GUARD.md).")
+    key = (module_id, where, detail)
+    if key not in _SPACE_ERRORS_LOGGED:
+        _SPACE_ERRORS_LOGGED.add(key)
+        logger.error(msg)
+    return EmbeddingSpaceError(msg)
+
+
+def _resolve_space(dim: int, want_centre: bool) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
+    """(model name, centre version, centre vector) for a substrate of dimension ``dim``.
+
+    The model is ng_embed's when the dimensions agree; centring is on when ``want_centre`` and the dims agree. An
+    ng_embed that predates #1107 (no embedding_centre) fails loud: ng_lite.py and ng_embed.py are vendored together.
+    """
+    try:
+        import ng_embed  # vendored sibling; importing it loads no model
+    except ImportError as exc:
+        raise RuntimeError(f"NG-Lite needs the vendored ng_embed.py beside it for the embedding space: {exc}") from exc
+    if dim != int(getattr(ng_embed, "EMBEDDING_DIM", -1)):
+        return None, None, None
+    model = ng_embed.MODEL_NAME
+    if not want_centre:
+        return model, None, None
+    if not hasattr(ng_embed, "embedding_centre"):
+        raise RuntimeError(
+            f"ng_embed.py at {getattr(ng_embed, '__file__', '?')} predates #1107 (no embedding_centre): re-vendor "
+            "ng_embed.py together with ng_lite.py")
+    return model, ng_embed.CENTRE_VERSION, ng_embed.embedding_centre()
+
+
+def _manifold_cos(vectors: List[Any], centre: np.ndarray) -> np.ndarray:
+    """Cosine of each vector to the centre direction (0 for a zero vector)."""
+    if not vectors:
+        return np.zeros(0, dtype=np.float32)
+    m = np.asarray([np.asarray(v, dtype=np.float32) for v in vectors], dtype=np.float32)
+    n = np.linalg.norm(m, axis=1)
+    c = centre / float(np.linalg.norm(centre))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = (m @ c) / np.where(n > 0, n, 1.0)
+    return np.where(n > 0, out, 0.0)
+
+
 def _vec_len(v: Any) -> Optional[int]:
     """Length of a stored vector (list / tuple / 1-D ndarray / raw float32 bytes); None if absent."""
     if v is None:
@@ -496,8 +585,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "success_boost": 0.15,      # Weight increase on success
     "failure_penalty": 0.20,    # Weight decrease on failure
 
-    # Novelty detection
-    "novelty_threshold": 0.7,   # Embedding distance above which = novel
+    # Novelty detection / node matching. Calibrated on MEAN-CENTRED cosines (#1107, MEAN_CENTRE.md §3): an input
+    # matches an existing node at centred cosine >= 1 - novelty_threshold. (0.7 was the raw-cosine value: with
+    # Snowflake's shared direction it matched nearly everything.)
+    "novelty_threshold": 0.40,
+
+    # Cricket rim (#1107): a constitutional node catches an input only at centred cosine >= this, and then wins over
+    # ordinary nodes. Not runtime-tunable (the rim is immutable); calibrated in MEAN_CENTRE.md §4.
+    "constitutional_threshold": 0.55,
+
+    # Mean-centring (#1107): subtract ng_embed's fixed model centre before every comparison (applies when
+    # embedding_dim is the model's dimension). False only for synthetic-vector test fixtures.
+    "mean_centre": True,
 
     # Pruning
     "pruning_threshold": 0.01,  # Synapses below this weight get pruned
@@ -522,7 +621,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Receptor Layer (#43) — vector quantization via adaptive prototypes
     "receptor_layer_enabled": True,
     "receptor_layer_k": 256,                # Initial prototype count
-    "receptor_prototype_threshold": 0.75,   # Cosine similarity to snap to prototype
+    "receptor_prototype_threshold": 0.75,   # Centred cosine to snap to a prototype (#1107, MEAN_CENTRE.md §3)
     "receptor_ema_alpha": 0.001,            # Slow drift rate (Elmer will tune later)
     "receptor_warmup_count": 256,           # Inputs before k-means init fires
 }
@@ -765,6 +864,13 @@ class NGLite:
         self._embedding_dim = int(self.config["embedding_dim"])
         if self._embedding_dim <= 0:
             raise ValueError(f"NG-Lite [{module_id}]: embedding_dim must be a positive int, got {self._embedding_dim}")
+        # #1107: the embedding space — model, centre version and the fixed centre (None: compare raw). Fixed for this
+        # instance's lifetime, like embedding_dim; a loaded state cannot change it.
+        self._mean_centre = bool(self.config.get("mean_centre", True))
+        self._model, self._centre_version, self._centre = _resolve_space(self._embedding_dim, self._mean_centre)
+        # The instance's own values of the space-calibrated keys (restored when a loaded state was calibrated under
+        # another centre version, see _space_migrate_config).
+        self._space_values = {k: self.config[k] for k in SPACE_KEYS if k in self.config}
         self._check_rim_entries(self.config.get("constitutional_embeddings", []), "constitutional_embeddings (config)")
 
         # Rust core (#1096): used only when NG_LITE_RUST_CORE is truthy (temporary rollout switch). It then
@@ -780,6 +886,7 @@ class NGLite:
                 )
             else:
                 self._core = NGLiteCore(module_id, self.config)
+                self._core.set_space(self._model, self._centre_version, self._centre, self._embedding_dim)
                 entries = self.config.get("constitutional_embeddings", [])
                 if entries:
                     self._core.seed_constitutional(entries)
@@ -859,6 +966,17 @@ class NGLite:
             detail = "; ".join(f"{len(v)} of {len(entries)} entries are {d}-d (e.g. {v[0]!r})"
                                for d, v in sorted(bad.items()))
             raise _dim_error(self.module_id, "the constitutional rim", got, self._embedding_dim, source, detail)
+        # #1107: the rim must also be in the model's space (a same-dim rim from another model passes the dim check)
+        centre = getattr(self, "_centre", None)
+        if centre is not None:
+            vecs = [e.get("embedding") for e in entries if isinstance(e, dict) and e.get("embedding") is not None]
+            cos = _manifold_cos(vecs, centre)
+            off = int((cos < MANIFOLD_MIN_COS).sum())
+            if off:
+                raise _space_error(
+                    self.module_id, "the constitutional rim",
+                    f"{off} of {len(vecs)} entries have cosine < {MANIFOLD_MIN_COS} to the {self._model} centre "
+                    f"direction (min {float(cos.min()):.3f}; this model's own vectors sit at ~0.85) — source: {source}")
 
     def _check_state_dims(self, state: Dict[str, Any], source: str) -> None:
         """A state's node embeddings and receptor prototypes must all be ``embedding_dim`` long.
@@ -902,6 +1020,81 @@ class NGLite:
         if not self.config.get("constitutional_embeddings"):
             self._check_rim_entries((state.get("config") or {}).get("constitutional_embeddings", []),
                                     f"{source} (saved config)")
+
+    def _check_state_space(self, state: Dict[str, Any], source: str) -> None:
+        """#1107: a state must be in this substrate's embedding space. Runs BEFORE import (either core).
+
+        A state records ``embedding_space.model``; another model is refused. An untagged (pre-#1107) state is checked
+        on the model's manifold instead: refused when the median cosine of its vectors to the centre direction is
+        below MANIFOLD_MIN_COS (hash noise / another model). No check for non-model dimensions (test fixtures).
+        """
+        if self._model is None:
+            return
+        space = state.get("embedding_space") or {}
+        model = space.get("model")
+        if model is not None:
+            if model != self._model:
+                raise _space_error(self.module_id, "the stored state",
+                                   f"it records model {model!r}, this substrate runs {self._model!r} — source: {source}")
+            return
+        if self._centre is None:
+            return
+        vecs = [n.get("embedding") for n in (state.get("nodes") or {}).values()
+                if isinstance(n, dict) and n.get("embedding") is not None]
+        vecs += list((state.get("receptor_layer") or {}).get("prototypes") or [])
+        if not vecs:
+            return
+        med = float(np.median(_manifold_cos(vecs, self._centre)))
+        if med < MANIFOLD_MIN_COS:
+            raise _space_error(
+                self.module_id, "the stored state (untagged)",
+                f"median cosine of its {len(vecs)} vectors to the {self._model} centre direction is {med:.3f} < "
+                f"{MANIFOLD_MIN_COS} (this model's own vectors sit at ~0.85) — source: {source}")
+
+    def _space_migrate_config(self, state: Dict[str, Any], source: str) -> None:
+        """#1107: after an import, the space-calibrated thresholds follow THIS instance when the state was calibrated
+        under another centre version (an untagged state = the raw-cosine era). The instance's ``mean_centre`` wins too.
+        Same values on both cores."""
+        saved_version = (state.get("embedding_space") or {}).get("centre_version")
+        updates: Dict[str, Any] = {"mean_centre": self._mean_centre}
+        if saved_version != self._centre_version:
+            changed = {k: (self.config.get(k), v) for k, v in self._space_values.items() if self.config.get(k) != v}
+            if changed:
+                logger.warning(
+                    "NG-Lite [%s]: %s was calibrated under centre %r, this substrate runs %r: space thresholds reset "
+                    "to this instance's values %s", self.module_id, source, saved_version, self._centre_version,
+                    {k: f"{a} -> {b}" for k, (a, b) in changed.items()})
+            updates.update(self._space_values)
+        for k, v in updates.items():
+            if self._core is not None:
+                self._core.set_config_value(k, v)
+            self.config[k] = v
+
+    def _space_tag(self) -> Dict[str, Any]:
+        """The ``embedding_space`` record written into every save (#1107)."""
+        return {"model": self._model, "dim": self._embedding_dim, "centre_version": self._centre_version}
+
+    # -------------------------------------------------------------------
+    # Mean-centring (#1107) — every comparison goes through these two. The Rust core mirrors them bit for bit:
+    # a single vector is re-normalised with _normalize (sqrt(dot)), a matrix row-wise like the prototype renorm.
+    # -------------------------------------------------------------------
+
+    def _centre_vec(self, emb: np.ndarray) -> np.ndarray:
+        """``normalize(emb - centre)`` (float32); ``emb`` itself when centring is off."""
+        if self._centre is None:
+            return emb
+        return self._normalize(emb - self._centre)
+
+    def _centre_rows(self, m: np.ndarray) -> np.ndarray:
+        """Row-wise ``(m - centre) / max(norm(axis=1), 1e-12)`` (float32); ``m`` itself when centring is off."""
+        if self._centre is None:
+            return m
+        c = m - self._centre
+        return c / np.maximum(np.linalg.norm(c, axis=1, keepdims=True), 1e-12)
+
+    def _snap_sims(self, emb: np.ndarray) -> np.ndarray:
+        """Similarities of a normalised input to every prototype (centred) — the receptor snap's comparison."""
+        return self._centre_rows(self._prototypes) @ self._centre_vec(emb)
 
     def _seed_constitutional_nodes(self) -> None:
         """Seed constitutional nodes from config embeddings.
@@ -1315,7 +1508,13 @@ class NGLite:
         emb = self._normalize(embedding)
         max_similarity = 0.0
 
-        for cached_emb in self._embedding_cache.values():
+        # #1107: compare mean-centred vectors (raw when centring is off)
+        if self._centre is None:
+            rows: Iterable[np.ndarray] = self._embedding_cache.values()
+        else:
+            emb = self._centre_vec(emb)
+            rows = self._centre_rows(np.stack(list(self._embedding_cache.values())))
+        for cached_emb in rows:
             similarity = float(np.dot(emb, cached_emb))
             if similarity > max_similarity:
                 max_similarity = similarity
@@ -1449,9 +1648,12 @@ class NGLite:
             elif self._core is not None:
                 # #1097: check the stored vectors before the core takes the state (never half-load a wrong-dim one)
                 with open(bin_path, "rb") as f:
-                    self._check_state_dims(_unpack_state(f.read()), bin_path)
+                    st = _unpack_state(f.read())
+                self._check_state_dims(st, bin_path)
+                self._check_state_space(st, bin_path)
                 self._core.load_binary(bin_path)
                 self._sync_from_core()
+                self._space_migrate_config(st, bin_path)
                 logger.info("NG-Lite state loaded (Rust core) from %s", bin_path)
             else:
                 with open(bin_path, "rb") as f:
@@ -1522,6 +1724,7 @@ class NGLite:
                 "total_successes": self._total_successes,
             },
             "receptor_layer": receptor_state,
+            "embedding_space": self._space_tag(),  # #1107
         }
 
     def _import_state(self, state: Dict[str, Any], source: str = "<state dict>") -> None:
@@ -1531,9 +1734,11 @@ class NGLite:
         ``source`` and both dimensions); nothing is imported when they do not match.
         """
         self._check_state_dims(state, source)
+        self._check_state_space(state, source)
         if self._core is not None:
             self._core.import_state(state)
             self._sync_from_core()
+            self._space_migrate_config(state, source)
             return
         self.module_id = state.get("module_id", self.module_id)
 
@@ -1547,6 +1752,7 @@ class NGLite:
         self.config["embedding_dim"] = self._embedding_dim  # #1097: the instance's model dimension wins
         if live_constitutional:
             self.config["constitutional_embeddings"] = live_constitutional
+        self._space_migrate_config(state, source)  # #1107
 
         # Clear caches before rebuild
         self._embedding_cache.clear()
@@ -1608,7 +1814,7 @@ class NGLite:
     TUNABLE_PARAMS: Dict[str, Tuple[float, float]] = {
         "success_boost":              (0.01,  0.50),
         "failure_penalty":            (0.01,  0.50),
-        "novelty_threshold":          (0.30,  0.95),
+        "novelty_threshold":          (0.20,  0.60),   # #1107: centred match 0.40..0.80
         "pruning_threshold":          (0.001, 0.10),
         "receptor_ema_alpha":         (0.0001, 0.01),
         "receptor_prototype_threshold": (0.50, 0.95),
@@ -1700,6 +1906,7 @@ class NGLite:
                 "avg_synapse_weight": c["avg_synapse_weight"],
                 "bridge_connected": bridge_connected,
                 "embedding_cache_size": c["embedding_cache_size"],
+                "embedding_space": self._space_tag(),
             }
         synapse_weights = [s.weight for s in self.synapses.values()]
         return {
@@ -1722,6 +1929,7 @@ class NGLite:
             ),
             "bridge_connected": bridge_connected,
             "embedding_cache_size": len(self._embedding_cache),
+            "embedding_space": self._space_tag(),
         }
 
     # -------------------------------------------------------------------
@@ -1934,9 +2142,9 @@ class NGLite:
             if self._prototypes is None:
                 return embedding
 
-        # Vectorized cosine similarity against all prototypes
+        # Vectorized cosine similarity against all prototypes (mean-centred, #1107)
         threshold = self.config["receptor_prototype_threshold"]
-        similarities = self._prototypes @ embedding  # (K,)
+        similarities = self._snap_sims(embedding)  # (K,)
         best_idx = int(np.argmax(similarities))
         best_sim = float(similarities[best_idx])
 
@@ -1973,9 +2181,10 @@ class NGLite:
         indices = rng.choice(n, size=k, replace=False)
         centroids = embeddings[indices].copy()
 
+        centred = self._centre_rows(embeddings)  # #1107: assign by centred cosine; centroids stay raw means
         for _ in range(20):
             # Assign each embedding to nearest centroid
-            sims = embeddings @ centroids.T  # (N, K)
+            sims = centred @ self._centre_rows(centroids).T  # (N, K)
             assignments = np.argmax(sims, axis=1)
 
             # Recompute centroids
@@ -2013,12 +2222,27 @@ class NGLite:
             return None
 
         # Vectorized similarity: stack all cached embeddings into a matrix
-        # and compute cosine similarities in one np.dot call.
+        # and compute cosine similarities in one np.dot call (mean-centred, #1107).
         cache_keys = list(self._embedding_cache.keys())
-        cache_matrix = np.stack(list(self._embedding_cache.values()))
-        similarities = cache_matrix @ embedding  # (N,) cosine similarities
+        cache_matrix = self._centre_rows(np.stack(list(self._embedding_cache.values())))
+        similarities = cache_matrix @ self._centre_vec(embedding)  # (N,) cosine similarities
 
-        best_idx = int(np.argmax(similarities))
+        # Cricket rim (#1107): a constitutional node catches the input at >= constitutional_threshold and then wins;
+        # below it a rim node matches nothing, and the ordinary nodes compete as before.
+        rim = np.fromiter(
+            (k in self.nodes and self.nodes[k].constitutional for k in cache_keys), dtype=bool, count=len(cache_keys))
+        if rim.any():
+            rim_idx = np.flatnonzero(rim)
+            rim_sims = similarities[rim_idx]
+            r = int(np.argmax(rim_sims))
+            if float(rim_sims[r]) >= self.config["constitutional_threshold"]:
+                return self.nodes[cache_keys[int(rim_idx[r])]]
+            ord_idx = np.flatnonzero(~rim)
+            if len(ord_idx) == 0:
+                return None
+            best_idx = int(ord_idx[int(np.argmax(similarities[ord_idx]))])
+        else:
+            best_idx = int(np.argmax(similarities))
         best_similarity = float(similarities[best_idx])
 
         if best_similarity >= (1.0 - threshold):
