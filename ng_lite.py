@@ -904,6 +904,10 @@ class NGLite:
         # Initialized via k-means after warmup_count inputs, then drifts via EMA.
         # Prototypes are a routing lens above existing nodes, not a replacement.
         self._prototypes: Optional[np.ndarray] = None  # (K, D) matrix or None
+        # #1107: centred copies, recomputed only when the raw vector changes (a row's centring does not depend on the
+        # other rows, so these are the exact bits _centre_rows would give for the whole matrix)
+        self._centred_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}  # hash -> (raw array, centred row)
+        self._centred_protos: Optional[Tuple[np.ndarray, np.ndarray]] = None  # (prototypes array, centred matrix)
         self._prototype_counts: Optional[np.ndarray] = None  # activation counts per prototype
         self._receptor_input_count: int = 0  # inputs seen before init
 
@@ -1092,9 +1096,40 @@ class NGLite:
         c = m - self._centre
         return c / np.maximum(np.linalg.norm(c, axis=1, keepdims=True), 1e-12)
 
+    def _centred_cache_rows(self) -> Tuple[List[str], np.ndarray]:
+        """(cache keys, the cached embeddings as a centred matrix) — what node matching and novelty compare against.
+        Each row is centred once per raw vector (validated by identity, so a replaced embedding is re-centred)."""
+        keys = list(self._embedding_cache.keys())
+        if self._centre is None:
+            return keys, np.stack(list(self._embedding_cache.values()))
+        cc = self._centred_cache
+        rows = []
+        for k in keys:
+            raw = self._embedding_cache[k]
+            hit = cc.get(k)
+            if hit is None or hit[0] is not raw:
+                hit = (raw, self._centre_rows(raw[None, :])[0])
+                cc[k] = hit
+            rows.append(hit[1])
+        if len(cc) > 2 * len(keys) + 64:  # drop entries of pruned / replaced nodes
+            live = set(keys)
+            for k in [k for k in cc if k not in live]:
+                del cc[k]
+        return keys, np.stack(rows)
+
+    def _centred_prototypes(self) -> np.ndarray:
+        """The prototypes, centred (cached per prototypes array; the snap's EMA drift re-centres its one row)."""
+        if self._centre is None:
+            return self._prototypes
+        hit = self._centred_protos
+        if hit is None or hit[0] is not self._prototypes:
+            hit = (self._prototypes, self._centre_rows(self._prototypes))
+            self._centred_protos = hit
+        return hit[1]
+
     def _snap_sims(self, emb: np.ndarray) -> np.ndarray:
         """Similarities of a normalised input to every prototype (centred) — the receptor snap's comparison."""
-        return self._centre_rows(self._prototypes) @ self._centre_vec(emb)
+        return self._centred_prototypes() @ self._centre_vec(emb)
 
     def _seed_constitutional_nodes(self) -> None:
         """Seed constitutional nodes from config embeddings.
@@ -1513,7 +1548,7 @@ class NGLite:
             rows: Iterable[np.ndarray] = self._embedding_cache.values()
         else:
             emb = self._centre_vec(emb)
-            rows = self._centre_rows(np.stack(list(self._embedding_cache.values())))
+            rows = self._centred_cache_rows()[1]
         for cached_emb in rows:
             similarity = float(np.dot(emb, cached_emb))
             if similarity > max_similarity:
@@ -2154,6 +2189,8 @@ class NGLite:
             self._prototypes[best_idx] = self._normalize(
                 (1.0 - alpha) * self._prototypes[best_idx] + alpha * embedding
             )
+            if self._centred_protos is not None and self._centred_protos[0] is self._prototypes:
+                self._centred_protos[1][best_idx] = self._centre_rows(self._prototypes[best_idx:best_idx + 1])[0]
             self._prototype_counts[best_idx] += 1
             return self._prototypes[best_idx].copy()
 
@@ -2223,8 +2260,7 @@ class NGLite:
 
         # Vectorized similarity: stack all cached embeddings into a matrix
         # and compute cosine similarities in one np.dot call (mean-centred, #1107).
-        cache_keys = list(self._embedding_cache.keys())
-        cache_matrix = self._centre_rows(np.stack(list(self._embedding_cache.values())))
+        cache_keys, cache_matrix = self._centred_cache_rows()
         similarities = cache_matrix @ self._centre_vec(embedding)  # (N,) cosine similarities
 
         # Cricket rim (#1107): a constitutional node catches the input at >= constitutional_threshold and then wins;
