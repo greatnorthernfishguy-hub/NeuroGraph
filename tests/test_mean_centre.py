@@ -165,7 +165,7 @@ def test_off_manifold_rim_is_refused_loud(core, caplog):
     iso = rng.standard_normal(D).astype(np.float32)
     with caplog.at_level(logging.ERROR, logger="ng_lite"):
         with pytest.raises(EmbeddingSpaceError, match="constitutional rim"):
-            NGLite(module_id="mc_rim", config={"constitutional_embeddings": [rim_entry(iso)]})
+            NGLite(module_id=f"mc_rim_{core}", config={"constitutional_embeddings": [rim_entry(iso)]})  # ERROR is once per case
     assert any(r.levelno == logging.ERROR for r in caplog.records)
 
 
