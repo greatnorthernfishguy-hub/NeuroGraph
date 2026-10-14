@@ -23,6 +23,14 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: public MODEL_NAME / EMBEDDING_DIM
+# What: Module constants MODEL_NAME and EMBEDDING_DIM, read from _DEFAULT_CONFIG (no behaviour change).
+# Why: The active model's identity and dimension had no public name. cc_topology_export/merge look up
+#   ng_embed.MODEL_NAME, which did not exist, so both sides read "unknown" and the cross-machine model check
+#   never fired; NG-Lite and the vector store need the dimension to fail loud on wrong-dim vectors
+#   (tests/test_dim_guard.py pins ng_lite.DEFAULT_CONFIG["embedding_dim"] to EMBEDDING_DIM).
+# How: Two assignments after _DEFAULT_CONFIG.
+# -------------------
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-ngembed-cap-roundrobin-20260926 — #666.
 # What: _extract_concepts now builds its concept union by round-robin interleave
@@ -238,6 +246,11 @@ _DEFAULT_CONFIG = {
     "tid_temperature": 0.2,
     "tid_max_tokens": 500,
 }
+
+# The active embedding model and its output dimension — the single source of truth for every consumer that stores
+# or compares vectors (#1097). A vector of any other dimension came from another model.
+MODEL_NAME: str = _DEFAULT_CONFIG["model_id"]
+EMBEDDING_DIM: int = int(_DEFAULT_CONFIG["embedding_dim"])
 
 # Concept extraction prompt — not classification, not labeling.
 # The LLM reads content and identifies distinct concepts within it.

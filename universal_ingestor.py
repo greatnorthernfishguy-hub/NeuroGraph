@@ -46,6 +46,18 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: SimpleVectorDB fails loud on a wrong dimension
+# What: SimpleVectorDB(dim=None) — the store's vector dimension. Explicit, or fixed by the first vector
+#   inserted / the vectors loaded. load() refuses a file whose vectors are not all that dimension (or are of
+#   mixed dimensions) BEFORE swapping it in; insert() and search() refuse a vector of another dimension.
+#   The error (VectorDimensionError, a ValueError) names the file, both dimensions and the counts per
+#   dimension, and is logged at ERROR once per distinct mismatch.
+# Why: A wrong-dim vector used to surface as a bare numpy shape error on the first dot product mid-search,
+#   which callers swallow at DEBUG ("Auto-knowledge harvest failed") — the 2026-03 384-vs-768 incident left
+#   Syl "reading blind" exactly this way. Josh 2026-10-14: make wrong dims structurally loud.
+# How: _vdb_dim_error + VectorDimensionError; dim checks in insert / search / load. Correct-dim data: one
+#   length comparison per call, nothing else changes. Old pickles without `dim` behave as dim=None.
+# -------------------
 # [2026-10-04] Claude (lane vdb-lock-leak) — SimpleVectorDB gets its own leaf RLock (#270)
 #   What: SimpleVectorDB._lock (threading.RLock) guards embeddings/metadata/content in EVERY
 #         method (insert, search, get, delete, count, all_ids, capture_state, load) plus new
@@ -364,6 +376,29 @@ class IngestionResult:
 # Simple Vector DB (PRD §7)
 # ---------------------------------------------------------------------------
 
+class VectorDimensionError(ValueError):
+    """A vector's dimension does not match the vector store's (#1097). Re-embed, never truncate or pad."""
+
+
+_VDB_DIM_LOGGED: set = set()
+
+
+def _vdb_dim_error(what: str, got: Any, expected: Any, source: Optional[str] = None,
+                   detail: str = "") -> VectorDimensionError:
+    msg = (
+        f"SimpleVectorDB: {what} is {got}-d but the store is {expected}-d"
+        + (f" — source: {source}" if source else "")
+        + (f" ({detail})" if detail else "")
+        + ". Vectors of different dimensions come from different embedding models and cannot be compared; "
+          "re-embed them from their stored content with the active model (ng_embed) — NeuroGraph DIM_GUARD.md."
+    )
+    key = (what, got, expected, source)
+    if key not in _VDB_DIM_LOGGED:
+        _VDB_DIM_LOGGED.add(key)
+        logging.getLogger("neurograph.vectordb").error(msg)
+    return VectorDimensionError(msg)
+
+
 class SimpleVectorDB:
     """In-memory vector database using numpy (PRD §7).
 
@@ -405,11 +440,24 @@ class SimpleVectorDB:
         results = db.search(np.array([0.1, 0.9, 0.2]), k=5, threshold=0.5)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dim: Optional[int] = None) -> None:
         self._lock = self._make_lock()
         self.embeddings: Dict[str, np.ndarray] = {}
         self.metadata: Dict[str, Dict[str, Any]] = {}
         self.content: Dict[str, str] = {}
+        # #1097: the store's vector dimension — explicit (the embedding model's, e.g. ng_embed.EMBEDDING_DIM), or
+        # None = fixed by the first vector inserted / the vectors loaded. Every vector in the store has it.
+        self.dim: Optional[int] = int(dim) if dim is not None else None
+        self._source: Optional[str] = None  # the file last loaded (named in dimension errors)
+
+    def _store_dim(self) -> Optional[int]:
+        """The dimension every stored vector has (caller holds the lock). None while unfixed and empty."""
+        d = getattr(self, "dim", None)
+        if d is not None:
+            return d
+        for v in self.embeddings.values():
+            return int(v.shape[0])
+        return None
 
     @staticmethod
     def _make_lock() -> Any:
@@ -442,6 +490,10 @@ class SimpleVectorDB:
         if norm > 0:
             embedding = embedding / norm
         with self._lock:
+            d = self._store_dim()
+            if d is not None and (embedding.ndim != 1 or embedding.shape[0] != d):
+                raise _vdb_dim_error(f"the vector inserted as {id!r}", embedding.shape[-1] if embedding.ndim else 0,
+                                     d, getattr(self, "_source", None))
             self.embeddings[id] = embedding
             self.content[id] = content
             self.metadata[id] = metadata or {}
@@ -472,6 +524,12 @@ class SimpleVectorDB:
             if not self.embeddings:
                 return []
             snapshot = list(self.embeddings.items())
+            d = self._store_dim()
+            source = getattr(self, "_source", None)
+        query_vector = np.asarray(query_vector)
+        q_len = query_vector.shape[-1] if query_vector.ndim else 0
+        if d is not None and q_len != d:
+            raise _vdb_dim_error("the query vector", q_len, d, source)
 
         norm = np.linalg.norm(query_vector)
         if norm > 0:
@@ -742,6 +800,20 @@ class SimpleVectorDB:
             new_content[id] = entry.get("content", "")
             new_metadata[id] = entry.get("metadata", {})
 
+        # #1097: every loaded vector must have the store's dimension (explicit), or — unfixed — one common
+        # dimension. Checked before the swap, so a wrong-dim file never replaces the live store.
+        dim_counts: Dict[int, int] = {}
+        for vec in new_embeddings.values():
+            dim_counts[int(vec.shape[0])] = dim_counts.get(int(vec.shape[0]), 0) + 1
+        explicit = getattr(self, "dim", None)
+        if dim_counts:
+            expected = explicit if explicit is not None else (next(iter(dim_counts)) if len(dim_counts) == 1 else None)
+            if expected is None or any(d != expected for d in dim_counts):
+                by_dim = ", ".join(f"{d}-d x{c}" for d, c in sorted(dim_counts.items()))
+                got = "/".join(str(d) for d in sorted(dim_counts) if d != expected) if expected else "mixed"
+                raise _vdb_dim_error("the stored vectors", got, expected if expected else "one common",
+                                     path, f"by dim: {by_dim} of {len(new_embeddings)}; nothing was loaded")
+
         with self._lock:
             # Clear existing state (same dict objects, so any holder of a reference
             # to these dicts keeps seeing the live store)
@@ -751,6 +823,7 @@ class SimpleVectorDB:
             self.embeddings.update(new_embeddings)
             self.content.update(new_content)
             self.metadata.update(new_metadata)
+            self._source = path
             return len(self.embeddings)
 
 

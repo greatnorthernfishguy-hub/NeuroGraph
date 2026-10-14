@@ -69,6 +69,27 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: fail loud on a wrong embedding dimension
+# What: Every vector that enters NG-Lite is checked against ``embedding_dim`` (the active embedding
+#   model's dimension; ng_embed's 768 by default, pinned by tests/test_dim_guard.py):
+#   - inputs to find_or_create_node / record_outcome / get_recommendations / detect_novelty;
+#   - constitutional (rim) entries at seeding (constructor and after a load);
+#   - a loaded state's node embeddings and receptor prototypes (load / _import_state), with the
+#     state file named in the error.
+#   A mismatch raises EmbeddingDimensionError (a ValueError subclass, so existing handlers still
+#   catch it) whose message names the module, what was wrong, the file, both dimensions and the
+#   counts per dimension; the same message is logged at ERROR once per distinct mismatch, so a
+#   caller's broad ``except`` can no longer make it silent. The check runs in this wrapper before
+#   any dispatch, so it covers the Python and the Rust core alike.
+#   A saved state's config can no longer override ``embedding_dim``: the constructor's value (the
+#   module's model) wins, and the stored vectors are checked against it.
+# Why: #1097 — Elmer's NG-Lite rim was 384-d (all-MiniLM-L6-v2) while every input is 768-d; each
+#   call raised a numpy shape error deep inside the similarity search, a broad except swallowed it,
+#   and the rim did nothing for weeks. Josh 2026-10-14: wrong dims keep surviving sweeps — make it
+#   structurally impossible to run on them quietly (LAW 4: at the source).
+# How: _check_input / _check_rim_entries / _check_state_dims + _dim_error; EmbeddingDimensionError.
+#   No change for correct-dim data (no extra work beyond one shape test per call).
+# -------------------
 # [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: Rust core usable; public reads; msgpack saves
 # What: (1) Public read methods served by whichever core holds the state: node_count / synapse_count /
 #   list_nodes / get_node / list_synapses / get_synapse / remove_synapses / get_history / export_state.
@@ -261,6 +282,54 @@ _RUST_CORE_ENV = "NG_LITE_RUST_CORE"
 LEGACY_JSON_SUFFIX = ".legacy-json"
 
 
+class EmbeddingDimensionError(ValueError):
+    """A vector's dimension does not match this NG-Lite's ``embedding_dim`` (#1097).
+
+    ``embedding_dim`` is the active embedding model's dimension. Vectors of another dimension come from
+    another model (e.g. the old 384-d all-MiniLM-L6-v2) and cannot be compared with the substrate's own;
+    the stored ones must be re-embedded from their source text, never truncated, padded or skipped.
+    A ValueError subclass, so existing ``except ValueError`` handlers still catch it — the ERROR log
+    written when it is raised is what keeps a broad handler from making it silent.
+    """
+
+
+# Distinct mismatches already logged at ERROR (module, where, got, expected, source) — log once, raise always.
+_DIM_ERRORS_LOGGED: Set[Tuple[str, str, Any, int, str]] = set()
+
+
+def _dim_error(module_id: str, where: str, got: Any, expected: int, source: str = "",
+               detail: str = "") -> EmbeddingDimensionError:
+    """Build (and log at ERROR, once per distinct mismatch) the loud dimension error."""
+    msg = (
+        f"NG-Lite [{module_id}]: {where} is {got}-d but this substrate's embedding_dim (the active "
+        f"embedding model's dimension) is {expected}-d"
+        + (f" — source: {source}" if source else "")
+        + (f" ({detail})" if detail else "")
+        + ". Vectors of different dimensions come from different models and cannot be compared; "
+          "re-embed the stored vectors from their source text with the active model (NeuroGraph "
+          "DIM_GUARD.md) — do not truncate, pad or skip them."
+    )
+    key = (module_id, where, got, expected, source)
+    if key not in _DIM_ERRORS_LOGGED:
+        _DIM_ERRORS_LOGGED.add(key)
+        logger.error(msg)
+    return EmbeddingDimensionError(msg)
+
+
+def _vec_len(v: Any) -> Optional[int]:
+    """Length of a stored vector (list / tuple / 1-D ndarray / raw float32 bytes); None if absent."""
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        return len(v) // 4
+    if isinstance(v, np.ndarray):
+        return int(v.shape[-1]) if v.ndim >= 1 else 0
+    try:
+        return len(v)
+    except TypeError:
+        return 0
+
+
 def _rust_core_requested() -> bool:
     """True when NG_LITE_RUST_CORE is truthy (1 / true / yes / on), the same rule ng_tract's export gate uses."""
     return os.environ.get(_RUST_CORE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
@@ -437,7 +506,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "relevance_threshold": 0.30,  # Min cosine similarity to absorb cross-module events
 
     # Embedding
-    "embedding_dim": 768,       # Expected embedding dimensionality (BAAI/bge-base-en-v1.5)
+    "embedding_dim": 768,       # The active embedding model's dimension (ng_embed: Snowflake/snowflake-arctic-embed-m-v1.5,
+                                # 768). Every vector in and out of NG-Lite is checked against it (#1097,
+                                # EmbeddingDimensionError); tests/test_dim_guard.py pins it to ng_embed's.
     "hash_dims": 128,           # Dims used for hashing (first N of embedding)
 
     # Persistence
@@ -689,6 +760,13 @@ class NGLite:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self._bridge = bridge
 
+        # #1097: the active embedding model's dimension. Fixed for this instance's lifetime — a loaded state
+        # cannot change it (its vectors are checked against it instead).
+        self._embedding_dim = int(self.config["embedding_dim"])
+        if self._embedding_dim <= 0:
+            raise ValueError(f"NG-Lite [{module_id}]: embedding_dim must be a positive int, got {self._embedding_dim}")
+        self._check_rim_entries(self.config.get("constitutional_embeddings", []), "constitutional_embeddings (config)")
+
         # Rust core (#1096): used only when NG_LITE_RUST_CORE is truthy (temporary rollout switch). It then
         # holds ALL learning state; the public reads below serve it. Otherwise the Python core runs.
         self._core = None
@@ -739,6 +817,91 @@ class NGLite:
         # (On the Rust core the seeding happened above, in the core.)
         if self._core is None:
             self._seed_constitutional_nodes()
+
+    # -------------------------------------------------------------------
+    # Dimension guard (#1097)
+    # -------------------------------------------------------------------
+
+    @property
+    def embedding_dim(self) -> int:
+        """The dimension every vector in this substrate must have (the active embedding model's)."""
+        return self._embedding_dim
+
+    def _check_input(self, embedding: Any, where: str) -> None:
+        """Raise EmbeddingDimensionError (logged at ERROR) when a 1-D input is not ``embedding_dim`` long.
+
+        Non-1-D inputs are left to the existing checks (record_outcome's ndim ValueError).
+        """
+        n = getattr(embedding, "ndim", None)
+        if n is None:
+            try:
+                embedding = np.asarray(embedding)
+            except Exception:  # noqa: BLE001 — not array-like: the existing paths report it
+                return
+            n = embedding.ndim
+        if n == 1 and embedding.shape[0] != self._embedding_dim:
+            raise _dim_error(self.module_id, f"the input embedding to {where}()", int(embedding.shape[0]),
+                             self._embedding_dim)
+
+    def _check_rim_entries(self, entries: Any, source: str) -> None:
+        """Every constitutional (rim) entry's embedding must be ``embedding_dim`` long."""
+        if not entries:
+            return
+        bad: Dict[int, List[str]] = {}
+        for i, entry in enumerate(entries):
+            raw = entry.get("embedding") if isinstance(entry, dict) else None
+            d = _vec_len(raw)
+            if d is not None and d != self._embedding_dim:
+                label = entry.get("category") or entry.get("description", "")[:40] or f"#{i}"
+                bad.setdefault(d, []).append(str(label))
+        if bad:
+            got = "/".join(str(d) for d in sorted(bad))
+            detail = "; ".join(f"{len(v)} of {len(entries)} entries are {d}-d (e.g. {v[0]!r})"
+                               for d, v in sorted(bad.items()))
+            raise _dim_error(self.module_id, "the constitutional rim", got, self._embedding_dim, source, detail)
+
+    def _check_state_dims(self, state: Dict[str, Any], source: str) -> None:
+        """A state's node embeddings and receptor prototypes must all be ``embedding_dim`` long.
+
+        Runs BEFORE the state is imported (either core), so a wrong-dim state is never half-loaded.
+        Counts every vector, so the error says how much of the state is affected.
+        """
+        counts: Dict[int, int] = {}
+        total = 0
+        for node in (state.get("nodes") or {}).values():
+            d = _vec_len(node.get("embedding")) if isinstance(node, dict) else None
+            if d is not None:
+                total += 1
+                counts[d] = counts.get(d, 0) + 1
+        protos = (state.get("receptor_layer") or {}).get("prototypes")
+        p_counts: Dict[int, int] = {}
+        if protos is not None and len(protos):
+            for p in protos:
+                d = _vec_len(p)
+                p_counts[d] = p_counts.get(d, 0) + 1
+        bad_nodes = {d: c for d, c in counts.items() if d != self._embedding_dim}
+        bad_protos = {d: c for d, c in p_counts.items() if d != self._embedding_dim}
+        if bad_nodes or bad_protos:
+            parts = []
+            if bad_nodes:
+                parts.append("node embeddings by dim: " + ", ".join(f"{d}-d x{c}" for d, c in sorted(counts.items()))
+                             + f" (of {total})")
+            if bad_protos:
+                parts.append("receptor prototypes by dim: "
+                             + ", ".join(f"{d}-d x{c}" for d, c in sorted(p_counts.items())))
+            got = "/".join(str(d) for d in sorted(set(bad_nodes) | set(bad_protos)))
+            raise _dim_error(self.module_id, "the stored state", got, self._embedding_dim, source, "; ".join(parts))
+        saved_dim = (state.get("config") or {}).get("embedding_dim")
+        if saved_dim is not None and int(saved_dim) != self._embedding_dim:
+            logger.warning(
+                "NG-Lite [%s]: %s records embedding_dim=%s but this substrate runs %d-d; its vectors match %d-d, "
+                "so it loads (the saved value is ignored)", self.module_id, source, saved_dim,
+                self._embedding_dim, self._embedding_dim,
+            )
+        # A saved rim is used only when the constructor brought none (see _import_state)
+        if not self.config.get("constitutional_embeddings"):
+            self._check_rim_entries((state.get("config") or {}).get("constitutional_embeddings", []),
+                                    f"{source} (saved config)")
 
     def _seed_constitutional_nodes(self) -> None:
         """Seed constitutional nodes from config embeddings.
@@ -797,6 +960,7 @@ class NGLite:
         Returns:
             The matched or newly created NGLiteNode.
         """
+        self._check_input(embedding, "find_or_create_node")
         # Rust core: a fresh node built from the core's answer (never a stub cached by hash — after the core
         # prunes and re-creates a node with the same hash such a stub carried a stale node_id, #1096).
         if self._core is not None:
@@ -896,6 +1060,7 @@ class NGLite:
         Raises:
             ValueError: If embedding is not a 1-D numpy array.
         """
+        self._check_input(embedding, "record_outcome")
         # Rust core — Hebbian learning, Welford variance and the outcome counters all live in the core
         if self._core is not None:
             result = self._core.record_outcome(
@@ -1042,6 +1207,7 @@ class NGLite:
             weight, activation volume, and strength signature.
             Empty list if no learned routes exist for this pattern.
         """
+        self._check_input(embedding, "get_recommendations")
         # Try bridge first
         if self._bridge and self._bridge.is_connected():
             try:
@@ -1125,6 +1291,7 @@ class NGLite:
         Returns:
             Novelty score from 0.0 (routine/known) to 1.0 (completely novel).
         """
+        self._check_input(embedding, "detect_novelty")
         # Try bridge first
         if self._bridge and self._bridge.is_connected():
             try:
@@ -1274,19 +1441,22 @@ class NGLite:
                 # #1098: the old Python core wrote JSON into this .msgpack-named file — convert it once
                 with open(bin_path, "r") as f:
                     state = json.load(f)
-                self._import_state(state)
+                self._import_state(state, source=bin_path)
                 shutil.copy2(bin_path, bin_path + LEGACY_JSON_SUFFIX)
                 self.save(bin_path)
                 logger.info("NG-Lite: converted the JSON inside %s to msgpack (JSON kept as %s)",
                             bin_path, bin_path + LEGACY_JSON_SUFFIX)
             elif self._core is not None:
+                # #1097: check the stored vectors before the core takes the state (never half-load a wrong-dim one)
+                with open(bin_path, "rb") as f:
+                    self._check_state_dims(_unpack_state(f.read()), bin_path)
                 self._core.load_binary(bin_path)
                 self._sync_from_core()
                 logger.info("NG-Lite state loaded (Rust core) from %s", bin_path)
             else:
                 with open(bin_path, "rb") as f:
                     state = _unpack_state(f.read())
-                self._import_state(state)
+                self._import_state(state, source=bin_path)
                 logger.info("NG-Lite state loaded from %s (%d nodes, %d synapses)",
                             bin_path, len(self.nodes), len(self.synapses))
             return True
@@ -1294,7 +1464,7 @@ class NGLite:
         if has_json:
             with open(legacy, "r") as f:
                 state = json.load(f)
-            self._import_state(state)
+            self._import_state(state, source=legacy)
             self.save(bin_path)
             os.replace(legacy, legacy + LEGACY_JSON_SUFFIX)
             logger.info("NG-Lite: migrated legacy JSON %s to msgpack %s (JSON kept as %s)",
@@ -1306,6 +1476,7 @@ class NGLite:
         """After the Rust core replaced its state: the wrapper's config / module_id follow the core, and the
         in-memory history restarts (as the Python core's _import_state does)."""
         self.config = self._core.get_config()
+        self.config["embedding_dim"] = self._embedding_dim  # #1097: the instance's model dimension, never the saved one
         self.module_id = self._core.get_module_id()
         self._history.clear()
 
@@ -1353,8 +1524,13 @@ class NGLite:
             "receptor_layer": receptor_state,
         }
 
-    def _import_state(self, state: Dict[str, Any]) -> None:
-        """Import state from a deserialized dict."""
+    def _import_state(self, state: Dict[str, Any], source: str = "<state dict>") -> None:
+        """Import state from a deserialized dict.
+
+        #1097: the state's vectors are checked against ``embedding_dim`` first (EmbeddingDimensionError names
+        ``source`` and both dimensions); nothing is imported when they do not match.
+        """
+        self._check_state_dims(state, source)
         if self._core is not None:
             self._core.import_state(state)
             self._sync_from_core()
@@ -1368,6 +1544,7 @@ class NGLite:
         saved_config = state.get("config", {})
         live_constitutional = self.config.get("constitutional_embeddings", [])
         self.config = {**DEFAULT_CONFIG, **saved_config}
+        self.config["embedding_dim"] = self._embedding_dim  # #1097: the instance's model dimension wins
         if live_constitutional:
             self.config["constitutional_embeddings"] = live_constitutional
 
