@@ -6,6 +6,11 @@ persistence, bridge interface, capacity limits, stats, and
 NGSaaSBridge integration.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: test vectors are 768-d (the substrate's embedding_dim)
+#   What: every 384-d test vector / shape assertion is 768-d.
+#   Why: the tests fed 384-d vectors to a 768-d NG-Lite — the mismatch the dimension guard now refuses.
+#   How: literal 384 -> 768; test_single_dim_embedding now asserts the intended contract (works at
+#   embedding_dim=1, refused on the 768-d default) instead of the old silent acceptance.
 # [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: persistence tests follow msgpack-only saves
 # What: TestPersistence reads the saved state as msgpack (the file save() returns), the JSON-validity test is now a
 #   msgpack-validity test, the legacy-node test feeds a legacy JSON state (migrated once on load), and cleanup
@@ -69,17 +74,17 @@ def small_ng():
 
 @pytest.fixture
 def embedding():
-    """A random 384-dim embedding, normalized."""
+    """A random 768-dim embedding, normalized."""
     rng = np.random.RandomState(42)
-    emb = rng.randn(384)
+    emb = rng.randn(768)
     return emb / np.linalg.norm(emb)
 
 
 @pytest.fixture
 def different_embedding():
-    """A different random 384-dim embedding."""
+    """A different random 768-dim embedding."""
     rng = np.random.RandomState(99)
-    emb = rng.randn(384)
+    emb = rng.randn(768)
     return emb / np.linalg.norm(emb)
 
 
@@ -107,7 +112,7 @@ class TestNodeManagement:
         node1 = ng.find_or_create_node(embedding)
         # Add small noise
         rng = np.random.RandomState(123)
-        noisy = embedding + rng.randn(384) * 0.01
+        noisy = embedding + rng.randn(768) * 0.01
         noisy = noisy / np.linalg.norm(noisy)
         node2 = ng.find_or_create_node(noisy)
         assert node1.node_id == node2.node_id
@@ -123,7 +128,7 @@ class TestNodeManagement:
         embeddings = []
         for i in range(4):
             rng = np.random.RandomState(i * 100)
-            emb = rng.randn(384)
+            emb = rng.randn(768)
             emb = emb / np.linalg.norm(emb)
             embeddings.append(emb)
 
@@ -275,7 +280,7 @@ class TestNovelty:
         ng.find_or_create_node(embedding)
         # Add moderate noise
         rng = np.random.RandomState(777)
-        noisy = embedding + rng.randn(384) * 0.3
+        noisy = embedding + rng.randn(768) * 0.3
         noisy = noisy / np.linalg.norm(noisy)
         novelty = ng.detect_novelty(noisy)
         assert 0.0 < novelty < 1.0
@@ -426,7 +431,7 @@ class TestPersistence:
             # Node should have its embedding
             node = list(ng2.nodes.values())[0]
             assert node.embedding is not None
-            assert node.embedding.shape == (384,)
+            assert node.embedding.shape == (768,)
         finally:
             _cleanup(filepath)
 
@@ -445,7 +450,7 @@ class TestPersistence:
 
             # Slightly noisy version of same embedding
             rng = np.random.RandomState(123)
-            noisy = embedding + rng.randn(384) * 0.01
+            noisy = embedding + rng.randn(768) * 0.01
             noisy = noisy / np.linalg.norm(noisy)
 
             # Should snap to existing node, not create new
@@ -906,15 +911,18 @@ class TestEdgeCases:
 
     def test_zero_vector(self, ng):
         """Zero vector should be handled gracefully."""
-        zero = np.zeros(384)
+        zero = np.zeros(768)
         node = ng.find_or_create_node(zero)
         assert node is not None
 
     def test_single_dim_embedding(self, ng):
-        """Very short embedding should work."""
+        """A very short embedding works on a substrate of that dimension, and is refused loudly on a 768-d one (#1097)."""
+        from ng_lite import EmbeddingDimensionError
         short = np.array([1.0])
-        node = ng.find_or_create_node(short)
-        assert node is not None
+        tiny = NGLite(module_id="tiny", config={"embedding_dim": 1, "receptor_layer_enabled": False})
+        assert tiny.find_or_create_node(short) is not None
+        with pytest.raises(EmbeddingDimensionError):
+            ng.find_or_create_node(short)
 
     def test_concurrent_targets_same_node(self, ng, embedding):
         """Same pattern mapping to many different targets."""
