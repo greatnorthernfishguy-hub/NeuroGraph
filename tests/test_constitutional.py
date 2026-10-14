@@ -7,6 +7,10 @@ semantic space. Synapses are frozen, nodes survive pruning, and the
 bucket comes up empty.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: persistence tests follow msgpack-only saves
+#   What: the old-state test reads the msgpack save, strips the field and feeds it back as a legacy JSON state
+#   (migrated once on load); cleanup removes the .json / .msgpack / .legacy-json trio.
+#   Why: Josh 2026-10-13: saves are msgpack, never JSON.
 # [2026-03-19] Claude Code (Opus 4.6) — Initial test suite
 # What: Tests for constitutional node seeding, frozen learning,
 #   empty recommendations, pruning immunity, and persistence.
@@ -26,6 +30,14 @@ import numpy as np
 import pytest
 
 from ng_lite import NGLite, NGLiteNode
+import msgpack
+
+
+def _cleanup(filepath):
+    bin_path, legacy = NGLite.state_paths(filepath)
+    for p in (filepath, bin_path, legacy, (legacy or "") + ".legacy-json", bin_path + ".legacy-json"):
+        if p and os.path.exists(p):
+            os.unlink(p)
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +266,7 @@ class TestConstitutionalPersistence:
             assert len(constitutional_nodes) == 1
             assert constitutional_nodes[0].metadata["constitutional_description"] == "must persist"
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_load_old_state_without_constitutional_field(self):
         """State files from before constitutional support load cleanly."""
@@ -271,11 +283,13 @@ class TestConstitutionalPersistence:
         try:
             ng.save(filepath)
 
-            # Manually strip constitutional field to simulate old state
-            with open(filepath) as f:
-                state = json.load(f)
+            # Manually strip constitutional field to simulate an old (legacy JSON) state
+            bin_path = NGLite.state_paths(filepath)[0]
+            with open(bin_path, "rb") as f:
+                state = msgpack.unpackb(f.read(), raw=False)
             for node_data in state["nodes"].values():
                 node_data.pop("constitutional", None)
+            os.unlink(bin_path)
             with open(filepath, "w") as f:
                 json.dump(state, f)
 
@@ -284,7 +298,7 @@ class TestConstitutionalPersistence:
             ng2.load(filepath)
             assert all(not n.constitutional for n in ng2.nodes.values())
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_new_constitutional_embeddings_seeded_after_load(self):
         """New rim constraints added to config after save get seeded on load."""
@@ -312,7 +326,7 @@ class TestConstitutionalPersistence:
             constitutional_nodes = [n for n in ng2.nodes.values() if n.constitutional]
             assert len(constitutional_nodes) == 2
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
 
 # ---------------------------------------------------------------------------

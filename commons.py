@@ -13,8 +13,9 @@ The Commons — shared substrate medium for peer-module communication.
 #         hold the state (with it, bucket_recent returned 0 rows and every eviction / the autonomic drop was a
 #         silent no-op); saves are msgpack, never JSON.
 #   How:  list_synapses(target_prefix=..., with_metadata=False) for the scans, sort by last_updated (stable, as
-#         before), remove_synapses for the window / drop; bucket_recent fetches metadata / the node embedding only
-#         for the rows it returns. Each read is a snapshot (also closes #1093's iterate-while-mutated window).
+#         before), remove_synapses for the window / drop; bucket_recent asks for the newest rows only
+#         (newest_first + limit, widening the window when dedup / suppression needs more) and fetches metadata / the
+#         node embedding only for the rows it returns. Each read is a snapshot (also closes #1093's iterate-while-mutated window).
 #   #368 note: the suppression map still is not persisted; when it is, it goes INTO this one msgpack artifact.
 # [2026-07-21] Claude Code (Sonnet 5) — #80 wire → Commons: _evict_old_wire() lifecycle carve-out
 #   What: New _WIRE_KEEP_PER_DIR env-configurable window (LAW 5) + _evict_old_wire(), mirroring
@@ -347,11 +348,19 @@ class Commons:
         seen: set = set()
         out: List[Tuple] = []
         want_meta = with_metadata or with_embedding   # embedding mode is always metadata-bearing
-        # #1096: a snapshot through NGLite's public read (no metadata on the scan — fetched below only for the
-        # rows returned). Only synapses newer than the watermark; newest first, stable for ties (same order the
-        # old sorted(self._ng.synapses.values()) + break-at-watermark loop produced).
-        syns = self._ng.list_synapses(since=since, with_metadata=False)
-        syns.sort(key=lambda s: s.last_updated, reverse=True)
+        # #1096: a snapshot through NGLite's public read — only synapses newer than the watermark, newest first,
+        # stable for ties (the same order the old sorted(self._ng.synapses.values()) + break-at-watermark loop
+        # produced), no metadata on the scan (fetched below only for the rows returned). Only the newest `want`
+        # rows are built; dedup / suppression can need more, so the window widens until `limit` rows are found
+        # or the scan is exhausted.
+        want = max(4 * max(int(limit), 1), 64)
+        while True:
+            syns = self._ng.list_synapses(since=since, with_metadata=False, newest_first=True, limit=want)
+            exhausted = len(syns) < want
+            n_unique = len({s.target_id for s in syns if s.target_id and s.target_id not in self._suppressed})
+            if exhausted or n_unique >= limit:
+                break
+            want *= 4
         node_emb: Dict[str, Any] = {}
         for syn in syns:
             ts = syn.last_updated

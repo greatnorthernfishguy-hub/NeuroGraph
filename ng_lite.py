@@ -1565,11 +1565,17 @@ class NGLite:
             return self._core.counts()[1]
         return len(self.synapses)
 
+    # Row -> dataclass without running the generated __init__ (a few µs per row; list_* builds thousands).
+    _NODE_ROW_FIELDS = ("node_id", "embedding_hash", "activation_count", "last_activation", "metadata",
+                        "embedding", "constitutional")
+    _SYN_ROW_FIELDS = ("source_id", "target_id", "weight", "activation_count", "success_count", "failure_count",
+                       "last_updated", "metadata", "welford_count", "welford_mean", "welford_m2")
+
     @staticmethod
     def _node_from_row(row: Tuple) -> NGLiteNode:
-        _key, node_id, emb_hash, act, last, md, emb, const = row
-        return NGLiteNode(node_id=node_id, embedding_hash=emb_hash, activation_count=act,
-                          last_activation=last, metadata=md, embedding=emb, constitutional=const)
+        n = object.__new__(NGLiteNode)
+        n.__dict__.update(zip(NGLite._NODE_ROW_FIELDS, row[1:]))
+        return n
 
     @staticmethod
     def _copy_node(n: NGLiteNode, with_embedding: bool) -> NGLiteNode:
@@ -1596,10 +1602,12 @@ class NGLite:
 
     @staticmethod
     def _synapse_from_row(row: Tuple) -> NGLiteSynapse:
-        src, tgt, w, act, sc, fc, last, md, wc, wm, wm2 = row
-        return NGLiteSynapse(source_id=src, target_id=tgt, weight=w, activation_count=act, success_count=sc,
-                             failure_count=fc, last_updated=last, metadata=md if md is not None else {},
-                             welford_count=wc, welford_mean=wm, welford_m2=wm2)
+        s = object.__new__(NGLiteSynapse)
+        d = s.__dict__
+        d.update(zip(NGLite._SYN_ROW_FIELDS, row))
+        if d["metadata"] is None:
+            d["metadata"] = {}
+        return s
 
     @staticmethod
     def _copy_synapse(s: NGLiteSynapse, with_metadata: bool) -> NGLiteSynapse:
@@ -1616,6 +1624,8 @@ class NGLite:
         target_prefix: Optional[str] = None,
         since: Optional[float] = None,
         with_metadata: bool = True,
+        newest_first: bool = False,
+        limit: Optional[int] = None,
     ) -> List[NGLiteSynapse]:
         """Synapses in storage (insertion) order, optionally filtered (filters AND together).
 
@@ -1625,11 +1635,13 @@ class NGLite:
             target_prefix: only targets starting with this string (e.g. ``"metrics:elmer:cpu:"``).
             since: only synapses with ``last_updated > since``.
             with_metadata: False -> ``metadata`` is ``{}`` (cheap scans; ``get_synapse`` the rows you keep).
+            newest_first: sort by ``last_updated`` descending (stable: ties keep storage order).
+            limit: keep only the first ``limit`` rows (after the sort) — only those are copied out.
         """
         if self._core is not None:
             return [self._synapse_from_row(r) for r in self._core.list_synapses(
-                source_id, target_id, target_prefix, since, with_metadata)]
-        out = []
+                source_id, target_id, target_prefix, since, with_metadata, newest_first, limit)]
+        sel = []
         for s in list(self.synapses.values()):
             if source_id is not None and s.source_id != source_id:
                 continue
@@ -1639,8 +1651,12 @@ class NGLite:
                 continue
             if since is not None and not s.last_updated > since:
                 continue
-            out.append(self._copy_synapse(s, with_metadata))
-        return out
+            sel.append(s)
+        if newest_first:
+            sel.sort(key=lambda s: s.last_updated, reverse=True)
+        if limit is not None:
+            sel = sel[:max(int(limit), 0)]
+        return [self._copy_synapse(s, with_metadata) for s in sel]
 
     def get_synapse(self, source_id: str, target_id: str) -> Optional[NGLiteSynapse]:
         """The synapse (source_id -> target_id), with metadata, or None."""

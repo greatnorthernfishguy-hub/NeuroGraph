@@ -140,3 +140,19 @@ def test_bucket_is_read_only_on_rust(core):
         assert c._ng.node_count() == n0  # quirk fix (c): a query writes nothing
     else:
         assert c._ng.node_count() >= n0  # the Python core still creates nodes on a query (unchanged)
+
+
+def test_bucket_recent_widens_past_duplicates_and_suppressed(core):
+    """bucket_recent asks NG-Lite for the newest rows only; dedup + suppression must still yield `limit` rows."""
+    c = _new(core)
+    for i in range(5):
+        c.deposit(_emb(600 + i), f"experience:old{i}")
+    for i in range(300):  # 300 re-deposits of ONE target from distinct nodes -> 300 synapses, 1 unique target
+        c.deposit(_emb(700 + i), "experience:hot")
+    for i in range(3):
+        c.deposit(_emb(1100 + i), f"experience:mid{i}")
+    c.suppress("experience:mid2")
+    rows = [r[0] for r in c.bucket_recent(limit=6)]
+    assert rows == ["experience:mid1", "experience:mid0", "experience:hot",
+                    "experience:old4", "experience:old3", "experience:old2"]
+    assert [r[0] for r in c.bucket_recent(limit=50)][-1] == "experience:old0"  # exhausted scan
