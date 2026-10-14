@@ -270,7 +270,20 @@ could never fire either; it now reads the forest result.
 | Elmer e2e on copies | PASS (§7.2) |
 
 Suites vs bases (one isolated pytest per file, Python core; base = dim-guard `6a8c8e7` with the `a2673f6` wheel,
-branch = this branch with the new wheel): PENDING_SUITES
+branch = this branch with the new wheel; failing ids compared file by file, `~/.cache/mean-centre/suite/`):
+
+| suite | base | branch | new failures |
+|---|---|---|---|
+| NeuroGraph, 42 files touching NG-Lite / Commons / vector store / ng_embed / ecosystem / topology merge (+ `test_mean_centre.py`) | 24 failing ids (bind_atomic 2, drain_pacing_seam 4 errors, dual_pass 6, merge_whole_graph 1, refeed 1, topology_callosum 1, topology_capture 4, ingestor 2, ng_lite 2 bridge) | the **same 24 ids**; `test_mean_centre` 18 passed | **0** |
+| daemon (`trial-s4a` scripts/tests, 21 files, `CC_NG_PYTHONPATH` = base / branch) | 75 failing ids in 9 files | the **same 75 ids** | **0** |
+| Elmer (`tests/`, `NEUROGRAPH_CANONICAL_PATH` = trial / NG branch) | `test_hook::test_start_stop` (flaky race with the eager-start thread: fails 2/2 in isolation on the base too) | same id; +4 new (`test_identity_768.py`) pass | **0** |
+| ng-tract-rs `cargo test --lib` | 67 passed | 69 passed | **0** |
+| ng-tract-rs `tests/test_ng_lite_core.py` | — (see table above) | 32 passed | **0** |
+
+No `EmbeddingSpaceError` / `EmbeddingDimensionError` and no threshold-reset WARNING in any branch suite log.
+Note for running Elmer's suite: `elmer_hook` runs `ng_updater.auto_update()`, which copies `ng_lite.py` /
+`ng_ecosystem.py` from `NEUROGRAPH_CANONICAL_PATH` (default `~/NeuroGraph`) **into the checkout under test** — set
+it to the matching NG root, or the run silently tests (and leaves behind) the live primary's files.
 
 ## 10. Install (Executive; ONE restart, combined with atomic-saves + dim-guard; rim never absent)
 
@@ -316,7 +329,7 @@ as the guard. Nothing here is safe to land alone.
 
 | repo | commits (oldest → newest) |
 |---|---|
-| NeuroGraph | `d601be5` ng_embed centre (VENDORED) · `1cd876d` ng_lite (VENDORED) · `f7428a0` NG rim data · `da335a1` tests · `xxxx` tonic_engine docstring · `xxxx` test fix · `xxxx` ng_lite centred-row cache (VENDORED) · this doc |
+| NeuroGraph | `d601be5` ng_embed centre (VENDORED) · `1cd876d` ng_lite (VENDORED) · `f7428a0` NG rim data · `da335a1` tests · `2fe8be5` tonic_engine docstring · `d6159da` test fix · `87be505` ng_lite centred-row cache (VENDORED) · `b525ce1` + final: this doc |
 | ng-tract-rs | `6881c55` NGLiteCore centring + tests · `f9a2c79` test follows the dim guard |
 | Elmer | `9c8739d` re-vendor ng_lite + ng_embed (VENDORED) · `5dc855b` rim data (PROTECTED) · `8366903` identity 768 / #1110 / Cricket check / loud rim |
 
