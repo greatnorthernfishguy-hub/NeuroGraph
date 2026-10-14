@@ -245,7 +245,8 @@ Back up both states while the daemon is stopped or between saves:
    `git -C ~/NeuroGraph-worktrees/trial-s4-20261002 fetch && git -C ~/NeuroGraph-worktrees/trial-s4-20261002 merge --ff-only origin/cc-laptop-nglite-rustcore-20261013`
    (or check the branch out there).
 2. **Elmer code (the laptop re-vendor).** `~/Elmer` is on `cc-revendor-ng-20260921` @ `13dde60`:
-   `git -C ~/Elmer fetch && git -C ~/Elmer merge --ff-only origin/cc-laptop-nglite-rustcore-20261013`
+   `git -C ~/Elmer fetch origin cc-laptop-nglite-rustcore-20261013 && git -C ~/Elmer merge --ff-only FETCH_HEAD`
+   (Elmer's remote fetches only `main` by refspec, so name the branch; tip `cae7288`).
    - **TRAP, decide before restarting.** `elmer_hook.py:160` runs `ng_updater.auto_update()` on import: a
      `git pull --ff-only` in `~/Elmer`, plus copying `ng_lite.py`, `ng_ecosystem.py`, `ng_autonomic.py`,
      `openclaw_adapter.py` and `ng_updater.py` from the canonical source over any copy that differs.
