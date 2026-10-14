@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: the correct-dim rim test uses on-manifold vectors
+# What: test_correct_rim_seeds builds its 768-d rim around ng_embed's centre (random isotropic 768-d vectors are now
+#   refused as another embedding space, by design — test_mean_centre.py covers that).
+# Why/How: #1107 embedding-space check on the rim; one helper.
 # [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: the dimension guard, on both NG-Lite cores
 # What: Proves that a wrong embedding dimension fails LOUD (EmbeddingDimensionError / VectorDimensionError,
 #   naming the file and both dimensions, logged at ERROR once) everywhere NG-Lite and SimpleVectorDB take
@@ -49,6 +53,16 @@ def _emb(seed, dim=768):
 
 def _rim(dim, n=3):
     return [{"category": f"cat{i}", "description": f"rim {i}", "embedding": _emb(100 + i, dim).tolist()}
+            for i in range(n)]
+
+
+def _snow_rim(n=3):
+    """A 768-d rim on the model's manifold (ng_embed's centre + a spread), for the correct-dim case (#1107)."""
+    import ng_embed
+    mu = np.asarray(ng_embed.embedding_centre(), np.float32)
+    rs = np.random.RandomState(7)
+    return [{"category": f"cat{i}", "description": f"rim {i}",
+             "embedding": (mu + rs.randn(768).astype(np.float32) * np.float32(0.6 / np.sqrt(768))).tolist()}
             for i in range(n)]
 
 
@@ -112,7 +126,7 @@ def test_wrong_dim_rim_refused_at_construction(core, caplog):
 
 
 def test_correct_rim_seeds(core):
-    ng = _ng(core, constitutional_embeddings=_rim(768))
+    ng = _ng(core, constitutional_embeddings=_snow_rim())
     assert ng.node_count() == 3
 
 
