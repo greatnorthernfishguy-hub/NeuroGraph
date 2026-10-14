@@ -3,6 +3,8 @@ CC Commons persistence (#84) — the medium survives a process restart, and stay
 off Syl's.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-07-28] Claude Code (DudeMan CC, Opus 5) — #84 CC Commons persist/restore
 # What: Covers cc_commons_checkpoint_path()/persist_cc_commons() and the restore that
 #       now happens inside get_cc_commons(). Four properties: (1) the path is under CC's
@@ -42,7 +44,7 @@ def _emb(seed, dim=768):
 
 
 def _count(commons, prefix):
-    return sum(1 for s in commons._ng.synapses.values()
+    return sum(1 for s in commons._ng.list_synapses()
                if getattr(s, "target_id", "").startswith(prefix))
 
 

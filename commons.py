@@ -2,6 +2,20 @@
 The Commons — shared substrate medium for peer-module communication.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096 / #1098: public NG-Lite reads; msgpack saves
+#   What: Every read / write of the medium's internals now goes through NGLite's public methods:
+#         _evict_old_metrics / _evict_old_errors / _evict_old_wire (one shared _evict_to_recent_window),
+#         bucket_recent, arousal and _drop_autonomic_synapses use list_synapses / get_synapse / get_node /
+#         remove_synapses instead of self._ng.synapses / self._ng.nodes. Same rows, same order, same evictions.
+#         persist() now writes real msgpack (it wrote JSON into commons.msgpack, #1098): NGLite.save is msgpack
+#         only, and restore() converts the old JSON-in-.msgpack file once (kept as commons.msgpack.legacy-json).
+#   Why:  Josh 2026-10-13 rulings on #1096 — consumers stop reading NGLite internals so the Rust NGLiteCore can
+#         hold the state (with it, bucket_recent returned 0 rows and every eviction / the autonomic drop was a
+#         silent no-op); saves are msgpack, never JSON.
+#   How:  list_synapses(target_prefix=..., with_metadata=False) for the scans, sort by last_updated (stable, as
+#         before), remove_synapses for the window / drop; bucket_recent fetches metadata / the node embedding only
+#         for the rows it returns. Each read is a snapshot (also closes #1093's iterate-while-mutated window).
+#   #368 note: the suppression map still is not persisted; when it is, it goes INTO this one msgpack artifact.
 # [2026-07-21] Claude Code (Sonnet 5) — #80 wire → Commons: _evict_old_wire() lifecycle carve-out
 #   What: New _WIRE_KEEP_PER_DIR env-configurable window (LAW 5) + _evict_old_wire(), mirroring
 #         _evict_old_metrics/_evict_old_errors's shape and recency logic. deposit() gets a new
@@ -200,25 +214,15 @@ class Commons:
         experience/topology for the weight-based max_synapses bound. Housekeeping keyed on the
         target_id namespace only; NOT a classification of the wire content (LAW 7 untouched).
         """
-        try:
-            parts = target_id.split(":")
-            # wire:tid.http.{dir}:{sha256hash} has only 3 ':'-parts total (unlike
-            # metrics:<source>:<kind>:<extra> / error:<module>:<ExcType>:<extra>, which have 4
-            # and window on the first 3). The group key here is the first 2 parts — the hash
-            # itself is per-deposit entropy, not part of the wire:tid.http.{dir} namespace.
-            if len(parts) < 2:
-                return
-            prefix = ":".join(parts[:2]) + ":"          # wire:tid.http.{dir}:
-            syns = self._ng.synapses
-            keys = [k for k, s in syns.items()
-                    if getattr(s, "target_id", "").startswith(prefix)]
-            if len(keys) <= _WIRE_KEEP_PER_DIR:
-                return
-            keys.sort(key=lambda k: getattr(syns[k], "last_updated", 0.0), reverse=True)
-            for k in keys[_WIRE_KEEP_PER_DIR:]:
-                del syns[k]
-        except Exception as exc:  # noqa: BLE001 — retention failure never breaks a deposit
-            logger.debug("wire eviction failed for %s: %s", target_id, exc)
+        parts = target_id.split(":")
+        # wire:tid.http.{dir}:{sha256hash} has only 3 ':'-parts total (unlike
+        # metrics:<source>:<kind>:<extra> / error:<module>:<ExcType>:<extra>, which have 4
+        # and window on the first 3). The group key here is the first 2 parts — the hash
+        # itself is per-deposit entropy, not part of the wire:tid.http.{dir} namespace.
+        if len(parts) < 2:
+            return
+        prefix = ":".join(parts[:2]) + ":"          # wire:tid.http.{dir}:
+        self._evict_to_recent_window(prefix, _WIRE_KEEP_PER_DIR, "wire", target_id)
 
     def _evict_old_errors(self, target_id: str) -> None:
         """Keep only the most-recent _ERRORS_KEEP_PER_KIND synapses for this error module:type.
@@ -227,21 +231,11 @@ class Commons:
         deposits are time-series telemetry, not memory — recency-windowed so a noisy module's
         exceptions never compete with experience/topology for the weight-based max_synapses bound.
         """
-        try:
-            parts = target_id.split(":")
-            if len(parts) < 3:
-                return
-            prefix = ":".join(parts[:3]) + ":"          # error:<module_id>:<ExcType>:
-            syns = self._ng.synapses
-            keys = [k for k, s in syns.items()
-                    if getattr(s, "target_id", "").startswith(prefix)]
-            if len(keys) <= _ERRORS_KEEP_PER_KIND:
-                return
-            keys.sort(key=lambda k: getattr(syns[k], "last_updated", 0.0), reverse=True)
-            for k in keys[_ERRORS_KEEP_PER_KIND:]:
-                del syns[k]
-        except Exception as exc:  # noqa: BLE001 — retention failure never breaks a deposit
-            logger.debug("error eviction failed for %s: %s", target_id, exc)
+        parts = target_id.split(":")
+        if len(parts) < 3:
+            return
+        prefix = ":".join(parts[:3]) + ":"          # error:<module_id>:<ExcType>:
+        self._evict_to_recent_window(prefix, _ERRORS_KEEP_PER_KIND, "error", target_id)
 
     def _evict_old_metrics(self, target_id: str) -> None:
         """Keep only the most-recent _METRICS_KEEP_PER_KIND synapses for this metric source:kind.
@@ -249,22 +243,27 @@ class Commons:
         Recency-windowed (by last_updated), bounded per source:kind, touching ONLY the
         metrics:<source>:<kind>: namespace — experience/topology synapses are never considered.
         """
+        parts = target_id.split(":")
+        if len(parts) < 3:
+            return
+        prefix = ":".join(parts[:3]) + ":"          # metrics:<source>:<kind>:
+        self._evict_to_recent_window(prefix, _METRICS_KEEP_PER_KIND, "metric", target_id)
+
+    def _evict_to_recent_window(self, prefix: str, keep: int, kind: str, target_id: str) -> None:
+        """Keep only the `keep` most-recent (by last_updated) synapses whose target starts with `prefix`.
+
+        The shared body of the metric / error / wire windows. Reads through NGLite's public list_synapses (a
+        snapshot, storage order), sorts newest first (stable, so ties keep storage order exactly as before), and
+        removes the rest with remove_synapses. A failure never breaks the deposit.
+        """
         try:
-            parts = target_id.split(":")
-            if len(parts) < 3:
+            syns = self._ng.list_synapses(target_prefix=prefix, with_metadata=False)
+            if len(syns) <= keep:
                 return
-            prefix = ":".join(parts[:3]) + ":"          # metrics:<source>:<kind>:
-            syns = self._ng.synapses
-            keys = [k for k, s in syns.items()
-                    if getattr(s, "target_id", "").startswith(prefix)]
-            if len(keys) <= _METRICS_KEEP_PER_KIND:
-                return
-            # newest first; delete everything past the keep window
-            keys.sort(key=lambda k: getattr(syns[k], "last_updated", 0.0), reverse=True)
-            for k in keys[_METRICS_KEEP_PER_KIND:]:
-                del syns[k]
+            syns.sort(key=lambda s: s.last_updated, reverse=True)
+            self._ng.remove_synapses([(s.source_id, s.target_id) for s in syns[keep:]])
         except Exception as exc:  # noqa: BLE001 — retention failure never breaks a deposit
-            logger.debug("metric eviction failed for %s: %s", target_id, exc)
+            logger.debug("%s eviction failed for %s: %s", kind, target_id, exc)
 
     # ---- Verb 2: bucket --------------------------------------------------
     def bucket(
@@ -348,16 +347,15 @@ class Commons:
         seen: set = set()
         out: List[Tuple] = []
         want_meta = with_metadata or with_embedding   # embedding mode is always metadata-bearing
-        # synapse.source_id is NGLiteNode.node_id, but self._ng.nodes is keyed by embedding_hash —
-        # build a node_id→node map once (only when needed). The Commons is bounded (≤max_nodes), so
-        # this O(n) reverse index is cheap and avoids a per-synapse scan.
-        id_to_node = ({n.node_id: n for n in self._ng.nodes.values()} if with_embedding else {})
-        for syn in sorted(self._ng.synapses.values(),
-                          key=lambda s: getattr(s, "last_updated", 0.0), reverse=True):
-            ts = getattr(syn, "last_updated", 0.0)
-            if ts <= since:
-                break  # sorted desc — everything past here is older than the watermark
-            tid = getattr(syn, "target_id", None)
+        # #1096: a snapshot through NGLite's public read (no metadata on the scan — fetched below only for the
+        # rows returned). Only synapses newer than the watermark; newest first, stable for ties (same order the
+        # old sorted(self._ng.synapses.values()) + break-at-watermark loop produced).
+        syns = self._ng.list_synapses(since=since, with_metadata=False)
+        syns.sort(key=lambda s: s.last_updated, reverse=True)
+        node_emb: Dict[str, Any] = {}
+        for syn in syns:
+            ts = syn.last_updated
+            tid = syn.target_id
             if not tid or tid in seen:
                 continue
             if tid in self._suppressed:
@@ -365,14 +363,17 @@ class Commons:
                 #          everywhere) and soft ("don't bring it up unprompted"). This path previously
                 #          bypassed the extraction boundary entirely (rim AND suppression) — a latent hole.
             seen.add(tid)
-            row: Tuple = (tid, getattr(syn, "weight", 0.0), f"recency@{ts:.3f}")
+            row: Tuple = (tid, syn.weight, f"recency@{ts:.3f}")
             if want_meta:
-                meta = getattr(syn, "metadata", {}).get("last_context", {})
+                full = self._ng.get_synapse(syn.source_id, tid)
+                meta = (full.metadata if full is not None else {}).get("last_context", {})
                 row = row + (meta,)
             if with_embedding:
-                node = id_to_node.get(getattr(syn, "source_id", ""))
-                emb = getattr(node, "embedding", None) if node is not None else None
-                row = row + (emb,)
+                # the deposit's ORIGINAL embedding lives on its pattern node (synapse.source_id = node_id)
+                if syn.source_id not in node_emb:
+                    node = self._ng.get_node(syn.source_id)
+                    node_emb[syn.source_id] = node.embedding if node is not None else None
+                row = row + (node_emb[syn.source_id],)
             out.append(row)
             if len(out) >= limit:
                 break
@@ -399,10 +400,9 @@ class Commons:
         try:
             latest = None
             latest_ts = -1.0
-            for syn in list(self._ng.synapses.values()):   # snapshot before iterate (#341)
-                if getattr(syn, "target_id", "") != "autonomic:arousal":
-                    continue
-                ts = getattr(syn, "last_updated", 0.0)
+            # snapshot via NGLite's public read (#341, #1096)
+            for syn in self._ng.list_synapses(target_id="autonomic:arousal"):
+                ts = syn.last_updated
                 if ts >= latest_ts:
                     latest_ts = ts
                     latest = syn
@@ -462,7 +462,7 @@ class Commons:
 
     # ---- Persistence hooks (#332: wired into neurograph_rpc.py auto-save + bootstrap) ----
     def persist(self, filepath: str) -> None:
-        """Write the Commons medium to disk (full-herd-death recovery, Tier 2)."""
+        """Write the Commons medium to disk as msgpack (full-herd-death recovery, Tier 2; #1098)."""
         self._ng.save(filepath)
 
     def restore(self, filepath: str) -> None:
@@ -481,11 +481,9 @@ class Commons:
     def _drop_autonomic_synapses(self) -> None:
         """Remove restored autonomic:* synapses so arousal fresh-assesses post-restore (#328)."""
         try:
-            syns = self._ng.synapses
-            keys = [k for k, s in syns.items()
-                    if getattr(s, "target_id", "").startswith("autonomic:")]
-            for k in keys:
-                del syns[k]
+            keys = [(s.source_id, s.target_id)
+                    for s in self._ng.list_synapses(target_prefix="autonomic:", with_metadata=False)]
+            self._ng.remove_synapses(keys)
             if keys:
                 logger.info(
                     "Commons restore: dropped %d autonomic:* synapse(s) — fresh-assess on restart (#328)",

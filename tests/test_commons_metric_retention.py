@@ -2,6 +2,8 @@
 Commons metric-stream retention (#320) — metrics windowed by recency, experience untouched.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-06-14] Claude Code (Fable 5) — metric retention (anti-OOM, Josh)
 # What: Proves Commons._evict_old_metrics: the metrics:<source>:<kind> namespace is capped to
 #       _METRICS_KEEP_PER_KIND most-recent synapses (by recency); experience/topology synapses are
@@ -28,7 +30,7 @@ def _emb(seed, dim=768):
 
 
 def _count(commons, prefix):
-    return sum(1 for s in commons._ng.synapses.values()
+    return sum(1 for s in commons._ng.list_synapses()
                if getattr(s, "target_id", "").startswith(prefix))
 
 
@@ -49,7 +51,7 @@ def test_recency_keeps_newest():
     for i in range(keep + 10):
         commons.deposit(_emb(i), f"metrics:neurograph:anomaly:h{i}:{2000.0+i}:{i}",
                         metadata={"kind": "metrics"})
-    kept = [s.target_id for s in commons._ng.synapses.values()
+    kept = [s.target_id for s in commons._ng.list_synapses()
             if getattr(s, "target_id", "").startswith("metrics:neurograph:anomaly:")]
     # the oldest 10 (i=0..9) must be gone; the newest must remain
     assert all(f":{i}" != t.rsplit(":", 1)[-1] for t in kept for i in range(10)) or True  # structural

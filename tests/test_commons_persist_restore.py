@@ -2,6 +2,8 @@
 Commons persist/restore lifecycle (#332) — round-trip survives restart; arousal fresh-assesses.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-07-05] Claude Code (Sonnet 5) — #332 persist/restore wired into neurograph_rpc.py
 # What: Proves Commons.persist()/restore() round-trip experience/topology/metrics/repair
 #       synapses through disk, and that restore() drops autonomic:* synapses so arousal
@@ -33,7 +35,7 @@ def _emb(seed, dim=768):
 
 
 def _count(commons, prefix):
-    return sum(1 for s in commons._ng.synapses.values()
+    return sum(1 for s in commons._ng.list_synapses()
                if getattr(s, "target_id", "").startswith(prefix))
 
 

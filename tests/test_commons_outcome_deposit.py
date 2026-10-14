@@ -2,6 +2,8 @@
 Commons Track-2 — outcome-throttle retirement (the LAST of the three NG _deposit_*_to_river throttles).
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-06-24] Claude Code (Opus 4.8) — retire _deposit_outcome_to_river throttle
 # What: Proves _deposit_outcome_to_river deposits a raw outcome (precomputed embedding + target_id +
 #       success + metadata) into a sandbox Commons as a single deposit, fail-soft. Mirrors the
@@ -43,7 +45,7 @@ def _drive(embedding, target_id, success=True, metadata=None):
 
 
 def _outcome_synapses(commons, target_id):
-    return [s for s in commons._ng.synapses.values() if getattr(s, "target_id", "") == target_id]
+    return [s for s in commons._ng.list_synapses() if getattr(s, "target_id", "") == target_id]
 
 
 def test_outcome_deposits_to_commons():

@@ -4,6 +4,15 @@ Tests for NG-Lite — Lightweight NeuroGraph Learning Substrate.
 Covers: node management, synapse learning, novelty detection,
 persistence, bridge interface, capacity limits, stats, and
 NGSaaSBridge integration.
+
+# ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: persistence tests follow msgpack-only saves
+# What: TestPersistence reads the saved state as msgpack (the file save() returns), the JSON-validity test is now a
+#   msgpack-validity test, the legacy-node test feeds a legacy JSON state (migrated once on load), and cleanup
+#   removes the .json / .msgpack / .legacy-json trio.
+# Why: Josh 2026-10-13: saves are msgpack, never JSON; a legacy JSON state is converted once on load.
+# How: _cleanup() + msgpack.unpackb; the assertions about the state's content are unchanged.
+# -------------------
 """
 
 import json
@@ -23,6 +32,20 @@ from ng_lite import (
     __version__,
 )
 from ng_bridge import NGSaaSBridge
+import msgpack
+
+
+def _cleanup(filepath):
+    """Remove a test state in every form it can take (x.json, x.msgpack, x.json.legacy-json)."""
+    bin_path, legacy = NGLite.state_paths(filepath)
+    for p in (filepath, bin_path, legacy, (legacy or "") + ".legacy-json", bin_path + ".legacy-json"):
+        if p and os.path.exists(p):
+            os.unlink(p)
+
+
+def _read_saved(filepath):
+    with open(NGLite.state_paths(filepath)[0], "rb") as f:
+        return msgpack.unpackb(f.read(), raw=False)
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +307,7 @@ class TestPersistence:
             assert ng2._total_successes == ng._total_successes
             assert ng2.module_id == ng.module_id
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_saved_weights_preserved(self, ng, embedding):
         for _ in range(20):
@@ -303,24 +326,26 @@ class TestPersistence:
                 assert key in ng2.synapses
                 assert abs(ng.synapses[key].weight - ng2.synapses[key].weight) < 1e-10
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
-    def test_save_file_is_valid_json(self, ng, embedding):
+    def test_save_file_is_msgpack(self, ng, embedding):
         ng.record_outcome(embedding, "test", success=True)
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             filepath = f.name
 
         try:
-            ng.save(filepath)
-            with open(filepath) as f:
-                data = json.load(f)
+            written = ng.save(filepath)
+            assert written == filepath[: -len(".json")] + ".msgpack"
+            with open(written, "rb") as f:
+                assert f.read(1) != b"{"  # not JSON (Josh 2026-10-13: saves are msgpack, never JSON)
+            data = _read_saved(filepath)
             assert "version" in data
             assert "nodes" in data
             assert "synapses" in data
             assert data["module_id"] == "test_module"
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_synapse_key_serialization(self, ng, embedding):
         """Synapse tuple keys serialize as pipe-delimited strings."""
@@ -331,8 +356,7 @@ class TestPersistence:
 
         try:
             ng.save(filepath)
-            with open(filepath) as f:
-                data = json.load(f)
+            data = _read_saved(filepath)
 
             # Synapse keys should be "source|target" format
             for key in data["synapses"]:
@@ -341,7 +365,7 @@ class TestPersistence:
                 assert len(parts) == 2
                 assert parts[0].startswith("n_")
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_load_forward_compatible(self, ng):
         """Loading a state with missing new config keys should use defaults."""
@@ -365,7 +389,7 @@ class TestPersistence:
             assert ng.config["max_nodes"] == 500  # Overridden
             assert ng.config["max_synapses"] == DEFAULT_CONFIG["max_synapses"]
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_counters_preserved(self, ng, embedding):
         """Node ID counter survives save/load."""
@@ -381,7 +405,7 @@ class TestPersistence:
             ng2.load(filepath)
             assert ng2._node_id_counter == 1
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_embedding_persists_across_load(self, ng, embedding):
         """Embeddings survive save/load and rebuild the cache."""
@@ -404,7 +428,7 @@ class TestPersistence:
             assert node.embedding is not None
             assert node.embedding.shape == (384,)
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_similarity_works_after_load(self, ng, embedding):
         """After save/load, similar embeddings snap to existing nodes."""
@@ -429,7 +453,7 @@ class TestPersistence:
             assert len(ng2.nodes) == 1
             assert node.activation_count == 2  # original + this one
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_no_sprawl_after_load(self, ng, embedding):
         """Recording same outcomes after load doesn't create duplicate nodes."""
@@ -451,7 +475,7 @@ class TestPersistence:
 
             assert len(ng2.nodes) == node_count_before
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_legacy_state_loads_without_embeddings(self, ng):
         """State files from before embedding persistence load cleanly."""
@@ -487,7 +511,7 @@ class TestPersistence:
             # Cache should be empty — no embeddings to rebuild from
             assert len(ng._embedding_cache) == 0
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_similarity_backfill_on_legacy_node(self, ng, embedding):
         """Legacy nodes (no embedding) get backfilled on similarity match."""
@@ -500,11 +524,11 @@ class TestPersistence:
         try:
             ng.save(filepath)
 
-            # Manually strip embeddings to simulate legacy state
-            with open(filepath) as f:
-                state = json.load(f)
+            # Manually strip embeddings to simulate a legacy JSON state (migrated once on load)
+            state = _read_saved(filepath)
             for node_data in state["nodes"].values():
                 node_data.pop("embedding", None)
+            os.unlink(NGLite.state_paths(filepath)[0])
             with open(filepath, "w") as f:
                 json.dump(state, f)
 
@@ -519,7 +543,7 @@ class TestPersistence:
             assert node_found.node_id == node.node_id
             assert node_found.embedding is not None
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-07-05] CC (laptop) — Tool-call deposits: Commons-only, never the main substrate
 # What: Tests for _handle_post_tool_use()/_deposit_tool_experience() in cc_ng_host.py.
 # Why:  Verifies the fix for CC's own "[NeuroGraph Surfaced Knowledge]" hook context
@@ -32,7 +34,7 @@ def _commons_has_target(target_id):
     from cc_ng_organism import get_cc_commons
     commons = get_cc_commons("/tmp/cc_tool_deposit_test_workspace")
     return any(
-        syn.target_id == target_id for syn in commons._ng.synapses.values()
+        syn.target_id == target_id for syn in commons._ng.list_synapses()
     )
 
 

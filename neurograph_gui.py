@@ -30,6 +30,14 @@ Grok Review Changelog (v0.7.1):
         extension against SUPPORTED_EXTENSIONS.  PyPDF2's text extraction
         does not execute embedded content.  PDF sandboxing would require
         process isolation infrastructure beyond the scope of a desktop GUI.
+
+# ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: Elmer panel reads the msgpack NG-Lite save
+# What: the Elmer panel reads ~/.et_modules/elmer/ng_lite_state.msgpack (falling back to a not yet migrated
+#   ng_lite_state.json) via _fetch_ng_lite_state instead of json-loading the .json.
+# Why: NG-Lite saves are msgpack only (Josh 2026-10-13); the .json is retired to .json.legacy-json on first load.
+# How: msgpack.unpackb, read-only; same dict shape as before.
+# -------------------
 """
 
 from __future__ import annotations
@@ -940,7 +948,7 @@ class EcosystemPoller:
         if panel == "bunyan":
             return self._fetch_bunyan()
         if panel == "elmer":
-            return self._fetch_json(
+            return self._fetch_ng_lite_state(
                 Path.home() / ".et_modules" / "elmer" / "ng_lite_state.json"
             )
         if panel == "thc":
@@ -980,6 +988,19 @@ class EcosystemPoller:
             except json.JSONDecodeError:
                 events.append({"raw": ln})
         return {"events": events}
+
+    def _fetch_ng_lite_state(self, path: Path) -> Dict[str, Any]:
+        """An NG-Lite state for display (#1096): the msgpack save (x.msgpack for x.json), else a not yet migrated
+        legacy JSON. Read-only."""
+        bin_path = path.with_suffix(".msgpack") if path.suffix == ".json" else path
+        try:
+            import msgpack
+            with open(bin_path, "rb") as fh:
+                return msgpack.unpackb(fh.read(), raw=False, strict_map_key=False)
+        except FileNotFoundError:
+            return self._fetch_json(path)
+        except Exception as exc:
+            return {"offline": True, "reason": str(exc)}
 
     def _fetch_json(self, path: Path) -> Dict[str, Any]:
         try:

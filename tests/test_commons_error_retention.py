@@ -2,6 +2,8 @@
 Commons error-stream retention (#330) — error:* windowed by recency, mirrors metrics:* (#320).
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-07-05] Claude Code (Sonnet 5) — #330 operational-logger error:* retention
 # What: Proves Commons._evict_old_errors: the error:<module_id>:<ExcType> namespace is capped
 #       to _ERRORS_KEEP_PER_KIND most-recent synapses (by recency); experience/topology/metrics
@@ -28,7 +30,7 @@ def _emb(seed, dim=768):
 
 
 def _count(commons, prefix):
-    return sum(1 for s in commons._ng.synapses.values()
+    return sum(1 for s in commons._ng.list_synapses()
                if getattr(s, "target_id", "").startswith(prefix))
 
 

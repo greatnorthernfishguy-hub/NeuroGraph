@@ -56,6 +56,12 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: load the NG-Lite state however it is saved
+# What: _init_ng_lite() calls NGLite.load(state_path) unconditionally instead of only when the .json exists.
+# Why: NG-Lite saves are msgpack only now (Josh 2026-10-13); save("x.json") writes x.msgpack, so gating the
+#   load on x.json existing would restart every module empty after its first msgpack save. NGLite.load resolves
+#   the msgpack (or migrates a legacy x.json once) and is a no-op when there is no state.
+# How: one call site; the log line reports what load() found.
 # [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 D-3 contract-doc correction.
 #   What: dual_record_outcome docstring now describes the raise-on-failure
 #         (DualPassIncompleteError) contract instead of the obsolete forest-only
@@ -360,9 +366,9 @@ class NGEcosystem:
             ng_config = self._config.get("ng_lite", {})
             self._ng = NGLite(module_id=self.module_id, config=ng_config)
 
-            if self._state_path.exists():
-                self._ng.load(str(self._state_path))
-                logger.debug("[%s] NGLite state loaded from %s", self.module_id, self._state_path)
+            # NGLite.load resolves the msgpack save (or migrates a legacy .json once); no-op if there is no state
+            if self._ng.load(str(self._state_path)):
+                logger.debug("[%s] NGLite state loaded for %s", self.module_id, self._state_path)
 
         except Exception as exc:
             logger.error("[%s] NGLite init failed: %s", self.module_id, exc)

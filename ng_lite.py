@@ -35,14 +35,17 @@ Connectivity tiers:
     connects to SaaS and upgrades to Tier 3 — all without code changes.
     If SaaS disconnects, it falls back to Tier 2 or 1 automatically.
 
-Serialization format notes:
-    NG-Lite uses JSON for persistence. This is deliberate:
-    - JSON is stdlib (no extra dependency)
-    - NG-Lite state is small (≤1000 nodes, ≤5000 synapses)
-    - Human-readable state files aid debugging
-    - The full NeuroGraph Foundation uses msgpack for its much larger
-      graphs (10K+ nodes with spike histories, numpy arrays, etc.)
-    - Format translation happens in the bridge layer, not here.
+Serialization format notes (2026-10-13, Josh: "JSON will have NOTHING to do
+with saves, period"):
+    - Saves are msgpack only, on both cores. ``save("x.json")`` writes
+      ``x.msgpack``; any other name is written as given. The content is the
+      ``_export_state()`` dict, embeddings / prototypes as msgpack float32.
+      The Python core needs the ``msgpack`` package (no JSON fallback).
+    - ``load()`` reads that msgpack. A legacy JSON state (``x.json``, or the
+      JSON the old Python core wrote into a ``.msgpack``-named file, #1098)
+      is converted ONCE: imported, re-saved as msgpack, and the JSON kept
+      aside as ``<file>.legacy-json``.
+    - Format translation for bridges still happens in the bridge layer.
 
 Weight range notes:
     NG-Lite weights are bounded [0.0, 1.0] for simplicity.
@@ -66,6 +69,29 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: Rust core usable; public reads; msgpack saves
+# What: (1) Public read methods served by whichever core holds the state: node_count / synapse_count /
+#   list_nodes / get_node / list_synapses / get_synapse / remove_synapses / get_history / export_state.
+#   They return snapshot copies (mutating them does not touch the substrate). Consumers stop reading
+#   NGLite.nodes / NGLite.synapses / _embedding_cache / _total_outcomes directly.
+#   (2) The Rust core (ng_tract.NGLiteCore) is used only when NG_LITE_RUST_CORE is truthy (temporary
+#   rollout switch; it goes away with the Python core). Set but unavailable -> a WARNING, Python core.
+#   On the Rust path nodes / synapses are a loud stand-in (RuntimeError on use, naming the public
+#   methods) instead of the old silently-empty dicts; get_stats / export_state / sync_with_bridge /
+#   update_tunable / config / module_id read the core; find_or_create_node returns a fresh node (no
+#   stale stub cached by hash); no double-counted outcomes.
+#   (3) Persistence: msgpack only, both cores (see "Serialization format notes" above). load() returns
+#   True when it loaded something. A legacy JSON state migrates once (kept as <file>.legacy-json).
+# Why: Josh 2026-10-13 rulings on #1096 (dial in on the laptop first, re-vendor later): the Rust core's
+#   path kept no Python-side state, so the Commons' bucket_recent returned 0 rows, its recency windows
+#   and autonomic drop were no-ops, and save() wrote .msgpack while callers loaded only if the .json
+#   existed. Saves are msgpack, never JSON. The #119 line below ("3-5x speedup", "zero API changes")
+#   described a path that never ran (ng_tract never exported NGLiteCore until #1076).
+# How: _rust_core_requested() gate in __init__; each public read dispatches on self._core; _pack_state()
+#   writes the same msgpack bytes the Rust core's save_binary writes (map / array headers, float32
+#   vectors, json-style key coercion); load() sniffs JSON vs msgpack. The Python core's learning
+#   behaviour is unchanged; the three Rust-core quirk fixes (warm-up count persisted, lossless load,
+#   read-only get_recommendations) are in ng_tract (Josh: fix them in the Rust core).
 # [2026-04-08] Claude Code (Opus 4.6) — Punchlist #55: CES attention tunables
 # What: Added surfacing_decay_rate, surfacing_min_confidence, prediction_window
 #   to DEFAULT_CONFIG and TUNABLE_PARAMS.
@@ -214,16 +240,177 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import shutil
+import struct
 import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
 logger = logging.getLogger("ng_lite")
 
 __version__ = "1.0.0"
+
+# Rollout switch for the Rust core (#1096). Temporary: it is removed together with the Python core.
+_RUST_CORE_ENV = "NG_LITE_RUST_CORE"
+
+# A converted legacy JSON state is kept aside under this suffix (never read again by NG-Lite).
+LEGACY_JSON_SUFFIX = ".legacy-json"
+
+
+def _rust_core_requested() -> bool:
+    """True when NG_LITE_RUST_CORE is truthy (1 / true / yes / on), the same rule ng_tract's export gate uses."""
+    return os.environ.get(_RUST_CORE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# msgpack persistence (both cores write the same bytes for the same state)
+# ---------------------------------------------------------------------------
+
+def _mp_map_header(n: int) -> bytes:
+    if n <= 15:
+        return bytes((0x80 | n,))
+    if n <= 0xFFFF:
+        return b"\xde" + struct.pack(">H", n)
+    return b"\xdf" + struct.pack(">I", n)
+
+
+def _mp_array_header(n: int) -> bytes:
+    if n <= 15:
+        return bytes((0x90 | n,))
+    if n <= 0xFFFF:
+        return b"\xdc" + struct.pack(">H", n)
+    return b"\xdd" + struct.pack(">I", n)
+
+
+_F32_REC = np.dtype([("m", "u1"), ("v", ">f4")])
+
+
+def _mp_f32_array(vec: np.ndarray) -> bytes:
+    """A 1-D vector as a msgpack array of float32 (0xca) values — what the Rust core writes for embeddings."""
+    v = np.asarray(vec, dtype=np.float32).ravel()
+    rec = np.empty(v.shape[0], dtype=_F32_REC)
+    rec["m"] = 0xCA
+    rec["v"] = v
+    return _mp_array_header(v.shape[0]) + rec.tobytes()
+
+
+def _json_key(k: Any) -> str:
+    """json.dump's dict-key coercion (the Rust core applies the same rule)."""
+    if isinstance(k, str):
+        return k
+    if k is None:
+        return "null"
+    if isinstance(k, bool):
+        return "true" if k else "false"
+    if isinstance(k, float):
+        return repr(k)
+    return str(k)
+
+
+def _pack_state(state: Dict[str, Any]) -> bytes:
+    """Encode an ``_export_state(arrays=True)`` dict as msgpack.
+
+    Containers are written here (dict keys coerced like json.dump), float ndarrays as float32 arrays, every
+    scalar through msgpack's own packer — so the bytes equal the Rust core's ``save_binary`` for the same state.
+    """
+    try:
+        import msgpack
+    except ImportError as exc:  # no JSON fallback (Josh 2026-10-13)
+        raise ImportError(
+            "NG-Lite saves are msgpack only; install the 'msgpack' package in this environment"
+        ) from exc
+    packer = msgpack.Packer(use_bin_type=True)
+    out: List[bytes] = []
+
+    def enc(x: Any) -> None:
+        if isinstance(x, dict):
+            out.append(_mp_map_header(len(x)))
+            for k, v in x.items():
+                out.append(packer.pack(_json_key(k)))
+                enc(v)
+        elif isinstance(x, (list, tuple)):
+            out.append(_mp_array_header(len(x)))
+            for v in x:
+                enc(v)
+        elif isinstance(x, np.ndarray):
+            if x.dtype.kind == "f" and x.ndim == 1:
+                out.append(_mp_f32_array(x))
+            elif x.dtype.kind == "f" and x.ndim == 2:
+                out.append(_mp_array_header(x.shape[0]))
+                for row in x:
+                    out.append(_mp_f32_array(row))
+            else:
+                enc(x.tolist())
+        elif isinstance(x, np.generic):
+            enc(x.item())
+        else:
+            out.append(packer.pack(x))
+
+    enc(state)
+    return b"".join(out)
+
+
+def _unpack_state(data: bytes) -> Dict[str, Any]:
+    try:
+        import msgpack
+    except ImportError as exc:
+        raise ImportError(
+            "NG-Lite states are msgpack; install the 'msgpack' package in this environment"
+        ) from exc
+    return msgpack.unpackb(data, raw=False, strict_map_key=False)
+
+
+def _looks_like_json(head: bytes) -> bool:
+    """A JSON object state (legacy) starts with '{' after optional whitespace; a msgpack state is a map."""
+    stripped = head.lstrip()
+    return stripped[:1] == b"{"
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    """temp file + fsync + rename (the Rust core's save_binary does the same)."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class _CoreHeldState:
+    """Stands in for ``NGLite.nodes`` / ``NGLite.synapses`` while the Rust core holds the state.
+
+    Any use raises, naming the public read methods. The old Rust path left these as silently-empty dicts, so a
+    consumer that read them saw an empty substrate and never knew (#1096).
+    """
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def _refuse(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            f"NGLite.{self._name} is held by the Rust core ({_RUST_CORE_ENV}); use the public reads: "
+            "node_count() / list_nodes() / get_node() / synapse_count() / list_synapses() / get_synapse() / "
+            "remove_synapses()"
+        )
+
+    __getitem__ = __setitem__ = __delitem__ = __iter__ = __len__ = __contains__ = __bool__ = _refuse
+    keys = values = items = get = pop = setdefault = update = clear = copy = _refuse
+
+    def __repr__(self) -> str:
+        return f"<NGLite.{self._name}: held by the Rust core>"
 
 
 # ---------------------------------------------------------------------------
@@ -502,22 +689,28 @@ class NGLite:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self._bridge = bridge
 
-        # Rust core — if available, all hot-path methods delegate here.
-        # Python fallback remains intact for modules without the wheel.
+        # Rust core (#1096): used only when NG_LITE_RUST_CORE is truthy (temporary rollout switch). It then
+        # holds ALL learning state; the public reads below serve it. Otherwise the Python core runs.
         self._core = None
-        try:
-            from ng_tract import NGLiteCore
-            self._core = NGLiteCore(module_id, self.config)
-            # Seed constitutional nodes in Rust core
-            entries = self.config.get("constitutional_embeddings", [])
-            if entries:
-                self._core.seed_constitutional(entries)
-        except ImportError:
-            pass  # Pure Python fallback
+        if _rust_core_requested():
+            try:
+                from ng_tract import NGLiteCore
+            except ImportError as exc:
+                logger.warning(
+                    "%s is set but ng_tract.NGLiteCore is unavailable (%s); module '%s' runs the Python core",
+                    _RUST_CORE_ENV, exc, module_id,
+                )
+            else:
+                self._core = NGLiteCore(module_id, self.config)
+                entries = self.config.get("constitutional_embeddings", [])
+                if entries:
+                    self._core.seed_constitutional(entries)
 
-        # Core collections (used by Python fallback, also for bridge/stats)
-        self.nodes: Dict[str, NGLiteNode] = {}
-        self.synapses: Dict[Tuple[str, str], NGLiteSynapse] = {}
+        # Core collections (Python core only; on the Rust core any use raises — see _CoreHeldState)
+        self.nodes: Dict[str, NGLiteNode] = {} if self._core is None else _CoreHeldState("nodes")  # type: ignore[assignment]
+        self.synapses: Dict[Tuple[str, str], NGLiteSynapse] = (
+            {} if self._core is None else _CoreHeldState("synapses")  # type: ignore[assignment]
+        )
 
         # Embedding cache: hash -> full embedding (for similarity search)
         self._embedding_cache: Dict[str, np.ndarray] = {}
@@ -543,7 +736,9 @@ class NGLite:
         # learn — the survival instinct. Synapses from constitutional nodes
         # are frozen. LRU pruning skips them. The bucket comes up empty
         # for inputs that land in constitutional semantic space.
-        self._seed_constitutional_nodes()
+        # (On the Rust core the seeding happened above, in the core.)
+        if self._core is None:
+            self._seed_constitutional_nodes()
 
     def _seed_constitutional_nodes(self) -> None:
         """Seed constitutional nodes from config embeddings.
@@ -602,20 +797,17 @@ class NGLite:
         Returns:
             The matched or newly created NGLiteNode.
         """
-        # Rust fast path
+        # Rust core: a fresh node built from the core's answer (never a stub cached by hash — after the core
+        # prunes and re-creates a node with the same hash such a stub carried a stale node_id, #1096).
         if self._core is not None:
-            result = self._core.find_or_create_node(embedding)
-            # Return a lightweight node-like object for callers that need it
-            emb_hash = result.get("embedding_hash", "")
-            if emb_hash not in self.nodes:
-                self.nodes[emb_hash] = NGLiteNode(
-                    node_id=result["node_id"],
-                    embedding_hash=emb_hash,
-                    activation_count=result.get("activation_count", 1),
-                    last_activation=time.time(),
-                    constitutional=result.get("constitutional", False),
-                )
-            return self.nodes[emb_hash]
+            r = self._core.find_or_create_node(embedding)
+            return NGLiteNode(
+                node_id=r["node_id"],
+                embedding_hash=r["embedding_hash"],
+                activation_count=r["activation_count"],
+                last_activation=r["last_activation"],
+                constitutional=r["constitutional"],
+            )
 
         emb = self._normalize(embedding)
 
@@ -704,11 +896,15 @@ class NGLite:
         Raises:
             ValueError: If embedding is not a 1-D numpy array.
         """
-        # Rust fast path — Hebbian learning, Welford variance, all in Rust
+        # Rust core — Hebbian learning, Welford variance and the outcome counters all live in the core
         if self._core is not None:
             result = self._core.record_outcome(
                 embedding, target_id, success, strength, metadata,
             )
+            if not result.get("constitutional"):
+                self._history.append(result)
+                if len(self._history) > self._history_max:
+                    self._history = self._history[-self._history_max:]
             # Bridge forwarding stays in Python
             if self._bridge and self._bridge.is_connected():
                 try:
@@ -723,9 +919,6 @@ class NGLite:
                         result["bridge_response"] = enriched
                 except Exception as e:
                     logger.warning("Bridge record_outcome failed: %s", e)
-            self._total_outcomes += 1
-            if success:
-                self._total_successes += 1
             return result
 
         # Input validation (Grok review: defensive boundary check)
@@ -862,7 +1055,7 @@ class NGLite:
             except Exception as e:
                 logger.warning("Bridge get_recommendations failed: %s", e)
 
-        # Rust fast path
+        # Rust core — read-only there (it creates / activates no node; ng_tract quirk fix c)
         if self._core is not None:
             return self._core.get_recommendations(embedding, top_k)
 
@@ -944,7 +1137,7 @@ class NGLite:
             except Exception as e:
                 logger.warning("Bridge detect_novelty failed: %s", e)
 
-        # Rust fast path
+        # Rust core
         if self._core is not None:
             return self._core.detect_novelty(embedding)
 
@@ -1013,77 +1206,124 @@ class NGLite:
     # Persistence
     # -------------------------------------------------------------------
 
-    def save(self, filepath: str) -> None:
-        """Save full state to binary (msgpack) via Rust.
+    @staticmethod
+    def state_paths(filepath: str) -> Tuple[str, Optional[str]]:
+        """(msgpack path, legacy JSON path or None) for a state path given by a caller.
 
-        Falls back to JSON if Rust core is unavailable.
-        Binary path: Rust serializes directly to bytes, writes to disk.
-        No Python dicts, no JSON, no inflation.
+        ``x.json`` -> (``x.msgpack``, ``x.json``); ``x.msgpack`` -> (``x.msgpack``, ``x.json``);
+        any other name -> (that name, None).
+        """
+        p = str(filepath)
+        if p.endswith(".json"):
+            return p[: -len(".json")] + ".msgpack", p
+        if p.endswith(".msgpack"):
+            return p, p[: -len(".msgpack")] + ".json"
+        return p, None
+
+    @classmethod
+    def state_exists(cls, filepath: str) -> bool:
+        """True when ``load(filepath)`` would find a state (the msgpack save or a legacy JSON)."""
+        bin_path, legacy = cls.state_paths(filepath)
+        return os.path.exists(bin_path) or (legacy is not None and os.path.exists(legacy))
+
+    def save(self, filepath: str) -> str:
+        """Save the full state as msgpack (both cores; never JSON — Josh 2026-10-13).
+
+        ``x.json`` is written as ``x.msgpack``; any other name as given. temp file + fsync + rename.
 
         Args:
-            filepath: Path to write the state file.
+            filepath: Path of the state (a ``.json`` name is mapped to its ``.msgpack`` sibling).
+
+        Returns:
+            The path written.
         """
+        bin_path, _ = self.state_paths(filepath)
         if self._core is not None:
-            # Binary persistence — Rust handles everything
-            bin_path = filepath.replace(".json", ".msgpack")
             self._core.save_binary(bin_path)
-            logger.info("NG-Lite state saved (binary) to %s", bin_path)
-            return
-
-        # Python fallback — JSON
-        state = self._export_state()
-        with open(filepath, "w") as f:
-            json.dump(state, f, indent=2)
+            logger.info("NG-Lite state saved (Rust core) to %s", bin_path)
+            return bin_path
+        _atomic_write(bin_path, _pack_state(self._export_state(arrays=True)))
         logger.info("NG-Lite state saved to %s (%d nodes, %d synapses)",
-                     filepath, len(self.nodes), len(self.synapses))
+                    bin_path, len(self.nodes), len(self.synapses))
+        return bin_path
 
-    def load(self, filepath: str) -> None:
-        """Load state from binary (msgpack) or JSON.
+    def load(self, filepath: str) -> bool:
+        """Load the state saved for ``filepath`` (see ``state_paths``). No-op when there is none.
 
-        Tries binary first (.msgpack), falls back to JSON (.json).
-        If loading JSON into Rust core, migrates via import_state.
+        Reads the msgpack save. A legacy JSON state — ``x.json`` with no msgpack beside it (or a newer one), or
+        JSON content inside the ``.msgpack`` file (#1098) — is converted ONCE: imported, re-saved as msgpack, and
+        the JSON kept aside as ``<file>.legacy-json``.
 
-        Args:
-            filepath: Path to the state file (.json or .msgpack).
+        Returns:
+            True if a state was loaded.
         """
-        import os
+        bin_path, legacy = self.state_paths(filepath)
+        has_bin = os.path.exists(bin_path)
+        has_json = legacy is not None and os.path.exists(legacy)
+        if has_bin and has_json and os.path.getmtime(legacy) > os.path.getmtime(bin_path):
+            logger.warning(
+                "NG-Lite: legacy JSON %s is newer than %s; converting the JSON (the msgpack is replaced)",
+                legacy, bin_path,
+            )
+            has_bin = False
 
-        bin_path = filepath.replace(".json", ".msgpack")
-
-        if self._core is not None:
-            # Try binary first
-            if os.path.exists(bin_path):
-                self._core.load_binary(bin_path)
-                logger.info("NG-Lite state loaded (binary) from %s", bin_path)
-                return
-            # JSON migration — read JSON, import into Rust core, then
-            # save binary so next load is native
-            if os.path.exists(filepath):
-                with open(filepath, "r") as f:
+        if has_bin:
+            with open(bin_path, "rb") as f:
+                head = f.read(64)
+            if _looks_like_json(head):
+                # #1098: the old Python core wrote JSON into this .msgpack-named file — convert it once
+                with open(bin_path, "r") as f:
                     state = json.load(f)
-                self._core.import_state(state)
-                self._core.save_binary(bin_path)
-                logger.info(
-                    "NG-Lite state migrated from JSON to binary: %s → %s",
-                    filepath, bin_path,
-                )
-                return
+                self._import_state(state)
+                shutil.copy2(bin_path, bin_path + LEGACY_JSON_SUFFIX)
+                self.save(bin_path)
+                logger.info("NG-Lite: converted the JSON inside %s to msgpack (JSON kept as %s)",
+                            bin_path, bin_path + LEGACY_JSON_SUFFIX)
+            elif self._core is not None:
+                self._core.load_binary(bin_path)
+                self._sync_from_core()
+                logger.info("NG-Lite state loaded (Rust core) from %s", bin_path)
+            else:
+                with open(bin_path, "rb") as f:
+                    state = _unpack_state(f.read())
+                self._import_state(state)
+                logger.info("NG-Lite state loaded from %s (%d nodes, %d synapses)",
+                            bin_path, len(self.nodes), len(self.synapses))
+            return True
 
-        # Pure Python fallback
-        if os.path.exists(filepath):
-            with open(filepath, "r") as f:
+        if has_json:
+            with open(legacy, "r") as f:
                 state = json.load(f)
             self._import_state(state)
-            logger.info("NG-Lite state loaded from %s (%d nodes, %d synapses)",
-                         filepath, len(self.nodes), len(self.synapses))
+            self.save(bin_path)
+            os.replace(legacy, legacy + LEGACY_JSON_SUFFIX)
+            logger.info("NG-Lite: migrated legacy JSON %s to msgpack %s (JSON kept as %s)",
+                        legacy, bin_path, legacy + LEGACY_JSON_SUFFIX)
+            return True
+        return False
 
-    def _export_state(self) -> Dict[str, Any]:
+    def _sync_from_core(self) -> None:
+        """After the Rust core replaced its state: the wrapper's config / module_id follow the core, and the
+        in-memory history restarts (as the Python core's _import_state does)."""
+        self.config = self._core.get_config()
+        self.module_id = self._core.get_module_id()
+        self._history.clear()
+
+    def export_state(self) -> Dict[str, Any]:
+        """The full state as a plain dict (the persisted schema), from whichever core holds it."""
+        return self._export_state()
+
+    def _export_state(self, arrays: bool = False) -> Dict[str, Any]:
         """Export full state as a serializable dict.
 
         Synapse keys are converted from (source_id, target_id) tuples
-        to "source_id|target_id" strings for JSON compatibility.
+        to "source_id|target_id" strings. ``arrays=True`` (the msgpack writer) leaves embeddings and prototypes
+        as float32 ndarrays instead of lists. On the Rust core this is the core's export (lists).
         """
-        # Convert synapse keys from tuples to strings for JSON
+        if self._core is not None:
+            return self._core.export_state()
+
+        # Convert synapse keys from tuples to strings
         synapses_serialized = {}
         for (src, tgt), syn in self.synapses.items():
             key = f"{src}|{tgt}"
@@ -1093,7 +1333,7 @@ class NGLite:
         receptor_state = {}
         if self._prototypes is not None:
             receptor_state = {
-                "prototypes": self._prototypes.tolist(),
+                "prototypes": self._prototypes if arrays else self._prototypes.tolist(),
                 "prototype_counts": self._prototype_counts.tolist(),
                 "input_count": self._receptor_input_count,
             }
@@ -1103,7 +1343,7 @@ class NGLite:
             "module_id": self.module_id,
             "timestamp": time.time(),
             "config": self.config,
-            "nodes": {k: self._serialize_node(v) for k, v in self.nodes.items()},
+            "nodes": {k: self._serialize_node(v, arrays) for k, v in self.nodes.items()},
             "synapses": synapses_serialized,
             "counters": {
                 "node_id_counter": self._node_id_counter,
@@ -1115,6 +1355,10 @@ class NGLite:
 
     def _import_state(self, state: Dict[str, Any]) -> None:
         """Import state from a deserialized dict."""
+        if self._core is not None:
+            self._core.import_state(state)
+            self._sync_from_core()
+            return
         self.module_id = state.get("module_id", self.module_id)
 
         # Restore config (merge with defaults for forward compatibility).
@@ -1207,22 +1451,20 @@ class NGLite:
         Returns dict with old_value, new_value, clamped (bool).
         Raises KeyError if key is not tunable.
         """
-        # Update Rust core if present
-        if self._core is not None:
-            try:
-                self._core.update_config(key, float(value))
-            except Exception:
-                pass  # Rust core may not have this key yet
-
         if key not in self.TUNABLE_PARAMS:
             raise KeyError(
                 f"'{key}' is not a tunable parameter. "
                 f"Allowed: {sorted(self.TUNABLE_PARAMS.keys())}"
             )
         lo, hi = self.TUNABLE_PARAMS[key]
-        old_value = self.config[key]
-        clamped = value < lo or value > hi
-        new_value = max(lo, min(hi, float(value)))
+        if self._core is not None:
+            # The core validates and clamps the same way and is the source of truth for its config.
+            r = self._core.update_config(key, float(value))
+            old_value, new_value, clamped = r["old_value"], r["new_value"], r["clamped"]
+        else:
+            old_value = self.config[key]
+            clamped = value < lo or value > hi
+            new_value = max(lo, min(hi, float(value)))
         self.config[key] = new_value
         logger.info(
             "Tunable updated: %s %.6f → %.6f%s",
@@ -1264,6 +1506,24 @@ class NGLite:
         or display to users. All routing/learning decisions should
         be queryable per transparency obligations.
         """
+        bridge_connected = self._bridge is not None and self._bridge.is_connected()
+        if self._core is not None:
+            c = self._core.get_stats()
+            return {
+                "version": __version__,
+                "module_id": self.module_id,
+                "node_count": c["node_count"],
+                "synapse_count": c["synapse_count"],
+                "max_nodes": c["max_nodes"],
+                "max_synapses": c["max_synapses"],
+                "memory_estimate_bytes": c["memory_estimate_bytes"],
+                "total_outcomes": c["total_outcomes"],
+                "total_successes": c["total_successes"],
+                "success_rate": c["success_rate"],
+                "avg_synapse_weight": c["avg_synapse_weight"],
+                "bridge_connected": bridge_connected,
+                "embedding_cache_size": c["embedding_cache_size"],
+            }
         synapse_weights = [s.weight for s in self.synapses.values()]
         return {
             "version": __version__,
@@ -1283,27 +1543,146 @@ class NGLite:
                 float(np.mean(synapse_weights))
                 if synapse_weights else 0.0
             ),
-            "bridge_connected": (
-                self._bridge is not None
-                and self._bridge.is_connected()
-            ),
+            "bridge_connected": bridge_connected,
             "embedding_cache_size": len(self._embedding_cache),
         }
+
+    # -------------------------------------------------------------------
+    # Public reads (#1096) — served by whichever core holds the state.
+    # Consumers use these instead of NGLite.nodes / .synapses / private fields.
+    # Every row is a snapshot copy: mutating it does not change the substrate.
+    # -------------------------------------------------------------------
+
+    def node_count(self) -> int:
+        """Number of pattern nodes (incl. constitutional ones)."""
+        if self._core is not None:
+            return self._core.counts()[0]
+        return len(self.nodes)
+
+    def synapse_count(self) -> int:
+        """Number of synapses."""
+        if self._core is not None:
+            return self._core.counts()[1]
+        return len(self.synapses)
+
+    @staticmethod
+    def _node_from_row(row: Tuple) -> NGLiteNode:
+        _key, node_id, emb_hash, act, last, md, emb, const = row
+        return NGLiteNode(node_id=node_id, embedding_hash=emb_hash, activation_count=act,
+                          last_activation=last, metadata=md, embedding=emb, constitutional=const)
+
+    @staticmethod
+    def _copy_node(n: NGLiteNode, with_embedding: bool) -> NGLiteNode:
+        emb = n.embedding.copy() if (with_embedding and n.embedding is not None) else None
+        return NGLiteNode(node_id=n.node_id, embedding_hash=n.embedding_hash, activation_count=n.activation_count,
+                          last_activation=n.last_activation, metadata=dict(n.metadata), embedding=emb,
+                          constitutional=n.constitutional)
+
+    def list_nodes(self, with_embedding: bool = True) -> List[NGLiteNode]:
+        """All pattern nodes, in storage order. ``with_embedding=False`` skips the vectors (embedding=None)."""
+        if self._core is not None:
+            return [self._node_from_row(r) for r in self._core.list_nodes(with_embedding)]
+        return [self._copy_node(n, with_embedding) for n in list(self.nodes.values())]
+
+    def get_node(self, node_id: str) -> Optional[NGLiteNode]:
+        """The node with this node_id (a synapse's ``source_id``), with its embedding, or None."""
+        if self._core is not None:
+            r = self._core.get_node(node_id)
+            return None if r is None else self._node_from_row(r)
+        for n in list(self.nodes.values()):
+            if n.node_id == node_id:
+                return self._copy_node(n, True)
+        return None
+
+    @staticmethod
+    def _synapse_from_row(row: Tuple) -> NGLiteSynapse:
+        src, tgt, w, act, sc, fc, last, md, wc, wm, wm2 = row
+        return NGLiteSynapse(source_id=src, target_id=tgt, weight=w, activation_count=act, success_count=sc,
+                             failure_count=fc, last_updated=last, metadata=md if md is not None else {},
+                             welford_count=wc, welford_mean=wm, welford_m2=wm2)
+
+    @staticmethod
+    def _copy_synapse(s: NGLiteSynapse, with_metadata: bool) -> NGLiteSynapse:
+        c = object.__new__(NGLiteSynapse)
+        c.__dict__.update(s.__dict__)
+        c.metadata = dict(s.metadata) if with_metadata else {}
+        return c
+
+    def list_synapses(
+        self,
+        *,
+        source_id: Optional[str] = None,
+        target_id: Optional[str] = None,
+        target_prefix: Optional[str] = None,
+        since: Optional[float] = None,
+        with_metadata: bool = True,
+    ) -> List[NGLiteSynapse]:
+        """Synapses in storage (insertion) order, optionally filtered (filters AND together).
+
+        Args:
+            source_id: only synapses from this node_id.
+            target_id: only synapses to exactly this target.
+            target_prefix: only targets starting with this string (e.g. ``"metrics:elmer:cpu:"``).
+            since: only synapses with ``last_updated > since``.
+            with_metadata: False -> ``metadata`` is ``{}`` (cheap scans; ``get_synapse`` the rows you keep).
+        """
+        if self._core is not None:
+            return [self._synapse_from_row(r) for r in self._core.list_synapses(
+                source_id, target_id, target_prefix, since, with_metadata)]
+        out = []
+        for s in list(self.synapses.values()):
+            if source_id is not None and s.source_id != source_id:
+                continue
+            if target_id is not None and s.target_id != target_id:
+                continue
+            if target_prefix is not None and not s.target_id.startswith(target_prefix):
+                continue
+            if since is not None and not s.last_updated > since:
+                continue
+            out.append(self._copy_synapse(s, with_metadata))
+        return out
+
+    def get_synapse(self, source_id: str, target_id: str) -> Optional[NGLiteSynapse]:
+        """The synapse (source_id -> target_id), with metadata, or None."""
+        if self._core is not None:
+            r = self._core.get_synapse(source_id, target_id)
+            return None if r is None else self._synapse_from_row(r)
+        s = self.synapses.get((source_id, target_id))
+        return None if s is None else self._copy_synapse(s, True)
+
+    def remove_synapses(self, keys: Iterable[Tuple[str, str]]) -> int:
+        """Remove these (source_id, target_id) synapses; returns how many existed.
+
+        The one write among the public methods: housekeeping that callers already did by deleting from
+        ``NGLite.synapses`` (the Commons' recency windows and its autonomic drop on restore).
+        """
+        ks = [(str(k[0]), str(k[1])) for k in keys]
+        if self._core is not None:
+            return self._core.remove_synapses(ks)
+        n = 0
+        for k in ks:
+            if self.synapses.pop(k, None) is not None:
+                n += 1
+        return n
+
+    def get_history(self) -> List[Dict[str, Any]]:
+        """Recent record_outcome results (in memory only, bounded; not persisted)."""
+        return list(self._history)
 
     # -------------------------------------------------------------------
     # Internal Methods
     # -------------------------------------------------------------------
 
-    def _serialize_node(self, node: NGLiteNode) -> Dict[str, Any]:
-        """Serialize a node to a JSON-compatible dict.
+    def _serialize_node(self, node: NGLiteNode, arrays: bool = False) -> Dict[str, Any]:
+        """Serialize a node to a plain dict.
 
-        Converts embedding from np.ndarray to list for JSON.
-        Omits embedding key when None (backward-compatible with
-        state files created before embedding persistence).
+        Converts embedding from np.ndarray to list (``arrays=True``: kept as the
+        ndarray, for the msgpack writer). Omits embedding key when None
+        (backward-compatible with state files created before embedding persistence).
         """
         d = asdict(node)
         if node.embedding is not None:
-            d["embedding"] = node.embedding.tolist()
+            d["embedding"] = node.embedding if arrays else node.embedding.tolist()
         else:
             d.pop("embedding", None)
         return d

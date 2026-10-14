@@ -2,6 +2,8 @@
 ng_commons_eco.py (VENDORED) — standalone tests for the Commons-backed eco adapter.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-09-21] Grok 4.6 — R3: dual_record_outcome must not degrade to forest.
 #       Mock ng_embed.embed in signal_error tests (768-vector) so they
 #       test deposits, not a live model / NG_EMBED_REMOTE=hf.
@@ -71,7 +73,7 @@ def test_record_outcome_deposits():
     c = commons_mod.Commons()
     r = _eco(c, namespaces=("threat:",)).record_outcome(_emb(4), "threat:sigZ", True, metadata={"x": 1})
     assert r is not None
-    assert any(getattr(s, "target_id", "").startswith("threat:") for s in c._ng.synapses.values())
+    assert any(getattr(s, "target_id", "").startswith("threat:") for s in c._ng.list_synapses())
 
 
 def test_failsoft_no_commons():
@@ -131,7 +133,7 @@ def test_dual_record_outcome_does_not_degrade_to_forest():
             eco.dual_record_outcome(content="x", embedding=_emb(1), target_id="threat:fb", success=True)
     finally:
         ng_embed.NGEmbed.get_instance = orig
-    targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
+    targets = [getattr(s, "target_id", "") for s in c._ng.list_synapses()]
     assert "threat:fb" not in targets, "no forest on dual-pass failure (R3)"
 
 
@@ -149,7 +151,7 @@ def test_signal_error_deposits_raw():
     except ValueError as exc:
         with patch("ng_embed.embed", side_effect=_embed_768):
             eco.signal_error(exc, {"where": "test"})
-    matches = [(s.target_id, s.metadata.get("last_context", {})) for s in c._ng.synapses.values()
+    matches = [(s.target_id, s.metadata.get("last_context", {})) for s in c._ng.list_synapses()
                if getattr(s, "target_id", "").startswith("error:")]
     assert len(matches) == 1
     target_id, meta = matches[0]
@@ -169,7 +171,7 @@ def test_signal_error_target_id_shape_matches_retention():
     except RuntimeError as exc:
         with patch("ng_embed.embed", side_effect=_embed_768):
             eco.signal_error(exc)
-    targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
+    targets = [getattr(s, "target_id", "") for s in c._ng.list_synapses()]
     assert "error:immunis:RuntimeError" in targets
 
 
@@ -189,7 +191,7 @@ def test_signal_error_no_context_defaults_empty():
     except TypeError as exc:
         with patch("ng_embed.embed", side_effect=_embed_768):
             eco.signal_error(exc)  # no context passed
-    matches = [s.metadata.get("last_context", {}) for s in c._ng.synapses.values()
+    matches = [s.metadata.get("last_context", {}) for s in c._ng.list_synapses()
                if getattr(s, "target_id", "").startswith("error:")]
     assert matches[0]["context"] == {}
 
@@ -205,7 +207,7 @@ def test_dual_record_outcome_forest_and_trees_live():
     emb = ng_embed.embed(content)
     res = eco.dual_record_outcome(content=content, embedding=emb, target_id="threat:probe", success=True)
     assert res and res.get("pass2_attempted"), "Pass 2 attempted"
-    targets = [getattr(s, "target_id", "") for s in c._ng.synapses.values()]
+    targets = [getattr(s, "target_id", "") for s in c._ng.list_synapses()]
     assert "threat:probe" in targets, "forest deposited"
     assert sum(1 for t in targets if "::tree::" in t) > 0, "tree concepts deposited to the Commons"
 

@@ -3,6 +3,8 @@ Commons wire-stream retention (#80) — wire:tid.http.{dir}:* windowed by recenc
 metrics:* (#320) / error:* (#330).
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-07-21] Claude Code (Sonnet 5) — #80 wire → Commons: _evict_old_wire() Task 1 acceptance
 # What: Proves Commons._evict_old_wire: the wire:tid.http.{outbound|inbound} namespace is capped
 #       to _WIRE_KEEP_PER_DIR most-recent synapses (by recency); experience/topology/metrics/error
@@ -34,7 +36,7 @@ def _emb(seed, dim=768):
 
 
 def _count(commons, prefix):
-    return sum(1 for s in commons._ng.synapses.values()
+    return sum(1 for s in commons._ng.list_synapses()
                if getattr(s, "target_id", "").startswith(prefix))
 
 
@@ -60,7 +62,7 @@ def test_recency_keeps_newest():
         commons.deposit(_emb(i), _wire_id("inbound", i), strength=0.5, metadata={})
     kept_seqs = sorted(
         int(s.target_id.rsplit(":h", 1)[-1], 16)
-        for s in commons._ng.synapses.values()
+        for s in commons._ng.list_synapses()
         if getattr(s, "target_id", "").startswith("wire:tid.http.inbound:")
     )
     assert kept_seqs[0] >= 10, f"oldest deposits evicted; smallest kept seq={kept_seqs[0]}"

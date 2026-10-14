@@ -2,6 +2,8 @@
 ng_salience_gate.py (VENDORED) — standalone tests for the parameterized salience gate.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-06-14] Claude Code (Fable 5) — vendored salience gate tests (#320 Part 2)
 # What: Proves SalienceGate independent of any module: salience-gated granular/nominal/run-length,
 #       competence graduation (asymmetric, no runaway), parameterized salience_fn + signature_fn,
@@ -52,7 +54,7 @@ def _anomaly(surprised=8, confirmed=2, pruned=0, sprouted=0):
 
 def _deposits(commons, salience=None):
     out = []
-    for s in commons._ng.synapses.values():
+    for s in commons._ng.list_synapses():
         tid = getattr(s, "target_id", "")
         if tid.startswith("metrics:"):
             meta = s.metadata.get("last_context", {})

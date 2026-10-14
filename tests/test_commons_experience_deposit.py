@@ -2,6 +2,8 @@
 Commons Track-2 — experience-throttle retirement (1a): NG deposits the raw full turn.
 
 # ---- Changelog ----
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: reads the medium through NGLite.list_synapses()
+#   (public read, served by either core) instead of NGLite.synapses, so this test also runs with NG_LITE_RUST_CORE=1.
 # [2026-06-14] Claude Code (Fable 5) — retire _deposit_experience_to_river throttle (step 1a)
 # What: Proves _deposit_experience_to_river deposits the RAW full turn (user + Syl, both halves)
 #       into a sandbox Commons as an "experience:" entry, unclassified, fail-soft. Bunyan
@@ -47,7 +49,7 @@ def _drive(user, assistant=None):
 
 
 def _experience_synapses(commons):
-    return [s for s in commons._ng.synapses.values()
+    return [s for s in commons._ng.list_synapses()
             if getattr(s, "target_id", "").startswith("experience:")]
 
 
