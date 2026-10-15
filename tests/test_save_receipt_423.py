@@ -1,6 +1,9 @@
 """#423 phase A — focused tests for the opt-in save receipt.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — test_file_flush_failure_refuses_acceptance: the failing
+#   fsync is now hit at the primary artifact's atomic write (fsync before rename) instead of first at the generation
+#   barrier; the test asserts the intent (a component failed, nothing accepted, no generation saved).
 # [2026-09-11] Claude Code (Opus 5) — #423 save-receipt tests
 # What: exercises NeuroGraphMemory.save()'s real body — legacy string/exception
 #   contract, strict primary acceptance, quarantine, and every component
@@ -586,7 +589,11 @@ class TestAcceptanceFlush(ReceiptTestCase):
         with patch.object(os, 'fsync', side_effect=OSError('storage failure')):
             result = save(self.sut(), with_receipt=True)
         self.assertFalse(result['accepted'])
-        self.assertEqual(result['components']['generation']['status'], 'failed')
+        # 2026-10-14 (atomic saves): checkpoint_guardian.atomic_file_write fsyncs each primary artifact BEFORE its
+        # rename, so a flush failure now refuses at the first artifact (graph 'failed', the rest 'not_attempted')
+        # instead of first surfacing at the generation barrier. Either way a component failed and nothing is accepted.
+        self.assertIn('failed', {c['status'] for c in result['components'].values()})
+        self.assertNotEqual(result['components']['generation']['status'], 'saved')
 
     def test_directory_flush_failure_refuses_acceptance(self):
         import stat
