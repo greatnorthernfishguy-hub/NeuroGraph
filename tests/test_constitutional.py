@@ -7,6 +7,17 @@ semantic space. Synapses are frozen, nodes survive pruning, and the
 bucket comes up empty.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: synthetic rims compare raw; the live rim is Snowflake
+#   What: the synthetic-vector tests set "mean_centre": False (isotropic random vectors are not in the embedding
+#   model's space; centring would — correctly — refuse them as a rim); the semantic-matching tests no longer set the
+#   raw-era novelty_threshold 0.7 (the rim now matches at constitutional_threshold). TestLiveEmbeddings runs the
+#   repo's rim, rebuilt at Snowflake 768 from its descriptions, with centring ON (the default).
+#   Why: #1107 (mean-centred comparisons, rim threshold, embedding-space check).
+#   How: _make_config_with_constitutional(raw=True); live fixture passes raw=False.
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: test vectors are 768-d (the substrate's embedding_dim)
+#   What: _make_embedding defaults to 768 and the semantic-matching noise is 768-d (were 384).
+#   Why: these tests fed 384-d vectors to a 768-d NG-Lite — exactly the mismatch the dimension guard now refuses.
+#   How: two literals; assertions unchanged.
 # [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: persistence tests follow msgpack-only saves
 #   What: the old-state test reads the msgpack save, strips the field and feeds it back as a legacy JSON state
 #   (migrated once on load); cleanup removes the .json / .msgpack / .legacy-json trio.
@@ -44,7 +55,7 @@ def _cleanup(filepath):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_embedding(seed: int = 0, dim: int = 384) -> np.ndarray:
+def _make_embedding(seed: int = 0, dim: int = 768) -> np.ndarray:
     """Generate a deterministic normalized embedding."""
     rng = np.random.RandomState(seed)
     emb = rng.randn(dim).astype(np.float32)
@@ -52,13 +63,20 @@ def _make_embedding(seed: int = 0, dim: int = 384) -> np.ndarray:
     return emb
 
 
-def _make_config_with_constitutional(embeddings_list):
-    """Build a config dict with constitutional embeddings."""
-    return {
+def _make_config_with_constitutional(embeddings_list, raw=True):
+    """Build a config dict with constitutional embeddings.
+
+    raw=True (synthetic isotropic vectors): compare raw cosines — such vectors are not in the embedding model's space,
+    so a centred NG-Lite would refuse them as a rim (#1107).
+    """
+    cfg = {
         "constitutional_embeddings": embeddings_list,
         # Disable receptor layer to keep tests deterministic
         "receptor_layer_enabled": False,
     }
+    if raw:
+        cfg["mean_centre"] = False
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -340,18 +358,16 @@ class TestSemanticMatching:
         """An embedding close to a constitutional node should match it."""
         base_emb = _make_embedding(10)
         # Create a slightly perturbed version (still very similar)
-        noise = np.random.RandomState(999).randn(384).astype(np.float32) * 0.05
+        noise = np.random.RandomState(999).randn(768).astype(np.float32) * 0.05
         similar_emb = base_emb + noise
         similar_emb /= np.linalg.norm(similar_emb)
 
         config = _make_config_with_constitutional([
             {"embedding": base_emb.tolist(), "description": "frozen concept"},
         ])
-        # Set novelty_threshold high so similarity matching is permissive
-        config["novelty_threshold"] = 0.7
         ng = NGLite(module_id="test", config=config)
 
-        # The similar embedding should match the constitutional node
+        # The similar embedding should match the constitutional node (cosine ~0.58 >= constitutional_threshold)
         node = ng.find_or_create_node(similar_emb)
         assert node.constitutional is True
 
@@ -363,7 +379,6 @@ class TestSemanticMatching:
         config = _make_config_with_constitutional([
             {"embedding": constitutional_emb.tolist(), "description": "frozen concept"},
         ])
-        config["novelty_threshold"] = 0.7
         ng = NGLite(module_id="test", config=config)
 
         node = ng.find_or_create_node(distant_emb)
@@ -389,7 +404,7 @@ class TestLiveEmbeddings:
         with open(path) as f:
             data = json.load(f)
 
-        return _make_config_with_constitutional(data["embeddings"])
+        return _make_config_with_constitutional(data["embeddings"], raw=False)
 
     def test_all_embeddings_seed_as_constitutional(self, constitutional_config):
         ng = NGLite(module_id="test", config=constitutional_config)
