@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5) — temps of dead writers clear themselves
+# What: _warn_stale_temps -> _clear_stale_temps: atomic_file_write DELETES this target's tmps left by dead writers
+#   (one WARNING naming them) instead of only reporting them.
+# Why: Josh 2026-10-15: "Temp files are temporary, so if they are no longer needed, I'm not aware of any reason to
+#   keep them around" / "Temp files clearing themselves once done sounds nice."
+# How: same match as before ("<stem>.tmp-<pid><suffix>", pid dead and not ours); only the process named in a tmp's
+#   name ever writes it, so a dead pid means nobody will. A pid reused by a live process is left alone. Never raises.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be
 #   atomic")
 # What: atomic_file_write() now fsyncs the tmp before os.replace and fsyncs the directory after; it reports (never
@@ -419,7 +426,7 @@ def _pid_alive(pid: int) -> bool:
 def find_stale_temps(final_path) -> List[str]:
     """Temps of THIS target ("<stem>.tmp-<pid><suffix>") whose writer process is gone (a save killed mid-way).
 
-    Reported, never deleted (deleting is Josh's call). Never raises.
+    _clear_stale_temps deletes what this returns. Never raises.
     """
     final = Path(final_path)
     prefix = f"{final.stem}.tmp-"
@@ -441,25 +448,24 @@ def find_stale_temps(final_path) -> List[str]:
     return stale
 
 
-_stale_warned: Dict[str, Tuple[str, ...]] = {}
-
-
-def _warn_stale_temps(final_path) -> None:
-    """WARNING once per process per distinct stale set of a target (not on every autosave)."""
-    stale = find_stale_temps(final_path)
-    key = str(final_path)
-    if not stale or _stale_warned.get(key) == tuple(sorted(stale)):
-        return
-    _stale_warned[key] = tuple(sorted(stale))
+def _clear_stale_temps(final_path) -> List[str]:
+    """Delete this target's tmps left by dead writers (interrupted saves). Returns the removed paths. Never raises."""
+    removed: List[str] = []
     total = 0
-    for p in stale:
+    for p in find_stale_temps(final_path):
         try:
-            total += os.path.getsize(p)
-        except OSError:
-            pass
-    logger.warning("Guardian: %d stale temp file(s) of %s left by dead writers (%.0f MB): %s -- interrupted saves; "
-                   "the real file is intact. Safe to delete.", len(stale), Path(final_path).name, total / 1e6,
-                   ", ".join(Path(p).name for p in stale))
+            size = os.path.getsize(p)
+            os.unlink(p)
+        except OSError as exc:
+            logger.debug("Guardian: could not remove stale temp %s (%s)", p, exc)
+            continue
+        removed.append(p)
+        total += size
+    if removed:
+        logger.warning("Guardian: removed %d stale temp file(s) of %s left by interrupted saves (%.0f MB): %s -- "
+                       "the real file was intact.", len(removed), Path(final_path).name, total / 1e6,
+                       ", ".join(Path(p).name for p in removed))
+    return removed
 
 
 def atomic_file_write(final_path: str, write_fn: Callable[[str], Any]) -> Any:
@@ -476,7 +482,7 @@ def atomic_file_write(final_path: str, write_fn: Callable[[str], Any]) -> Any:
     """
     final = Path(final_path)
     tmp = final.with_name(f"{final.stem}.tmp-{os.getpid()}{final.suffix}")
-    _warn_stale_temps(final)
+    _clear_stale_temps(final)
     try:
         result = write_fn(str(tmp))
         fd = os.open(str(tmp), os.O_RDONLY)

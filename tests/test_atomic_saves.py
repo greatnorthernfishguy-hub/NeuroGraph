@@ -67,22 +67,33 @@ def test_tmp_fsynced_before_replace_and_dir_after(tmp_path, monkeypatch):
     assert events == [("fsync", "file"), ("replace", None), ("fsync", "dir")]
 
 
-def test_stale_tmps_reported_not_deleted(tmp_path, caplog):
+def test_stale_tmps_of_dead_writers_clear_themselves(tmp_path, caplog):
+    """Josh 2026-10-15: the next write removes this target's tmps left by dead writers; it never touches a live
+    writer's tmp or another target's."""
     final = tmp_path / "vectors.msgpack"
     cg.atomic_write_bytes(final, b"v")
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
     stale = tmp_path / f"vectors.tmp-{dead.pid}.msgpack"
     stale.write_bytes(b"torn")
-    mine = tmp_path / f"vectors.tmp-{os.getpid()}.msgpack"
-    assert cg.find_stale_temps(final) == [str(stale)]
-    with caplog.at_level("WARNING", logger="checkpoint_guardian"):
-        cg.atomic_write_bytes(final, b"v2")
-        cg.atomic_write_bytes(final, b"v3")
-    warns = [r for r in caplog.records if "stale temp" in r.getMessage()]
-    assert len(warns) == 1                      # once per distinct stale set, not every autosave
-    assert stale.exists() and not mine.exists()
-    assert final.read_bytes() == b"v3"
+    other = tmp_path / f"main.tmp-{dead.pid}.msgpack"
+    other.write_bytes(b"other target")
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    live_tmp = tmp_path / f"vectors.tmp-{live.pid}.msgpack"
+    live_tmp.write_bytes(b"in flight")
+    try:
+        assert cg.find_stale_temps(final) == [str(stale)]
+        with caplog.at_level("WARNING", logger="checkpoint_guardian"):
+            cg.atomic_write_bytes(final, b"v2")
+            cg.atomic_write_bytes(final, b"v3")
+        warns = [r for r in caplog.records if "stale temp" in r.getMessage()]
+        assert len(warns) == 1                      # one line when something was removed, silence after
+        assert not stale.exists()
+        assert other.exists() and live_tmp.exists()
+        assert final.read_bytes() == b"v3"
+    finally:
+        live.kill()
+        live.wait()
 
 
 # ---- (2) SIGKILL harness ----

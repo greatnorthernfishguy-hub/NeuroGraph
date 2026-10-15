@@ -8,6 +8,12 @@ by connecting to the NeuroGraphMemory singleton that this manager helps
 them discover.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5) — temps of dead writers clear themselves
+#   What: _clear_dead_writer_temps(path) runs before each atomic write: removes "<path>.tmp-<pid>" files whose writer
+#         pid is dead (left by a save killed mid-write).
+#   Why:  Josh 2026-10-15: "Temp files are temporary, so if they are no longer needed, I'm not aware of any reason to
+#         keep them around" / "Temp files clearing themselves once done sounds nice."
+#   How:  exact name match for this target only; our own pid and any live pid are skipped; never raises.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
 #   What: ModuleManifest.to_file() and _save_registry() write through _atomic_write_text (temp + fsync + os.replace +
 #         directory fsync) instead of open('w') + json.dump.
@@ -44,6 +50,34 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("et_modules.manager")
 
 
+def _clear_dead_writer_temps(path):
+    """Remove "<path>.tmp-<pid>" files whose writer pid is dead (an interrupted save). Never raises.
+
+    Josh 2026-10-15: "Temp files clearing themselves once done sounds nice." Only the process named in a temp's
+    name ever writes it, so a dead pid means nobody will; a pid reused by a live process is left alone."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    prefix = os.path.basename(path) + ".tmp-"
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        digits = name[len(prefix):] if name.startswith(prefix) else ""
+        if not digits.isdigit() or int(digits) == os.getpid():
+            continue
+        try:
+            os.kill(int(digits), 0)
+            continue
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
 def _atomic_write_text(path: str, text: str) -> None:
     """temp file in the same directory -> write -> fsync -> os.replace -> fsync the directory.
 
@@ -51,6 +85,7 @@ def _atomic_write_text(path: str, text: str) -> None:
     """
     path = os.fspath(path)
     directory = os.path.dirname(os.path.abspath(path)) or "."
+    _clear_dead_writer_temps(path)
     tmp = f"{path}.tmp-{os.getpid()}"
     try:
         mode = os.stat(path).st_mode & 0o7777
