@@ -17,7 +17,7 @@ paths are unchanged (torch.save / msgpack / JSON exactly as before), so no reade
 
 | Repo | Branch | Base | Commits |
 |---|---|---|---|
-| NeuroGraph | `cc-laptop-atomic-saves-20261014` | `04e6c42` | `c92dda5` (non-protected), `fc4dfdf` **PROTECTED** (`activation_persistence.py`), this doc |
+| NeuroGraph | `cc-laptop-atomic-saves-20261014` | `04e6c42` | `c92dda5` (non-protected), `fc4dfdf` **PROTECTED** (`activation_persistence.py`), `796dda6` (#423 test follows the earlier fsync), this doc |
 | Elmer | `cc-laptop-atomic-saves-20261014` | `cae7288` | `bd5cf15` (proto_weights.pt — the incident), `95ddcc0` (failed restore keeps the files), `2f06958` (et_modules/manager.py, byte-identical to NG `c92dda5`) |
 | UniAI | `cc-laptop-atomic-saves-20261014` | `3080e47` | `bcc6c75` |
 | docs (daemon) | `cc-laptop-atomic-saves-daemon-20261014` | `origin/cc-laptop-trial-s4a-20261002` (`e4d5dc40`) | `6dbee99f` |
@@ -128,8 +128,8 @@ ONE run at a time. Logs: `~/.cache/atomic-saves-20261014/`.
 | Test | Writers | Result |
 |---|---|---|
 | Elmer `tests/test_atomic_saves.py` (6) | `save_evolved_weights` (A1+A2), helper failure path, modes, stale-temp report, failed-restore keeps files (A3) | **6 passed**. Stats run (40 kills each): atomic **40/40 loadable, 34 killed mid-write**; in-place control **37/40 torn** |
-| NG `tests/test_atomic_saves.py` | guardian helper (fsync order asserted: file fsync -> replace -> dir fsync), stale tmps, `NeuroGraphMemory.save()` set (A6/A7), ChannelRegistry + KillSwitch + ETModuleManager (A5/A9/A10), DistanceCache (A11), in-place control tears | see suite results |
-| NG `tests/test_atomic_saves_activation.py` (protected commit) | `ActivationPersistence.write_state` (A8), full `NeuroGraphMemory.save()` incl. sidecar | see suite results |
+| NG `tests/test_atomic_saves.py` (7) | guardian helper (fsync order asserted: file fsync -> replace -> dir fsync), stale tmps reported once / not deleted, `NeuroGraphMemory.save()` set (A6/A7, 15 kills), ChannelRegistry + KillSwitch + ETModuleManager (A5/A9/A10, 20 kills), DistanceCache (A11, 20 kills), in-place control tears | **7 passed** |
+| NG `tests/test_atomic_saves_activation.py` (2, protected commit) | `ActivationPersistence.write_state` (A8, 20 kills, complete writes replace), full `NeuroGraphMemory.save()` incl. the sidecar | **2 passed** |
 | daemon `scripts/tests/test_cc_ng_daemon_atomic_saves.py` (4) | A12-A18 incl. last_good never absent (25 kills) | **4 passed** |
 | UniAI `lenia/tests/test_atomic_saves.py` (2) | A19-A21 (real `FlowLeniaF1.suspend`, real `write_result`) | **2 passed** |
 | TID `tests/test_atomic_saves.py` (2) | A22-A23 (real `save_stats`, real `_save_routing_state`) | **2 passed** |
@@ -148,7 +148,18 @@ random point in 0.1 s .. 1.5 x one save, then `torch.load(mmap=True)` + key set 
 
 ### Existing suites, branch vs base (new failures only)
 
-SUITE_RESULTS_PLACEHOLDER
+Same harness, same venvs, base worktrees at the base commits (`~/atomic-saves-wt/base/*`). Logs:
+`~/.cache/atomic-saves-20261014/logs/` and `suite/`.
+
+| Suite | Base | Branch | New failures |
+|---|---|---|---|
+| Elmer `tests/` (venv nglite-rustcore) | 114 passed, 1 failed (`test_hook.py::TestElmerHook::test_start_stop`) | **121 passed** (6 new) | none (the base failure passed on the branch: flaky) |
+| UniAI `lenia/tests/` (venv-f1) | 6 passed | **8 passed** (2 new) | none |
+| TID `tests/` per file (TID venv) | 2 files fail (`test_inference_difference.py` 2 failed: consciousness_boost, exploration_config_defaults; `test_ng_ecosystem.py` 2 failed + 22 errors); `test_transparent_proxy.py` times out | identical failing sets; same timeout; `test_atomic_saves.py` 2 passed | none |
+| daemon `scripts/tests` + `test_cc_ng_daemon_guard.py` (NG = the matching NG side) | 76 failed, 1092 passed, 6 skipped | 75 failed, **1097 passed**, 6 skipped | none (identical failing set; base's extra failure `test_pith_telemetry_d4::test_snapshots_survive_sigkill` passed on the branch) |
+| NeuroGraph per file (164 files; every non-passing branch file re-run on base `04e6c42`) | 38 files non-zero on both | 126 files rc 0 incl. `test_atomic_saves.py` 7 passed, `test_atomic_saves_activation.py` 2 passed | **one, fixed:** `test_save_receipt_423.py::TestAcceptanceFlush::test_file_flush_failure_refuses_acceptance` asserted the generation barrier is the first fsync to fail; the guardian now fsyncs the primary artifact first, so the receipt fails at `graph` (generation `not_attempted`), still `accepted=False`. Test updated to assert the intent (`796dda6`); the file then passes (37 + guardian 66 passed together). All other 37 files: identical failing test sets; 6 files killed by the 3.5 GB scope (`test_auto_knowledge`, `test_ces`, `test_coordinator`, `test_et_modules`, `test_openclaw_hook`, `test_tonic_prefetch`) and `test_snn.py` (600 s timeout) stop at the same point on both sides |
+
+Pre-existing failures are environment / branch-state issues present at the base; none were touched here.
 
 ## Protected-file commits needing Josh's "proceed"
 
@@ -170,7 +181,7 @@ TID from canonical. Optional hardening at the canonical source (would need a re-
 
 1. **Before anything**: verified backups (sha256) of `~/.elmer/proto_weights.pt`, `proto_lenia_state.pt`, and the CC
    checkpoint set; Josh's "proceed" for `fc4dfdf` if it is to be included.
-2. Merge (no restart yet): NG `c92dda5` (+ `fc4dfdf` if approved) into `cc-laptop-trial-s4-20261002`; Elmer `bd5cf15`,
+2. Merge (no restart yet): NG `c92dda5` + `796dda6` (+ `fc4dfdf` if approved) into `cc-laptop-trial-s4-20261002`; Elmer `bd5cf15`,
    `95ddcc0`, `2f06958` into `cc-revendor-ng-20260921`; UniAI `bcc6c75` into main (or whichever UniAI checkout the daemon
    imports — confirm with the daemon's UniAI path); daemon `6dbee99f` into `cc-laptop-trial-s4a-20261002`. All four load
    into the ONE daemon process, so one restart covers them.
