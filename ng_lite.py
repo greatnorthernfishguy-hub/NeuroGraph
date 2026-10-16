@@ -81,7 +81,8 @@ Date: February 2026
 #   logs one INFO line every sleep. (2) sleep_epoch / last_sleep_at: incremented / stamped by each sleep, saved in the
 #   state as "sleep": {epoch, last_sleep_at} (absent until the first sleep, so a never-slept state saves byte-
 #   identically), restored by load, read through sleep_state() and get_stats(). (3) DEFAULT_CONFIG + TUNABLE_PARAMS:
-#   sleep_d0 0.1 (0-0.5), sleep_h 0.05 (0.001-1), sleep_grace_sleeps 2 (0-10), sleep_armor_gain 1.0 (0-5),
+#   sleep_d0 0.2 (0-0.5), sleep_h 0.5 (0.001-1) [Josh 2026-10-16 from the Commons harness; the mind's 0.1/0.05 clear
+#   nothing on NG-Lite's 0-1 scale, where links are born at 0.5], sleep_grace_sleeps 2 (0-10), sleep_armor_gain 1.0 (0-5),
 #   sleep_armor_max 5.0 (1-10); the weight threshold is the existing pruning_threshold (0.01). (4) The caps (1,000 /
 #   5,000) are unchanged; at-cap insertion now evicts by the sleep's rule: synapses longest-faint first, then lowest
 #   armored strength w * armor; nodes longest-orphaned first, then the weakest strongest-link armored strength, then
@@ -630,8 +631,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Sleep (#1114) — NGLite.sleep(), run by the HOST on its own autonomic clock (LAW 8); NG-Lite has no timer.
     # The mind's rule (sleep spec 2026-10-06 §3.1): d = sleep_d0 * sleep_h / (sleep_h + w) / armor; w <- w * (1 - d).
     # Starting values are the mind's (d0 0.1, h 0.05, grace 2); NGLITE_SLEEP.md has the Commons harness.
-    "sleep_d0": 0.1,            # loss fraction of a faint link (w << h) per sleep
-    "sleep_h": 0.05,            # the "half-established" weight: an established link (w >> h) loses ~d0*h/w
+    "sleep_d0": 0.2,            # loss fraction of a faint link (w << h) per sleep (Josh 2026-10-16, harness §3)
+    "sleep_h": 0.5,             # the "half-established" weight (NG-Lite links are born at 0.5 on a 0-1 scale): an established link (w >> h) loses ~d0*h/w
     "sleep_grace_sleeps": 2,    # sleeps a link may stay below pruning_threshold (an orphan node unlinked) before it goes
     "sleep_armor_gain": 1.0,    # armor = min(sleep_armor_max, 1 + gain * ln(outcomes)); outcomes = success + failure
     "sleep_armor_max": 5.0,     # (both sides count: a contested link is evidence, not faintness); 1 outcome = no armor

@@ -94,11 +94,12 @@ def test_faint_link_loses_about_d0_established_about_d0_h_over_w():
     a = put(ng, 1, "faint", 0.004)
     b = put(ng, 2, "strong", 0.9)
     ng.sleep(now=1.0)
-    d0, h = 0.1, 0.05
+    d0, h = ng_lite.DEFAULT_CONFIG["sleep_d0"], ng_lite.DEFAULT_CONFIG["sleep_h"]
     assert w_of(ng, a, "faint") == 0.004 * (1.0 - d0 * h / (h + 0.004))
     assert w_of(ng, b, "strong") == 0.9 * (1.0 - d0 * h / (h + 0.9))
-    assert (1 - w_of(ng, a, "faint") / 0.004) > 0.09          # ~d0
-    assert (1 - w_of(ng, b, "strong") / 0.9) < 0.006           # ~d0*h/w
+    faint_loss, strong_loss = 1 - w_of(ng, a, "faint") / 0.004, 1 - w_of(ng, b, "strong") / 0.9
+    assert faint_loss > 0.9 * d0                               # a faint link (w << h) loses ~d0
+    assert strong_loss < 0.5 * faint_loss                      # an established link loses far less (~d0*h/(h+w))
 
 
 def test_armor_grows_with_outcomes_and_a_contested_link_counts_its_evidence():
@@ -112,7 +113,8 @@ def test_armor_grows_with_outcomes_and_a_contested_link_counts_its_evidence():
     loss = {k: 1 - w_of(ng, s, k) / 0.5 for s, k in ((one, "one"), (many, "many"), (cont, "cont"))}
     assert loss["many"] < loss["one"] and loss["cont"] == loss["many"]
     armor = 1.0 + 1.0 * math.log(9.0)
-    assert w_of(ng, many, "many") == 0.5 * (1.0 - 0.1 * 0.05 / (0.05 + 0.5) / armor)
+    d0, h = ng_lite.DEFAULT_CONFIG["sleep_d0"], ng_lite.DEFAULT_CONFIG["sleep_h"]
+    assert w_of(ng, many, "many") == 0.5 * (1.0 - d0 * h / (h + 0.5) / armor)
     # the cap
     assert ng._sleep_armor(NGLiteSynapse(success_count=10 ** 6)) == 5.0
 
@@ -233,7 +235,7 @@ def test_sleep_parameters_are_tunable_and_clamped():
     for k in ("sleep_d0", "sleep_h", "sleep_grace_sleeps", "sleep_armor_gain", "sleep_armor_max"):
         assert k in ng.get_tunables() and k in ng_lite.DEFAULT_CONFIG
     assert (ng_lite.DEFAULT_CONFIG["sleep_d0"], ng_lite.DEFAULT_CONFIG["sleep_h"],
-            ng_lite.DEFAULT_CONFIG["sleep_grace_sleeps"]) == (0.1, 0.05, 2)   # the mind's values (spec 10-06 §3)
+            ng_lite.DEFAULT_CONFIG["sleep_grace_sleeps"]) == (0.2, 0.5, 2)   # Josh 2026-10-16, from the Commons harness
 
 
 # ---------------------------------------------------------------- caps
