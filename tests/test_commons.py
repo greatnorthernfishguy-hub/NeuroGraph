@@ -2,6 +2,12 @@
 Commons POC smoke test — proves the substrate axiom: deposit + bucket, no send.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane nglite-sleep) — #1114: the axiom guard admits sleep / sleep_state
+# What: test_no_send_surface_exists' allow-list gains "sleep" (the host's autonomic maintenance verb, like persist) and
+#       "sleep_state" (the epoch read members bucket). The forbidden send/route roots check is unchanged.
+# Why:  design 2026-10-15-ng-lite-sleep-design.md §2.2 / §2.3 (Josh 2026-10-15): the daemon sleeps the Commons on the
+#       mind's clock through a public verb instead of reaching into Commons._ng; neither name sends or addresses.
+# How:  two names in the set, with the reason beside them.
 # [2026-06-07] Claude Code (Opus 4.7, 1M) — Commons Pool POC smoke test
 # What: Proves two "modules" communicate through the shared Commons medium with ZERO
 #       module-to-module contact — module A deposits, module B buckets, B sees A's
@@ -92,8 +98,12 @@ def test_no_send_surface_exists():
     #   Same non-verb category as persist/stats — they shape/inspect the medium's extraction, no transport.
     # None is a send/route/to/broadcast verb — the axiom this guard actually protects. A param added to
     # a bucket (e.g. bucket_recent's with_embedding) adds NO public name, so it stays invisible here.
+    # sleep / sleep_state (#1114, 2026-10-15) = the medium's own autonomic maintenance (the host runs it on the mind's
+    #   clock, like persist) and the read of its epoch (a bucket-family read: members learn the Commons slept by
+    #   dipping it, design 2026-10-15-ng-lite-sleep-design.md §2.3). Neither addresses or transports anything.
     allowed = {"deposit", "bucket", "bucket_recent", "arousal", "read_arousal", "persist", "restore",
-               "stats", "suppress", "lift_suppression", "is_suppressed", "suppression_mode"}
+               "stats", "suppress", "lift_suppression", "is_suppressed", "suppression_mode",
+               "sleep", "sleep_state"}
     extra = public - allowed
     assert not extra, (
         f"Commons must expose only the deposit + bucket-family + persist/restore/stats/suppression "
