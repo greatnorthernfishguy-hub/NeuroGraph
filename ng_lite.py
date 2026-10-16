@@ -1920,6 +1920,13 @@ class NGLite:
         self._sleep_check_params()
         now = time.time() if now is None else float(now)
         if self._core is not None:
+            if not hasattr(self._core, "sleep"):
+                msg = (f"NG-Lite [{self.module_id}] sleep: the installed ng_tract NGLiteCore predates #1114 (no sleep); "
+                       "install the ng-tract-rs cc-laptop-nglite-sleep-rs-20261015 wheel (nothing was changed)")
+                if not getattr(self, "_sleep_wheel_logged", False):
+                    self._sleep_wheel_logged = True
+                    logger.error(msg)
+                raise RuntimeError(msg)
             rep = dict(self._core.sleep(now))
             rep["core"] = "rust"
         else:
@@ -1939,6 +1946,8 @@ class NGLite:
         """``{"epoch": int, "last_sleep_at": float | None}`` — the public read a consumer polls to learn this
         substrate slept (design §2.3). Cheap: no scan."""
         if self._core is not None:
+            if not hasattr(self._core, "sleep_state"):  # a pre-#1114 wheel: that core cannot sleep, so it never slept
+                return {"epoch": 0, "last_sleep_at": None}
             epoch, last = self._core.sleep_state()
             return {"epoch": epoch, "last_sleep_at": last}
         return {"epoch": self._sleep_epoch, "last_sleep_at": self._last_sleep_at}
@@ -2164,8 +2173,8 @@ class NGLite:
                 "bridge_connected": bridge_connected,
                 "embedding_cache_size": c["embedding_cache_size"],
                 "embedding_space": self._space_tag(),
-                "sleep_epoch": c["sleep_epoch"],          # #1114
-                "last_sleep_at": c["last_sleep_at"],
+                "sleep_epoch": c.get("sleep_epoch", 0),   # #1114 (a pre-#1114 wheel never slept)
+                "last_sleep_at": c.get("last_sleep_at"),
             }
         synapse_weights = [s.weight for s in self.synapses.values()]
         return {

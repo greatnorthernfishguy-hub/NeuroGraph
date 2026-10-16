@@ -312,3 +312,22 @@ def test_persist_cc_commons_serializes_writers(tmp_path, monkeypatch):
     for t in ts:
         t.join()
     assert peak[0] == 1
+
+
+def test_rust_core_without_sleep_fails_loud_and_reads_stay_truthful(caplog):
+    """A pre-#1114 ng_tract wheel with the new ng_lite.py (install order): sleep raises naming the wheel, logged at
+    ERROR once; get_stats / sleep_state report the core's truth (it cannot sleep, so epoch 0)."""
+    class OldCore:
+        def get_stats(self):
+            return {k: 0 for k in ("node_count", "synapse_count", "max_nodes", "max_synapses", "memory_estimate_bytes",
+                                   "total_outcomes", "total_successes", "success_rate", "avg_synapse_weight",
+                                   "embedding_cache_size")}
+    ng = make()
+    ng._core = OldCore()
+    with caplog.at_level(logging.ERROR, logger="ng_lite"):
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="predates #1114"):
+                ng.sleep()
+    assert sum("predates #1114" in m for m in caplog.messages) == 1
+    assert ng.sleep_state() == {"epoch": 0, "last_sleep_at": None}
+    assert ng.get_stats()["sleep_epoch"] == 0 and ng.get_stats()["last_sleep_at"] is None
