@@ -69,6 +69,30 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane nglite-sleep) — #1114 Phase 1: NGLite.sleep(); the epoch; cap eviction by the same rule
+# What: (1) NGLite.sleep(now=None): one sleep pass the HOST calls on its own autonomic clock (NG-Lite has no timer).
+#   Strength-aware downscaling d = sleep_d0 * sleep_h / (sleep_h + w) / armor, w <- w * (1 - d), armor =
+#   min(sleep_armor_max, 1 + sleep_armor_gain * ln(success + failure)) (1 outcome = no armor; both sides count, so a
+#   contested link is armored by its evidence). A link below pruning_threshold after the downscale counts one more
+#   faint sleep (synapse metadata "sleep_faint"; dropped when it is back at/above) and is cleared once that exceeds
+#   sleep_grace_sleeps; a non-constitutional node with no synapse counts orphan sleeps (node metadata "sleep_orphan")
+#   and is removed after the same grace. Constitutional (rim) nodes and the synapses from them are never touched.
+#   Weight only: last_updated / counters / Welford unchanged, so recency buckets do not move. Returns a report and
+#   logs one INFO line every sleep. (2) sleep_epoch / last_sleep_at: incremented / stamped by each sleep, saved in the
+#   state as "sleep": {epoch, last_sleep_at} (absent until the first sleep, so a never-slept state saves byte-
+#   identically), restored by load, read through sleep_state() and get_stats(). (3) DEFAULT_CONFIG + TUNABLE_PARAMS:
+#   sleep_d0 0.1 (0-0.5), sleep_h 0.05 (0.001-1), sleep_grace_sleeps 2 (0-10), sleep_armor_gain 1.0 (0-5),
+#   sleep_armor_max 5.0 (1-10); the weight threshold is the existing pruning_threshold (0.01). (4) The caps (1,000 /
+#   5,000) are unchanged; at-cap insertion now evicts by the sleep's rule: synapses longest-faint first, then lowest
+#   armored strength w * armor; nodes longest-orphaned first, then the weakest strongest-link armored strength, then
+#   the lowest activation count; ties keep storage order (oldest first) — never the newest for being new.
+# Why: punch list #1114, design ~/docs/superpowers/specs/2026-10-15-ng-lite-sleep-design.md §2.1 (Josh 2026-10-15,
+#   approved direction): NG-Lite forgot only when a deposit hit a full cap (LAW 8: gated on a deposit), by weight
+#   alone, one for one. The CC Commons sits pinned at 5,000 synapses. The rule is the mind's (sleep spec 2026-10-06
+#   §3.1 / §3.3, live on the laptop CC NeuroGraph); the epoch is how consumers learn the Commons slept (design §2.3).
+# How: _sleep_python here, NGLiteCore.sleep in ng-tract-rs (cc-laptop-nglite-sleep-rs-20261015), op for op; the
+#   wrapper validates the parameters, dispatches, adds "core" / "seconds" and logs. Sleep bookkeeping lives in the
+#   existing metadata dicts (like strength_sum), so an older ng_lite.py / wheel still loads a slept state. NGLITE_SLEEP.md.
 # [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: mean-centred comparisons; the rim threshold; space tag
 # What: (1) Every similarity comparison subtracts the embedding model's fixed centre (ng_embed.embedding_centre(),
 #   versioned ng_embed.CENTRE_VERSION) from both sides and re-normalises before the cosine: node matching
@@ -285,6 +309,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import struct
@@ -600,6 +625,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # Pruning
     "pruning_threshold": 0.01,  # Synapses below this weight get pruned
+                                # (#1114: by NGLite.sleep(), after sleep_grace_sleeps consecutive sleeps below it)
+
+    # Sleep (#1114) — NGLite.sleep(), run by the HOST on its own autonomic clock (LAW 8); NG-Lite has no timer.
+    # The mind's rule (sleep spec 2026-10-06 §3.1): d = sleep_d0 * sleep_h / (sleep_h + w) / armor; w <- w * (1 - d).
+    # Starting values are the mind's (d0 0.1, h 0.05, grace 2); NGLITE_SLEEP.md has the Commons harness.
+    "sleep_d0": 0.1,            # loss fraction of a faint link (w << h) per sleep
+    "sleep_h": 0.05,            # the "half-established" weight: an established link (w >> h) loses ~d0*h/w
+    "sleep_grace_sleeps": 2,    # sleeps a link may stay below pruning_threshold (an orphan node unlinked) before it goes
+    "sleep_armor_gain": 1.0,    # armor = min(sleep_armor_max, 1 + gain * ln(outcomes)); outcomes = success + failure
+    "sleep_armor_max": 5.0,     # (both sides count: a contested link is evidence, not faintness); 1 outcome = no armor
 
     # Peer bridge relevance (#44)
     "relevance_threshold": 0.30,  # Min cosine similarity to absorb cross-module events
@@ -919,6 +954,11 @@ class NGLite:
         self._total_outcomes = 0
         self._total_successes = 0
         self._node_id_counter = 0
+
+        # Sleep (#1114): how many sleeps this substrate has had, and when the last one ran (persisted; the Rust core
+        # keeps its own copy). A consumer that buckets this NG-Lite learns it slept by the epoch moving (design §2.3).
+        self._sleep_epoch = 0
+        self._last_sleep_at: Optional[float] = None
 
         # Cricket rim: seed constitutional nodes from config.
         # These nodes represent semantic regions where the topology cannot
@@ -1760,6 +1800,7 @@ class NGLite:
             },
             "receptor_layer": receptor_state,
             "embedding_space": self._space_tag(),  # #1107
+            **self._sleep_export(),                # #1114 (absent until the first sleep)
         }
 
     def _import_state(self, state: Dict[str, Any], source: str = "<state dict>") -> None:
@@ -1817,6 +1858,9 @@ class NGLite:
         self._total_outcomes = counters.get("total_outcomes", 0)
         self._total_successes = counters.get("total_successes", 0)
 
+        # Sleep epoch (#1114) — an old state (never slept) has no "sleep" key
+        self._sleep_epoch, self._last_sleep_at = self._sleep_import(state)
+
         # Restore receptor layer (#43) — old state files load cleanly (no key)
         receptor = state.get("receptor_layer", {})
         if receptor.get("prototypes"):
@@ -1841,6 +1885,178 @@ class NGLite:
         self._seed_constitutional_nodes()
 
     # -------------------------------------------------------------------
+    # Sleep (#1114) — the substrate forgets the way the mind does
+    # -------------------------------------------------------------------
+
+    def sleep(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """One sleep pass. The HOST calls it on its own autonomic clock (LAW 8); NG-Lite never runs it itself.
+
+        Design: ``~/docs/superpowers/specs/2026-10-15-ng-lite-sleep-design.md`` §2.1 (the mind's rule, sleep spec
+        2026-10-06 §3.1 / §3.3). Bit-identical on the Python and the Rust core.
+
+        1. Strength-aware downscaling of every synapse: ``d = sleep_d0 * sleep_h / (sleep_h + w) / armor``, then
+           ``w <- w * (1 - d)``. A faint link loses about d0 per sleep, an established one about d0*h/w. ``armor =
+           min(sleep_armor_max, 1 + sleep_armor_gain * ln(n))`` for n = success_count + failure_count outcomes
+           (n <= 1: armor 1). Both sides count, so a contested link is armored by its evidence. Weight only:
+           ``last_updated``, the counters and Welford stay as they are (recency buckets are unchanged).
+        2. Clearance with grace, counted in SLEEPS: a link whose weight is below ``pruning_threshold`` after the
+           downscale gets one more faint sleep (``metadata["sleep_faint"]``); at or above, the count is dropped.
+           It is removed once the count exceeds ``sleep_grace_sleeps`` (grace 2: below at three sleeps in a row).
+        3. Orphan nodes: a non-constitutional node with no synapse left gets one more orphan sleep
+           (``metadata["sleep_orphan"]``) and is removed once that exceeds ``sleep_grace_sleeps``.
+        4. Frozen stays frozen: constitutional (rim) nodes and the synapses from them are never touched.
+        5. ``sleep_epoch`` += 1 and ``last_sleep_at`` = ``now`` (persisted with the state; ``sleep_state()``,
+           ``get_stats()``).
+
+        Args:
+            now: wall-clock time to stamp (default ``time.time()``).
+
+        Returns:
+            The report: epoch, last_sleep_at, synapses_before / _after, nodes_before / _after, downscaled, faint
+            (below threshold and still in grace), cleared, orphans_waiting, orphans_collected, frozen_synapses,
+            frozen_nodes, core ("python" / "rust"), seconds. Also logged at INFO, every sleep.
+        """
+        t0 = time.perf_counter()
+        self._sleep_check_params()
+        now = time.time() if now is None else float(now)
+        if self._core is not None:
+            rep = dict(self._core.sleep(now))
+            rep["core"] = "rust"
+        else:
+            rep = self._sleep_python(now)
+            rep["core"] = "python"
+        rep["seconds"] = time.perf_counter() - t0
+        logger.info(
+            "NG-Lite sleep [%s] epoch=%d: synapses %d->%d (downscaled %d, faint %d, cleared %d, frozen %d), "
+            "nodes %d->%d (orphans waiting %d, collected %d, frozen %d), %s core, %.3fs",
+            self.module_id, rep["epoch"], rep["synapses_before"], rep["synapses_after"], rep["downscaled"],
+            rep["faint"], rep["cleared"], rep["frozen_synapses"], rep["nodes_before"], rep["nodes_after"],
+            rep["orphans_waiting"], rep["orphans_collected"], rep["frozen_nodes"], rep["core"], rep["seconds"],
+        )
+        return rep
+
+    def sleep_state(self) -> Dict[str, Any]:
+        """``{"epoch": int, "last_sleep_at": float | None}`` — the public read a consumer polls to learn this
+        substrate slept (design §2.3). Cheap: no scan."""
+        if self._core is not None:
+            epoch, last = self._core.sleep_state()
+            return {"epoch": epoch, "last_sleep_at": last}
+        return {"epoch": self._sleep_epoch, "last_sleep_at": self._last_sleep_at}
+
+    _SLEEP_PARAM_OK = (
+        ("sleep_d0", lambda v: 0.0 <= v <= 1.0, "in [0, 1]"),
+        ("sleep_h", lambda v: 0.0 < v < float("inf"), "> 0"),
+        ("sleep_grace_sleeps", lambda v: 0.0 <= v < float("inf"), ">= 0"),
+        ("sleep_armor_gain", lambda v: 0.0 <= v < float("inf"), ">= 0"),
+        ("sleep_armor_max", lambda v: 1.0 <= v < float("inf"), ">= 1"),
+        ("pruning_threshold", lambda v: 0.0 <= v < float("inf"), ">= 0"),
+    )
+
+    def _sleep_check_params(self) -> None:
+        """Refuse a sleep whose parameters could make a weight negative / NaN (a constructor config bypasses the
+        TUNABLE_PARAMS clamp). ValueError names the key; nothing is changed."""
+        for key, ok, want in self._SLEEP_PARAM_OK:
+            v = self.config.get(key)  # the wrapper's config mirrors the Rust core's (update_tunable / load)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not ok(float(v)):
+                raise ValueError(f"NG-Lite [{self.module_id}] sleep: config {key} must be {want} (got {v!r})")
+
+    def _sleep_armor(self, syn: NGLiteSynapse) -> float:
+        """The evidence armor of a synapse: ``min(sleep_armor_max, 1 + sleep_armor_gain * ln(n))``, n = its outcomes
+        (success + failure — both sides of a contest are evidence). n <= 1 -> 1.0 (no armor)."""
+        n = syn.success_count + syn.failure_count
+        if n <= 1:
+            return 1.0
+        a = 1.0 + float(self.config["sleep_armor_gain"]) * math.log(float(n))
+        amax = float(self.config["sleep_armor_max"])
+        return a if a < amax else amax
+
+    def _sleep_python(self, now: float) -> Dict[str, Any]:
+        """``sleep()`` on the Python core (the Rust core's ``NGLiteCore.sleep`` is the same, op for op).
+
+        Works on snapshots of the dicts (another thread may deposit meanwhile; removal is ``pop``)."""
+        d0 = float(self.config["sleep_d0"])
+        h = float(self.config["sleep_h"])
+        grace = float(self.config["sleep_grace_sleeps"])
+        wt = float(self.config["pruning_threshold"])
+        frozen_ids = {n.node_id for n in list(self.nodes.values()) if n.constitutional}
+        syn_items = list(self.synapses.items())
+        rep: Dict[str, Any] = {
+            "synapses_before": len(syn_items), "nodes_before": len(self.nodes),
+            "downscaled": 0, "faint": 0, "cleared": 0, "frozen_synapses": 0,
+            "orphans_waiting": 0, "orphans_collected": 0, "frozen_nodes": 0,
+        }
+        clear: List[Tuple[str, str]] = []
+        for key, syn in syn_items:
+            if syn.source_id in frozen_ids:
+                rep["frozen_synapses"] += 1
+                continue
+            w = syn.weight
+            d = d0 * h / (h + w) / self._sleep_armor(syn)
+            nw = w * (1.0 - d)
+            if nw != w:
+                syn.weight = nw
+                rep["downscaled"] += 1
+            if nw < wt:
+                f = int(syn.metadata.get("sleep_faint", 0)) + 1
+                if f > grace:
+                    clear.append(key)
+                else:
+                    syn.metadata["sleep_faint"] = f
+                    rep["faint"] += 1
+            elif "sleep_faint" in syn.metadata:
+                del syn.metadata["sleep_faint"]
+        for key in clear:
+            if self.synapses.pop(key, None) is not None:
+                rep["cleared"] += 1
+
+        linked = {s.source_id for s in list(self.synapses.values())}
+        for nh, node in list(self.nodes.items()):
+            if node.constitutional:
+                rep["frozen_nodes"] += 1
+                continue
+            if node.node_id in linked:
+                if "sleep_orphan" in node.metadata:
+                    del node.metadata["sleep_orphan"]
+                continue
+            o = int(node.metadata.get("sleep_orphan", 0)) + 1
+            if o > grace:
+                if self.nodes.pop(nh, None) is not None:
+                    self._embedding_cache.pop(nh, None)
+                    rep["orphans_collected"] += 1
+            else:
+                node.metadata["sleep_orphan"] = o
+                rep["orphans_waiting"] += 1
+
+        self._sleep_epoch += 1
+        self._last_sleep_at = now
+        rep["synapses_after"] = len(self.synapses)
+        rep["nodes_after"] = len(self.nodes)
+        rep["epoch"] = self._sleep_epoch
+        rep["last_sleep_at"] = now
+        return rep
+
+    def _sleep_export(self) -> Dict[str, Any]:
+        """The state's ``"sleep"`` entry (#1114): absent until the first sleep, so a never-slept state saves
+        byte-identically to before."""
+        if self._sleep_epoch <= 0:
+            return {}
+        return {"sleep": {"epoch": self._sleep_epoch, "last_sleep_at": self._last_sleep_at}}
+
+    @staticmethod
+    def _sleep_import(state: Dict[str, Any]) -> Tuple[int, Optional[float]]:
+        sl = state.get("sleep")
+        if not isinstance(sl, dict):
+            return 0, None
+        epoch = sl.get("epoch", 0)
+        last = sl.get("last_sleep_at")
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or (
+                isinstance(epoch, float) and not math.isfinite(epoch)):
+            epoch = 0
+        epoch = int(epoch)
+        last = float(last) if isinstance(last, (int, float)) and not isinstance(last, bool) else None
+        return epoch, last
+
+    # -------------------------------------------------------------------
     # Dynamic Tuning (Phase 4 — Elmer outward)
     # -------------------------------------------------------------------
 
@@ -1851,6 +2067,12 @@ class NGLite:
         "failure_penalty":            (0.01,  0.50),
         "novelty_threshold":          (0.20,  0.60),   # #1107: centred match 0.40..0.80
         "pruning_threshold":          (0.001, 0.10),
+        # Sleep (#1114)
+        "sleep_d0":                   (0.0,   0.5),
+        "sleep_h":                    (0.001, 1.0),
+        "sleep_grace_sleeps":         (0.0,   10.0),
+        "sleep_armor_gain":           (0.0,   5.0),
+        "sleep_armor_max":            (1.0,   10.0),
         "receptor_ema_alpha":         (0.0001, 0.01),
         "receptor_prototype_threshold": (0.50, 0.95),
         "relevance_threshold":        (0.10,  0.70),   # Punchlist #44
@@ -1942,6 +2164,8 @@ class NGLite:
                 "bridge_connected": bridge_connected,
                 "embedding_cache_size": c["embedding_cache_size"],
                 "embedding_space": self._space_tag(),
+                "sleep_epoch": c["sleep_epoch"],          # #1114
+                "last_sleep_at": c["last_sleep_at"],
             }
         synapse_weights = [s.weight for s in self.synapses.values()]
         return {
@@ -1965,6 +2189,8 @@ class NGLite:
             "bridge_connected": bridge_connected,
             "embedding_cache_size": len(self._embedding_cache),
             "embedding_space": self._space_tag(),
+            "sleep_epoch": self._sleep_epoch,             # #1114
+            "last_sleep_at": self._last_sleep_at,
         }
 
     # -------------------------------------------------------------------
@@ -2310,22 +2536,36 @@ class NGLite:
         return synapse
 
     def _prune_least_used_node(self) -> None:
-        """Remove the node with the lowest activation count (LRU).
+        """At the node cap, before a new node is inserted: remove one node and its synapses (#1114 rule).
+
+        The cap is only a safety ceiling; the sleep (``sleep()``) is what forgets. The evictee is chosen by the
+        sleep's own rule, never for being new:
+            1. longest-orphaned first (consecutive sleeps with no link, counted only while it still has none);
+            2. then the weakest — its strongest link's armored strength ``w * armor`` (0 for an orphan);
+            3. then the lowest activation count; ties keep storage order (the oldest-inserted goes first).
 
         Constitutional nodes are never pruned — they are the rim.
         """
         if not self.nodes:
             return
 
-        # Find least-used non-constitutional node
         prunable = [h for h in self.nodes if not self.nodes[h].constitutional]
         if not prunable:
             return
 
-        least_hash = min(
-            prunable,
-            key=lambda h: self.nodes[h].activation_count,
-        )
+        strongest: Dict[str, float] = {}
+        for syn in self.synapses.values():
+            v = syn.weight * self._sleep_armor(syn)
+            if syn.source_id not in strongest or v > strongest[syn.source_id]:
+                strongest[syn.source_id] = v
+
+        def rank(h: str) -> Tuple[int, float, int]:
+            n = self.nodes[h]
+            if n.node_id in strongest:
+                return (0, strongest[n.node_id], n.activation_count)
+            return (-int(n.metadata.get("sleep_orphan", 0)), 0.0, n.activation_count)
+
+        least_hash = min(prunable, key=rank)
         least_node = self.nodes[least_hash]
 
         # Remove associated synapses
@@ -2341,7 +2581,13 @@ class NGLite:
         self._embedding_cache.pop(least_hash, None)
 
     def _prune_weakest_synapse(self) -> None:
-        """Remove the synapse with the lowest weight.
+        """At the synapse cap, before a new synapse is inserted: remove one synapse (#1114 rule).
+
+        The cap is only a safety ceiling; the sleep (``sleep()``) is what forgets. The evictee is chosen by the
+        sleep's own rule, never for being new:
+            1. longest-faint first (consecutive sleeps below ``pruning_threshold``, counted only while it still is);
+            2. then the lowest armored strength ``w * armor`` (armor grows with the outcomes it has seen);
+            ties keep storage order (the oldest-inserted goes first).
 
         Cricket rim (#92): synapses whose source is a constitutional node are
         never pruned — their weight is frozen so they accumulate as apparent
@@ -2360,7 +2606,14 @@ class NGLite:
         if not prunable:
             return
 
-        weakest_key = min(prunable, key=lambda k: self.synapses[k].weight)
+        wt = self.config["pruning_threshold"]
+
+        def rank(k: Tuple[str, str]) -> Tuple[int, float]:
+            syn = self.synapses[k]
+            faint = int(syn.metadata.get("sleep_faint", 0)) if syn.weight < wt else 0
+            return (-faint, syn.weight * self._sleep_armor(syn))
+
+        weakest_key = min(prunable, key=rank)
         del self.synapses[weakest_key]
 
     def _record_history(self, entry: Dict[str, Any]) -> None:

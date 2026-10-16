@@ -2,6 +2,13 @@
 The Commons — shared substrate medium for peer-module communication.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane nglite-sleep) — #1114 Phase 1: Commons.sleep() / sleep_state()
+#   What: two pass-throughs to the medium's NG-Lite: sleep(now=None) (NGLite.sleep — the strength-aware downscale +
+#         clearance + orphan collection, returns its report) and sleep_state() ({"epoch", "last_sleep_at"}).
+#   Why:  design ~/docs/superpowers/specs/2026-10-15-ng-lite-sleep-design.md §2.2 / §2.3 (Josh 2026-10-15): the host
+#         sleeps the Commons on its NeuroGraph's clock, and members learn it slept by the epoch. A public verb, so the
+#         daemon never reaches into Commons._ng.
+#   How:  one line each; nothing else in the medium changes (deposits, buckets, windows, suppression, persistence).
 # [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096 / #1098: public NG-Lite reads; msgpack saves
 #   What: Every read / write of the medium's internals now goes through NGLite's public methods:
 #         _evict_old_metrics / _evict_old_errors / _evict_old_wire (one shared _evict_to_recent_window),
@@ -504,6 +511,21 @@ class Commons:
     def stats(self) -> Dict[str, Any]:
         """Medium telemetry (node/synapse counts, etc.) — read-only introspection."""
         return self._ng.get_stats()
+
+    # ---- Sleep (#1114) ---------------------------------------------------
+    def sleep(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """One sleep of the medium (NGLite.sleep): the medium forgets the way the mind does.
+
+        Run by the HOST on the mind's own autonomic clock, right after its NeuroGraph's sleep (design
+        2026-10-15-ng-lite-sleep-design.md §2.2) — never by a deposit, never by a conversation (LAW 8). Returns the
+        NG-Lite sleep report. The suppression map is untouched (a cleared target simply has nothing left to surface).
+        """
+        return self._ng.sleep(now=now)
+
+    def sleep_state(self) -> Dict[str, Any]:
+        """{"epoch", "last_sleep_at"} of the medium — the public read a member polls on its own pulse to learn the
+        Commons slept (design §2.3; Phase 2 consumers). Read-only, no scan."""
+        return self._ng.sleep_state()
 
 
 def get_commons(config: Optional[Dict[str, Any]] = None) -> Commons:

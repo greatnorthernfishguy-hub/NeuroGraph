@@ -3,6 +3,13 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane nglite-sleep) — #1114: persist_cc_commons serializes its writers
+# What: persist_cc_commons holds a module lock (_cc_commons_persist_lock) around Commons.persist.
+# Why:  the daemon now also persists the Commons right after the Commons sleeps (design 2026-10-15-ng-lite-sleep-design.md
+#       §2.2), from the dream-loop thread, while the autosave pulse persists from its own thread. NGLite.save writes the
+#       temp file "<path>.tmp.<pid>" on both cores, so two threads of one process could write the same temp file.
+# How:  a threading.Lock; same file, same bytes, same fail-soft return. A sleep's Commons persist waits for a running
+#       autosave persist (0.1-0.7 s) instead of racing it.
 # [2026-10-04] Claude (lane vdb-lock-leak) — vector-store reads go through SimpleVectorDB's locked accessors (#270)
 # What: surface_wants_for_graph / surface_wants read content via vdb.get_content(nid).
 # Why:  SimpleVectorDB is now guarded by its own leaf lock; direct reads of its embeddings/content/metadata
@@ -1690,6 +1697,10 @@ logger = logging.getLogger("cc_ng_organism")
 # cc-ng-daemon.py, or the VPS's neurograph_rpc.py process hosting cc_ng_host.py).
 _cc_commons: "Optional[Any]" = None
 _cc_commons_lock = threading.Lock()
+# [2026-10-15] #1114: ONE writer of commons.msgpack at a time in this process. NGLite.save's temp file is
+# "<path>.tmp.<pid>" on both cores, so two threads of one process persisting at once (the autosave pulse and the
+# post-sleep persist) would write the SAME temp file.
+_cc_commons_persist_lock = threading.Lock()
 
 # Hosted CC organ instances, keyed by module_id — retained so their pulse
 # threads aren't GC-eligible and so status/shutdown can reach them (mirrors
@@ -1763,7 +1774,8 @@ def persist_cc_commons(workspace_dir: str) -> bool:
     _path = cc_commons_checkpoint_path(workspace_dir)
     try:
         os.makedirs(os.path.dirname(_path), exist_ok=True)
-        _cc_commons.persist(_path)
+        with _cc_commons_persist_lock:   # #1114: one writer of the shared temp name at a time
+            _cc_commons.persist(_path)
         return True
     except Exception as exc:
         logger.debug("CC Commons persist failed (non-fatal): %s", exc)
