@@ -23,6 +23,14 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, Executive; Josh "#1115 is good") — #1115: embeddings are batch-invariant
+#   What: _onnx_embed_ids_batch runs each sequence through the ONNX session on its own (shape [1, len]).
+#   Why:  the int8 dynamically-quantized model computes activation scales over the whole batch tensor, so the
+#         same text came out at 0.977-0.992 cosine depending on its batch-mates and their padding. "Same text ->
+#         same vector -> same node" did not hold across batches (Commons, dual-pass trees, windows, hash nodes).
+#   How:  per-sequence session.run with the batch padding stripped (masked pad positions still widen the
+#         quantizer's range); results equal the existing single-text path, so stored vectors, the
+#         mean-centring vector and the thresholds stay valid. ~1.3x slower per batch on the laptop CPU.
 # [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: the model's fixed mean-centring vector
 # What: CENTRE_VERSION / CENTRE_SHA256 and embedding_centre(): a 768-d float32 vector shipped inside this file (base64,
 #   sha256-checked on first use, returned read-only). It is the mean of 18,675 L2-normalised document-mode Snowflake
@@ -799,26 +807,28 @@ class NGEmbed:
                 raise EmbeddingUnavailableError(
                     "embedding window exceeds 512 tokens"
                 )
-        max_len = max(len(ids) for ids in ids_list)
-        input_ids = np.zeros((len(ids_list), max_len), dtype=np.int64)
-        attention_mask = np.zeros((len(ids_list), max_len), dtype=np.int64)
-        for i, ids in enumerate(ids_list):
-            length = len(ids)
-            input_ids[i, :length] = ids
-            attn = attention_list[i]
-            attention_mask[i, :length] = attn[:length]
-
-        outputs = self._session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            },
-        )
-
+        # #1115: one sequence per session.run. The shipped model is dynamically int8-quantized
+        # (onnx/model_quantized.onnx): activation scales are computed over the WHOLE input tensor, so
+        # other texts and their padding in the same batch changed this text's vector (measured 0.977-0.992
+        # cosine to its single-text vector). Running each sequence alone makes every result equal the
+        # single-text embedding (same model, same vector space, same centre); cost ~1.3x on the laptop CPU.
         results = []
-        for i in range(len(ids_list)):
-            vec = outputs[1][i, :].astype(np.float32)
+        for i, ids in enumerate(ids_list):
+            attn = list(attention_list[i][:len(ids)])
+            # Strip the tokenizer's batch padding too: padded positions (attention 0) still enter the
+            # quantizer's activation range even when masked, so a text padded to a longer batch-mate's
+            # length would not equal its own single-text embedding.
+            length = len(attn)
+            while length > 0 and attn[length - 1] == 0:
+                length -= 1
+            outputs = self._session.run(
+                None,
+                {
+                    "input_ids": np.asarray([ids[:length]], dtype=np.int64),
+                    "attention_mask": np.asarray([attn[:length]], dtype=np.int64),
+                },
+            )
+            vec = outputs[1][0, :].astype(np.float32)
             if normalize:
                 norm = np.linalg.norm(vec)
                 if norm > 0:
