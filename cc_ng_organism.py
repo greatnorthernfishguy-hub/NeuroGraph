@@ -3,6 +3,22 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-16] Claude Code (Opus 5.5) — #1131 condition F: recall reports what the cue EVOKED (gated, default OFF)
+# What: cc_pattern_completion_recall gains an evoked-minus-spontaneous stage behind CC_RECALL_EVOKED (default "0";
+#       knob CC_RECALL_EVOKED_OVERSAMPLE, default 6). When on: the harvest is oversampled (k x 6), ONE stimulus-free
+#       read-mode prime_and_propagate of the same depth records each node's spontaneous voltage, every harvested
+#       node is re-scored (evoked - spontaneous) and dropped if not above 0, then sorted. New helpers
+#       _cc_recall_harvest_steps / _cc_spontaneous_activity / _cc_evoked_over_spontaneous. Drops are reported via
+#       _pith_log_drop (#818 shape). Off = byte-identical to before.
+# Why:  dev-log 2026-10-16_cc-recall-reverberating-loop-1131 -- once the network runs, a self-sustaining assembly
+#       fires with no input and wins every recall (A after 50 idle steps: 42/80 distinct, 50 % junk). F fixed every
+#       state measured (80/80 distinct, scores 3-21). A mind reports what the cue evoked, not what it was already
+#       doing. Josh approved building it 2026-10-16. The loop's SOURCE (homeostasis/sleep not quieting it, LAW 4)
+#       is a separate open lead.
+# How:  write_mode=False (voltages, refractory and hyperedge refractory restored; no STDP, aging or sprouting);
+#       the sweep runs right after the harvest so both propagations see the same moment; the step count mirrors
+#       openclaw_hook._harvest_associations (protected) and is pinned by tests/test_cc_recall_evoked.py.
+#       Anticipatory bonus and GSG re-score still add on top, as in the experiment.
 # [2026-10-15] Claude Code (Opus 5.5, lane nglite-sleep) — #1114: persist_cc_commons serializes its writers
 # What: persist_cc_commons holds a module lock (_cc_commons_persist_lock) around Commons.persist.
 # Why:  the daemon now also persists the Commons right after the Commons sleeps (design 2026-10-15-ng-lite-sleep-design.md
@@ -4935,6 +4951,68 @@ _CC_RECALL_SELECTIVITY_OVERSAMPLE = max(1, int(os.environ.get("CC_RECALL_SELECTI
 # query-specific seeds (0 = engine default of 3). Measured hypothesis: the spread
 # converges to the same hub attractor basin at 3 steps regardless of seed.
 _CC_RECALL_PROP_STEPS = int(os.environ.get("CC_RECALL_PROP_STEPS", "0"))
+# [2026-10-16] #1131 condition F -- evoked minus spontaneous (gated OFF).
+# Measured (dev-log 2026-10-16_cc-recall-reverberating-loop-1131): once the network
+# runs, a self-sustaining assembly fires with NO input at the same voltage it shows
+# in every recall, so the earliest/strongest firers win whatever the cue. A mind
+# reports what the cue EVOKED, not what it was already doing: one stimulus-free,
+# read-mode sweep of the same propagation gives each node's spontaneous activity;
+# each harvested node then scores (evoked - spontaneous), and a node the cue did not
+# drive above its own ongoing activity is not recalled. OVERSAMPLE the harvest so
+# cue-evoked nodes behind the loop are in the pool at all (the experiment used x6).
+# Non-vendored, env-tunable, off by default (LAW 5). Read-only: write_mode=False.
+_CC_RECALL_EVOKED = os.environ.get("CC_RECALL_EVOKED", "0") not in ("0", "false", "")
+_CC_RECALL_EVOKED_OVERSAMPLE = max(1, int(os.environ.get("CC_RECALL_EVOKED_OVERSAMPLE", "6")))
+
+
+def _cc_recall_harvest_steps(graph: Any, novelty: float) -> int:
+    """The propagation depth the recall harvest actually runs, so the spontaneous sweep
+    covers the same window.  Mirrors openclaw_hook._harvest_associations' step choice
+    (base = the CC_RECALL_PROP_STEPS override or graph.config propagation_steps, then
+    the #255 novelty scaling) -- that file is protected, so the formula is mirrored
+    here and pinned by test_cc_recall_evoked's step-parity test."""
+    base = (_CC_RECALL_PROP_STEPS if _CC_RECALL_PROP_STEPS > 0
+            else graph.config.get("propagation_steps", 3))
+    ns = (novelty - 0.5) * 2.0
+    return max(1, round(base * (1.0 + ns * 0.4)))
+
+
+def _cc_spontaneous_activity(graph: Any, steps: int) -> Dict[str, float]:
+    """What fires with no stimulus at all: one read-mode prime_and_propagate with zero
+    current (the engine returns early on an empty prime list, so one node is 'primed'
+    with 0.0 -- a no-op on its voltage).  Read mode restores every voltage and
+    refractory counter and applies no plasticity, aging or sprouting.  Returns
+    {node_id: voltage at its FIRST firing} -- the same quantity the harvest reports as
+    a node's strength."""
+    if graph is None or not graph.nodes:
+        return {}
+    probe = next(iter(graph.nodes))
+    result = graph.prime_and_propagate(node_ids=[probe], currents=[0.0], steps=steps,
+                                       write_mode=False)
+    spontaneous: Dict[str, float] = {}
+    for entry in result.fired_entries:
+        spontaneous.setdefault(entry.node_id, entry.voltage_at_fire)
+    return spontaneous
+
+
+def _cc_evoked_over_spontaneous(graph: Any, surfaced: List[Dict[str, Any]],
+                                steps: int) -> List[Dict[str, Any]]:
+    """#1131 F: re-score harvested nodes by (evoked - spontaneous) and drop the ones the
+    cue did not drive above their own ongoing activity.  Sorted by the new strength."""
+    spontaneous = _cc_spontaneous_activity(graph, steps)
+    kept, dropped = [], []
+    for item in surfaced:
+        evoked = float(item.get("strength", 0.0) or 0.0)
+        net = evoked - spontaneous.get(item.get("node_id"), 0.0)
+        if net > 0.0:
+            item["strength"] = net
+            kept.append(item)
+        else:
+            dropped.append((item.get("node_id"), len(item.get("content") or "")))
+    _pith_log_drop("recall", "spontaneous (not evoked above own spontaneous activity, #1131)",
+                   "results", dropped)
+    kept.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
+    return kept
 
 
 def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
@@ -5000,6 +5078,8 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         old_thresh = cfg.get("prime_threshold", 0.4)
         old_steps = cfg.get("propagation_steps", 3)
         harvest_max = k * _CC_RECALL_SELECTIVITY_OVERSAMPLE if _CC_RECALL_SELECTIVITY else k
+        if _CC_RECALL_EVOKED:
+            harvest_max = max(harvest_max, k * _CC_RECALL_EVOKED_OVERSAMPLE)
         if preserve_graph_config:
             # provider_context is a read-only observation boundary.  The host
             # must not temporarily rewrite graph.config; use the canonical
@@ -5030,6 +5110,15 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                 cfg["max_surfaced"] = old_max
                 cfg["prime_threshold"] = old_thresh
                 cfg["propagation_steps"] = old_steps
+
+        # #1131 F (gated): evoked minus spontaneous. The stimulus-free sweep runs right
+        # AFTER the harvest (not before) so the two propagations are adjacent: the
+        # harvest embeds the query first, and read mode restores every voltage, so the
+        # sweep sees the same network moment the harvest's propagation did. Skipped
+        # when the harvest found nothing (no cost on an empty recall).
+        if _CC_RECALL_EVOKED and surfaced:
+            surfaced = _cc_evoked_over_spontaneous(
+                ng.graph, surfaced, _cc_recall_harvest_steps(ng.graph, novelty))
 
         # Anticipatory bonus (#256 port) -- canonical rpc.py:2981-2989
         promoted_ids: set = set()
