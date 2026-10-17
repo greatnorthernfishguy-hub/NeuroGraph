@@ -3,8 +3,9 @@
 # What: (1) switch off (key absent AND explicit False) == the trial tip 4e2ed30 exactly over a hyperedge-heavy
 #       workload (step, Tonic write-mode sweeps, read-mode recall sweeps, rewards, node churn): per-step fired nodes and
 #       hyperedges, node voltages / thresholds, hyperedge state, synapse state, sweep entries, and the final checkpoint
-#       bytes (after dropping only the three new config keys); native node store off and on. (2) DEFAULT_CONFIG gains
-#       exactly the three keys, every existing default unchanged. (3) the gain function. (4) switch on: a hyperedge
+#       bytes (absent: identical; explicit False: identical once the three keys the host set are left out); native node
+#       store off and on. (2) the keys are NOT in DEFAULT_CONFIG (the repo's protected-flag convention) and
+#       DEFAULT_CONFIG equals 4e2ed30's exactly. (3) the gain function. (4) switch on: a hyperedge
 #       that keeps re-igniting itself fades and goes quiet, while a rarely-active one keeps full drive and still
 #       completes its pattern when cued; the first-step injection is scaled by exactly the gain in step() and in both
 #       sweep modes. (5) synapse / STDP behaviour unchanged by the switch (no hyperedges: on == off exactly). (6)
@@ -198,17 +199,20 @@ def test_switch_off_is_the_trial_tip_exactly(mode, seed, how):
         if how == "explicit_false" else None
     gb, lb = run(mode, start, seed, cfg=cfg)
     if how == "absent":
-        for k in NEW_KEYS:                 # restored from a 4e2ed30 checkpoint: the defaults fill in (off)
-            assert gb.config[k] == NF.DEFAULT_CONFIG[k]
+        assert not [k for k in NEW_KEYS if k in gb.config]
     _assert_logs_equal(la, lb)
     assert sum(len(x[1]) for x in la[0::9]) > 20, "workload must actually fire hyperedges"
-    assert ckpt_bytes(ga) == ckpt_bytes(gb, drop_new_keys=True)
+    if how == "absent":
+        assert ckpt_bytes(ga) == ckpt_bytes(gb)                       # byte for byte, config included
+    else:
+        assert ckpt_bytes(ga) == ckpt_bytes(gb, drop_new_keys=True)   # only the keys the host itself set differ
 
 
-def test_off_checkpoint_differs_only_by_the_three_config_keys():
+def test_explicit_false_checkpoint_differs_only_by_the_keys_the_host_set():
     start = built(0)
     ga, _ = run("base", start, 0, rounds=5)
-    gb, _ = run("off", start, 0, rounds=5)
+    gb, _ = run("off", start, 0, rounds=5, cfg={"he_habituation_enabled": False, "he_habituation_half": 0.05,
+                                                 "he_habituation_power": 2.0})
     a = msgpack.unpackb(ckpt_bytes(ga), raw=False, strict_map_key=False)
     b = msgpack.unpackb(ckpt_bytes(gb), raw=False, strict_map_key=False)
     ca, cb = a.pop("config"), b.pop("config")
@@ -221,14 +225,18 @@ def test_off_checkpoint_differs_only_by_the_three_config_keys():
 # (2) DEFAULT_CONFIG
 # ---------------------------------------------------------------------------
 
-def test_default_config_gains_exactly_the_three_keys_off():
-    assert set(NF.DEFAULT_CONFIG) - set(BASE.DEFAULT_CONFIG) == set(NEW_KEYS)
-    assert set(BASE.DEFAULT_CONFIG) <= set(NF.DEFAULT_CONFIG)
-    for k, v in BASE.DEFAULT_CONFIG.items():
-        assert NF.DEFAULT_CONFIG[k] == v, k
-    assert NF.DEFAULT_CONFIG["he_habituation_enabled"] is False
-    assert NF.DEFAULT_CONFIG["he_habituation_half"] == 0.05
-    assert NF.DEFAULT_CONFIG["he_habituation_power"] == 2.0
+def test_keys_are_not_in_default_config_and_default_config_is_unchanged():
+    for k in NEW_KEYS:
+        assert k not in NF.DEFAULT_CONFIG
+        assert k not in NF.Graph().config
+    assert NF.DEFAULT_CONFIG == BASE.DEFAULT_CONFIG
+    assert list(NF.DEFAULT_CONFIG) == list(BASE.DEFAULT_CONFIG)
+
+
+def test_absent_keys_read_as_off_half_0_05_power_2():
+    g = NF.Graph()
+    assert g._he_habituation_gain(0.05) == pytest.approx(0.5)              # half 0.05
+    assert g._he_habituation_gain(0.1) == pytest.approx(1 / (1 + 2 ** 2))  # power 2
 
 
 # ---------------------------------------------------------------------------
