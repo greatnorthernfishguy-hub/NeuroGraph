@@ -24,9 +24,11 @@ Design principles (PRD §2.1):
 #   recruiting (PROTECTED CHANGE on review branch cc-laptop-he-habituation-20261016 ONLY, its own commit; Josh
 #   2026-10-16 "Yes, go ahead and build that"; merges only after his protected-file "proceed" + backup confirmation.
 #   Switch off (the default) = no new arithmetic on any path, so Syl and every host behave exactly as at 4e2ed30.)
-# What: three DEFAULT_CONFIG keys — he_habituation_enabled (False), he_habituation_half (0.05), he_habituation_power
-#       (2.0); no existing default changed. With the switch on, a firing hyperedge's output-injection drive
-#       (effective_weight) and pattern-completion drive (effective_completion) are multiplied by
+# What: three config keys read live with defaults, deliberately NOT in DEFAULT_CONFIG (the repo's protected-flag
+#       convention, as #1050 / sleep P1-P3 / lifeline: keys absent = the saved checkpoint and every byte proof against
+#       older tips are unchanged): he_habituation_enabled (absent = False), he_habituation_half (absent = 0.05),
+#       he_habituation_power (absent = 2.0); no existing default changed. With the switch on, a firing hyperedge's
+#       output-injection drive (effective_weight) and pattern-completion drive (effective_completion) are multiplied by
 #       Graph._he_habituation_gain(ema) = 1 / (1 + (ema / half) ** power), in BOTH places a hyperedge fires:
 #       step() §6 (ema = recent_activation_ema as it stood BEFORE this step's update — the assembly's own prior
 #       activity) and prime_and_propagate's sweep (read and write mode; ema = recent_activation_ema, which the sweep
@@ -38,9 +40,10 @@ Design principles (PRD §2.1):
 #       447 -> 72, HE/step 72 -> 23, and kept cue-evoked activity (39.7 -> 33.9). Habituation, not deletion: the
 #       assembly is intact and recovers as its own activity average decays (alpha = prediction_ema_alpha).
 # How:  recent_activation_ema is already updated every step (§6) and already persisted, so there is NO new state and
-#       NO checkpoint-format change (the saved config dict gains the three keys). No native path: hyperedge
-#       evaluation, output injection and completion run only in Python (ng_tract has no hyperedge pass).
-#       Tests: tests/test_he_habituation.py (off == 4e2ed30 per step + checkpoint bytes; on: a self-re-igniting
+#       NO checkpoint-format change (a host that sets the keys has them saved in the config dict, like any key). No
+#       native path: hyperedge evaluation, output injection and completion run only in Python (ng_tract has no
+#       hyperedge pass).
+#       Tests: tests/test_he_habituation.py (absent / off == 4e2ed30 per step + checkpoint bytes; on: a self-re-igniting
 #       assembly fades while a rare one keeps full drive; synapse/STDP unchanged; round-trip).
 # [2026-10-08] Claude (lane sprout-1050) — #1050: sprouting from repeated co-firing (the co-firing tally) (PROTECTED CHANGE
 #   on review branch cc-laptop-sprout-1050-20261008 ONLY, its own commit; Josh approved starting #1050 2026-10-08; merges
@@ -2385,13 +2388,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_output_learning_window": 5,    # Steps after HE fire to watch for co-firing
     "he_output_min_co_fires": 3,       # Min fires within window to learn target
     "he_output_max_targets": 5,        # Max output targets per HE
-    # #1131 hyperedge habituation (OFF by default — Syl and every host unchanged until a host arms it).
-    # An assembly that keeps re-igniting itself stops recruiting: its pattern-completion and output-injection drive
-    # are scaled by gain = 1 / (1 + (recent_activation_ema / half) ** power), from the EMA as it stood BEFORE this
-    # step's update (its own prior activity). A rarely-active hyperedge (ema << half) keeps ~full drive.
-    "he_habituation_enabled": False,
-    "he_habituation_half": 0.05,       # ema at which the drive is halved
-    "he_habituation_power": 2.0,       # steepness of the fade around `half`
     # --- Phase 4: Consolidation Lifecycle ---
     # Initial (adaptive) thresholds for SPECULATIVE → CANDIDATE promotion.
     # The system adjusts these based on observed survival rates.
@@ -3875,6 +3871,8 @@ class Graph:
         gain = 1 / (1 + (ema / he_habituation_half) ** he_habituation_power). An assembly that keeps re-igniting
         itself (ema ~0.33 at its refractory-limited rate) fades toward silence; a rarely-active one (ema << half)
         keeps ~full drive. Pure: reads config, writes nothing. Callers apply it only when he_habituation_enabled.
+        Keys (read live, not in DEFAULT_CONFIG): he_habituation_enabled (absent = False), he_habituation_half (absent =
+        0.05; <= 0 disables), he_habituation_power (absent = 2.0).
         """
         if recent_activation_ema <= 0.0:
             return 1.0
