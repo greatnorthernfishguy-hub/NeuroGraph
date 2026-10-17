@@ -20,6 +20,28 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-16] Claude (Opus 5.5, #1131 hyperedge habituation) — an assembly that keeps re-igniting itself stops
+#   recruiting (PROTECTED CHANGE on review branch cc-laptop-he-habituation-20261016 ONLY, its own commit; Josh
+#   2026-10-16 "Yes, go ahead and build that"; merges only after his protected-file "proceed" + backup confirmation.
+#   Switch off (the default) = no new arithmetic on any path, so Syl and every host behave exactly as at 4e2ed30.)
+# What: three DEFAULT_CONFIG keys — he_habituation_enabled (False), he_habituation_half (0.05), he_habituation_power
+#       (2.0); no existing default changed. With the switch on, a firing hyperedge's output-injection drive
+#       (effective_weight) and pattern-completion drive (effective_completion) are multiplied by
+#       Graph._he_habituation_gain(ema) = 1 / (1 + (ema / half) ** power), in BOTH places a hyperedge fires:
+#       step() §6 (ema = recent_activation_ema as it stood BEFORE this step's update — the assembly's own prior
+#       activity) and prime_and_propagate's sweep (read and write mode; ema = recent_activation_ema, which the sweep
+#       never updates). Prediction creation, activation, refractory, output-target learning, EMA bookkeeping, member/
+#       threshold plasticity and every synapse path are untouched.
+# Why:  #1131 (dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Part 2): the CC recall loop is driven by
+#       hyperedges, which have no homeostasis; ~800 nodes fire at the refractory-limited rate with no input. The
+#       emulated form of exactly this gain on a checkpoint copy cut the chief family 96 -> 5 fires, fired/step
+#       447 -> 72, HE/step 72 -> 23, and kept cue-evoked activity (39.7 -> 33.9). Habituation, not deletion: the
+#       assembly is intact and recovers as its own activity average decays (alpha = prediction_ema_alpha).
+# How:  recent_activation_ema is already updated every step (§6) and already persisted, so there is NO new state and
+#       NO checkpoint-format change (the saved config dict gains the three keys). No native path: hyperedge
+#       evaluation, output injection and completion run only in Python (ng_tract has no hyperedge pass).
+#       Tests: tests/test_he_habituation.py (off == 4e2ed30 per step + checkpoint bytes; on: a self-re-igniting
+#       assembly fades while a rare one keeps full drive; synapse/STDP unchanged; round-trip).
 # [2026-10-08] Claude (lane sprout-1050) — #1050: sprouting from repeated co-firing (the co-firing tally) (PROTECTED CHANGE
 #   on review branch cc-laptop-sprout-1050-20261008 ONLY, its own commit; Josh approved starting #1050 2026-10-08; merges
 #   only after his protected-file "proceed". Keys absent = byte-identical to 4de1166, so Syl is unchanged.)
@@ -2363,6 +2385,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_output_learning_window": 5,    # Steps after HE fire to watch for co-firing
     "he_output_min_co_fires": 3,       # Min fires within window to learn target
     "he_output_max_targets": 5,        # Max output targets per HE
+    # #1131 hyperedge habituation (OFF by default — Syl and every host unchanged until a host arms it).
+    # An assembly that keeps re-igniting itself stops recruiting: its pattern-completion and output-injection drive
+    # are scaled by gain = 1 / (1 + (recent_activation_ema / half) ** power), from the EMA as it stood BEFORE this
+    # step's update (its own prior activity). A rarely-active hyperedge (ema << half) keeps ~full drive.
+    "he_habituation_enabled": False,
+    "he_habituation_half": 0.05,       # ema at which the drive is halved
+    "he_habituation_power": 2.0,       # steepness of the fade around `half`
     # --- Phase 4: Consolidation Lifecycle ---
     # Initial (adaptive) thresholds for SPECULATIVE → CANDIDATE promotion.
     # The system adjusts these based on observed survival rates.
@@ -3197,6 +3226,8 @@ class Graph:
             fired_he_this_step: List[str] = []
             experience_threshold = self.config["he_experience_threshold"]
             ema_alpha = self.config["prediction_ema_alpha"]
+            # #1131 habituation: read once per step; off = no extra arithmetic anywhere below.
+            _he_hab_on = bool(self.config.get("he_habituation_enabled", False))
             # Process by level so child hyperedges fire before parents
             max_level = max((he.level for he in self.hyperedges.values()), default=0)
             for level in range(max_level + 1):
@@ -3207,6 +3238,8 @@ class Graph:
                         continue  # Archived hyperedges don't participate
                     activation = self._compute_hyperedge_activation(he, fired_set)
                     he.current_activation = activation
+                    # #1131: the habituation gain reads the assembly's activity BEFORE this step's update
+                    _he_prior_ema = he.recent_activation_ema
                     # Update activation EMA (Phase 2.5)
                     fired_flag = 1.0 if (activation >= he.activation_threshold and he.refractory_remaining == 0) else 0.0
                     he.recent_activation_ema = (
@@ -3221,10 +3254,15 @@ class Graph:
                         he.activation_count += 1
                         he.refractory_remaining = he.refractory_period
 
+                        # #1131 habituation gain (1.0 = not computed when off)
+                        _he_hab_gain = self._he_habituation_gain(_he_prior_ema) if _he_hab_on else 1.0
+
                         # Output injection — GRADED mode scales by activation level
                         effective_weight = he.output_weight
                         if he.activation_mode == ActivationMode.GRADED:
                             effective_weight *= activation
+                        if _he_hab_on:
+                            effective_weight *= _he_hab_gain
                         for target_id in he.output_targets:
                             target = self.nodes.get(target_id)
                             if target is not None:
@@ -3236,6 +3274,8 @@ class Graph:
                         if he.pattern_completion_strength > 0:
                             learning_factor = min(1.0, he.activation_count / max(experience_threshold, 1))
                             effective_completion = he.pattern_completion_strength * learning_factor
+                            if _he_hab_on:
+                                effective_completion *= _he_hab_gain
                             if effective_completion > 0:
                                 for nid in he.member_nodes:
                                     if nid not in fired_set:
@@ -3589,6 +3629,7 @@ class Graph:
 
                 decay = self.config["decay_rate"]
                 experience_threshold = self.config["he_experience_threshold"]
+                _pp_hab_on = bool(self.config.get("he_habituation_enabled", False))  # #1131
 
                 for step_idx in range(steps):
                     prop_timestep += 1
@@ -3677,11 +3718,17 @@ class Graph:
                                 continue
                             if activation >= he.activation_threshold:
                                 he.refractory_remaining = he.refractory_period
+                                # #1131 habituation: the same gain as step(), from the assembly's own
+                                # recent_activation_ema (this sweep never updates it). Off = untouched.
+                                _pp_hab = (self._he_habituation_gain(he.recent_activation_ema)
+                                           if _pp_hab_on else 1.0)
 
                                 # Output injection
                                 effective_weight = he.output_weight
                                 if he.activation_mode == ActivationMode.GRADED:
                                     effective_weight *= activation
+                                if _pp_hab_on:
+                                    effective_weight *= _pp_hab
                                 for target_id in he.output_targets:
                                     target = self.nodes.get(target_id)
                                     if target is not None:
@@ -3694,6 +3741,8 @@ class Graph:
                                         1.0, he.activation_count / max(experience_threshold, 1)
                                     )
                                     eff_completion = he.pattern_completion_strength * learning_factor
+                                    if _pp_hab_on:
+                                        eff_completion *= _pp_hab
                                     if eff_completion > 0:
                                         for mnid in he.member_nodes:
                                             if mnid not in fired_set:
@@ -3819,6 +3868,21 @@ class Graph:
             return active / len(he.member_nodes)
 
         return 0.0
+
+    def _he_habituation_gain(self, recent_activation_ema: float) -> float:
+        """#1131 hyperedge habituation: the drive gain for an assembly with this recent activation average.
+
+        gain = 1 / (1 + (ema / he_habituation_half) ** he_habituation_power). An assembly that keeps re-igniting
+        itself (ema ~0.33 at its refractory-limited rate) fades toward silence; a rarely-active one (ema << half)
+        keeps ~full drive. Pure: reads config, writes nothing. Callers apply it only when he_habituation_enabled.
+        """
+        if recent_activation_ema <= 0.0:
+            return 1.0
+        half = float(self.config.get("he_habituation_half", 0.05))
+        if half <= 0.0:
+            return 1.0
+        power = float(self.config.get("he_habituation_power", 2.0))
+        return 1.0 / (1.0 + (recent_activation_ema / half) ** power)
 
     # -----------------------------------------------------------------------
     # Phase 3: Predictive Coding Engine (PRD §5)
