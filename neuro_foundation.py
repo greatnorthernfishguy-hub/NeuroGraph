@@ -20,6 +20,31 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — Graph.hyperedges may be backed by the native ng_tract.HyperedgeStore
+#   (phase H1), OFF by default (PROTECTED CHANGE on review branch cc-laptop-hyperedge-store-h1-20261018 ONLY, its own commit;
+#   Josh 2026-10-18 "Yes, please" = build H1 on review branches; merges only after his protected-file "proceed" + backups)
+# What: Graph(config, *, native_node_store=None, native_hyperedge_store=None). The native store is used only when the
+#       installed ng_tract has HyperedgeStore AND the opt-in is set: the keyword, or (keyword None) the host-set default
+#       (set_native_hyperedge_store_default; this module reads no environment; no host calls it). Otherwise
+#       self.hyperedges / self._archived_hyperedges are today's dicts of Hyperedge and every line of the dict path runs
+#       exactly as before. When on: self.hyperedges is the store (view 0) and self._archived_hyperedges its archive view
+#       (view 1, sharing rows: `_archived_hyperedges[hid] = he` keeps ONE object in both, as the dicts do); a
+#       HyperedgeRef's member_nodes / member_weights / output_targets / child_hyperedges are read-only (frozenset /
+#       mapping / tuple / frozenset), so the 13 collection-mutating sites (HyperedgePlasticityRule.apply x4,
+#       remove_node, step §6a output learning, consolidate_hyperedges, dedup_and_split_oversized_hyperedges x2,
+#       shed_floor_members) call the store's add_member / remove_member / set_member_weight(s) /
+#       append_output_target / remove_output_target on the native path; create_hyperedge /
+#       create_hierarchical_hyperedge return the live HyperedgeRef; _serialize_hyperedge reads the ref's own dict;
+#       _serialize_full emits both hyperedge sub-maps as native msgpack bytes; write_checkpoint splices them verbatim
+#       (as "synapses" / "nodes"); restore slices their raw bytes and _deserialize hands them to bulk_load_msgpack
+#       (dict-form hyperedges, e.g. legacy JSON, take the existing loop).
+# Why:  spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §1.2-§1.5, §4 H1 (Q2: the Python hyperedge code is
+#       frozen as the parity oracle; no new behaviour here). The opt-in is NOT a config key (config is saved in the
+#       checkpoint; byte-identity tests depend on DEFAULT_CONFIG).
+# How:  every read is getattr(self / graph, "_native_he", False): duck-typed graphs take the dict path. Pass state
+#       (_node_hyperedges, _he_co_fire_counts, _he_last_fired_step, _he_output_candidates) stays Python in H1 (it moves
+#       with its passes in H2). Checkpoint bytes equal the dict path's except member_nodes / child_hyperedges list
+#       order (Python set order; equal as sets), §1.5. Tests: tests/test_hyperedge_store_h1.py.
 # [2026-10-08] Claude (lane sprout-1050) — #1050: sprouting from repeated co-firing (the co-firing tally) (PROTECTED CHANGE
 #   on review branch cc-laptop-sprout-1050-20261008 ONLY, its own commit; Josh approved starting #1050 2026-10-08; merges
 #   only after his protected-file "proceed". Keys absent = byte-identical to 4de1166, so Syl is unchanged.)
@@ -947,6 +972,27 @@ def _native_node_store_wanted(explicit: Optional[bool] = None) -> bool:
     if not hasattr(ng_tract, "NodeStore"):
         return False
     return bool(_NATIVE_NODE_STORE_DEFAULT if explicit is None else explicit)
+
+
+_NATIVE_HYPEREDGE_STORE_DEFAULT = False   # H1: set ONLY by a host, via set_native_hyperedge_store_default (no env here)
+
+
+def set_native_hyperedge_store_default(enabled: bool) -> bool:
+    """H1 native hyperedge store (2026-10-18, lane hyperedge-store-h1, #1136): the HOST's switch, as P1's
+    set_native_node_store_default. A host that reads its own configuration (LAW 5) calls this before constructing its
+    Graph; Graphs created while it is True use ng_tract.HyperedgeStore when the installed wheel has it. Process-wide;
+    returns the previous value. No host calls it yet (the enable phase is later, spec §4)."""
+    global _NATIVE_HYPEREDGE_STORE_DEFAULT
+    prev, _NATIVE_HYPEREDGE_STORE_DEFAULT = _NATIVE_HYPEREDGE_STORE_DEFAULT, bool(enabled)
+    return prev
+
+
+def _native_hyperedge_store_wanted(explicit: Optional[bool] = None) -> bool:
+    """H1 opt-in: the installed ng_tract must have HyperedgeStore AND the caller opts in (the Graph keyword when
+    given, else the host-set default, OFF unless a host called set_native_hyperedge_store_default(True))."""
+    if not hasattr(ng_tract, "HyperedgeStore"):
+        return False
+    return bool(_NATIVE_HYPEREDGE_STORE_DEFAULT if explicit is None else explicit)
 
 
 def _share_metadata_texts(meta: Any, pool: Dict[str, str]) -> Any:
@@ -2207,6 +2253,7 @@ class HyperedgePlasticityRule(PlasticityRule):
         fired_set = set(fired_node_ids)
         if not fired_set:
             return
+        _native_he = getattr(graph, "_native_he", False)   # [2026-10-18] H1
 
         for hid, he in graph.hyperedges.items():
             if not he.is_learnable:
@@ -2217,14 +2264,23 @@ class HyperedgePlasticityRule(PlasticityRule):
                 continue
 
             # --- Member Weight Adaptation ---
-            for nid in list(he.member_nodes):
-                w = he.member_weights.get(nid, 1.0)
-                if nid in fired_set:
-                    # Active member during firing → strengthen
-                    he.member_weights[nid] = min(w + self.member_weight_lr, 5.0)
-                else:
-                    # Inactive member during firing → weaken
-                    he.member_weights[nid] = max(w - self.member_weight_lr * 0.5, 0.01)
+            if _native_he:
+                # [2026-10-18] H1: the same values, written through the store in one batch (each member's
+                # weight is read before any write, and members are distinct, so the batch equals the loop)
+                _mw = he.member_weights
+                graph.hyperedges.set_member_weights(hid, [
+                    (nid, min(_mw.get(nid, 1.0) + self.member_weight_lr, 5.0) if nid in fired_set
+                     else max(_mw.get(nid, 1.0) - self.member_weight_lr * 0.5, 0.01))
+                    for nid in list(he.member_nodes)])
+            else:
+                for nid in list(he.member_nodes):
+                    w = he.member_weights.get(nid, 1.0)
+                    if nid in fired_set:
+                        # Active member during firing → strengthen
+                        he.member_weights[nid] = min(w + self.member_weight_lr, 5.0)
+                    else:
+                        # Inactive member during firing → weaken
+                        he.member_weights[nid] = max(w - self.member_weight_lr * 0.5, 0.01)
 
             # --- Member Evolution: add co-firing non-members ---
             he_co_fire_counts = graph._he_co_fire_counts.get(hid)
@@ -2247,8 +2303,11 @@ class HyperedgePlasticityRule(PlasticityRule):
                     he_co_fire_counts[nid] = he_co_fire_counts.get(nid, 0) + 1
                     if he_co_fire_counts[nid] >= self.evolution_min_co_fires:
                         # Promote to member
-                        he.member_nodes.add(nid)
-                        he.member_weights[nid] = self.evolution_initial_weight
+                        if _native_he:   # [2026-10-18] H1
+                            graph.hyperedges.add_member(hid, nid, self.evolution_initial_weight)
+                        else:
+                            he.member_nodes.add(nid)
+                            he.member_weights[nid] = self.evolution_initial_weight
                         graph._node_hyperedges.setdefault(nid, set()).add(hid)
                         # #381: tenure stamp, metadata-resident — rides the
                         # already-serialized dict; missing key = legacy member.
@@ -2402,7 +2461,8 @@ class Graph:
         config: Override any key from ``DEFAULT_CONFIG``.
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, *, native_node_store: Optional[bool] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, *, native_node_store: Optional[bool] = None,
+                 native_hyperedge_store: Optional[bool] = None):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
 
         # --- Core collections (sparse) ---
@@ -2423,7 +2483,14 @@ class Graph:
         self.synapses = ng_tract.SynapseStore()
         self.synapses.set_synapse_type_class(SynapseType)
         self.synapses.set_synapse_class(Synapse)
-        self.hyperedges: Dict[str, Hyperedge] = {}
+        # [2026-10-18] H1 native hyperedge store: ng_tract.HyperedgeStore (same mapping API; values are
+        # write-through HyperedgeRef views) only when the wheel has it AND the opt-in is set.
+        self._native_he: bool = _native_hyperedge_store_wanted(native_hyperedge_store)
+        if self._native_he:
+            self.hyperedges = ng_tract.HyperedgeStore()
+            self.hyperedges.set_classes(Hyperedge, ActivationMode, ConsolidationState)
+        else:
+            self.hyperedges: Dict[str, Hyperedge] = {}
 
         # --- Sparse adjacency indices ---
         # node_id → set of synapse_ids
@@ -2459,7 +2526,11 @@ class Graph:
         # Nodes that fired during each prediction's window (rolling)
         self._prediction_window_fired: Dict[str, Set[str]] = {}
         # Archived hyperedges (for cross-level pruning)
-        self._archived_hyperedges: Dict[str, Hyperedge] = {}
+        # [2026-10-18] H1: the store's archive view when native (shares rows with self.hyperedges)
+        if self._native_he:
+            self._archived_hyperedges = self.hyperedges.archive_store()
+        else:
+            self._archived_hyperedges: Dict[str, Hyperedge] = {}
 
         # --- Plasticity rules ---
         self._plasticity_rules: List[PlasticityRule] = [
@@ -2778,10 +2849,15 @@ class Graph:
             for hid in list(self._node_hyperedges.get(node_id, set())):
                 he = self.hyperedges.get(hid)
                 if he:
-                    he.member_nodes.discard(node_id)
-                    he.member_weights.pop(node_id, None)
-                    if node_id in he.output_targets:
-                        he.output_targets.remove(node_id)
+                    if getattr(self, "_native_he", False):   # [2026-10-18] H1
+                        self.hyperedges.remove_member(hid, node_id)
+                        if node_id in he.output_targets:
+                            self.hyperedges.remove_output_target(hid, node_id)
+                    else:
+                        he.member_nodes.discard(node_id)
+                        he.member_weights.pop(node_id, None)
+                        if node_id in he.output_targets:
+                            he.output_targets.remove(node_id)
                     if len(he.member_nodes) == 0:
                         self._remove_hyperedge_internal(hid)
                     else:
@@ -2987,6 +3063,8 @@ class Graph:
                 **({"hyperedge_id": hyperedge_id} if hyperedge_id is not None else {}),
             )
             self.hyperedges[he.hyperedge_id] = he
+            if getattr(self, "_native_he", False):
+                he = self.hyperedges[he.hyperedge_id]   # [2026-10-18] H1: the live HyperedgeRef (the Hyperedge was copied in)
             # Phase 4: stamp creation time.
             he.creation_time = self.timestep
             for nid in member_node_ids:
@@ -3299,7 +3377,10 @@ class Graph:
                         continue  # Already learned
                     candidates[nid] = candidates.get(nid, 0) + 1
                     if candidates[nid] >= ol_min and len(he.output_targets) < ol_max:
-                        he.output_targets.append(nid)
+                        if getattr(self, "_native_he", False):   # [2026-10-18] H1
+                            self.hyperedges.append_output_target(hid, nid)
+                        else:
+                            he.output_targets.append(nid)
                         self._emit("he_output_learned", hid=hid, target=nid)
                         logger.info(
                             "Phase 2.5b: HE %s learned output target %s "
@@ -6640,6 +6721,8 @@ class Graph:
                 level=max_child_level + 1,
             )
             self.hyperedges[he.hyperedge_id] = he
+            if getattr(self, "_native_he", False):
+                he = self.hyperedges[he.hyperedge_id]   # [2026-10-18] H1: the live HyperedgeRef
             for nid in all_member_nodes:
                 self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
             self._he_co_fire_counts[he.hyperedge_id] = {}
@@ -6826,8 +6909,11 @@ class Graph:
                             continue
                         # Merge B into A: expand A's members, keep lower threshold
                         for nid in he_b.member_nodes - he_a.member_nodes:
-                            he_a.member_nodes.add(nid)
-                            he_a.member_weights[nid] = he_b.member_weights.get(nid, 1.0)
+                            if getattr(self, "_native_he", False):   # [2026-10-18] H1
+                                self.hyperedges.add_member(hid_a, nid, he_b.member_weights.get(nid, 1.0))
+                            else:
+                                he_a.member_nodes.add(nid)
+                                he_a.member_weights[nid] = he_b.member_weights.get(nid, 1.0)
                             self._node_hyperedges.setdefault(nid, set()).add(hid_a)
                         he_a.activation_threshold = min(
                             he_a.activation_threshold,
@@ -7075,7 +7161,14 @@ class Graph:
                     since2 = he2.metadata.get("member_since", {}) or {}
                     for nid in he2.member_nodes:
                         w2 = he2.member_weights.get(nid, 1.0)
-                        if nid in he.member_nodes:
+                        if getattr(self, "_native_he", False):   # [2026-10-18] H1
+                            if nid in he.member_nodes:
+                                self.hyperedges.set_member_weight(hid, nid, max(
+                                    he.member_weights.get(nid, w2), w2))
+                            else:
+                                self.hyperedges.add_member(hid, nid, w2)
+                                self._node_hyperedges.setdefault(nid, set()).add(hid)
+                        elif nid in he.member_nodes:
                             he.member_weights[nid] = max(
                                 he.member_weights.get(nid, w2), w2)
                         else:
@@ -7158,8 +7251,11 @@ class Graph:
                 if missing:
                     core_he = self.hyperedges[child_ids[0]]
                     for nid in missing:
-                        core_he.member_nodes.add(nid)
-                        core_he.member_weights[nid] = weights.get(nid, 1.0)
+                        if getattr(self, "_native_he", False):   # [2026-10-18] H1
+                            self.hyperedges.add_member(child_ids[0], nid, weights.get(nid, 1.0))
+                        else:
+                            core_he.member_nodes.add(nid)
+                            core_he.member_weights[nid] = weights.get(nid, 1.0)
                         self._node_hyperedges.setdefault(nid, set()).add(child_ids[0])
 
                 # Archive the parent (reversible) and drop it from the reverse index.
@@ -7330,8 +7426,11 @@ class Graph:
                 ]
                 allowed = max(0, len(he.member_nodes) - min_keep)
                 for nid in candidates[:allowed]:
-                    he.member_nodes.discard(nid)
-                    he.member_weights.pop(nid, None)
+                    if getattr(self, "_native_he", False):   # [2026-10-18] H1
+                        self.hyperedges.remove_member(hid, nid)
+                    else:
+                        he.member_nodes.discard(nid)
+                        he.member_weights.pop(nid, None)
                     if isinstance(since, dict):
                         since.pop(nid, None)
                     hset = self._node_hyperedges.get(nid)
@@ -7665,7 +7764,8 @@ class Graph:
             for key, value in captured.items():
                 f.write(packer.pack(key))
                 # [2026-10-05] P1: "nodes" is pre-packed bytes too when the native node store is on
-                if key in ("synapses", "nodes") and isinstance(value, (bytes, bytearray)):
+                # [2026-10-18] H1: and both hyperedge maps when the native hyperedge store is on
+                if key in ("synapses", "nodes", "hyperedges", "archived_hyperedges") and isinstance(value, (bytes, bytearray)):
                     f.write(value)  # verbatim pre-packed {sid: {15-key}} / {nid: {19-key}} map
                 else:
                     f.write(packer.pack(value))
@@ -7705,7 +7805,8 @@ class Graph:
             n_pairs = unpacker.read_map_header()
             for _ in range(n_pairs):
                 key = unpacker.unpack()
-                if key == "synapses" or (key == "nodes" and getattr(self, "_native_nodes", False)):   # [2026-10-05] P1: nodes too, when native
+                if key == "synapses" or (key == "nodes" and getattr(self, "_native_nodes", False)) or (   # [2026-10-05] P1: nodes too, when native
+                        key in ("hyperedges", "archived_hyperedges") and getattr(self, "_native_he", False)):   # [2026-10-18] H1
                     start = unpacker.tell()
                     unpacker.skip()  # advance past the value WITHOUT inflating it
                     data[key] = raw[start:unpacker.tell()]  # raw sub-map bytes
@@ -7760,6 +7861,15 @@ class Graph:
         }
 
     def _serialize_hyperedge(self, he: Hyperedge, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
+        _cd = getattr(he, "checkpoint_dict", None) if getattr(self, "_native_he", False) else None
+        if _cd is not None:
+            # [2026-10-18] H1: a HyperedgeRef builds the same 20-key dict itself (member / child lists in the
+            # store's order; fresh lists / dicts for its native collections); _memo deep-copies as below.
+            d = _cd()
+            if _memo is not None:
+                for _k in ("member_weights", "output_targets", "metadata"):
+                    d[_k] = copy.deepcopy(d[_k], _memo)
+            return d
         return {
             "hyperedge_id": he.hyperedge_id,
             "member_nodes": list(he.member_nodes),
@@ -7820,8 +7930,10 @@ class Graph:
         # list(items()) alone would not provide a coherent mutation boundary.
         # [2026-10-05] P1: the native node store packs its own {nid: {19-key}} bytes (detached by construction)
         _nodes      = None if getattr(self, "_native_nodes", False) else list(self.nodes.items())
-        _hyperedges = list(self.hyperedges.items())
-        _archived   = list(self._archived_hyperedges.items())
+        # [2026-10-18] H1: the native hyperedge store packs both of its views itself (detached bytes)
+        _native_he  = getattr(self, "_native_he", False)
+        _hyperedges = None if _native_he else list(self.hyperedges.items())
+        _archived   = None if _native_he else list(self._archived_hyperedges.items())
         _act_preds  = list(self.active_predictions.items())
         _syn_hist   = list(self._synapse_confirmation_history.items())
         _he_preds   = list(self._active_predictions.items())
@@ -7844,11 +7956,12 @@ class Graph:
             # materializing ~644K transient Python dicts. checkpoint() splices these
             # bytes verbatim into the outer map (see the streaming write below).
             "synapses": _packed_synapses,
-            "hyperedges": {hid: self._serialize_hyperedge(h, _memo=_memo) for hid, h in _hyperedges},
-            "archived_hyperedges": {
+            "hyperedges": (self.hyperedges.to_checkpoint_msgpack() if _hyperedges is None
+                           else {hid: self._serialize_hyperedge(h, _memo=_memo) for hid, h in _hyperedges}),
+            "archived_hyperedges": (self._archived_hyperedges.to_checkpoint_msgpack() if _archived is None else {
                 hid: self._serialize_hyperedge(h, _memo=_memo)
                 for hid, h in _archived
-            },
+            }),
             # Phase 3: Active synapse-level predictions
             "active_predictions": {
                 pid: self._serialize_prediction(pred)
@@ -8134,7 +8247,17 @@ class Graph:
             self._incoming.setdefault(post_id, set()).add(sid)
 
         # Restore hyperedges
-        for hid, hd in data.get("hyperedges", {}).items():
+        _he_data = data.get("hyperedges", {})
+        if getattr(self, "_native_he", False) and isinstance(_he_data, (bytes, bytearray)):
+            # [2026-10-18] H1: raw sub-map (sliced by restore) -> native bulk load (the loop's defaults); then the same
+            # index setup as the loop, in the same order.
+            self.hyperedges.bulk_load_msgpack(_he_data, archived_default=False)
+            for hid, he in self.hyperedges.items():
+                for nid in he.member_nodes:
+                    self._node_hyperedges.setdefault(nid, set()).add(hid)
+                self._he_co_fire_counts[hid] = {}
+            _he_data = {}
+        for hid, hd in _he_data.items():
             he = Hyperedge(
                 hyperedge_id=hid,
                 member_nodes=set(hd["member_nodes"]),
@@ -8166,7 +8289,11 @@ class Graph:
 
         # Restore archived hyperedges (Phase 2.5)
         self._archived_hyperedges.clear()
-        for hid, hd in data.get("archived_hyperedges", {}).items():
+        _arch_data = data.get("archived_hyperedges", {})
+        if getattr(self, "_native_he", False) and isinstance(_arch_data, (bytes, bytearray)):
+            self._archived_hyperedges.bulk_load_msgpack(_arch_data, archived_default=True)   # [2026-10-18] H1
+            _arch_data = {}
+        for hid, hd in _arch_data.items():
             he = Hyperedge(
                 hyperedge_id=hid,
                 member_nodes=set(hd["member_nodes"]),
