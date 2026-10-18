@@ -33,6 +33,11 @@ Laws observed:
 #         DualSubstrateBridge (deferred to tract bridge), direct TID config.
 #   How:  Flat in repo root like CES modules. Config via dataclass + JSON
 #         override at ~/.neurograph/syl_daemon.json. Workspace at ~/.syl/.
+# [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — salience's hyperedge count uses the native store when available
+#   What: when graph.hyperedges is a native ng_tract.HyperedgeStore, he_count is HyperedgeStore.membership_count(nid);
+#         otherwise the unchanged scan.
+#   Why:  spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §1.3 (hot readers get native helpers).
+#   How:  getattr(graph.hyperedges, "membership_count", None). Syl's wheel has no HyperedgeStore: her path is unchanged.
 # -------------------
 """
 
@@ -345,7 +350,8 @@ class SalienceReader:
         score += min(ema * 10.0, 0.3)
 
         # Hyperedge membership — is this part of recognized patterns?
-        he_count = sum(
+        _mc = getattr(self._graph.hyperedges, "membership_count", None)   # [2026-10-18] H1 native store
+        he_count = _mc(nid) if _mc is not None else sum(
             1 for he in self._graph.hyperedges.values()
             if nid in he.member_nodes
         )

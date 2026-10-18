@@ -26,6 +26,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — _build_he_index uses the native store's member_index when available
+# What: when graph.hyperedges is a native ng_tract.HyperedgeStore, the node -> membership-count index is one
+#       HyperedgeStore.member_index() call; otherwise the unchanged loop.
+# Why:  spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §1.3 (hot readers get native helpers).
+# How:  getattr(graph.hyperedges, "member_index", None); same counts (only .get is read from the index).
 # [2026-10-06] Claude (lane nodestore-p2a) — the activity / recency scans read native node columns when available
 # What: _read_active_nodes and _read_recent_spikes iterate _node_scan_rows(graph, fields): one NodeStore.columns()
 #   copy (node order) when graph.nodes is a native ng_tract.NodeStore, else each node's attributes (unchanged reads).
@@ -463,6 +468,9 @@ class TonicThread:
         to _read_active_nodes + _update_thread, replacing their O(N×H) inner scans with
         O(1) lookups. (#347)
         """
+        _mi = getattr(self._graph.hyperedges, "member_index", None)   # [2026-10-18] H1 native store
+        if _mi is not None:
+            return _mi()
         idx: Dict[str, int] = {}
         for he in self._graph.hyperedges.values():
             for nid in he.member_nodes:

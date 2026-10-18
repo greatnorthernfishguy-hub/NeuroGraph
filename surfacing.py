@@ -17,6 +17,12 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — _score_node counts memberships natively when available
+# What: when graph.hyperedges is a native ng_tract.HyperedgeStore (it has membership_count), the hyperedge-membership
+#       count is one HyperedgeStore.membership_count(node_id) under the same _step_lock; otherwise the unchanged scan.
+# Why:  spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §1.3: a HyperedgeRef's member_nodes is a
+#       frozenset built on demand, so scanning every hyperedge per scored node would be a regression.
+# How:  getattr(graph.hyperedges, "membership_count", None); counts the same entries (every value of graph.hyperedges).
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1: format_context renders WHOLE
 # What: SurfacingMonitor.format_context() no longer cuts an item at 200 chars (word-snap +
 #       "..."). The header marker "[NeuroGraph Surfaced Knowledge]" (miniTID's rail marker),
@@ -373,15 +379,23 @@ class SurfacingMonitor:
         # single graph.step(), a much shorter window per call than Lenia's
         # multi-hour populate(), but the same unguarded iteration.
         _lock = getattr(self._graph, '_step_lock', None)
-        if _lock is not None:
-            with _lock:
-                _hes = list(self._graph.hyperedges.values())
+        _mc = getattr(self._graph.hyperedges, 'membership_count', None)   # [2026-10-18] H1 native store
+        if _mc is not None:
+            if _lock is not None:
+                with _lock:
+                    he_count = _mc(node_id)
+            else:
+                he_count = _mc(node_id)
         else:
-            _hes = list(self._graph.hyperedges.values())
-        he_count = 0
-        for he in _hes:
-            if node_id in getattr(he, 'member_nodes', getattr(he, 'member_node_ids', [])):
-                he_count += 1
+            if _lock is not None:
+                with _lock:
+                    _hes = list(self._graph.hyperedges.values())
+            else:
+                _hes = list(self._graph.hyperedges.values())
+            he_count = 0
+            for he in _hes:
+                if node_id in getattr(he, 'member_nodes', getattr(he, 'member_node_ids', [])):
+                    he_count += 1
         he_norm = min(he_count / 10.0, 1.0)
 
         w_v = self._cfg.weight_voltage
