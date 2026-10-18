@@ -3,6 +3,13 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-17] Claude Code (Opus 5.5, Executive; #1123) — drain_ingest_tract(should_stop=None)
+#   What: an optional probe checked between turns, like max_seconds; when it returns True the pass ends
+#         ("host_stopping") and the untaken turns stay in the tract.
+#   Why:  at the 2026-10-17 11:30 stop the drain absorbed a turn at 11:31:23, 78 s after the signal, holding
+#         _concurrent_lock past shutdown's 90 s wait, so the final graph save was skipped (~12 min lost). Its pass cap
+#         (CC_NG_DRAIN_MAX_SECONDS 120) is longer than the wait.
+#   How:  default None = behaviour unchanged; the daemon passes `lambda: not STATE.running`.
 # [2026-10-16] Claude Code (Opus 5.5) — #1131 condition F: recall reports what the cue EVOKED (gated, default OFF)
 # What: cc_pattern_completion_recall gains an evoked-minus-spontaneous stage behind CC_RECALL_EVOKED (default "0";
 #       knob CC_RECALL_EVOKED_OVERSAMPLE, default 6). When on: the harvest is oversampled (k x 6), ONE stimulus-free
@@ -4200,7 +4207,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         batch_nodes: int = None, receipt: dict = None,
                         max_seconds: float = 0, retry_tract_path: str = None,
                         defer_tract_path: str = None, defer_over_bytes: int = 0,
-                        hold_on_failure: bool = False):
+                        should_stop=None, hold_on_failure: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -4433,6 +4440,16 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             if max_seconds and (time.monotonic() - _t_start) >= max_seconds:
                 ended = "time_cap_reached"   # MVP 2026-10-03: bound one drain pass; the rest stays in the tract
                 break
+            # #1123 (2026-10-17): the host is shutting down -- stop between turns so its final save can take the
+            # lock; the rest stays in the tract for the next start. A raising probe never stops the drain.
+            if should_stop is not None:
+                try:
+                    _stop = bool(should_stop())
+                except Exception:  # noqa: BLE001
+                    _stop = False
+                if _stop:
+                    ended = "host_stopping"
+                    break
         if hold_on_failure:
             # Truncate only what precedes the first failed entry (or the whole
             # walked span when nothing failed: safe_offset == consumed_offset).

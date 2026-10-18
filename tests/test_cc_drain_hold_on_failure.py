@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-10-17] Claude Code (Opus 5.5) — #1123: should_stop pinned (signature list) + three behaviour tests at the end.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4, dispatch #14658) — N8 (TRIAL branch, test-only): F-A, the stale
 #   cross-change pin. test_signature_hold_on_failure_is_last_and_defaults_false pinned the exact pre-D24 signature; with D24 in the same tree
 #   the signature is [..., max_entries, batch_nodes, receipt, hold_on_failure]. UPDATED to assert the prefix list (now with batch_nodes,
@@ -229,7 +230,8 @@ def test_signature_hold_on_failure_is_last_and_defaults_false():
                            "max_entries", "batch_nodes", "receipt",
                            "max_seconds",   # MVP 2026-10-03: the wall-time cap per pass
                            "retry_tract_path",   # MVP 2026-10-03: failed turns move aside, nothing dropped
-                           "defer_tract_path", "defer_over_bytes"]   # MVP 2026-10-03: oversize turns wait aside
+                           "defer_tract_path", "defer_over_bytes",   # MVP 2026-10-03: oversize turns wait aside
+                           "should_stop"]   # 2026-10-17 #1123: a stopping host ends the pass between turns
     assert params[-1] == "hold_on_failure"
     assert sig.parameters["hold_on_failure"].default is False
 
@@ -467,3 +469,47 @@ def test_defer_moves_an_oversize_turn_whole_unattempted_and_the_rest_flow(env):
     assert absorbed == 2
     assert _read(path) == b""
     assert _read(deferred) == frames[1]   # moved whole; never attempted (it would have failed)
+
+
+# ------------------------------------------------------------- #1123 (2026-10-17): should_stop
+# A stopping host ends the pass between turns (the 2026-10-17 11:30 stop held _concurrent_lock past
+# shutdown's 90 s wait). None (default) and a raising probe change nothing.
+def _drain(env, path, **kw):
+    env.calls.clear()
+    return cc_ng_organism.drain_ingest_tract(object(), None, {"last_forest_id": None}, tract_path=path,
+                                             return_consumed=True, **kw)
+
+
+def test_signature_has_should_stop_defaulting_none():
+    assert inspect.signature(cc_ng_organism.drain_ingest_tract).parameters["should_stop"].default is None
+
+
+def test_stop_probe_ends_the_pass_between_turns_and_keeps_the_rest(env):
+    frames = _build(env, "all_success")
+    path_a = _write(env, "stop_none", frames)
+    absorbed_none, _ = _drain(env, path_a)
+    calls_none = len(env.calls)
+    assert calls_none >= 2, "scenario needs at least two turns"
+    seen = {"n": 0}
+
+    def stop_after_first():
+        seen["n"] += 1
+        return seen["n"] >= 1          # True right after the first turn
+    path_b = _write(env, "stop_after_first", frames)
+    absorbed_stop, _ = _drain(env, path_b, should_stop=stop_after_first)
+    assert len(env.calls) == 1 and absorbed_stop <= 1
+    assert len(_read(path_b)) > 0                 # the untaken turns are still in the tract
+
+
+def test_raising_probe_and_false_probe_change_nothing(env):
+    frames = _build(env, "all_success")
+    path_a = _write(env, "ref", frames)
+    _drain(env, path_a)
+    ref = len(env.calls)
+
+    def boom():
+        raise RuntimeError("probe broke")
+    for probe in (lambda: False, boom):
+        path = _write(env, "probe_%s" % id(probe), frames)
+        _drain(env, path, should_stop=probe)
+        assert len(env.calls) == ref
