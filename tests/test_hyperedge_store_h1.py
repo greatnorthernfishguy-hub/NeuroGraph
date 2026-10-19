@@ -1,3 +1,10 @@
+# ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — keep this file on the H1 path
+# What: with both native stores on, new_graph turns the graph's H2 native passes off (the Python passes over the store).
+# Why:  the H2 passes sum in the store's member order, so voltages match an oracle only when the order is handed to it;
+#       that is test_hyperedge_store_h2.py's job. This file keeps proving H1 as it was.
+# How:  _he_ps_to_python() then _native_he_passes = False, right after construction.
+# -------------------
 # [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — equivalence: native hyperedge store (H1) ON / OFF vs the TRIAL TIP
 """H1 native hyperedge store: byte- and trace-equivalence against the trial tip (spec 2026-10-17 §1.5, §3.1).
 
@@ -64,6 +71,11 @@ def new_graph(mode, config=None, native_nodes=False):
     if mode == "base":
         return BASE.Graph(config)
     g = NF.Graph(config, native_node_store=native_nodes, native_hyperedge_store=(mode == "on"))
+    if getattr(g, "_native_he_passes", False):
+        # [2026-10-18] H2: this file proves H1 (the frozen Python passes over the store); the native passes, which
+        # need the member order handed to the oracle for bitwise voltages, are proven in test_hyperedge_store_h2.py
+        g._he_ps_to_python()
+        g._native_he_passes = False
     assert g._native_he == (mode == "on")
     assert isinstance(g.hyperedges, dict) == (mode != "on")
     return g

@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — the test writes hyperedge collections the way the engine does
+# What: a member / weight write goes through the store API (add_member / set_member_weight / remove_member) when
+#       graph.hyperedges is the native ng_tract.HyperedgeStore, and the plain dict / set write otherwise; an
+#       output_targets check compares list(...) (the store hands out a tuple).
+# Why:  spec 2026-10-17-rust-hyperedge-store-design.md §1.3: a HyperedgeRef's collections are read-only (fail loud), so
+#       a direct `he.member_nodes.add` raises with the store forced on. Same assertions, unchanged dict path.
+# How:  _set_w helper / inline hasattr checks.
 # [2026-07-11] Claude Code (Fable 5 design / Haiku implementation) — #381 A/B/D engine tests
 # What: wake-side cap (bound=50, counter hygiene, tenure stamps), discovery guards
 #   (avalanche skip, Jaccard dup), dream-side shed (floor+tenure, reverse-index,
@@ -90,12 +97,20 @@ def test_discovery_still_mints_genuinely_new():
 
 # ---- dream side: shed ----
 
+def _set_w(g, he, nid, w):
+    """he.member_weights[nid] = w — through the store API when graph.hyperedges is the native HyperedgeStore."""
+    if hasattr(g.hyperedges, "set_member_weight"):
+        g.hyperedges.set_member_weight(he.hyperedge_id, nid, w)
+    else:
+        he.member_weights[nid] = w
+
+
 def test_shed_removes_floor_members_and_cleans_reverse_index():
     g = _graph(20, he_shed_weight_threshold=0.02, he_shed_min_tenure=10)
     he = g.create_hyperedge({f"n{i}" for i in range(8)})
     g.timestep = 1000
     for nid in ("n0", "n1"):
-        he.member_weights[nid] = 0.01               # at floor
+        _set_w(g, he, nid, 0.01)                    # at floor
         he.metadata.setdefault("member_since", {})[nid] = 0   # ancient tenure
     shed = g.shed_floor_members()
     assert shed == 2
@@ -108,7 +123,7 @@ def test_shed_honors_min_tenure_and_min_keep():
     g = _graph(10, he_shed_weight_threshold=0.02, he_shed_min_tenure=10_000)
     he = g.create_hyperedge({"n0", "n1", "n2", "n3"})
     g.timestep = 100
-    he.member_weights["n0"] = 0.01
+    _set_w(g, he, "n0", 0.01)
     he.metadata.setdefault("member_since", {})["n0"] = 95   # too young
     assert g.shed_floor_members() == 0
     # min-keep: floor everything on a 3-member HE (he_discovery_min_nodes=3) -> nothing shed
@@ -116,7 +131,7 @@ def test_shed_honors_min_tenure_and_min_keep():
     he2 = g2.create_hyperedge({"n0", "n1", "n2"})
     g2.timestep = 1000
     for nid in ("n0", "n1", "n2"):
-        he2.member_weights[nid] = 0.01
+        _set_w(g2, he2, nid, 0.01)
     assert g2.shed_floor_members() == 0
 
 
@@ -124,7 +139,7 @@ def test_shed_skips_archived_and_unlearnable():
     g = _graph(10, he_shed_min_tenure=1)
     he = g.create_hyperedge({"n0", "n1", "n2", "n3"}, is_learnable=False)
     g.timestep = 1000
-    he.member_weights["n0"] = 0.01
+    _set_w(g, he, "n0", 0.01)
     assert g.shed_floor_members() == 0
 
 

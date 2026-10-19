@@ -9,6 +9,13 @@ Covers:
 """
 
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — the test writes hyperedge collections the way the engine does
+# What: a member / weight write goes through the store API (add_member / set_member_weight / remove_member) when
+#       graph.hyperedges is the native ng_tract.HyperedgeStore, and the plain dict / set write otherwise; an
+#       output_targets check compares list(...) (the store hands out a tuple).
+# Why:  spec 2026-10-17-rust-hyperedge-store-design.md §1.3: a HyperedgeRef's collections are read-only (fail loud), so
+#       a direct `he.member_nodes.add` raises with the store forced on. Same assertions, unchanged dict path.
+# How:  _set_w helper / inline hasattr checks.
 # [2026-03-23] Claude Code (Opus 4.6) — Initial test suite for output_target learning
 #   What: 7 tests covering the output_target learning rule in step() §5b.
 #   Why:  New feature needs regression coverage.
@@ -52,7 +59,7 @@ class TestOutputTargetLearning:
         output_node = g.create_node("out").node_id
 
         he = g.create_hyperedge(set(members), activation_threshold=0.6)
-        assert he.output_targets == []
+        assert list(he.output_targets) == []     # a tuple from the native store, a list from the dict path
 
         # Fire all members so HE fires (step T)
         for nid in members:

@@ -1,6 +1,13 @@
 # tests/test_seam_split.py
 #
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — the test writes hyperedge collections the way the engine does
+# What: a member / weight write goes through the store API (add_member / set_member_weight / remove_member) when
+#       graph.hyperedges is the native ng_tract.HyperedgeStore, and the plain dict / set write otherwise; an
+#       output_targets check compares list(...) (the store hands out a tuple).
+# Why:  spec 2026-10-17-rust-hyperedge-store-design.md §1.3: a HyperedgeRef's collections are read-only (fail loud), so
+#       a direct `he.member_nodes.add` raises with the store forced on. Same assertions, unchanged dict path.
+# How:  _set_w helper / inline hasattr checks.
 # [2026-08-14] Claude Code (Opus 4.8) — Unit coverage for #147 dream seam-split
 # What: Exercises Graph.dedup_and_split_oversized_hyperedges() and its seam-score
 #   helper directly against a real Graph — the substrate-mutating dream-repair op
@@ -351,5 +358,9 @@ def test_seam_score_empty_edge_returns_empty():
     ids = ["n0", "n1"]
     _add_nodes(g, ids)
     he = g.create_hyperedge(member_node_ids=set(ids))
-    he.member_nodes.clear()
+    if hasattr(g.hyperedges, "remove_member"):           # native HyperedgeStore: collections are read-only
+        for nid in list(he.member_nodes):
+            g.hyperedges.remove_member(he.hyperedge_id, nid)
+    else:
+        he.member_nodes.clear()
     assert g._seam_score_members(he.hyperedge_id, he) == {}

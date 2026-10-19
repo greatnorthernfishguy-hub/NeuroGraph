@@ -1,3 +1,12 @@
+# ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — the test writes hyperedge collections the way the engine does
+# What: a member / weight write goes through the store API (add_member / set_member_weight / remove_member) when
+#       graph.hyperedges is the native ng_tract.HyperedgeStore, and the plain dict / set write otherwise; an
+#       output_targets check compares list(...) (the store hands out a tuple).
+# Why:  spec 2026-10-17-rust-hyperedge-store-design.md §1.3: a HyperedgeRef's collections are read-only (fail loud), so
+#       a direct `he.member_nodes.add` raises with the store forced on. Same assertions, unchanged dict path.
+# How:  _set_w helper / inline hasattr checks.
+# -------------------
 """Tests for Phase 2 Hypergraph Engine.
 
 Covers PRD §4:
@@ -430,8 +439,11 @@ class TestHierarchicalHyperedges:
         )
         # Add the other 2 nodes to level 1 only
         for nid in ids[2:]:
-            he_l1.member_nodes.add(nid)
-            he_l1.member_weights[nid] = 1.0
+            if hasattr(g.hyperedges, "add_member"):      # native HyperedgeStore: collections are read-only
+                g.hyperedges.add_member(he_l1.hyperedge_id, nid, 1.0)
+            else:
+                he_l1.member_nodes.add(nid)
+                he_l1.member_weights[nid] = 1.0
 
         # Fire all 4 nodes
         for nid in ids:
