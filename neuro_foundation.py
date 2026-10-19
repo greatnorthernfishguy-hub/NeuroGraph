@@ -20,6 +20,34 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — H2: the hyperedge passes run natively on the store's columns when
+#   BOTH native stores are on; #1142 choose-by-contribution and #1140 sorted saves behind protected flags (PROTECTED CHANGE
+#   on review branch cc-laptop-hyperedge-store-h2-20261018 ONLY, its own commit; Josh 2026-10-18 "Let's keep going" =
+#   build H2 on review branches; merges only after his protected-file "proceed" + backups of both msgpack files)
+# What: (1) Graph._native_he_passes = native hyperedge store AND native node store AND a wheel with
+#       HyperedgeStore.evaluate_step (spec Q1). Then step() §6 + §6a + the hyperedge refractory decrement are ONE native
+#       call (HyperedgeStore.evaluate_step: activation, EMA, fire, count, output injection and pattern completion into
+#       the NodeStore voltage column, output-target learning); Python builds the PredictionStates and emits
+#       prediction_created / hyperedge_fired / he_output_learned in the loop's order. prime_and_propagate's hyperedge
+#       sweep + its refractory decrement -> evaluate_sweep (returns the working_set additions in order);
+#       HyperedgePlasticityRule.apply -> plasticity_pass (member_since stamps and _node_hyperedges stay Python, per
+#       promotion in order); inject_reward's threshold learning -> reward_thresholds. The pass state
+#       (_he_last_fired_step, _he_output_candidates, _he_co_fire_counts) moves into the store; those names become
+#       read-only live views; the checkpoint packs the first two natively (spliced like "nodes"). A pass that declines
+#       (None/False: a non-canonical value, a busy borrow) hands the state to the frozen loop as plain dicts
+#       (_he_ps_to_python); the next native pass takes it back (_he_ps_to_native). _node_hyperedges stays Python (no
+#       native pass reads it; ~40 slow-path sites and two non-engine modules use it).
+#       (2) #1142 (Josh's ruling 3b), protected flag he_member_choice_by_contribution (read live; absent = off =
+#       today's order): shed_floor_members sheds the least-contributing qualifying members first — key (member
+#       weight ascending, co-fire tally ascending, node id); the seam split ranks the core by (seam score desc, member
+#       weight desc, co-fire tally desc, node id); a dominant-manifold tie in _seam_score_members goes to the name.
+#       (3) #1140 (ruling 3a), protected flag he_checkpoint_sorted_members (absent = off): the Python path saves
+#       member_nodes / child_hyperedges sorted (the native store always does).
+# Why:  spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §1.4, §4 H2, §6A (Q1, Q2) and the 2026-10-18
+#       H1 rulings. The Python hyperedge code is unchanged and stays the oracle and the fallback; no new dynamics.
+# How:  every switch absent / off and either native store off = the H1 code path line for line (the Python loops are
+#       only re-indented under `if <native result> is None`). Neither flag is in DEFAULT_CONFIG.
+#       Tests: tests/test_hyperedge_store_h2.py.
 # [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — Graph.hyperedges may be backed by the native ng_tract.HyperedgeStore
 #   (phase H1), OFF by default (PROTECTED CHANGE on review branch cc-laptop-hyperedge-store-h1-20261018 ONLY, its own commit;
 #   Josh 2026-10-18 "Yes, please" = build H1 on review branches; merges only after his protected-file "proceed" + backups)
@@ -972,6 +1000,17 @@ def _native_node_store_wanted(explicit: Optional[bool] = None) -> bool:
     if not hasattr(ng_tract, "NodeStore"):
         return False
     return bool(_NATIVE_NODE_STORE_DEFAULT if explicit is None else explicit)
+
+
+def _ckpt_id_list(ids: Any, sort: bool) -> list:
+    """[2026-10-18] H2 (#1140): a saved id list — sorted when asked (falls back to list order if the ids are not
+    mutually orderable), else list(ids) exactly as before."""
+    if sort:
+        try:
+            return sorted(ids)
+        except TypeError:
+            pass
+    return list(ids)
 
 
 _NATIVE_HYPEREDGE_STORE_DEFAULT = False   # H1: set ONLY by a host, via set_native_hyperedge_store_default (no env here)
@@ -2254,6 +2293,20 @@ class HyperedgePlasticityRule(PlasticityRule):
         if not fired_set:
             return
         _native_he = getattr(graph, "_native_he", False)   # [2026-10-18] H1
+        # [2026-10-18] H2 (#1136): the whole rule as one native pass when the graph's native passes are on (the store
+        # owns _he_co_fire_counts). The member_since tenure stamp and the _node_hyperedges reverse index stay Python,
+        # written here per promotion in the loop's order. A declined pass (None) hands the state to the loop below.
+        _to_native = getattr(graph, "_he_ps_to_native", None)
+        if _to_native is not None and _to_native():
+            _promos = graph.hyperedges.plasticity_pass(
+                graph.nodes, list(fired_set), self.member_weight_lr, self.evolution_min_co_fires,
+                self.evolution_initial_weight, graph.config.get("he_max_members", 50))
+            if _promos is not None:
+                for hid, nid in _promos:
+                    graph._node_hyperedges.setdefault(nid, set()).add(hid)
+                    graph.hyperedges[hid].metadata.setdefault("member_since", {})[nid] = timestep
+                return
+            graph._he_ps_to_python()
 
         for hid, he in graph.hyperedges.items():
             if not he.is_learnable:
@@ -2588,6 +2641,16 @@ class Graph:
         self._he_last_fired_step: Dict[str, int] = {}
         # he_id → {candidate_node_id: fire_count_within_window}
         self._he_output_candidates: Dict[str, Dict[str, int]] = {}
+        # [2026-10-18] H2 (#1136): the native hyperedge passes (evaluate_step / evaluate_sweep / plasticity_pass /
+        # reward_thresholds) run only with BOTH native stores (Q1: injection and completion write the NodeStore's
+        # voltage column) and a wheel that has them. Then the store owns the three pass-state maps above, and these
+        # names become its read-only live views (writes fail loud, §1.3). A declined pass hands the state to the
+        # frozen Python loop as plain dicts (_he_ps_to_python) and the next native pass takes it back.
+        self._native_he_passes: bool = bool(self._native_he and self._native_nodes
+                                            and hasattr(self.hyperedges, "evaluate_step"))
+        self._he_ps_in_py: bool = False
+        if self._native_he_passes:
+            self._he_ps_views()
 
         # --- Telemetry counters ---
         self._total_pruned = 0
@@ -3069,7 +3132,10 @@ class Graph:
             he.creation_time = self.timestep
             for nid in member_node_ids:
                 self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
-            self._he_co_fire_counts[he.hyperedge_id] = {}
+            if self._he_ps_native():   # [2026-10-18] H2: the store owns the co-fire tally
+                self.hyperedges.cofire_reset(he.hyperedge_id)
+            else:
+                self._he_co_fire_counts[he.hyperedge_id] = {}
             self._dirty_hyperedges.add(he.hyperedge_id)
             return he
 
@@ -3079,9 +3145,12 @@ class Graph:
             return
         for nid in he.member_nodes:
             self._node_hyperedges.get(nid, set()).discard(hyperedge_id)
-        self._he_co_fire_counts.pop(hyperedge_id, None)
-        self._he_last_fired_step.pop(hyperedge_id, None)
-        self._he_output_candidates.pop(hyperedge_id, None)
+        if self._he_ps_native():   # [2026-10-18] H2: the store owns the pass state
+            self.hyperedges.pass_state_forget(hyperedge_id)
+        else:
+            self._he_co_fire_counts.pop(hyperedge_id, None)
+            self._he_last_fired_step.pop(hyperedge_id, None)
+            self._he_output_candidates.pop(hyperedge_id, None)
         self._dirty_hyperedges.discard(hyperedge_id)
 
     def remove_hyperedge(self, hyperedge_id: str) -> None:
@@ -3275,130 +3344,172 @@ class Graph:
             fired_he_this_step: List[str] = []
             experience_threshold = self.config["he_experience_threshold"]
             ema_alpha = self.config["prediction_ema_alpha"]
-            # Process by level so child hyperedges fire before parents
-            max_level = max((he.level for he in self.hyperedges.values()), default=0)
-            for level in range(max_level + 1):
-                for hid, he in self.hyperedges.items():
-                    if he.level != level:
-                        continue
-                    if he.is_archived:
-                        continue  # Archived hyperedges don't participate
-                    activation = self._compute_hyperedge_activation(he, fired_set)
-                    he.current_activation = activation
-                    # Update activation EMA (Phase 2.5)
-                    fired_flag = 1.0 if (activation >= he.activation_threshold and he.refractory_remaining == 0) else 0.0
-                    he.recent_activation_ema = (
-                        (1.0 - ema_alpha) * he.recent_activation_ema
-                        + ema_alpha * fired_flag
-                    )
-                    if he.refractory_remaining > 0:
-                        continue  # Still in refractory — cannot fire
-                    if activation >= he.activation_threshold:
-                        result.fired_hyperedge_ids.append(hid)
-                        fired_he_this_step.append(hid)
-                        he.activation_count += 1
-                        he.refractory_remaining = he.refractory_period
-
-                        # Output injection — GRADED mode scales by activation level
-                        effective_weight = he.output_weight
-                        if he.activation_mode == ActivationMode.GRADED:
-                            effective_weight *= activation
-                        for target_id in he.output_targets:
-                            target = self.nodes.get(target_id)
-                            if target is not None:
-                                target.voltage += effective_weight * target.intrinsic_excitability
-
-                        # Dynamic pattern completion (Phase 2.5):
-                        # Scale by experience: new HEs complete weakly, experienced ones fully.
-                        # completion_strength = base × min(1.0, activation_count / threshold)
-                        if he.pattern_completion_strength > 0:
-                            learning_factor = min(1.0, he.activation_count / max(experience_threshold, 1))
-                            effective_completion = he.pattern_completion_strength * learning_factor
-                            if effective_completion > 0:
-                                for nid in he.member_nodes:
-                                    if nid not in fired_set:
-                                        node = self.nodes.get(nid)
-                                        if node is not None and node.refractory_remaining == 0:
-                                            node.voltage += (
-                                                effective_completion
-                                                * he.member_weights.get(nid, 1.0)
-                                                * node.intrinsic_excitability
-                                            )
-
-                        # Prediction creation (Phase 2.5): predict output targets will fire
-                        if he.output_targets:
-                            pred_id = f"pred_{self._prediction_counter}"
-                            self._prediction_counter += 1
-                            pred = PredictionState(
-                                hyperedge_id=hid,
-                                predicted_targets=set(he.output_targets),
-                                prediction_strength=activation,
-                                prediction_timestamp=self.timestep,
-                                prediction_window=self.config["prediction_window"],
-                            )
-                            self._active_predictions[pred_id] = pred
-                            self._prediction_window_fired[pred_id] = set()
-                            self._total_predictions += 1
-                            self._emit("prediction_created", prediction_id=pred_id,
-                                       hyperedge_id=hid, targets=list(he.output_targets))
-
-                        self._emit("hyperedge_fired", hid=hid, activation=activation)
-
-            # 6a. Phase 2.5b: Output target learning
-            # When an HE fires, we start watching. On subsequent steps, any
-            # non-member node that fires within the window gets counted. If it
-            # fires enough times (min_co_fires), it becomes an output_target.
-            ol_window = self.config["he_output_learning_window"]
-            ol_min = self.config["he_output_min_co_fires"]
-            ol_max = self.config["he_output_max_targets"]
-
-            # Record which HEs fired THIS step
-            for hid in fired_he_this_step:
-                self._he_last_fired_step[hid] = self.timestep
-                self._he_output_candidates[hid] = {}
-
-            # For all HEs with active learning windows, count fired non-members
-            expired_windows: List[str] = []
-            for hid, fire_step in self._he_last_fired_step.items():
-                if hid in fired_he_this_step:
-                    continue  # Just started tracking — skip this step
-                if self.timestep - fire_step > ol_window:
-                    expired_windows.append(hid)
-                    continue
-                he = self.hyperedges.get(hid)
-                if he is None:
-                    expired_windows.append(hid)
-                    continue
-                candidates = self._he_output_candidates.get(hid, {})
-                for nid in fired_ids:
-                    if nid in he.member_nodes:
-                        continue  # Members excluded
-                    if nid in he.output_targets:
-                        continue  # Already learned
-                    candidates[nid] = candidates.get(nid, 0) + 1
-                    if candidates[nid] >= ol_min and len(he.output_targets) < ol_max:
-                        if getattr(self, "_native_he", False):   # [2026-10-18] H1
-                            self.hyperedges.append_output_target(hid, nid)
-                        else:
-                            he.output_targets.append(nid)
-                        self._emit("he_output_learned", hid=hid, target=nid)
-                        logger.info(
-                            "Phase 2.5b: HE %s learned output target %s "
-                            "(co-fires=%d within window=%d)",
-                            hid, nid, candidates[nid], ol_window,
+            # [2026-10-18] H2 (#1136): with the native passes on (both native stores), §6 + §6a + the hyperedge
+            # refractory decrement run as ONE native pass over the store's columns (the same loop, natively; the
+            # store owns the pass state). Python then builds the PredictionStates and emits the events in the order
+            # the loop below emits them. A declined pass (None) hands the pass state to this frozen loop.
+            _he_ev = None
+            if self._he_ps_to_native():
+                _he_ev = self.hyperedges.evaluate_step(
+                    self.nodes, fired_ids, self.timestep, experience_threshold, ema_alpha,
+                    self.config["he_output_learning_window"], self.config["he_output_min_co_fires"],
+                    self.config["he_output_max_targets"])
+                if _he_ev is None:
+                    self._he_ps_to_python()
+            if _he_ev is not None:
+                _he_fired, _he_events, _he_learned = _he_ev
+                result.fired_hyperedge_ids.extend(_he_fired)
+                for hid, activation, _he_targets in _he_events:
+                    # Prediction creation (Phase 2.5): predict output targets will fire
+                    if _he_targets:
+                        pred_id = f"pred_{self._prediction_counter}"
+                        self._prediction_counter += 1
+                        pred = PredictionState(
+                            hyperedge_id=hid,
+                            predicted_targets=set(_he_targets),
+                            prediction_strength=activation,
+                            prediction_timestamp=self.timestep,
+                            prediction_window=self.config["prediction_window"],
                         )
-                self._he_output_candidates[hid] = candidates
+                        self._active_predictions[pred_id] = pred
+                        self._prediction_window_fired[pred_id] = set()
+                        self._total_predictions += 1
+                        self._emit("prediction_created", prediction_id=pred_id,
+                                   hyperedge_id=hid, targets=list(_he_targets))
+                    self._emit("hyperedge_fired", hid=hid, activation=activation)
+                _ol_window = self.config["he_output_learning_window"]
+                for hid, nid, _he_count in _he_learned:
+                    self._emit("he_output_learned", hid=hid, target=nid)
+                    logger.info(
+                        "Phase 2.5b: HE %s learned output target %s "
+                        "(co-fires=%d within window=%d)",
+                        hid, nid, _he_count, _ol_window,
+                    )
+            else:
+                # Process by level so child hyperedges fire before parents
+                max_level = max((he.level for he in self.hyperedges.values()), default=0)
+                for level in range(max_level + 1):
+                    for hid, he in self.hyperedges.items():
+                        if he.level != level:
+                            continue
+                        if he.is_archived:
+                            continue  # Archived hyperedges don't participate
+                        activation = self._compute_hyperedge_activation(he, fired_set)
+                        he.current_activation = activation
+                        # Update activation EMA (Phase 2.5)
+                        fired_flag = 1.0 if (activation >= he.activation_threshold and he.refractory_remaining == 0) else 0.0
+                        he.recent_activation_ema = (
+                            (1.0 - ema_alpha) * he.recent_activation_ema
+                            + ema_alpha * fired_flag
+                        )
+                        if he.refractory_remaining > 0:
+                            continue  # Still in refractory — cannot fire
+                        if activation >= he.activation_threshold:
+                            result.fired_hyperedge_ids.append(hid)
+                            fired_he_this_step.append(hid)
+                            he.activation_count += 1
+                            he.refractory_remaining = he.refractory_period
 
-            # Clean up expired windows
-            for hid in expired_windows:
-                self._he_last_fired_step.pop(hid, None)
-                self._he_output_candidates.pop(hid, None)
+                            # Output injection — GRADED mode scales by activation level
+                            effective_weight = he.output_weight
+                            if he.activation_mode == ActivationMode.GRADED:
+                                effective_weight *= activation
+                            for target_id in he.output_targets:
+                                target = self.nodes.get(target_id)
+                                if target is not None:
+                                    target.voltage += effective_weight * target.intrinsic_excitability
 
-            # Decrement hyperedge refractory counters (skip those that just fired)
-            fired_he_set = set(fired_he_this_step)
-            for hid, he in self.hyperedges.items():
-                if he.refractory_remaining > 0 and hid not in fired_he_set:
-                    he.refractory_remaining -= 1
+                            # Dynamic pattern completion (Phase 2.5):
+                            # Scale by experience: new HEs complete weakly, experienced ones fully.
+                            # completion_strength = base × min(1.0, activation_count / threshold)
+                            if he.pattern_completion_strength > 0:
+                                learning_factor = min(1.0, he.activation_count / max(experience_threshold, 1))
+                                effective_completion = he.pattern_completion_strength * learning_factor
+                                if effective_completion > 0:
+                                    for nid in he.member_nodes:
+                                        if nid not in fired_set:
+                                            node = self.nodes.get(nid)
+                                            if node is not None and node.refractory_remaining == 0:
+                                                node.voltage += (
+                                                    effective_completion
+                                                    * he.member_weights.get(nid, 1.0)
+                                                    * node.intrinsic_excitability
+                                                )
+
+                            # Prediction creation (Phase 2.5): predict output targets will fire
+                            if he.output_targets:
+                                pred_id = f"pred_{self._prediction_counter}"
+                                self._prediction_counter += 1
+                                pred = PredictionState(
+                                    hyperedge_id=hid,
+                                    predicted_targets=set(he.output_targets),
+                                    prediction_strength=activation,
+                                    prediction_timestamp=self.timestep,
+                                    prediction_window=self.config["prediction_window"],
+                                )
+                                self._active_predictions[pred_id] = pred
+                                self._prediction_window_fired[pred_id] = set()
+                                self._total_predictions += 1
+                                self._emit("prediction_created", prediction_id=pred_id,
+                                           hyperedge_id=hid, targets=list(he.output_targets))
+
+                            self._emit("hyperedge_fired", hid=hid, activation=activation)
+
+                # 6a. Phase 2.5b: Output target learning
+                # When an HE fires, we start watching. On subsequent steps, any
+                # non-member node that fires within the window gets counted. If it
+                # fires enough times (min_co_fires), it becomes an output_target.
+                ol_window = self.config["he_output_learning_window"]
+                ol_min = self.config["he_output_min_co_fires"]
+                ol_max = self.config["he_output_max_targets"]
+
+                # Record which HEs fired THIS step
+                for hid in fired_he_this_step:
+                    self._he_last_fired_step[hid] = self.timestep
+                    self._he_output_candidates[hid] = {}
+
+                # For all HEs with active learning windows, count fired non-members
+                expired_windows: List[str] = []
+                for hid, fire_step in self._he_last_fired_step.items():
+                    if hid in fired_he_this_step:
+                        continue  # Just started tracking — skip this step
+                    if self.timestep - fire_step > ol_window:
+                        expired_windows.append(hid)
+                        continue
+                    he = self.hyperedges.get(hid)
+                    if he is None:
+                        expired_windows.append(hid)
+                        continue
+                    candidates = self._he_output_candidates.get(hid, {})
+                    for nid in fired_ids:
+                        if nid in he.member_nodes:
+                            continue  # Members excluded
+                        if nid in he.output_targets:
+                            continue  # Already learned
+                        candidates[nid] = candidates.get(nid, 0) + 1
+                        if candidates[nid] >= ol_min and len(he.output_targets) < ol_max:
+                            if getattr(self, "_native_he", False):   # [2026-10-18] H1
+                                self.hyperedges.append_output_target(hid, nid)
+                            else:
+                                he.output_targets.append(nid)
+                            self._emit("he_output_learned", hid=hid, target=nid)
+                            logger.info(
+                                "Phase 2.5b: HE %s learned output target %s "
+                                "(co-fires=%d within window=%d)",
+                                hid, nid, candidates[nid], ol_window,
+                            )
+                    self._he_output_candidates[hid] = candidates
+
+                # Clean up expired windows
+                for hid in expired_windows:
+                    self._he_last_fired_step.pop(hid, None)
+                    self._he_output_candidates.pop(hid, None)
+
+                # Decrement hyperedge refractory counters (skip those that just fired)
+                fired_he_set = set(fired_he_this_step)
+                for hid, he in self.hyperedges.items():
+                    if he.refractory_remaining > 0 and hid not in fired_he_set:
+                        he.refractory_remaining -= 1
 
             # 6b. Evaluate Phase 2.5 hyperedge-level predictions
             he_confirmed_this_step = 0
@@ -3748,53 +3859,63 @@ class Graph:
                             )
 
                     # 6. Evaluate hyperedges (pattern completion, output injection)
-                    max_level = max((he.level for he in self.hyperedges.values()), default=0)
-                    for level in range(max_level + 1):
-                        for hid, he in self.hyperedges.items():
-                            if he.level != level or he.is_archived:
-                                continue
-                            activation = self._compute_hyperedge_activation(he, fired_set)
-                            if he.refractory_remaining > 0:
-                                continue
-                            if activation >= he.activation_threshold:
-                                he.refractory_remaining = he.refractory_period
+                    # [2026-10-18] H2 (#1136): with the native passes on, this sweep step's hyperedge evaluation AND its
+                    # hyperedge refractory decrement (below) run as one native pass; it returns the node ids the loop
+                    # adds to working_set, in order. A declined pass (None) runs the frozen loops.
+                    _he_sw = (self.hyperedges.evaluate_sweep(self.nodes, fired_ids, experience_threshold)
+                              if getattr(self, "_native_he_passes", False) else None)
+                    if _he_sw is not None:
+                        for _he_t in _he_sw:
+                            working_set.add(_he_t)
+                    else:
+                        max_level = max((he.level for he in self.hyperedges.values()), default=0)
+                        for level in range(max_level + 1):
+                            for hid, he in self.hyperedges.items():
+                                if he.level != level or he.is_archived:
+                                    continue
+                                activation = self._compute_hyperedge_activation(he, fired_set)
+                                if he.refractory_remaining > 0:
+                                    continue
+                                if activation >= he.activation_threshold:
+                                    he.refractory_remaining = he.refractory_period
 
-                                # Output injection
-                                effective_weight = he.output_weight
-                                if he.activation_mode == ActivationMode.GRADED:
-                                    effective_weight *= activation
-                                for target_id in he.output_targets:
-                                    target = self.nodes.get(target_id)
-                                    if target is not None:
-                                        target.voltage += effective_weight * target.intrinsic_excitability
-                                        working_set.add(target_id)  # now active (#164)
+                                    # Output injection
+                                    effective_weight = he.output_weight
+                                    if he.activation_mode == ActivationMode.GRADED:
+                                        effective_weight *= activation
+                                    for target_id in he.output_targets:
+                                        target = self.nodes.get(target_id)
+                                        if target is not None:
+                                            target.voltage += effective_weight * target.intrinsic_excitability
+                                            working_set.add(target_id)  # now active (#164)
 
-                                # Pattern completion (pre-charge inactive members)
-                                if he.pattern_completion_strength > 0:
-                                    learning_factor = min(
-                                        1.0, he.activation_count / max(experience_threshold, 1)
-                                    )
-                                    eff_completion = he.pattern_completion_strength * learning_factor
-                                    if eff_completion > 0:
-                                        for mnid in he.member_nodes:
-                                            if mnid not in fired_set:
-                                                mnode = self.nodes.get(mnid)
-                                                if mnode and mnode.refractory_remaining == 0:
-                                                    mnode.voltage += (
-                                                        eff_completion
-                                                        * he.member_weights.get(mnid, 1.0)
-                                                        * mnode.intrinsic_excitability
-                                                    )
-                                                    working_set.add(mnid)  # now active (#164)
+                                    # Pattern completion (pre-charge inactive members)
+                                    if he.pattern_completion_strength > 0:
+                                        learning_factor = min(
+                                            1.0, he.activation_count / max(experience_threshold, 1)
+                                        )
+                                        eff_completion = he.pattern_completion_strength * learning_factor
+                                        if eff_completion > 0:
+                                            for mnid in he.member_nodes:
+                                                if mnid not in fired_set:
+                                                    mnode = self.nodes.get(mnid)
+                                                    if mnode and mnode.refractory_remaining == 0:
+                                                        mnode.voltage += (
+                                                            eff_completion
+                                                            * he.member_weights.get(mnid, 1.0)
+                                                            * mnode.intrinsic_excitability
+                                                        )
+                                                        working_set.add(mnid)  # now active (#164)
 
                     # Decrement refractory counters — O(working_set) not O(n) (#164)
                     for nid in working_set:
                         node = self.nodes[nid]
                         if node.refractory_remaining > 0 and nid not in fired_set:
                             node.refractory_remaining -= 1
-                    for hid, he in self.hyperedges.items():
-                        if he.refractory_remaining > 0 and hid not in set(fired_ids):
-                            he.refractory_remaining -= 1
+                    if _he_sw is None:   # [2026-10-18] H2: the native sweep did this decrement
+                        for hid, he in self.hyperedges.items():
+                            if he.refractory_remaining > 0 and hid not in set(fired_ids):
+                                he.refractory_remaining -= 1
 
                     # Write mode: apply STDP plasticity on fired nodes
                     if write_mode and fired_ids:
@@ -3863,6 +3984,38 @@ class Graph:
     # -----------------------------------------------------------------------
     # Hyperedge Activation (PRD §4.2)
     # -----------------------------------------------------------------------
+
+    # [2026-10-18] H2 (#1136): where the hyperedge pass state lives (see Graph.__init__)
+    def _he_ps_views(self) -> None:
+        self._he_last_fired_step = self.hyperedges.pass_state_view("last_fired")
+        self._he_output_candidates = self.hyperedges.pass_state_view("candidates")
+        self._he_co_fire_counts = self.hyperedges.pass_state_view("cofire")
+
+    def _he_ps_native(self) -> bool:
+        """True while the native passes are on AND the store holds the pass state (not handed to Python)."""
+        return getattr(self, "_native_he_passes", False) and not getattr(self, "_he_ps_in_py", False)
+
+    def _he_ps_to_python(self) -> None:
+        """A native pass declined: hand the pass state to the frozen Python loop as plain dicts."""
+        if self._he_ps_native():
+            (self._he_last_fired_step, self._he_output_candidates,
+             self._he_co_fire_counts) = self.hyperedges.pass_state_export()
+            self._he_ps_in_py = True
+
+    def _he_ps_to_native(self) -> bool:
+        """Before a native pass: True when the native passes are on (taking the state back from Python if a
+        declined pass handed it out). A non-canonical value -> the native passes stay off for this graph."""
+        if not getattr(self, "_native_he_passes", False):
+            return False
+        if self._he_ps_in_py:
+            if not self.hyperedges.pass_state_import(self._he_last_fired_step, self._he_output_candidates,
+                                                     self._he_co_fire_counts):
+                self._native_he_passes = False
+                logger.warning("H2: hyperedge pass state is not canonical; native hyperedge passes off for this graph")
+                return False
+            self._he_ps_in_py = False
+            self._he_ps_views()
+        return True
 
     def _compute_hyperedge_activation(
         self, he: Hyperedge, fired_set: Set[str]
@@ -6643,19 +6796,22 @@ class Graph:
                     self.synapses, strength, self.config["learning_rate"], scope)
 
             # Hyperedge threshold learning (PRD §4.3)
-            for he in self.hyperedges.values():
-                if not he.is_learnable:
-                    continue
-                # Scope check for hyperedges
-                if scope is not None:
-                    if not he.member_nodes.intersection(scope):
+            # [2026-10-18] H2 (#1136): native when the graph's native passes are on (a declined pass runs the loop)
+            if not (getattr(self, "_native_he_passes", False)
+                    and self.hyperedges.reward_thresholds(strength, lr, scope)):
+                for he in self.hyperedges.values():
+                    if not he.is_learnable:
                         continue
-                # Threshold adapts for recently-fired hyperedges
-                if he.refractory_remaining > 0:
-                    if strength > 0:
-                        he.activation_threshold = max(0.1, he.activation_threshold - lr * strength)
-                    else:
-                        he.activation_threshold = min(1.0, he.activation_threshold - lr * strength)
+                    # Scope check for hyperedges
+                    if scope is not None:
+                        if not he.member_nodes.intersection(scope):
+                            continue
+                    # Threshold adapts for recently-fired hyperedges
+                    if he.refractory_remaining > 0:
+                        if strength > 0:
+                            he.activation_threshold = max(0.1, he.activation_threshold - lr * strength)
+                        else:
+                            he.activation_threshold = min(1.0, he.activation_threshold - lr * strength)
 
             self._emit(
                 "reward_injected",
@@ -6725,7 +6881,10 @@ class Graph:
                 he = self.hyperedges[he.hyperedge_id]   # [2026-10-18] H1: the live HyperedgeRef
             for nid in all_member_nodes:
                 self._node_hyperedges.setdefault(nid, set()).add(he.hyperedge_id)
-            self._he_co_fire_counts[he.hyperedge_id] = {}
+            if self._he_ps_native():   # [2026-10-18] H2: the store owns the co-fire tally
+                self.hyperedges.cofire_reset(he.hyperedge_id)
+            else:
+                self._he_co_fire_counts[he.hyperedge_id] = {}
             self._dirty_hyperedges.add(he.hyperedge_id)
             return he
 
@@ -7000,7 +7159,11 @@ class Graph:
             mt = getattr(node, "manifold_type", None) if node is not None else None
             if mt is not None:
                 manifold_counts[mt] = manifold_counts.get(mt, 0) + 1
-        dominant_manifold = max(manifold_counts, key=manifold_counts.get) if manifold_counts else None
+        if manifold_counts and self.config.get("he_member_choice_by_contribution", False):
+            # [2026-10-18] H2 #1142: a tie between manifolds goes to the name, not to member-list order
+            dominant_manifold = max(sorted(manifold_counts), key=manifold_counts.get)
+        else:
+            dominant_manifold = max(manifold_counts, key=manifold_counts.get) if manifold_counts else None
 
         raw = {nid: {} for nid in members}
         for nid in members:
@@ -7205,8 +7368,16 @@ class Graph:
                 # discriminate — graceful degradation for the §8.15 clock-gated caveat,
                 # so the same code is correct on the clock-live VPS and the laptop.
                 seam = self._seam_score_members(hid, he)
-                members = sorted(he.member_nodes,
-                                 key=lambda nid: seam.get(nid, 0.0), reverse=True)
+                if self.config.get("he_member_choice_by_contribution", False):
+                    # [2026-10-18] H2 #1142 (Josh's ruling 3b): the core is the highest seam score; ties go to the
+                    # larger contribution — higher member weight, then more co-fires in the member-evolution
+                    # tally — then node id; never member-list (hash-seed) order.
+                    _cf = self._he_co_fire_counts.get(hid) or {}
+                    members = sorted(he.member_nodes, key=lambda nid: (
+                        -seam.get(nid, 0.0), -weights.get(nid, 1.0), -_cf.get(nid, 0), str(nid)))
+                else:
+                    members = sorted(he.member_nodes,
+                                     key=lambda nid: seam.get(nid, 0.0), reverse=True)
                 core = members[:cap]
                 periphery = members[cap:]
                 if not periphery:
@@ -7414,6 +7585,8 @@ class Graph:
             shed_thresh = self.config.get("he_shed_weight_threshold", 0.02)
             min_keep = self.config["he_discovery_min_nodes"]
             min_tenure = self.config.get("he_shed_min_tenure", 50)
+            # [2026-10-18] H2 #1142: protected flag, read live; absent = off = today's order
+            _by_contrib = bool(self.config.get("he_member_choice_by_contribution", False))
             total = 0
             for hid, he in self.hyperedges.items():
                 if he.is_archived or not he.is_learnable:
@@ -7425,6 +7598,12 @@ class Graph:
                     and (self.timestep - since.get(nid, 0)) >= min_tenure
                 ]
                 allowed = max(0, len(he.member_nodes) - min_keep)
+                if _by_contrib:
+                    # [2026-10-18] H2 #1142 (Josh's ruling 3b): shed the least-contributing members first — lowest
+                    # member weight, then fewest co-fires in the member-evolution tally, then node id — never by
+                    # member-list (hash-seed) order.
+                    _cf = self._he_co_fire_counts.get(hid) or {}
+                    candidates.sort(key=lambda n: (he.member_weights.get(n, 1.0), _cf.get(n, 0), str(n)))
                 for nid in candidates[:allowed]:
                     if getattr(self, "_native_he", False):   # [2026-10-18] H1
                         self.hyperedges.remove_member(hid, nid)
@@ -7765,7 +7944,9 @@ class Graph:
                 f.write(packer.pack(key))
                 # [2026-10-05] P1: "nodes" is pre-packed bytes too when the native node store is on
                 # [2026-10-18] H1: and both hyperedge maps when the native hyperedge store is on
-                if key in ("synapses", "nodes", "hyperedges", "archived_hyperedges") and isinstance(value, (bytes, bytearray)):
+                # [2026-10-18] H2: and the two hyperedge pass-state maps when the native passes own them
+                if key in ("synapses", "nodes", "hyperedges", "archived_hyperedges", "he_last_fired_step",
+                           "he_output_candidates") and isinstance(value, (bytes, bytearray)):
                     f.write(value)  # verbatim pre-packed {sid: {15-key}} / {nid: {19-key}} map
                 else:
                     f.write(packer.pack(value))
@@ -7870,9 +8051,13 @@ class Graph:
                 for _k in ("member_weights", "output_targets", "metadata"):
                     d[_k] = copy.deepcopy(d[_k], _memo)
             return d
+        # [2026-10-18] H2 (#1140, Josh's ruling 3a): member / child lists sorted in saved checkpoints when the
+        # protected flag he_checkpoint_sorted_members is set (absent = off = today's list(set) bytes). The native
+        # store always writes them sorted. Bookkeeping only: a set is rebuilt on load.
+        _srt = bool(self.config.get("he_checkpoint_sorted_members", False))
         return {
             "hyperedge_id": he.hyperedge_id,
-            "member_nodes": list(he.member_nodes),
+            "member_nodes": _ckpt_id_list(he.member_nodes, _srt),
             "member_weights": copy.deepcopy(he.member_weights, _memo) if _memo is not None else he.member_weights,
             "activation_threshold": he.activation_threshold,
             "activation_mode": he.activation_mode.name,
@@ -7885,7 +8070,7 @@ class Graph:
             "refractory_remaining": he.refractory_remaining,
             "activation_count": he.activation_count,
             "pattern_completion_strength": he.pattern_completion_strength,
-            "child_hyperedges": list(he.child_hyperedges),
+            "child_hyperedges": _ckpt_id_list(he.child_hyperedges, _srt),
             "level": he.level,
             # Phase 2.5 fields
             "recent_activation_ema": he.recent_activation_ema,
@@ -7934,6 +8119,8 @@ class Graph:
         _native_he  = getattr(self, "_native_he", False)
         _hyperedges = None if _native_he else list(self.hyperedges.items())
         _archived   = None if _native_he else list(self._archived_hyperedges.items())
+        # [2026-10-18] H2: the pass state the native passes own, packed by the store (detached bytes)
+        _he_ps_packed = self.hyperedges.pass_state_msgpack() if self._he_ps_native() else None
         _act_preds  = list(self.active_predictions.items())
         _syn_hist   = list(self._synapse_confirmation_history.items())
         _he_preds   = list(self._active_predictions.items())
@@ -8026,8 +8213,11 @@ class Graph:
             "total_he_state_transitions":  self._total_he_state_transitions,
             "total_he_substrate_culled":   self._total_he_substrate_culled,
             # Phase 2.5b: Output target learning state
-            "he_last_fired_step": copy.deepcopy(self._he_last_fired_step, _memo) if _memo is not None else self._he_last_fired_step,
-            "he_output_candidates": copy.deepcopy(self._he_output_candidates, _memo) if _memo is not None else self._he_output_candidates,
+            # [2026-10-18] H2: packed natively (detached bytes, spliced by write_checkpoint) while the store owns them
+            "he_last_fired_step": (_he_ps_packed[0] if _he_ps_packed is not None else
+                                   copy.deepcopy(self._he_last_fired_step, _memo) if _memo is not None else self._he_last_fired_step),
+            "he_output_candidates": (_he_ps_packed[1] if _he_ps_packed is not None else
+                                     copy.deepcopy(self._he_output_candidates, _memo) if _memo is not None else self._he_output_candidates),
             # v0.4.2 Hibernation state — ephemeral process counters serialized so
             # subprocess loads (CC hook, Codemine worker) believe the process never
             # stopped. Without these, homeostatic scaling never fires, in-flight spikes
@@ -8255,7 +8445,10 @@ class Graph:
             for hid, he in self.hyperedges.items():
                 for nid in he.member_nodes:
                     self._node_hyperedges.setdefault(nid, set()).add(hid)
-                self._he_co_fire_counts[hid] = {}
+                if self._he_ps_native():   # [2026-10-18] H2
+                    self.hyperedges.cofire_reset(hid)
+                else:
+                    self._he_co_fire_counts[hid] = {}
             _he_data = {}
         for hid, hd in _he_data.items():
             he = Hyperedge(
@@ -8285,7 +8478,10 @@ class Graph:
             self.hyperedges[hid] = he
             for nid in he.member_nodes:
                 self._node_hyperedges.setdefault(nid, set()).add(hid)
-            self._he_co_fire_counts[hid] = {}
+            if self._he_ps_native():   # [2026-10-18] H2
+                self.hyperedges.cofire_reset(hid)
+            else:
+                self._he_co_fire_counts[hid] = {}
 
         # Restore archived hyperedges (Phase 2.5)
         self._archived_hyperedges.clear()
@@ -8358,8 +8554,16 @@ class Graph:
         self._total_he_substrate_culled  = data.get("total_he_substrate_culled", 0)
 
         # Restore Phase 2.5b: Output target learning state
-        self._he_last_fired_step = data.get("he_last_fired_step", {})
-        self._he_output_candidates = data.get("he_output_candidates", {})
+        if not (self._he_ps_native() and self.hyperedges.pass_state_load(
+                data.get("he_last_fired_step", {}), data.get("he_output_candidates", {}))):
+            if self._he_ps_native():
+                # [2026-10-18] H2: a non-canonical saved value (not {str: int}) -> this graph keeps the pass state in
+                # Python dicts and runs the frozen loops (the native passes stay off for it)
+                self._he_ps_to_python()
+                self._native_he_passes = False
+                logger.warning("H2: saved hyperedge pass state is not canonical; native hyperedge passes off for this graph")
+            self._he_last_fired_step = data.get("he_last_fired_step", {})
+            self._he_output_candidates = data.get("he_output_candidates", {})
 
         # Restore Phase 3 active predictions with validation
         self.active_predictions.clear()
