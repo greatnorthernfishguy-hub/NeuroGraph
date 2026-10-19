@@ -20,6 +20,37 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-19] Claude (lane stability-s, #1136 phase S; Josh 2026-10-19 "Yes, please start the S build") — the stability
+#   set, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s-20261019 ONLY, its own commit; merges only
+#   after Josh's protected-file "proceed" + backups of both msgpack files). Every key below is read live, absent = off,
+#   NOT in DEFAULT_CONFIG; with all of them absent this file runs exactly as 11d3898 (no new call, no new argument, no
+#   new checkpoint key).
+# What: spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §2.3 — one mechanism set on three timescales:
+#       C1 he_inject_respects_refractory: output injection skips a refractory target (step + both sweep modes);
+#       H  he_habituation_enabled (+ _half 0.05, _power 2.0; the reference names and gain, cc-laptop-he-habituation-
+#          20261016): output and completion drive x 1 / (1 + (ema / half) ** power), step (ema before this step's
+#          update) + both sweep modes;
+#       N  node_homeo_evidence_enabled (+ node_homeo_v_floor 0.5, _leak 0.02, _v_alpha 0.01): option D — evidence-
+#          gated (v_ema >= v_floor x threshold = "driven but failing"), leaky (no evidence -> excitability -> 1.0 and
+#          threshold -> default_threshold by `leak` per scaling interval), symmetric (the silent x(1 + 5 rate) branch
+#          is gone); the 5.0 cap stays as the rail; node column v_ema saved only when on;
+#       S  syn_scale_evidence_enabled (+ syn_scale_rate_tau 2000, _max_up 1.03, _max_down 0.97): synaptic scaling
+#          against a LONG firing-rate EMA (node column syn_rate_ema, saved only when on), factor bounded both ways,
+#          UP only with N's evidence; replaces the (target / rate) ** 0.1 node_scales in HomeostaticRule.apply;
+#       C2 he_threshold_homeo_enabled (+ he_rate_target 0.05, he_threshold_homeo_rate 0.001): an over-active
+#          learnable assembly's threshold rises (upward only, cap 1.0);
+#       C3 he_target_unlearn_enabled (+ _d 0.02, _p 0.05, _floor 0.1): output-target weights (HE column
+#          output_target_weights, saved only on rows C3 wrote) depress by d per fire, potentiate by p on unexplained
+#          firing (lag >= 2 in the window, or lag 1 when C1 shunted the push), weak ones released in sleep_cycle (Q7);
+#       #1134 homeostatic_degree_targets_persist: HomeostaticRule._degree_targets saved / restored (key
+#          homeostatic_degree_targets), so a restored graph continues step for step.
+# Why:  #1131 / #1141: the CC mind's reverberating hyperedge loop and its growing ~20-25 min relaxation oscillation
+#       (dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Parts 2-5); Josh's decisions Q2-Q11 (spec §6A).
+# How:  Q2 — no new behaviour in Python: each mechanism is a parameter to an existing native pass (NodeStore
+#       detect_fired / update_firing_ema / adapt_thresholds / adapt_excitability + the new evidence_scales;
+#       HyperedgeStore evaluate_step / evaluate_sweep + the new release_weak_targets). Graph._stability_params() reads
+#       the keys once per step; on a graph without the native passes a set key logs ERROR once and stays OFF. A
+#       declined native pass runs today's Python loop for that call (no new behaviour there either).
 # [2026-10-21] Claude Code (Opus 5.5, laptop; lane tonic-unified) — RD §5 (B): optional damped structural plasticity on step()
 #   (PROTECTED CHANGE — needs Josh's proceed; Syl approved RD 2026-06-10 "Build it, lover."; Josh 2026-10-21 "1 Yes, let's build it.")
 #   What: step(structural_damping=None). With None (every existing caller) step 8 is the unchanged call. With (k, m) — passed
@@ -891,6 +922,7 @@ from typing import (
     Deque,
     Dict,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -1983,6 +2015,15 @@ class STDPRule(PlasticityRule):
             return
         _stdp_python(self, graph, fired_node_ids, timestep)
 
+class _StabParams(NamedTuple):
+    """[2026-10-19] S (#1136): one step's stability-set switches (Graph._stability_params). Each field None = off."""
+    he: Optional[tuple]          # (hab, c1, c2, c3) for HyperedgeStore.evaluate_step / evaluate_sweep
+    c3_floor: Optional[float]    # C3 release floor (sleep_cycle)
+    v_alpha: Optional[float]     # N / S evidence trace v_ema (NodeStore.detect_fired)
+    node: Optional[tuple]        # N: (v_floor, leak, default_threshold)
+    syn: Optional[tuple]         # S: (long_alpha, max_up, max_down, v_floor)
+
+
 class HomeostaticRule(PlasticityRule):
     """Homeostatic plasticity (PRD §3.2).
 
@@ -2083,18 +2124,26 @@ class HomeostaticRule(PlasticityRule):
         timestep: int,
     ) -> None:
         fired_set = set(fired_node_ids)
+        # [2026-10-19] S (#1136): N / S switches (graph._stab is set by step(); None = all off -> the P2a calls exactly).
+        # They exist only as arguments to the native passes; a declined pass runs today's Python loop (Q2).
+        _st = getattr(graph, "_stab", None)
+        _n_ev = _st.node if _st is not None else None     # (v_floor, leak, default_threshold)
+        _s_ev = _st.syn if _st is not None else None      # (long_alpha, max_up, max_down, v_floor)
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
         _native = getattr(graph.nodes, "update_firing_ema", None)
-        if _native is None or not _native(fired_set, self.ema_alpha):
+        if _native is None or not (_native(fired_set, self.ema_alpha) if _s_ev is None
+                                   else _native(fired_set, self.ema_alpha, _s_ev[0])):
             _update_firing_ema_python(graph.nodes, fired_set, self.ema_alpha)
 
         # Threshold adaptation: continuous, 0.001/step (PRD §3.2.1)
         threshold_ceiling = graph.config.get("threshold_ceiling", 5.0)
         _native = getattr(graph.nodes, "adapt_thresholds", None)
-        if _native is None or not _native(self._degree_targets, self.target_firing_rate,
-                                          self.threshold_rate, threshold_ceiling):
+        if _native is None or not (_native(self._degree_targets, self.target_firing_rate,
+                                           self.threshold_rate, threshold_ceiling) if _n_ev is None
+                                   else _native(self._degree_targets, self.target_firing_rate,
+                                                self.threshold_rate, threshold_ceiling, (_n_ev[0],))):
             _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                      self.threshold_rate, threshold_ceiling)
 
@@ -2109,7 +2158,8 @@ class HomeostaticRule(PlasticityRule):
         # {nid: target / rate} for the non-silent nodes in node order; `ratio ** scaling_factor`
         # stays in Python (libm pow is not proven bit-identical to CPython's float.__pow__).
         _native = getattr(graph.nodes, "adapt_excitability", None)
-        _ratios = (_native(self._degree_targets, self.target_firing_rate, self.excitability_rate)
+        _ratios = ((_native(self._degree_targets, self.target_firing_rate, self.excitability_rate) if _n_ev is None
+                    else _native(self._degree_targets, self.target_firing_rate, self.excitability_rate, _n_ev))
                    if _native is not None else None)
         if _ratios is None:
             node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
@@ -2118,6 +2168,11 @@ class HomeostaticRule(PlasticityRule):
             node_scales: Dict[str, float] = {}
             for nid, ratio in _ratios.items():
                 node_scales[nid] = ratio ** self.scaling_factor
+        if _s_ev is not None:
+            # [2026-10-19] S (#1136): slow, bounded, evidence-gated scaling replaces the per-step-rate factors. A
+            # declined native pass scales nothing this interval (never today's unbounded factor while S is on).
+            node_scales = graph.nodes.evidence_scales(self._degree_targets, self.target_firing_rate,
+                                                      self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3]) or {}
 
         # [2026-10-04] One native pass applies every node's scale to its incoming
         # synapses: weight = max(0, min(weight * scale, max_weight)). Each synapse has
@@ -3242,6 +3297,10 @@ class Graph:
         with self._step_lock:
             self.timestep += 1
             result = StepResult(timestep=self.timestep)
+            # [2026-10-19] S (#1136): the stability set's switches, read live once per step (None = all off)
+            _stab = self._stability_params()
+            if _stab is not None or "_stab" in self.__dict__:
+                self._stab = _stab
 
             # 1. Voltage decay: v = v * decay_rate + (1-decay) * resting  (PRD §2.2.4)
             # [2026-10-06] P2a: native NodeStore pass when available (declines -> the original loop)
@@ -3279,10 +3338,14 @@ class Graph:
             #    [2026-10-06] P2a: native only when NO pre_fire handler is registered (a handler is a
             #    Python call per node); the native pass returns the ids in node order, or None.
             fired_ids = None
+            # [2026-10-19] S (#1136) N / S: v_alpha given = the native pass first updates v_ema (pre-detection voltage)
+            _va = _stab.v_alpha if _stab is not None else None
             if not self._event_handlers.get("pre_fire"):
                 _native = getattr(self.nodes, "detect_fired", None)
                 if _native is not None:
-                    fired_ids = _native()
+                    fired_ids = _native() if _va is None else _native(_va)
+            elif _va is not None:
+                self.nodes.update_v_ema(_va)
             if fired_ids is None:
                 fired_ids = _detect_fired_python(self.nodes, self._event_handlers)
 
@@ -3390,7 +3453,9 @@ class Graph:
                 _he_ev = self.hyperedges.evaluate_step(
                     self.nodes, fired_ids, self.timestep, experience_threshold, ema_alpha,
                     self.config["he_output_learning_window"], self.config["he_output_min_co_fires"],
-                    self.config["he_output_max_targets"])
+                    self.config["he_output_max_targets"],
+                    # [2026-10-19] S (#1136) H / C1 / C2 / C3 (absent = the H2 call exactly)
+                    **({"stab": _stab.he} if _stab is not None and _stab.he is not None else {}))
                 if _he_ev is None:
                     self._he_ps_to_python()
             if _he_ev is not None:
@@ -3821,6 +3886,7 @@ class Graph:
 
                 decay = self.config["decay_rate"]
                 experience_threshold = self.config["he_experience_threshold"]
+                _pp_stab = self._stability_params()   # [2026-10-19] S (#1136): None = all off
 
                 for step_idx in range(steps):
                     prop_timestep += 1
@@ -3902,7 +3968,10 @@ class Graph:
                     # [2026-10-18] H2 (#1136): with the native passes on, this sweep step's hyperedge evaluation AND its
                     # hyperedge refractory decrement (below) run as one native pass; it returns the node ids the loop
                     # adds to working_set, in order. A declined pass (None) runs the frozen loops.
-                    _he_sw = (self.hyperedges.evaluate_sweep(self.nodes, fired_ids, experience_threshold)
+                    _he_sw = (self.hyperedges.evaluate_sweep(
+                                  self.nodes, fired_ids, experience_threshold,
+                                  # [2026-10-19] S (#1136) H / C1 / C3 weights (absent = the H2 call exactly)
+                                  **({"stab": _pp_stab.he} if _pp_stab is not None and _pp_stab.he is not None else {}))
                               if getattr(self, "_native_he_passes", False) else None)
                     if _he_sw is not None:
                         for _he_t in _he_sw:
@@ -4041,6 +4110,70 @@ class Graph:
             (self._he_last_fired_step, self._he_output_candidates,
              self._he_co_fire_counts) = self.hyperedges.pass_state_export()
             self._he_ps_in_py = True
+
+    # ------------------------------------------------------------------------------------------------------------
+    # [2026-10-19] S (#1136): the stability set's switches (spec §2.3). Keys read live, absent = off, NOT in
+    # DEFAULT_CONFIG. Rust only (Q2): without the native passes a set key logs ERROR once and stays off.
+    # ------------------------------------------------------------------------------------------------------------
+    _STAB_HE_KEYS = ("he_habituation_enabled", "he_inject_respects_refractory",
+                     "he_threshold_homeo_enabled", "he_target_unlearn_enabled")
+    _STAB_NODE_KEYS = ("node_homeo_evidence_enabled", "syn_scale_evidence_enabled")
+
+    def _stab_error_once(self, keys, need: str) -> None:
+        seen = self.__dict__.setdefault("_stab_err_logged", set())
+        fresh = [k for k in keys if k not in seen]
+        if fresh:
+            seen.update(fresh)
+            logger.error("stability set (#1136): %s set but this graph lacks %s -- staying OFF "
+                         "(the Python path is the frozen oracle and gains no new behaviour)", ", ".join(fresh), need)
+
+    def _stability_params(self) -> Optional["_StabParams"]:
+        """The stability set's switches for this step, or None when every one is off (the common case: the code
+        paths then make exactly the 11d3898 calls). Pure read of config + a one-time ERROR log."""
+        c = self.config
+        he = [k for k in self._STAB_HE_KEYS if c.get(k, False)]
+        nd = [k for k in self._STAB_NODE_KEYS if c.get(k, False)]
+        if not he and not nd:
+            return None
+        if he and not (getattr(self, "_native_he_passes", False)
+                       and hasattr(self.hyperedges, "release_weak_targets")):
+            self._stab_error_once(he, "the native hyperedge passes (both native stores, S-phase ng_tract)")
+            he = []
+        if nd and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "evidence_scales")):
+            self._stab_error_once(nd, "the native node store (S-phase ng_tract)")
+            nd = []
+        if not he and not nd:
+            return None
+        hab = ((float(c.get("he_habituation_half", 0.05)), float(c.get("he_habituation_power", 2.0)))
+               if "he_habituation_enabled" in he else None)
+        c2 = ((float(c.get("he_rate_target", 0.05)), float(c.get("he_threshold_homeo_rate", 0.001)))
+              if "he_threshold_homeo_enabled" in he else None)
+        c3 = ((float(c.get("he_target_unlearn_d", 0.02)), float(c.get("he_target_unlearn_p", 0.05)))
+              if "he_target_unlearn_enabled" in he else None)
+        n_on = "node_homeo_evidence_enabled" in nd
+        s_on = "syn_scale_evidence_enabled" in nd
+        v_floor = float(c.get("node_homeo_v_floor", 0.5))
+        return _StabParams(
+            he=(hab, "he_inject_respects_refractory" in he, c2, c3) if he else None,
+            c3_floor=float(c.get("he_target_unlearn_floor", 0.1)) if c3 is not None else None,
+            v_alpha=float(c.get("node_homeo_v_alpha", 0.01)) if (n_on or s_on) else None,
+            node=((v_floor, float(c.get("node_homeo_leak", 0.02)), float(c.get("default_threshold", 0.85)))
+                  if n_on else None),
+            syn=((1.0 / float(c.get("syn_scale_rate_tau", 2000.0)), float(c.get("syn_scale_max_up", 1.03)),
+                  float(c.get("syn_scale_max_down", 0.97)), v_floor) if s_on else None),
+        )
+
+    def _stab_release_weak_targets(self) -> Optional[List[Tuple[str, str]]]:
+        """[2026-10-19] S (#1136) C3: the sleep-time release (Q7) of output targets whose weight fell below
+        he_target_unlearn_floor. None when C3 is off (nothing touched)."""
+        st = self._stability_params()
+        if st is None or st.c3_floor is None:
+            return None
+        with self._step_lock:
+            out = self.hyperedges.release_weak_targets(st.c3_floor)
+        if out:
+            logger.info("sleep_cycle: C3 released %d weak hyperedge output target(s) (floor %.3f)", len(out), st.c3_floor)
+        return out
 
     def _he_ps_to_native(self) -> bool:
         """Before a native pass: True when the native passes are on (taking the state back from Python if a
@@ -4713,11 +4846,14 @@ class Graph:
         """
         import time as _time   # local: the module namespace stays as it was
         t0 = _time.perf_counter()
+        _c3_rel = self._stab_release_weak_targets()   # [2026-10-19] S (#1136) C3 release (None = off: no key below)
         if self.config.get("sleep_disuse_enabled", False):
             record = self._sleep_cycle_disuse(t0)
             if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = unchanged)
                 with self._step_lock:
                     record["tally_retracted"] = self._sprout_tally_sleep_retract()
+            if _c3_rel is not None:
+                record["he_targets_released"] = len(_c3_rel)
             return record
         with self._step_lock:
             syn_before = len(self.synapses)
@@ -4738,6 +4874,8 @@ class Graph:
             }
             if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = unchanged)
                 record["tally_retracted"] = self._sprout_tally_sleep_retract()
+            if _c3_rel is not None:
+                record["he_targets_released"] = len(_c3_rel)
             self._emit("sleep_cycle", **record)
         logger.log(self._sleep_log_level(),   # [2026-10-07] observe: DEBUG on an observe shadow (sleep_observe), else INFO
                    "sleep_cycle: t=%s pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d in_sleep_mode=%s %.3fs",
@@ -8344,6 +8482,11 @@ class Graph:
             **({"strength_budget_steps_since": _sb_steps} if (_sb_steps := next(
                 (r._steps_since_budget for r in self._plasticity_rules
                  if isinstance(r, StrengthBudgetRule)), 0)) else {}),
+            # [2026-10-19] #1134 (S window): the homeostat's per-node degree targets, so a restored graph continues
+            # step for step. Emitted ONLY with config homeostatic_degree_targets_persist (absent = the key set above).
+            **({"homeostatic_degree_targets": dict(next(
+                (r._degree_targets for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), {}))}
+               if self.config.get("homeostatic_degree_targets_persist", False) else {}),
         }
 
     def _serialize_incremental(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
@@ -8804,6 +8947,10 @@ class Graph:
         for rule in self._plasticity_rules:
             if isinstance(rule, HomeostaticRule):
                 rule._steps_since_scaling = homeostatic_steps
+                # [2026-10-19] #1134: the saved degree targets (present only when a host persisted them)
+                _dt = data.get("homeostatic_degree_targets")
+                if isinstance(_dt, dict):
+                    rule._degree_targets = dict(_dt)
                 break
         # 2026-10-04 strength budget interval counter (absent key == 0).
         for rule in self._plasticity_rules:
