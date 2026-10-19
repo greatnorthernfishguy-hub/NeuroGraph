@@ -20,6 +20,12 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-19] Claude Code (Opus 5.5, Executive; Josh: "1 sounds good for the tie breaker", "You have my Proceed")
+#   — #1142 tie-break by activity
+#   What: behind he_member_choice_by_contribution, shed ties go to the least active member (lowest firing_rate_ema)
+#         and the seam core keeps the more active one, before the co-fire tally and node id.
+#   Why:  the member-evolution tally is almost always 0 for members, so ties fell to node id (arbitrary again).
+#   How:  _he_member_fre(nid); dream-side only (Python); flag still off by default.
 # [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — H2: the hyperedge passes run natively on the store's columns when
 #   BOTH native stores are on; #1142 choose-by-contribution and #1140 sorted saves behind protected flags (PROTECTED CHANGE
 #   on review branch cc-laptop-hyperedge-store-h2-20261018 ONLY, its own commit; Josh 2026-10-18 "Let's keep going" =
@@ -7102,6 +7108,14 @@ class Graph:
 
             return merged_count
 
+    def _he_member_fre(self, nid) -> float:
+        """[2026-10-19] #1142 tie-break: a member node's firing_rate_ema (0.0 if absent) -- activity, not list order."""
+        node = self.nodes.get(nid)
+        try:
+            return float(getattr(node, "firing_rate_ema", 0.0) or 0.0) if node is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def _seam_score_members(self, hid, he):
         """Per-member seam score for #147 splitting — member_weight primary plus the
         §8.15 SNN-concept auxiliary family, min-max normalized across THIS HE's
@@ -7372,9 +7386,11 @@ class Graph:
                     # [2026-10-18] H2 #1142 (Josh's ruling 3b): the core is the highest seam score; ties go to the
                     # larger contribution — higher member weight, then more co-fires in the member-evolution
                     # tally — then node id; never member-list (hash-seed) order.
+                    # [2026-10-19] Josh: after weight, the MORE ACTIVE member (higher firing_rate_ema) stays core.
                     _cf = self._he_co_fire_counts.get(hid) or {}
                     members = sorted(he.member_nodes, key=lambda nid: (
-                        -seam.get(nid, 0.0), -weights.get(nid, 1.0), -_cf.get(nid, 0), str(nid)))
+                        -seam.get(nid, 0.0), -weights.get(nid, 1.0), -self._he_member_fre(nid),
+                        -_cf.get(nid, 0), str(nid)))
                 else:
                     members = sorted(he.member_nodes,
                                      key=lambda nid: seam.get(nid, 0.0), reverse=True)
@@ -7602,8 +7618,11 @@ class Graph:
                     # [2026-10-18] H2 #1142 (Josh's ruling 3b): shed the least-contributing members first — lowest
                     # member weight, then fewest co-fires in the member-evolution tally, then node id — never by
                     # member-list (hash-seed) order.
+                    # [2026-10-19] Josh: ties go to the LEAST ACTIVE member (lowest firing_rate_ema) -- the tally is
+                    # nearly always 0 for members -- then the co-fire tally, then node id.
                     _cf = self._he_co_fire_counts.get(hid) or {}
-                    candidates.sort(key=lambda n: (he.member_weights.get(n, 1.0), _cf.get(n, 0), str(n)))
+                    candidates.sort(key=lambda n: (he.member_weights.get(n, 1.0), self._he_member_fre(n),
+                                                   _cf.get(n, 0), str(n)))
                 for nid in candidates[:allowed]:
                     if getattr(self, "_native_he", False):   # [2026-10-18] H1
                         self.hyperedges.remove_member(hid, nid)
