@@ -741,3 +741,21 @@ def test_stale_ref_raises_and_the_lenia_reader_snapshots_under_the_lock():
     s_n._build_hyperedge_membership()
     s_d._build_hyperedge_membership()
     assert {k: set(v) for k, v in s_n._he_membership.items()} == {k: set(v) for k, v in s_d._he_membership.items()}
+
+
+# [2026-10-19] Josh's tie-break: among equal-weight floor members, the LEAST ACTIVE (lowest firing_rate_ema) is shed first
+def test_1142_tie_break_sheds_the_least_active_member_first():
+    cfg = dict(HE_CFG)
+    cfg["he_member_choice_by_contribution"] = True
+    g = NF.Graph(cfg)
+    for i in range(8):
+        g.create_node(node_id="m%02d" % i)
+    g.timestep = 100
+    a = g.create_hyperedge({"m%02d" % i for i in range(8)},
+                           member_weights={"m%02d" % i: (0.01 if i < 6 else 2.0) for i in range(8)},
+                           metadata={"member_since": {"m%02d" % i: 0 for i in range(8)}})
+    # equal weight at the floor; activity decides: m05 is the most active floor member, so it is the one kept
+    for i, fre in enumerate([0.30, 0.10, 0.20, 0.05, 0.15, 0.40]):
+        g.nodes["m%02d" % i].firing_rate_ema = fre
+    assert g.shed_floor_members() == 5
+    assert sorted(g.hyperedges[a.hyperedge_id].member_nodes) == ["m05", "m06", "m07"]
