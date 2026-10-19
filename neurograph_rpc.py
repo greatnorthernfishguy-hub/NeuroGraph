@@ -13,6 +13,15 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — hyperedge member sets read UNDER graph._step_lock
+# What: TonicBridge._hyperedge_complete snapshots every member set under graph._step_lock, then computes the
+#       implied nodes outside it.
+# Why:  spec 2026-10-17-rust-hyperedge-store-design.md §1.2 D3 + the H1 reader audit: with the native hyperedge store a
+#       ref to a hyperedge removed after the snapshot raises KeyError on its next read (today's dicts hand back the dead
+#       object's stale members, or raise "changed size during iteration"). Reading the members inside the same lock
+#       the engine mutates under fixes both, for either backing. Results are unchanged.
+# How:  the lock is the graph's own RLock (innermost in the established _concurrent_lock -> _step_lock order); the
+#       arithmetic stays outside it.
 # [2026-10-05] Claude (lane rust-hotpaths-onto-s4, review branch cc-laptop-rust-hotpaths-onto-s4-20261005)
 #   What: carries the overnight lane's change below (d0e3a40) onto trial s4 unchanged.
 #   Why:  Josh approved integrating the overnight Rust hot-path review (2026-10-05).
@@ -1883,9 +1892,17 @@ class TonicBridge:
             return set()
         implied = set()
         try:
-            for he in _memory.graph.hyperedges.values():
+            # [2026-10-18] #1136 H2: member sets snapshotted under the step lock (a native ref of a hyperedge removed
+            # meanwhile raises KeyError, which ended this scan early)
+            _g = _memory.graph
+            _lock = getattr(_g, "_step_lock", None)
+            if _lock is not None:
+                with _lock:
+                    _he_members = [he.member_nodes for he in _g.hyperedges.values()]
+            else:
+                _he_members = [he.member_nodes for he in _g.hyperedges.values()]
+            for member_ids in _he_members:
                 # member_nodes is Set[str] in neuro_foundation.py (not member_node_ids)
-                member_ids = he.member_nodes
                 if not member_ids:
                     continue
                 active = member_ids & fired_ids

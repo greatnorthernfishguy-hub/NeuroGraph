@@ -3,6 +3,15 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — hyperedge member sets read UNDER graph._step_lock
+# What: generate_emergent_want's hyperedge completion snapshots every member set under graph._step_lock, then
+#       computes the implied nodes outside it.
+# Why:  spec 2026-10-17-rust-hyperedge-store-design.md §1.2 D3 + the H1 reader audit: with the native hyperedge store a
+#       ref to a hyperedge removed after the snapshot raises KeyError on its next read (today's dicts hand back the dead
+#       object's stale members, or raise "changed size during iteration"). Reading the members inside the same lock
+#       the engine mutates under fixes both, for either backing. Results are unchanged.
+# How:  the lock is the graph's own RLock (innermost in the established _concurrent_lock -> _step_lock order); the
+#       arithmetic stays outside it.
 # [2026-10-17] Claude Code (Opus 5.5, Executive; #1123) — drain_ingest_tract(should_stop=None)
 #   What: an optional probe checked between turns, like max_seconds; when it returns True the pass ends
 #         ("host_stopping") and the untaken turns stay in the tract.
@@ -3158,8 +3167,15 @@ def generate_emergent_want(
         # Hyperedge completion -- nodes implied by >=50% of a hyperedge's
         # members firing, even though they didn't fire themselves.
         implied: set = set()
-        for he in graph.hyperedges.values():
-            member_ids = he.member_nodes
+        # [2026-10-18] #1136 H2: member sets snapshotted under the step lock (a native ref of a hyperedge removed
+        # meanwhile raises KeyError, which would void this whole want)
+        _lock = getattr(graph, "_step_lock", None)
+        if _lock is not None:
+            with _lock:
+                _he_members = [he.member_nodes for he in graph.hyperedges.values()]
+        else:
+            _he_members = [he.member_nodes for he in graph.hyperedges.values()]
+        for member_ids in _he_members:
             if not member_ids:
                 continue
             active = member_ids & fired

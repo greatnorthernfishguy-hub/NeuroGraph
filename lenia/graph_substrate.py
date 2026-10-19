@@ -1,4 +1,13 @@
 # ---- Changelog ----
+# [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — hyperedge member sets read UNDER graph._step_lock
+# What: _build_hyperedge_membership snapshots (hyperedge_id, members) inside the existing _step_lock block instead of
+#       the refs alone.
+# Why:  spec 2026-10-17-rust-hyperedge-store-design.md §1.2 D3 + the H1 reader audit: with the native hyperedge store a
+#       ref to a hyperedge removed after the snapshot raises KeyError on its next read (today's dicts hand back the dead
+#       object's stale members, or raise "changed size during iteration"). Reading the members inside the same lock
+#       the engine mutates under fixes both, for either backing. Results are unchanged.
+# How:  the lock is the graph's own RLock (innermost in the established _concurrent_lock -> _step_lock order); the
+#       arithmetic stays outside it.
 # 2026-03-25 Claude Code — Initial creation
 # What: Concrete LeniaSubstrate implementation wrapping NeuroGraph's Graph
 # Why: Maps Lenia's abstract entity/distance interface to NG's nodes/synapses
@@ -377,21 +386,29 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         membership once also turns an O(pairs * hyperedges) per-populate
         cost into O(hyperedges + pairs).
         """
+        def _snap():
+            # [2026-10-18] #1136 H2: ids and members read inside the lock (a native HyperedgeRef of an edge removed
+            # after the snapshot would raise KeyError; a dict's member set could change mid-scan)
+            out = []
+            for he in self._graph.hyperedges.values():
+                members = (
+                    he.node_ids if hasattr(he, "node_ids") else
+                    (he.member_nodes if hasattr(he, "member_nodes") else [])
+                )
+                out.append((he.hyperedge_id, list(members)))
+            return out
+
         _lock = getattr(self._graph, "_step_lock", None)
         if _lock is not None:
             with _lock:
-                _hes = list(self._graph.hyperedges.values())
+                _hes = _snap()
         else:
-            _hes = list(self._graph.hyperedges.values())
+            _hes = _snap()
 
         membership: Dict[str, Set[str]] = defaultdict(set)
-        for he in _hes:
-            members = (
-                he.node_ids if hasattr(he, "node_ids") else
-                (he.member_nodes if hasattr(he, "member_nodes") else [])
-            )
+        for hid, members in _hes:
             for nid in members:
-                membership[nid].add(he.hyperedge_id)
+                membership[nid].add(hid)
         self._he_membership = membership
 
     def _hyperedge_similarity(self, a: str, b: str) -> float:
