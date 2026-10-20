@@ -20,6 +20,23 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-20] Claude (lane stability-s4, #1136 round S4; Josh 2026-10-20 "Good plan, let's do this plan") — the slow
+#   node homeostat gets a finite equilibrium, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s4-20261020
+#   ONLY, its own commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: two keys, read live, absent = off, NOT in DEFAULT_CONFIG; both need node_homeo_slow_enabled (S3) and the
+#       S4-round ng_tract (NodeStore.stab_round >= 4), else ERROR once and off:
+#       (1) node_homeo_prop_enabled (+ node_homeo_prop_unit 2.0, node_homeo_prop_max 4.0): N's moves are proportional
+#           to the node's bounded log distance from its set point (one S3 step at `unit` x off target, at most `max`
+#           steps) and saturate with the headroom left toward the rail they head for (intrinsic plasticity keeps a
+#           neuron inside a bounded operating range).
+#       (2) node_homeo_hopeless_enabled (+ node_homeo_hopeless_fail 0.95, node_homeo_hopeless_window 1000.0,
+#           node_homeo_hopeless_leak 0.0; also needs node_homeo_input_evidence_enabled): an afferented node whose input
+#           is failing (fail_ema >= fail) and that has not fired at all for `window` steps gets no upward drive (it holds,
+#           or leaks to baseline by `leak` > 0); its synapses are left to synaptic learning and sleep.
+# Why:  dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Part 8: S3's fixed step has no finite equilibrium (hot core
+#       too slow down, the failing periphery wound up without bound -> a fade at horizon 2,000, a re-ignition at 500).
+# How:  extra keywords (prop=..., hopeless=...) on NodeStore.adapt_thresholds / adapt_excitability, only while on; with
+#       both keys absent this file makes exactly the S3 commit's (3285f29) native calls.
 # [2026-10-20] Claude (lane stability-s3, #1136 round S3; Josh 2026-10-20 "I concur with your recommendations. Start the
 #   next round") — slow node homeostasis, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s3-20261020
 #   ONLY, its own commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
@@ -2076,6 +2093,9 @@ class _StabParams(NamedTuple):
     inhib: Optional[tuple] = None    # (4) (gain, decay, g_max, base_alpha): NodeStore.detect_fired
     # [2026-10-20] S3 (#1136): None = off (S2 exactly)
     slow: Optional[tuple] = None     # (rate_mult, long_alpha): N judges the long rate, moves at rate_mult x the rule's
+    # [2026-10-20] S4 (#1136): None = off (S3 exactly); both only with `slow`
+    prop: Optional[tuple] = None     # (unit, max): proportional, saturating N moves
+    hope: Optional[tuple] = None     # (fail_min, window, leak): no upward drive for a node with hopeless input
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2196,6 +2216,16 @@ class HomeostaticRule(PlasticityRule):
         _thr_rate = self.threshold_rate if _slow is None else self.threshold_rate * _slow[0]
         _exc_rate = self.excitability_rate if _slow is None else self.excitability_rate * _slow[0]
         _skw = {"slow": True} if _slow is not None else {}
+        # [2026-10-20] S4 (#1136): proportional, saturating moves / giving up on hopeless inputs (refinements of slow;
+        # _stability_params only sets them with slow, and hope only with evidence by input received)
+        _tkw = dict(_skw)
+        _xkw = dict(_skw)
+        if _slow is not None and _st.prop is not None:
+            _tkw["prop"] = (_st.prop[0], _st.prop[1], _n_ev[2])
+            _xkw["prop"] = _st.prop
+        if _slow is not None and _st.hope is not None and _ev_in is not None:
+            _tkw["hopeless"] = (_st.hope[0], _st.hope[1], float(timestep))
+            _xkw["hopeless"] = (_st.hope[0], _st.hope[1], float(timestep), _st.hope[2])
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
@@ -2212,7 +2242,7 @@ class HomeostaticRule(PlasticityRule):
                                    else _native(self._degree_targets, self.target_firing_rate,
                                                 _thr_rate, threshold_ceiling,
                                                 (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in + _w_step,
-                                                **_skw)):
+                                                **_tkw)):
             _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                      self.threshold_rate, threshold_ceiling)
 
@@ -2229,7 +2259,7 @@ class HomeostaticRule(PlasticityRule):
         _native = getattr(graph.nodes, "adapt_excitability", None)
         _ratios = ((_native(self._degree_targets, self.target_firing_rate, self.excitability_rate) if _n_ev is None
                     else _native(self._degree_targets, self.target_firing_rate, _exc_rate,
-                                 _n_ev if _ev_in is None else _n_ev + _ev_in + _w_int, **_skw))
+                                 _n_ev if _ev_in is None else _n_ev + _ev_in + _w_int, **_xkw))
                    if _native is not None else None)
         if _ratios is None:
             node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
@@ -4211,6 +4241,8 @@ class Graph:
     _STAB_S2_HE_KEYS = ("he_threshold_leak_enabled",)
     # [2026-10-20] S3 (#1136): needs the S3 wheel (NodeStore.stab_round >= 3)
     _STAB_S3_NODE_KEYS = ("node_homeo_slow_enabled",)
+    # [2026-10-20] S4 (#1136): need the S4 wheel (NodeStore.stab_round >= 4) and node_homeo_slow_enabled
+    _STAB_S4_NODE_KEYS = ("node_homeo_prop_enabled", "node_homeo_hopeless_enabled")
 
     def _stab_error_once(self, keys, need: str) -> None:
         seen = self.__dict__.setdefault("_stab_err_logged", set())
@@ -4240,6 +4272,26 @@ class Graph:
         if s3n and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 3):
             self._stab_error_once(s3n, "the native node store (S3-round ng_tract)")
             s3n = []
+        s4n = [k for k in self._STAB_S4_NODE_KEYS if c.get(k, False)]
+        if s4n and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 4):
+            self._stab_error_once(s4n, "the native node store (S4-round ng_tract)")
+            s4n = []
+        if s4n and "node_homeo_slow_enabled" not in s3n:
+            self._stab_error_once(s4n, "node_homeo_slow_enabled (S4 refines slow node homeostasis)")
+            s4n = []
+        # out-of-range parameters would make the native pass decline (and the frozen Python loop run): refuse them here
+        if "node_homeo_prop_enabled" in s4n and not (float(c.get("node_homeo_prop_unit", 2.0)) > 1.0
+                                                      and float(c.get("node_homeo_prop_max", 4.0)) > 0.0):
+            self._stab_error_once(["node_homeo_prop_enabled"], "node_homeo_prop_unit > 1 and node_homeo_prop_max > 0")
+            s4n = [k for k in s4n if k != "node_homeo_prop_enabled"]
+        if "node_homeo_hopeless_enabled" in s4n and not (float(c.get("node_homeo_hopeless_window", 1000.0)) > 0.0
+                                                          and 0.0 <= float(c.get("node_homeo_hopeless_leak", 0.0)) <= 1.0):
+            self._stab_error_once(["node_homeo_hopeless_enabled"],
+                                  "node_homeo_hopeless_window > 0 and 0 <= node_homeo_hopeless_leak <= 1")
+            s4n = [k for k in s4n if k != "node_homeo_hopeless_enabled"]
+        if "node_homeo_hopeless_enabled" in s4n and "node_homeo_input_evidence_enabled" not in s2n:
+            self._stab_error_once(["node_homeo_hopeless_enabled"], "node_homeo_input_evidence_enabled (it judges input)")
+            s4n = [k for k in s4n if k != "node_homeo_hopeless_enabled"]
         if s2h and not (getattr(self, "_native_he_passes", False) and hasattr(self.hyperedges, "c2_bases")):
             self._stab_error_once(s2h, "the native hyperedge passes (S2-round ng_tract)")
             s2h = []
@@ -4291,6 +4343,12 @@ class Graph:
             # [2026-10-20] S3 (#1136): slow node homeostasis needs N
             slow=((float(c.get("node_homeo_slow_rate_mult", 0.2)), 1.0 / float(c.get("syn_scale_rate_tau", 2000.0)))
                   if ("node_homeo_slow_enabled" in s3n and n_on) else None),
+            # [2026-10-20] S4 (#1136): both refine slow (needs N); hope also needs evidence by input received
+            prop=((float(c.get("node_homeo_prop_unit", 2.0)), float(c.get("node_homeo_prop_max", 4.0)))
+                  if ("node_homeo_prop_enabled" in s4n and n_on) else None),
+            hope=((float(c.get("node_homeo_hopeless_fail", 0.95)), float(c.get("node_homeo_hopeless_window", 1000.0)),
+                   float(c.get("node_homeo_hopeless_leak", 0.0)))
+                  if ("node_homeo_hopeless_enabled" in s4n and n_on and in_on) else None),
         )
 
     def _stab_release_weak_targets(self) -> Optional[List[Tuple[str, str]]]:
