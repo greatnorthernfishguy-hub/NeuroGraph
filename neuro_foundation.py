@@ -20,6 +20,21 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-20] Claude (lane stability-s3, #1136 round S3; Josh 2026-10-20 "I concur with your recommendations. Start the
+#   next round") — slow node homeostasis, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s3-20261020
+#   ONLY, its own commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: node_homeo_slow_enabled (read live, absent = off, NOT in DEFAULT_CONFIG; needs node_homeo_evidence_enabled and
+#       the S3-round ng_tract, NodeStore.stab_round >= 3) + node_homeo_slow_rate_mult (default 0.2): N's threshold and
+#       excitability moves judge the node's rate by its LONG rate (S's trace, horizon syn_scale_rate_tau, default 2000
+#       steps) instead of firing_rate_ema (~100 steps), and move at rate_mult x HomeostaticRule's threshold_rate /
+#       excitability_rate. N's leak to baseline (unafferented nodes) is unchanged. The long rate advances whenever slow
+#       is on, also with S off. Synaptic scaling is unchanged (its ratios stay on firing_rate_ema).
+# Why:  dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Part 7 (S2: the node homeostat is too fast — a slow
+#       ~1,300-step cycle with remembered evidence, a fade with recency-only evidence) and Part 5 item 1 (a neuron's own
+#       homeostasis runs over hours to days, far slower than its activity and its synaptic learning).
+# How:  one extra keyword (slow=True) on NodeStore.adapt_thresholds / adapt_excitability and scaled rates, only while on;
+#       with the key absent this file makes exactly the S2 commit's (274a4a6) native calls. On an older wheel the key
+#       logs ERROR once and stays off.
 # [2026-10-19] Claude (lane stability-s2, #1136 round S2, tuning) — node_homeo_input_recent_enabled (read live, absent = off,
 #   NOT in DEFAULT_CONFIG; needs node_homeo_input_evidence_enabled): "driven but failing" also requires that an input
 #   actually FAILED to fire the node recently — this step for the per-step threshold move, within the last scaling
@@ -2059,6 +2074,8 @@ class _StabParams(NamedTuple):
     ev_recent: bool = False          # (1, tuning) also require a recently FAILED input (window: 1 step / 1 interval)
     deadband: Optional[float] = None  # (2) S settles inside the deadband
     inhib: Optional[tuple] = None    # (4) (gain, decay, g_max, base_alpha): NodeStore.detect_fired
+    # [2026-10-20] S3 (#1136): None = off (S2 exactly)
+    slow: Optional[tuple] = None     # (rate_mult, long_alpha): N judges the long rate, moves at rate_mult x the rule's
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2173,12 +2190,18 @@ class HomeostaticRule(PlasticityRule):
         _rec = _st is not None and _st.ev_recent and _ev_in is not None
         _w_step = (1,) if _rec else ()
         _w_int = (self.scaling_interval,) if _rec else ()
+        # [2026-10-20] S3 (#1136): slow node homeostasis (only with N): the long rate decides, at scaled rates
+        _slow = _st.slow if (_st is not None and _n_ev is not None) else None
+        _long_a = _s_ev[0] if _s_ev is not None else (_slow[1] if _slow is not None else None)
+        _thr_rate = self.threshold_rate if _slow is None else self.threshold_rate * _slow[0]
+        _exc_rate = self.excitability_rate if _slow is None else self.excitability_rate * _slow[0]
+        _skw = {"slow": True} if _slow is not None else {}
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
         _native = getattr(graph.nodes, "update_firing_ema", None)
-        if _native is None or not (_native(fired_set, self.ema_alpha) if _s_ev is None
-                                   else _native(fired_set, self.ema_alpha, _s_ev[0])):
+        if _native is None or not (_native(fired_set, self.ema_alpha) if _long_a is None
+                                   else _native(fired_set, self.ema_alpha, _long_a)):
             _update_firing_ema_python(graph.nodes, fired_set, self.ema_alpha)
 
         # Threshold adaptation: continuous, 0.001/step (PRD §3.2.1)
@@ -2187,8 +2210,9 @@ class HomeostaticRule(PlasticityRule):
         if _native is None or not (_native(self._degree_targets, self.target_firing_rate,
                                            self.threshold_rate, threshold_ceiling) if _n_ev is None
                                    else _native(self._degree_targets, self.target_firing_rate,
-                                                self.threshold_rate, threshold_ceiling,
-                                                (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in + _w_step)):
+                                                _thr_rate, threshold_ceiling,
+                                                (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in + _w_step,
+                                                **_skw)):
             _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                      self.threshold_rate, threshold_ceiling)
 
@@ -2204,8 +2228,8 @@ class HomeostaticRule(PlasticityRule):
         # stays in Python (libm pow is not proven bit-identical to CPython's float.__pow__).
         _native = getattr(graph.nodes, "adapt_excitability", None)
         _ratios = ((_native(self._degree_targets, self.target_firing_rate, self.excitability_rate) if _n_ev is None
-                    else _native(self._degree_targets, self.target_firing_rate, self.excitability_rate,
-                                 _n_ev if _ev_in is None else _n_ev + _ev_in + _w_int))
+                    else _native(self._degree_targets, self.target_firing_rate, _exc_rate,
+                                 _n_ev if _ev_in is None else _n_ev + _ev_in + _w_int, **_skw))
                    if _native is not None else None)
         if _ratios is None:
             node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
@@ -4185,6 +4209,8 @@ class Graph:
     # [2026-10-19] S2 (#1136): need the S2 wheel (NodeStore.observe_inputs / HyperedgeStore.c2_bases)
     _STAB_S2_NODE_KEYS = ("node_homeo_input_evidence_enabled", "syn_scale_settle_enabled", "burst_inhibition_enabled")
     _STAB_S2_HE_KEYS = ("he_threshold_leak_enabled",)
+    # [2026-10-20] S3 (#1136): needs the S3 wheel (NodeStore.stab_round >= 3)
+    _STAB_S3_NODE_KEYS = ("node_homeo_slow_enabled",)
 
     def _stab_error_once(self, keys, need: str) -> None:
         seen = self.__dict__.setdefault("_stab_err_logged", set())
@@ -4210,6 +4236,10 @@ class Graph:
             self._stab_error_once(s2n, "the native node store (S2-round ng_tract)")
             s2n = []
             inh_on = False
+        s3n = [k for k in self._STAB_S3_NODE_KEYS if c.get(k, False)]
+        if s3n and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 3):
+            self._stab_error_once(s3n, "the native node store (S3-round ng_tract)")
+            s3n = []
         if s2h and not (getattr(self, "_native_he_passes", False) and hasattr(self.hyperedges, "c2_bases")):
             self._stab_error_once(s2h, "the native hyperedge passes (S2-round ng_tract)")
             s2h = []
@@ -4258,6 +4288,9 @@ class Graph:
             inhib=((float(c.get("burst_inh_gain", 10.0)), float(c.get("burst_inh_decay", 0.5)),
                     float(c.get("burst_inh_max", 1.0)), float(c.get("burst_inh_base_alpha", 0.01)))
                    if inh_on else None),
+            # [2026-10-20] S3 (#1136): slow node homeostasis needs N
+            slow=((float(c.get("node_homeo_slow_rate_mult", 0.2)), 1.0 / float(c.get("syn_scale_rate_tau", 2000.0)))
+                  if ("node_homeo_slow_enabled" in s3n and n_on) else None),
         )
 
     def _stab_release_weak_targets(self) -> Optional[List[Tuple[str, str]]]:
