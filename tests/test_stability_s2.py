@@ -407,3 +407,35 @@ def test_burst_inhibition_with_a_pre_fire_handler_logs_error_once_and_stays_off(
             g.step()
     assert sum("burst_inhibition_enabled" in r.getMessage() for r in caplog.records) == 1
     assert g.nodes.s2_state()[1] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# (7) tuning refinement: wind up only while failed input is actually arriving (node_homeo_input_recent_enabled)
+# ---------------------------------------------------------------------------
+
+def _stale_run(recent):
+    cfg = {"node_homeo_evidence_enabled": True, "node_homeo_leak": 0.1, "node_homeo_input_evidence_enabled": True,
+           "co_activation_window": 0}
+    if recent:
+        cfg["node_homeo_input_recent_enabled"] = True
+    g, y = S._homeo_graph(cfg)
+    r = y[0]
+    g.nodes[r].firing_rate_ema = 0.001
+    for k in range(60):                                   # weak input that keeps failing
+        S._pace(g, k)
+        g.stimulate(r, 0.1)
+        g.step()
+    after_input = (g.nodes[r].intrinsic_excitability, g.nodes[r].threshold)
+    for k in range(60, 360):                              # then nothing arrives (a quiet phase)
+        S._pace(g, k)
+        g.step()
+    return after_input, (g.nodes[r].intrinsic_excitability, g.nodes[r].threshold)
+
+
+@needs_s2
+def test_recent_evidence_stops_wind_up_through_a_quiet_phase():
+    (x_on, t_on), (x_on_end, t_on_end) = _stale_run(True)
+    (x_off, t_off), (x_off_end, t_off_end) = _stale_run(False)
+    assert x_on > 1.0 and t_on < 0.85                     # while failed input arrived: up-regulated (both rules)
+    assert (x_on_end, t_on_end) == (x_on, t_on)           # quiet phase: holds (afferented, no recent failure)
+    assert x_off_end > x_off and t_off_end < t_off        # the S2 rule without recency keeps winding up on stale evidence
