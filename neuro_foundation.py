@@ -20,6 +20,13 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-19] Claude (lane stability-s2, #1136 round S2, tuning) — node_homeo_input_recent_enabled (read live, absent = off,
+#   NOT in DEFAULT_CONFIG; needs node_homeo_input_evidence_enabled): "driven but failing" also requires that an input
+#   actually FAILED to fire the node recently — this step for the per-step threshold move, within the last scaling
+#   interval for excitability and S's up-scaling. Why: the S2 settle runs (s2_full, s2_t1) showed a slow homeostatic
+#   oscillation: ~10K afferented nodes kept their "failing" evidence (sampled only when input arrives, so it holds)
+#   through the quiet phase and wound up on it with no input arriving. How: a 3rd item (the window) on the input-evidence
+#   tuples; absent = the S2 rule above exactly. PROTECTED CHANGE, review branch only, own commit.
 # [2026-10-19] Claude (lane stability-s2, #1136 round S2; Josh 2026-10-19 "Yeah, let's do all 4 now") — four corrections to
 #   the stability set, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s2-20261019 ONLY, its own commit;
 #   merges only after Josh's protected-file "proceed" + backups of both msgpack files). Every key below is read live,
@@ -2049,6 +2056,7 @@ class _StabParams(NamedTuple):
     # [2026-10-19] S2 (#1136): None = off (S exactly)
     inp: Optional[tuple] = None      # (1) (decay, input_min, input_alpha, fail_alpha): NodeStore.detect_fired / observe_inputs
     ev_in: Optional[tuple] = None    # (1) (rate_min, fail_min): N / S evidence by input received
+    ev_recent: bool = False          # (1, tuning) also require a recently FAILED input (window: 1 step / 1 interval)
     deadband: Optional[float] = None  # (2) S settles inside the deadband
     inhib: Optional[tuple] = None    # (4) (gain, decay, g_max, base_alpha): NodeStore.detect_fired
 
@@ -2160,6 +2168,11 @@ class HomeostaticRule(PlasticityRule):
         _s_ev = _st.syn if _st is not None else None      # (long_alpha, max_up, max_down, v_floor)
         # [2026-10-19] S2 (#1136): evidence by input received appends (rate_min, fail_min) to N's evidence tuples
         _ev_in = _st.ev_in if _st is not None else None
+        # [2026-10-19] S2 tuning: the recency window (1 step for the per-step threshold move, one scaling interval for
+        # excitability and S); absent = the S2 tuples exactly
+        _rec = _st is not None and _st.ev_recent and _ev_in is not None
+        _w_step = (1,) if _rec else ()
+        _w_int = (self.scaling_interval,) if _rec else ()
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
@@ -2175,7 +2188,7 @@ class HomeostaticRule(PlasticityRule):
                                            self.threshold_rate, threshold_ceiling) if _n_ev is None
                                    else _native(self._degree_targets, self.target_firing_rate,
                                                 self.threshold_rate, threshold_ceiling,
-                                                (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in)):
+                                                (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in + _w_step)):
             _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                      self.threshold_rate, threshold_ceiling)
 
@@ -2192,7 +2205,7 @@ class HomeostaticRule(PlasticityRule):
         _native = getattr(graph.nodes, "adapt_excitability", None)
         _ratios = ((_native(self._degree_targets, self.target_firing_rate, self.excitability_rate) if _n_ev is None
                     else _native(self._degree_targets, self.target_firing_rate, self.excitability_rate,
-                                 _n_ev if _ev_in is None else _n_ev + _ev_in))
+                                 _n_ev if _ev_in is None else _n_ev + _ev_in + _w_int))
                    if _native is not None else None)
         if _ratios is None:
             node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
@@ -2207,7 +2220,7 @@ class HomeostaticRule(PlasticityRule):
             # [2026-10-19] S2: input = evidence by input received, deadband = settle (absent = S's call exactly)
             _s2kw = {}
             if _ev_in is not None:
-                _s2kw["input"] = _ev_in
+                _s2kw["input"] = _ev_in + _w_int
             if _st.deadband is not None:
                 _s2kw["deadband"] = _st.deadband
             node_scales = graph.nodes.evidence_scales(self._degree_targets, self.target_firing_rate,
@@ -4240,6 +4253,7 @@ class Graph:
                  if in_on else None),
             ev_in=((float(c.get("node_homeo_input_rate_min", 0.0005)), float(c.get("node_homeo_fail_min", 0.5)))
                    if in_on else None),
+            ev_recent=bool(in_on and c.get("node_homeo_input_recent_enabled", False)),
             deadband=float(c.get("syn_scale_deadband", 0.2)) if settle_on else None,
             inhib=((float(c.get("burst_inh_gain", 10.0)), float(c.get("burst_inh_decay", 0.5)),
                     float(c.get("burst_inh_max", 1.0)), float(c.get("burst_inh_base_alpha", 0.01)))
