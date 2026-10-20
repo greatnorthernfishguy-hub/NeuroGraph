@@ -20,6 +20,30 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-19] Claude (lane stability-s2, #1136 round S2; Josh 2026-10-19 "Yeah, let's do all 4 now") — four corrections to
+#   the stability set, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s2-20261019 ONLY, its own commit;
+#   merges only after Josh's protected-file "proceed" + backups of both msgpack files). Every key below is read live,
+#   absent = off, NOT in DEFAULT_CONFIG; with all of them absent this file runs exactly as the S commit (275807f), and
+#   with every S2 key absent it makes exactly S's native calls.
+# What: spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §2.3 (S2 rows):
+#       (1) node_homeo_input_evidence_enabled (+ node_homeo_input_min 0.01, _input_alpha 0.002, _input_rate_min
+#           0.0005, _fail_alpha 0.25, _fail_min 0.5): N's and S's "driven but failing" judged by the input a node
+#           RECEIVES (an input event = delivered drive >= input_min; afferented = in_ema >= rate_min; failing = of the
+#           input events, fail_ema >= fail_min did not fire it), not by its mean voltage. Needs N or S.
+#       (2) syn_scale_settle_enabled (+ syn_scale_deadband 0.2): S settles in a deadband around the set point it
+#           restores, approached proportionally, still bounded both ways. Needs S.
+#       (3) he_threshold_leak_enabled (+ he_threshold_leak_rate 0.002): #1144 — a C2-raised assembly threshold leaks
+#           back toward that assembly's own baseline while its activity is below target. Needs C2.
+#       (4) burst_inhibition_enabled (+ burst_inh_gain 10.0, _decay 0.5, _max 1.0, _base_alpha 0.01): a global
+#           inhibitory pool driven by the fired fraction's excess over recent activity raises every node's effective
+#           threshold on the next steps (fast, bounded, scales with the burst).
+# Why:  dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Part 6 (the S round: the set ended the oscillation but
+#       over-damped the mind; #1144).
+# How:  Q2 — each is an argument to an existing native pass (NodeStore detect_fired / adapt_thresholds /
+#       adapt_excitability / evidence_scales, HyperedgeStore evaluate_step) or the new NodeStore.observe_inputs (a step
+#       whose detection runs in Python). On a wheel without them, a set key logs ERROR once and stays OFF. #1145
+#       (plasticity only on a step where something fired) is NOT changed here: the input traces advance in detection,
+#       every step.
 # [2026-10-19] Claude (lane stability-s, #1136 phase S; Josh 2026-10-19 "Yes, please start the S build") — the stability
 #   set, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s-20261019 ONLY, its own commit; merges only
 #   after Josh's protected-file "proceed" + backups of both msgpack files). Every key below is read live, absent = off,
@@ -1996,6 +2020,11 @@ class _StabParams(NamedTuple):
     v_alpha: Optional[float]     # N / S evidence trace v_ema (NodeStore.detect_fired)
     node: Optional[tuple]        # N: (v_floor, leak, default_threshold)
     syn: Optional[tuple]         # S: (long_alpha, max_up, max_down, v_floor)
+    # [2026-10-19] S2 (#1136): None = off (S exactly)
+    inp: Optional[tuple] = None      # (1) (decay, input_min, input_alpha, fail_alpha): NodeStore.detect_fired / observe_inputs
+    ev_in: Optional[tuple] = None    # (1) (rate_min, fail_min): N / S evidence by input received
+    deadband: Optional[float] = None  # (2) S settles inside the deadband
+    inhib: Optional[tuple] = None    # (4) (gain, decay, g_max, base_alpha): NodeStore.detect_fired
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2103,6 +2132,8 @@ class HomeostaticRule(PlasticityRule):
         _st = getattr(graph, "_stab", None)
         _n_ev = _st.node if _st is not None else None     # (v_floor, leak, default_threshold)
         _s_ev = _st.syn if _st is not None else None      # (long_alpha, max_up, max_down, v_floor)
+        # [2026-10-19] S2 (#1136): evidence by input received appends (rate_min, fail_min) to N's evidence tuples
+        _ev_in = _st.ev_in if _st is not None else None
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
@@ -2117,7 +2148,8 @@ class HomeostaticRule(PlasticityRule):
         if _native is None or not (_native(self._degree_targets, self.target_firing_rate,
                                            self.threshold_rate, threshold_ceiling) if _n_ev is None
                                    else _native(self._degree_targets, self.target_firing_rate,
-                                                self.threshold_rate, threshold_ceiling, (_n_ev[0],))):
+                                                self.threshold_rate, threshold_ceiling,
+                                                (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in)):
             _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                      self.threshold_rate, threshold_ceiling)
 
@@ -2133,7 +2165,8 @@ class HomeostaticRule(PlasticityRule):
         # stays in Python (libm pow is not proven bit-identical to CPython's float.__pow__).
         _native = getattr(graph.nodes, "adapt_excitability", None)
         _ratios = ((_native(self._degree_targets, self.target_firing_rate, self.excitability_rate) if _n_ev is None
-                    else _native(self._degree_targets, self.target_firing_rate, self.excitability_rate, _n_ev))
+                    else _native(self._degree_targets, self.target_firing_rate, self.excitability_rate,
+                                 _n_ev if _ev_in is None else _n_ev + _ev_in))
                    if _native is not None else None)
         if _ratios is None:
             node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
@@ -2145,8 +2178,14 @@ class HomeostaticRule(PlasticityRule):
         if _s_ev is not None:
             # [2026-10-19] S (#1136): slow, bounded, evidence-gated scaling replaces the per-step-rate factors. A
             # declined native pass scales nothing this interval (never today's unbounded factor while S is on).
+            # [2026-10-19] S2: input = evidence by input received, deadband = settle (absent = S's call exactly)
+            _s2kw = {}
+            if _ev_in is not None:
+                _s2kw["input"] = _ev_in
+            if _st.deadband is not None:
+                _s2kw["deadband"] = _st.deadband
             node_scales = graph.nodes.evidence_scales(self._degree_targets, self.target_firing_rate,
-                                                      self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3]) or {}
+                                                      self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3], **_s2kw) or {}
 
         # [2026-10-04] One native pass applies every node's scale to its incoming
         # synapses: weight = max(0, min(weight * scale, max_weight)). Each synapse has
@@ -3309,14 +3348,26 @@ class Graph:
             fired_ids = None
             # [2026-10-19] S (#1136) N / S: v_alpha given = the native pass first updates v_ema (pre-detection voltage)
             _va = _stab.v_alpha if _stab is not None else None
+            # [2026-10-19] S2 (#1136): input observation (1) and burst inhibition (4) ride the same native pass
+            _s2_inp = _stab.inp if _stab is not None else None
+            _s2_inh = _stab.inhib if _stab is not None else None
             if not self._event_handlers.get("pre_fire"):
                 _native = getattr(self.nodes, "detect_fired", None)
                 if _native is not None:
-                    fired_ids = _native() if _va is None else _native(_va)
-            elif _va is not None:
-                self.nodes.update_v_ema(_va)
+                    if _s2_inp is None and _s2_inh is None:
+                        fired_ids = _native() if _va is None else _native(_va)
+                    else:
+                        fired_ids = _native(_va, _s2_inp, _s2_inh)
+            else:
+                if _va is not None:
+                    self.nodes.update_v_ema(_va)
+                if _s2_inh is not None:
+                    self._stab_error_once(("burst_inhibition_enabled",),
+                                          "native fire detection (a pre_fire handler is registered)")
             if fired_ids is None:
                 fired_ids = _detect_fired_python(self.nodes, self._event_handlers)
+                if _s2_inp is not None:   # S2: a step detected in Python still observes its input (before step 4)
+                    self.nodes.observe_inputs(fired_ids, _s2_inp)
 
             # 3b. Zero-firing circuit breaker tracking
             if fired_ids:
@@ -4084,6 +4135,9 @@ class Graph:
     _STAB_HE_KEYS = ("he_habituation_enabled", "he_inject_respects_refractory",
                      "he_threshold_homeo_enabled", "he_target_unlearn_enabled")
     _STAB_NODE_KEYS = ("node_homeo_evidence_enabled", "syn_scale_evidence_enabled")
+    # [2026-10-19] S2 (#1136): need the S2 wheel (NodeStore.observe_inputs / HyperedgeStore.c2_bases)
+    _STAB_S2_NODE_KEYS = ("node_homeo_input_evidence_enabled", "syn_scale_settle_enabled", "burst_inhibition_enabled")
+    _STAB_S2_HE_KEYS = ("he_threshold_leak_enabled",)
 
     def _stab_error_once(self, keys, need: str) -> None:
         seen = self.__dict__.setdefault("_stab_err_logged", set())
@@ -4099,7 +4153,20 @@ class Graph:
         c = self.config
         he = [k for k in self._STAB_HE_KEYS if c.get(k, False)]
         nd = [k for k in self._STAB_NODE_KEYS if c.get(k, False)]
-        if not he and not nd:
+        # [2026-10-19] S2 (#1136): burst inhibition stands alone; the other S2 keys modify N / S / C2 (below)
+        inh_on = bool(c.get("burst_inhibition_enabled", False))
+        if not he and not nd and not inh_on:
+            return None
+        s2n = [k for k in self._STAB_S2_NODE_KEYS if c.get(k, False)]
+        s2h = [k for k in self._STAB_S2_HE_KEYS if c.get(k, False)]
+        if s2n and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "observe_inputs")):
+            self._stab_error_once(s2n, "the native node store (S2-round ng_tract)")
+            s2n = []
+            inh_on = False
+        if s2h and not (getattr(self, "_native_he_passes", False) and hasattr(self.hyperedges, "c2_bases")):
+            self._stab_error_once(s2h, "the native hyperedge passes (S2-round ng_tract)")
+            s2h = []
+        if not he and not nd and not inh_on:
             return None
         if he and not (getattr(self, "_native_he_passes", False)
                        and hasattr(self.hyperedges, "release_weak_targets")):
@@ -4108,7 +4175,7 @@ class Graph:
         if nd and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "evidence_scales")):
             self._stab_error_once(nd, "the native node store (S-phase ng_tract)")
             nd = []
-        if not he and not nd:
+        if not he and not nd and not inh_on:
             return None
         hab = ((float(c.get("he_habituation_half", 0.05)), float(c.get("he_habituation_power", 2.0)))
                if "he_habituation_enabled" in he else None)
@@ -4119,14 +4186,30 @@ class Graph:
         n_on = "node_homeo_evidence_enabled" in nd
         s_on = "syn_scale_evidence_enabled" in nd
         v_floor = float(c.get("node_homeo_v_floor", 0.5))
+        # [2026-10-19] S2 (#1136): (1) needs N or S, (2) needs S, (3) needs C2; each absent = S exactly
+        in_on = "node_homeo_input_evidence_enabled" in s2n and (n_on or s_on)
+        settle_on = "syn_scale_settle_enabled" in s2n and s_on
+        leak_on = "he_threshold_leak_enabled" in s2h and c2 is not None
+        he_t = (hab, "he_inject_respects_refractory" in he, c2, c3)
+        if leak_on:
+            he_t = he_t + (float(c.get("he_threshold_leak_rate", 0.002)),)
         return _StabParams(
-            he=(hab, "he_inject_respects_refractory" in he, c2, c3) if he else None,
+            he=he_t if he else None,
             c3_floor=float(c.get("he_target_unlearn_floor", 0.1)) if c3 is not None else None,
-            v_alpha=float(c.get("node_homeo_v_alpha", 0.01)) if (n_on or s_on) else None,
+            v_alpha=float(c.get("node_homeo_v_alpha", 0.01)) if ((n_on or s_on) and not in_on) else None,
             node=((v_floor, float(c.get("node_homeo_leak", 0.02)), float(c.get("default_threshold", 0.85)))
                   if n_on else None),
             syn=((1.0 / float(c.get("syn_scale_rate_tau", 2000.0)), float(c.get("syn_scale_max_up", 1.03)),
                   float(c.get("syn_scale_max_down", 0.97)), v_floor) if s_on else None),
+            inp=((float(c["decay_rate"]), float(c.get("node_homeo_input_min", 0.01)),
+                  float(c.get("node_homeo_input_alpha", 0.002)), float(c.get("node_homeo_fail_alpha", 0.25)))
+                 if in_on else None),
+            ev_in=((float(c.get("node_homeo_input_rate_min", 0.0005)), float(c.get("node_homeo_fail_min", 0.5)))
+                   if in_on else None),
+            deadband=float(c.get("syn_scale_deadband", 0.2)) if settle_on else None,
+            inhib=((float(c.get("burst_inh_gain", 10.0)), float(c.get("burst_inh_decay", 0.5)),
+                    float(c.get("burst_inh_max", 1.0)), float(c.get("burst_inh_base_alpha", 0.01)))
+                   if inh_on else None),
         )
 
     def _stab_release_weak_targets(self) -> Optional[List[Tuple[str, str]]]:
