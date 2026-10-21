@@ -20,6 +20,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-21] Claude (lane rebaseline, #1136 / #1151; Josh 2026-10-21 "Let's go with your suggestion" + "Agreed?" on recall
+#   feeling the S5 brakes) — read-mode recall sweeps feel the live brakes, SWITCH AND WIRING ONLY (PROTECTED CHANGE on
+#   review branch cc-laptop-rebaseline-20261021 ONLY, its own commit; merges only after Josh's protected-file "proceed"
+#   + backups of both msgpack files).
+# What: one key, recall_brakes_enabled, read live, absent = off, NOT in DEFAULT_CONFIG; needs the recall-round ng_tract
+#       (NodeStore / SynapseStore .recall_round >= 1), else ERROR once and off. With it on, prime_and_propagate in READ
+#       mode (cue evaluation, the null sweep, F recall; never the Tonic's write mode) detects through
+#       NodeStore.recall_detect (S5's AHP brake: threshold + ca_split_ahp_gain x the live slow calcium; round I's
+#       inhibition at the live g_inh, divisive by default) and reads synapses through propagation_rows(std_read=the
+#       graph's timestep) (weight x the live depression resource, nothing spent). Each brake applies only while step()
+#       runs it. Read-only: no threshold, calcium, conductance, PV, resource or weight is written; the sweep's voltages
+#       and refractory counters are restored after the sweep exactly as before.
+# Why:  dev-log #1131 Parts 10-12; interneuron design Q5 / risk 10: a brake-free sweep fires nodes step() holds back.
+# How:  key absent = the S5 + round I calls exactly (no new call, no new argument).
 # [2026-10-20] Claude (lane interneurons-i, #1151 / #1136 round I; Josh 2026-10-20 "I'm all in on the inhibitory neurons,
 #   as long as we don't do them in Python" + "It looks good as laid out") — inhibitory interneurons, SWITCHES AND WIRING
 #   ONLY (PROTECTED CHANGE on review branch cc-laptop-interneurons-i-20261020 ONLY, its own commit; merges only after
@@ -4046,6 +4060,14 @@ class Graph:
                             or node.refractory_remaining > 0):
                         working_set.add(nid)
 
+                # [2026-10-21] rebaseline (#1136 / #1151): read-mode recall feels the live brakes (None = the frozen
+                # loop). Taken BEFORE the prime, so the prime is drive the divisive shunt sees (as a cue is in step()).
+                _rb = (self._recall_brakes(self._stability_params())
+                       if not write_mode and self.config.get("recall_brakes_enabled", False) else None)
+                if _rb is not None and _rb[2] is not None and _rb[2][1] == 0.0:
+                    if not self.nodes.recall_brakes_begin():
+                        _rb = (_rb[0], _rb[1], None)
+
                 # --- PRIME: inject current into specified nodes ---
                 for nid, current in zip(node_ids, currents):
                     node = self.nodes.get(nid)
@@ -4088,13 +4110,21 @@ class Graph:
                             working_set.add(target_id)  # now active (#164)
 
                     # 3. Detect firing nodes — O(working_set) not O(n) (#164)
-                    fired_ids: List[str] = []
-                    for nid in working_set:
-                        node = self.nodes[nid]
-                        if node.refractory_remaining > 0:
-                            continue
-                        if node.voltage >= node.threshold:
-                            fired_ids.append(nid)
+                    # [2026-10-21] rebaseline: with recall brakes, the native detection over the same working set in the
+                    # same order (AHP-raised thresholds, the live g_inh); a declined pass runs the frozen loop
+                    fired_ids = (self.nodes.recall_detect(list(working_set), ahp=_rb[0], inh=_rb[2])
+                                 if _rb is not None else None)
+                    if fired_ids is None:
+                        if _rb is not None:
+                            self._stab_error_once(("recall_brakes_enabled",), "a canonical node store (recall_detect "
+                                                  "declined; this sweep step ran without the brakes)")
+                        fired_ids = []
+                        for nid in working_set:
+                            node = self.nodes[nid]
+                            if node.refractory_remaining > 0:
+                                continue
+                            if node.voltage >= node.threshold:
+                                fired_ids.append(nid)
 
                     # 4. Reset fired nodes and set refractory
                     for nid in fired_ids:
@@ -4128,7 +4158,10 @@ class Graph:
                         # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
                         # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
                         _out_ids = list(self._outgoing.get(nid, ()))
-                        for _row in _pp_rows(_out_ids, _age_on):
+                        # [2026-10-21] rebaseline: with recall brakes, depletion read-only (an inhibitory presynaptic
+                        # node is exempt, as in step())
+                        for _row in (_pp_rows(_out_ids, _age_on) if _rb is None or _rb[1] is None or node.is_inhibitory
+                                     else _pp_rows(_out_ids, _age_on, std_read=_rb[1])):
                             if _row is None:
                                 continue
                             _syn_post, _syn_w, _syn_inhib, _syn_delay = _row
@@ -4213,6 +4246,9 @@ class Graph:
                 # Observational propagation borrows activation state. A failure must
                 # return every borrowed transient field before releasing _step_lock.
                 # Write mode is living activity, so its state intentionally persists.
+                if not write_mode and self.config.get("recall_brakes_enabled", False) \
+                        and getattr(type(self.nodes), "recall_round", 0) >= 1:
+                    self.nodes.recall_brakes_end()   # [2026-10-21] rebaseline: drop the sweep's drive baseline
                 if not write_mode:
                     for nid, node in self.nodes.items():
                         node.voltage = saved_voltages.get(nid, node.resting_potential)
@@ -4522,6 +4558,29 @@ class Graph:
                                       "interneuron_pool_max / _k_min / _cover / _coincidence >= 1, 0 < _ratio_max <= 1, "
                                       "_theta > 0, _w_min / _refractory / _w_ie >= 0, _retire_window > 0")
         return il_t, ir_t
+
+    def _recall_brakes(self, st: Optional["_StabParams"]) -> Optional[tuple]:
+        """[2026-10-21] rebaseline (#1136 / #1151; Josh 2026-10-21): with ``recall_brakes_enabled`` (read live, absent =
+        off, not in DEFAULT_CONFIG), a READ-MODE recall sweep feels the brakes step() applies right now, read-only:
+        (ahp gain or None, std_read timestep or None, (decay_rate, offset flag) or None) — S5's AHP brake when
+        ca_split runs, depletion when syn_std runs, round I's inhibition when the layer runs and exists. None = no
+        brake applies (the frozen loop exactly). Needs the recall-round wheel (recall_round >= 1 on both stores), else
+        ERROR once and off. Pure read of config / store state."""
+        if not self.config.get("recall_brakes_enabled", False):
+            return None
+        if not (getattr(type(self.nodes), "recall_round", 0) >= 1
+                and getattr(type(self.synapses), "recall_round", 0) >= 1):
+            self._stab_error_once(("recall_brakes_enabled",), "the native node + synapse stores (recall-round ng_tract)")
+            return None
+        if st is None:
+            return None
+        ahp = float(st.ca_split[3]) if st.ca_split is not None else None
+        std_r = float(self.timestep) if st.std is not None else None
+        inh = ((float(st.ilayer[0]), float(st.ilayer[6]))
+               if st.ilayer is not None and self.nodes.interneurons_exists() else None)
+        if ahp is None and std_r is None and inh is None:
+            return None
+        return (ahp, std_r, inh)
 
     def _interneurons_recruit(self, params: tuple) -> Optional[Dict[str, Any]]:
         """[2026-10-20] round I (#1151): one recruitment / maintenance run of the native interneuron layer (design
