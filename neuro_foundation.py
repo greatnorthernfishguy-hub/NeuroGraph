@@ -20,6 +20,33 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-20] Claude (lane stability-s5, #1136 round S5; Josh 2026-10-20 "OK, let's do your recs ... Yeah, the order
+#   sounds right") — spike-frequency adaptation (#1149), short-term synaptic depression (#1150) and direction agreement
+#   for node homeostasis, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s5-20261020 ONLY, its own
+#   commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: three keys, read live, absent = off, NOT in DEFAULT_CONFIG; each needs the S5-round ng_tract
+#       (NodeStore.stab_round >= 5, SynapseStore.stab_round >= 5 for depression), else ERROR once and off:
+#       (1) ca_split_enabled (+ ca_split_slow_tau 200, ca_split_ahp_gain 0.075, ca_split_slow_delta = delta_Ca): a LAW 3
+#           repair of the IcaN / IK-AHP channels (#254), not a new mechanism. Today both currents read one fast pool
+#           (Ca_i, +delta_Ca per spike, x Ca_decay per step) and the net (g_CaN - g_AHP) x Ca_i = +0.02 x Ca_i is
+#           depolarizing. Split: the fast pool drives IcaN alone (voltage += g_CaN x Ca_i, short attractor persistence),
+#           and a SLOW pool (node column Ca_slow, +slow_delta per spike, x exp(-1 / slow_tau) per step) drives IK-AHP
+#           as a raised effective threshold at fire detection (threshold + ahp_gain x Ca_slow): a node firing at the
+#           refractory maximum accumulates a brake that slows it gradually, and the brake wears off within slow_tau
+#           once it quiets. Needs calcium on (delta_Ca != 0) and native fire detection (no pre_fire handler).
+#       (2) syn_std_enabled (+ syn_std_u 0.2, syn_std_tau 50): short-term synaptic depression (transmitter depletion,
+#           Tsodyks-Markram depression only) in step()'s propagation: delivered current = weight x resource; each use
+#           spends U of the resource, which recovers with syn_std_tau steps. Learned weights / STDP are untouched; the
+#           resource is transient (not saved). Inhibitory synapses and inhibitory presynaptic nodes are exempt (the hook
+#           for the interneuron round). Recall sweeps (prime_and_propagate) are unchanged.
+#       (3) node_homeo_agree_enabled (needs node_homeo_slow_enabled): N's threshold / excitability move toward target
+#           only when the fast rate (firing_rate_ema) is on the same side of the target as the long rate that decides
+#           it; otherwise the node holds (dev-log #1131 Part 9 proposal 2; interneuron design Q9).
+# Why:  dev-log #1131 Part 9: the mind's only sustained activity is one bistable reverberating core at the refractory
+#       maximum, which slow homeostasis can only switch off; a medium-timescale per-neuron brake (adaptation) and a
+#       per-synapse one (depression) are what grade such a loop in a brain.
+# How:  with all three absent, step() and HomeostaticRule.apply make exactly the S4 calls (the new arguments are
+#       passed only when on). The Python path stays the frozen oracle.
 # [2026-10-20] Claude (lane stability-s4, #1136 round S4; Josh 2026-10-20 "Good plan, let's do this plan") — the slow
 #   node homeostat gets a finite equilibrium, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s4-20261020
 #   ONLY, its own commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
@@ -2096,6 +2123,10 @@ class _StabParams(NamedTuple):
     # [2026-10-20] S4 (#1136): None = off (S3 exactly); both only with `slow`
     prop: Optional[tuple] = None     # (unit, max): proportional, saturating N moves
     hope: Optional[tuple] = None     # (fail_min, window, leak): no upward drive for a node with hopeless input
+    # [2026-10-20] S5 (#1136): None / False = off (S4 exactly)
+    ca_split: Optional[tuple] = None  # #1149 (g_CaN, slow_keep, slow_delta, ahp_gain): fast IcaN + slow IK-AHP pool
+    std: Optional[tuple] = None       # #1150 (U, tau_rec): short-term synaptic depression in step()'s propagation
+    agree: bool = False               # N moves only when the fast and the long rate agree on the direction
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2226,6 +2257,10 @@ class HomeostaticRule(PlasticityRule):
         if _slow is not None and _st.hope is not None and _ev_in is not None:
             _tkw["hopeless"] = (_st.hope[0], _st.hope[1], float(timestep))
             _xkw["hopeless"] = (_st.hope[0], _st.hope[1], float(timestep), _st.hope[2])
+        # [2026-10-20] S5 (#1136): direction agreement (a refinement of slow; _stability_params sets it only with slow)
+        if _slow is not None and _st.agree:
+            _tkw["agree"] = True
+            _xkw["agree"] = True
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
@@ -3432,12 +3467,22 @@ class Graph:
             # g_CaN > g_AHP at defaults → mild attractor persistence.
             # Ca_i decay ensures effect fades between firing episodes.
             _delta_Ca = self.config.get("delta_Ca", 0.0)
+            # [2026-10-20] S5 (#1136 / #1149): the calcium split = (g_CaN, slow_keep, slow_delta, ahp_gain), or None
+            _ca5 = _stab.ca_split if _stab is not None else None
             if _delta_Ca:
                 _Ca_decay = self.config.get("Ca_decay", 0.9)
                 _g_net = self.config.get("g_CaN", 0.0) - self.config.get("g_AHP", 0.0)
                 _native = getattr(self.nodes, "calcium_currents", None)
-                if _native is None or not _native(_g_net, _Ca_decay):
+                if _ca5 is not None:
+                    # split: the fast pool carries IcaN alone; the slow pool (IK-AHP) decays natively. A declined pass
+                    # runs today's channels (the frozen Python loop) and the split is off for this step.
+                    if not _native(_ca5[0], _Ca_decay, _ca5[1]):
+                        _ca5 = None
+                        _calcium_currents_python(self.nodes, _g_net, _Ca_decay)
+                elif _native is None or not _native(_g_net, _Ca_decay):
                     _calcium_currents_python(self.nodes, _g_net, _Ca_decay)
+            else:
+                _ca5 = None
 
             # 3. Detect firing nodes
             #    Lenia FlowGraph: pre_fire handlers can adjust thresholds.
@@ -3452,7 +3497,9 @@ class Graph:
             if not self._event_handlers.get("pre_fire"):
                 _native = getattr(self.nodes, "detect_fired", None)
                 if _native is not None:
-                    if _s2_inp is None and _s2_inh is None:
+                    if _ca5 is not None:   # [2026-10-20] S5: + the slow IK-AHP brake (threshold + gain x Ca_slow)
+                        fired_ids = _native(_va, _s2_inp, _s2_inh, _ca5[3])
+                    elif _s2_inp is None and _s2_inh is None:
                         fired_ids = _native() if _va is None else _native(_va)
                     else:
                         fired_ids = _native(_va, _s2_inp, _s2_inh)
@@ -3476,7 +3523,9 @@ class Graph:
             # 4. Reset fired nodes and set refractory
             #    [2026-10-06] P2a: the native pass does the node writes; _recent_spikes stays Python (P3)
             _native = getattr(self.nodes, "fire", None)
-            if _native is not None and _native(fired_ids, self.timestep, _delta_Ca if _delta_Ca else None):
+            if _native is not None and (_native(fired_ids, self.timestep, _delta_Ca if _delta_Ca else None)
+                                        if _ca5 is None else
+                                        _native(fired_ids, self.timestep, _delta_Ca, _ca5[2])):
                 for nid in fired_ids:
                     # Track recent spikes for sprouting
                     self._recent_spikes.setdefault(nid, deque(maxlen=20)).append(self.timestep)
@@ -3508,6 +3557,10 @@ class Graph:
             _prop_rows = getattr(self.synapses, "propagation_rows", None)
             if _prop_rows is None:
                 _prop_rows = lambda ids, reset: _propagation_rows_python(self.synapses, ids, reset)  # noqa: E731
+            # [2026-10-20] S5 (#1136 / #1150): short-term depression (the native pass reports weight x resource and
+            # spends it); an inhibitory presynaptic node is exempt (the hook for the interneuron round)
+            _std5 = ((_stab.std[0], _stab.std[1], float(self.timestep))
+                     if _stab is not None and _stab.std is not None else None)
             for nid in fired_ids:
                 node = self.nodes[nid]
                 sign = -1.0 if node.is_inhibitory else 1.0
@@ -3517,7 +3570,8 @@ class Graph:
                 # per outgoing synapse in this set's iteration order, and inactive_steps = 0
                 # on each (was `syn.inactive_steps = 0` at the end of every iteration).
                 _out_ids = list(self._outgoing.get(nid, ()))
-                for syn_id, _row in zip(_out_ids, _prop_rows(_out_ids, True)):
+                for syn_id, _row in zip(_out_ids, (_prop_rows(_out_ids, True) if _std5 is None or node.is_inhibitory
+                                                   else _prop_rows(_out_ids, True, _std5))):
                     if _row is None:
                         logger.debug("Stale synapse ref %s in outgoing[%s]", syn_id, nid)
                         continue
@@ -4243,6 +4297,8 @@ class Graph:
     _STAB_S3_NODE_KEYS = ("node_homeo_slow_enabled",)
     # [2026-10-20] S4 (#1136): need the S4 wheel (NodeStore.stab_round >= 4) and node_homeo_slow_enabled
     _STAB_S4_NODE_KEYS = ("node_homeo_prop_enabled", "node_homeo_hopeless_enabled")
+    # [2026-10-20] S5 (#1136): need the S5 wheel (NodeStore / SynapseStore .stab_round >= 5)
+    _STAB_S5_KEYS = ("ca_split_enabled", "syn_std_enabled", "node_homeo_agree_enabled")
 
     def _stab_error_once(self, keys, need: str) -> None:
         seen = self.__dict__.setdefault("_stab_err_logged", set())
@@ -4260,8 +4316,13 @@ class Graph:
         nd = [k for k in self._STAB_NODE_KEYS if c.get(k, False)]
         # [2026-10-19] S2 (#1136): burst inhibition stands alone; the other S2 keys modify N / S / C2 (below)
         inh_on = bool(c.get("burst_inhibition_enabled", False))
-        if not he and not nd and not inh_on:
+        # [2026-10-20] S5 (#1136): the calcium split and depression stand alone; agreement refines slow (below)
+        s5 = [k for k in self._STAB_S5_KEYS if c.get(k, False)]
+        if not he and not nd and not inh_on and not s5:
             return None
+        ca_t = std_t = None
+        if s5:
+            ca_t, std_t = self._stab_s5_standalone(c, s5)
         s2n = [k for k in self._STAB_S2_NODE_KEYS if c.get(k, False)]
         s2h = [k for k in self._STAB_S2_HE_KEYS if c.get(k, False)]
         if s2n and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "observe_inputs")):
@@ -4295,7 +4356,17 @@ class Graph:
         if s2h and not (getattr(self, "_native_he_passes", False) and hasattr(self.hyperedges, "c2_bases")):
             self._stab_error_once(s2h, "the native hyperedge passes (S2-round ng_tract)")
             s2h = []
-        if not he and not nd and not inh_on:
+        # [2026-10-20] S5 (#1136): agreement refines slow node homeostasis (S3) and needs the S5 kernels
+        agree_on = "node_homeo_agree_enabled" in s5
+        if agree_on and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 5):
+            self._stab_error_once(["node_homeo_agree_enabled"], "the native node store (S5-round ng_tract)")
+            agree_on = False
+        if agree_on and not ("node_homeo_slow_enabled" in s3n and c.get("node_homeo_evidence_enabled", False)):
+            self._stab_error_once(["node_homeo_agree_enabled"],
+                                  "node_homeo_slow_enabled + node_homeo_evidence_enabled (agreement refines slow N)")
+            agree_on = False
+        s5_any = ca_t is not None or std_t is not None
+        if not he and not nd and not inh_on and not s5_any:
             return None
         if he and not (getattr(self, "_native_he_passes", False)
                        and hasattr(self.hyperedges, "release_weak_targets")):
@@ -4304,7 +4375,7 @@ class Graph:
         if nd and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "evidence_scales")):
             self._stab_error_once(nd, "the native node store (S-phase ng_tract)")
             nd = []
-        if not he and not nd and not inh_on:
+        if not he and not nd and not inh_on and not s5_any:
             return None
         hab = ((float(c.get("he_habituation_half", 0.05)), float(c.get("he_habituation_power", 2.0)))
                if "he_habituation_enabled" in he else None)
@@ -4349,7 +4420,46 @@ class Graph:
             hope=((float(c.get("node_homeo_hopeless_fail", 0.95)), float(c.get("node_homeo_hopeless_window", 1000.0)),
                    float(c.get("node_homeo_hopeless_leak", 0.0)))
                   if ("node_homeo_hopeless_enabled" in s4n and n_on and in_on) else None),
+            # [2026-10-20] S5 (#1136)
+            ca_split=ca_t,
+            std=std_t,
+            agree=bool(agree_on and n_on),
         )
+
+    def _stab_s5_standalone(self, c, s5) -> Tuple[Optional[tuple], Optional[tuple]]:
+        """[2026-10-20] S5 (#1136): the calcium split (#1149) and short-term depression (#1150) tuples, or None each
+        (ERROR once when a set key cannot run). Pure read of config."""
+        ca_t = std_t = None
+        if "ca_split_enabled" in s5:
+            nat = getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 5
+            tau = float(c.get("ca_split_slow_tau", 200.0))
+            gain = float(c.get("ca_split_ahp_gain", 0.075))
+            d_ca = float(c.get("delta_Ca", 0.0) or 0.0)
+            delta = float(c.get("ca_split_slow_delta", d_ca))
+            if not nat:
+                self._stab_error_once(["ca_split_enabled"], "the native node store (S5-round ng_tract)")
+            elif self._event_handlers.get("pre_fire"):
+                self._stab_error_once(["ca_split_enabled"], "native fire detection (a pre_fire handler is registered)")
+            elif not d_ca:
+                self._stab_error_once(["ca_split_enabled"], "the calcium channels on (delta_Ca != 0)")
+            elif not (tau > 1.0 and math.isfinite(tau) and gain >= 0.0 and math.isfinite(gain)
+                      and delta >= 0.0 and math.isfinite(delta)):
+                self._stab_error_once(["ca_split_enabled"],
+                                      "ca_split_slow_tau > 1, ca_split_ahp_gain >= 0 and ca_split_slow_delta >= 0")
+            else:
+                ca_t = (float(c.get("g_CaN", 0.0)), math.exp(-1.0 / tau), delta, gain)
+        if "syn_std_enabled" in s5:
+            u = float(c.get("syn_std_u", 0.2))
+            tau = float(c.get("syn_std_tau", 50.0))
+            # the native stores (as every stability key: a dict-backed node graph is the frozen oracle's shape)
+            if not (getattr(self, "_native_nodes", False) and hasattr(self.synapses, "propagation_rows")
+                    and getattr(type(self.synapses), "stab_round", 0) >= 5):
+                self._stab_error_once(["syn_std_enabled"], "the native node + synapse stores (S5-round ng_tract)")
+            elif not (0.0 < u <= 1.0 and tau > 0.0 and math.isfinite(tau)):
+                self._stab_error_once(["syn_std_enabled"], "0 < syn_std_u <= 1 and syn_std_tau > 0")
+            else:
+                std_t = (u, tau)
+        return ca_t, std_t
 
     def _stab_release_weak_targets(self) -> Optional[List[Tuple[str, str]]]:
         """[2026-10-19] S (#1136) C3: the sleep-time release (Q7) of output targets whose weight fell below
