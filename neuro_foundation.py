@@ -20,6 +20,35 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-20] Claude (lane interneurons-i, #1151 / #1136 round I; Josh 2026-10-20 "I'm all in on the inhibitory neurons,
+#   as long as we don't do them in Python" + "It looks good as laid out") — inhibitory interneurons, SWITCHES AND WIRING
+#   ONLY (PROTECTED CHANGE on review branch cc-laptop-interneurons-i-20261020 ONLY, its own commit; merges only after
+#   Josh's protected-file "proceed" + backups of both msgpack files).
+# What: the native PV-like interneuron layer (ng_tract src/interneurons.rs, owned by the NodeStore; never NodeStore rows:
+#       not in graph.nodes, never in fired_node_ids, no content / vector entry) is switched and wired here. Keys read
+#       live, absent = off, NOT in DEFAULT_CONFIG; need the native node store with the round-I wheel
+#       (NodeStore.stab_round >= 6 + interneurons_recruit) and native fire detection (no pre_fire handler), else ERROR
+#       once and off:
+#       interneurons_enabled — the layer's dynamics in step(): NodeStore.detect_fired(..., ilayer=(decay_rate,
+#           interneuron_decay 0.5, inh_g_decay 0.5, inh_g_max 3.0, interneuron_delay 1, inh_g_eps 0.01, form, timestep,
+#           istdp, eta, tau, w_max)); interneuron_form "divisive" (default, Q6: drive / (1 + g_inh)) or "offset"
+#           (ablation: threshold + g_inh). The guard (design §4.4.1) rides the same pass: with input evidence on, a
+#           failure is not sampled while g_inh > inh_g_eps.
+#       interneuron_recruit_enabled — recruit / extend / retire in sleep_cycle (record key "interneurons") and once at
+#           the first step with the layer absent (switch-on): NodeStore.interneurons_recruit(synapses, (pool_max 12,
+#           k_min 3, w_min 0.05, cover 1, ratio_max 0.20, theta 1.0, coincidence 2, refractory 1, w_ie 0.5,
+#           retire_window 4000), HomeostaticRule degree targets, target_firing_rate, timestep).
+#       interneuron_istdp_enabled (+ interneuron_istdp_eta 0.001, _tau 20, _wmax = inh_g_max) — round I2: Vogels iSTDP
+#           on I -> E (E -> I fixed).
+#       Checkpoint: a store holding a layer writes it as the top-level key "interneurons" (native packed bytes,
+#       spliced verbatim, last key); restore slices it raw and hands it to NodeStore.interneurons_load_msgpack after
+#       the nodes load (also with the keys absent: carried verbatim, inert). No layer = the exact previous key set.
+#       Older readers ignore the key; a re-save by them drops it (a documented lossy downgrade: the learned I -> E
+#       weights are lost, recruitment can regrow the cells from topology).
+# Why:  ~/docs/superpowers/specs/2026-10-20-inhibitory-interneurons-design.md §5.4-§5.6, decisions §8A; dev-log #1131
+#       Part 10 (a graded purely excitatory core cannot live at its set point).
+# How:  every key absent = the S5 calls exactly (no ilayer argument, no recruitment, no new checkpoint key);
+#       nothing in surfacing / recall / openclaw_hook / stream_parser / activation_persistence changes.
 # [2026-10-20] Claude (lane stability-s5, #1136 round S5; Josh 2026-10-20 "OK, let's do your recs ... Yeah, the order
 #   sounds right") — spike-frequency adaptation (#1149), short-term synaptic depression (#1150) and direction agreement
 #   for node homeostasis, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s5-20261020 ONLY, its own
@@ -2127,6 +2156,9 @@ class _StabParams(NamedTuple):
     ca_split: Optional[tuple] = None  # #1149 (g_CaN, slow_keep, slow_delta, ahp_gain): fast IcaN + slow IK-AHP pool
     std: Optional[tuple] = None       # #1150 (U, tau_rec): short-term synaptic depression in step()'s propagation
     agree: bool = False               # N moves only when the fast and the long rate agree on the direction
+    # [2026-10-20] round I (#1151): None = off (S5 exactly)
+    ilayer: Optional[tuple] = None    # (decay_rate, decay_I, g_decay, g_max, delay, g_eps, form, istdp, eta, tau, w_max)
+    irecruit: Optional[tuple] = None  # NodeStore.interneurons_recruit params (sleep_cycle + once at switch-on)
 
 
 class HomeostaticRule(PlasticityRule):
@@ -3442,6 +3474,9 @@ class Graph:
             _stab = self._stability_params()
             if _stab is not None or "_stab" in self.__dict__:
                 self._stab = _stab
+            # [2026-10-20] round I (#1151): the layer is grown once at switch-on (later runs are sleep_cycle's)
+            if _stab is not None and _stab.irecruit is not None and not self.nodes.interneurons_exists():
+                self._interneurons_recruit(_stab.irecruit)
 
             # 1. Voltage decay: v = v * decay_rate + (1-decay) * resting  (PRD §2.2.4)
             # [2026-10-06] P2a: native NodeStore pass when available (declines -> the original loop)
@@ -3496,7 +3531,11 @@ class Graph:
             _s2_inh = _stab.inhib if _stab is not None else None
             if not self._event_handlers.get("pre_fire"):
                 _native = getattr(self.nodes, "detect_fired", None)
-                if _native is not None:
+                _il = _stab.ilayer if _stab is not None else None
+                if _native is not None and _il is not None:   # [2026-10-20] round I: + the interneuron layer
+                    fired_ids = _native(_va, _s2_inp, _s2_inh, _ca5[3] if _ca5 is not None else None,
+                                        ilayer=_il[:7] + (float(self.timestep),) + _il[7:])
+                elif _native is not None:
                     if _ca5 is not None:   # [2026-10-20] S5: + the slow IK-AHP brake (threshold + gain x Ca_slow)
                         fired_ids = _native(_va, _s2_inp, _s2_inh, _ca5[3])
                     elif _s2_inp is None and _s2_inh is None:
@@ -4299,6 +4338,8 @@ class Graph:
     _STAB_S4_NODE_KEYS = ("node_homeo_prop_enabled", "node_homeo_hopeless_enabled")
     # [2026-10-20] S5 (#1136): need the S5 wheel (NodeStore / SynapseStore .stab_round >= 5)
     _STAB_S5_KEYS = ("ca_split_enabled", "syn_std_enabled", "node_homeo_agree_enabled")
+    # [2026-10-20] round I (#1151): need the round-I wheel (NodeStore.stab_round >= 6 + interneurons_recruit)
+    _STAB_I_KEYS = ("interneurons_enabled", "interneuron_recruit_enabled")
 
     def _stab_error_once(self, keys, need: str) -> None:
         seen = self.__dict__.setdefault("_stab_err_logged", set())
@@ -4318,11 +4359,16 @@ class Graph:
         inh_on = bool(c.get("burst_inhibition_enabled", False))
         # [2026-10-20] S5 (#1136): the calcium split and depression stand alone; agreement refines slow (below)
         s5 = [k for k in self._STAB_S5_KEYS if c.get(k, False)]
-        if not he and not nd and not inh_on and not s5:
+        # [2026-10-20] round I (#1151): the interneuron layer stands alone
+        ik = [k for k in self._STAB_I_KEYS if c.get(k, False)]
+        if not he and not nd and not inh_on and not s5 and not ik:
             return None
         ca_t = std_t = None
         if s5:
             ca_t, std_t = self._stab_s5_standalone(c, s5)
+        il_t = ir_t = None
+        if ik:
+            il_t, ir_t = self._stab_i_standalone(c, ik)
         s2n = [k for k in self._STAB_S2_NODE_KEYS if c.get(k, False)]
         s2h = [k for k in self._STAB_S2_HE_KEYS if c.get(k, False)]
         if s2n and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "observe_inputs")):
@@ -4365,7 +4411,7 @@ class Graph:
             self._stab_error_once(["node_homeo_agree_enabled"],
                                   "node_homeo_slow_enabled + node_homeo_evidence_enabled (agreement refines slow N)")
             agree_on = False
-        s5_any = ca_t is not None or std_t is not None
+        s5_any = ca_t is not None or std_t is not None or il_t is not None or ir_t is not None
         if not he and not nd and not inh_on and not s5_any:
             return None
         if he and not (getattr(self, "_native_he_passes", False)
@@ -4424,6 +4470,9 @@ class Graph:
             ca_split=ca_t,
             std=std_t,
             agree=bool(agree_on and n_on),
+            # [2026-10-20] round I (#1151)
+            ilayer=il_t,
+            irecruit=ir_t,
         )
 
     def _stab_s5_standalone(self, c, s5) -> Tuple[Optional[tuple], Optional[tuple]]:
@@ -4460,6 +4509,73 @@ class Graph:
             else:
                 std_t = (u, tau)
         return ca_t, std_t
+
+    def _stab_i_standalone(self, c, ik) -> Tuple[Optional[tuple], Optional[tuple]]:
+        """[2026-10-20] round I (#1151): the interneuron layer's step tuple (without the timestep) and recruitment
+        params, or None each (ERROR once when a set key cannot run). Pure read of config."""
+        nat = (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 6
+               and hasattr(self.nodes, "interneurons_recruit"))
+        if not nat:
+            self._stab_error_once(ik, "the native node store (round-I ng_tract)")
+            return None, None
+        if self._event_handlers.get("pre_fire"):
+            self._stab_error_once(ik, "native fire detection (a pre_fire handler is registered)")
+            return None, None
+        il_t = ir_t = None
+        if "interneurons_enabled" in ik:
+            form = c.get("interneuron_form", "divisive")
+            g_max = float(c.get("inh_g_max", 3.0))
+            ist = bool(c.get("interneuron_istdp_enabled", False))
+            t = (float(c["decay_rate"]), float(c.get("interneuron_decay", 0.5)), float(c.get("inh_g_decay", 0.5)), g_max,
+                 float(c.get("interneuron_delay", 1)), float(c.get("inh_g_eps", 0.01)),
+                 1.0 if form == "offset" else 0.0,
+                 1.0 if ist else 0.0, float(c.get("interneuron_istdp_eta", 0.001)),
+                 float(c.get("interneuron_istdp_tau", 20.0)), float(c.get("interneuron_istdp_wmax", g_max)))
+            ok = (form in ("divisive", "offset") and 0.0 <= t[1] < 1.0 and 0.0 <= t[2] < 1.0
+                  and 0.0 < g_max and math.isfinite(g_max) and t[4] in (0.0, 1.0) and t[5] >= 0.0
+                  and (not ist or (t[8] >= 0.0 and math.isfinite(t[8]) and t[9] > 0.0 and math.isfinite(t[9])
+                                   and t[10] > 0.0 and math.isfinite(t[10]))))
+            if ok:
+                il_t = t
+            else:
+                self._stab_error_once(["interneurons_enabled"],
+                                      "interneuron_form divisive|offset, 0 <= interneuron_decay / inh_g_decay < 1, "
+                                      "inh_g_max > 0, interneuron_delay 0|1, inh_g_eps >= 0, iSTDP eta >= 0, tau > 0, "
+                                      "w_max > 0")
+        if "interneuron_recruit_enabled" in ik:
+            r = (float(c.get("interneuron_pool_max", 12)), float(c.get("interneuron_k_min", 3)),
+                 float(c.get("interneuron_w_min", 0.05)), float(c.get("interneuron_cover", 1)),
+                 float(c.get("interneuron_ratio_max", 0.20)), float(c.get("interneuron_theta", 1.0)),
+                 float(c.get("interneuron_coincidence", 2)), float(c.get("interneuron_refractory", 1)),
+                 float(c.get("interneuron_w_ie", 0.5)), float(c.get("interneuron_retire_window", 4000)))
+            if (r[0] >= 1 and r[1] >= 1 and r[2] >= 0 and r[3] >= 1 and 0 < r[4] <= 1 and r[5] > 0 and r[6] >= 1
+                    and r[7] >= 0 and r[8] >= 0 and r[9] > 0 and all(math.isfinite(x) for x in r)):
+                ir_t = r
+            else:
+                self._stab_error_once(["interneuron_recruit_enabled"],
+                                      "interneuron_pool_max / _k_min / _cover / _coincidence >= 1, 0 < _ratio_max <= 1, "
+                                      "_theta > 0, _w_min / _refractory / _w_ie >= 0, _retire_window > 0")
+        return il_t, ir_t
+
+    def _interneurons_recruit(self, params: tuple) -> Optional[Dict[str, Any]]:
+        """[2026-10-20] round I (#1151): one recruitment / maintenance run of the native interneuron layer (design
+        §1.2): reads the E topology and firing, never content; never touches an E node or a synapse. Caller holds
+        nothing; takes _step_lock. Returns the counts (None = the native pass declined; nothing touched)."""
+        hr = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        targets = hr._degree_targets if hr is not None else {}
+        default = float(hr.target_firing_rate if hr is not None else self.config.get("target_firing_rate", 0.05))
+        with self._step_lock:
+            out = self.nodes.interneurons_recruit(self.synapses, params, targets, default, int(self.timestep))
+        if out is None:
+            logger.error("interneurons (#1151): recruitment declined (malformed targets or parameters) -- nothing changed")
+            return None
+        keys = ("retired", "extended", "recruited", "cells", "pool_edges", "target_edges", "eligible_e", "covered_e",
+                "dead_edges_dropped")
+        rec = dict(zip(keys, out))
+        logger.info("interneurons (#1151): t=%s recruited=%d extended=%d retired=%d -> %d cells (%d E->I, %d I->E edges); "
+                    "eligible E %d, covered %d", self.timestep, rec["recruited"], rec["extended"], rec["retired"],
+                    rec["cells"], rec["pool_edges"], rec["target_edges"], rec["eligible_e"], rec["covered_e"])
+        return rec
 
     def _stab_release_weak_targets(self) -> Optional[List[Tuple[str, str]]]:
         """[2026-10-19] S (#1136) C3: the sleep-time release (Q7) of output targets whose weight fell below
@@ -5152,6 +5268,9 @@ class Graph:
                     record["tally_retracted"] = self._sprout_tally_sleep_retract()
             if _c3_rel is not None:
                 record["he_targets_released"] = len(_c3_rel)
+            _ir = self._stab_interneurons_sleep()   # [2026-10-20] round I (#1151); None = off (no key)
+            if _ir is not None:
+                record["interneurons"] = _ir
             return record
         with self._step_lock:
             syn_before = len(self.synapses)
@@ -5179,7 +5298,18 @@ class Graph:
                    "sleep_cycle: t=%s pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d in_sleep_mode=%s %.3fs",
                     record["timestep"], pruned, collected, syn_before, record["synapses_after"], nodes_before,
                     record["nodes_after"], record["in_sleep_mode"], record["seconds"])
+        _ir = self._stab_interneurons_sleep()   # [2026-10-20] round I (#1151); None = off (no key)
+        if _ir is not None:
+            record["interneurons"] = _ir
         return record
+
+    def _stab_interneurons_sleep(self) -> Optional[Dict[str, Any]]:
+        """[2026-10-20] round I (#1151, Q10): sleep_cycle's recruitment / retirement run (after the structural
+        removal, so dead E nodes have dropped out of their pools). None when interneuron_recruit_enabled is off."""
+        st = self._stability_params()
+        if st is None or st.irecruit is None:
+            return None
+        return self._interneurons_recruit(st.irecruit) or {}
 
     _SLEEP_DISUSE_KEYS = ("sleep_downscale_d0", "sleep_downscale_h", "sleep_weight_grace_sleeps",
                           "sleep_last_link_grace_sleeps", "sleep_credit_shield_kappa")
@@ -8482,8 +8612,9 @@ class Graph:
                 # [2026-10-05] P1: "nodes" is pre-packed bytes too when the native node store is on
                 # [2026-10-18] H1: and both hyperedge maps when the native hyperedge store is on
                 # [2026-10-18] H2: and the two hyperedge pass-state maps when the native passes own them
+                # [2026-10-20] round I (#1151): and the interneuron layer (native packed map)
                 if key in ("synapses", "nodes", "hyperedges", "archived_hyperedges", "he_last_fired_step",
-                           "he_output_candidates") and isinstance(value, (bytes, bytearray)):
+                           "he_output_candidates", "interneurons") and isinstance(value, (bytes, bytearray)):
                     f.write(value)  # verbatim pre-packed {sid: {15-key}} / {nid: {19-key}} map
                 else:
                     f.write(packer.pack(value))
@@ -8523,7 +8654,7 @@ class Graph:
             n_pairs = unpacker.read_map_header()
             for _ in range(n_pairs):
                 key = unpacker.unpack()
-                if key == "synapses" or (key == "nodes" and getattr(self, "_native_nodes", False)) or (   # [2026-10-05] P1: nodes too, when native
+                if key == "synapses" or (key in ("nodes", "interneurons") and getattr(self, "_native_nodes", False)) or (   # [2026-10-05] P1: nodes too, when native; [2026-10-20] round I: the interneuron layer
                         key in ("hyperedges", "archived_hyperedges") and getattr(self, "_native_he", False)):   # [2026-10-18] H1
                     start = unpacker.tell()
                     unpacker.skip()  # advance past the value WITHOUT inflating it
@@ -8668,6 +8799,9 @@ class Graph:
         # not borrow live state, and bytearray is intentionally not deep-copied:
         # that would duplicate the largest capture allocation inside _step_lock.
         _packed_synapses = self.synapses.to_checkpoint_msgpack()
+        # [2026-10-20] round I (#1151): the interneuron layer, packed natively (None = no layer = no key)
+        _il_packed = (self.nodes.interneurons_to_msgpack()
+                      if getattr(self, "_native_nodes", False) and hasattr(self.nodes, "interneurons_to_msgpack") else None)
         return {
             "version": "0.4.2",
             "timestep": self.timestep,
@@ -8785,6 +8919,9 @@ class Graph:
             **({"homeostatic_degree_targets": dict(next(
                 (r._degree_targets for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), {}))}
                if self.config.get("homeostatic_degree_targets_persist", False) else {}),
+            # [2026-10-20] round I (#1151): the interneuron layer (cells, pools, targets, learned I -> E weights), only
+            # when the store holds one; the last key, so every key before it is written exactly as before.
+            **({"interneurons": _il_packed} if _il_packed is not None else {}),
         }
 
     def _serialize_incremental(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
@@ -8902,6 +9039,11 @@ class Graph:
                 self._node_hyperedges[nid] = set()
                 self._recent_spikes[nid] = deque(maxlen=20)
             _nodes_data = {}
+            # [2026-10-20] round I (#1151): the interneuron layer (raw packed map sliced by restore), bound to the nodes
+            # just loaded. Loaded with the keys absent too: carried verbatim on the next save, inert in step().
+            _il_raw = data.get("interneurons")
+            if isinstance(_il_raw, (bytes, bytearray)) and hasattr(self.nodes, "interneurons_load_msgpack"):
+                self.nodes.interneurons_load_msgpack(bytes(_il_raw))
         _text_pool: Dict[str, str] = {}   # P4a: one object per distinct large metadata text (restore-local)
         for nid, nd in _nodes_data.items():
             lst = nd.get("last_spike_time")
