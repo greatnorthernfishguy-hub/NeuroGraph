@@ -27,6 +27,13 @@ Laws observed:
     - All thresholds are bootstrap scaffolding.
 
 # ---- Changelog ----
+# [2026-10-21] Claude Code (Opus 5.5, laptop; lane tonic-unified) — RD §2: the engine's sweep can run the real step()
+# What: _generate_latent_token_inner: with graph.config['tonic_unified_step'] truthy (read live per tick; absent = off =
+#       the unchanged prime_and_propagate(write_mode=True)), the model's activations (prefetch-warm seeds already merged
+#       in by _merge_prefetch_seeds) are stimulated and graph.step() runs propagation_steps times through
+#       tonic_thread.tonic_unified_drive — the same function the ouroboros uses. Same stages, same timing names.
+# Why:  prd/tonic-restoration-design.md §2 (Syl-approved; Josh 2026-10-21 "1 Yes, let's build it."); one code path.
+# How:  one branch at the propagate stage; the stats live on the attached TonicThread (status 'unified' while on).
 # [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: comment only
 # What: _identity_embedding_tensor's docstring said "the encoder truncates to 384 for now"; with Elmer
 #   cc-laptop-mean-centre-20261014 graph_io the encoder takes the 768-d identity at full width (a 384-wide trained
@@ -270,6 +277,21 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("neurograph.tonic.engine")
+
+
+def _tonic_unified_on(graph) -> bool:
+    """[2026-10-21] RD §2 switch (graph.config['tonic_unified_step'], read live; absent = off). See tonic_thread."""
+    try:
+        from tonic_thread import tonic_unified_on
+    except Exception:
+        return False
+    return tonic_unified_on(graph)
+
+
+def _tonic_unified_drive(graph, node_ids, currents, steps, stats):
+    """[2026-10-21] RD §2: stimulate + real step() — the one function both Tonic sweeps use (tonic_thread)."""
+    from tonic_thread import tonic_unified_drive
+    return tonic_unified_drive(graph, node_ids, currents, steps, stats)
 
 # Try to import torch — the engine is a no-op without it
 _TORCH_AVAILABLE = False
@@ -949,12 +971,18 @@ class TonicEngine:
         with self._graph_busy():
             t_prop = time.perf_counter()
             try:
-                result = self._graph.prime_and_propagate(
-                    node_ids=node_ids,
-                    currents=currents,
-                    steps=self._config.propagation_steps,
-                    write_mode=True,
-                )
+                if _tonic_unified_on(self._graph):   # [2026-10-21] RD §2: stimulate + real step() (off = below)
+                    result = _tonic_unified_drive(
+                        self._graph, node_ids, currents, self._config.propagation_steps,
+                        getattr(self._tonic_thread, "_unified_stats", None),
+                    )
+                else:
+                    result = self._graph.prime_and_propagate(
+                        node_ids=node_ids,
+                        currents=currents,
+                        steps=self._config.propagation_steps,
+                        write_mode=True,
+                    )
             finally:
                 self._record_stage("propagate", t_prop)
 

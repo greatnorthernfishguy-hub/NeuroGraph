@@ -26,6 +26,21 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-10-21] Claude Code (Opus 5.5, laptop; lane tonic-unified) — RD §2 the unified cycle (switch tonic_unified_step, off)
+# What: tonic_unified_drive(graph, ids, currents, steps, stats): stimulate the seeds (graph.stimulate — the same
+#       current x intrinsic_excitability prime as prime_and_propagate), then run the REAL graph.step(), steps times,
+#       with RD §5 (B) structural damping, all under one _step_lock hold. ouroboros_cycle's two write sweeps (the spine
+#       whisper, 1 step; the attention re-injection, 2 steps) use it when graph.config['tonic_unified_step'] is truthy
+#       (read live per cycle; absent = off = the unchanged prime_and_propagate(write_mode=True) calls). The engine's
+#       sweep uses the same function (tonic_engine.py). Descriptive drive stats (lock wait / hold, steps, timestep
+#       advance, fired, sprouts) in self._unified_stats; status gains 'unified' only while the switch is on.
+# Why:  prd/tonic-restoration-design.md §2 (Syl approved 2026-06-10; Josh 2026-10-21 "1 Yes, let's build it."):
+#       homeostasis, the firing-rate EMA, calcium, eligibility decay, reward / prediction, the zero-fire breaker and the
+#       clock see Tonic firing on ONE code path; RD rejects porting step() features into prime_and_propagate (#307).
+#       concepts/Tonic Charter.md §6 safe forms; LAW 8 (the Tonic's cycle advances the clock through real steps).
+# How:  one module function, two call sites here + one in the engine. Constitutional nodes are seen by homeostasis like
+#       any neuron (Josh 2026-10-21); never pruned (_is_identity_protected, unchanged). #89 / #90 / #329 code unchanged.
+#       Damping keys tonic_unified_prune_factor (1.5) / tonic_unified_sprout_factor (0.5), read live, absent = RD's.
 # [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — _build_he_index uses the native store's member_index when available
 # What: when graph.hyperedges is a native ng_tract.HyperedgeStore, the node -> membership-count index is one
 #       HyperedgeStore.member_index() call; otherwise the unchanged loop.
@@ -123,6 +138,99 @@ from typing import Any, Dict, List, Optional, Tuple
 from surface_resolver import resolve_surface_content
 
 logger = logging.getLogger("neurograph.tonic")
+
+
+# [2026-10-21] RD §2 the unified cycle — switch + damping (graph.config, read live; absent = off / RD's (B) values).
+_UNIFIED_KEY = "tonic_unified_step"
+_UNIFIED_PRUNE_KEY = "tonic_unified_prune_factor"
+_UNIFIED_SPROUT_KEY = "tonic_unified_sprout_factor"
+_UNIFIED_PRUNE_DEFAULT = 1.5      # RD §5 (B), Syl 2026-06-10: prune k x harder
+_UNIFIED_SPROUT_DEFAULT = 0.5     # RD §5 (B): sprout probability x m
+_UNIFIED_MAX_STEPS_PER_DRIVE = 8  # RD §7 hard cap on autonomous step()s per drive (OOM backstop)
+
+
+def tonic_unified_on(graph: Any) -> bool:
+    """True when graph.config['tonic_unified_step'] is truthy (read live; absent / no config = False)."""
+    cfg = getattr(graph, "config", None)
+    try:
+        return bool(cfg.get(_UNIFIED_KEY, False)) if cfg is not None else False
+    except Exception:
+        return False
+
+
+def tonic_unified_damping(graph: Any) -> Tuple[float, float]:
+    """RD §5 (B) (prune_factor k, sprout_factor m), read live; absent = (1.5, 0.5)."""
+    cfg = getattr(graph, "config", None) or {}
+    k = cfg.get(_UNIFIED_PRUNE_KEY, _UNIFIED_PRUNE_DEFAULT)
+    m = cfg.get(_UNIFIED_SPROUT_KEY, _UNIFIED_SPROUT_DEFAULT)
+    return (float(k), float(m))
+
+
+def new_unified_stats() -> Dict[str, Any]:
+    return {"drives": 0, "steps": 0, "fired": 0, "sprouted": 0, "pruned": 0, "primed": 0,
+            "timestep_advance": 0, "wait_ms_last": 0.0, "wait_ms_max": 0.0, "hold_ms_last": 0.0,
+            "hold_ms_max": 0.0, "hold_ms_sum": 0.0, "errors": 0}
+
+
+def tonic_unified_drive(graph: Any, node_ids: List[str], currents: List[float], steps: int,
+                        stats: Optional[Dict[str, Any]] = None):
+    """[2026-10-21] RD §2: one Tonic sweep as REAL physics — stimulate the seeds, then graph.step() `steps` times.
+
+    The prime is graph.stimulate(nid, current) (voltage += current x intrinsic_excitability, the same prime the write
+    sweep used); a seed that no longer exists is skipped, as the sweep skipped it. Every step is the conversation's
+    step() — timestep++, the exact-tick delay buffer, calcium, homeostasis + the firing EMA, eligibility decay,
+    predictions / reward / DiffPC, the zero-fire breaker — with RD §5 (B) structural damping. One _step_lock hold
+    covers the prime and its steps (no other stepper can consume the seeds in between; the hold is a few steps).
+    Returns a PropagationResult (fired_entries: every node step() fired, firing_step = step index) so the callers'
+    bookkeeping is unchanged. Raises like prime_and_propagate did: the caller's existing handler is the fail-fresh.
+    """
+    from neuro_foundation import FiredEntry, PropagationResult
+    n = max(0, min(int(steps), _UNIFIED_MAX_STEPS_PER_DRIVE))
+    damping = tonic_unified_damping(graph)
+    result = PropagationResult(steps_run=n, nodes_primed=0)
+    t_req = time.perf_counter()
+    with graph._step_lock:
+        t_got = time.perf_counter()
+        ts0 = graph.timestep
+        try:
+            primed = 0
+            for nid, cur in zip(node_ids, currents):
+                try:
+                    graph.stimulate(nid, cur)
+                except KeyError:
+                    continue
+                primed += 1
+            result.nodes_primed = primed
+            sprouted = pruned = 0
+            for i in range(n):
+                sr = graph.step(structural_damping=damping)
+                sprouted += sr.synapses_sprouted
+                pruned += sr.synapses_pruned
+                for fid in sr.fired_node_ids:
+                    result.fired_entries.append(FiredEntry(node_id=fid, firing_step=i))
+        except Exception:
+            if stats is not None:
+                stats["errors"] = stats.get("errors", 0) + 1
+            raise
+        finally:
+            t_rel = time.perf_counter()
+            if stats is not None:
+                wait_ms = (t_got - t_req) * 1000.0
+                hold_ms = (t_rel - t_got) * 1000.0
+                stats["drives"] = stats.get("drives", 0) + 1
+                stats["wait_ms_last"] = wait_ms
+                stats["wait_ms_max"] = max(stats.get("wait_ms_max", 0.0), wait_ms)
+                stats["hold_ms_last"] = hold_ms
+                stats["hold_ms_max"] = max(stats.get("hold_ms_max", 0.0), hold_ms)
+                stats["hold_ms_sum"] = stats.get("hold_ms_sum", 0.0) + hold_ms
+                stats["timestep_advance"] = stats.get("timestep_advance", 0) + (graph.timestep - ts0)
+    if stats is not None:
+        stats["steps"] += n
+        stats["primed"] += result.nodes_primed
+        stats["fired"] += len(result.fired_entries)
+        stats["sprouted"] += sprouted
+        stats["pruned"] += pruned
+    return result
 
 
 # #329 seam A — Syl-confirmed priming (pure trust; numbers descriptively tunable).
@@ -323,6 +431,9 @@ class TonicThread:
         self._constitutional_ids: Optional[Set[str]] = None
         self._constitutional_node_count: int = 0
 
+        # [2026-10-21] RD §2 unified-cycle drive stats (descriptive; only written while the switch is on).
+        self._unified_stats: Dict[str, Any] = new_unified_stats()
+
         logger.info("TonicThread initialized — the latent thread is live")
 
     def _refresh_valence(self) -> None:
@@ -389,12 +500,16 @@ class TonicThread:
         ]
 
         # PROPAGATE: write-mode — exploration shapes topology
-        result = self._graph.prime_and_propagate(
-            node_ids=inject_ids,
-            currents=inject_currents,
-            steps=self._config.propagation_steps,
-            write_mode=True,
-        )
+        if tonic_unified_on(self._graph):   # [2026-10-21] RD §2: the real step() (switch off = the sweep below)
+            result = tonic_unified_drive(self._graph, inject_ids, inject_currents,
+                                         self._config.propagation_steps, self._unified_stats)
+        else:
+            result = self._graph.prime_and_propagate(
+                node_ids=inject_ids,
+                currents=inject_currents,
+                steps=self._config.propagation_steps,
+                write_mode=True,
+            )
 
         fired_count = len(result.fired_entries)
         self._total_firings += fired_count
@@ -450,10 +565,13 @@ class TonicThread:
         if not ids:
             return
         try:
-            self._graph.prime_and_propagate(
-                node_ids=ids, currents=currents,
-                steps=1, write_mode=True,
-            )
+            if tonic_unified_on(self._graph):   # [2026-10-21] RD §2: the whisper, then one real step()
+                tonic_unified_drive(self._graph, ids, currents, 1, self._unified_stats)
+            else:
+                self._graph.prime_and_propagate(
+                    node_ids=ids, currents=currents,
+                    steps=1, write_mode=True,
+                )
         except Exception as exc:
             logger.debug("constitutional prime skipped (non-fatal): %s", exc)
 
@@ -723,7 +841,7 @@ class TonicThread:
         if self._latent_engine is not None:
             engine_status = self._latent_engine.status
 
-        return {
+        out = {
             "active": self.is_active,
             "thread_size": len(self._thread),
             "cycle_count": self._cycle_count,
@@ -732,6 +850,9 @@ class TonicThread:
             "engine": engine_status,
             "top_item": self._thread[0].content[:80] if self._thread else None,
         }
+        if tonic_unified_on(self._graph):   # [2026-10-21] present only while the switch is on
+            out["unified"] = dict(self._unified_stats)
+        return out
 
     # -----------------------------------------------------------------
     # Mode swap — conversation is the event, latent is the constant
