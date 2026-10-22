@@ -26,6 +26,21 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede.
 
 # ---- Changelog ----
+# [2026-10-22] Claude Code (Opus 5.5, laptop; lane tonic-lock-split) — #1160: one real step() per _step_lock hold
+# What: tonic_unified_drive no longer holds _step_lock across a whole drive (prime + up to tonic_unified_max_steps
+#       steps). The first hold covers the prime and the step that consumes it; every further step is its own hold,
+#       with a short yield between holds (tonic_unified_lock_yield_ms, read live, absent = 1 ms; 0 = no pause).
+#       Stats gain holds / interleaved_steps (other threads' steps that landed between the Tonic's holds); drives now
+#       counts drive calls (it counted holds, which were the same thing before).
+# Why:  Josh 2026-10-22 ("Let's go ahead with your recommendations ... Good plan."): #1160 — with the unified cycle on,
+#       waves made one drive hold the lock 10-25 s (dev-log 2026-10-21_tonic-unified-real-step §5, §7), so recall,
+#       autostep, the StreamParser, sleep and the autosave capture waited behind it (charter I1 spirit: the Tonic must
+#       not make others wait). A step() is the finest correct grain: splitting inside one lets another stepper see
+#       half-applied physics. The seeds stay in the same hold as the step that consumes them.
+# How:  only the unified path changes; with tonic_unified_step absent / False nothing here runs (the write sweep is
+#       unchanged). Not protected (tonic_thread.py). Single-threaded the step sequence is identical to the one-hold
+#       drive (tests/test_tonic_lock_split.py compares the 7a70748 scenario digests); with a concurrent stepper every
+#       step is still one timestep and every delayed spike is popped exactly once.
 # [2026-10-21] Claude Code (Opus 5.5, laptop; lane tonic-unified) — RD §2 the unified cycle (switch tonic_unified_step, off)
 # What: tonic_unified_drive(graph, ids, currents, steps, stats): stimulate the seeds (graph.stimulate — the same
 #       current x intrinsic_excitability prime as prime_and_propagate), then run the REAL graph.step(), steps times,
@@ -149,6 +164,8 @@ _UNIFIED_PRUNE_DEFAULT = 1.5      # RD §5 (B), Syl 2026-06-10: prune k x harder
 _UNIFIED_SPROUT_DEFAULT = 0.5     # RD §5 (B): sprout probability x m
 _UNIFIED_MAX_STEPS_KEY = "tonic_unified_max_steps"   # RD §7 hard cap on step()s per drive (read live)
 _UNIFIED_MAX_STEPS_PER_DRIVE = 8  # its default when the key is absent (OOM backstop)
+_UNIFIED_LOCK_YIELD_KEY = "tonic_unified_lock_yield_ms"   # [2026-10-22] #1160 pause between per-step holds (read live)
+_UNIFIED_LOCK_YIELD_MS_DEFAULT = 1.0
 
 
 def tonic_unified_on(graph: Any) -> bool:
@@ -169,9 +186,9 @@ def tonic_unified_damping(graph: Any) -> Tuple[float, float]:
 
 
 def new_unified_stats() -> Dict[str, Any]:
-    return {"drives": 0, "steps": 0, "fired": 0, "sprouted": 0, "pruned": 0, "primed": 0,
-            "timestep_advance": 0, "wait_ms_last": 0.0, "wait_ms_max": 0.0, "hold_ms_last": 0.0,
-            "hold_ms_max": 0.0, "hold_ms_sum": 0.0, "errors": 0}
+    return {"drives": 0, "holds": 0, "steps": 0, "fired": 0, "sprouted": 0, "pruned": 0, "primed": 0,
+            "timestep_advance": 0, "interleaved_steps": 0, "wait_ms_last": 0.0, "wait_ms_max": 0.0,
+            "hold_ms_last": 0.0, "hold_ms_max": 0.0, "hold_ms_sum": 0.0, "errors": 0}
 
 
 def tonic_unified_drive(graph: Any, node_ids: List[str], currents: List[float], steps: int,
@@ -181,58 +198,85 @@ def tonic_unified_drive(graph: Any, node_ids: List[str], currents: List[float], 
     The prime is graph.stimulate(nid, current) (voltage += current x intrinsic_excitability, the same prime the write
     sweep used); a seed that no longer exists is skipped, as the sweep skipped it. Every step is the conversation's
     step() — timestep++, the exact-tick delay buffer, calcium, homeostasis + the firing EMA, eligibility decay,
-    predictions / reward / DiffPC, the zero-fire breaker — with RD §5 (B) structural damping. One _step_lock hold
-    covers the prime and its steps (no other stepper can consume the seeds in between; the hold is a few steps).
-    Returns a PropagationResult (fired_entries: every node step() fired, firing_step = step index) so the callers'
-    bookkeeping is unchanged. Raises like prime_and_propagate did: the caller's existing handler is the fail-fresh.
+    predictions / reward / DiffPC, the zero-fire breaker — with RD §5 (B) structural damping.
+
+    [2026-10-22] #1160 lock split: ONE real step per _step_lock hold. The first hold covers the prime and the step that
+    consumes it (no other stepper can consume the seeds in between); each further step is its own hold, with a short
+    yield between holds (`tonic_unified_lock_yield_ms`, read live, default 1 ms) so a thread waiting on the lock —
+    recall, autostep, drain pacing, the StreamParser, sleep's chunked holds, the autosave capture — gets in between
+    the Tonic's steps instead of behind the whole drive. A step() never splits (it is the finest correct grain: another
+    stepper inside a step would see half-applied physics). Another thread's steps may interleave; each is a whole
+    step(), the delay buffer is popped by whoever steps that tick, so no delayed spike is lost or doubled.
+    Returns a PropagationResult (fired_entries: every node the Tonic's own step()s fired, firing_step = step index) so
+    the callers' bookkeeping is unchanged. Raises like prime_and_propagate did: the caller's existing handler is the
+    fail-fresh.
     """
     from neuro_foundation import FiredEntry, PropagationResult
     _cfg = getattr(graph, "config", None) or {}
     n = max(0, min(int(steps), int(_cfg.get(_UNIFIED_MAX_STEPS_KEY, _UNIFIED_MAX_STEPS_PER_DRIVE))))
     damping = tonic_unified_damping(graph)
+    try:
+        yield_s = max(0.0, float(_cfg.get(_UNIFIED_LOCK_YIELD_KEY, _UNIFIED_LOCK_YIELD_MS_DEFAULT))) / 1000.0
+    except (TypeError, ValueError):
+        yield_s = _UNIFIED_LOCK_YIELD_MS_DEFAULT / 1000.0
     result = PropagationResult(steps_run=n, nodes_primed=0)
-    t_req = time.perf_counter()
-    with graph._step_lock:
-        t_got = time.perf_counter()
-        ts0 = graph.timestep
-        try:
-            primed = 0
-            for nid, cur in zip(node_ids, currents):
-                try:
-                    graph.stimulate(nid, cur)
-                except KeyError:
-                    continue
-                primed += 1
-            result.nodes_primed = primed
-            sprouted = pruned = 0
-            for i in range(n):
-                sr = graph.step(structural_damping=damping)
-                sprouted += sr.synapses_sprouted
-                pruned += sr.synapses_pruned
-                for fid in sr.fired_node_ids:
-                    result.fired_entries.append(FiredEntry(node_id=fid, firing_step=i))
-        except Exception:
-            if stats is not None:
-                stats["errors"] = stats.get("errors", 0) + 1
-            raise
-        finally:
-            t_rel = time.perf_counter()
-            if stats is not None:
-                wait_ms = (t_got - t_req) * 1000.0
-                hold_ms = (t_rel - t_got) * 1000.0
-                stats["drives"] = stats.get("drives", 0) + 1
-                stats["wait_ms_last"] = wait_ms
-                stats["wait_ms_max"] = max(stats.get("wait_ms_max", 0.0), wait_ms)
-                stats["hold_ms_last"] = hold_ms
-                stats["hold_ms_max"] = max(stats.get("hold_ms_max", 0.0), hold_ms)
-                stats["hold_ms_sum"] = stats.get("hold_ms_sum", 0.0) + hold_ms
-                stats["timestep_advance"] = stats.get("timestep_advance", 0) + (graph.timestep - ts0)
+    lock = graph._step_lock
+    sprouted = pruned = 0
+    own_steps = 0
+    interleaved = 0
+    ts_end_prev = None
+    # one hold per real step; the first also carries the prime. A drive with 0 steps still primes (one hold).
+    for i in range(max(1, n)):
+        if i > 0 and yield_s > 0.0:
+            time.sleep(yield_s)   # GIL + lock released: a waiter gets in between the Tonic's steps (#1160)
+        t_req = time.perf_counter()
+        with lock:
+            t_got = time.perf_counter()
+            ts0 = graph.timestep
+            if ts_end_prev is not None:
+                interleaved += max(0, ts0 - ts_end_prev)
+            try:
+                if i == 0:
+                    primed = 0
+                    for nid, cur in zip(node_ids, currents):
+                        try:
+                            graph.stimulate(nid, cur)
+                        except KeyError:
+                            continue
+                        primed += 1
+                    result.nodes_primed = primed
+                if i < n:
+                    sr = graph.step(structural_damping=damping)
+                    own_steps += 1
+                    sprouted += sr.synapses_sprouted
+                    pruned += sr.synapses_pruned
+                    for fid in sr.fired_node_ids:
+                        result.fired_entries.append(FiredEntry(node_id=fid, firing_step=i))
+            except Exception:
+                if stats is not None:
+                    stats["errors"] = stats.get("errors", 0) + 1
+                raise
+            finally:
+                t_rel = time.perf_counter()
+                ts_end_prev = graph.timestep
+                if stats is not None:
+                    wait_ms = (t_got - t_req) * 1000.0
+                    hold_ms = (t_rel - t_got) * 1000.0
+                    stats["holds"] = stats.get("holds", 0) + 1
+                    stats["wait_ms_last"] = wait_ms
+                    stats["wait_ms_max"] = max(stats.get("wait_ms_max", 0.0), wait_ms)
+                    stats["hold_ms_last"] = hold_ms
+                    stats["hold_ms_max"] = max(stats.get("hold_ms_max", 0.0), hold_ms)
+                    stats["hold_ms_sum"] = stats.get("hold_ms_sum", 0.0) + hold_ms
+                    stats["timestep_advance"] = stats.get("timestep_advance", 0) + (graph.timestep - ts0)
     if stats is not None:
-        stats["steps"] += n
+        stats["drives"] = stats.get("drives", 0) + 1
+        stats["steps"] += own_steps
         stats["primed"] += result.nodes_primed
         stats["fired"] += len(result.fired_entries)
         stats["sprouted"] += sprouted
         stats["pruned"] += pruned
+        stats["interleaved_steps"] = stats.get("interleaved_steps", 0) + interleaved
     return result
 
 
