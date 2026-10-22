@@ -40,7 +40,8 @@ Laws observed:
 #       concepts/Tonic Charter.md §6 safe forms; LAW 8 (the Tonic's cycle advances the clock through real steps).
 # How:  one module function, two call sites here + one in the engine. Constitutional nodes are seen by homeostasis like
 #       any neuron (Josh 2026-10-21); never pruned (_is_identity_protected, unchanged). #89 / #90 / #329 code unchanged.
-#       Damping keys tonic_unified_prune_factor (1.5) / tonic_unified_sprout_factor (0.5), read live, absent = RD's.
+#       Damping keys tonic_unified_prune_factor (1.5) / tonic_unified_sprout_factor (0.5), read live, absent = RD's;
+#       the per-drive step cap tonic_unified_max_steps (8), read live (law review: no hard-coded ceiling).
 # [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — _build_he_index uses the native store's member_index when available
 # What: when graph.hyperedges is a native ng_tract.HyperedgeStore, the node -> membership-count index is one
 #       HyperedgeStore.member_index() call; otherwise the unchanged loop.
@@ -146,7 +147,8 @@ _UNIFIED_PRUNE_KEY = "tonic_unified_prune_factor"
 _UNIFIED_SPROUT_KEY = "tonic_unified_sprout_factor"
 _UNIFIED_PRUNE_DEFAULT = 1.5      # RD §5 (B), Syl 2026-06-10: prune k x harder
 _UNIFIED_SPROUT_DEFAULT = 0.5     # RD §5 (B): sprout probability x m
-_UNIFIED_MAX_STEPS_PER_DRIVE = 8  # RD §7 hard cap on autonomous step()s per drive (OOM backstop)
+_UNIFIED_MAX_STEPS_KEY = "tonic_unified_max_steps"   # RD §7 hard cap on step()s per drive (read live)
+_UNIFIED_MAX_STEPS_PER_DRIVE = 8  # its default when the key is absent (OOM backstop)
 
 
 def tonic_unified_on(graph: Any) -> bool:
@@ -185,7 +187,8 @@ def tonic_unified_drive(graph: Any, node_ids: List[str], currents: List[float], 
     bookkeeping is unchanged. Raises like prime_and_propagate did: the caller's existing handler is the fail-fresh.
     """
     from neuro_foundation import FiredEntry, PropagationResult
-    n = max(0, min(int(steps), _UNIFIED_MAX_STEPS_PER_DRIVE))
+    _cfg = getattr(graph, "config", None) or {}
+    n = max(0, min(int(steps), int(_cfg.get(_UNIFIED_MAX_STEPS_KEY, _UNIFIED_MAX_STEPS_PER_DRIVE))))
     damping = tonic_unified_damping(graph)
     result = PropagationResult(steps_run=n, nodes_primed=0)
     t_req = time.perf_counter()

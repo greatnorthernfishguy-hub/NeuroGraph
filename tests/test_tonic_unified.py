@@ -499,3 +499,10 @@ def test_off_is_byte_identical_to_the_base_line():
     assert _scenario(ROOT, "absent") == base
     assert _scenario(ROOT, "false") == base
     assert _scenario(ROOT, "on") != base
+
+
+def test_step_cap_read_live():
+    g, ids = _graph(extra={"tonic_unified_max_steps": 1})
+    ts = g.timestep
+    tonic_unified_drive(g, [], [], 5)
+    assert g.timestep == ts + 1
