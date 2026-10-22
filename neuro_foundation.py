@@ -20,6 +20,33 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-22] Claude (lane stability-s6, #1136 / #1139 / #1166; Josh 2026-10-22 "I think that we should have some form of
+#   intrinsic spontaneous activity in NG, yes." + "And I concur with your recommendations for the next round, as well.")
+#   — S6: the bounded breaker, intrinsic spontaneous activity, the quiet hold on synaptic up-scaling. SWITCHES AND WIRING
+#   ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s6-20261022 ONLY, its own commit; merges only after
+#   Josh's protected-file "proceed" + backups of both msgpack files).
+# What: three keys, read live, absent = off, NOT in DEFAULT_CONFIG; Rust only (Q2: no Python oracle), each needs the S6
+#       wheel (NodeStore.stab_round >= 7; S6-2 also SynapseStore.stab_round >= 6), else ERROR once and off.
+#       (1) breaker_homeo_enabled (#1139): the zero-fire breaker keeps its trigger (zero_fire_breaker_steps silent steps
+#           -> the zero_fire_breaker_tripped event, unchanged) but no longer multiplies every node x1.2 / x0.9: from the
+#           trip until something fires, every silent step runs ONE homeostatic up-move (NodeStore.breaker_lift) on the
+#           nodes under their own target only — threshold down at HomeostaticRule's threshold rate (x the slow mult
+#           when slow), excitability up at its excitability rate every scaling interval of silence, each scaled by S4's
+#           bounded distance (when prop) and headroom (always), so nothing is pushed onto a rail. Plasticity does not run
+#           on a silent step (#1145), so this is the homeostat's own up-direction standing in while the mind is silent.
+#       (2) spontaneous_activity_enabled (+ spont_release_p 0.002, spont_quantal 0.25, spont_seed 0) (#1166): every
+#           step, before fire detection, SynapseStore.spontaneous_release: miniature PSPs — each synapse releases one
+#           quantum with probability p (deterministic per seed / timestep / synapse), delivering q x weight x sign x
+#           the post node's excitability. Its spikes are ordinary spikes (homeostasis, the brakes and the interneurons
+#           see them as any other); the input sensor (S2-1) does not count a node's own minis as afferent input.
+#       (3) syn_scale_quiet_hold_enabled (+ syn_scale_quiet_window 100): S's synaptic UP-scaling only for a node that
+#           received afferent input within the window, sized from the long rate counted over driven epochs only (r_drv);
+#           down-scaling unchanged. Needs S (syn_scale_evidence_enabled) and S2-1 (node_homeo_input_evidence_enabled).
+# Why:  dev-log 2026-10-22 whole-mind proof, arm B: the braked mind is silent between Tonic drives; after 200 silent
+#       drain steps the breaker put 9,200 nodes back on the excitability cap; up-scaling wound mean weight 0.078 ->
+#       0.105 across the quiet stretches. Design: hyperedge-store design §2.3 S6 rows.
+# How:  with every S6 key absent step() and HomeostaticRule make exactly round I's calls (no new argument is passed);
+#       nothing new is saved (the S6 columns are transient in the wheel; _breaker_lift_active is transient here).
 # [2026-10-21] Claude (lane rebaseline, #1136 / #1151; Josh 2026-10-21 "Let's go with your suggestion" + "Agreed?" on recall
 #   feeling the S5 brakes) — read-mode recall sweeps feel the live brakes, SWITCH AND WIRING ONLY (PROTECTED CHANGE on
 #   review branch cc-laptop-rebaseline-20261021 ONLY, its own commit; merges only after Josh's protected-file "proceed"
@@ -2173,6 +2200,10 @@ class _StabParams(NamedTuple):
     # [2026-10-20] round I (#1151): None = off (S5 exactly)
     ilayer: Optional[tuple] = None    # (decay_rate, decay_I, g_decay, g_max, delay, g_eps, form, istdp, eta, tau, w_max)
     irecruit: Optional[tuple] = None  # NodeStore.interneurons_recruit params (sleep_cycle + once at switch-on)
+    # [2026-10-22] S6 (#1136): None = off (round I exactly)
+    breaker: Optional[tuple] = None   # #1139 (thr_rate, exc_rate, interval, default_threshold, slow, prop (unit, max) | None)
+    spont: Optional[tuple] = None     # #1166 (p, q, seed): miniature PSPs before fire detection
+    quiet: Optional[int] = None       # S6-3 window: hold S's up-scaling while the node receives no afferent input
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2311,8 +2342,11 @@ class HomeostaticRule(PlasticityRule):
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
         _native = getattr(graph.nodes, "update_firing_ema", None)
+        # [2026-10-22] S6-3: the quiet hold advances the driven long rate beside S's (only with S on)
+        _qw = _st.quiet if (_st is not None and _s_ev is not None) else None
         if _native is None or not (_native(fired_set, self.ema_alpha) if _long_a is None
-                                   else _native(fired_set, self.ema_alpha, _long_a)):
+                                   else _native(fired_set, self.ema_alpha, _long_a) if _qw is None
+                                   else _native(fired_set, self.ema_alpha, _long_a, quiet=_qw)):
             _update_firing_ema_python(graph.nodes, fired_set, self.ema_alpha)
 
         # Threshold adaptation: continuous, 0.001/step (PRD §3.2.1)
@@ -2358,6 +2392,8 @@ class HomeostaticRule(PlasticityRule):
                 _s2kw["input"] = _ev_in + _w_int
             if _st.deadband is not None:
                 _s2kw["deadband"] = _st.deadband
+            if _qw is not None:   # [2026-10-22] S6-3
+                _s2kw["quiet"] = _qw
             node_scales = graph.nodes.evidence_scales(self._degree_targets, self.target_firing_rate,
                                                       self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3], **_s2kw) or {}
 
@@ -3511,6 +3547,14 @@ class Graph:
                     continue
                 target.voltage += current * target.intrinsic_excitability
 
+            # 2b. [2026-10-22] S6-2 (#1166): intrinsic spontaneous activity — miniature PSPs (spontaneous vesicle
+            #     release), natively, before detection; its spikes are ordinary spikes. A declined pass skips this step.
+            if _stab is not None and _stab.spont is not None:
+                if self.synapses.spontaneous_release(self.nodes, _stab.spont[0], _stab.spont[1], _stab.spont[2],
+                                                     self.timestep) is None:
+                    self._stab_error_once(("spontaneous_activity_enabled",),
+                                          "a native pass that accepts it (the S6 stores declined this step)")
+
             # 3a. IcaN + IK-AHP: calcium-gated intrinsic currents (#254)
             # Net voltage adjustment = (g_CaN - g_AHP) * Ca_i per step.
             # g_CaN > g_AHP at defaults → mild attractor persistence.
@@ -3970,19 +4014,29 @@ class Graph:
             # 11. Zero-firing circuit breaker
             breaker_steps = self.config.get("zero_fire_breaker_steps", 200)
             alert_steps = self.config.get("zero_fire_alert_steps", 50)
+            # [2026-10-22] S6-1 (#1139): the bounded breaker (None = the global boost, as before)
+            _bk = _stab.breaker if _stab is not None else None
+            if fired_ids:
+                self.__dict__.pop("_breaker_lift_active", None)
             if self._steps_since_last_fire >= breaker_steps:
-                self._emergency_excitability_boost()
+                if _bk is None:
+                    self._emergency_excitability_boost()
+                else:
+                    self._breaker_homeo_trip()
                 self._emit(
                     "zero_fire_breaker_tripped",
                     steps_silent=self._steps_since_last_fire,
                     timestep=self.timestep,
                 )
                 logger.warning(
-                    "Zero-fire breaker tripped at step %d (%d steps silent). "
-                    "Emergency excitability boost applied.",
+                    "Zero-fire breaker tripped at step %d (%d steps silent). %s",
                     self.timestep, self._steps_since_last_fire,
+                    "Emergency excitability boost applied." if _bk is None else
+                    "Bounded homeostatic lift (S6-1) runs until a node fires.",
                 )
                 self._steps_since_last_fire = 0
+            elif _bk is not None and self.__dict__.get("_breaker_lift_active"):
+                self._breaker_homeo_lift(_bk)
             elif self._steps_since_last_fire == alert_steps:
                 self._emit(
                     "zero_fire_warning",
@@ -4376,6 +4430,8 @@ class Graph:
     _STAB_S5_KEYS = ("ca_split_enabled", "syn_std_enabled", "node_homeo_agree_enabled")
     # [2026-10-20] round I (#1151): need the round-I wheel (NodeStore.stab_round >= 6 + interneurons_recruit)
     _STAB_I_KEYS = ("interneurons_enabled", "interneuron_recruit_enabled")
+    # [2026-10-22] S6 (#1136): need the S6 wheel (NodeStore.stab_round >= 7; spontaneous also SynapseStore >= 6)
+    _STAB_S6_KEYS = ("breaker_homeo_enabled", "spontaneous_activity_enabled", "syn_scale_quiet_hold_enabled")
 
     def _stab_error_once(self, keys, need: str) -> None:
         seen = self.__dict__.setdefault("_stab_err_logged", set())
@@ -4397,8 +4453,13 @@ class Graph:
         s5 = [k for k in self._STAB_S5_KEYS if c.get(k, False)]
         # [2026-10-20] round I (#1151): the interneuron layer stands alone
         ik = [k for k in self._STAB_I_KEYS if c.get(k, False)]
-        if not he and not nd and not inh_on and not s5 and not ik:
+        # [2026-10-22] S6 (#1136): the breaker and spontaneous activity stand alone; the quiet hold refines S (below)
+        s6 = [k for k in self._STAB_S6_KEYS if c.get(k, False)]
+        if not he and not nd and not inh_on and not s5 and not ik and not s6:
             return None
+        bk_t = sp_t = None
+        if s6:
+            bk_t, sp_t = self._stab_s6_standalone(c, s6)
         ca_t = std_t = None
         if s5:
             ca_t, std_t = self._stab_s5_standalone(c, s5)
@@ -4447,7 +4508,10 @@ class Graph:
             self._stab_error_once(["node_homeo_agree_enabled"],
                                   "node_homeo_slow_enabled + node_homeo_evidence_enabled (agreement refines slow N)")
             agree_on = False
-        s5_any = ca_t is not None or std_t is not None or il_t is not None or ir_t is not None
+        s5_any = (ca_t is not None or std_t is not None or il_t is not None or ir_t is not None
+                  or bk_t is not None or sp_t is not None)
+        if "syn_scale_quiet_hold_enabled" in s6 and "syn_scale_evidence_enabled" not in nd:
+            self._stab_error_once(["syn_scale_quiet_hold_enabled"], "syn_scale_evidence_enabled (it refines S)")
         if not he and not nd and not inh_on and not s5_any:
             return None
         if he and not (getattr(self, "_native_he_passes", False)
@@ -4470,6 +4534,20 @@ class Graph:
         v_floor = float(c.get("node_homeo_v_floor", 0.5))
         # [2026-10-19] S2 (#1136): (1) needs N or S, (2) needs S, (3) needs C2; each absent = S exactly
         in_on = "node_homeo_input_evidence_enabled" in s2n and (n_on or s_on)
+        # [2026-10-22] S6-3: the quiet hold refines S and needs S2-1's input sensor (it reads the last afferent input)
+        q_w = None
+        if "syn_scale_quiet_hold_enabled" in s6:
+            w = float(c.get("syn_scale_quiet_window", 100))
+            if not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 7):
+                self._stab_error_once(["syn_scale_quiet_hold_enabled"], "the native node store (S6-round ng_tract)")
+            elif not (s_on and in_on):
+                self._stab_error_once(["syn_scale_quiet_hold_enabled"],
+                                      "syn_scale_evidence_enabled + node_homeo_input_evidence_enabled (it refines S and "
+                                      "reads the input sensor)")
+            elif not (w >= 1.0 and math.isfinite(w)):
+                self._stab_error_once(["syn_scale_quiet_hold_enabled"], "syn_scale_quiet_window >= 1")
+            else:
+                q_w = int(w)
         settle_on = "syn_scale_settle_enabled" in s2n and s_on
         leak_on = "he_threshold_leak_enabled" in s2h and c2 is not None
         he_t = (hab, "he_inject_respects_refractory" in he, c2, c3)
@@ -4509,7 +4587,53 @@ class Graph:
             # [2026-10-20] round I (#1151)
             ilayer=il_t,
             irecruit=ir_t,
+            # [2026-10-22] S6 (#1136)
+            breaker=(bk_t if bk_t is None else self._stab_s6_breaker(c, bk_t, n_on)),
+            spont=sp_t,
+            quiet=q_w,
         )
+
+    def _stab_s6_standalone(self, c, s6) -> Tuple[Optional[tuple], Optional[tuple]]:
+        """[2026-10-22] S6 (#1136): the bounded breaker's switch (True) and spontaneous activity's (p, q, seed), or None
+        each (ERROR once when a set key cannot run). Pure read of config."""
+        nat7 = getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 7
+        bk_t = sp_t = None
+        if "breaker_homeo_enabled" in s6:
+            if nat7 and hasattr(self.nodes, "breaker_lift"):
+                bk_t = True
+            else:
+                self._stab_error_once(["breaker_homeo_enabled"], "the native node store (S6-round ng_tract)")
+        if "spontaneous_activity_enabled" in s6:
+            p = float(c.get("spont_release_p", 0.002))
+            q = float(c.get("spont_quantal", 0.25))
+            seed = int(c.get("spont_seed", 0))
+            if not (nat7 and getattr(type(self.synapses), "stab_round", 0) >= 6
+                    and hasattr(self.synapses, "spontaneous_release")):
+                self._stab_error_once(["spontaneous_activity_enabled"],
+                                      "the native node + synapse stores (S6-round ng_tract)")
+            elif not (0.0 <= p <= 1.0 and 0.0 <= q and math.isfinite(q) and seed >= 0):
+                self._stab_error_once(["spontaneous_activity_enabled"],
+                                      "0 <= spont_release_p <= 1, spont_quantal >= 0, spont_seed >= 0")
+            else:
+                sp_t = (p, q, seed)
+        return bk_t, sp_t
+
+    def _stab_s6_breaker(self, c, bk_t, n_on: bool) -> tuple:
+        """[2026-10-22] S6-1: the lift's rates = HomeostaticRule's (x the slow mult when S3 slow runs, as N moves), S4's
+        bounded distance when prop runs; headroom always. Pure read of config."""
+        rule = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        thr = float(rule.threshold_rate) if rule is not None else 0.001
+        exc = float(rule.excitability_rate) if rule is not None else 0.01
+        interval = int(rule.scaling_interval) if rule is not None else int(c.get("scaling_interval", 25))
+        slow = bool(n_on and c.get("node_homeo_slow_enabled", False)
+                    and getattr(type(self.nodes), "stab_round", 0) >= 3)
+        if slow:
+            m = float(c.get("node_homeo_slow_rate_mult", 0.2))
+            thr, exc = thr * m, exc * m
+        prop = None
+        if slow and c.get("node_homeo_prop_enabled", False):
+            prop = (float(c.get("node_homeo_prop_unit", 2.0)), float(c.get("node_homeo_prop_max", 4.0)))
+        return (thr, exc, interval, float(c.get("default_threshold", 0.85)), slow, prop)
 
     def _stab_s5_standalone(self, c, s5) -> Tuple[Optional[tuple], Optional[tuple]]:
         """[2026-10-20] S5 (#1136): the calcium split (#1149) and short-term depression (#1150) tuples, or None each
@@ -8553,6 +8677,28 @@ class Graph:
         logger.info(
             "Emergency excitability boost applied to %d nodes", boosted,
         )
+
+    def _breaker_homeo_trip(self) -> None:
+        """[2026-10-22] S6-1 (#1139): the breaker's trip with ``breaker_homeo_enabled``: no global boost; the bounded
+        homeostatic lift runs on this and every further silent step until something fires (_breaker_homeo_lift)."""
+        self._breaker_lift_active = 0
+        _st = getattr(self, "_stab", None)
+        if _st is not None and _st.breaker is not None:
+            self._breaker_homeo_lift(_st.breaker)
+
+    def _breaker_homeo_lift(self, bk: tuple) -> None:
+        """[2026-10-22] S6-1 (#1139): one silent step's homeostatic up-move, natively (NodeStore.breaker_lift): only nodes
+        under their own (degree) target; threshold every silent step, excitability every scaling interval of silence;
+        S4's bounded distance and headroom, so nothing reaches a rail. A declined pass logs ERROR once (no fallback)."""
+        k = int(self.__dict__.get("_breaker_lift_active") or 0)
+        self._breaker_lift_active = k + 1
+        thr_rate, exc_rate, interval, dthr, slow, prop = bk
+        rule = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        targets = rule._degree_targets if rule is not None else {}
+        default_t = float(rule.target_firing_rate) if rule is not None else float(self.config["target_firing_rate"])
+        er = exc_rate if (k % max(1, int(interval)) == 0) else None
+        if self.nodes.breaker_lift(targets, default_t, thr_rate, er, dthr, slow=slow, prop=prop) is None:
+            self._stab_error_once(("breaker_homeo_enabled",), "a native pass that accepts it (breaker_lift declined)")
 
     # -----------------------------------------------------------------------
     # Persistence (PRD §6)
