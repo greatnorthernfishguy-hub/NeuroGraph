@@ -20,6 +20,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-21] Claude Code (Opus 5.5, laptop; lane tonic-unified) — RD §5 (B): optional damped structural plasticity on step()
+#   (PROTECTED CHANGE — needs Josh's proceed; Syl approved RD 2026-06-10 "Build it, lover."; Josh 2026-10-21 "1 Yes, let's build it.")
+#   What: step(structural_damping=None). With None (every existing caller) step 8 is the unchanged call. With (k, m) — passed
+#         ONLY by the Tonic's unified cycle (tonic_thread.tonic_unified_drive, config tonic_unified_step) — step 8 runs
+#         _structural_plasticity(fired_ids, damping=(k, m)): the wake prune (when it runs at all; not under
+#         structural_plasticity_in_sleep) is k x harder (weight_threshold / k, grace_period x k, inactivity_threshold x k),
+#         and each sprout the rules accept is kept with probability m (the rest dropped, as a rail drop).
+#   Why:  prd/tonic-restoration-design.md §2 (the Tonic's autonomous cycle runs the real step()) and Syl's §5 (B) decision:
+#         "prune at threshold T x k (harder to prune), sprout at probability p x m (less likely). Start k=1.5, m=0.5".
+#         Conversation-anchored step() keeps FULL plasticity (the default path is untouched).
+#   How:  new keyword-only arguments, all default None: _structural_plasticity(damping=), _prune_synapses(prune_factor=)
+#         (default path only; refused in competing / sleep-unit mode), _sprout_synapses(sprout_keep=),
+#         _sprout_from_tally(keep=). No random draw unless m < 1. Identity protection (_is_identity_protected) is the same
+#         authority on the damped path. Nothing in DEFAULT_CONFIG; tests/test_tonic_unified.py.
 # [2026-10-19] Claude Code (Opus 5.5, Executive; Josh: "1 sounds good for the tie breaker", "You have my Proceed")
 #   — #1142 tie-break by activity
 #   What: behind he_member_choice_by_contribution, shed ties go to the least active member (lowest firing_rate_ema)
@@ -1718,6 +1732,18 @@ def _decrement_refractory_python(nodes, fired_this_step) -> None:
             node.refractory_remaining -= 1
 
 
+def _validate_structural_damping(damping: Any) -> Tuple[float, float]:
+    """[2026-10-21] RD §5 (B): (k, m) -> floats, k >= 1 (prune k x harder), 0 <= m <= 1 (keep a sprout w.p. m)."""
+    try:
+        k, m = damping
+        k, m = float(k), float(m)
+    except Exception as exc:
+        raise ValueError("structural_damping must be a (prune_factor, sprout_keep) pair (got %r)" % (damping,)) from exc
+    if not (1.0 <= k < float("inf")) or not (0.0 <= m <= 1.0):
+        raise ValueError("structural_damping needs prune_factor >= 1 and 0 <= sprout_keep <= 1 (got %r)" % (damping,))
+    return k, m
+
+
 def _update_firing_ema_python(nodes, fired_set, ema_alpha) -> None:
     for nid, node in nodes.items():
         fired = 1.0 if nid in fired_set else 0.0
@@ -3187,7 +3213,7 @@ class Graph:
     # Simulation Loop (PRD §2.2.4, §8 step)
     # -----------------------------------------------------------------------
 
-    def step(self) -> StepResult:
+    def step(self, structural_damping: Optional[Tuple[float, float]] = None) -> StepResult:
         """Advance one timestep (PRD §2.2.4 Simulation Loop, §8 step).
 
         Pipeline:
@@ -3204,6 +3230,11 @@ class Graph:
             8. Structural plasticity (prune / sprout)
             9. Decrement refractory counters
             10. Record telemetry / emit events
+
+        Args:
+            structural_damping: [2026-10-21] RD §5 (B). None (the default; every conversation-anchored caller): step 8
+                is unchanged. (k, m): passed only by the Tonic's unified cycle — prune k x harder, keep each sprout
+                with probability m (see _structural_plasticity).
 
         Returns:
             StepResult with fired nodes, hyperedges, pruning/sprouting counts.
@@ -3600,7 +3631,10 @@ class Graph:
                 result.diffpc_mean_pred_error = _dc_err
 
             # 8. Structural plasticity
-            pruned, sprouted = self._structural_plasticity(fired_ids)
+            if structural_damping is None:
+                pruned, sprouted = self._structural_plasticity(fired_ids)
+            else:   # [2026-10-21] RD §5 (B): the Tonic's unified cycle only
+                pruned, sprouted = self._structural_plasticity(fired_ids, damping=structural_damping)
             result.synapses_pruned = pruned
             result.synapses_sprouted = sprouted
             self._total_pruned += pruned
@@ -4615,7 +4649,8 @@ class Graph:
     # Structural Plasticity (PRD §3.3)
     # -----------------------------------------------------------------------
 
-    def _structural_plasticity(self, fired_ids: List[str]) -> Tuple[int, int]:
+    def _structural_plasticity(self, fired_ids: List[str],
+                               damping: Optional[Tuple[float, float]] = None) -> Tuple[int, int]:
         """Apply pruning and sprouting rules (PRD §3.3).
 
         [2026-10-06] sleep phase P1: when config `structural_plasticity_in_sleep` is truthy (read live, absent =
@@ -4623,9 +4658,22 @@ class Graph:
         runs only in `sleep_cycle`, called by a host on its own clock. Sprouting (wake growth) always stays.
         Key absent: exactly the code path before this change.
 
+        [2026-10-21] RD §5 (B) damping (keyword, default None = exactly the path above): (k, m) with k >= 1 and
+        0 <= m <= 1. The wake prune (only when it runs here) is k x harder (_prune_synapses(prune_factor=k)); each
+        sprout the rules accept is kept with probability m (_sprout_synapses(sprout_keep=m)). Orphan collection is
+        unchanged (identity-protected nodes already survive it). Passed only by the Tonic's unified cycle.
+
         Returns:
             (num_pruned, num_sprouted)
         """
+        if damping is not None:
+            k, m = _validate_structural_damping(damping)
+            if self.config.get("structural_plasticity_in_sleep", False):
+                return 0, self._sprout_synapses(fired_ids, sprout_keep=m)
+            pruned = self._prune_synapses(prune_factor=k)
+            self._collect_orphan_nodes()
+            sprouted = self._sprout_synapses(fired_ids, sprout_keep=m)
+            return pruned, sprouted
         if self.config.get("structural_plasticity_in_sleep", False):
             return 0, self._sprout_synapses(fired_ids)
         pruned = self._prune_synapses()
@@ -5358,6 +5406,7 @@ class Graph:
         last_link_grace_sleeps: Optional[int] = None,
         credit_shield_kappa: Optional[float] = None,
         defer_removal: bool = False,
+        prune_factor: Optional[float] = None,
     ) -> int:
         """Prune weak/inactive synapses (PRD §3.3.1).
 
@@ -5410,6 +5459,10 @@ class Graph:
         sleep's decision hold): everything above runs exactly as without it (counters, lifelines, shield, last-link
         stamps), but the chosen ids are NOT removed and no "pruned" event is emitted here: they are returned in
         report['deferred_ids'] (report REQUIRED) for the caller to remove; the return value is then 0 (nothing removed).
+
+        [2026-10-21] prune_factor (keyword-only, default None = unchanged; RD §5 (B), the Tonic's unified cycle only): the
+        DEFAULT path's three rules are k x harder — weight_threshold / k, grace_period x k, inactivity_threshold x k
+        (rounded up). Refused in competing mode and in sleep-unit mode. Identity protection is unchanged.
         """
         wt = self.config["weight_threshold"]
         grace = self.config["grace_period"]
@@ -5425,6 +5478,8 @@ class Graph:
             raise ValueError("_prune_synapses: sleep_now / last_link_grace_sleeps / credit_shield_kappa / defer_removal "
                              "need grace_sleeps")
         if sleep_units:
+            if prune_factor is not None:   # [2026-10-21]
+                raise ValueError("_prune_synapses: prune_factor is not valid with the sleep-unit clearance")
             if competing_mode:
                 raise ValueError("_prune_synapses: the sleep-unit clearance is not valid in competing mode")
             if order_key is not None or max_removals is not None:
@@ -5445,6 +5500,17 @@ class Graph:
             _ll_key = "last_link_since_sleep"
         else:
             _ll_key = "last_link_since"
+            if prune_factor is not None:   # [2026-10-21] RD §5 (B): k x harder, default path only
+                if competing_mode:
+                    raise ValueError("_prune_synapses: prune_factor is not valid in competing mode")
+                _k = float(prune_factor)
+                if isinstance(prune_factor, bool) or not (1.0 <= _k < float("inf")):
+                    raise ValueError("_prune_synapses: prune_factor must be a finite number >= 1 (got %r)"
+                                     % (prune_factor,))
+                wt = wt / _k                                 # a lower bar: fewer synapses fall below it
+                grace = int(math.ceil(grace * _k))           # and they must stay below it longer
+                inactivity = (int(math.ceil(inactivity * _k)) if isinstance(inactivity, int)
+                              else inactivity * _k)          # unused longer before the activity rule removes
             if not competing_mode and "sleep_low_weight_unit" in self.config:
                 del self.config["sleep_low_weight_unit"]   # counters advance per step again: no longer sleep units
         if max_removals is not None and (
@@ -6282,7 +6348,7 @@ class Graph:
             self._emit("nodes_collected", count=removed, timestep=self.timestep, node_ids=removed_ids)
         return removed
 
-    def _sprout_synapses(self, fired_ids: List[str]) -> int:
+    def _sprout_synapses(self, fired_ids: List[str], sprout_keep: Optional[float] = None) -> int:
         """Create synapses between co-activating nodes (PRD §3.3.2).
 
         Co-activation rule: two nodes fire within co_activation_window,
@@ -6294,11 +6360,20 @@ class Graph:
         [2026-10-08] #1050: with config `sprout_tally_enabled` truthy (read live, absent = False, NOT in
         DEFAULT_CONFIG) the co-firing tally decides instead (`_sprout_from_tally`): a pair sprouts only after
         repeated co-firing. Key absent: exactly this path.
+
+        [2026-10-21] sprout_keep (default None = unchanged; RD §5 (B), the Tonic's unified cycle only): each sprout the
+        rules accept is kept with probability sprout_keep (one random.random() draw per accepted sprout, none when the
+        value is None or >= 1); a dropped one is not created but uses its slot under the 10-per-step cap (so the cap
+        cannot refill it and m stays a true fraction, as on the tally path where the rails cap first).
         """
         if not fired_ids:
             return 0
         if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = this path, unchanged)
+            if sprout_keep is not None:
+                return self._sprout_from_tally(fired_ids, keep=sprout_keep)
             return self._sprout_from_tally(fired_ids)
+        _damp = sprout_keep is not None and sprout_keep < 1.0   # [2026-10-21]
+        _dropped = 0   # [2026-10-21] a damped-out sprout still uses its slot under the per-step cap (as the tally path)
 
         window = self.config["co_activation_window"]
         initial_w = self.config["initial_sprouting_weight"]
@@ -6348,12 +6423,12 @@ class Graph:
             return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ()))
 
         for nid in fired_ids:
-            if count >= max_sprouts_per_step:
+            if count + _dropped >= max_sprouts_per_step:   # [2026-10-21] _dropped is 0 unless damped
                 break
             if _deg_cap and _sprout_degree(nid) >= _deg_cap and not self._is_identity_protected(nid):
                 continue  # saturated ordinary hub — no new outgoing sprouts
             for other_id in candidates:
-                if count >= max_sprouts_per_step:
+                if count + _dropped >= max_sprouts_per_step:
                     break
                 if _deg_cap and _sprout_degree(nid) >= _deg_cap and not self._is_identity_protected(nid):
                     break  # nid reached the cap mid-step — stop sprouting from it
@@ -6364,6 +6439,9 @@ class Graph:
                     continue
                 if _deg_cap and _sprout_degree(other_id) >= _deg_cap and not self._is_identity_protected(other_id):
                     continue  # saturated ordinary hub — no new incoming sprouts
+                if _damp and random.random() >= sprout_keep:   # [2026-10-21] RD §5 (B): damped sprout
+                    _dropped += 1
+                    continue
                 _delay = self._sprout_delay(nid, other_id)   # [2026-10-08] #1050: body moved verbatim
                 self.create_synapse(nid, other_id, weight=initial_w, delay=_delay)
                 existing_pairs.add((nid, other_id))
@@ -6471,7 +6549,7 @@ class Graph:
         return _cofire_tally_update_python(tally, list(fired), list(cands), self.timestep, prm["k"], prm["theta"],
                                            prm["lam"], prm["floor"], prm["gap"], connected)
 
-    def _sprout_from_tally(self, fired_ids: List[str]) -> int:
+    def _sprout_from_tally(self, fired_ids: List[str], keep: Optional[float] = None) -> int:
         """#1050 sprouting (config `sprout_tally_enabled`): co-firing feeds a bounded per-node partner table; a link
         sprouts only when a pair's decayed co-firing score reaches theta. Candidates are today's set (a node with a
         spike 1..co_activation_window steps ago that did not fire now), ordered most recent first (stable). Direction
@@ -6503,6 +6581,10 @@ class Graph:
         st["calls"] += 1
         crossings = self._sprout_tally_feed(list(fired_ids), [nid for _, nid in recent], prm)
         made = self._sprout_tally_rails(crossings, st)
+        if keep is not None and keep < 1.0 and made:   # [2026-10-21] RD §5 (B): each accepted sprout kept w.p. keep
+            _kept = [pm for pm in made if random.random() < keep]
+            st["damped_dropped"] = st.get("damped_dropped", 0) + (len(made) - len(_kept))
+            made = _kept
         for pre, post in made:
             self.create_synapse(pre, post, weight=initial_w, delay=self._sprout_delay(pre, post))
         count = len(made)
