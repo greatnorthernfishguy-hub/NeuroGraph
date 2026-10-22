@@ -46,7 +46,9 @@ Design principles (PRD §2.1):
 #       drain steps the breaker put 9,200 nodes back on the excitability cap; up-scaling wound mean weight 0.078 ->
 #       0.105 across the quiet stretches. Design: hyperedge-store design §2.3 S6 rows.
 # How:  with every S6 key absent step() and HomeostaticRule make exactly round I's calls (no new argument is passed);
-#       nothing new is saved (the S6 columns are transient in the wheel; _breaker_lift_active is transient here).
+#       nothing new is saved (the S6 columns are transient in the wheel; _breaker_lift_active is transient here and
+#       cleared by restore()). Law review LOW (2026-10-22): the lift is its own branch after the alert, so the
+#       zero_fire_warning still fires during a lift run.
 # [2026-10-21] Claude (lane rebaseline, #1136 / #1151; Josh 2026-10-21 "Let's go with your suggestion" + "Agreed?" on recall
 #   feeling the S5 brakes) — read-mode recall sweeps feel the live brakes, SWITCH AND WIRING ONLY (PROTECTED CHANGE on
 #   review branch cc-laptop-rebaseline-20261021 ONLY, its own commit; merges only after Josh's protected-file "proceed"
@@ -4018,7 +4020,8 @@ class Graph:
             _bk = _stab.breaker if _stab is not None else None
             if fired_ids:
                 self.__dict__.pop("_breaker_lift_active", None)
-            if self._steps_since_last_fire >= breaker_steps:
+            _tripped = self._steps_since_last_fire >= breaker_steps
+            if _tripped:
                 if _bk is None:
                     self._emergency_excitability_boost()
                 else:
@@ -4035,8 +4038,6 @@ class Graph:
                     "Bounded homeostatic lift (S6-1) runs until a node fires.",
                 )
                 self._steps_since_last_fire = 0
-            elif _bk is not None and self.__dict__.get("_breaker_lift_active"):
-                self._breaker_homeo_lift(_bk)
             elif self._steps_since_last_fire == alert_steps:
                 self._emit(
                     "zero_fire_warning",
@@ -4047,6 +4048,9 @@ class Graph:
                     "Zero-fire warning at step %d (%d steps without any neuron firing).",
                     self.timestep, self._steps_since_last_fire,
                 )
+            # [2026-10-22] S6-1: the bounded lift on every further silent step (its own branch, so the alert still fires)
+            if _bk is not None and not _tripped and not fired_ids and self.__dict__.get("_breaker_lift_active"):
+                self._breaker_homeo_lift(_bk)
 
             return result
 
@@ -8842,6 +8846,7 @@ class Graph:
 
     def restore(self, path: str) -> None:
         """Load state from checkpoint (PRD §8 restore, §6)."""
+        self.__dict__.pop("_breaker_lift_active", None)   # [2026-10-22] S6-1: transient, never carried across a restore
         if path.endswith(".msgpack"):
             if msgpack is None:
                 raise ImportError("msgpack required for .msgpack deserialization")
