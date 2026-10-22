@@ -31,7 +31,11 @@ Laws observed:
 #       steps). The first hold covers the prime and the step that consumes it; every further step is its own hold,
 #       with a short yield between holds (tonic_unified_lock_yield_ms, read live, absent = 1 ms; 0 = no pause).
 #       Stats gain holds / interleaved_steps (other threads' steps that landed between the Tonic's holds); drives now
-#       counts drive calls (it counted holds, which were the same thing before).
+#       counts drive calls, failed ones included (it counted holds, which were the same thing before).
+#       Law review (2026-10-22): compliant; acted on LOW (drives counted before the work, so an error still counts).
+#       MEDIUM for Josh: another thread's step that lands between the Tonic's holds may fire nodes the Tonic primed;
+#       those fires belong to that step, not to result.fired_entries (the Tonic's own attribution) — measured by
+#       interleaved_steps, deliberately NOT re-attributed.
 # Why:  Josh 2026-10-22 ("Let's go ahead with your recommendations ... Good plan."): #1160 — with the unified cycle on,
 #       waves made one drive hold the lock 10-25 s (dev-log 2026-10-21_tonic-unified-real-step §5, §7), so recall,
 #       autostep, the StreamParser, sleep and the autosave capture waited behind it (charter I1 spirit: the Tonic must
@@ -220,6 +224,8 @@ def tonic_unified_drive(graph: Any, node_ids: List[str], currents: List[float], 
     except (TypeError, ValueError):
         yield_s = _UNIFIED_LOCK_YIELD_MS_DEFAULT / 1000.0
     result = PropagationResult(steps_run=n, nodes_primed=0)
+    if stats is not None:
+        stats["drives"] = stats.get("drives", 0) + 1   # every drive call, failed ones included (as before the split)
     lock = graph._step_lock
     sprouted = pruned = 0
     own_steps = 0
@@ -270,7 +276,6 @@ def tonic_unified_drive(graph: Any, node_ids: List[str], currents: List[float], 
                     stats["hold_ms_sum"] = stats.get("hold_ms_sum", 0.0) + hold_ms
                     stats["timestep_advance"] = stats.get("timestep_advance", 0) + (graph.timestep - ts0)
     if stats is not None:
-        stats["drives"] = stats.get("drives", 0) + 1
         stats["steps"] += own_steps
         stats["primed"] += result.nodes_primed
         stats["fired"] += len(result.fired_entries)
