@@ -28,6 +28,18 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-10-22] Claude Code (Opus 5.5; #1161 / #1123) — save(after_capture=...): a caller's outer lock ends at the capture
+# (PROTECTED CHANGE on review branch cc-laptop-save-lock-20261022 ONLY; merges only after Josh's protected-file "proceed")
+# What: save() takes an optional keyword after_capture (a no-argument callable). It is called exactly once, right after
+#       _capture_checkpoint_state() returns or raises (and on the ownership refusal just before it), before the guardian
+#       permit and before any byte is written. A raise inside the callback is logged and never fails the save.
+# Why:  the CC daemon holds graph._concurrent_lock around the whole save (capture + ~70 s write of ~772 MB + vectors), so
+#       hook deposits, provider_context recall and the shutdown's final save wait behind the WRITE (live 2026-10-22 04:13:
+#       the 90 s shutdown wait expired while an autosave was writing; the exit left a 451 MB main.tmp). The detached
+#       capture (#423) already makes the write safe without any lock; only the caller could not let go of its own.
+# How:  absent (None) = byte-identical behaviour and the same lock scopes as before. No change to what is captured, what is
+#       written, the atomic chain, the guardian gate, the manifest or the generation ring: the callback runs before all of
+#       them and touches none of them. The daemon passes a releaser for the _concurrent_lock it holds.
 # [2026-10-07] Claude Opus 5.5 (lane guardian-1051) — #1051 reconciled synapse gate: host wiring
 # (PROTECTED CHANGE on review branch cc-laptop-guardian-1051-20261007 ONLY; merges only after Josh's protected-file "proceed")
 # What: four small additions, all inert unless NG_GUARDIAN_RECONCILE is on (then checkpoint_guardian arms them):
@@ -1572,7 +1584,8 @@ class NeuroGraphMemory:
             failure.checkpoint_component = stage
             raise failure from exc
 
-    def save(self, *, with_receipt: bool = False) -> "str | Dict[str, Any]":
+    def save(self, *, with_receipt: bool = False,
+             after_capture: Optional[Any] = None) -> "str | Dict[str, Any]":
         """Save graph state to checkpoint.
 
         Legacy return contract (``with_receipt=False``, the default):
@@ -1644,6 +1657,13 @@ class NeuroGraphMemory:
 
         Caller must NOT hold the graph mutation lock. Capture acquires it briefly;
         a separate per-instance lock serializes publication. No clock advances.
+
+        ``after_capture`` (optional, #1161 / #1123): a no-argument callable run
+        exactly once, right after the capture returns or raises (or the
+        ownership check refuses), before the guardian permit and before any
+        write. A caller holding an outer lock (the CC daemon's
+        ``_concurrent_lock``) uses it to release that lock for the write. Its
+        own exceptions are logged and ignored. ``None`` = unchanged behaviour.
         """
         # #423: every line of receipt bookkeeping below is guarded by
         # `with_receipt`; detached capture is common to both return modes.
@@ -1689,12 +1709,20 @@ class NeuroGraphMemory:
                 }
 
             try:
-                owns_mutation_lock = getattr(self.graph._step_lock, "_is_owned", None)
-                if not callable(owns_mutation_lock):
-                    raise RuntimeError("checkpoint requires an ownership-aware canonical RLock")
-                if owns_mutation_lock():
-                    raise RuntimeError("save called while holding graph mutation lock; release it before publication")
-                captured = self._capture_checkpoint_state()
+                try:
+                    owns_mutation_lock = getattr(self.graph._step_lock, "_is_owned", None)
+                    if not callable(owns_mutation_lock):
+                        raise RuntimeError("checkpoint requires an ownership-aware canonical RLock")
+                    if owns_mutation_lock():
+                        raise RuntimeError("save called while holding graph mutation lock; release it before publication")
+                    captured = self._capture_checkpoint_state()
+                finally:
+                    # #1161 / #1123: the snapshot is complete (or refused); the caller may drop its outer lock now.
+                    if after_capture is not None:
+                        try:
+                            after_capture()
+                        except Exception:  # noqa: BLE001 -- a caller's releaser must never fail the save
+                            logger.exception("save(after_capture=...) callback raised; the save continues")
             except Exception as exc:
                 if not with_receipt:
                     raise
