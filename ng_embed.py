@@ -23,6 +23,19 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-10-23] Claude Code (Opus 5.5, laptop; #920 / #922, Josh "go ahead" 2026-10-23; P503: trying is allowed, NO re-vendor)
+#   What: (1) NEW NGEmbed.prepare_dual_record(content): the pure COMPUTE half of dual_record_outcome (TID concept
+#         extraction + the tree embeddings), writes nothing, takes no lock. (2) dual_record_outcome(..., prepared=)
+#         keyword-only: with a prepare_dual_record() result it skips the extraction and the tree embedding and only
+#         WRITES; prepared=None (default) is the old single call, unchanged. (3) _tid_extract_window remembers the
+#         exception CLASS of the last failed TID call (self._last_failure_class; stats["dual_pass"]["last_failure_class"])
+#         and the rate-limited R3 WARNING names it (class name only, never str(exc)).
+#   Why:  #920/P497(4): the slow TID call ran under the CC daemon's _concurrent_lock (one call per 2000-char window,
+#         up to tid_timeout=30 s each), so a slow TID made hooks and the Tonic wait. Compute outside, commit inside.
+#         And the poison-turn diagnosis (2026-10-23) found the failing calls invisible: requests gives up at
+#         tid_timeout, uvicorn then drops TID's access line for the disconnected client, and the class was only at debug.
+#   How:  R3 is unchanged: a None extraction still raises DualPassIncompleteError before ANY write, on both paths.
+#         Canonical change on the NG review branch cc-laptop-poison-920-20261023 only; NOT re-vendored anywhere.
 # [2026-10-15] Claude Code (Opus 5.5, Executive; Josh "#1115 is good") — #1115: embeddings are batch-invariant
 #   What: _onnx_embed_ids_batch runs each sequence through the ONNX session on its own (shape [1, len]).
 #   Why:  the int8 dynamically-quantized model computes activation scales over the whole batch tensor, so the
@@ -415,6 +428,7 @@ class NGEmbed:
         # stays the cumulative truth.
         self._last_extract_warn = 0.0
         self._failures_at_last_warn = 0
+        self._last_failure_class = None   # [2026-10-23] #920: class name of the last failed TID call
 
     # -- Singleton -----------------------------------------------------------
 
@@ -1064,6 +1078,7 @@ class NGEmbed:
         metadata: Optional[Dict[str, Any]] = None,
         *,
         windows: Optional[Sequence[EmbedWindow]] = None,
+        prepared: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Dual-pass learning: forest embedding + tree concept extraction.
 
@@ -1083,6 +1098,13 @@ class NGEmbed:
             metadata: Additional metadata dict.
             windows: Optional precomputed EmbedWindow sequence. Echoed
                 into result["windows"] when non-empty; not deposited here.
+            prepared: Optional result of prepare_dual_record(content) for
+                THIS content (2026-10-23, #920/#922): the extraction and
+                the tree embeddings were computed earlier (outside the
+                caller's lock); this call only writes. A prepared
+                extraction failure (concepts None) takes the SAME R3 path:
+                WARNING + signal_error + DualPassIncompleteError, no write.
+                None (default) = extract and embed here, as before.
 
         Returns:
             {
@@ -1095,7 +1117,10 @@ class NGEmbed:
         """
         # Extract before any write. None = TID broke (raise, no deposit).
         # [] = completed dual-pass with zero trees (write forest).
-        concepts = self._extract_concepts(content)
+        if prepared is not None:
+            concepts = prepared.get("concepts")
+        else:
+            concepts = self._extract_concepts(content)
         if concepts is None:
             # Warn + signal RATE-LIMITED (see _extraction_warn_due): when
             # TID is permanently absent every deposit fails, so per-deposit
@@ -1105,8 +1130,9 @@ class NGEmbed:
                 logger.warning(
                     "dual_record_outcome[%s]: concept extraction FAILED — no deposit "
                     "(R3 atomicity); cumulative TID extraction failures=%d "
-                    "(+%d since last warn — TID absent/unreachable)",
+                    "(+%d since last warn — TID absent/unreachable); last_failure=%s",
                     target_id, self._failures, _since,
+                    (prepared or {}).get("failure_class") or getattr(self, "_last_failure_class", None) or "-",
                 )
                 _signal = getattr(ecosystem, "signal_error", None)
                 if callable(_signal):
@@ -1123,7 +1149,15 @@ class NGEmbed:
             )
 
         # Embed trees before any write so embed failure leaves no forest.
-        tree_embeddings = self.embed_batch(concepts) if concepts else []
+        if prepared is not None:
+            tree_embeddings = list(prepared.get("tree_embeddings") or [])
+            if len(tree_embeddings) != len(concepts):
+                raise DualPassIncompleteError(
+                    f"prepared dual pass for {target_id} has {len(tree_embeddings)} tree embeddings "
+                    f"for {len(concepts)} concepts; no deposit"
+                )
+        else:
+            tree_embeddings = self.embed_batch(concepts) if concepts else []
 
         # Workstream 2 (#274, 2026-05-31): use record_outcome_broadcast when
         # the ecosystem supports it; fall back to record_outcome for
@@ -1190,6 +1224,29 @@ class NGEmbed:
         )
 
         return result
+
+    def prepare_dual_record(self, content: str) -> Dict[str, Any]:
+        """The pure COMPUTE half of dual_record_outcome (2026-10-23, #920/#922).
+
+        Runs the TID concept extraction and embeds the concepts, and nothing
+        else: no ecosystem, no write, no lock. Pass the result to
+        dual_record_outcome(..., prepared=) for the SAME content to write.
+
+        Returns {"concepts": [str] | None, "tree_embeddings": [np.ndarray],
+        "failure_class": str | None}. concepts None = the extraction FAILED
+        (failure_class = the exception class of the failed TID call, e.g.
+        "ReadTimeout", or "extraction_failed"); dual_record_outcome then
+        raises DualPassIncompleteError without writing (R3). An embedding
+        failure raises here (EmbeddingUnavailableError), as it would have
+        inside dual_record_outcome, before any write.
+        """
+        self._last_failure_class = None
+        concepts = self._extract_concepts(content)
+        if concepts is None:
+            return {"concepts": None, "tree_embeddings": [],
+                    "failure_class": self._last_failure_class or "extraction_failed"}
+        tree_embeddings = self.embed_batch(concepts) if concepts else []
+        return {"concepts": concepts, "tree_embeddings": list(tree_embeddings), "failure_class": None}
 
     def _create_substrate_link(
         self,
@@ -1281,6 +1338,7 @@ class NGEmbed:
             # caller (dual_record_outcome) so a permanently-absent TID doesn't flood
             # the log; the per-call exception detail stays at debug.
             self._failures += 1
+            self._last_failure_class = type(exc).__name__
             logger.debug("Concept extraction failed (TID): %s", exc)
             return None
 
@@ -1373,6 +1431,7 @@ class NGEmbed:
                 "extractions": self._extractions,
                 "concepts_total": self._concepts_total,
                 "failures": self._failures,
+                "last_failure_class": getattr(self, "_last_failure_class", None),
                 "avg_concepts": (
                     round(self._concepts_total / self._extractions, 1)
                     if self._extractions > 0 else 0
