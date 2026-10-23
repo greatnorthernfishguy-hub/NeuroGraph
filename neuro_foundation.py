@@ -20,6 +20,10 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-23] Claude (lane stability-s7b) — S7b law-review LOWs (PROTECTED CHANGE, its own commit, review branch only):
+#   relax set alone (no N keys) on a native graph now logs its ERROR instead of being hidden by the all-off early return
+#   (L7; the early check uses _STAB_S7B_KEYS, L8); a fractional node_homeo_relax_window is refused with the ERROR instead
+#   of being truncated (L12). Behaviour with relax absent unchanged.
 # [2026-10-23] Claude (lane stability-s7b, #1136 / #1141; Josh 2026-10-23 ~07:15 "go ahead and start on that node at the
 #   limit work" = S7 dev-log §8 option (a)) — gain relaxation for afferented nodes whose input succeeds. SWITCHES AND
 #   WIRING ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s7b-20261023 ONLY, its own commit; merges only
@@ -4482,10 +4486,14 @@ class Graph:
         ik = [k for k in self._STAB_I_KEYS if c.get(k, False)]
         # [2026-10-22] S6 (#1136): the breaker and spontaneous activity stand alone; the quiet hold refines S (below)
         s6 = [k for k in self._STAB_S6_KEYS if c.get(k, False)]
-        # [2026-10-23] S7b (#1136): a relax key that cannot run says so even when everything else is off (dict graphs)
-        if c.get("node_homeo_relax_enabled", False) and not (getattr(self, "_native_nodes", False)
-                                                             and getattr(type(self.nodes), "stab_round", 0) >= 8):
-            self._stab_error_once(["node_homeo_relax_enabled"], "the native node store (S7b-round ng_tract)")
+        # [2026-10-23] S7b (#1136): a relax key that cannot run says so even when everything else is off (a dict graph, or
+        # relax set without the N keys it refines -- law review L7: the early return below would otherwise hide it)
+        s7b = [k for k in self._STAB_S7B_KEYS if c.get(k, False)]
+        if s7b and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 8):
+            self._stab_error_once(s7b, "the native node store (S7b-round ng_tract)")
+        elif s7b and not nd:
+            self._stab_error_once(s7b, "node_homeo_evidence_enabled + node_homeo_slow_enabled + "
+                                       "node_homeo_input_evidence_enabled (relax refines slow N and judges input received)")
         if not he and not nd and not inh_on and not s5 and not ik and not s6:
             return None
         bk_t = sp_t = None
@@ -4653,13 +4661,14 @@ class Graph:
         if t is not None and not (0.0 < step * t[0] <= 1.0):
             t = None
         if t is None or not (t[0] > 0.0 and math.isfinite(t[0]) and math.isfinite(t[1])
-                             and 0.0 <= t[3] <= t[2] <= fmin and t[4] >= 1.0 and math.isfinite(t[4])):
+                             and 0.0 <= t[3] <= t[2] <= fmin and t[4] >= 1.0 and math.isfinite(t[4])
+                             and t[4] == int(t[4])):
             self._stab_error_once(["node_homeo_relax_enabled"],
                                   "0 < node_homeo_relax_mult x the slow excitability step <= 1, finite "
                                   "node_homeo_relax_from, 0 <= node_homeo_relax_resume <= node_homeo_relax_stop <= "
-                                  "node_homeo_fail_min, node_homeo_relax_window >= 1")
+                                  "node_homeo_fail_min, node_homeo_relax_window a whole number >= 1")
             return None
-        return (t[0], t[1], t[2], t[3], float(int(t[4])))
+        return (t[0], t[1], t[2], t[3], t[4])
 
     def _stab_s6_standalone(self, c, s6) -> Tuple[Optional[tuple], Optional[tuple]]:
         """[2026-10-22] S6 (#1136): the bounded breaker's switch (True) and spontaneous activity's (p, q, seed), or None
