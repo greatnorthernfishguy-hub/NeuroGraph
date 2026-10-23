@@ -20,6 +20,21 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-23] Claude (lane stability-s7b, #1136 / #1141; Josh 2026-10-23 ~07:15 "go ahead and start on that node at the
+#   limit work" = S7 dev-log §8 option (a)) — gain relaxation for afferented nodes whose input succeeds. SWITCHES AND
+#   WIRING ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s7b-20261023 ONLY, its own commit; merges only
+#   after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: node_homeo_relax_enabled (read live, absent = off, NOT in DEFAULT_CONFIG; Rust only, needs the S7b wheel
+#       NodeStore.stab_round >= 8, node_homeo_evidence_enabled + node_homeo_slow_enabled +
+#       node_homeo_input_evidence_enabled, else ERROR once and off) + node_homeo_relax_mult 1.0 (the relax rate per
+#       scaling interval = the slow homeostat's excitability step x mult), node_homeo_relax_from 4.5 (entry at / near
+#       the rail), node_homeo_relax_stop 0.35 / node_homeo_relax_resume 0.2 (the hysteresis on fail_ema; 0 <= resume <=
+#       stop <= node_homeo_fail_min), node_homeo_relax_window 1000.0 (a success must be this recent, observed steps).
+#       HomeostaticRule.apply passes relax=(rate, from, stop, resume, window) to NodeStore.adapt_excitability.
+# Why:  hyperedge-store design §2.3 S7b row; S7 dev-log §5 / §8 (56 % of the cap plateau is S2's afferented-succeeding
+#       hold, a gain the rule never re-examines).
+# How:  one more _StabParams field (relax, None = off) and one keyword on the native call, only while on; every key
+#       absent = the S7 branch's calls exactly (no new arithmetic, no new checkpoint key).
 # [2026-10-22] Claude (lane stability-s6, #1136 / #1139 / #1166; Josh 2026-10-22 "I think that we should have some form of
 #   intrinsic spontaneous activity in NG, yes." + "And I concur with your recommendations for the next round, as well.")
 #   — S6: the bounded breaker, intrinsic spontaneous activity, the quiet hold on synaptic up-scaling. SWITCHES AND WIRING
@@ -2206,6 +2221,8 @@ class _StabParams(NamedTuple):
     breaker: Optional[tuple] = None   # #1139 (thr_rate, exc_rate, interval, default_threshold, slow, prop (unit, max) | None)
     spont: Optional[tuple] = None     # #1166 (p, q, seed): miniature PSPs before fire detection
     quiet: Optional[int] = None       # S6-3 window: hold S's up-scaling while the node receives no afferent input
+    # [2026-10-23] S7b (#1136): None = off (S7 exactly)
+    relax: Optional[tuple] = None     # (mult, from, stop, resume, window): gain relaxation of succeeding afferented nodes
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2340,6 +2357,10 @@ class HomeostaticRule(PlasticityRule):
         if _slow is not None and _st.agree:
             _tkw["agree"] = True
             _xkw["agree"] = True
+        # [2026-10-23] S7b (#1136): gain relaxation (a refinement of slow, judged by input received); the rate is the slow
+        # homeostat's own excitability step x mult
+        if _slow is not None and _st.relax is not None and _ev_in is not None:
+            _xkw["relax"] = (_exc_rate * _st.relax[0], _st.relax[1], _st.relax[2], _st.relax[3], _st.relax[4])
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
@@ -4436,6 +4457,8 @@ class Graph:
     _STAB_I_KEYS = ("interneurons_enabled", "interneuron_recruit_enabled")
     # [2026-10-22] S6 (#1136): need the S6 wheel (NodeStore.stab_round >= 7; spontaneous also SynapseStore >= 6)
     _STAB_S6_KEYS = ("breaker_homeo_enabled", "spontaneous_activity_enabled", "syn_scale_quiet_hold_enabled")
+    # [2026-10-23] S7b (#1136): needs the S7b wheel (NodeStore.stab_round >= 8); refines slow N, judged by input received
+    _STAB_S7B_KEYS = ("node_homeo_relax_enabled",)
 
     def _stab_error_once(self, keys, need: str) -> None:
         seen = self.__dict__.setdefault("_stab_err_logged", set())
@@ -4459,6 +4482,10 @@ class Graph:
         ik = [k for k in self._STAB_I_KEYS if c.get(k, False)]
         # [2026-10-22] S6 (#1136): the breaker and spontaneous activity stand alone; the quiet hold refines S (below)
         s6 = [k for k in self._STAB_S6_KEYS if c.get(k, False)]
+        # [2026-10-23] S7b (#1136): a relax key that cannot run says so even when everything else is off (dict graphs)
+        if c.get("node_homeo_relax_enabled", False) and not (getattr(self, "_native_nodes", False)
+                                                             and getattr(type(self.nodes), "stab_round", 0) >= 8):
+            self._stab_error_once(["node_homeo_relax_enabled"], "the native node store (S7b-round ng_tract)")
         if not he and not nd and not inh_on and not s5 and not ik and not s6:
             return None
         bk_t = sp_t = None
@@ -4553,6 +4580,7 @@ class Graph:
             else:
                 q_w = int(w)
         settle_on = "syn_scale_settle_enabled" in s2n and s_on
+        relax_t = self._stab_s7b_relax(c, s2n, s3n, n_on, in_on)
         leak_on = "he_threshold_leak_enabled" in s2h and c2 is not None
         he_t = (hab, "he_inject_respects_refractory" in he, c2, c3)
         if leak_on:
@@ -4595,7 +4623,43 @@ class Graph:
             breaker=(bk_t if bk_t is None else self._stab_s6_breaker(c, bk_t, n_on)),
             spont=sp_t,
             quiet=q_w,
+            relax=relax_t,
         )
+
+    def _stab_s7b_relax(self, c, s2n, s3n, n_on: bool, in_on: bool) -> Optional[tuple]:
+        """[2026-10-23] S7b (#1136): gain relaxation's (mult, from, stop, resume, window), or None (off; ERROR once when
+        the key is set but cannot run). Pure read of config."""
+        if not c.get("node_homeo_relax_enabled", False):
+            return None
+        if not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 8):
+            self._stab_error_once(["node_homeo_relax_enabled"], "the native node store (S7b-round ng_tract)")
+            return None
+        if not (n_on and "node_homeo_slow_enabled" in s3n and in_on and "node_homeo_input_evidence_enabled" in s2n):
+            self._stab_error_once(["node_homeo_relax_enabled"],
+                                  "node_homeo_evidence_enabled + node_homeo_slow_enabled + node_homeo_input_evidence_enabled "
+                                  "(relax refines slow N and judges input received)")
+            return None
+        try:
+            t = (float(c.get("node_homeo_relax_mult", 1.0)), float(c.get("node_homeo_relax_from", 4.5)),
+                 float(c.get("node_homeo_relax_stop", 0.35)), float(c.get("node_homeo_relax_resume", 0.2)),
+                 float(c.get("node_homeo_relax_window", 1000.0)))
+        except (TypeError, ValueError):
+            t = None
+        fmin = float(c.get("node_homeo_fail_min", 0.5))
+        # the kernel takes rate = the slow excitability step x mult in (0, 1]; out of range it would decline the pass
+        rule = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        step = ((float(rule.excitability_rate) if rule is not None else 0.01)
+                * float(c.get("node_homeo_slow_rate_mult", 0.2)))
+        if t is not None and not (0.0 < step * t[0] <= 1.0):
+            t = None
+        if t is None or not (t[0] > 0.0 and math.isfinite(t[0]) and math.isfinite(t[1])
+                             and 0.0 <= t[3] <= t[2] <= fmin and t[4] >= 1.0 and math.isfinite(t[4])):
+            self._stab_error_once(["node_homeo_relax_enabled"],
+                                  "0 < node_homeo_relax_mult x the slow excitability step <= 1, finite "
+                                  "node_homeo_relax_from, 0 <= node_homeo_relax_resume <= node_homeo_relax_stop <= "
+                                  "node_homeo_fail_min, node_homeo_relax_window >= 1")
+            return None
+        return (t[0], t[1], t[2], t[3], float(int(t[4])))
 
     def _stab_s6_standalone(self, c, s6) -> Tuple[Optional[tuple], Optional[tuple]]:
         """[2026-10-22] S6 (#1136): the bounded breaker's switch (True) and spontaneous activity's (p, q, seed), or None
