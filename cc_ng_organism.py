@@ -3,6 +3,28 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-23] Claude Code (Opus 5.5, laptop; #920 finished on the retry tract; Josh "go ahead" 2026-10-23, Exec P497/P498/P503)
+# What: (1) COMPUTE OUTSIDE, COMMIT INSIDE: NEW prepare_conversational_dual_pass(text) (forest embedding, windows and
+#       ng_embed.prepare_dual_record: the TID extraction + tree embeddings; no graph, no lock, never raises) and NEW
+#       prepare_ingest_tract(path, cache, ...) (reads the head of a tract WITHOUT truncating it and prepares up to N turns
+#       into a caller-owned cache keyed by sha256 of the raw frame). run_conversational_dual_pass(..., prepared=) and
+#       drain_ingest_tract(..., prepared=, prepared_only=) take a prepared turn and only WRITE; with prepared_only the drain
+#       stops at the first turn that was not prepared (reason "unprepared") instead of calling TID under the caller's lock.
+#       (2) POISON POLICY on the retry tract (P497 as ruled + the chief's literal count): drain_ingest_tract(..., max_retries=)
+#       counts a held/rotated failure per raw frame in a DURABLE sidecar <tract>.retries (JSON, atomic replace); the first
+#       failure in the main tract (the move to the retry tract) is attempt 1, each failure in the retry tract is one retry;
+#       once a frame has failed max_retries retries (= max_retries + 1 attempts) its exact raw bytes are appended WHOLE to the
+#       append-only <tract>.quarantine (O_APPEND, never truncated/capped/rotated; fsync of file and directory BEFORE the tract
+#       advances; idempotent tail check), ONE ERROR names the #907 hash (redact_node_id of the forest id) + the frame hash +
+#       the failure class, and state["quarantined_total"] counts it. A failed quarantine write keeps the frame in the tract.
+#       Nothing is discarded; nothing re-ingests from the quarantine file (a deliberate later act, #928).
+#       (3) The failure CLASS reaches the drain's lines: the prepared turn's failure_class (e.g. ReadTimeout), or
+#       stage-based ("commit_returned_false"/"absorb_raised:<Class>").
+# Why:  #920 (P497): with the retry tract (2026-10-03) a failing turn rotated for ever with no bound; the 2026-10-23 diagnosis
+#       found the failing calls are client-side TID timeouts (tid_timeout 30 s), and that the TID call ran under the daemon's
+#       _concurrent_lock (P497(4), #922, #1161). Defaults (max_retries=None, prepared=None, prepared_only=False) are the
+#       previous behaviour, unchanged.
+# How:  tests/test_cc_poison_retry_920.py. The vendored half is ng_embed.py's prepare_dual_record/prepared= (own commit).
 # [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — hyperedge member sets read UNDER graph._step_lock
 # What: generate_emergent_want's hyperedge completion snapshots every member set under graph._step_lock, then
 #       computes the implied nodes outside it.
@@ -3963,7 +3985,7 @@ def cc_update_probation(graph) -> list:
         return graduated
 
 
-def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict) -> bool:
+def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: dict, prepared: dict = None) -> bool:
     """Core dual-pass on one turn's text. Returns True on success, False on
     failure -- caller decides retry policy (this function does not enqueue).
     Mirrors canonical's _run_conversational_dual_pass, parameterized, EXCEPT that
@@ -3985,9 +4007,16 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
     a clean graph, so it equals one clean pass. False is never returned for a
     success and True is never returned after a partial write. A failure before
     the first write (nothing to undo) logs at debug, as before, and returns False.
+
+    prepared (2026-10-23, #920; default None = unchanged): a prepare_conversational_dual_pass(text) result for THIS text.
+    The windows and the TID extraction + tree embeddings come from it, so this call only WRITES (the caller can hold its
+    lock for the writes alone). A prepared extraction failure still goes through dual_record_outcome's R3 path (WARNING,
+    DualPassIncompleteError, no write); a prepare that could not even embed returns False before any write.
     """
     if graph is None or embedding is None:
         return False
+    if prepared is not None and prepared.get("ndr") is None:
+        return False   # the prepare could not embed / had no prepare_dual_record: nothing written, nothing to undo
     eco = None
     stage = "setup"
     _absent = object()
@@ -4000,14 +4029,18 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
         target_id = "cc:conv::" + hashlib.sha1(text.encode()).hexdigest()
         embedder = NGEmbed.get_instance()
         windows = ()
-        try:
-            windows = embedder.embed_windows(text).windows  # () on short turns
-        except Exception as win_exc:  # noqa: BLE001 — windows are extra topology
-            logger.debug("CC embed_windows failed (non-fatal, no window nodes): %s", win_exc)
+        if prepared is not None:
+            windows = tuple(prepared.get("windows") or ())
+        else:
+            try:
+                windows = embedder.embed_windows(text).windows  # () on short turns
+            except Exception as win_exc:  # noqa: BLE001 — windows are extra topology
+                logger.debug("CC embed_windows failed (non-fatal, no window nodes): %s", win_exc)
         meta = {"source": "cc_gateway", "creation_mode": "conversational",
                 "_forest_content": text}
         eco = _CCConversationalDualPassEco(graph, vector_db)
         stage = "dual_record"
+        _ndr_kw = {"prepared": prepared["ndr"]} if prepared is not None else {}
         _result = embedder.dual_record_outcome(
             ecosystem=eco,
             content=text,
@@ -4016,6 +4049,7 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
             success=True,
             strength=1.0,
             metadata=meta,
+            **_ndr_kw,
         )
         window_ids = []
         stage = "windows"
@@ -4186,11 +4220,225 @@ def cc_gateway_tract_path() -> str:
     return os.environ.get("CC_GATEWAY_TRACT_PATH", _DEFAULT_CC_GATEWAY_TRACT_PATH)
 
 
-def _apply_gateway_experience(graph, vector_db, state, entry):
-    """Canonical raw conversation embedding/dual-pass, shared by both drains."""
+def _apply_gateway_experience(graph, vector_db, state, entry, prepared: dict = None):
+    """Canonical raw conversation embedding/dual-pass, shared by both drains. prepared (2026-10-23, #920): a
+    prepare_conversational_dual_pass result for this entry's text -- the call then only writes."""
+    if prepared is not None:
+        return run_conversational_dual_pass(
+            graph, vector_db, entry.content, prepared.get("embedding"), state, prepared=prepared)
     from ng_embed import embed
     return run_conversational_dual_pass(
         graph, vector_db, entry.content, embed(entry.content), state)
+
+
+# ---- #920 (2026-10-23): compute outside the lock, commit inside; bounded retry -> quarantine on the retry tract ----
+_DRAIN_QUARANTINE_SUFFIX = ".quarantine"   # beside the tract: <tract>.quarantine, append-only, never capped/rotated/truncated
+_DRAIN_RETRIES_SUFFIX = ".retries"         # beside the tract: <tract>.retries, {sha256(frame): failed retries} (bookkeeping)
+
+
+def prepared_dual_pass_supported() -> bool:
+    """True when the loaded ng_embed has the compute/commit split (NGEmbed.prepare_dual_record + dual_record_outcome's
+    prepared=). A caller uses the prepared path only then; otherwise it keeps the single in-lock call."""
+    try:
+        import inspect
+        from ng_embed import NGEmbed
+        return (hasattr(NGEmbed, "prepare_dual_record")
+                and "prepared" in inspect.signature(NGEmbed.dual_record_outcome).parameters)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def prepare_conversational_dual_pass(text: str) -> dict:
+    """The COMPUTE half of one conversational dual pass (2026-10-23, #920 / P497(4)): the forest embedding, the windows,
+    and ng_embed's prepare_dual_record (the TID concept extraction + the tree embeddings). Touches no graph, takes no
+    lock, writes nothing, NEVER raises. Pass the result to run_conversational_dual_pass(..., prepared=) for the SAME text.
+
+    Returns {"embedding", "windows", "ndr", "ok", "failure_class", "seconds"}: ok is True only when the extraction
+    succeeded (a legitimate empty concept list is ok); failure_class is the failed TID call's exception class (e.g.
+    "ReadTimeout"), "extraction_failed", or "prepare_raised:<Class>" when an embedding raised (ndr is then None and the
+    commit returns False before any write). Class names only, never str(exc) or text."""
+    out = {"embedding": None, "windows": (), "ndr": None, "ok": False, "failure_class": None, "seconds": 0.0}
+    t0 = time.monotonic()
+    try:
+        from ng_embed import NGEmbed, embed as _ng_embed_fn
+        embedder = NGEmbed.get_instance()
+        out["embedding"] = _ng_embed_fn(text)
+        try:
+            out["windows"] = tuple(embedder.embed_windows(text).windows)
+        except Exception as win_exc:  # noqa: BLE001 -- windows are extra topology (as in the in-lock path)
+            logger.debug("CC embed_windows failed (non-fatal, no window nodes): %s", type(win_exc).__name__)
+        ndr = embedder.prepare_dual_record(text)
+        out["ndr"] = ndr
+        out["ok"] = ndr.get("concepts") is not None
+        out["failure_class"] = None if out["ok"] else (ndr.get("failure_class") or "extraction_failed")
+    except Exception as exc:  # noqa: BLE001
+        out["ndr"] = None
+        out["ok"] = False
+        out["failure_class"] = "prepare_raised:" + type(exc).__name__
+    out["seconds"] = time.monotonic() - t0
+    return out
+
+
+def _drain_frame_key(frame: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(frame).hexdigest()
+
+
+def prepare_ingest_tract(tract_path: str, cache: dict, max_entries: int, defer_over_bytes: int = 0,
+                         stop_on_failure: bool = False, should_stop=None) -> dict:
+    """Prepare (compute only) up to `max_entries` turns at the HEAD of a tract into `cache` (2026-10-23, #920 / P497(4)).
+
+    Run by the caller WITHOUT the graph lock, just before it drains the same tract under the lock with
+    drain_ingest_tract(prepared=cache, prepared_only=True). Reads the file and never writes or truncates it. Applies
+    the drain's own filters (entry type, source, empty text, and the oversize defer, which the drain moves aside
+    unattempted), so it prepares exactly the turns the drain will attempt, in order. Keys are sha256 of the raw frame
+    bytes; a key already in the cache is not prepared again (a success kept from an earlier cycle). With
+    stop_on_failure the pass stops after the FIRST failed prepare (one TID failure per pass at most).
+
+    Returns {"supported", "examined", "prepared", "cached", "failed", "classes", "seconds"}. Never raises."""
+    t0 = time.monotonic()
+    summary = {"supported": True, "examined": 0, "prepared": 0, "cached": 0, "failed": 0, "classes": {},
+               "seconds": 0.0}
+    if not prepared_dual_pass_supported():
+        summary["supported"] = False
+        return summary
+    try:
+        if max_entries <= 0 or not tract_path or not os.path.exists(tract_path):
+            return summary
+        import ng_tract
+        with open(tract_path, "rb") as f:
+            data = f.read()
+        if not data:
+            return summary
+        reader = ng_tract.TractReader(data)
+        off = 0
+        for entry in reader:
+            start, off = off, reader.position()
+            if entry.entry_type != ng_tract.ENTRY_EXPERIENCE or entry.source != "cc_gateway":
+                continue
+            text = entry.content
+            if not text or not text.strip():
+                continue
+            if defer_over_bytes and len(text) > defer_over_bytes:
+                continue
+            if summary["examined"] >= max_entries:
+                break
+            summary["examined"] += 1
+            key = _drain_frame_key(data[start:off])
+            if key in cache:
+                summary["cached"] += 1
+                continue
+            p = prepare_conversational_dual_pass(text)
+            cache[key] = p
+            if p["ok"]:
+                summary["prepared"] += 1
+            else:
+                summary["failed"] += 1
+                cls = p.get("failure_class") or "-"
+                summary["classes"][cls] = summary["classes"].get(cls, 0) + 1
+                if stop_on_failure:
+                    break
+            if should_stop is not None:
+                try:
+                    if should_stop():
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as exc:  # noqa: BLE001 -- a prepare failure only means the drain finds fewer prepared turns
+        logger.warning("CC ingest-tract prepare failed (non-fatal; the drain takes only what was prepared): %s",
+                       type(exc).__name__)
+    summary["seconds"] = time.monotonic() - t0
+    return summary
+
+
+def _drain_retries_load(tract_path: str) -> dict:
+    """The durable per-frame retry counts beside the tract ({} when absent or unreadable -- an unreadable file only
+    means some frames get extra attempts; nothing is lost either way)."""
+    try:
+        with open(tract_path + _DRAIN_RETRIES_SUFFIX, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return {str(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CC ingest-tract retry counts unreadable (%s): counting from zero", type(exc).__name__)
+        return {}
+
+
+def _drain_retries_save(tract_path: str, counts: dict) -> None:
+    """Atomic replace (tmp + fsync + rename) of <tract>.retries. Bookkeeping only (raw experience never lives here)."""
+    path = tract_path + _DRAIN_RETRIES_SUFFIX
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(counts, f, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CC ingest-tract retry counts not saved (%s): the next pass recounts from the last save",
+                       type(exc).__name__)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _drain_quarantine_mode(tract_path: str) -> int:
+    """Creation mode for a NEW quarantine file: never wider than the tract file's own mode (same raw bytes)."""
+    import stat
+    try:
+        return stat.S_IMODE(os.stat(tract_path).st_mode) & 0o666
+    except OSError:
+        return 0o600
+
+
+def _drain_quarantine_frame(tract_path: str, frame: bytes):
+    """Append `frame` (the exact raw bytes of ONE tract entry) WHOLE to `<tract_path>.quarantine`, durably.
+
+    APPEND-ONLY: O_WRONLY|O_APPEND|O_CREAT, never O_TRUNC; never read back and rewritten, capped, rotated or truncated
+    (the condensate-dataset rule). The file is a flat run of tract entries, the tract's own format. DURABLE before an
+    ok return, always: write, flush, fsync(file), fsync(directory). IDEMPOTENT: when the file already ENDS with
+    `frame` (a crash between this fsync and the tract rewrite re-quarantines the same frame) nothing is appended again;
+    a frame carries its own deposit stamp, so two distinct turns never have identical bytes.
+    Returns (ok, stored, exc_class): stored 'appended' | 'already_present' | None. NEVER raises."""
+    qpath = tract_path + _DRAIN_QUARANTINE_SUFFIX
+    try:
+        try:
+            size = os.path.getsize(qpath)
+        except FileNotFoundError:
+            size = None
+        present = False
+        if size is not None and size >= len(frame):
+            with open(qpath, "rb") as f:
+                f.seek(size - len(frame))
+                present = f.read(len(frame)) == frame
+        fd = os.open(qpath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, _drain_quarantine_mode(tract_path))
+        with os.fdopen(fd, "ab") as f:
+            if not present:
+                f.write(frame)
+            f.flush()
+            os.fsync(f.fileno())
+        dfd = os.open(os.path.dirname(os.path.abspath(qpath)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return (True, "already_present" if present else "appended", "-")
+    except Exception as exc:  # noqa: BLE001 -- the caller rotates the frame instead (never discards it)
+        return (False, None, type(exc).__name__)
+
+
+def _drain_turn_tags(frame: bytes, text: str):
+    """(#907 hash of the turn's forest id, frame hash) for a log line: `forest:<12 hex>` via the ONE redaction helper
+    cc_topology_merge.redact_node_id (never the id itself), and `entry:<12 hex of sha256(frame)>`. Never text."""
+    import hashlib
+    try:
+        from cc_topology_merge import redact_node_id
+        turn = redact_node_id("cc:conv::" + hashlib.sha1(text.encode()).hexdigest())
+    except Exception:  # noqa: BLE001 -- no helper: print no turn id at all rather than a raw one
+        turn = "forest:?"
+    return turn, "entry:%s" % _drain_frame_key(frame)[:12]
 
 
 def _cc_drain_size_cap(batch_nodes) -> int:
@@ -4223,7 +4471,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         batch_nodes: int = None, receipt: dict = None,
                         max_seconds: float = 0, retry_tract_path: str = None,
                         defer_tract_path: str = None, defer_over_bytes: int = 0,
-                        should_stop=None, hold_on_failure: bool = False):
+                        should_stop=None, max_retries: int = None, prepared: dict = None,
+                        prepared_only: bool = False, hold_on_failure: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -4329,6 +4578,24 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     (not drained automatically) -- one atomic dual pass over a 120 KB turn ran ~40
     sequential extractions and held the pass (and every save) for 40+ minutes.
     Scheduling by size only; nothing dropped, nothing labelled. Unset = unchanged.
+
+    prepared + prepared_only (2026-10-23, #920 / P497(4) "compute OUTSIDE, commit INSIDE"; default None/False =
+    unchanged): `prepared` is a cache filled by prepare_ingest_tract() WITHOUT the lock (keyed by sha256 of the raw
+    frame). A prepared turn is only WRITTEN here (no TID call, no embedding under the caller's lock); its cache entry is
+    removed once used. With prepared_only=True the pass STOPS at the first turn that has no prepared entry (receipt
+    reason "unprepared"; that turn and everything after it stay in the tract, nothing is attempted or counted), so the
+    caller's lock is never held across a TID call. With prepared_only=False an unprepared turn is computed inline.
+
+    max_retries (2026-10-23, #920 / P497, the chief's literal count; default None = unbounded, as before): applies ONLY
+    when hold_on_failure is on AND this pass rotates its own failures (retry_tract_path == tract_path, the retry pass).
+    The first failure happened in the main tract (moving the turn here); every failure here is one RETRY, counted per
+    raw frame in the durable sidecar <tract>.retries (survives restarts). A frame whose retries reach max_retries
+    (= max_retries + 1 attempts in all: default 5 -> 6 attempts) is QUARANTINED instead of rotated: its exact raw bytes
+    are appended WHOLE to the append-only <tract>.quarantine (fsync of file and directory BEFORE the tract advances;
+    never capped, rotated or truncated), ONE ERROR names the #907 turn hash, the frame hash and the failure class, and
+    state["quarantined_total"] is incremented. A FAILED quarantine write rotates the frame as before (one ERROR):
+    nothing is ever discarded. Re-ingest from the quarantine file is a deliberate later act (#928), never done here.
+    A TID outage reads as a failure too; the caller's prepare pass bounds that to one failure per pass.
     """
     def _ret(absorbed_n: int, consumed: bytes = b""):
         return (absorbed_n, consumed) if return_consumed else absorbed_n
@@ -4339,6 +4606,9 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                             turns_taken=0, reason="no_batch")
     ids_before = None   # set only when pacing or a receipt asked us to track arrivals
     ended = "tract_exhausted"
+    bounded = None      # #920: the retry bound, live only on a rotating hold pass with a positive int max_retries
+    retry_counts = None
+    retry_counts_dirty = False
 
     def _fill_receipt(reason: str, taken_n: int) -> None:
         if receipt is None:
@@ -4354,6 +4624,14 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     path = tract_path or cc_gateway_tract_path()
     if not os.path.exists(path):
         return _ret(0)
+    if (max_retries is not None and hold_on_failure and retry_tract_path
+            and os.path.abspath(retry_tract_path) == os.path.abspath(path)):
+        if isinstance(max_retries, int) and not isinstance(max_retries, bool) and max_retries > 0:
+            bounded = max_retries
+            retry_counts = _drain_retries_load(path)
+        else:
+            logger.warning("CC ingest-tract: max_retries is not a positive integer -- the retry bound is OFF for this "
+                           "pass (a failing retry rotates without a bound, as before #920)")
     try:
         import ng_tract
         from ng_embed import embed as ng_embed_fn
@@ -4411,27 +4689,82 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                     continue
                 except Exception as dexc:  # noqa: BLE001 - attempt it normally instead
                     logger.warning("CC ingest-tract defer append failed (%s); attempting the turn", type(dexc).__name__)
+            # #920: a prepared turn is only WRITTEN under the caller's lock; prepared_only stops at an unprepared one
+            # (left in the tract untouched and uncounted: it is prepared next cycle, outside the lock).
+            prep = None
+            frame_key = None
+            if prepared is not None or bounded is not None:
+                frame_key = _drain_frame_key(data[entry_start:consumed_offset])
+            if prepared is not None:
+                prep = prepared.pop(frame_key, None)
+                if prep is None and prepared_only:
+                    ended = "unprepared"
+                    consumed_offset = entry_start   # never past an unattempted turn (the hold-off path truncates this)
+                    break
             taken += 1
             hold_reason = None
             hold_exc_type = "-"
             try:
-                if _apply_gateway_experience(graph, vector_db, state, entry):
+                _ok = (_apply_gateway_experience(graph, vector_db, state, entry, prepared=prep) if prep is not None
+                       else _apply_gateway_experience(graph, vector_db, state, entry))
+                if _ok:
                     absorbed += 1
                     safe_offset = consumed_offset
+                    if bounded is not None and retry_counts.pop(frame_key, None) is not None:
+                        retry_counts_dirty = True   # it landed: its count ends
                 else:
                     hold_reason = "absorb_returned_false"
             except Exception as exc:
                 logger.debug("CC ingest-tract entry failed (non-fatal): %s", exc)
                 hold_reason = "absorb_raised"
                 hold_exc_type = type(exc).__name__
+            if hold_reason is not None and bounded is not None:
+                # #920: one more retry for this frame (durable count); at the bound QUARANTINE it instead of rotating.
+                fail_class = ((prep.get("failure_class") or "commit_failed") if prep is not None
+                              else ("absorb_raised:" + hold_exc_type if hold_exc_type != "-" else "absorb_returned_false"))
+                frame = data[entry_start:consumed_offset]
+                n = int(retry_counts.get(frame_key, 0)) + 1
+                retry_counts[frame_key] = n
+                retry_counts_dirty = True
+                turn_tag, entry_tag = _drain_turn_tags(frame, text)
+                if n >= bounded:
+                    ok, stored, qexc = _drain_quarantine_frame(path, frame)
+                    qname = os.path.basename(path) + _DRAIN_QUARANTINE_SUFFIX
+                    if ok:
+                        safe_offset = consumed_offset
+                        retry_counts.pop(frame_key, None)
+                        if stored == "appended":
+                            try:
+                                state["quarantined_total"] = int(state.get("quarantined_total", 0)) + 1
+                            except Exception:  # noqa: BLE001 -- bookkeeping; the frame is already durable
+                                pass
+                        logger.error(
+                            "CC ingest-tract QUARANTINED: turn=%s %s class=%s reason=%s exc_type=%s -- quarantining "
+                            "after %d attempts (= max_retries + 1), max_retries=%d; the raw frame is durably in %s "
+                            "(append-only, never truncated; stored=%s) and the retry tract moves past it; nothing was "
+                            "discarded; re-ingest is a deliberate separate act",
+                            turn_tag, entry_tag, fail_class, hold_reason, hold_exc_type, n + 1, bounded, qname, stored)
+                        hold_reason = None
+                    else:
+                        logger.error(
+                            "CC ingest-tract QUARANTINE FAILED: turn=%s %s class=%s quarantine_exc_type=%s file=%s -- "
+                            "the frame is rotated to the end of the retry tract instead; nothing was discarded",
+                            turn_tag, entry_tag, fail_class, qexc, qname)
+                else:
+                    logger.warning(
+                        "CC ingest-tract retry failed: turn=%s %s class=%s reason=%s exc_type=%s retry=%d of "
+                        "max_retries=%d -- rotated to the end of the retry tract",
+                        turn_tag, entry_tag, fail_class, hold_reason, hold_exc_type, n, bounded)
             if hold_on_failure and hold_reason is not None and retry_tract_path:
                 try:
                     with open(retry_tract_path, "ab") as rf:
                         rf.write(data[entry_start:consumed_offset])
                     safe_offset = consumed_offset
-                    logger.warning(
-                        "CC ingest-tract retry: reason=%s exc_type=%s -- failed entry moved whole "
-                        "to the retry tract; the pass continues", hold_reason, hold_exc_type)
+                    if bounded is None:
+                        logger.warning(
+                            "CC ingest-tract retry: reason=%s exc_type=%s%s -- failed entry moved whole "
+                            "to the retry tract; the pass continues", hold_reason, hold_exc_type,
+                            (" class=%s" % (prep.get("failure_class") or "commit_failed")) if prep is not None else "")
                     hold_reason = None
                 except Exception as rexc:  # noqa: BLE001 - falls through to the hold below
                     logger.warning("CC ingest-tract retry append failed (%s); holding instead",
@@ -4479,6 +4812,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
         _fill_receipt("parse_failed", taken)
         return _ret(absorbed)  # consumed=b"" -- nothing was truncated
 
+    if retry_counts_dirty:
+        _drain_retries_save(path, retry_counts)   # #920: before the rewrite; a crash in between = one extra attempt
     _fill_receipt(ended, taken)
     # Truncate only the bytes we actually consumed. miniTID is a separate
     # process that only appends; if it appends between our initial read and

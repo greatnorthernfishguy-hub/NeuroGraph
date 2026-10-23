@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-10-23] Claude Code (Opus 5.5) — #920: the signature pin lists max_retries, prepared, prepared_only (before hold_on_failure). Test-only.
 # [2026-10-17] Claude Code (Opus 5.5) — #1123: should_stop pinned (signature list) + three behaviour tests at the end.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4, dispatch #14658) — N8 (TRIAL branch, test-only): F-A, the stale
 #   cross-change pin. test_signature_hold_on_failure_is_last_and_defaults_false pinned the exact pre-D24 signature; with D24 in the same tree
@@ -231,7 +232,8 @@ def test_signature_hold_on_failure_is_last_and_defaults_false():
                            "max_seconds",   # MVP 2026-10-03: the wall-time cap per pass
                            "retry_tract_path",   # MVP 2026-10-03: failed turns move aside, nothing dropped
                            "defer_tract_path", "defer_over_bytes",   # MVP 2026-10-03: oversize turns wait aside
-                           "should_stop"]   # 2026-10-17 #1123: a stopping host ends the pass between turns
+                           "should_stop",   # 2026-10-17 #1123: a stopping host ends the pass between turns
+                           "max_retries", "prepared", "prepared_only"]   # 2026-10-23 #920: bound + compute outside the lock
     assert params[-1] == "hold_on_failure"
     assert sig.parameters["hold_on_failure"].default is False
 
