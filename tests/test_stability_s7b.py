@@ -9,6 +9,8 @@
 #       census reports "relax"; NodeStore.s7b_rows reads the per-row state. (3) nothing new is saved.
 # Why:  hyperedge-store design §2.3 S7b row; S7 dev-log §8 option (a).
 # How:  oracle via `git show b5bbed4:neuro_foundation.py` (tests.test_hyperedge_store_h2._load); the S / S6 helpers.
+# [2026-10-23] Claude (lane stability-s7b) — law review: + relax alone on a native graph -> ERROR (L7), + a fractional
+#   window is refused (L12).
 # -------------------
 """#1136 round S7b: gain relaxation of afferented nodes whose input succeeds."""
 import logging
@@ -69,7 +71,7 @@ def test_keys_not_in_default_config():
 
 @needs_s7b
 @pytest.mark.parametrize("case", ["no_slow", "no_input_evidence", "stop_over_fail_min", "resume_over_stop",
-                                  "bad_window", "bad_mult"])
+                                  "bad_window", "fractional_window", "bad_mult"])
 def test_misconfigured_relax_logs_error_once_and_changes_nothing(case, caplog):
     cfg, extra = S7_ARM, dict(node_homeo_relax_enabled=True)
     if case == "no_slow":
@@ -83,6 +85,7 @@ def test_misconfigured_relax_logs_error_once_and_changes_nothing(case, caplog):
         extra.update({"stop_over_fail_min": dict(node_homeo_relax_stop=0.6),
                       "resume_over_stop": dict(node_homeo_relax_resume=0.4),
                       "bad_window": dict(node_homeo_relax_window=0.0),
+                      "fractional_window": dict(node_homeo_relax_window=1000.5),
                       "bad_mult": dict(node_homeo_relax_mult=1e6)}[case])
     start = H2.built(0)
     t = S.Pair(restore_as(CMOD, "native", start), restore_as(NF, "native", start), 0)
@@ -107,6 +110,20 @@ def test_relax_on_a_dict_backed_graph_logs_error_and_stays_off(caplog):
     with caplog.at_level(logging.ERROR):
         S.drive(t, random.Random(0), 10)
     assert any("S7b-round" in r.getMessage() for r in caplog.records)
+    t.b.g.config.pop("node_homeo_relax_enabled")
+    assert ckpt(t.a.g) == ckpt(t.b.g)
+
+
+@needs_s7b
+def test_relax_alone_on_a_native_graph_logs_error_and_stays_off(caplog):
+    # [2026-10-23] law review L7: relax set with none of the N keys it refines
+    start = H2.built(0)
+    t = S.Pair(restore_as(CMOD, "native", start), restore_as(NF, "native", start), 0)
+    t.b.g.config.update(node_homeo_relax_enabled=True)
+    with caplog.at_level(logging.ERROR):
+        S.drive(t, random.Random(0), 10)
+    errs = [r for r in caplog.records if "node_homeo_relax_enabled" in r.getMessage() and r.levelno == logging.ERROR]
+    assert len(errs) == 1, [r.getMessage() for r in errs]
     t.b.g.config.pop("node_homeo_relax_enabled")
     assert ckpt(t.a.g) == ckpt(t.b.g)
 
