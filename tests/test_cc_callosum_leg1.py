@@ -1,6 +1,9 @@
 # tests/test_cc_callosum_leg1.py
 #
 # ---- Changelog ----
+# [2026-10-23 night] Claude Code (Opus 5.5, laptop) — #1176: test_drain_ingest_tract_return_consumed_empty_when_truncate_write_fails
+#   injects the failure at the trim's new commit point (os.replace onto the tract) instead of open(path, "wb"); same assertions
+#   (+ the tract still holds the entry).
 # [2026-09-11] Codex — isolate local/trickle tests; receipt gateway cases moved
 #   to test_cc_gateway_durable.py. No real NG/model fixture.
 # [2026-07-27] Claude Code (Sonnet 5) — CC Corpus Callosum Leg 1 (#70) tests
@@ -397,20 +400,24 @@ def test_drain_ingest_tract_return_consumed_empty_when_truncate_write_fails(
     the unconditional `data` a naive fix would still report."""
     import builtins
     import ng_tract
+    real_open = builtins.open
     tract_path = str(tmp_path / "turns.tract")
     ng_tract.deposit_experience(
         raw=b"a turn whose truncate write fails",
         source="cc_gateway", tract_paths=[tract_path],
     )
 
-    real_open = builtins.open
+    # [2026-10-23 night] #1176: the trim is no longer open(path, "wb") but a write to <tract>.trim-tmp + an atomic
+    # os.replace onto the tract (cc_ng_organism._drain_trim_head_locked); the simulated failure moves to that commit point.
+    import os as _os
+    real_replace = _os.replace
 
-    def _flaky_open(path, mode="r", *args, **kwargs):
-        if str(path) == tract_path and mode == "wb":
+    def _flaky_replace(src, dst, *args, **kwargs):
+        if str(dst) == tract_path:
             raise OSError("simulated disk-full on truncate write")
-        return real_open(path, mode, *args, **kwargs)
+        return real_replace(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "open", _flaky_open)
+    monkeypatch.setattr(_os, "replace", _flaky_replace)
 
     absorbed, consumed = drain_ingest_tract(
         cc_ng.graph, cc_ng.vector_db, {"last_forest_id": None},
@@ -418,6 +425,8 @@ def test_drain_ingest_tract_return_consumed_empty_when_truncate_write_fails(
 
     assert absorbed >= 1        # the entry WAS absorbed into the dual-pass
     assert consumed == b""      # but the truncate write never landed
+    with real_open(tract_path, "rb") as f:
+        assert f.read()         # and the tract still holds the entry (nothing half-written)
 
 
 
