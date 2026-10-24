@@ -15,9 +15,13 @@
 #       forest id) and sends every later copy of a quarantined text straight to <retry tract>.quarantine, whole, with no
 #       attempt (index <retry tract>.quarantine.texts, rebuilt from the quarantine file when stale);
 #       prepare_ingest_tract(quarantine_base=) does not prepare (no TID call) a quarantined text.
-#       state quarantined_copies_total. (3) #1176: the head trim holds miniTID's own tract lock (flock LOCK_EX on the
-#       tract file) across the re-read and an in-place rewrite (_drain_trim_head_locked), so an append can no longer land
-#       between them and be erased; a file that no longer starts with the consumed prefix is left untouched.
+#       state quarantined_copies_total. A "copy" = within CC_NG_DRAIN_COPY_WINDOW_S (default 1800) of the text's latest
+#       quarantined frame; a later genuine recurrence is attempted normally (law review 2026-10-23, finding 2).
+#       (3) #1176: the head trim holds miniTID's own tract lock (flock LOCK_EX on the tract's inode) across the re-read
+#       and an ATOMIC RENAME of the remainder over the tract (_drain_trim_head_locked; review finding 3: an in-place
+#       rewrite could be cut by a crash and wedge the tract), so an append can no longer land between them and be erased.
+#       Needs the #1173 miniTID (append_frame_locked re-opens the path when its locked inode was renamed away); with the
+#       OLD miniTID a writer blocked during a trim would append to the replaced inode. Install / roll back together.
 # Why:  #1173 (dev-log 2026-10-23_turn-duplication-1173): ~94 % of turns.tract frames were copies; every copy ran TID and
 #       added parallel topology. #920 per frame gave each copy its own 6 attempts. #1176: the read-then-"wb" trim could
 #       erase a concurrent miniTID append (raw experience, LAW 7).
@@ -4457,6 +4461,7 @@ def prepare_ingest_tract(tract_path: str, cache: dict, max_entries: int, defer_o
     summary = {"supported": True, "examined": 0, "prepared": 0, "cached": 0, "failed": 0, "classes": {},
                "seconds": 0.0}
     qtexts = None
+    copy_window = drain_copy_window_s()
     if quarantine_base:
         summary["quarantined_skipped"] = 0
         try:
@@ -4488,8 +4493,8 @@ def prepare_ingest_tract(tract_path: str, cache: dict, max_entries: int, defer_o
             if summary["examined"] >= max_entries:
                 break
             summary["examined"] += 1
-            if qtexts and _drain_text_key(text) in qtexts:
-                summary["quarantined_skipped"] += 1   # #920 per text: no TID call for a quarantined text
+            if qtexts and _drain_is_quarantined_copy(qtexts, _drain_text_key(text), entry.timestamp, copy_window):
+                summary["quarantined_skipped"] += 1   # #920 per text: no TID call for a copy of a quarantined text
                 continue
             key = _drain_frame_key(data[start:off])
             if key in cache:
@@ -4597,7 +4602,35 @@ def _drain_quarantine_frame(tract_path: str, frame: bytes):
 
 
 # ---- #920 per text (2026-10-23, #1173; Josh's approval): count retries and quarantine by the TEXT (the #907 forest id) ----
-_DRAIN_QTEXTS_SUFFIX = ".quarantine.texts"   # beside the quarantine file: {"size": bytes, "texts": {sha1(text): copies}}
+_DRAIN_QTEXTS_SUFFIX = ".quarantine.texts"   # beside the quarantine file: {"size", "texts": {sha1(text): [frames, last_ts]}}
+
+
+def drain_copy_window_s() -> float:
+    """CC_NG_DRAIN_COPY_WINDOW_S (LAW 5, default 1800 = the 30-min burst rule miniTID and the backlog collapse use): a frame
+    of an already-quarantined text is a COPY (straight to quarantine) only when its deposit stamp is within this window of
+    the latest quarantined frame of that text. A later occurrence is a genuine recurrence and is attempted normally."""
+    try:
+        v = float(os.environ.get("CC_NG_DRAIN_COPY_WINDOW_S", "1800"))
+        return v if v > 0 else 1800.0
+    except ValueError:
+        return 1800.0
+
+
+def _drain_is_quarantined_copy(qtexts: dict, tkey: str, ts: float, window_s: float) -> bool:
+    """True when `tkey` is quarantined AND this frame's stamp is within window_s of its latest quarantined frame."""
+    rec = qtexts.get(tkey)
+    if not rec:
+        return False
+    try:
+        return abs(float(ts) - float(rec[1])) <= window_s
+    except Exception:  # noqa: BLE001 -- an unreadable record: attempt the frame normally (costs a TID call, loses nothing)
+        return False
+
+
+def _drain_qtexts_note(qtexts: dict, tkey: str, ts: float, appended: bool) -> None:
+    """Record one more quarantined frame of `tkey` (count when appended) and slide its latest stamp forward."""
+    n, last = (qtexts.get(tkey) or [0, 0.0])
+    qtexts[tkey] = [int(n) + (1 if appended else 0) or 1, max(float(last), float(ts or 0.0))]
 
 
 def _drain_text_key(text: str) -> str:
@@ -4607,7 +4640,7 @@ def _drain_text_key(text: str) -> str:
 
 
 def _drain_qtexts_rebuild(qbase: str) -> dict:
-    """{sha1(text): frames} counted from <qbase>.quarantine itself (the durable truth). {} when absent."""
+    """{sha1(text): [frames, latest deposit stamp]} counted from <qbase>.quarantine itself (the durable truth)."""
     texts = {}
     qpath = qbase + _DRAIN_QUARANTINE_SUFFIX
     try:
@@ -4619,7 +4652,8 @@ def _drain_qtexts_rebuild(qbase: str) -> dict:
     for entry in ng_tract.TractReader(data):
         if entry.entry_type == ng_tract.ENTRY_EXPERIENCE and entry.content:
             k = _drain_text_key(entry.content)
-            texts[k] = texts.get(k, 0) + 1
+            n, last = texts.get(k, [0, 0.0])
+            texts[k] = [n + 1, max(last, float(entry.timestamp))]
     return texts
 
 
@@ -4637,7 +4671,7 @@ def _drain_qtexts_load(qbase: str) -> dict:
         with open(qbase + _DRAIN_QTEXTS_SUFFIX, "r", encoding="utf-8") as f:
             d = json.load(f)
         if isinstance(d, dict) and int(d.get("size", -1)) == size and isinstance(d.get("texts"), dict):
-            return {str(k): int(v) for k, v in d["texts"].items()}
+            return {str(k): [int(v[0]), float(v[1])] for k, v in d["texts"].items()}
     except FileNotFoundError:
         pass
     except Exception as exc:  # noqa: BLE001
@@ -4675,29 +4709,46 @@ def _drain_qtexts_save(qbase: str, texts: dict) -> None:
 
 
 def _drain_trim_head_locked(path: str, consumed_prefix: bytes) -> bytes:
-    """#1176 (2026-10-23): remove `consumed_prefix` from the head of the tract at `path` WITHOUT losing an append.
+    """#1176 (2026-10-23): remove `consumed_prefix` from the head of the tract at `path` WITHOUT losing an append and
+    without a crash window.
 
-    miniTID appends with flock(LOCK_EX) on the tract file itself (ng_tract deposit_to_file: open by path with
-    O_APPEND, LOCK_EX, write, unlock; Condensate rust_core/vendor/ng_tract/src/write.rs). This trim takes the SAME lock
-    on the SAME inode for the whole re-read + rewrite, so no append can land between them (before: a re-read, then
-    open(path, "wb"), and an append in between was erased). The rewrite is in place (same inode -- a rename would leave
-    a writer blocked on the old inode appending to an unlinked file): seek(0), write the remainder, truncate, fsync. The
-    lock is held only for this (milliseconds; a miniTID append waits that long). When the file no longer starts with
-    the prefix (someone else rewrote it) NOTHING is written (before: it was written back unchanged, itself a race).
-    Returns the bytes actually removed (b"" when nothing was removed). Raises on an I/O error (the caller logs it)."""
+    miniTID appends with flock(LOCK_EX) on the tract file it opened by path (O_APPEND). This trim takes the SAME lock on
+    the tract's CURRENT inode for the whole re-read + replace, so no append can land between them (before: a re-read,
+    then open(path, "wb"), and an append in between was erased). The remainder is written to `<tract>.trim-tmp`,
+    fsynced and RENAMED over the tract (atomic: a crash leaves either the whole old tract -- its consumed prefix is then
+    absorbed again, the long-standing crash-after-absorb case -- or the whole new one; never a half-written file), then
+    the directory is fsynced, and only then is the lock released. A writer that was blocked on the old inode re-checks
+    after it gets the lock and re-opens the path (the #1173 miniTID's append_frame_locked does: Condensate minitid.rs),
+    so its frame lands in the new tract. When the file no longer starts with the prefix, or the path is no longer the
+    inode we locked (another trim replaced it), NOTHING is written. Returns the bytes removed (b"" when none). Raises on
+    an I/O error (the caller logs it; the tract is then unchanged)."""
     import fcntl
-    with open(path, "r+b") as f:
+    with open(path, "rb") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
+            if os.stat(path).st_ino != os.fstat(f.fileno()).st_ino:
+                return b""
             current = f.read()
             if not current.startswith(consumed_prefix):
                 return b""
-            remainder = current[len(consumed_prefix):]
-            f.seek(0)
-            f.write(remainder)
-            f.truncate()
-            f.flush()
-            os.fsync(f.fileno())
+            tmp = path + ".trim-tmp"
+            mode = os.fstat(f.fileno()).st_mode & 0o777
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            try:
+                view = memoryview(current)[len(consumed_prefix):]
+                while view:
+                    n = os.write(fd, view)
+                    view = view[n:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+            dfd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
             return consumed_prefix
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
@@ -4875,13 +4926,17 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     hold_on_failure and a retry_tract_path, (a) the retry count is kept per TURN TEXT (key "text:" + sha1(text), the
     #907 forest id) instead of per raw frame, so the copies of one text share ONE budget of max_retries; (b) once a text
     is quarantined, every later copy of it -- in this tract or in the main tract -- goes straight to the same
-    <retry tract>.quarantine, WHOLE (append-only, fsynced, never discarded), with no TID attempt, counted in
+    <retry tract>.quarantine, WHOLE (append-only, fsynced, never discarded), with no TID attempt -- a COPY being a frame
+    whose deposit stamp is within CC_NG_DRAIN_COPY_WINDOW_S (default 1800) of that text's latest quarantined frame (a later
+    occurrence is a genuine recurrence and is attempted normally) -- counted in
     state["quarantined_copies_total"] (and in quarantined_total) and in the index <retry tract>.quarantine.texts
     ({sha1: copies}; rebuilt from the quarantine file whenever it does not match it). Such a copy counts as taken
     (max_entries bounds the work as before). Legacy per-frame keys in <tract>.retries are dropped at the next save.
 
-    The head trim (#1176, 2026-10-23) holds miniTID's own tract lock (flock LOCK_EX on the tract file) across the
-    re-read and the in-place rewrite, so an append can never land between them: see _drain_trim_head_locked.
+    The head trim (#1176, 2026-10-23) holds miniTID's own tract lock (flock LOCK_EX on the tract's inode) across the
+    re-read and an atomic rename of the remainder over the tract, so an append can never land between them and a crash
+    never leaves a half-written tract: see _drain_trim_head_locked (it needs the #1173 miniTID, whose append re-opens
+    the path when the inode it locked was renamed away).
     """
     def _ret(absorbed_n: int, consumed: bytes = b""):
         return (absorbed_n, consumed) if return_consumed else absorbed_n
@@ -4928,6 +4983,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     qbase = retry_tract_path if (per_text and hold_on_failure and retry_tract_path) else None
     qtexts = _drain_qtexts_load(qbase) if qbase else None
     qtexts_dirty = False
+    copy_window = drain_copy_window_s()
 
     try:
         with open(path, "rb") as f:
@@ -4982,15 +5038,17 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
             # #920 per text: a copy of an already-quarantined TEXT goes straight to the quarantine, whole, unattempted.
             if qtexts is not None:
                 tkey = _drain_text_key(text)
-                if tkey in qtexts:
+                if _drain_is_quarantined_copy(qtexts, tkey, entry.timestamp, copy_window):
                     frame = data[entry_start:consumed_offset]
                     ok, stored, qexc = _drain_quarantine_frame(qbase, frame)
                     if ok:
                         taken += 1
                         safe_offset = consumed_offset
+                        if prepared is not None:
+                            prepared.pop(_drain_frame_key(frame), None)   # an earlier prepare of this copy is not used
+                        _drain_qtexts_note(qtexts, tkey, entry.timestamp, stored == "appended")
+                        qtexts_dirty = True
                         if stored == "appended":
-                            qtexts[tkey] = int(qtexts.get(tkey, 0)) + 1
-                            qtexts_dirty = True
                             try:
                                 state["quarantined_total"] = int(state.get("quarantined_total", 0)) + 1
                                 state["quarantined_copies_total"] = int(state.get("quarantined_copies_total", 0)) + 1
@@ -5001,7 +5059,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                             "CC ingest-tract: copy of a QUARANTINED turn moved straight to %s (no attempt): turn=%s %s "
                             "copies=%d stored=%s; nothing was discarded",
                             os.path.basename(qbase) + _DRAIN_QUARANTINE_SUFFIX, turn_tag, entry_tag,
-                            int(qtexts.get(tkey, 0)), stored)
+                            int(qtexts[tkey][0]), stored)
                         if max_entries and taken >= max_entries:
                             ended = "entries_cap_reached"
                             break
@@ -5063,9 +5121,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                     if ok:
                         safe_offset = consumed_offset
                         retry_counts.pop(count_key, None)
-                        if qtexts is not None:   # #920 per text: its later copies go straight to the quarantine
-                            tk = _drain_text_key(text)
-                            qtexts[tk] = max(1, int(qtexts.get(tk, 0)) + (1 if stored == "appended" else 0))
+                        if qtexts is not None:   # #920 per text: its copies (30-min rule) go straight to the quarantine
+                            _drain_qtexts_note(qtexts, _drain_text_key(text), entry.timestamp, stored == "appended")
                             qtexts_dirty = True
                         if stored == "appended":
                             try:

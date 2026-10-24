@@ -58,7 +58,7 @@ def test_copies_share_one_budget_then_go_straight_to_quarantine(env, caplog):
     assert _read(retry) == b""
     assert st["quarantined_total"] == 3 and st["quarantined_copies_total"] == 2
     idx = json.load(open(retry + ".quarantine.texts"))
-    assert idx["texts"] == {_sha1("POISON same text"): 3}
+    assert list(idx["texts"]) == [_sha1("POISON same text")] and idx["texts"][_sha1("POISON same text")][0] == 3
     assert idx["size"] == os.path.getsize(retry + ".quarantine")
     assert json.load(open(retry + ".retries")) == {}
     msgs = [r.getMessage() for r in caplog.records]
@@ -116,15 +116,18 @@ def test_index_rebuilt_when_missing_or_stale(env):
     retry = _write(env.tmp / "retry.tract", [])
     with open(retry + ".quarantine", "wb") as f:
         f.write(q)
-    assert cc_ng_organism._drain_qtexts_load(retry) == {_sha1("POISON once"): 1}     # no index yet
+    import ng_tract
+    ts = next(iter(ng_tract.TractReader(q))).timestamp
+    want = {_sha1("POISON once"): [1, ts]}
+    assert cc_ng_organism._drain_qtexts_load(retry) == want                          # no index yet
     with open(retry + ".quarantine.texts", "w") as f:
         json.dump({"size": 1, "texts": {}}, f)                                        # stale (size mismatch)
-    assert cc_ng_organism._drain_qtexts_load(retry) == {_sha1("POISON once"): 1}
+    assert cc_ng_organism._drain_qtexts_load(retry) == want
     with open(retry + ".quarantine.texts", "w") as f:
         f.write("{not json")
-    assert cc_ng_organism._drain_qtexts_load(retry) == {_sha1("POISON once"): 1}
-    cc_ng_organism._drain_qtexts_save(retry, {"x": 7})
-    assert cc_ng_organism._drain_qtexts_load(retry) == {"x": 7}                       # a matching index is trusted
+    assert cc_ng_organism._drain_qtexts_load(retry) == want
+    cc_ng_organism._drain_qtexts_save(retry, {"x": [7, 5.0]})
+    assert cc_ng_organism._drain_qtexts_load(retry) == {"x": [7, 5.0]}               # a matching index is trusted
 
 
 def test_legacy_per_frame_keys_dropped_and_success_ends_text_count(env):
@@ -172,3 +175,41 @@ def test_quarantine_append_failure_attempts_the_copy_and_drops_nothing(env, monk
     _main(main, retry, {"last_forest_id": None})
     assert [t for t, _ in env.calls] == ["POISON once"]                        # attempted normally instead
     assert _frames_of(_read(retry)) == [copy]                                  # parked whole in the retry tract
+
+
+def test_a_genuine_recurrence_past_the_copy_window_is_attempted(env, monkeypatch):
+    """A later occurrence of a quarantined text (outside CC_NG_DRAIN_COPY_WINDOW_S of its latest quarantined frame) is a
+    genuine recurrence, not a copy: it is attempted normally (and prepared), never quarantined unseen."""
+    q = _frame(env.tmp, "POISON once", 0)
+    retry = _write(env.tmp / "retry.tract", [])
+    with open(retry + ".quarantine", "wb") as f:
+        f.write(q)
+    later = _frame(env.tmp, "POISON once", 1)
+    main = _write(env.tmp / "turns.tract", [later])
+    monkeypatch.setenv("CC_NG_DRAIN_COPY_WINDOW_S", "0.000001")       # every other frame is "later" than the window
+    summ = cc_ng_organism.prepare_ingest_tract(main, {}, max_entries=4, quarantine_base=retry)
+    assert summ["quarantined_skipped"] == 0 and _FakeNGEmbed.calls == ["POISON once"]
+    _main(main, retry, {"last_forest_id": None})
+    assert [t for t, _ in env.calls] == ["POISON once"]                # attempted
+    assert _frames_of(_read(retry + ".quarantine")) == [q]              # not quarantined unseen
+    assert _frames_of(_read(retry)) == [later]                          # parked for retry like any failure
+
+
+def test_copy_window_env(monkeypatch):
+    monkeypatch.delenv("CC_NG_DRAIN_COPY_WINDOW_S", raising=False)
+    assert cc_ng_organism.drain_copy_window_s() == 1800.0
+    for raw, want in (("60", 60.0), ("0", 1800.0), ("-5", 1800.0), ("x", 1800.0)):
+        monkeypatch.setenv("CC_NG_DRAIN_COPY_WINDOW_S", raw)
+        assert cc_ng_organism.drain_copy_window_s() == want
+
+
+def test_diverted_copy_leaves_no_prepared_entry(env):
+    q = _frame(env.tmp, "POISON once", 0)
+    retry = _write(env.tmp / "retry.tract", [])
+    with open(retry + ".quarantine", "wb") as f:
+        f.write(q)
+    copy = _frame(env.tmp, "POISON once", 1)
+    main = _write(env.tmp / "turns.tract", [copy])
+    cache = {hashlib.sha256(copy).hexdigest(): {"ok": False}}           # prepared before the text was quarantined
+    _main(main, retry, {"last_forest_id": None}, prepared=cache, prepared_only=True)
+    assert cache == {}

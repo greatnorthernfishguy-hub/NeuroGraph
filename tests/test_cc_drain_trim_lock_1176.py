@@ -29,19 +29,30 @@ from test_cc_poison_retry_920 import env, _frame, _write, _read, _frames_of  # n
 
 
 def _minitid_append(path, data):
-    """ng_tract deposit_to_file, byte for byte in behaviour: O_APPEND, flock(LOCK_EX), write all, unlock, close."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o664)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    """The #1173 miniTID append_frame_locked, step for step: open by path (O_APPEND), flock(LOCK_EX), and ONLY if the
+    path is still the inode we locked (the drain's trim renames a new tract in place) write, else unlock, close and
+    re-open (Condensate rust_core/src/minitid.rs)."""
+    for _ in range(64):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o664)
         try:
-            view = memoryview(data)
-            while view:
-                n = os.write(fd, view)
-                view = view[n:]
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                try:
+                    same = os.stat(path).st_ino == os.fstat(fd).st_ino
+                except FileNotFoundError:
+                    same = False
+                if not same:
+                    continue
+                view = memoryview(data)
+                while view:
+                    n = os.write(fd, view)
+                    view = view[n:]
+                return
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+            os.close(fd)
+    raise AssertionError("append could not settle on the current inode")
 
 
 def _writer(path, frames_path, start_evt, n_frames, tag):
@@ -135,3 +146,29 @@ def test_trim_fsyncs(env, monkeypatch):
     path = _write(env.tmp / "turns.tract", [a, b])
     cc_ng_organism._drain_trim_head_locked(path, a)
     assert synced and _read(path) == b
+
+
+def test_trim_is_a_rename_and_never_leaves_a_half_file(env, monkeypatch):
+    """The remainder is written to <tract>.trim-tmp and renamed in: a crash before the rename leaves the WHOLE old tract
+    (absorbed again next pass, as before), never a half-written one; the temp file is fsynced first."""
+    a, b = _frame(env.tmp, "x", 1), _frame(env.tmp, "y", 2)
+    path = _write(env.tmp / "turns.tract", [a, b])
+    ino = os.stat(path).st_ino
+
+    def boom(src, dst):
+        raise OSError("crash before the rename")
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        cc_ng_organism._drain_trim_head_locked(path, a)
+    assert _read(path) == a + b and os.stat(path).st_ino == ino          # untouched
+    monkeypatch.undo()
+    assert cc_ng_organism._drain_trim_head_locked(path, a) == a
+    assert _read(path) == b and os.stat(path).st_ino != ino                # replaced, not rewritten in place
+
+
+def test_trim_keeps_the_tract_mode(env):
+    a, b = _frame(env.tmp, "x", 1), _frame(env.tmp, "y", 2)
+    path = _write(env.tmp / "turns.tract", [a, b])
+    os.chmod(path, 0o600)
+    cc_ng_organism._drain_trim_head_locked(path, a)
+    assert os.stat(path).st_mode & 0o777 == 0o600
