@@ -3793,8 +3793,8 @@ _CC_HE_MEMBER_WEIGHT_CAP = 5.0       # the literal cap HyperedgePlasticityRule.a
 # 2026-10-24 (law review C-2; Josh ~00:15 "narrow it ... along the lines of how biology deals with it"): a recurrence
 # potentiates with SOFT BOUNDS, dw = eta * (w_ceiling - w), never a fixed step up to max_weight. Weight-dependent
 # plasticity: potentiation shrinks as the synapse strengthens (Bi & Poo 1998, the LTP a pair shows is inversely related
-# to its starting strength; van Rossum, Bi & Turrigiano 2000 and Rubin, Lee & Sompolinsky 2001, multiplicative /
-# soft-bound STDP), and LTP saturates at a few times baseline (occlusion: a saturated pathway cannot be potentiated
+# to its starting strength; Rubin, Lee & Sompolinsky 2001 and Guetig et al. 2003, multiplicative / soft-bound STDP
+# with LTP proportional to (w_max - w)), and LTP saturates at a few times baseline (occlusion: a saturated pathway cannot be potentiated
 # further, Moser et al. 1998). So each recurrence adds less, the weight approaches a ceiling a few times its birth weight
 # and never max_weight (5.0): a common short prompt ("yes", "continue") cannot climb into a permanent hub that the
 # weight rules can no longer clear (#59 rich-get-richer through weight). A synapse already at or above its ceiling
@@ -3946,14 +3946,17 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
     be truthful about a bind that wrote less than a turn with trees needs:
     trees (how many it was handed), tree_pairs / window_pairs (forest<->member synapse PAIRS
     written), hyperedge (bool), window_chain (links), sequence ("written" | "no_predecessor"), plus
-    has_trees / has_windows. Existing nodes and synapses are never touched: this
-    only ever ADDS this turn's topology.
+    has_trees / has_windows. With the switch OFF, existing nodes and synapses are never touched: this only ever ADDS
+    this turn's topology. With CC_NG_BIND_REINFORCE_EXISTING ON (below) an existing forest<->tree synapse or same-member
+    hyperedge is REINFORCED instead (its weight changes); nothing is ever removed.
 
     #1173 (2026-10-23; CC_NG_BIND_REINFORCE_EXISTING, default off; narrowed 2026-10-24, law review C-2): with the switch
     ON, a forest<->tree write whose delay-1 EXCITATORY pre->post synapse already exists (find_synapse_id with the bind's
     type/delay match) or a hyperedge over exactly the same members (find_hyperedge_id), the Leg 2 merge's own lookups,
     REINFORCES that edge with a soft bound (_cc_reinforce_synapse / _cc_reinforce_hyperedge) instead of adding a
-    parallel one. forest<->window, the window chain and the sequence link are always written as before. A reinforced pair counts in tree_pairs / window_pairs and a reinforced hyperedge sets
+    parallel one. forest<->window, the window chain and the sequence link are always written as before.
+    status["reinforced_synapses"] counts MATCHED synapses (no parallel one added), including one already at or above its
+    ceiling whose weight was left unchanged (an occluded recurrence); the journal holds only the ones whose weight moved. A reinforced pair counts in tree_pairs / window_pairs and a reinforced hyperedge sets
     hyperedge=True (the turn IS bound); status["reinforced_synapses"] / ["reinforced_hyperedge"] say how. The rollback
     undoes a reinforcement exactly as it removes a created edge. With the switch OFF nothing here changes.
     """
