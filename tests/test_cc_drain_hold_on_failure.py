@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-10-23 night] Claude Code (Opus 5.5, laptop) — #1173 / #1176: (1) the signature pin allows drain_ingest_tract's new last
+#   keyword `per_text` (default False) after hold_on_failure; (2) the byte-identity guard's file-write-opens check now pins the
+#   #1176 change (the tract is never opened for writing: trim = temp file + rename under the tract lock); returns, bytes,
+#   call sequence and logs are still compared to the base unchanged.
 # [2026-10-23] Claude Code (Opus 5.5) — #920: the signature pin lists max_retries, prepared, prepared_only (before hold_on_failure). Test-only.
 # [2026-10-17] Claude Code (Opus 5.5) — #1123: should_stop pinned (signature list) + three behaviour tests at the end.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4, dispatch #14658) — N8 (TRIAL branch, test-only): F-A, the stale
@@ -227,6 +231,9 @@ def test_signature_hold_on_failure_is_last_and_defaults_false():
     last-ness, then the default."""
     sig = inspect.signature(cc_ng_organism.drain_ingest_tract)
     params = list(sig.parameters)
+    # [2026-10-23 night] #1173: `per_text` (default False = per raw frame) is appended AFTER hold_on_failure.
+    assert params[-1] == "per_text" and sig.parameters["per_text"].default is False
+    params = params[:-1]
     assert params[:-1] == ["graph", "vector_db", "state", "tract_path", "return_consumed",
                            "max_entries", "batch_nodes", "receipt",
                            "max_seconds",   # MVP 2026-10-03: the wall-time cap per pass
@@ -423,7 +430,12 @@ def test_default_is_byte_identical_to_the_base_module(env, name, rc):
     assert a_new == a_old
     assert c_new == c_old
     assert l_new == l_old
-    assert [m for m in w_new] == [m for m in w_old]
+    # [2026-10-23 night] #1176: the one intended difference. The base rewrote the tract with open(path, "wb") (an append
+    # between its re-read and that open was erased); the trim now writes <tract>.trim-tmp and renames it in under the
+    # tract lock, so the tract itself is never opened for writing. Everything above (returns, resulting bytes, the dual
+    # pass call sequence, every log record) stays byte-identical to the base.
+    assert w_new == []
+    assert w_old in ([], ["wb"])
 
 
 # ------------------------------------------------- retry tract (MVP 2026-10-03, Josh)
