@@ -3,6 +3,27 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-23 night] Claude Code (Opus 5.5, laptop; #1173 fix set; Josh 2026-10-23 ~19:30 "yes to your proposed plan" +
+#   "it should reinforce existing"; build + prove only, installed at the Saturday stop)
+# What: (1) REINFORCE ON RECURRENCE (#1173 point 4, CC_NG_BIND_REINFORCE_EXISTING, LAW 5, default OFF = unchanged):
+#       _cc_bind_conversational_topology reinforces an EXISTING pre->post synapse (by the weight a new one would have
+#       had, capped at max_weight; peak follows) and an EXISTING same-member hyperedge (each member +member_weight_lr,
+#       cap 5.0, metadata cc_recurrences) instead of adding parallel ones, using the Leg 2 merge's own lookups
+#       (cc_topology_merge.find_synapse_id / find_hyperedge_id). Journalled; _CCConversationalDualPassEco.rollback
+#       undoes a reinforcement while the edge still holds what this call wrote. state bind_reinforced_*_total.
+#       (2) #920 PER TEXT: drain_ingest_tract(per_text=True) counts retries per turn text ("text:"+sha1, the #907
+#       forest id) and sends every later copy of a quarantined text straight to <retry tract>.quarantine, whole, with no
+#       attempt (index <retry tract>.quarantine.texts, rebuilt from the quarantine file when stale);
+#       prepare_ingest_tract(quarantine_base=) does not prepare (no TID call) a quarantined text.
+#       state quarantined_copies_total. (3) #1176: the head trim holds miniTID's own tract lock (flock LOCK_EX on the
+#       tract file) across the re-read and an in-place rewrite (_drain_trim_head_locked), so an append can no longer land
+#       between them and be erased; a file that no longer starts with the consumed prefix is left untouched.
+# Why:  #1173 (dev-log 2026-10-23_turn-duplication-1173): ~94 % of turns.tract frames were copies; every copy ran TID and
+#       added parallel topology. #920 per frame gave each copy its own 6 attempts. #1176: the read-then-"wb" trim could
+#       erase a concurrent miniTID append (raw experience, LAW 7).
+# How:  every new behaviour is behind a keyword whose default is the previous behaviour, or (the trim) strictly safer.
+#       No protected or vendored file. Tests: tests/test_cc_bind_reinforce_1173.py, tests/test_cc_drain_per_text_920.py,
+#       tests/test_cc_drain_trim_lock_1176.py.
 # [2026-10-23] Claude Code (Opus 5.5, laptop; #920 finished on the retry tract; Josh "go ahead" 2026-10-23, Exec P497/P498/P503)
 # What: (1) COMPUTE OUTSIDE, COMMIT INSIDE: NEW prepare_conversational_dual_pass(text) (forest embedding, windows and
 #       ng_embed.prepare_dual_record: the TID extraction + tree embeddings; no graph, no lock, never raises) and NEW
@@ -3634,6 +3655,33 @@ class _CCConversationalDualPassEco:
         graph, vdb = self._graph, self._vector_db
         ok = True
         with _cc_mutation_lock(graph):
+            # #1173: a reinforcement of a PRE-EXISTING edge is undone first, last-in-first-out, and only while the edge
+            # still holds what this call wrote (a change another writer made since -- STDP in a step -- is left alone).
+            for sid, before_w, before_peak, wrote_w, wrote_peak in reversed(self.topology.get("reinforced_synapses", ())):
+                try:
+                    if sid in graph.synapses:
+                        syn = graph.synapses[sid]
+                        if float(syn.weight) == wrote_w:
+                            syn.weight = before_w
+                        if float(syn.peak_weight) == wrote_peak:
+                            syn.peak_weight = before_peak
+                except Exception:
+                    ok = False
+            for hid, before_w, before_meta, wrote_w, wrote_meta in reversed(self.topology.get("reinforced_hyperedges", ())):
+                try:
+                    if hid in graph.hyperedges:
+                        he = graph.hyperedges[hid]
+                        cur = {n: float(w) for n, w in dict(he.member_weights).items()}
+                        restore = [(n, before_w.get(n, 1.0)) for n, w in wrote_w.items() if cur.get(n) == w]
+                        if restore:
+                            if getattr(graph, "_native_he", False):
+                                graph.hyperedges.set_member_weights(hid, restore)
+                            else:
+                                he.member_weights.update(dict(restore))
+                        if dict(he.metadata or {}) == wrote_meta:
+                            he.metadata = dict(before_meta)
+                except Exception:
+                    ok = False
             for sid in reversed(self.topology["synapses"]):
                 if sid is None:
                     continue
@@ -3718,6 +3766,77 @@ class _CCConversationalDualPassEco:
         return self.record_outcome(embedding, target_id, success, strength, metadata)
 
 
+# ---- #1173 (2026-10-23, Josh): a genuine repeat bind REINFORCES the existing edge instead of adding a parallel one ----
+# Josh 2026-10-23 ~19:30: "Yeah, it should reinforce existing. We already do that for the leg 2 laptop/vps sync. So there
+# is an established pattern already." The pattern: cc_topology_merge's Leg 2 idempotency guards (Tier 2 _synapse_exists,
+# Tier 3 _hyperedge_exists), now find_synapse_id / find_hyperedge_id, the SAME lookups used here (one implementation).
+# LAW 5 switch: CC_NG_BIND_REINFORCE_EXISTING (default OFF = the bind adds every edge, byte-identical to before).
+_CC_HE_REINFORCE_LR_DEFAULT = 0.05   # HyperedgePlasticityRule.member_weight_lr's default (neuro_foundation.py)
+_CC_HE_MEMBER_WEIGHT_CAP = 5.0       # the cap HyperedgePlasticityRule.apply uses for member weights
+
+
+def cc_bind_reinforce_enabled() -> bool:
+    """CC_NG_BIND_REINFORCE_EXISTING (LAW 5; read per bind so a test or a restart sees the current value). Default off."""
+    return os.environ.get("CC_NG_BIND_REINFORCE_EXISTING", "0").strip() not in ("0", "", "false", "False", "no")
+
+
+def _cc_he_member_lr(graph) -> float:
+    """The graph's own hyperedge member-weight learning rate (its HyperedgePlasticityRule), else the rule's default."""
+    try:
+        from neuro_foundation import HyperedgePlasticityRule
+        for r in getattr(graph, "_plasticity_rules", ()) or ():
+            if isinstance(r, HyperedgePlasticityRule):
+                return float(r.member_weight_lr)
+    except Exception:  # noqa: BLE001 -- fall back to the rule's documented default
+        pass
+    return _CC_HE_REINFORCE_LR_DEFAULT
+
+
+def _cc_reinforce_synapse(graph, sid, weight, journal):
+    """Reinforce the EXISTING synapse `sid` by the weight the bind would have given a new one (so a recurrence adds the
+    same drive a parallel synapse would have, held in ONE synapse), capped at its max_weight like every weight update in
+    neuro_foundation (min(w + dw, max_weight)); peak_weight follows as in STDP. The before/after values are journalled
+    so a failed dual pass rolls it back. Raises on failure (#904: nothing in the bind is swallowed)."""
+    syn = graph.synapses[sid]
+    before_w, before_peak = float(syn.weight), float(syn.peak_weight)
+    new_w = max(0.0, min(before_w + float(weight), float(syn.max_weight)))
+    syn.weight = new_w
+    if new_w > before_peak:
+        syn.peak_weight = new_w
+    try:
+        graph._dirty_synapses.add(sid)
+    except Exception:  # noqa: BLE001 -- dirty tracking is an incremental-save optimisation; the weight is written
+        pass
+    if journal is not None:
+        journal.setdefault("reinforced_synapses", []).append(
+            (sid, before_w, before_peak, float(syn.weight), float(syn.peak_weight)))
+
+
+def _cc_reinforce_hyperedge(graph, hid, journal):
+    """Reinforce the EXISTING same-member hyperedge `hid`: the recurrence is the whole bound set occurring together
+    again, so every member's weight gets HyperedgePlasticityRule's co-firing increment (member_weight_lr, cap 5.0), and
+    metadata["cc_recurrences"] counts it. Native store (H1, off on the live CC today): member weights through
+    set_member_weights. Journalled for rollback. Raises on failure."""
+    he = graph.hyperedges[hid]
+    lr = _cc_he_member_lr(graph)
+    before_w = {n: float(w) for n, w in dict(he.member_weights).items()}
+    new_w = {n: min(before_w.get(n, 1.0) + lr, _CC_HE_MEMBER_WEIGHT_CAP) for n in list(he.member_nodes)}
+    before_meta = dict(he.metadata or {})
+    if getattr(graph, "_native_he", False):
+        graph.hyperedges.set_member_weights(hid, list(new_w.items()))
+    else:
+        he.member_weights.update(new_w)
+    meta = dict(before_meta)
+    meta["cc_recurrences"] = int(meta.get("cc_recurrences", 0)) + 1
+    he.metadata = meta
+    try:
+        graph._dirty_hyperedges.add(hid)
+    except Exception:  # noqa: BLE001
+        pass
+    if journal is not None:
+        journal.setdefault("reinforced_hyperedges", []).append((hid, before_w, before_meta, dict(new_w), meta))
+
+
 def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding, state, window_ids=None,
                                       journal=None):
     """Wire forest<->tree synapses, intra-turn window delay-chains (#257
@@ -3743,9 +3862,21 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
     written), hyperedge (bool), window_chain (links), sequence ("written" | "no_predecessor"), plus
     has_trees / has_windows. Existing nodes and synapses are never touched: this
     only ever ADDS this turn's topology.
+
+    #1173 (2026-10-23; CC_NG_BIND_REINFORCE_EXISTING, default off): with the switch ON, a write whose edge already
+    exists -- a pre->post synapse (find_synapse_id) or a hyperedge over exactly the same members (find_hyperedge_id),
+    the Leg 2 merge's own lookups -- REINFORCES that edge (_cc_reinforce_synapse / _cc_reinforce_hyperedge) instead of
+    adding a parallel one. A reinforced pair counts in tree_pairs / window_pairs and a reinforced hyperedge sets
+    hyperedge=True (the turn IS bound); status["reinforced_synapses"] / ["reinforced_hyperedge"] say how. The rollback
+    undoes a reinforcement exactly as it removes a created edge. With the switch OFF nothing here changes.
     """
     status = {"trees": 0, "tree_pairs": 0, "window_pairs": 0, "hyperedge": False, "window_chain": 0,
               "sequence": "no_predecessor", "has_trees": False, "has_windows": False}
+    reinforce = cc_bind_reinforce_enabled()
+    if reinforce:
+        from cc_topology_merge import find_synapse_id, find_hyperedge_id
+        status["reinforced_synapses"] = 0
+        status["reinforced_hyperedge"] = False
 
     def _site(name):
         if journal is not None:
@@ -3755,6 +3886,12 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
 
     def _syn(site, pre, post, weight, delay=None):
         _site(site)
+        if reinforce:
+            existing = find_synapse_id(graph, pre, post)
+            if existing is not None:
+                _cc_reinforce_synapse(graph, existing, weight, journal)
+                status["reinforced_synapses"] += 1
+                return
         if delay is None:
             syn = graph.create_synapse(pre, post, weight=weight)
         else:
@@ -3781,12 +3918,18 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
             status["window_pairs"] += 1
         if tree_ids or window_ids:
             _site("hyperedge")
-            he = graph.create_hyperedge(
-                member_node_ids=set([forest_id] + tree_ids + window_ids),
-                metadata={"creation_mode": "conversational", "cc": True},
-            )
-            if journal is not None:
-                journal["hyperedges"].append(getattr(he, "hyperedge_id", None))
+            members = set([forest_id] + tree_ids + window_ids)
+            existing_he = find_hyperedge_id(graph, members) if reinforce else None
+            if existing_he is not None:
+                _cc_reinforce_hyperedge(graph, existing_he, journal)
+                status["reinforced_hyperedge"] = True
+            else:
+                he = graph.create_hyperedge(
+                    member_node_ids=members,
+                    metadata={"creation_mode": "conversational", "cc": True},
+                )
+                if journal is not None:
+                    journal["hyperedges"].append(getattr(he, "hyperedge_id", None))
             status["hyperedge"] = True
         if len(window_ids) >= 2:
             import random as _rnd
@@ -4079,6 +4222,15 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
                 _bound.get("tree_pairs", 0) >= _bound["trees"] and _bound.get("hyperedge")):
             eco.topology["site"] = "bind_postcondition"
             raise RuntimeError("bind wrote less than a turn with trees needs")
+        if _bound and ("reinforced_synapses" in _bound):
+            # #1173: COUNTED (caller-owned, in-process) so the daemon's status shows the switch at work.
+            try:
+                state["bind_reinforced_synapses_total"] = (int(state.get("bind_reinforced_synapses_total", 0))
+                                                           + int(_bound.get("reinforced_synapses", 0)))
+                if _bound.get("reinforced_hyperedge"):
+                    state["bind_reinforced_hyperedges_total"] = int(state.get("bind_reinforced_hyperedges_total", 0)) + 1
+            except Exception:  # noqa: BLE001 -- bookkeeping only; the turn is written
+                pass
         return True
     except Exception as exc:
         if eco is None or not eco.writes:
@@ -4285,7 +4437,7 @@ def _drain_frame_key(frame: bytes) -> str:
 
 
 def prepare_ingest_tract(tract_path: str, cache: dict, max_entries: int, defer_over_bytes: int = 0,
-                         stop_on_failure: bool = False, should_stop=None) -> dict:
+                         stop_on_failure: bool = False, should_stop=None, quarantine_base: str = None) -> dict:
     """Prepare (compute only) up to `max_entries` turns at the HEAD of a tract into `cache` (2026-10-23, #920 / P497(4)).
 
     Run by the caller WITHOUT the graph lock, just before it drains the same tract under the lock with
@@ -4295,10 +4447,22 @@ def prepare_ingest_tract(tract_path: str, cache: dict, max_entries: int, defer_o
     bytes; a key already in the cache is not prepared again (a success kept from an earlier cycle). With
     stop_on_failure the pass stops after the FIRST failed prepare (one TID failure per pass at most).
 
-    Returns {"supported", "examined", "prepared", "cached", "failed", "classes", "seconds"}. Never raises."""
+    quarantine_base (2026-10-23, #920 per text; default None = unchanged): the retry tract whose quarantine holds whole
+    texts. A turn whose TEXT is already quarantined there is examined but NOT prepared (no TID call): the drain moves it
+    straight to the quarantine (drain_ingest_tract(per_text=True)). Counted in "quarantined_skipped".
+
+    Returns {"supported", "examined", "prepared", "cached", "failed", "classes", "seconds"} (+ "quarantined_skipped"
+    with quarantine_base). Never raises."""
     t0 = time.monotonic()
     summary = {"supported": True, "examined": 0, "prepared": 0, "cached": 0, "failed": 0, "classes": {},
                "seconds": 0.0}
+    qtexts = None
+    if quarantine_base:
+        summary["quarantined_skipped"] = 0
+        try:
+            qtexts = _drain_qtexts_load(quarantine_base)
+        except Exception:  # noqa: BLE001 -- never raises; without the index every turn is prepared as before
+            qtexts = None
     if not prepared_dual_pass_supported():
         summary["supported"] = False
         return summary
@@ -4324,6 +4488,9 @@ def prepare_ingest_tract(tract_path: str, cache: dict, max_entries: int, defer_o
             if summary["examined"] >= max_entries:
                 break
             summary["examined"] += 1
+            if qtexts and _drain_text_key(text) in qtexts:
+                summary["quarantined_skipped"] += 1   # #920 per text: no TID call for a quarantined text
+                continue
             key = _drain_frame_key(data[start:off])
             if key in cache:
                 summary["cached"] += 1
@@ -4429,6 +4596,113 @@ def _drain_quarantine_frame(tract_path: str, frame: bytes):
         return (False, None, type(exc).__name__)
 
 
+# ---- #920 per text (2026-10-23, #1173; Josh's approval): count retries and quarantine by the TEXT (the #907 forest id) ----
+_DRAIN_QTEXTS_SUFFIX = ".quarantine.texts"   # beside the quarantine file: {"size": bytes, "texts": {sha1(text): copies}}
+
+
+def _drain_text_key(text: str) -> str:
+    """sha1 of the turn text = the hash in its forest id `cc:conv::<sha1>` (#907). One key for every copy of a text."""
+    import hashlib
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def _drain_qtexts_rebuild(qbase: str) -> dict:
+    """{sha1(text): frames} counted from <qbase>.quarantine itself (the durable truth). {} when absent."""
+    texts = {}
+    qpath = qbase + _DRAIN_QUARANTINE_SUFFIX
+    try:
+        with open(qpath, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return texts
+    import ng_tract
+    for entry in ng_tract.TractReader(data):
+        if entry.entry_type == ng_tract.ENTRY_EXPERIENCE and entry.content:
+            k = _drain_text_key(entry.content)
+            texts[k] = texts.get(k, 0) + 1
+    return texts
+
+
+def _drain_qtexts_load(qbase: str) -> dict:
+    """The quarantined-text index for the quarantine file beside `qbase`. The index records the quarantine file size it
+    reflects; when that differs from the file (a crash between the append and the index save, or no index yet) it is
+    rebuilt from the quarantine file, so a quarantined text is never forgotten. Unreadable -> rebuilt; a rebuild that
+    fails -> {} (copies are then attempted normally: costs TID calls, loses nothing)."""
+    qpath = qbase + _DRAIN_QUARANTINE_SUFFIX
+    try:
+        size = os.path.getsize(qpath)
+    except OSError:
+        size = 0
+    try:
+        with open(qbase + _DRAIN_QTEXTS_SUFFIX, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and int(d.get("size", -1)) == size and isinstance(d.get("texts"), dict):
+            return {str(k): int(v) for k, v in d["texts"].items()}
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CC ingest-tract quarantined-text index unreadable (%s): rebuilding it from the quarantine file",
+                       type(exc).__name__)
+    try:
+        return _drain_qtexts_rebuild(qbase)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CC ingest-tract quarantined-text index could not be rebuilt (%s): copies of quarantined texts "
+                       "are attempted normally this pass", type(exc).__name__)
+        return {}
+
+
+def _drain_qtexts_save(qbase: str, texts: dict) -> None:
+    """Atomic replace (tmp + fsync + rename) of <qbase>.quarantine.texts, stamped with the quarantine file's size."""
+    path = qbase + _DRAIN_QTEXTS_SUFFIX
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        try:
+            size = os.path.getsize(qbase + _DRAIN_QUARANTINE_SUFFIX)
+        except OSError:
+            size = 0
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"size": size, "texts": texts}, f, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 -- the next load rebuilds it from the quarantine file
+        logger.warning("CC ingest-tract quarantined-text index not saved (%s): the next pass rebuilds it",
+                       type(exc).__name__)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _drain_trim_head_locked(path: str, consumed_prefix: bytes) -> bytes:
+    """#1176 (2026-10-23): remove `consumed_prefix` from the head of the tract at `path` WITHOUT losing an append.
+
+    miniTID appends with flock(LOCK_EX) on the tract file itself (ng_tract deposit_to_file: open by path with
+    O_APPEND, LOCK_EX, write, unlock; Condensate rust_core/vendor/ng_tract/src/write.rs). This trim takes the SAME lock
+    on the SAME inode for the whole re-read + rewrite, so no append can land between them (before: a re-read, then
+    open(path, "wb"), and an append in between was erased). The rewrite is in place (same inode -- a rename would leave
+    a writer blocked on the old inode appending to an unlinked file): seek(0), write the remainder, truncate, fsync. The
+    lock is held only for this (milliseconds; a miniTID append waits that long). When the file no longer starts with
+    the prefix (someone else rewrote it) NOTHING is written (before: it was written back unchanged, itself a race).
+    Returns the bytes actually removed (b"" when nothing was removed). Raises on an I/O error (the caller logs it)."""
+    import fcntl
+    with open(path, "r+b") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            current = f.read()
+            if not current.startswith(consumed_prefix):
+                return b""
+            remainder = current[len(consumed_prefix):]
+            f.seek(0)
+            f.write(remainder)
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+            return consumed_prefix
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 def _drain_turn_tags(frame: bytes, text: str):
     """(#907 hash of the turn's forest id, frame hash) for a log line: `forest:<12 hex>` via the ONE redaction helper
     cc_topology_merge.redact_node_id (never the id itself), and `entry:<12 hex of sha256(frame)>`. Never text."""
@@ -4472,7 +4746,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                         max_seconds: float = 0, retry_tract_path: str = None,
                         defer_tract_path: str = None, defer_over_bytes: int = 0,
                         should_stop=None, max_retries: int = None, prepared: dict = None,
-                        prepared_only: bool = False, hold_on_failure: bool = False):
+                        prepared_only: bool = False, hold_on_failure: bool = False, per_text: bool = False):
     """Drain miniTID's turn-deposit tract file, running each raw experience
     entry through the conversational dual-pass (Task 1). Feeder (miniTID)
     deposits, this drains independently -- no handshake, matching the
@@ -4596,6 +4870,18 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     state["quarantined_total"] is incremented. A FAILED quarantine write rotates the frame as before (one ERROR):
     nothing is ever discarded. Re-ingest from the quarantine file is a deliberate later act (#928), never done here.
     A TID outage reads as a failure too; the caller's prepare pass bounds that to one failure per pass.
+
+    per_text (2026-10-23, #920 per text, #1173; Josh's approval; default False = per raw frame, as above): with
+    hold_on_failure and a retry_tract_path, (a) the retry count is kept per TURN TEXT (key "text:" + sha1(text), the
+    #907 forest id) instead of per raw frame, so the copies of one text share ONE budget of max_retries; (b) once a text
+    is quarantined, every later copy of it -- in this tract or in the main tract -- goes straight to the same
+    <retry tract>.quarantine, WHOLE (append-only, fsynced, never discarded), with no TID attempt, counted in
+    state["quarantined_copies_total"] (and in quarantined_total) and in the index <retry tract>.quarantine.texts
+    ({sha1: copies}; rebuilt from the quarantine file whenever it does not match it). Such a copy counts as taken
+    (max_entries bounds the work as before). Legacy per-frame keys in <tract>.retries are dropped at the next save.
+
+    The head trim (#1176, 2026-10-23) holds miniTID's own tract lock (flock LOCK_EX on the tract file) across the
+    re-read and the in-place rewrite, so an append can never land between them: see _drain_trim_head_locked.
     """
     def _ret(absorbed_n: int, consumed: bytes = b""):
         return (absorbed_n, consumed) if return_consumed else absorbed_n
@@ -4638,6 +4924,10 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
     except Exception as exc:
         logger.debug("CC ingest-tract drain unavailable (non-fatal): %s", exc)
         return _ret(0)
+    # #920 per text: the quarantine that holds whole texts is the RETRY tract's (both passes put copies there).
+    qbase = retry_tract_path if (per_text and hold_on_failure and retry_tract_path) else None
+    qtexts = _drain_qtexts_load(qbase) if qbase else None
+    qtexts_dirty = False
 
     try:
         with open(path, "rb") as f:
@@ -4689,12 +4979,52 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                     continue
                 except Exception as dexc:  # noqa: BLE001 - attempt it normally instead
                     logger.warning("CC ingest-tract defer append failed (%s); attempting the turn", type(dexc).__name__)
+            # #920 per text: a copy of an already-quarantined TEXT goes straight to the quarantine, whole, unattempted.
+            if qtexts is not None:
+                tkey = _drain_text_key(text)
+                if tkey in qtexts:
+                    frame = data[entry_start:consumed_offset]
+                    ok, stored, qexc = _drain_quarantine_frame(qbase, frame)
+                    if ok:
+                        taken += 1
+                        safe_offset = consumed_offset
+                        if stored == "appended":
+                            qtexts[tkey] = int(qtexts.get(tkey, 0)) + 1
+                            qtexts_dirty = True
+                            try:
+                                state["quarantined_total"] = int(state.get("quarantined_total", 0)) + 1
+                                state["quarantined_copies_total"] = int(state.get("quarantined_copies_total", 0)) + 1
+                            except Exception:  # noqa: BLE001 -- bookkeeping; the frame is already durable
+                                pass
+                        turn_tag, entry_tag = _drain_turn_tags(frame, text)
+                        logger.warning(
+                            "CC ingest-tract: copy of a QUARANTINED turn moved straight to %s (no attempt): turn=%s %s "
+                            "copies=%d stored=%s; nothing was discarded",
+                            os.path.basename(qbase) + _DRAIN_QUARANTINE_SUFFIX, turn_tag, entry_tag,
+                            int(qtexts.get(tkey, 0)), stored)
+                        if max_entries and taken >= max_entries:
+                            ended = "entries_cap_reached"
+                            break
+                        if max_seconds and (time.monotonic() - _t_start) >= max_seconds:
+                            ended = "time_cap_reached"
+                            break
+                        if should_stop is not None:
+                            try:
+                                if bool(should_stop()):
+                                    ended = "host_stopping"
+                                    break
+                            except Exception:  # noqa: BLE001
+                                pass
+                        continue
+                    logger.error("CC ingest-tract: a copy of a quarantined turn could not be quarantined (%s); it is "
+                                 "attempted normally instead; nothing was discarded", qexc)
             # #920: a prepared turn is only WRITTEN under the caller's lock; prepared_only stops at an unprepared one
             # (left in the tract untouched and uncounted: it is prepared next cycle, outside the lock).
             prep = None
             frame_key = None
             if prepared is not None or bounded is not None:
                 frame_key = _drain_frame_key(data[entry_start:consumed_offset])
+            count_key = ("text:" + _drain_text_key(text)) if (per_text and bounded is not None) else frame_key
             if prepared is not None:
                 prep = prepared.pop(frame_key, None)
                 if prep is None and prepared_only:
@@ -4710,7 +5040,7 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 if _ok:
                     absorbed += 1
                     safe_offset = consumed_offset
-                    if bounded is not None and retry_counts.pop(frame_key, None) is not None:
+                    if bounded is not None and retry_counts.pop(count_key, None) is not None:
                         retry_counts_dirty = True   # it landed: its count ends
                 else:
                     hold_reason = "absorb_returned_false"
@@ -4723,8 +5053,8 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                 fail_class = ((prep.get("failure_class") or "commit_failed") if prep is not None
                               else ("absorb_raised:" + hold_exc_type if hold_exc_type != "-" else "absorb_returned_false"))
                 frame = data[entry_start:consumed_offset]
-                n = int(retry_counts.get(frame_key, 0)) + 1
-                retry_counts[frame_key] = n
+                n = int(retry_counts.get(count_key, 0)) + 1
+                retry_counts[count_key] = n
                 retry_counts_dirty = True
                 turn_tag, entry_tag = _drain_turn_tags(frame, text)
                 if n >= bounded:
@@ -4732,7 +5062,11 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
                     qname = os.path.basename(path) + _DRAIN_QUARANTINE_SUFFIX
                     if ok:
                         safe_offset = consumed_offset
-                        retry_counts.pop(frame_key, None)
+                        retry_counts.pop(count_key, None)
+                        if qtexts is not None:   # #920 per text: its later copies go straight to the quarantine
+                            tk = _drain_text_key(text)
+                            qtexts[tk] = max(1, int(qtexts.get(tk, 0)) + (1 if stored == "appended" else 0))
+                            qtexts_dirty = True
                         if stored == "appended":
                             try:
                                 state["quarantined_total"] = int(state.get("quarantined_total", 0)) + 1
@@ -4812,8 +5146,12 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
         _fill_receipt("parse_failed", taken)
         return _ret(absorbed)  # consumed=b"" -- nothing was truncated
 
-    if retry_counts_dirty:
+    if retry_counts_dirty or (per_text and bounded is not None and any(not k.startswith("text:") for k in retry_counts)):
+        if per_text and bounded is not None:
+            retry_counts = {k: v for k, v in retry_counts.items() if k.startswith("text:")}   # legacy per-frame keys
         _drain_retries_save(path, retry_counts)   # #920: before the rewrite; a crash in between = one extra attempt
+    if qtexts_dirty:
+        _drain_qtexts_save(qbase, qtexts)   # after the quarantine appends' fsync; stamped with the file size
     _fill_receipt(ended, taken)
     # Truncate only the bytes we actually consumed. miniTID is a separate
     # process that only appends; if it appends between our initial read and
@@ -4846,22 +5184,12 @@ def drain_ingest_tract(graph, vector_db, state: dict, tract_path: str = None,
         return _ret(absorbed)
     consumed_actual = b""
     try:
-        with open(path, "rb") as f:
-            current = f.read()
-        if current.startswith(consumed_prefix):
-            remainder = current[len(consumed_prefix):]
-            with open(path, "wb") as f:
-                f.write(remainder)
-            consumed_actual = consumed_prefix  # only now -- the write actually succeeded
-        else:
-            # Someone else touched the file since our read (not the plain
-            # append-only case we can safely trim a known prefix from).
-            # Write it back unchanged rather than guess -- nothing of ours
-            # was removed, so consumed_actual correctly stays b"".
-            with open(path, "wb") as f:
-                f.write(current)
+        # #1176: under miniTID's own tract lock, in place; b"" when the file no longer starts with our prefix (then
+        # nothing is written: nothing of ours was removed, so consumed_actual correctly stays b"").
+        consumed_actual = _drain_trim_head_locked(path, consumed_prefix)
     except Exception as exc:
-        logger.debug("CC ingest-tract truncate failed (non-fatal): %s", exc)
+        logger.warning("CC ingest-tract head trim failed (non-fatal; the tract keeps the consumed span and the next "
+                       "pass re-reads it): %s", type(exc).__name__)
 
     if absorbed:
         logger.info("CC ingest-tract: absorbed %d turn(s) into recall", absorbed)

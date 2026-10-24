@@ -3,6 +3,16 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-23] Claude Code (Opus 5.5, laptop; #1173 reinforce-on-recurrence, Josh 2026-10-23 ~19:30)
+# What: the two Leg 2 idempotency guards are split into lookups that return the id: NEW find_synapse_id(graph, pre, post)
+#   and find_hyperedge_id(graph, members) (smallest id when several match, so the choice is deterministic);
+#   _synapse_exists / _hyperedge_exists are now `find_...(...) is not None` -- the same answer, so the merge is unchanged.
+# Why: Josh: a genuine repeat bind "should reinforce existing. We already do that for the leg 2 laptop/vps sync. So there
+#   is an established pattern already." The pattern is these two guards (Tier 2 / Tier 3 of merge_cc_topology): never
+#   stack a parallel synapse over an existing pre->post pair or a second hyperedge over the same member set.
+#   cc_ng_organism._cc_bind_conversational_topology reuses the SAME lookups (one implementation, LAW 3) to find the
+#   existing edge it reinforces.
+# How: pure refactor of the two functions at the end of this file. Tests: tests/test_cc_bind_reinforce_1173.py.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane in-transit-hold-905d, dispatch #14460/#14474) — #905-DELTA: the whole-graph hold covers ONLY nodes whose binding is IN TRANSIT
 # What: a NEW `held_unbound_nodes(graph, node_ids, merge_landed=None)` and a once-read, fail-closed in-transit id set read from the NEW LAW 5
 #   path variable CC_NG_IN_TRANSIT_IDS_PATH. The merge's batch-end check and `whole_graph_guard` (which gains an ADDITIVE keyword
@@ -1425,65 +1435,88 @@ def whole_graph_guard(graph: Any, merge_landed: Optional[Set[str]] = None):
     return _guard
 
 
-def _hyperedge_exists(graph: Any, members: Set[str]) -> bool:
-    """Idempotency guard for hyperedges -- the counterpart to _synapse_exists.
+def find_hyperedge_id(graph: Any, members: Set[str]) -> Optional[str]:
+    """The id of an existing hyperedge whose member set is exactly `members`, or None.
 
-    Without this, a re-merge stacks a second binding hyperedge over the same
-    member set, and the turn it binds gets its activation counted twice on
-    every pass. Uses graph._node_hyperedges (neuro_foundation.py:1532,
-    node_id -> set of hyperedge_ids) so only edges touching one member are
-    examined rather than the whole hyperedge table.
+    The Leg 2 idempotency lookup (_hyperedge_exists is `find_hyperedge_id(...) is not None`). Since 2026-10-23 (#1173)
+    it is also the lookup cc_ng_organism's conversational bind uses to REINFORCE the existing same-member hyperedge of a
+    recurring turn instead of stacking a parallel one (Josh: "it should reinforce existing. We already do that for the
+    leg 2 laptop/vps sync"). Uses graph._node_hyperedges (neuro_foundation.py:1532, node_id -> set of hyperedge_ids) so
+    only edges touching one member are examined rather than the whole hyperedge table. When several match (parallel
+    edges stacked before #1173), the smallest id is returned, so the choice is deterministic.
     """
     if not members:
-        return False
+        return None
     try:
         probe = next(iter(members))
         candidate_ids = getattr(graph, "_node_hyperedges", {}).get(probe) or ()
         table = getattr(graph, "hyperedges", {})
+        found = []
         for hid in candidate_ids:
             he = table.get(hid)
             if he is None:
                 continue
             existing = getattr(he, "member_nodes", None)
             if existing is not None and set(existing) == members:
-                return True
-        return False
+                found.append(hid)
+        return min(found) if found else None
     except Exception:
         try:
-            for he in getattr(graph, "hyperedges", {}).values():
-                existing = getattr(he, "member_nodes", None)
-                if existing is not None and set(existing) == members:
-                    return True
+            found = [hid for hid, he in getattr(graph, "hyperedges", {}).items()
+                     if getattr(he, "member_nodes", None) is not None and set(he.member_nodes) == members]
+            return min(found) if found else None
         except Exception:
             pass
-        return False
+        return None
+
+
+def _hyperedge_exists(graph: Any, members: Set[str]) -> bool:
+    """Idempotency guard for hyperedges -- the counterpart to _synapse_exists.
+
+    Without this, a re-merge stacks a second binding hyperedge over the same
+    member set, and the turn it binds gets its activation counted twice on
+    every pass. The lookup is find_hyperedge_id (2026-10-23: split out so the
+    conversational bind can reinforce the edge it finds; this guard's answer is
+    unchanged).
+    """
+    return find_hyperedge_id(graph, members) is not None
+
+
+def find_synapse_id(graph: Any, pre: str, post: str) -> Optional[str]:
+    """The id of an existing pre->post synapse, or None.
+
+    The Leg 2 idempotency lookup (_synapse_exists is `find_synapse_id(...) is not None`). Since 2026-10-23 (#1173) it is
+    also the lookup cc_ng_organism's conversational bind uses to REINFORCE the existing synapse of a recurring turn
+    instead of adding a parallel one. Uses the graph's own sparse adjacency index (neuro_foundation.py:1529, _outgoing:
+    node_id -> set of synapse_ids), so this is O(out-degree) rather than a full scan of graph.synapses. When several
+    match (parallel synapses stacked before #1173), the smallest id is returned, so the choice is deterministic.
+    """
+    try:
+        syn_ids = getattr(graph, "_outgoing", {}).get(pre) or ()
+        synapses = getattr(graph, "synapses", {})
+        found = []
+        for sid in syn_ids:
+            syn = synapses.get(sid)
+            if syn is not None and getattr(syn, "post_node_id", None) == post:
+                found.append(sid)
+        return min(found) if found else None
+    except Exception:
+        # Index unavailable/shaped differently -> fall back to a full scan
+        # rather than reporting "no edge" and creating a duplicate.
+        try:
+            found = [sid for sid, syn in getattr(graph, "synapses", {}).items()
+                     if getattr(syn, "pre_node_id", None) == pre and getattr(syn, "post_node_id", None) == post]
+            return min(found) if found else None
+        except Exception:
+            pass
+        return None
 
 
 def _synapse_exists(graph: Any, pre: str, post: str) -> bool:
     """Idempotency guard for synapses. Re-absorbing must not stack duplicate
     edges between the same pair -- that would silently multiply effective
-    conductance on every pass.
-
-    Uses the graph's own sparse adjacency index (neuro_foundation.py:1529,
-    _outgoing: node_id -> set of synapse_ids), so this is O(out-degree) rather
-    than a full scan of graph.synapses on every candidate edge.
+    conductance on every pass. The lookup is find_synapse_id (2026-10-23: split
+    out so the conversational bind can reinforce the synapse it finds; this
+    guard's answer is unchanged).
     """
-    try:
-        syn_ids = getattr(graph, "_outgoing", {}).get(pre) or ()
-        synapses = getattr(graph, "synapses", {})
-        for sid in syn_ids:
-            syn = synapses.get(sid)
-            if syn is not None and getattr(syn, "post_node_id", None) == post:
-                return True
-        return False
-    except Exception:
-        # Index unavailable/shaped differently -> fall back to a full scan
-        # rather than reporting "no edge" and creating a duplicate.
-        try:
-            for syn in getattr(graph, "synapses", {}).values():
-                if (getattr(syn, "pre_node_id", None) == pre
-                        and getattr(syn, "post_node_id", None) == post):
-                    return True
-        except Exception:
-            pass
-        return False
+    return find_synapse_id(graph, pre, post) is not None
