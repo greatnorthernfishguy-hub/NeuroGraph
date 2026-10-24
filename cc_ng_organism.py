@@ -3,6 +3,19 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-24] Claude Code (Opus 5.5, laptop; #1173 law review C-2; Josh 2026-10-24 ~00:15 "I say fix everything first. Go
+#   ahead and narrow it, I suppose. Seems like it's along the lines of how biology deals with it")
+# What: the bind's reinforce-on-recurrence (CC_NG_BIND_REINFORCE_EXISTING, still default OFF) is NARROWED: (1) scope =
+#   only the forest<->tree synapses + the same-member hyperedge (forest<->window, the window chain and the sequence link
+#   are always written, as with the switch off); (2) the synapse lookup matches only the bind's own edge (EXCITATORY,
+#   delay 1) via find_synapse_id(match=); (3) SOFT-BOUND potentiation dw = eta*(ceiling - w) (weight-dependent STDP / LTP
+#   saturation) with a ceiling = 3x the birth weight (0.6 / 0.45) instead of +0.2/+0.15 up to max_weight 5.0, and the
+#   hyperedge members dw = he_eta*(2.0 - w) instead of +0.05 up to 5.0. LAW 5 knobs CC_NG_BIND_REINFORCE_ETA /
+#   _CEILING_FACTOR / _HE_ETA / _HE_CEILING. A synapse already at/above its ceiling is not changed.
+# Why: law review 2026-10-24 C-2 + the MEDIUM finding (the lookup ignored type and delay; magnitude made a durable hub of
+#   a common short prompt, #59 rich-get-richer through weight).
+# How: _cc_reinforce_synapse / _cc_reinforce_hyperedge / cc_bind_reinforce_params; identity protection still never read
+#   at deposit (Packet 153-155 regression tests run with the switch ON). Tests: tests/test_cc_bind_reinforce_1173.py.
 # [2026-10-23 night] Claude Code (Opus 5.5, laptop; #1173 fix set; Josh 2026-10-23 ~19:30 "yes to your proposed plan" +
 #   "it should reinforce existing"; build + prove only, installed at the Saturday stop)
 # What: (1) REINFORCE ON RECURRENCE (#1173 point 4, CC_NG_BIND_REINFORCE_EXISTING, LAW 5, default OFF = unchanged):
@@ -3776,12 +3789,73 @@ class _CCConversationalDualPassEco:
 # Tier 3 _hyperedge_exists), now find_synapse_id / find_hyperedge_id, the SAME lookups used here (one implementation).
 # LAW 5 switch: CC_NG_BIND_REINFORCE_EXISTING (default OFF = the bind adds every edge, byte-identical to before).
 _CC_HE_REINFORCE_LR_DEFAULT = 0.05   # HyperedgePlasticityRule.member_weight_lr's default (neuro_foundation.py)
-_CC_HE_MEMBER_WEIGHT_CAP = 5.0       # the cap HyperedgePlasticityRule.apply uses for member weights
+_CC_HE_MEMBER_WEIGHT_CAP = 5.0       # the literal cap HyperedgePlasticityRule.apply uses (not exposed by the engine: punch)
+# 2026-10-24 (law review C-2; Josh ~00:15 "narrow it ... along the lines of how biology deals with it"): a recurrence
+# potentiates with SOFT BOUNDS, dw = eta * (w_ceiling - w), never a fixed step up to max_weight. Weight-dependent
+# plasticity: potentiation shrinks as the synapse strengthens (Bi & Poo 1998, the LTP a pair shows is inversely related
+# to its starting strength; van Rossum, Bi & Turrigiano 2000 and Rubin, Lee & Sompolinsky 2001, multiplicative /
+# soft-bound STDP), and LTP saturates at a few times baseline (occlusion: a saturated pathway cannot be potentiated
+# further, Moser et al. 1998). So each recurrence adds less, the weight approaches a ceiling a few times its birth weight
+# and never max_weight (5.0): a common short prompt ("yes", "continue") cannot climb into a permanent hub that the
+# weight rules can no longer clear (#59 rich-get-richer through weight). A synapse already at or above its ceiling
+# (STDP raised it) is left alone: a recurrence never depresses. LAW 5 knobs, read per bind:
+#   CC_NG_BIND_REINFORCE_ETA            eta, default 0.2 (first recurrence of a 0.2 forest->tree synapse: +0.08)
+#   CC_NG_BIND_REINFORCE_CEILING_FACTOR ceiling = factor x the weight the bind writes at birth, default 3.0
+#                                       (forest->tree 0.6, tree->forest 0.45), and never above the synapse's max_weight
+#   CC_NG_BIND_REINFORCE_HE_ETA         hyperedge member eta, default = the graph's HyperedgePlasticityRule
+#                                       member_weight_lr (0.05: the first recurrence adds what one co-firing adds)
+#   CC_NG_BIND_REINFORCE_HE_CEILING     hyperedge member-weight ceiling, default 2.0 (members are born at 1.0), never
+#                                       above the engine's 5.0
+_CC_REINFORCE_ETA_DEFAULT = 0.2
+_CC_REINFORCE_CEILING_FACTOR_DEFAULT = 3.0
+_CC_HE_REINFORCE_CEILING_DEFAULT = 2.0
+# Scope (law review C-2, narrowed 2026-10-24): ONLY the forest<->tree synapses and the same-member hyperedge reinforce.
+# forest<->window, the window chain and the previous->current sequence link are always WRITTEN as before (a delayed
+# time-ordering link is never merged into another synapse). The tree sites write delay-1 EXCITATORY synapses, and only a
+# synapse of exactly that type and delay counts as "the same edge" (a sprouted / STDP synapse of another delay or an
+# inhibitory one on the same pair is not reinforced; a new bind synapse is written beside it, as with the switch off).
+_CC_REINFORCE_SITES = frozenset({"tree_synapse"})
+_CC_BIND_TREE_DELAY = 1   # the bind writes forest<->tree synapses with create_synapse's default delay
 
 
 def cc_bind_reinforce_enabled() -> bool:
     """CC_NG_BIND_REINFORCE_EXISTING (LAW 5; read per bind so a test or a restart sees the current value). Default off."""
     return os.environ.get("CC_NG_BIND_REINFORCE_EXISTING", "0").strip() not in ("0", "", "false", "False", "no")
+
+
+def _cc_env_float(name, default, lo, hi):
+    """A float knob from env, clamped to [lo, hi]; absent or unparsable -> default."""
+    try:
+        v = float(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return min(max(v, lo), hi)
+
+
+def cc_bind_reinforce_params(graph=None) -> dict:
+    """The soft-bound reinforcement constants (LAW 5 env, read per bind). See the block comment above."""
+    return {
+        "eta": _cc_env_float("CC_NG_BIND_REINFORCE_ETA", _CC_REINFORCE_ETA_DEFAULT, 0.0, 1.0),
+        "ceiling_factor": _cc_env_float("CC_NG_BIND_REINFORCE_CEILING_FACTOR",
+                                        _CC_REINFORCE_CEILING_FACTOR_DEFAULT, 1.0, 25.0),
+        "he_eta": _cc_env_float("CC_NG_BIND_REINFORCE_HE_ETA", _cc_he_member_lr(graph), 0.0, 1.0),
+        "he_ceiling": _cc_env_float("CC_NG_BIND_REINFORCE_HE_CEILING", _CC_HE_REINFORCE_CEILING_DEFAULT,
+                                    1.0, _CC_HE_MEMBER_WEIGHT_CAP),
+    }
+
+
+def _cc_soft_bound_step(w, eta, ceiling):
+    """Saturating potentiation: w + eta * (ceiling - w), never below w (a recurrence does not depress)."""
+    return w + max(0.0, eta * (ceiling - w))
+
+
+def _cc_is_bind_tree_synapse(syn) -> bool:
+    """The edge the bind's tree site writes: EXCITATORY, delay 1. Anything else on the pair is a different edge."""
+    st = getattr(syn, "synapse_type", None)
+    return (getattr(st, "name", st) == "EXCITATORY"
+            and int(getattr(syn, "delay", _CC_BIND_TREE_DELAY)) == _CC_BIND_TREE_DELAY)
 
 
 def _cc_he_member_lr(graph) -> float:
@@ -3796,14 +3870,19 @@ def _cc_he_member_lr(graph) -> float:
     return _CC_HE_REINFORCE_LR_DEFAULT
 
 
-def _cc_reinforce_synapse(graph, sid, weight, journal):
-    """Reinforce the EXISTING synapse `sid` by the weight the bind would have given a new one (so a recurrence adds the
-    same drive a parallel synapse would have, held in ONE synapse), capped at its max_weight like every weight update in
-    neuro_foundation (min(w + dw, max_weight)); peak_weight follows as in STDP. The before/after values are journalled
-    so a failed dual pass rolls it back. Raises on failure (#904: nothing in the bind is swallowed)."""
+def _cc_reinforce_synapse(graph, sid, birth_weight, journal, params=None):
+    """Reinforce the EXISTING synapse `sid` with a soft bound: w += eta * (ceiling - w), ceiling = ceiling_factor x the
+    weight the bind gives this site at birth, never above the synapse's max_weight; peak_weight follows as in STDP.
+    A synapse at or above its ceiling is not changed (and not journalled). The before/after values are journalled so a
+    failed dual pass rolls it back. Raises on failure (#904: nothing in the bind is swallowed). Returns True when the
+    weight changed."""
+    p = params or cc_bind_reinforce_params(graph)
     syn = graph.synapses[sid]
     before_w, before_peak = float(syn.weight), float(syn.peak_weight)
-    new_w = max(0.0, min(before_w + float(weight), float(syn.max_weight)))
+    ceiling = min(p["ceiling_factor"] * float(birth_weight), float(syn.max_weight))
+    new_w = max(0.0, min(_cc_soft_bound_step(before_w, p["eta"], ceiling), float(syn.max_weight)))
+    if new_w == before_w:
+        return False
     syn.weight = new_w
     if new_w > before_peak:
         syn.peak_weight = new_w
@@ -3814,17 +3893,20 @@ def _cc_reinforce_synapse(graph, sid, weight, journal):
     if journal is not None:
         journal.setdefault("reinforced_synapses", []).append(
             (sid, before_w, before_peak, float(syn.weight), float(syn.peak_weight)))
+    return True
 
 
-def _cc_reinforce_hyperedge(graph, hid, journal):
+def _cc_reinforce_hyperedge(graph, hid, journal, params=None):
     """Reinforce the EXISTING same-member hyperedge `hid`: the recurrence is the whole bound set occurring together
-    again, so every member's weight gets HyperedgePlasticityRule's co-firing increment (member_weight_lr, cap 5.0), and
+    again, so every member's weight takes a soft-bound step, w += he_eta * (he_ceiling - w) (he_eta defaults to
+    HyperedgePlasticityRule's co-firing rate; he_ceiling 2.0, never above the engine's 5.0), and
     metadata["cc_recurrences"] counts it. Native store (H1, off on the live CC today): member weights through
     set_member_weights. Journalled for rollback. Raises on failure."""
+    p = params or cc_bind_reinforce_params(graph)
     he = graph.hyperedges[hid]
-    lr = _cc_he_member_lr(graph)
+    ceiling = min(p["he_ceiling"], _CC_HE_MEMBER_WEIGHT_CAP)
     before_w = {n: float(w) for n, w in dict(he.member_weights).items()}
-    new_w = {n: min(before_w.get(n, 1.0) + lr, _CC_HE_MEMBER_WEIGHT_CAP) for n in list(he.member_nodes)}
+    new_w = {n: _cc_soft_bound_step(before_w.get(n, 1.0), p["he_eta"], ceiling) for n in list(he.member_nodes)}
     before_meta = dict(he.metadata or {})
     if getattr(graph, "_native_he", False):
         graph.hyperedges.set_member_weights(hid, list(new_w.items()))
@@ -3867,10 +3949,11 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
     has_trees / has_windows. Existing nodes and synapses are never touched: this
     only ever ADDS this turn's topology.
 
-    #1173 (2026-10-23; CC_NG_BIND_REINFORCE_EXISTING, default off): with the switch ON, a write whose edge already
-    exists -- a pre->post synapse (find_synapse_id) or a hyperedge over exactly the same members (find_hyperedge_id),
-    the Leg 2 merge's own lookups -- REINFORCES that edge (_cc_reinforce_synapse / _cc_reinforce_hyperedge) instead of
-    adding a parallel one. A reinforced pair counts in tree_pairs / window_pairs and a reinforced hyperedge sets
+    #1173 (2026-10-23; CC_NG_BIND_REINFORCE_EXISTING, default off; narrowed 2026-10-24, law review C-2): with the switch
+    ON, a forest<->tree write whose delay-1 EXCITATORY pre->post synapse already exists (find_synapse_id with the bind's
+    type/delay match) or a hyperedge over exactly the same members (find_hyperedge_id), the Leg 2 merge's own lookups,
+    REINFORCES that edge with a soft bound (_cc_reinforce_synapse / _cc_reinforce_hyperedge) instead of adding a
+    parallel one. forest<->window, the window chain and the sequence link are always written as before. A reinforced pair counts in tree_pairs / window_pairs and a reinforced hyperedge sets
     hyperedge=True (the turn IS bound); status["reinforced_synapses"] / ["reinforced_hyperedge"] say how. The rollback
     undoes a reinforcement exactly as it removes a created edge. With the switch OFF nothing here changes.
     """
@@ -3881,6 +3964,7 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
         from cc_topology_merge import find_synapse_id, find_hyperedge_id
         status["reinforced_synapses"] = 0
         status["reinforced_hyperedge"] = False
+        reinforce_params = cc_bind_reinforce_params(graph)
 
     def _site(name):
         if journal is not None:
@@ -3890,10 +3974,11 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
 
     def _syn(site, pre, post, weight, delay=None):
         _site(site)
-        if reinforce:
-            existing = find_synapse_id(graph, pre, post)
+        if reinforce and site in _CC_REINFORCE_SITES:
+            # 2026-10-24 (C-2): only the tree site, and only an edge of the bind's own type and delay
+            existing = find_synapse_id(graph, pre, post, match=_cc_is_bind_tree_synapse)
             if existing is not None:
-                _cc_reinforce_synapse(graph, existing, weight, journal)
+                _cc_reinforce_synapse(graph, existing, weight, journal, reinforce_params)
                 status["reinforced_synapses"] += 1
                 return
         if delay is None:
@@ -3925,7 +4010,7 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
             members = set([forest_id] + tree_ids + window_ids)
             existing_he = find_hyperedge_id(graph, members) if reinforce else None
             if existing_he is not None:
-                _cc_reinforce_hyperedge(graph, existing_he, journal)
+                _cc_reinforce_hyperedge(graph, existing_he, journal, reinforce_params)
                 status["reinforced_hyperedge"] = True
             else:
                 he = graph.create_hyperedge(

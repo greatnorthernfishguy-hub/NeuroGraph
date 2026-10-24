@@ -3,6 +3,12 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-24] Claude Code (Opus 5.5, laptop; #1173 law review C-2, Josh ~00:15 "narrow it")
+# What: find_synapse_id(..., match=None): an optional predicate a candidate must also satisfy. None = any synapse on the
+#   pair, exactly as before (Leg 2's _synapse_exists passes nothing, so the merge is unchanged).
+# Why: the conversational bind's reinforcement must only match an edge of its own type and delay (a delayed or inhibitory
+#   synapse on the same pair is a different edge); Leg 2 only skips, so its looser match stays.
+# How: one implementation for both callers (LAW 3); tests/test_cc_bind_reinforce_1173.py.
 # [2026-10-23] Claude Code (Opus 5.5, laptop; #1173 reinforce-on-recurrence, Josh 2026-10-23 ~19:30)
 # What: the two Leg 2 idempotency guards are split into lookups that return the id: NEW find_synapse_id(graph, pre, post)
 #   and find_hyperedge_id(graph, members) (smallest id when several match, so the choice is deterministic);
@@ -287,7 +293,7 @@ import re
 import stat
 import threading
 import time
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -1482,8 +1488,13 @@ def _hyperedge_exists(graph: Any, members: Set[str]) -> bool:
     return find_hyperedge_id(graph, members) is not None
 
 
-def find_synapse_id(graph: Any, pre: str, post: str) -> Optional[str]:
+def find_synapse_id(graph: Any, pre: str, post: str, match: Optional[Callable[[Any], bool]] = None) -> Optional[str]:
     """The id of an existing pre->post synapse, or None.
+
+    `match` (keyword, default None = any synapse on the pair, exactly the Leg 2 behaviour): a predicate a candidate must
+    also satisfy. The conversational bind's reinforcement passes its own type/delay test (2026-10-24, law review C-2),
+    because REINFORCING needs a stricter "same edge" than Leg 2's SKIP: a delayed or inhibitory synapse on the same pair
+    is a different edge.
 
     The Leg 2 idempotency lookup (_synapse_exists is `find_synapse_id(...) is not None`). Since 2026-10-23 (#1173) it is
     also the lookup cc_ng_organism's conversational bind uses to REINFORCE the existing synapse of a recurring turn
@@ -1497,7 +1508,7 @@ def find_synapse_id(graph: Any, pre: str, post: str) -> Optional[str]:
         found = []
         for sid in syn_ids:
             syn = synapses.get(sid)
-            if syn is not None and getattr(syn, "post_node_id", None) == post:
+            if syn is not None and getattr(syn, "post_node_id", None) == post and (match is None or match(syn)):
                 found.append(sid)
         return min(found) if found else None
     except Exception:
@@ -1505,7 +1516,8 @@ def find_synapse_id(graph: Any, pre: str, post: str) -> Optional[str]:
         # rather than reporting "no edge" and creating a duplicate.
         try:
             found = [sid for sid, syn in getattr(graph, "synapses", {}).items()
-                     if getattr(syn, "pre_node_id", None) == pre and getattr(syn, "post_node_id", None) == post]
+                     if getattr(syn, "pre_node_id", None) == pre and getattr(syn, "post_node_id", None) == post
+                     and (match is None or match(syn))]
             return min(found) if found else None
         except Exception:
             pass
