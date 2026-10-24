@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-10-23] Claude Code (Opus 5.5, laptop; #920) — test_signatures_are_pinned: run_conversational_dual_pass gained the keyword
+#   `prepared` (default None = unchanged behaviour); the pin now lists it and checks the default. Nothing else changed.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 builder, lane ng-trial-chain-s4, dispatch #14658) — N8 (TRIAL branch, test-only): F-B, the stale cross-change pin.
 #   test_generate_emergent_want_is_untouched compared generate_emergent_want to the PRE-#905 base (c5684334), which cannot hold once #905 part A is in the
 #   same tree (either merge order). RE-BASED (not retired) to compare against #905's own version (ee94f7d2) through the same `git show` mechanism, so it
@@ -194,7 +196,10 @@ def _forest_id(text):
 
 def test_signatures_are_pinned():
     import inspect
-    assert list(inspect.signature(org.run_conversational_dual_pass).parameters) == ['graph', 'vector_db', 'text', 'embedding', 'state']
+    # [2026-10-23] #920: one keyword appended (prepared=None = the old single in-lock call); the five positionals unchanged.
+    assert list(inspect.signature(org.run_conversational_dual_pass).parameters) == ['graph', 'vector_db', 'text', 'embedding', 'state',
+                                                                                   'prepared']
+    assert inspect.signature(org.run_conversational_dual_pass).parameters['prepared'].default is None
     assert list(inspect.signature(org.drain_ingest_tract).parameters)[-1] == 'hold_on_failure'
     assert inspect.signature(org.drain_ingest_tract).parameters['hold_on_failure'].default is False
 
