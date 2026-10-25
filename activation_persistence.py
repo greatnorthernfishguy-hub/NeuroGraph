@@ -15,6 +15,15 @@ Usage::
     ap.restore(graph, "/path/to/checkpoint.msgpack")
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — sidecar written atomically
+#   (PROTECTED CHANGE; ported 2026-10-25 to Syl's review branch syl-stage1-20261025; installs only after Josh's "proceed")
+#   What: write_state() writes <checkpoint>.activations.json through checkpoint_guardian.atomic_write_text instead of
+#         open('w') + json.dump.
+#   Why:  Josh 2026-10-14 "anything that can't risk a failed save, be atomic". open('w') truncates first; a daemon
+#         restart / kill mid-dump left a truncated sidecar that restore() rejects (all activations lost) and that the
+#         generation ring copies into the generation as-is.
+#   How:  same path, same JSON content (json.dumps == json.dump output), errors still raised (#423); the reader,
+#         _sidecar_defect() and rotate_generations() need no change.
 # [2026-02-22] Claude (Opus 4.6) — Initial implementation.
 #   What: ActivationPersistence with capture/save/restore, exponential
 #         temporal decay, max_entries bounding, and auto-save timer.
@@ -160,8 +169,10 @@ class ActivationPersistence:
         entries = captured.get("entries", {})
 
         try:
-            with open(sidecar_path, "w") as f:
-                json.dump(captured, f)
+            # Atomic (temp + fsync + os.replace + dir fsync): a kill mid-write leaves the previous sidecar, never a
+            # truncated one. Same path, same JSON bytes, so restore() and the generation ring's copy are unchanged.
+            from checkpoint_guardian import atomic_write_text
+            atomic_write_text(sidecar_path, json.dumps(captured))
         except Exception as exc:
             logger.error(
                 "Failed to save activation sidecar to %s: %s", sidecar_path, exc,
