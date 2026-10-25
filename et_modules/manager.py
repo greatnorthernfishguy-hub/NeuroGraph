@@ -8,6 +8,19 @@ by connecting to the NeuroGraphMemory singleton that this manager helps
 them discover.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5) — temps of dead writers clear themselves
+#   What: _clear_dead_writer_temps(path) runs before each atomic write: removes "<path>.tmp-<pid>" files whose writer
+#         pid is dead (left by a save killed mid-write).
+#   Why:  Josh 2026-10-15: "Temp files are temporary, so if they are no longer needed, I'm not aware of any reason to
+#         keep them around" / "Temp files clearing themselves once done sounds nice."
+#   How:  exact name match for this target only; our own pid and any live pid are skipped; never raises.
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
+#   What: ModuleManifest.to_file() and _save_registry() write through _atomic_write_text (temp + fsync + os.replace +
+#         directory fsync) instead of open('w') + json.dump.
+#   Why:  ~/.et_modules/registry.json is rewritten by the live daemon; a kill mid-write left a truncated registry that
+#         _load_registry() discards (every registered module forgotten until it re-registers).
+#   How:  same paths, same JSON. Helper is local so the file stays byte-identical in the repos that carry a copy
+#         (Elmer's et_modules/manager.py).
 # [2026-02-17] Claude (Opus 4.6) — Initial creation.
 #   What: ETModuleManager class with discover(), status(), update_all(),
 #         register(), offer_tier3_upgrade(), and shared learning dir mgmt.
@@ -35,6 +48,71 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("et_modules.manager")
+
+
+def _clear_dead_writer_temps(path):
+    """Remove "<path>.tmp-<pid>" files whose writer pid is dead (an interrupted save). Never raises.
+
+    Josh 2026-10-15: "Temp files clearing themselves once done sounds nice." Only the process named in a temp's
+    name ever writes it, so a dead pid means nobody will; a pid reused by a live process is left alone."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    prefix = os.path.basename(path) + ".tmp-"
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        digits = name[len(prefix):] if name.startswith(prefix) else ""
+        if not digits.isdigit() or int(digits) == os.getpid():
+            continue
+        try:
+            os.kill(int(digits), 0)
+            continue
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """temp file in the same directory -> write -> fsync -> os.replace -> fsync the directory.
+
+    Self-contained on purpose: this package is copied into other modules (Elmer) that have no checkpoint_guardian.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    _clear_dead_writer_temps(path)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+    except FileNotFoundError:
+        mode = None
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -84,9 +162,8 @@ class ModuleManifest:
             return None
 
     def to_file(self, path: str) -> None:
-        """Save this manifest to an et_module.json file."""
-        with open(path, "w") as f:
-            json.dump(asdict(self), f, indent=2)
+        """Save this manifest to an et_module.json file (atomically)."""
+        _atomic_write_text(path, json.dumps(asdict(self), indent=2))
 
 
 @dataclass
@@ -370,8 +447,7 @@ class ETModuleManager:
         }
 
         try:
-            with open(self._registry_path, "w") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_text(str(self._registry_path), json.dumps(data, indent=2))
         except OSError as e:
             logger.error("Failed to save registry: %s", e)
 

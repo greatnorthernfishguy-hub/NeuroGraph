@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
+# What: enable()/disable() write the 'enabled' file through checkpoint_guardian.atomic_write_text.
+# Why: write_text truncates first; a kill in between left an empty file, which __init__ reads as disabled (a silent Lenia-off on the next start).
+# How: same file, same 'True'/'False' content.
 # 2026-03-25 Claude Code — Initial creation
 # What: Global kill switch with energy watchdog
 # Why: Syl's Law — must be able to disable all field→SNN modulation instantly
@@ -28,6 +32,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from checkpoint_guardian import atomic_write_text
 from lenia.config import LeniaConfig
 
 logger = logging.getLogger(__name__)
@@ -79,7 +84,7 @@ class KillSwitch:
             return
 
         self._enabled = True
-        self._path.write_text("True")
+        atomic_write_text(self._path, "True")
 
         if self._engine:
             self._engine.start()
@@ -98,7 +103,7 @@ class KillSwitch:
             return
 
         self._enabled = False
-        self._path.write_text("False")
+        atomic_write_text(self._path, "False")
 
         if self._engine:
             self._engine.stop()

@@ -1,4 +1,14 @@
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1184) — port of the laptop atomic-saves line (c92dda5 +
+#   fe67f88, proven live on the laptop since 2026-10-14/15) onto Syl's 18a090e guardian, without #1051.
+# What: atomic_file_write() fsyncs the tmp before os.replace and the directory after, and first removes THIS target's
+#   tmps left by dead writers ("<stem>.tmp-<pid><suffix>", pid dead and not ours; one WARNING naming them). New
+#   atomic_write_bytes / atomic_write_text; write_manifest and write_guard_state use atomic_write_text.
+# Why: VPS 2026-10-24: 13.9 GB + 6.7 GB of main.tmp-<pid>.msgpack from saves killed mid-write (OOM kills) filled the
+#   disk; nothing cleaned them. Josh 2026-10-15: "Temp files clearing themselves once done sounds nice."
+# How: same tmp names, final bytes and formats; one listdir per write. A pid reused by a live process is left alone.
+#   The laptop's #1051 reconciled synapse gate (bfe788e/b1563f9, inert unless NG_GUARDIAN_RECONCILE) is NOT ported.
+# -------------------
 # [2026-09-11] Codex — #423 durability before generation retention.
 # What: flush source artifacts, generation members and directories before pruning;
 # optional pre-prune verification callback; copy failures now prevent eviction.
@@ -124,9 +134,7 @@ def write_manifest(checkpoint_path, stats: Dict[str, Any]) -> Path:
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
     data.update(stats)
-    tmp = p.with_name(p.name + f".tmp-{os.getpid()}")
-    tmp.write_text(json.dumps(data, indent=2))
-    os.replace(tmp, p)
+    atomic_write_text(p, json.dumps(data, indent=2))
     return p
 
 
@@ -177,9 +185,7 @@ def write_guard_state(checkpoint_path, state: Dict[str, Any]) -> None:
     to the manifest reference, it must never block a save."""
     p = guard_state_path_for(checkpoint_path)
     try:
-        tmp = p.with_name(p.name + f".tmp-{os.getpid()}")
-        tmp.write_text(json.dumps(state, indent=2))
-        os.replace(tmp, p)
+        atomic_write_text(p, json.dumps(state, indent=2))
     except Exception as exc:
         logger.debug("Guardian: guard-state write failed (non-fatal): %s", exc)
 
@@ -340,20 +346,103 @@ def best_effort_git_hash(repo_dir) -> Optional[str]:
 
 # ---- atomic writes ----
 
+def _fsync_dir(directory) -> None:
+    """fsync a directory so a rename into it survives power loss. Best-effort: logged, never raised."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        logger.debug("Guardian: cannot open %s for fsync (%s)", directory, exc)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        logger.warning("Guardian: directory fsync failed for %s (%s)", directory, exc)
+    finally:
+        os.close(fd)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def find_stale_temps(final_path) -> List[str]:
+    """Temps of THIS target ("<stem>.tmp-<pid><suffix>") whose writer process is gone (a save killed mid-way).
+
+    _clear_stale_temps deletes what this returns. Never raises.
+    """
+    final = Path(final_path)
+    prefix = f"{final.stem}.tmp-"
+    stale = []
+    try:
+        names = os.listdir(final.parent)
+    except OSError:
+        return stale
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(final.suffix)):
+            continue
+        digits = name[len(prefix):len(name) - len(final.suffix)] if final.suffix else name[len(prefix):]
+        if not digits.isdigit():
+            continue
+        pid = int(digits)
+        if pid == os.getpid() or _pid_alive(pid):
+            continue
+        stale.append(str(final.parent / name))
+    return stale
+
+
+def _clear_stale_temps(final_path) -> List[str]:
+    """Delete this target's tmps left by dead writers (interrupted saves). Returns the removed paths. Never raises."""
+    removed: List[str] = []
+    total = 0
+    for p in find_stale_temps(final_path):
+        try:
+            size = os.path.getsize(p)
+            os.unlink(p)
+        except OSError as exc:
+            logger.debug("Guardian: could not remove stale temp %s (%s)", p, exc)
+            continue
+        removed.append(p)
+        total += size
+    if removed:
+        logger.warning("Guardian: removed %d stale temp file(s) of %s left by interrupted saves (%.0f MB): %s -- "
+                       "the real file was intact.", len(removed), Path(final_path).name, total / 1e6,
+                       ", ".join(Path(p).name for p in removed))
+    return removed
+
+
 def atomic_file_write(final_path: str, write_fn: Callable[[str], Any]) -> Any:
-    """Run write_fn against a tmp path, then os.replace onto final_path.
+    """Run write_fn against a tmp path, fsync it, then os.replace onto final_path and fsync the directory.
 
     The tmp name PRESERVES the final suffix ("main.tmp-1234.msgpack") because
     both writers dispatch on extension: graph.checkpoint() refuses
     non-.msgpack paths loudly (#325) and SimpleVectorDB.save() silently
     switches to JSON (#356 trap). On write_fn failure the final file is
-    untouched and the tmp is removed.
+    untouched and the tmp is removed. A process killed mid-write leaves the
+    previous final file intact (and a stale tmp, removed by the next write of
+    this target); the fsync before the rename means a power loss / hard hang
+    right after the rename cannot leave an empty or partly-flushed file under
+    the final name.
     """
     final = Path(final_path)
     tmp = final.with_name(f"{final.stem}.tmp-{os.getpid()}{final.suffix}")
+    _clear_stale_temps(final)
     try:
         result = write_fn(str(tmp))
+        fd = os.open(str(tmp), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, final)
+        _fsync_dir(final.parent)
         return result
     finally:
         if tmp.exists():
@@ -361,6 +450,19 @@ def atomic_file_write(final_path: str, write_fn: Callable[[str], Any]) -> Any:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def atomic_write_bytes(final_path, data: bytes) -> None:
+    """Write `data` to final_path atomically (atomic_file_write)."""
+    def _write(p: str) -> None:
+        with open(p, "wb") as f:
+            f.write(data)
+    atomic_file_write(str(final_path), _write)
+
+
+def atomic_write_text(final_path, text: str, encoding: str = "utf-8") -> None:
+    """Write `text` to final_path atomically (atomic_file_write)."""
+    atomic_write_bytes(final_path, text.encode(encoding))
 
 
 # ---- the gate ----

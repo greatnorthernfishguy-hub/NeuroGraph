@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
+# What: ChannelRegistry._save() writes channels.json through checkpoint_guardian.atomic_write_text.
+# Why: open('w') + json.dump truncated the registry first; a kill mid-write left a file _load() cannot parse.
+# How: same path, same JSON; reader unchanged.
 # 2026-03-25 Claude Code — Initial creation
 # What: Channel registry — birth, merge, death lifecycle management
 # Why: Channel count is substrate-governed, not hardcoded
@@ -288,8 +292,8 @@ class ChannelRegistry:
                 for cid, ch in self._channels.items()
             },
         }
-        with open(self._path, "w") as f:
-            json.dump(data, f, indent=2)
+        from checkpoint_guardian import atomic_write_text
+        atomic_write_text(self._path, json.dumps(data, indent=2))   # temp + fsync + os.replace
 
     def _load(self):
         """Load registry from JSON."""
