@@ -1,10 +1,60 @@
 # tests/test_ng_embed_dualpass.py
+# ---- Changelog ----
+# [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
+#   lane z2-ngembed-cap-roundrobin-20260926 — #666.
+# What: two tests for _extract_concepts round-robin interleave: (1) with 2 windows
+#   and the default cap of 20, both windows are represented and the exact
+#   interleaved order is asserted against a hand-computed literal list; (2) two
+#   identical windows collapse to a single concept and make 2 TID calls.
+# Why:  a positional union let the head window fill the cap and silently drop
+#   later windows' concepts (#666, Exec P267(2)).
+# How:  _extract_instance() + _TidResp + monkeypatched requests.post; text
+#   "word " * 600 (3000 chars) yields exactly 2 windows.
+# -------------------
+# [2026-09-25] Claude Code (kimi-k2.7-code) — Packet 214 V-1/V-2/D-2/LAW-5
+#   corrective build.
+# What: (1) Replaced source-grep truncation test with a behavioral test using the
+#   real tokenizer when locally cached: assert truncation is disabled and
+#   assert >512-token input encodes to >512 ids. (2) Added a V-2 behavioral
+#   test against the real cached tokenizer that proves EmbedWindow.text is built
+#   from raw input char offsets rather than tokenizer.decode round-trip (LAW 7).
+#   (3) Set HF_HUB_OFFLINE before the first import that may pull in huggingface
+#   hub code. (4) Added explicit delenv for NG_EMBED_TID_ENDPOINT and a test
+#   asserting the override actually takes effect.
+# Why:  V-1 source-grep was not enough; V-2 fake tokenizers could not distinguish
+#   decode-based text from offset-sliced text; real-tokenizer behavior locks the fix.
+#   HUB_OFFLINE must be set before import to have effect; the endpoint env override
+#   test makes LAW-5 observability explicit.
+# How:  test_tokenizer_truncation_is_not_enabled_on_loaded_instance uses real
+#   tokenizer; test_real_tokenizer_window_text_uses_raw_char_offsets compares
+#   window text to raw-input char slices, asserting decode was not used. env
+#   override test checks _config after construction. Fixture cleans NG_EMBED_TID_ENDPOINT.
+# [2026-09-22] Grok 4.6 — punchlist-001 B6: repo-required changelog header
+# What: This file now carries the changelog header the repo requires.
+# Why:  It previously started at imports.
+# How:  Header opened with B2/B3 test landings; this entry closes B6.
+# [2026-09-22] Grok 4.6 — punchlist-001 B3: openclaw_adapter has no _hash_embed
+# What: Assert OpenClawAdapter has no _hash_embed method and the source
+#       contains no def _hash_embed / self._hash_embed call.
+# Why:  384-dim hash vectors are forbidden; modules call ng_embed or raise.
+# How:  inspect.getsource(openclaw_adapter).
+# [2026-09-22] Grok 4.6 — punchlist-001 B2: overlapping TID extraction windows
+# What: Assert short text is one TID call; long text windows cover the tail;
+#       union then max_concepts; any window None fails the extraction;
+#       legitimate [] still returns [].
+# Why:  text[:2000] dropped the rest of the turn from Pass 2.
+# How:  Fake requests.post; NGEmbed.__new__ so no ONNX/HF load.
+# -------------------
 import os
 import sys
 import inspect
 import threading
 import numpy as np
 import pytest
+
+# HF_HUB_OFFLINE must be set before huggingface_hub/tokenizers code is imported
+# for the constant to take effect on local tokenizer downloads.
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,6 +67,7 @@ def _reset_singleton_and_env(monkeypatch):
     monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
     monkeypatch.delenv("NG_EMBED_ALLOW_HASH_FALLBACK", raising=False)
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("NG_EMBED_TID_ENDPOINT", raising=False)
     NGEmbed.reset_instance()
     yield
     NGEmbed.reset_instance()
@@ -28,6 +79,78 @@ def test_hash_embed_symbol_does_not_exist():
     assert "_hash_embed" not in src
     assert "sha384" not in src.lower()
     assert "NG_EMBED_ALLOW_HASH_FALLBACK" not in src
+
+
+def test_tid_endpoint_env_override(monkeypatch):
+    """LAW-5: NG_EMBED_TID_ENDPOINT actually overrides the default endpoint."""
+    override = "http://127.0.0.1:9999/custom/chat"
+    monkeypatch.setenv("NG_EMBED_TID_ENDPOINT", override)
+    emb = NGEmbed()
+    assert emb._config["tid_endpoint"] == override
+
+
+def test_real_tokenizer_window_text_uses_raw_char_offsets(monkeypatch):
+    """V-2: EmbedWindow.text must come from the raw input via offset slices,
+    not from tokenizer.decode (which can normalize whitespace/unicode).
+
+    Uses the real cached tokenizer; skips if it is not available offline.
+    """
+    emb = NGEmbed()
+    monkeypatch.setattr(emb, "_ensure_model", lambda: True)
+    emb._model_loaded = True
+    # Load the tokenizer through the configured path so no_truncation() is applied.
+    try:
+        emb._ensure_tokenizer()
+    except Exception:
+        pytest.skip("real tokenizer not available in local HF cache")
+    tok = emb._tokenizer
+
+    # Load the tokenizer through the configured path so no_truncation() is applied.
+    try:
+        emb._ensure_tokenizer()
+    except Exception:
+        pytest.skip("real tokenizer not available in local HF cache")
+    tok = emb._tokenizer
+
+    seen = []
+
+    def fake_onnx(text, normalize=False, is_query=False, _ids=None):
+        # Vector content is irrelevant; we only inspect the text argument.
+        return _one_hot(768, len(text) % 768)
+
+    monkeypatch.setattr(emb, "_onnx_embed", fake_onnx)
+
+    # Build an input guaranteed to need at least two windows. Each distinct word
+    # should be its own token(s), so 1000 space-separated words exceed 512.
+    chunk = " ".join(f"tok{i}" for i in range(1000))
+    we = emb.embed_windows(chunk)
+
+
+    assert we.token_count > ng_embed_mod._WINDOW_TOKENS, (
+        "test input must exceed one window"
+    )
+    assert len(we.windows) >= 2, "long input must produce multiple windows"
+
+    enc = tok.encode(chunk)
+    for idx, (wrapped, _interior, weight, start, end) in enumerate(
+        emb._window_token_ids(list(enc.ids))
+    ):
+        char_start = enc.offsets[start][0]
+        char_end = enc.offsets[end - 1][1]
+        expected = chunk[char_start:char_end]
+        actual = we.windows[idx].text
+        assert actual == expected, (
+            f"window {idx} text must match raw char-offset slice; "
+            f"got {actual!r}, expected {expected!r}"
+        )
+
+
+def test_openclaw_adapter_has_no_hash_embed():
+    import openclaw_adapter as oc
+    assert not hasattr(oc.OpenClawAdapter, "_hash_embed")
+    src = inspect.getsource(oc)
+    assert "def _hash_embed" not in src
+    assert "self._hash_embed" not in src
 
 
 def test_embed_raises_when_model_unavailable(monkeypatch):
@@ -51,9 +174,10 @@ def test_empty_batch_returns_empty_without_touching_model(monkeypatch):
 
 
 class _Enc:
-    def __init__(self, ids):
+    def __init__(self, ids, offsets=None):
         self.ids = list(ids)
         self.attention_mask = [1] * len(self.ids)
+        self.offsets = offsets if offsets is not None else [(i, i + 1) for i in range(len(self.ids))]
 
 
 class _FakeTok:
@@ -79,7 +203,9 @@ class _ClsSepTok:
 
     def encode(self, text):
         interior = [100 + i for i in range(len(text))]
-        return _Enc([self.CLS] + interior + [self.SEP])
+        ids = [self.CLS] + interior + [self.SEP]
+        offsets = [(0, 0)] + [(i, i + 1) for i in range(len(text))] + [(0, 0)]
+        return _Enc(ids, offsets)
 
     def decode(self, ids, skip_special_tokens=True):
         seq = list(ids)
@@ -101,20 +227,24 @@ def _one_hot(dim, idx):
 
 
 def test_tokenizer_truncation_is_not_enabled_on_loaded_instance(monkeypatch):
+    """Behavioral V-1 test: real tokenizer must not truncate >512 tokens.
+
+    The vector-distinctness acceptance criterion (>512 tokens alter the
+    forest vector vs. a 512-token prefix) is covered by the fast fake-
+    tokenizer pooling tests below.
+    """
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     emb = NGEmbed()
-    called = {"trunc": False}
-    tok = _FakeTok()
-    def _boom(**k):
-        called["trunc"] = True
-        raise AssertionError("enable_truncation must not be called")
-    tok.enable_truncation = _boom  # type: ignore
-    # Force the load path to install our tokenizer. Easier: set attrs after fake load.
-    monkeypatch.setattr(emb, "_ensure_model", lambda: True)
-    emb._tokenizer = tok
-    emb._model_loaded = True
-    # The production _ensure_model body must not call enable_truncation.
-    src = inspect.getsource(NGEmbed._ensure_model)
-    assert "enable_truncation" not in src
+    if not emb._ensure_model():
+        pytest.skip("model files not in local HF cache")
+    tok = emb._tokenizer
+    # V-1: truncation config shipped with the tokenizer is disabled.
+    assert tok.truncation is None
+    # Build an input guaranteed to exceed 512 tokens while keeping the
+    # behavioral test fast on CPU.
+    long_text = "word " * 600
+    encoding = tok.encode(long_text)
+    assert len(encoding.ids) > 512, "no_truncation() must allow >512 token encodings"
 
 
 def test_short_input_matches_single_window_primitive(monkeypatch):
@@ -366,3 +496,174 @@ def test_keepalive_refcount_concurrent_starts(monkeypatch):
     if emb._keepalive_thread is not None:
         emb._keepalive_thread.join(timeout=2)
         assert not emb._keepalive_thread.is_alive()
+
+
+def _extract_instance(**cfg_over):
+    emb = NGEmbed.__new__(NGEmbed)
+    cfg = dict(ng_embed_mod._DEFAULT_CONFIG)
+    cfg.update(cfg_over)
+    emb._config = cfg
+    emb._failures = 0
+    return emb
+
+
+class _TidResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._payload}}]}
+
+
+def test_extract_windows_short_is_single_window():
+    emb = _extract_instance()
+    text = "short turn"
+    assert emb._char_extract_windows(text) == [text]
+
+
+def test_extract_windows_cover_full_text_with_overlap():
+    emb = _extract_instance(max_content_for_extraction=2000, extract_window_overlap=256)
+    text = "H" * 2000 + "TAIL_MARKER_XYZ"
+    windows = emb._char_extract_windows(text)
+    assert len(windows) >= 2
+    assert windows[0] == text[:2000]
+    assert "TAIL_MARKER_XYZ" in windows[-1]
+    reconstructed = windows[0]
+    for w in windows[1:]:
+        assert w[:256] == reconstructed[-256:]
+        reconstructed = reconstructed[:-256] + w
+    assert reconstructed == text
+
+
+def test_extract_concepts_short_text_one_tid_call(monkeypatch):
+    import requests
+    emb = _extract_instance()
+    calls = []
+
+    def fake_post(url, json=None, timeout=None, **k):
+        calls.append((json["messages"][1]["content"], timeout))
+        return _TidResp('["alpha"]')
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts("hello concepts")
+    assert out == ["alpha"]
+    assert len(calls) == 1
+    assert "hello concepts" in calls[0][0]
+    assert calls[0][1] == emb._config["tid_timeout"]
+
+
+def test_extract_concepts_long_text_covers_tail(monkeypatch):
+    import requests
+    emb = _extract_instance()
+    text = "A" * 2000 + "UNIQUE_TAIL_MARKER"
+    seen_contents = []
+
+    def fake_post(url, json=None, timeout=None, **k):
+        body = json["messages"][1]["content"]
+        seen_contents.append(body)
+        return _TidResp('[]')
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out == []
+    assert len(seen_contents) >= 2
+    assert any("UNIQUE_TAIL_MARKER" in body for body in seen_contents)
+
+
+def test_extract_concepts_unions_then_caps_max_concepts(monkeypatch):
+    import requests
+    emb = _extract_instance(max_concepts=3)
+    text = "X" * 2500
+    payloads = ['["alpha", "beta"]', '["beta", "gamma", "delta"]']
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        payload = payloads[min(calls["n"], len(payloads) - 1)]
+        calls["n"] += 1
+        return _TidResp(payload)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out == ["alpha", "beta", "gamma"]
+    assert calls["n"] >= 2
+
+
+def test_extract_concepts_round_robin_keeps_every_window_under_cap(monkeypatch):
+    import json
+    import requests
+    emb = _extract_instance()
+    text = "word " * 600
+    assert len(emb._char_extract_windows(text)) == 2
+    window0 = [f"w0-c{i:02d}" for i in range(20)]
+    window1 = window0[:5] + [f"w1-c{i:02d}" for i in range(10)]
+    payloads = [json.dumps(window0), json.dumps(window1)]
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        payload = payloads[min(calls["n"], len(payloads) - 1)]
+        calls["n"] += 1
+        return _TidResp(payload)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert len(out) == 20
+    assert len(set(out)) == 20
+    assert any(c.startswith("w1-c") for c in out)
+    expected = [
+        "w0-c00", "w0-c01", "w0-c02", "w0-c03", "w0-c04",
+        "w0-c05", "w1-c00", "w0-c06", "w1-c01", "w0-c07",
+        "w1-c02", "w0-c08", "w1-c03", "w0-c09", "w1-c04",
+        "w0-c10", "w1-c05", "w0-c11", "w1-c06", "w0-c12",
+    ]
+    assert out == expected
+
+
+def test_extract_concepts_identical_windows_single_concept(monkeypatch):
+    import json
+    import requests
+    emb = _extract_instance()
+    text = "word " * 600
+    payloads = [json.dumps(["word"]), json.dumps(["word"])]
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        payload = payloads[min(calls["n"], len(payloads) - 1)]
+        calls["n"] += 1
+        return _TidResp(payload)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out == ["word"]
+    assert calls["n"] == 2
+
+
+def test_extract_concepts_window_failure_returns_none(monkeypatch):
+    import requests
+    emb = _extract_instance()
+    text = "Y" * 2500
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _TidResp('["kept"]')
+        raise RuntimeError("TID down")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    out = emb._extract_concepts(text)
+    assert out is None
+    assert emb._failures >= 1
+
+
+def test_extract_concepts_all_empty_returns_empty_list(monkeypatch):
+    import requests
+    emb = _extract_instance()
+
+    def fake_post(url, json=None, timeout=None, **k):
+        return _TidResp("[]")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    assert emb._extract_concepts("Z" * 2500) == []
