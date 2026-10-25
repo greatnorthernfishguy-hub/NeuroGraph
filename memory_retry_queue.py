@@ -1,4 +1,12 @@
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #920 adapted) — an item at max_attempts is QUARANTINED, not lost
+# What: drain() appends each item it would drop to "<path>.quarantine.msgpack" (append-only, length-prefixed msgpack
+#       frames: target_id, content, attempts, dropped_at, last_error) before dropping it from the queue; the INFO log
+#       names the file. A failed quarantine append keeps the item in the queue (never lost) and logs a WARNING.
+# Why:  laptop #920 (proven live 2026-10-23): bounded retry -> durable quarantine, never silent loss. Here the queue
+#       held 2,377 of Syl's turn memories (attempts 0) on 2026-10-24 while ng_embed's import was broken; three failed
+#       drains would have discarded them.
+# How:  the bounded, non-cyclic behaviour is unchanged (an item is still never retried past max_attempts).
 # [2026-06-05] CC (Sonnet 4.6) — #297 review fixes: atomic _save(), drain limit param, import os
 # What: _save() now writes to .tmp then os.replace() — atomic, no zero-byte corruption on kill.
 #       drain() gains optional limit= param — pulse processes only oldest N per pass.
@@ -21,7 +29,7 @@
 Non-cyclic by construction: a drain pass NEVER re-enters extraction during the
 same pass, and any item reaching max_attempts is DROPPED (logged), never re-queued.
 The explicit guard against the wire->absorb->extract OOM recursion class (spec §6.1)."""
-import os, msgpack, logging
+import os, msgpack, logging, struct, time
 from typing import Callable, Dict, Any, List
 logger = logging.getLogger(__name__)
 
@@ -49,6 +57,26 @@ class RetryQueue:
         except Exception as e:
             logger.warning("retry-queue save failed: %s", e)
 
+    @property
+    def quarantine_path(self) -> str:
+        return self.path + ".quarantine.msgpack"
+
+    def _quarantine(self, item: Dict[str, Any], last_error) -> bool:
+        """Append one length-prefixed msgpack frame; fsync. True on success. Never raises."""
+        try:
+            frame = msgpack.packb({"target_id": item.get("target_id"), "content": item.get("content"),
+                                   "attempts": item.get("attempts"), "dropped_at": time.time(),
+                                   "last_error": last_error}, use_bin_type=True)
+            with open(self.quarantine_path, "ab") as f:
+                f.write(struct.pack(">I", len(frame)) + frame)
+                f.flush()
+                os.fsync(f.fileno())
+            return True
+        except Exception as e:
+            logger.warning("retry-queue quarantine append failed for %s (kept in queue): %s",
+                           item.get("target_id"), e)
+            return False
+
     def pending_count(self) -> int:
         return len(self._items)
 
@@ -69,17 +97,21 @@ class RetryQueue:
         for item in to_process:
             item["attempts"] += 1
             ok = False
+            last_error = None
             try:
                 ok = bool(attempt(item))
             except Exception as e:
+                last_error = repr(e)[:500]
                 logger.debug("retry attempt raised (non-fatal): %s", e)
             if ok:
                 succeeded += 1
             elif item["attempts"] < self.max_attempts:
                 survivors.append(item)
+            elif self._quarantine(item, last_error):
+                logger.info("retry-queue quarantined %s after %d attempts (%s)",
+                            item["target_id"], item["attempts"], self.quarantine_path)
             else:
-                logger.info("retry-queue dropping %s after %d attempts",
-                            item["target_id"], item["attempts"])
+                survivors.append(item)  # could not quarantine: keep it rather than lose it
         self._items = survivors + rest   # unprocessed items retained for next pulse
         self._save()
         return succeeded
