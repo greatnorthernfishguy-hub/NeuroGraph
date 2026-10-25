@@ -2,6 +2,13 @@
 OpenClaw Adapter — E-T Systems Module Integration for OpenClaw Skills
 
 # ---- Changelog ----
+# [2026-09-22] Grok 4.6 — punchlist-001 B3: delete _hash_embed
+#   What: Removed _hash_embed and the example/docstring advice to call it.
+#         Abstract _embed now tells modules to call ng_embed.embed / NGEmbed
+#         or fail closed (raise). 384-dim hash vectors are forbidden.
+#   Why:  Josh: no hash embedding anywhere. A module with no embedder must
+#         not synthesize a vector.
+#   How:  Usage example calls ng_embed.embed; fallback section deleted.
 # [2026-04-29] Claude (Sonnet 4.6) — _drain_river() fix: use _drain_all() return value
 #   What: _drain_river() counted events via _peer_events delta — deleted in #155.
 #         getattr(..., '_peer_events', []) always returned [] so new_count=0 always.
@@ -56,9 +63,10 @@ Usage (inside a module's openclaw hook file):
         DEFAULT_WORKSPACE = "~/.openclaw/trollguard"
 
         def _embed(self, text: str) -> "np.ndarray":
-            # Return your module's embedding for text.
-            # If you have no embedder, use the fallback:
-            return self._hash_embed(text)
+            # Return your module's 768-dim embedding for text.
+            # Modules without a local embedder call ng_embed.embed / NGEmbed.
+            from ng_embed import embed
+            return embed(text)
 
         def _module_on_message(self, text: str, embedding: "np.ndarray") -> dict:
             # Module-specific processing (scan, route, classify, etc.)
@@ -190,8 +198,8 @@ class OpenClawAdapter(ABC):
     def _embed(self, text: str) -> np.ndarray:
         """Return a normalized np.ndarray embedding for text.
 
-        If your module has no embedder, call self._hash_embed(text) as
-        a zero-dependency fallback.
+        Call ng_embed.embed / NGEmbed. A module with no embedder must
+        fail closed (raise); hash vectors are forbidden.
         """
         ...
 
@@ -392,21 +400,4 @@ class OpenClawAdapter(ABC):
         except Exception as exc:
             logger.debug("Event log write failed: %s", exc)
 
-    # -----------------------------------------------------------------
-    # Embedding fallback (zero-dependency)
-    # -----------------------------------------------------------------
 
-    def _hash_embed(self, text: str, dims: int = 384) -> np.ndarray:
-        """Hash-based embedding fallback requiring only numpy + stdlib.
-
-        Produces a deterministic, normalized vector from text.
-        Lower quality than sentence-transformers but always available.
-        Use when your module has no dedicated embedder.
-        """
-        import hashlib
-
-        rng_seed = int(hashlib.sha256(text.encode()).hexdigest(), 16) % (2**32)
-        rng = np.random.RandomState(rng_seed)
-        vec = rng.randn(dims).astype(np.float32)
-        norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
