@@ -48,7 +48,7 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
-# [2026-10-25] Claude Code (Opus 5.5, laptop) — #1185 resumable, bounded, damage-tolerant cursor drain
+# [2026-10-25] Claude Code (Opus 5.5, laptop) — #1189 resumable, bounded, damage-tolerant cursor drain
 #   What: _drain_with_cursor rewritten around the tract's own frame validation:
 #     (a) a damaged unit (zero-filled / torn body, bad header) starts a damaged region
 #         that ends at the next whole CRC-valid frame (_btf_unit_at / _btf_next_valid);
@@ -81,8 +81,8 @@ License: AGPL-3.0
 #   How:  Python-side framing with zlib.crc32 (same CRC-32 as crc32fast), so it works
 #     identically with both installed readers (ng-tract-rs skips bad-CRC frames
 #     silently; UniAI's raises). Only validated units reach ng_tract.TractReader, in
-#     slices <= 8 MiB. Tests: tests/test_tract_drain_resume_1185.py; measurements:
-#     scripts/tract_1185_bench.py. Delivery is still at-most-once per committed batch.
+#     slices <= 8 MiB. Tests: tests/test_tract_drain_resume_1189.py; measurements:
+#     scripts/tract_1189_bench.py. Delivery is still at-most-once per committed batch.
 #     Re-vendor to every module + the VPS is a separate, later install step.
 # [2026-06-04] Claude Code (Opus 4.7) — Phase 4 canonical drift removal (substrate-as-protocol PRD §5.4)
 #   What: Four drift-removal edits to canonical NGTractBridge.
@@ -254,7 +254,7 @@ _CURSOR_SUFFIX: str = ".cursor"
 # Compact when cursor advances past this many bytes (active consumer only).
 _COMPACT_THRESHOLD_BYTES: int = 50 * 1024 * 1024  # 50 MB
 
-# #1185 (2026-10-25) resumable drain. Every damaged region's raw bytes go to
+# #1189 (2026-10-25) resumable drain. Every damaged region's raw bytes go to
 # <tract>.damaged (append-only, never truncated) before the cursor moves past them.
 _DAMAGED_SUFFIX: str = ".damaged"
 # BTF v0.1 §4 envelope: magic "BT", version 1, entry_type 1..3, u32 LE
@@ -713,7 +713,7 @@ class NGTractBridge(NGBridge):
     def disconnect(self) -> None:
         """Disconnect the bridge.
 
-        #1185: also asks the ng_tract writer to fdatasync every tract it has
+        #1189: also asks the ng_tract writer to fdatasync every tract it has
         appended to since its last sync (the "on close" half of the bounded
         fsync cadence). Older wheels have no sync_tracts(); nothing to do then.
         """
@@ -974,7 +974,7 @@ class NGTractBridge(NGBridge):
     ) -> bool:
         """Atomically replace the cursor sidecar (temp + fsync + rename).
 
-        The format stays the plain JSON {"offset","ts","entries"}; #1185 adds the
+        The format stays the plain JSON {"offset","ts","entries"}; #1189 adds the
         optional "ino" (the tract inode the offset belongs to) and, only during a
         compaction, "prev_ino"/"prev_offset", so an offset is never applied to a
         different file. Older readers ignore the extra keys. Returns False when
@@ -1039,14 +1039,14 @@ class NGTractBridge(NGBridge):
         Called only when the cursor reached EOF at drain time, so the kept part is
         normally empty: just frames appended since the read.
 
-        #1185 (the #1176 lock design): the copy and the rename happen under
+        #1189 (the #1176 lock design): the copy and the rename happen under
         flock(LOCK_EX) on the tract's current inode, the same lock every tract
         writer takes, so no append can land between the copy and the rename. The
         remainder is streamed (bounded RAM) to <tract>.compact, fsynced, and the
         cursor is written BEFORE the rename as {offset 0, ino new, prev_ino old,
         prev_offset old}, so a crash on either side of the rename resumes at the
         right place. A writer blocked on the old inode re-checks the path after it
-        gets the lock and re-opens it (ng_tract >= #1185, miniTID #1176).
+        gets the lock and re-opens it (ng_tract >= #1189, miniTID #1176).
         Writers without that re-check (older wheels) can still lose an append that
         races the rename, as before.
         """
@@ -1191,7 +1191,7 @@ class NGTractBridge(NGBridge):
         self, tract_path: Path, peer_id: str,
         entry_types: Optional[Set[int]] = None,
     ) -> List[Any]:
-        """Resumable, bounded, damage-tolerant incremental drain (#1185).
+        """Resumable, bounded, damage-tolerant incremental drain (#1189).
 
         Walks the tract from the cursor in windows of NG_TRACT_DRAIN_CHUNK_BYTES
         (never the whole remaining file). Each window is split into units with the
