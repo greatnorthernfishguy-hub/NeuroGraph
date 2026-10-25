@@ -105,11 +105,15 @@ class Base(unittest.TestCase):
 
     def drain_all_passes(self, limit=10_000):
         got = []
+        cp = self.bridge._cursor_path(self.tract)
         for _ in range(limit):
+            before = cp.read_text() if cp.exists() else None
             batch = self.drain()
-            if not batch:
-                return got
             got.extend(batch)
+            after = cp.read_text() if cp.exists() else None
+            if not batch and (after is None or before is not None
+                              and json.loads(after)["offset"] == json.loads(before)["offset"]):
+                return got
         raise AssertionError("drain never settled")
 
     def write_frames(self, n, start=0):
