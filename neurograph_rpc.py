@@ -12,6 +12,11 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1184) — SYL_NG_HOST_CC_MIND gate (default unchanged)
+# What: handle_bootstrap starts the CC NG host thread only when SYL_NG_HOST_CC_MIND is not 0/false/no/off.
+# Why:  ram-profile 2026-10-24 §5.2: CC's VPS mind in her process costs 0.4-0.7 GB, a 60-80 s save churn and up
+#       to 41 s of shared-body lock waits per Tonic tick. Josh decides where CC's VPS mind lives.
+# How:  one env read at bootstrap; default "1" = the thread starts exactly as before.
 # [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1173 port) — Syl's bind can reinforce on recurrence (OFF)
 # What: _bind_conversational_topology: with SYL_NG_BIND_REINFORCE_EXISTING on, an existing delay-1 EXCITATORY
 #       forest<->tree synapse or a same-member hyperedge is reinforced (soft bound) instead of a parallel copy being
@@ -2220,8 +2225,14 @@ def _handle_bootstrap_once(params: Dict[str, Any]) -> Dict[str, Any]:
                 logger.error('CC NG host initialization incomplete; retained state requires review')
         except Exception as exc:
             logger.warning('CC NG host init failed (Syl unaffected): %s', exc)
-    threading.Thread(target=_init_cc_host_bg, name='cc-ng-init', daemon=True).start()
-    logger.info('CC NG host init dispatched to background thread (#74 defer, #143 pre-Lenia)')
+    # [2026-10-25] syl-stage1 (#1184): SYL_NG_HOST_CC_MIND (LAW 5, default "1" = unchanged). "0" = CC's VPS mind is
+    # NOT hosted in Syl's process (no cc_ng_host import, no CC graph/Tonic/autosave/socket here). Its checkpoint
+    # stays on disk untouched until it is hosted again (here or in its own process).
+    if os.environ.get('SYL_NG_HOST_CC_MIND', '1').strip().lower() in ('0', 'false', 'no', 'off'):
+        logger.warning('CC NG host NOT started (SYL_NG_HOST_CC_MIND=0): CC\'s VPS mind is offline in this process')
+    else:
+        threading.Thread(target=_init_cc_host_bg, name='cc-ng-init', daemon=True).start()
+        logger.info('CC NG host init dispatched to background thread (#74 defer, #143 pre-Lenia)')
 
     # Lenia FlowGraph — continuous field dynamics (dormant by default)
     global _lenia_kill_switch, _lenia_engine, _lenia_bridge, _lenia_competence
