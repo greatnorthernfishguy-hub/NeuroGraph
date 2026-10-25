@@ -27,6 +27,15 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1184) — saves let go of _concurrent_lock after the capture
+# What: _save_releasing_after_capture(ng): acquire graph._concurrent_lock, call ng.save(after_capture=<release>) so
+#       the lock ends right after the detached capture; used by the autosave loop and the final shutdown save. If the
+#       installed NeuroGraphMemory.save has no after_capture (the PROTECTED openclaw_hook commit not installed), the
+#       old shape runs: the lock is held for the whole save.
+# Why:  #1161 / #1123, proven on the laptop daemon 2026-10-22: holding the lock through the ~write made hook deposits,
+#       recall and the shutdown's final save wait behind it. Here CC's VPS mind saves every 60 s inside Syl's process.
+# How:  same thread acquires and releases (the callback runs inside save()); a finally releases if the callback never
+#       ran. No change to what is saved or when.
 # [2026-09-13] Codex — expose read-only topology-built provider context.
 # What: add the provider_context socket verb through the shared Pith assembler.
 # Why: miniTID needs a fresh situational model rather than ranked memory snippets.
@@ -1370,14 +1379,41 @@ def _serve_loop() -> None:
         t.start()
 
 
+def _save_accepts_after_capture(ng) -> bool:
+    try:
+        import inspect
+        return "after_capture" in inspect.signature(ng.save).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _save_releasing_after_capture(ng, **kwargs):
+    """ng.save() under graph._concurrent_lock, released right after the capture when save() supports it (#1161)."""
+    lock = ng.graph._concurrent_lock
+    if not _save_accepts_after_capture(ng):
+        with lock:
+            return ng.save(**kwargs)
+    lock.acquire()
+    held = [True]
+
+    def _release() -> None:
+        if held[0]:
+            held[0] = False
+            lock.release()
+
+    try:
+        return ng.save(after_capture=_release, **kwargs)
+    finally:
+        _release()
+
+
 def _autosave_loop() -> None:
     while _STATE.running:
         time.sleep(AUTOSAVE_INTERVAL)
         if not _STATE.running or _STATE.cc_ng is None:
             continue
         try:
-            with _STATE.cc_ng.graph._concurrent_lock:
-                _STATE.cc_ng.save()
+            _save_releasing_after_capture(_STATE.cc_ng)
             logger.debug("CC autosave complete")
             # WANTs (#294/Mind-Not-Database): materialize any [WANT]...[/WANT]
             # markers deposited since the last pulse into first-class want-nodes.
@@ -1832,8 +1868,7 @@ def shutdown_cc_host() -> None:
 
     try:
         if _STATE.cc_ng is not None:
-            with _STATE.cc_ng.graph._concurrent_lock:
-                _STATE.cc_ng.save()
+            _save_releasing_after_capture(_STATE.cc_ng)
     except Exception as exc:
         logger.warning("CC final save failed: %s", exc)
 
