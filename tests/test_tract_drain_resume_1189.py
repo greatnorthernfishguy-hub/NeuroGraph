@@ -1,5 +1,5 @@
 # ---- Changelog ----
-# [2026-10-25] Claude Code (Opus 5.5) — #1185 resumable, damage-tolerant tract drain
+# [2026-10-25] Claude Code (Opus 5.5) — #1189 resumable, damage-tolerant tract drain
 # What: Synthetic-tract tests for NGTractBridge._drain_with_cursor: zeroed-page damage
 #       mid-file and at the tail, byte-exact <tract>.damaged records, bounded batches
 #       with per-batch cursor commits, a real crash (os._exit) mid-pass and resume,
@@ -11,7 +11,7 @@
 # How:  Frames are made by the installed ng_tract wheel's own encoder (write_outcome),
 #       written into temp dirs; nothing live is touched.
 # -------------------
-"""#1185 drain tests. Temp dirs only; no live tract, cursor or checkpoint is read."""
+"""#1189 drain tests. Temp dirs only; no live tract, cursor or checkpoint is read."""
 
 import fcntl
 import json
@@ -62,7 +62,7 @@ def parse_damaged(path: Path):
 
 
 def locked_append(path: str, data: bytes) -> None:
-    """The writer side of the #1176 design (as ng_tract >= #1185 and miniTID do it):
+    """The writer side of the #1176 design (as ng_tract >= #1189 and miniTID do it):
     open O_APPEND, flock, re-check the path is still this inode, one write."""
     while True:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o664)
@@ -83,7 +83,7 @@ def locked_append(path: str, data: bytes) -> None:
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="tract1185_")
+        self.tmp = tempfile.mkdtemp(prefix="tract1189_")
         self.tracts = os.path.join(self.tmp, "tracts")
         os.makedirs(os.path.join(self.tracts, "peer"))
         self.tract = Path(self.tracts) / "peer" / "me.tract"

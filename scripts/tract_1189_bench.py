@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
-# [2026-10-25] Claude Code (Opus 5.5) — #1185 drain / durability measurements
-# What: Three read-only-or-scratch measurements for the #1185 tract fixes:
+# [2026-10-25] Claude Code (Opus 5.5) — #1189 drain / durability measurements
+# What: Three read-only-or-scratch measurements for the #1189 tract fixes:
 #       `synth`  builds a ~3 GB synthetic tract with injected zeroed-page regions in a
 #                scratch dir and drains it to the end with the new reader (peak RSS,
 #                time, frames delivered, regions skipped, .damaged byte-exactness);
@@ -16,9 +16,9 @@
 #       to the file it drains.
 # -------------------
 """Usage:
-  tract_1185_bench.py synth <scratch_dir> [--gb 3] [--regions 200] [--generate-only]
-  tract_1185_bench.py drain <copy_of_tract> [--orig <hardlink to its original bytes>]
-  tract_1185_bench.py write <scratch_dir> [--frames 20000]
+  tract_1189_bench.py synth <scratch_dir> [--gb 3] [--regions 200] [--generate-only]
+  tract_1189_bench.py drain <copy_of_tract> [--orig <hardlink to its original bytes>]
+  tract_1189_bench.py write <scratch_dir> [--frames 20000]
 """
 import argparse
 import bisect
