@@ -12,6 +12,21 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1184) — module loader keeps the host's complete modules
+# What: _bootstrap_modules() captures the host's own generic vendored modules once (by identity) before any
+#       module loads and restores exactly those after each module and once at the end (unconditionally);
+#       ng_embed is imported up front and no longer stashed/popped, so every module shares the host's one
+#       embedder module (one ONNX session). An ERROR is logged if ng_embed is incomplete after the loads.
+# Why:  VPS boot 2026-10-24 21:32Z: sys.modules['ng_embed'] ended as a module with __file__
+#       (/home/josh/NeuroGraph/ng_embed.py) but no NGEmbed/embed/embed_batch -> CC's VPS mind on hash
+#       fallback, Syl's dual-pass dispatch, valence and lazy expansion failing (16.6k ImportErrors). Cause,
+#       reproduced with her real ng_embed.py: the loader popped a module a concurrent thread was still
+#       executing (its @dataclass under `from __future__ import annotations` then raises), and restored
+#       "whatever sat in sys.modules" instead of the host's object. Nine boots earlier the same day won
+#       the race; this one lost it. The canonical laptop ng_embed.py fails the same way (not a fix).
+# How:  _GENERIC_PREFIXES / _SHARED_HOST_MODULES / _is_generic_vendored_name hoisted to module level;
+#       per-module isolation of core/pipelines/runtime/surgery/ng_lite/... unchanged.
+#       Test: tests/test_module_loader_host_generics.py.
 # [2026-09-21] Grok 4.6 — §7 intra-turn window chains, graph-only
 # What: After a successful conversational dual_record_outcome, long turns deposit
 #       window nodes via _deposit_memory_node(..., index_in_recall=False), delay-chain
@@ -881,6 +896,21 @@ def _bootstrap_modules() -> List[str]:
         key=lambda x: (1 if x[0] == "elmer" else 0, x[0]),
     )
 
+    # [2026-10-25] syl-stage1 — the host's OWN generic vendored modules, captured once, by identity,
+    # before any module loads. After each module the loader puts back exactly these objects
+    # (never "whatever happens to sit in sys.modules at stash time"), so a half-executed copy that
+    # a concurrent thread imported during a load window can never be stashed and restored as the
+    # host's module. ng_embed is imported here so it is always present and complete, and it is
+    # NOT stashed at all (see _SHARED_HOST_MODULES).
+    try:
+        import ng_embed as _host_ng_embed  # noqa: F401 -- one complete, shared embedder module
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Module boot: host ng_embed import failed before module loads: %s", exc)
+    _host_generics = {
+        name: mod for name, mod in list(sys.modules.items())
+        if _is_generic_vendored_name(name) and name not in _SHARED_HOST_MODULES
+    }
+
     for module_id, meta in modules:
         if module_id in skip:
             continue
@@ -913,15 +943,17 @@ def _bootstrap_modules() -> List[str]:
 
             # Namespace isolation: save sys.path, clear generic collisions
             # Each module vendors core/, pipelines/, runtime/ — these collide.
-            _generic_prefixes = ("core", "pipelines", "runtime", "surgery", "openclaw_adapter", "ng_ecosystem", "ng_lite", "ng_embed", "ng_autonomic", "ng_peer_bridge", "ng_tract_bridge")
+            # [2026-10-25] syl-stage1: the prefix list lives in _GENERIC_PREFIXES (module level);
+            # ng_embed is no longer on it (shared host module, never popped).
+            _generic_prefixes = _GENERIC_PREFIXES
             # Also clear module-specific packages that could collide
             # (but NOT the module's own package — that breaks lazy imports)
             path_snapshot = list(sys.path)
-            stashed = {}
+            stashed = dict(_host_generics)
             for mod_name in list(sys.modules.keys()):
                 for pfx in _generic_prefixes:
                     if mod_name == pfx or mod_name.startswith(pfx + "."):
-                        stashed[mod_name] = sys.modules.pop(mod_name)
+                        sys.modules.pop(mod_name)
                         break
 
             if install_path and install_path not in sys.path:
@@ -983,13 +1015,34 @@ def _bootstrap_modules() -> List[str]:
                         sys.modules.pop(mod_name, None)
                         break
 
-            # Restore path and stashed generics
+            # Restore path and the host's own generics. [2026-10-25] syl-stage1: unconditional --
+            # whatever a concurrent thread put under a host name during the window (possibly a
+            # half-executed copy) is replaced by the host's complete module object.
             sys.path[:] = path_snapshot
-            for mod_name, mod_obj in stashed.items():
-                if mod_name not in sys.modules:
-                    sys.modules[mod_name] = mod_obj
+            sys.modules.update(stashed)
 
+    # [2026-10-25] syl-stage1: final reconciliation, and a loud check that the shared embedder
+    # module is the complete one (the 2026-10-24 21:32Z failure mode).
+    sys.modules.update(_host_generics)
+    _emb = sys.modules.get("ng_embed")
+    if _emb is None or not all(hasattr(_emb, n) for n in ("NGEmbed", "embed", "embed_batch")):
+        logger.error("Module boot: sys.modules['ng_embed'] is incomplete after module loads (%r)", _emb)
     return started
+
+
+# [2026-10-25] syl-stage1 — module-loader namespace isolation, hoisted so the boot and the tests
+# share one definition. ng_embed is deliberately absent: every module's runtime use is a lazy
+# "from ng_embed import embed" that already resolved to the host's copy once its own load window
+# closed; keeping it un-popped gives one ONNX session and removes the window in which a thread's
+# fresh import could be popped mid-exec (dataclass(...) under "from __future__ import annotations"
+# then raises, leaving a module with __file__ but no NGEmbed/embed/embed_batch).
+_GENERIC_PREFIXES = ("core", "pipelines", "runtime", "surgery", "openclaw_adapter", "ng_ecosystem",
+                     "ng_lite", "ng_autonomic", "ng_peer_bridge", "ng_tract_bridge")
+_SHARED_HOST_MODULES = frozenset({"ng_embed"})
+
+
+def _is_generic_vendored_name(name: str) -> bool:
+    return any(name == p or name.startswith(p + ".") for p in _GENERIC_PREFIXES)
 
 
 def _tune_he_overlap_threshold() -> None:
