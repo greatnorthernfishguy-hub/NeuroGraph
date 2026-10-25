@@ -3,6 +3,12 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1173 port) — find_synapse_id / find_hyperedge_id
+# What: the laptop's lookups (8bea79e) verbatim: the Leg 2 guards _synapse_exists / _hyperedge_exists become
+#       "find_...(...) is not None" (unchanged answers); find_synapse_id takes an optional match predicate.
+# Why:  Syl's bind (neurograph_rpc._bind_conversational_topology) reinforces on recurrence behind
+#       SYL_NG_BIND_REINFORCE_EXISTING (default off) with the SAME lookups (one implementation, as on the laptop).
+# How:  smallest matching id when several match (deterministic); fallbacks unchanged.
 # [2026-09-11] Codex — #423 completed topology batches are capture boundaries
 # What: serialize in-memory Tier 1/2/3 apply and membership reads on _step_lock.
 # Why: graph/vector capture must not observe nodes before their binding arrives.
@@ -136,7 +142,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -654,65 +660,94 @@ def _unbound_nodes(graph: Any, node_ids: Set[str]) -> Set[str]:
     }
 
 
-def _hyperedge_exists(graph: Any, members: Set[str]) -> bool:
-    """Idempotency guard for hyperedges -- the counterpart to _synapse_exists.
+def find_hyperedge_id(graph: Any, members: Set[str]) -> Optional[str]:
+    """The id of an existing hyperedge whose member set is exactly `members`, or None.
 
-    Without this, a re-merge stacks a second binding hyperedge over the same
-    member set, and the turn it binds gets its activation counted twice on
-    every pass. Uses graph._node_hyperedges (neuro_foundation.py:1532,
-    node_id -> set of hyperedge_ids) so only edges touching one member are
-    examined rather than the whole hyperedge table.
+    The Leg 2 idempotency lookup (_hyperedge_exists is `find_hyperedge_id(...) is not None`). Since 2026-10-23 (#1173)
+    it is also the lookup cc_ng_organism's conversational bind uses to REINFORCE the existing same-member hyperedge of a
+    recurring turn instead of stacking a parallel one (Josh: "it should reinforce existing. We already do that for the
+    leg 2 laptop/vps sync"). Uses graph._node_hyperedges (neuro_foundation.py:1532, node_id -> set of hyperedge_ids) so
+    only edges touching one member are examined rather than the whole hyperedge table. When several match (parallel
+    edges stacked before #1173), the smallest id is returned, so the choice is deterministic.
     """
     if not members:
-        return False
+        return None
     try:
         probe = next(iter(members))
         candidate_ids = getattr(graph, "_node_hyperedges", {}).get(probe) or ()
         table = getattr(graph, "hyperedges", {})
+        found = []
         for hid in candidate_ids:
             he = table.get(hid)
             if he is None:
                 continue
             existing = getattr(he, "member_nodes", None)
             if existing is not None and set(existing) == members:
-                return True
-        return False
+                found.append(hid)
+        return min(found) if found else None
     except Exception:
         try:
-            for he in getattr(graph, "hyperedges", {}).values():
-                existing = getattr(he, "member_nodes", None)
-                if existing is not None and set(existing) == members:
-                    return True
+            found = [hid for hid, he in getattr(graph, "hyperedges", {}).items()
+                     if getattr(he, "member_nodes", None) is not None and set(he.member_nodes) == members]
+            return min(found) if found else None
         except Exception:
             pass
-        return False
+        return None
+
+
+def _hyperedge_exists(graph: Any, members: Set[str]) -> bool:
+    """Idempotency guard for hyperedges -- the counterpart to _synapse_exists.
+
+    Without this, a re-merge stacks a second binding hyperedge over the same
+    member set, and the turn it binds gets its activation counted twice on
+    every pass. The lookup is find_hyperedge_id (2026-10-23: split out so the
+    conversational bind can reinforce the edge it finds; this guard's answer is
+    unchanged).
+    """
+    return find_hyperedge_id(graph, members) is not None
+
+
+def find_synapse_id(graph: Any, pre: str, post: str, match: Optional[Callable[[Any], bool]] = None) -> Optional[str]:
+    """The id of an existing pre->post synapse, or None.
+
+    `match` (keyword, default None = any synapse on the pair, exactly the Leg 2 behaviour): a predicate a candidate must
+    also satisfy. The conversational bind's reinforcement passes its own type/delay test (2026-10-24, law review C-2),
+    because REINFORCING needs a stricter "same edge" than Leg 2's SKIP: a delayed or inhibitory synapse on the same pair
+    is a different edge.
+
+    The Leg 2 idempotency lookup (_synapse_exists is `find_synapse_id(...) is not None`). Since 2026-10-23 (#1173) it is
+    also the lookup cc_ng_organism's conversational bind uses to REINFORCE the existing synapse of a recurring turn
+    instead of adding a parallel one. Uses the graph's own sparse adjacency index (neuro_foundation.py:1529, _outgoing:
+    node_id -> set of synapse_ids), so this is O(out-degree) rather than a full scan of graph.synapses. When several
+    match (parallel synapses stacked before #1173), the smallest id is returned, so the choice is deterministic.
+    """
+    try:
+        syn_ids = getattr(graph, "_outgoing", {}).get(pre) or ()
+        synapses = getattr(graph, "synapses", {})
+        found = []
+        for sid in syn_ids:
+            syn = synapses.get(sid)
+            if syn is not None and getattr(syn, "post_node_id", None) == post and (match is None or match(syn)):
+                found.append(sid)
+        return min(found) if found else None
+    except Exception:
+        # Index unavailable/shaped differently -> fall back to a full scan
+        # rather than reporting "no edge" and creating a duplicate.
+        try:
+            found = [sid for sid, syn in getattr(graph, "synapses", {}).items()
+                     if getattr(syn, "pre_node_id", None) == pre and getattr(syn, "post_node_id", None) == post
+                     and (match is None or match(syn))]
+            return min(found) if found else None
+        except Exception:
+            pass
+        return None
 
 
 def _synapse_exists(graph: Any, pre: str, post: str) -> bool:
     """Idempotency guard for synapses. Re-absorbing must not stack duplicate
     edges between the same pair -- that would silently multiply effective
-    conductance on every pass.
-
-    Uses the graph's own sparse adjacency index (neuro_foundation.py:1529,
-    _outgoing: node_id -> set of synapse_ids), so this is O(out-degree) rather
-    than a full scan of graph.synapses on every candidate edge.
+    conductance on every pass. The lookup is find_synapse_id (2026-10-23: split
+    out so the conversational bind can reinforce the synapse it finds; this
+    guard's answer is unchanged).
     """
-    try:
-        syn_ids = getattr(graph, "_outgoing", {}).get(pre) or ()
-        synapses = getattr(graph, "synapses", {})
-        for sid in syn_ids:
-            syn = synapses.get(sid)
-            if syn is not None and getattr(syn, "post_node_id", None) == post:
-                return True
-        return False
-    except Exception:
-        # Index unavailable/shaped differently -> fall back to a full scan
-        # rather than reporting "no edge" and creating a duplicate.
-        try:
-            for syn in getattr(graph, "synapses", {}).values():
-                if (getattr(syn, "pre_node_id", None) == pre
-                        and getattr(syn, "post_node_id", None) == post):
-                    return True
-        except Exception:
-            pass
-        return False
+    return find_synapse_id(graph, pre, post) is not None

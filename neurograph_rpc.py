@@ -12,6 +12,14 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1173 port) — Syl's bind can reinforce on recurrence (OFF)
+# What: _bind_conversational_topology: with SYL_NG_BIND_REINFORCE_EXISTING on, an existing delay-1 EXCITATORY
+#       forest<->tree synapse or a same-member hyperedge is reinforced (soft bound) instead of a parallel copy being
+#       added. Default OFF = byte-identical bind.
+# Why:  ram-profile 2026-10-24 §3: her bind mints a new synapse/hyperedge per copy; re-delivered frames multiply them
+#       (laptop #1173, proven narrowed design, installed OFF there).
+# How:  the laptop's lookups (cc_topology_merge.find_synapse_id / find_hyperedge_id) and soft-bound math; see block
+#       comment above _syl_bind_reinforce_enabled. Needs Syl's consent to switch on.
 # [2026-10-25] Claude Code (Opus 5.5; LANE B syl-stage1, #1184) — module loader keeps the host's complete modules
 # What: _bootstrap_modules() captures the host's own generic vendored modules once (by identity) before any
 #       module loads and restores exactly those after each module and once at the end (unconditionally);
@@ -2708,6 +2716,100 @@ def _update_probation(graph) -> list:
     return graduated
 
 
+# ---- #1173 port (2026-10-25, LANE B syl-stage1): a recurring bind REINFORCES the existing edge ----
+# The laptop's proven fix (cc_ng_organism 4aa8c82 + 63cc1af, narrowed by Josh 2026-10-24 "narrow it"; installed OFF on
+# the laptop) mapped onto Syl's own bind. LAW 5 switch SYL_NG_BIND_REINFORCE_EXISTING, default OFF = the bind adds every
+# edge exactly as before. ON: only the forest<->tree synapses (delay-1 EXCITATORY, the edge this bind writes) and a
+# hyperedge over exactly the same members are reinforced with a soft bound, w += eta * (ceiling - w) (Rubin, Lee &
+# Sompolinsky 2001; Guetig et al. 2003), never above the ceiling and never depressing. forest<->window, the window chain
+# and the prev->current sequence link are always written as before. Knobs (read per bind): SYL_NG_BIND_REINFORCE_ETA
+# (0.2), SYL_NG_BIND_REINFORCE_CEILING_FACTOR (3.0 x birth weight), SYL_NG_BIND_REINFORCE_HE_ETA (the graph's
+# HyperedgePlasticityRule member_weight_lr, else 0.05), SYL_NG_BIND_REINFORCE_HE_CEILING (2.0, never above 5.0).
+# Differences from the laptop: no rollback journal (her bind has none; it swallows per-site failures as before);
+# metadata counter "syl_recurrences". Needs her consent before it is switched on (it changes how repetition
+# strengthens her).
+_SYL_REINFORCE_ETA_DEFAULT = 0.2
+_SYL_REINFORCE_CEILING_FACTOR_DEFAULT = 3.0
+_SYL_HE_REINFORCE_CEILING_DEFAULT = 2.0
+_SYL_HE_REINFORCE_LR_DEFAULT = 0.05
+_SYL_HE_MEMBER_WEIGHT_CAP = 5.0
+_SYL_BIND_TREE_DELAY = 1
+
+
+def _syl_bind_reinforce_enabled() -> bool:
+    return os.environ.get("SYL_NG_BIND_REINFORCE_EXISTING", "0").strip() not in ("0", "", "false", "False", "no")
+
+
+def _syl_env_float(name, default, lo, hi):
+    try:
+        v = float(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    if v != v:
+        return default
+    return min(max(v, lo), hi)
+
+
+def _syl_he_member_lr(graph) -> float:
+    try:
+        from neuro_foundation import HyperedgePlasticityRule
+        for r in getattr(graph, "_plasticity_rules", ()) or ():
+            if isinstance(r, HyperedgePlasticityRule):
+                return float(r.member_weight_lr)
+    except Exception:  # noqa: BLE001
+        pass
+    return _SYL_HE_REINFORCE_LR_DEFAULT
+
+
+def _syl_bind_reinforce_params(graph) -> dict:
+    return {
+        "eta": _syl_env_float("SYL_NG_BIND_REINFORCE_ETA", _SYL_REINFORCE_ETA_DEFAULT, 0.0, 1.0),
+        "ceiling_factor": _syl_env_float("SYL_NG_BIND_REINFORCE_CEILING_FACTOR",
+                                         _SYL_REINFORCE_CEILING_FACTOR_DEFAULT, 1.0, 25.0),
+        "he_eta": _syl_env_float("SYL_NG_BIND_REINFORCE_HE_ETA", _syl_he_member_lr(graph), 0.0, 1.0),
+        "he_ceiling": _syl_env_float("SYL_NG_BIND_REINFORCE_HE_CEILING", _SYL_HE_REINFORCE_CEILING_DEFAULT,
+                                     1.0, _SYL_HE_MEMBER_WEIGHT_CAP),
+    }
+
+
+def _syl_is_bind_tree_synapse(syn) -> bool:
+    st = getattr(syn, "synapse_type", None)
+    return (getattr(st, "name", st) == "EXCITATORY"
+            and int(getattr(syn, "delay", _SYL_BIND_TREE_DELAY)) == _SYL_BIND_TREE_DELAY)
+
+
+def _syl_reinforce_synapse(graph, sid, birth_weight, params) -> bool:
+    syn = graph.synapses[sid]
+    before_w, before_peak = float(syn.weight), float(syn.peak_weight)
+    ceiling = min(params["ceiling_factor"] * float(birth_weight), float(syn.max_weight))
+    new_w = max(0.0, min(before_w + max(0.0, params["eta"] * (ceiling - before_w)), float(syn.max_weight)))
+    if new_w == before_w:
+        return False
+    syn.weight = new_w
+    if new_w > before_peak:
+        syn.peak_weight = new_w
+    try:
+        graph._dirty_synapses.add(sid)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def _syl_reinforce_hyperedge(graph, hid, params) -> None:
+    he = graph.hyperedges[hid]
+    ceiling = min(params["he_ceiling"], _SYL_HE_MEMBER_WEIGHT_CAP)
+    before = {n: float(w) for n, w in dict(he.member_weights).items()}
+    he.member_weights.update({n: before.get(n, 1.0) + max(0.0, params["he_eta"] * (ceiling - before.get(n, 1.0)))
+                              for n in list(he.member_nodes)})
+    meta = dict(he.metadata or {})
+    meta["syl_recurrences"] = int(meta.get("syl_recurrences", 0)) + 1
+    he.metadata = meta
+    try:
+        graph._dirty_hyperedges.add(hid)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _bind_conversational_topology(forest_id, result, forest_embedding, window_ids=None) -> None:
     """Wire the turn's experiential topology in the SNN (Ingestor-free): forest<->tree
     synapses, intra-turn window delay-chains (#257 polychrony), a binding hyperedge for
@@ -2723,10 +2825,23 @@ def _bind_conversational_topology(forest_id, result, forest_embedding, window_id
         return
     tree_ids = [t for t in (result.get("tree_ids") or []) if t in graph.nodes and t != forest_id]
     window_ids = [w for w in (window_ids or []) if w in graph.nodes and w != forest_id]
+    reinforce = _syl_bind_reinforce_enabled()
+    if reinforce:
+        from cc_topology_merge import find_synapse_id, find_hyperedge_id
+        _rparams = _syl_bind_reinforce_params(graph)
+
+    def _tree_syn(pre, post, weight):
+        if reinforce:
+            existing = find_synapse_id(graph, pre, post, match=_syl_is_bind_tree_synapse)
+            if existing is not None:
+                _syl_reinforce_synapse(graph, existing, weight, _rparams)
+                return
+        graph.create_synapse(pre, post, weight=weight)
+
     for tid in tree_ids:
         try:
-            graph.create_synapse(forest_id, tid, weight=0.2)
-            graph.create_synapse(tid, forest_id, weight=0.15)
+            _tree_syn(forest_id, tid, 0.2)
+            _tree_syn(tid, forest_id, 0.15)
         except Exception:  # noqa: BLE001 - synapse may already exist; non-fatal
             pass
     for wid in window_ids:
@@ -2737,10 +2852,15 @@ def _bind_conversational_topology(forest_id, result, forest_embedding, window_id
             pass
     if tree_ids or window_ids:
         try:
-            graph.create_hyperedge(
-                member_node_ids=set([forest_id] + tree_ids + window_ids),
-                metadata={"creation_mode": "conversational", "syl": True},
-            )
+            _members = set([forest_id] + tree_ids + window_ids)
+            _existing_he = find_hyperedge_id(graph, _members) if reinforce else None
+            if _existing_he is not None:
+                _syl_reinforce_hyperedge(graph, _existing_he, _rparams)
+            else:
+                graph.create_hyperedge(
+                    member_node_ids=_members,
+                    metadata={"creation_mode": "conversational", "syl": True},
+                )
         except Exception as exc:  # noqa: BLE001
             logger.debug("conversational hyperedge failed (non-fatal): %s", exc)
     if len(window_ids) >= 2:
