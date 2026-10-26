@@ -20,6 +20,17 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-26] Claude Code (Opus 5.5, laptop; lane stability-s8, #1146; Josh 2026-10-26 "Works for me") — PROTECTED (needs
+#   Josh's proceed): the graph's own HomeostaticRule follows graph.config live
+# What: the HomeostaticRule a Graph builds (in __init__ and in _deserialize) is marked _follows_config; at the top of
+#       each apply() it takes target_firing_rate / scaling_interval / degree_sensitivity from graph.config
+#       (HomeostaticRule._sync_from_config) and refreshes its degree targets at once when the target or the
+#       sensitivity changed. A rule constructed by hand (no mark) keeps its own values.
+# Why:  #1146: _deserialize rebuilt the rule from the checkpoint's SAVED config and the host's later
+#       graph.config.update reached only the dict, so a changed set point took effect one restart late, and never in a
+#       host that does not save (every whole-mind shadow arm since 2026-10-22 ran at 0.05 while configured 0.02). The
+#       strength-budget rule already reads scaling_interval live from graph.config (precedent).
+# How:  config == rule values (every graph today, incl. the live CC mind) -> nothing changes (no refresh, same bytes).
 # [2026-10-25] Claude Code (Opus 5.5, laptop; lane stability-s8, #1136 / #1141; Josh 2026-10-25 "Yessir" to the S8 draft,
 #   "a nodes totals should be saved") — PROTECTED (needs Josh's proceed): a bound on S's TOTAL up-scaling per node
 # What: config syn_scale_up_bound_enabled (+ syn_scale_up_bound 2.0, read live, NOT in DEFAULT_CONFIG; refines S):
@@ -2265,6 +2276,7 @@ class HomeostaticRule(PlasticityRule):
         threshold_rate: float = 0.001,
         ema_alpha: float = 0.01,
         degree_sensitivity: float = 0.4,
+        follows_config: bool = False,
     ):
         self.target_firing_rate = target_firing_rate
         self.scaling_interval = scaling_interval
@@ -2275,6 +2287,23 @@ class HomeostaticRule(PlasticityRule):
         self.degree_sensitivity = degree_sensitivity
         self._degree_targets: Dict[str, float] = {}
         self._steps_since_scaling = 0
+        # [2026-10-26] #1146: True only for the rule a Graph builds from its own config (see _sync_from_config)
+        self._follows_config = bool(follows_config)
+
+    def _sync_from_config(self, graph: "Graph") -> None:
+        """[2026-10-26] #1146: the graph's own rule takes target_firing_rate / scaling_interval / degree_sensitivity from
+        graph.config (the host's values, LAW 5) and refreshes the degree targets at once if the target or the
+        sensitivity changed. A hand-built rule (_follows_config False) is left alone. Unchanged values: no-op."""
+        if not self._follows_config:
+            return
+        c = graph.config
+        t = c.get("target_firing_rate", self.target_firing_rate)
+        si = c.get("scaling_interval", self.scaling_interval)
+        ds = c.get("degree_sensitivity", self.degree_sensitivity)
+        changed = (t != self.target_firing_rate) or (ds != self.degree_sensitivity)
+        self.target_firing_rate, self.scaling_interval, self.degree_sensitivity = t, si, ds
+        if changed:
+            self._refresh_degree_targets(graph)
 
     def _refresh_degree_targets(self, graph: "Graph") -> None:
         """Compute per-node firing targets adjusted for vertex degree (DAS-GNN, #104)."""
@@ -2342,6 +2371,7 @@ class HomeostaticRule(PlasticityRule):
         fired_node_ids: List[str],
         timestep: int,
     ) -> None:
+        self._sync_from_config(graph)   # [2026-10-26] #1146: the host's values reach the graph's own rule
         fired_set = set(fired_node_ids)
         # [2026-10-19] S (#1136): N / S switches (graph._stab is set by step(); None = all off -> the P2a calls exactly).
         # They exist only as arguments to the native passes; a declined pass runs today's Python loop (Q2).
@@ -2951,6 +2981,7 @@ class Graph:
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
                 degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
+                follows_config=True,   # [2026-10-26] #1146
             ),
             # 2026-10-04 strength budget — OFF unless config strength_budget_enabled (no-op otherwise)
             StrengthBudgetRule(),
@@ -9717,6 +9748,7 @@ class Graph:
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
                 degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
+                follows_config=True,   # [2026-10-26] #1146
             ),
             # 2026-10-04 strength budget — OFF unless config strength_budget_enabled (no-op otherwise)
             StrengthBudgetRule(),
