@@ -20,6 +20,17 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5, laptop; lane stability-s8, #1136 / #1141; Josh 2026-10-25 "Yessir" to the S8 draft,
+#   "a nodes totals should be saved") — PROTECTED (needs Josh's proceed): a bound on S's TOTAL up-scaling per node
+# What: config syn_scale_up_bound_enabled (+ syn_scale_up_bound 2.0, read live, NOT in DEFAULT_CONFIG; refines S):
+#       _StabParams.up_bound = B; HomeostaticRule.apply passes evidence_scales(..., up_bound=B) (NodeStore.stab_round >= 9),
+#       so no node's incoming weights are scaled up by S more than B x in net (down-scaling never blocked, it returns
+#       room); the per-node totals are SAVED (checkpoint key syn_scale_up_totals, emitted only with the bound on, before
+#       the interneurons key) and restored on load; each sleep_cycle's strength-aware downscale returns room by
+#       (1 - sleep_downscale_d0) (Graph._s8_sleep_shrink, its own function).
+# Why:  S8 weight ledger (2026-10-25): ~95 % of S7bfull's waking weight climb is S up-scaling ~1,500 driven-but-failing
+#       nodes without a total bound (each interval bounded at 1.03, the product not).
+# How:  absent / False = S7b exactly (no new argument passed, no key written, nothing read). Malformed -> ERROR once, off.
 # [2026-10-23] Claude (lane stability-s7b) — S7b law-review LOWs (PROTECTED CHANGE, its own commit, review branch only):
 #   relax set alone (no N keys) on a native graph now logs its ERROR instead of being hidden by the all-off early return
 #   (L7; the early check uses _STAB_S7B_KEYS, L8); a fractional node_homeo_relax_window is refused with the ERROR instead
@@ -2227,6 +2238,8 @@ class _StabParams(NamedTuple):
     quiet: Optional[int] = None       # S6-3 window: hold S's up-scaling while the node receives no afferent input
     # [2026-10-23] S7b (#1136): None = off (S7 exactly)
     relax: Optional[tuple] = None     # (mult, from, stop, resume, window): gain relaxation of succeeding afferented nodes
+    # [2026-10-25] S8 (#1136): None = off (S7b exactly)
+    up_bound: Optional[float] = None  # S's total up-scaling bound B per node
 
 
 class HomeostaticRule(PlasticityRule):
@@ -2421,6 +2434,8 @@ class HomeostaticRule(PlasticityRule):
                 _s2kw["deadband"] = _st.deadband
             if _qw is not None:   # [2026-10-22] S6-3
                 _s2kw["quiet"] = _qw
+            if _st.up_bound is not None:   # [2026-10-25] S8
+                _s2kw["up_bound"] = _st.up_bound
             node_scales = graph.nodes.evidence_scales(self._degree_targets, self.target_firing_rate,
                                                       self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3], **_s2kw) or {}
 
@@ -4494,6 +4509,10 @@ class Graph:
         elif s7b and not nd:
             self._stab_error_once(s7b, "node_homeo_evidence_enabled + node_homeo_slow_enabled + "
                                        "node_homeo_input_evidence_enabled (relax refines slow N and judges input received)")
+        # [2026-10-25] S8 (#1136): the bound says so when it cannot run on this graph at all (as S7b's L7 check above)
+        if c.get("syn_scale_up_bound_enabled", False) and not (
+                getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 9):
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "the native node store (S8-round ng_tract)")
         if not he and not nd and not inh_on and not s5 and not ik and not s6:
             return None
         bk_t = sp_t = None
@@ -4632,7 +4651,36 @@ class Graph:
             spont=sp_t,
             quiet=q_w,
             relax=relax_t,
+            up_bound=self._stab_s8_bound(c, s_on),
         )
+
+    def _stab_s8_bound(self, c, s_on: bool) -> Optional[float]:
+        """[2026-10-25] S8 (#1136): the total up-scaling bound B (> 1), or None (off; ERROR once when the key is set but
+        cannot run). Pure read of config."""
+        if not c.get("syn_scale_up_bound_enabled", False):
+            return None
+        if not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 9):
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "the native node store (S8-round ng_tract)")
+            return None
+        if not s_on:
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "syn_scale_evidence_enabled (it bounds S)")
+            return None
+        try:
+            b = float(c.get("syn_scale_up_bound", 2.0))
+        except (TypeError, ValueError):
+            b = float("nan")
+        if not (b > 1.0 and math.isfinite(b)):
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "a finite syn_scale_up_bound > 1")
+            return None
+        return b
+
+    def _s8_sleep_shrink(self, d0: float) -> None:
+        """[2026-10-25] S8 (#1136): a sleep's downscale returns scaling room: every node's total shrinks by ln(1 - d0).
+        Only with the bound on (and d0 in (0, 1)); nothing else is touched."""
+        if self._stab_s8_bound(self.config, bool(self.config.get("syn_scale_evidence_enabled", False))) is None:
+            return
+        if 0.0 < d0 < 1.0:
+            self.nodes.s8_shrink(1.0 - d0)
 
     def _stab_s7b_relax(self, c, s2n, s3n, n_on: bool, in_on: bool) -> Optional[tuple]:
         """[2026-10-23] S7b (#1136): gain relaxation's (mult, from, stop, resume, window), or None (off; ERROR once when
@@ -5743,6 +5791,7 @@ class Graph:
             ds = {"synapses_scaled": 0, "clamped": 0, "native": None}
             if prm["d0"] > 0.0:
                 ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
+                self._s8_sleep_shrink(prm["d0"])   # [2026-10-25] S8
             t_c = _time.perf_counter()
             rep: Dict[str, Any] = {}
             self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
@@ -5841,6 +5890,7 @@ class Graph:
             t_b = _time.perf_counter()
             if prm["d0"] > 0.0:
                 ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
+                self._s8_sleep_shrink(prm["d0"])   # [2026-10-25] S8
             rep: Dict[str, Any] = {}
             t_c = _time.perf_counter()
             pruned = self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
@@ -9202,6 +9252,10 @@ class Graph:
             **({"homeostatic_degree_targets": dict(next(
                 (r._degree_targets for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), {}))}
                if self.config.get("homeostatic_degree_targets_persist", False) else {}),
+            # [2026-10-25] S8 (#1136): each node's total up-scaling (only with the bound on)
+            **({"syn_scale_up_totals": dict(self.nodes.s8_totals())}
+               if self._stab_s8_bound(self.config, bool(self.config.get("syn_scale_evidence_enabled", False))) is not None
+               else {}),
             # [2026-10-20] round I (#1151): the interneuron layer (cells, pools, targets, learned I -> E weights), only
             # when the store holds one; the last key, so every key before it is written exactly as before.
             **({"interneurons": _il_packed} if _il_packed is not None else {}),
@@ -9680,6 +9734,10 @@ class Graph:
             if isinstance(rule, StrengthBudgetRule):
                 rule._steps_since_budget = data.get("strength_budget_steps_since", 0)
                 break
+        # [2026-10-25] S8 (#1136): the saved per-node total up-scaling (present only when a host ran the bound)
+        _s8 = data.get("syn_scale_up_totals")
+        if isinstance(_s8, dict) and hasattr(self.nodes, "s8_load_totals"):
+            self.nodes.s8_load_totals(_s8)
 
         self._dirty_nodes.clear()
         self._dirty_synapses.clear()
