@@ -176,18 +176,70 @@ def test_totals_are_saved_restored_and_the_s7b_branch_reads_the_file():
     assert "syn_scale_up_totals" not in msgpack.unpackb(ckpt(g), raw=False, strict_map_key=False)
 
 
-@needs_s8
-def test_sleep_returns_room_by_ln_one_minus_d0():
+DISUSE = {"sleep_disuse_enabled": True, "structural_plasticity_in_sleep": True, "sleep_downscale_d0": 0.1,
+          "sleep_downscale_h": 0.05, "sleep_weight_grace_sleeps": 1, "sleep_last_link_grace_sleeps": 2,
+          "sleep_credit_shield_kappa": 0.015}
+
+
+def _bitten(cfg_extra=None):
     cfg = {k: v for k, v in S8_ARM.items() if not k.startswith("interneuron")}
     cfg.update(spontaneous_activity_enabled=False, syn_scale_up_bound=1.05)
+    cfg.update(cfg_extra or {})
     g = _graph(7, cfg)
-    _drive_weak(g, 600)
+    _drive_weak(g, 300)
+    assert g.nodes.s8_state(1.05)["rows_at_bound"] > 0
+    return g
+
+
+@needs_s8
+@pytest.mark.parametrize("chunked", [False, True])
+def test_sleep_cycle_returns_exactly_the_measured_room(chunked):
+    # [2026-10-25] law review MEDIUM 1 + 2: through sleep_cycle() itself, both the one-hold and the chunked path
+    extra = dict(DISUSE)
+    if chunked:
+        extra.update(sleep_clearance_chunk_seconds=0.002, sleep_clearance_chunk_gap_seconds=0.0)
+    g = _bitten(extra)
+    before_g = dict(g.nodes.s8_totals())
+    before_w = dict(g.synapses.incoming_weight_sums())
+    calls = []
+    orig = g.sleep_downscale_strength_aware
+
+    def spy(d0, h):
+        w0 = dict(g.synapses.incoming_weight_sums())
+        r = orig(d0, h)
+        calls.append((w0, dict(g.synapses.incoming_weight_sums())))
+        return r
+    g.sleep_downscale_strength_aware = spy
+    g.sleep_cycle()
+    assert len(calls) == 1
+    w0, w1 = calls[0]
+    assert w0 == pytest.approx(before_w)
+    after_g = dict(g.nodes.s8_totals())
+    for nid, v in before_g.items():
+        b, a = w0.get(nid, 0.0), w1.get(nid, 0.0)
+        want = v if b <= 0.0 else (max(0.0, v + math.log(a / b)) if a > 0.0 else 0.0)
+        if a > b:
+            want = v   # a rise is never "returned room"
+        assert after_g.get(nid, 0.0) == pytest.approx(want, abs=1e-12), nid
+    # strong links lose less than d0: the room returned is less than ln(1 - d0) would have given
+    some = [nid for nid in before_g if w0.get(nid, 0) > 0 and w1.get(nid, 0) > 0]
+    assert some and all(math.log(w1[n] / w0[n]) >= math.log(0.9) - 1e-12 for n in some)
+
+
+@needs_s8
+def test_sleep_cycle_with_d0_zero_returns_no_room():
+    g = _bitten(dict(DISUSE, sleep_downscale_d0=0.0))
     before = dict(g.nodes.s8_totals())
-    g._s8_sleep_shrink(0.01)
-    after = dict(g.nodes.s8_totals())
-    for nid, v in before.items():
-        assert after.get(nid, 0.0) == pytest.approx(max(0.0, v + math.log(0.99)))
-    # off: nothing moves
+    g.sleep_cycle()
+    assert dict(g.nodes.s8_totals()) == before
+
+
+@needs_s8
+def test_sleep_shrink_is_inert_with_the_bound_off():
+    g = _bitten()
+    tot = dict(g.nodes.s8_totals())
+    assert g._s8_incoming_sums() is not None
     g.config["syn_scale_up_bound_enabled"] = False
-    g._s8_sleep_shrink(0.5)
-    assert dict(g.nodes.s8_totals()) == after
+    assert g._s8_incoming_sums() is None
+    g._s8_sleep_shrink(None)
+    assert dict(g.nodes.s8_totals()) == tot
