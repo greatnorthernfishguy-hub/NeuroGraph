@@ -26,8 +26,9 @@ Design principles (PRD §2.1):
 #       _StabParams.up_bound = B; HomeostaticRule.apply passes evidence_scales(..., up_bound=B) (NodeStore.stab_round >= 9),
 #       so no node's incoming weights are scaled up by S more than B x in net (down-scaling never blocked, it returns
 #       room); the per-node totals are SAVED (checkpoint key syn_scale_up_totals, emitted only with the bound on, before
-#       the interneurons key) and restored on load; each sleep_cycle's strength-aware downscale returns room by
-#       (1 - sleep_downscale_d0) (Graph._s8_sleep_shrink, its own function).
+#       the interneurons key) and restored on load; each sleep_cycle's strength-aware downscale returns each node's room
+#       by what it actually removed from that node's input, ln(after / before) of its incoming weight sum
+#       (Graph._s8_incoming_sums + Graph._s8_sleep_shrink, their own functions; law review MEDIUM 1).
 # Why:  S8 weight ledger (2026-10-25): ~95 % of S7bfull's waking weight climb is S up-scaling ~1,500 driven-but-failing
 #       nodes without a total bound (each interval bounded at 1.03, the product not).
 # How:  absent / False = S7b exactly (no new argument passed, no key written, nothing read). Malformed -> ERROR once, off.
@@ -4674,13 +4675,28 @@ class Graph:
             return None
         return b
 
-    def _s8_sleep_shrink(self, d0: float) -> None:
-        """[2026-10-25] S8 (#1136): a sleep's downscale returns scaling room: every node's total shrinks by ln(1 - d0).
-        Only with the bound on (and d0 in (0, 1)); nothing else is touched."""
+    def _s8_incoming_sums(self) -> Optional[Dict[str, float]]:
+        """[2026-10-25] S8 (#1136; law review MEDIUM 1): each node's incoming weight sum, read before a sleep's downscale,
+        or None while the bound is off (nothing read). Read-only."""
         if self._stab_s8_bound(self.config, bool(self.config.get("syn_scale_evidence_enabled", False))) is None:
+            return None
+        return dict(self.synapses.incoming_weight_sums())
+
+    def _s8_sleep_shrink(self, before: Optional[Dict[str, float]]) -> None:
+        """[2026-10-25] S8 (#1136): a sleep's downscale returns each node's scaling room by what it actually removed from
+        that node's input: its total shrinks by ln(after / before) of the incoming weight sum (the strength-aware
+        downscale takes little from strong links, so a uniform ln(1 - d0) would over-return room -- law review MEDIUM 1).
+        `before` = _s8_incoming_sums() taken before the downscale; None = off, nothing touched."""
+        if before is None:
             return
-        if 0.0 < d0 < 1.0:
-            self.nodes.s8_shrink(1.0 - d0)
+        after = self.synapses.incoming_weight_sums()
+        lfs = {}
+        for nid, b in before.items():
+            if b > 0.0:
+                a = float(after.get(nid, 0.0))
+                lfs[nid] = math.log(a / b) if a > 0.0 else float("-inf")
+        if lfs:
+            self.nodes.s8_shrink_rows(lfs)
 
     def _stab_s7b_relax(self, c, s2n, s3n, n_on: bool, in_on: bool) -> Optional[tuple]:
         """[2026-10-23] S7b (#1136): gain relaxation's (mult, from, stop, resume, window), or None (off; ERROR once when
@@ -5790,8 +5806,9 @@ class Graph:
             sleep_index = int(self.config.get("sleep_cycles_completed", 0)) + 1
             ds = {"synapses_scaled": 0, "clamped": 0, "native": None}
             if prm["d0"] > 0.0:
+                _s8b = self._s8_incoming_sums()   # [2026-10-25] S8: None while the bound is off
                 ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
-                self._s8_sleep_shrink(prm["d0"])   # [2026-10-25] S8
+                self._s8_sleep_shrink(_s8b)
             t_c = _time.perf_counter()
             rep: Dict[str, Any] = {}
             self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
@@ -5889,8 +5906,9 @@ class Graph:
             ds = {"synapses_scaled": 0, "clamped": 0, "native": None}
             t_b = _time.perf_counter()
             if prm["d0"] > 0.0:
+                _s8b = self._s8_incoming_sums()   # [2026-10-25] S8: None while the bound is off
                 ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
-                self._s8_sleep_shrink(prm["d0"])   # [2026-10-25] S8
+                self._s8_sleep_shrink(_s8b)
             rep: Dict[str, Any] = {}
             t_c = _time.perf_counter()
             pruned = self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
