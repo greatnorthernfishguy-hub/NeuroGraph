@@ -20,6 +20,19 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-26] Claude Code (Opus 5.5, laptop; lane stability-s9, #1136; Josh 2026-10-26 "you have my 'go' when S8 is
+#   done") — PROTECTED (needs Josh's proceed): S9, the reward commits only the links of each prediction event
+# What: config reward_event_scoped_enabled (+ reward_confirm_scaling 0.25; read live, NOT in DEFAULT_CONFIG; needs the
+#       native synapse store with SynapseStore.reward_round >= 1 and three_factor_enabled, else ERROR once and off):
+#       a CONFIRMED prediction A->B commits A->B's own trace at once (inject_reward(conf x reward_confirm_scaling,
+#       scope={A}, post_scope={B})); a FAILED one (A predicted B, set F fired) commits only the links from A to F + {B}
+#       (the wrong link's penalized trace and the links to what actually fired) instead of broadcasting to every trace in
+#       the mind. inject_reward gains post_scope (the paired pre AND post scope; native only; hyperedges use the event's
+#       nodes as their scope).
+# Why:  S8 weight ledger: with S bounded, the surprise's global broadcast is the remaining waking climb (S8full rewards
+#       +7,924 net); it also committed confirmations only when some unrelated prediction failed. Josh: correct
+#       predictions reinforce the current model; a surprise doesn't fit it and creates new links (dev-log S8 §10).
+# How:  key absent / False = the broadcast exactly (no new argument passed). Nothing new is saved.
 # [2026-10-26] Claude Code (Opus 5.5, laptop; lane stability-s8, #1146; Josh 2026-10-26 "Works for me") — PROTECTED (needs
 #   Josh's proceed): the graph's own HomeostaticRule follows graph.config live
 # What: the HomeostaticRule a Graph builds (in __init__ and in _deserialize) is marked _follows_config; at the top of
@@ -4541,6 +4554,10 @@ class Graph:
         elif s7b and not nd:
             self._stab_error_once(s7b, "node_homeo_evidence_enabled + node_homeo_slow_enabled + "
                                        "node_homeo_input_evidence_enabled (relax refines slow N and judges input received)")
+        # [2026-10-26] S9 (#1136): a set reward key that cannot run says so once, whatever else is on (it is read only in
+        # the prediction handlers otherwise)
+        if c.get("reward_event_scoped_enabled", False):
+            self._stab_s9_reward()
         # [2026-10-25] S8 (#1136): the bound says so when it cannot run on this graph at all (as S7b's L7 check above)
         if c.get("syn_scale_up_bound_enabled", False) and not (
                 getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 9):
@@ -4685,6 +4702,27 @@ class Graph:
             relax=relax_t,
             up_bound=self._stab_s8_bound(c, s_on),
         )
+
+    def _stab_s9_reward(self) -> Optional[float]:
+        """[2026-10-26] S9 (#1136): the confirm scaling when event-scoped reward is on, else None (ERROR once when the
+        key is set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_event_scoped_enabled", False):
+            return None
+        if getattr(type(self.synapses), "reward_round", 0) < 1:
+            self._stab_error_once(["reward_event_scoped_enabled"], "the native synapse store (S9-round ng_tract)")
+            return None
+        if not c.get("three_factor_enabled", False):
+            self._stab_error_once(["reward_event_scoped_enabled"], "three_factor_enabled (it scopes the three-factor reward)")
+            return None
+        try:
+            k = float(c.get("reward_confirm_scaling", 0.25))
+        except (TypeError, ValueError):
+            k = float("nan")
+        if not (0.0 <= k <= 1.0):
+            self._stab_error_once(["reward_event_scoped_enabled"], "0 <= reward_confirm_scaling <= 1")
+            return None
+        return k
 
     def _stab_s8_bound(self, c, s_on: bool) -> Optional[float]:
         """[2026-10-25] S8 (#1136): the total up-scaling bound B (> 1), or None (off; ERROR once when the key is set but
@@ -5216,6 +5254,11 @@ class Graph:
             else:
                 # In three-factor mode, add to eligibility trace
                 syn.eligibility_trace += bonus
+                # [2026-10-26] S9: commit this link's own trace now (None = off: committed later by a broadcast)
+                _s9 = self._stab_s9_reward()
+                if _s9 is not None:
+                    self.inject_reward(pred.confidence * _s9, scope={pred.source_node_id},
+                                       post_scope={pred.target_node_id})
             syn.last_update_time = float(self.timestep)
             if syn.weight > syn.peak_weight:
                 syn.peak_weight = syn.weight
@@ -5307,7 +5350,12 @@ class Graph:
         if self.config.get("three_factor_enabled", False):
             surprise_strength = pred.confidence * self.config.get("surprise_reward_scaling", 0.5)
             if surprise_strength > 0.01:  # Don't bother with negligible surprise
-                self.inject_reward(surprise_strength)
+                # [2026-10-26] S9: only the event's links (A -> what fired + the wrong target), not every trace
+                if self._stab_s9_reward() is not None:
+                    self.inject_reward(surprise_strength, scope={pred.source_node_id},
+                                       post_scope=set(recent_fired) | {pred.target_node_id})
+                else:
+                    self.inject_reward(surprise_strength)
 
     def _surprise_exploration(
         self, pred: Prediction, recent_fired: Set[str]
@@ -7770,6 +7818,7 @@ class Graph:
         self,
         strength: float,
         scope: Optional[Set[str]] = None,
+        post_scope: Optional[Set[str]] = None,
     ) -> None:
         """Broadcast reward for three-factor learning (PRD §5.2, §8 inject_reward).
 
@@ -7784,7 +7833,12 @@ class Graph:
                 Positive = reinforce, negative = weaken.
             scope: Optional set of node IDs to limit reward scope.
                 If None, reward applies globally to all synapses with traces.
+            post_scope: [2026-10-26] S9 — with `scope`, a PAIRED scope: only synapses whose pre node is in
+                `scope` AND whose post node is in `post_scope` (one prediction event's links). Native synapse store
+                only (SynapseStore.reward_round >= 1); hyperedges use scope | post_scope.
         """
+        if post_scope is not None and (scope is None or getattr(type(self.synapses), "reward_round", 0) < 1):
+            raise ValueError("inject_reward: post_scope needs scope and the S9 native synapse store")
         with self._step_lock:
             lr = self.config["he_threshold_lr"]
             self._total_rewards_injected += 1
@@ -7802,7 +7856,10 @@ class Graph:
             # weight = max(0, min(weight + dw, max_weight)); trace *= 0.9 (decay after
             # use); peak_weight tracks the new max.
             _reward = getattr(self.synapses, "apply_eligibility_reward", None)
-            if _reward is not None:
+            if post_scope is not None:   # [2026-10-26] S9: the paired scope (checked above: native only)
+                _reward(strength, self.config["learning_rate"], scope, post_scope)
+                scope = set(scope) | set(post_scope)   # the hyperedge part: the event's nodes
+            elif _reward is not None:
                 _reward(strength, self.config["learning_rate"], scope)
             else:  # [2026-10-05] per-SynapseRef fallback (the original loop)
                 _apply_eligibility_reward_python(
