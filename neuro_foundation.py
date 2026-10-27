@@ -26,9 +26,10 @@ Design principles (PRD §2.1):
 # What: config reward_rpe_enabled (+ reward_rpe_tau 2000 events; read live, NOT in DEFAULT_CONFIG; needs
 #       three_factor_enabled and NOT reward_event_scoped_enabled, else ERROR once and off): each resolved synapse-level
 #       prediction is an outcome o (+confidence confirmed, -confidence failed); a failed one no longer broadcasts on its
-#       own. After the step's predictions resolve, ONE global inject_reward(surprise_reward_scaling x sum(o - b)) where b
-#       is the running expected outcome as it stood at the step's start; then b += (o - b) / tau per event. A step that
-#       resolves nothing sends nothing and leaves b. b starts at the first event's outcome; NOT saved (relearns on load).
+#       own. After the step's predictions resolve, ONE global inject_reward(surprise_reward_scaling x (mean(o) - b))
+#       where b is the running expected outcome as it stood at the step's start; then b += (o - b) / tau per event. A step
+#       that resolves nothing sends nothing and leaves b. b starts at the first step's mean; NOT saved (relearns on load).
+#       (try 1 summed the outcomes: a reward that grew with the count of resolutions; the copy's weights jumped 55 %.)
 # Why:  S8 ledger: the surprise broadcast was always positive (+conf x 0.5) — a surprise treated as good news — and that
 #       one-signed bias is the waking climb. S9 cut its reach instead and lost mind-wide STDP learning (~800x less moved
 #       per call; dev-log S9 §3.2). Dopamine is global, lands on tagged (eligible) synapses, and is signed against
@@ -4751,10 +4752,14 @@ class Graph:
         tau = self._stab_s10_rpe()
         if tau is None or not outcomes:
             return
+        # [2026-10-27] try-1 fix: the step's MEAN outcome, not the sum (a sum scaled the signal with the number of
+        # resolutions -- ~40 / step early -> ~30x the old per-surprise strength on every trace, mean weight 0.078 -> 0.121
+        # in 25 steps); dopamine is a bounded level, not a count. b starts at the first STEP's mean (its delta = 0).
+        mean_o = sum(outcomes) / len(outcomes)
         b = self.__dict__.get("_s10_rpe_baseline")
         if b is None:
-            b = outcomes[0]
-        delta = sum(o - b for o in outcomes)
+            b = mean_o
+        delta = mean_o - b
         for o in outcomes:
             b += (o - b) / tau
         self._s10_rpe_baseline = b

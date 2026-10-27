@@ -1,6 +1,7 @@
 # ---- Changelog ----
 # [2026-10-27] Claude (lane stability-s10, #1136; Josh 2026-10-27 "what's the most similar, conceptually, to how the brain
 #   does it?" / "Yes, go ahead") — S10: the reward is a signed prediction error against expectation, once per step
+# [2026-10-27] try-1 fix: the step's MEAN outcome (not the sum) and b starts at the first step's mean; + 2 tests.
 # What: (1) the S10 key absent / explicitly False == the S9 NG branch (7274482's module) exactly on the dict, NodeStore-only
 #       and native paths with the S7b arm's keys (final checkpoint BYTES); not in DEFAULT_CONFIG; set keys that cannot run
 #       (no three-factor, S9 also on, bad tau) log ERROR once and change nothing. (2) the rule: a failed prediction no
@@ -140,7 +141,7 @@ def test_better_than_expected_potentiates():
 def test_as_expected_sends_nothing():
     g, syn = _graph(NF, True)
     w0, n0 = _w(g, syn), g._total_rewards_injected
-    g._s10_rpe_broadcast([0.6])   # the first event sets the expectation: its own delta is 0
+    g._s10_rpe_broadcast([0.6, 0.6])   # the first step sets the expectation: its own delta is 0
     assert g._s10_rpe_baseline == 0.6
     g._s10_rpe_broadcast([0.6, 0.6])
     assert _w(g, syn) == w0 and g._total_rewards_injected == n0
@@ -162,7 +163,7 @@ def test_the_step_takes_the_kept_outcomes_once():
     n0 = g._total_rewards_injected
     g.step()
     assert g._total_rewards_injected == n0 + 1
-    assert g._reward_history[-1]["strength"] == pytest.approx(0.5 * 2 * (-0.8 - 0.5))
+    assert g._reward_history[-1]["strength"] == pytest.approx(0.5 * (-0.8 - 0.5))   # the MEAN, not the sum
     assert "_s10_events" not in g.__dict__
 
 
@@ -173,13 +174,33 @@ def test_a_steady_stream_nets_about_zero():
     total = n = 0.0
     for _ in range(3000):
         ev = [(0.6 if rng.random() < 0.3 else -0.6) for _ in range(rng.randint(1, 8))]
-        b = g.__dict__.get("_s10_rpe_baseline", ev[0])
-        total += sum(o - b for o in ev)
-        n += len(ev)
+        m = sum(ev) / len(ev)
+        b = g.__dict__.get("_s10_rpe_baseline", m)
+        total += m - b
+        n += 1
         g._s10_rpe_broadcast(ev)
-    # the base's broadcast here would be +0.3 / failure on average (always positive); RPE: ~0 per event
+    # the base's broadcast here would be +0.3 / failure on average (always positive); RPE: ~0 per step
     assert abs(total / n) < 0.02, total / n
     assert g._s10_rpe_baseline == pytest.approx(0.3 * 0.6 - 0.7 * 0.6, abs=0.06)
+
+
+def test_the_signal_does_not_grow_with_the_number_of_resolutions():
+    # try 1 summed: 40 confirmations in a step gave 40x one's strength, on every trace
+    one, _ = _graph(NF, True)
+    many, _ = _graph(NF, True)
+    one._s10_rpe_baseline = many._s10_rpe_baseline = -0.2
+    one._s10_rpe_broadcast([0.8])
+    many._s10_rpe_broadcast([0.8] * 40)
+    assert one._reward_history[-1]["strength"] == pytest.approx(many._reward_history[-1]["strength"])
+    assert abs(many._reward_history[-1]["strength"]) <= 0.5 * 2.0   # |mean(o) - b| <= 2 for |o|, |b| <= 1
+
+
+def test_the_expectation_starts_at_the_first_steps_mean():
+    g, syn = _graph(NF, True)
+    w0 = _w(g, syn)
+    g._s10_rpe_broadcast([-0.8, 0.8, 0.8, 0.8])   # try 1 started b at -0.8 (the first event) -> a large false "better"
+    assert g._s10_rpe_baseline == pytest.approx(0.4, abs=0.01)   # the step's mean, then 4 tiny per-event moves
+    assert _w(g, syn) == w0
 
 
 def test_nothing_new_is_saved():
