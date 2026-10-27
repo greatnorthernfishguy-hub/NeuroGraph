@@ -20,6 +20,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-27] Claude Code (Opus 5.5, laptop; lane stability-s10, #1136; Josh 2026-10-27 "what's the most similar,
+#   conceptually, to how the brain does it?" / "Yes, go ahead") — PROTECTED (needs Josh's proceed): S10, the reward is a
+#   signed prediction error against expectation (dopamine-like RPE), broadcast once per step
+# What: config reward_rpe_enabled (+ reward_rpe_tau 2000 events; read live, NOT in DEFAULT_CONFIG; needs
+#       three_factor_enabled and NOT reward_event_scoped_enabled, else ERROR once and off): each resolved synapse-level
+#       prediction is an outcome o (+confidence confirmed, -confidence failed); a failed one no longer broadcasts on its
+#       own. After the step's predictions resolve, ONE global inject_reward(surprise_reward_scaling x sum(o - b)) where b
+#       is the running expected outcome as it stood at the step's start; then b += (o - b) / tau per event. A step that
+#       resolves nothing sends nothing and leaves b. b starts at the first event's outcome; NOT saved (relearns on load).
+# Why:  S8 ledger: the surprise broadcast was always positive (+conf x 0.5) — a surprise treated as good news — and that
+#       one-signed bias is the waking climb. S9 cut its reach instead and lost mind-wide STDP learning (~800x less moved
+#       per call; dev-log S9 §3.2). Dopamine is global, lands on tagged (eligible) synapses, and is signed against
+#       expectation, so it nets ~0 (dev-log 2026-10-27_stability-s10-rpe-reward).
+# How:  key absent / False = the S9 branch exactly (the per-event broadcast; nothing new is called or kept).
 # [2026-10-26] Claude Code (Opus 5.5, laptop; lane stability-s9, #1136; Josh 2026-10-26 "you have my 'go' when S8 is
 #   done") — PROTECTED (needs Josh's proceed): S9, the reward commits only the links of each prediction event
 # What: config reward_event_scoped_enabled (+ reward_confirm_scaling 0.25; read live, NOT in DEFAULT_CONFIG; needs the
@@ -4039,6 +4053,10 @@ class Graph:
 
             # 6f. Clean up expired Phase 3 predictions
             self._cleanup_predictions()
+            # [2026-10-27] S10 (#1136): the step's one signed reward (only when outcomes were kept, i.e. S10 on)
+            _s10 = self.__dict__.pop("_s10_events", None)
+            if _s10:
+                self._s10_rpe_broadcast(_s10)
 
             # 7. Apply plasticity rules
             if fired_ids:
@@ -4558,6 +4576,9 @@ class Graph:
         # the prediction handlers otherwise)
         if c.get("reward_event_scoped_enabled", False):
             self._stab_s9_reward()
+        # [2026-10-27] S10 (#1136): likewise for the RPE reward
+        if c.get("reward_rpe_enabled", False):
+            self._stab_s10_rpe()
         # [2026-10-25] S8 (#1136): the bound says so when it cannot run on this graph at all (as S7b's L7 check above)
         if c.get("syn_scale_up_bound_enabled", False) and not (
                 getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 9):
@@ -4702,6 +4723,44 @@ class Graph:
             relax=relax_t,
             up_bound=self._stab_s8_bound(c, s_on),
         )
+
+    def _stab_s10_rpe(self) -> Optional[float]:
+        """[2026-10-27] S10 (#1136): the RPE baseline time constant (events) when the signed per-step reward is on, else
+        None (ERROR once when the key is set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_rpe_enabled", False):
+            return None
+        if not c.get("three_factor_enabled", False):
+            self._stab_error_once(["reward_rpe_enabled"], "three_factor_enabled (it signs the three-factor reward)")
+            return None
+        if c.get("reward_event_scoped_enabled", False):
+            self._stab_error_once(["reward_rpe_enabled"], "reward_event_scoped_enabled off (two answers to one question)")
+            return None
+        try:
+            tau = float(c.get("reward_rpe_tau", 2000))
+        except (TypeError, ValueError):
+            tau = float("nan")
+        if not (tau >= 1.0):   # also refuses NaN
+            self._stab_error_once(["reward_rpe_enabled"], "reward_rpe_tau >= 1")
+            return None
+        return tau
+
+    def _s10_rpe_broadcast(self, outcomes: List[float]) -> None:
+        """[2026-10-27] S10 (#1136): one global, signed reward for this step's resolved predictions, judged against the
+        running expected outcome b (as it stood at the step's start); then b learns from them."""
+        tau = self._stab_s10_rpe()
+        if tau is None or not outcomes:
+            return
+        b = self.__dict__.get("_s10_rpe_baseline")
+        if b is None:
+            b = outcomes[0]
+        delta = sum(o - b for o in outcomes)
+        for o in outcomes:
+            b += (o - b) / tau
+        self._s10_rpe_baseline = b
+        strength = delta * self.config.get("surprise_reward_scaling", 0.5)
+        if abs(strength) > 0.01:   # as the base: don't bother with a negligible signal
+            self.inject_reward(strength)
 
     def _stab_s9_reward(self) -> Optional[float]:
         """[2026-10-26] S9 (#1136): the confirm scaling when event-scoped reward is on, else None (ERROR once when the
@@ -5270,6 +5329,9 @@ class Graph:
             history.append(True)
 
         self._total_predictions_confirmed += 1
+        # [2026-10-27] S10: the outcome joins this step's signed reward (None = off: nothing kept)
+        if self._stab_s10_rpe() is not None:
+            self.__dict__.setdefault("_s10_events", []).append(pred.confidence)
 
         outcome = PredictionOutcome(
             prediction=pred,
@@ -5347,7 +5409,10 @@ class Graph:
         # the failing synapse gets reduced crystallization. The broadcast
         # benefits other active traces that weren't involved in the failed
         # prediction.
-        if self.config.get("three_factor_enabled", False):
+        # [2026-10-27] S10: the outcome joins this step's signed reward instead of broadcasting on its own
+        if self._stab_s10_rpe() is not None:
+            self.__dict__.setdefault("_s10_events", []).append(-pred.confidence)
+        elif self.config.get("three_factor_enabled", False):
             surprise_strength = pred.confidence * self.config.get("surprise_reward_scaling", 0.5)
             if surprise_strength > 0.01:  # Don't bother with negligible surprise
                 # [2026-10-26] S9: only the event's links (A -> what fired + the wrong target), not every trace
