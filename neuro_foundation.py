@@ -20,6 +20,22 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-28] Claude Code (Opus 5.5, laptop; lane stability-s13, #1136; Josh 2026-10-28 "Yes, go ahead with both") —
+#   PROTECTED (needs Josh's proceed): S13, two independent switches against the two biased terms of the reward's net
+#   weight change (dev-log 2026-10-28 S12 §5: S12cal ledger split (a) mean(R) x mean(e) -99, (b) Cov +37, (c) clip +39)
+# What: (1) reward_floor_symmetric_enabled (needs three_factor_enabled and the S13 wheel, SynapseStore.reward_floor_round
+#       >= 1, else ERROR once and off): every inject_reward synapse sweep caps |dw| at the synapse's own weight in EITHER
+#       direction (symmetric_floor=True), so the floor at 0 no longer swallows only depression. (2)
+#       reward_rpe_per_source_enabled (+ reward_rpe_source_tau 20 events; needs reward_rpe_enabled, else ERROR once and
+#       off): S10's surprise is judged per predicting node, not against one global running outcome: each resolved
+#       prediction gives hit (1 confirmed / 0 failed) and delta = hit - q_src, q_src that source node's expected hit rate
+#       (starts at the prediction's own confidence; then q += (hit - q) / tau; NOT saved, relearns on load); the step's
+#       one reward is surprise_reward_scaling x mean(delta) (S10's global baseline is then not used). Both read live,
+#       NOT in DEFAULT_CONFIG; off / absent = the S12 branch exactly.
+# Why:  (c) is the hard-bound rectification (van Rossum, Bi & Turrigiano 2000); (a) is the global-baseline bias
+#       (Fremaux, Sprekeler & Gerstner 2010: a single global expected reward does not cancel the unsupervised term when
+#       reward depends on context; a per-context critic does). Brain: each predictor's expectation is its own.
+# How:  the S10 commit tail is shared (_s10_commit: the 0.01 gate, S12's gain, the floor flag via inject_reward).
 # [2026-10-28] Claude Code (Opus 5.5, laptop; lane stability-s12, #1136; Josh 2026-10-28 "I'll go with your
 #   recommendation of (a)" / "Go ahead and do both of them") — PROTECTED (needs Josh's proceed): S12, the RPE commit
 #   shares a fixed plasticity budget across the step's tagged synapses
@@ -4080,7 +4096,10 @@ class Graph:
             self._cleanup_predictions()
             # [2026-10-27] S10 (#1136): the step's one signed reward (only when outcomes were kept, i.e. S10 on)
             _s10 = self.__dict__.pop("_s10_events", None)
-            if _s10:
+            _s13 = self.__dict__.pop("_s13_events", None)   # [2026-10-28] S13: per-source surprise replaces the global one
+            if _s13 and self._stab_s13_per_source() is not None:
+                self._s13_source_rpe_broadcast(_s13)
+            elif _s10:
                 self._s10_rpe_broadcast(_s10)
 
             # 7. Apply plasticity rules
@@ -4607,6 +4626,11 @@ class Graph:
         # [2026-10-28] S12 (#1136): the trace-normalised commit, too (it is read only at a commit otherwise)
         if c.get("reward_rpe_trace_norm_enabled", False):
             self._stab_s12_trace_norm()
+        # [2026-10-28] S13 (#1136): both switches say so once when they cannot run
+        if c.get("reward_rpe_per_source_enabled", False):
+            self._stab_s13_per_source()
+        if c.get("reward_floor_symmetric_enabled", False):
+            self._stab_s13_floor()
         # [2026-10-27] S11 (#1136): C2-down says so even when nothing else of the set is on
         if c.get("he_threshold_homeo_down_enabled", False) and not c.get("he_threshold_homeo_enabled", False):
             self._stab_error_once(["he_threshold_homeo_down_enabled"], "he_threshold_homeo_enabled (it is C2's other half)")
@@ -4819,13 +4843,64 @@ class Graph:
         for o in outcomes:
             b += (o - b) / tau
         self._s10_rpe_baseline = b
-        strength = delta * self.config.get("surprise_reward_scaling", 0.5)
+        self._s10_commit(delta * self.config.get("surprise_reward_scaling", 0.5))
+
+    def _s10_commit(self, strength: float) -> None:
+        """[2026-10-28] the RPE step's one commit (S10 / S13): the 0.01 gate, then S12's gain when on."""
         if abs(strength) > 0.01:   # as the base: don't bother with a negligible signal
             norm = self._stab_s12_trace_norm()
             if norm is None:
                 self.inject_reward(strength)
             else:   # [2026-10-28] S12: the commit shares a fixed budget across the step's tagged synapses
                 self.inject_reward(strength, trace_gain=self._s12_trace_gain(*norm))
+
+    def _stab_s13_per_source(self) -> Optional[float]:
+        """[2026-10-28] S13 (#1136): the per-source expectation time constant (events) when reward_rpe_per_source_enabled
+        is on and can run, else None (ERROR once when the key is set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_rpe_per_source_enabled", False):
+            return None
+        if self._stab_s10_rpe() is None:
+            self._stab_error_once(["reward_rpe_per_source_enabled"], "reward_rpe_enabled (it judges S10's outcomes per source)")
+            return None
+        try:
+            tau = float(c.get("reward_rpe_source_tau", 20))
+        except (TypeError, ValueError):
+            tau = float("nan")
+        if not (tau >= 1.0):   # also refuses NaN
+            self._stab_error_once(["reward_rpe_per_source_enabled"], "reward_rpe_source_tau >= 1")
+            return None
+        return tau
+
+    def _stab_s13_floor(self) -> bool:
+        """[2026-10-28] S13 (#1136): True when reward_floor_symmetric_enabled is on and can run (ERROR once when the key is
+        set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_floor_symmetric_enabled", False):
+            return False
+        if not c.get("three_factor_enabled", False):
+            self._stab_error_once(["reward_floor_symmetric_enabled"], "three_factor_enabled (it bounds the reward commit)")
+            return False
+        if getattr(type(self.synapses), "reward_floor_round", 0) < 1:
+            self._stab_error_once(["reward_floor_symmetric_enabled"], "the S13 native synapse store (reward_floor_round >= 1)")
+            return False
+        return True
+
+    def _s13_source_rpe_broadcast(self, events: List[tuple]) -> None:
+        """[2026-10-28] S13 (#1136): the step's one reward from per-source surprise: mean over resolved predictions of
+        hit - q_src (q_src the source's expected hit rate before this event), then each q_src learns from its hit."""
+        tau = self._stab_s13_per_source()
+        if tau is None or not events:
+            return
+        q = self.__dict__.get("_s13_q")
+        if q is None:
+            q = self._s13_q = {}
+        deltas = []
+        for src, hit, conf in events:
+            e = q.get(src, conf)
+            deltas.append(hit - e)
+            q[src] = e + (hit - e) / tau
+        self._s10_commit(sum(deltas) / len(deltas) * self.config.get("surprise_reward_scaling", 0.5))
 
     def _stab_s12_trace_norm(self) -> Optional[tuple]:
         """[2026-10-28] S12 (#1136): `(tau, cap)` when reward_rpe_trace_norm_enabled is on and can run, else None
@@ -5436,6 +5511,8 @@ class Graph:
         # [2026-10-27] S10: the outcome joins this step's signed reward (None = off: nothing kept)
         if self._stab_s10_rpe() is not None:
             self.__dict__.setdefault("_s10_events", []).append(pred.confidence)
+            if self._stab_s13_per_source() is not None:   # [2026-10-28] S13: who predicted, and whether it came true
+                self.__dict__.setdefault("_s13_events", []).append((pred.source_node_id, 1.0, pred.confidence))
 
         outcome = PredictionOutcome(
             prediction=pred,
@@ -5516,6 +5593,8 @@ class Graph:
         # [2026-10-27] S10: the outcome joins this step's signed reward instead of broadcasting on its own
         if self._stab_s10_rpe() is not None:
             self.__dict__.setdefault("_s10_events", []).append(-pred.confidence)
+            if self._stab_s13_per_source() is not None:   # [2026-10-28] S13
+                self.__dict__.setdefault("_s13_events", []).append((pred.source_node_id, 0.0, pred.confidence))
         elif self.config.get("three_factor_enabled", False):
             surprise_strength = pred.confidence * self.config.get("surprise_reward_scaling", 0.5)
             if surprise_strength > 0.01:  # Don't bother with negligible surprise
@@ -8029,11 +8108,12 @@ class Graph:
             # use); peak_weight tracks the new max.
             _reward = getattr(self.synapses, "apply_eligibility_reward", None)
             syn_strength = strength if trace_gain == 1.0 else strength * trace_gain   # [2026-10-28] S12
+            _floor = {"symmetric_floor": True} if self._stab_s13_floor() else {}   # [2026-10-28] S13 (native only)
             if post_scope is not None:   # [2026-10-26] S9: the paired scope (checked above: native only)
-                _reward(syn_strength, self.config["learning_rate"], scope, post_scope)
+                _reward(syn_strength, self.config["learning_rate"], scope, post_scope, **_floor)
                 scope = set(scope) | set(post_scope)   # the hyperedge part: the event's nodes
             elif _reward is not None:
-                _reward(syn_strength, self.config["learning_rate"], scope)
+                _reward(syn_strength, self.config["learning_rate"], scope, **_floor)
             else:  # [2026-10-05] per-SynapseRef fallback (the original loop)
                 _apply_eligibility_reward_python(
                     self.synapses, syn_strength, self.config["learning_rate"], scope)
