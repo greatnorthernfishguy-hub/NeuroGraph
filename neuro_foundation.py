@@ -20,6 +20,20 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-28] Claude Code (Opus 5.5, laptop; lane stability-s12, #1136; Josh 2026-10-28 "I'll go with your
+#   recommendation of (a)" / "Go ahead and do both of them") — PROTECTED (needs Josh's proceed): S12, the RPE commit
+#   shares a fixed plasticity budget across the step's tagged synapses
+# What: config reward_rpe_trace_norm_enabled (+ reward_rpe_trace_norm_tau 200 commits, reward_rpe_trace_norm_cap 4.0;
+#       read live, NOT in DEFAULT_CONFIG; needs reward_rpe_enabled, else ERROR once and off): before S10's per-step
+#       inject_reward, the eligibility mass M = sum |trace| (|trace| >= 1e-9) is read and the SYNAPTIC commit is scaled by
+#       min(cap, R / M), R the running mean of M (starts at the first M; NOT saved, relearns on load), so the step's total
+#       synaptic commit is ~ trace-weighted delta x R whatever M is. Hyperedge thresholds keep the unscaled strength.
+#       inject_reward gains trace_gain (default 1.0 = unchanged; scales only the synapse sweep's strength).
+# Why:  dev-log 2026-10-27_stability-s10-rpe-reward §5.2: delta is zero-mean but dw = trace x delta, and steps that go
+#       better than expected carry more trace, so the reward still netted +412 over S11cal's 3,000 waking steps. Brain:
+#       synaptic tagging and capture -- tagged synapses share a limited pool of plasticity proteins, so how much a
+#       dopamine signal can write does not grow with how many synapses are tagged.
+# How:  off / absent = the S11 branch exactly (inject_reward called as before; nothing new read or kept).
 # [2026-10-27] Claude Code (Opus 5.5, laptop; lane stability-s11, #1136; Josh 2026-10-27 "Go ahead and try the run
 #   overnight") — PROTECTED (needs Josh's proceed): S11, C2 gets its downward half (C2-down), evidence-gated
 # What: config he_threshold_homeo_down_enabled (+ he_threshold_homeo_down_rate 0.001, _evidence 0.5, _floor 0.1; read
@@ -4590,6 +4604,9 @@ class Graph:
         # [2026-10-27] S10 (#1136): likewise for the RPE reward
         if c.get("reward_rpe_enabled", False):
             self._stab_s10_rpe()
+        # [2026-10-28] S12 (#1136): the trace-normalised commit, too (it is read only at a commit otherwise)
+        if c.get("reward_rpe_trace_norm_enabled", False):
+            self._stab_s12_trace_norm()
         # [2026-10-27] S11 (#1136): C2-down says so even when nothing else of the set is on
         if c.get("he_threshold_homeo_down_enabled", False) and not c.get("he_threshold_homeo_enabled", False):
             self._stab_error_once(["he_threshold_homeo_down_enabled"], "he_threshold_homeo_enabled (it is C2's other half)")
@@ -4804,7 +4821,50 @@ class Graph:
         self._s10_rpe_baseline = b
         strength = delta * self.config.get("surprise_reward_scaling", 0.5)
         if abs(strength) > 0.01:   # as the base: don't bother with a negligible signal
-            self.inject_reward(strength)
+            norm = self._stab_s12_trace_norm()
+            if norm is None:
+                self.inject_reward(strength)
+            else:   # [2026-10-28] S12: the commit shares a fixed budget across the step's tagged synapses
+                self.inject_reward(strength, trace_gain=self._s12_trace_gain(*norm))
+
+    def _stab_s12_trace_norm(self) -> Optional[tuple]:
+        """[2026-10-28] S12 (#1136): `(tau, cap)` when reward_rpe_trace_norm_enabled is on and can run, else None
+        (ERROR once when the key is set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_rpe_trace_norm_enabled", False):
+            return None
+        if not c.get("reward_rpe_enabled", False):
+            self._stab_error_once(["reward_rpe_trace_norm_enabled"], "reward_rpe_enabled (it scales the RPE commit)")
+            return None
+        try:
+            t = (float(c.get("reward_rpe_trace_norm_tau", 200)), float(c.get("reward_rpe_trace_norm_cap", 4.0)))
+        except (TypeError, ValueError):
+            t = (float("nan"),) * 2
+        if not (t[0] >= 1.0 and t[1] >= 1.0):   # also refuses NaN
+            self._stab_error_once(["reward_rpe_trace_norm_enabled"],
+                                  "reward_rpe_trace_norm_tau >= 1 and reward_rpe_trace_norm_cap >= 1")
+            return None
+        return t
+
+    def _s12_trace_gain(self, tau: float, cap: float) -> float:
+        """[2026-10-28] S12 (#1136): the synaptic gain for this commit, min(cap, R / M) with M this step's eligibility
+        mass and R its running mean (then R learns from M). M ~ 0: nothing to commit, gain 1 and R untouched."""
+        cp = getattr(self.synapses, "eligibility_copy", None)
+        if cp is not None:
+            e = np.abs(np.asarray(cp(), dtype=float))
+            m = float(e[e >= 1e-9].sum())
+        else:   # dict / duck-typed stores: the same sum, as the Python sweep sees it
+            m = float(sum(abs(s.eligibility_trace) for s in self.synapses.values()
+                          if abs(s.eligibility_trace) >= 1e-9))
+        if m < 1e-9:
+            return 1.0
+        r = self.__dict__.get("_s12_trace_ref")
+        if r is None:
+            r = m
+        gain = min(cap, r / m)
+        self._s12_trace_ref = r + (m - r) / tau
+        self._s12_last = (m, r, gain)   # read by the copy-run harness; NOT saved
+        return gain
 
     def _stab_s9_reward(self) -> Optional[float]:
         """[2026-10-26] S9 (#1136): the confirm scaling when event-scoped reward is on, else None (ERROR once when the
@@ -7928,6 +7988,7 @@ class Graph:
         strength: float,
         scope: Optional[Set[str]] = None,
         post_scope: Optional[Set[str]] = None,
+        trace_gain: float = 1.0,
     ) -> None:
         """Broadcast reward for three-factor learning (PRD §5.2, §8 inject_reward).
 
@@ -7945,6 +8006,8 @@ class Graph:
             post_scope: [2026-10-26] S9 — with `scope`, a PAIRED scope: only synapses whose pre node is in
                 `scope` AND whose post node is in `post_scope` (one prediction event's links). Native synapse store
                 only (SynapseStore.reward_round >= 1); hyperedges use scope | post_scope.
+            trace_gain: [2026-10-28] S12 — multiplies the strength of the SYNAPSE sweep only (hyperedge thresholds,
+                the history and the event keep `strength`). 1.0 = unchanged.
         """
         if post_scope is not None and (scope is None or getattr(type(self.synapses), "reward_round", 0) < 1):
             raise ValueError("inject_reward: post_scope needs scope and the S9 native synapse store")
@@ -7965,14 +8028,15 @@ class Graph:
             # weight = max(0, min(weight + dw, max_weight)); trace *= 0.9 (decay after
             # use); peak_weight tracks the new max.
             _reward = getattr(self.synapses, "apply_eligibility_reward", None)
+            syn_strength = strength if trace_gain == 1.0 else strength * trace_gain   # [2026-10-28] S12
             if post_scope is not None:   # [2026-10-26] S9: the paired scope (checked above: native only)
-                _reward(strength, self.config["learning_rate"], scope, post_scope)
+                _reward(syn_strength, self.config["learning_rate"], scope, post_scope)
                 scope = set(scope) | set(post_scope)   # the hyperedge part: the event's nodes
             elif _reward is not None:
-                _reward(strength, self.config["learning_rate"], scope)
+                _reward(syn_strength, self.config["learning_rate"], scope)
             else:  # [2026-10-05] per-SynapseRef fallback (the original loop)
                 _apply_eligibility_reward_python(
-                    self.synapses, strength, self.config["learning_rate"], scope)
+                    self.synapses, syn_strength, self.config["learning_rate"], scope)
 
             # Hyperedge threshold learning (PRD §4.3)
             # [2026-10-18] H2 (#1136): native when the graph's native passes are on (a declined pass runs the loop)
