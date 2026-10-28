@@ -20,6 +20,16 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-10-27] Claude Code (Opus 5.5, laptop; lane stability-s11, #1136; Josh 2026-10-27 "Go ahead and try the run
+#   overnight") — PROTECTED (needs Josh's proceed): S11, C2 gets its downward half (C2-down), evidence-gated
+# What: config he_threshold_homeo_down_enabled (+ he_threshold_homeo_down_rate 0.001, _evidence 0.5, _floor 0.1; read
+#       live, NOT in DEFAULT_CONFIG; needs C2 and the S11 wheel, HyperedgeStore.c2_down_round >= 1, else ERROR once and
+#       off): Graph._stab_s11_c2_down passes (rate, evidence, floor) as stab's 6th item. In the native pass a learnable,
+#       non-refractory assembly below 0.8 x he_rate_target whose activation reached `evidence` of its threshold but not
+#       all of it lowers the threshold by `rate` (floor `floor`); an assembly without input is untouched.
+# Why:  dev-log 2026-10-27_stability-s10-rpe-reward §4.3: once S10 signed the reward, nothing lowered a hyperedge
+#       threshold — the always-positive surprise reward had been doing C2's missing half.
+# How:  off / absent = the S10 branch exactly (stab unchanged); nothing new is saved.
 # [2026-10-27] Claude Code (Opus 5.5, laptop; lane stability-s10, #1136; Josh 2026-10-27 "what's the most similar,
 #   conceptually, to how the brain does it?" / "Yes, go ahead") — PROTECTED (needs Josh's proceed): S10, the reward is a
 #   signed prediction error against expectation (dopamine-like RPE), broadcast once per step
@@ -4580,6 +4590,9 @@ class Graph:
         # [2026-10-27] S10 (#1136): likewise for the RPE reward
         if c.get("reward_rpe_enabled", False):
             self._stab_s10_rpe()
+        # [2026-10-27] S11 (#1136): C2-down says so even when nothing else of the set is on
+        if c.get("he_threshold_homeo_down_enabled", False) and not c.get("he_threshold_homeo_enabled", False):
+            self._stab_error_once(["he_threshold_homeo_down_enabled"], "he_threshold_homeo_enabled (it is C2's other half)")
         # [2026-10-25] S8 (#1136): the bound says so when it cannot run on this graph at all (as S7b's L7 check above)
         if c.get("syn_scale_up_bound_enabled", False) and not (
                 getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 9):
@@ -4683,6 +4696,10 @@ class Graph:
         he_t = (hab, "he_inject_respects_refractory" in he, c2, c3)
         if leak_on:
             he_t = he_t + (float(c.get("he_threshold_leak_rate", 0.002)),)
+        # [2026-10-27] S11 (#1136): C2's downward half, as the optional 6th item (None / absent = S2 exactly)
+        c2d = self._stab_s11_c2_down(c, c2)
+        if c2d is not None:
+            he_t = he_t + ((None,) if len(he_t) == 4 else ()) + (c2d,)
         return _StabParams(
             he=he_t if he else None,
             c3_floor=float(c.get("he_target_unlearn_floor", 0.1)) if c3 is not None else None,
@@ -4745,6 +4762,28 @@ class Graph:
             self._stab_error_once(["reward_rpe_enabled"], "reward_rpe_tau >= 1")
             return None
         return tau
+
+    def _stab_s11_c2_down(self, c: dict, c2: Optional[tuple]) -> Optional[tuple]:
+        """[2026-10-27] S11 (#1136): C2-down `(rate, evidence, floor)` when he_threshold_homeo_down_enabled is on and can
+        run, else None (ERROR once when the key is set but cannot run). Pure read of config."""
+        if not c.get("he_threshold_homeo_down_enabled", False):
+            return None
+        if c2 is None:
+            self._stab_error_once(["he_threshold_homeo_down_enabled"], "he_threshold_homeo_enabled (it is C2's other half)")
+            return None
+        if getattr(type(self.hyperedges), "c2_down_round", 0) < 1:
+            self._stab_error_once(["he_threshold_homeo_down_enabled"], "the S11 native hyperedge store (c2_down_round >= 1)")
+            return None
+        try:
+            t = (float(c.get("he_threshold_homeo_down_rate", 0.001)), float(c.get("he_threshold_homeo_down_evidence", 0.5)),
+                 float(c.get("he_threshold_homeo_down_floor", 0.1)))
+        except (TypeError, ValueError):
+            t = (float("nan"),) * 3
+        if not (0.0 < t[0] < 1.0 and 0.0 < t[1] < 1.0 and 0.0 <= t[2] < 1.0):   # also refuses NaN
+            self._stab_error_once(["he_threshold_homeo_down_enabled"],
+                                  "he_threshold_homeo_down_rate in (0, 1), _evidence in (0, 1), _floor in [0, 1)")
+            return None
+        return t
 
     def _s10_rpe_broadcast(self, outcomes: List[float]) -> None:
         """[2026-10-27] S10 (#1136): one global, signed reward for this step's resolved predictions, judged against the
