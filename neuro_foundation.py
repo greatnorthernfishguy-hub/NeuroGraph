@@ -5546,6 +5546,48 @@ class Graph:
                 row[k - 1] += cur
         return out
 
+    def _receiver_reads(self, ids: List[str]) -> List[Optional[tuple]]:
+        """[2026-11-01] S18 (spec §10): (threshold, voltage, excitability, refractory_remaining, firing_rate_ema,
+        resting_potential, is_inhibitory) per id, from the native NodeStore in one call when it has receiver_reads
+        (None entries, and the whole list without it, are read through the node objects: the same values)."""
+        native = None if self.__dict__.get("_recv_python") else getattr(self.nodes, "receiver_reads", None)
+        got = native(ids) if native is not None else [None] * len(ids)
+        out: List[Optional[tuple]] = []
+        for nid, r in zip(ids, got):
+            if r is None:
+                n = self.nodes.get(nid)
+                r = None if n is None else (n.threshold, n.voltage, n.intrinsic_excitability, n.refractory_remaining,
+                                            n.firing_rate_ema, n.resting_potential, bool(n.is_inhibitory))
+            out.append(r)
+        return out
+
+    def _receiver_out_rows(self, pre_ids: List[str]) -> List[Tuple[str, str, str, float]]:
+        """[2026-11-01] S18 (spec §10): (post, synapse_id, pre, weight) for the given pre nodes' outgoing excitatory
+        links with weight > 0 — native SynapseStore.receiver_out_rows in one call when present, else the same walk in
+        Python over _outgoing."""
+        native = None if self.__dict__.get("_recv_python") else getattr(self.synapses, "receiver_out_rows", None)
+        if native is not None:
+            return native(list(pre_ids))
+        out = []
+        for a in pre_ids:
+            for sid in self._outgoing.get(a, ()):
+                syn = self.synapses.get(sid)
+                if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
+                    continue
+                out.append((syn.post_node_id, sid, a, syn.weight))
+        return out
+
+    def _receiver_peak_v(self, v: float, rest: float, ex: float, ticks: Optional[List[float]],
+                         extra: float = 0.0) -> float:
+        """_receiver_peak on plain numbers (the bulk-read path)."""
+        decay = self.config["decay_rate"]
+        peak = -math.inf
+        for k, c in enumerate(ticks or (0.0,)):
+            v = v * decay + (1.0 - decay) * rest + c * ex + (extra if k == 0 else 0.0)
+            if v > peak:
+                peak = v
+        return peak
+
     def _receiver_peak(self, node: Any, ticks: Optional[List[float]], extra: float = 0.0) -> float:
         """[2026-11-01] S18 review C1: the highest voltage the pending input alone would give `node`, tick by tick as
         step() applies it (decay toward resting, then that tick's arrivals x excitability), plus `extra` (imagined
@@ -5586,37 +5628,35 @@ class Graph:
         stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _tp
         _tp = _time_mod.perf_counter()
         contrib: Dict[str, Dict[str, Tuple[str, float]]] = {}   # T -> syn_id -> (pre id, weight)
-        for a in fired_ids:
-            na = self.nodes.get(a)
-            if na is None or na.is_inhibitory:
-                continue
-            for sid in self._outgoing.get(a, ()):
-                syn = self.synapses.get(sid)
-                if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
-                    continue
-                contrib.setdefault(syn.post_node_id, {})[sid] = (a, syn.weight)
+        if not self.__dict__.get("_recv_python") and hasattr(self.nodes, "receiver_reads") \
+                and hasattr(self.synapses, "receiver_out_rows"):
+            stats["native_steps"] = stats.get("native_steps", 0) + 1
+        exc_fired = [a for a, r in zip(fired_ids, self._receiver_reads(list(fired_ids))) if r is not None and not r[6]]
+        for post, sid, a, w in self._receiver_out_rows(exc_fired):
+            contrib.setdefault(post, {})[sid] = (a, w)
         stats["s_contrib"] = stats.get("s_contrib", 0.0) + _time_mod.perf_counter() - _tp
         _tp = _time_mod.perf_counter()
         passing = []
-        for tgt, syns in contrib.items():
-            node = self.nodes.get(tgt)
-            if node is None or node.refractory_remaining > 0:
+        _tg = list(contrib)
+        for tgt, rd in zip(_tg, self._receiver_reads(_tg)):
+            syns = contrib[tgt]
+            if rd is None or rd[3] > 0:
                 continue
+            theta, _v, _ex, _refr, _fr, _rest, _inh = rd
             i = self._receiver_row(st, tgt)
             dt = self.timestep - int(st["last_t"][i])
             if dt > 0:
                 st["pred_ema"][i] *= (1.0 - alpha) ** dt
                 st["last_t"][i] = self.timestep
             rho = float(st["rho"][i])
-            rho = rho + eta if st["pred_ema"][i] > k * node.firing_rate_ema else rho - eta
+            rho = rho + eta if st["pred_ema"][i] > k * _fr else rho - eta
             rho = min(0.99, max(rho_min, rho))
             st["rho"][i] = rho
-            theta = node.threshold
             ticks = pend.get(tgt)
-            d = sum(ticks) * node.intrinsic_excitability if ticks else 0.0
+            d = sum(ticks) * _ex if ticks else 0.0
             if theta <= 0.0 or d < rho * theta:
                 continue
-            peak = self._receiver_peak(node, ticks)
+            peak = self._receiver_peak_v(_v, _rest, _ex, ticks)
             if peak >= theta:   # the pending input fires it alone on some tick: causation, not prediction
                 continue
             strength = d / theta
@@ -5685,45 +5725,47 @@ class Graph:
             imagined: Dict[str, float] = {}
             succ: Dict[str, List[Tuple[str, str, float]]] = {}   # parent pid -> [(S, syn_id, part)]
             by_s: Dict[str, Dict[str, Tuple[str, float]]] = {}   # S -> syn_id -> (pre, part) (this hop's contributors)
+            _pt = [par.target_node_id for par in parents]
+            _pr = dict(zip(_pt, self._receiver_reads(_pt)))
+            _rows = self._receiver_out_rows([t for t in dict.fromkeys(_pt) if _pr[t] is not None and not _pr[t][6]])
+            _by_pre: Dict[str, List[Tuple[str, str, float]]] = {}
+            for post, sid, a, w in _rows:
+                _by_pre.setdefault(a, []).append((post, sid, w))
+            _sn_ids = list(dict.fromkeys(post for post, _sid, _a, _w in _rows))
+            rd_s = dict(zip(_sn_ids, self._receiver_reads(_sn_ids)))
             for par in parents:
-                pn = self.nodes.get(par.target_node_id)
-                if pn is None or pn.is_inhibitory:
-                    continue
-                for sid in self._outgoing.get(par.target_node_id, ()):
-                    syn = self.synapses.get(sid)
-                    if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
+                for post, sid, w in _by_pre.get(par.target_node_id, ()):
+                    r = rd_s.get(post)
+                    if r is None or post in path[par.prediction_id]:
                         continue
-                    sn = self.nodes.get(syn.post_node_id)
-                    if sn is None or syn.post_node_id in path[par.prediction_id]:
-                        continue
-                    part = par.strength * decay * syn.weight * sn.intrinsic_excitability
-                    imagined[syn.post_node_id] = imagined.get(syn.post_node_id, 0.0) + part
-                    succ.setdefault(par.prediction_id, []).append((syn.post_node_id, sid, part))
-                    by_s.setdefault(syn.post_node_id, {})[sid] = (par.target_node_id, part)
+                    part = par.strength * decay * w * r[2]
+                    imagined[post] = imagined.get(post, 0.0) + part
+                    succ.setdefault(par.prediction_id, []).append((post, sid, part))
+                    by_s.setdefault(post, {})[sid] = (par.target_node_id, part)
             nxt: List[Prediction] = []
             for par in parents:
                 # review I2: every successor competes, pending ones too; if the winner is already predicted (another
                 # parent converged on it), this parent's branch ends there instead of growing a weaker second one.
                 best = None
                 for sname, _sid, _part in succ.get(par.prediction_id, ()):
-                    sn = self.nodes.get(sname)
-                    if sn.threshold <= 0.0:
+                    s_thr, s_v, s_ex, s_refr, _sfr, s_rest, _sinh = rd_s[sname]
+                    if s_thr <= 0.0:
                         continue
                     ticks = pend.get(sname)
-                    d = (sum(ticks) * sn.intrinsic_excitability if ticks else 0.0) + imagined[sname]
-                    strength = d / sn.threshold
+                    d = (sum(ticks) * s_ex if ticks else 0.0) + imagined[sname]
+                    strength = d / s_thr
                     if sname in pending_by_target:
                         if best is None or strength > best[0]:
                             best = (strength, sname, d, None, None, None)
                         continue
-                    if sn.refractory_remaining > 0:
+                    if s_refr > 0:
                         continue
                     i = self._receiver_row(st, sname)
                     rho = float(st["rho"][i])
-                    if d < rho * sn.threshold:
+                    if d < rho * s_thr:
                         continue
-                    peak = self._receiver_peak(sn, ticks, imagined[sname])
-                    if peak >= sn.threshold:
+                    peak = self._receiver_peak_v(s_v, s_rest, s_ex, ticks, imagined[sname])
+                    if peak >= s_thr:
                         continue
                     if best is None or strength > best[0]:
                         best = (strength, sname, d, rho, i, peak)

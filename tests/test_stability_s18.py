@@ -424,3 +424,96 @@ def test_receiver_table_capacity_is_its_own_knob():
 def test_receiver_default_capacity_is_10000():
     g, _ = _rg()
     assert g._receiver_max_active() == 10000
+
+
+# ---------------------------------------------------------------------------
+# (5) the native reads (spec §10: the pass cost > 2 % of a step in S18short2) — oracle: the Python path, same state
+# ---------------------------------------------------------------------------
+
+HAVE_RECV = (getattr(NF.ng_tract.SynapseStore, "receiver_round", 0) >= 1
+             and getattr(getattr(NF.ng_tract, "NodeStore", object), "receiver_round", 0) >= 1)
+needs_recv = pytest.mark.skipif(not HAVE_RECV, reason="ng_tract without the S18 receiver reads")
+
+
+def _native_graph(seed):
+    g = restore_as(NF, "native", H2.built(seed))
+    g.config.update(dict(ARM, **RPE, **ON))
+    return g
+
+
+@needs_recv
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_native_out_rows_match_python(seed):
+    g = _native_graph(seed)
+    rng = random.Random(seed)
+    ids = list(g.nodes.keys())
+    for _ in range(5):
+        fired = rng.sample(ids, min(40, len(ids)))
+        want = set()
+        for a in fired:
+            for sid in g._outgoing.get(a, ()):
+                syn = g.synapses.get(sid)
+                if syn is not None and syn.synapse_type != NF.SynapseType.INHIBITORY and syn.weight > 0.0:
+                    want.add((syn.post_node_id, sid, a, syn.weight))
+        got = g.synapses.receiver_out_rows(fired)
+        assert len(got) == len(set(got)) and set(got) == want
+
+
+@needs_recv
+@pytest.mark.parametrize("seed", [0, 1])
+def test_native_reads_match_getters(seed):
+    g = _native_graph(seed)
+    ids = list(g.nodes.keys())[:200] + ["no-such-node"]
+    got = g.nodes.receiver_reads(ids)
+    assert got[-1] is None
+    for nid, r in zip(ids[:-1], got[:-1]):
+        n = g.nodes.get(nid)
+        assert r == (n.threshold, n.voltage, n.intrinsic_excitability, n.refractory_remaining, n.firing_rate_ema,
+                     n.resting_potential, bool(n.is_inhibitory))
+
+
+def _snapshot(g):
+    preds = sorted((p.target_node_id, p.chain_depth, round(p.strength, 12), round(p.confidence, 12),
+                    tuple(sorted((sid, round(sh, 12)) for sid, sh in p.contributors)), round(p.pre_charge_applied, 12))
+                   for p in g.active_predictions.values() if p.contributors is not None)
+    st = g._receiver_state()
+    rows = sorted((nid, round(float(st["rho"][i]), 12), round(float(st["pred_ema"][i]), 12)) for nid, i in st["idx"].items())
+    volts = sorted((nid, round(n.voltage, 12)) for nid, n in g.nodes.items())
+    s = {k: v for k, v in g._recv_stats.items() if not k.startswith("s") or k == "seconds"}
+    s.pop("seconds")
+    s.pop("native_steps", None)   # which path ran, not what it did
+    return preds, rows, volts, s
+
+
+@needs_recv
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_receiver_pass_native_equals_python(seed):
+    """Same graph, same pending input, same fired set: the native-read pass registers exactly what the Python pass does."""
+    out = []
+    for python in (True, False):
+        g = _native_graph(seed)
+        g.__dict__["_recv_python"] = python
+        rng = random.Random(100 + seed)
+        ids = list(g.nodes.keys())
+        for _ in range(6):
+            fired = rng.sample(ids, min(60, len(ids)))
+            for a in fired:
+                for sid in g._outgoing.get(a, ()):
+                    syn = g.synapses.get(sid)
+                    if syn is not None:
+                        _pend(g, syn.post_node_id, syn.weight * rng.uniform(0.2, 1.0), dt=rng.randint(1, 5))
+            g._receiver_predictions(fired, g._stab_receiver())
+            g.timestep += 1
+        assert g._recv_stats["registered"] > 0
+        out.append(_snapshot(g))
+    assert out[0] == out[1]
+
+
+@needs_recv
+def test_receiver_pass_takes_the_native_reads_when_present():
+    for python, want in ((False, True), (True, False)):
+        g = _native_graph(0)
+        g.__dict__["_recv_python"] = python
+        fired = list(g.nodes.keys())[:30]
+        g._receiver_predictions(fired, g._stab_receiver())
+        assert (g._recv_stats.get("native_steps", 0) > 0) is want
