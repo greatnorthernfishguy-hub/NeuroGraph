@@ -5532,15 +5532,43 @@ class Graph:
             st["last_t"][i] = self.timestep
         return i
 
-    def _pending_input(self) -> Dict[str, float]:
-        """Net input already on its way to each target over the next d_max ticks (this step's spikes and earlier ones
-        in flight), as the delivery queue holds it (signed, after manifold attenuation)."""
-        out: Dict[str, float] = {}
+    def _pending_input(self) -> Dict[str, List[float]]:
+        """Input already on its way to each target, PER ARRIVAL TICK over the next d_max ticks (this step's spikes and
+        earlier ones in flight), as the delivery queue holds it (signed, after manifold attenuation): T -> [tick 1..]."""
+        out: Dict[str, List[float]] = {}
         t = self.timestep
-        for ts in range(t + 1, t + int(self.config.get("d_max", 5)) + 1):
-            for tgt, cur in self._delay_buffer.get(ts, ()):
-                out[tgt] = out.get(tgt, 0.0) + cur
+        n = int(self.config.get("d_max", 5))
+        for k in range(1, n + 1):
+            for tgt, cur in self._delay_buffer.get(t + k, ()):
+                row = out.get(tgt)
+                if row is None:
+                    row = out[tgt] = [0.0] * n
+                row[k - 1] += cur
         return out
+
+    def _receiver_peak(self, node: Any, ticks: Optional[List[float]], extra: float = 0.0) -> float:
+        """[2026-11-01] S18 review C1: the highest voltage the pending input alone would give `node`, tick by tick as
+        step() applies it (decay toward resting, then that tick's arrivals x excitability), plus `extra` (imagined
+        input on a chain hop, added at the first tick). Detection happens after each delivery, so "cannot fire it
+        alone" is peak < threshold, not net < threshold - v (a later inhibitory tranche cannot hide an earlier one)."""
+        decay = self.config["decay_rate"]
+        rest = node.resting_potential
+        ex = node.intrinsic_excitability
+        v = node.voltage
+        peak = -math.inf
+        for k, c in enumerate(ticks or (0.0,)):
+            v = v * decay + (1.0 - decay) * rest + c * ex + (extra if k == 0 else 0.0)
+            if v > peak:
+                peak = v
+        return peak
+
+    def _receiver_max_active(self) -> int:
+        """[2026-11-01] S18short: the receiver path's own table size (prediction_receiver_max_active, default 10000):
+        with each neuron predicted about as often as it fires, ~fired-per-step x window predictions are pending."""
+        try:
+            return max(0, int(self.config.get("prediction_receiver_max_active", 10000)))
+        except (TypeError, ValueError):
+            return 10000
 
     def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
         """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
@@ -5551,9 +5579,12 @@ class Graph:
         st = self._receiver_state()
         stats = self.__dict__["_recv_stats"]
         window = self.config["prediction_window"]
-        max_active = self.config["prediction_max_active"]
+        max_active = self._receiver_max_active()
         pre_factor = self.config["prediction_pre_charge_factor"]
+        _tp = _time_mod.perf_counter()
         pend = self._pending_input()
+        stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
         contrib: Dict[str, Dict[str, Tuple[str, float]]] = {}   # T -> syn_id -> (pre id, weight)
         for a in fired_ids:
             na = self.nodes.get(a)
@@ -5564,6 +5595,8 @@ class Graph:
                 if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
                     continue
                 contrib.setdefault(syn.post_node_id, {})[sid] = (a, syn.weight)
+        stats["s_contrib"] = stats.get("s_contrib", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
         passing = []
         for tgt, syns in contrib.items():
             node = self.nodes.get(tgt)
@@ -5578,17 +5611,23 @@ class Graph:
             rho = rho + eta if st["pred_ema"][i] > k * node.firing_rate_ema else rho - eta
             rho = min(0.99, max(rho_min, rho))
             st["rho"][i] = rho
-            theta, v = node.threshold, node.voltage
-            d = pend.get(tgt, 0.0) * node.intrinsic_excitability
-            if theta <= 0.0 or not (rho * theta <= d < theta - v):
+            theta = node.threshold
+            ticks = pend.get(tgt)
+            d = sum(ticks) * node.intrinsic_excitability if ticks else 0.0
+            if theta <= 0.0 or d < rho * theta:
+                continue
+            peak = self._receiver_peak(node, ticks)
+            if peak >= theta:   # the pending input fires it alone on some tick: causation, not prediction
                 continue
             strength = d / theta
-            passing.append((strength, tgt, d, rho, syns, i))
+            passing.append((strength, tgt, d, rho, syns, i, peak))
         passing.sort(key=lambda x: -x[0])
+        stats["s_cand"] = stats.get("s_cand", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
         pending_by_target = {pr.target_node_id: pr for pr in self.active_predictions.values()
                              if pr.contributors is not None}
         new_preds: List[Prediction] = []
-        for strength, tgt, d, rho, syns, i in passing:
+        for strength, tgt, d, rho, syns, i, peak in passing:
             conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
             old = pending_by_target.get(tgt)
             if old is not None:
@@ -5599,12 +5638,12 @@ class Graph:
                 old.confidence = max(old.confidence, conf)
                 stats["merged"] += 1
                 continue
+            st["pred_ema"][i] += alpha   # the neuron reached its predictive state: an episode, registered or not
             if len(self.active_predictions) >= max_active:
                 stats["dropped"] += 1
                 continue
             node = self.nodes.get(tgt)
-            pre = min(strength * pre_factor * node.intrinsic_excitability,
-                      max(0.0, node.threshold - node.voltage - d - margin))
+            pre = min(strength * pre_factor * node.intrinsic_excitability, max(0.0, node.threshold - peak - margin))
             pred = Prediction(target_node_id=tgt, strength=strength, confidence=conf, created_at=self.timestep,
                               expires_at=self.timestep + window, chain_depth=0, pre_charge_applied=pre,
                               drive=d, rho=rho)
@@ -5616,14 +5655,16 @@ class Graph:
             self._predicted_this_step.add(tgt)
             self._total_predictions_made += 1
             stats["registered"] += 1
-            st["pred_ema"][i] += alpha
             new_preds.append(pred)
             self._emit("prediction_generated", source=pred.source_node_id, target=tgt, strength=strength,
                        confidence=conf, chain_depth=0, timestep=self.timestep)
+        stats["s_reg"] = stats.get("s_reg", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
         self._receiver_chains(new_preds, pend, pending_by_target, params)
+        stats["s_chain"] = stats.get("s_chain", 0.0) + _time_mod.perf_counter() - _tp
         stats["seconds"] += _time_mod.perf_counter() - _t0
 
-    def _receiver_chains(self, parents: List["Prediction"], pend: Dict[str, float],
+    def _receiver_chains(self, parents: List["Prediction"], pend: Dict[str, List[float]],
                          pending_by_target: Dict[str, "Prediction"], params: tuple) -> None:
         """Spec §4.6: a predicted node is a weak, imagined source (its strength x chain_decay x the delivered factors of
         its own synapses), added to each successor's real pending input; the successor is tested with the same rule;
@@ -5634,7 +5675,7 @@ class Graph:
         stats = self.__dict__["_recv_stats"]
         decay = self.config["prediction_chain_decay"]
         max_depth = self.config["prediction_max_chain_depth"]
-        max_active = self.config["prediction_max_active"]
+        max_active = self._receiver_max_active()
         window = self.config["prediction_window"]
         pre_factor = self.config["prediction_pre_charge_factor"]
         path = {pr.prediction_id: {pr.target_node_id} for pr in parents}
@@ -5661,28 +5702,45 @@ class Graph:
                     by_s.setdefault(syn.post_node_id, {})[sid] = (par.target_node_id, part)
             nxt: List[Prediction] = []
             for par in parents:
+                # review I2: every successor competes, pending ones too; if the winner is already predicted (another
+                # parent converged on it), this parent's branch ends there instead of growing a weaker second one.
                 best = None
                 for sname, _sid, _part in succ.get(par.prediction_id, ()):
                     sn = self.nodes.get(sname)
-                    if sname in pending_by_target or sn.refractory_remaining > 0 or sn.threshold <= 0.0:
+                    if sn.threshold <= 0.0:
+                        continue
+                    ticks = pend.get(sname)
+                    d = (sum(ticks) * sn.intrinsic_excitability if ticks else 0.0) + imagined[sname]
+                    strength = d / sn.threshold
+                    if sname in pending_by_target:
+                        if best is None or strength > best[0]:
+                            best = (strength, sname, d, None, None, None)
+                        continue
+                    if sn.refractory_remaining > 0:
                         continue
                     i = self._receiver_row(st, sname)
                     rho = float(st["rho"][i])
-                    d = pend.get(sname, 0.0) * sn.intrinsic_excitability + imagined[sname]
-                    if not (rho * sn.threshold <= d < sn.threshold - sn.voltage):
+                    if d < rho * sn.threshold:
                         continue
-                    strength = d / sn.threshold
+                    peak = self._receiver_peak(sn, ticks, imagined[sname])
+                    if peak >= sn.threshold:
+                        continue
                     if best is None or strength > best[0]:
-                        best = (strength, sname, d, rho, i)
-                if best is None or best[0] < chain_floor or len(self.active_predictions) >= max_active:
-                    if best is not None and best[0] >= chain_floor:
-                        stats["dropped"] += 1
+                        best = (strength, sname, d, rho, i, peak)
+                if best is None or best[3] is None or best[0] < chain_floor:
                     continue
-                strength, sname, d, rho, i = best
+                strength, sname, d, rho, i, peak = best
+                dt = self.timestep - int(st["last_t"][i])   # review I3: the episode EMA decays on this path too
+                if dt > 0:
+                    st["pred_ema"][i] *= (1.0 - alpha) ** dt
+                    st["last_t"][i] = self.timestep
+                st["pred_ema"][i] += alpha
+                if len(self.active_predictions) >= max_active:
+                    stats["dropped"] += 1
+                    continue
                 sn = self.nodes.get(sname)
                 conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
-                pre = min(strength * pre_factor * sn.intrinsic_excitability,
-                          max(0.0, sn.threshold - sn.voltage - d - margin))
+                pre = min(strength * pre_factor * sn.intrinsic_excitability, max(0.0, sn.threshold - peak - margin))
                 pred = Prediction(target_node_id=sname, strength=strength, confidence=conf,
                                   created_at=self.timestep, expires_at=self.timestep + window, chain_depth=hop,
                                   pre_charge_applied=pre, drive=d, rho=rho)
@@ -5697,7 +5755,6 @@ class Graph:
                 self._total_predictions_made += 1
                 stats["registered"] += 1
                 stats["chains"] += 1
-                st["pred_ema"][i] += alpha
                 nxt.append(pred)
                 self._emit("prediction_generated", source=pred.source_node_id, target=sname, strength=strength,
                            confidence=conf, chain_depth=hop, timestep=self.timestep)

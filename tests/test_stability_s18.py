@@ -175,7 +175,7 @@ def test_one_state_per_neuron_merges():
 
 
 def test_capacity_keeps_strongest():
-    g, p = _rg(n_src=0, prediction_max_active=2)
+    g, p = _rg(n_src=0, prediction_receiver_max_active=2)
     for i, w in enumerate((0.3, 0.5, 0.4)):
         g.create_node(node_id=f"T{i}")
         g.nodes[f"T{i}"].threshold = 0.8
@@ -325,3 +325,102 @@ def test_checkpoint_roundtrip_base_loader(kind):
     g2.config.update(ON)
     for _ in range(5):
         g2.step()
+
+
+# ---------------------------------------------------------------------------
+# (4) final-review fixes (Grok 4.7, 2026-11-01) + the S18short findings
+# ---------------------------------------------------------------------------
+
+def test_mixed_sign_ticks_that_fire_alone_register_nothing():
+    """Review C1: +0.55 at t+1, -0.20 at t+3: the net 0.35 is partway, but the first tick alone fires T (0.97*0.30+0.55)."""
+    g, p = _rg(n_src=1, w=0.55, extra={"i0": {"is_inhibitory": True}})
+    g.create_synapse("i0", "T", weight=0.2)
+    g.nodes["T"].voltage = 0.30
+    _pend(g, "T", 0.55, dt=1)
+    _pend(g, "T", -0.20, dt=3)
+    g._receiver_predictions(["s0", "i0"], p)
+    assert _preds_on(g, "T") == []
+
+
+def test_spread_ticks_that_cannot_fire_alone_register():
+    g, p = _rg(n_src=2, w=0.2)
+    _pend(g, "T", 0.2, dt=1)
+    _pend(g, "T", 0.2, dt=2)
+    g._receiver_predictions(["s0", "s1"], p)
+    assert len(_preds_on(g, "T")) == 1
+
+
+def test_precharge_with_mixed_ticks_never_fires():
+    rng = random.Random(11)
+    decay = NF.DEFAULT_CONFIG["decay_rate"]
+    for _ in range(60):
+        g, p = _rg(n_src=1, w=0.5, theta=rng.uniform(0.5, 1.0), prediction_pre_charge_factor=1.0,
+                   extra={"i0": {"is_inhibitory": True}})
+        g.create_synapse("i0", "T", weight=0.3)
+        g.nodes["T"].voltage = rng.uniform(0.0, 0.3)
+        ticks = {1: rng.uniform(0.0, 0.5), 2: -rng.uniform(0.0, 0.3), 3: rng.uniform(0.0, 0.4)}
+        for dt, c in ticks.items():
+            _pend(g, "T", c, dt=dt)
+        g._receiver_predictions(["s0", "i0"], p)
+        if _preds_on(g, "T"):
+            v = g.nodes["T"].voltage
+            for k in (1, 2, 3, 4, 5):
+                v = v * decay + ticks.get(k, 0.0)
+                assert v < g.nodes["T"].threshold, (k, ticks)
+
+
+def test_converging_parents_do_not_grow_second_branch():
+    """Review I2: P1 and P2 both lead to U (their strongest); P2 also to a weaker W. U is registered once, W never."""
+    g, p = _rg(n_src=0)
+    for n in ("P1", "P2", "U", "W", "a1", "a2"):
+        g.create_node(node_id=n)
+        g.nodes[n].threshold = 0.8
+    g.create_synapse("a1", "P1", weight=0.3)
+    g.create_synapse("a2", "P2", weight=0.3)
+    g.create_synapse("P1", "U", weight=1.0)
+    g.create_synapse("P2", "U", weight=1.0)
+    g.create_synapse("P2", "W", weight=0.95)   # imagined 0.375*0.7*0.95 = 0.249 >= rho*theta 0.24: W passes alone
+    _fire(g, p, ["a1", "a2"], [("P1", 0.3), ("P2", 0.3)])
+    deep = sorted(pr.target_node_id for pr in g.active_predictions.values() if pr.chain_depth == 1)
+    assert deep == ["U"]
+
+
+def test_chain_episode_decays_pred_ema():
+    """Review I3: a chain registration decays the target's episode EMA over the gap before adding alpha."""
+    g, p = _chain_graph()
+    st = g._receiver_state()
+    i = g._receiver_row(st, "U1")
+    st["pred_ema"][i], st["last_t"][i] = 1.0, g.timestep
+    g.timestep += 100
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    assert [pr.target_node_id for pr in g.active_predictions.values() if pr.chain_depth == 1] == ["U1"]
+    alpha = p[4]
+    assert float(st["pred_ema"][i]) == pytest.approx((1 - alpha) ** 100 + alpha)
+    assert int(st["last_t"][i]) == g.timestep
+
+
+def test_passing_but_dropped_still_counts_as_an_episode():
+    """S18short: the table cap is bookkeeping; a neuron that reached the predictive state counts toward its own rate."""
+    g, p = _rg(n_src=0, prediction_max_active=0, prediction_receiver_max_active=0)
+    g.create_node(node_id="a0")
+    g.create_synapse("a0", "T", weight=0.3)
+    _fire(g, p, ["a0"], [("T", 0.3)])
+    st = g._receiver_state()
+    assert g._recv_stats["dropped"] == 1
+    assert float(st["pred_ema"][st["idx"]["T"]]) == pytest.approx(p[4])
+
+
+def test_receiver_table_capacity_is_its_own_knob():
+    g, p = _rg(n_src=0, prediction_max_active=1, prediction_receiver_max_active=3)
+    for i in range(3):
+        g.create_node(node_id=f"T{i}")
+        g.nodes[f"T{i}"].threshold = 0.8
+        g.create_node(node_id=f"a{i}")
+        g.create_synapse(f"a{i}", f"T{i}", weight=0.4)
+    _fire(g, p, ["a0", "a1", "a2"], [(f"T{i}", 0.4) for i in range(3)])
+    assert len(g.active_predictions) == 3 and g._recv_stats["dropped"] == 0
+
+
+def test_receiver_default_capacity_is_10000():
+    g, _ = _rg()
+    assert g._receiver_max_active() == 10000
