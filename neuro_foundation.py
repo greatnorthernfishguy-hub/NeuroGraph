@@ -20,6 +20,19 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-01] DudeMan CC (Claude Opus 5.5, laptop; S18 / #1202; Josh 2026-11-01 "Yeah, the design looks good"; copy-run
+#   branch only, backup ceremony waived by Josh for this branch) — receiver-side, graded predictions
+# What: prediction_receiver_enabled (+ _rho0 0.3, _k 1.0, _eta 0.002, _rho_min 0.1, _ema_alpha 0.01, _chain_floor 0.05,
+#       _margin 0.05; NOT in DEFAULT_CONFIG; bad params -> ERROR once and off): a neuron is predicted when the input
+#       pending for it charges it at least rho_T of the way to its threshold but cannot fire it alone; graded by that
+#       charge and its own record; each neuron's rho_T held so it is predicted about as often as it fires; credit by
+#       share to the converging synapses; chains gated at every hop, one branch. Off / absent = the 1d0a1a0 branch exactly.
+# Why:  docs/superpowers/specs/2026-11-01-receiver-side-prediction-design.md: the fixed prediction_threshold 3.0 lets
+#       only cap-level links predict, and such a link fires its target outright (causation, not expectation).
+#       Brain: the predictive state is subthreshold dendritic depolarization at the receiver (Larkum 1999; Bouhadjar
+#       et al. 2022 PLoS Comp Biol, with per-neuron predictive-rate homeostasis); expectation graded and local (Yamada &
+#       Chao 2026 Commun Biol).
+# How:  _stab_receiver() reads the config; _generate_predictions branches to _receiver_predictions when it is on.
 # [2026-10-28] Claude Code (Opus 5.5, laptop; lane stability-s13, #1136; Josh 2026-10-28 "Yes, go ahead with both") —
 #   PROTECTED (needs Josh's proceed): S13, two independent switches against the two biased terms of the reward's net
 #   weight change (dev-log 2026-10-28 S12 §5: S12cal ledger split (a) mean(R) x mean(e) -99, (b) Cov +37, (c) clip +39)
@@ -4886,6 +4899,30 @@ class Graph:
             return False
         return True
 
+    def _stab_receiver(self) -> Optional[Tuple[float, float, float, float, float, float, float]]:
+        """[2026-11-01] S18 (#1202): (rho0, k, eta, rho_min, ema_alpha, chain_floor, margin) when
+        prediction_receiver_enabled is on and its params are sound, else None (ERROR once when on but unsound).
+        Pure read of config."""
+        c = self.config
+        if not c.get("prediction_receiver_enabled", False):
+            return None
+        try:
+            p = tuple(float(c.get("prediction_receiver_" + k, d)) for k, d in (
+                ("rho0", 0.3), ("k", 1.0), ("eta", 0.002), ("rho_min", 0.1), ("ema_alpha", 0.01),
+                ("chain_floor", 0.05), ("margin", 0.05)))
+        except (TypeError, ValueError):
+            p = None
+        if p is not None:
+            rho0, k, eta, rho_min, alpha, floor, margin = p
+            ok = (all(math.isfinite(x) for x in p) and 0.0 < rho_min <= rho0 < 1.0 and k > 0.0
+                  and 0.0 < eta < 1.0 and 0.0 < alpha <= 1.0 and floor >= 0.0 and margin >= 0.0)
+            if ok:
+                return p
+        self._stab_error_once(["prediction_receiver_enabled"],
+                              "finite params with 0 < rho_min <= rho0 < 1, k > 0, 0 < eta < 1, 0 < ema_alpha <= 1, "
+                              "chain_floor >= 0, margin >= 0")
+        return None
+
     def _s13_source_rpe_broadcast(self, events: List[tuple]) -> None:
         """[2026-10-28] S13 (#1136): the step's one reward from per-source surprise: mean over resolved predictions of
         hit - q_src (q_src the source's expected hit rate before this event), then each q_src learns from its hit."""
@@ -5312,6 +5349,11 @@ class Graph:
         hyperedge sources.
         """
         if not fired_ids:
+            return
+        # [2026-11-01] S18 (#1202): receiver-side, graded predictions replace the source-side gate when on
+        _recv_params = self._stab_receiver()
+        if _recv_params is not None:
+            self._receiver_predictions(fired_ids, _recv_params)
             return
 
         threshold = self.config["prediction_threshold"]
