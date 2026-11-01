@@ -56,3 +56,80 @@ def test_params_clamped(monkeypatch):
     assert p["backlog"] == 0
     assert p["batch"] == 1000
     assert p["birth_up"] == 0.01
+
+
+# ---- Task 3: the concept index and nearest-concept lookup ----
+
+import numpy as np
+from universal_ingestor import SimpleVectorDB
+
+
+def _unit(*xs):
+    v = np.asarray(xs, dtype=np.float32)
+    return v / np.linalg.norm(v)
+
+
+@pytest.fixture
+def zero_centre(monkeypatch):
+    monkeypatch.setattr(cc_ng_organism, "_cc_concept_centre", lambda dim: np.zeros(dim, dtype=np.float32))
+
+
+def _concept_row(vdb, cid, vec, label="c"):
+    vdb.insert(cid, np.asarray(vec, dtype=np.float32), label, {"cc": True, "_cc_concept": True})
+
+
+def test_empty_index_returns_no_match(zero_centre):
+    assert cc_ng_organism._cc_concept_nearest(SimpleVectorDB(), _unit(1, 0, 0), 0.6) is None
+
+
+def test_match_above_threshold(zero_centre):
+    vdb = SimpleVectorDB()
+    _concept_row(vdb, "cc:concept::a", _unit(1, 0, 0))
+    _concept_row(vdb, "cc:concept::b", _unit(0, 1, 0))
+    vdb.insert("cc:conv::x::tree::q", _unit(1, 0.05, 0), "not a concept", {"cc": True})
+    hit = cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 0.1, 0), 0.6)
+    assert hit is not None and hit[0] == "cc:concept::a" and hit[1] > 0.9
+
+
+def test_below_threshold_none(zero_centre):
+    vdb = SimpleVectorDB()
+    _concept_row(vdb, "cc:concept::a", _unit(1, 0, 0))
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 1.5, 0), 0.6) is None
+
+
+def test_centred_not_raw(monkeypatch):
+    centre = np.asarray([0.6, 0.6, 0.0], dtype=np.float32)
+    monkeypatch.setattr(cc_ng_organism, "_cc_concept_centre", lambda dim: centre)
+    vdb = SimpleVectorDB()
+    _concept_row(vdb, "cc:concept::a", _unit(1, 0.2, 0))
+    q = _unit(0.2, 1, 0)
+    assert float(np.dot(_unit(1, 0.2, 0), q)) >= 0.35       # raw cosine is sizeable ...
+    assert cc_ng_organism._cc_concept_nearest(vdb, q, 0.35) is None   # ... centred it is not a match
+
+
+def test_dim_mismatch_skipped(zero_centre):
+    vdb = SimpleVectorDB()
+    _concept_row(vdb, "cc:concept::a", _unit(1, 0, 0))
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 0, 0, 0), 0.6) is None
+
+
+def test_index_rebuilds_after_vdb_change(zero_centre):
+    vdb = SimpleVectorDB()
+    _concept_row(vdb, "cc:concept::a", _unit(1, 0, 0))
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 0, 0), 0.6)[0] == "cc:concept::a"
+    _concept_row(vdb, "cc:concept::a", _unit(0, 0, 1))      # same object, same count, new vector
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 0, 0), 0.6) is None
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(0, 0, 1), 0.6)[0] == "cc:concept::a"
+
+
+def test_index_after_load(zero_centre, tmp_path):
+    other = SimpleVectorDB()
+    _concept_row(other, "cc:concept::z", _unit(0, 1, 0))
+    path = str(tmp_path / "v.msgpack")
+    other.save(path)
+    vdb = SimpleVectorDB()
+    _concept_row(vdb, "cc:concept::a", _unit(1, 0, 0))
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 0, 0), 0.6)[0] == "cc:concept::a"
+    vdb.load(path)                                          # same object, same concept count, different rows
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 0, 0), 0.6) is None
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(0, 1, 0), 0.6)[0] == "cc:concept::z"

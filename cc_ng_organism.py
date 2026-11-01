@@ -3838,6 +3838,98 @@ def cc_concept_params() -> dict:
         "batch": _cc_env_int("CC_NG_CONCEPT_BACKLOG_BATCH", 25, 1, 1000),
     }
 
+
+# The concept index (spec §5.1): the concept prototypes, centred and normalised, matched by one matrix product. It is a
+# cache of the vector DB's own concept rows (metadata "_cc_concept"), never a second store: it is valid only for the same
+# vector DB object, while the module's concept-write counter is unchanged, and while every cached row is still the very
+# array the vector DB holds (SimpleVectorDB.insert and .load replace arrays, so a reload or replacement rebuilds it).
+_CC_CONCEPT_INDEX = {"vdb": None, "counter": -1, "ids": [], "arrays": [], "mat": None, "dim": None}
+_CC_CONCEPT_WRITES = [0]
+
+
+def _cc_concept_bump():
+    """Every concept write and every rollback bumps this; a stale index is then rebuilt on the next lookup."""
+    _CC_CONCEPT_WRITES[0] += 1
+
+
+def _cc_concept_centre(dim):
+    """The embedder's mean-centring vector when its dimension matches, else zeros (centring off). Read-only use of the
+    vendored ng_embed (LAW 2: nothing in it changes)."""
+    import numpy as _np
+    try:
+        import ng_embed as _ne
+        c = _np.asarray(_ne.embedding_centre(), dtype=_np.float32)
+        if c.shape == (dim,):
+            return c
+    except Exception:  # noqa: BLE001 -- no embedder / a stub module: plain cosine
+        pass
+    return _np.zeros(dim, dtype=_np.float32)
+
+
+def _cc_centred_unit(vec, centre):
+    import numpy as _np
+    v = _np.asarray(vec, dtype=_np.float32) - centre
+    n = float(_np.linalg.norm(v))
+    return v / n if n > 1e-12 else None
+
+
+def _cc_concept_index(vector_db):
+    """The valid index for `vector_db` (rebuilt when stale). Returns the cache dict."""
+    import numpy as _np
+    idx = _CC_CONCEPT_INDEX
+    emb = getattr(vector_db, "embeddings", {})
+    valid = (idx["vdb"] is vector_db and idx["counter"] == _CC_CONCEPT_WRITES[0]
+             and all(emb.get(cid) is arr for cid, arr in zip(idx["ids"], idx["arrays"])))
+    if valid:
+        return idx
+    ids, arrays, rows, dim = [], [], [], None
+    meta = getattr(vector_db, "metadata", {})
+    for cid, m in list(meta.items()):
+        if not (isinstance(m, dict) and m.get("_cc_concept")):
+            continue
+        arr = emb.get(cid)
+        if arr is None:
+            continue
+        a = _np.asarray(arr)
+        if a.ndim != 1:
+            continue
+        if dim is None:
+            dim = a.shape[0]
+        if a.shape[0] != dim:
+            continue
+        ids.append(cid)
+        arrays.append(arr)
+        rows.append(a)
+    mat = None
+    if rows:
+        centre = _cc_concept_centre(dim)
+        cen = [_cc_centred_unit(r, centre) for r in rows]
+        keep = [i for i, c in enumerate(cen) if c is not None]
+        ids = [ids[i] for i in keep]
+        arrays = [arrays[i] for i in keep]
+        mat = _np.stack([cen[i] for i in keep]) if keep else None
+    idx.update(vdb=vector_db, counter=_CC_CONCEPT_WRITES[0], ids=ids, arrays=arrays, mat=mat, dim=dim)
+    return idx
+
+
+def _cc_concept_nearest(vector_db, vec, match):
+    """The best concept for `vec` and its centred cosine when >= match, else None. A vector whose dimension differs from
+    the concepts' is not matched (skipped, not raised)."""
+    import numpy as _np
+    idx = _cc_concept_index(vector_db)
+    if idx["mat"] is None:
+        return None
+    q = _np.asarray(vec, dtype=_np.float32)
+    if q.ndim != 1 or q.shape[0] != idx["dim"]:
+        return None
+    qc = _cc_centred_unit(q, _cc_concept_centre(idx["dim"]))
+    if qc is None:
+        return None
+    sims = idx["mat"] @ qc
+    i = int(_np.argmax(sims))
+    sim = float(sims[i])
+    return (idx["ids"][i], sim) if sim >= match else None
+
 def _cc_soft_bound_step(w, eta, ceiling):
     """Saturating potentiation: w + eta * (ceiling - w), never below w (a recurrence does not depress)."""
     return w + max(0.0, eta * (ceiling - w))
