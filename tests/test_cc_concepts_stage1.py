@@ -40,7 +40,7 @@ def test_concepts_on(monkeypatch):
 def test_params_defaults():
     p = cc_ng_organism.cc_concept_params()
     assert p == {"match": 0.60, "drift": 0.05, "eta": 0.2, "ceiling": 1.0, "birth_up": 0.2, "birth_down": 0.15,
-                 "reactivate": 0.5, "backlog": 200, "batch": 25}
+                 "reactivate": 1.1, "backlog": 200, "batch": 10}
     assert isinstance(p["backlog"], int) and isinstance(p["batch"], int)
 
 
@@ -302,13 +302,15 @@ def _same_state(a, b):
         assert np.allclose(ra[k][0], rb[k][0]) and ra[k][1] == rb[k][1] and ra[k][2] == rb[k][2], k
 
 
-@pytest.mark.parametrize("fail_after", ["node", "syn", "reinforce", "proto", "meta", "volt"])
+@pytest.mark.parametrize("fail_after", ["node", "syn_pair", "reinforce", "proto", "meta", "volt"])
 def test_rollback_restores_concepts(monkeypatch, concepts_on, fail_after):
     third_concept = "embed" if fail_after == "node" else "lenia"     # "node": the third turn founds a NEW concept
     _fake_embedder(monkeypatch, {"one": ["lenia"], "two": ["lenia2"], "three": [third_concept]})
     g, vdb, st = Graph(), SimpleVectorDB(), {}
     _turn(g, vdb, st, "one")
     _turn(g, vdb, st, "two")        # the third turn matches an EXISTING concept (or founds one, for "node")
+    for _ in range(5):              # the concept cools between experiences, so the third turn reactivates it
+        g.step()
     before = _state_of(g, vdb)
     real = cc_ng_organism._cc_concept_journal_add
     seen = []
@@ -332,7 +334,6 @@ def test_rollback_restores_concepts(monkeypatch, concepts_on, fail_after):
 
 
 def test_concept_fires_with_turn(monkeypatch, concepts_on):
-    monkeypatch.setenv("CC_NG_CONCEPT_REACTIVATE", "5.0")
     _fake_embedder(monkeypatch, {"one": ["lenia"], "two": ["lenia2"]})
     g, vdb, st = Graph(), SimpleVectorDB(), {}
     _turn(g, vdb, st, "one")
@@ -520,7 +521,113 @@ def test_backlog_lock_hold_bounded(monkeypatch, concepts_on):
     for i in range(2000):                              # the past to recognise
         _past_tree(g, vdb, f"cc:conv::{i}::tree::x", rng.standard_normal(768), i)
     t0 = time.monotonic()
-    out = _backlog(g, vdb, budget=2000, batch=25)
+    out = _backlog(g, vdb, budget=2000, batch=10)
     assert out["max_hold_s"] < 1.0, out
     assert out["created"] + out["matched"] == 2000
     print("backlog 2000 trees:", round(time.monotonic() - t0, 1), "s, max hold", round(out["max_hold_s"], 3), "s")
+
+
+# ---- Final-review fixes (GPT-6.1 Sol, 2026-10-31) ----
+
+def test_create_failure_after_mutation_rolls_back(monkeypatch, concepts_on):
+    """F1: a failure INSIDE create_node / create_synapse after they mutated leaves nothing behind."""
+    _fake_embedder(monkeypatch, {"one": ["lenia"]})
+    for target in ("create_node", "create_synapse"):
+        g, vdb, st = Graph(), SimpleVectorDB(), {}
+        real = getattr(g, target)
+        calls = {"n": 0}
+
+        def wrapped(*a, _real=real, _t=target, **k):
+            out = _real(*a, **k)
+            nid = k.get("node_id") or (a[0] if a else "")
+            if (_t == "create_node" and str(nid).startswith("cc:concept::")) or \
+               (_t == "create_synapse" and any(str(x).startswith("cc:concept::") for x in a[:2])):
+                raise RuntimeError("fail after mutation in " + _t)
+            return out
+        monkeypatch.setattr(g, target, wrapped)
+        assert _turn(g, vdb, st, "one") is False
+        assert _concepts(g) == [] and not any(i.startswith("cc:concept::") for i in vdb.embeddings), target
+        assert not any(s.pre_node_id.startswith("cc:concept::") or s.post_node_id.startswith("cc:concept::")
+                       for s in g.synapses.values()), target
+
+
+def test_backlog_batch_bounds_examined_trees(concepts_on):
+    """F2: already-recognised trees count toward the batch, and the completeness check stays cheap on a huge concept."""
+    g, vdb = Graph(), SimpleVectorDB()
+    for i in range(2500):
+        _past_tree(g, vdb, f"cc:conv::{i}::tree::x", _unit(1, 0, 0, 0), i)
+    _backlog(g, vdb, budget=100000, batch=500)          # all 2,500 share one concept now
+    lock = _CountingLock(g._step_lock)
+    g._step_lock = lock
+    out = _backlog(g, vdb, budget=1, batch=1)
+    assert out["max_hold_s"] < 0.5, out
+    assert lock.enters >= 2500 // 1 // 2               # many short holds, not one long one
+
+
+def test_index_sees_concepts_added_by_load(zero_centre, tmp_path):
+    """F3: an empty index must not stay empty after concepts arrive in the same store (load / merge)."""
+    other = SimpleVectorDB()
+    _concept_row(other, "cc:concept::z", _unit(0, 1, 0))
+    path = str(tmp_path / "v.msgpack")
+    other.save(path)
+    vdb = SimpleVectorDB()
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(0, 1, 0), 0.6) is None
+    vdb.load(path)
+    hit = cc_ng_organism._cc_concept_nearest(vdb, _unit(0, 1, 0), 0.6)
+    assert hit is not None and hit[0] == "cc:concept::z"
+    _concept_row(vdb, "cc:concept::y", _unit(1, 0, 0))   # an outside writer adds a concept row
+    assert cc_ng_organism._cc_concept_nearest(vdb, _unit(1, 0, 0), 0.6)[0] == "cc:concept::y"
+
+
+def test_exact_repeat_is_recurrence(monkeypatch, concepts_on):
+    monkeypatch.setenv("CC_NG_BIND_REINFORCE_EXISTING", "1")
+    _fake_embedder(monkeypatch, {"same words": ["lenia"]})
+    g, vdb, st = Graph(), SimpleVectorDB(), {}
+    _turn(g, vdb, st, "same words")
+    cid = _concepts(g)[0]
+    g.nodes[cid].voltage = 0.0
+    t = _tree("same words", "lenia")
+    w_before = float(_pairs(g)[(t, cid)][0].weight)
+    assert _turn(g, vdb, st, "same words")
+    assert g.nodes[cid].metadata["_cc_recognitions"] == 2
+    assert float(_pairs(g)[(t, cid)][0].weight) > w_before
+    assert g.nodes[cid].voltage > 0.0
+    assert st.get("concepts_recurred_total") == 1
+
+
+def test_cold_concept_fires_with_default_reactivation(monkeypatch, concepts_on):
+    """F5: with DEFAULT settings, a cold matched concept fires on the step after the turn (intervening steps between)."""
+    _fake_embedder(monkeypatch, {"one": ["lenia"], "two": ["lenia2"]})
+    g, vdb, st = Graph(), SimpleVectorDB(), {}
+    _turn(g, vdb, st, "one")
+    for _ in range(10):
+        g.step()
+    cid = _concepts(g)[0]
+    assert g.nodes[cid].voltage < g.nodes[cid].threshold
+    _turn(g, vdb, st, "two")
+    fired = set(g.step().fired_node_ids or [])
+    assert cid in fired
+
+
+def test_episode_vector_row_metadata_unchanged(monkeypatch, concepts_on):
+    """F10: recognition must not change the episode's vector-row metadata (deposits alias node and row metadata)."""
+    _fake_embedder(monkeypatch, {"aliased": ["lenia"]})
+    g, vdb, st = Graph(), SimpleVectorDB(), {}
+    monkeypatch.delenv("CC_NG_CONCEPTS")
+    _turn(g, vdb, st, "aliased")
+    t = _tree("aliased", "lenia")
+    g.nodes[t].metadata = vdb.metadata[t]              # the live deposit path's aliasing
+    row_before = copy.deepcopy(vdb.metadata[t])
+    monkeypatch.setenv("CC_NG_CONCEPTS", "1")
+    cc_ng_organism.cc_concept_recognize_backlog(g, vdb, 10, 10)
+    assert g.nodes[t].metadata.get("_cc_concept_id")
+    assert vdb.metadata[t] == row_before
+
+
+def test_turn_path_hold_recorded(monkeypatch, concepts_on):
+    """Law Enforcer condition 1: the encoding-time lock hold is measured (read by the copy-run census)."""
+    _fake_embedder(monkeypatch, {"one": ["lenia"]})
+    g, vdb, st = Graph(), SimpleVectorDB(), {}
+    _turn(g, vdb, st, "one")
+    last, mx = g.__dict__["_cc_concept_hold"]
+    assert 0.0 <= last <= mx
