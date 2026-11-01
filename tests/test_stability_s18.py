@@ -213,3 +213,115 @@ def test_rho_rises_when_overpredicted_falls_when_under():
         g.timestep += 1
         _fire(g, p, ["s0"], [("T", 0.01)])   # candidate, never predicted
     assert float(st["rho"][st["idx"]["T"]]) == pytest.approx(0.1)   # down to rho_min, not below
+
+
+# ---------------------------------------------------------------------------
+# (3) credit by share, chains, checkpoints, a whole-graph run
+# ---------------------------------------------------------------------------
+
+def _weights(g, srcs, tgt="T"):
+    return [g._find_synapse(s, tgt).weight for s in srcs]
+
+
+def test_confirm_splits_bonus_by_share():
+    g, p = _rg(n_src=0, three_factor_enabled=False, prediction_confirm_bonus=0.1)
+    for i, w in enumerate((0.2, 0.1, 0.1)):
+        g.create_node(node_id=f"s{i}")
+        g.create_synapse(f"s{i}", "T", weight=w)
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.2), ("T", 0.1), ("T", 0.1)])
+    (pred,) = _preds_on(g, "T")
+    shares = dict(pred.contributors)
+    assert sorted(shares.values()) == pytest.approx([0.25, 0.25, 0.5])
+    before = _weights(g, ["s0", "s1", "s2"])
+    g._evaluate_predictions({"T"})
+    after = _weights(g, ["s0", "s1", "s2"])
+    want = [b + 0.1 * pred.confidence * sh for b, sh in zip(before, (0.5, 0.25, 0.25))]
+    assert after == pytest.approx(want)
+    assert _preds_on(g, "T") == []
+
+
+def test_error_splits_penalty_by_share_and_updates_own_record():
+    g, p = _rg(three_factor_enabled=False, prediction_error_penalty=0.05)
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    (pred,) = _preds_on(g, "T")
+    st = g._receiver_state()
+    c0 = float(st["conf_ema"][st["idx"]["T"]])
+    g.timestep = pred.expires_at + 1
+    g._cleanup_predictions()
+    assert _weights(g, ["s0", "s1", "s2"]) == pytest.approx([0.1 - 0.05 * pred.confidence / 3] * 3)
+    assert float(st["conf_ema"][st["idx"]["T"]]) < c0
+
+
+def test_shares_sum_to_one_excitatory_only():
+    g, p = _rg(n_src=2, w=0.2, theta=0.6, extra={"i0": {"is_inhibitory": True}})
+    g.create_synapse("i0", "T", weight=0.1)
+    _fire(g, p, ["s0", "s1", "i0"], [("T", 0.2), ("T", 0.2), ("T", -0.1)])
+    (pred,) = _preds_on(g, "T")
+    pre = {g.synapses.get(sid).pre_node_id for sid, _ in pred.contributors}
+    assert pre == {"s0", "s1"} and sum(s for _, s in pred.contributors) == pytest.approx(1.0)
+
+
+def test_contributor_synapse_pruned_midflight():
+    g, p = _rg(three_factor_enabled=False)
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    (pred,) = _preds_on(g, "T")
+    g.remove_synapse(pred.contributors[0][0])
+    g.timestep = pred.expires_at + 1
+    g._cleanup_predictions()   # no exception; the other two still get the penalty
+    assert _preds_on(g, "T") == []
+
+
+def _chain_graph(w1=2.0, w2=1.0, **cfg):
+    g, p = _rg(**cfg)
+    for u in ("U1", "U2"):
+        g.create_node(node_id=u)
+        g.nodes[u].threshold = 0.8
+    g.create_synapse("T", "U1", weight=w1)
+    g.create_synapse("T", "U2", weight=w2)
+    return g, g._stab_receiver()
+
+
+def test_chain_follows_strongest_branch_only():
+    g, p = _chain_graph()
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    deep = [pr for pr in g.active_predictions.values() if pr.chain_depth == 1]
+    assert [pr.target_node_id for pr in deep] == ["U1"]
+    (head,) = _preds_on(g, "T")
+    assert deep[0].source_node_id == head.source_node_id   # credited to the chain's origin
+    assert g._recv_stats["chains"] == 1
+
+
+def test_chain_stops_below_floor():
+    g, p = _chain_graph(prediction_receiver_chain_floor=0.9)
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    assert [pr for pr in g.active_predictions.values() if pr.chain_depth > 0] == []
+
+
+@pytest.mark.parametrize("kind", ["dict", "nodes", "native"])
+def test_receiver_on_runs_the_drive_harness(kind):
+    start = H2.built(0)
+    t = S.Pair(restore_as(NF, kind, start), restore_as(NF, kind, start), 0)
+    t.op("keys", lambda g: g.config.update(dict(ARM, **RPE, **ON) if kind == "native" else dict(RPE, **ON)))
+    S.drive(t, random.Random(0), 25, sleep_every=True)
+    assert t.b.g._recv_stats["registered"] > 0
+    assert ckpt(t.a.g) == ckpt(t.b.g)   # deterministic: two identical runs agree
+
+
+@pytest.mark.parametrize("kind", ["dict", "native"])
+def test_checkpoint_roundtrip_base_loader(kind):
+    start = H2.built(1)
+    t = S.Pair(restore_as(NF, kind, start), restore_as(NF, kind, start), 1)
+    t.op("keys", lambda g: g.config.update(dict(ARM, **RPE, **ON) if kind == "native" else dict(RPE, **ON)))
+    S.drive(t, random.Random(1), 20)
+    g = t.b.g
+    sid, syn = next(iter(g.synapses.items()))
+    pr = NF.Prediction(target_node_id=syn.post_node_id, strength=0.4, confidence=0.5, created_at=g.timestep,
+                       expires_at=g.timestep + 10, drive=0.3, rho=0.3)
+    NF.Graph._receiver_set_contributors(pr, {sid: (syn.pre_node_id, syn.weight)})
+    g.active_predictions[pr.prediction_id] = pr   # a pending receiver prediction is in the checkpoint
+    b = ckpt(t.b.g)
+    restore_as(CMOD, kind, b)                       # the base loader reads it
+    g2 = restore_as(NF, kind, b)
+    g2.config.update(ON)
+    for _ in range(5):
+        g2.step()

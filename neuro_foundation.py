@@ -5587,6 +5587,7 @@ class Graph:
         passing.sort(key=lambda x: -x[0])
         pending_by_target = {pr.target_node_id: pr for pr in self.active_predictions.values()
                              if pr.contributors is not None}
+        new_preds: List[Prediction] = []
         for strength, tgt, d, rho, syns, i in passing:
             conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
             old = pending_by_target.get(tgt)
@@ -5616,9 +5617,113 @@ class Graph:
             self._total_predictions_made += 1
             stats["registered"] += 1
             st["pred_ema"][i] += alpha
+            new_preds.append(pred)
             self._emit("prediction_generated", source=pred.source_node_id, target=tgt, strength=strength,
                        confidence=conf, chain_depth=0, timestep=self.timestep)
+        self._receiver_chains(new_preds, pend, pending_by_target, params)
         stats["seconds"] += _time_mod.perf_counter() - _t0
+
+    def _receiver_chains(self, parents: List["Prediction"], pend: Dict[str, float],
+                         pending_by_target: Dict[str, "Prediction"], params: tuple) -> None:
+        """Spec §4.6: a predicted node is a weak, imagined source (its strength x chain_decay x the delivered factors of
+        its own synapses), added to each successor's real pending input; the successor is tested with the same rule;
+        several parents may converge; each parent continues only to its strongest passing successor; a chain stops
+        below chain_floor or at prediction_max_chain_depth. Credited to the chain's origin (source_node_id)."""
+        _rho0, _k, _eta, _rho_min, alpha, chain_floor, margin = params
+        st = self._receiver_state()
+        stats = self.__dict__["_recv_stats"]
+        decay = self.config["prediction_chain_decay"]
+        max_depth = self.config["prediction_max_chain_depth"]
+        max_active = self.config["prediction_max_active"]
+        window = self.config["prediction_window"]
+        pre_factor = self.config["prediction_pre_charge_factor"]
+        path = {pr.prediction_id: {pr.target_node_id} for pr in parents}
+        for hop in range(1, max_depth + 1):
+            if not parents:
+                return
+            imagined: Dict[str, float] = {}
+            succ: Dict[str, List[Tuple[str, str, float]]] = {}   # parent pid -> [(S, syn_id, part)]
+            by_s: Dict[str, Dict[str, Tuple[str, float]]] = {}   # S -> syn_id -> (pre, part) (this hop's contributors)
+            for par in parents:
+                pn = self.nodes.get(par.target_node_id)
+                if pn is None or pn.is_inhibitory:
+                    continue
+                for sid in self._outgoing.get(par.target_node_id, ()):
+                    syn = self.synapses.get(sid)
+                    if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
+                        continue
+                    sn = self.nodes.get(syn.post_node_id)
+                    if sn is None or syn.post_node_id in path[par.prediction_id]:
+                        continue
+                    part = par.strength * decay * syn.weight * sn.intrinsic_excitability
+                    imagined[syn.post_node_id] = imagined.get(syn.post_node_id, 0.0) + part
+                    succ.setdefault(par.prediction_id, []).append((syn.post_node_id, sid, part))
+                    by_s.setdefault(syn.post_node_id, {})[sid] = (par.target_node_id, part)
+            nxt: List[Prediction] = []
+            for par in parents:
+                best = None
+                for sname, _sid, _part in succ.get(par.prediction_id, ()):
+                    sn = self.nodes.get(sname)
+                    if sname in pending_by_target or sn.refractory_remaining > 0 or sn.threshold <= 0.0:
+                        continue
+                    i = self._receiver_row(st, sname)
+                    rho = float(st["rho"][i])
+                    d = pend.get(sname, 0.0) * sn.intrinsic_excitability + imagined[sname]
+                    if not (rho * sn.threshold <= d < sn.threshold - sn.voltage):
+                        continue
+                    strength = d / sn.threshold
+                    if best is None or strength > best[0]:
+                        best = (strength, sname, d, rho, i)
+                if best is None or best[0] < chain_floor or len(self.active_predictions) >= max_active:
+                    if best is not None and best[0] >= chain_floor:
+                        stats["dropped"] += 1
+                    continue
+                strength, sname, d, rho, i = best
+                sn = self.nodes.get(sname)
+                conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
+                pre = min(strength * pre_factor * sn.intrinsic_excitability,
+                          max(0.0, sn.threshold - sn.voltage - d - margin))
+                pred = Prediction(target_node_id=sname, strength=strength, confidence=conf,
+                                  created_at=self.timestep, expires_at=self.timestep + window, chain_depth=hop,
+                                  pre_charge_applied=pre, drive=d, rho=rho)
+                self._receiver_set_contributors(pred, by_s[sname])
+                pred.source_node_id = par.source_node_id   # the chain's origin
+                if pre > 0.0:
+                    sn.voltage += pre
+                self.active_predictions[pred.prediction_id] = pred
+                pending_by_target[sname] = pred
+                path[pred.prediction_id] = path[par.prediction_id] | {sname}
+                self._predicted_this_step.add(sname)
+                self._total_predictions_made += 1
+                stats["registered"] += 1
+                stats["chains"] += 1
+                st["pred_ema"][i] += alpha
+                nxt.append(pred)
+                self._emit("prediction_generated", source=pred.source_node_id, target=sname, strength=strength,
+                           confidence=conf, chain_depth=hop, timestep=self.timestep)
+            parents = nxt
+
+    def _prediction_links(self, pred: "Prediction") -> List[Tuple[Any, float]]:
+        """[2026-11-01] S18: the synapses a prediction's outcome acts on, with shares: a receiver prediction's existing
+        contributors; otherwise today's one source->target synapse at share 1.0 (x * 1.0 == x: unchanged)."""
+        if pred.contributors:
+            out = []
+            for sid, share in pred.contributors:
+                syn = self.synapses.get(sid)
+                if syn is not None:   # pruned mid-flight: skipped
+                    out.append((syn, share))
+            return out
+        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
+        return [(syn, 1.0)] if syn is not None else []
+
+    def _receiver_record(self, pred: "Prediction", hit: float) -> None:
+        """[2026-11-01] S18: a receiver prediction's outcome updates its target's own record (conf_ema, alpha 0.05)."""
+        if pred.contributors is None:
+            return
+        st = self.__dict__.get("_recv")
+        i = st["idx"].get(pred.target_node_id) if st is not None else None
+        if i is not None:
+            st["conf_ema"][i] += 0.05 * (hit - st["conf_ema"][i])
 
     @staticmethod
     def _receiver_set_contributors(pred: "Prediction", syns: Dict[str, Tuple[str, float]]) -> None:
@@ -5658,17 +5763,16 @@ class Graph:
             - Record confirmation in synapse history
             - Emit PredictionConfirmed event
         """
-        # Find the synapse from source to target
-        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
-        if syn is not None:
-            bonus = confirm_bonus * pred.confidence
+        # Find the synapse from source to target ([2026-11-01] S18: or the receiver prediction's contributors, by share)
+        for _j, (syn, _share) in enumerate(self._prediction_links(pred)):
+            bonus = confirm_bonus * pred.confidence * _share
             if not self.config["three_factor_enabled"]:
                 syn.weight = min(syn.weight + bonus, syn.max_weight)
             else:
                 # In three-factor mode, add to eligibility trace
                 syn.eligibility_trace += bonus
                 # [2026-10-26] S9: commit this link's own trace now (None = off: committed later by a broadcast)
-                _s9 = self._stab_s9_reward()
+                _s9 = self._stab_s9_reward() if _j == 0 else None
                 if _s9 is not None:
                     self.inject_reward(pred.confidence * _s9, scope={pred.source_node_id},
                                        post_scope={pred.target_node_id})
@@ -5681,6 +5785,7 @@ class Graph:
                 syn.synapse_id, deque(maxlen=100)
             )
             history.append(True)
+        self._receiver_record(pred, 1.0)
 
         self._total_predictions_confirmed += 1
         # [2026-10-27] S10: the outcome joins this step's signed reward (None = off: nothing kept)
@@ -5717,9 +5822,8 @@ class Graph:
             - Emit SurpriseEvent
             - Trigger surprise-driven exploration
         """
-        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
-        if syn is not None:
-            penalty = error_penalty * pred.confidence
+        for syn, _share in self._prediction_links(pred):   # [2026-11-01] S18: contributors by share, else the one link
+            penalty = error_penalty * pred.confidence * _share
             if not self.config["three_factor_enabled"]:
                 syn.weight = max(0.0, syn.weight - penalty)
             else:
@@ -5731,6 +5835,7 @@ class Graph:
                 syn.synapse_id, deque(maxlen=100)
             )
             history.append(False)
+        self._receiver_record(pred, 0.0)
 
         self._total_predictions_errors += 1
 
