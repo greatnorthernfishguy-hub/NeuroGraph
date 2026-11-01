@@ -1,8 +1,7 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
 # [2026-10-31] DudeMan CC (Claude Opus 5.5, laptop; #1203 stage 1) -- the `functions()` namespace also carries
-#   `cc_concepts_enabled=lambda: False` (the dual pass reads the CC_NG_CONCEPTS switch through it). Harness-only; off = the
-#   previous behaviour, which this harness tests.
+#   `cc_concepts_enabled=lambda: False` (the dual pass reads the CC_NG_CONCEPTS switch through it). Harness-only.
 # [2026-10-23 night] Claude Code (Opus 5.5, laptop) — #1173; harness-only, NO assertion changed
 # What: the `functions()` namespace gains `cc_bind_reinforce_enabled=lambda: False`: _cc_bind_conversational_topology now reads
 #       its CC_NG_BIND_REINFORCE_EXISTING switch through that module-level helper, which an AST extract of selected functions

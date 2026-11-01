@@ -333,9 +333,8 @@ def test_state_counters(reinforce_on, monkeypatch):
     fake = types.ModuleType("ng_embed")
     fake.NGEmbed = _NDR
     monkeypatch.setitem(sys.modules, "ng_embed", fake)
-    # [2026-10-31] stage-1 transplant onto the S13 copy line: that line's run_conversational_dual_pass predates the
-    # live line's `prepared=` keyword (#922 prefetch), so the call omits it; the counters under test are unchanged.
-    ok = cc_ng_organism.run_conversational_dual_pass(g, None, "text", [0.0], state)
+    ok = cc_ng_organism.run_conversational_dual_pass(g, None, "text", [0.0], state,
+                                                     prepared={"ndr": {}, "windows": ()})
     assert ok is True
     assert state["bind_reinforced_synapses_total"] == 4 and state["bind_reinforced_hyperedges_total"] == 1
 

@@ -48,6 +48,42 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-10-25] Claude Code (Opus 5.5, laptop) — #1189 resumable, bounded, damage-tolerant cursor drain
+#   What: _drain_with_cursor rewritten around the tract's own frame validation:
+#     (a) a damaged unit (zero-filled / torn body, bad header) starts a damaged region
+#         that ends at the next whole CRC-valid frame (_btf_unit_at / _btf_next_valid);
+#         ONLY that region is skipped, its raw bytes + tract offset are appended to
+#         <tract>.damaged (append-only, fsynced) BEFORE the cursor passes them, and one
+#         loud ERROR line per pass names the count, bytes and offsets (LAW 7);
+#     (b) reads in windows of NG_TRACT_DRAIN_CHUNK_BYTES (default 64 MiB), never the
+#         whole remaining file;
+#     (c) delivers at most NG_TRACT_DRAIN_MAX_ENTRIES (default 10,000) entries and walks
+#         about NG_TRACT_DRAIN_MAX_BYTES (default 256 MiB) per pass and tract, committing
+#         the cursor after every window, so a crash mid-pass resumes at the last batch;
+#     (d) cursor stays the JSON {"offset","ts","entries"} with atomic temp+fsync+rename;
+#         it gains an optional "ino" (and "prev_ino"/"prev_offset" during a compaction)
+#         so an offset is never applied to another file. Old cursors (no "ino") are
+#         honoured as before; old readers ignore the new keys.
+#     Also: a CRC-valid frame the Rust reader cannot decode, and a JSONL line that is
+#     not JSON, go to .damaged instead of vanishing; an incomplete tail frame is held,
+#     never skipped; _compact_tract now runs under the tract flock with an inode check
+#     (the #1176 design), streams the remainder, writes the cursor before its rename,
+#     and keeps the cumulative "entries" count (it used to reset it to 0);
+#     disconnect() calls ng_tract.sync_tracts() when the wheel has it. _resync_offset
+#     (#285) is removed: its header check lives on in _btf_unit_at, with the CRC added.
+#   Why:  The #285 resync scanned from byte 1 of the slice, so a pass that hit a
+#     corrupt frame advanced the cursor by ONE frame, re-delivered every good entry
+#     before it, and re-read the whole remaining file (3 GB) on every pass. Syl's two
+#     condensate tracts (~3.1 GB) carry 162 / 248 zero-filled regions, so her drains
+#     re-read 3 GB per pass and re-delivered ~8.7k entries each time (VPS RAM profile
+#     2026-10-24 §1/§3; #1184). Ungated: this is a correctness fix; the old behaviour
+#     has no use worth a switch (a switch would keep the re-delivery firehose).
+#   How:  Python-side framing with zlib.crc32 (same CRC-32 as crc32fast), so it works
+#     identically with both installed readers (ng-tract-rs skips bad-CRC frames
+#     silently; UniAI's raises). Only validated units reach ng_tract.TractReader, in
+#     slices <= 8 MiB. Tests: tests/test_tract_drain_resume_1189.py; measurements:
+#     scripts/tract_1189_bench.py. Delivery is still at-most-once per committed batch.
+#     Re-vendor to every module + the VPS is a separate, later install step.
 # [2026-06-04] Claude Code (Opus 4.7) — Phase 4 canonical drift removal (substrate-as-protocol PRD §5.4)
 #   What: Four drift-removal edits to canonical NGTractBridge.
 #     (1) get_recommendations(): removed self._drain_all() side effect — function now just queries
@@ -200,6 +236,7 @@ import random
 import struct
 import sys
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -216,6 +253,106 @@ logger = logging.getLogger("ng_tract_bridge")
 _CURSOR_SUFFIX: str = ".cursor"
 # Compact when cursor advances past this many bytes (active consumer only).
 _COMPACT_THRESHOLD_BYTES: int = 50 * 1024 * 1024  # 50 MB
+
+# #1189 (2026-10-25) resumable drain. Every damaged region's raw bytes go to
+# <tract>.damaged (append-only, never truncated) before the cursor moves past them.
+_DAMAGED_SUFFIX: str = ".damaged"
+# BTF v0.1 §4 envelope: magic "BT", version 1, entry_type 1..3, u32 LE
+# total_length (envelope included), f64 timestamp, u32 LE CRC32 of the payload.
+_BTF_MAGIC: bytes = b"\x42\x54"
+_BTF_ENVELOPE: int = 24
+_BTF_TYPES = (1, 2, 3)
+
+# LAW 5 knobs (read per pass, so a changed environment applies without a restart
+# of the reader object). Defaults bound one pass's RAM to about one chunk plus the
+# decoded entries of one pass.
+_ENV_DRAIN_CHUNK = "NG_TRACT_DRAIN_CHUNK_BYTES"        # read window, and the largest frame accepted
+_ENV_DRAIN_MAX_ENTRIES = "NG_TRACT_DRAIN_MAX_ENTRIES"  # entries delivered per pass (per tract)
+_ENV_DRAIN_MAX_BYTES = "NG_TRACT_DRAIN_MAX_BYTES"      # tract bytes walked per pass (per tract)
+_DEFAULT_DRAIN_CHUNK = 64 * 1024 * 1024
+_DEFAULT_DRAIN_MAX_ENTRIES = 10_000
+_DEFAULT_DRAIN_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _env_pos_int(name: str, default: int) -> int:
+    """A positive int from the environment; the default (with one warning) on a bad value."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        v = int(raw)
+        if v > 0:
+            return v
+    except ValueError:
+        pass
+    logger.warning("%s=%r is not a positive integer; using %d", name, raw, default)
+    return default
+
+
+def _btf_unit_at(buf: Any, i: int, max_frame: int) -> Tuple[str, int]:
+    """Classify the bytes of `buf` at offset `i` (the tract's own frame validation).
+
+    Returns (kind, n):
+      ("frame", n)  a whole BTF frame of n bytes: plausible header (magic, version 1,
+                    entry_type 1..3, 24 <= total_length <= max_frame) AND its payload
+                    CRC32 matches the envelope.
+      ("jsonl", n)  a legacy JSONL residual line ('{' ... '\\n'), n includes the newline.
+      ("short", n)  a plausible header (or a '{' line) that runs past the end of `buf`:
+                    more bytes are needed to judge it (n = bytes needed, or 0 if unknown).
+      ("bad", 0)    anything else: zeroed or garbage bytes, an implausible header, or a
+                    whole frame whose CRC does not match (a torn / zero-filled body).
+    """
+    n = len(buf)
+    if i >= n:
+        return ("short", 0)
+    if buf[i] == 0x7B:  # '{'
+        j = buf.find(b"\n", i)
+        if j < 0:
+            return ("short", 0)
+        return ("jsonl", j + 1 - i)
+    if n - i < _BTF_ENVELOPE:
+        # A header fragment at the end of the window: only a "BT" (or lone "B") prefix
+        # can still become a frame.
+        if buf[i] == 0x42 and (n - i < 2 or buf[i + 1] == 0x54):
+            return ("short", _BTF_ENVELOPE)
+        return ("bad", 0)
+    if buf[i] != 0x42 or buf[i + 1] != 0x54 or buf[i + 2] != 1 or buf[i + 3] not in _BTF_TYPES:
+        return ("bad", 0)
+    total = int.from_bytes(buf[i + 4:i + 8], "little")
+    if total < _BTF_ENVELOPE or total > max_frame:
+        return ("bad", 0)
+    if i + total > n:
+        return ("short", total)
+    crc = int.from_bytes(buf[i + 16:i + 20], "little")
+    if zlib.crc32(memoryview(buf)[i + _BTF_ENVELOPE:i + total]) != crc:
+        return ("bad", 0)
+    return ("frame", total)
+
+
+def _btf_next_valid(buf: Any, start: int, max_frame: int) -> Tuple[Optional[int], str]:
+    """First offset >= start where a whole, CRC-valid BTF frame begins.
+
+    Returns (j, "frame") when found; (j, "short") when the first plausible header
+    from `start` runs past the end of `buf` (it cannot be judged yet, so nothing at
+    or after j may be called damaged); (None, "none") when no frame can start in
+    [start, len(buf)). Only BTF frames are resync points: a JSONL line cannot be
+    validated, so a stray '{' inside a damaged region is never trusted.
+    """
+    n = len(buf)
+    j = start
+    while True:
+        j = buf.find(_BTF_MAGIC, j)
+        if j < 0:
+            # A lone trailing "B" could be the first byte of a header.
+            if n > start and buf[n - 1] == 0x42:
+                return (n - 1, "short")
+            return (None, "none")
+        kind, _ = _btf_unit_at(buf, j, max_frame)
+        if kind == "frame":
+            return (j, "frame")
+        if kind == "short":
+            return (j, "short")
+        j += 1
 
 # -----------------------------------------------------------------------
 # MmapTract — Double-buffer myelinated transport
@@ -574,8 +711,20 @@ class NGTractBridge(NGBridge):
     # -------------------------------------------------------------------
 
     def disconnect(self) -> None:
-        """Disconnect the bridge."""
+        """Disconnect the bridge.
+
+        #1189: also asks the ng_tract writer to fdatasync every tract it has
+        appended to since its last sync (the "on close" half of the bounded
+        fsync cadence). Older wheels have no sync_tracts(); nothing to do then.
+        """
         self._connected = False
+        try:
+            import ng_tract
+            sync = getattr(ng_tract, "sync_tracts", None)
+            if sync is not None:
+                sync()
+        except Exception as exc:  # noqa: BLE001 -- a flush must never break disconnect
+            logger.warning("ng_tract.sync_tracts failed on disconnect: %s", exc)
         logger.info("NGTractBridge disconnected for '%s'", self.module_id)
 
     def reconnect(self) -> None:
@@ -802,172 +951,424 @@ class NGTractBridge(NGBridge):
     def _cursor_path(self, tract_path: Path) -> Path:
         return tract_path.with_suffix(_CURSOR_SUFFIX)
 
+    def _damaged_path(self, tract_path: Path) -> Path:
+        return tract_path.with_name(tract_path.name + _DAMAGED_SUFFIX)
+
     def _read_cursor(self, tract_path: Path) -> Dict[str, Any]:
         cp = self._cursor_path(tract_path)
         if cp.exists():
             try:
-                return json.loads(cp.read_text())
+                state = json.loads(cp.read_text())
+                if isinstance(state, dict) and "offset" in state:
+                    state.setdefault("entries", 0)
+                    state.setdefault("ts", 0.0)
+                    return state
             except Exception:
                 pass
         return {"offset": 0, "ts": 0.0, "entries": 0}
 
-    def _write_cursor(self, tract_path: Path, offset: int, entries_total: int) -> None:
+    def _write_cursor(
+        self, tract_path: Path, offset: int, entries_total: int,
+        ino: Optional[int] = None, prev_ino: Optional[int] = None,
+        prev_offset: Optional[int] = None,
+    ) -> bool:
+        """Atomically replace the cursor sidecar (temp + fsync + rename).
+
+        The format stays the plain JSON {"offset","ts","entries"}; #1189 adds the
+        optional "ino" (the tract inode the offset belongs to) and, only during a
+        compaction, "prev_ino"/"prev_offset", so an offset is never applied to a
+        different file. Older readers ignore the extra keys. Returns False when
+        the cursor could not be written (the caller must not deliver past it).
+        """
         cp = self._cursor_path(tract_path)
         # with_name avoids fragile multi-dot suffix handling
         tmp = cp.with_name(cp.name + ".tmp")
+        state: Dict[str, Any] = {"offset": offset, "ts": time.time(), "entries": entries_total}
+        if ino is not None:
+            state["ino"] = ino
+        if prev_ino is not None:
+            state["prev_ino"] = prev_ino
+            state["prev_offset"] = prev_offset
         try:
-            tmp.write_text(json.dumps({
-                "offset": offset, "ts": time.time(), "entries": entries_total,
-            }))
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o664)
+            try:
+                os.write(fd, json.dumps(state).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
             os.replace(str(tmp), str(cp))
+            return True
         except OSError as exc:
             logger.warning("Cursor write failed (%s): %s", cp.name, exc)
+            return False
 
-    def _compact_tract(self, tract_path: Path, cursor_offset: int) -> None:
-        """Rewrite tract file keeping only bytes from cursor_offset onward.
-
-        Only called when cursor_offset == file_size at drain time, so the
-        "live" portion is typically empty or contains only entries that
-        arrived in the narrow window between our read and this rename.
-        Those new entries are preserved in the compact file.
-
-        There is a negligible race window (~ms) where a concurrent Rust
-        deposit_outcome() append may be captured in live_bytes or missed.
-        This is acceptable: the SNN substrate is probabilistic and tolerates
-        occasional entry loss. The alternative (4–6 GB stuck tract files)
-        is not acceptable.
-        """
+    def _cursor_offset(
+        self, tract_path: Path, cursor: Dict[str, Any], st: os.stat_result, peer_id: str,
+    ) -> int:
+        """The cursor's offset in THIS file (inode `st`), never one that belongs to another file."""
         try:
-            compact_path = tract_path.with_suffix(".compact")
+            offset = max(0, int(cursor.get("offset", 0) or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        ino = cursor.get("ino")
+        if ino is not None and ino != st.st_ino:
+            if cursor.get("prev_ino") == st.st_ino:
+                # A compaction wrote its cursor but crashed before its rename:
+                # this is still the old file, so the old offset applies.
+                offset = max(0, int(cursor.get("prev_offset") or 0))
+            else:
+                logger.warning(
+                    "Tract %s/%s was replaced since the cursor was written "
+                    "(inode %s -> %s); reading the new file from offset 0",
+                    peer_id, tract_path.name, ino, st.st_ino,
+                )
+                offset = 0
+        if offset > st.st_size:
+            logger.warning(
+                "Cursor for %s/%s is past EOF (%d > %d): the file shrank or was "
+                "replaced (e.g. a compaction crashed between its rename and its "
+                "cursor write); reading from offset 0",
+                peer_id, tract_path.name, offset, st.st_size,
+            )
+            offset = 0
+        return offset
+
+    def _compact_tract(self, tract_path: Path, cursor_offset: int, entries_total: int = 0) -> None:
+        """Rewrite the tract keeping only the bytes from cursor_offset onward.
+
+        Called only when the cursor reached EOF at drain time, so the kept part is
+        normally empty: just frames appended since the read.
+
+        #1189 (the #1176 lock design): the copy and the rename happen under
+        flock(LOCK_EX) on the tract's current inode, the same lock every tract
+        writer takes, so no append can land between the copy and the rename. The
+        remainder is streamed (bounded RAM) to <tract>.compact, fsynced, and the
+        cursor is written BEFORE the rename as {offset 0, ino new, prev_ino old,
+        prev_offset old}, so a crash on either side of the rename resumes at the
+        right place. A writer blocked on the old inode re-checks the path after it
+        gets the lock and re-opens it (ng_tract >= #1189, miniTID #1176).
+        Writers without that re-check (older wheels) can still lose an append that
+        races the rename, as before.
+        """
+        compact_path = tract_path.with_suffix(".compact")
+        try:
             with open(tract_path, "rb") as f:
-                f.seek(cursor_offset)
-                live_bytes = f.read()
-            compact_path.write_bytes(live_bytes)
-            os.replace(str(compact_path), str(tract_path))
-            self._write_cursor(tract_path, 0, 0)
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    old = os.fstat(f.fileno())
+                    if os.stat(str(tract_path)).st_ino != old.st_ino:
+                        return  # replaced under us; the next pass sees the new file
+                    f.seek(cursor_offset)
+                    fd = os.open(str(compact_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                 old.st_mode & 0o777)
+                    kept = 0
+                    try:
+                        while True:
+                            block = f.read(8 * 1024 * 1024)
+                            if not block:
+                                break
+                            view = memoryview(block)
+                            while view:
+                                view = view[os.write(fd, view):]
+                            kept += len(block)
+                        os.fsync(fd)
+                        new_ino = os.fstat(fd).st_ino
+                    finally:
+                        os.close(fd)
+                    if not self._write_cursor(tract_path, 0, entries_total, ino=new_ino,
+                                              prev_ino=old.st_ino, prev_offset=cursor_offset):
+                        os.unlink(str(compact_path))
+                        return
+                    os.replace(str(compact_path), str(tract_path))
+                    dfd = os.open(str(tract_path.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dfd)
+                    finally:
+                        os.close(dfd)
+                    self._write_cursor(tract_path, 0, entries_total, ino=new_ino)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             logger.info(
                 "Compacted %s: cleared %d bytes (live=%d)",
-                tract_path.name, cursor_offset, len(live_bytes),
+                tract_path.name, cursor_offset, kept,
             )
         except Exception:
             logger.exception("Compact failed for %s — skipping", tract_path)
+
+    def _preserve_damaged(
+        self, tract_path: Path, records: List[Tuple[int, Any, str]],
+    ) -> bool:
+        """Append damaged bytes, each with its tract offset, to <tract>.damaged (LAW 7).
+
+        Record: one ASCII line
+            #ng-tract-damaged v1 offset=<tract offset> length=<n> reason=<r> ts=<unix>\\n
+        then exactly <n> raw bytes, then "\\n". Append-only (O_APPEND, never
+        truncated, rotated or rewritten), fsynced before returning True. On any
+        error returns False, and the caller must NOT move the cursor past them.
+        """
+        dp = self._damaged_path(tract_path)
+        try:
+            fd = os.open(str(dp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o664)
+        except OSError as exc:
+            logger.error("Damaged-frame side file open failed (%s): %s", dp, exc)
+            return False
+        try:
+            now = time.time()
+            for offset, data, reason in records:
+                head = ("#ng-tract-damaged v1 offset=%d length=%d reason=%s ts=%.6f\n"
+                        % (offset, len(data), reason, now)).encode()
+                for part in (head, data, b"\n"):
+                    view = memoryview(part)
+                    while view:
+                        view = view[os.write(fd, view):]
+            os.fsync(fd)
+            return True
+        except OSError as exc:
+            logger.error("Damaged-frame side file write failed (%s): %s", dp, exc)
+            return False
+        finally:
+            os.close(fd)
+
+    # A decode call never gets more than this many bytes (bounds the copies the
+    # Rust reader makes of its input).
+    _DECODE_SLICE_BYTES = 8 * 1024 * 1024
+
+    def _decode_units(
+        self, ng_tract: Any, buf: bytes, units: List[Tuple[int, int]],
+    ) -> Tuple[List[Any], List[Tuple[int, int, str]]]:
+        """Decode pre-validated units (frames / JSONL lines) with the Rust reader.
+
+        Returns (entries in order, damaged (start, end, reason) in `buf` offsets).
+        A unit the reader cannot turn into exactly one entry (an undecodable
+        payload behind a valid CRC, or a JSONL line that is not JSON) is returned
+        as damaged instead of being dropped silently. Both wheels are handled:
+        ng-tract-rs skips such a frame, UniAI's reader raises.
+        """
+        out: List[Any] = []
+        bad: List[Tuple[int, int, str]] = []
+
+        def _emit(item: Any, s: int, e: int) -> None:
+            if isinstance(item, bytes):
+                try:
+                    out.append(json.loads(item))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    bad.append((s, e, "json"))
+            else:
+                out.append(item)
+
+        k = 0
+        while k < len(units):
+            # One run: contiguous units, at most _DECODE_SLICE_BYTES (or one unit).
+            k2 = k + 1
+            while (k2 < len(units) and units[k2][0] == units[k2 - 1][1]
+                   and units[k2][1] - units[k][0] <= self._DECODE_SLICE_BYTES):
+                k2 += 1
+            run = units[k:k2]
+            got: Optional[List[Any]]
+            try:
+                got = list(ng_tract.TractReader(buf[run[0][0]:run[-1][1]]))
+                if len(got) != len(run):
+                    got = None
+            except Exception:
+                got = None
+            if got is not None:
+                for item, (s, e) in zip(got, run):
+                    _emit(item, s, e)
+            else:
+                for s, e in run:
+                    try:
+                        one = list(ng_tract.TractReader(buf[s:e]))
+                    except Exception:
+                        one = []
+                    if len(one) == 1:
+                        _emit(one[0], s, e)
+                    else:
+                        bad.append((s, e, "undecodable"))
+            k = k2
+        return out, bad
 
     def _drain_with_cursor(
         self, tract_path: Path, peer_id: str,
         entry_types: Optional[Set[int]] = None,
     ) -> List[Any]:
-        """Non-destructive incremental drain using a cursor sidecar.
+        """Resumable, bounded, damage-tolerant incremental drain (#1189).
 
-        Reads from the last cursor position, yielding only new entries.
-        Updates the cursor atomically after each successful drain.
-        Triggers compaction only when the cursor reaches end-of-file
-        (no partial BTF frame outstanding) and the file exceeds
-        _COMPACT_THRESHOLD_BYTES — this invariant prevents a compacted
-        file from starting with a truncated BTF frame, which would make
-        TractReader return None immediately and silently skip all subsequent
-        valid entries.
+        Walks the tract from the cursor in windows of NG_TRACT_DRAIN_CHUNK_BYTES
+        (never the whole remaining file). Each window is split into units with the
+        tract's own frame validation (_btf_unit_at: header + CRC32). Valid units
+        are decoded and delivered; the cursor is committed after every window
+        (batch), so a crash mid-pass resumes at the last committed batch.
+
+        Damage: a unit that fails validation starts a damaged region, which ends
+        at the next whole CRC-valid frame (_btf_next_valid). The region's raw
+        bytes go to <tract>.damaged with their offset BEFORE the cursor moves past
+        them (LAW 7: kept, never silently lost), and one loud line per pass names
+        the count and offsets. Only that region is skipped; the drain carries on.
+
+        Tail: an incomplete last frame (a write in flight, or a torn tail with no
+        valid frame after it yet) is never skipped: the cursor holds at its start.
+
+        Bounds per pass and per tract: NG_TRACT_DRAIN_MAX_ENTRIES units delivered,
+        about NG_TRACT_DRAIN_MAX_BYTES walked (checked per window). A larger
+        backlog is delivered over several passes; nothing is re-delivered.
+
+        Delivery stays at-most-once per committed batch, as before: the cursor is
+        committed before the caller absorbs the entries.
 
         Falls back to _drain_single_tract (rename+delete) on ImportError.
         """
-        cursor_state = self._read_cursor(tract_path)
-        start_offset: int = cursor_state["offset"]
-        entries_so_far: int = cursor_state["entries"]
-
-        # Read only the unread slice — avoids loading 6GB into memory for
-        # large backlogs. file_size captured inside the same open() call so
-        # the EOF check uses a consistent snapshot.
         try:
-            with open(tract_path, "rb") as f:
-                file_size = os.fstat(f.fileno()).st_size
-                if not file_size or start_offset >= file_size:
-                    return []
-                if start_offset:
-                    f.seek(start_offset)
-                raw_slice = f.read()
+            import ng_tract
+        except ImportError:
+            # ng_tract not available — fall back to destructive rename+delete
+            return self._drain_single_tract(tract_path, peer_id, entry_types)
+
+        chunk = _env_pos_int(_ENV_DRAIN_CHUNK, _DEFAULT_DRAIN_CHUNK)
+        max_entries = _env_pos_int(_ENV_DRAIN_MAX_ENTRIES, _DEFAULT_DRAIN_MAX_ENTRIES)
+        max_bytes = _env_pos_int(_ENV_DRAIN_MAX_BYTES, _DEFAULT_DRAIN_MAX_BYTES)
+        max_frame = chunk  # a frame must fit one window
+
+        try:
+            f = open(tract_path, "rb")
         except OSError as exc:
             logger.warning("Tract read failed (%s/%s): %s", peer_id, self.module_id, exc)
             return []
 
-        if not raw_slice:
-            return []
-
         entries: List[Any] = []
-        new_offset = start_offset
-        try:
-            import ng_tract
-            # raw_slice starts at byte 0 relative to start_offset — no start_pos needed
-            reader = ng_tract.TractReader(raw_slice)
-            for entry in reader:
-                if isinstance(entry, bytes):
-                    try:
-                        entries.append(json.loads(entry))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
-                else:
-                    if entry_types is not None and hasattr(entry, "entry_type"):
-                        if entry.entry_type not in entry_types:
-                            continue
-                    entries.append(entry)
-            new_offset = start_offset + reader.position()
-            clean_eof = reader.position() == len(raw_slice)
-        except ImportError:
-            # ng_tract not available — fall back to destructive rename+delete
-            return self._drain_single_tract(tract_path, peer_id, entry_types)
-        except Exception as exc:
-            # #285: a bad start byte means the cursor landed mid-frame (partial frame
-            # at the read boundary) or hit a malformed/non-BTF frame. The old behavior
-            # left the cursor un-advanced → the SAME bad slice re-read every drain →
-            # permanent stall (observed 2026-06-08: cursor stranded 23 B before EOF on
-            # an old backlog, throwing "unknown entry start byte: 0x5f" every cycle).
-            # Self-heal instead: resync past the bad bytes to the next valid frame
-            # header, or to EOF if none remains. Guarantees forward progress so a
-            # mid-frame cursor never stalls again. Conservative header validation
-            # (magic+version+entry_type+plausible length) avoids landing on a
-            # coincidental payload byte-match. Never compact on this path (no clean EOF).
-            resync = self._resync_offset(raw_slice)
-            new_offset = start_offset + resync
-            clean_eof = False
-            logger.warning(
-                "Cursor drain resync (%s/%s): %s — advanced cursor +%d byte(s) past "
-                "unparseable region (%d good entries this pass)",
-                peer_id, self.module_id, exc, resync, len(entries),
-            )
+        regions: List[List[int]] = []   # merged [offset, length] damaged this pass
+        held: Optional[str] = None      # why the pass stopped before EOF
+        with f:
+            st = os.fstat(f.fileno())
+            file_size = st.st_size
+            cursor = self._read_cursor(tract_path)
+            pos = self._cursor_offset(tract_path, cursor, st, peer_id)
+            try:
+                total = int(cursor.get("entries", 0) or 0)
+            except (TypeError, ValueError):
+                total = 0
+            start_pos = pos
+            delivered_units = 0
+            while pos < file_size:
+                if delivered_units >= max_entries or pos - start_pos >= max_bytes:
+                    held = "budget"
+                    break
+                try:
+                    f.seek(pos)
+                    buf = f.read(min(chunk, file_size - pos))
+                except OSError as exc:
+                    logger.warning("Tract read failed (%s/%s): %s", peer_id, self.module_id, exc)
+                    held = "io"
+                    break
+                if not buf:
+                    break
+                n = len(buf)
+                at_eof = pos + n >= file_size
+                units: List[Tuple[int, int]] = []
+                dmg: List[Tuple[int, int, str]] = []
+                budget = max_entries - delivered_units
+                stop: Optional[str] = None
+                i = 0
+                while i < n:
+                    if len(units) >= budget:
+                        stop = "budget"
+                        break
+                    kind, size = _btf_unit_at(buf, i, max_frame)
+                    if kind in ("frame", "jsonl"):
+                        units.append((i, i + size))
+                        i += size
+                        continue
+                    if kind == "short" and (i > 0 or at_eof):
+                        if at_eof:
+                            # A frame that runs past EOF is a write in flight, UNLESS a
+                            # whole valid frame already starts inside its span: then it
+                            # is a torn frame that later appends have overtaken.
+                            j, jk = _btf_next_valid(buf, i + 1, max_frame)
+                            if jk == "frame":
+                                dmg.append((i, j, "torn"))
+                                i = j
+                                continue
+                        # Needs bytes past this window: the next window starts here,
+                        # or, at EOF, it is a frame still being written: hold.
+                        stop = "tail" if at_eof else "window"
+                        break
+                    # Damaged from i (an over-long JSONL line at i == 0 lands here too).
+                    hdr_ok = (buf[i:i + 2] == _BTF_MAGIC and n - i >= 8
+                              and buf[i + 2] == 1 and buf[i + 3] in _BTF_TYPES)
+                    reason = "crc" if hdr_ok else "header"
+                    j, jk = _btf_next_valid(buf, i + 1, max_frame)
+                    if jk == "frame":
+                        dmg.append((i, j, reason))
+                        i = j
+                        continue
+                    if at_eof:
+                        # No valid frame after it (yet): a torn tail, or a write in
+                        # flight. Never skipped here; the writer's reopen repair or a
+                        # later valid frame resolves it.
+                        stop = "tail"
+                        break
+                    end = j if jk == "short" else n
+                    dmg.append((i, end, reason))
+                    i = end
+                consumed = i
 
-        if new_offset > start_offset:
-            new_total = entries_so_far + len(entries)
-            self._write_cursor(tract_path, new_offset, new_total)
-            # Only compact when reader consumed entire slice (== EOF at snapshot).
-            # This guarantees the compact file starts on a clean entry boundary.
-            # Never compact after a resync (clean_eof is False there).
-            if clean_eof and new_offset >= _COMPACT_THRESHOLD_BYTES:
-                self._compact_tract(tract_path, new_offset)
+                batch, undecodable = self._decode_units(ng_tract, buf, units)
+                if undecodable:
+                    dmg.extend(undecodable)
+                    dmg.sort()
+                if dmg:
+                    records = [(pos + s, memoryview(buf)[s:e], r) for s, e, r in dmg]
+                    if not self._preserve_damaged(tract_path, records):
+                        logger.error(
+                            "Tract drain %s/%s: could not preserve %d damaged region(s) at "
+                            "offset %d; holding the cursor there (nothing skipped)",
+                            peer_id, self.module_id, len(dmg), pos + dmg[0][0],
+                        )
+                        held = "preserve"
+                        break
+                if entry_types is not None:
+                    batch = [e for e in batch
+                             if not hasattr(e, "entry_type") or e.entry_type in entry_types]
+                if consumed > 0:
+                    if not self._write_cursor(tract_path, pos + consumed, total + len(batch),
+                                              ino=st.st_ino):
+                        held = "cursor"
+                        break
+                    total += len(batch)
+                    delivered_units += len(units)
+                    entries.extend(batch)
+                    for s, e, _r in dmg:
+                        o = pos + s
+                        if regions and regions[-1][0] + regions[-1][1] == o:
+                            regions[-1][1] += e - s
+                        else:
+                            regions.append([o, e - s])
+                    pos += consumed
+                if stop in ("tail", "budget"):
+                    held = stop
+                    break
+                if consumed == 0:
+                    held = stop or "stalled"
+                    break
+
+        if regions:
+            shown = ", ".join("%d+%d" % (o, l) for o, l in regions[:20])
+            more = "" if len(regions) <= 20 else " ... +%d more" % (len(regions) - 20)
+            logger.error(
+                "Tract drain %s/%s: SKIPPED %d damaged region(s), %d bytes, preserved in %s "
+                "(offset+length: %s%s); %d entries delivered this pass",
+                peer_id, self.module_id, len(regions), sum(l for _, l in regions),
+                self._damaged_path(tract_path).name, shown, more, len(entries),
+            )
+        if held == "tail":
+            logger.debug("Tract drain %s/%s: holding at %d (incomplete tail, %d bytes)",
+                         peer_id, self.module_id, pos, file_size - pos)
+
+        # Compact only at a clean EOF (no held tail, nothing left), so the compact
+        # file starts on a frame boundary.
+        if held is None and pos == file_size and pos >= _COMPACT_THRESHOLD_BYTES:
+            self._compact_tract(tract_path, pos, total)
 
         return entries
-
-    @staticmethod
-    def _resync_offset(raw_slice: bytes) -> int:
-        """#285 self-heal: return the offset (within raw_slice) of the next valid BTF
-        frame header after a mid-frame/garbage region, or len(raw_slice) (skip to EOF)
-        if none remains.
-
-        Scans from byte 1 (past the current bad byte) for a header that validates as
-        magic(0x42 0x54) + version(0x01) + entry_type∈{1,2,3} + a plausible
-        total_length (>= envelope SIZE 24, not overrunning the slice). Conservative
-        validation avoids resyncing onto a coincidental `42 54` inside a payload.
-        Always returns a value > 0, so the caller's cursor strictly advances (no stall).
-        """
-        n = len(raw_slice)
-        i = 1
-        while True:
-            j = raw_slice.find(b"\x42\x54", i)
-            if j < 0 or j + 8 > n:
-                return n  # no valid header ahead — skip the unparseable tail to EOF
-            version = raw_slice[j + 2]
-            entry_type = raw_slice[j + 3]
-            total_length = int.from_bytes(raw_slice[j + 4:j + 8], "little")
-            if version == 1 and entry_type in (1, 2, 3) and 24 <= total_length <= (n - j):
-                return j  # plausible frame header — resync here
-            i = j + 2  # coincidental match; keep scanning
 
     # -------------------------------------------------------------------
     # Internal: Duck-typing accessors for mixed typed/dict peer events
