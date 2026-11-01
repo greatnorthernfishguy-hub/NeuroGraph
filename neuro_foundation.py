@@ -1690,6 +1690,11 @@ class Prediction:
     chain_depth: int = 0
     via_hyperedge: Optional[str] = None
     pre_charge_applied: float = 0.0
+    # [2026-11-01] S18 (#1202): receiver-side predictions only (None otherwise; not serialized): the converging
+    # excitatory synapses with their shares of the drive, the drive itself, and the target's rho at registration.
+    contributors: Optional[List[Tuple[str, float]]] = None
+    drive: Optional[float] = None
+    rho: Optional[float] = None
 
 
 @dataclass
@@ -5494,6 +5499,134 @@ class Graph:
                     max_active=max_active,
                     visited=visited,
                 )
+
+    # [2026-11-01] S18 (#1202): receiver-side, graded predictions (spec 2026-11-01-receiver-side-prediction-design.md)
+    def _receiver_state(self) -> Dict[str, Any]:
+        """Per-neuron S18 state (in memory only, not saved): id -> row index into compact arrays rho (the neuron's
+        fraction-of-threshold bar), pred_ema (prediction episodes, decayed lazily from last_t) and conf_ema (its own
+        record as a predicted target). Rows are added on first sight; arrays grow by doubling."""
+        st = self.__dict__.get("_recv")
+        if st is None:
+            n = 1024
+            rho0 = self._stab_receiver()
+            rho0 = rho0[0] if rho0 is not None else 0.3
+            st = self.__dict__["_recv"] = {
+                "idx": {}, "rho0": rho0,
+                "rho": np.full(n, rho0), "pred_ema": np.zeros(n), "conf_ema": np.full(n, 0.5),
+                "last_t": np.zeros(n, dtype=np.int64),
+            }
+            self.__dict__["_recv_stats"] = {"dropped": 0, "registered": 0, "merged": 0, "chains": 0,
+                                            "seconds": 0.0}
+        return st
+
+    def _receiver_row(self, st: Dict[str, Any], nid: str) -> int:
+        i = st["idx"].get(nid)
+        if i is None:
+            i = st["idx"][nid] = len(st["idx"])
+            if i >= len(st["rho"]):
+                m = 2 * len(st["rho"])
+                st["rho"] = np.concatenate([st["rho"], np.full(m - len(st["rho"]), st["rho0"])])
+                st["pred_ema"] = np.concatenate([st["pred_ema"], np.zeros(m - len(st["pred_ema"]))])
+                st["conf_ema"] = np.concatenate([st["conf_ema"], np.full(m - len(st["conf_ema"]), 0.5)])
+                st["last_t"] = np.concatenate([st["last_t"], np.zeros(m - len(st["last_t"]), dtype=np.int64)])
+            st["last_t"][i] = self.timestep
+        return i
+
+    def _pending_input(self) -> Dict[str, float]:
+        """Net input already on its way to each target over the next d_max ticks (this step's spikes and earlier ones
+        in flight), as the delivery queue holds it (signed, after manifold attenuation)."""
+        out: Dict[str, float] = {}
+        t = self.timestep
+        for ts in range(t + 1, t + int(self.config.get("d_max", 5)) + 1):
+            for tgt, cur in self._delay_buffer.get(ts, ()):
+                out[tgt] = out.get(tgt, 0.0) + cur
+        return out
+
+    def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
+        """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
+        but cannot fire it alone: rho_T * theta <= D < theta - v (spec §4.1-4.4, 4.7-4.8). Chains: §4.6."""
+        import time as _time_mod
+        _t0 = _time_mod.perf_counter()
+        rho0, k, eta, rho_min, alpha, chain_floor, margin = params
+        st = self._receiver_state()
+        stats = self.__dict__["_recv_stats"]
+        window = self.config["prediction_window"]
+        max_active = self.config["prediction_max_active"]
+        pre_factor = self.config["prediction_pre_charge_factor"]
+        pend = self._pending_input()
+        contrib: Dict[str, Dict[str, Tuple[str, float]]] = {}   # T -> syn_id -> (pre id, weight)
+        for a in fired_ids:
+            na = self.nodes.get(a)
+            if na is None or na.is_inhibitory:
+                continue
+            for sid in self._outgoing.get(a, ()):
+                syn = self.synapses.get(sid)
+                if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
+                    continue
+                contrib.setdefault(syn.post_node_id, {})[sid] = (a, syn.weight)
+        passing = []
+        for tgt, syns in contrib.items():
+            node = self.nodes.get(tgt)
+            if node is None or node.refractory_remaining > 0:
+                continue
+            i = self._receiver_row(st, tgt)
+            dt = self.timestep - int(st["last_t"][i])
+            if dt > 0:
+                st["pred_ema"][i] *= (1.0 - alpha) ** dt
+                st["last_t"][i] = self.timestep
+            rho = float(st["rho"][i])
+            rho = rho + eta if st["pred_ema"][i] > k * node.firing_rate_ema else rho - eta
+            rho = min(0.99, max(rho_min, rho))
+            st["rho"][i] = rho
+            theta, v = node.threshold, node.voltage
+            d = pend.get(tgt, 0.0) * node.intrinsic_excitability
+            if theta <= 0.0 or not (rho * theta <= d < theta - v):
+                continue
+            strength = d / theta
+            passing.append((strength, tgt, d, rho, syns, i))
+        passing.sort(key=lambda x: -x[0])
+        pending_by_target = {pr.target_node_id: pr for pr in self.active_predictions.values()
+                             if pr.contributors is not None}
+        for strength, tgt, d, rho, syns, i in passing:
+            conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
+            old = pending_by_target.get(tgt)
+            if old is not None:
+                merged = dict(old.contributors_raw) if hasattr(old, "contributors_raw") else {}
+                merged.update(syns)
+                self._receiver_set_contributors(old, merged)
+                old.strength = max(old.strength, strength)
+                old.confidence = max(old.confidence, conf)
+                stats["merged"] += 1
+                continue
+            if len(self.active_predictions) >= max_active:
+                stats["dropped"] += 1
+                continue
+            node = self.nodes.get(tgt)
+            pre = min(strength * pre_factor * node.intrinsic_excitability,
+                      max(0.0, node.threshold - node.voltage - d - margin))
+            pred = Prediction(target_node_id=tgt, strength=strength, confidence=conf, created_at=self.timestep,
+                              expires_at=self.timestep + window, chain_depth=0, pre_charge_applied=pre,
+                              drive=d, rho=rho)
+            self._receiver_set_contributors(pred, syns)
+            if pre > 0.0:
+                node.voltage += pre
+            self.active_predictions[pred.prediction_id] = pred
+            pending_by_target[tgt] = pred
+            self._predicted_this_step.add(tgt)
+            self._total_predictions_made += 1
+            stats["registered"] += 1
+            st["pred_ema"][i] += alpha
+            self._emit("prediction_generated", source=pred.source_node_id, target=tgt, strength=strength,
+                       confidence=conf, chain_depth=0, timestep=self.timestep)
+        stats["seconds"] += _time_mod.perf_counter() - _t0
+
+    @staticmethod
+    def _receiver_set_contributors(pred: "Prediction", syns: Dict[str, Tuple[str, float]]) -> None:
+        """Shares of the excitatory drive by weight; source_node_id = the largest-share contributor's pre node."""
+        tot = sum(w for _, w in syns.values())
+        pred.contributors_raw = dict(syns)
+        pred.contributors = [(sid, w / tot) for sid, (_, w) in syns.items()]
+        pred.source_node_id = max(syns.values(), key=lambda x: x[1])[0]
 
     def _evaluate_predictions(self, fired_set: Set[str]) -> None:
         """Check active predictions against fired nodes (PRD §5.1).

@@ -80,3 +80,136 @@ def test_bad_params_error_once_and_change_nothing(bad, caplog):
     for k in list(ON) + list(bad):
         t.b.g.config.pop(k)
     assert ckpt(t.a.g) == ckpt(t.b.g)
+
+
+# ---------------------------------------------------------------------------
+# (2) the predictive state
+# ---------------------------------------------------------------------------
+
+def _rg(n_src=3, w=0.1, theta=0.8, extra=None, **cfg):
+    """sources s0.. -> T (weight w each); T's threshold theta; returns (graph, params)."""
+    g = NF.Graph(dict(ON, **cfg))
+    g.create_node(node_id="T")
+    g.nodes["T"].threshold = theta
+    for i in range(n_src):
+        g.create_node(node_id=f"s{i}")
+        g.create_synapse(f"s{i}", "T", weight=w)
+    for nid, kw in (extra or {}).items():
+        g.create_node(node_id=nid, **kw)
+    return g, g._stab_receiver()
+
+
+def _pend(g, target, current, dt=1):
+    g._delay_buffer.setdefault(g.timestep + dt, []).append((target, current))
+
+
+def _fire(g, params, srcs, currents):
+    for s, (tgt, c) in zip(srcs, currents):
+        _pend(g, tgt, c)
+    g._receiver_predictions(list(srcs), params)
+
+
+def _preds_on(g, target):
+    return [p for p in g.active_predictions.values() if p.target_node_id == target]
+
+
+def test_partway_drive_registers_graded_prediction():
+    g, p = _rg()
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    (pred,) = _preds_on(g, "T")
+    assert pred.strength == pytest.approx(0.3 / 0.8)
+    assert pred.chain_depth == 0 and pred.drive == pytest.approx(0.3) and pred.rho == pytest.approx(0.3, abs=0.003)   # rho moves by eta at every visit, the first too
+    assert sum(s for _, s in pred.contributors) == pytest.approx(1.0) and len(pred.contributors) == 3
+    assert pred.source_node_id in {"s0", "s1", "s2"}
+    assert pred.expires_at == g.timestep + g.config["prediction_window"]
+
+
+def test_drive_that_fires_alone_registers_nothing():
+    g, p = _rg(n_src=1, w=4.6)
+    _fire(g, p, ["s0"], [("T", 4.6)])
+    assert _preds_on(g, "T") == []
+
+
+def test_below_rho_registers_nothing():
+    g, p = _rg(n_src=1, w=0.05)
+    _fire(g, p, ["s0"], [("T", 0.05)])   # 0.0625 of the way < rho0 0.3
+    assert _preds_on(g, "T") == []
+
+
+def test_inhibitory_only_drive_registers_nothing():
+    g, p = _rg(n_src=0, extra={"i0": {"is_inhibitory": True}})
+    g.create_synapse("i0", "T", weight=0.5)
+    _fire(g, p, ["i0"], [("T", -0.5)])
+    assert _preds_on(g, "T") == []
+
+
+def test_inhibition_nets_the_drive():
+    g, p = _rg(n_src=3, w=0.1, theta=0.6, extra={"i0": {"is_inhibitory": True}})   # net 0.2 of 0.6 > rho
+    g.create_synapse("i0", "T", weight=0.1)
+    _fire(g, p, ["s0", "s1", "s2", "i0"], [("T", 0.1)] * 3 + [("T", -0.1)])
+    (pred,) = _preds_on(g, "T")
+    assert pred.drive == pytest.approx(0.2)
+    assert {s for s, _ in pred.contributors} and all(sh > 0 for _, sh in pred.contributors)
+
+
+def test_refractory_target_registers_nothing():
+    g, p = _rg()
+    g.nodes["T"].refractory_remaining = 2
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    assert _preds_on(g, "T") == []
+
+
+def test_one_state_per_neuron_merges():
+    g, p = _rg(n_src=6)
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    (first,) = _preds_on(g, "T")
+    exp, s0 = first.expires_at, first.strength
+    g.timestep += 1
+    g._delay_buffer.pop(g.timestep, None)   # step 1's input delivered (not pending any more)
+    g.nodes["T"].voltage = 0.1
+    _fire(g, p, ["s3", "s4", "s5", "s3"], [("T", 0.1)] * 4)
+    (pred,) = _preds_on(g, "T")
+    assert pred.expires_at == exp and pred.strength >= s0
+    assert g._recv_stats["merged"] == 1
+    assert len({sid for sid, _ in pred.contributors}) == 6
+
+
+def test_capacity_keeps_strongest():
+    g, p = _rg(n_src=0, prediction_max_active=2)
+    for i, w in enumerate((0.3, 0.5, 0.4)):
+        g.create_node(node_id=f"T{i}")
+        g.nodes[f"T{i}"].threshold = 0.8
+        g.create_node(node_id=f"a{i}")
+        g.create_synapse(f"a{i}", f"T{i}", weight=w)
+    _fire(g, p, ["a0", "a1", "a2"], [("T0", 0.3), ("T1", 0.5), ("T2", 0.4)])
+    assert {pr.target_node_id for pr in g.active_predictions.values()} == {"T1", "T2"}
+    assert g._recv_stats["dropped"] == 1
+
+
+def test_precharge_never_fires_target():
+    rng = random.Random(7)
+    for _ in range(50):
+        theta, d, v = rng.uniform(0.5, 1.2), rng.uniform(0.0, 1.0), rng.uniform(-0.2, 0.4)
+        g, p = _rg(n_src=1, w=d, theta=theta, prediction_pre_charge_factor=1.0)
+        g.nodes["T"].voltage = v
+        _fire(g, p, ["s0"], [("T", d)])
+        if _preds_on(g, "T"):
+            assert g.nodes["T"].voltage + d < theta
+
+
+def test_rho_rises_when_overpredicted_falls_when_under():
+    g, p = _rg()
+    g.nodes["T"].firing_rate_ema = 0.0
+    st = g._receiver_state()
+    for _ in range(40):
+        g.active_predictions.clear()
+        g.timestep += 1
+        _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    rho_hi = float(st["rho"][st["idx"]["T"]])
+    assert rho_hi > 0.3
+    g.nodes["T"].firing_rate_ema = 0.5
+    for _ in range(400):
+        g.active_predictions.clear()
+        g.timestep += 1
+        _fire(g, p, ["s0"], [("T", 0.01)])   # candidate, never predicted
+    assert float(st["rho"][st["idx"]["T"]]) == pytest.approx(0.1)   # down to rho_min, not below
