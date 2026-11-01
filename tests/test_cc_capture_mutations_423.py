@@ -1,5 +1,10 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-10-23 night] Claude Code (Opus 5.5, laptop) — #1173; harness-only, NO assertion changed
+# What: the `functions()` namespace gains `cc_bind_reinforce_enabled=lambda: False`: _cc_bind_conversational_topology now reads
+#       its CC_NG_BIND_REINFORCE_EXISTING switch through that module-level helper, which an AST extract of selected functions
+#       does not carry (NameError -> the dual pass failed in test_dual_pass_outcome_and_embedding_outside_lock[False-False]).
+#       Off = the bind's previous behaviour, which is what this harness tests.
 # [2026-10-02] Claude Sonnet 5.5 (Z12 build worker, lane sweep-probation-p552, NG-3c / round 2) — Exec P563 (the window logic is canonical); harness-only, NO assertion changed
 # What: the NG-3 / NG-3b additions to this harness are SUPERSEDED and removed: `functions()` again always extracts only `_cc_mutation_lock`, and its namespace drops `threading`,
 #       `_PROBATION_HEARTBEAT`, `_PROBATION_HEARTBEAT_LOCK` and `_CC_PROBATION_STEP_WINDOW` (none of those exist in the organism any more). The one new namespace entry is
@@ -83,7 +88,9 @@ def functions(*names):
               _CC_CONV_SYNAPSE_DELAY_MAX=3,
               _cc_embed_to_poincare_dir=lambda x:x, _cc_has_ever_fired=lambda n:False,
               cc_anticipate=lambda *a:None,
-              PROBATION_UNADVANCED_CREATION_MODES=('ingested',))
+              PROBATION_UNADVANCED_CREATION_MODES=('ingested',),
+              # [2026-10-23 night] #1173: the bind reads its LAW 5 switch through this helper (default off = the old adds)
+              cc_bind_reinforce_enabled=lambda: False)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*nodes],type_ignores=[])),str(SOURCE),'exec'),ns)
     return ns
 
