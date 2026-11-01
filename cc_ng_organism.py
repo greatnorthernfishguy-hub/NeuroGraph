@@ -3847,8 +3847,13 @@ def cc_concept_params() -> dict:
 # cache of the vector DB's own concept rows (metadata "_cc_concept"), never a second store: it is valid only for the same
 # vector DB object, while the module's concept-write counter is unchanged, and while every cached row is still the very
 # array the vector DB holds (SimpleVectorDB.insert and .load replace arrays, so a reload or replacement rebuilds it).
-_CC_CONCEPT_INDEX = {"vdb": None, "counter": -1, "ids": [], "arrays": [], "mat": None, "dim": None}
+_CC_CONCEPT_INDEX = {"vdb": None, "counter": -1, "ids": [], "arrays": [], "mat": None, "dim": None,
+                     "buf": None, "hold": None}
 _CC_CONCEPT_WRITES = [0]
+# The current step-lock hold of a recognition pass (a fresh token per hold, None outside). Under the step lock only the
+# concept code writes concept rows, and it keeps the index in step itself, so the per-row identity check runs once per
+# hold instead of once per lookup (measured: it was a third of the backlog's lock time).
+_CC_CONCEPT_HOLD = [None]
 
 
 def _cc_concept_bump():
@@ -3882,9 +3887,12 @@ def _cc_concept_index(vector_db):
     import numpy as _np
     idx = _CC_CONCEPT_INDEX
     emb = getattr(vector_db, "embeddings", {})
-    valid = (idx["vdb"] is vector_db and idx["counter"] == _CC_CONCEPT_WRITES[0]
-             and all(emb.get(cid) is arr for cid, arr in zip(idx["ids"], idx["arrays"])))
+    hold = _CC_CONCEPT_HOLD[0]
+    valid = idx["vdb"] is vector_db and idx["counter"] == _CC_CONCEPT_WRITES[0]
+    if valid and not (hold is not None and idx["hold"] is hold):
+        valid = all(emb.get(cid) is arr for cid, arr in zip(idx["ids"], idx["arrays"]))
     if valid:
+        idx["hold"] = hold
         return idx
     ids, arrays, rows, dim = [], [], [], None
     meta = getattr(vector_db, "metadata", {})
@@ -3911,8 +3919,16 @@ def _cc_concept_index(vector_db):
         keep = [i for i, c in enumerate(cen) if c is not None]
         ids = [ids[i] for i in keep]
         arrays = [arrays[i] for i in keep]
-        mat = _np.stack([cen[i] for i in keep]) if keep else None
-    idx.update(vdb=vector_db, counter=_CC_CONCEPT_WRITES[0], ids=ids, arrays=arrays, mat=mat, dim=dim)
+        if keep:
+            buf = _np.empty((max(64, 2 * len(keep)), dim), dtype=_np.float32)
+            buf[:len(keep)] = _np.stack([cen[i] for i in keep])
+            mat = buf[:len(keep)]
+    else:
+        buf = None
+    if mat is None:
+        buf = None
+    idx.update(vdb=vector_db, counter=_CC_CONCEPT_WRITES[0], ids=ids, arrays=arrays, mat=mat, dim=dim, buf=buf,
+               hold=_CC_CONCEPT_HOLD[0])
     return idx
 
 
@@ -3940,8 +3956,10 @@ def _cc_concept_index_put(vector_db, cid):
     import numpy as _np
     idx = _CC_CONCEPT_INDEX
     emb = getattr(vector_db, "embeddings", {})
-    ok = (idx["vdb"] is vector_db and idx["counter"] == _CC_CONCEPT_WRITES[0]
-          and all(emb.get(c) is a for c, a in zip(idx["ids"], idx["arrays"]) if c != cid))
+    hold = _CC_CONCEPT_HOLD[0]
+    ok = idx["vdb"] is vector_db and idx["counter"] == _CC_CONCEPT_WRITES[0]
+    if ok and not (hold is not None and idx["hold"] is hold):
+        ok = all(emb.get(c) is a for c, a in zip(idx["ids"], idx["arrays"]) if c != cid)
     _cc_concept_bump()
     arr = emb.get(cid)
     if not ok or arr is None:
@@ -3959,10 +3977,19 @@ def _cc_concept_index_put(vector_db, cid):
         idx["arrays"][i] = arr
         idx["mat"][i] = row
     else:
+        n = len(idx["ids"])
+        buf = idx["buf"]
+        if buf is None or n >= buf.shape[0]:   # grow by doubling: amortised O(1) per new concept
+            nb = _np.empty((max(64, 2 * (n + 1)), idx["dim"]), dtype=_np.float32)
+            if n:
+                nb[:n] = idx["mat"]
+            buf = idx["buf"] = nb
+        buf[n] = row
         idx["ids"].append(cid)
         idx["arrays"].append(arr)
-        idx["mat"] = row[None, :] if idx["mat"] is None else _np.vstack([idx["mat"], row])
+        idx["mat"] = buf[:n + 1]
     idx["counter"] = _CC_CONCEPT_WRITES[0]
+    idx["hold"] = hold
 
 
 _CC_CONCEPT_ABSENT = object()
@@ -4155,8 +4182,12 @@ def _cc_concept_recognize(graph, vector_db, eco, tree_ids, state) -> dict:
     journal = eco.topology.setdefault("concepts", [])
     counts = {"matched": 0, "created": 0, "repaired": 0, "skipped": 0, "concept_ids": []}
     with _cc_mutation_lock(graph):
-        for tid in tree_ids:
-            out = _cc_concept_recognize_tree(graph, vector_db, tid, params, journal)
+        _CC_CONCEPT_HOLD[0] = object()
+        try:
+            outs = [(tid, _cc_concept_recognize_tree(graph, vector_db, tid, params, journal)) for tid in tree_ids]
+        finally:
+            _CC_CONCEPT_HOLD[0] = None
+        for tid, out in outs:
             counts[out] += 1
             cid = graph.nodes[tid].metadata.get("_cc_concept_id") if tid in graph.nodes else None
             if cid and cid not in counts["concept_ids"]:
@@ -4167,6 +4198,68 @@ def _cc_concept_recognize(graph, vector_db, eco, tree_ids, state) -> dict:
     except Exception:  # noqa: BLE001 -- bookkeeping only
         pass
     return counts
+
+
+def cc_concept_recognize_backlog(graph, vector_db, budget, batch) -> dict:
+    """Sleep-time recognition of the EXISTING past (spec §10.1): tree nodes not yet completely recognised, oldest
+    creation_time first, at most `budget` recognitions, in holds of at most `batch` trees. Takes graph._step_lock
+    itself, briefly, per batch (the Tonic and recall get the lock between batches); the caller must NOT hold it. Each
+    tree has its own journal and is rolled back alone if it fails. A no-op when CC_NG_CONCEPTS is off."""
+    import time as _t
+    out = {"matched": 0, "created": 0, "repaired": 0, "skipped": 0, "failed": 0, "remaining": 0, "max_hold_s": 0.0}
+    if not cc_concepts_enabled() or budget <= 0:
+        return out
+    params = cc_concept_params()
+    lock = graph._step_lock
+    with lock:   # one short snapshot of the candidate ids and their ages
+        cands = []
+        for nid, node in list(graph.nodes.items()):
+            m = getattr(node, "metadata", None) or {}
+            if m.get("_tree_concept") and not m.get("_cc_concept_skip"):
+                cands.append((float(getattr(node, "creation_time", 0.0) or 0.0), nid))
+    cands.sort()
+    done, i, n = 0, 0, len(cands)
+    while i < n and done < budget:
+        t0 = _t.monotonic()
+        with lock:
+            _CC_CONCEPT_HOLD[0] = object()
+            taken = 0
+            try:
+                while i < n and taken < batch and done < budget:
+                    _ct, tid = cands[i]
+                    i += 1
+                    node = graph.nodes.get(tid)
+                    if node is None:
+                        continue
+                    mark = node.metadata.get("_cc_concept_id")
+                    if node.metadata.get("_cc_concept_skip") or (mark and _cc_concept_complete(graph, tid, mark)):
+                        continue
+                    taken += 1
+                    journal = []
+                    try:
+                        res = _cc_concept_recognize_tree(graph, vector_db, tid, params, journal)
+                    except Exception as exc:  # noqa: BLE001 -- this tree only; the sleep goes on
+                        _cc_concept_undo(graph, vector_db, journal)
+                        out["failed"] += 1
+                        logger.warning("CC concept backlog: tree %s failed and was rolled back: %s", tid[:48], exc)
+                        continue
+                    out[res] += 1
+                    if res != "skipped":
+                        done += 1
+            finally:
+                _CC_CONCEPT_HOLD[0] = None
+        out["max_hold_s"] = max(out["max_hold_s"], _t.monotonic() - t0)
+    with lock:
+        rest = 0
+        for _ct, tid in cands[i:]:
+            node = graph.nodes.get(tid)
+            if node is None or node.metadata.get("_cc_concept_skip"):
+                continue
+            mark = node.metadata.get("_cc_concept_id")
+            if not (mark and _cc_concept_complete(graph, tid, mark)):
+                rest += 1
+        out["remaining"] = rest
+    return out
 
 def _cc_soft_bound_step(w, eta, ceiling):
     """Saturating potentiation: w + eta * (ceiling - w), never below w (a recurrence does not depress)."""

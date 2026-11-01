@@ -397,3 +397,130 @@ def test_checkpoint_round_trip(monkeypatch, concepts_on, tmp_path):
     assert np.allclose(vdb2.get(cid)["embedding"], vdb.get(cid)["embedding"])
     assert _turn(g2, vdb2, {}, "three")
     assert _concepts(g2) == [cid] and g2.nodes[cid].metadata["_cc_recognitions"] == 3
+
+
+# ---- Task 5: sleep-time recognition of the existing past ----
+
+import time
+
+
+def _past_tree(g, vdb, tid, vec, ctime, concept="x"):
+    n = g.create_node(node_id=tid, metadata={"_tree_concept": True, "_concept": concept, "cc": True})
+    n.creation_time = float(ctime)
+    vdb.insert(tid, np.asarray(vec, dtype=np.float32), concept, {"cc": True, "_tree_concept": True})
+    return n
+
+
+def _backlog(g, vdb, budget=200, batch=25):
+    return cc_ng_organism.cc_concept_recognize_backlog(g, vdb, budget, batch)
+
+
+def test_backlog_oldest_first_and_budget(concepts_on):
+    g, vdb = Graph(), SimpleVectorDB()
+    for i, t in enumerate([50, 10, 40, 20, 30]):
+        _past_tree(g, vdb, f"cc:conv::{i}::tree::x", _unit(1, 0.01 * i, 0, 0), t)
+    out = _backlog(g, vdb, budget=2)
+    marked = sorted(n for n, node in g.nodes.items() if node.metadata.get("_cc_concept_id"))
+    assert marked == ["cc:conv::1::tree::x", "cc:conv::3::tree::x"]      # creation_time 10 and 20
+    assert out["created"] + out["matched"] == 2 and out["remaining"] == 3
+
+
+def test_backlog_idempotent(concepts_on):
+    g, vdb = Graph(), SimpleVectorDB()
+    for i in range(3):
+        _past_tree(g, vdb, f"cc:conv::{i}::tree::x", _unit(1, 0.01 * i, 0, 0), i)
+    _backlog(g, vdb)
+    n_syn, n_nodes = len(g.synapses), len(g.nodes)
+    out = _backlog(g, vdb)
+    assert out["created"] == out["matched"] == out["repaired"] == 0
+    assert (len(g.synapses), len(g.nodes)) == (n_syn, n_nodes)
+
+
+def test_backlog_off_noop(zero_centre):
+    g, vdb = Graph(), SimpleVectorDB()
+    _past_tree(g, vdb, "cc:conv::0::tree::x", _unit(1, 0, 0, 0), 0)
+    out = _backlog(g, vdb)
+    assert out["created"] == 0 and _concepts(g) == []
+
+
+def test_backlog_tree_failure_rolls_back_only_that_tree(monkeypatch, concepts_on):
+    g, vdb = Graph(), SimpleVectorDB()
+    a = _past_tree(g, vdb, "cc:conv::a::tree::x", _unit(1, 0, 0, 0), 1)
+    _past_tree(g, vdb, "cc:conv::b::tree::x", _unit(1, 0.05, 0, 0), 2)
+    _backlog(g, vdb)
+    cid = a.metadata["_cc_concept_id"]
+    # tree b loses its concept->tree link: the next backlog REPAIRS it, which REINFORCES the surviving tree->concept link
+    sid = _pairs(g)[(cid, "cc:conv::b::tree::x")][0].synapse_id
+    g.remove_synapse(sid)
+    up = _pairs(g)[("cc:conv::b::tree::x", cid)][0]
+    _past_tree(g, vdb, "cc:conv::c::tree::x", _unit(0, 1, 0, 0), 3)   # an unrelated tree after it
+    before = _state_of(g, vdb)
+    real = cc_ng_organism._cc_concept_journal_add
+
+    def boom(journal, entry):
+        real(journal, entry)
+        if entry[0] == "reinforce":
+            raise RuntimeError("injected after reinforce")
+    monkeypatch.setattr(cc_ng_organism, "_cc_concept_journal_add", boom)
+    out = _backlog(g, vdb)
+    assert out["failed"] == 1
+    assert float(up.weight) == before[1][up.synapse_id][2]           # the reinforcement was undone
+    assert (cid, "cc:conv::b::tree::x") not in _pairs(g)             # tree b: nothing left of its attempt
+    assert g.nodes["cc:conv::c::tree::x"].metadata.get("_cc_concept_id")   # tree c still recognised
+
+
+def test_backlog_vectorless_not_retried(concepts_on):
+    g, vdb = Graph(), SimpleVectorDB()
+    n = g.create_node(node_id="cc:conv::v::tree::x", metadata={"_tree_concept": True, "_concept": "x"})
+    n.creation_time = 0.0
+    assert _backlog(g, vdb)["skipped"] == 1
+    assert n.metadata.get("_cc_concept_skip") == "no_vector"
+    assert _backlog(g, vdb)["skipped"] == 0 and _backlog(g, vdb)["remaining"] == 0
+
+
+class _CountingLock:
+    def __init__(self, inner):
+        self.inner, self.enters = inner, 0
+
+    def __enter__(self):
+        self.inner.acquire()
+        self.enters += 1
+        return self
+
+    def __exit__(self, *a):
+        self.inner.release()
+
+    def acquire(self, *a, **k):
+        return self.inner.acquire(*a, **k)
+
+    def release(self):
+        return self.inner.release()
+
+
+def test_backlog_releases_lock(concepts_on):
+    g, vdb = Graph(), SimpleVectorDB()
+    for i in range(5):
+        _past_tree(g, vdb, f"cc:conv::{i}::tree::x", _unit(1, 0, 0.3 * i, 0), i)
+    lock = _CountingLock(g._step_lock)
+    g._step_lock = lock
+    _backlog(g, vdb, budget=5, batch=2)
+    assert lock.enters >= 3                        # 2 + 2 + 1 trees: at least three separate holds
+
+
+def test_backlog_lock_hold_bounded(monkeypatch, concepts_on):
+    rng = np.random.default_rng(7)
+    g, vdb = Graph(), SimpleVectorDB()
+    for i in range(30000 - 5000):
+        g.create_node(node_id=f"n{i}")
+    for i in range(3000):                              # existing concepts
+        v = rng.standard_normal(768).astype(np.float32)
+        g.create_node(node_id=f"cc:concept::{i:016d}", metadata={"_cc_concept": True, "_label": "c",
+                                                                 "_cc_recognitions": 1})
+        vdb.insert(f"cc:concept::{i:016d}", v, "c", {"cc": True, "_cc_concept": True})
+    for i in range(2000):                              # the past to recognise
+        _past_tree(g, vdb, f"cc:conv::{i}::tree::x", rng.standard_normal(768), i)
+    t0 = time.monotonic()
+    out = _backlog(g, vdb, budget=2000, batch=25)
+    assert out["max_hold_s"] < 1.0, out
+    assert out["created"] + out["matched"] == 2000
+    print("backlog 2000 trees:", round(time.monotonic() - t0, 1), "s, max hold", round(out["max_hold_s"], 3), "s")
