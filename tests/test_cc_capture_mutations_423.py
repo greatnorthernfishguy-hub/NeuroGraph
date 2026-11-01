@@ -1,5 +1,8 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-10-31] DudeMan CC (Claude Opus 5.5, laptop; #1203 stage 1) -- the `functions()` namespace also carries
+#   `cc_concepts_enabled=lambda: False` (the dual pass reads the CC_NG_CONCEPTS switch through it). Harness-only; off = the
+#   previous behaviour, which this harness tests.
 # [2026-10-23 night] Claude Code (Opus 5.5, laptop) — #1173; harness-only, NO assertion changed
 # What: the `functions()` namespace gains `cc_bind_reinforce_enabled=lambda: False`: _cc_bind_conversational_topology now reads
 #       its CC_NG_BIND_REINFORCE_EXISTING switch through that module-level helper, which an AST extract of selected functions
@@ -90,7 +93,7 @@ def functions(*names):
               cc_anticipate=lambda *a:None,
               PROBATION_UNADVANCED_CREATION_MODES=('ingested',),
               # [2026-10-23 night] #1173: the bind reads its LAW 5 switch through this helper (default off = the old adds)
-              cc_bind_reinforce_enabled=lambda: False)
+              cc_bind_reinforce_enabled=lambda: False, cc_concepts_enabled=lambda: False)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*nodes],type_ignores=[])),str(SOURCE),'exec'),ns)
     return ns
 
