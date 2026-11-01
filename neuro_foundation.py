@@ -1695,6 +1695,7 @@ class Prediction:
     contributors: Optional[List[Tuple[str, float]]] = None
     drive: Optional[float] = None
     rho: Optional[float] = None
+    contributors_raw: Optional[Dict[str, Tuple[str, float]]] = None   # syn_id -> (pre, weight): merge input
 
 
 @dataclass
@@ -5579,24 +5580,11 @@ class Graph:
 
     def _receiver_peak_v(self, v: float, rest: float, ex: float, ticks: Optional[List[float]],
                          extra: float = 0.0) -> float:
-        """_receiver_peak on plain numbers (the bulk-read path)."""
-        decay = self.config["decay_rate"]
-        peak = -math.inf
-        for k, c in enumerate(ticks or (0.0,)):
-            v = v * decay + (1.0 - decay) * rest + c * ex + (extra if k == 0 else 0.0)
-            if v > peak:
-                peak = v
-        return peak
-
-    def _receiver_peak(self, node: Any, ticks: Optional[List[float]], extra: float = 0.0) -> float:
-        """[2026-11-01] S18 review C1: the highest voltage the pending input alone would give `node`, tick by tick as
+        """[2026-11-01] S18 review C1: the highest voltage the pending input alone would give the neuron (v, resting, excitability), tick by tick as
         step() applies it (decay toward resting, then that tick's arrivals x excitability), plus `extra` (imagined
         input on a chain hop, added at the first tick). Detection happens after each delivery, so "cannot fire it
         alone" is peak < threshold, not net < threshold - v (a later inhibitory tranche cannot hide an earlier one)."""
         decay = self.config["decay_rate"]
-        rest = node.resting_potential
-        ex = node.intrinsic_excitability
-        v = node.voltage
         peak = -math.inf
         for k, c in enumerate(ticks or (0.0,)):
             v = v * decay + (1.0 - decay) * rest + c * ex + (extra if k == 0 else 0.0)
@@ -5671,7 +5659,7 @@ class Graph:
             conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
             old = pending_by_target.get(tgt)
             if old is not None:
-                merged = dict(old.contributors_raw) if hasattr(old, "contributors_raw") else {}
+                merged = dict(old.contributors_raw or {})
                 merged.update(syns)
                 self._receiver_set_contributors(old, merged)
                 old.strength = max(old.strength, strength)
