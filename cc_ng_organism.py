@@ -3797,6 +3797,47 @@ def cc_bind_reinforce_params(graph=None) -> dict:
     }
 
 
+
+# ---- #1203 concept formation stage 1 (2026-10-31, Josh "You are a go"): one concept node per recurring concept ----
+# Spec: docs/superpowers/specs/2026-10-31-concept-formation-and-recall-design.md (§5.1 recognition at encoding, §5.2 the
+# concept node, §10 calls). LAW 5: every knob an env var read per call; CC_NG_CONCEPTS default OFF = byte-identical.
+#   CC_NG_CONCEPT_MATCH             centred cosine for "the same concept", default 0.60 (NG-Lite's novelty rule)
+#   CC_NG_CONCEPT_DRIFT             prototype step toward a recognised member, default 0.05
+#   CC_NG_CONCEPT_ETA / _CEILING    soft bound for tree<->concept links, defaults 0.2 / 1.0
+#   CC_NG_CONCEPT_BIRTH_UP / _DOWN  link weights at birth, tree->concept 0.2, concept->tree 0.15 (the bind's forest<->tree)
+#   CC_NG_CONCEPT_REACTIVATE        current passed to graph.stimulate for a recognised concept, default 0.5
+#   CC_NG_CONCEPT_BACKLOG_PER_SLEEP trees recognised per sleep from the existing past, default 200
+#   CC_NG_CONCEPT_BACKLOG_BATCH     trees per step-lock hold in that backlog, default 25
+
+
+def cc_concepts_enabled() -> bool:
+    """CC_NG_CONCEPTS (LAW 5; read per call). Default off."""
+    return os.environ.get("CC_NG_CONCEPTS", "0").strip() not in ("0", "", "false", "False", "no")
+
+
+def _cc_env_int(name, default, lo, hi):
+    """An int knob from env, clamped to [lo, hi]; absent or unparsable -> default."""
+    try:
+        v = int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, lo), hi)
+
+
+def cc_concept_params() -> dict:
+    """The concept-formation knobs (LAW 5 env, read per call). See the block comment above."""
+    return {
+        "match": _cc_env_float("CC_NG_CONCEPT_MATCH", 0.60, 0.30, 0.95),
+        "drift": _cc_env_float("CC_NG_CONCEPT_DRIFT", 0.05, 0.0, 0.5),
+        "eta": _cc_env_float("CC_NG_CONCEPT_ETA", 0.2, 0.0, 1.0),
+        "ceiling": _cc_env_float("CC_NG_CONCEPT_CEILING", 1.0, 0.2, 5.0),
+        "birth_up": _cc_env_float("CC_NG_CONCEPT_BIRTH_UP", 0.2, 0.01, 1.0),
+        "birth_down": _cc_env_float("CC_NG_CONCEPT_BIRTH_DOWN", 0.15, 0.01, 1.0),
+        "reactivate": _cc_env_float("CC_NG_CONCEPT_REACTIVATE", 0.5, 0.0, 5.0),
+        "backlog": _cc_env_int("CC_NG_CONCEPT_BACKLOG_PER_SLEEP", 200, 0, 100000),
+        "batch": _cc_env_int("CC_NG_CONCEPT_BACKLOG_BATCH", 25, 1, 1000),
+    }
+
 def _cc_soft_bound_step(w, eta, ceiling):
     """Saturating potentiation: w + eta * (ceiling - w), never below w (a recurrence does not depress)."""
     return w + max(0.0, eta * (ceiling - w))
