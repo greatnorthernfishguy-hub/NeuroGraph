@@ -517,3 +517,48 @@ def test_receiver_pass_takes_the_native_reads_when_present():
         fired = list(g.nodes.keys())[:30]
         g._receiver_predictions(fired, g._stab_receiver())
         assert (g._recv_stats.get("native_steps", 0) > 0) is want
+
+
+# ---------------------------------------------------------------------------
+# (6) the effective threshold (S18cal: busy neurons predicted below chance — the stored threshold misses S5's brake)
+# ---------------------------------------------------------------------------
+
+HAVE_EFF = getattr(getattr(NF.ng_tract, "NodeStore", object), "receiver_round", 0) >= 2
+needs_eff = pytest.mark.skipif(not HAVE_EFF, reason="ng_tract without the effective-threshold read (receiver_round 2)")
+
+
+@needs_eff
+def test_native_effective_threshold_is_stored_plus_ahp():
+    g = _native_graph(0)
+    g.config.update(delta_Ca=0.2, ca_split_slow_delta=0.2)   # calcium on, so firing charges the slow pool
+    for nid in list(g.nodes.keys())[:40]:
+        g.nodes.get(nid).voltage = 5.0
+    for _ in range(6):
+        g.step()
+    on, ca, _ = g.nodes.s5_state()
+    assert on and ca is not None and max(ca) > 0.0, "the slow pool has charge to test with"
+    ids = list(g.nodes.keys())
+    base = g.nodes.receiver_reads(ids)
+    eff = g.nodes.receiver_reads(ids, ahp_gain=0.075)
+    for b, e, c in zip(base, eff, ca):
+        assert e[0] == pytest.approx(b[0] + 0.075 * c) and e[1:] == b[1:]
+    pooled = [p[0] - b[0] for p, b in zip(g.nodes.receiver_reads(ids, pool=True), base)]
+    assert min(pooled) == pytest.approx(max(pooled)) and min(pooled) >= 0.0   # one pool offset for every row
+    with pytest.raises(ValueError):
+        g.nodes.receiver_reads(ids, ahp_gain=-1.0)
+
+
+@needs_eff
+@pytest.mark.parametrize("ca_on", [True, False])
+def test_receiver_pass_asks_for_the_effective_threshold(ca_on):
+    g = _native_graph(1)
+    g.config["ca_split_enabled"] = ca_on
+    seen = []
+    orig = g._receiver_reads
+    g._receiver_reads = lambda ids, ahp_gain=0.0, pool=False: (seen.append((ahp_gain, pool)), orig(ids, ahp_gain, pool))[1]
+    g._receiver_predictions(list(g.nodes.keys())[:30], g._stab_receiver())
+    want = float(g.config.get("ca_split_ahp_gain", 0.075)) if ca_on else 0.0
+    # the first read only filters the fired set by is_inhibitory (no threshold used); every candidate read after it
+    # must carry the detector's gain
+    assert len(seen) >= 2 and all(a == pytest.approx(want) for a, _ in seen[1:])
+    assert all(p is False for _, p in seen)   # interneurons on: the detector adds no pool offset (divisive form)

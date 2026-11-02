@@ -5547,12 +5547,29 @@ class Graph:
                 row[k - 1] += cur
         return out
 
-    def _receiver_reads(self, ids: List[str]) -> List[Optional[tuple]]:
+    def _receiver_theta_args(self) -> Tuple[float, bool]:
+        """[2026-11-01] S18cal finding: the threshold fire detection actually applies. (ahp_gain, pool) for
+        _receiver_reads: S5's IK-AHP brake gain when the calcium split runs, and S2's pool offset only on the detection
+        path that adds it (burst inhibition on, interneuron layer off: with the layer on its inhibition is divisive and
+        is not a threshold offset). (0.0, False) = the stored threshold."""
+        stab = self._stability_params()
+        if stab is None:
+            return 0.0, False
+        gain = float(stab.ca_split[3]) if stab.ca_split is not None else 0.0
+        pool = stab.inhib is not None and stab.ilayer is None
+        return gain, pool
+
+    def _receiver_reads(self, ids: List[str], ahp_gain: float = 0.0, pool: bool = False) -> List[Optional[tuple]]:
         """[2026-11-01] S18 (spec §10): (threshold, voltage, excitability, refractory_remaining, firing_rate_ema,
         resting_potential, is_inhibitory) per id, from the native NodeStore in one call when it has receiver_reads
-        (None entries, and the whole list without it, are read through the node objects: the same values)."""
+        (None entries, and the whole list without it, are read through the node objects: the same values). With
+        receiver_round >= 2 the threshold is the EFFECTIVE detection threshold for (ahp_gain, pool); without it (or on
+        the Python path, which cannot see ca_slow) it is the stored threshold."""
         native = None if self.__dict__.get("_recv_python") else getattr(self.nodes, "receiver_reads", None)
-        got = native(ids) if native is not None else [None] * len(ids)
+        if native is not None and getattr(type(self.nodes), "receiver_round", 0) >= 2 and (ahp_gain or pool):
+            got = native(ids, ahp_gain, pool)
+        else:
+            got = native(ids) if native is not None else [None] * len(ids)
         out: List[Optional[tuple]] = []
         for nid, r in zip(ids, got):
             if r is None:
@@ -5626,7 +5643,8 @@ class Graph:
         _tp = _time_mod.perf_counter()
         passing = []
         _tg = list(contrib)
-        for tgt, rd in zip(_tg, self._receiver_reads(_tg)):
+        _gain, _pool = self._receiver_theta_args()
+        for tgt, rd in zip(_tg, self._receiver_reads(_tg, _gain, _pool)):
             syns = contrib[tgt]
             if rd is None or rd[3] > 0:
                 continue
@@ -5720,7 +5738,7 @@ class Graph:
             for post, sid, a, w in _rows:
                 _by_pre.setdefault(a, []).append((post, sid, w))
             _sn_ids = list(dict.fromkeys(post for post, _sid, _a, _w in _rows))
-            rd_s = dict(zip(_sn_ids, self._receiver_reads(_sn_ids)))
+            rd_s = dict(zip(_sn_ids, self._receiver_reads(_sn_ids, *self._receiver_theta_args())))
             for par in parents:
                 for post, sid, w in _by_pre.get(par.target_node_id, ()):
                     r = rd_s.get(post)
