@@ -15,6 +15,7 @@ import os
 import random
 
 import pytest
+from collections import deque
 
 from tests import test_hyperedge_store_h2 as H2   # noqa: E402
 from tests import test_stability_s as S            # noqa: E402
@@ -562,3 +563,47 @@ def test_receiver_pass_asks_for_the_effective_threshold(ca_on):
     # must carry the detector's gain
     assert len(seen) >= 2 and all(a == pytest.approx(want) for a, _ in seen[1:])
     assert all(p is False for _, p in seen)   # interneurons on: the detector adds no pool offset (divisive form)
+
+
+# ---------------------------------------------------------------------------
+# (7) a receiver miss grows no wiring (Josh 2026-11-01: wiring the predictor to every recent firer on a failed
+#     prediction is "completely backwards … not brain-like"; a miss = weaken what converged + the error signal + tag
+#     the context; learning what actually happened is the surprise side, a later design)
+# ---------------------------------------------------------------------------
+
+def _miss_graph(**cfg):
+    g, p = _rg(three_factor_enabled=False, **cfg)
+    for i in range(5):
+        g.create_node(node_id=f"x{i}")   # fired recently, unrelated to the prediction
+    return g, p
+
+
+def _expire_with_recent_firers(g, pred):
+    g.timestep = pred.expires_at + 1
+    for i in range(5):
+        g._recent_spikes.setdefault(f"x{i}", deque(maxlen=50)).append(g.timestep - 1)
+    g._cleanup_predictions()
+
+
+def test_receiver_miss_grows_no_synapse_but_keeps_tag_and_novelty():
+    g, p = _miss_graph()
+    _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
+    (pred,) = _preds_on(g, "T")
+    src_syns = [sid for sid in g._outgoing.get(pred.source_node_id, ())]
+    for sid in src_syns:
+        g.synapses.get(sid).inactive_steps = 0
+    n_syn, novel0 = len(g.synapses), g._total_novel_sequences
+    _expire_with_recent_firers(g, pred)
+    assert len(g.synapses) == n_syn, "a receiver miss wires nothing"
+    assert g._total_novel_sequences == novel0 + 1, "novelty still counted"
+    assert all(g.synapses.get(sid).salience > 1.0 for sid in src_syns), "the context is still tagged"
+
+
+def test_old_prediction_miss_still_explores():
+    g, _p = _miss_graph()
+    pred = NF.Prediction(source_node_id="s0", target_node_id="T", strength=0.5, confidence=0.5,
+                         created_at=g.timestep, expires_at=g.timestep + 10)
+    g.active_predictions[pred.prediction_id] = pred
+    n_syn = len(g.synapses)
+    _expire_with_recent_firers(g, pred)
+    assert len(g.synapses) == n_syn + 5, "the source-side path explores as before (s0 -> each recent firer)"

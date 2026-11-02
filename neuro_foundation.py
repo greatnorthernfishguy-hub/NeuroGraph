@@ -33,6 +33,11 @@ Design principles (PRD §2.1):
 #       et al. 2022 PLoS Comp Biol, with per-neuron predictive-rate homeostasis); expectation graded and local (Yamada &
 #       Chao 2026 Commun Biol).
 # How:  _stab_receiver() reads the config; _generate_predictions branches to _receiver_predictions when it is on.
+#       Same day, after the review and the S18cal calibration: per-tick simulated peak for "cannot fire it alone"; the
+#       receiver path's own table (prediction_receiver_max_active 10000); native bulk reads (ng_tract receiver_round 2:
+#       outgoing rows, node fields, the EFFECTIVE detection threshold incl. S5's AHP brake); and a receiver prediction's
+#       miss wires nothing in _surprise_exploration (Josh: wiring the predictor to every recent firer is "completely
+#       backwards"); the source-side path is unchanged.
 # [2026-10-28] Claude Code (Opus 5.5, laptop; lane stability-s13, #1136; Josh 2026-10-28 "Yes, go ahead with both") —
 #   PROTECTED (needs Josh's proceed): S13, two independent switches against the two biased terms of the reward's net
 #   weight change (dev-log 2026-10-28 S12 §5: S12cal ledger split (a) mean(R) x mean(e) -99, (b) Cov +37, (c) clip +39)
@@ -6010,7 +6015,12 @@ class Graph:
         alternative_nodes = recent_fired - {expected_id}
 
         sprouted_count = 0
-        _tally = bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
+        # [2026-11-01] S18 (#1202; Josh 2026-11-01): a RECEIVER prediction's miss wires nothing. Its learning is the
+        # weakening of what converged + the error signal (_on_prediction_error) + the context tag and novelty count
+        # below; wiring the predictor to every recent firer is "completely backwards … not brain-like" (Josh). The
+        # source-side path (contributors None) explores exactly as before.
+        _sprout = pred.contributors is None
+        _tally = _sprout and bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
         if _tally:
             sprouted_count = self._surprise_exploration_tally(pred, alternative_nodes)
         # #59: cap the surprise-driven feeder too. The degree cap only guarded co-firing
@@ -6023,7 +6033,7 @@ class Graph:
         def _deg(x: str) -> int:
             return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ()))
 
-        for alt_id in (() if _tally else alternative_nodes):
+        for alt_id in (() if (_tally or not _sprout) else alternative_nodes):
             if alt_id == source_id:
                 continue
             if alt_id not in self.nodes:
