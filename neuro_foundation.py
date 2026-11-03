@@ -3710,6 +3710,10 @@ class Graph:
             _dpr = self._stab_diffpc_receiver() if self.config.get("diffpc_receiver_enabled", False) else None
             if _dpr is not None or "_diffpc_p" in self.__dict__:
                 self.__dict__["_diffpc_p"] = _dpr
+            if _dpr is not None and not _dpr[3]:
+                self.__dict__["_diffpc_miss_step"] = [0, 0.0]
+                if not self.__dict__.get("_diffpc_reset_done"):   # once per mind: the old clock's values go
+                    self._diffpc_reset_ema()
             # [2026-10-20] round I (#1151): the layer is grown once at switch-on (later runs are sleep_cycle's)
             if _stab is not None and _stab.irecruit is not None and not self.nodes.interneurons_exists():
                 self._interneurons_recruit(_stab.irecruit)
@@ -6356,6 +6360,39 @@ class Graph:
         if n is None or n.is_inhibitory:
             return
         self._diffpc_stats_get()["misses"] += 1
+        p = self.__dict__.get("_diffpc_p")
+        if p is not None and not p[3]:
+            e = abs(float(pred.strength))
+            n.pred_error_ema = 0.9 * n.pred_error_ema + 0.1 * e
+            ms = self.__dict__.setdefault("_diffpc_miss_step", [0, 0.0])
+            ms[0] += 1
+            ms[1] += e
+
+    def _diffpc_reset_ema(self) -> None:
+        """Switch-on (not count-only): every node's pred_error_ema to 0, once; the flag is checkpointed."""
+        for _nid, n in self.nodes.items():
+            if n.pred_error_ema != 0.0:
+                n.pred_error_ema = 0.0
+        self.__dict__["_diffpc_reset_done"] = True
+
+    def _diffpc_corrected(self, fired_ids: List[str], params: tuple) -> Tuple[int, float]:
+        """7b with the switch on: the |e| record for this step's outcomes (confirmed 0, surprise sigma; the misses
+        were recorded at expiry). Today's body (pred_weights, the +-trace nudge) does not run. Returns (outcomes
+        this step, mean |e| of them) for StepResult."""
+        conf, surp = self.__dict__.get("_diffpc_last", ([], []))
+        for nid in conf:
+            n = self.nodes.get(nid)
+            if n is not None:
+                n.pred_error_ema = 0.9 * n.pred_error_ema
+        err = 0.0
+        for nid, sig in surp:
+            n = self.nodes.get(nid)
+            if n is not None:
+                n.pred_error_ema = 0.9 * n.pred_error_ema + 0.1 * sig
+            err += sig
+        ms = self.__dict__.get("_diffpc_miss_step", [0, 0.0])
+        count = len(conf) + len(surp) + ms[0]
+        return count, ((err + ms[1]) / count if count else 0.0)
 
     def _diffpc_step(self, fired_ids: List[str]) -> Tuple[int, float]:
         """Ternary prediction error computation + prediction weight update (DiffPC).
@@ -6373,6 +6410,8 @@ class Graph:
         # [2026-11-03] S19: the step's corrected-DiffPC params (None, or count-only = today's body below, exactly;
         # count-only's counts were taken at detection)
         _dp = self.__dict__.get("_diffpc_p")
+        if _dp is not None and not _dp[3]:
+            return self._diffpc_corrected(fired_ids, _dp)
         epsilon = self.config.get("diffpc_epsilon", 0.2)
         pred_lr = self.config.get("diffpc_pred_lr", 0.01)
         trace_boost = self.config.get("diffpc_trace_boost", 0.05)
@@ -10188,6 +10227,8 @@ class Graph:
                else {}),
             # [2026-10-20] round I (#1151): the interneuron layer (cells, pools, targets, learned I -> E weights), only
             # when the store holds one; the last key, so every key before it is written exactly as before.
+            # [2026-11-03] S19 (#1202 follow-up): corrected DiffPC has reset pred_error_ema (only once it has)
+            **({"diffpc_receiver_reset_done": True} if self.__dict__.get("_diffpc_reset_done") else {}),
             **({"interneurons": _il_packed} if _il_packed is not None else {}),
         }
 
@@ -10669,6 +10710,11 @@ class Graph:
         _s8 = data.get("syn_scale_up_totals")
         if isinstance(_s8, dict) and hasattr(self.nodes, "s8_load_totals"):
             self.nodes.s8_load_totals(_s8)
+        # [2026-11-03] S19: the one-time pred_error_ema reset is not repeated after a reload
+        if data.get("diffpc_receiver_reset_done"):
+            self.__dict__["_diffpc_reset_done"] = True
+        else:
+            self.__dict__.pop("_diffpc_reset_done", None)
 
         self._dirty_nodes.clear()
         self._dirty_synapses.clear()

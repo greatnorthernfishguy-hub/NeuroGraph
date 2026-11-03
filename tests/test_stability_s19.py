@@ -272,3 +272,98 @@ def test_injection_recorder_reads_the_voltage_change(kind):
     g._diffpc_record_injection(before)
     ex = g.nodes[nid].intrinsic_excitability
     assert g._diffpc_ring[g.timestep + 1] == {nid: pytest.approx(0.5 * g.config["decay_rate"] / ex)}
+
+
+# ---------------------------------------------------------------------------
+# (3) the |e| record, its one reset, the old body silent
+# ---------------------------------------------------------------------------
+
+def test_ema_abs_updates():
+    g = _dg(count_only=False, diffpc_receiver_eta=0.0)
+    g.nodes["T"].pred_error_ema = 0.7          # the old clock's value: reset at switch-on
+    g.stimulate("T", 2.0)
+    g.step()                                   # surprise, sigma 0.8
+    e1 = g.nodes["T"].pred_error_ema
+    assert e1 == pytest.approx(0.08)
+    for _ in range(10):
+        g.step()
+    e1 = g.nodes["T"].pred_error_ema
+    _predict(g, "T", expires_in=1, strength=0.5)
+    for _ in range(3):
+        g.step()                               # the miss, |e| = 0.5
+    assert g._diffpc_stats["misses"] == 1
+    assert g.nodes["T"].pred_error_ema == pytest.approx(0.9 * e1 + 0.05)
+
+
+def test_confirmed_decays_ema():
+    g = _dg(count_only=False, diffpc_receiver_eta=0.0)
+    g.step()
+    g.nodes["T"].pred_error_ema = 0.5
+    _predict(g, "T")
+    g.stimulate("T", 2.0)
+    g.step()
+    assert g.nodes["T"].pred_error_ema == pytest.approx(0.45)
+
+
+def _layered(count_only):
+    g = _dg(count_only=count_only, diffpc_receiver_eta=0.0)
+    g.create_node(node_id="S")
+    g.nodes["S"].threshold = 0.5
+    g.create_synapse("S", "T", weight=0.1)
+    g.nodes["S"].diffpc_layer, g.nodes["T"].diffpc_layer = 2, 1
+    sid = next(iter(g._outgoing["S"]))
+    g.stimulate("S", 2.0)
+    g.step()
+    return g, g.synapses.get(sid)
+
+
+def test_old_body_silent_when_on():
+    g, syn = _layered(count_only=True)
+    assert g.nodes["S"].pred_weights            # control: count-only runs today's body
+    g, syn = _layered(count_only=False)
+    assert g.nodes["S"].pred_weights == {} and syn.eligibility_trace == 0.0
+
+
+def test_step_result_reports_corrected_counts():
+    g = _dg(count_only=False, diffpc_receiver_eta=0.0)
+    g.stimulate("T", 2.0)
+    r = g.step()
+    assert r.diffpc_ternary_spikes == 1 and r.diffpc_mean_pred_error == pytest.approx(0.8)
+
+
+def _reload(g):
+    h = restore_as(NF, "dict", ckpt(g))
+    h.config.update({k: v for k, v in g.config.items() if k.startswith(("diffpc_receiver", "prediction_receiver"))})
+    return h
+
+
+def test_reset_once_across_reload():
+    g = _dg(count_only=False, diffpc_receiver_eta=0.0)
+    g.nodes["z"].pred_error_ema = 0.4
+    g.step()
+    assert g.nodes["z"].pred_error_ema == 0.0
+    g.nodes["z"].pred_error_ema = 0.4
+    h = _reload(g)
+    assert h.nodes["z"].pred_error_ema == pytest.approx(0.4)
+    h.step()
+    assert h.nodes["z"].pred_error_ema == pytest.approx(0.4)   # z is silent: no outcome, no second reset
+    assert "_diffpc_stats" not in _reload(h).__dict__
+
+
+def test_reset_flag_only_saved_when_set():
+    g = _dg(count_only=True)
+    g.step()
+    assert "diffpc_receiver_reset_done" not in g._serialize_full()
+    g.config["diffpc_receiver_count_only"] = False
+    g.step()
+    assert g._serialize_full()["diffpc_receiver_reset_done"] is True
+
+
+def test_stats_not_in_checkpoint():
+    g = _dg(count_only=False, diffpc_receiver_eta=0.0)
+    g.stimulate("T", 2.0)
+    g.step()
+    base = NF.Graph(dict(RECV))
+    base.create_node(node_id="T")
+    extra = set(g._serialize_full()) - set(base._serialize_full())
+    assert extra == {"diffpc_receiver_reset_done"}
