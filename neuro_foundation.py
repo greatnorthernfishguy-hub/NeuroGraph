@@ -6321,6 +6321,15 @@ class Graph:
         st = self._diffpc_stats_get()
         sa = self.__dict__.setdefault("_diffpc_surprised_at", {})
         peaks = self.__dict__["_diffpc_peaks"] = {}
+        # every spike of the last W + d_max steps (the plateau credits each one that ARRIVED in the window)
+        hist = self.__dict__.get("_diffpc_fired")
+        if hist is None:
+            hist = self.__dict__["_diffpc_fired"] = deque()
+        if fired_ids:
+            hist.append((t, list(fired_ids)))
+        keep = window + int(self.config.get("d_max", 5))
+        while hist and hist[0][0] <= t - keep:
+            hist.popleft()
         if not fired_ids:
             return [], []
         pending = {pr.target_node_id for pr in self.active_predictions.values() if pr.drive is not None}
@@ -6420,10 +6429,11 @@ class Graph:
         if not targets:
             return []
         rows = None
-        if not self.__dict__.get("_diffpc_python") and getattr(type(self.synapses), "diffpc_round", 0) >= 1:
-            rows = self.synapses.diffpc_plateau(self.nodes, targets, self.timestep, window)
+        hist = list(self.__dict__.get("_diffpc_fired", ()))
+        if not self.__dict__.get("_diffpc_python") and getattr(type(self.synapses), "diffpc_round", 0) >= 2:
+            rows = self.synapses.diffpc_plateau(targets, self.timestep, window, hist)
         if rows is None:
-            rows = self._diffpc_plateau_python(targets, self.timestep, window)
+            rows = self._diffpc_plateau_python(targets, self.timestep, window, hist)
         hit = set()
         for sid, _pre, dw in rows:
             syn = self.synapses.get(sid)
@@ -6435,9 +6445,16 @@ class Graph:
         st["syn_touched"] += len(rows)
         return rows
 
-    def _diffpc_plateau_python(self, targets: List[Tuple[str, float, float]], timestep: int,
-                               window: int) -> List[Tuple[str, str, float]]:
-        """The Python form of SynapseStore.diffpc_plateau (same contract, same arithmetic, rows by synapse id)."""
+    def _diffpc_plateau_python(self, targets: List[Tuple[str, float, float]], timestep: int, window: int,
+                               fired_history: List[Tuple[int, List[str]]]) -> List[Tuple[str, str, float]]:
+        """The Python form of SynapseStore.diffpc_plateau (same contract, same arithmetic, rows by synapse id): each
+        row is credited for EVERY pre spike that arrived in [t - W + 1, t] (spike step + delay, from the fired
+        history); share w x sum 0.5^(t - a); dw divided by the number of those arrivals, so a replay of the pattern
+        raises the target by at most dv_total (review C1 / I2)."""
+        spikes: Dict[str, List[int]] = {}
+        for step, ids in fired_history:
+            for nid in ids:
+                spikes.setdefault(nid, []).append(step)
         out: List[Tuple[str, str, float]] = []
         t = float(timestep)
         lo = t - window + 1.0
@@ -6447,21 +6464,28 @@ class Graph:
                 syn = self.synapses.get(sid)
                 if syn is None:
                     continue
-                pre = self.nodes.get(syn.pre_node_id)
-                a = (pre.last_spike_time + syn.delay) if pre is not None else -math.inf
-                ok = (syn.synapse_type != SynapseType.INHIBITORY and syn.weight > 0.0 and lo <= a <= t)
-                cand.append((sid, syn, syn.weight * 0.5 ** (t - a) if ok else None))
+                sh = None
+                if syn.synapse_type != SynapseType.INHIBITORY and syn.weight > 0.0:
+                    k = n = 0.0
+                    for step in spikes.get(syn.pre_node_id, ()):
+                        a = float(step + syn.delay)
+                        if lo <= a <= t:
+                            k += 0.5 ** (t - a)
+                            n += 1.0
+                    if n > 0.0:
+                        sh = (syn.weight * k, n)
+                cand.append((sid, syn, sh))
             total = 0.0   # a plain left-to-right sum (Python 3.12's sum() is compensated; the native one is not)
             for _s, _y, sh in cand:
                 if sh is not None:
-                    total += sh
+                    total += sh[0]
             if not (dv > 0.0 and ex > 0.0 and total > 0.0):
                 continue
             for sid, syn, sh in cand:
                 if sh is None:
                     continue
                 w = syn.weight
-                dw = min(min(w, syn.max_weight - w), dv * (sh / total) / ex)
+                dw = min(min(w, syn.max_weight - w), dv * (sh[0] / total) / ex / sh[1])
                 if dw > 0.0:
                     syn.weight = w + dw
                     out.append((sid, syn.pre_node_id, dw))

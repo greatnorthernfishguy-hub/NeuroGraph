@@ -482,7 +482,7 @@ def _kick(g, seed, k):
 def test_plateau_native_equals_python(seed):
     cfg = dict(ON, three_factor_enabled=True)
     a, b = S.graph_of(NF, "native", dict(cfg)), S.graph_of(NF, "native", dict(cfg))
-    if getattr(type(b.synapses), "diffpc_round", 0) < 1:
+    if getattr(type(b.synapses), "diffpc_round", 0) < 2:
         pytest.skip("the installed ng_tract lacks diffpc_plateau")
     a._diffpc_python = True
     t = S.Pair(a, b, seed)
@@ -492,3 +492,52 @@ def test_plateau_native_equals_python(seed):
     assert t.b.g._diffpc_stats["syn_touched"] > 0, t.b.g._diffpc_stats
     assert t.a.g._diffpc_stats == t.b.g._diffpc_stats
     assert ckpt(t.a.g) == ckpt(t.b.g)
+
+
+# ---------------------------------------------------------------------------
+# (5) final review (Grok 4.7): C1 a replay delivers the new weight once per arrival; I2 every arrived spike counts
+# ---------------------------------------------------------------------------
+
+def test_plateau_divides_by_the_arrivals_so_a_replay_cannot_fire_t():
+    g = _dg(count_only=False, diffpc_receiver_eta=1.0, three_factor_enabled=True)
+    g.create_node(node_id="s0")
+    g.create_synapse("s0", "T", weight=0.3)
+    st = g._receiver_state()
+    st["rho"][g._receiver_row(st, "T")] = 0.99  # S18 never predicts T here, and the cap theta - margin - peak decides
+    fires = []
+    for _ in range(4):                          # s0 fires as often as its refractory period allows
+        g.stimulate("s0", 2.0)
+        if "s0" in g.step().fired_node_ids:
+            fires.append(g.timestep)
+    g.step()
+    g.stimulate("T", 2.0)
+    g.step()
+    t = g.timestep
+    n = sum(1 for f in fires if t - 5 + 1 <= f + 1 <= t)
+    assert n >= 2, fires
+    assert [x for x, _ in _last(g)[1]] == ["T"]
+    peak, theta, ex = g._diffpc_peaks["T"]
+    (row,) = _rows_to(g)
+    w_before = g._find_synapse("s0", "T").weight - row[2]
+    rho = float(st["rho"][st["idx"]["T"]])
+    dv = min(rho * theta - peak, theta - 0.05 - peak)
+    assert dv / ex / n < w_before                # the division, not the own-weight bound, sets dw
+    assert row[2] == pytest.approx(dv / ex / n)
+    assert n * row[2] * ex <= theta - 0.05 - peak + 1e-12   # every delivery at the new weight, no decay: still below
+
+
+def test_plateau_credits_an_arrived_spike_when_the_pre_fired_again():
+    g = _dg(count_only=False, three_factor_enabled=True)
+    g.create_node(node_id="s0")
+    g.create_synapse("s0", "T", weight=0.05, delay=3)
+    g.stimulate("s0", 2.0)
+    assert "s0" in g.step().fired_node_ids     # step 1: arrives at 4
+    g.step()
+    g.step()
+    g.stimulate("s0", 2.0)                      # step 4: s0 fires again (arrives at 7, in flight) ...
+    g.stimulate("T", 2.0)                       # ... as T fires with step 1's spike just arrived
+    r = g.step()
+    assert {"s0", "T"} <= set(r.fired_node_ids)
+    assert "T" in [x for x, _ in _last(g)[1]]
+    assert [r_[1] for r_ in _rows_to(g)] == ["s0"]
+    assert g._diffpc_stats["plateaued"] == 1      # T (s0's own external surprises have no inputs: plateau_empty)
