@@ -111,3 +111,164 @@ def test_bad_params_error_once(bad, caplog):
         assert g._stab_diffpc_receiver() is None
         assert g._stab_diffpc_receiver() is None
     assert len(_errs(caplog)) == 1, [r.getMessage() for r in _errs(caplog)]
+
+
+# ---------------------------------------------------------------------------
+# (2) the error on the arrival clock
+# ---------------------------------------------------------------------------
+
+def _dg(theta=0.8, fr=0.2, **cfg):
+    """A dict graph with the corrected DiffPC on (count-only unless told otherwise) and one excitatory target T."""
+    g = NF.Graph(dict(ON, diffpc_receiver_count_only=cfg.pop("count_only", True), **cfg))
+    g.create_node(node_id="T")
+    g.nodes["T"].threshold = theta
+    g.nodes["T"].firing_rate_ema = fr
+    g.create_node(node_id="z")              # a silent input, so T is never collected as an orphan
+    g.create_synapse("z", "T", weight=0.01)
+    return g
+
+
+def _pend(g, target, current, dt=1):
+    g._delay_buffer.setdefault(g.timestep + dt, []).append((target, current))
+
+
+def _predict(g, target, expires_in=5, strength=0.5):
+    p = NF.Prediction(source_node_id="s", target_node_id=target, strength=strength, confidence=0.5,
+                      created_at=g.timestep, expires_at=g.timestep + expires_in, contributors=[],
+                      drive=0.3, rho=0.3)
+    g.active_predictions[p.prediction_id] = p
+    return p
+
+
+def _last(g):
+    return g._diffpc_last
+
+
+def test_surprise_external_input():
+    g = _dg()
+    g.stimulate("T", 2.0)
+    r = g.step()
+    assert "T" in r.fired_node_ids
+    conf, surp = _last(g)
+    assert conf == [] and surp == [("T", pytest.approx(0.8))]
+    assert g._diffpc_stats["surprised"] == 1
+
+
+def test_not_surprise_when_arrivals_fire_it():
+    g = _dg()
+    g.create_node(node_id="s0")
+    g.create_synapse("s0", "T", weight=2.0)
+    _pend(g, "T", 2.0)
+    r = g.step()
+    assert "T" in r.fired_node_ids
+    assert _last(g) == ([], [])
+    assert g._diffpc_stats["surprised"] == 0
+
+
+def test_partial_arrivals_still_surprise():
+    g = _dg()
+    _pend(g, "T", 0.3)
+    g.stimulate("T", 2.0)
+    g.step()
+    assert [nid for nid, _ in _last(g)[1]] == ["T"]
+
+
+def test_he_injection_counts_as_explained():
+    g = _dg()
+    for m in ("m0", "m1"):
+        g.create_node(node_id=m)
+        g.nodes[m].threshold = 0.5
+    g.create_hyperedge({"m0", "m1"}, activation_threshold=0.5, output_targets=["T"], output_weight=2.0)
+    g.stimulate("m0", 2.0)
+    g.stimulate("m1", 2.0)
+    r1 = g.step()
+    assert {"m0", "m1"} <= set(r1.fired_node_ids) and r1.fired_hyperedge_ids
+    r2 = g.step()
+    assert "T" in r2.fired_node_ids
+    assert "T" not in [nid for nid, _ in _last(g)[1]]
+
+
+def test_confirmed_not_surprised():
+    g = _dg()
+    _predict(g, "T")
+    g.stimulate("T", 2.0)
+    g.step()
+    assert _last(g) == (["T"], [])
+    assert g._diffpc_stats["confirmed"] == 1 and g._diffpc_stats["surprised"] == 0
+
+
+def test_miss_counted():
+    g = _dg()
+    _predict(g, "T", expires_in=1)
+    old = NF.Prediction(source_node_id="s", target_node_id="T", strength=0.5, confidence=0.5,
+                        created_at=g.timestep, expires_at=g.timestep + 1)   # source-side: not DiffPC's
+    g.active_predictions[old.prediction_id] = old
+    for _ in range(3):
+        g.step()
+    assert g._diffpc_stats["misses"] == 1
+
+
+def test_inhibitory_never_surprised():
+    g = _dg()
+    g.create_node(node_id="I", is_inhibitory=True)
+    g.nodes["I"].threshold = 0.8
+    g.stimulate("I", 2.0)
+    _predict(g, "I")
+    r = g.step()
+    assert "I" in r.fired_node_ids
+    assert _last(g) == ([], [])
+    assert g._diffpc_stats["surprised"] == 0 and g._diffpc_stats["confirmed"] == 0
+
+
+def _fire_T(g, predicted):
+    if predicted:
+        _predict(g, "T")
+    g.stimulate("T", 2.0)
+    r = g.step()
+    assert "T" in r.fired_node_ids
+    for _ in range(10):   # past refractory
+        g.step()
+
+
+def test_learned_from_surprise_counts():
+    g = _dg()
+    _fire_T(g, predicted=False)          # surprise
+    _fire_T(g, predicted=True)           # next firing predicted -> learned
+    st = g._diffpc_stats
+    assert (st["surprised"], st["followups"], st["learned"]) == (1, 1, 1)
+    _fire_T(g, predicted=False)          # surprise again
+    _fire_T(g, predicted=False)          # next firing unpredicted (also a surprise) -> followup, not learned
+    assert (st["surprised"], st["followups"], st["learned"]) == (3, 2, 1)
+
+
+def test_followup_window_is_200_steps():
+    g = _dg()
+    _fire_T(g, predicted=False)
+    for _ in range(200):
+        g.step()
+    _fire_T(g, predicted=True)
+    assert g._diffpc_stats["followups"] == 0
+
+
+@pytest.mark.parametrize("kind", ["dict", "native"])
+def test_count_only_counts_and_old_body_runs(kind):
+    t = _pair(kind, 0, dict(RPE, **RECV))
+    t.b.g.config.update(dict(ON, diffpc_receiver_count_only=True))
+    S.drive(t, random.Random(0), 25, sleep_every=True)
+    st = t.b.g._diffpc_stats
+    assert st["surprised"] > 0 and st["confirmed"] + st["misses"] > 0, st
+    for k in S19_SWITCHES:
+        t.b.g.config.pop(k, None)
+    assert ckpt(t.a.g) == ckpt(t.b.g)
+
+
+@pytest.mark.parametrize("kind", ["dict", "native"])
+def test_injection_recorder_reads_the_voltage_change(kind):
+    g = restore_as(NF, kind, H2.built(0))
+    g.config.update(ON)
+    nid = next(iter(g.nodes.keys()))
+    before = g._diffpc_voltages()
+    g.nodes[nid].voltage += 0.5
+    g._diffpc_record_injection(before)
+    ex = g.nodes[nid].intrinsic_excitability
+    assert g._diffpc_ring[g.timestep + 1] == {nid: pytest.approx(0.5 * g.config["decay_rate"] / ex)}

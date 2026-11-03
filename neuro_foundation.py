@@ -3706,6 +3706,10 @@ class Graph:
             _stab = self._stability_params()
             if _stab is not None or "_stab" in self.__dict__:
                 self._stab = _stab
+            # [2026-11-03] S19 (#1202 follow-up): corrected DiffPC, read live once per step (None = off: no new work)
+            _dpr = self._stab_diffpc_receiver() if self.config.get("diffpc_receiver_enabled", False) else None
+            if _dpr is not None or "_diffpc_p" in self.__dict__:
+                self.__dict__["_diffpc_p"] = _dpr
             # [2026-10-20] round I (#1151): the layer is grown once at switch-on (later runs are sleep_cycle's)
             if _stab is not None and _stab.irecruit is not None and not self.nodes.interneurons_exists():
                 self._interneurons_recruit(_stab.irecruit)
@@ -3728,6 +3732,8 @@ class Graph:
                     )
                     continue
                 target.voltage += current * target.intrinsic_excitability
+            if _dpr is not None:   # [2026-11-03] S19: this tick's arrivals are explained drive
+                self._diffpc_record_arrivals(arrivals, _dpr[2])
 
             # 2b. [2026-10-22] S6-2 (#1166): intrinsic spontaneous activity — miniature PSPs (spontaneous vesicle
             #     release), natively, before detection; its spikes are ordinary spikes. A declined pass skips this step.
@@ -3792,6 +3798,9 @@ class Graph:
                 fired_ids = _detect_fired_python(self.nodes, self._event_handlers)
                 if _s2_inp is not None:   # S2: a step detected in Python still observes its input (before step 4)
                     self.nodes.observe_inputs(fired_ids, _s2_inp)
+            # [2026-11-03] S19: the error is classified as detection saw it (threshold, rate) -- before step 4
+            if _dpr is not None:
+                self._diffpc_last = self._diffpc_classify(fired_ids)
 
             # 3b. Zero-firing circuit breaker tracking
             if fired_ids:
@@ -3900,6 +3909,7 @@ class Graph:
             # store owns the pass state). Python then builds the PredictionStates and emits the events in the order
             # the loop below emits them. A declined pass (None) hands the pass state to this frozen loop.
             _he_ev = None
+            _dp_v0 = self._diffpc_voltages() if _dpr is not None else None   # [2026-11-03] S19: HE drive = delta v
             if self._he_ps_to_native():
                 _he_ev = self.hyperedges.evaluate_step(
                     self.nodes, fired_ids, self.timestep, experience_threshold, ema_alpha,
@@ -4063,6 +4073,9 @@ class Graph:
                 for hid, he in self.hyperedges.items():
                     if he.refractory_remaining > 0 and hid not in fired_he_set:
                         he.refractory_remaining -= 1
+
+            if _dp_v0 is not None:   # [2026-11-03] S19: injection + pattern completion, explained drive for t+1
+                self._diffpc_record_injection(_dp_v0)
 
             # 6b. Evaluate Phase 2.5 hyperedge-level predictions
             he_confirmed_this_step = 0
@@ -6196,8 +6209,11 @@ class Graph:
             if self.timestep > pred.expires_at:
                 expired.append(pid)
 
+        _dp_on = self.__dict__.get("_diffpc_p") is not None   # [2026-11-03] S19: a receiver prediction's miss
         for pid in expired:
             pred = self.active_predictions.pop(pid)
+            if _dp_on and pred.drive is not None:
+                self._diffpc_record_miss(pred)
             self._on_prediction_error(pred, error_penalty, recent_fired)
 
     def _find_synapse(
@@ -6225,6 +6241,122 @@ class Graph:
     # DiffPC: Difference Predictive Coding (#DiffPC)
     # -----------------------------------------------------------------------
 
+    # -----------------------------------------------------------------------
+    # [2026-11-03] S19 (#1202 follow-up): corrected DiffPC -- the error half of the receiver predictions.
+    # In memory only (never serialized): the explained-drive ring, the step's outcomes, the counters.
+    # -----------------------------------------------------------------------
+
+    _DIFFPC_FOLLOWUP = 200   # learned-from-surprise: T's next firing within this many steps
+
+    def _diffpc_stats_get(self) -> Dict[str, Any]:
+        st = self.__dict__.get("_diffpc_stats")
+        if st is None:
+            st = self.__dict__["_diffpc_stats"] = {
+                "confirmed": 0, "misses": 0, "surprised": 0, "plateaued": 0, "plateau_empty": 0, "syn_touched": 0,
+                "followups": 0, "learned": 0, "sum_dw": 0.0}
+        return st
+
+    def _diffpc_ring_get(self) -> Dict[int, Dict[str, float]]:
+        r = self.__dict__.get("_diffpc_ring")
+        if r is None:
+            r = self.__dict__["_diffpc_ring"] = {}
+        return r
+
+    def _diffpc_record_arrivals(self, arrivals: List[Tuple[str, float]], window: int) -> None:
+        """This tick's delivered input per target (signed current, before excitability), and the ring trimmed to the
+        last `window` ticks (the next tick's injections are kept)."""
+        ring = self._diffpc_ring_get()
+        t = self.timestep
+        row = ring.setdefault(t, {})
+        for tgt, cur in arrivals:
+            row[tgt] = row.get(tgt, 0.0) + cur
+        for k in [k for k in ring if k <= t - window]:
+            del ring[k]
+
+    def _diffpc_voltages(self):
+        """Every node's voltage, for the hyperedge pass's delta: (ids, numpy array) from the native store in one
+        read, else {id: voltage}."""
+        cols = getattr(self.nodes, "columns", None)
+        got = cols(["voltage"]) if cols is not None else None
+        if got is not None:
+            return got[0], got[1]
+        return {nid: n.voltage for nid, n in self.nodes.items()}
+
+    def _diffpc_record_injection(self, before) -> None:
+        """The hyperedge pass's voltage change per node (output injection + pattern completion), as explained drive
+        for the NEXT tick: delta x decay / excitability, so _receiver_peak_v (decay, then the tick's current x
+        excitability) reproduces the voltage detection at t+1 sees."""
+        decay = self.config["decay_rate"]
+        row = self._diffpc_ring_get().setdefault(self.timestep + 1, {})
+        cols = getattr(self.nodes, "columns", None)
+        if isinstance(before, tuple):
+            got = cols(["voltage", "intrinsic_excitability"])
+            if got is not None and got[0] == before[0]:
+                ids, v1, ex = got
+                d = v1 - before[1]
+                for i in np.nonzero(d != 0.0)[0]:
+                    if ex[i] > 0.0:
+                        nid = ids[i]
+                        row[nid] = row.get(nid, 0.0) + float(d[i]) * decay / float(ex[i])
+                return
+            before = dict(zip(before[0], before[1].tolist()))
+        for nid, n in self.nodes.items():
+            dv = n.voltage - before.get(nid, n.voltage)
+            if dv != 0.0 and n.intrinsic_excitability > 0.0:
+                row[nid] = row.get(nid, 0.0) + dv * decay / n.intrinsic_excitability
+
+    def _diffpc_classify(self, fired_ids: List[str]) -> Tuple[List[str], List[Tuple[str, float]]]:
+        """The step's outcome per fired EXCITATORY neuron T (spec §2.2), as detection saw it:
+        confirmed = a receiver prediction for T is pending; surprise = none pending and T's explained drive (the
+        ring's last W ticks, oldest first, simulated from rest) peaks below its effective threshold, sigma = 1 - fr.
+        Returns (confirmed ids, surprised (id, sigma) by sigma descending then id). Also counts, keeps each
+        surprised neuron's (peak, theta, excitability) in _diffpc_peaks, and runs the learned-from-surprise rule."""
+        p = self.__dict__.get("_diffpc_p")
+        window = p[2]
+        t = self.timestep
+        st = self._diffpc_stats_get()
+        sa = self.__dict__.setdefault("_diffpc_surprised_at", {})
+        peaks = self.__dict__["_diffpc_peaks"] = {}
+        if not fired_ids:
+            return [], []
+        pending = {pr.target_node_id for pr in self.active_predictions.values() if pr.drive is not None}
+        ring = self._diffpc_ring_get()
+        rows = [ring.get(k, {}) for k in range(t - window + 1, t + 1)]
+        reads = self._receiver_reads(list(fired_ids), *self._receiver_theta_args())
+        conf: List[str] = []
+        surp: List[Tuple[str, float]] = []
+        for nid, r in zip(fired_ids, reads):
+            if r is None or r[6]:
+                continue
+            theta, _v, ex, _ref, fr, rest, _inh = r
+            t0 = sa.pop(nid, None)
+            if t0 is not None and t - t0 <= self._DIFFPC_FOLLOWUP:
+                st["followups"] += 1
+                if nid in pending:
+                    st["learned"] += 1
+            if nid in pending:
+                conf.append(nid)
+                continue
+            peak = self._receiver_peak_v(rest, rest, ex, [row.get(nid, 0.0) for row in rows])
+            if peak < theta:
+                surp.append((nid, min(1.0, max(0.0, 1.0 - fr))))
+                peaks[nid] = (peak, theta, ex)
+                sa[nid] = t
+        surp.sort(key=lambda x: (-x[1], x[0]))
+        st["confirmed"] += len(conf)
+        st["surprised"] += len(surp)
+        if t % self._DIFFPC_FOLLOWUP == 0:
+            for nid in [n for n, t0 in sa.items() if t - t0 > self._DIFFPC_FOLLOWUP]:
+                del sa[nid]
+        return conf, surp
+
+    def _diffpc_record_miss(self, pred: "Prediction") -> None:
+        """A receiver prediction expired unconfirmed (error -strength) on an excitatory neuron."""
+        n = self.nodes.get(pred.target_node_id)
+        if n is None or n.is_inhibitory:
+            return
+        self._diffpc_stats_get()["misses"] += 1
+
     def _diffpc_step(self, fired_ids: List[str]) -> Tuple[int, float]:
         """Ternary prediction error computation + prediction weight update (DiffPC).
 
@@ -6238,8 +6370,9 @@ class Graph:
         Returns:
             (ternary_spike_count, mean_abs_error_where_ternary_nonzero)
         """
-        # [2026-11-03] S19: corrected DiffPC (None = today's body below, exactly)
-        _dp = self._stab_diffpc_receiver() if self.config.get("diffpc_receiver_enabled", False) else None
+        # [2026-11-03] S19: the step's corrected-DiffPC params (None, or count-only = today's body below, exactly;
+        # count-only's counts were taken at detection)
+        _dp = self.__dict__.get("_diffpc_p")
         epsilon = self.config.get("diffpc_epsilon", 0.2)
         pred_lr = self.config.get("diffpc_pred_lr", 0.01)
         trace_boost = self.config.get("diffpc_trace_boost", 0.05)
