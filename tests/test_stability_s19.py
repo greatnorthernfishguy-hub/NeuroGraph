@@ -367,3 +367,128 @@ def test_stats_not_in_checkpoint():
     base.create_node(node_id="T")
     extra = set(g._serialize_full()) - set(base._serialize_full())
     assert extra == {"diffpc_receiver_reset_done"}
+
+
+# ---------------------------------------------------------------------------
+# (4) the plateau: aimed at the predicted band, never at causation
+# ---------------------------------------------------------------------------
+
+def _pg(w=(0.1, 0.1), eta=0.5, rho=None, **cfg):
+    """s0.. -> T (delay 1); the inputs fire at step 1, arrive at step 2, and T is fired at step 2 from outside."""
+    g = _dg(count_only=False, diffpc_receiver_eta=eta, three_factor_enabled=True, **cfg)
+    for i, wi in enumerate(w):
+        g.create_node(node_id=f"s{i}")
+        g.create_synapse(f"s{i}", "T", weight=wi)
+    if rho is not None:
+        st = g._receiver_state()
+        st["rho"][g._receiver_row(st, "T")] = rho
+    for i in range(len(w)):
+        g.stimulate(f"s{i}", 2.0)
+    g.step()
+    g.stimulate("T", 2.0)
+    g.step()
+    return g
+
+
+def _rows_to(g, tgt="T"):
+    return [r for r in g._diffpc_rows if g.synapses.get(r[0]).post_node_id == tgt]
+
+
+def test_plateau_sized_by_eta_of_the_gap():
+    g = _pg()
+    assert [n for n, _ in _last(g)[1]] == ["T"]
+    peak, theta, ex = g._diffpc_peaks["T"]      # the two arrivals from rest (~0.2; homeostasis moves ex / theta)
+    assert peak == pytest.approx(0.2 * ex)
+    st = g._receiver_state()
+    rho = float(st["rho"][st["idx"]["T"]])      # S18's own bar for T (rho0 0.3, moved by eta at each visit)
+    dv = 0.5 * (rho * theta - peak)             # eta x (rho theta - peak)
+    rows = _rows_to(g)
+    assert sorted(r[1] for r in rows) == ["s0", "s1"]
+    assert [r[2] for r in rows] == pytest.approx([dv / 2 / ex, dv / 2 / ex])
+    assert g._diffpc_stats["plateaued"] == 1 and g._diffpc_stats["syn_touched"] == 2
+
+
+def test_plateau_raises_toward_band_not_threshold():
+    g = _pg(eta=1.0, rho=0.99, w=(0.3, 0.2))    # the gap to the band (0.29) is past theta - margin - peak (0.25)
+    peak, theta, ex = g._diffpc_peaks["T"]
+    gain = sum(r[2] for r in _rows_to(g)) * ex   # both on the newest tick: the re-simulated peak rises by this
+    assert 0.0 < gain <= theta - 0.05 - peak + 1e-12
+    assert gain == pytest.approx(theta - 0.05 - peak)
+
+
+def test_in_band_drive_is_predicted_not_surprised():
+    g = _pg(w=(0.2, 0.2))                       # pending 0.4 >= rho theta: S18 predicted it, so it is confirmed
+    assert _last(g) == (["T"], [])
+
+
+def test_plateau_skips_when_in_band():
+    g = _dg(count_only=False)
+    g.step()
+    g._diffpc_peaks = {"T": (0.3, 0.8, 1.0)}    # peak already >= rho0 theta (0.24)
+    assert g._diffpc_plateau([("T", 0.8)], g._stab_diffpc_receiver()) == []
+    assert g._diffpc_stats["plateau_empty"] == 0 and g._diffpc_stats["plateaued"] == 0
+
+
+def test_plateau_no_inputs_is_noop_python():
+    g = _dg(count_only=False)
+    g.stimulate("T", 2.0)
+    g.step()
+    assert [n for n, _ in _last(g)[1]] == ["T"]
+    assert g._diffpc_rows == [] and g._diffpc_stats["plateau_empty"] == 1
+
+
+def test_plateau_top_k_only():
+    g = _dg(count_only=False, diffpc_receiver_k=1, three_factor_enabled=True)
+    g.create_node(node_id="U")
+    g.nodes["U"].threshold = 0.8
+    g.nodes["U"].firing_rate_ema = 0.5         # sigma 0.5 < T's 0.8
+    for i, tgt in enumerate(("T", "U")):
+        g.create_node(node_id=f"s{i}")
+        g.create_synapse(f"s{i}", tgt, weight=0.1)
+        g.stimulate(f"s{i}", 2.0)
+    g.step()
+    g.stimulate("T", 2.0)
+    g.stimulate("U", 2.0)
+    g.step()
+    assert [n for n, _ in _last(g)[1]] == ["T", "U"]
+    assert {g.synapses.get(r[0]).post_node_id for r in g._diffpc_rows} == {"T"}
+
+
+def test_eta_zero_writes_nothing():
+    g = _pg(eta=0.0)
+    assert [n for n, _ in _last(g)[1]] == ["T"]
+    assert g._diffpc_rows == [] and g._diffpc_stats["sum_dw"] == 0.0
+
+
+def _net(g, seed):
+    """12 excitatory neurons, sparse weak links (each input partway, none firing a target alone), delays 1..5."""
+    rng = random.Random(seed)
+    for i in range(12):
+        g.create_node(node_id=f"n{i:02d}")
+        g.nodes[f"n{i:02d}"].threshold = 0.8
+    for i in range(12):
+        for j in rng.sample([j for j in range(12) if j != i], 4):
+            g.create_synapse(f"n{i:02d}", f"n{j:02d}", weight=rng.uniform(0.03, 0.15), delay=rng.randint(1, 5))
+
+
+def _kick(g, seed, k):
+    rng = random.Random(seed * 1000 + k)
+    for nid in rng.sample(sorted(g.nodes.keys()), 3):
+        g.stimulate(nid, 2.0)
+    g.step()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_plateau_native_equals_python(seed):
+    cfg = dict(ON, three_factor_enabled=True)
+    a, b = S.graph_of(NF, "native", dict(cfg)), S.graph_of(NF, "native", dict(cfg))
+    if getattr(type(b.synapses), "diffpc_round", 0) < 1:
+        pytest.skip("the installed ng_tract lacks diffpc_plateau")
+    a._diffpc_python = True
+    t = S.Pair(a, b, seed)
+    t.op("build", lambda g: _net(g, seed))
+    for k in range(300):
+        t.op(f"step {k}", lambda g: _kick(g, seed, k))
+    assert t.b.g._diffpc_stats["syn_touched"] > 0, t.b.g._diffpc_stats
+    assert t.a.g._diffpc_stats == t.b.g._diffpc_stats
+    assert ckpt(t.a.g) == ckpt(t.b.g)

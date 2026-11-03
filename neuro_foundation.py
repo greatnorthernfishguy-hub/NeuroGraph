@@ -6390,9 +6390,82 @@ class Graph:
             if n is not None:
                 n.pred_error_ema = 0.9 * n.pred_error_ema + 0.1 * sig
             err += sig
+        self._diffpc_rows = self._diffpc_plateau(surp, params)
         ms = self.__dict__.get("_diffpc_miss_step", [0, 0.0])
         count = len(conf) + len(surp) + ms[0]
         return count, ((err + ms[1]) / count if count else 0.0)
+
+    def _diffpc_plateau(self, surp: List[Tuple[str, float]], params: tuple) -> List[Tuple[str, str, float]]:
+        """Surprise -> plateau (spec §2.3) for the top K surprised: dv_total = eta x (rho_T theta_T - peak), at most
+        theta_T - margin - peak (so the inputs that arrived can come to predict T, never fire it); skipped when the
+        peak is already in the band. One native diffpc_plateau call (Python fallback: _diffpc_plateau_python)."""
+        eta, k, window, _co = params
+        st = self._diffpc_stats_get()
+        if eta <= 0.0 or not surp:
+            return []
+        margin = self._stab_receiver()[6]
+        recv = self._receiver_state()
+        peaks = self.__dict__.get("_diffpc_peaks", {})
+        targets = []
+        for nid, _sig in surp[:k]:
+            peak, theta, ex = peaks[nid]
+            i = recv["idx"].get(nid)
+            rho = float(recv["rho"][i]) if i is not None else recv["rho0"]
+            gap = rho * theta - peak
+            if gap <= 0.0:
+                continue
+            dv = min(eta * gap, theta - margin - peak)
+            if dv > 0.0:
+                targets.append((nid, dv, ex))
+        if not targets:
+            return []
+        rows = None
+        if not self.__dict__.get("_diffpc_python") and getattr(type(self.synapses), "diffpc_round", 0) >= 1:
+            rows = self.synapses.diffpc_plateau(self.nodes, targets, self.timestep, window)
+        if rows is None:
+            rows = self._diffpc_plateau_python(targets, self.timestep, window)
+        hit = set()
+        for sid, _pre, dw in rows:
+            syn = self.synapses.get(sid)
+            if syn is not None:
+                hit.add(syn.post_node_id)
+            st["sum_dw"] += dw
+        st["plateaued"] += len(hit)
+        st["plateau_empty"] += len(targets) - len(hit)
+        st["syn_touched"] += len(rows)
+        return rows
+
+    def _diffpc_plateau_python(self, targets: List[Tuple[str, float, float]], timestep: int,
+                               window: int) -> List[Tuple[str, str, float]]:
+        """The Python form of SynapseStore.diffpc_plateau (same contract, same arithmetic, rows by synapse id)."""
+        out: List[Tuple[str, str, float]] = []
+        t = float(timestep)
+        lo = t - window + 1.0
+        for post, dv, ex in targets:
+            cand = []
+            for sid in sorted(self._incoming.get(post, ())):
+                syn = self.synapses.get(sid)
+                if syn is None:
+                    continue
+                pre = self.nodes.get(syn.pre_node_id)
+                a = (pre.last_spike_time + syn.delay) if pre is not None else -math.inf
+                ok = (syn.synapse_type != SynapseType.INHIBITORY and syn.weight > 0.0 and lo <= a <= t)
+                cand.append((sid, syn, syn.weight * 0.5 ** (t - a) if ok else None))
+            total = 0.0   # a plain left-to-right sum (Python 3.12's sum() is compensated; the native one is not)
+            for _s, _y, sh in cand:
+                if sh is not None:
+                    total += sh
+            if not (dv > 0.0 and ex > 0.0 and total > 0.0):
+                continue
+            for sid, syn, sh in cand:
+                if sh is None:
+                    continue
+                w = syn.weight
+                dw = min(min(w, syn.max_weight - w), dv * (sh / total) / ex)
+                if dw > 0.0:
+                    syn.weight = w + dw
+                    out.append((sid, syn.pre_node_id, dw))
+        return out
 
     def _diffpc_step(self, fired_ids: List[str]) -> Tuple[int, float]:
         """Ternary prediction error computation + prediction weight update (DiffPC).
