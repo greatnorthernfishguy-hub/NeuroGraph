@@ -20,6 +20,22 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-03] DudeMan CC (Claude Opus 5.5, laptop; S19 / #1202 follow-up; Josh 2026-11-02 "DiffPC shouldn't be
+#   turned off, it should be corrected"; copy-run branch only, backup ceremony waived) — DiffPC corrected
+# What: diffpc_receiver_enabled (+ _count_only, _eta 0.5, _k 64, _window 5; NOT in DEFAULT_CONFIG; needs
+#       prediction_receiver_enabled; bad params -> ERROR once and off). DiffPC becomes the error half of S18's receiver
+#       predictions: per neuron on the arrival clock, confirmed (0) / miss (-s, at expiry) / surprise (+sigma = 1 - fr:
+#       fired, not predicted, and its explained drive -- arrivals + hyperedge injection + pattern completion over the
+#       last W ticks, simulated from rest -- could not fire it). Surprise -> a one-shot plateau on the inputs that
+#       arrived in the window, sized to raise the arrival peak toward the predicted band rho*theta, never above
+#       theta - margin. pred_error_ema = EMA of |e| (reset once at switch-on). pred_weights retired (not read or
+#       written). Count-only: today's body runs and the corrected errors are only counted.
+# Why:  docs/superpowers/specs/2026-11-02-diffpc-correction-design.md: today's DiffPC compares on the wrong clock
+#       (same step), starts from a 0.5 prior, scores causation as confirmation, and its +-0.05 trace nudge is
+#       committed with the step's global RPE sign; its per-link counters duplicate S18's expectation.
+# How:  _stab_diffpc_receiver (pure config read), an explained-drive ring fed at delivery and by hyperedge injections,
+#       _diffpc_classify / _diffpc_record_miss, native SynapseStore.diffpc_plateau (Python fallback pinned by an oracle
+#       test). Switch absent / False, and count-only, are byte-identical to 15b1958 (tests/test_stability_s19.py).
 # [2026-11-01] DudeMan CC (Claude Opus 5.5, laptop; S18 / #1202; Josh 2026-11-01 "Yeah, the design looks good"; copy-run
 #   branch only, backup ceremony waived by Josh for this branch) — receiver-side, graded predictions
 # What: prediction_receiver_enabled (+ _rho0 0.3, _k 1.0, _eta 0.002, _rho_min 0.1, _ema_alpha 0.01, _chain_floor 0.05,
@@ -4934,6 +4950,31 @@ class Graph:
                               "chain_floor >= 0, margin >= 0")
         return None
 
+    def _stab_diffpc_receiver(self) -> Optional[Tuple[float, int, int, bool]]:
+        """[2026-11-03] S19 (#1202 follow-up): (eta, k, window, count_only) when diffpc_receiver_enabled is on, the
+        receiver path is on and the params are sound, else None (ERROR once when on but it cannot run). Pure read of
+        config."""
+        c = self.config
+        if not c.get("diffpc_receiver_enabled", False):
+            return None
+        if self._stab_receiver() is None:
+            self._stab_error_once(["diffpc_receiver_enabled"], "prediction_receiver_enabled with sound params "
+                                  "(corrected DiffPC is the error half of the receiver predictions)")
+            return None
+        try:
+            eta = float(c.get("diffpc_receiver_eta", 0.5))
+            k, w = c.get("diffpc_receiver_k", 64), c.get("diffpc_receiver_window", 5)
+            ok = (math.isfinite(eta) and 0.0 <= eta <= 1.0 and isinstance(k, int) and not isinstance(k, bool)
+                  and k >= 1 and isinstance(w, int) and not isinstance(w, bool)
+                  and 1 <= w <= int(c.get("d_max", 5)))
+        except (TypeError, ValueError):
+            ok = False
+        if ok:
+            return eta, k, w, bool(c.get("diffpc_receiver_count_only", False))
+        self._stab_error_once(["diffpc_receiver_enabled"], "finite params with 0 <= diffpc_receiver_eta <= 1, "
+                              "integer diffpc_receiver_k >= 1, integer 1 <= diffpc_receiver_window <= d_max")
+        return None
+
     def _s13_source_rpe_broadcast(self, events: List[tuple]) -> None:
         """[2026-10-28] S13 (#1136): the step's one reward from per-source surprise: mean over resolved predictions of
         hit - q_src (q_src the source's expected hit rate before this event), then each q_src learns from its hit."""
@@ -6197,6 +6238,8 @@ class Graph:
         Returns:
             (ternary_spike_count, mean_abs_error_where_ternary_nonzero)
         """
+        # [2026-11-03] S19: corrected DiffPC (None = today's body below, exactly)
+        _dp = self._stab_diffpc_receiver() if self.config.get("diffpc_receiver_enabled", False) else None
         epsilon = self.config.get("diffpc_epsilon", 0.2)
         pred_lr = self.config.get("diffpc_pred_lr", 0.01)
         trace_boost = self.config.get("diffpc_trace_boost", 0.05)
