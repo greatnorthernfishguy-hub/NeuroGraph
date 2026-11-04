@@ -20,6 +20,15 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-04] DudeMan CC (Claude Opus 5.5, laptop; LAW 3 dead-end removal, register #1207; Josh 2026-11-04 "use all
+#   of the good work" + no objection to retiring the ruled-out rounds) — S9 and S12 removed
+# What: S9 event-scoped reward (reward_event_scoped_enabled, reward_confirm_scaling, inject_reward(post_scope=)) and S12
+#       the trace-normalised RPE commit (reward_rpe_trace_norm_*, inject_reward(trace_gain=), _s12_trace_gain) are
+#       deleted. S10's "S9 on -> S10 off" guard goes with S9. S14 / S16 left no code (arm overrides of the original
+#       eligibility_trace_tau / prediction_pre_charge_factor, which stay).
+# Why:  their own results ruled them out: S9 "right in direction, too weak" and superseded by S10 (S9 dev-log §3.1,
+#       S10 dev-log §2); S12 "not kept" (dev-log 2026-10-28 §7). LAW 3: no live-code shrapnel.
+# How:  the keys are no longer read (an old checkpoint or env carrying them is inert). Off-path bytes unchanged.
 # [2026-11-04] DudeMan CC (Claude Opus 5.5, laptop; S19 Rust-only, #1202; Josh 2026-11-03: "There isn't going to be any
 #   Python fallback… New Python is not going into the production code" / "Just focus on the Rust"; copy-run branch)
 # What: corrected DiffPC now runs entirely in ng_tract.DiffPc. Deleted here: the explained-drive ring, the voltage
@@ -4687,16 +4696,9 @@ class Graph:
         elif s7b and not nd:
             self._stab_error_once(s7b, "node_homeo_evidence_enabled + node_homeo_slow_enabled + "
                                        "node_homeo_input_evidence_enabled (relax refines slow N and judges input received)")
-        # [2026-10-26] S9 (#1136): a set reward key that cannot run says so once, whatever else is on (it is read only in
-        # the prediction handlers otherwise)
-        if c.get("reward_event_scoped_enabled", False):
-            self._stab_s9_reward()
         # [2026-10-27] S10 (#1136): likewise for the RPE reward
         if c.get("reward_rpe_enabled", False):
             self._stab_s10_rpe()
-        # [2026-10-28] S12 (#1136): the trace-normalised commit, too (it is read only at a commit otherwise)
-        if c.get("reward_rpe_trace_norm_enabled", False):
-            self._stab_s12_trace_norm()
         # [2026-10-28] S13 (#1136): both switches say so once when they cannot run
         if c.get("reward_rpe_per_source_enabled", False):
             self._stab_s13_per_source()
@@ -4863,9 +4865,6 @@ class Graph:
         if not c.get("three_factor_enabled", False):
             self._stab_error_once(["reward_rpe_enabled"], "three_factor_enabled (it signs the three-factor reward)")
             return None
-        if c.get("reward_event_scoped_enabled", False):
-            self._stab_error_once(["reward_rpe_enabled"], "reward_event_scoped_enabled off (two answers to one question)")
-            return None
         try:
             tau = float(c.get("reward_rpe_tau", 2000))
         except (TypeError, ValueError):
@@ -4917,13 +4916,10 @@ class Graph:
         self._s10_commit(delta * self.config.get("surprise_reward_scaling", 0.5))
 
     def _s10_commit(self, strength: float) -> None:
-        """[2026-10-28] the RPE step's one commit (S10 / S13): the 0.01 gate, then S12's gain when on."""
+        """[2026-10-28] the RPE step's one commit (S10 / S13): the 0.01 gate. (S12's trace-norm gain was removed
+        2026-11-04: S12 was not kept, dev-log 2026-10-28 §7.)"""
         if abs(strength) > 0.01:   # as the base: don't bother with a negligible signal
-            norm = self._stab_s12_trace_norm()
-            if norm is None:
-                self.inject_reward(strength)
-            else:   # [2026-10-28] S12: the commit shares a fixed budget across the step's tagged synapses
-                self.inject_reward(strength, trace_gain=self._s12_trace_gain(*norm))
+            self.inject_reward(strength)
 
     def _stab_s13_per_source(self) -> Optional[float]:
         """[2026-10-28] S13 (#1136): the per-source expectation time constant (events) when reward_rpe_per_source_enabled
@@ -5029,66 +5025,6 @@ class Graph:
             deltas.append(hit - e)
             q[src] = e + (hit - e) / tau
         self._s10_commit(sum(deltas) / len(deltas) * self.config.get("surprise_reward_scaling", 0.5))
-
-    def _stab_s12_trace_norm(self) -> Optional[tuple]:
-        """[2026-10-28] S12 (#1136): `(tau, cap)` when reward_rpe_trace_norm_enabled is on and can run, else None
-        (ERROR once when the key is set but cannot run). Pure read of config."""
-        c = self.config
-        if not c.get("reward_rpe_trace_norm_enabled", False):
-            return None
-        if not c.get("reward_rpe_enabled", False):
-            self._stab_error_once(["reward_rpe_trace_norm_enabled"], "reward_rpe_enabled (it scales the RPE commit)")
-            return None
-        try:
-            t = (float(c.get("reward_rpe_trace_norm_tau", 200)), float(c.get("reward_rpe_trace_norm_cap", 4.0)))
-        except (TypeError, ValueError):
-            t = (float("nan"),) * 2
-        if not (t[0] >= 1.0 and t[1] >= 1.0):   # also refuses NaN
-            self._stab_error_once(["reward_rpe_trace_norm_enabled"],
-                                  "reward_rpe_trace_norm_tau >= 1 and reward_rpe_trace_norm_cap >= 1")
-            return None
-        return t
-
-    def _s12_trace_gain(self, tau: float, cap: float) -> float:
-        """[2026-10-28] S12 (#1136): the synaptic gain for this commit, min(cap, R / M) with M this step's eligibility
-        mass and R its running mean (then R learns from M). M ~ 0: nothing to commit, gain 1 and R untouched."""
-        cp = getattr(self.synapses, "eligibility_copy", None)
-        if cp is not None:
-            e = np.abs(np.asarray(cp(), dtype=float))
-            m = float(e[e >= 1e-9].sum())
-        else:   # dict / duck-typed stores: the same sum, as the Python sweep sees it
-            m = float(sum(abs(s.eligibility_trace) for s in self.synapses.values()
-                          if abs(s.eligibility_trace) >= 1e-9))
-        if m < 1e-9:
-            return 1.0
-        r = self.__dict__.get("_s12_trace_ref")
-        if r is None:
-            r = m
-        gain = min(cap, r / m)
-        self._s12_trace_ref = r + (m - r) / tau
-        self._s12_last = (m, r, gain)   # read by the copy-run harness; NOT saved
-        return gain
-
-    def _stab_s9_reward(self) -> Optional[float]:
-        """[2026-10-26] S9 (#1136): the confirm scaling when event-scoped reward is on, else None (ERROR once when the
-        key is set but cannot run). Pure read of config."""
-        c = self.config
-        if not c.get("reward_event_scoped_enabled", False):
-            return None
-        if getattr(type(self.synapses), "reward_round", 0) < 1:
-            self._stab_error_once(["reward_event_scoped_enabled"], "the native synapse store (S9-round ng_tract)")
-            return None
-        if not c.get("three_factor_enabled", False):
-            self._stab_error_once(["reward_event_scoped_enabled"], "three_factor_enabled (it scopes the three-factor reward)")
-            return None
-        try:
-            k = float(c.get("reward_confirm_scaling", 0.25))
-        except (TypeError, ValueError):
-            k = float("nan")
-        if not (0.0 <= k <= 1.0):
-            self._stab_error_once(["reward_event_scoped_enabled"], "0 <= reward_confirm_scaling <= 1")
-            return None
-        return k
 
     def _stab_s8_bound(self, c, s_on: bool) -> Optional[float]:
         """[2026-10-25] S8 (#1136): the total up-scaling bound B (> 1), or None (off; ERROR once when the key is set but
@@ -5961,11 +5897,6 @@ class Graph:
             else:
                 # In three-factor mode, add to eligibility trace
                 syn.eligibility_trace += bonus
-                # [2026-10-26] S9: commit this link's own trace now (None = off: committed later by a broadcast)
-                _s9 = self._stab_s9_reward() if _j == 0 else None
-                if _s9 is not None:
-                    self.inject_reward(pred.confidence * _s9, scope={pred.source_node_id},
-                                       post_scope={pred.target_node_id})
             syn.last_update_time = float(self.timestep)
             if syn.weight > syn.peak_weight:
                 syn.peak_weight = syn.weight
@@ -6068,12 +5999,7 @@ class Graph:
         elif self.config.get("three_factor_enabled", False):
             surprise_strength = pred.confidence * self.config.get("surprise_reward_scaling", 0.5)
             if surprise_strength > 0.01:  # Don't bother with negligible surprise
-                # [2026-10-26] S9: only the event's links (A -> what fired + the wrong target), not every trace
-                if self._stab_s9_reward() is not None:
-                    self.inject_reward(surprise_strength, scope={pred.source_node_id},
-                                       post_scope=set(recent_fired) | {pred.target_node_id})
-                else:
-                    self.inject_reward(surprise_strength)
+                self.inject_reward(surprise_strength)
 
     def _surprise_exploration(
         self, pred: Prediction, recent_fired: Set[str]
@@ -8576,8 +8502,6 @@ class Graph:
         self,
         strength: float,
         scope: Optional[Set[str]] = None,
-        post_scope: Optional[Set[str]] = None,
-        trace_gain: float = 1.0,
     ) -> None:
         """Broadcast reward for three-factor learning (PRD §5.2, §8 inject_reward).
 
@@ -8592,14 +8516,7 @@ class Graph:
                 Positive = reinforce, negative = weaken.
             scope: Optional set of node IDs to limit reward scope.
                 If None, reward applies globally to all synapses with traces.
-            post_scope: [2026-10-26] S9 — with `scope`, a PAIRED scope: only synapses whose pre node is in
-                `scope` AND whose post node is in `post_scope` (one prediction event's links). Native synapse store
-                only (SynapseStore.reward_round >= 1); hyperedges use scope | post_scope.
-            trace_gain: [2026-10-28] S12 — multiplies the strength of the SYNAPSE sweep only (hyperedge thresholds,
-                the history and the event keep `strength`). 1.0 = unchanged.
         """
-        if post_scope is not None and (scope is None or getattr(type(self.synapses), "reward_round", 0) < 1):
-            raise ValueError("inject_reward: post_scope needs scope and the S9 native synapse store")
         with self._step_lock:
             lr = self.config["he_threshold_lr"]
             self._total_rewards_injected += 1
@@ -8617,12 +8534,9 @@ class Graph:
             # weight = max(0, min(weight + dw, max_weight)); trace *= 0.9 (decay after
             # use); peak_weight tracks the new max.
             _reward = getattr(self.synapses, "apply_eligibility_reward", None)
-            syn_strength = strength if trace_gain == 1.0 else strength * trace_gain   # [2026-10-28] S12
+            syn_strength = strength
             _floor = {"symmetric_floor": True} if self._stab_s13_floor() else {}   # [2026-10-28] S13 (native only)
-            if post_scope is not None:   # [2026-10-26] S9: the paired scope (checked above: native only)
-                _reward(syn_strength, self.config["learning_rate"], scope, post_scope, **_floor)
-                scope = set(scope) | set(post_scope)   # the hyperedge part: the event's nodes
-            elif _reward is not None:
+            if _reward is not None:
                 _reward(syn_strength, self.config["learning_rate"], scope, **_floor)
             else:  # [2026-10-05] per-SynapseRef fallback (the original loop)
                 _apply_eligibility_reward_python(

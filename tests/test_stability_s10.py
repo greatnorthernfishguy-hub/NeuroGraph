@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-11-04] DudeMan CC — the with_s9 case removed with S9 itself (LAW 3 dead-end removal; S9 superseded by S10).
 # [2026-10-27] Claude (lane stability-s10, #1136; Josh 2026-10-27 "what's the most similar, conceptually, to how the brain
 #   does it?" / "Yes, go ahead") — S10: the reward is a signed prediction error against expectation, once per step
 # [2026-10-27] try-1 fix: the step's MEAN outcome (not the sum) and b starts at the first step's mean; + 2 tests.
@@ -57,16 +58,12 @@ def test_keys_not_in_default_config():
     assert list(NF.DEFAULT_CONFIG.items()) == list(CMOD.DEFAULT_CONFIG.items())
 
 
-@pytest.mark.parametrize("case", ["no_three_factor", "with_s9", "zero_tau", "text_tau"])
+@pytest.mark.parametrize("case", ["no_three_factor", "zero_tau", "text_tau"])   # 2026-11-04: S9 removed (LAW 3)
 def test_misconfigured_s10_logs_error_once_and_changes_nothing(case, caplog):
     base = dict(ARM)
     extra = dict(reward_rpe_enabled=True)
     if case == "no_three_factor":
         base["three_factor_enabled"] = False
-    elif case == "with_s9":
-        if getattr(NF.ng_tract.SynapseStore, "reward_round", 0) < 1:
-            pytest.skip("ng_tract without the S9 reward pass")
-        base["reward_event_scoped_enabled"] = True   # both sides run S9; only b also asks for S10
     elif case == "zero_tau":
         extra["reward_rpe_tau"] = 0
     elif case == "text_tau":
