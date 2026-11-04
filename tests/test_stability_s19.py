@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-11-04] DudeMan CC (S19 Rust-only; Josh 2026-11-03 "Just focus on the Rust") — trimmed to the native DiffPc
+# What: graphs are native (DiffPC has no Python path); outcomes / stats / peaks / plateau rows are read from
+#       ng_tract.DiffPc (last(), stats(), peaks(), rows()); interneurons are scored for the record only. Deleted: the
+#       native-equals-Python oracle, the voltage-delta recorder test, and the direct call of the deleted Python plateau
+#       (the mechanism's arithmetic is tested in ng-tract-rs src/diffpc.rs + src/store.rs).
+# Why:  docs/superpowers/plans/2026-11-04-diffpc-rust-only.md.
+# How:  the same small hand-built graphs, through the engine; off / count-only still == the S18 parent 15b1958.
 # [2026-11-03] DudeMan CC (Claude Opus 5.5, laptop; #1202 follow-up, DiffPC corrected; Josh 2026-11-02 "DiffPC
 #   shouldn't be turned off, it should be corrected" / "Yeah, this is good as well") — S19: DiffPC as the error half of
 #   S18's receiver predictions
@@ -6,7 +13,7 @@
 #       checkpoint BYTES); keys not in DEFAULT_CONFIG; bad params / no receiver log ERROR once and change nothing.
 #       (2) the error on the arrival clock: confirmed / miss / surprise, explained drive = arrivals + hyperedge
 #       injections, excitatory only, learned-from-surprise. (3) the |e| record, its one reset, the old body silent.
-#       (4) the plateau: aimed at the predicted band, never at causation, top K, native == Python.
+#       (4) the plateau: aimed at the predicted band, never at causation, top K.
 # Why:  docs/superpowers/specs/2026-11-02-diffpc-correction-design.md; plan 2026-11-02-diffpc-correction.md.
 # How:  oracle via `git show 15b1958:neuro_foundation.py` (tests.test_hyperedge_store_h2._load); the S / S7b helpers;
 #       small hand-built graphs for the mechanism.
@@ -80,8 +87,9 @@ def test_keys_not_in_default_config():
 
 
 def test_params_default_when_on():
-    assert NF.Graph(dict(ON))._stab_diffpc_receiver() == (0.5, 64, 5, False)
-    assert NF.Graph(dict(ON, diffpc_receiver_count_only=True))._stab_diffpc_receiver() == (0.5, 64, 5, True)
+    assert NF.Graph(dict(ON), native_node_store=True, native_hyperedge_store=True)._stab_diffpc_receiver() == (0.5, 64, 5, False)
+    assert NF.Graph(dict(ON, diffpc_receiver_count_only=True),
+                    native_node_store=True, native_hyperedge_store=True)._stab_diffpc_receiver() == (0.5, 64, 5, True)
     assert NF.Graph()._stab_diffpc_receiver() is None
     assert NF.Graph(dict(RECV))._stab_diffpc_receiver() is None
 
@@ -101,6 +109,17 @@ def test_needs_receiver(caplog):
     assert ckpt(t.a.g) == ckpt(t.b.g)
 
 
+def test_no_native_store_is_off_with_one_error(caplog):
+    # Rust-only (Josh 2026-11-03: no Python fallback): a graph without the native NodeStore cannot run it
+    g = NF.Graph(dict(ON))
+    with caplog.at_level(logging.ERROR):
+        assert g._stab_diffpc_receiver() is None
+        g.step()
+        g.step()
+    assert len(_errs(caplog)) == 1, [r.getMessage() for r in _errs(caplog)]
+    assert "_diffpc" not in g.__dict__
+
+
 @pytest.mark.parametrize("bad", [dict(diffpc_receiver_eta=-0.1), dict(diffpc_receiver_eta=1.5),
                                  dict(diffpc_receiver_k=0), dict(diffpc_receiver_k="many"),
                                  dict(diffpc_receiver_window=0), dict(diffpc_receiver_window=6),
@@ -118,8 +137,8 @@ def test_bad_params_error_once(bad, caplog):
 # ---------------------------------------------------------------------------
 
 def _dg(theta=0.8, fr=0.2, **cfg):
-    """A dict graph with the corrected DiffPC on (count-only unless told otherwise) and one excitatory target T."""
-    g = NF.Graph(dict(ON, diffpc_receiver_count_only=cfg.pop("count_only", True), **cfg))
+    """A native graph with the corrected DiffPC on (count-only unless told otherwise) and one excitatory target T."""
+    g = NF.Graph(dict(ON, diffpc_receiver_count_only=cfg.pop("count_only", True), **cfg), native_node_store=True, native_hyperedge_store=True)
     g.create_node(node_id="T")
     g.nodes["T"].threshold = theta
     g.nodes["T"].firing_rate_ema = fr
@@ -141,7 +160,11 @@ def _predict(g, target, expires_in=5, strength=0.5):
 
 
 def _last(g):
-    return g._diffpc_last
+    return g._diffpc.last()
+
+
+def _st(g):
+    return g._diffpc.stats()
 
 
 def test_surprise_external_input():
@@ -151,7 +174,7 @@ def test_surprise_external_input():
     assert "T" in r.fired_node_ids
     conf, surp = _last(g)
     assert conf == [] and surp == [("T", pytest.approx(0.8))]
-    assert g._diffpc_stats["surprised"] == 1
+    assert _st(g)["surprised"] == 1
 
 
 def test_not_surprise_when_arrivals_fire_it():
@@ -162,7 +185,7 @@ def test_not_surprise_when_arrivals_fire_it():
     r = g.step()
     assert "T" in r.fired_node_ids
     assert _last(g) == ([], [])
-    assert g._diffpc_stats["surprised"] == 0
+    assert _st(g)["surprised"] == 0
 
 
 def test_partial_arrivals_still_surprise():
@@ -194,7 +217,7 @@ def test_confirmed_not_surprised():
     g.stimulate("T", 2.0)
     g.step()
     assert _last(g) == (["T"], [])
-    assert g._diffpc_stats["confirmed"] == 1 and g._diffpc_stats["surprised"] == 0
+    assert _st(g)["confirmed"] == 1 and _st(g)["surprised"] == 0
 
 
 def test_miss_counted():
@@ -205,19 +228,26 @@ def test_miss_counted():
     g.active_predictions[old.prediction_id] = old
     for _ in range(3):
         g.step()
-    assert g._diffpc_stats["misses"] == 1
+    assert _st(g)["misses"] == 1
 
 
-def test_inhibitory_never_surprised():
-    g = _dg()
-    g.create_node(node_id="I", is_inhibitory=True)
-    g.nodes["I"].threshold = 0.8
-    g.stimulate("I", 2.0)
-    _predict(g, "I")
+def test_inhibitory_scored_for_the_record_only():
+    # Josh 2026-11-03 ("Yes to the interneuron scoring"): an interneuron's outcome is recorded, never plateaued
+    g = _dg(count_only=False)
+    for nid in ("I", "J"):
+        g.create_node(node_id=nid, is_inhibitory=True)
+        g.nodes[nid].threshold = 0.8
+        g.nodes[nid].firing_rate_ema = 0.3
+        g.nodes[nid].pred_error_ema = 0.0
+        g.stimulate(nid, 2.0)
+    _predict(g, "J")
     r = g.step()
-    assert "I" in r.fired_node_ids
-    assert _last(g) == ([], [])
-    assert g._diffpc_stats["surprised"] == 0 and g._diffpc_stats["confirmed"] == 0
+    assert {"I", "J"} <= set(r.fired_node_ids)
+    assert _last(g) == ([], [])                       # not in the excitatory outcome (no plateau candidate)
+    st = _st(g)
+    assert (st["inh_surprised"], st["inh_confirmed"], st["surprised"], st["confirmed"]) == (1, 1, 0, 0)
+    assert g.nodes["I"].pred_error_ema == pytest.approx(0.07)   # surprise, sigma 0.7
+    assert g.nodes["J"].pred_error_ema == 0.0                   # confirmed
 
 
 def _fire_T(g, predicted):
@@ -234,10 +264,11 @@ def test_learned_from_surprise_counts():
     g = _dg()
     _fire_T(g, predicted=False)          # surprise
     _fire_T(g, predicted=True)           # next firing predicted -> learned
-    st = g._diffpc_stats
+    st = _st(g)
     assert (st["surprised"], st["followups"], st["learned"]) == (1, 1, 1)
     _fire_T(g, predicted=False)          # surprise again
     _fire_T(g, predicted=False)          # next firing unpredicted (also a surprise) -> followup, not learned
+    st = _st(g)
     assert (st["surprised"], st["followups"], st["learned"]) == (3, 2, 1)
 
 
@@ -247,31 +278,18 @@ def test_followup_window_is_200_steps():
     for _ in range(200):
         g.step()
     _fire_T(g, predicted=True)
-    assert g._diffpc_stats["followups"] == 0
+    assert _st(g)["followups"] == 0
 
 
-@pytest.mark.parametrize("kind", ["dict", "native"])
-def test_count_only_counts_and_old_body_runs(kind):
-    t = _pair(kind, 0, dict(RPE, **RECV))
+def test_count_only_counts_and_old_body_runs():
+    t = _pair("native", 0, dict(RPE, **RECV))
     t.b.g.config.update(dict(ON, diffpc_receiver_count_only=True))
     S.drive(t, random.Random(0), 25, sleep_every=True)
-    st = t.b.g._diffpc_stats
+    st = _st(t.b.g)
     assert st["surprised"] > 0 and st["confirmed"] + st["misses"] > 0, st
     for k in S19_SWITCHES:
         t.b.g.config.pop(k, None)
     assert ckpt(t.a.g) == ckpt(t.b.g)
-
-
-@pytest.mark.parametrize("kind", ["dict", "native"])
-def test_injection_recorder_reads_the_voltage_change(kind):
-    g = restore_as(NF, kind, H2.built(0))
-    g.config.update(ON)
-    nid = next(iter(g.nodes.keys()))
-    before = g._diffpc_voltages()
-    g.nodes[nid].voltage += 0.5
-    g._diffpc_record_injection(before)
-    ex = g.nodes[nid].intrinsic_excitability
-    assert g._diffpc_ring[g.timestep + 1] == {nid: pytest.approx(0.5 * g.config["decay_rate"] / ex)}
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +309,7 @@ def test_ema_abs_updates():
     _predict(g, "T", expires_in=1, strength=0.5)
     for _ in range(3):
         g.step()                               # the miss, |e| = 0.5
-    assert g._diffpc_stats["misses"] == 1
+    assert _st(g)["misses"] == 1
     assert g.nodes["T"].pred_error_ema == pytest.approx(0.9 * e1 + 0.05)
 
 
@@ -332,7 +350,7 @@ def test_step_result_reports_corrected_counts():
 
 
 def _reload(g):
-    h = restore_as(NF, "dict", ckpt(g))
+    h = restore_as(NF, "native", ckpt(g))
     h.config.update({k: v for k, v in g.config.items() if k.startswith(("diffpc_receiver", "prediction_receiver"))})
     return h
 
@@ -347,7 +365,7 @@ def test_reset_once_across_reload():
     assert h.nodes["z"].pred_error_ema == pytest.approx(0.4)
     h.step()
     assert h.nodes["z"].pred_error_ema == pytest.approx(0.4)   # z is silent: no outcome, no second reset
-    assert "_diffpc_stats" not in _reload(h).__dict__
+    assert "_diffpc" not in _reload(h).__dict__
 
 
 def test_reset_flag_only_saved_when_set():
@@ -363,7 +381,7 @@ def test_stats_not_in_checkpoint():
     g = _dg(count_only=False, diffpc_receiver_eta=0.0)
     g.stimulate("T", 2.0)
     g.step()
-    base = NF.Graph(dict(RECV))
+    base = NF.Graph(dict(RECV), native_node_store=True, native_hyperedge_store=True)
     base.create_node(node_id="T")
     extra = set(g._serialize_full()) - set(base._serialize_full())
     assert extra == {"diffpc_receiver_reset_done"}
@@ -391,13 +409,13 @@ def _pg(w=(0.1, 0.1), eta=0.5, rho=None, **cfg):
 
 
 def _rows_to(g, tgt="T"):
-    return [r for r in g._diffpc_rows if g.synapses.get(r[0]).post_node_id == tgt]
+    return [r for r in g._diffpc.rows() if g.synapses.get(r[0]).post_node_id == tgt]
 
 
 def test_plateau_sized_by_eta_of_the_gap():
     g = _pg()
     assert [n for n, _ in _last(g)[1]] == ["T"]
-    peak, theta, ex = g._diffpc_peaks["T"]      # the two arrivals from rest (~0.2; homeostasis moves ex / theta)
+    peak, theta, ex = g._diffpc.peaks()["T"]      # the two arrivals from rest (~0.2; homeostasis moves ex / theta)
     assert peak == pytest.approx(0.2 * ex)
     st = g._receiver_state()
     rho = float(st["rho"][st["idx"]["T"]])      # S18's own bar for T (rho0 0.3, moved by eta at each visit)
@@ -405,12 +423,12 @@ def test_plateau_sized_by_eta_of_the_gap():
     rows = _rows_to(g)
     assert sorted(r[1] for r in rows) == ["s0", "s1"]
     assert [r[2] for r in rows] == pytest.approx([dv / 2 / ex, dv / 2 / ex])
-    assert g._diffpc_stats["plateaued"] == 1 and g._diffpc_stats["syn_touched"] == 2
+    assert _st(g)["plateaued"] == 1 and _st(g)["syn_touched"] == 2
 
 
 def test_plateau_raises_toward_band_not_threshold():
     g = _pg(eta=1.0, rho=0.99, w=(0.3, 0.2))    # the gap to the band (0.29) is past theta - margin - peak (0.25)
-    peak, theta, ex = g._diffpc_peaks["T"]
+    peak, theta, ex = g._diffpc.peaks()["T"]
     gain = sum(r[2] for r in _rows_to(g)) * ex   # both on the newest tick: the re-simulated peak rises by this
     assert 0.0 < gain <= theta - 0.05 - peak + 1e-12
     assert gain == pytest.approx(theta - 0.05 - peak)
@@ -421,20 +439,12 @@ def test_in_band_drive_is_predicted_not_surprised():
     assert _last(g) == (["T"], [])
 
 
-def test_plateau_skips_when_in_band():
-    g = _dg(count_only=False)
-    g.step()
-    g._diffpc_peaks = {"T": (0.3, 0.8, 1.0)}    # peak already >= rho0 theta (0.24)
-    assert g._diffpc_plateau([("T", 0.8)], g._stab_diffpc_receiver()) == []
-    assert g._diffpc_stats["plateau_empty"] == 0 and g._diffpc_stats["plateaued"] == 0
-
-
-def test_plateau_no_inputs_is_noop_python():
+def test_plateau_no_inputs_is_noop():
     g = _dg(count_only=False)
     g.stimulate("T", 2.0)
     g.step()
     assert [n for n, _ in _last(g)[1]] == ["T"]
-    assert g._diffpc_rows == [] and g._diffpc_stats["plateau_empty"] == 1
+    assert g._diffpc.rows() == [] and _st(g)["plateau_empty"] == 1
 
 
 def test_plateau_top_k_only():
@@ -451,47 +461,13 @@ def test_plateau_top_k_only():
     g.stimulate("U", 2.0)
     g.step()
     assert [n for n, _ in _last(g)[1]] == ["T", "U"]
-    assert {g.synapses.get(r[0]).post_node_id for r in g._diffpc_rows} == {"T"}
+    assert {g.synapses.get(r[0]).post_node_id for r in g._diffpc.rows()} == {"T"}
 
 
 def test_eta_zero_writes_nothing():
     g = _pg(eta=0.0)
     assert [n for n, _ in _last(g)[1]] == ["T"]
-    assert g._diffpc_rows == [] and g._diffpc_stats["sum_dw"] == 0.0
-
-
-def _net(g, seed):
-    """12 excitatory neurons, sparse weak links (each input partway, none firing a target alone), delays 1..5."""
-    rng = random.Random(seed)
-    for i in range(12):
-        g.create_node(node_id=f"n{i:02d}")
-        g.nodes[f"n{i:02d}"].threshold = 0.8
-    for i in range(12):
-        for j in rng.sample([j for j in range(12) if j != i], 4):
-            g.create_synapse(f"n{i:02d}", f"n{j:02d}", weight=rng.uniform(0.03, 0.15), delay=rng.randint(1, 5))
-
-
-def _kick(g, seed, k):
-    rng = random.Random(seed * 1000 + k)
-    for nid in rng.sample(sorted(g.nodes.keys()), 3):
-        g.stimulate(nid, 2.0)
-    g.step()
-
-
-@pytest.mark.parametrize("seed", [0, 1, 2])
-def test_plateau_native_equals_python(seed):
-    cfg = dict(ON, three_factor_enabled=True)
-    a, b = S.graph_of(NF, "native", dict(cfg)), S.graph_of(NF, "native", dict(cfg))
-    if getattr(type(b.synapses), "diffpc_round", 0) < 2:
-        pytest.skip("the installed ng_tract lacks diffpc_plateau")
-    a._diffpc_python = True
-    t = S.Pair(a, b, seed)
-    t.op("build", lambda g: _net(g, seed))
-    for k in range(300):
-        t.op(f"step {k}", lambda g: _kick(g, seed, k))
-    assert t.b.g._diffpc_stats["syn_touched"] > 0, t.b.g._diffpc_stats
-    assert t.a.g._diffpc_stats == t.b.g._diffpc_stats
-    assert ckpt(t.a.g) == ckpt(t.b.g)
+    assert g._diffpc.rows() == [] and _st(g)["sum_dw"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +492,7 @@ def test_plateau_divides_by_the_arrivals_so_a_replay_cannot_fire_t():
     n = sum(1 for f in fires if t - 5 + 1 <= f + 1 <= t)
     assert n >= 2, fires
     assert [x for x, _ in _last(g)[1]] == ["T"]
-    peak, theta, ex = g._diffpc_peaks["T"]
+    peak, theta, ex = g._diffpc.peaks()["T"]
     (row,) = _rows_to(g)
     w_before = g._find_synapse("s0", "T").weight - row[2]
     rho = float(st["rho"][st["idx"]["T"]])
@@ -540,4 +516,4 @@ def test_plateau_credits_an_arrived_spike_when_the_pre_fired_again():
     assert {"s0", "T"} <= set(r.fired_node_ids)
     assert "T" in [x for x, _ in _last(g)[1]]
     assert [r_[1] for r_ in _rows_to(g)] == ["s0"]
-    assert g._diffpc_stats["plateaued"] == 1      # T (s0's own external surprises have no inputs: plateau_empty)
+    assert _st(g)["plateaued"] == 1      # T (s0's own external surprises have no inputs: plateau_empty)
