@@ -3939,7 +3939,7 @@ class Graph:
                 if _he_ev is None:
                     self._he_ps_to_python()
             if _he_ev is None and _dps is not None:
-                _dps.he_declined()   # the pass did not run natively: its drive is missing this step (counted)
+                _dps.he_declined(self.timestep)   # its drive is unknown: the next W ticks' firings are not judged (review I5)
             if _he_ev is not None:
                 _he_fired, _he_events, _he_learned = _he_ev
                 result.fired_hyperedge_ids.extend(_he_fired)

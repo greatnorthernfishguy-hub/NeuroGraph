@@ -3,7 +3,8 @@
 # What: graphs are native (DiffPC has no Python path); outcomes / stats / peaks / plateau rows are read from
 #       ng_tract.DiffPc (last(), stats(), peaks(), rows()); interneurons are scored for the record only. Deleted: the
 #       native-equals-Python oracle, the voltage-delta recorder test, and the direct call of the deleted Python plateau
-#       (the mechanism's arithmetic is tested in ng-tract-rs src/diffpc.rs + src/store.rs).
+#       (the mechanism's arithmetic is tested in ng-tract-rs src/diffpc.rs + src/store.rs). Same day, Grok review: M2
+#       peak_weight asserted after a plateau; M9 the count-only byte test is native-only.
 # Why:  docs/superpowers/plans/2026-11-04-diffpc-rust-only.md.
 # How:  the same small hand-built graphs, through the engine; off / count-only still == the S18 parent 15b1958.
 # [2026-11-03] DudeMan CC (Claude Opus 5.5, laptop; #1202 follow-up, DiffPC corrected; Josh 2026-11-02 "DiffPC
@@ -69,7 +70,7 @@ def test_off_equals_base(kind, seed, recv, how):
 
 
 @pytest.mark.parametrize("seed", [0, 1])
-@pytest.mark.parametrize("kind", ["dict", "native"])
+@pytest.mark.parametrize("kind", ["native"])   # review M9: a dict graph cannot run DiffPC at all (its own test below)
 def test_count_only_equals_base(kind, seed):
     t = _pair(kind, seed, dict(RPE, **RECV))
     t.b.g.config.update(dict(ON, diffpc_receiver_count_only=True))
@@ -422,6 +423,9 @@ def test_plateau_sized_by_eta_of_the_gap():
     dv = 0.5 * (rho * theta - peak)             # eta x (rho theta - peak)
     rows = _rows_to(g)
     assert sorted(r[1] for r in rows) == ["s0", "s1"]
+    for sid, _pre, _dw in rows:                  # review M2: peak_weight follows the raised weight
+        syn = g.synapses.get(sid)
+        assert syn.peak_weight == syn.weight
     assert [r[2] for r in rows] == pytest.approx([dv / 2 / ex, dv / 2 / ex])
     assert _st(g)["plateaued"] == 1 and _st(g)["syn_touched"] == 2
 
