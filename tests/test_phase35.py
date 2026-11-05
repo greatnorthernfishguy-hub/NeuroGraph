@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-11-04] DudeMan CC (#1210b) — + the prediction-outcome log keeps a sample + count; old ones cut on restore.
 # [2026-11-04] DudeMan CC (#1210) — + the novel-sequence log keeps n_firing + a 32-id sample; old oversized events cut on restore.
 # -------------------
 """
@@ -394,6 +395,20 @@ class TestPredictionSupportStatePersistence:
         assert a["firing_nodes"] == sorted(big)[:32] and a["n_firing"] == 4000
         assert b == {"source": "A", "firing_nodes": ["C"], "timestep": 6}
         assert len(c["firing_nodes"]) == 32 and c["n_firing"] == 99          # an existing count is kept
+
+    # [2026-11-04] #1210b: an error outcome keeps a 32-id sample + the count, and old ones are cut on restore
+    def test_prediction_outcome_sample_and_restore(self):
+        g = build_predictive_graph()
+        g.create_node(node_id="A")
+        big = [f"n{i:05d}" for i in range(3000, 0, -1)]
+        g._prediction_outcomes.append(PredictionOutcome(actual_firing_nodes=list(big)))          # an older, full list
+        g._prediction_outcomes.append(PredictionOutcome(confirmed=True, actual_firing_nodes=["A"]))
+        g2 = checkpoint_and_restore(g)
+        a, b = list(g2._prediction_outcomes)
+        assert a.actual_firing_nodes == sorted(big)[:32] and a.n_actual_firing == 3000
+        assert b.actual_firing_nodes == ["A"] and b.n_actual_firing == 0
+        d = g2._serialize_full()["prediction_outcomes"]
+        assert d[0]["n_actual_firing"] == 3000 and "n_actual_firing" not in d[1]   # saved only when set
 
     def test_reward_history_restored(self):
         """Reward history should survive serialization."""

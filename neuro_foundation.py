@@ -20,6 +20,13 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-04] DudeMan CC (#1210b; Josh 2026-11-04 "go ahead and do the quick one now") — the prediction-outcome log
+#   keeps a sample too
+# What: an error outcome stores the 32 smallest recently-fired ids + n_actual_firing (saved only when set), not every
+#       recently-fired node; outcomes restored from an older save are cut the same way. The 1,000-outcome deque and
+#       confirmed outcomes (one id) are unchanged.
+# Why:  70 MB of the 761 MB checkpoint, ~100 MB resident after a restore; read by nothing (save / restore / migrate).
+# How:  the error path in _on_prediction_error, _serialize_full and _deserialize. Tests: tests/test_phase35.py.
 # [2026-11-04] DudeMan CC (Claude Opus 5.5, laptop; #1210; Josh 2026-11-04 "You have my fresh go") — the novel-sequence
 #   log keeps a sample, not every firing node
 # What: each logged novel-sequence event stores n_firing + the 32 smallest firing ids (deterministic), not the full
@@ -1394,13 +1401,15 @@ class PredictionOutcome:
         prediction: The original prediction.
         confirmed: Whether the target fired within the window.
         resolved_at: Timestep when the prediction was resolved.
-        actual_firing_nodes: Nodes that actually fired (for error analysis).
+        actual_firing_nodes: Nodes that actually fired (for error analysis). [2026-11-04] #1210b: at most a
+            32-id sample (the smallest ids) for an error; n_actual_firing holds the full count.
     """
 
     prediction: Prediction = field(default_factory=Prediction)
     confirmed: bool = False
     resolved_at: int = 0
     actual_firing_nodes: List[str] = field(default_factory=list)
+    n_actual_firing: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -4386,7 +4395,8 @@ class Graph:
             prediction=pred,
             confirmed=False,
             resolved_at=self.timestep,
-            actual_firing_nodes=list(recent_fired),
+            actual_firing_nodes=heapq.nsmallest(self._NOVEL_SAMPLE, recent_fired),   # [2026-11-04] #1210b: a sample
+            n_actual_firing=len(recent_fired),
         )
         self._prediction_outcomes.append(outcome)
 
@@ -8292,6 +8302,7 @@ class Graph:
                     "confirmed": po.confirmed,
                     "resolved_at": po.resolved_at,
                     "actual_firing_nodes": copy.deepcopy(po.actual_firing_nodes, _memo) if _memo is not None else po.actual_firing_nodes,
+                    **({"n_actual_firing": po.n_actual_firing} if po.n_actual_firing else {}),   # [2026-11-04] #1210b
                 }
                 for po in self._prediction_outcomes
             ],
@@ -8743,7 +8754,12 @@ class Graph:
                 confirmed=pod.get("confirmed", False),
                 resolved_at=pod.get("resolved_at", 0),
                 actual_firing_nodes=pod.get("actual_firing_nodes", []),
+                n_actual_firing=int(pod.get("n_actual_firing", 0) or 0),
             )
+            # [2026-11-04] #1210b: an older save's full firing list is cut to the sample (its count kept)
+            if len(outcome.actual_firing_nodes) > self._NOVEL_SAMPLE:
+                outcome.n_actual_firing = outcome.n_actual_firing or len(outcome.actual_firing_nodes)
+                outcome.actual_firing_nodes = heapq.nsmallest(self._NOVEL_SAMPLE, outcome.actual_firing_nodes)
             self._prediction_outcomes.append(outcome)
 
         # Restore per-synapse confirmation history
