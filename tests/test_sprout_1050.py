@@ -433,3 +433,65 @@ def test_whole_run_tally_on_is_deterministic_and_sprouts_less(seed):
     sprouted_tally = sum(x[2] for x in la if isinstance(x, tuple) and len(x) == 3 and isinstance(x[0], list))
     sprouted_today = sum(x[2] for x in lc if isinstance(x, tuple) and len(x) == 3 and isinstance(x[0], list))
     assert 0 < sprouted_tally < sprouted_today
+
+
+# ---------------------------------------------------------------------------
+# [2026-11-05] #1212: the native surprise window == the per-prediction path it replaces
+# ---------------------------------------------------------------------------
+
+SURPRISE_WINDOW = NATIVE and hasattr(NF.ng_tract.SynapseStore, "cofire_tally_surprise")
+needs_window = pytest.mark.skipif(not SURPRISE_WINDOW, reason="installed ng_tract has no cofire_tally_surprise")
+
+
+def _heard(g):
+    """Register a handler on the three surprise events; returns the captured list (ids as sorted lists)."""
+    got = []
+    for ev in ("prediction_error", "surprise_sprouted", "novel_sequence"):
+        def cb(_ev=ev, **kw):
+            got.append((_ev, sorted((k, sorted(v) if isinstance(v, list) else v) for k, v in kw.items())))
+        g.register_event_handler(ev, cb)
+    return got
+
+
+@needs_window
+@pytest.mark.parametrize("heard", [False, True])
+@pytest.mark.parametrize("seed", P1.SEEDS)
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_surprise_window_equals_per_prediction_path(mode, seed, heard, monkeypatch):
+    start = P1.built_bytes(seed)
+    cfg = dict(TALLY, **DISUSE, prediction_threshold=0.5)   # the workload's weights predict (default bar 3.0)
+    act = tally_workload(30)
+    calls = {"window": 0}
+    real = NF._cofire_surprise_native
+
+    def counting(store):
+        r = real(store)
+        if r is None:
+            return None
+        def setw(fired, _f=r[0]):
+            calls["window"] += 1
+            return _f(fired)
+        return (setw, r[1])
+
+    def prep(got):
+        def p(g):
+            g.config.update(cfg)
+            if heard:
+                got.extend([_heard(g)])
+        return p
+
+    monkeypatch.setattr(NF, "_cofire_surprise_native", counting)
+    ga_heard = []
+    a, (la, _), ga = run(mode, start, act, seed, prep(ga_heard))
+    assert calls["window"] > 0                                                      # the window path really ran
+    monkeypatch.setattr(NF, "_cofire_surprise_native", lambda store: None)
+    gb_heard = []
+    b, (lb, _), gb = run(mode, start, act, seed, prep(gb_heard))
+    P1.compare(la, lb, [], [], a, b)                                                # tally, stats, synapses, bytes
+    assert ga._sprout_tally_stats["surprise_calls"] == gb._sprout_tally_stats["surprise_calls"] > 0
+    assert ga._sprout_tally_stats["surprise_sprouted"] == gb._sprout_tally_stats["surprise_sprouted"]
+    assert ga._total_novel_sequences == gb._total_novel_sequences
+    assert ga._novel_sequence_log == gb._novel_sequence_log
+    assert ga._total_predictions_errors == gb._total_predictions_errors > 0
+    if heard:
+        assert ga_heard[0] == gb_heard[0] and len(ga_heard[0]) > 0                   # events unchanged when heard

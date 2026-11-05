@@ -20,6 +20,18 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-05] DudeMan CC (#1212; Josh 2026-11-05 "Yeah, go on the Rust") — the surprise path stops copying the fired
+#   window per failed prediction
+# What: under the co-firing tally with the native surprise window (ng_tract SynapseStore.cofire_tally_set_window /
+#       cofire_tally_surprise), _cleanup_predictions hands the step's fired window to the store once (sorted, live nodes)
+#       and each failed prediction makes one native touch over it; recent_fired minus the expected target is no longer
+#       built as a set per prediction (_has_learned_pattern gains `exclude`). The prediction_error / surprise_sprouted /
+#       novel_sequence events build their full id lists only when a handler is registered (none on the live daemon).
+#       Same crossings, sprouts, tally state, stats and logs; an older wheel keeps the per-prediction path unchanged.
+# Why:  ~90 failed predictions a step each copied ~21 k ids several times and passed them to the tally as new strings
+#       (~1.9 M small allocations a step): the CC daemon's 5.2 -> 7.7 GB between-save swing (#1210 follow-up).
+# How:  _cofire_surprise_native, _cleanup_predictions, _on_prediction_error, _surprise_exploration(_tally),
+#       _has_learned_pattern. Tests: tests/test_sprout_1050.py (window path == per-prediction path).
 # [2026-11-04] DudeMan CC (#1210b; Josh 2026-11-04 "go ahead and do the quick one now") — the prediction-outcome log
 #   keeps a sample too
 # What: an error outcome stores the 32 smallest recently-fired ids + n_actual_firing (saved only when set), not every
@@ -1532,6 +1544,13 @@ def poincare_dir_array(metadata: Optional[Dict[str, Any]]) -> Optional["np.ndarr
 def _cofire_tally_native(store):
     """The native tally entry point of `store`, or None (older wheel). Module-level so a test can force the fallback."""
     return getattr(store, "cofire_tally_update", None)
+
+
+def _cofire_surprise_native(store):
+    """[2026-11-05] #1212: the native surprise-window pair (cofire_tally_set_window, cofire_tally_surprise) of `store`,
+    or None (older wheel: the per-prediction cofire_tally_update path is used). Module-level so a test can force it."""
+    a, b = getattr(store, "cofire_tally_set_window", None), getattr(store, "cofire_tally_surprise", None)
+    return (a, b) if a is not None and b is not None else None
 
 
 def _cofire_tally_update_python(tally, fired, cands, t, k, theta, lam, floor, gap, connected):
@@ -4400,15 +4419,16 @@ class Graph:
         )
         self._prediction_outcomes.append(outcome)
 
-        self._emit(
-            "prediction_error",
-            source=pred.source_node_id,
-            expected_target=pred.target_node_id,
-            strength=pred.strength,
-            confidence=pred.confidence,
-            actual_fired=list(recent_fired),
-            timestep=self.timestep,
-        )
+        if self._event_handlers.get("prediction_error"):   # [2026-11-05] #1212: the full list only when heard
+            self._emit(
+                "prediction_error",
+                source=pred.source_node_id,
+                expected_target=pred.target_node_id,
+                strength=pred.strength,
+                confidence=pred.confidence,
+                actual_fired=list(recent_fired),
+                timestep=self.timestep,
+            )
 
         # Surprise-driven exploration (PRD §5.2)
         self._surprise_exploration(pred, recent_fired)
@@ -4444,11 +4464,12 @@ class Graph:
         expected_id = pred.target_node_id
         sprout_weight = self.config["surprise_sprouting_weight"]
 
-        # Find what fired instead of the expected target
-        alternative_nodes = recent_fired - {expected_id}
-
+        # Find what fired instead of the expected target. [2026-11-05] #1212: under the native surprise window the
+        # set is not built per failed prediction (recent_fired minus the expected target is read in place below)
         sprouted_count = 0
         _tally = bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
+        _win = _tally and getattr(self, "_surprise_window_t", None) == self.timestep
+        alternative_nodes = None if _win else recent_fired - {expected_id}
         if _tally:
             sprouted_count = self._surprise_exploration_tally(pred, alternative_nodes)
         # #59: cap the surprise-driven feeder too. The degree cap only guarded co-firing
@@ -4504,12 +4525,12 @@ class Graph:
             except (KeyError, ValueError):
                 continue
 
-        if sprouted_count > 0:
+        if sprouted_count > 0 and self._event_handlers.get("surprise_sprouted"):   # #1212: the list only when heard
             self._emit(
                 "surprise_sprouted",
                 source=source_id,
                 expected=expected_id,
-                alternatives=list(alternative_nodes),
+                alternatives=list(recent_fired - {expected_id} if alternative_nodes is None else alternative_nodes),
                 count=sprouted_count,
                 timestep=self.timestep,
             )
@@ -4527,16 +4548,23 @@ class Graph:
                 syn.salience = min(salience_max, max(syn.salience, context_boost))
 
         # Novelty detection: check if any fired sequence has NO learned patterns
-        if alternative_nodes and not self._has_learned_pattern(source_id, alternative_nodes):
+        if alternative_nodes is None:   # #1212: the same test, read from recent_fired without the expected target
+            _any_alt = len(recent_fired) > (1 if expected_id in recent_fired else 0)
+            _novel = _any_alt and not self._has_learned_pattern(source_id, recent_fired, exclude=expected_id)
+        else:
+            _novel = bool(alternative_nodes) and not self._has_learned_pattern(source_id, alternative_nodes)
+        if _novel:
             self._total_novel_sequences += 1
-            self._log_novel_sequence(source_id, alternative_nodes)
+            _alts = (a for a in recent_fired if a != expected_id) if alternative_nodes is None else alternative_nodes
+            self._log_novel_sequence(source_id, _alts)
 
-            self._emit(
-                "novel_sequence",
-                source=source_id,
-                firing_nodes=list(alternative_nodes),
-                timestep=self.timestep,
-            )
+            if self._event_handlers.get("novel_sequence"):   # #1212: the full list only when heard
+                self._emit(
+                    "novel_sequence",
+                    source=source_id,
+                    firing_nodes=list(recent_fired - {expected_id} if alternative_nodes is None else alternative_nodes),
+                    timestep=self.timestep,
+                )
 
     # [2026-11-04] #1210: a logged novel-sequence event keeps the count and a fixed-size sample of the firing nodes, not
     # every one (each held ~21 k ids: 980 MB of a 1.33 GB checkpoint, ~1.6 GB resident, read by nothing)
@@ -4566,17 +4594,17 @@ class Graph:
         return e
 
     def _has_learned_pattern(
-        self, source_id: str, targets: Set[str]
+        self, source_id: str, targets: Set[str], exclude: Optional[str] = None
     ) -> bool:
         """Check if any of the targets have a learned connection from source.
 
         A "learned pattern" means there exists a synapse with weight above
-        the prediction threshold.
+        the prediction threshold. [2026-11-05] #1212: `exclude` drops one target (targets minus {exclude}, unbuilt).
         """
         threshold = self.config["prediction_threshold"]
         for syn_id in self._outgoing.get(source_id, set()):
             syn = self.synapses.get(syn_id)
-            if syn and syn.post_node_id in targets and syn.weight >= threshold:
+            if syn and syn.post_node_id in targets and syn.post_node_id != exclude and syn.weight >= threshold:
                 return True
         return False
 
@@ -4601,6 +4629,15 @@ class Graph:
         for pid, pred in self.active_predictions.items():
             if self.timestep > pred.expires_at:
                 expired.append(pid)
+
+        # [2026-11-05] #1212: under the tally, the fired window goes to the native store once for the step (sorted,
+        # live nodes only: the order and filter each surprise touch used to rebuild), not once per failed prediction
+        self._surprise_window_t = None
+        if expired and self.config.get("sprout_tally_enabled", False):
+            _sw = _cofire_surprise_native(self.synapses)
+            if _sw is not None and _cofire_tally_native(self.synapses) is not None:
+                _sw[0](sorted(a for a in recent_fired if a in self.nodes))
+                self._surprise_window_t = self.timestep
 
         for pid in expired:
             pred = self.active_predictions.pop(pid)
@@ -6676,7 +6713,7 @@ class Graph:
                                              "retracted_in_sleep": 0, "surprise_calls": 0, "surprise_sprouted": 0}
         return st
 
-    def _surprise_exploration_tally(self, pred: "Prediction", alternative_nodes: Set[str]) -> int:
+    def _surprise_exploration_tally(self, pred: "Prediction", alternative_nodes: Optional[Set[str]]) -> int:
         """#1050: surprise-driven sprouting under the co-firing tally (config `sprout_tally_enabled`). Each node that
         fired instead of the expected target (C) gets one tally touch for the pair source -> C (the predicted
         direction), in sorted order; a pair sprouts only when its score reaches theta -- the same bar as co-firing,
@@ -6686,11 +6723,23 @@ class Graph:
         prm = self._sprout_tally_params()
         st = self._sprout_tally_stats_dict()
         source_id = pred.source_node_id
-        alts = sorted(a for a in alternative_nodes if a != source_id and a in self.nodes)
-        if not alts or source_id not in self.nodes:
-            return 0
-        st["surprise_calls"] += 1
-        crossings = self._sprout_tally_feed(alts, [source_id], prm)
+        if alternative_nodes is None:
+            # [2026-11-05] #1212: the step's native surprise window (set once in _cleanup_predictions) -- the same
+            # touch as below over (window minus {source, expected}), with no id list per failed prediction
+            if source_id not in self.nodes:
+                return 0
+            got = _cofire_surprise_native(self.synapses)[1](source_id, pred.target_node_id, self.timestep, prm["k"],
+                                                             prm["theta"], prm["lam"], prm["floor"], prm["gap"])
+            if got is None:
+                return 0
+            st["surprise_calls"] += 1
+            crossings = [tuple(x) for x in got]
+        else:
+            alts = sorted(a for a in alternative_nodes if a != source_id and a in self.nodes)
+            if not alts or source_id not in self.nodes:
+                return 0
+            st["surprise_calls"] += 1
+            crossings = self._sprout_tally_feed(alts, [source_id], prm)
         made = self._sprout_tally_rails(crossings, st)
         sprout_weight = self.config["surprise_sprouting_weight"]
         surprise_magnitude = pred.strength * pred.confidence
