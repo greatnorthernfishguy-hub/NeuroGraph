@@ -20,6 +20,15 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-04] DudeMan CC (Claude Opus 5.5, laptop; #1210; Josh 2026-11-04 "You have my fresh go") — the novel-sequence
+#   log keeps a sample, not every firing node
+# What: each logged novel-sequence event stores n_firing + the 32 smallest firing ids (deterministic), not the full
+#       list; events restored from an older save are cut the same way. The 1,000-event cap, the emitted
+#       "novel_sequence" event (full list, for handlers) and total_novel_sequences are unchanged.
+# Why:  the log was 980 MB of the 1.33 GB live checkpoint (749 events x ~21 k ids), ~1.6 GB resident after a restore,
+#       deep-copied and packed at every save; nothing reads it (save / restore / neurograph_migrate only).
+# How:  Graph._log_novel_sequence (the append + cap, moved out of _surprise_exploration) and _compact_novel_event (at
+#       _deserialize). Tests: tests/test_phase35.py.
 # [2026-10-21] Claude Code (Opus 5.5, laptop; lane tonic-unified) — RD §5 (B): optional damped structural plasticity on step()
 #   (PROTECTED CHANGE — needs Josh's proceed; Syl approved RD 2026-06-10 "Build it, lover."; Josh 2026-10-21 "1 Yes, let's build it.")
 #   What: step(structural_damping=None). With None (every existing caller) step 8 is the unchanged call. With (k, m) — passed
@@ -876,6 +885,7 @@ Design principles (PRD §2.1):
 from __future__ import annotations
 
 import copy
+import heapq
 import json
 import logging
 import math
@@ -888,6 +898,7 @@ from enum import Enum, auto
 from typing import (
     Any,
     Callable,
+    Iterable,
     Deque,
     Dict,
     List,
@@ -4508,15 +4519,7 @@ class Graph:
         # Novelty detection: check if any fired sequence has NO learned patterns
         if alternative_nodes and not self._has_learned_pattern(source_id, alternative_nodes):
             self._total_novel_sequences += 1
-            novel_event = {
-                "source": source_id,
-                "firing_nodes": list(alternative_nodes),
-                "timestep": self.timestep,
-            }
-            self._novel_sequence_log.append(novel_event)
-            # Cap log size
-            if len(self._novel_sequence_log) > 1000:
-                self._novel_sequence_log = self._novel_sequence_log[-500:]
+            self._log_novel_sequence(source_id, alternative_nodes)
 
             self._emit(
                 "novel_sequence",
@@ -4524,6 +4527,33 @@ class Graph:
                 firing_nodes=list(alternative_nodes),
                 timestep=self.timestep,
             )
+
+    # [2026-11-04] #1210: a logged novel-sequence event keeps the count and a fixed-size sample of the firing nodes, not
+    # every one (each held ~21 k ids: 980 MB of a 1.33 GB checkpoint, ~1.6 GB resident, read by nothing)
+    _NOVEL_SAMPLE = 32
+
+    def _log_novel_sequence(self, source_id: str, firing: Iterable[str]) -> None:
+        """Append one novel-sequence event to the (capped) log: source, n_firing, the _NOVEL_SAMPLE smallest firing ids
+        (deterministic across hash seeds) and the timestep. The emitted event still carries the full list."""
+        firing = list(firing)
+        self._novel_sequence_log.append({
+            "source": source_id,
+            "firing_nodes": heapq.nsmallest(self._NOVEL_SAMPLE, firing),
+            "n_firing": len(firing),
+            "timestep": self.timestep,
+        })
+        # Cap log size
+        if len(self._novel_sequence_log) > 1000:
+            self._novel_sequence_log = self._novel_sequence_log[-500:]
+
+    @classmethod
+    def _compact_novel_event(cls, e: Any) -> Any:
+        """#1210, at restore: an old event with more than _NOVEL_SAMPLE firing ids is cut to the sample (n_firing keeps
+        the original count). Anything else is returned unchanged."""
+        if isinstance(e, dict) and isinstance(e.get("firing_nodes"), list) and len(e["firing_nodes"]) > cls._NOVEL_SAMPLE:
+            fn = e["firing_nodes"]
+            e = dict(e, firing_nodes=heapq.nsmallest(cls._NOVEL_SAMPLE, fn), n_firing=e.get("n_firing", len(fn)))
+        return e
 
     def _has_learned_pattern(
         self, source_id: str, targets: Set[str]
@@ -8726,7 +8756,8 @@ class Graph:
             self._synapse_confirmation_history[syn_id] = d
 
         # Restore logs
-        self._novel_sequence_log = list(data.get("novel_sequence_log", []))
+        # [2026-11-04] #1210: oversized events from an older save are cut to the sample as they are restored
+        self._novel_sequence_log = [self._compact_novel_event(e) for e in data.get("novel_sequence_log", [])]
         self._reward_history = list(data.get("reward_history", []))
 
         # Restore Phase 2.5 HE-level predictions with validation

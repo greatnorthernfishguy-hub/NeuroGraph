@@ -1,3 +1,6 @@
+# ---- Changelog ----
+# [2026-11-04] DudeMan CC (#1210) — + the novel-sequence log keeps n_firing + a 32-id sample; old oversized events cut on restore.
+# -------------------
 """
 Tests for Phase 3.5: Predictive State Persistence & Validation.
 
@@ -360,6 +363,37 @@ class TestPredictionSupportStatePersistence:
         g2 = checkpoint_and_restore(g)
         assert len(g2._novel_sequence_log) == 1
         assert g2._novel_sequence_log[0]["source"] == "A"
+
+    # [2026-11-04] #1210: the log keeps the count and a 32-id sample, not every firing node
+    def test_novel_sequence_event_keeps_count_and_sample(self):
+        g = build_predictive_graph()
+        firing = {f"n{i:05d}" for i in range(5000)}
+        g._log_novel_sequence("A", firing)
+        e = g._novel_sequence_log[-1]
+        assert e["n_firing"] == 5000
+        assert e["firing_nodes"] == sorted(firing)[:32]   # the 32 smallest: the same under any hash seed
+        assert e["source"] == "A" and e["timestep"] == g.timestep
+
+    def test_novel_sequence_log_cap_unchanged(self):
+        g = build_predictive_graph()
+        for _ in range(1001):
+            g._log_novel_sequence("A", ["x"])
+        assert len(g._novel_sequence_log) == 500
+
+    def test_oversized_old_events_are_cut_on_restore(self):
+        g = build_predictive_graph()
+        g.create_node(node_id="A")
+        big = [f"n{i:05d}" for i in range(4000, 0, -1)]
+        g._novel_sequence_log.extend([
+            {"source": "A", "firing_nodes": big, "timestep": 5},                 # an older, oversized event
+            {"source": "A", "firing_nodes": ["C"], "timestep": 6},               # small: unchanged
+            {"source": "A", "firing_nodes": big[:40], "n_firing": 99, "timestep": 7},
+        ])
+        g2 = checkpoint_and_restore(g)
+        a, b, c = g2._novel_sequence_log
+        assert a["firing_nodes"] == sorted(big)[:32] and a["n_firing"] == 4000
+        assert b == {"source": "A", "firing_nodes": ["C"], "timestep": 6}
+        assert len(c["firing_nodes"]) == 32 and c["n_firing"] == 99          # an existing count is kept
 
     def test_reward_history_restored(self):
         """Reward history should survive serialization."""
