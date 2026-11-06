@@ -3085,6 +3085,8 @@ def _surface_wants_native(graph: Any, vector_db: Any, provenance: str = "cc_auth
         for code, nid, content_text, fp in items:
             if code == 2:
                 # The off path's own checks, for a row the native walk could not decide. Never recorded (fp None).
+                # TEMPORARY (Josh 2026-11-06, option 1): delete with #1216, when metadata / texts are typed Rust columns
+                # and no row can have another shape. 0 of 54,172 live rows take it.
                 meta = getattr(nodes.get(nid), "metadata", None) or {}
                 if meta.get("kind") == "want":
                     code = 0
