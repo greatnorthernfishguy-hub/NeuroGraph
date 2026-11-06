@@ -7,6 +7,8 @@
 #       (4) on without the native stores raises.
 # Why:  spec docs superpowers/specs/2026-11-05-surprise-alternatives-design.md §4 (readiness bar, tests).
 # How:  the test_sprout_1050 / test_sleep_p1 builders and workload; the base engine is loaded from git (e2f93d4).
+# [2026-11-05] DudeMan CC — review fixes: lists not sets (M4); + I1 late-synapse node, birth step never in the slot
+#   (I2), counters reset on clear (M3).
 # -------------------
 import importlib.util
 import os
@@ -118,9 +120,9 @@ def test_only_step_fired_nodes_at_the_due_moment_within_reach():
     # created at 100: B due at 101 (+-1, never before 101). C2 fired at the due moment but is out of reach; Y (a
     # sibling of B) and C1 (A -> X -> C1) are in reach; H fired only at 104 (outside the slot).
     _ring(g, [(100, ["C1"]), (101, ["C1", "C2", "Y"]), (102, []), (103, []), (104, ["H"])])
-    assert g._surprise_slot_alternatives(_pred(100)) == {"C1", "Y"}
+    assert g._surprise_slot_alternatives(_pred(100)) == ["C1", "Y"]
     # a depth-2 chain prediction is due at 103 (102..104): only H
-    assert g._surprise_slot_alternatives(_pred(100, depth=2)) == {"H"}
+    assert g._surprise_slot_alternatives(_pred(100, depth=2)) == ["H"]
 
 
 @needs_slot
@@ -130,16 +132,16 @@ def test_the_rarer_eligible_node_wins_the_top_k():
     g.nodes["H"].firing_rate_ema = 0.40      # a hub that fires all the time
     g.nodes["Y"].firing_rate_ema = 0.005
     _ring(g, [(100, []), (101, ["C1", "H", "Y"]), (102, [])])
-    assert g._surprise_slot_alternatives(_pred(100)) == {"Y"}
+    assert g._surprise_slot_alternatives(_pred(100)) == ["Y"]
     g.nodes["Y"].firing_rate_ema = 0.9
-    assert g._surprise_slot_alternatives(_pred(100)) == {"C1"}
+    assert g._surprise_slot_alternatives(_pred(100)) == ["C1"]
 
 
 @needs_slot
 def test_an_uncovered_slot_gives_none_never_the_whole_window():
     g = _g()
     _ring(g, [(105, ["C1", "Y"])])                      # e.g. right after a restore: the ring starts at 105
-    assert g._surprise_slot_alternatives(_pred(100)) == set()
+    assert g._surprise_slot_alternatives(_pred(100)) == []
     st = g.synapses.surprise_stats()
     assert st["uncovered"] == 1 and st["calls"] == 1
 
@@ -194,3 +196,33 @@ def test_on_without_the_native_node_store_raises():
     g.create_node(node_id="A")
     with pytest.raises(RuntimeError, match="native NodeStore"):
         g._surprise_slot_store()
+
+
+@needs_slot
+def test_a_node_that_gains_its_first_synapse_later_is_still_in_the_slot():
+    """Review I1: C fires at the due moment with no synapse at all; X -> C sprouts afterwards (X -> B exists, so C is a
+    sibling of B); at expiry C is an alternative."""
+    g = _g()
+    g.create_node(node_id="N")
+    _ring(g, [(100, []), (101, ["N"]), (102, [])])
+    g.create_synapse("X2", "N", weight=0.5)
+    g.nodes["N"].firing_rate_ema = 0.01
+    assert "N" in g._surprise_slot_alternatives(_pred(100))
+
+
+@needs_slot
+def test_the_birth_step_is_never_in_the_slot():
+    g = _g()
+    g.nodes["C1"].firing_rate_ema = 0.001
+    _ring(g, [(100, ["C1"]), (101, []), (102, [])])     # C1 fired only with A, at A's birth step
+    assert g._surprise_slot_alternatives(_pred(100)) == []
+
+
+@needs_slot
+def test_clear_resets_the_counters():
+    g = _g()
+    _ring(g, [(105, ["C1"])])
+    g._surprise_slot_alternatives(_pred(100))
+    assert g.synapses.surprise_stats()["calls"] == 1
+    g.synapses.surprise_ring_clear()
+    assert g.synapses.surprise_stats()["calls"] == 0

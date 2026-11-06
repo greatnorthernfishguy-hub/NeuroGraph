@@ -31,6 +31,8 @@ Design principles (PRD §2.1):
 #       (~21 k) is credited for each failed prediction.
 # How:  step() (record), _cleanup_predictions (no window when on), _surprise_exploration, _surprise_slot_store,
 #       _surprise_slot_alternatives. Tests: tests/test_surprise_slot.py.
+#       Review fixes (Grok 4.7, 2026-11-05): I2 one slot interval (never the birth step) in code, docstring and spec; M1 the
+#       #1212 window is skipped while a prediction_error handler is registered; M4 the alternatives are a sorted list.
 # [2026-11-05] DudeMan CC (#1212; Josh 2026-11-05 "Yeah, go on the Rust") — the surprise path stops copying the fired
 #   window per failed prediction
 # What: under the co-firing tally with the native surprise window (ng_tract SynapseStore.cofire_tally_set_window /
@@ -4652,7 +4654,10 @@ class Graph:
         # [2026-11-05] #1212: under the tally, the fired window goes to the native store once for the step (sorted,
         # live nodes only: the order and filter each surprise touch used to rebuild), not once per failed prediction
         self._surprise_window_t = None
-        if expired and self.config.get("sprout_tally_enabled", False) and not self.config.get("surprise_slot_enabled", False):
+        # (not when a prediction_error handler is registered: one could remove a node mid-loop, which the per-prediction
+        # path re-checks -- review M1; none is registered on the CC daemon)
+        if (expired and self.config.get("sprout_tally_enabled", False) and not self.config.get("surprise_slot_enabled", False)
+                and not self._event_handlers.get("prediction_error")):
             _sw = _cofire_surprise_native(self.synapses)
             if _sw is not None and _cofire_tally_native(self.synapses) is not None:
                 _sw[0](sorted(a for a in recent_fired if a in self.nodes))
@@ -6740,17 +6745,18 @@ class Graph:
                                "SynapseStore.surprise_alternatives")
         return self.synapses
 
-    def _surprise_slot_alternatives(self, pred: "Prediction") -> Set[str]:
+    def _surprise_slot_alternatives(self, pred: "Prediction") -> List[str]:
         """#1212: a failed prediction's alternatives under the surprise slot: step()-fired nodes in
-        [created_at + 1 + depth - tol, created_at + 1 + depth + tol] (not before created_at + 1), in reach of the
-        source / the expected target's neighbourhood, the surprise_topk rarest (native). Empty when the slot is not
-        covered (after a restore)."""
+        [max(created_at + 1, due - tol), due + tol], due = created_at + 1 + depth -- never A's own birth step, where B
+        cannot be due (review I2: the spec states the same interval; the ring keeps prediction_window + 1 steps, which
+        covers it at expiry). In reach of the source / the expected target's neighbourhood, the surprise_topk rarest
+        (native). Sorted by id (review M4: no hash-order dependence). Empty when the slot is not covered."""
         tol = int(self.config.get("surprise_slot_tol", 1))
         due = pred.created_at + 1 + pred.chain_depth
         got = self._surprise_slot_store().surprise_alternatives(
             pred.source_node_id, pred.target_node_id, max(pred.created_at + 1, due - tol), due + tol,
             int(self.config.get("surprise_topk", 4)), self.nodes)
-        return set(got) if got else set()
+        return sorted(got) if got else []
 
     def _surprise_exploration_tally(self, pred: "Prediction", alternative_nodes: Optional[Set[str]]) -> int:
         """#1050: surprise-driven sprouting under the co-firing tally (config `sprout_tally_enabled`). Each node that
