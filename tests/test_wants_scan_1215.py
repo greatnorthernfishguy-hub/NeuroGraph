@@ -6,6 +6,9 @@
 #       an unchanged pass, a rewritten text, a deleted want node, a create_node that fails once, a text with more skips
 #       than the per-call detail cap, a checkpoint restore; (3) on: an unchanged text is not parsed again; (4) the record
 #       follows rows through delete + compaction, and clear() empties it; (5) on without the native NodeStore raises.
+# [2026-11-06] DudeMan CC — review (Grok 4.7) probes: skip lines the FIFO evicts come back as off; a row the fast path
+#   cannot decide (list / dict-subclass metadata, a kind whose __eq__ reaches the store, bytes content) behaves as off,
+#   including raising at the same row; the walk now returns one row-ordered item list.
 # Why:  spec docs/superpowers/specs/2026-11-06-wants-scan-incremental-design.md §4.1.
 # How:  a real neuro_foundation.Graph (native NodeStore) and universal_ingestor.SimpleVectorDB; the base organism is
 #       loaded from git (NG_WANTS_SCAN_BASE_REV, default e2f93d4). Needs ng_tract with NodeStore.wants_scan.
@@ -79,7 +82,7 @@ def _snap(g, ret, reports, details):
     wants = {}
     for nid, node in g.nodes.items():
         md = node.metadata or {}
-        if md.get("kind") == "want":
+        if isinstance(md, dict) and md.get("kind") == "want":
             wants[nid] = (md.get("want_text"), md.get("want_state"), md.get("provenance"), md.get("source_node"))
     syn = sorted((s.pre_node_id, s.post_node_id, round(s.weight, 9)) for s in g.synapses.values()
                  if s.post_node_id in wants)
@@ -184,8 +187,8 @@ def test_the_record_follows_rows_and_clear_empties_it():
         g.remove_node(f"tmp{i}")
     g.nodes.compact_now()
     assert g.nodes.wants_scan_stats()["recorded"] == before
-    _, todo = g.nodes.wants_scan(vdb.content)
-    assert todo == []                                   # records still match their rows after the compaction
+    items = g.nodes.wants_scan(vdb.content)
+    assert [i for i in items if i[0] == 1] == []        # records still match their rows after the compaction
     g.nodes.clear()
     assert g.nodes.wants_scan_stats()["recorded"] == 0
 
@@ -195,3 +198,86 @@ def test_on_without_the_native_node_store_raises(monkeypatch):
     g = NF.Graph(native_node_store=False)
     with pytest.raises(RuntimeError, match="native NodeStore"):
         ORG.surface_wants(g, SimpleVectorDB(dim=4))
+
+
+# ---------------------------------------------------------------------------
+# Review (Grok 4.7, 2026-11-06): rows the fast path cannot decide, and skip lines the FIFO makes due again
+# ---------------------------------------------------------------------------
+
+def _pair_run(mod_native, setup, monkeypatch, caplog, passes=1, seen_max=None):
+    """Build a graph, apply `setup(g, vdb)`, run `passes` pulses; one snapshot (or exception type) per pulse."""
+    ORG._WANT_SKIP_SEEN.clear()
+    ORG._WANT_SKIP_STATE.update(last_key=None, last_emit=None)
+    monkeypatch.setattr(ORG, "WANTS_SCAN_NATIVE", mod_native)
+    if seen_max is not None:
+        monkeypatch.setattr(ORG, "WANT_SKIP_SEEN_MAX", seen_max)
+    g, vdb = _build()
+    setup(g, vdb)
+    out = []
+    for _ in range(passes):
+        caplog.clear()
+        err = None
+        with caplog.at_level(logging.INFO, logger=ORG.logger.name):
+            try:
+                ret = ORG.surface_wants(g, vdb)
+            except Exception as e:  # noqa: BLE001 - the off path's raise is part of the contract
+                err, ret = type(e).__name__, []
+        details = [r.getMessage() for r in caplog.records if "node=" in r.getMessage()]
+        snap = _snap(g, ret, [], details)
+        snap["err"] = err
+        out.append(snap)
+    return out
+
+
+def _late_conv(nid, text=None):
+    def setup(g, vdb):
+        g.create_node(node_id=nid, metadata={"creation_mode": "conversational"})
+        if text is not None:
+            vdb.insert(id=nid, embedding=EMB, content=text, metadata={})
+        g.create_node(node_id="c9", metadata={"creation_mode": "conversational"})     # a real want AFTER the odd row
+        vdb.insert(id="c9", embedding=EMB, content="x\n\n[WANT] after the odd row [/WANT]\n", metadata={})
+    return setup
+
+
+@needs_native
+def test_fifo_evicted_skip_lines_come_back_as_off(monkeypatch, caplog):
+    off = _pair_run(False, lambda g, v: None, monkeypatch, caplog, passes=4, seen_max=4)
+    on = _pair_run(True, lambda g, v: None, monkeypatch, caplog, passes=4, seen_max=4)
+    assert off == on
+    assert sum(len(s["details"]) for s in on[1:]) > 0      # the evicted lines are logged again, as off
+
+
+@needs_native
+@pytest.mark.parametrize("odd", ["list_metadata", "mapping_metadata", "eq_kind", "bytes_content"])
+def test_a_row_the_fast_path_cannot_decide_behaves_as_off(odd, monkeypatch, caplog):
+    class Meta(dict):                 # a dict subclass: not an exact dict
+        pass
+
+    class Kind:                       # a kind whose __eq__ reaches the store (the review's panic probe)
+        def __init__(self, g):
+            self.g = g
+
+        def __eq__(self, other):
+            self.g.create_node(node_id=f"eq_probe_{len(self.g.nodes)}", metadata={})
+            return False
+        __hash__ = object.__hash__
+
+    def setup(g, vdb):
+        if odd == "list_metadata":
+            _late_conv("odd")(g, vdb)
+            g.nodes["odd"].metadata = [1, 2]
+        elif odd == "mapping_metadata":
+            _late_conv("odd", "y\n\n[WANT] from a mapping row [/WANT]\n")(g, vdb)
+            g.nodes["odd"].metadata = Meta(creation_mode="conversational")
+        elif odd == "eq_kind":
+            _late_conv("odd")(g, vdb)
+            g.nodes["odd"].metadata = {"kind": Kind(g), "creation_mode": "ingested"}
+        else:
+            _late_conv("odd", b"[WANT] bytes [/WANT]")(g, vdb)
+    off = _pair_run(False, setup, monkeypatch, caplog, passes=2)
+    on = _pair_run(True, setup, monkeypatch, caplog, passes=2)
+    assert off == on
+    if odd in ("list_metadata", "bytes_content"):
+        assert on[0]["err"] in ("AttributeError", "TypeError")        # raised at the same row as off
+    else:
+        assert on[0]["err"] is None

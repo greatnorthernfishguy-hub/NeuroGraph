@@ -8,7 +8,10 @@
 #   CC_NG_WANTS_SCAN_NATIVE (default off = the scan exactly as before). On: the walk runs in the native NodeStore
 #   (wants_scan: want ids + the texts to parse; per-node record of the last parsed text), parse_wants runs only on
 #   those, and a text is recorded (wants_scan_done) once every want it produced is a node and its skip details are all
-#   logged. _log_want_skips now returns the node ids whose detail lines it deferred.
+#   logged. _log_want_skips now returns the node ids whose detail lines are due again (deferred or FIFO-evicted).
+#   Review fixes (Grok 4.7, same day): rows the native walk cannot decide are handed back in row order and get the off
+#   path's own checks here (no Python under the store's borrow; a raise lands at the same row); evicted skip lines make
+#   their node's record forgotten (wants_scan_forget).
 # Why:  measured on the live mind 2026-11-06: every autosave re-parsed the same 103 texts (11.6 M chars), 13-26 s under
 #   _step_lock, to find 10 wants that already exist; recalls queue behind it (#1161).
 # How:  spec docs/superpowers/specs/2026-11-06-wants-scan-incremental-design.md; tests/test_wants_scan_1215.py (on = off
@@ -2925,8 +2928,9 @@ def _log_want_skips(events: List[Tuple[str, SkippedMarker]]) -> None:
     only the node id, the offset, the literal marker token ("[WANT]" / "[/WANT]") as its
     kind, and the reason -- so a pasted secret can never reach the log.
 
-    Returns the node ids with a detail line deferred to a later pulse (#1215: those texts are
-    parsed again); if logging itself failed, every node id in `events`."""
+    Returns the node ids with a detail line due on a later pulse -- deferred past the per-call
+    cap, or evicted from the seen FIFO (#1215: those texts are parsed again); if logging itself
+    failed, every node id in `events`."""
     deferred_nids: set = set()
     try:
         with _WANT_SKIP_LOCK:
@@ -2945,7 +2949,8 @@ def _log_want_skips(events: List[Tuple[str, SkippedMarker]]) -> None:
                     continue
                 _WANT_SKIP_SEEN[seen_key] = None
                 if len(_WANT_SKIP_SEEN) > WANT_SKIP_SEEN_MAX:
-                    _WANT_SKIP_SEEN.popitem(last=False)
+                    evicted_key, _ = _WANT_SKIP_SEEN.popitem(last=False)
+                    deferred_nids.add(evicted_key[0])   # #1215: its line is due again on a later pulse
                 details.append((nid, sk))
             last_emit = _WANT_SKIP_STATE["last_emit"]
             emit_summary = bool(events) and (
@@ -3047,12 +3052,15 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
 
 
 def _surface_wants_native(graph: Any, vector_db: Any, provenance: str = "cc_authored") -> List[Dict[str, Any]]:
-    """#1215: surface_wants, re-parsing only what changed. The native NodeStore walks the rows and returns the want
-    node ids and the conversational texts with a marker that are new, rewritten, or whose recorded wants are no longer
-    all nodes; only those go through parse_wants. Want creation, the synapse, the failure reports and the skip log are
-    surface_wants' own. A text is recorded only when every want it produced is a node and none of its skip details
-    were deferred, so anything left undone is parsed again next pulse. Returns the existing open wants (row order),
-    then the ones created now. Needs the native NodeStore (wants_scan) and a vector DB with a dict `content`."""
+    """#1215: surface_wants, re-parsing only what changed. The native NodeStore walks the rows and returns, in row
+    order, the want nodes, the conversational texts with a marker that are new, rewritten, or whose recorded wants are
+    no longer all nodes, and any row it cannot decide natively (metadata not an exact dict, a non-str kind /
+    creation_mode / text), which gets the off path's own checks here. Only the texts go through parse_wants. Want
+    creation, the synapse, the failure reports and the skip log are surface_wants' own, in the same row order, so a
+    raise lands at the same row. A text is recorded only when every want it produced is a node and none of its skip
+    details are due again (deferred past the per-call cap, or evicted from the skip log's FIFO: those are forgotten
+    and parsed next pulse). Returns the open wants (a want node's position or a created want's, row order). Needs the
+    native NodeStore (wants_scan) and a vector DB whose `content` is an exact dict."""
     skip_events: List[Tuple[str, SkippedMarker]] = []
     done: List[Tuple[str, Tuple[int, int], List[str]]] = []
     with _cc_mutation_lock(graph):
@@ -3063,24 +3071,37 @@ def _surface_wants_native(graph: Any, vector_db: Any, provenance: str = "cc_auth
         if not hasattr(nodes, "wants_scan"):
             raise RuntimeError("CC_NG_WANTS_SCAN_NATIVE needs the native NodeStore with wants_scan (#1215)")
         if vector_db is None:
-            want_ids, todo = nodes.wants_scan({})
+            items = nodes.wants_scan({})
         else:
             content, vlock = getattr(vector_db, "content", None), getattr(vector_db, "_lock", None)
-            if not isinstance(content, dict) or vlock is None:
+            if type(content) is not dict or vlock is None:
                 raise RuntimeError("CC_NG_WANTS_SCAN_NATIVE needs a vector DB with a dict content and _lock (#1215)")
             with vlock:
-                want_ids, todo = nodes.wants_scan(content)
-        for wid in want_ids:
-            meta = getattr(nodes.get(wid), "metadata", None) or {}
-            if meta.get("want_state", "open") == "open":
-                open_wants.append({"id": wid, "text": meta.get("want_text", ""),
-                                   "provenance": meta.get("provenance"),
-                                   "state": "open", "source": meta.get("source_node")})
+                items = nodes.wants_scan(content)
         syn_attempted = syn_failed = 0
         syn_exc_types: List[str] = []
         create_attempted = create_failed = 0
         create_exc_types: List[str] = []
-        for nid, content_text, fp in todo:
+        for code, nid, content_text, fp in items:
+            if code == 2:
+                # The off path's own checks, for a row the native walk could not decide. Never recorded (fp None).
+                meta = getattr(nodes.get(nid), "metadata", None) or {}
+                if meta.get("kind") == "want":
+                    code = 0
+                else:
+                    if meta.get("creation_mode") != "conversational":
+                        continue
+                    content_text = (vector_db.get_content(nid) if vector_db is not None else "") or ""
+                    if "WANT]" not in content_text:
+                        continue
+                    code = 1
+            if code == 0:
+                meta = getattr(nodes.get(nid), "metadata", None) or {}
+                if meta.get("want_state", "open") == "open":
+                    open_wants.append({"id": nid, "text": meta.get("want_text", ""),
+                                       "provenance": meta.get("provenance"),
+                                       "state": "open", "source": meta.get("source_node")})
+                continue
             parsed = parse_wants(content_text)
             skip_events.extend((nid, sk) for sk in parsed.skipped)
             produced: List[str] = []
@@ -3113,17 +3134,19 @@ def _surface_wants_native(graph: Any, vector_db: Any, provenance: str = "cc_auth
                         syn_exc_types.append(type(syn_exc).__name__)
                 open_wants.append({"id": want_id, "text": want.text,
                                    "provenance": provenance, "state": "open", "source": nid})
-            if complete:
+            if complete and fp is not None:
                 done.append((nid, fp, produced))
         _cc_report_want_create_failures("surface_wants", create_attempted, create_failed, create_exc_types)
         _cc_report_want_synapse_failures("surface_wants", syn_attempted, syn_failed, syn_exc_types)
-    deferred = _log_want_skips(skip_events)
-    done = [d for d in done if d[0] not in deferred]
-    if done:
+    due_again = _log_want_skips(skip_events)
+    done = [d for d in done if d[0] not in due_again]
+    if done or due_again:
         with _cc_mutation_lock(graph):   # the record is NodeStore state: written under the same lock as the walk
-            nodes.wants_scan_done(done)
+            if due_again:
+                nodes.wants_scan_forget(sorted(due_again))
+            if done:
+                nodes.wants_scan_done(done)
     return open_wants
-
 
 
 def _cc_report(callback: Optional[Any], *args: Any) -> None:
