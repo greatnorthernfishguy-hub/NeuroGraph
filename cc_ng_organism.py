@@ -3,6 +3,16 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-06] DudeMan CC (Claude Opus 5.5, laptop; #1215 / #1161; Josh 2026-11-06 "Please dive into that.")
+# What: surface_wants re-parses only texts that are new, changed, or whose wants went missing, behind
+#   CC_NG_WANTS_SCAN_NATIVE (default off = the scan exactly as before). On: the walk runs in the native NodeStore
+#   (wants_scan: want ids + the texts to parse; per-node record of the last parsed text), parse_wants runs only on
+#   those, and a text is recorded (wants_scan_done) once every want it produced is a node and its skip details are all
+#   logged. _log_want_skips now returns the node ids whose detail lines it deferred.
+# Why:  measured on the live mind 2026-11-06: every autosave re-parsed the same 103 texts (11.6 M chars), 13-26 s under
+#   _step_lock, to find 10 wants that already exist; recalls queue behind it (#1161).
+# How:  spec docs/superpowers/specs/2026-11-06-wants-scan-incremental-design.md; tests/test_wants_scan_1215.py (on = off
+#   after every pass of a scripted sequence, and off = e2f93d4). Needs ng_tract with NodeStore.wants_scan.
 # [2026-10-24] Claude Code (Opus 5.5, laptop; #1173 law review C-2; Josh 2026-10-24 ~00:15 "I say fix everything first. Go
 #   ahead and narrow it, I suppose. Seems like it's along the lines of how biology deals with it")
 # What: the bind's reinforce-on-recurrence (CC_NG_BIND_REINFORCE_EXISTING, still default OFF) is NARROWED: (1) scope =
@@ -2375,6 +2385,8 @@ def _want_skip_env_int(name: str, default: int, minimum: int) -> int:
 WANT_SKIP_SUMMARY_INTERVAL_S = _want_skip_env_int("CC_WANT_SKIP_SUMMARY_INTERVAL_S", 3600, 1)
 WANT_SKIP_SEEN_MAX = _want_skip_env_int("CC_WANT_SKIP_SEEN_MAX", 4096, 1)
 WANT_SKIP_DETAIL_PER_CALL_MAX = _want_skip_env_int("CC_WANT_SKIP_DETAIL_PER_CALL_MAX", 50, 1)
+# #1215: the incremental want scan (native NodeStore record). Off = the full scan every pulse.
+WANTS_SCAN_NATIVE = os.environ.get("CC_NG_WANTS_SCAN_NATIVE", "0") == "1"
 
 _WANT_FENCE_LINE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)\r?$", re.MULTILINE)
 _WANT_BLANK_LINE_RE = re.compile(r"\r?\n[ \t]*\r?\n")
@@ -2911,7 +2923,11 @@ def _log_want_skips(events: List[Tuple[str, SkippedMarker]]) -> None:
     once per (node, offset, reason) (bounded FIFO, <= WANT_SKIP_DETAIL_PER_CALL_MAX per
     call, the rest deferred). Logs NO want body and NO surrounding text: a detail line carries
     only the node id, the offset, the literal marker token ("[WANT]" / "[/WANT]") as its
-    kind, and the reason -- so a pasted secret can never reach the log."""
+    kind, and the reason -- so a pasted secret can never reach the log.
+
+    Returns the node ids with a detail line deferred to a later pulse (#1215: those texts are
+    parsed again); if logging itself failed, every node id in `events`."""
+    deferred_nids: set = set()
     try:
         with _WANT_SKIP_LOCK:
             counts = Counter(sk.reason for _, sk in events)
@@ -2925,6 +2941,7 @@ def _log_want_skips(events: List[Tuple[str, SkippedMarker]]) -> None:
                     continue
                 if len(details) >= WANT_SKIP_DETAIL_PER_CALL_MAX:
                     deferred += 1
+                    deferred_nids.add(nid)
                     continue
                 _WANT_SKIP_SEEN[seen_key] = None
                 if len(_WANT_SKIP_SEEN) > WANT_SKIP_SEEN_MAX:
@@ -2949,6 +2966,8 @@ def _log_want_skips(events: List[Tuple[str, SkippedMarker]]) -> None:
                         sk.marker, nid, sk.start, sk.reason)
     except Exception as exc:  # noqa: BLE001 - logging must never break surfacing
         logger.debug("want skip log failed (non-fatal): %s", exc)
+        return {nid for nid, _ in events}
+    return deferred_nids
 
 
 def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -> List[Dict[str, Any]]:
@@ -2964,7 +2983,11 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
     Which markers are real wants is decided by parse_wants() (#810) -- structural
     legitimacy, no length limit. Markers it rejects as mentions are logged at INFO
     (flood-bounded, after the graph lock is released), never dropped silently.
+
+    With CC_NG_WANTS_SCAN_NATIVE=1 the same scan runs incrementally (#1215, _surface_wants_native).
     """
+    if WANTS_SCAN_NATIVE:
+        return _surface_wants_native(graph, vector_db, provenance)
     skip_events: List[Tuple[str, SkippedMarker]] = []
     with _cc_mutation_lock(graph):
         open_wants: List[Dict[str, Any]] = []
@@ -3021,6 +3044,86 @@ def surface_wants(graph: Any, vector_db: Any, provenance: str = "cc_authored") -
         _cc_report_want_synapse_failures("surface_wants", syn_attempted, syn_failed, syn_exc_types)
     _log_want_skips(skip_events)
     return open_wants
+
+
+def _surface_wants_native(graph: Any, vector_db: Any, provenance: str = "cc_authored") -> List[Dict[str, Any]]:
+    """#1215: surface_wants, re-parsing only what changed. The native NodeStore walks the rows and returns the want
+    node ids and the conversational texts with a marker that are new, rewritten, or whose recorded wants are no longer
+    all nodes; only those go through parse_wants. Want creation, the synapse, the failure reports and the skip log are
+    surface_wants' own. A text is recorded only when every want it produced is a node and none of its skip details
+    were deferred, so anything left undone is parsed again next pulse. Returns the existing open wants (row order),
+    then the ones created now. Needs the native NodeStore (wants_scan) and a vector DB with a dict `content`."""
+    skip_events: List[Tuple[str, SkippedMarker]] = []
+    done: List[Tuple[str, Tuple[int, int], List[str]]] = []
+    with _cc_mutation_lock(graph):
+        open_wants: List[Dict[str, Any]] = []
+        if graph is None:
+            return open_wants
+        nodes = graph.nodes
+        if not hasattr(nodes, "wants_scan"):
+            raise RuntimeError("CC_NG_WANTS_SCAN_NATIVE needs the native NodeStore with wants_scan (#1215)")
+        if vector_db is None:
+            want_ids, todo = nodes.wants_scan({})
+        else:
+            content, vlock = getattr(vector_db, "content", None), getattr(vector_db, "_lock", None)
+            if not isinstance(content, dict) or vlock is None:
+                raise RuntimeError("CC_NG_WANTS_SCAN_NATIVE needs a vector DB with a dict content and _lock (#1215)")
+            with vlock:
+                want_ids, todo = nodes.wants_scan(content)
+        for wid in want_ids:
+            meta = getattr(nodes.get(wid), "metadata", None) or {}
+            if meta.get("want_state", "open") == "open":
+                open_wants.append({"id": wid, "text": meta.get("want_text", ""),
+                                   "provenance": meta.get("provenance"),
+                                   "state": "open", "source": meta.get("source_node")})
+        syn_attempted = syn_failed = 0
+        syn_exc_types: List[str] = []
+        create_attempted = create_failed = 0
+        create_exc_types: List[str] = []
+        for nid, content_text, fp in todo:
+            parsed = parse_wants(content_text)
+            skip_events.extend((nid, sk) for sk in parsed.skipped)
+            produced: List[str] = []
+            complete = True
+            for want in parsed.wants:
+                want_id = want.want_id
+                produced.append(want_id)
+                if want_id in graph.nodes:
+                    continue
+                try:
+                    create_attempted += 1
+                    graph.create_node(node_id=want_id, metadata={
+                        "kind": "want", "want_text": want.text, "want_state": "open",
+                        "provenance": provenance, "source_node": nid,
+                        "creation_mode": "conversational",
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    # #915, as surface_wants: per want, counted, class name only; retried next pulse (not recorded).
+                    create_failed += 1
+                    complete = False
+                    if type(exc).__name__ not in create_exc_types:
+                        create_exc_types.append(type(exc).__name__)
+                    continue
+                try:
+                    syn_attempted += 1
+                    graph.create_synapse(nid, want_id, weight=0.3)
+                except Exception as syn_exc:  # noqa: BLE001
+                    syn_failed += 1
+                    if type(syn_exc).__name__ not in syn_exc_types:
+                        syn_exc_types.append(type(syn_exc).__name__)
+                open_wants.append({"id": want_id, "text": want.text,
+                                   "provenance": provenance, "state": "open", "source": nid})
+            if complete:
+                done.append((nid, fp, produced))
+        _cc_report_want_create_failures("surface_wants", create_attempted, create_failed, create_exc_types)
+        _cc_report_want_synapse_failures("surface_wants", syn_attempted, syn_failed, syn_exc_types)
+    deferred = _log_want_skips(skip_events)
+    done = [d for d in done if d[0] not in deferred]
+    if done:
+        with _cc_mutation_lock(graph):   # the record is NodeStore state: written under the same lock as the walk
+            nodes.wants_scan_done(done)
+    return open_wants
+
 
 
 def _cc_report(callback: Optional[Any], *args: Any) -> None:
