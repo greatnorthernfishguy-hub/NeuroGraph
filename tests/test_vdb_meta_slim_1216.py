@@ -10,6 +10,8 @@
 # Why:  spec docs/superpowers/specs/2026-11-06-node-metadata-and-text-in-rust-design.md S1 / §5.
 # How:  a real neuro_foundation.Graph (native NodeStore) + universal_ingestor.SimpleVectorDB, deposits through the
 #       journalled _CCConversationalDualPassEco; the base organism is loaded from git (NG_VDB_SLIM_BASE_REV, e2f93d4).
+# [2026-11-06] DudeMan CC — review (Grok 4.7) I1: _tree_concept kept (Lenia's tree/forest split reads it from the
+#   vector DB); the tests pin it per entry.
 # -------------------
 import importlib.util
 import os
@@ -100,7 +102,8 @@ def test_on_keeps_the_graph_and_the_text_and_slims_only_the_entry_metadata(monke
     assert set(on) == set(off) == {"cc:conv::f1"} | {f"cc:conv::f1::tree::{i}" for i in range(3)}
     for k in on:
         assert on[k][:2] == off[k][:2]                                  # embedding and text equal
-        assert on[k][2] == {"creation_mode": "conversational", "source": "cc_gateway"}
+        assert on[k][2] == {kk: off[k][2][kk] for kk in ("creation_mode", "source", "_tree_concept") if kk in off[k][2]}
+        assert von.get_metadata(k).get("_tree_concept") == voff.get_metadata(k).get("_tree_concept")   # Lenia
         assert "_forest_content" in gon.nodes[k].metadata               # every key still on the node
     # Josh's condition: the text is still there for a direct read and a search
     assert von.get_content("cc:conv::f1") == TURN
@@ -114,7 +117,8 @@ def test_the_load_trim_slims_old_entries_and_keeps_text(monkeypatch):
     before = {k: (vdb.embeddings[k].tobytes(), vdb.content[k]) for k in vdb.content}
     n, trimmed = ORG.cc_slim_vector_metadata(vdb)
     assert (n, trimmed) == (4, 4)
-    assert all(vdb.metadata[k] == {"creation_mode": "conversational", "source": "cc_gateway"} for k in vdb.content)
+    assert all(set(vdb.metadata[k]) <= {"creation_mode", "source", "_tree_concept"} for k in vdb.content)
+    assert [k for k in vdb.content if vdb.metadata[k].get("_tree_concept")] == [f"cc:conv::f1::tree::{i}" for i in range(3)]
     assert {k: (vdb.embeddings[k].tobytes(), vdb.content[k]) for k in vdb.content} == before
     assert "_forest_content" in g.nodes["cc:conv::f1"].metadata         # the node's dict is not the one trimmed
     assert ORG.cc_slim_vector_metadata(vdb) == (4, 0)                   # idempotent

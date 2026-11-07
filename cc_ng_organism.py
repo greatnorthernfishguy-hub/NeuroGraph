@@ -7,6 +7,9 @@
 #   available, I'm fine with that")
 # What: CC_NG_VDB_META_SLIM (default off = unchanged): the deposit gives the vector DB entry only {creation_mode, source}
 #   instead of the node's own metadata dict, and cc_slim_vector_metadata(vector_db) trims existing entries to those keys
+#   (+ _tree_concept, which Lenia reads from the vector DB: Grok 4.7 review, same day; the trim is one-way for the vector
+#   DB's copy -- the keys stay on the node). Laptop daemon only: the load trim is in the CC daemon, so the switch is not
+#   for the VPS's Path-B host (cc_ng_host inside Syl's process).
 #   (the daemon calls it once after load). The entry's text, embedding and search are untouched; every key stays on the
 #   node, where the CC readers read it.
 # Why:  measured 2026-11-06: after a restart the vector DB holds a second, stale copy of every node's metadata (~730 MB
@@ -3471,17 +3474,20 @@ def _cc_mutation_lock(graph):
 # after a restart). On: only the keys something reads from the vector DB (the daemon's admin clean). Everything else
 # stays on the node.
 VDB_META_SLIM = os.environ.get("CC_NG_VDB_META_SLIM", "0") == "1"
-_VDB_META_KEEP = ("creation_mode", "source")
+# creation_mode / source: the daemon's admin clean; _tree_concept: Lenia's tree/forest split (lenia/graph_substrate.py,
+# review 2026-11-06 I1).
+_VDB_META_KEEP = ("creation_mode", "source", "_tree_concept")
 
 
 def cc_vdb_entry_metadata(meta: Any) -> Dict[str, Any]:
-    """#1216 S1: the slim vector-DB entry metadata for a node's metadata: only creation_mode and source."""
+    """#1216 S1: the slim vector-DB entry metadata for a node's metadata: only the keys something reads from the
+    vector DB (_VDB_META_KEEP)."""
     meta = meta if isinstance(meta, dict) else {}
     return {k: meta[k] for k in _VDB_META_KEEP if k in meta}
 
 
 def cc_slim_vector_metadata(vector_db: Any) -> Tuple[int, int]:
-    """#1216 S1: trim every vector-DB entry's metadata to creation_mode / source, under the vector DB's lock. The text,
+    """#1216 S1: trim every vector-DB entry's metadata to _VDB_META_KEEP, under the vector DB's lock. The text,
     embedding and search are untouched. Returns (entries, trimmed). The host calls it once after load, when
     CC_NG_VDB_META_SLIM is on; a no-op on a vector DB without a dict `metadata`."""
     store = getattr(vector_db, "metadata", None)
