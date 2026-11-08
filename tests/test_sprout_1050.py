@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-11-05] DudeMan CC (#1212 review M1) — the window test expects no window while a prediction_error handler is registered.
 # [2026-10-08] Claude (lane sprout-1050) — CREATE: #1050 co-firing tally sprouting — equivalence, rules, native == fallback
 # What: (1) keys ABSENT: the branch == the trial tip 4de1166 exactly over the P1 whole-run workload (step, Tonic ticks,
 #       recall, node churn, rewards, competition, downscale, snapshots; per-step synapse state bitwise; final checkpoint
@@ -483,7 +484,7 @@ def test_surprise_window_equals_per_prediction_path(mode, seed, heard, monkeypat
     monkeypatch.setattr(NF, "_cofire_surprise_native", counting)
     ga_heard = []
     a, (la, _), ga = run(mode, start, act, seed, prep(ga_heard))
-    assert calls["window"] > 0                                                      # the window path really ran
+    assert (calls["window"] > 0) != heard     # the window ran -- except while a prediction_error handler is registered
     monkeypatch.setattr(NF, "_cofire_surprise_native", lambda store: None)
     gb_heard = []
     b, (lb, _), gb = run(mode, start, act, seed, prep(gb_heard))
