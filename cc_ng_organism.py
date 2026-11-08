@@ -16,6 +16,23 @@
 #   _step_lock, to find 10 wants that already exist; recalls queue behind it (#1161).
 # How:  spec docs/superpowers/specs/2026-11-06-wants-scan-incremental-design.md; tests/test_wants_scan_1215.py (on = off
 #   after every pass of a scripted sequence, and off = e2f93d4). Needs ng_tract with NodeStore.wants_scan.
+# [2026-11-06] DudeMan CC (Claude Opus 5.5, laptop; #1216 S1; Josh 2026-11-06 "As long as ... the text is still
+#   available, I'm fine with that")
+# What: CC_NG_VDB_META_SLIM (default off = unchanged): the deposit gives the vector DB entry only {creation_mode, source}
+#   instead of the node's own metadata dict, and cc_slim_vector_metadata(vector_db) trims existing entries to those keys
+#   (+ _tree_concept, which Lenia reads from the vector DB: Grok 4.7 review, same day; the trim is one-way for the vector
+#   DB's copy -- the keys stay on the node). Laptop daemon only: the load trim is in the CC daemon, so the switch is not
+#   for the VPS's Path-B host (cc_ng_host inside Syl's process).
+#   (the daemon calls it once after load). The entry's text, embedding and search are untouched; every key stays on the
+#   node, where the CC readers read it.
+# Why:  measured 2026-11-06: after a restart the vector DB holds a second, stale copy of every node's metadata (~730 MB
+#   of Python objects: _forest_content 459 MB, poincare_dir 268 MB) that nothing on the CC side reads; only the admin
+#   clean reads creation_mode / source from it. Spec docs/superpowers/specs/2026-11-06-node-metadata-and-text-in-rust-
+#   design.md S1.
+# How:  one helper (cc_vdb_entry_metadata) for both paths; tests/test_vdb_meta_slim_1216.py.
+# [2026-11-08] DudeMan CC (Josh 2026-11-08 "Day test, please") — MERGE for the 11-08 go-live: #1215 (live 09:13) + #1212
+#   surprise slot (28c5ce4, switch CC_NG_SURPRISE_SLOT, off until its day A/B) + #1216 S1 (9dca5be, CC_NG_VDB_META_SLIM);
+#   each stays behind its own switch; only this header conflicted.
 # [2026-10-24] Claude Code (Opus 5.5, laptop; #1173 law review C-2; Josh 2026-10-24 ~00:15 "I say fix everything first. Go
 #   ahead and narrow it, I suppose. Seems like it's along the lines of how biology deals with it")
 # What: the bind's reinforce-on-recurrence (CC_NG_BIND_REINFORCE_EXISTING, still default OFF) is NARROWED: (1) scope =
@@ -3584,6 +3601,39 @@ def _cc_mutation_lock(graph):
     return nullcontext() if graph is None else graph._step_lock
 
 
+# #1216 S1: the vector DB entry's metadata. Off: the node's own dict (shared while the process runs, a separate stale copy
+# after a restart). On: only the keys something reads from the vector DB (the daemon's admin clean). Everything else
+# stays on the node.
+VDB_META_SLIM = os.environ.get("CC_NG_VDB_META_SLIM", "0") == "1"
+# creation_mode / source: the daemon's admin clean; _tree_concept: Lenia's tree/forest split (lenia/graph_substrate.py,
+# review 2026-11-06 I1).
+_VDB_META_KEEP = ("creation_mode", "source", "_tree_concept")
+
+
+def cc_vdb_entry_metadata(meta: Any) -> Dict[str, Any]:
+    """#1216 S1: the slim vector-DB entry metadata for a node's metadata: only the keys something reads from the
+    vector DB (_VDB_META_KEEP)."""
+    meta = meta if isinstance(meta, dict) else {}
+    return {k: meta[k] for k in _VDB_META_KEEP if k in meta}
+
+
+def cc_slim_vector_metadata(vector_db: Any) -> Tuple[int, int]:
+    """#1216 S1: trim every vector-DB entry's metadata to _VDB_META_KEEP, under the vector DB's lock. The text,
+    embedding and search are untouched. Returns (entries, trimmed). The host calls it once after load, when
+    CC_NG_VDB_META_SLIM is on; a no-op on a vector DB without a dict `metadata`."""
+    store = getattr(vector_db, "metadata", None)
+    lock = getattr(vector_db, "_lock", None)
+    if type(store) is not dict or lock is None:
+        return 0, 0
+    trimmed = 0
+    with lock:
+        for eid, md in store.items():
+            if isinstance(md, dict) and any(k not in _VDB_META_KEEP for k in md):
+                store[eid] = cc_vdb_entry_metadata(md)   # replaces the value only: the dict's size is unchanged
+                trimmed += 1
+        return len(store), trimmed
+
+
 def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
                              index_in_recall=True):
     """Deposit ONE experiential memory node into both the SNN graph and the
@@ -3618,7 +3668,8 @@ def _cc_deposit_memory_node(graph, vector_db, node_id, embedding, content, meta,
         if index_in_recall:
             try:
                 vector_db.insert(id=node_id, embedding=embedding, content=content,
-                                  metadata=node.metadata)
+                                  metadata=(cc_vdb_entry_metadata(node.metadata) if VDB_META_SLIM
+                                            else node.metadata))
             except Exception as exc:
                 # #915: fixed reason code + the exception CLASS name only -- str(exc) / the node id can carry user words.
                 logger.warning("CC recall insert failed: reason=recall_insert_failed exc_type=%s", type(exc).__name__)
