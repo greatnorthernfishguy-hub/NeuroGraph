@@ -33,6 +33,19 @@
 # [2026-11-08] DudeMan CC (Josh 2026-11-08 "Day test, please") — MERGE for the 11-08 go-live: #1215 (live 09:13) + #1212
 #   surprise slot (28c5ce4, switch CC_NG_SURPRISE_SLOT, off until its day A/B) + #1216 S1 (9dca5be, CC_NG_VDB_META_SLIM);
 #   each stays behind its own switch; only this header conflicted.
+# [2026-10-31] DudeMan CC (Claude Opus 5.5, laptop; lane concepts-stage1, #1203; Josh 2026-10-31 "You are a go")
+#   — #1173 reinforce-on-recurrence TRANSPLANTED onto the S13 copy-run line (no merge, no cherry-pick).
+#   SUPERSEDED the same evening: the live tip 9aeed40 was then MERGED into this line (Josh 2026-10-31 "Yeah, let's do
+#   it"), so the copy runs carry the live code in full; the transplanted #1173 pieces coincide with the merged ones.
+# What: the #1173 block (cc_bind_reinforce_enabled/_params, _cc_env_float, _cc_soft_bound_step, _cc_is_bind_tree_synapse,
+#   _cc_reinforce_synapse/_hyperedge), the reinforcing _cc_bind_conversational_topology, the rollback's reinforcement undo
+#   and the dual pass's counters, byte-for-byte from the live line's final #1173 state (8bea79e); cc_topology_merge.py
+#   whole from 8bea79e (only #1173 ever changed it).
+# Why: concept formation stage 1 tests on a copy arm with #1173 ON (its soak), but the copy line (41427fa) predates #1173;
+#   a merge or cherry-pick would also bring protected openclaw_hook.py, vendored ng_embed.py/ng_tract_bridge.py and the
+#   #920/#1176 drain work. Switch default OFF: byte-identical behaviour.
+# How: tests/test_cc_bind_reinforce_1173.py (19 pass) + the copy line's dual-pass/atomic/capture/drain suites (no new
+#   failure vs baseline).
 # [2026-10-24] Claude Code (Opus 5.5, laptop; #1173 law review C-2; Josh 2026-10-24 ~00:15 "I say fix everything first. Go
 #   ahead and narrow it, I suppose. Seems like it's along the lines of how biology deals with it")
 # What: the bind's reinforce-on-recurrence (CC_NG_BIND_REINFORCE_EXISTING, still default OFF) is NARROWED: (1) scope =
@@ -1801,6 +1814,7 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import copy
 import os
 import re
 import sys
@@ -3851,6 +3865,9 @@ class _CCConversationalDualPassEco:
         graph, vdb = self._graph, self._vector_db
         ok = True
         with _cc_mutation_lock(graph):
+            # [2026-10-31] #1203: concept writes came last (after the bind), so they are undone first.
+            if self.topology.get("concepts"):
+                ok = _cc_concept_undo(graph, vdb, self.topology["concepts"]) and ok
             # #1173: a reinforcement of a PRE-EXISTING edge is undone first, last-in-first-out, and only while the edge
             # still holds what this call wrote (a change another writer made since -- STDP in a step -- is left alone).
             for sid, before_w, before_peak, wrote_w, wrote_peak in reversed(self.topology.get("reinforced_synapses", ())):
@@ -4024,6 +4041,522 @@ def cc_bind_reinforce_params(graph=None) -> dict:
                                     1.0, _CC_HE_MEMBER_WEIGHT_CAP),
     }
 
+
+
+# ---- #1203 concept formation stage 1 (2026-10-31, Josh "You are a go"): one concept node per recurring concept ----
+# Spec: docs/superpowers/specs/2026-10-31-concept-formation-and-recall-design.md (§5.1 recognition at encoding, §5.2 the
+# concept node, §10 calls). LAW 5: every knob an env var read per call; CC_NG_CONCEPTS default OFF = byte-identical.
+#   CC_NG_CONCEPT_MATCH             centred cosine for "the same concept", default 0.60 (NG-Lite's novelty rule)
+#   CC_NG_CONCEPT_DRIFT             prototype step toward a recognised member, default 0.05
+#   CC_NG_CONCEPT_ETA / _CEILING    soft bound for tree<->concept links, defaults 0.2 / 1.0
+#   CC_NG_CONCEPT_BIRTH_UP / _DOWN  link weights at birth, tree->concept 0.2, concept->tree 0.15 (the bind's forest<->tree)
+#   CC_NG_CONCEPT_REACTIVATE        reactivation of a recognised concept, as a multiple of what brings it from its
+#                                   current voltage to its own firing threshold, default 1.1 (it fires with the turn)
+#   CC_NG_CONCEPT_BACKLOG_PER_SLEEP trees recognised per sleep from the existing past, default 200
+#   CC_NG_CONCEPT_BACKLOG_BATCH     trees EXAMINED per step-lock hold in that backlog, default 10
+
+
+def cc_concepts_enabled() -> bool:
+    """CC_NG_CONCEPTS (LAW 5; read per call). Default off."""
+    return os.environ.get("CC_NG_CONCEPTS", "0").strip() not in ("0", "", "false", "False", "no")
+
+
+def _cc_env_int(name, default, lo, hi):
+    """An int knob from env, clamped to [lo, hi]; absent or unparsable -> default."""
+    try:
+        v = int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, lo), hi)
+
+
+def cc_concept_params() -> dict:
+    """The concept-formation knobs (LAW 5 env, read per call). See the block comment above."""
+    return {
+        "match": _cc_env_float("CC_NG_CONCEPT_MATCH", 0.60, 0.30, 0.95),
+        "drift": _cc_env_float("CC_NG_CONCEPT_DRIFT", 0.05, 0.0, 0.5),
+        "eta": _cc_env_float("CC_NG_CONCEPT_ETA", 0.2, 0.0, 1.0),
+        "ceiling": _cc_env_float("CC_NG_CONCEPT_CEILING", 1.0, 0.2, 5.0),
+        "birth_up": _cc_env_float("CC_NG_CONCEPT_BIRTH_UP", 0.2, 0.01, 1.0),
+        "birth_down": _cc_env_float("CC_NG_CONCEPT_BIRTH_DOWN", 0.15, 0.01, 1.0),
+        "reactivate": _cc_env_float("CC_NG_CONCEPT_REACTIVATE", 1.1, 0.0, 5.0),
+        "backlog": _cc_env_int("CC_NG_CONCEPT_BACKLOG_PER_SLEEP", 200, 0, 100000),
+        "batch": _cc_env_int("CC_NG_CONCEPT_BACKLOG_BATCH", 10, 1, 1000),
+    }
+
+
+# The concept index (spec §5.1): the concept prototypes, centred and normalised, matched by one matrix product. It is a
+# cache of the vector DB's own concept rows (metadata "_cc_concept"), never a second store: it is valid only for the same
+# vector DB object, while the module's concept-write counter is unchanged, and while every cached row is still the very
+# array the vector DB holds (SimpleVectorDB.insert and .load replace arrays, so a reload or replacement rebuilds it).
+_CC_CONCEPT_INDEX = {"vdb": None, "counter": -1, "ids": [], "arrays": [], "mat": None, "dim": None,
+                     "buf": None, "hold": None, "vdb_len": -1}
+_CC_CONCEPT_WRITES = [0]
+# The current step-lock hold of a recognition pass (a fresh token per hold, None outside). Under the step lock only the
+# concept code writes concept rows, and it keeps the index in step itself, so the per-row identity check runs once per
+# hold instead of once per lookup (measured: it was a third of the backlog's lock time).
+_CC_CONCEPT_HOLD = [None]
+
+
+def _cc_concept_bump():
+    """Every concept write and every rollback bumps this; a stale index is then rebuilt on the next lookup."""
+    _CC_CONCEPT_WRITES[0] += 1
+
+
+def _cc_concept_centre(dim):
+    """The embedder's mean-centring vector when its dimension matches, else zeros (centring off). Read-only use of the
+    vendored ng_embed (LAW 2: nothing in it changes)."""
+    import numpy as _np
+    try:
+        import ng_embed as _ne
+        c = _np.asarray(_ne.embedding_centre(), dtype=_np.float32)
+        if c.shape == (dim,):
+            return c
+    except Exception:  # noqa: BLE001 -- no embedder / a stub module: plain cosine
+        pass
+    return _np.zeros(dim, dtype=_np.float32)
+
+
+def _cc_centred_unit(vec, centre):
+    import numpy as _np
+    v = _np.asarray(vec, dtype=_np.float32) - centre
+    n = float(_np.linalg.norm(v))
+    return v / n if n > 1e-12 else None
+
+
+def _cc_concept_index(vector_db):
+    """The valid index for `vector_db` (rebuilt when stale). Returns the cache dict."""
+    import numpy as _np
+    idx = _CC_CONCEPT_INDEX
+    emb = getattr(vector_db, "embeddings", {})
+    hold = _CC_CONCEPT_HOLD[0]
+    valid = (idx["vdb"] is vector_db and idx["counter"] == _CC_CONCEPT_WRITES[0]
+             and idx["vdb_len"] == len(emb))   # a row added or removed by any writer (load, merge, deposit) rebuilds
+    if valid and not (hold is not None and idx["hold"] is hold):
+        valid = all(emb.get(cid) is arr for cid, arr in zip(idx["ids"], idx["arrays"]))
+    if valid:
+        idx["hold"] = hold
+        return idx
+    ids, arrays, rows, dim = [], [], [], None
+    meta = getattr(vector_db, "metadata", {})
+    for cid, m in list(meta.items()):
+        if not (isinstance(m, dict) and m.get("_cc_concept")):
+            continue
+        arr = emb.get(cid)
+        if arr is None:
+            continue
+        a = _np.asarray(arr)
+        if a.ndim != 1:
+            continue
+        if dim is None:
+            dim = a.shape[0]
+        if a.shape[0] != dim:
+            continue
+        ids.append(cid)
+        arrays.append(arr)
+        rows.append(a)
+    mat = None
+    if rows:
+        centre = _cc_concept_centre(dim)
+        cen = [_cc_centred_unit(r, centre) for r in rows]
+        keep = [i for i, c in enumerate(cen) if c is not None]
+        ids = [ids[i] for i in keep]
+        arrays = [arrays[i] for i in keep]
+        if keep:
+            buf = _np.empty((max(64, 2 * len(keep)), dim), dtype=_np.float32)
+            buf[:len(keep)] = _np.stack([cen[i] for i in keep])
+            mat = buf[:len(keep)]
+    else:
+        buf = None
+    if mat is None:
+        buf = None
+    idx.update(vdb=vector_db, counter=_CC_CONCEPT_WRITES[0], ids=ids, arrays=arrays, mat=mat, dim=dim, buf=buf,
+               hold=_CC_CONCEPT_HOLD[0], vdb_len=len(emb))
+    return idx
+
+
+def _cc_concept_nearest(vector_db, vec, match):
+    """The best concept for `vec` and its centred cosine when >= match, else None. A vector whose dimension differs from
+    the concepts' is not matched (skipped, not raised)."""
+    import numpy as _np
+    idx = _cc_concept_index(vector_db)
+    if idx["mat"] is None:
+        return None
+    q = _np.asarray(vec, dtype=_np.float32)
+    if q.ndim != 1 or q.shape[0] != idx["dim"]:
+        return None
+    qc = _cc_centred_unit(q, _cc_concept_centre(idx["dim"]))
+    if qc is None:
+        return None
+    sims = idx["mat"] @ qc
+    i = int(_np.argmax(sims))
+    sim = float(sims[i])
+    return (idx["ids"][i], sim) if sim >= match else None
+
+
+def _cc_concept_index_put(vector_db, cid):
+    """After a concept row was written: refresh that one row in a valid index in place (no rebuild), then bump."""
+    import numpy as _np
+    idx = _CC_CONCEPT_INDEX
+    emb = getattr(vector_db, "embeddings", {})
+    hold = _CC_CONCEPT_HOLD[0]
+    ok = idx["vdb"] is vector_db and idx["counter"] == _CC_CONCEPT_WRITES[0]
+    if ok and idx["vdb_len"] != len(emb) and not (cid not in idx["ids"] and idx["vdb_len"] + 1 == len(emb)):
+        ok = False   # something besides this concept row changed the store
+    if ok and not (hold is not None and idx["hold"] is hold):
+        ok = all(emb.get(c) is a for c, a in zip(idx["ids"], idx["arrays"]) if c != cid)
+    _cc_concept_bump()
+    arr = emb.get(cid)
+    if not ok or arr is None:
+        return
+    a = _np.asarray(arr)
+    if idx["dim"] is None:
+        idx["dim"] = a.shape[0]
+    if a.ndim != 1 or a.shape[0] != idx["dim"]:
+        return
+    row = _cc_centred_unit(a, _cc_concept_centre(idx["dim"]))
+    if row is None:
+        return
+    if cid in idx["ids"]:
+        i = idx["ids"].index(cid)
+        idx["arrays"][i] = arr
+        idx["mat"][i] = row
+    else:
+        n = len(idx["ids"])
+        buf = idx["buf"]
+        if buf is None or n >= buf.shape[0]:   # grow by doubling: amortised O(1) per new concept
+            nb = _np.empty((max(64, 2 * (n + 1)), idx["dim"]), dtype=_np.float32)
+            if n:
+                nb[:n] = idx["mat"]
+            buf = idx["buf"] = nb
+        buf[n] = row
+        idx["ids"].append(cid)
+        idx["arrays"].append(arr)
+        idx["mat"] = buf[:n + 1]
+    idx["counter"] = _CC_CONCEPT_WRITES[0]
+    idx["hold"] = hold
+    idx["vdb_len"] = len(emb)
+
+
+_CC_CONCEPT_ABSENT = object()
+
+
+def _cc_concept_journal_add(journal, entry):
+    """Record ONE concept write before it is made (the undo list is replayed in reverse)."""
+    if journal is not None:
+        journal.append(entry)
+
+
+def _cc_concept_set_meta(node, nid, key, value, journal):
+    old = copy.deepcopy(node.metadata[key]) if key in node.metadata else _CC_CONCEPT_ABSENT
+    _cc_concept_journal_add(journal, ("meta", nid, key, old))
+    node.metadata[key] = value
+
+
+def _cc_concept_undo(graph, vector_db, entries) -> bool:
+    """Undo concept writes in reverse order (encoding: eco.rollback; sleep: one tree's own list). True when every
+    step succeeded. A reinforcement is restored only while the synapse still holds what we wrote."""
+    ok = True
+    for e in reversed(list(entries or ())):
+        try:
+            kind = e[0]
+            if kind == "node":
+                if e[1] in graph.nodes:
+                    graph.remove_node(e[1])
+                if vector_db.get(e[1]) is not None:
+                    vector_db.delete(e[1])
+            elif kind == "syn_pair":   # every synapse on the pair that was not there before the create
+                _k, pre, post, before_ids = e
+                for sid in list(getattr(graph, "_outgoing", {}).get(pre) or ()):
+                    syn = graph.synapses.get(sid)
+                    if syn is not None and syn.post_node_id == post and sid not in before_ids:
+                        graph.remove_synapse(sid)
+            elif kind == "detach":     # node metadata that was the vector row's own dict before recognition
+                node = graph.nodes.get(e[1])
+                if node is not None:
+                    node.metadata = e[2]
+            elif kind == "reinforce":
+                _k, sid, before_w, before_peak, wrote_w = e
+                syn = graph.synapses.get(sid)
+                if syn is not None and float(syn.weight) == wrote_w:
+                    syn.weight, syn.peak_weight = before_w, before_peak
+            elif kind == "proto":
+                _k, cid, old_vec, old_content, old_meta = e
+                vector_db.insert(cid, old_vec, old_content, copy.deepcopy(old_meta))
+            elif kind == "meta":
+                _k, nid, key, old = e
+                node = graph.nodes.get(nid)
+                if node is not None:
+                    if old is _CC_CONCEPT_ABSENT:
+                        node.metadata.pop(key, None)
+                    else:
+                        node.metadata[key] = old
+            elif kind == "volt":
+                node = graph.nodes.get(e[1])
+                if node is not None:
+                    node.voltage = e[2]
+        except Exception:  # noqa: BLE001 -- keep undoing; the caller reports a partial rollback
+            ok = False
+    _cc_concept_bump()
+    return ok
+
+
+def _cc_concept_link(graph, pre, post, birth, params, journal):
+    """Create the tree<->concept synapse, or strengthen the existing one with the soft bound (never above max_weight)."""
+    from cc_topology_merge import find_synapse_id
+    sid = find_synapse_id(graph, pre, post, match=_cc_is_bind_tree_synapse)
+    if sid is None:
+        before = frozenset(x for x in (getattr(graph, "_outgoing", {}).get(pre) or ())
+                           if getattr(graph.synapses.get(x), "post_node_id", None) == post)
+        _cc_concept_journal_add(journal, ("syn_pair", pre, post, before))   # journalled BEFORE the write
+        graph.create_synapse(pre, post, weight=birth)
+        return "created"
+    syn = graph.synapses[sid]
+    before_w, before_peak = float(syn.weight), float(syn.peak_weight)
+    new_w = max(0.0, min(_cc_soft_bound_step(before_w, params["eta"], min(params["ceiling"], float(syn.max_weight))),
+                         float(syn.max_weight)))
+    if new_w == before_w:
+        return "held"
+    _cc_concept_journal_add(journal, ("reinforce", sid, before_w, before_peak, new_w))
+    syn.weight = new_w
+    if new_w > before_peak:
+        syn.peak_weight = new_w
+    return "reinforced"
+
+
+def _cc_concept_complete(graph, tree_id, cid) -> bool:
+    """A recognition mark counts only while its concept and both links still exist."""
+    if cid not in graph.nodes:
+        return False
+    syns = graph.synapses
+    up = down = False
+    for sid in getattr(graph, "_outgoing", {}).get(tree_id) or ():        # the tree's own out-links (small)
+        x = syns.get(sid)
+        if x is not None and x.post_node_id == cid and _cc_is_bind_tree_synapse(x):
+            up = True
+            break
+    for sid in getattr(graph, "_incoming", {}).get(tree_id) or ():        # the tree's own in-links (small)
+        x = syns.get(sid)
+        if x is not None and x.pre_node_id == cid and _cc_is_bind_tree_synapse(x):
+            down = True
+            break
+    return up and down
+
+
+def _cc_tree_text(graph, vector_db, tree_id):
+    node = graph.nodes.get(tree_id)
+    t = (node.metadata.get("_concept") if node is not None else None)
+    if not t:
+        row = vector_db.get(tree_id) or {}
+        t = row.get("content") or tree_id
+    return str(t)[:200]
+
+
+def _cc_concept_write_row(graph, vector_db, cid, vec, journal):
+    """Write the concept's vector row (content = its label, metadata a COPY of the node's) and its poincare_dir."""
+    import numpy as _np
+    from neuro_foundation import pack_poincare_dir
+    node = graph.nodes[cid]
+    old = vector_db.get(cid)
+    if old is not None:
+        _cc_concept_journal_add(journal, ("proto", cid, _np.array(old["embedding"]), old["content"],
+                                          copy.deepcopy(old["metadata"])))
+    _cc_concept_set_meta(node, cid, "poincare_dir", pack_poincare_dir(_cc_embed_to_poincare_dir(vec)), journal)
+    vector_db.insert(cid, _np.asarray(vec, dtype=_np.float32), node.metadata.get("_label", ""),
+                     copy.deepcopy({k: v for k, v in node.metadata.items() if k != "poincare_dir"}))
+    _cc_concept_index_put(vector_db, cid)
+
+
+def _cc_concept_recognize_tree(graph, vector_db, tree_id, params, journal, encoding=False) -> str:
+    """Recognise one tree node (spec §5.1): link it to the nearest concept (and strengthen and nudge that concept), or
+    found a new concept from it. The tree itself only gains `_cc_concept_id` (or `_cc_concept_skip`). Returns
+    "matched", "created", "repaired" or "skipped". Every write is journalled first. Caller holds the step lock."""
+    import hashlib as _hl
+    import numpy as _np
+    node = graph.nodes.get(tree_id)
+    if node is None:
+        return "skipped"
+    row = vector_db.get(tree_id)
+    vec = None if row is None else row.get("embedding")
+    if vec is None:
+        if not node.metadata.get("_cc_concept_skip"):
+            _cc_concept_set_meta(node, tree_id, "_cc_concept_skip", "no_vector", journal)
+        return "skipped"
+    vec = _np.asarray(vec, dtype=_np.float32)
+    mark = node.metadata.get("_cc_concept_id")
+    if mark and _cc_concept_complete(graph, tree_id, mark):
+        if not encoding:
+            return "skipped"   # sleep: already recognised
+        # encoding: the SAME text again (content-hashed ids) is a genuine recurrence -- credit, strengthen, reactivate
+        cid = mark
+        cnode = graph.nodes[cid]
+        _cc_concept_set_meta(cnode, cid, "_cc_recognitions", int(cnode.metadata.get("_cc_recognitions", 0)) + 1, journal)
+        _cc_concept_link(graph, tree_id, cid, params["birth_up"], params, journal)
+        _cc_concept_link(graph, cid, tree_id, params["birth_down"], params, journal)
+        _cc_concept_reactivate(graph, cid, params, journal)
+        return "recurred"
+    if mark and mark in graph.nodes:
+        cid, outcome = mark, "repaired"
+    else:
+        hit = _cc_concept_nearest(vector_db, vec, params["match"])
+        if hit is None:
+            idx = _CC_CONCEPT_INDEX   # just refreshed by _cc_concept_nearest
+            if idx["vdb"] is vector_db and idx["dim"] is not None and vec.shape[0] != idx["dim"]:
+                _cc_concept_set_meta(node, tree_id, "_cc_concept_skip", "dim_mismatch", journal)
+                return "skipped"
+        if hit is not None:
+            cid, outcome = hit[0], "matched"
+        else:
+            cid = "cc:concept::" + _hl.sha1(tree_id.encode("utf-8")).hexdigest()[:16]
+            outcome = "repaired" if cid in graph.nodes else "created"
+    if outcome == "created":
+        label = _cc_tree_text(graph, vector_db, tree_id)
+        meta = {"cc": True, "_cc_concept": True, "creation_mode": "concept", "_label": label,
+                "_cc_label_from": tree_id, "_cc_label_sim": 1.0, "_cc_recognitions": 1, "_cc_founded_by": tree_id}
+        _cc_concept_journal_add(journal, ("node", cid))   # journalled BEFORE the write
+        graph.create_node(node_id=cid, metadata=dict(meta))
+        _cc_concept_write_row(graph, vector_db, cid, vec, journal)
+    elif outcome == "matched":
+        cnode = graph.nodes[cid]
+        proto = _np.asarray(vector_db.get(cid)["embedding"], dtype=_np.float32)
+        new = (1.0 - params["drift"]) * proto + params["drift"] * vec
+        n = float(_np.linalg.norm(new))
+        new = new / n if n > 1e-12 else proto
+        _cc_concept_set_meta(cnode, cid, "_cc_recognitions", int(cnode.metadata.get("_cc_recognitions", 0)) + 1, journal)
+        centre = _cc_concept_centre(new.shape[0])
+        pc = _cc_centred_unit(new, centre)
+
+        def _sim(v):
+            vc = _cc_centred_unit(v, centre)
+            return float(vc @ pc) if (vc is not None and pc is not None) else -1.0
+        holder = cnode.metadata.get("_cc_label_from")
+        hrow = vector_db.get(holder) if holder else None
+        holder_sim = _sim(_np.asarray(hrow["embedding"], dtype=_np.float32)) if hrow is not None else -1.0
+        mine = _sim(vec)
+        if mine > holder_sim:
+            _cc_concept_set_meta(cnode, cid, "_label", _cc_tree_text(graph, vector_db, tree_id), journal)
+            _cc_concept_set_meta(cnode, cid, "_cc_label_from", tree_id, journal)
+            _cc_concept_set_meta(cnode, cid, "_cc_label_sim", mine, journal)
+        else:
+            _cc_concept_set_meta(cnode, cid, "_cc_label_sim", holder_sim, journal)
+        _cc_concept_write_row(graph, vector_db, cid, new, journal)
+    _cc_concept_link(graph, tree_id, cid, params["birth_up"], params, journal)
+    _cc_concept_link(graph, cid, tree_id, params["birth_down"], params, journal)
+    if node.metadata.get("_cc_concept_id") != cid:
+        _cc_concept_detach_row_meta(graph, vector_db, tree_id, node, journal)
+        _cc_concept_set_meta(node, tree_id, "_cc_concept_id", cid, journal)
+    if outcome != "repaired":
+        _cc_concept_reactivate(graph, cid, params, journal)
+    return outcome
+
+
+def _cc_concept_reactivate(graph, cid, params, journal):
+    """Make the recognised concept fire with the turn (spec §5.1): a stimulus of `reactivate` x what brings it from
+    its current voltage to its own threshold (graph.stimulate scales by intrinsic_excitability)."""
+    if params["reactivate"] <= 0.0:
+        return
+    cnode = graph.nodes[cid]
+    exc = max(float(getattr(cnode, "intrinsic_excitability", 1.0) or 1.0), 1e-6)
+    need = max(0.0, float(cnode.threshold) - float(cnode.voltage)) / exc
+    if need <= 0.0:
+        return
+    _cc_concept_journal_add(journal, ("volt", cid, float(cnode.voltage)))
+    graph.stimulate(cid, params["reactivate"] * need)
+
+
+def _cc_concept_detach_row_meta(graph, vector_db, tree_id, node, journal):
+    """Deposits alias a node's metadata with its vector row's: give the node its own dict before recognition adds a
+    key, so the episode's vector row is unchanged (Global Constraint: the episode is never changed)."""
+    try:
+        row_meta = vector_db.metadata.get(tree_id)
+    except Exception:  # noqa: BLE001
+        row_meta = None
+    if row_meta is not None and node.metadata is row_meta:
+        _cc_concept_journal_add(journal, ("detach", tree_id, node.metadata))
+        node.metadata = dict(node.metadata)
+
+
+def _cc_concept_recognize(graph, vector_db, eco, tree_ids, state) -> dict:
+    """Recognition at encoding for one turn's trees (after the bind; inside the dual pass's try, so a raise rolls the
+    whole turn back through eco.rollback). Writes are journalled in eco.topology["concepts"]."""
+    params = cc_concept_params()
+    journal = eco.topology.setdefault("concepts", [])
+    counts = {"matched": 0, "created": 0, "repaired": 0, "recurred": 0, "skipped": 0, "concept_ids": []}
+    with _cc_mutation_lock(graph):
+        _CC_CONCEPT_HOLD[0] = object()
+        _t0 = time.monotonic()
+        try:
+            outs = [(tid, _cc_concept_recognize_tree(graph, vector_db, tid, params, journal, encoding=True))
+                    for tid in tree_ids]
+        finally:
+            _CC_CONCEPT_HOLD[0] = None
+            _held = time.monotonic() - _t0   # Law Enforcer condition 1: the turn-path hold, read by the copy census
+            _prev = graph.__dict__.get("_cc_concept_hold", (0.0, 0.0))
+            graph.__dict__["_cc_concept_hold"] = (_held, max(_held, _prev[1]))
+        for tid, out in outs:
+            counts[out] += 1
+            cid = graph.nodes[tid].metadata.get("_cc_concept_id") if tid in graph.nodes else None
+            if cid and cid not in counts["concept_ids"]:
+                counts["concept_ids"].append(cid)
+    try:
+        for k in ("matched", "created", "repaired", "recurred", "skipped"):
+            state[f"concepts_{k}_total"] = int(state.get(f"concepts_{k}_total", 0)) + counts[k]
+    except Exception:  # noqa: BLE001 -- bookkeeping only
+        pass
+    return counts
+
+
+def cc_concept_recognize_backlog(graph, vector_db, budget, batch) -> dict:
+    """Sleep-time recognition of the EXISTING past (spec §10.1): tree nodes not yet completely recognised, oldest
+    creation_time first, at most `budget` recognitions, in holds of at most `batch` trees. Takes graph._step_lock
+    itself, briefly, per batch (the Tonic and recall get the lock between batches); the caller must NOT hold it. Each
+    tree has its own journal and is rolled back alone if it fails. A no-op when CC_NG_CONCEPTS is off."""
+    import time as _t
+    out = {"matched": 0, "created": 0, "repaired": 0, "skipped": 0, "failed": 0, "remaining": 0, "max_hold_s": 0.0}
+    if not cc_concepts_enabled() or budget <= 0:
+        return out
+    params = cc_concept_params()
+    lock = graph._step_lock
+    with lock:   # one short snapshot of the candidate ids and their ages
+        cands = []
+        for nid, node in list(graph.nodes.items()):
+            m = getattr(node, "metadata", None) or {}
+            if m.get("_tree_concept") and not m.get("_cc_concept_skip"):
+                cands.append((float(getattr(node, "creation_time", 0.0) or 0.0), nid))
+    cands.sort()
+    done, i, n = 0, 0, len(cands)
+    while i < n and done < budget:
+        t0 = _t.monotonic()
+        with lock:
+            _CC_CONCEPT_HOLD[0] = object()
+            taken = 0
+            try:
+                while i < n and taken < batch and done < budget:
+                    _ct, tid = cands[i]
+                    i += 1
+                    node = graph.nodes.get(tid)
+                    if node is None:
+                        continue
+                    taken += 1   # every EXAMINED tree counts toward the hold's batch
+                    mark = node.metadata.get("_cc_concept_id")
+                    if node.metadata.get("_cc_concept_skip") or (mark and _cc_concept_complete(graph, tid, mark)):
+                        continue
+                    journal = []
+                    try:
+                        res = _cc_concept_recognize_tree(graph, vector_db, tid, params, journal)
+                    except Exception as exc:  # noqa: BLE001 -- this tree only; the sleep goes on
+                        _cc_concept_undo(graph, vector_db, journal)
+                        out["failed"] += 1
+                        logger.warning("CC concept backlog: tree %s failed and was rolled back: %s", tid[:48], exc)
+                        continue
+                    out[res] += 1
+                    if res != "skipped":
+                        done += 1
+            finally:
+                _CC_CONCEPT_HOLD[0] = None
+        out["max_hold_s"] = max(out["max_hold_s"], _t.monotonic() - t0)
+    out["remaining"] = n - i   # candidates not yet examined (an upper bound: some may already be complete)
+    return out
 
 def _cc_soft_bound_step(w, eta, ceiling):
     """Saturating potentiation: w + eta * (ceiling - w), never below w (a recurrence does not depress)."""
@@ -4493,6 +5026,9 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
                 _bound.get("tree_pairs", 0) >= _bound["trees"] and _bound.get("hyperedge")):
             eco.topology["site"] = "bind_postcondition"
             raise RuntimeError("bind wrote less than a turn with trees needs")
+        if cc_concepts_enabled():   # [2026-10-31] #1203 stage 1: recognition at encoding (spec §5.1)
+            stage = "concepts"
+            _cc_concept_recognize(graph, vector_db, eco, list((_result or {}).get("tree_ids") or []), state)
         if _bound and ("reinforced_synapses" in _bound):
             # #1173: COUNTED (caller-owned, in-process) so the daemon's status shows the switch at work.
             try:

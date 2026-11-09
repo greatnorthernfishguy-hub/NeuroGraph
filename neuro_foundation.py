@@ -20,6 +20,14 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; #1136 merge; Josh 2026-11-09 "Proceed")
+#   What: the #1136 stability set + learning loop (branch cc-laptop-diffpc-correction-20261103) merged into the live line
+#         (1308658). One logic conflict, in _surprise_exploration: S18's rule (a RECEIVER prediction's miss wires nothing)
+#         now gates the #1212 tally window and surprise slot too; both apply only to the source-side path. A receiver
+#         miss reads recent_fired minus the expected target for its novelty count, as S18 did. _cleanup_predictions keeps
+#         both the #1212 window set-up and S19's DiffPC miss record. Everything else merged without conflict.
+#   Why:  the unified Tonic alone fails (TUGL night 2026-11-08); the S13 configuration it needs lived only on the branch.
+#   How:  merge commit; register docs/punchlist/reference/ng-go-live-register.md (2026-11-09 rulings).
 # [2026-11-05] DudeMan CC (#1212; Josh 2026-11-05 "write it up ... You have my go") — the surprise slot (config
 #   surprise_slot_enabled, absent = off = e2f93d4 exactly; surprise_slot_tol 1, surprise_topk 4)
 # What: with it on, step() records its fired nodes in the native SynapseStore by timestep, and a failed prediction's
@@ -61,6 +69,364 @@ Design principles (PRD §2.1):
 #       deep-copied and packed at every save; nothing reads it (save / restore / neurograph_migrate only).
 # How:  Graph._log_novel_sequence (the append + cap, moved out of _surprise_exploration) and _compact_novel_event (at
 #       _deserialize). Tests: tests/test_phase35.py.
+# [2026-11-04] DudeMan CC (Claude Opus 5.5, laptop; LAW 3 dead-end removal, register #1207; Josh 2026-11-04 "use all
+#   of the good work" + no objection to retiring the ruled-out rounds) — S9 and S12 removed
+# What: S9 event-scoped reward (reward_event_scoped_enabled, reward_confirm_scaling, inject_reward(post_scope=)) and S12
+#       the trace-normalised RPE commit (reward_rpe_trace_norm_*, inject_reward(trace_gain=), _s12_trace_gain) are
+#       deleted. S10's "S9 on -> S10 off" guard goes with S9. S14 / S16 left no code (arm overrides of the original
+#       eligibility_trace_tau / prediction_pre_charge_factor, which stay).
+# Why:  their own results ruled them out: S9 "right in direction, too weak" and superseded by S10 (S9 dev-log §3.1,
+#       S10 dev-log §2); S12 "not kept" (dev-log 2026-10-28 §7). LAW 3: no live-code shrapnel.
+# How:  the keys are no longer read (an old checkpoint or env carrying them is inert). Off-path bytes unchanged.
+# [2026-11-04] DudeMan CC (Claude Opus 5.5, laptop; S19 Rust-only, #1202; Josh 2026-11-03: "There isn't going to be any
+#   Python fallback… New Python is not going into the production code" / "Just focus on the Rust"; copy-run branch)
+# What: corrected DiffPC now runs entirely in ng_tract.DiffPc. Deleted here: the explained-drive ring, the voltage
+#       before/after reads around the hyperedge pass, _diffpc_classify / _record_miss / _reset_ema bodies, the
+#       plateau and its Python fallback (_diffpc_plateau_python, _diffpc_python), the stats dict. Kept: the switch
+#       (now also needs the native DiffPc + stores, else ERROR once and off), one call per hook point, S18's pending
+#       targets and rho handed over (S18's own state is still Python; register #1207 lists its port), the reset flag.
+#       Also (Josh 2026-11-03): interneurons scored for the record only; peak_weight written; excitatory synapses only;
+#       the hyperedge pass reports its own drive (evaluate_step diffpc=).
+# Why:  docs/superpowers/plans/2026-11-04-diffpc-rust-only.md.
+# How:  _diffpc_state() holds the DiffPc; delivery -> record_arrivals; detection -> classify; expiry -> record_miss;
+#       7b -> apply (record + plateau). Off and count-only bytes unchanged (tests/test_stability_s19.py).
+# [2026-11-03] DudeMan CC (Claude Opus 5.5, laptop; S19 / #1202 follow-up; Josh 2026-11-02 "DiffPC shouldn't be
+#   turned off, it should be corrected"; copy-run branch only, backup ceremony waived) — DiffPC corrected
+# What: diffpc_receiver_enabled (+ _count_only, _eta 0.5, _k 64, _window 5; NOT in DEFAULT_CONFIG; needs
+#       prediction_receiver_enabled; bad params -> ERROR once and off). DiffPC becomes the error half of S18's receiver
+#       predictions: per neuron on the arrival clock, confirmed (0) / miss (-s, at expiry) / surprise (+sigma = 1 - fr:
+#       fired, not predicted, and its explained drive -- arrivals + hyperedge injection + pattern completion over the
+#       last W ticks, simulated from rest -- could not fire it). Surprise -> a one-shot plateau on the inputs that
+#       arrived in the window, sized to raise the arrival peak toward the predicted band rho*theta, never above
+#       theta - margin. pred_error_ema = EMA of |e| (reset once at switch-on). pred_weights retired (not read or
+#       written). Count-only: today's body runs and the corrected errors are only counted.
+# Why:  docs/superpowers/specs/2026-11-02-diffpc-correction-design.md: today's DiffPC compares on the wrong clock
+#       (same step), starts from a 0.5 prior, scores causation as confirmation, and its +-0.05 trace nudge is
+#       committed with the step's global RPE sign; its per-link counters duplicate S18's expectation.
+# How:  _stab_diffpc_receiver (pure config read), an explained-drive ring fed at delivery and by hyperedge injections,
+#       _diffpc_classify / _diffpc_record_miss, native SynapseStore.diffpc_plateau (Python fallback pinned by an oracle
+#       test). Switch absent / False, and count-only, are byte-identical to 15b1958 (tests/test_stability_s19.py).
+# [2026-11-01] DudeMan CC (Claude Opus 5.5, laptop; S18 / #1202; Josh 2026-11-01 "Yeah, the design looks good"; copy-run
+#   branch only, backup ceremony waived by Josh for this branch) — receiver-side, graded predictions
+# What: prediction_receiver_enabled (+ _rho0 0.3, _k 1.0, _eta 0.002, _rho_min 0.1, _ema_alpha 0.01, _chain_floor 0.05,
+#       _margin 0.05; NOT in DEFAULT_CONFIG; bad params -> ERROR once and off): a neuron is predicted when the input
+#       pending for it charges it at least rho_T of the way to its threshold but cannot fire it alone; graded by that
+#       charge and its own record; each neuron's rho_T held so it is predicted about as often as it fires; credit by
+#       share to the converging synapses; chains gated at every hop, one branch. Off / absent = the 1d0a1a0 branch exactly.
+# Why:  docs/superpowers/specs/2026-11-01-receiver-side-prediction-design.md: the fixed prediction_threshold 3.0 lets
+#       only cap-level links predict, and such a link fires its target outright (causation, not expectation).
+#       Brain: the predictive state is subthreshold dendritic depolarization at the receiver (Larkum 1999; Bouhadjar
+#       et al. 2022 PLoS Comp Biol, with per-neuron predictive-rate homeostasis); expectation graded and local (Yamada &
+#       Chao 2026 Commun Biol).
+# How:  _stab_receiver() reads the config; _generate_predictions branches to _receiver_predictions when it is on.
+#       Same day, after the review and the S18cal calibration: per-tick simulated peak for "cannot fire it alone"; the
+#       receiver path's own table (prediction_receiver_max_active 10000); native bulk reads (ng_tract receiver_round 2:
+#       outgoing rows, node fields, the EFFECTIVE detection threshold incl. S5's AHP brake); and a receiver prediction's
+#       miss wires nothing in _surprise_exploration (Josh: wiring the predictor to every recent firer is "completely
+#       backwards"); the source-side path is unchanged.
+# [2026-10-28] Claude Code (Opus 5.5, laptop; lane stability-s13, #1136; Josh 2026-10-28 "Yes, go ahead with both") —
+#   PROTECTED (needs Josh's proceed): S13, two independent switches against the two biased terms of the reward's net
+#   weight change (dev-log 2026-10-28 S12 §5: S12cal ledger split (a) mean(R) x mean(e) -99, (b) Cov +37, (c) clip +39)
+# What: (1) reward_floor_symmetric_enabled (needs three_factor_enabled and the S13 wheel, SynapseStore.reward_floor_round
+#       >= 1, else ERROR once and off): every inject_reward synapse sweep caps |dw| at the synapse's own weight in EITHER
+#       direction (symmetric_floor=True), so the floor at 0 no longer swallows only depression. (2)
+#       reward_rpe_per_source_enabled (+ reward_rpe_source_tau 20 events; needs reward_rpe_enabled, else ERROR once and
+#       off): S10's surprise is judged per predicting node, not against one global running outcome: each resolved
+#       prediction gives hit (1 confirmed / 0 failed) and delta = hit - q_src, q_src that source node's expected hit rate
+#       (starts at the prediction's own confidence; then q += (hit - q) / tau; NOT saved, relearns on load); the step's
+#       one reward is surprise_reward_scaling x mean(delta) (S10's global baseline is then not used). Both read live,
+#       NOT in DEFAULT_CONFIG; off / absent = the S12 branch exactly.
+# Why:  (c) is the hard-bound rectification (van Rossum, Bi & Turrigiano 2000); (a) is the global-baseline bias
+#       (Fremaux, Sprekeler & Gerstner 2010: a single global expected reward does not cancel the unsupervised term when
+#       reward depends on context; a per-context critic does). Brain: each predictor's expectation is its own.
+# How:  the S10 commit tail is shared (_s10_commit: the 0.01 gate, S12's gain, the floor flag via inject_reward).
+# [2026-10-28] Claude Code (Opus 5.5, laptop; lane stability-s12, #1136; Josh 2026-10-28 "I'll go with your
+#   recommendation of (a)" / "Go ahead and do both of them") — PROTECTED (needs Josh's proceed): S12, the RPE commit
+#   shares a fixed plasticity budget across the step's tagged synapses
+# What: config reward_rpe_trace_norm_enabled (+ reward_rpe_trace_norm_tau 200 commits, reward_rpe_trace_norm_cap 4.0;
+#       read live, NOT in DEFAULT_CONFIG; needs reward_rpe_enabled, else ERROR once and off): before S10's per-step
+#       inject_reward, the eligibility mass M = sum |trace| (|trace| >= 1e-9) is read and the SYNAPTIC commit is scaled by
+#       min(cap, R / M), R the running mean of M (starts at the first M; NOT saved, relearns on load), so the step's total
+#       synaptic commit is ~ trace-weighted delta x R whatever M is. Hyperedge thresholds keep the unscaled strength.
+#       inject_reward gains trace_gain (default 1.0 = unchanged; scales only the synapse sweep's strength).
+# Why:  dev-log 2026-10-27_stability-s10-rpe-reward §5.2: delta is zero-mean but dw = trace x delta, and steps that go
+#       better than expected carry more trace, so the reward still netted +412 over S11cal's 3,000 waking steps. Brain:
+#       synaptic tagging and capture -- tagged synapses share a limited pool of plasticity proteins, so how much a
+#       dopamine signal can write does not grow with how many synapses are tagged.
+# How:  off / absent = the S11 branch exactly (inject_reward called as before; nothing new read or kept).
+# [2026-10-27] Claude Code (Opus 5.5, laptop; lane stability-s11, #1136; Josh 2026-10-27 "Go ahead and try the run
+#   overnight") — PROTECTED (needs Josh's proceed): S11, C2 gets its downward half (C2-down), evidence-gated
+# What: config he_threshold_homeo_down_enabled (+ he_threshold_homeo_down_rate 0.001, _evidence 0.5, _floor 0.1; read
+#       live, NOT in DEFAULT_CONFIG; needs C2 and the S11 wheel, HyperedgeStore.c2_down_round >= 1, else ERROR once and
+#       off): Graph._stab_s11_c2_down passes (rate, evidence, floor) as stab's 6th item. In the native pass a learnable,
+#       non-refractory assembly below 0.8 x he_rate_target whose activation reached `evidence` of its threshold but not
+#       all of it lowers the threshold by `rate` (floor `floor`); an assembly without input is untouched.
+# Why:  dev-log 2026-10-27_stability-s10-rpe-reward §4.3: once S10 signed the reward, nothing lowered a hyperedge
+#       threshold — the always-positive surprise reward had been doing C2's missing half.
+# How:  off / absent = the S10 branch exactly (stab unchanged); nothing new is saved.
+# [2026-10-27] Claude Code (Opus 5.5, laptop; lane stability-s10, #1136; Josh 2026-10-27 "what's the most similar,
+#   conceptually, to how the brain does it?" / "Yes, go ahead") — PROTECTED (needs Josh's proceed): S10, the reward is a
+#   signed prediction error against expectation (dopamine-like RPE), broadcast once per step
+# What: config reward_rpe_enabled (+ reward_rpe_tau 2000 events; read live, NOT in DEFAULT_CONFIG; needs
+#       three_factor_enabled and NOT reward_event_scoped_enabled, else ERROR once and off): each resolved synapse-level
+#       prediction is an outcome o (+confidence confirmed, -confidence failed); a failed one no longer broadcasts on its
+#       own. After the step's predictions resolve, ONE global inject_reward(surprise_reward_scaling x (mean(o) - b))
+#       where b is the running expected outcome as it stood at the step's start; then b += (o - b) / tau per event. A step
+#       that resolves nothing sends nothing and leaves b. b starts at the first step's mean; NOT saved (relearns on load).
+#       (try 1 summed the outcomes: a reward that grew with the count of resolutions; the copy's weights jumped 55 %.)
+# Why:  S8 ledger: the surprise broadcast was always positive (+conf x 0.5) — a surprise treated as good news — and that
+#       one-signed bias is the waking climb. S9 cut its reach instead and lost mind-wide STDP learning (~800x less moved
+#       per call; dev-log S9 §3.2). Dopamine is global, lands on tagged (eligible) synapses, and is signed against
+#       expectation, so it nets ~0 (dev-log 2026-10-27_stability-s10-rpe-reward).
+# How:  key absent / False = the S9 branch exactly (the per-event broadcast; nothing new is called or kept).
+# [2026-10-26] Claude Code (Opus 5.5, laptop; lane stability-s9, #1136; Josh 2026-10-26 "you have my 'go' when S8 is
+#   done") — PROTECTED (needs Josh's proceed): S9, the reward commits only the links of each prediction event
+# What: config reward_event_scoped_enabled (+ reward_confirm_scaling 0.25; read live, NOT in DEFAULT_CONFIG; needs the
+#       native synapse store with SynapseStore.reward_round >= 1 and three_factor_enabled, else ERROR once and off):
+#       a CONFIRMED prediction A->B commits A->B's own trace at once (inject_reward(conf x reward_confirm_scaling,
+#       scope={A}, post_scope={B})); a FAILED one (A predicted B, set F fired) commits only the links from A to F + {B}
+#       (the wrong link's penalized trace and the links to what actually fired) instead of broadcasting to every trace in
+#       the mind. inject_reward gains post_scope (the paired pre AND post scope; native only; hyperedges use the event's
+#       nodes as their scope).
+# Why:  S8 weight ledger: with S bounded, the surprise's global broadcast is the remaining waking climb (S8full rewards
+#       +7,924 net); it also committed confirmations only when some unrelated prediction failed. Josh: correct
+#       predictions reinforce the current model; a surprise doesn't fit it and creates new links (dev-log S8 §10).
+# How:  key absent / False = the broadcast exactly (no new argument passed). Nothing new is saved.
+# [2026-10-26] Claude Code (Opus 5.5, laptop; lane stability-s8, #1146; Josh 2026-10-26 "Works for me") — PROTECTED (needs
+#   Josh's proceed): the graph's own HomeostaticRule follows graph.config live
+# What: the HomeostaticRule a Graph builds (in __init__ and in _deserialize) is marked _follows_config; at the top of
+#       each apply() it takes target_firing_rate / scaling_interval / degree_sensitivity from graph.config
+#       (HomeostaticRule._sync_from_config) and refreshes its degree targets at once when the target or the
+#       sensitivity changed. A rule constructed by hand (no mark) keeps its own values.
+# Why:  #1146: _deserialize rebuilt the rule from the checkpoint's SAVED config and the host's later
+#       graph.config.update reached only the dict, so a changed set point took effect one restart late, and never in a
+#       host that does not save (every whole-mind shadow arm since 2026-10-22 ran at 0.05 while configured 0.02). The
+#       strength-budget rule already reads scaling_interval live from graph.config (precedent).
+# How:  config == rule values (every graph today, incl. the live CC mind) -> nothing changes (no refresh, same bytes).
+# [2026-10-25] Claude Code (Opus 5.5, laptop; lane stability-s8, #1136 / #1141; Josh 2026-10-25 "Yessir" to the S8 draft,
+#   "a nodes totals should be saved") — PROTECTED (needs Josh's proceed): a bound on S's TOTAL up-scaling per node
+# What: config syn_scale_up_bound_enabled (+ syn_scale_up_bound 2.0, read live, NOT in DEFAULT_CONFIG; refines S):
+#       _StabParams.up_bound = B; HomeostaticRule.apply passes evidence_scales(..., up_bound=B) (NodeStore.stab_round >= 9),
+#       so no node's incoming weights are scaled up by S more than B x in net (down-scaling never blocked, it returns
+#       room); the per-node totals are SAVED (checkpoint key syn_scale_up_totals, emitted only with the bound on, before
+#       the interneurons key) and restored on load; each sleep_cycle's strength-aware downscale returns each node's room
+#       by what it actually removed from that node's input, ln(after / before) of its incoming weight sum
+#       (Graph._s8_incoming_sums + Graph._s8_sleep_shrink, their own functions; law review MEDIUM 1).
+# Why:  S8 weight ledger (2026-10-25): ~95 % of S7bfull's waking weight climb is S up-scaling ~1,500 driven-but-failing
+#       nodes without a total bound (each interval bounded at 1.03, the product not).
+# How:  absent / False = S7b exactly (no new argument passed, no key written, nothing read). Malformed -> ERROR once, off.
+# [2026-10-23] Claude (lane stability-s7b) — S7b law-review LOWs (PROTECTED CHANGE, its own commit, review branch only):
+#   relax set alone (no N keys) on a native graph now logs its ERROR instead of being hidden by the all-off early return
+#   (L7; the early check uses _STAB_S7B_KEYS, L8); a fractional node_homeo_relax_window is refused with the ERROR instead
+#   of being truncated (L12). Behaviour with relax absent unchanged.
+# [2026-10-23] Claude (lane stability-s7b, #1136 / #1141; Josh 2026-10-23 ~07:15 "go ahead and start on that node at the
+#   limit work" = S7 dev-log §8 option (a)) — gain relaxation for afferented nodes whose input succeeds. SWITCHES AND
+#   WIRING ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s7b-20261023 ONLY, its own commit; merges only
+#   after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: node_homeo_relax_enabled (read live, absent = off, NOT in DEFAULT_CONFIG; Rust only, needs the S7b wheel
+#       NodeStore.stab_round >= 8, node_homeo_evidence_enabled + node_homeo_slow_enabled +
+#       node_homeo_input_evidence_enabled, else ERROR once and off) + node_homeo_relax_mult 1.0 (the relax rate per
+#       scaling interval = the slow homeostat's excitability step x mult), node_homeo_relax_from 4.5 (entry at / near
+#       the rail), node_homeo_relax_stop 0.35 / node_homeo_relax_resume 0.2 (the hysteresis on fail_ema; 0 <= resume <=
+#       stop <= node_homeo_fail_min), node_homeo_relax_window 1000.0 (a success must be this recent, observed steps).
+#       HomeostaticRule.apply passes relax=(rate, from, stop, resume, window) to NodeStore.adapt_excitability.
+# Why:  hyperedge-store design §2.3 S7b row; S7 dev-log §5 / §8 (56 % of the cap plateau is S2's afferented-succeeding
+#       hold, a gain the rule never re-examines).
+# How:  one more _StabParams field (relax, None = off) and one keyword on the native call, only while on; every key
+#       absent = the S7 branch's calls exactly (no new arithmetic, no new checkpoint key).
+# [2026-10-22] Claude (lane stability-s6, #1136 / #1139 / #1166; Josh 2026-10-22 "I think that we should have some form of
+#   intrinsic spontaneous activity in NG, yes." + "And I concur with your recommendations for the next round, as well.")
+#   — S6: the bounded breaker, intrinsic spontaneous activity, the quiet hold on synaptic up-scaling. SWITCHES AND WIRING
+#   ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s6-20261022 ONLY, its own commit; merges only after
+#   Josh's protected-file "proceed" + backups of both msgpack files).
+# What: three keys, read live, absent = off, NOT in DEFAULT_CONFIG; Rust only (Q2: no Python oracle), each needs the S6
+#       wheel (NodeStore.stab_round >= 7; S6-2 also SynapseStore.stab_round >= 6), else ERROR once and off.
+#       (1) breaker_homeo_enabled (#1139): the zero-fire breaker keeps its trigger (zero_fire_breaker_steps silent steps
+#           -> the zero_fire_breaker_tripped event, unchanged) but no longer multiplies every node x1.2 / x0.9: from the
+#           trip until something fires, every silent step runs ONE homeostatic up-move (NodeStore.breaker_lift) on the
+#           nodes under their own target only — threshold down at HomeostaticRule's threshold rate (x the slow mult
+#           when slow), excitability up at its excitability rate every scaling interval of silence, each scaled by S4's
+#           bounded distance (when prop) and headroom (always), so nothing is pushed onto a rail. Plasticity does not run
+#           on a silent step (#1145), so this is the homeostat's own up-direction standing in while the mind is silent.
+#       (2) spontaneous_activity_enabled (+ spont_release_p 0.002, spont_quantal 0.25, spont_seed 0) (#1166): every
+#           step, before fire detection, SynapseStore.spontaneous_release: miniature PSPs — each synapse releases one
+#           quantum with probability p (deterministic per seed / timestep / synapse), delivering q x weight x sign x
+#           the post node's excitability. Its spikes are ordinary spikes (homeostasis, the brakes and the interneurons
+#           see them as any other); the input sensor (S2-1) does not count a node's own minis as afferent input.
+#       (3) syn_scale_quiet_hold_enabled (+ syn_scale_quiet_window 100): S's synaptic UP-scaling only for a node that
+#           received afferent input within the window, sized from the long rate counted over driven epochs only (r_drv);
+#           down-scaling unchanged. Needs S (syn_scale_evidence_enabled) and S2-1 (node_homeo_input_evidence_enabled).
+# Why:  dev-log 2026-10-22 whole-mind proof, arm B: the braked mind is silent between Tonic drives; after 200 silent
+#       drain steps the breaker put 9,200 nodes back on the excitability cap; up-scaling wound mean weight 0.078 ->
+#       0.105 across the quiet stretches. Design: hyperedge-store design §2.3 S6 rows.
+# How:  with every S6 key absent step() and HomeostaticRule make exactly round I's calls (no new argument is passed);
+#       nothing new is saved (the S6 columns are transient in the wheel; _breaker_lift_active is transient here and
+#       cleared by restore()). Law review LOW (2026-10-22): the lift is its own branch after the alert, so the
+#       zero_fire_warning still fires during a lift run.
+# [2026-10-21] Claude (lane rebaseline, #1136 / #1151; Josh 2026-10-21 "Let's go with your suggestion" + "Agreed?" on recall
+#   feeling the S5 brakes) — read-mode recall sweeps feel the live brakes, SWITCH AND WIRING ONLY (PROTECTED CHANGE on
+#   review branch cc-laptop-rebaseline-20261021 ONLY, its own commit; merges only after Josh's protected-file "proceed"
+#   + backups of both msgpack files).
+# What: one key, recall_brakes_enabled, read live, absent = off, NOT in DEFAULT_CONFIG; needs the recall-round ng_tract
+#       (NodeStore / SynapseStore .recall_round >= 1), else ERROR once and off. With it on, prime_and_propagate in READ
+#       mode (cue evaluation, the null sweep, F recall; never the Tonic's write mode) detects through
+#       NodeStore.recall_detect (S5's AHP brake: threshold + ca_split_ahp_gain x the live slow calcium; round I's
+#       inhibition at the live g_inh, divisive by default) and reads synapses through propagation_rows(std_read=the
+#       graph's timestep) (weight x the live depression resource, nothing spent). Each brake applies only while step()
+#       runs it. Read-only: no threshold, calcium, conductance, PV, resource or weight is written; the sweep's voltages
+#       and refractory counters are restored after the sweep exactly as before.
+# Why:  dev-log #1131 Parts 10-12; interneuron design Q5 / risk 10: a brake-free sweep fires nodes step() holds back.
+# How:  key absent = the S5 + round I calls exactly (no new call, no new argument).
+# [2026-10-20] Claude (lane interneurons-i, #1151 / #1136 round I; Josh 2026-10-20 "I'm all in on the inhibitory neurons,
+#   as long as we don't do them in Python" + "It looks good as laid out") — inhibitory interneurons, SWITCHES AND WIRING
+#   ONLY (PROTECTED CHANGE on review branch cc-laptop-interneurons-i-20261020 ONLY, its own commit; merges only after
+#   Josh's protected-file "proceed" + backups of both msgpack files).
+# What: the native PV-like interneuron layer (ng_tract src/interneurons.rs, owned by the NodeStore; never NodeStore rows:
+#       not in graph.nodes, never in fired_node_ids, no content / vector entry) is switched and wired here. Keys read
+#       live, absent = off, NOT in DEFAULT_CONFIG; need the native node store with the round-I wheel
+#       (NodeStore.stab_round >= 6 + interneurons_recruit) and native fire detection (no pre_fire handler), else ERROR
+#       once and off:
+#       interneurons_enabled — the layer's dynamics in step(): NodeStore.detect_fired(..., ilayer=(decay_rate,
+#           interneuron_decay 0.5, inh_g_decay 0.5, inh_g_max 3.0, interneuron_delay 1, inh_g_eps 0.01, form, timestep,
+#           istdp, eta, tau, w_max)); interneuron_form "divisive" (default, Q6: drive / (1 + g_inh)) or "offset"
+#           (ablation: threshold + g_inh). The guard (design §4.4.1) rides the same pass: with input evidence on, a
+#           failure is not sampled while g_inh > inh_g_eps.
+#       interneuron_recruit_enabled — recruit / extend / retire in sleep_cycle (record key "interneurons") and once at
+#           the first step with the layer absent (switch-on): NodeStore.interneurons_recruit(synapses, (pool_max 12,
+#           k_min 3, w_min 0.05, cover 1, ratio_max 0.20, theta 1.0, coincidence 2, refractory 1, w_ie 0.5,
+#           retire_window 4000), HomeostaticRule degree targets, target_firing_rate, timestep).
+#       interneuron_istdp_enabled (+ interneuron_istdp_eta 0.001, _tau 20, _wmax = inh_g_max) — round I2: Vogels iSTDP
+#           on I -> E (E -> I fixed).
+#       Checkpoint: a store holding a layer writes it as the top-level key "interneurons" (native packed bytes,
+#       spliced verbatim, last key); restore slices it raw and hands it to NodeStore.interneurons_load_msgpack after
+#       the nodes load (also with the keys absent: carried verbatim, inert). No layer = the exact previous key set.
+#       Older readers ignore the key; a re-save by them drops it (a documented lossy downgrade: the learned I -> E
+#       weights are lost, recruitment can regrow the cells from topology).
+# Why:  ~/docs/superpowers/specs/2026-10-20-inhibitory-interneurons-design.md §5.4-§5.6, decisions §8A; dev-log #1131
+#       Part 10 (a graded purely excitatory core cannot live at its set point).
+# How:  every key absent = the S5 calls exactly (no ilayer argument, no recruitment, no new checkpoint key);
+#       nothing in surfacing / recall / openclaw_hook / stream_parser / activation_persistence changes.
+# [2026-10-20] Claude (lane stability-s5, #1136 round S5; Josh 2026-10-20 "OK, let's do your recs ... Yeah, the order
+#   sounds right") — spike-frequency adaptation (#1149), short-term synaptic depression (#1150) and direction agreement
+#   for node homeostasis, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s5-20261020 ONLY, its own
+#   commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: three keys, read live, absent = off, NOT in DEFAULT_CONFIG; each needs the S5-round ng_tract
+#       (NodeStore.stab_round >= 5, SynapseStore.stab_round >= 5 for depression), else ERROR once and off:
+#       (1) ca_split_enabled (+ ca_split_slow_tau 200, ca_split_ahp_gain 0.075, ca_split_slow_delta = delta_Ca): a LAW 3
+#           repair of the IcaN / IK-AHP channels (#254), not a new mechanism. Today both currents read one fast pool
+#           (Ca_i, +delta_Ca per spike, x Ca_decay per step) and the net (g_CaN - g_AHP) x Ca_i = +0.02 x Ca_i is
+#           depolarizing. Split: the fast pool drives IcaN alone (voltage += g_CaN x Ca_i, short attractor persistence),
+#           and a SLOW pool (node column Ca_slow, +slow_delta per spike, x exp(-1 / slow_tau) per step) drives IK-AHP
+#           as a raised effective threshold at fire detection (threshold + ahp_gain x Ca_slow): a node firing at the
+#           refractory maximum accumulates a brake that slows it gradually, and the brake wears off within slow_tau
+#           once it quiets. Needs calcium on (delta_Ca != 0) and native fire detection (no pre_fire handler).
+#       (2) syn_std_enabled (+ syn_std_u 0.2, syn_std_tau 50): short-term synaptic depression (transmitter depletion,
+#           Tsodyks-Markram depression only) in step()'s propagation: delivered current = weight x resource; each use
+#           spends U of the resource, which recovers with syn_std_tau steps. Learned weights / STDP are untouched; the
+#           resource is transient (not saved). Inhibitory synapses and inhibitory presynaptic nodes are exempt (the hook
+#           for the interneuron round). Recall sweeps (prime_and_propagate) are unchanged.
+#       (3) node_homeo_agree_enabled (needs node_homeo_slow_enabled): N's threshold / excitability move toward target
+#           only when the fast rate (firing_rate_ema) is on the same side of the target as the long rate that decides
+#           it; otherwise the node holds (dev-log #1131 Part 9 proposal 2; interneuron design Q9).
+# Why:  dev-log #1131 Part 9: the mind's only sustained activity is one bistable reverberating core at the refractory
+#       maximum, which slow homeostasis can only switch off; a medium-timescale per-neuron brake (adaptation) and a
+#       per-synapse one (depression) are what grade such a loop in a brain.
+# How:  with all three absent, step() and HomeostaticRule.apply make exactly the S4 calls (the new arguments are
+#       passed only when on). The Python path stays the frozen oracle.
+# [2026-10-20] Claude (lane stability-s4, #1136 round S4; Josh 2026-10-20 "Good plan, let's do this plan") — the slow
+#   node homeostat gets a finite equilibrium, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s4-20261020
+#   ONLY, its own commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: two keys, read live, absent = off, NOT in DEFAULT_CONFIG; both need node_homeo_slow_enabled (S3) and the
+#       S4-round ng_tract (NodeStore.stab_round >= 4), else ERROR once and off:
+#       (1) node_homeo_prop_enabled (+ node_homeo_prop_unit 2.0, node_homeo_prop_max 4.0): N's moves are proportional
+#           to the node's bounded log distance from its set point (one S3 step at `unit` x off target, at most `max`
+#           steps) and saturate with the headroom left toward the rail they head for (intrinsic plasticity keeps a
+#           neuron inside a bounded operating range).
+#       (2) node_homeo_hopeless_enabled (+ node_homeo_hopeless_fail 0.95, node_homeo_hopeless_window 1000.0,
+#           node_homeo_hopeless_leak 0.0; also needs node_homeo_input_evidence_enabled): an afferented node whose input
+#           is failing (fail_ema >= fail) and that has not fired at all for `window` steps gets no upward drive (it holds,
+#           or leaks to baseline by `leak` > 0); its synapses are left to synaptic learning and sleep.
+# Why:  dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Part 8: S3's fixed step has no finite equilibrium (hot core
+#       too slow down, the failing periphery wound up without bound -> a fade at horizon 2,000, a re-ignition at 500).
+# How:  extra keywords (prop=..., hopeless=...) on NodeStore.adapt_thresholds / adapt_excitability, only while on; with
+#       both keys absent this file makes exactly the S3 commit's (3285f29) native calls.
+# [2026-10-20] Claude (lane stability-s3, #1136 round S3; Josh 2026-10-20 "I concur with your recommendations. Start the
+#   next round") — slow node homeostasis, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s3-20261020
+#   ONLY, its own commit; merges only after Josh's protected-file "proceed" + backups of both msgpack files).
+# What: node_homeo_slow_enabled (read live, absent = off, NOT in DEFAULT_CONFIG; needs node_homeo_evidence_enabled and
+#       the S3-round ng_tract, NodeStore.stab_round >= 3) + node_homeo_slow_rate_mult (default 0.2): N's threshold and
+#       excitability moves judge the node's rate by its LONG rate (S's trace, horizon syn_scale_rate_tau, default 2000
+#       steps) instead of firing_rate_ema (~100 steps), and move at rate_mult x HomeostaticRule's threshold_rate /
+#       excitability_rate. N's leak to baseline (unafferented nodes) is unchanged. The long rate advances whenever slow
+#       is on, also with S off. Synaptic scaling is unchanged (its ratios stay on firing_rate_ema).
+# Why:  dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Part 7 (S2: the node homeostat is too fast — a slow
+#       ~1,300-step cycle with remembered evidence, a fade with recency-only evidence) and Part 5 item 1 (a neuron's own
+#       homeostasis runs over hours to days, far slower than its activity and its synaptic learning).
+# How:  one extra keyword (slow=True) on NodeStore.adapt_thresholds / adapt_excitability and scaled rates, only while on;
+#       with the key absent this file makes exactly the S2 commit's (274a4a6) native calls. On an older wheel the key
+#       logs ERROR once and stays off.
+# [2026-10-19] Claude (lane stability-s2, #1136 round S2, tuning) — node_homeo_input_recent_enabled (read live, absent = off,
+#   NOT in DEFAULT_CONFIG; needs node_homeo_input_evidence_enabled): "driven but failing" also requires that an input
+#   actually FAILED to fire the node recently — this step for the per-step threshold move, within the last scaling
+#   interval for excitability and S's up-scaling. Why: the S2 settle runs (s2_full, s2_t1) showed a slow homeostatic
+#   oscillation: ~10K afferented nodes kept their "failing" evidence (sampled only when input arrives, so it holds)
+#   through the quiet phase and wound up on it with no input arriving. How: a 3rd item (the window) on the input-evidence
+#   tuples; absent = the S2 rule above exactly. PROTECTED CHANGE, review branch only, own commit.
+# [2026-10-19] Claude (lane stability-s2, #1136 round S2; Josh 2026-10-19 "Yeah, let's do all 4 now") — four corrections to
+#   the stability set, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s2-20261019 ONLY, its own commit;
+#   merges only after Josh's protected-file "proceed" + backups of both msgpack files). Every key below is read live,
+#   absent = off, NOT in DEFAULT_CONFIG; with all of them absent this file runs exactly as the S commit (275807f), and
+#   with every S2 key absent it makes exactly S's native calls.
+# What: spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §2.3 (S2 rows):
+#       (1) node_homeo_input_evidence_enabled (+ node_homeo_input_min 0.01, _input_alpha 0.002, _input_rate_min
+#           0.0005, _fail_alpha 0.25, _fail_min 0.5): N's and S's "driven but failing" judged by the input a node
+#           RECEIVES (an input event = delivered drive >= input_min; afferented = in_ema >= rate_min; failing = of the
+#           input events, fail_ema >= fail_min did not fire it), not by its mean voltage. Needs N or S.
+#       (2) syn_scale_settle_enabled (+ syn_scale_deadband 0.2): S settles in a deadband around the set point it
+#           restores, approached proportionally, still bounded both ways. Needs S.
+#       (3) he_threshold_leak_enabled (+ he_threshold_leak_rate 0.002): #1144 — a C2-raised assembly threshold leaks
+#           back toward that assembly's own baseline while its activity is below target. Needs C2.
+#       (4) burst_inhibition_enabled (+ burst_inh_gain 10.0, _decay 0.5, _max 1.0, _base_alpha 0.01): a global
+#           inhibitory pool driven by the fired fraction's excess over recent activity raises every node's effective
+#           threshold on the next steps (fast, bounded, scales with the burst).
+# Why:  dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Part 6 (the S round: the set ended the oscillation but
+#       over-damped the mind; #1144).
+# How:  Q2 — each is an argument to an existing native pass (NodeStore detect_fired / adapt_thresholds /
+#       adapt_excitability / evidence_scales, HyperedgeStore evaluate_step) or the new NodeStore.observe_inputs (a step
+#       whose detection runs in Python). On a wheel without them, a set key logs ERROR once and stays OFF. #1145
+#       (plasticity only on a step where something fired) is NOT changed here: the input traces advance in detection,
+#       every step.
+# [2026-10-19] Claude (lane stability-s, #1136 phase S; Josh 2026-10-19 "Yes, please start the S build") — the stability
+#   set, RUST ONLY (PROTECTED CHANGE on review branch cc-laptop-stability-s-20261019 ONLY, its own commit; merges only
+#   after Josh's protected-file "proceed" + backups of both msgpack files). Every key below is read live, absent = off,
+#   NOT in DEFAULT_CONFIG; with all of them absent this file runs exactly as 11d3898 (no new call, no new argument, no
+#   new checkpoint key).
+# What: spec superpowers/specs/2026-10-17-rust-hyperedge-store-design.md §2.3 — one mechanism set on three timescales:
+#       C1 he_inject_respects_refractory: output injection skips a refractory target (step + both sweep modes);
+#       H  he_habituation_enabled (+ _half 0.05, _power 2.0; the reference names and gain, cc-laptop-he-habituation-
+#          20261016): output and completion drive x 1 / (1 + (ema / half) ** power), step (ema before this step's
+#          update) + both sweep modes;
+#       N  node_homeo_evidence_enabled (+ node_homeo_v_floor 0.5, _leak 0.02, _v_alpha 0.01): option D — evidence-
+#          gated (v_ema >= v_floor x threshold = "driven but failing"), leaky (no evidence -> excitability -> 1.0 and
+#          threshold -> default_threshold by `leak` per scaling interval), symmetric (the silent x(1 + 5 rate) branch
+#          is gone); the 5.0 cap stays as the rail; node column v_ema saved only when on;
+#       S  syn_scale_evidence_enabled (+ syn_scale_rate_tau 2000, _max_up 1.03, _max_down 0.97): synaptic scaling
+#          against a LONG firing-rate EMA (node column syn_rate_ema, saved only when on), factor bounded both ways,
+#          UP only with N's evidence; replaces the (target / rate) ** 0.1 node_scales in HomeostaticRule.apply;
+#       C2 he_threshold_homeo_enabled (+ he_rate_target 0.05, he_threshold_homeo_rate 0.001): an over-active
+#          learnable assembly's threshold rises (upward only, cap 1.0);
+#       C3 he_target_unlearn_enabled (+ _d 0.02, _p 0.05, _floor 0.1): output-target weights (HE column
+#          output_target_weights, saved only on rows C3 wrote) depress by d per fire, potentiate by p on unexplained
+#          firing (lag >= 2 in the window, or lag 1 when C1 shunted the push), weak ones released in sleep_cycle (Q7);
+#       #1134 homeostatic_degree_targets_persist: HomeostaticRule._degree_targets saved / restored (key
+#          homeostatic_degree_targets), so a restored graph continues step for step.
+# Why:  #1131 / #1141: the CC mind's reverberating hyperedge loop and its growing ~20-25 min relaxation oscillation
+#       (dev-log 2026-10-16_cc-recall-reverberating-loop-1131.md Parts 2-5); Josh's decisions Q2-Q11 (spec §6A).
+# How:  Q2 — no new behaviour in Python: each mechanism is a parameter to an existing native pass (NodeStore
+#       detect_fired / update_firing_ema / adapt_thresholds / adapt_excitability + the new evidence_scales;
+#       HyperedgeStore evaluate_step / evaluate_sweep + the new release_weak_targets). Graph._stability_params() reads
+#       the keys once per step; on a graph without the native passes a set key logs ERROR once and stays OFF. A
+#       declined native pass runs today's Python loop for that call (no new behaviour there either).
 # [2026-10-21] Claude Code (Opus 5.5, laptop; lane tonic-unified) — RD §5 (B): optional damped structural plasticity on step()
 #   (PROTECTED CHANGE — needs Josh's proceed; Syl approved RD 2026-06-10 "Build it, lover."; Josh 2026-10-21 "1 Yes, let's build it.")
 #   What: step(structural_damping=None). With None (every existing caller) step 8 is the unchanged call. With (k, m) — passed
@@ -934,6 +1300,7 @@ from typing import (
     Deque,
     Dict,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -1416,6 +1783,12 @@ class Prediction:
     chain_depth: int = 0
     via_hyperedge: Optional[str] = None
     pre_charge_applied: float = 0.0
+    # [2026-11-01] S18 (#1202): receiver-side predictions only (None otherwise; not serialized): the converging
+    # excitatory synapses with their shares of the drive, the drive itself, and the target's rho at registration.
+    contributors: Optional[List[Tuple[str, float]]] = None
+    drive: Optional[float] = None
+    rho: Optional[float] = None
+    contributors_raw: Optional[Dict[str, Tuple[str, float]]] = None   # syn_id -> (pre, weight): merge input
 
 
 @dataclass
@@ -2035,6 +2408,41 @@ class STDPRule(PlasticityRule):
             return
         _stdp_python(self, graph, fired_node_ids, timestep)
 
+class _StabParams(NamedTuple):
+    """[2026-10-19] S (#1136): one step's stability-set switches (Graph._stability_params). Each field None = off."""
+    he: Optional[tuple]          # (hab, c1, c2, c3) for HyperedgeStore.evaluate_step / evaluate_sweep
+    c3_floor: Optional[float]    # C3 release floor (sleep_cycle)
+    v_alpha: Optional[float]     # N / S evidence trace v_ema (NodeStore.detect_fired)
+    node: Optional[tuple]        # N: (v_floor, leak, default_threshold)
+    syn: Optional[tuple]         # S: (long_alpha, max_up, max_down, v_floor)
+    # [2026-10-19] S2 (#1136): None = off (S exactly)
+    inp: Optional[tuple] = None      # (1) (decay, input_min, input_alpha, fail_alpha): NodeStore.detect_fired / observe_inputs
+    ev_in: Optional[tuple] = None    # (1) (rate_min, fail_min): N / S evidence by input received
+    ev_recent: bool = False          # (1, tuning) also require a recently FAILED input (window: 1 step / 1 interval)
+    deadband: Optional[float] = None  # (2) S settles inside the deadband
+    inhib: Optional[tuple] = None    # (4) (gain, decay, g_max, base_alpha): NodeStore.detect_fired
+    # [2026-10-20] S3 (#1136): None = off (S2 exactly)
+    slow: Optional[tuple] = None     # (rate_mult, long_alpha): N judges the long rate, moves at rate_mult x the rule's
+    # [2026-10-20] S4 (#1136): None = off (S3 exactly); both only with `slow`
+    prop: Optional[tuple] = None     # (unit, max): proportional, saturating N moves
+    hope: Optional[tuple] = None     # (fail_min, window, leak): no upward drive for a node with hopeless input
+    # [2026-10-20] S5 (#1136): None / False = off (S4 exactly)
+    ca_split: Optional[tuple] = None  # #1149 (g_CaN, slow_keep, slow_delta, ahp_gain): fast IcaN + slow IK-AHP pool
+    std: Optional[tuple] = None       # #1150 (U, tau_rec): short-term synaptic depression in step()'s propagation
+    agree: bool = False               # N moves only when the fast and the long rate agree on the direction
+    # [2026-10-20] round I (#1151): None = off (S5 exactly)
+    ilayer: Optional[tuple] = None    # (decay_rate, decay_I, g_decay, g_max, delay, g_eps, form, istdp, eta, tau, w_max)
+    irecruit: Optional[tuple] = None  # NodeStore.interneurons_recruit params (sleep_cycle + once at switch-on)
+    # [2026-10-22] S6 (#1136): None = off (round I exactly)
+    breaker: Optional[tuple] = None   # #1139 (thr_rate, exc_rate, interval, default_threshold, slow, prop (unit, max) | None)
+    spont: Optional[tuple] = None     # #1166 (p, q, seed): miniature PSPs before fire detection
+    quiet: Optional[int] = None       # S6-3 window: hold S's up-scaling while the node receives no afferent input
+    # [2026-10-23] S7b (#1136): None = off (S7 exactly)
+    relax: Optional[tuple] = None     # (mult, from, stop, resume, window): gain relaxation of succeeding afferented nodes
+    # [2026-10-25] S8 (#1136): None = off (S7b exactly)
+    up_bound: Optional[float] = None  # S's total up-scaling bound B per node
+
+
 class HomeostaticRule(PlasticityRule):
     """Homeostatic plasticity (PRD §3.2).
 
@@ -2057,6 +2465,7 @@ class HomeostaticRule(PlasticityRule):
         threshold_rate: float = 0.001,
         ema_alpha: float = 0.01,
         degree_sensitivity: float = 0.4,
+        follows_config: bool = False,
     ):
         self.target_firing_rate = target_firing_rate
         self.scaling_interval = scaling_interval
@@ -2067,6 +2476,23 @@ class HomeostaticRule(PlasticityRule):
         self.degree_sensitivity = degree_sensitivity
         self._degree_targets: Dict[str, float] = {}
         self._steps_since_scaling = 0
+        # [2026-10-26] #1146: True only for the rule a Graph builds from its own config (see _sync_from_config)
+        self._follows_config = bool(follows_config)
+
+    def _sync_from_config(self, graph: "Graph") -> None:
+        """[2026-10-26] #1146: the graph's own rule takes target_firing_rate / scaling_interval / degree_sensitivity from
+        graph.config (the host's values, LAW 5) and refreshes the degree targets at once if the target or the
+        sensitivity changed. A hand-built rule (_follows_config False) is left alone. Unchanged values: no-op."""
+        if not self._follows_config:
+            return
+        c = graph.config
+        t = c.get("target_firing_rate", self.target_firing_rate)
+        si = c.get("scaling_interval", self.scaling_interval)
+        ds = c.get("degree_sensitivity", self.degree_sensitivity)
+        changed = (t != self.target_firing_rate) or (ds != self.degree_sensitivity)
+        self.target_firing_rate, self.scaling_interval, self.degree_sensitivity = t, si, ds
+        if changed:
+            self._refresh_degree_targets(graph)
 
     def _refresh_degree_targets(self, graph: "Graph") -> None:
         """Compute per-node firing targets adjusted for vertex degree (DAS-GNN, #104)."""
@@ -2134,19 +2560,64 @@ class HomeostaticRule(PlasticityRule):
         fired_node_ids: List[str],
         timestep: int,
     ) -> None:
+        self._sync_from_config(graph)   # [2026-10-26] #1146: the host's values reach the graph's own rule
         fired_set = set(fired_node_ids)
+        # [2026-10-19] S (#1136): N / S switches (graph._stab is set by step(); None = all off -> the P2a calls exactly).
+        # They exist only as arguments to the native passes; a declined pass runs today's Python loop (Q2).
+        _st = getattr(graph, "_stab", None)
+        _n_ev = _st.node if _st is not None else None     # (v_floor, leak, default_threshold)
+        _s_ev = _st.syn if _st is not None else None      # (long_alpha, max_up, max_down, v_floor)
+        # [2026-10-19] S2 (#1136): evidence by input received appends (rate_min, fail_min) to N's evidence tuples
+        _ev_in = _st.ev_in if _st is not None else None
+        # [2026-10-19] S2 tuning: the recency window (1 step for the per-step threshold move, one scaling interval for
+        # excitability and S); absent = the S2 tuples exactly
+        _rec = _st is not None and _st.ev_recent and _ev_in is not None
+        _w_step = (1,) if _rec else ()
+        _w_int = (self.scaling_interval,) if _rec else ()
+        # [2026-10-20] S3 (#1136): slow node homeostasis (only with N): the long rate decides, at scaled rates
+        _slow = _st.slow if (_st is not None and _n_ev is not None) else None
+        _long_a = _s_ev[0] if _s_ev is not None else (_slow[1] if _slow is not None else None)
+        _thr_rate = self.threshold_rate if _slow is None else self.threshold_rate * _slow[0]
+        _exc_rate = self.excitability_rate if _slow is None else self.excitability_rate * _slow[0]
+        _skw = {"slow": True} if _slow is not None else {}
+        # [2026-10-20] S4 (#1136): proportional, saturating moves / giving up on hopeless inputs (refinements of slow;
+        # _stability_params only sets them with slow, and hope only with evidence by input received)
+        _tkw = dict(_skw)
+        _xkw = dict(_skw)
+        if _slow is not None and _st.prop is not None:
+            _tkw["prop"] = (_st.prop[0], _st.prop[1], _n_ev[2])
+            _xkw["prop"] = _st.prop
+        if _slow is not None and _st.hope is not None and _ev_in is not None:
+            _tkw["hopeless"] = (_st.hope[0], _st.hope[1], float(timestep))
+            _xkw["hopeless"] = (_st.hope[0], _st.hope[1], float(timestep), _st.hope[2])
+        # [2026-10-20] S5 (#1136): direction agreement (a refinement of slow; _stability_params sets it only with slow)
+        if _slow is not None and _st.agree:
+            _tkw["agree"] = True
+            _xkw["agree"] = True
+        # [2026-10-23] S7b (#1136): gain relaxation (a refinement of slow, judged by input received); the rate is the slow
+        # homeostat's own excitability step x mult
+        if _slow is not None and _st.relax is not None and _ev_in is not None:
+            _xkw["relax"] = (_exc_rate * _st.relax[0], _st.relax[1], _st.relax[2], _st.relax[3], _st.relax[4])
 
         # Update firing rate EMA for every node
         # [2026-10-06] P2a: native NodeStore pass when available; it declines (False) -> the original loop
         _native = getattr(graph.nodes, "update_firing_ema", None)
-        if _native is None or not _native(fired_set, self.ema_alpha):
+        # [2026-10-22] S6-3: the quiet hold advances the driven long rate beside S's (only with S on)
+        _qw = _st.quiet if (_st is not None and _s_ev is not None) else None
+        if _native is None or not (_native(fired_set, self.ema_alpha) if _long_a is None
+                                   else _native(fired_set, self.ema_alpha, _long_a) if _qw is None
+                                   else _native(fired_set, self.ema_alpha, _long_a, quiet=_qw)):
             _update_firing_ema_python(graph.nodes, fired_set, self.ema_alpha)
 
         # Threshold adaptation: continuous, 0.001/step (PRD §3.2.1)
         threshold_ceiling = graph.config.get("threshold_ceiling", 5.0)
         _native = getattr(graph.nodes, "adapt_thresholds", None)
-        if _native is None or not _native(self._degree_targets, self.target_firing_rate,
-                                          self.threshold_rate, threshold_ceiling):
+        if _native is None or not (_native(self._degree_targets, self.target_firing_rate,
+                                           self.threshold_rate, threshold_ceiling) if _n_ev is None
+                                   else _native(self._degree_targets, self.target_firing_rate,
+                                                _thr_rate, threshold_ceiling,
+                                                (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in + _w_step,
+                                                **_tkw)):
             _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                      self.threshold_rate, threshold_ceiling)
 
@@ -2161,7 +2632,9 @@ class HomeostaticRule(PlasticityRule):
         # {nid: target / rate} for the non-silent nodes in node order; `ratio ** scaling_factor`
         # stays in Python (libm pow is not proven bit-identical to CPython's float.__pow__).
         _native = getattr(graph.nodes, "adapt_excitability", None)
-        _ratios = (_native(self._degree_targets, self.target_firing_rate, self.excitability_rate)
+        _ratios = ((_native(self._degree_targets, self.target_firing_rate, self.excitability_rate) if _n_ev is None
+                    else _native(self._degree_targets, self.target_firing_rate, _exc_rate,
+                                 _n_ev if _ev_in is None else _n_ev + _ev_in + _w_int, **_xkw))
                    if _native is not None else None)
         if _ratios is None:
             node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
@@ -2170,6 +2643,21 @@ class HomeostaticRule(PlasticityRule):
             node_scales: Dict[str, float] = {}
             for nid, ratio in _ratios.items():
                 node_scales[nid] = ratio ** self.scaling_factor
+        if _s_ev is not None:
+            # [2026-10-19] S (#1136): slow, bounded, evidence-gated scaling replaces the per-step-rate factors. A
+            # declined native pass scales nothing this interval (never today's unbounded factor while S is on).
+            # [2026-10-19] S2: input = evidence by input received, deadband = settle (absent = S's call exactly)
+            _s2kw = {}
+            if _ev_in is not None:
+                _s2kw["input"] = _ev_in + _w_int
+            if _st.deadband is not None:
+                _s2kw["deadband"] = _st.deadband
+            if _qw is not None:   # [2026-10-22] S6-3
+                _s2kw["quiet"] = _qw
+            if _st.up_bound is not None:   # [2026-10-25] S8
+                _s2kw["up_bound"] = _st.up_bound
+            node_scales = graph.nodes.evidence_scales(self._degree_targets, self.target_firing_rate,
+                                                      self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3], **_s2kw) or {}
 
         # [2026-10-04] One native pass applies every node's scale to its incoming
         # synapses: weight = max(0, min(weight * scale, max_weight)). Each synapse has
@@ -2682,6 +3170,7 @@ class Graph:
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
                 degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
+                follows_config=True,   # [2026-10-26] #1146
             ),
             # 2026-10-04 strength budget — OFF unless config strength_budget_enabled (no-op otherwise)
             StrengthBudgetRule(),
@@ -3294,6 +3783,21 @@ class Graph:
         with self._step_lock:
             self.timestep += 1
             result = StepResult(timestep=self.timestep)
+            # [2026-10-19] S (#1136): the stability set's switches, read live once per step (None = all off)
+            _stab = self._stability_params()
+            if _stab is not None or "_stab" in self.__dict__:
+                self._stab = _stab
+            # [2026-11-03] S19 (#1202 follow-up): corrected DiffPC, read live once per step (None = off: no new work)
+            _dpr = self._stab_diffpc_receiver() if self.config.get("diffpc_receiver_enabled", False) else None
+            if _dpr is not None or "_diffpc_p" in self.__dict__:
+                self.__dict__["_diffpc_p"] = _dpr
+            _dps = self._diffpc_state(_dpr[2]) if _dpr is not None else None   # [2026-11-04] the native DiffPc
+            if _dps is not None and not _dpr[3] and not self.__dict__.get("_diffpc_reset_done"):
+                _dps.reset_ema(self.nodes)   # once per mind: the old clock's values go
+                self.__dict__["_diffpc_reset_done"] = True
+            # [2026-10-20] round I (#1151): the layer is grown once at switch-on (later runs are sleep_cycle's)
+            if _stab is not None and _stab.irecruit is not None and not self.nodes.interneurons_exists():
+                self._interneurons_recruit(_stab.irecruit)
 
             # 1. Voltage decay: v = v * decay_rate + (1-decay) * resting  (PRD §2.2.4)
             # [2026-10-06] P2a: native NodeStore pass when available (declines -> the original loop)
@@ -3313,30 +3817,77 @@ class Graph:
                     )
                     continue
                 target.voltage += current * target.intrinsic_excitability
+            if _dps is not None:   # [2026-11-03] S19: this tick's arrivals are explained drive
+                _dps.record_arrivals(self.timestep, arrivals)
+
+            # 2b. [2026-10-22] S6-2 (#1166): intrinsic spontaneous activity — miniature PSPs (spontaneous vesicle
+            #     release), natively, before detection; its spikes are ordinary spikes. A declined pass skips this step.
+            if _stab is not None and _stab.spont is not None:
+                if self.synapses.spontaneous_release(self.nodes, _stab.spont[0], _stab.spont[1], _stab.spont[2],
+                                                     self.timestep) is None:
+                    self._stab_error_once(("spontaneous_activity_enabled",),
+                                          "a native pass that accepts it (the S6 stores declined this step)")
 
             # 3a. IcaN + IK-AHP: calcium-gated intrinsic currents (#254)
             # Net voltage adjustment = (g_CaN - g_AHP) * Ca_i per step.
             # g_CaN > g_AHP at defaults → mild attractor persistence.
             # Ca_i decay ensures effect fades between firing episodes.
             _delta_Ca = self.config.get("delta_Ca", 0.0)
+            # [2026-10-20] S5 (#1136 / #1149): the calcium split = (g_CaN, slow_keep, slow_delta, ahp_gain), or None
+            _ca5 = _stab.ca_split if _stab is not None else None
             if _delta_Ca:
                 _Ca_decay = self.config.get("Ca_decay", 0.9)
                 _g_net = self.config.get("g_CaN", 0.0) - self.config.get("g_AHP", 0.0)
                 _native = getattr(self.nodes, "calcium_currents", None)
-                if _native is None or not _native(_g_net, _Ca_decay):
+                if _ca5 is not None:
+                    # split: the fast pool carries IcaN alone; the slow pool (IK-AHP) decays natively. A declined pass
+                    # runs today's channels (the frozen Python loop) and the split is off for this step.
+                    if not _native(_ca5[0], _Ca_decay, _ca5[1]):
+                        _ca5 = None
+                        _calcium_currents_python(self.nodes, _g_net, _Ca_decay)
+                elif _native is None or not _native(_g_net, _Ca_decay):
                     _calcium_currents_python(self.nodes, _g_net, _Ca_decay)
+            else:
+                _ca5 = None
 
             # 3. Detect firing nodes
             #    Lenia FlowGraph: pre_fire handlers can adjust thresholds.
             #    [2026-10-06] P2a: native only when NO pre_fire handler is registered (a handler is a
             #    Python call per node); the native pass returns the ids in node order, or None.
             fired_ids = None
+            # [2026-10-19] S (#1136) N / S: v_alpha given = the native pass first updates v_ema (pre-detection voltage)
+            _va = _stab.v_alpha if _stab is not None else None
+            # [2026-10-19] S2 (#1136): input observation (1) and burst inhibition (4) ride the same native pass
+            _s2_inp = _stab.inp if _stab is not None else None
+            _s2_inh = _stab.inhib if _stab is not None else None
             if not self._event_handlers.get("pre_fire"):
                 _native = getattr(self.nodes, "detect_fired", None)
-                if _native is not None:
-                    fired_ids = _native()
+                _il = _stab.ilayer if _stab is not None else None
+                if _native is not None and _il is not None:   # [2026-10-20] round I: + the interneuron layer
+                    fired_ids = _native(_va, _s2_inp, _s2_inh, _ca5[3] if _ca5 is not None else None,
+                                        ilayer=_il[:7] + (float(self.timestep),) + _il[7:])
+                elif _native is not None:
+                    if _ca5 is not None:   # [2026-10-20] S5: + the slow IK-AHP brake (threshold + gain x Ca_slow)
+                        fired_ids = _native(_va, _s2_inp, _s2_inh, _ca5[3])
+                    elif _s2_inp is None and _s2_inh is None:
+                        fired_ids = _native() if _va is None else _native(_va)
+                    else:
+                        fired_ids = _native(_va, _s2_inp, _s2_inh)
+            else:
+                if _va is not None:
+                    self.nodes.update_v_ema(_va)
+                if _s2_inh is not None:
+                    self._stab_error_once(("burst_inhibition_enabled",),
+                                          "native fire detection (a pre_fire handler is registered)")
             if fired_ids is None:
                 fired_ids = _detect_fired_python(self.nodes, self._event_handlers)
+                if _s2_inp is not None:   # S2: a step detected in Python still observes its input (before step 4)
+                    self.nodes.observe_inputs(fired_ids, _s2_inp)
+            # [2026-11-03] S19: the error is classified as detection saw it (threshold, rate) -- before step 4
+            if _dps is not None:
+                _dps.classify(self.nodes, self.timestep, list(fired_ids),
+                              {pr.target_node_id for pr in self.active_predictions.values() if pr.drive is not None},
+                              *self._receiver_theta_args(), self.config["decay_rate"])
 
             # 3b. Zero-firing circuit breaker tracking
             if fired_ids:
@@ -3347,7 +3898,9 @@ class Graph:
             # 4. Reset fired nodes and set refractory
             #    [2026-10-06] P2a: the native pass does the node writes; _recent_spikes stays Python (P3)
             _native = getattr(self.nodes, "fire", None)
-            if _native is not None and _native(fired_ids, self.timestep, _delta_Ca if _delta_Ca else None):
+            if _native is not None and (_native(fired_ids, self.timestep, _delta_Ca if _delta_Ca else None)
+                                        if _ca5 is None else
+                                        _native(fired_ids, self.timestep, _delta_Ca, _ca5[2])):
                 for nid in fired_ids:
                     # Track recent spikes for sprouting
                     self._recent_spikes.setdefault(nid, deque(maxlen=20)).append(self.timestep)
@@ -3382,6 +3935,10 @@ class Graph:
             _prop_rows = getattr(self.synapses, "propagation_rows", None)
             if _prop_rows is None:
                 _prop_rows = lambda ids, reset: _propagation_rows_python(self.synapses, ids, reset)  # noqa: E731
+            # [2026-10-20] S5 (#1136 / #1150): short-term depression (the native pass reports weight x resource and
+            # spends it); an inhibitory presynaptic node is exempt (the hook for the interneuron round)
+            _std5 = ((_stab.std[0], _stab.std[1], float(self.timestep))
+                     if _stab is not None and _stab.std is not None else None)
             for nid in fired_ids:
                 node = self.nodes[nid]
                 sign = -1.0 if node.is_inhibitory else 1.0
@@ -3391,7 +3948,8 @@ class Graph:
                 # per outgoing synapse in this set's iteration order, and inactive_steps = 0
                 # on each (was `syn.inactive_steps = 0` at the end of every iteration).
                 _out_ids = list(self._outgoing.get(nid, ()))
-                for syn_id, _row in zip(_out_ids, _prop_rows(_out_ids, True)):
+                for syn_id, _row in zip(_out_ids, (_prop_rows(_out_ids, True) if _std5 is None or node.is_inhibitory
+                                                   else _prop_rows(_out_ids, True, _std5))):
                     if _row is None:
                         logger.debug("Stale synapse ref %s in outgoing[%s]", syn_id, nid)
                         continue
@@ -3445,9 +4003,15 @@ class Graph:
                 _he_ev = self.hyperedges.evaluate_step(
                     self.nodes, fired_ids, self.timestep, experience_threshold, ema_alpha,
                     self.config["he_output_learning_window"], self.config["he_output_min_co_fires"],
-                    self.config["he_output_max_targets"])
+                    self.config["he_output_max_targets"],
+                    # [2026-10-19] S (#1136) H / C1 / C2 / C3 (absent = the H2 call exactly)
+                    **({"stab": _stab.he} if _stab is not None and _stab.he is not None else {}),
+                    # [2026-11-04] S19: the pass reports its own drive into DiffPC's ring (absent = unchanged)
+                    **({"diffpc": (_dps, self.config["decay_rate"])} if _dps is not None else {}))
                 if _he_ev is None:
                     self._he_ps_to_python()
+            if _he_ev is None and _dps is not None:
+                _dps.he_declined(self.timestep)   # its drive is unknown: the next W ticks' firings are not judged (review I5)
             if _he_ev is not None:
                 _he_fired, _he_events, _he_learned = _he_ev
                 result.fired_hyperedge_ids.extend(_he_fired)
@@ -3673,6 +4237,13 @@ class Graph:
 
             # 6f. Clean up expired Phase 3 predictions
             self._cleanup_predictions()
+            # [2026-10-27] S10 (#1136): the step's one signed reward (only when outcomes were kept, i.e. S10 on)
+            _s10 = self.__dict__.pop("_s10_events", None)
+            _s13 = self.__dict__.pop("_s13_events", None)   # [2026-10-28] S13: per-source surprise replaces the global one
+            if _s13 and self._stab_s13_per_source() is not None:
+                self._s13_source_rpe_broadcast(_s13)
+            elif _s10:
+                self._s10_rpe_broadcast(_s10)
 
             # 7. Apply plasticity rules
             if fired_ids:
@@ -3735,17 +4306,26 @@ class Graph:
             # 11. Zero-firing circuit breaker
             breaker_steps = self.config.get("zero_fire_breaker_steps", 200)
             alert_steps = self.config.get("zero_fire_alert_steps", 50)
-            if self._steps_since_last_fire >= breaker_steps:
-                self._emergency_excitability_boost()
+            # [2026-10-22] S6-1 (#1139): the bounded breaker (None = the global boost, as before)
+            _bk = _stab.breaker if _stab is not None else None
+            if fired_ids:
+                self.__dict__.pop("_breaker_lift_active", None)
+            _tripped = self._steps_since_last_fire >= breaker_steps
+            if _tripped:
+                if _bk is None:
+                    self._emergency_excitability_boost()
+                else:
+                    self._breaker_homeo_trip()
                 self._emit(
                     "zero_fire_breaker_tripped",
                     steps_silent=self._steps_since_last_fire,
                     timestep=self.timestep,
                 )
                 logger.warning(
-                    "Zero-fire breaker tripped at step %d (%d steps silent). "
-                    "Emergency excitability boost applied.",
+                    "Zero-fire breaker tripped at step %d (%d steps silent). %s",
                     self.timestep, self._steps_since_last_fire,
+                    "Emergency excitability boost applied." if _bk is None else
+                    "Bounded homeostatic lift (S6-1) runs until a node fires.",
                 )
                 self._steps_since_last_fire = 0
             elif self._steps_since_last_fire == alert_steps:
@@ -3758,6 +4338,9 @@ class Graph:
                     "Zero-fire warning at step %d (%d steps without any neuron firing).",
                     self.timestep, self._steps_since_last_fire,
                 )
+            # [2026-10-22] S6-1: the bounded lift on every further silent step (its own branch, so the alert still fires)
+            if _bk is not None and not _tripped and not fired_ids and self.__dict__.get("_breaker_lift_active"):
+                self._breaker_homeo_lift(_bk)
 
             return result
 
@@ -3859,6 +4442,14 @@ class Graph:
                             or node.refractory_remaining > 0):
                         working_set.add(nid)
 
+                # [2026-10-21] rebaseline (#1136 / #1151): read-mode recall feels the live brakes (None = the frozen
+                # loop). Taken BEFORE the prime, so the prime is drive the divisive shunt sees (as a cue is in step()).
+                _rb = (self._recall_brakes(self._stability_params())
+                       if not write_mode and self.config.get("recall_brakes_enabled", False) else None)
+                if _rb is not None and _rb[2] is not None and _rb[2][1] == 0.0:
+                    if not self.nodes.recall_brakes_begin():
+                        _rb = (_rb[0], _rb[1], None)
+
                 # --- PRIME: inject current into specified nodes ---
                 for nid, current in zip(node_ids, currents):
                     node = self.nodes.get(nid)
@@ -3876,6 +4467,7 @@ class Graph:
 
                 decay = self.config["decay_rate"]
                 experience_threshold = self.config["he_experience_threshold"]
+                _pp_stab = self._stability_params()   # [2026-10-19] S (#1136): None = all off
 
                 for step_idx in range(steps):
                     prop_timestep += 1
@@ -3900,13 +4492,21 @@ class Graph:
                             working_set.add(target_id)  # now active (#164)
 
                     # 3. Detect firing nodes — O(working_set) not O(n) (#164)
-                    fired_ids: List[str] = []
-                    for nid in working_set:
-                        node = self.nodes[nid]
-                        if node.refractory_remaining > 0:
-                            continue
-                        if node.voltage >= node.threshold:
-                            fired_ids.append(nid)
+                    # [2026-10-21] rebaseline: with recall brakes, the native detection over the same working set in the
+                    # same order (AHP-raised thresholds, the live g_inh); a declined pass runs the frozen loop
+                    fired_ids = (self.nodes.recall_detect(list(working_set), ahp=_rb[0], inh=_rb[2])
+                                 if _rb is not None else None)
+                    if fired_ids is None:
+                        if _rb is not None:
+                            self._stab_error_once(("recall_brakes_enabled",), "a canonical node store (recall_detect "
+                                                  "declined; this sweep step ran without the brakes)")
+                        fired_ids = []
+                        for nid in working_set:
+                            node = self.nodes[nid]
+                            if node.refractory_remaining > 0:
+                                continue
+                            if node.voltage >= node.threshold:
+                                fired_ids.append(nid)
 
                     # 4. Reset fired nodes and set refractory
                     for nid in fired_ids:
@@ -3940,7 +4540,10 @@ class Graph:
                         # #59: Tonic use keeps a synapse alive — mirror step()'s reset so the
                         # age-on-write pass below only ages synapses the Tonic ISN'T exercising.
                         _out_ids = list(self._outgoing.get(nid, ()))
-                        for _row in _pp_rows(_out_ids, _age_on):
+                        # [2026-10-21] rebaseline: with recall brakes, depletion read-only (an inhibitory presynaptic
+                        # node is exempt, as in step())
+                        for _row in (_pp_rows(_out_ids, _age_on) if _rb is None or _rb[1] is None or node.is_inhibitory
+                                     else _pp_rows(_out_ids, _age_on, std_read=_rb[1])):
                             if _row is None:
                                 continue
                             _syn_post, _syn_w, _syn_inhib, _syn_delay = _row
@@ -3957,7 +4560,10 @@ class Graph:
                     # [2026-10-18] H2 (#1136): with the native passes on, this sweep step's hyperedge evaluation AND its
                     # hyperedge refractory decrement (below) run as one native pass; it returns the node ids the loop
                     # adds to working_set, in order. A declined pass (None) runs the frozen loops.
-                    _he_sw = (self.hyperedges.evaluate_sweep(self.nodes, fired_ids, experience_threshold)
+                    _he_sw = (self.hyperedges.evaluate_sweep(
+                                  self.nodes, fired_ids, experience_threshold,
+                                  # [2026-10-19] S (#1136) H / C1 / C3 weights (absent = the H2 call exactly)
+                                  **({"stab": _pp_stab.he} if _pp_stab is not None and _pp_stab.he is not None else {}))
                               if getattr(self, "_native_he_passes", False) else None)
                     if _he_sw is not None:
                         for _he_t in _he_sw:
@@ -4022,6 +4628,9 @@ class Graph:
                 # Observational propagation borrows activation state. A failure must
                 # return every borrowed transient field before releasing _step_lock.
                 # Write mode is living activity, so its state intentionally persists.
+                if not write_mode and self.config.get("recall_brakes_enabled", False) \
+                        and getattr(type(self.nodes), "recall_round", 0) >= 1:
+                    self.nodes.recall_brakes_end()   # [2026-10-21] rebaseline: drop the sweep's drive baseline
                 if not write_mode:
                     for nid, node in self.nodes.items():
                         node.voltage = saved_voltages.get(nid, node.resting_potential)
@@ -4096,6 +4705,647 @@ class Graph:
             (self._he_last_fired_step, self._he_output_candidates,
              self._he_co_fire_counts) = self.hyperedges.pass_state_export()
             self._he_ps_in_py = True
+
+    # ------------------------------------------------------------------------------------------------------------
+    # [2026-10-19] S (#1136): the stability set's switches (spec §2.3). Keys read live, absent = off, NOT in
+    # DEFAULT_CONFIG. Rust only (Q2): without the native passes a set key logs ERROR once and stays off.
+    # ------------------------------------------------------------------------------------------------------------
+    _STAB_HE_KEYS = ("he_habituation_enabled", "he_inject_respects_refractory",
+                     "he_threshold_homeo_enabled", "he_target_unlearn_enabled")
+    _STAB_NODE_KEYS = ("node_homeo_evidence_enabled", "syn_scale_evidence_enabled")
+    # [2026-10-19] S2 (#1136): need the S2 wheel (NodeStore.observe_inputs / HyperedgeStore.c2_bases)
+    _STAB_S2_NODE_KEYS = ("node_homeo_input_evidence_enabled", "syn_scale_settle_enabled", "burst_inhibition_enabled")
+    _STAB_S2_HE_KEYS = ("he_threshold_leak_enabled",)
+    # [2026-10-20] S3 (#1136): needs the S3 wheel (NodeStore.stab_round >= 3)
+    _STAB_S3_NODE_KEYS = ("node_homeo_slow_enabled",)
+    # [2026-10-20] S4 (#1136): need the S4 wheel (NodeStore.stab_round >= 4) and node_homeo_slow_enabled
+    _STAB_S4_NODE_KEYS = ("node_homeo_prop_enabled", "node_homeo_hopeless_enabled")
+    # [2026-10-20] S5 (#1136): need the S5 wheel (NodeStore / SynapseStore .stab_round >= 5)
+    _STAB_S5_KEYS = ("ca_split_enabled", "syn_std_enabled", "node_homeo_agree_enabled")
+    # [2026-10-20] round I (#1151): need the round-I wheel (NodeStore.stab_round >= 6 + interneurons_recruit)
+    _STAB_I_KEYS = ("interneurons_enabled", "interneuron_recruit_enabled")
+    # [2026-10-22] S6 (#1136): need the S6 wheel (NodeStore.stab_round >= 7; spontaneous also SynapseStore >= 6)
+    _STAB_S6_KEYS = ("breaker_homeo_enabled", "spontaneous_activity_enabled", "syn_scale_quiet_hold_enabled")
+    # [2026-10-23] S7b (#1136): needs the S7b wheel (NodeStore.stab_round >= 8); refines slow N, judged by input received
+    _STAB_S7B_KEYS = ("node_homeo_relax_enabled",)
+
+    def _stab_error_once(self, keys, need: str) -> None:
+        seen = self.__dict__.setdefault("_stab_err_logged", set())
+        fresh = [k for k in keys if k not in seen]
+        if fresh:
+            seen.update(fresh)
+            logger.error("stability set (#1136): %s set but this graph lacks %s -- staying OFF "
+                         "(the Python path is the frozen oracle and gains no new behaviour)", ", ".join(fresh), need)
+
+    def _stability_params(self) -> Optional["_StabParams"]:
+        """The stability set's switches for this step, or None when every one is off (the common case: the code
+        paths then make exactly the 11d3898 calls). Pure read of config + a one-time ERROR log."""
+        c = self.config
+        he = [k for k in self._STAB_HE_KEYS if c.get(k, False)]
+        nd = [k for k in self._STAB_NODE_KEYS if c.get(k, False)]
+        # [2026-10-19] S2 (#1136): burst inhibition stands alone; the other S2 keys modify N / S / C2 (below)
+        inh_on = bool(c.get("burst_inhibition_enabled", False))
+        # [2026-10-20] S5 (#1136): the calcium split and depression stand alone; agreement refines slow (below)
+        s5 = [k for k in self._STAB_S5_KEYS if c.get(k, False)]
+        # [2026-10-20] round I (#1151): the interneuron layer stands alone
+        ik = [k for k in self._STAB_I_KEYS if c.get(k, False)]
+        # [2026-10-22] S6 (#1136): the breaker and spontaneous activity stand alone; the quiet hold refines S (below)
+        s6 = [k for k in self._STAB_S6_KEYS if c.get(k, False)]
+        # [2026-10-23] S7b (#1136): a relax key that cannot run says so even when everything else is off (a dict graph, or
+        # relax set without the N keys it refines -- law review L7: the early return below would otherwise hide it)
+        s7b = [k for k in self._STAB_S7B_KEYS if c.get(k, False)]
+        if s7b and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 8):
+            self._stab_error_once(s7b, "the native node store (S7b-round ng_tract)")
+        elif s7b and not nd:
+            self._stab_error_once(s7b, "node_homeo_evidence_enabled + node_homeo_slow_enabled + "
+                                       "node_homeo_input_evidence_enabled (relax refines slow N and judges input received)")
+        # [2026-10-27] S10 (#1136): likewise for the RPE reward
+        if c.get("reward_rpe_enabled", False):
+            self._stab_s10_rpe()
+        # [2026-10-28] S13 (#1136): both switches say so once when they cannot run
+        if c.get("reward_rpe_per_source_enabled", False):
+            self._stab_s13_per_source()
+        if c.get("reward_floor_symmetric_enabled", False):
+            self._stab_s13_floor()
+        # [2026-10-27] S11 (#1136): C2-down says so even when nothing else of the set is on
+        if c.get("he_threshold_homeo_down_enabled", False) and not c.get("he_threshold_homeo_enabled", False):
+            self._stab_error_once(["he_threshold_homeo_down_enabled"], "he_threshold_homeo_enabled (it is C2's other half)")
+        # [2026-10-25] S8 (#1136): the bound says so when it cannot run on this graph at all (as S7b's L7 check above)
+        if c.get("syn_scale_up_bound_enabled", False) and not (
+                getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 9):
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "the native node store (S8-round ng_tract)")
+        if not he and not nd and not inh_on and not s5 and not ik and not s6:
+            return None
+        bk_t = sp_t = None
+        if s6:
+            bk_t, sp_t = self._stab_s6_standalone(c, s6)
+        ca_t = std_t = None
+        if s5:
+            ca_t, std_t = self._stab_s5_standalone(c, s5)
+        il_t = ir_t = None
+        if ik:
+            il_t, ir_t = self._stab_i_standalone(c, ik)
+        s2n = [k for k in self._STAB_S2_NODE_KEYS if c.get(k, False)]
+        s2h = [k for k in self._STAB_S2_HE_KEYS if c.get(k, False)]
+        if s2n and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "observe_inputs")):
+            self._stab_error_once(s2n, "the native node store (S2-round ng_tract)")
+            s2n = []
+            inh_on = False
+        s3n = [k for k in self._STAB_S3_NODE_KEYS if c.get(k, False)]
+        if s3n and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 3):
+            self._stab_error_once(s3n, "the native node store (S3-round ng_tract)")
+            s3n = []
+        s4n = [k for k in self._STAB_S4_NODE_KEYS if c.get(k, False)]
+        if s4n and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 4):
+            self._stab_error_once(s4n, "the native node store (S4-round ng_tract)")
+            s4n = []
+        if s4n and "node_homeo_slow_enabled" not in s3n:
+            self._stab_error_once(s4n, "node_homeo_slow_enabled (S4 refines slow node homeostasis)")
+            s4n = []
+        # out-of-range parameters would make the native pass decline (and the frozen Python loop run): refuse them here
+        if "node_homeo_prop_enabled" in s4n and not (float(c.get("node_homeo_prop_unit", 2.0)) > 1.0
+                                                      and float(c.get("node_homeo_prop_max", 4.0)) > 0.0):
+            self._stab_error_once(["node_homeo_prop_enabled"], "node_homeo_prop_unit > 1 and node_homeo_prop_max > 0")
+            s4n = [k for k in s4n if k != "node_homeo_prop_enabled"]
+        if "node_homeo_hopeless_enabled" in s4n and not (float(c.get("node_homeo_hopeless_window", 1000.0)) > 0.0
+                                                          and 0.0 <= float(c.get("node_homeo_hopeless_leak", 0.0)) <= 1.0):
+            self._stab_error_once(["node_homeo_hopeless_enabled"],
+                                  "node_homeo_hopeless_window > 0 and 0 <= node_homeo_hopeless_leak <= 1")
+            s4n = [k for k in s4n if k != "node_homeo_hopeless_enabled"]
+        if "node_homeo_hopeless_enabled" in s4n and "node_homeo_input_evidence_enabled" not in s2n:
+            self._stab_error_once(["node_homeo_hopeless_enabled"], "node_homeo_input_evidence_enabled (it judges input)")
+            s4n = [k for k in s4n if k != "node_homeo_hopeless_enabled"]
+        if s2h and not (getattr(self, "_native_he_passes", False) and hasattr(self.hyperedges, "c2_bases")):
+            self._stab_error_once(s2h, "the native hyperedge passes (S2-round ng_tract)")
+            s2h = []
+        # [2026-10-20] S5 (#1136): agreement refines slow node homeostasis (S3) and needs the S5 kernels
+        agree_on = "node_homeo_agree_enabled" in s5
+        if agree_on and not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 5):
+            self._stab_error_once(["node_homeo_agree_enabled"], "the native node store (S5-round ng_tract)")
+            agree_on = False
+        if agree_on and not ("node_homeo_slow_enabled" in s3n and c.get("node_homeo_evidence_enabled", False)):
+            self._stab_error_once(["node_homeo_agree_enabled"],
+                                  "node_homeo_slow_enabled + node_homeo_evidence_enabled (agreement refines slow N)")
+            agree_on = False
+        s5_any = (ca_t is not None or std_t is not None or il_t is not None or ir_t is not None
+                  or bk_t is not None or sp_t is not None)
+        if "syn_scale_quiet_hold_enabled" in s6 and "syn_scale_evidence_enabled" not in nd:
+            self._stab_error_once(["syn_scale_quiet_hold_enabled"], "syn_scale_evidence_enabled (it refines S)")
+        if not he and not nd and not inh_on and not s5_any:
+            return None
+        if he and not (getattr(self, "_native_he_passes", False)
+                       and hasattr(self.hyperedges, "release_weak_targets")):
+            self._stab_error_once(he, "the native hyperedge passes (both native stores, S-phase ng_tract)")
+            he = []
+        if nd and not (getattr(self, "_native_nodes", False) and hasattr(self.nodes, "evidence_scales")):
+            self._stab_error_once(nd, "the native node store (S-phase ng_tract)")
+            nd = []
+        if not he and not nd and not inh_on and not s5_any:
+            return None
+        hab = ((float(c.get("he_habituation_half", 0.05)), float(c.get("he_habituation_power", 2.0)))
+               if "he_habituation_enabled" in he else None)
+        c2 = ((float(c.get("he_rate_target", 0.05)), float(c.get("he_threshold_homeo_rate", 0.001)))
+              if "he_threshold_homeo_enabled" in he else None)
+        c3 = ((float(c.get("he_target_unlearn_d", 0.02)), float(c.get("he_target_unlearn_p", 0.05)))
+              if "he_target_unlearn_enabled" in he else None)
+        n_on = "node_homeo_evidence_enabled" in nd
+        s_on = "syn_scale_evidence_enabled" in nd
+        v_floor = float(c.get("node_homeo_v_floor", 0.5))
+        # [2026-10-19] S2 (#1136): (1) needs N or S, (2) needs S, (3) needs C2; each absent = S exactly
+        in_on = "node_homeo_input_evidence_enabled" in s2n and (n_on or s_on)
+        # [2026-10-22] S6-3: the quiet hold refines S and needs S2-1's input sensor (it reads the last afferent input)
+        q_w = None
+        if "syn_scale_quiet_hold_enabled" in s6:
+            w = float(c.get("syn_scale_quiet_window", 100))
+            if not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 7):
+                self._stab_error_once(["syn_scale_quiet_hold_enabled"], "the native node store (S6-round ng_tract)")
+            elif not (s_on and in_on):
+                self._stab_error_once(["syn_scale_quiet_hold_enabled"],
+                                      "syn_scale_evidence_enabled + node_homeo_input_evidence_enabled (it refines S and "
+                                      "reads the input sensor)")
+            elif not (w >= 1.0 and math.isfinite(w)):
+                self._stab_error_once(["syn_scale_quiet_hold_enabled"], "syn_scale_quiet_window >= 1")
+            else:
+                q_w = int(w)
+        settle_on = "syn_scale_settle_enabled" in s2n and s_on
+        relax_t = self._stab_s7b_relax(c, s2n, s3n, n_on, in_on)
+        leak_on = "he_threshold_leak_enabled" in s2h and c2 is not None
+        he_t = (hab, "he_inject_respects_refractory" in he, c2, c3)
+        if leak_on:
+            he_t = he_t + (float(c.get("he_threshold_leak_rate", 0.002)),)
+        # [2026-10-27] S11 (#1136): C2's downward half, as the optional 6th item (None / absent = S2 exactly)
+        c2d = self._stab_s11_c2_down(c, c2)
+        if c2d is not None:
+            he_t = he_t + ((None,) if len(he_t) == 4 else ()) + (c2d,)
+        return _StabParams(
+            he=he_t if he else None,
+            c3_floor=float(c.get("he_target_unlearn_floor", 0.1)) if c3 is not None else None,
+            v_alpha=float(c.get("node_homeo_v_alpha", 0.01)) if ((n_on or s_on) and not in_on) else None,
+            node=((v_floor, float(c.get("node_homeo_leak", 0.02)), float(c.get("default_threshold", 0.85)))
+                  if n_on else None),
+            syn=((1.0 / float(c.get("syn_scale_rate_tau", 2000.0)), float(c.get("syn_scale_max_up", 1.03)),
+                  float(c.get("syn_scale_max_down", 0.97)), v_floor) if s_on else None),
+            inp=((float(c["decay_rate"]), float(c.get("node_homeo_input_min", 0.01)),
+                  float(c.get("node_homeo_input_alpha", 0.002)), float(c.get("node_homeo_fail_alpha", 0.25)))
+                 if in_on else None),
+            ev_in=((float(c.get("node_homeo_input_rate_min", 0.0005)), float(c.get("node_homeo_fail_min", 0.5)))
+                   if in_on else None),
+            ev_recent=bool(in_on and c.get("node_homeo_input_recent_enabled", False)),
+            deadband=float(c.get("syn_scale_deadband", 0.2)) if settle_on else None,
+            inhib=((float(c.get("burst_inh_gain", 10.0)), float(c.get("burst_inh_decay", 0.5)),
+                    float(c.get("burst_inh_max", 1.0)), float(c.get("burst_inh_base_alpha", 0.01)))
+                   if inh_on else None),
+            # [2026-10-20] S3 (#1136): slow node homeostasis needs N
+            slow=((float(c.get("node_homeo_slow_rate_mult", 0.2)), 1.0 / float(c.get("syn_scale_rate_tau", 2000.0)))
+                  if ("node_homeo_slow_enabled" in s3n and n_on) else None),
+            # [2026-10-20] S4 (#1136): both refine slow (needs N); hope also needs evidence by input received
+            prop=((float(c.get("node_homeo_prop_unit", 2.0)), float(c.get("node_homeo_prop_max", 4.0)))
+                  if ("node_homeo_prop_enabled" in s4n and n_on) else None),
+            hope=((float(c.get("node_homeo_hopeless_fail", 0.95)), float(c.get("node_homeo_hopeless_window", 1000.0)),
+                   float(c.get("node_homeo_hopeless_leak", 0.0)))
+                  if ("node_homeo_hopeless_enabled" in s4n and n_on and in_on) else None),
+            # [2026-10-20] S5 (#1136)
+            ca_split=ca_t,
+            std=std_t,
+            agree=bool(agree_on and n_on),
+            # [2026-10-20] round I (#1151)
+            ilayer=il_t,
+            irecruit=ir_t,
+            # [2026-10-22] S6 (#1136)
+            breaker=(bk_t if bk_t is None else self._stab_s6_breaker(c, bk_t, n_on)),
+            spont=sp_t,
+            quiet=q_w,
+            relax=relax_t,
+            up_bound=self._stab_s8_bound(c, s_on),
+        )
+
+    def _stab_s10_rpe(self) -> Optional[float]:
+        """[2026-10-27] S10 (#1136): the RPE baseline time constant (events) when the signed per-step reward is on, else
+        None (ERROR once when the key is set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_rpe_enabled", False):
+            return None
+        if not c.get("three_factor_enabled", False):
+            self._stab_error_once(["reward_rpe_enabled"], "three_factor_enabled (it signs the three-factor reward)")
+            return None
+        try:
+            tau = float(c.get("reward_rpe_tau", 2000))
+        except (TypeError, ValueError):
+            tau = float("nan")
+        if not (tau >= 1.0):   # also refuses NaN
+            self._stab_error_once(["reward_rpe_enabled"], "reward_rpe_tau >= 1")
+            return None
+        return tau
+
+    def _stab_s11_c2_down(self, c: dict, c2: Optional[tuple]) -> Optional[tuple]:
+        """[2026-10-27] S11 (#1136): C2-down `(rate, evidence, floor)` when he_threshold_homeo_down_enabled is on and can
+        run, else None (ERROR once when the key is set but cannot run). Pure read of config."""
+        if not c.get("he_threshold_homeo_down_enabled", False):
+            return None
+        if c2 is None:
+            self._stab_error_once(["he_threshold_homeo_down_enabled"], "he_threshold_homeo_enabled (it is C2's other half)")
+            return None
+        if getattr(type(self.hyperedges), "c2_down_round", 0) < 1:
+            self._stab_error_once(["he_threshold_homeo_down_enabled"], "the S11 native hyperedge store (c2_down_round >= 1)")
+            return None
+        try:
+            t = (float(c.get("he_threshold_homeo_down_rate", 0.001)), float(c.get("he_threshold_homeo_down_evidence", 0.5)),
+                 float(c.get("he_threshold_homeo_down_floor", 0.1)))
+        except (TypeError, ValueError):
+            t = (float("nan"),) * 3
+        if not (0.0 < t[0] < 1.0 and 0.0 < t[1] < 1.0 and 0.0 <= t[2] < 1.0):   # also refuses NaN
+            self._stab_error_once(["he_threshold_homeo_down_enabled"],
+                                  "he_threshold_homeo_down_rate in (0, 1), _evidence in (0, 1), _floor in [0, 1)")
+            return None
+        return t
+
+    def _s10_rpe_broadcast(self, outcomes: List[float]) -> None:
+        """[2026-10-27] S10 (#1136): one global, signed reward for this step's resolved predictions, judged against the
+        running expected outcome b (as it stood at the step's start); then b learns from them."""
+        tau = self._stab_s10_rpe()
+        if tau is None or not outcomes:
+            return
+        # [2026-10-27] try-1 fix: the step's MEAN outcome, not the sum (a sum scaled the signal with the number of
+        # resolutions -- ~40 / step early -> ~30x the old per-surprise strength on every trace, mean weight 0.078 -> 0.121
+        # in 25 steps); dopamine is a bounded level, not a count. b starts at the first STEP's mean (its delta = 0).
+        mean_o = sum(outcomes) / len(outcomes)
+        b = self.__dict__.get("_s10_rpe_baseline")
+        if b is None:
+            b = mean_o
+        delta = mean_o - b
+        for o in outcomes:
+            b += (o - b) / tau
+        self._s10_rpe_baseline = b
+        self._s10_commit(delta * self.config.get("surprise_reward_scaling", 0.5))
+
+    def _s10_commit(self, strength: float) -> None:
+        """[2026-10-28] the RPE step's one commit (S10 / S13): the 0.01 gate. (S12's trace-norm gain was removed
+        2026-11-04: S12 was not kept, dev-log 2026-10-28 §7.)"""
+        if abs(strength) > 0.01:   # as the base: don't bother with a negligible signal
+            self.inject_reward(strength)
+
+    def _stab_s13_per_source(self) -> Optional[float]:
+        """[2026-10-28] S13 (#1136): the per-source expectation time constant (events) when reward_rpe_per_source_enabled
+        is on and can run, else None (ERROR once when the key is set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_rpe_per_source_enabled", False):
+            return None
+        if self._stab_s10_rpe() is None:
+            self._stab_error_once(["reward_rpe_per_source_enabled"], "reward_rpe_enabled (it judges S10's outcomes per source)")
+            return None
+        try:
+            tau = float(c.get("reward_rpe_source_tau", 20))
+        except (TypeError, ValueError):
+            tau = float("nan")
+        if not (tau >= 1.0):   # also refuses NaN
+            self._stab_error_once(["reward_rpe_per_source_enabled"], "reward_rpe_source_tau >= 1")
+            return None
+        return tau
+
+    def _stab_s13_floor(self) -> bool:
+        """[2026-10-28] S13 (#1136): True when reward_floor_symmetric_enabled is on and can run (ERROR once when the key is
+        set but cannot run). Pure read of config."""
+        c = self.config
+        if not c.get("reward_floor_symmetric_enabled", False):
+            return False
+        if not c.get("three_factor_enabled", False):
+            self._stab_error_once(["reward_floor_symmetric_enabled"], "three_factor_enabled (it bounds the reward commit)")
+            return False
+        if getattr(type(self.synapses), "reward_floor_round", 0) < 1:
+            self._stab_error_once(["reward_floor_symmetric_enabled"], "the S13 native synapse store (reward_floor_round >= 1)")
+            return False
+        return True
+
+    def _stab_receiver(self) -> Optional[Tuple[float, float, float, float, float, float, float]]:
+        """[2026-11-01] S18 (#1202): (rho0, k, eta, rho_min, ema_alpha, chain_floor, margin) when
+        prediction_receiver_enabled is on and its params are sound, else None (ERROR once when on but unsound).
+        Pure read of config."""
+        c = self.config
+        if not c.get("prediction_receiver_enabled", False):
+            return None
+        try:
+            p = tuple(float(c.get("prediction_receiver_" + k, d)) for k, d in (
+                ("rho0", 0.3), ("k", 1.0), ("eta", 0.002), ("rho_min", 0.1), ("ema_alpha", 0.01),
+                ("chain_floor", 0.05), ("margin", 0.05)))
+        except (TypeError, ValueError):
+            p = None
+        if p is not None:
+            rho0, k, eta, rho_min, alpha, floor, margin = p
+            ok = (all(math.isfinite(x) for x in p) and 0.0 < rho_min <= rho0 < 1.0 and k > 0.0
+                  and 0.0 < eta < 1.0 and 0.0 < alpha <= 1.0 and floor >= 0.0 and margin >= 0.0)
+            if ok:
+                return p
+        self._stab_error_once(["prediction_receiver_enabled"],
+                              "finite params with 0 < rho_min <= rho0 < 1, k > 0, 0 < eta < 1, 0 < ema_alpha <= 1, "
+                              "chain_floor >= 0, margin >= 0")
+        return None
+
+    def _stab_diffpc_receiver(self) -> Optional[Tuple[float, int, int, bool]]:
+        """[2026-11-03] S19 (#1202 follow-up): (eta, k, window, count_only) when diffpc_receiver_enabled is on, the
+        receiver path is on and the params are sound, else None (ERROR once when on but it cannot run). Pure read of
+        config."""
+        c = self.config
+        if not c.get("diffpc_receiver_enabled", False):
+            return None
+        if self._stab_receiver() is None:
+            self._stab_error_once(["diffpc_receiver_enabled"], "prediction_receiver_enabled with sound params "
+                                  "(corrected DiffPC is the error half of the receiver predictions)")
+            return None
+        try:
+            eta = float(c.get("diffpc_receiver_eta", 0.5))
+            k, w = c.get("diffpc_receiver_k", 64), c.get("diffpc_receiver_window", 5)
+            ok = (math.isfinite(eta) and 0.0 <= eta <= 1.0 and isinstance(k, int) and not isinstance(k, bool)
+                  and k >= 1 and isinstance(w, int) and not isinstance(w, bool)
+                  and 1 <= w <= int(c.get("d_max", 5)))
+        except (TypeError, ValueError):
+            ok = False
+        if ok and not (hasattr(ng_tract, "DiffPc") and isinstance(self.nodes, getattr(ng_tract, "NodeStore", ()))
+                       and isinstance(self.synapses, ng_tract.SynapseStore)
+                       and getattr(self, "_native_he_passes", False)):
+            # [2026-11-04] Rust-only (Josh 2026-11-03: no Python fallback): no native DiffPc / stores -> off. The native
+            # hyperedge passes are needed too: only they report their drive (a Python pass would leave it unexplained)
+            self._stab_error_once(["diffpc_receiver_enabled"], "an ng_tract wheel with DiffPc and the native "
+                                  "NodeStore / SynapseStore / hyperedge passes (corrected DiffPC has no Python path)")
+            return None
+        if ok:
+            return eta, k, w, bool(c.get("diffpc_receiver_count_only", False))
+        self._stab_error_once(["diffpc_receiver_enabled"], "finite params with 0 <= diffpc_receiver_eta <= 1, "
+                              "integer diffpc_receiver_k >= 1, integer 1 <= diffpc_receiver_window <= d_max")
+        return None
+
+    def _s13_source_rpe_broadcast(self, events: List[tuple]) -> None:
+        """[2026-10-28] S13 (#1136): the step's one reward from per-source surprise: mean over resolved predictions of
+        hit - q_src (q_src the source's expected hit rate before this event), then each q_src learns from its hit."""
+        tau = self._stab_s13_per_source()
+        if tau is None or not events:
+            return
+        q = self.__dict__.get("_s13_q")
+        if q is None:
+            q = self._s13_q = {}
+        deltas = []
+        for src, hit, conf in events:
+            e = q.get(src, conf)
+            deltas.append(hit - e)
+            q[src] = e + (hit - e) / tau
+        self._s10_commit(sum(deltas) / len(deltas) * self.config.get("surprise_reward_scaling", 0.5))
+
+    def _stab_s8_bound(self, c, s_on: bool) -> Optional[float]:
+        """[2026-10-25] S8 (#1136): the total up-scaling bound B (> 1), or None (off; ERROR once when the key is set but
+        cannot run). Pure read of config."""
+        if not c.get("syn_scale_up_bound_enabled", False):
+            return None
+        if not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 9):
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "the native node store (S8-round ng_tract)")
+            return None
+        if not s_on:
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "syn_scale_evidence_enabled (it bounds S)")
+            return None
+        try:
+            b = float(c.get("syn_scale_up_bound", 2.0))
+        except (TypeError, ValueError):
+            b = float("nan")
+        if not (b > 1.0 and math.isfinite(b)):
+            self._stab_error_once(["syn_scale_up_bound_enabled"], "a finite syn_scale_up_bound > 1")
+            return None
+        return b
+
+    def _s8_incoming_sums(self) -> Optional[Dict[str, float]]:
+        """[2026-10-25] S8 (#1136; law review MEDIUM 1): each node's incoming weight sum, read before a sleep's downscale,
+        or None while the bound is off (nothing read). Read-only."""
+        if self._stab_s8_bound(self.config, bool(self.config.get("syn_scale_evidence_enabled", False))) is None:
+            return None
+        return dict(self.synapses.incoming_weight_sums())
+
+    def _s8_sleep_shrink(self, before: Optional[Dict[str, float]]) -> None:
+        """[2026-10-25] S8 (#1136): a sleep's downscale returns each node's scaling room by what it actually removed from
+        that node's input: its total shrinks by ln(after / before) of the incoming weight sum (the strength-aware
+        downscale takes little from strong links, so a uniform ln(1 - d0) would over-return room -- law review MEDIUM 1).
+        `before` = _s8_incoming_sums() taken before the downscale; None = off, nothing touched."""
+        if before is None:
+            return
+        after = self.synapses.incoming_weight_sums()
+        lfs = {}
+        for nid, b in before.items():
+            if b > 0.0:
+                a = float(after.get(nid, 0.0))
+                lfs[nid] = math.log(a / b) if a > 0.0 else float("-inf")
+        if lfs:
+            self.nodes.s8_shrink_rows(lfs)
+
+    def _stab_s7b_relax(self, c, s2n, s3n, n_on: bool, in_on: bool) -> Optional[tuple]:
+        """[2026-10-23] S7b (#1136): gain relaxation's (mult, from, stop, resume, window), or None (off; ERROR once when
+        the key is set but cannot run). Pure read of config."""
+        if not c.get("node_homeo_relax_enabled", False):
+            return None
+        if not (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 8):
+            self._stab_error_once(["node_homeo_relax_enabled"], "the native node store (S7b-round ng_tract)")
+            return None
+        if not (n_on and "node_homeo_slow_enabled" in s3n and in_on and "node_homeo_input_evidence_enabled" in s2n):
+            self._stab_error_once(["node_homeo_relax_enabled"],
+                                  "node_homeo_evidence_enabled + node_homeo_slow_enabled + node_homeo_input_evidence_enabled "
+                                  "(relax refines slow N and judges input received)")
+            return None
+        try:
+            t = (float(c.get("node_homeo_relax_mult", 1.0)), float(c.get("node_homeo_relax_from", 4.5)),
+                 float(c.get("node_homeo_relax_stop", 0.35)), float(c.get("node_homeo_relax_resume", 0.2)),
+                 float(c.get("node_homeo_relax_window", 1000.0)))
+        except (TypeError, ValueError):
+            t = None
+        fmin = float(c.get("node_homeo_fail_min", 0.5))
+        # the kernel takes rate = the slow excitability step x mult in (0, 1]; out of range it would decline the pass
+        rule = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        step = ((float(rule.excitability_rate) if rule is not None else 0.01)
+                * float(c.get("node_homeo_slow_rate_mult", 0.2)))
+        if t is not None and not (0.0 < step * t[0] <= 1.0):
+            t = None
+        if t is None or not (t[0] > 0.0 and math.isfinite(t[0]) and math.isfinite(t[1])
+                             and 0.0 <= t[3] <= t[2] <= fmin and t[4] >= 1.0 and math.isfinite(t[4])
+                             and t[4] == int(t[4])):
+            self._stab_error_once(["node_homeo_relax_enabled"],
+                                  "0 < node_homeo_relax_mult x the slow excitability step <= 1, finite "
+                                  "node_homeo_relax_from, 0 <= node_homeo_relax_resume <= node_homeo_relax_stop <= "
+                                  "node_homeo_fail_min, node_homeo_relax_window a whole number >= 1")
+            return None
+        return (t[0], t[1], t[2], t[3], t[4])
+
+    def _stab_s6_standalone(self, c, s6) -> Tuple[Optional[tuple], Optional[tuple]]:
+        """[2026-10-22] S6 (#1136): the bounded breaker's switch (True) and spontaneous activity's (p, q, seed), or None
+        each (ERROR once when a set key cannot run). Pure read of config."""
+        nat7 = getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 7
+        bk_t = sp_t = None
+        if "breaker_homeo_enabled" in s6:
+            if nat7 and hasattr(self.nodes, "breaker_lift"):
+                bk_t = True
+            else:
+                self._stab_error_once(["breaker_homeo_enabled"], "the native node store (S6-round ng_tract)")
+        if "spontaneous_activity_enabled" in s6:
+            p = float(c.get("spont_release_p", 0.002))
+            q = float(c.get("spont_quantal", 0.25))
+            seed = int(c.get("spont_seed", 0))
+            if not (nat7 and getattr(type(self.synapses), "stab_round", 0) >= 6
+                    and hasattr(self.synapses, "spontaneous_release")):
+                self._stab_error_once(["spontaneous_activity_enabled"],
+                                      "the native node + synapse stores (S6-round ng_tract)")
+            elif not (0.0 <= p <= 1.0 and 0.0 <= q and math.isfinite(q) and seed >= 0):
+                self._stab_error_once(["spontaneous_activity_enabled"],
+                                      "0 <= spont_release_p <= 1, spont_quantal >= 0, spont_seed >= 0")
+            else:
+                sp_t = (p, q, seed)
+        return bk_t, sp_t
+
+    def _stab_s6_breaker(self, c, bk_t, n_on: bool) -> tuple:
+        """[2026-10-22] S6-1: the lift's rates = HomeostaticRule's (x the slow mult when S3 slow runs, as N moves), S4's
+        bounded distance when prop runs; headroom always. Pure read of config."""
+        rule = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        thr = float(rule.threshold_rate) if rule is not None else 0.001
+        exc = float(rule.excitability_rate) if rule is not None else 0.01
+        interval = int(rule.scaling_interval) if rule is not None else int(c.get("scaling_interval", 25))
+        slow = bool(n_on and c.get("node_homeo_slow_enabled", False)
+                    and getattr(type(self.nodes), "stab_round", 0) >= 3)
+        if slow:
+            m = float(c.get("node_homeo_slow_rate_mult", 0.2))
+            thr, exc = thr * m, exc * m
+        prop = None
+        if slow and c.get("node_homeo_prop_enabled", False):
+            prop = (float(c.get("node_homeo_prop_unit", 2.0)), float(c.get("node_homeo_prop_max", 4.0)))
+        return (thr, exc, interval, float(c.get("default_threshold", 0.85)), slow, prop)
+
+    def _stab_s5_standalone(self, c, s5) -> Tuple[Optional[tuple], Optional[tuple]]:
+        """[2026-10-20] S5 (#1136): the calcium split (#1149) and short-term depression (#1150) tuples, or None each
+        (ERROR once when a set key cannot run). Pure read of config."""
+        ca_t = std_t = None
+        if "ca_split_enabled" in s5:
+            nat = getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 5
+            tau = float(c.get("ca_split_slow_tau", 200.0))
+            gain = float(c.get("ca_split_ahp_gain", 0.075))
+            d_ca = float(c.get("delta_Ca", 0.0) or 0.0)
+            delta = float(c.get("ca_split_slow_delta", d_ca))
+            if not nat:
+                self._stab_error_once(["ca_split_enabled"], "the native node store (S5-round ng_tract)")
+            elif self._event_handlers.get("pre_fire"):
+                self._stab_error_once(["ca_split_enabled"], "native fire detection (a pre_fire handler is registered)")
+            elif not d_ca:
+                self._stab_error_once(["ca_split_enabled"], "the calcium channels on (delta_Ca != 0)")
+            elif not (tau > 1.0 and math.isfinite(tau) and gain >= 0.0 and math.isfinite(gain)
+                      and delta >= 0.0 and math.isfinite(delta)):
+                self._stab_error_once(["ca_split_enabled"],
+                                      "ca_split_slow_tau > 1, ca_split_ahp_gain >= 0 and ca_split_slow_delta >= 0")
+            else:
+                ca_t = (float(c.get("g_CaN", 0.0)), math.exp(-1.0 / tau), delta, gain)
+        if "syn_std_enabled" in s5:
+            u = float(c.get("syn_std_u", 0.2))
+            tau = float(c.get("syn_std_tau", 50.0))
+            # the native stores (as every stability key: a dict-backed node graph is the frozen oracle's shape)
+            if not (getattr(self, "_native_nodes", False) and hasattr(self.synapses, "propagation_rows")
+                    and getattr(type(self.synapses), "stab_round", 0) >= 5):
+                self._stab_error_once(["syn_std_enabled"], "the native node + synapse stores (S5-round ng_tract)")
+            elif not (0.0 < u <= 1.0 and tau > 0.0 and math.isfinite(tau)):
+                self._stab_error_once(["syn_std_enabled"], "0 < syn_std_u <= 1 and syn_std_tau > 0")
+            else:
+                std_t = (u, tau)
+        return ca_t, std_t
+
+    def _stab_i_standalone(self, c, ik) -> Tuple[Optional[tuple], Optional[tuple]]:
+        """[2026-10-20] round I (#1151): the interneuron layer's step tuple (without the timestep) and recruitment
+        params, or None each (ERROR once when a set key cannot run). Pure read of config."""
+        nat = (getattr(self, "_native_nodes", False) and getattr(type(self.nodes), "stab_round", 0) >= 6
+               and hasattr(self.nodes, "interneurons_recruit"))
+        if not nat:
+            self._stab_error_once(ik, "the native node store (round-I ng_tract)")
+            return None, None
+        if self._event_handlers.get("pre_fire"):
+            self._stab_error_once(ik, "native fire detection (a pre_fire handler is registered)")
+            return None, None
+        il_t = ir_t = None
+        if "interneurons_enabled" in ik:
+            form = c.get("interneuron_form", "divisive")
+            g_max = float(c.get("inh_g_max", 3.0))
+            ist = bool(c.get("interneuron_istdp_enabled", False))
+            t = (float(c["decay_rate"]), float(c.get("interneuron_decay", 0.5)), float(c.get("inh_g_decay", 0.5)), g_max,
+                 float(c.get("interneuron_delay", 1)), float(c.get("inh_g_eps", 0.01)),
+                 1.0 if form == "offset" else 0.0,
+                 1.0 if ist else 0.0, float(c.get("interneuron_istdp_eta", 0.001)),
+                 float(c.get("interneuron_istdp_tau", 20.0)), float(c.get("interneuron_istdp_wmax", g_max)))
+            ok = (form in ("divisive", "offset") and 0.0 <= t[1] < 1.0 and 0.0 <= t[2] < 1.0
+                  and 0.0 < g_max and math.isfinite(g_max) and t[4] in (0.0, 1.0) and t[5] >= 0.0
+                  and (not ist or (t[8] >= 0.0 and math.isfinite(t[8]) and t[9] > 0.0 and math.isfinite(t[9])
+                                   and t[10] > 0.0 and math.isfinite(t[10]))))
+            if ok:
+                il_t = t
+            else:
+                self._stab_error_once(["interneurons_enabled"],
+                                      "interneuron_form divisive|offset, 0 <= interneuron_decay / inh_g_decay < 1, "
+                                      "inh_g_max > 0, interneuron_delay 0|1, inh_g_eps >= 0, iSTDP eta >= 0, tau > 0, "
+                                      "w_max > 0")
+        if "interneuron_recruit_enabled" in ik:
+            r = (float(c.get("interneuron_pool_max", 12)), float(c.get("interneuron_k_min", 3)),
+                 float(c.get("interneuron_w_min", 0.05)), float(c.get("interneuron_cover", 1)),
+                 float(c.get("interneuron_ratio_max", 0.20)), float(c.get("interneuron_theta", 1.0)),
+                 float(c.get("interneuron_coincidence", 2)), float(c.get("interneuron_refractory", 1)),
+                 float(c.get("interneuron_w_ie", 0.5)), float(c.get("interneuron_retire_window", 4000)))
+            if (r[0] >= 1 and r[1] >= 1 and r[2] >= 0 and r[3] >= 1 and 0 < r[4] <= 1 and r[5] > 0 and r[6] >= 1
+                    and r[7] >= 0 and r[8] >= 0 and r[9] > 0 and all(math.isfinite(x) for x in r)):
+                ir_t = r
+            else:
+                self._stab_error_once(["interneuron_recruit_enabled"],
+                                      "interneuron_pool_max / _k_min / _cover / _coincidence >= 1, 0 < _ratio_max <= 1, "
+                                      "_theta > 0, _w_min / _refractory / _w_ie >= 0, _retire_window > 0")
+        return il_t, ir_t
+
+    def _recall_brakes(self, st: Optional["_StabParams"]) -> Optional[tuple]:
+        """[2026-10-21] rebaseline (#1136 / #1151; Josh 2026-10-21): with ``recall_brakes_enabled`` (read live, absent =
+        off, not in DEFAULT_CONFIG), a READ-MODE recall sweep feels the brakes step() applies right now, read-only:
+        (ahp gain or None, std_read timestep or None, (decay_rate, offset flag) or None) — S5's AHP brake when
+        ca_split runs, depletion when syn_std runs, round I's inhibition when the layer runs and exists. None = no
+        brake applies (the frozen loop exactly). Needs the recall-round wheel (recall_round >= 1 on both stores), else
+        ERROR once and off. Pure read of config / store state."""
+        if not self.config.get("recall_brakes_enabled", False):
+            return None
+        if not (getattr(type(self.nodes), "recall_round", 0) >= 1
+                and getattr(type(self.synapses), "recall_round", 0) >= 1):
+            self._stab_error_once(("recall_brakes_enabled",), "the native node + synapse stores (recall-round ng_tract)")
+            return None
+        if st is None:
+            return None
+        ahp = float(st.ca_split[3]) if st.ca_split is not None else None
+        std_r = float(self.timestep) if st.std is not None else None
+        inh = ((float(st.ilayer[0]), float(st.ilayer[6]))
+               if st.ilayer is not None and self.nodes.interneurons_exists() else None)
+        if ahp is None and std_r is None and inh is None:
+            return None
+        return (ahp, std_r, inh)
+
+    def _interneurons_recruit(self, params: tuple) -> Optional[Dict[str, Any]]:
+        """[2026-10-20] round I (#1151): one recruitment / maintenance run of the native interneuron layer (design
+        §1.2): reads the E topology and firing, never content; never touches an E node or a synapse. Caller holds
+        nothing; takes _step_lock. Returns the counts (None = the native pass declined; nothing touched)."""
+        hr = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        targets = hr._degree_targets if hr is not None else {}
+        default = float(hr.target_firing_rate if hr is not None else self.config.get("target_firing_rate", 0.05))
+        with self._step_lock:
+            out = self.nodes.interneurons_recruit(self.synapses, params, targets, default, int(self.timestep))
+        if out is None:
+            logger.error("interneurons (#1151): recruitment declined (malformed targets or parameters) -- nothing changed")
+            return None
+        keys = ("retired", "extended", "recruited", "cells", "pool_edges", "target_edges", "eligible_e", "covered_e",
+                "dead_edges_dropped")
+        rec = dict(zip(keys, out))
+        logger.info("interneurons (#1151): t=%s recruited=%d extended=%d retired=%d -> %d cells (%d E->I, %d I->E edges); "
+                    "eligible E %d, covered %d", self.timestep, rec["recruited"], rec["extended"], rec["retired"],
+                    rec["cells"], rec["pool_edges"], rec["target_edges"], rec["eligible_e"], rec["covered_e"])
+        return rec
+
+    def _stab_release_weak_targets(self) -> Optional[List[Tuple[str, str]]]:
+        """[2026-10-19] S (#1136) C3: the sleep-time release (Q7) of output targets whose weight fell below
+        he_target_unlearn_floor. None when C3 is off (nothing touched)."""
+        st = self._stability_params()
+        if st is None or st.c3_floor is None:
+            return None
+        with self._step_lock:
+            out = self.hyperedges.release_weak_targets(st.c3_floor)
+        if out:
+            logger.info("sleep_cycle: C3 released %d weak hyperedge output target(s) (floor %.3f)", len(out), st.c3_floor)
+        return out
 
     def _he_ps_to_native(self) -> bool:
         """Before a native pass: True when the native passes are on (taking the state back from Python if a
@@ -4189,6 +5439,11 @@ class Graph:
         hyperedge sources.
         """
         if not fired_ids:
+            return
+        # [2026-11-01] S18 (#1202): receiver-side, graded predictions replace the source-side gate when on
+        _recv_params = self._stab_receiver()
+        if _recv_params is not None:
+            self._receiver_predictions(fired_ids, _recv_params)
             return
 
         threshold = self.config["prediction_threshold"]
@@ -4330,6 +5585,343 @@ class Graph:
                     visited=visited,
                 )
 
+    # [2026-11-01] S18 (#1202): receiver-side, graded predictions (spec 2026-11-01-receiver-side-prediction-design.md)
+    def _receiver_state(self) -> Dict[str, Any]:
+        """Per-neuron S18 state (in memory only, not saved): id -> row index into compact arrays rho (the neuron's
+        fraction-of-threshold bar), pred_ema (prediction episodes, decayed lazily from last_t) and conf_ema (its own
+        record as a predicted target). Rows are added on first sight; arrays grow by doubling."""
+        st = self.__dict__.get("_recv")
+        if st is None:
+            n = 1024
+            rho0 = self._stab_receiver()
+            rho0 = rho0[0] if rho0 is not None else 0.3
+            st = self.__dict__["_recv"] = {
+                "idx": {}, "rho0": rho0,
+                "rho": np.full(n, rho0), "pred_ema": np.zeros(n), "conf_ema": np.full(n, 0.5),
+                "last_t": np.zeros(n, dtype=np.int64),
+            }
+            self.__dict__["_recv_stats"] = {"dropped": 0, "registered": 0, "merged": 0, "chains": 0,
+                                            "seconds": 0.0}
+        return st
+
+    def _receiver_row(self, st: Dict[str, Any], nid: str) -> int:
+        i = st["idx"].get(nid)
+        if i is None:
+            i = st["idx"][nid] = len(st["idx"])
+            if i >= len(st["rho"]):
+                m = 2 * len(st["rho"])
+                st["rho"] = np.concatenate([st["rho"], np.full(m - len(st["rho"]), st["rho0"])])
+                st["pred_ema"] = np.concatenate([st["pred_ema"], np.zeros(m - len(st["pred_ema"]))])
+                st["conf_ema"] = np.concatenate([st["conf_ema"], np.full(m - len(st["conf_ema"]), 0.5)])
+                st["last_t"] = np.concatenate([st["last_t"], np.zeros(m - len(st["last_t"]), dtype=np.int64)])
+            st["last_t"][i] = self.timestep
+        return i
+
+    def _pending_input(self) -> Dict[str, List[float]]:
+        """Input already on its way to each target, PER ARRIVAL TICK over the next d_max ticks (this step's spikes and
+        earlier ones in flight), as the delivery queue holds it (signed, after manifold attenuation): T -> [tick 1..]."""
+        out: Dict[str, List[float]] = {}
+        t = self.timestep
+        n = int(self.config.get("d_max", 5))
+        for k in range(1, n + 1):
+            for tgt, cur in self._delay_buffer.get(t + k, ()):
+                row = out.get(tgt)
+                if row is None:
+                    row = out[tgt] = [0.0] * n
+                row[k - 1] += cur
+        return out
+
+    def _receiver_theta_args(self) -> Tuple[float, bool]:
+        """[2026-11-01] S18cal finding: the threshold fire detection actually applies. (ahp_gain, pool) for
+        _receiver_reads: S5's IK-AHP brake gain when the calcium split runs, and S2's pool offset only on the detection
+        path that adds it (burst inhibition on, interneuron layer off: with the layer on its inhibition is divisive and
+        is not a threshold offset). (0.0, False) = the stored threshold."""
+        stab = self._stability_params()
+        if stab is None:
+            return 0.0, False
+        gain = float(stab.ca_split[3]) if stab.ca_split is not None else 0.0
+        pool = stab.inhib is not None and stab.ilayer is None
+        return gain, pool
+
+    def _receiver_reads(self, ids: List[str], ahp_gain: float = 0.0, pool: bool = False) -> List[Optional[tuple]]:
+        """[2026-11-01] S18 (spec §10): (threshold, voltage, excitability, refractory_remaining, firing_rate_ema,
+        resting_potential, is_inhibitory) per id, from the native NodeStore in one call when it has receiver_reads
+        (None entries, and the whole list without it, are read through the node objects: the same values). With
+        receiver_round >= 2 the threshold is the EFFECTIVE detection threshold for (ahp_gain, pool); without it (or on
+        the Python path, which cannot see ca_slow) it is the stored threshold."""
+        native = None if self.__dict__.get("_recv_python") else getattr(self.nodes, "receiver_reads", None)
+        if native is not None and getattr(type(self.nodes), "receiver_round", 0) >= 2 and (ahp_gain or pool):
+            got = native(ids, ahp_gain, pool)
+        else:
+            got = native(ids) if native is not None else [None] * len(ids)
+        out: List[Optional[tuple]] = []
+        for nid, r in zip(ids, got):
+            if r is None:
+                n = self.nodes.get(nid)
+                r = None if n is None else (n.threshold, n.voltage, n.intrinsic_excitability, n.refractory_remaining,
+                                            n.firing_rate_ema, n.resting_potential, bool(n.is_inhibitory))
+            out.append(r)
+        return out
+
+    def _receiver_out_rows(self, pre_ids: List[str]) -> List[Tuple[str, str, str, float]]:
+        """[2026-11-01] S18 (spec §10): (post, synapse_id, pre, weight) for the given pre nodes' outgoing excitatory
+        links with weight > 0 — native SynapseStore.receiver_out_rows in one call when present, else the same walk in
+        Python over _outgoing."""
+        native = None if self.__dict__.get("_recv_python") else getattr(self.synapses, "receiver_out_rows", None)
+        if native is not None:
+            return native(list(pre_ids))
+        out = []
+        for a in pre_ids:
+            for sid in self._outgoing.get(a, ()):
+                syn = self.synapses.get(sid)
+                if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
+                    continue
+                out.append((syn.post_node_id, sid, a, syn.weight))
+        return out
+
+    def _receiver_peak_v(self, v: float, rest: float, ex: float, ticks: Optional[List[float]],
+                         extra: float = 0.0) -> float:
+        """[2026-11-01] S18 review C1: the highest voltage the pending input alone would give the neuron (v, resting, excitability), tick by tick as
+        step() applies it (decay toward resting, then that tick's arrivals x excitability), plus `extra` (imagined
+        input on a chain hop, added at the first tick). Detection happens after each delivery, so "cannot fire it
+        alone" is peak < threshold, not net < threshold - v (a later inhibitory tranche cannot hide an earlier one)."""
+        decay = self.config["decay_rate"]
+        peak = -math.inf
+        for k, c in enumerate(ticks or (0.0,)):
+            v = v * decay + (1.0 - decay) * rest + c * ex + (extra if k == 0 else 0.0)
+            if v > peak:
+                peak = v
+        return peak
+
+    def _receiver_max_active(self) -> int:
+        """[2026-11-01] S18short: the receiver path's own table size (prediction_receiver_max_active, default 10000):
+        with each neuron predicted about as often as it fires, ~fired-per-step x window predictions are pending."""
+        try:
+            return max(0, int(self.config.get("prediction_receiver_max_active", 10000)))
+        except (TypeError, ValueError):
+            return 10000
+
+    def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
+        """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
+        but cannot fire it alone: rho_T * theta <= D < theta - v (spec §4.1-4.4, 4.7-4.8). Chains: §4.6."""
+        import time as _time_mod
+        _t0 = _time_mod.perf_counter()
+        rho0, k, eta, rho_min, alpha, chain_floor, margin = params
+        st = self._receiver_state()
+        stats = self.__dict__["_recv_stats"]
+        window = self.config["prediction_window"]
+        max_active = self._receiver_max_active()
+        pre_factor = self.config["prediction_pre_charge_factor"]
+        _tp = _time_mod.perf_counter()
+        pend = self._pending_input()
+        stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
+        contrib: Dict[str, Dict[str, Tuple[str, float]]] = {}   # T -> syn_id -> (pre id, weight)
+        if not self.__dict__.get("_recv_python") and hasattr(self.nodes, "receiver_reads") \
+                and hasattr(self.synapses, "receiver_out_rows"):
+            stats["native_steps"] = stats.get("native_steps", 0) + 1
+        exc_fired = [a for a, r in zip(fired_ids, self._receiver_reads(list(fired_ids))) if r is not None and not r[6]]
+        for post, sid, a, w in self._receiver_out_rows(exc_fired):
+            contrib.setdefault(post, {})[sid] = (a, w)
+        stats["s_contrib"] = stats.get("s_contrib", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
+        passing = []
+        _tg = list(contrib)
+        _gain, _pool = self._receiver_theta_args()
+        for tgt, rd in zip(_tg, self._receiver_reads(_tg, _gain, _pool)):
+            syns = contrib[tgt]
+            if rd is None or rd[3] > 0:
+                continue
+            theta, _v, _ex, _refr, _fr, _rest, _inh = rd
+            i = self._receiver_row(st, tgt)
+            dt = self.timestep - int(st["last_t"][i])
+            if dt > 0:
+                st["pred_ema"][i] *= (1.0 - alpha) ** dt
+                st["last_t"][i] = self.timestep
+            rho = float(st["rho"][i])
+            rho = rho + eta if st["pred_ema"][i] > k * _fr else rho - eta
+            rho = min(0.99, max(rho_min, rho))
+            st["rho"][i] = rho
+            ticks = pend.get(tgt)
+            d = sum(ticks) * _ex if ticks else 0.0
+            if theta <= 0.0 or d < rho * theta:
+                continue
+            peak = self._receiver_peak_v(_v, _rest, _ex, ticks)
+            if peak >= theta:   # the pending input fires it alone on some tick: causation, not prediction
+                continue
+            strength = d / theta
+            passing.append((strength, tgt, d, rho, syns, i, peak))
+        passing.sort(key=lambda x: -x[0])
+        stats["s_cand"] = stats.get("s_cand", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
+        pending_by_target = {pr.target_node_id: pr for pr in self.active_predictions.values()
+                             if pr.contributors is not None}
+        new_preds: List[Prediction] = []
+        for strength, tgt, d, rho, syns, i, peak in passing:
+            conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
+            old = pending_by_target.get(tgt)
+            if old is not None:
+                merged = dict(old.contributors_raw or {})
+                merged.update(syns)
+                self._receiver_set_contributors(old, merged)
+                old.strength = max(old.strength, strength)
+                old.confidence = max(old.confidence, conf)
+                stats["merged"] += 1
+                continue
+            st["pred_ema"][i] += alpha   # the neuron reached its predictive state: an episode, registered or not
+            if len(self.active_predictions) >= max_active:
+                stats["dropped"] += 1
+                continue
+            node = self.nodes.get(tgt)
+            pre = min(strength * pre_factor * node.intrinsic_excitability, max(0.0, node.threshold - peak - margin))
+            pred = Prediction(target_node_id=tgt, strength=strength, confidence=conf, created_at=self.timestep,
+                              expires_at=self.timestep + window, chain_depth=0, pre_charge_applied=pre,
+                              drive=d, rho=rho)
+            self._receiver_set_contributors(pred, syns)
+            if pre > 0.0:
+                node.voltage += pre
+            self.active_predictions[pred.prediction_id] = pred
+            pending_by_target[tgt] = pred
+            self._predicted_this_step.add(tgt)
+            self._total_predictions_made += 1
+            stats["registered"] += 1
+            new_preds.append(pred)
+            self._emit("prediction_generated", source=pred.source_node_id, target=tgt, strength=strength,
+                       confidence=conf, chain_depth=0, timestep=self.timestep)
+        stats["s_reg"] = stats.get("s_reg", 0.0) + _time_mod.perf_counter() - _tp
+        _tp = _time_mod.perf_counter()
+        self._receiver_chains(new_preds, pend, pending_by_target, params)
+        stats["s_chain"] = stats.get("s_chain", 0.0) + _time_mod.perf_counter() - _tp
+        stats["seconds"] += _time_mod.perf_counter() - _t0
+
+    def _receiver_chains(self, parents: List["Prediction"], pend: Dict[str, List[float]],
+                         pending_by_target: Dict[str, "Prediction"], params: tuple) -> None:
+        """Spec §4.6: a predicted node is a weak, imagined source (its strength x chain_decay x the delivered factors of
+        its own synapses), added to each successor's real pending input; the successor is tested with the same rule;
+        several parents may converge; each parent continues only to its strongest passing successor; a chain stops
+        below chain_floor or at prediction_max_chain_depth. Credited to the chain's origin (source_node_id)."""
+        _rho0, _k, _eta, _rho_min, alpha, chain_floor, margin = params
+        st = self._receiver_state()
+        stats = self.__dict__["_recv_stats"]
+        decay = self.config["prediction_chain_decay"]
+        max_depth = self.config["prediction_max_chain_depth"]
+        max_active = self._receiver_max_active()
+        window = self.config["prediction_window"]
+        pre_factor = self.config["prediction_pre_charge_factor"]
+        path = {pr.prediction_id: {pr.target_node_id} for pr in parents}
+        for hop in range(1, max_depth + 1):
+            if not parents:
+                return
+            imagined: Dict[str, float] = {}
+            succ: Dict[str, List[Tuple[str, str, float]]] = {}   # parent pid -> [(S, syn_id, part)]
+            by_s: Dict[str, Dict[str, Tuple[str, float]]] = {}   # S -> syn_id -> (pre, part) (this hop's contributors)
+            _pt = [par.target_node_id for par in parents]
+            _pr = dict(zip(_pt, self._receiver_reads(_pt)))
+            _rows = self._receiver_out_rows([t for t in dict.fromkeys(_pt) if _pr[t] is not None and not _pr[t][6]])
+            _by_pre: Dict[str, List[Tuple[str, str, float]]] = {}
+            for post, sid, a, w in _rows:
+                _by_pre.setdefault(a, []).append((post, sid, w))
+            _sn_ids = list(dict.fromkeys(post for post, _sid, _a, _w in _rows))
+            rd_s = dict(zip(_sn_ids, self._receiver_reads(_sn_ids, *self._receiver_theta_args())))
+            for par in parents:
+                for post, sid, w in _by_pre.get(par.target_node_id, ()):
+                    r = rd_s.get(post)
+                    if r is None or post in path[par.prediction_id]:
+                        continue
+                    part = par.strength * decay * w * r[2]
+                    imagined[post] = imagined.get(post, 0.0) + part
+                    succ.setdefault(par.prediction_id, []).append((post, sid, part))
+                    by_s.setdefault(post, {})[sid] = (par.target_node_id, part)
+            nxt: List[Prediction] = []
+            for par in parents:
+                # review I2: every successor competes, pending ones too; if the winner is already predicted (another
+                # parent converged on it), this parent's branch ends there instead of growing a weaker second one.
+                best = None
+                for sname, _sid, _part in succ.get(par.prediction_id, ()):
+                    s_thr, s_v, s_ex, s_refr, _sfr, s_rest, _sinh = rd_s[sname]
+                    if s_thr <= 0.0:
+                        continue
+                    ticks = pend.get(sname)
+                    d = (sum(ticks) * s_ex if ticks else 0.0) + imagined[sname]
+                    strength = d / s_thr
+                    if sname in pending_by_target:
+                        if best is None or strength > best[0]:
+                            best = (strength, sname, d, None, None, None)
+                        continue
+                    if s_refr > 0:
+                        continue
+                    i = self._receiver_row(st, sname)
+                    rho = float(st["rho"][i])
+                    if d < rho * s_thr:
+                        continue
+                    peak = self._receiver_peak_v(s_v, s_rest, s_ex, ticks, imagined[sname])
+                    if peak >= s_thr:
+                        continue
+                    if best is None or strength > best[0]:
+                        best = (strength, sname, d, rho, i, peak)
+                if best is None or best[3] is None or best[0] < chain_floor:
+                    continue
+                strength, sname, d, rho, i, peak = best
+                dt = self.timestep - int(st["last_t"][i])   # review I3: the episode EMA decays on this path too
+                if dt > 0:
+                    st["pred_ema"][i] *= (1.0 - alpha) ** dt
+                    st["last_t"][i] = self.timestep
+                st["pred_ema"][i] += alpha
+                if len(self.active_predictions) >= max_active:
+                    stats["dropped"] += 1
+                    continue
+                sn = self.nodes.get(sname)
+                conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
+                pre = min(strength * pre_factor * sn.intrinsic_excitability, max(0.0, sn.threshold - peak - margin))
+                pred = Prediction(target_node_id=sname, strength=strength, confidence=conf,
+                                  created_at=self.timestep, expires_at=self.timestep + window, chain_depth=hop,
+                                  pre_charge_applied=pre, drive=d, rho=rho)
+                self._receiver_set_contributors(pred, by_s[sname])
+                pred.source_node_id = par.source_node_id   # the chain's origin
+                if pre > 0.0:
+                    sn.voltage += pre
+                self.active_predictions[pred.prediction_id] = pred
+                pending_by_target[sname] = pred
+                path[pred.prediction_id] = path[par.prediction_id] | {sname}
+                self._predicted_this_step.add(sname)
+                self._total_predictions_made += 1
+                stats["registered"] += 1
+                stats["chains"] += 1
+                nxt.append(pred)
+                self._emit("prediction_generated", source=pred.source_node_id, target=sname, strength=strength,
+                           confidence=conf, chain_depth=hop, timestep=self.timestep)
+            parents = nxt
+
+    def _prediction_links(self, pred: "Prediction") -> List[Tuple[Any, float]]:
+        """[2026-11-01] S18: the synapses a prediction's outcome acts on, with shares: a receiver prediction's existing
+        contributors; otherwise today's one source->target synapse at share 1.0 (x * 1.0 == x: unchanged)."""
+        if pred.contributors:
+            out = []
+            for sid, share in pred.contributors:
+                syn = self.synapses.get(sid)
+                if syn is not None:   # pruned mid-flight: skipped
+                    out.append((syn, share))
+            return out
+        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
+        return [(syn, 1.0)] if syn is not None else []
+
+    def _receiver_record(self, pred: "Prediction", hit: float) -> None:
+        """[2026-11-01] S18: a receiver prediction's outcome updates its target's own record (conf_ema, alpha 0.05)."""
+        if pred.contributors is None:
+            return
+        st = self.__dict__.get("_recv")
+        i = st["idx"].get(pred.target_node_id) if st is not None else None
+        if i is not None:
+            st["conf_ema"][i] += 0.05 * (hit - st["conf_ema"][i])
+
+    @staticmethod
+    def _receiver_set_contributors(pred: "Prediction", syns: Dict[str, Tuple[str, float]]) -> None:
+        """Shares of the excitatory drive by weight; source_node_id = the largest-share contributor's pre node."""
+        tot = sum(w for _, w in syns.values())
+        pred.contributors_raw = dict(syns)
+        pred.contributors = [(sid, w / tot) for sid, (_, w) in syns.items()]
+        pred.source_node_id = max(syns.values(), key=lambda x: x[1])[0]
+
     def _evaluate_predictions(self, fired_set: Set[str]) -> None:
         """Check active predictions against fired nodes (PRD §5.1).
 
@@ -4360,10 +5952,9 @@ class Graph:
             - Record confirmation in synapse history
             - Emit PredictionConfirmed event
         """
-        # Find the synapse from source to target
-        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
-        if syn is not None:
-            bonus = confirm_bonus * pred.confidence
+        # Find the synapse from source to target ([2026-11-01] S18: or the receiver prediction's contributors, by share)
+        for _j, (syn, _share) in enumerate(self._prediction_links(pred)):
+            bonus = confirm_bonus * pred.confidence * _share
             if not self.config["three_factor_enabled"]:
                 syn.weight = min(syn.weight + bonus, syn.max_weight)
             else:
@@ -4378,8 +5969,14 @@ class Graph:
                 syn.synapse_id, deque(maxlen=100)
             )
             history.append(True)
+        self._receiver_record(pred, 1.0)
 
         self._total_predictions_confirmed += 1
+        # [2026-10-27] S10: the outcome joins this step's signed reward (None = off: nothing kept)
+        if self._stab_s10_rpe() is not None:
+            self.__dict__.setdefault("_s10_events", []).append(pred.confidence)
+            if self._stab_s13_per_source() is not None:   # [2026-10-28] S13: who predicted, and whether it came true
+                self.__dict__.setdefault("_s13_events", []).append((pred.source_node_id, 1.0, pred.confidence))
 
         outcome = PredictionOutcome(
             prediction=pred,
@@ -4409,9 +6006,8 @@ class Graph:
             - Emit SurpriseEvent
             - Trigger surprise-driven exploration
         """
-        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
-        if syn is not None:
-            penalty = error_penalty * pred.confidence
+        for syn, _share in self._prediction_links(pred):   # [2026-11-01] S18: contributors by share, else the one link
+            penalty = error_penalty * pred.confidence * _share
             if not self.config["three_factor_enabled"]:
                 syn.weight = max(0.0, syn.weight - penalty)
             else:
@@ -4423,6 +6019,7 @@ class Graph:
                 syn.synapse_id, deque(maxlen=100)
             )
             history.append(False)
+        self._receiver_record(pred, 0.0)
 
         self._total_predictions_errors += 1
 
@@ -4459,7 +6056,12 @@ class Graph:
         # the failing synapse gets reduced crystallization. The broadcast
         # benefits other active traces that weren't involved in the failed
         # prediction.
-        if self.config.get("three_factor_enabled", False):
+        # [2026-10-27] S10: the outcome joins this step's signed reward instead of broadcasting on its own
+        if self._stab_s10_rpe() is not None:
+            self.__dict__.setdefault("_s10_events", []).append(-pred.confidence)
+            if self._stab_s13_per_source() is not None:   # [2026-10-28] S13
+                self.__dict__.setdefault("_s13_events", []).append((pred.source_node_id, 0.0, pred.confidence))
+        elif self.config.get("three_factor_enabled", False):
             surprise_strength = pred.confidence * self.config.get("surprise_reward_scaling", 0.5)
             if surprise_strength > 0.01:  # Don't bother with negligible surprise
                 self.inject_reward(surprise_strength)
@@ -4483,9 +6085,16 @@ class Graph:
         # Find what fired instead of the expected target. [2026-11-05] #1212: under the native surprise window the
         # set is not built per failed prediction (recent_fired minus the expected target is read in place below)
         sprouted_count = 0
-        _tally = bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
+        # [2026-11-01] S18 (#1202; Josh 2026-11-01): a RECEIVER prediction's miss wires nothing. Its learning is the
+        # weakening of what converged + the error signal (_on_prediction_error) + the context tag and novelty count
+        # below; wiring the predictor to every recent firer is "completely backwards … not brain-like" (Josh). The
+        # source-side path (contributors None) explores exactly as before.
+        # [2026-11-09] #1136 merge: the #1212 window / slot apply to that source-side path only (a receiver miss reads
+        # recent_fired minus the expected target for its novelty count, as S18 does).
+        _sprout = pred.contributors is None
+        _tally = _sprout and bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
         _win = _tally and getattr(self, "_surprise_window_t", None) == self.timestep
-        if self.config.get("surprise_slot_enabled", False):
+        if _sprout and self.config.get("surprise_slot_enabled", False):
             # [2026-11-05] #1212 surprise slot (spec 2026-11-05-surprise-alternatives-design): only nodes that fired
             # in step() where the expected target was due, within reach, the few rarest -- not the whole window
             alternative_nodes = self._surprise_slot_alternatives(pred)
@@ -4503,7 +6112,7 @@ class Graph:
         def _deg(x: str) -> int:
             return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ()))
 
-        for alt_id in (() if _tally else alternative_nodes):
+        for alt_id in (() if (_tally or not _sprout) else alternative_nodes):
             if alt_id == source_id:
                 continue
             if alt_id not in self.nodes:
@@ -4663,8 +6272,12 @@ class Graph:
                 _sw[0](sorted(a for a in recent_fired if a in self.nodes))
                 self._surprise_window_t = self.timestep
 
+        _dp_p = self.__dict__.get("_diffpc_p")   # [2026-11-03] S19: a receiver prediction's miss
+        _dps = self.__dict__.get("_diffpc") if _dp_p is not None else None
         for pid in expired:
             pred = self.active_predictions.pop(pid)
+            if _dps is not None and pred.drive is not None:
+                _dps.record_miss(self.nodes, pred.target_node_id, float(pred.strength), bool(_dp_p[3]))
             self._on_prediction_error(pred, error_penalty, recent_fired)
 
     def _find_synapse(
@@ -4692,6 +6305,32 @@ class Graph:
     # DiffPC: Difference Predictive Coding (#DiffPC)
     # -----------------------------------------------------------------------
 
+    # -----------------------------------------------------------------------
+    # [2026-11-03] S19 (#1202 follow-up): corrected DiffPC -- the error half of the receiver predictions.
+    # In memory only (never serialized): the explained-drive ring, the step's outcomes, the counters.
+    # -----------------------------------------------------------------------
+
+
+    def _diffpc_state(self, window: int):
+        """[2026-11-04] S19 Rust-only: this Graph's ng_tract.DiffPc (made on first use, remade if W changes). Its
+        counters are in memory only (stats()), never checkpointed."""
+        dp = self.__dict__.get("_diffpc")
+        if dp is None or dp.window != window:
+            dp = self.__dict__["_diffpc"] = ng_tract.DiffPc(window, int(self.config.get("d_max", 5)))
+        return dp
+
+    def _diffpc_corrected(self, params: tuple) -> Tuple[int, float]:
+        """7b with the switch on (not count-only), natively: the step's pred_error_ema record, then the plateau on the
+        top K surprised, sized with S18's rho per target and margin. Returns (outcomes, mean |e|) for StepResult."""
+        eta, k, _w, _co = params
+        dp = self.__dict__["_diffpc"]
+        recv = self._receiver_state()
+        rhos = []
+        for nid in dp.top_k(k):
+            i = recv["idx"].get(nid)
+            rhos.append(float(recv["rho"][i]) if i is not None else recv["rho0"])
+        return dp.apply(self.nodes, self.synapses, self.timestep, eta, k, self._stab_receiver()[6], rhos)
+
     def _diffpc_step(self, fired_ids: List[str]) -> Tuple[int, float]:
         """Ternary prediction error computation + prediction weight update (DiffPC).
 
@@ -4705,6 +6344,11 @@ class Graph:
         Returns:
             (ternary_spike_count, mean_abs_error_where_ternary_nonzero)
         """
+        # [2026-11-03] S19: the step's corrected-DiffPC params (None, or count-only = today's body below, exactly;
+        # count-only's counts were taken at detection)
+        _dp = self.__dict__.get("_diffpc_p")
+        if _dp is not None and not _dp[3]:
+            return self._diffpc_corrected(_dp)
         epsilon = self.config.get("diffpc_epsilon", 0.2)
         pred_lr = self.config.get("diffpc_pred_lr", 0.01)
         trace_boost = self.config.get("diffpc_trace_boost", 0.05)
@@ -4814,11 +6458,17 @@ class Graph:
         """
         import time as _time   # local: the module namespace stays as it was
         t0 = _time.perf_counter()
+        _c3_rel = self._stab_release_weak_targets()   # [2026-10-19] S (#1136) C3 release (None = off: no key below)
         if self.config.get("sleep_disuse_enabled", False):
             record = self._sleep_cycle_disuse(t0)
             if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = unchanged)
                 with self._step_lock:
                     record["tally_retracted"] = self._sprout_tally_sleep_retract()
+            if _c3_rel is not None:
+                record["he_targets_released"] = len(_c3_rel)
+            _ir = self._stab_interneurons_sleep()   # [2026-10-20] round I (#1151); None = off (no key)
+            if _ir is not None:
+                record["interneurons"] = _ir
             return record
         with self._step_lock:
             syn_before = len(self.synapses)
@@ -4839,12 +6489,25 @@ class Graph:
             }
             if self.config.get("sprout_tally_enabled", False):   # [2026-10-08] #1050 (absent = unchanged)
                 record["tally_retracted"] = self._sprout_tally_sleep_retract()
+            if _c3_rel is not None:
+                record["he_targets_released"] = len(_c3_rel)
             self._emit("sleep_cycle", **record)
         logger.log(self._sleep_log_level(),   # [2026-10-07] observe: DEBUG on an observe shadow (sleep_observe), else INFO
                    "sleep_cycle: t=%s pruned=%d nodes_collected=%d synapses %d->%d nodes %d->%d in_sleep_mode=%s %.3fs",
                     record["timestep"], pruned, collected, syn_before, record["synapses_after"], nodes_before,
                     record["nodes_after"], record["in_sleep_mode"], record["seconds"])
+        _ir = self._stab_interneurons_sleep()   # [2026-10-20] round I (#1151); None = off (no key)
+        if _ir is not None:
+            record["interneurons"] = _ir
         return record
+
+    def _stab_interneurons_sleep(self) -> Optional[Dict[str, Any]]:
+        """[2026-10-20] round I (#1151, Q10): sleep_cycle's recruitment / retirement run (after the structural
+        removal, so dead E nodes have dropped out of their pools). None when interneuron_recruit_enabled is off."""
+        st = self._stability_params()
+        if st is None or st.irecruit is None:
+            return None
+        return self._interneurons_recruit(st.irecruit) or {}
 
     _SLEEP_DISUSE_KEYS = ("sleep_downscale_d0", "sleep_downscale_h", "sleep_weight_grace_sleeps",
                           "sleep_last_link_grace_sleeps", "sleep_credit_shield_kappa")
@@ -5017,7 +6680,9 @@ class Graph:
             sleep_index = int(self.config.get("sleep_cycles_completed", 0)) + 1
             ds = {"synapses_scaled": 0, "clamped": 0, "native": None}
             if prm["d0"] > 0.0:
+                _s8b = self._s8_incoming_sums()   # [2026-10-25] S8: None while the bound is off
                 ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
+                self._s8_sleep_shrink(_s8b)
             t_c = _time.perf_counter()
             rep: Dict[str, Any] = {}
             self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
@@ -5115,7 +6780,9 @@ class Graph:
             ds = {"synapses_scaled": 0, "clamped": 0, "native": None}
             t_b = _time.perf_counter()
             if prm["d0"] > 0.0:
+                _s8b = self._s8_incoming_sums()   # [2026-10-25] S8: None while the bound is off
                 ds = self.sleep_downscale_strength_aware(prm["d0"], prm["h"])
+                self._s8_sleep_shrink(_s8b)
             rep: Dict[str, Any] = {}
             t_c = _time.perf_counter()
             pruned = self._prune_synapses(report=rep, grace_sleeps=prm["G"], sleep_now=sleep_index,
@@ -7011,11 +8678,13 @@ class Graph:
             # weight = max(0, min(weight + dw, max_weight)); trace *= 0.9 (decay after
             # use); peak_weight tracks the new max.
             _reward = getattr(self.synapses, "apply_eligibility_reward", None)
+            syn_strength = strength
+            _floor = {"symmetric_floor": True} if self._stab_s13_floor() else {}   # [2026-10-28] S13 (native only)
             if _reward is not None:
-                _reward(strength, self.config["learning_rate"], scope)
+                _reward(syn_strength, self.config["learning_rate"], scope, **_floor)
             else:  # [2026-10-05] per-SynapseRef fallback (the original loop)
                 _apply_eligibility_reward_python(
-                    self.synapses, strength, self.config["learning_rate"], scope)
+                    self.synapses, syn_strength, self.config["learning_rate"], scope)
 
             # Hyperedge threshold learning (PRD §4.3)
             # [2026-10-18] H2 (#1136): native when the graph's native passes are on (a declined pass runs the loop)
@@ -8063,6 +9732,28 @@ class Graph:
             "Emergency excitability boost applied to %d nodes", boosted,
         )
 
+    def _breaker_homeo_trip(self) -> None:
+        """[2026-10-22] S6-1 (#1139): the breaker's trip with ``breaker_homeo_enabled``: no global boost; the bounded
+        homeostatic lift runs on this and every further silent step until something fires (_breaker_homeo_lift)."""
+        self._breaker_lift_active = 0
+        _st = getattr(self, "_stab", None)
+        if _st is not None and _st.breaker is not None:
+            self._breaker_homeo_lift(_st.breaker)
+
+    def _breaker_homeo_lift(self, bk: tuple) -> None:
+        """[2026-10-22] S6-1 (#1139): one silent step's homeostatic up-move, natively (NodeStore.breaker_lift): only nodes
+        under their own (degree) target; threshold every silent step, excitability every scaling interval of silence;
+        S4's bounded distance and headroom, so nothing reaches a rail. A declined pass logs ERROR once (no fallback)."""
+        k = int(self.__dict__.get("_breaker_lift_active") or 0)
+        self._breaker_lift_active = k + 1
+        thr_rate, exc_rate, interval, dthr, slow, prop = bk
+        rule = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+        targets = rule._degree_targets if rule is not None else {}
+        default_t = float(rule.target_firing_rate) if rule is not None else float(self.config["target_firing_rate"])
+        er = exc_rate if (k % max(1, int(interval)) == 0) else None
+        if self.nodes.breaker_lift(targets, default_t, thr_rate, er, dthr, slow=slow, prop=prop) is None:
+            self._stab_error_once(("breaker_homeo_enabled",), "a native pass that accepts it (breaker_lift declined)")
+
     # -----------------------------------------------------------------------
     # Persistence (PRD §6)
     # -----------------------------------------------------------------------
@@ -8180,8 +9871,9 @@ class Graph:
                 # [2026-10-05] P1: "nodes" is pre-packed bytes too when the native node store is on
                 # [2026-10-18] H1: and both hyperedge maps when the native hyperedge store is on
                 # [2026-10-18] H2: and the two hyperedge pass-state maps when the native passes own them
+                # [2026-10-20] round I (#1151): and the interneuron layer (native packed map)
                 if key in ("synapses", "nodes", "hyperedges", "archived_hyperedges", "he_last_fired_step",
-                           "he_output_candidates") and isinstance(value, (bytes, bytearray)):
+                           "he_output_candidates", "interneurons") and isinstance(value, (bytes, bytearray)):
                     f.write(value)  # verbatim pre-packed {sid: {15-key}} / {nid: {19-key}} map
                 else:
                     f.write(packer.pack(value))
@@ -8204,6 +9896,7 @@ class Graph:
 
     def restore(self, path: str) -> None:
         """Load state from checkpoint (PRD §8 restore, §6)."""
+        self.__dict__.pop("_breaker_lift_active", None)   # [2026-10-22] S6-1: transient, never carried across a restore
         if path.endswith(".msgpack"):
             if msgpack is None:
                 raise ImportError("msgpack required for .msgpack deserialization")
@@ -8221,7 +9914,7 @@ class Graph:
             n_pairs = unpacker.read_map_header()
             for _ in range(n_pairs):
                 key = unpacker.unpack()
-                if key == "synapses" or (key == "nodes" and getattr(self, "_native_nodes", False)) or (   # [2026-10-05] P1: nodes too, when native
+                if key == "synapses" or (key in ("nodes", "interneurons") and getattr(self, "_native_nodes", False)) or (   # [2026-10-05] P1: nodes too, when native; [2026-10-20] round I: the interneuron layer
                         key in ("hyperedges", "archived_hyperedges") and getattr(self, "_native_he", False)):   # [2026-10-18] H1
                     start = unpacker.tell()
                     unpacker.skip()  # advance past the value WITHOUT inflating it
@@ -8366,6 +10059,9 @@ class Graph:
         # not borrow live state, and bytearray is intentionally not deep-copied:
         # that would duplicate the largest capture allocation inside _step_lock.
         _packed_synapses = self.synapses.to_checkpoint_msgpack()
+        # [2026-10-20] round I (#1151): the interneuron layer, packed natively (None = no layer = no key)
+        _il_packed = (self.nodes.interneurons_to_msgpack()
+                      if getattr(self, "_native_nodes", False) and hasattr(self.nodes, "interneurons_to_msgpack") else None)
         return {
             "version": "0.4.2",
             "timestep": self.timestep,
@@ -8479,6 +10175,20 @@ class Graph:
             **({"strength_budget_steps_since": _sb_steps} if (_sb_steps := next(
                 (r._steps_since_budget for r in self._plasticity_rules
                  if isinstance(r, StrengthBudgetRule)), 0)) else {}),
+            # [2026-10-19] #1134 (S window): the homeostat's per-node degree targets, so a restored graph continues
+            # step for step. Emitted ONLY with config homeostatic_degree_targets_persist (absent = the key set above).
+            **({"homeostatic_degree_targets": dict(next(
+                (r._degree_targets for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), {}))}
+               if self.config.get("homeostatic_degree_targets_persist", False) else {}),
+            # [2026-10-25] S8 (#1136): each node's total up-scaling (only with the bound on)
+            **({"syn_scale_up_totals": dict(self.nodes.s8_totals())}
+               if self._stab_s8_bound(self.config, bool(self.config.get("syn_scale_evidence_enabled", False))) is not None
+               else {}),
+            # [2026-10-20] round I (#1151): the interneuron layer (cells, pools, targets, learned I -> E weights), only
+            # when the store holds one; the last key, so every key before it is written exactly as before.
+            # [2026-11-03] S19 (#1202 follow-up): corrected DiffPC has reset pred_error_ema (only once it has)
+            **({"diffpc_receiver_reset_done": True} if self.__dict__.get("_diffpc_reset_done") else {}),
+            **({"interneurons": _il_packed} if _il_packed is not None else {}),
         }
 
     def _serialize_incremental(self, *, _memo: Optional[dict] = None) -> Dict[str, Any]:
@@ -8596,6 +10306,11 @@ class Graph:
                 self._node_hyperedges[nid] = set()
                 self._recent_spikes[nid] = deque(maxlen=20)
             _nodes_data = {}
+            # [2026-10-20] round I (#1151): the interneuron layer (raw packed map sliced by restore), bound to the nodes
+            # just loaded. Loaded with the keys absent too: carried verbatim on the next save, inert in step().
+            _il_raw = data.get("interneurons")
+            if isinstance(_il_raw, (bytes, bytearray)) and hasattr(self.nodes, "interneurons_load_msgpack"):
+                self.nodes.interneurons_load_msgpack(bytes(_il_raw))
         _text_pool: Dict[str, str] = {}   # P4a: one object per distinct large metadata text (restore-local)
         for nid, nd in _nodes_data.items():
             lst = nd.get("last_spike_time")
@@ -8920,6 +10635,7 @@ class Graph:
                 target_firing_rate=self.config["target_firing_rate"],
                 scaling_interval=self.config["scaling_interval"],
                 degree_sensitivity=self.config.get("degree_sensitivity", 0.4),
+                follows_config=True,   # [2026-10-26] #1146
             ),
             # 2026-10-04 strength budget — OFF unless config strength_budget_enabled (no-op otherwise)
             StrengthBudgetRule(),
@@ -8945,12 +10661,25 @@ class Graph:
         for rule in self._plasticity_rules:
             if isinstance(rule, HomeostaticRule):
                 rule._steps_since_scaling = homeostatic_steps
+                # [2026-10-19] #1134: the saved degree targets (present only when a host persisted them)
+                _dt = data.get("homeostatic_degree_targets")
+                if isinstance(_dt, dict):
+                    rule._degree_targets = dict(_dt)
                 break
         # 2026-10-04 strength budget interval counter (absent key == 0).
         for rule in self._plasticity_rules:
             if isinstance(rule, StrengthBudgetRule):
                 rule._steps_since_budget = data.get("strength_budget_steps_since", 0)
                 break
+        # [2026-10-25] S8 (#1136): the saved per-node total up-scaling (present only when a host ran the bound)
+        _s8 = data.get("syn_scale_up_totals")
+        if isinstance(_s8, dict) and hasattr(self.nodes, "s8_load_totals"):
+            self.nodes.s8_load_totals(_s8)
+        # [2026-11-03] S19: the one-time pred_error_ema reset is not repeated after a reload
+        if data.get("diffpc_receiver_reset_done"):
+            self.__dict__["_diffpc_reset_done"] = True
+        else:
+            self.__dict__.pop("_diffpc_reset_done", None)
 
         self._dirty_nodes.clear()
         self._dirty_synapses.clear()
