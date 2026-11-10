@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 S18 Rust-only) — S18's rho is seeded / read through
+#   NodeStore.receiver_set_state / receiver_state (the `_recv` dict is gone); test_off_equals_base runs the receiver-on
+#   case on the native stores only (a dict graph keeps the Rust-only receiver off, as DiffPC: M9).
 # [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; #1136 merge into the live line 1308658; Josh 2026-11-09 "Proceed")
 # What: the off / count-only / needs-receiver comparisons go through _same_as_base: the S18 parent 15b1958 predates the
 #       live line's #1210 / #1210b (a novel-sequence event and an error outcome keep the 32 smallest ids + their count),
@@ -68,8 +71,8 @@ def _pair(kind, seed, base_cfg):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("seed", [0, 1])
-@pytest.mark.parametrize("kind", ["dict", "native"])
-@pytest.mark.parametrize("recv", [False, True])
+# [2026-11-10] S18 Rust-only: the receiver runs on the native stores only (a dict graph keeps it off, as DiffPC: M9)
+@pytest.mark.parametrize("kind,recv", [("dict", False), ("native", False), ("native", True)])
 @pytest.mark.parametrize("how", ["absent", "explicit_false"])
 def test_off_equals_base(kind, seed, recv, how):
     t = _pair(kind, seed, dict(RPE, **(RECV if recv else {})))
@@ -411,9 +414,8 @@ def _pg(w=(0.1, 0.1), eta=0.5, rho=None, **cfg):
     for i, wi in enumerate(w):
         g.create_node(node_id=f"s{i}")
         g.create_synapse(f"s{i}", "T", weight=wi)
-    if rho is not None:
-        st = g._receiver_state()
-        st["rho"][g._receiver_row(st, "T")] = rho
+    if rho is not None:   # [2026-11-10] S18's state is NodeStore columns
+        g.nodes.receiver_set_state("T", g._stab_receiver()[0], g.timestep, rho=rho)
     for i in range(len(w)):
         g.stimulate(f"s{i}", 2.0)
     g.step()
@@ -431,8 +433,7 @@ def test_plateau_sized_by_eta_of_the_gap():
     assert [n for n, _ in _last(g)[1]] == ["T"]
     peak, theta, ex = g._diffpc.peaks()["T"]      # the two arrivals from rest (~0.2; homeostasis moves ex / theta)
     assert peak == pytest.approx(0.2 * ex)
-    st = g._receiver_state()
-    rho = float(st["rho"][st["idx"]["T"]])      # S18's own bar for T (rho0 0.3, moved by eta at each visit)
+    rho = g.nodes.receiver_state(["T"])[0][0]   # S18's own bar for T (rho0 0.3, moved by eta at each visit)
     dv = 0.5 * (rho * theta - peak)             # eta x (rho theta - peak)
     rows = _rows_to(g)
     assert sorted(r[1] for r in rows) == ["s0", "s1"]
@@ -495,8 +496,7 @@ def test_plateau_divides_by_the_arrivals_so_a_replay_cannot_fire_t():
     g = _dg(count_only=False, diffpc_receiver_eta=1.0, three_factor_enabled=True)
     g.create_node(node_id="s0")
     g.create_synapse("s0", "T", weight=0.3)
-    st = g._receiver_state()
-    st["rho"][g._receiver_row(st, "T")] = 0.99  # S18 never predicts T here, and the cap theta - margin - peak decides
+    g.nodes.receiver_set_state("T", g._stab_receiver()[0], g.timestep, rho=0.99)  # S18 never predicts T here; the cap decides
     fires = []
     for _ in range(4):                          # s0 fires as often as its refractory period allows
         g.stimulate("s0", 2.0)
@@ -512,7 +512,7 @@ def test_plateau_divides_by_the_arrivals_so_a_replay_cannot_fire_t():
     peak, theta, ex = g._diffpc.peaks()["T"]
     (row,) = _rows_to(g)
     w_before = g._find_synapse("s0", "T").weight - row[2]
-    rho = float(st["rho"][st["idx"]["T"]])
+    rho = g.nodes.receiver_state(["T"])[0][0]
     dv = min(rho * theta - peak, theta - 0.05 - peak)
     assert dv / ex / n < w_before                # the division, not the own-weight bound, sets dw
     assert row[2] == pytest.approx(dv / ex / n)

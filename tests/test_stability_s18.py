@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 S18 Rust-only, plan 2026-11-10-s18-receiver-rust-only) — the
+#   receiver is Rust-only: _rg builds the native stores; state is read / seeded through NodeStore.receiver_state /
+#   receiver_set_state (the `_recv` dict is gone); the native-vs-Python-path tests become PARITY against the pre-port
+#   engine (NG 4409133): one pass exactly, field for field, and twin whole runs (receiver on, with and without S19) to
+#   equal checkpoint bytes; + the receiver needs the native stores (ERROR once, off); the effective-threshold check
+#   wraps the native scans. (`_receiver_max_active` / capacity tests unchanged.)
 # [2026-11-01] DudeMan CC (Claude Opus 5.5, laptop; #1202 receiver-side predictions; Josh 2026-11-01 "Yeah, the design
 #   looks good") — S18: a neuron is predicted when pending input charges it partway but cannot fire it alone
 # What: (1) the switch absent / explicitly False == the synced copy line (1d0a1a0's module) exactly (final checkpoint
@@ -62,7 +68,7 @@ def test_keys_not_in_default_config():
 
 
 def test_params_default_when_on():
-    g = NF.Graph(dict(ON))
+    g = NF.Graph(dict(ON), native_node_store=True, native_hyperedge_store=True)   # [2026-11-10] Rust-only
     assert g._stab_receiver() == (0.3, 1.0, 0.002, 0.1, 0.01, 0.05, 0.05)
     assert NF.Graph()._stab_receiver() is None
 
@@ -89,7 +95,7 @@ def test_bad_params_error_once_and_change_nothing(bad, caplog):
 
 def _rg(n_src=3, w=0.1, theta=0.8, extra=None, **cfg):
     """sources s0.. -> T (weight w each); T's threshold theta; returns (graph, params)."""
-    g = NF.Graph(dict(ON, **cfg))
+    g = NF.Graph(dict(ON, **cfg), native_node_store=True, native_hyperedge_store=True)   # [2026-11-10] Rust-only
     g.create_node(node_id="T")
     g.nodes["T"].threshold = theta
     for i in range(n_src):
@@ -98,6 +104,11 @@ def _rg(n_src=3, w=0.1, theta=0.8, extra=None, **cfg):
     for nid, kw in (extra or {}).items():
         g.create_node(node_id=nid, **kw)
     return g, g._stab_receiver()
+
+
+def _rs(g, nid):
+    """[2026-11-10] the receiver's state for one node: (rho, pred_ema, conf_ema, last_t), None if not seen."""
+    return g.nodes.receiver_state([nid])[0]
 
 
 def _pend(g, target, current, dt=1):
@@ -201,19 +212,18 @@ def test_precharge_never_fires_target():
 def test_rho_rises_when_overpredicted_falls_when_under():
     g, p = _rg()
     g.nodes["T"].firing_rate_ema = 0.0
-    st = g._receiver_state()
     for _ in range(40):
         g.active_predictions.clear()
         g.timestep += 1
         _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
-    rho_hi = float(st["rho"][st["idx"]["T"]])
+    rho_hi = _rs(g, "T")[0]
     assert rho_hi > 0.3
     g.nodes["T"].firing_rate_ema = 0.5
     for _ in range(400):
         g.active_predictions.clear()
         g.timestep += 1
         _fire(g, p, ["s0"], [("T", 0.01)])   # candidate, never predicted
-    assert float(st["rho"][st["idx"]["T"]]) == pytest.approx(0.1)   # down to rho_min, not below
+    assert _rs(g, "T")[0] == pytest.approx(0.1)   # down to rho_min, not below
 
 
 # ---------------------------------------------------------------------------
@@ -245,12 +255,11 @@ def test_error_splits_penalty_by_share_and_updates_own_record():
     g, p = _rg(three_factor_enabled=False, prediction_error_penalty=0.05)
     _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
     (pred,) = _preds_on(g, "T")
-    st = g._receiver_state()
-    c0 = float(st["conf_ema"][st["idx"]["T"]])
+    c0 = _rs(g, "T")[2]
     g.timestep = pred.expires_at + 1
     g._cleanup_predictions()
     assert _weights(g, ["s0", "s1", "s2"]) == pytest.approx([0.1 - 0.05 * pred.confidence / 3] * 3)
-    assert float(st["conf_ema"][st["idx"]["T"]]) < c0
+    assert _rs(g, "T")[2] < c0
 
 
 def test_shares_sum_to_one_excitatory_only():
@@ -298,7 +307,7 @@ def test_chain_stops_below_floor():
     assert [pr for pr in g.active_predictions.values() if pr.chain_depth > 0] == []
 
 
-@pytest.mark.parametrize("kind", ["dict", "nodes", "native"])
+@pytest.mark.parametrize("kind", ["nodes", "native"])   # [2026-11-10] a dict graph keeps the Rust-only receiver off (test below)
 def test_receiver_on_runs_the_drive_harness(kind):
     start = H2.built(0)
     t = S.Pair(restore_as(NF, kind, start), restore_as(NF, kind, start), 0)
@@ -389,15 +398,13 @@ def test_converging_parents_do_not_grow_second_branch():
 def test_chain_episode_decays_pred_ema():
     """Review I3: a chain registration decays the target's episode EMA over the gap before adding alpha."""
     g, p = _chain_graph()
-    st = g._receiver_state()
-    i = g._receiver_row(st, "U1")
-    st["pred_ema"][i], st["last_t"][i] = 1.0, g.timestep
+    assert g.nodes.receiver_set_state("U1", p[0], g.timestep, pred_ema=1.0, last_t=g.timestep)
     g.timestep += 100
     _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
     assert [pr.target_node_id for pr in g.active_predictions.values() if pr.chain_depth == 1] == ["U1"]
     alpha = p[4]
-    assert float(st["pred_ema"][i]) == pytest.approx((1 - alpha) ** 100 + alpha)
-    assert int(st["last_t"][i]) == g.timestep
+    assert _rs(g, "U1")[1] == pytest.approx((1 - alpha) ** 100 + alpha)
+    assert _rs(g, "U1")[3] == g.timestep
 
 
 def test_passing_but_dropped_still_counts_as_an_episode():
@@ -406,9 +413,8 @@ def test_passing_but_dropped_still_counts_as_an_episode():
     g.create_node(node_id="a0")
     g.create_synapse("a0", "T", weight=0.3)
     _fire(g, p, ["a0"], [("T", 0.3)])
-    st = g._receiver_state()
     assert g._recv_stats["dropped"] == 1
-    assert float(st["pred_ema"][st["idx"]["T"]]) == pytest.approx(p[4])
+    assert _rs(g, "T")[1] == pytest.approx(p[4])
 
 
 def test_receiver_table_capacity_is_its_own_knob():
@@ -473,27 +479,42 @@ def test_native_reads_match_getters(seed):
                      n.resting_potential, bool(n.is_inhibitory))
 
 
+# [2026-11-10] S18 Rust-only: the Python receiver path is deleted; the oracle is now the PRE-PORT engine (NG 4409133:
+# the Python `_recv` state and loops over the same native reads), run beside the ported one. Exact equality, no rounding.
+PREPORT_REV = os.environ.get("NG_S18_PREPORT_REV", "4409133")
+PREMOD = H2._load(PREPORT_REV, "nf_s18_preport")
+
+
+def _state_rows(g):
+    """Every seen neuron's receiver state, by id: the pre-port `_recv` dict or the NodeStore columns."""
+    if "_recv" in g.__dict__:
+        st = g.__dict__["_recv"]
+        return sorted((nid, float(st["rho"][i]), float(st["pred_ema"][i]), float(st["conf_ema"][i]), int(st["last_t"][i]))
+                      for nid, i in st["idx"].items() if nid in g.nodes)
+    if not hasattr(g.nodes, "receiver_state"):
+        return []
+    ids = list(g.nodes.keys())
+    return sorted((nid,) + r for nid, r in zip(ids, g.nodes.receiver_state(ids)) if r is not None)
+
+
 def _snapshot(g):
-    preds = sorted((p.target_node_id, p.chain_depth, round(p.strength, 12), round(p.confidence, 12),
-                    tuple(sorted((sid, round(sh, 12)) for sid, sh in p.contributors)), round(p.pre_charge_applied, 12))
+    preds = sorted((p.target_node_id, p.chain_depth, p.strength, p.confidence, p.source_node_id, p.drive, p.rho,
+                    tuple(p.contributors), p.pre_charge_applied)
                    for p in g.active_predictions.values() if p.contributors is not None)
-    st = g._receiver_state()
-    rows = sorted((nid, round(float(st["rho"][i]), 12), round(float(st["pred_ema"][i]), 12)) for nid, i in st["idx"].items())
-    volts = sorted((nid, round(n.voltage, 12)) for nid, n in g.nodes.items())
-    s = {k: v for k, v in g._recv_stats.items() if not k.startswith("s") or k == "seconds"}
-    s.pop("seconds")
-    s.pop("native_steps", None)   # which path ran, not what it did
-    return preds, rows, volts, s
+    volts = sorted((nid, n.voltage) for nid, n in g.nodes.items())
+    s = {k: g._recv_stats[k] for k in ("dropped", "registered", "merged", "chains")}
+    return preds, _state_rows(g), volts, s
 
 
 @needs_recv
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_receiver_pass_native_equals_python(seed):
-    """Same graph, same pending input, same fired set: the native-read pass registers exactly what the Python pass does."""
+def test_rust_receiver_pass_equals_the_preport_python_exactly(seed):
+    """Same graph, same pending input, same fired sets: the ported pass registers exactly what the pre-port Python
+    pass did (every field, bit for bit) and leaves the same per-neuron state and voltages (pre-charge)."""
     out = []
-    for python in (True, False):
-        g = _native_graph(seed)
-        g.__dict__["_recv_python"] = python
+    for mod in (PREMOD, NF):
+        g = restore_as(mod, "native", H2.built(seed))
+        g.config.update(dict(ARM, **RPE, **ON))
         rng = random.Random(100 + seed)
         ids = list(g.nodes.keys())
         for _ in range(6):
@@ -505,19 +526,34 @@ def test_receiver_pass_native_equals_python(seed):
                         _pend(g, syn.post_node_id, syn.weight * rng.uniform(0.2, 1.0), dt=rng.randint(1, 5))
             g._receiver_predictions(fired, g._stab_receiver())
             g.timestep += 1
-        assert g._recv_stats["registered"] > 0
+        assert g._recv_stats["registered"] > 0 and g._recv_stats["chains"] >= 0
         out.append(_snapshot(g))
     assert out[0] == out[1]
 
 
 @needs_recv
-def test_receiver_pass_takes_the_native_reads_when_present():
-    for python, want in ((False, True), (True, False)):
-        g = _native_graph(0)
-        g.__dict__["_recv_python"] = python
-        fired = list(g.nodes.keys())[:30]
-        g._receiver_predictions(fired, g._stab_receiver())
-        assert (g._recv_stats.get("native_steps", 0) > 0) is want
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("s19", [False, True])
+def test_rust_receiver_whole_run_equals_the_preport_engine(seed, s19):
+    """A twin run with the receiver on (and S19's corrected DiffPC, which sizes its plateau with S18's rho): the final
+    checkpoint BYTES of the ported engine equal the pre-port engine's."""
+    start = H2.built(seed)
+    t = S.Pair(restore_as(PREMOD, "native", start), restore_as(NF, "native", start), seed)
+    extra = {"diffpc_receiver_enabled": True} if s19 else {}
+    t.op("keys", lambda g: g.config.update(dict(ARM, **RPE, **ON, **extra)))
+    S.drive(t, random.Random(seed), 25, sleep_every=True)
+    assert t.b.g._recv_stats["registered"] > 0
+    assert _state_rows(t.a.g) == _state_rows(t.b.g)
+    assert ckpt(t.a.g) == ckpt(t.b.g)
+
+
+def test_receiver_needs_the_native_stores(caplog):
+    """[2026-11-10] no Python path (Josh 2026-11-03): on the Python node store the receiver logs ERROR once, stays off."""
+    g = NF.Graph(dict(ON))
+    with caplog.at_level(logging.ERROR):
+        assert g._stab_receiver() is None and g._stab_receiver() is None
+    errs = [r for r in caplog.records if r.levelno == logging.ERROR and "prediction_receiver_enabled" in r.getMessage()]
+    assert len(errs) == 1 and "receiver_round" in errs[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
@@ -551,17 +587,17 @@ def test_native_effective_threshold_is_stored_plus_ahp():
 
 @needs_eff
 @pytest.mark.parametrize("ca_on", [True, False])
-def test_receiver_pass_asks_for_the_effective_threshold(ca_on):
+def test_receiver_pass_asks_for_the_effective_threshold(ca_on, monkeypatch):
     g = _native_graph(1)
     g.config["ca_split_enabled"] = ca_on
     seen = []
-    orig = g._receiver_reads
-    g._receiver_reads = lambda ids, ahp_gain=0.0, pool=False: (seen.append((ahp_gain, pool)), orig(ids, ahp_gain, pool))[1]
+    # [2026-11-10] Rust-only: the candidate and chain scans take (ahp_gain, pool) as their own arguments
+    for name, gi in (("receiver_candidates", 11), ("receiver_chain_hop", 11)):
+        orig = getattr(NF.ng_tract, name)
+        monkeypatch.setattr(NF.ng_tract, name, lambda *a, _o=orig, _gi=gi: (seen.append((a[_gi], a[_gi + 1])), _o(*a))[1])
     g._receiver_predictions(list(g.nodes.keys())[:30], g._stab_receiver())
     want = float(g.config.get("ca_split_ahp_gain", 0.075)) if ca_on else 0.0
-    # the first read only filters the fired set by is_inhibitory (no threshold used); every candidate read after it
-    # must carry the detector's gain
-    assert len(seen) >= 2 and all(a == pytest.approx(want) for a, _ in seen[1:])
+    assert seen and all(a == pytest.approx(want) for a, _ in seen)
     assert all(p is False for _, p in seen)   # interneurons on: the detector adds no pool offset (divisive form)
 
 

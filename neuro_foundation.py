@@ -20,6 +20,19 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 before-live Rust ports; Josh 2026-11-10 "You may proceed")
+#   What: S18 receiver predictions Rust-only (plan docs/superpowers/plans/2026-11-10-s18-receiver-rust-only.md). The
+#         per-neuron state (rho / pred_ema / conf_ema / last_t) is NodeStore columns; the candidate scan is
+#         ng_tract.receiver_candidates and each chain hop ng_tract.receiver_chain_hop; registration (Prediction objects,
+#         merge, pre-charge, emit) stays here. _receiver_record -> NodeStore.receiver_record; _diffpc_corrected reads rho
+#         through NodeStore.receiver_rhos. Deleted (LAW 3): _receiver_state, _receiver_row, _receiver_reads,
+#         _receiver_out_rows, _receiver_peak_v and the `_recv_python` fallback. _stab_receiver ERRORs once and stays off
+#         without the wheel / native NodeStore (receiver_round >= 3) / SynapseStore. _recv_stats keeps its counters
+#         (+ read_skipped); s_contrib folds into s_cand.
+#   Why:  Josh 2026-11-03 "no new Python in production"; the `_recv` dict grew with every node ever seen, never pruned.
+#   How:  ng-tract-rs f36a0a0; the Python op for op (insertion order, stable sort, pow): bit-identical, checked by the
+#         parity test against the pre-port engine (4409133). Same intended difference as S13: a node removed and re-added
+#         under the same id starts with fresh receiver state. S18 stays OFF on the merge (Josh 2026-11-09).
 # [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 before-live Rust ports; Josh 2026-11-10 "Yes, please proceed")
 #   What: S10 / S13 reward prediction error runs in Rust. _s10_rpe_broadcast calls ng_tract.s10_rpe_step;
 #         _s13_source_rpe_broadcast calls NodeStore.s13_source_rpe (each source's expectation is a NodeStore column);
@@ -5042,6 +5055,13 @@ class Graph:
             rho0, k, eta, rho_min, alpha, floor, margin = p
             ok = (all(math.isfinite(x) for x in p) and 0.0 < rho_min <= rho0 < 1.0 and k > 0.0
                   and 0.0 < eta < 1.0 and 0.0 < alpha <= 1.0 and floor >= 0.0 and margin >= 0.0)
+            if ok and not (hasattr(ng_tract, "receiver_candidates")
+                           and getattr(type(self.nodes), "receiver_round", 0) >= 3
+                           and isinstance(self.synapses, getattr(ng_tract, "SynapseStore", ()))):
+                # [2026-11-10] Rust-only (Josh 2026-11-03): no Python path for the receiver
+                self._stab_error_once(["prediction_receiver_enabled"], "an ng_tract wheel with receiver_candidates and "
+                                      "the native NodeStore (receiver_round >= 3) and SynapseStore")
+                return None
             if ok:
                 return p
         self._stab_error_once(["prediction_receiver_enabled"],
@@ -5588,36 +5608,14 @@ class Graph:
                 )
 
     # [2026-11-01] S18 (#1202): receiver-side, graded predictions (spec 2026-11-01-receiver-side-prediction-design.md)
-    def _receiver_state(self) -> Dict[str, Any]:
-        """Per-neuron S18 state (in memory only, not saved): id -> row index into compact arrays rho (the neuron's
-        fraction-of-threshold bar), pred_ema (prediction episodes, decayed lazily from last_t) and conf_ema (its own
-        record as a predicted target). Rows are added on first sight; arrays grow by doubling."""
-        st = self.__dict__.get("_recv")
-        if st is None:
-            n = 1024
-            rho0 = self._stab_receiver()
-            rho0 = rho0[0] if rho0 is not None else 0.3
-            st = self.__dict__["_recv"] = {
-                "idx": {}, "rho0": rho0,
-                "rho": np.full(n, rho0), "pred_ema": np.zeros(n), "conf_ema": np.full(n, 0.5),
-                "last_t": np.zeros(n, dtype=np.int64),
-            }
-            self.__dict__["_recv_stats"] = {"dropped": 0, "registered": 0, "merged": 0, "chains": 0,
-                                            "seconds": 0.0}
-        return st
-
-    def _receiver_row(self, st: Dict[str, Any], nid: str) -> int:
-        i = st["idx"].get(nid)
-        if i is None:
-            i = st["idx"][nid] = len(st["idx"])
-            if i >= len(st["rho"]):
-                m = 2 * len(st["rho"])
-                st["rho"] = np.concatenate([st["rho"], np.full(m - len(st["rho"]), st["rho0"])])
-                st["pred_ema"] = np.concatenate([st["pred_ema"], np.zeros(m - len(st["pred_ema"]))])
-                st["conf_ema"] = np.concatenate([st["conf_ema"], np.full(m - len(st["conf_ema"]), 0.5)])
-                st["last_t"] = np.concatenate([st["last_t"], np.zeros(m - len(st["last_t"]), dtype=np.int64)])
-            st["last_t"][i] = self.timestep
-        return i
+    def _receiver_stats(self) -> Dict[str, Any]:
+        """[2026-11-10] S18 Rust-only: the receiver pass's counters (in memory only; harness reads). The per-neuron state
+        (rho, prediction-episode EMA, own confirmation record) is in the NodeStore's receiver columns."""
+        stats = self.__dict__.get("_recv_stats")
+        if stats is None:
+            stats = self.__dict__["_recv_stats"] = {"dropped": 0, "registered": 0, "merged": 0, "chains": 0,
+                                                    "seconds": 0.0, "read_skipped": 0}
+        return stats
 
     def _pending_input(self) -> Dict[str, List[float]]:
         """Input already on its way to each target, PER ARRIVAL TICK over the next d_max ticks (this step's spikes and
@@ -5645,56 +5643,6 @@ class Graph:
         pool = stab.inhib is not None and stab.ilayer is None
         return gain, pool
 
-    def _receiver_reads(self, ids: List[str], ahp_gain: float = 0.0, pool: bool = False) -> List[Optional[tuple]]:
-        """[2026-11-01] S18 (spec §10): (threshold, voltage, excitability, refractory_remaining, firing_rate_ema,
-        resting_potential, is_inhibitory) per id, from the native NodeStore in one call when it has receiver_reads
-        (None entries, and the whole list without it, are read through the node objects: the same values). With
-        receiver_round >= 2 the threshold is the EFFECTIVE detection threshold for (ahp_gain, pool); without it (or on
-        the Python path, which cannot see ca_slow) it is the stored threshold."""
-        native = None if self.__dict__.get("_recv_python") else getattr(self.nodes, "receiver_reads", None)
-        if native is not None and getattr(type(self.nodes), "receiver_round", 0) >= 2 and (ahp_gain or pool):
-            got = native(ids, ahp_gain, pool)
-        else:
-            got = native(ids) if native is not None else [None] * len(ids)
-        out: List[Optional[tuple]] = []
-        for nid, r in zip(ids, got):
-            if r is None:
-                n = self.nodes.get(nid)
-                r = None if n is None else (n.threshold, n.voltage, n.intrinsic_excitability, n.refractory_remaining,
-                                            n.firing_rate_ema, n.resting_potential, bool(n.is_inhibitory))
-            out.append(r)
-        return out
-
-    def _receiver_out_rows(self, pre_ids: List[str]) -> List[Tuple[str, str, str, float]]:
-        """[2026-11-01] S18 (spec §10): (post, synapse_id, pre, weight) for the given pre nodes' outgoing excitatory
-        links with weight > 0 — native SynapseStore.receiver_out_rows in one call when present, else the same walk in
-        Python over _outgoing."""
-        native = None if self.__dict__.get("_recv_python") else getattr(self.synapses, "receiver_out_rows", None)
-        if native is not None:
-            return native(list(pre_ids))
-        out = []
-        for a in pre_ids:
-            for sid in self._outgoing.get(a, ()):
-                syn = self.synapses.get(sid)
-                if syn is None or syn.synapse_type == SynapseType.INHIBITORY or syn.weight <= 0.0:
-                    continue
-                out.append((syn.post_node_id, sid, a, syn.weight))
-        return out
-
-    def _receiver_peak_v(self, v: float, rest: float, ex: float, ticks: Optional[List[float]],
-                         extra: float = 0.0) -> float:
-        """[2026-11-01] S18 review C1: the highest voltage the pending input alone would give the neuron (v, resting, excitability), tick by tick as
-        step() applies it (decay toward resting, then that tick's arrivals x excitability), plus `extra` (imagined
-        input on a chain hop, added at the first tick). Detection happens after each delivery, so "cannot fire it
-        alone" is peak < threshold, not net < threshold - v (a later inhibitory tranche cannot hide an earlier one)."""
-        decay = self.config["decay_rate"]
-        peak = -math.inf
-        for k, c in enumerate(ticks or (0.0,)):
-            v = v * decay + (1.0 - decay) * rest + c * ex + (extra if k == 0 else 0.0)
-            if v > peak:
-                peak = v
-        return peak
-
     def _receiver_max_active(self) -> int:
         """[2026-11-01] S18short: the receiver path's own table size (prediction_receiver_max_active, default 10000):
         with each neuron predicted about as often as it fires, ~fired-per-step x window predictions are pending."""
@@ -5705,12 +5653,12 @@ class Graph:
 
     def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
         """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
-        but cannot fire it alone: rho_T * theta <= D < theta - v (spec §4.1-4.4, 4.7-4.8). Chains: §4.6."""
+        but cannot fire it alone: rho_T * theta <= D < theta - v (spec §4.1-4.4, 4.7-4.8). Chains: §4.6.
+        [2026-11-10] Rust-only: the candidate scan is ng_tract.receiver_candidates; registration stays here."""
         import time as _time_mod
         _t0 = _time_mod.perf_counter()
         rho0, k, eta, rho_min, alpha, chain_floor, margin = params
-        st = self._receiver_state()
-        stats = self.__dict__["_recv_stats"]
+        stats = self._receiver_stats()
         window = self.config["prediction_window"]
         max_active = self._receiver_max_active()
         pre_factor = self.config["prediction_pre_charge_factor"]
@@ -5718,49 +5666,21 @@ class Graph:
         pend = self._pending_input()
         stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _tp
         _tp = _time_mod.perf_counter()
-        contrib: Dict[str, Dict[str, Tuple[str, float]]] = {}   # T -> syn_id -> (pre id, weight)
-        if not self.__dict__.get("_recv_python") and hasattr(self.nodes, "receiver_reads") \
-                and hasattr(self.synapses, "receiver_out_rows"):
-            stats["native_steps"] = stats.get("native_steps", 0) + 1
-        exc_fired = [a for a, r in zip(fired_ids, self._receiver_reads(list(fired_ids))) if r is not None and not r[6]]
-        for post, sid, a, w in self._receiver_out_rows(exc_fired):
-            contrib.setdefault(post, {})[sid] = (a, w)
-        stats["s_contrib"] = stats.get("s_contrib", 0.0) + _time_mod.perf_counter() - _tp
-        _tp = _time_mod.perf_counter()
-        passing = []
-        _tg = list(contrib)
         _gain, _pool = self._receiver_theta_args()
-        for tgt, rd in zip(_tg, self._receiver_reads(_tg, _gain, _pool)):
-            syns = contrib[tgt]
-            if rd is None or rd[3] > 0:
-                continue
-            theta, _v, _ex, _refr, _fr, _rest, _inh = rd
-            i = self._receiver_row(st, tgt)
-            dt = self.timestep - int(st["last_t"][i])
-            if dt > 0:
-                st["pred_ema"][i] *= (1.0 - alpha) ** dt
-                st["last_t"][i] = self.timestep
-            rho = float(st["rho"][i])
-            rho = rho + eta if st["pred_ema"][i] > k * _fr else rho - eta
-            rho = min(0.99, max(rho_min, rho))
-            st["rho"][i] = rho
-            ticks = pend.get(tgt)
-            d = sum(ticks) * _ex if ticks else 0.0
-            if theta <= 0.0 or d < rho * theta:
-                continue
-            peak = self._receiver_peak_v(_v, _rest, _ex, ticks)
-            if peak >= theta:   # the pending input fires it alone on some tick: causation, not prediction
-                continue
-            strength = d / theta
-            passing.append((strength, tgt, d, rho, syns, i, peak))
-        passing.sort(key=lambda x: -x[0])
+        passing, skipped = ng_tract.receiver_candidates(
+            self.nodes, self.synapses, list(fired_ids), pend, self.timestep, rho0, k, eta, rho_min, alpha,
+            self.config["decay_rate"], _gain, _pool)
+        stats["read_skipped"] += skipped
+        stats["native_steps"] = stats.get("native_steps", 0) + 1
         stats["s_cand"] = stats.get("s_cand", 0.0) + _time_mod.perf_counter() - _tp
         _tp = _time_mod.perf_counter()
         pending_by_target = {pr.target_node_id: pr for pr in self.active_predictions.values()
                              if pr.contributors is not None}
         new_preds: List[Prediction] = []
-        for strength, tgt, d, rho, syns, i, peak in passing:
-            conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
+        episodes: List[str] = []
+        for strength, tgt, d, rho, contrib, peak, conf_ema in passing:
+            syns = {sid: (pre_id, w) for sid, pre_id, w in contrib}
+            conf = min(1.0, 0.6 * strength + 0.4 * conf_ema)
             old = pending_by_target.get(tgt)
             if old is not None:
                 merged = dict(old.contributors_raw or {})
@@ -5770,7 +5690,7 @@ class Graph:
                 old.confidence = max(old.confidence, conf)
                 stats["merged"] += 1
                 continue
-            st["pred_ema"][i] += alpha   # the neuron reached its predictive state: an episode, registered or not
+            episodes.append(tgt)   # the neuron reached its predictive state: an episode, registered or not
             if len(self.active_predictions) >= max_active:
                 stats["dropped"] += 1
                 continue
@@ -5790,6 +5710,7 @@ class Graph:
             new_preds.append(pred)
             self._emit("prediction_generated", source=pred.source_node_id, target=tgt, strength=strength,
                        confidence=conf, chain_depth=0, timestep=self.timestep)
+        self.nodes.receiver_mark(episodes, alpha)
         stats["s_reg"] = stats.get("s_reg", 0.0) + _time_mod.perf_counter() - _tp
         _tp = _time_mod.perf_counter()
         self._receiver_chains(new_preds, pend, pending_by_target, params)
@@ -5801,84 +5722,36 @@ class Graph:
         """Spec §4.6: a predicted node is a weak, imagined source (its strength x chain_decay x the delivered factors of
         its own synapses), added to each successor's real pending input; the successor is tested with the same rule;
         several parents may converge; each parent continues only to its strongest passing successor; a chain stops
-        below chain_floor or at prediction_max_chain_depth. Credited to the chain's origin (source_node_id)."""
-        _rho0, _k, _eta, _rho_min, alpha, chain_floor, margin = params
-        st = self._receiver_state()
-        stats = self.__dict__["_recv_stats"]
+        below chain_floor or at prediction_max_chain_depth. Credited to the chain's origin (source_node_id).
+        [2026-11-10] Rust-only: each hop's scoring is ng_tract.receiver_chain_hop; registration stays here."""
+        rho0, _k, _eta, _rho_min, alpha, chain_floor, margin = params
+        stats = self._receiver_stats()
         decay = self.config["prediction_chain_decay"]
         max_depth = self.config["prediction_max_chain_depth"]
         max_active = self._receiver_max_active()
         window = self.config["prediction_window"]
         pre_factor = self.config["prediction_pre_charge_factor"]
+        _gain, _pool = self._receiver_theta_args()
         path = {pr.prediction_id: {pr.target_node_id} for pr in parents}
         for hop in range(1, max_depth + 1):
             if not parents:
                 return
-            imagined: Dict[str, float] = {}
-            succ: Dict[str, List[Tuple[str, str, float]]] = {}   # parent pid -> [(S, syn_id, part)]
-            by_s: Dict[str, Dict[str, Tuple[str, float]]] = {}   # S -> syn_id -> (pre, part) (this hop's contributors)
-            _pt = [par.target_node_id for par in parents]
-            _pr = dict(zip(_pt, self._receiver_reads(_pt)))
-            _rows = self._receiver_out_rows([t for t in dict.fromkeys(_pt) if _pr[t] is not None and not _pr[t][6]])
-            _by_pre: Dict[str, List[Tuple[str, str, float]]] = {}
-            for post, sid, a, w in _rows:
-                _by_pre.setdefault(a, []).append((post, sid, w))
-            _sn_ids = list(dict.fromkeys(post for post, _sid, _a, _w in _rows))
-            rd_s = dict(zip(_sn_ids, self._receiver_reads(_sn_ids, *self._receiver_theta_args())))
-            for par in parents:
-                for post, sid, w in _by_pre.get(par.target_node_id, ()):
-                    r = rd_s.get(post)
-                    if r is None or post in path[par.prediction_id]:
-                        continue
-                    part = par.strength * decay * w * r[2]
-                    imagined[post] = imagined.get(post, 0.0) + part
-                    succ.setdefault(par.prediction_id, []).append((post, sid, part))
-                    by_s.setdefault(post, {})[sid] = (par.target_node_id, part)
+            wins, dropped, skipped = ng_tract.receiver_chain_hop(
+                self.nodes, self.synapses, [(p.target_node_id, p.strength, list(path[p.prediction_id])) for p in parents],
+                pend, list(pending_by_target), len(self.active_predictions), max_active, self.timestep, rho0, alpha,
+                self.config["decay_rate"], _gain, _pool, decay, chain_floor)
+            stats["dropped"] += dropped
+            stats["read_skipped"] += skipped
             nxt: List[Prediction] = []
-            for par in parents:
-                # review I2: every successor competes, pending ones too; if the winner is already predicted (another
-                # parent converged on it), this parent's branch ends there instead of growing a weaker second one.
-                best = None
-                for sname, _sid, _part in succ.get(par.prediction_id, ()):
-                    s_thr, s_v, s_ex, s_refr, _sfr, s_rest, _sinh = rd_s[sname]
-                    if s_thr <= 0.0:
-                        continue
-                    ticks = pend.get(sname)
-                    d = (sum(ticks) * s_ex if ticks else 0.0) + imagined[sname]
-                    strength = d / s_thr
-                    if sname in pending_by_target:
-                        if best is None or strength > best[0]:
-                            best = (strength, sname, d, None, None, None)
-                        continue
-                    if s_refr > 0:
-                        continue
-                    i = self._receiver_row(st, sname)
-                    rho = float(st["rho"][i])
-                    if d < rho * s_thr:
-                        continue
-                    peak = self._receiver_peak_v(s_v, s_rest, s_ex, ticks, imagined[sname])
-                    if peak >= s_thr:
-                        continue
-                    if best is None or strength > best[0]:
-                        best = (strength, sname, d, rho, i, peak)
-                if best is None or best[3] is None or best[0] < chain_floor:
-                    continue
-                strength, sname, d, rho, i, peak = best
-                dt = self.timestep - int(st["last_t"][i])   # review I3: the episode EMA decays on this path too
-                if dt > 0:
-                    st["pred_ema"][i] *= (1.0 - alpha) ** dt
-                    st["last_t"][i] = self.timestep
-                st["pred_ema"][i] += alpha
-                if len(self.active_predictions) >= max_active:
-                    stats["dropped"] += 1
-                    continue
+            for pi, strength, sname, d, rho, peak, conf_ema, contrib in wins:
+                par = parents[pi]
                 sn = self.nodes.get(sname)
-                conf = min(1.0, 0.6 * strength + 0.4 * float(st["conf_ema"][i]))
+                conf = min(1.0, 0.6 * strength + 0.4 * conf_ema)
                 pre = min(strength * pre_factor * sn.intrinsic_excitability, max(0.0, sn.threshold - peak - margin))
                 pred = Prediction(target_node_id=sname, strength=strength, confidence=conf,
                                   created_at=self.timestep, expires_at=self.timestep + window, chain_depth=hop,
                                   pre_charge_applied=pre, drive=d, rho=rho)
-                self._receiver_set_contributors(pred, by_s[sname])
+                self._receiver_set_contributors(pred, {sid: (pre_id, part) for sid, pre_id, part in contrib})
                 pred.source_node_id = par.source_node_id   # the chain's origin
                 if pre > 0.0:
                     sn.voltage += pre
@@ -5911,10 +5784,7 @@ class Graph:
         """[2026-11-01] S18: a receiver prediction's outcome updates its target's own record (conf_ema, alpha 0.05)."""
         if pred.contributors is None:
             return
-        st = self.__dict__.get("_recv")
-        i = st["idx"].get(pred.target_node_id) if st is not None else None
-        if i is not None:
-            st["conf_ema"][i] += 0.05 * (hit - st["conf_ema"][i])
+        self.nodes.receiver_record(pred.target_node_id, hit)   # [2026-11-10] a NodeStore column (Rust-only)
 
     @staticmethod
     def _receiver_set_contributors(pred: "Prediction", syns: Dict[str, Tuple[str, float]]) -> None:
@@ -6326,11 +6196,7 @@ class Graph:
         top K surprised, sized with S18's rho per target and margin. Returns (outcomes, mean |e|) for StepResult."""
         eta, k, _w, _co = params
         dp = self.__dict__["_diffpc"]
-        recv = self._receiver_state()
-        rhos = []
-        for nid in dp.top_k(k):
-            i = recv["idx"].get(nid)
-            rhos.append(float(recv["rho"][i]) if i is not None else recv["rho0"])
+        rhos = self.nodes.receiver_rhos(dp.top_k(k), self._stab_receiver()[0])   # [2026-11-10] NodeStore columns
         return dp.apply(self.nodes, self.synapses, self.timestep, eta, k, self._stab_receiver()[6], rhos)
 
     def _diffpc_step(self, fired_ids: List[str]) -> Tuple[int, float]:
