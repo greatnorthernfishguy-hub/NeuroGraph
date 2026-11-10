@@ -3,6 +3,15 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1203 concepts stage 1, #1136 before-live ports; plan
+#   docs/superpowers/plans/2026-11-10-concepts-rust-port.md; Josh 2026-11-10 "Let's do it" on C1 / C2 / C3(a))
+#   What: the concept index's prototypes and search are ng_tract.ConceptIndex: _cc_concept_index rebuilds it,
+#         _cc_concept_nearest / _cc_concept_index_put call it, recognition's prototype drift and label similarity use
+#         ConceptIndex.drift / centred_cos. The module-global numpy matrix and _cc_centred_unit are gone (LAW 3).
+#   Why:  Josh 2026-11-03 "no new Python in production"; 2026-11-05 "no Python objects".
+#   How:  ng-tract-rs c979d9a. Not bit-identical to the numpy index (OpenBLAS float32 kernels); the bar (C2) is the same
+#         decisions on the checkpoint's tree nodes, borderline cases listed, values within 1e-6. Orchestration (node /
+#         synapse / vector-DB writes, the undo journal) stays here (C1); metadata moves with #1216 S2 / S4 (C3a).
 # [2026-11-06] DudeMan CC (Claude Opus 5.5, laptop; #1215 / #1161; Josh 2026-11-06 "Please dive into that.")
 # What: surface_wants re-parses only texts that are new, changed, or whose wants went missing, behind
 #   CC_NG_WANTS_SCAN_NATIVE (default off = the scan exactly as before). On: the walk runs in the native NodeStore
@@ -4089,8 +4098,10 @@ def cc_concept_params() -> dict:
 # cache of the vector DB's own concept rows (metadata "_cc_concept"), never a second store: it is valid only for the same
 # vector DB object, while the module's concept-write counter is unchanged, and while every cached row is still the very
 # array the vector DB holds (SimpleVectorDB.insert and .load replace arrays, so a reload or replacement rebuilds it).
-_CC_CONCEPT_INDEX = {"vdb": None, "counter": -1, "ids": [], "arrays": [], "mat": None, "dim": None,
-                     "buf": None, "hold": None, "vdb_len": -1}
+# [2026-11-10] #1136 Rust port (plan 2026-11-10-concepts-rust-port, Josh C1 / C2 / C3(a)): the prototypes and the search
+# are ng_tract.ConceptIndex ("native"); this dict keeps only the validity bookkeeping (no numpy matrix).
+_CC_CONCEPT_INDEX = {"vdb": None, "counter": -1, "ids": [], "arrays": [], "native": None, "dim": None,
+                     "hold": None, "vdb_len": -1}
 _CC_CONCEPT_WRITES = [0]
 # The current step-lock hold of a recognition pass (a fresh token per hold, None outside). Under the step lock only the
 # concept code writes concept rows, and it keeps the index in step itself, so the per-row identity check runs once per
@@ -4117,13 +4128,6 @@ def _cc_concept_centre(dim):
     return _np.zeros(dim, dtype=_np.float32)
 
 
-def _cc_centred_unit(vec, centre):
-    import numpy as _np
-    v = _np.asarray(vec, dtype=_np.float32) - centre
-    n = float(_np.linalg.norm(v))
-    return v / n if n > 1e-12 else None
-
-
 def _cc_concept_index(vector_db):
     """The valid index for `vector_db` (rebuilt when stale). Returns the cache dict."""
     import numpy as _np
@@ -4137,6 +4141,7 @@ def _cc_concept_index(vector_db):
     if valid:
         idx["hold"] = hold
         return idx
+    import ng_tract
     ids, arrays, rows, dim = [], [], [], None
     meta = getattr(vector_db, "metadata", {})
     for cid, m in list(meta.items()):
@@ -4155,22 +4160,15 @@ def _cc_concept_index(vector_db):
         ids.append(cid)
         arrays.append(arr)
         rows.append(a)
-    mat = None
+    native = None
     if rows:
-        centre = _cc_concept_centre(dim)
-        cen = [_cc_centred_unit(r, centre) for r in rows]
-        keep = [i for i, c in enumerate(cen) if c is not None]
+        native = ng_tract.ConceptIndex(_cc_concept_centre(dim))
+        keep = [i for i, r in enumerate(rows) if native.put(ids[i], _np.asarray(r, dtype=_np.float32))]
         ids = [ids[i] for i in keep]
         arrays = [arrays[i] for i in keep]
-        if keep:
-            buf = _np.empty((max(64, 2 * len(keep)), dim), dtype=_np.float32)
-            buf[:len(keep)] = _np.stack([cen[i] for i in keep])
-            mat = buf[:len(keep)]
-    else:
-        buf = None
-    if mat is None:
-        buf = None
-    idx.update(vdb=vector_db, counter=_CC_CONCEPT_WRITES[0], ids=ids, arrays=arrays, mat=mat, dim=dim, buf=buf,
+        if not keep:
+            native = None
+    idx.update(vdb=vector_db, counter=_CC_CONCEPT_WRITES[0], ids=ids, arrays=arrays, native=native, dim=dim,
                hold=_CC_CONCEPT_HOLD[0], vdb_len=len(emb))
     return idx
 
@@ -4180,18 +4178,12 @@ def _cc_concept_nearest(vector_db, vec, match):
     the concepts' is not matched (skipped, not raised)."""
     import numpy as _np
     idx = _cc_concept_index(vector_db)
-    if idx["mat"] is None:
+    if idx["native"] is None:
         return None
     q = _np.asarray(vec, dtype=_np.float32)
     if q.ndim != 1 or q.shape[0] != idx["dim"]:
         return None
-    qc = _cc_centred_unit(q, _cc_concept_centre(idx["dim"]))
-    if qc is None:
-        return None
-    sims = idx["mat"] @ qc
-    i = int(_np.argmax(sims))
-    sim = float(sims[i])
-    return (idx["ids"][i], sim) if sim >= match else None
+    return idx["native"].nearest(q, float(match))   # [2026-11-10] Rust: centred cosine, first maximum, >= match
 
 
 def _cc_concept_index_put(vector_db, cid):
@@ -4209,30 +4201,21 @@ def _cc_concept_index_put(vector_db, cid):
     arr = emb.get(cid)
     if not ok or arr is None:
         return
+    import ng_tract
     a = _np.asarray(arr)
     if idx["dim"] is None:
         idx["dim"] = a.shape[0]
     if a.ndim != 1 or a.shape[0] != idx["dim"]:
         return
-    row = _cc_centred_unit(a, _cc_concept_centre(idx["dim"]))
-    if row is None:
+    if idx["native"] is None:
+        idx["native"] = ng_tract.ConceptIndex(_cc_concept_centre(idx["dim"]))
+    if not idx["native"].put(cid, _np.asarray(a, dtype=_np.float32)):   # a zero vector: not indexed (as before)
         return
     if cid in idx["ids"]:
-        i = idx["ids"].index(cid)
-        idx["arrays"][i] = arr
-        idx["mat"][i] = row
+        idx["arrays"][idx["ids"].index(cid)] = arr
     else:
-        n = len(idx["ids"])
-        buf = idx["buf"]
-        if buf is None or n >= buf.shape[0]:   # grow by doubling: amortised O(1) per new concept
-            nb = _np.empty((max(64, 2 * (n + 1)), idx["dim"]), dtype=_np.float32)
-            if n:
-                nb[:n] = idx["mat"]
-            buf = idx["buf"] = nb
-        buf[n] = row
         idx["ids"].append(cid)
         idx["arrays"].append(arr)
-        idx["mat"] = buf[:n + 1]
     idx["counter"] = _CC_CONCEPT_WRITES[0]
     idx["hold"] = hold
     idx["vdb_len"] = len(emb)
@@ -4418,17 +4401,14 @@ def _cc_concept_recognize_tree(graph, vector_db, tree_id, params, journal, encod
         _cc_concept_write_row(graph, vector_db, cid, vec, journal)
     elif outcome == "matched":
         cnode = graph.nodes[cid]
+        import ng_tract
         proto = _np.asarray(vector_db.get(cid)["embedding"], dtype=_np.float32)
-        new = (1.0 - params["drift"]) * proto + params["drift"] * vec
-        n = float(_np.linalg.norm(new))
-        new = new / n if n > 1e-12 else proto
+        new = ng_tract.ConceptIndex.drift(proto, vec, float(params["drift"]))   # [2026-11-10] Rust
         _cc_concept_set_meta(cnode, cid, "_cc_recognitions", int(cnode.metadata.get("_cc_recognitions", 0)) + 1, journal)
-        centre = _cc_concept_centre(new.shape[0])
-        pc = _cc_centred_unit(new, centre)
+        _ix = _CC_CONCEPT_INDEX["native"]   # just used by _cc_concept_nearest for this match: same centre
 
         def _sim(v):
-            vc = _cc_centred_unit(v, centre)
-            return float(vc @ pc) if (vc is not None and pc is not None) else -1.0
+            return _ix.centred_cos(_np.asarray(v, dtype=_np.float32), new)
         holder = cnode.metadata.get("_cc_label_from")
         hrow = vector_db.get(holder) if holder else None
         holder_sim = _sim(_np.asarray(hrow["embedding"], dtype=_np.float32)) if hrow is not None else -1.0
