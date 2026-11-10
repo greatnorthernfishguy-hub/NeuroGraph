@@ -4,7 +4,8 @@
 #   receiver_set_state (the `_recv` dict is gone); the native-vs-Python-path tests become PARITY against the pre-port
 #   engine (NG 4409133): one pass exactly, field for field, and twin whole runs (receiver on, with and without S19) to
 #   equal checkpoint bytes; + the receiver needs the native stores (ERROR once, off); the effective-threshold check
-#   wraps the native scans. (`_receiver_max_active` / capacity tests unchanged.)
+#   wraps the native scans. (`_receiver_max_active` / capacity tests unchanged.) The chain-episode decay is checked EXACTLY
+#   against CPython's float ** int (Grok review 2026-11-10).
 # [2026-11-01] DudeMan CC (Claude Opus 5.5, laptop; #1202 receiver-side predictions; Josh 2026-11-01 "Yeah, the design
 #   looks good") — S18: a neuron is predicted when pending input charges it partway but cannot fire it alone
 # What: (1) the switch absent / explicitly False == the synced copy line (1d0a1a0's module) exactly (final checkpoint
@@ -403,7 +404,8 @@ def test_chain_episode_decays_pred_ema():
     _fire(g, p, ["s0", "s1", "s2"], [("T", 0.1)] * 3)
     assert [pr.target_node_id for pr in g.active_predictions.values() if pr.chain_depth == 1] == ["U1"]
     alpha = p[4]
-    assert _rs(g, "U1")[1] == pytest.approx((1 - alpha) ** 100 + alpha)
+    # exact, not approx (Grok review 2026-11-10): Rust's powf decay against CPython's float ** int, bit for bit
+    assert _rs(g, "U1")[1] == 1.0 * (1 - alpha) ** 100 + alpha
     assert _rs(g, "U1")[3] == g.timestep
 
 

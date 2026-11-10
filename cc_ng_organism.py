@@ -12,6 +12,7 @@
 #   How:  ng-tract-rs c979d9a. Not bit-identical to the numpy index (OpenBLAS float32 kernels); the bar (C2) is the same
 #         decisions on the checkpoint's tree nodes, borderline cases listed, values within 1e-6. Orchestration (node /
 #         synapse / vector-DB writes, the undo journal) stays here (C1); metadata moves with #1216 S2 / S4 (C3a).
+#         Grok review Minor 2: _cc_concepts_runnable gates encoding and the backlog (no ConceptIndex -> ERROR once, off).
 # [2026-11-06] DudeMan CC (Claude Opus 5.5, laptop; #1215 / #1161; Josh 2026-11-06 "Please dive into that.")
 # What: surface_wants re-parses only texts that are new, changed, or whose wants went missing, behind
 #   CC_NG_WANTS_SCAN_NATIVE (default off = the scan exactly as before). On: the walk runs in the native NodeStore
@@ -4070,6 +4071,28 @@ def cc_concepts_enabled() -> bool:
     return os.environ.get("CC_NG_CONCEPTS", "0").strip() not in ("0", "", "false", "False", "no")
 
 
+_CC_CONCEPTS_NATIVE_ERR = [False]
+
+
+def _cc_concepts_runnable() -> bool:
+    """[2026-11-10] CC_NG_CONCEPTS on AND the wheel carries ng_tract.ConceptIndex. The index has no Python path (Josh
+    2026-11-03): without it concepts log ERROR once and stay off, as S10 / S13 / S18 do -- never a raise mid-turn (it
+    would roll the turn back) and never an empty index (every tree would found a new concept). Grok review 2026-11-10
+    (sdd/2026-11-10-merge-1136-review/review-grok.md, Minor 2)."""
+    if not cc_concepts_enabled():
+        return False
+    try:
+        import ng_tract
+        ok = hasattr(ng_tract, "ConceptIndex")
+    except Exception:  # noqa: BLE001 -- no wheel at all: the same answer
+        ok = False
+    if not ok and not _CC_CONCEPTS_NATIVE_ERR[0]:
+        _CC_CONCEPTS_NATIVE_ERR[0] = True
+        logger.error("CC_NG_CONCEPTS is on but this ng_tract wheel has no ConceptIndex: concept recognition stays OFF "
+                     "(the concept index has no Python path)")
+    return ok
+
+
 def _cc_env_int(name, default, lo, hi):
     """An int knob from env, clamped to [lo, hi]; absent or unparsable -> default."""
     try:
@@ -4493,7 +4516,7 @@ def cc_concept_recognize_backlog(graph, vector_db, budget, batch) -> dict:
     tree has its own journal and is rolled back alone if it fails. A no-op when CC_NG_CONCEPTS is off."""
     import time as _t
     out = {"matched": 0, "created": 0, "repaired": 0, "skipped": 0, "failed": 0, "remaining": 0, "max_hold_s": 0.0}
-    if not cc_concepts_enabled() or budget <= 0:
+    if not _cc_concepts_runnable() or budget <= 0:
         return out
     params = cc_concept_params()
     lock = graph._step_lock
@@ -5006,7 +5029,7 @@ def run_conversational_dual_pass(graph, vector_db, text: str, embedding, state: 
                 _bound.get("tree_pairs", 0) >= _bound["trees"] and _bound.get("hyperedge")):
             eco.topology["site"] = "bind_postcondition"
             raise RuntimeError("bind wrote less than a turn with trees needs")
-        if cc_concepts_enabled():   # [2026-10-31] #1203 stage 1: recognition at encoding (spec §5.1)
+        if _cc_concepts_runnable():   # [2026-10-31] #1203 stage 1: recognition at encoding (spec §5.1); 2026-11-10 + wheel check
             stage = "concepts"
             _cc_concept_recognize(graph, vector_db, eco, list((_result or {}).get("tree_ids") or []), state)
         if _bound and ("reinforced_synapses" in _bound):

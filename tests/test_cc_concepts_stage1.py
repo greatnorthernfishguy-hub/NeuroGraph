@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; Grok review Minor 2) — + concepts on with a wheel lacking ConceptIndex:
+#   ERROR once, recognition off, turns land, no concept founded, backlog idle.
 # [2026-10-31] DudeMan CC (Claude Opus 5.5, laptop; lane concepts-stage1, #1203; Josh 2026-10-31 "You are a go")
 # What: tests for concept formation stage 1 — the switch and parameters, the concept index, recognition at encoding,
 #   sleep-time recognition of the existing past.
@@ -203,6 +205,26 @@ def test_off_is_byte_identical(monkeypatch, zero_centre):
     assert _concepts(g) == []
     assert all("_cc_concept_id" not in n.metadata for n in g.nodes.values())
     assert len(g.synapses) == 2          # forest<->tree only
+
+
+def test_without_the_native_index_concepts_log_error_once_and_stay_off(monkeypatch, concepts_on, caplog):
+    """[2026-11-10] Grok review Minor 2: a wheel with no ConceptIndex -> ERROR once, recognition off (as S10 / S13 /
+    S18), the turn still lands and no concept is founded; the sleep backlog does nothing either."""
+    import logging
+    import ng_tract
+    monkeypatch.delattr(ng_tract, "ConceptIndex")
+    monkeypatch.setattr(cc_ng_organism, "_CC_CONCEPTS_NATIVE_ERR", [False])
+    _fake_embedder(monkeypatch, {"proto hits lenia": ["lenia"], "back to lenia later": ["lenia2"]})
+    g, vdb, st = Graph(), SimpleVectorDB(), {}
+    with caplog.at_level(logging.ERROR, logger="cc_ng_organism"):
+        assert _turn(g, vdb, st, "proto hits lenia") is True
+        assert _turn(g, vdb, st, "back to lenia later") is True
+        out = cc_ng_organism.cc_concept_recognize_backlog(g, vdb, 100, 10)
+    assert _concepts(g) == []
+    assert all("_cc_concept_id" not in n.metadata for n in g.nodes.values())
+    assert out["matched"] == out["created"] == out["failed"] == 0
+    errs = [r for r in caplog.records if r.levelno == logging.ERROR and "ConceptIndex" in r.getMessage()]
+    assert len(errs) == 1
 
 
 def test_same_concept_two_turns_one_node(monkeypatch, concepts_on):
