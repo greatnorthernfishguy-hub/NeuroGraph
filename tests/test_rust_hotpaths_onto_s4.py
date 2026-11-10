@@ -1,3 +1,6 @@
+# [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; test repair #1217; Josh 2026-11-09 "Yes, please") -- the checkpoint
+#   compares go through tests/d1210_intended.same_ckpt: since #1210 / #1210b (2026-11-04) the base 5246b63's checkpoint
+#   differed in exactly the novel-sequence / error-outcome id lists, so 48 of these tests failed and checked nothing.
 # [2026-10-06] Claude (lane sleep-p1) — D15 (sleep-phase spec): the BASE engine gets D15's one named intended change
 #   (tests/d15_intended.apply_d15_rule: drop pre.pred_weights[post] with the last pre->post synapse) so this file keeps checking
 #   everything else bitwise; with D15 switched off the file passes unchanged (SLEEP_P1.md §6).
@@ -34,6 +37,7 @@ import pytest
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 import neuro_foundation as NF  # noqa: E402  (the branch)
+from tests import d1210_intended as D1210  # noqa: E402  (#1210: named intended change)
 
 BASE_REV = os.environ.get("NG_ONTO_S4_BASE_REV", "5246b63")   # trial tip this branch was cut from
 
@@ -238,7 +242,7 @@ def test_prune_site(seed, flags, fallback):
         return out
     (a, ra), (b, rb) = twins(base_bytes(seed), act, seed, fallback)
     assert ra == rb
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 @pytest.mark.parametrize("flags", ["absent", "lifeline"])
@@ -254,7 +258,7 @@ def test_competing_mode_unchanged(seed, flags):
         return recs
     (a, ra), (b, rb) = twins(base_bytes(seed), act, seed)
     assert ra == rb
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -268,7 +272,7 @@ def test_inject_reward_site(seed, fallback):
         g.inject_reward(1, scope=frozenset(rng.sample(nodes, 40)) | {"ghost"})
         g.inject_reward(0.7, scope=list(rng.sample(nodes, 20)))
     (a, _), (b, _) = twins(base_bytes(seed), act, seed, fallback)
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -280,7 +284,7 @@ def test_homeostatic_scaling_site(seed, fallback):
         for k in range(7):  # scaling_interval=3 -> the scaling branch runs twice
             hr.apply(g, rng.sample(nodes, 15), g.timestep + k)
     (a, _), (b, _) = twins(base_bytes(seed), act, seed, fallback)
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -297,7 +301,7 @@ def test_stdp_site(seed, three_factor, fallback):
                 g.nodes[nid].last_spike_time = float(g.timestep + k)
             st.apply(g, fired, g.timestep + k)
     (a, _), (b, _) = twins(base_bytes(seed), act, seed, fallback)
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -316,7 +320,7 @@ def test_step_and_sprout_site(seed, fallback):
         return log
     (a, ra), (b, rb) = twins(base_bytes(seed), act, seed, fallback)
     assert ra == rb
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -333,7 +337,7 @@ def test_prime_and_propagate_site(seed, fallback):
         return log
     (a, ra), (b, rb) = twins(base_bytes(seed), act, seed, fallback)
     assert ra == rb
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -345,7 +349,7 @@ def test_telemetry_and_subgraph_site(seed, fallback):
         return (repr(t), g.extract_subgraph(sub))
     (a, ra), (b, rb) = twins(base_bytes(seed), act, seed, fallback)
     assert ra == rb
-    assert a == b
+    assert D1210.same_ckpt(a, b)
     assert repr(BASE.Graph().get_telemetry()) == repr(NF.Graph().get_telemetry())
 
 
@@ -406,8 +410,8 @@ def test_whole_run(seed, flags, fallback):
         return act0(mod, g, rng)
     (a, (la, sa)), (b, (lb, sb)) = twins(base_bytes(seed), act, seed, fallback)
     assert la == lb
-    assert sa == sb
-    assert a == b
+    assert D1210.same_ckpts(sa, sb)
+    assert D1210.same_ckpt(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +471,7 @@ def test_checkpoint_copy(flags):
                 "fired_entries_per_pp": [len(t) for t in ra["trace"] if isinstance(t, list)],
                 "identical": a == b and ra == rb}) + "\n")
     assert ra == rb
-    assert a == b
+    assert D1210.same_ckpt(a, b)
 
 
 # ---------------------------------------------------------------------------

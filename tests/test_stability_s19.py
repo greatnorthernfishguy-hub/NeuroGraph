@@ -6,7 +6,7 @@
 #       decoded msgpack, unchanged. Measured on the merge: the ONLY differing fields were novel_sequence_log and
 #       prediction_outcomes' id lists / counts (seeds 0 and 1, native, receiver on) -- #1210's intended change.
 # Why:  distinguish the live line's intentional change from an S19 leak; the parent stays the oracle for the rest.
-# How:  _as_1210 mirrors neuro_foundation._log_novel_sequence / _on_prediction_error (heapq.nsmallest, _NOVEL_SAMPLE).
+# How:  tests/d1210_intended.py (shared with test_rust_hotpaths_onto_s4).
 # [2026-11-04] DudeMan CC (S19 Rust-only; Josh 2026-11-03 "Just focus on the Rust") — trimmed to the native DiffPc
 # What: graphs are native (DiffPC has no Python path); outcomes / stats / peaks / plateau rows are read from
 #       ng_tract.DiffPc (last(), stats(), peaks(), rows()); interneurons are scored for the record only. Deleted: the
@@ -37,6 +37,7 @@ import pytest
 from tests import test_hyperedge_store_h2 as H2   # noqa: E402
 from tests import test_stability_s as S            # noqa: E402
 from tests import test_stability_s7b as S7B        # noqa: E402
+from tests import d1210_intended as D1210           # noqa: E402
 
 NF = H2.NF
 BASE_REV = os.environ.get("NG_S19_BASE_REV", "15b1958")
@@ -51,26 +52,8 @@ ckpt = S.ckpt
 restore_as = S.restore_as
 
 
-def _as_1210(d):
-    """The S18 parent's decoded checkpoint as the live line's #1210 / #1210b would have saved it."""
-    import heapq
-    n = NF.Graph._NOVEL_SAMPLE
-    for ev in d.get("novel_sequence_log", []):
-        fired = ev["firing_nodes"]
-        ev["firing_nodes"], ev["n_firing"] = heapq.nsmallest(n, fired), len(fired)
-    for po in d.get("prediction_outcomes", []):
-        if not po["confirmed"]:
-            fired = po["actual_firing_nodes"]
-            po["actual_firing_nodes"] = heapq.nsmallest(n, fired)
-            if fired:
-                po["n_actual_firing"] = len(fired)
-    return d
-
-
 def _same_as_base(a, b):
-    import msgpack
-    un = lambda g: msgpack.unpackb(ckpt(g), strict_map_key=False, raw=False)
-    return _as_1210(un(a)) == un(b)
+    return D1210.same_ckpt(ckpt(a), ckpt(b))   # tests/d1210_intended.py
 
 
 def _pair(kind, seed, base_cfg):
