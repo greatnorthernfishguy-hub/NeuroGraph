@@ -1,4 +1,8 @@
 # ---- Changelog ----
+# [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 Rust ports) — per-source tests follow the Rust port (ng-tract-rs
+#   dc0fbd3): sources are the graph's real nodes, expectations are seeded through NodeStore.s13_source_rpe at tau 1 and read
+#   with s13_expectations (the _s13_q dict is gone). New: a non-node source counts and keeps nothing; a removed node's value
+#   goes with it; on the Python node store S13 per-source is off with one ERROR.
 # [2026-10-28] Claude (lane stability-s13, #1136; Josh 2026-10-28 "Yes, go ahead with both") — S13: the symmetric reward
 #   floor and per-source surprise
 # What: (1) both S13 keys absent / explicitly False == the S12 NG branch (aa1f82d's module) exactly on the dict,
@@ -151,12 +155,17 @@ def _src_graph(m=NF, tau=20):
     return g, syn
 
 
+def _seed(g, **q):
+    """[2026-11-10] set source expectations exactly: one event per source at tau 1 lands q on the event's hit."""
+    g.nodes.s13_source_rpe([(src, v, v) for src, v in q.items()], 1.0)
+
+
 def test_a_source_that_does_as_well_as_it_expects_sends_nothing():
     g, syn = _src_graph()
-    g._s13_q = {"good": 0.9, "bad": 0.1}
+    _seed(g, n1=0.9, n2=0.1)
     n0 = g._total_rewards_injected
-    # "good" hits (0.9 expected) and "bad" misses (0.1 expected): both nearly as expected -> |mean delta| 0.1 x 0.5 = 0.05
-    g._s13_source_rpe_broadcast([("good", 1.0, 0.9), ("bad", 0.0, 0.1)])
+    # n1 hits (0.9 expected) and n2 misses (0.1 expected): both nearly as expected -> |mean delta| 0.1 x 0.5 = 0.05
+    g._s13_source_rpe_broadcast([("n1", 1.0, 0.9), ("n2", 0.0, 0.1)])
     assert g._total_rewards_injected == n0, "mean delta 0: nothing sent"
     # S10 judges the same step against ONE global expectation: a large signal from the mix alone
     b, _ = _graph(NF, {}, weights=(0.5,))
@@ -167,25 +176,25 @@ def test_a_source_that_does_as_well_as_it_expects_sends_nothing():
 
 def test_the_expectation_starts_at_the_confidence_and_learns():
     g, syn = _src_graph(tau=4)
-    g._s13_source_rpe_broadcast([("a", 0.0, 0.8)])
-    assert g._s13_q["a"] == pytest.approx(0.8 + (0.0 - 0.8) / 4)
+    g._s13_source_rpe_broadcast([("n1", 0.0, 0.8)])
+    assert g.nodes.s13_expectations()["n1"] == pytest.approx(0.8 + (0.0 - 0.8) / 4)
     assert g._reward_history[-1]["strength"] == pytest.approx(0.5 * (0.0 - 0.8))
 
 
 def test_the_step_reward_is_the_mean_delta_once():
     g, syn = _src_graph()
-    g._s13_q = {"a": 0.5, "b": 0.5}
+    _seed(g, n1=0.5, n2=0.5)
     n0 = g._total_rewards_injected
-    g._s13_source_rpe_broadcast([("a", 1.0, 0.5), ("a", 1.0, 0.5), ("b", 1.0, 0.5)])
+    g._s13_source_rpe_broadcast([("n1", 1.0, 0.5), ("n1", 1.0, 0.5), ("n2", 1.0, 0.5)])
     assert g._total_rewards_injected == n0 + 1
     assert g._reward_history[-1]["strength"] > 0
 
 
 def test_step_routes_kept_events_to_the_per_source_rule():
     g, syn = _src_graph()
-    g._s13_q = {"a": 0.2}
+    _seed(g, n1=0.2)
     g._s10_events = [0.8]
-    g._s13_events = [("a", 1.0, 0.8)]
+    g._s13_events = [("n1", 1.0, 0.8)]
     g._s10_rpe_baseline = 0.8   # S10 would see delta 0: only S13 sends
     n0 = g._total_rewards_injected
     g.step()
@@ -195,13 +204,39 @@ def test_step_routes_kept_events_to_the_per_source_rule():
     assert g._s10_rpe_baseline == 0.8, "S10's global expectation is not used under S13"
 
 
+def test_a_source_that_is_not_a_node_counts_and_keeps_nothing():
+    """[2026-11-10] Rust port: the expectations are a NodeStore column. A source that is not a live node (removed
+    between prediction and resolution) still contributes its delta, from its confidence, and keeps no expectation; a
+    removed node's expectation goes with it, so one re-added under the same id starts fresh."""
+    g, syn = _src_graph(tau=4)
+    g._s13_source_rpe_broadcast([("gone", 1.0, 0.25)])
+    assert g._reward_history[-1]["strength"] == pytest.approx(0.5 * 0.75)
+    assert "gone" not in g.nodes.s13_expectations()
+    _seed(g, n3=0.9)
+    g.remove_node("n3")
+    assert "n3" not in g.nodes.s13_expectations()
+    g.create_node(node_id="n3")
+    assert "n3" not in g.nodes.s13_expectations()
+
+
+def test_per_source_on_the_python_node_store_logs_error_once_and_stays_off(caplog):
+    """[2026-11-10] no Python path (Josh 2026-11-03): without a NodeStore carrying s13_rpe_round, S13 per-source is off."""
+    g = NF.Graph(dict(RPE, reward_rpe_per_source_enabled=True))
+    assert getattr(type(g.nodes), "s13_rpe_round", 0) < 1
+    with caplog.at_level(logging.ERROR):
+        assert g._stab_s13_per_source() is None
+        assert g._stab_s13_per_source() is None
+    errs = [r for r in caplog.records if r.levelno == logging.ERROR and "reward_rpe_per_source_enabled" in r.getMessage()]
+    assert len(errs) == 1 and "s13_rpe_round" in errs[0].getMessage()
+
+
 def test_nothing_new_is_saved():
     g, syn = _src_graph()
-    g._s13_source_rpe_broadcast([("a", 1.0, 0.5)])
-    assert g._s13_q
+    g._s13_source_rpe_broadcast([("n1", 1.0, 0.5)])
+    assert g.nodes.s13_expectations()
     off, _ = _graph(NF, {}, weights=(0.5, 0.5, 0.5))
     d = msgpack.unpackb(ckpt(g), raw=False, strict_map_key=False)
     assert set(d) == set(msgpack.unpackb(ckpt(off), raw=False, strict_map_key=False))
     assert b"_s13" not in ckpt(g)
     back = restore_as(NF, "native", ckpt(g))
-    assert "_s13_q" not in back.__dict__
+    assert back.nodes.s13_expectations() == {}, "not saved (as the Python dict was not)"

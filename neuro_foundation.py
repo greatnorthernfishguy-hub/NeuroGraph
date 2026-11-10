@@ -20,6 +20,15 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 before-live Rust ports; Josh 2026-11-10 "Yes, please proceed")
+#   What: S10 / S13 reward prediction error runs in Rust. _s10_rpe_broadcast calls ng_tract.s10_rpe_step;
+#         _s13_source_rpe_broadcast calls NodeStore.s13_source_rpe (each source's expectation is a NodeStore column);
+#         the Python loops and the _s13_q dict are gone. _stab_s10_rpe / _stab_s13_per_source ERROR once and stay off
+#         without the wheel function / a NodeStore with s13_rpe_round >= 1 (no Python path).
+#   Why:  register "Python that must move to Rust before production" (Josh 2026-11-03: no new Python in production);
+#         _s13_q grew with every node that ever predicted and was never pruned.
+#   How:  ng-tract-rs dc0fbd3; arithmetic op for op the Python in f64, same order: bit-identical (cargo parity tests).
+#         Intended difference: a source removed and re-added under the same id starts fresh (the dict kept the old value).
 # [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; #1136 merge; Josh 2026-11-09 "Proceed")
 #   What: the #1136 stability set + learning loop (branch cc-laptop-diffpc-correction-20261103) merged into the live line
 #         (1308658). One logic conflict, in _surprise_exploration: S18's rule (a RECEIVER prediction's miss wires nothing)
@@ -4935,6 +4944,9 @@ class Graph:
         if not (tau >= 1.0):   # also refuses NaN
             self._stab_error_once(["reward_rpe_enabled"], "reward_rpe_tau >= 1")
             return None
+        if not hasattr(ng_tract, "s10_rpe_step"):   # [2026-11-10] Rust-only (Josh 2026-11-03): no Python path
+            self._stab_error_once(["reward_rpe_enabled"], "an ng_tract wheel with s10_rpe_step")
+            return None
         return tau
 
     def _stab_s11_c2_down(self, c: dict, c2: Optional[tuple]) -> Optional[tuple]:
@@ -4968,14 +4980,8 @@ class Graph:
         # [2026-10-27] try-1 fix: the step's MEAN outcome, not the sum (a sum scaled the signal with the number of
         # resolutions -- ~40 / step early -> ~30x the old per-surprise strength on every trace, mean weight 0.078 -> 0.121
         # in 25 steps); dopamine is a bounded level, not a count. b starts at the first STEP's mean (its delta = 0).
-        mean_o = sum(outcomes) / len(outcomes)
-        b = self.__dict__.get("_s10_rpe_baseline")
-        if b is None:
-            b = mean_o
-        delta = mean_o - b
-        for o in outcomes:
-            b += (o - b) / tau
-        self._s10_rpe_baseline = b
+        # [2026-11-10] the step runs in Rust (ng_tract.s10_rpe_step: the same arithmetic, bit-identical)
+        delta, self._s10_rpe_baseline = ng_tract.s10_rpe_step(outcomes, self.__dict__.get("_s10_rpe_baseline"), tau)
         self._s10_commit(delta * self.config.get("surprise_reward_scaling", 0.5))
 
     def _s10_commit(self, strength: float) -> None:
@@ -4999,6 +5005,9 @@ class Graph:
             tau = float("nan")
         if not (tau >= 1.0):   # also refuses NaN
             self._stab_error_once(["reward_rpe_per_source_enabled"], "reward_rpe_source_tau >= 1")
+            return None
+        if getattr(type(self.nodes), "s13_rpe_round", 0) < 1:   # [2026-11-10] Rust-only: the expectations are a NodeStore column
+            self._stab_error_once(["reward_rpe_per_source_enabled"], "the native NodeStore with s13_rpe_round >= 1")
             return None
         return tau
 
@@ -5079,15 +5088,8 @@ class Graph:
         tau = self._stab_s13_per_source()
         if tau is None or not events:
             return
-        q = self.__dict__.get("_s13_q")
-        if q is None:
-            q = self._s13_q = {}
-        deltas = []
-        for src, hit, conf in events:
-            e = q.get(src, conf)
-            deltas.append(hit - e)
-            q[src] = e + (hit - e) / tau
-        self._s10_commit(sum(deltas) / len(deltas) * self.config.get("surprise_reward_scaling", 0.5))
+        # [2026-11-10] each source's expectation is a NodeStore column; the loop runs in Rust (bit-identical)
+        self._s10_commit(self.nodes.s13_source_rpe(events, tau) * self.config.get("surprise_reward_scaling", 0.5))
 
     def _stab_s8_bound(self, c, s_on: bool) -> Optional[float]:
         """[2026-10-25] S8 (#1136): the total up-scaling bound B (> 1), or None (off; ERROR once when the key is set but
