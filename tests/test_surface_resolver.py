@@ -1,3 +1,10 @@
+# ---- Changelog ----
+# [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; #512 / #881 / #1028; Josh 2026-11-09 "Yes, please")
+#   What: the calls pass the production index, t._build_he_index(), as tonic_thread.ouroboros_cycle does (:525-526).
+#   Why:  #347 (3ff647c, 2026-06-27) made he_index a required argument; these tests crashed on the call since then, so
+#         the behaviour they guard went untested for ~4 months. With the argument they pass unchanged.
+#   How:  test-only; no assertion changed.
+# -------------------
 # tests/test_surface_resolver.py
 #
 # Sandbox tests for the substrate-first surfacing content resolver.
@@ -116,7 +123,7 @@ def test_tonic_thread_surfaces_forest_not_shard_end_to_end():
     class _Res:
         fired_entries = []
 
-    thread._update_thread([(nid, 1.0)], _Res())
+    thread._update_thread([(nid, 1.0)], _Res(), thread._build_he_index())
     rendered = thread.format_latent_context() or ""
     assert "Laughs" in rendered, f"her _forest_content not surfaced; got: {rendered!r}"
     assert "WANT" not in rendered, "the vdb shard surfaced instead of her voice"
@@ -135,7 +142,7 @@ def test_tonic_thread_filters_ingested_code_node():
     class _Res:
         fired_entries = []
 
-    thread._update_thread([(nid, 1.0)], _Res())
+    thread._update_thread([(nid, 1.0)], _Res(), thread._build_he_index())
     rendered = thread.format_latent_context() or ""
     assert "NeuroGraph Foundation" not in rendered, f"ingested code surfaced: {rendered!r}"
 

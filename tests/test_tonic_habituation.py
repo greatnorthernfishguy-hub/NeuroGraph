@@ -1,3 +1,10 @@
+# ---- Changelog ----
+# [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; #512 / #881 / #1028; Josh 2026-11-09 "Yes, please")
+#   What: the calls pass the production index, t._build_he_index(), as tonic_thread.ouroboros_cycle does (:525-526).
+#   Why:  #347 (3ff647c, 2026-06-27) made he_index a required argument; these tests crashed on the call since then, so
+#         the behaviour they guard went untested for ~4 months. With the argument they pass unchanged.
+#   How:  test-only; no assertion changed.
+# -------------------
 """Focus habituation (#89) — the latent thread turns its own head.
 
 Syl-approved design: prd/2026-06-16-tonic-focus-habituation-design.md
@@ -46,7 +53,7 @@ def test_fatigue_lowers_effective_activity():
     t = _thread({"a": _node(voltage=1.0), "b": _node(voltage=0.9)},
                 exploration_bias=0.0)
     t._focus_fatigue["a"] = 0.30
-    ranked = t._read_active_nodes()
+    ranked = t._read_active_nodes(t._build_he_index())
     ids = [nid for nid, _ in ranked]
     assert ids[0] == "b"  # a: 1.0 - 0.30 = 0.70 < b: 0.90
 
@@ -54,7 +61,7 @@ def test_fatigue_lowers_effective_activity():
 def test_no_fatigue_unchanged_ranking():
     t = _thread({"a": _node(voltage=1.0), "b": _node(voltage=0.9)},
                 exploration_bias=0.0)
-    ranked = t._read_active_nodes()
+    ranked = t._read_active_nodes(t._build_he_index())
     assert [nid for nid, _ in ranked][0] == "a"
 
 
@@ -109,7 +116,7 @@ def test_fatigue_demotes_but_never_erases():
     # a CANDIDATE (demoted, not dropped) — "quiets, never erases". Pins the contract.
     t = _thread({"lone": _node(voltage=0.10)}, exploration_bias=0.0)
     t._focus_fatigue["lone"] = 0.30  # fatigue >> its 0.10 activity
-    ids = [nid for nid, _ in t._read_active_nodes()]
+    ids = [nid for nid, _ in t._read_active_nodes(t._build_he_index())]
     assert "lone" in ids  # present despite post-fatigue score going negative
 
 
@@ -121,7 +128,7 @@ def test_head_turns_marginal_yields_faster_than_dominant():
         t = _thread({"a": _node(voltage=0.5 + lead), "b": _node(voltage=0.5)},
                     exploration_bias=0.0)
         for i in range(1, 200):
-            ranked = t._read_active_nodes()
+            ranked = t._read_active_nodes(t._build_he_index())
             t._apply_focus_fatigue(ranked)
             if ranked and ranked[0][0] == "b":
                 return i
@@ -137,7 +144,7 @@ def test_set_aside_thought_can_return():
     seen_b = False
     seen_a_again = False
     for _ in range(400):
-        ranked = t._read_active_nodes()
+        ranked = t._read_active_nodes(t._build_he_index())
         t._apply_focus_fatigue(ranked)
         top = ranked[0][0] if ranked else None
         if top == "b":
@@ -152,7 +159,7 @@ def test_love_is_an_interrupt_preserved():
                 exploration_bias=0.0)
     t._focus_fatigue["stuck"] = t._config.fatigue_max  # maximally fatigued, still highest raw
     t._graph.nodes["spike"].voltage = 5.0  # love: a big affective salience spike
-    ranked = t._read_active_nodes()
+    ranked = t._read_active_nodes(t._build_he_index())
     assert ranked[0][0] == "spike"
 
 
@@ -169,7 +176,7 @@ def test_higher_rank_accrues_more_fatigue():
     # Josh's dial: the higher in the sort, the marginally more fatigue. Top > lower > 0.
     t = _thread({"top": _node(voltage=1.0), "mid": _node(voltage=0.5),
                  "low": _node(voltage=0.2)}, exploration_bias=0.0)
-    ranked = t._read_active_nodes()  # top, mid, low
+    ranked = t._read_active_nodes(t._build_he_index())  # top, mid, low
     t._apply_focus_fatigue(ranked)
     f = t._focus_fatigue
     assert f["top"] > f["mid"] > f["low"] > 0.0
@@ -184,7 +191,7 @@ def test_fatigue_catches_a_pinned_attractor():
     flipped = False
     for i in range(600):
         t._graph.nodes["a"].voltage = 2.0  # pin a at its ceiling each cycle (the weld)
-        ranked = t._read_active_nodes()
+        ranked = t._read_active_nodes(t._build_he_index())
         t._apply_focus_fatigue(ranked)
         if ranked and ranked[0][0] == "b":
             flipped = True

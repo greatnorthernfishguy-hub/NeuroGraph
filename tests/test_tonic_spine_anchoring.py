@@ -4,6 +4,11 @@ import tonic_engine
 import tonic_thread
 
 # ---- Changelog ----
+# [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; #512 / #881 / #1028; Josh 2026-11-09 "Yes, please")
+#   What: the calls pass the production index, t._build_he_index(), as tonic_thread.ouroboros_cycle does (:525-526).
+#   Why:  #347 (3ff647c, 2026-06-27) made he_index a required argument; these tests crashed on the call since then, so
+#         the behaviour they guard went untested for ~4 months. With the argument they pass unchanged.
+#   How:  test-only; no assertion changed.
 # [2026-09-23] Claude Code (Opus 4.8, Tonic CC) — Packet 086(2) heuristic-collapse updates.
 # What: dropped test_heuristic_includes_constitutional_pull — it tested seam B's
 #   constitutional pull inside _heuristic_inference, which was the failover-only path
@@ -64,7 +69,7 @@ def test_no_floor_constitutional_not_special_cased():
     g = _spine_graph()
     t = tonic_thread.TonicThread(g, SimpleNamespace(get=lambda nid: None))
     t._config.exploration_bias = 0.0
-    active = t._read_active_nodes()
+    active = t._read_active_nodes(t._build_he_index())
     assert all(not nid.startswith("constitutional") for nid, _ in active)
 
 def test_unwired_node_gets_more_charge_than_wired():
