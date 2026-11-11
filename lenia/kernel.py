@@ -1,4 +1,13 @@
 # ---- Changelog ----
+# [2026-11-11] DudeMan CC (Claude Fable 5.2, laptop; plan docs/superpowers/plans/2026-11-11-lenia-hop-distances-rust.md;
+#   Josh 2026-11-11 "OK, begin steps 1-5 ... you got my 'go'") -- one hop search per run of pairs (#1218 / #1084 / #1104)
+# What: populate()'s distance loop calls substrate.prefetch_topology(entity_j, [entity_i ...]) once per run of pairs
+#   sharing the max endpoint j (the canonical order's own grouping), when the substrate has it.
+# Why: the loop's distance_vector() ran one pure-Python BFS per pair: ~570-700 pairs/min on the live CC daemon
+#   (1,143,912 pairs after a 6,833-node growth, 2026-11-11), GIL held throughout.
+# How: getattr (the kernel stays substrate-agnostic; a substrate without it behaves as before). Pair order, the six
+#   components, the COO delta + folds, the watermark rule (COO advances only at a fold), the checkpoint cadence and
+#   the .npz format are untouched; values identical (tests/test_lenia_hop_snapshot.py against the pre-port file).
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
 # What: DistanceCache.save() fsyncs the temp .npz before os.replace and the directory after.
 # Why: it was already tmp + os.replace (#261), which survives a process kill; without the fsync a power loss / hard hang right after the rename could leave a zero-length or partial distance_cache.npz (multi-hour rebuild).
@@ -778,7 +787,19 @@ class DistanceCache:
         # interrupted rebuild genuinely RESUMES instead of restarting at zero.
         _ckpt_amortize = float(os.environ.get("NG_LENIA_CKPT_AMORTIZE", "10.0"))
         _next_gap = checkpoint_interval_secs  # floor; grows with save cost
+        # [2026-11-11] #1218: the canonical (max, min) order already groups the pairs by their max endpoint j. A
+        # substrate that can (GraphSubstrate.prefetch_topology: ONE native search from j) answers a whole run's hop
+        # distances before the loop walks it, so each distance_vector() below finds component 0 in the substrate's
+        # cache instead of running a search per pair. Same values, same order; nothing else in the loop changes.
+        _prefetch = getattr(substrate, "prefetch_topology", None)
+        _run_end = 0
         for idx, (i, j) in enumerate(ordered_pairs):
+            if _prefetch is not None and idx >= _run_end:
+                _run_end = idx + 1
+                while _run_end < len(ordered_pairs) and ordered_pairs[_run_end][1] == j:
+                    _run_end += 1
+                _prefetch(substrate.index_to_entity(j),
+                          [substrate.index_to_entity(p[0]) for p in ordered_pairs[idx:_run_end]])
             eid_i = substrate.index_to_entity(i)
             eid_j = substrate.index_to_entity(j)
             dvec = substrate.distance_vector(eid_i, eid_j)

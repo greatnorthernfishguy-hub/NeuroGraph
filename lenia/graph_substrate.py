@@ -1,4 +1,16 @@
 # ---- Changelog ----
+# [2026-11-11] DudeMan CC (Claude Fable 5.2, laptop; plan docs/superpowers/plans/2026-11-11-lenia-hop-distances-rust.md;
+#   Josh 2026-11-11 "OK, begin steps 1-5 ... you got my 'go'") -- hop distances natively (#1218 / #1084 / #1104)
+# What: _build_adjacency builds an ng_tract.HopSnapshot from the edge tuples it already copies out under _step_lock
+#       (the `_adj` dict of lists is gone; _edge_weight unchanged). _topology_distance asks the snapshot (one search)
+#       instead of running a Python BFS; the BFS is deleted. New prefetch_topology(source_id, target_ids): ONE search
+#       answers a whole group of pairs and fills _topo_cache with the values _topology_distance would have stored.
+# Why:  measured 2026-11-11 on the live CC daemon: the incremental populate's 1,143,912 pairs ran one pure-Python BFS
+#       each at ~570-700 pairs/min (~30 h), holding the GIL (Tonic ticks 140-565 s, live stepping 82 steps in 53 min).
+#       Josh 2026-11-03 "no new Python in production"; #1084 "Rust, per Josh's end goal".
+# How:  values identical (a hop count is a shortest-path length on the same frozen snapshot; 0.0 for a == b,
+#       float(len(entity_list)) when unreachable). The snapshot owns its data: no live-store borrow (#147), GIL released
+#       during the search. No Python fallback: without ng_tract.HopSnapshot _build_adjacency raises.
 # [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — hyperedge member sets read UNDER graph._step_lock
 # What: _build_hyperedge_membership snapshots (hyperedge_id, members) inside the existing _step_lock block instead of
 #       the refs alone.
@@ -158,8 +170,8 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         }
         # Cache for BFS distances
         self._topo_cache: Dict[Tuple[str, str], int] = {}
-        # Adjacency list cache
-        self._adj: Optional[Dict[str, List[str]]] = None
+        # [2026-11-11] the frozen undirected adjacency (ng_tract.HopSnapshot); None = not built yet
+        self._hops: Any = None
         # #147: per-pair synapse weights, materialized alongside _adj under _step_lock
         self._edge_weight: Optional[Dict[Tuple[str, str], float]] = None
         # Hyperedge membership cache (entity_id -> set of hyperedge_ids)
@@ -171,8 +183,15 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         self._embeddings_cached = False
 
     def _build_adjacency(self):
-        """Build adjacency list from synapses (cached)."""
-        self._adj = defaultdict(list)
+        """Build the hop snapshot + the per-pair weight map from synapses (cached)."""
+        # [2026-11-11] no Python fallback (Josh 2026-11-03): the search is ng_tract.HopSnapshot or nothing
+        try:
+            from ng_tract import HopSnapshot as _HopSnapshot
+        except ImportError as exc:
+            raise RuntimeError(
+                "lenia.graph_substrate: the installed ng_tract has no HopSnapshot (hop distances are native since "
+                "2026-11-11, #1218); install the wheel built from ng-tract-rs with src/hop_snapshot.rs"
+            ) from exc
         self._edge_weight = {}
         # #88/#147: snapshot synapse PRIMITIVES under the Graph's step lock. list() copies the
         # container but each element stays a live ng_tract (Rust) proxy — reading syn.* AFTER the
@@ -194,12 +213,11 @@ class NeuroGraphSubstrate(LeniaSubstrate):
                 for s in self._graph.synapses.values()
             ]
         for pre, post, weight in _edges:
-            self._adj[pre].append(post)
-            self._adj[post].append(pre)
             # first-seen weight per unordered pair mirrors the old first-match return
             key = (pre, post) if pre <= post else (post, pre)
             if key not in self._edge_weight:
                 self._edge_weight[key] = weight
+        self._hops = _HopSnapshot([(pre, post) for pre, post, _w in _edges])
 
     def _cache_embeddings(self):
         """Build embedding matrix from vector DB for fast cosine similarity.
@@ -326,12 +344,16 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         """Called when nodes/synapses are added or removed."""
         self._rebuild_index()
         self._topo_cache.clear()
-        self._adj = None
+        self._hops = None
 
     # -- Private distance computation --
 
     def _topology_distance(self, a: str, b: str) -> float:
-        """BFS hop count between two nodes."""
+        """Hop count between two nodes over the synapse snapshot (undirected, unbounded).
+
+        0.0 for a == b; float(len(entity_list)) when no path exists. [2026-11-11] one native search
+        (ng_tract.HopSnapshot.hops_from) instead of a Python BFS; same values.
+        """
         if a == b:
             return 0.0
 
@@ -339,32 +361,32 @@ class NeuroGraphSubstrate(LeniaSubstrate):
         if pair in self._topo_cache:
             return self._topo_cache[pair]
 
-        if self._adj is None:
+        if self._hops is None:
             self._build_adjacency()
 
-        visited = {a}
-        frontier = [a]
-        depth = 0
-        while frontier:
-            depth += 1
-            next_frontier = []
-            for node in frontier:
-                for neighbor in self._adj.get(node, []):
-                    if neighbor == b:
-                        self._topo_cache[pair] = float(depth)
-                        return float(depth)
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        next_frontier.append(neighbor)
-            frontier = next_frontier
-
-        result = float(len(self._entity_list))
+        result = self._hops.hops_from(a, [b], float(len(self._entity_list)))[0]
         self._topo_cache[pair] = result
         return result
 
+    def prefetch_topology(self, source_id: str, target_ids: List[str]) -> None:
+        """[2026-11-11] Answer a whole group of pairs (source, t) with ONE search and fill _topo_cache.
+
+        The values and cache keys are exactly what _topology_distance(source, t) would have stored one pair at a
+        time; a pair already cached keeps its value (as the per-pair path left it). DistanceCache.populate() calls
+        this per run of pairs sharing an endpoint, so the loop's distance_vector() calls hit the cache.
+        """
+        todo = [t for t in target_ids
+                if t != source_id and (min(source_id, t), max(source_id, t)) not in self._topo_cache]
+        if not todo:
+            return
+        if self._hops is None:
+            self._build_adjacency()
+        for t, d in zip(todo, self._hops.hops_from(source_id, todo, float(len(self._entity_list)))):
+            self._topo_cache[(min(source_id, t), max(source_id, t))] = d
+
     def _synaptic_distance(self, a: str, b: str) -> float:
         """Direct synapse weight. Returns 0 if no direct connection."""
-        if self._adj is None:
+        if self._edge_weight is None:
             self._build_adjacency()
 
         # #147: weights were materialized in _build_adjacency INSIDE _step_lock
