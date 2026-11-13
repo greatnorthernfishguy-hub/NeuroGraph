@@ -1,3 +1,19 @@
+# [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) — native tick piece 1 (punch #1221; Josh 2026-11-13 "I see no
+#   problems with moving to one native Rust tick." / "1 Proceed"): the prediction engine's working state and its
+#   confirm / miss handling are ng_tract.PredictionBook.
+# What: Graph._pb (one PredictionBook) owns what were Python containers: _recent_spikes, active_predictions,
+#   _synapse_confirmation_history, _prediction_outcomes, _novel_sequence_log and the four prediction counters. Those
+#   names stay as stateless views over the book (checkpoint code, hosts' readers, tests). _evaluate_predictions and
+#   _cleanup_predictions call the book (confirm / expire_*); _on_prediction_confirmed, _on_prediction_error,
+#   _log_novel_sequence and the second half of _surprise_exploration are gone (their bodies are the book's);
+#   _surprise_explore keeps the host half (tally touch, rails, create_synapse). The per-step all-node scans of the
+#   spike record (:6124, :8022, :8204 at ec3c1f5) are native queries. #1222 (Josh "It needs to be fixed"): a receiver
+#   prediction's contributors / drive / rho are saved and restored (extra keys on receiver predictions only).
+# Why: spec docs/superpowers/specs/2026-11-12-lightweight-substrate-design.md §3; measured: _cleanup_predictions
+#   35-48 % of Graph.step, from per-miss work proportional to the whole fired window.
+# How: plan docs/superpowers/plans/2026-11-13-native-tick-m1-prediction-miss-path.md. Parity against this file at
+#   ec3c1f5 (tests/test_native_tick_m1.py). Deliberate differences: a pair with two synapses resolves to the lowest
+#   row (_find_synapse -> SynapseStore.find_first; Python's set walk followed the process's str hash seed, #1223).
 # [2026-10-05] Claude (lane rust-hotpaths-onto-s4) — per-synapse hot loops call native SynapseStore batch methods (overnight lane 0f76205/29c5f87/5e380a5 rebased onto trial s4; Josh approved 2026-10-05), Python fallback kept per site / why: 1.5-2 s per call on 193K synapses; bit-identical to the trial tip (tests/test_rust_hotpaths_onto_s4.py)
 """
 NeuroGraph Foundation - Core Cognitive Architecture (Phase 1 + 2 + 3)
@@ -1833,6 +1849,318 @@ class PredictionOutcome:
 
 
 # ---------------------------------------------------------------------------
+# [2026-11-13] native tick piece 1 (#1221): the old attribute names over ng_tract.PredictionBook.
+# These classes hold NO state (each keeps only the book): they exist for the checkpoint code, the hosts' readers and
+# the tests. step()'s own passes call the book directly and never build these objects.
+# ---------------------------------------------------------------------------
+
+def _pb_prediction(book, row) -> "Prediction":
+    """One book row as a Prediction (a snapshot: writing to it does not write to the book)."""
+    (pid, src, tgt), (strength, conf, created, expires, depth), (via, pre, is_recv, drive, rho) = row
+    p = Prediction(prediction_id=pid, source_node_id=src, target_node_id=tgt, strength=strength, confidence=conf,
+                   created_at=created, expires_at=expires, chain_depth=depth, via_hyperedge=via, pre_charge_applied=pre)
+    if is_recv:
+        raw = book.receiver_raw(pid)
+        p.drive, p.rho = drive, rho
+        p.contributors = [tuple(x) for x in (book.contributors(pid) or [])]
+        p.contributors_raw = {sid: (pre_id, w) for sid, pre_id, w in raw[0]} if raw is not None else {}
+    return p
+
+
+def _pb_insert(book, pid: str, p: "Prediction", keep_source: bool = True) -> str:
+    """`active_predictions[pid] = p`. A receiver prediction (contributors not None) goes in with its merge input when
+    it has one (the shares are then the book's own, equal to _receiver_set_contributors'), else with its contributors
+    list as given. Returns the source stored."""
+    recv = shares = None
+    if p.contributors is not None:
+        raw = p.contributors_raw
+        recv = ([(sid, pre_id, w) for sid, (pre_id, w) in (raw or {}).items()],
+                0.0 if p.drive is None else p.drive, 0.0 if p.rho is None else p.rho)
+        if not raw:
+            shares = [tuple(x) for x in p.contributors]
+    return book.insert(pid, p.source_node_id if keep_source else None, p.target_node_id, p.strength, p.confidence,
+                       p.created_at, p.expires_at, p.chain_depth, p.via_hyperedge, p.pre_charge_applied, recv, shares)
+
+
+class _PredictionsView:
+    """Graph.active_predictions: prediction id -> Prediction snapshot, in insertion order."""
+
+    __slots__ = ("_b",)
+
+    def __init__(self, book):
+        self._b = book
+
+    def __len__(self):
+        return len(self._b)
+
+    def __contains__(self, pid):
+        return isinstance(pid, str) and pid in self._b
+
+    def __iter__(self):
+        return iter(self._b.ids())
+
+    def keys(self):
+        return self._b.ids()
+
+    def values(self):
+        return [_pb_prediction(self._b, r) for r in self._b.items()]
+
+    def items(self):
+        return [(r[0][0], _pb_prediction(self._b, r)) for r in self._b.items()]
+
+    def get(self, pid, default=None):
+        r = self._b.get(pid)
+        return default if r is None else _pb_prediction(self._b, r)
+
+    def __getitem__(self, pid):
+        r = self._b.get(pid)
+        if r is None:
+            raise KeyError(pid)
+        return _pb_prediction(self._b, r)
+
+    def __setitem__(self, pid, pred):
+        _pb_insert(self._b, pid, pred)
+
+    def __delitem__(self, pid):
+        if not self._b.remove(pid):
+            raise KeyError(pid)
+
+    def pop(self, pid, *default):
+        r = self._b.get(pid)
+        if r is None:
+            if default:
+                return default[0]
+            raise KeyError(pid)
+        p = _pb_prediction(self._b, r)
+        self._b.remove(pid)
+        return p
+
+    def clear(self):
+        self._b.clear()
+
+
+class _SpikeRingView:
+    """One node's entry of Graph._recent_spikes: the bounded deque of appended timesteps, write-through."""
+
+    __slots__ = ("_b", "_id", "_cap")
+
+    def __init__(self, book, nid, cap):
+        self._b, self._id, self._cap = book, nid, cap
+
+    @property
+    def maxlen(self):
+        got = self._b.spike_get(self._id)
+        return self._cap if got is None else got[1]
+
+    def _values(self):
+        got = self._b.spike_get(self._id)
+        return [] if got is None else got[0]
+
+    def append(self, t):
+        self._b.spike_append([self._id], int(t), self._cap)
+
+    def __iter__(self):
+        return iter(self._values())
+
+    def __len__(self):
+        return len(self._values())
+
+    def __bool__(self):
+        return bool(self._values())
+
+    def __getitem__(self, i):
+        return self._values()[i]
+
+    def __eq__(self, other):
+        return self._values() == list(other)
+
+    def __repr__(self):
+        return "deque(%r, maxlen=%r)" % (self._values(), self.maxlen)
+
+
+class _SpikesView:
+    """Graph._recent_spikes: node id -> its spike ring, in dict order."""
+
+    __slots__ = ("_b",)
+
+    def __init__(self, book):
+        self._b = book
+
+    def __len__(self):
+        return self._b.spike_len()
+
+    def __contains__(self, nid):
+        return isinstance(nid, str) and self._b.spike_get(nid) is not None
+
+    def __iter__(self):
+        return iter([nid for nid, _v, _c in self._b.spike_items()])
+
+    def keys(self):
+        return [nid for nid, _v, _c in self._b.spike_items()]
+
+    def items(self):
+        return [(nid, _SpikeRingView(self._b, nid, cap)) for nid, _v, cap in self._b.spike_items()]
+
+    def get(self, nid, default=None):
+        got = self._b.spike_get(nid)
+        return default if got is None else _SpikeRingView(self._b, nid, got[1])
+
+    def __getitem__(self, nid):
+        got = self._b.spike_get(nid)
+        if got is None:
+            raise KeyError(nid)
+        return _SpikeRingView(self._b, nid, got[1])
+
+    def __setitem__(self, nid, ring):
+        cap = ring.maxlen
+        self._b.spike_set(nid, [int(t) for t in ring], (len(ring) if cap is None else cap))
+
+    def setdefault(self, nid, ring):
+        got = self._b.spike_get(nid)
+        if got is None:
+            self[nid] = ring
+            got = self._b.spike_get(nid)
+        return _SpikeRingView(self._b, nid, got[1])
+
+    def pop(self, nid, *default):
+        got = self._b.spike_get(nid)
+        if got is None:
+            if default:
+                return default[0]
+            raise KeyError(nid)
+        self._b.spike_remove(nid)
+        return deque(got[0], maxlen=got[1])
+
+    def clear(self):
+        self._b.spike_clear()
+
+
+class _HistoryView:
+    """Graph._synapse_confirmation_history: synapse id -> its last 100 outcomes (a list snapshot), in dict order."""
+
+    __slots__ = ("_b",)
+
+    def __init__(self, book):
+        self._b = book
+
+    def __len__(self):
+        return self._b.hist_len()
+
+    def __contains__(self, sid):
+        return isinstance(sid, str) and self._b.hist_get(sid) is not None
+
+    def __iter__(self):
+        return iter([sid for sid, _h in self._b.hist_items()])
+
+    def keys(self):
+        return [sid for sid, _h in self._b.hist_items()]
+
+    def items(self):
+        return self._b.hist_items()
+
+    def get(self, sid, default=None):
+        got = self._b.hist_get(sid)
+        return default if got is None else got
+
+    def __getitem__(self, sid):
+        got = self._b.hist_get(sid)
+        if got is None:
+            raise KeyError(sid)
+        return got
+
+    def __setitem__(self, sid, values):
+        self._b.hist_set(sid, [bool(x) for x in values])
+
+    def pop(self, sid, *default):
+        got = self._b.hist_get(sid)
+        if got is None:
+            if default:
+                return default[0]
+            raise KeyError(sid)
+        self._b.hist_remove(sid)
+        return got
+
+    def clear(self):
+        self._b.hist_clear()
+
+
+class _OutcomesView:
+    """Graph._prediction_outcomes: the last 1000 resolved predictions, oldest first."""
+
+    __slots__ = ("_b",)
+
+    def __init__(self, book):
+        self._b = book
+
+    def _all(self):
+        out = []
+        for row, confirmed, resolved_at, actual, n_actual in self._b.outcome_items():
+            out.append(PredictionOutcome(prediction=_pb_prediction(None, row[:2] + (row[2][:2] + (False, None, None),)),
+                                         confirmed=confirmed, resolved_at=resolved_at, actual_firing_nodes=actual,
+                                         n_actual_firing=n_actual))
+        return out
+
+    def __len__(self):
+        return self._b.outcomes_len()
+
+    def __iter__(self):
+        return iter(self._all())
+
+    def __getitem__(self, i):
+        return self._all()[i]
+
+    def append(self, o):
+        p = o.prediction
+        self._b.outcome_push(p.prediction_id, p.source_node_id, p.target_node_id, p.strength, p.confidence,
+                             p.created_at, p.expires_at, p.chain_depth, p.via_hyperedge, p.pre_charge_applied,
+                             bool(o.confirmed), o.resolved_at, list(o.actual_firing_nodes), int(o.n_actual_firing))
+
+    def clear(self):
+        self._b.outcomes_clear()
+
+
+class _NovelLogView:
+    """Graph._novel_sequence_log: the capped list of novel-sequence events (dicts, the saved shape)."""
+
+    __slots__ = ("_b",)
+
+    def __init__(self, book):
+        self._b = book
+
+    def _all(self):
+        out = []
+        for source, firing, n_firing, timestep in self._b.novel_items():
+            e = {"source": source, "firing_nodes": firing}
+            if n_firing is not None:
+                e["n_firing"] = n_firing
+            e["timestep"] = timestep
+            out.append(e)
+        return out
+
+    def __len__(self):
+        return self._b.novel_len()
+
+    def __iter__(self):
+        return iter(self._all())
+
+    def __getitem__(self, i):
+        return self._all()[i]
+
+    def __eq__(self, other):
+        return self._all() == list(other)
+
+    def append(self, e):
+        self._b.novel_push_restored(e["source"], list(e["firing_nodes"]), e.get("n_firing"), int(e["timestep"]))
+
+    def extend(self, events):
+        for e in events:
+            self.append(e)
+
+    def clear(self):
+        self._b.novel_clear()
+
+
+# ---------------------------------------------------------------------------
 # Auto-Knowledge: Spreading Activation Harvest Data Structures
 # ---------------------------------------------------------------------------
 
@@ -3108,6 +3436,74 @@ class Graph:
         config: Override any key from ``DEFAULT_CONFIG``.
     """
 
+    # [2026-11-13] native tick piece 1 (#1221): the names below are views / properties over self._pb
+    # (ng_tract.PredictionBook). Assigning a plain container loads it into the book.
+    @property
+    def active_predictions(self):
+        return _PredictionsView(self._pb)
+
+    @active_predictions.setter
+    def active_predictions(self, preds):
+        items = list(preds.items())
+        self._pb.clear()
+        for pid, p in items:
+            _pb_insert(self._pb, pid, p)
+
+    @property
+    def _recent_spikes(self):
+        return _SpikesView(self._pb)
+
+    @_recent_spikes.setter
+    def _recent_spikes(self, rings):
+        items = [(nid, list(r), getattr(r, "maxlen", None)) for nid, r in rings.items()]
+        self._pb.spike_clear()
+        for nid, vals, cap in items:
+            self._pb.spike_set(nid, [int(t) for t in vals], len(vals) if cap is None else cap)
+
+    @property
+    def _synapse_confirmation_history(self):
+        return _HistoryView(self._pb)
+
+    @_synapse_confirmation_history.setter
+    def _synapse_confirmation_history(self, hist):
+        items = [(sid, [bool(x) for x in h]) for sid, h in hist.items()]
+        self._pb.hist_clear()
+        for sid, h in items:
+            self._pb.hist_set(sid, h)
+
+    @property
+    def _prediction_outcomes(self):
+        return _OutcomesView(self._pb)
+
+    @property
+    def _novel_sequence_log(self):
+        return _NovelLogView(self._pb)
+
+    @_novel_sequence_log.setter
+    def _novel_sequence_log(self, events):
+        events = list(events)
+        self._pb.novel_clear()
+        _NovelLogView(self._pb).extend(events)
+
+    def _pb_counter(i):   # noqa: N805  (class-body helper: one property per book counter)
+        def _get(self):
+            return self._pb.counters()[i]
+
+        def _set(self, v):
+            c = list(self._pb.counters())
+            c[i] = int(v)
+            self._pb.set_counters(*c)
+        return property(_get, _set)
+
+    _total_predictions_made = _pb_counter(0)
+    _total_predictions_confirmed = _pb_counter(1)
+    _total_predictions_errors = _pb_counter(2)
+    _total_novel_sequences = _pb_counter(3)
+    del _pb_counter
+    # #1222: an open receiver prediction is saved with its receiver part. False restores the pre-2026-11-13 file shape:
+    # only for tests that compare checkpoint bytes with an older engine loaded from git.
+    _PB_SAVE_RECEIVER_PART = True
+
     def __init__(self, config: Optional[Dict[str, Any]] = None, *, native_node_store: Optional[bool] = None,
                  native_hyperedge_store: Optional[bool] = None):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
@@ -3150,8 +3546,10 @@ class Graph:
         self._delay_buffer: Dict[int, List[Tuple[str, float]]] = {}
 
         # --- Co-activation tracking for sprouting ---
-        # Stores recent spike times per node for co-activation detection
-        self._recent_spikes: Dict[str, Deque[int]] = {}
+        # [2026-11-13] native tick piece 1 (#1221): the prediction engine's working state. `_recent_spikes` (recent spike
+        # times per node), `active_predictions`, `_synapse_confirmation_history`, `_prediction_outcomes`,
+        # `_novel_sequence_log` and the prediction counters are views / properties over this book (see the class body).
+        self._pb = ng_tract.PredictionBook()
 
         # --- Phase 2: Hyperedge co-fire tracking for member evolution ---
         # hid → {node_id: co_fire_count}
@@ -3206,23 +3604,14 @@ class Graph:
         ]
 
         # --- Phase 3: Predictive Coding state ---
-        # Active predictions awaiting confirmation or expiry
-        self.active_predictions: Dict[str, Prediction] = {}
-        # Recent prediction outcomes for accuracy tracking
-        self._prediction_outcomes: Deque[PredictionOutcome] = deque(maxlen=1000)
-        # Per-synapse confirmation history: synapse_id → deque of bool
-        self._synapse_confirmation_history: Dict[str, Deque[bool]] = {}
+        # Active predictions, recent outcomes, the per-synapse confirmation history and the novel-sequence log:
+        # in self._pb ([2026-11-13] #1221)
         # Nodes predicted this step (to avoid double-prediction)
         self._predicted_this_step: Set[str] = set()
-        # Novel sequence log
-        self._novel_sequence_log: List[Dict[str, Any]] = []
         # Reward history
         self._reward_history: List[Dict[str, Any]] = []
         # Prediction telemetry counters
-        self._total_predictions_made = 0
-        self._total_predictions_confirmed = 0
-        self._total_predictions_errors = 0
-        self._total_novel_sequences = 0
+        # (_total_predictions_made / _confirmed / _errors and _total_novel_sequences: self._pb's counters)
         self._total_rewards_injected = 0
 
         # --- Event handlers ---
@@ -3908,7 +4297,7 @@ class Graph:
             # [2026-11-03] S19: the error is classified as detection saw it (threshold, rate) -- before step 4
             if _dps is not None:
                 _dps.classify(self.nodes, self.timestep, list(fired_ids),
-                              {pr.target_node_id for pr in self.active_predictions.values() if pr.drive is not None},
+                              set(self._pb.targets(True)),   # [2026-11-13] #1221: the open receiver predictions' targets
                               *self._receiver_theta_args(), self.config["decay_rate"])
 
             # 3b. Zero-firing circuit breaker tracking
@@ -3923,9 +4312,8 @@ class Graph:
             if _native is not None and (_native(fired_ids, self.timestep, _delta_Ca if _delta_Ca else None)
                                         if _ca5 is None else
                                         _native(fired_ids, self.timestep, _delta_Ca, _ca5[2])):
-                for nid in fired_ids:
-                    # Track recent spikes for sprouting
-                    self._recent_spikes.setdefault(nid, deque(maxlen=20)).append(self.timestep)
+                # Track recent spikes for sprouting ([2026-11-13] #1221: one call into the book's spike record)
+                self._pb.spike_append(list(fired_ids), self.timestep, 20)
             else:
                 _fire_python(self.nodes, self._recent_spikes, fired_ids, self.timestep, _delta_Ca)
             if self.config.get("surprise_slot_enabled", False):   # [2026-11-05] #1212: step() firings, by timestep
@@ -4449,8 +4837,7 @@ class Graph:
 
                 # Collect current prediction targets for was_predicted tagging
                 predicted_targets: Set[str] = set()
-                for pred in self.active_predictions.values():
-                    predicted_targets.add(pred.target_node_id)
+                predicted_targets.update(self._pb.targets())   # [2026-11-13] #1221
                 for pred_state in self._active_predictions.values():
                     predicted_targets.update(pred_state.predicted_targets)
 
@@ -4670,10 +5057,7 @@ class Graph:
                 if all_fired:
                     _record_ts = self.timestep - 1 if self.timestep > 0 else 0
                     _window_cap = self.config["co_activation_window"] * 2
-                    for _nid in all_fired:
-                        self._recent_spikes.setdefault(
-                            _nid, deque(maxlen=_window_cap)
-                        ).append(_record_ts)
+                    self._pb.spike_append(all_fired, _record_ts, _window_cap)   # [2026-11-13] #1221
                     self._sprout_synapses(all_fired)
 
             # #59 age-on-write: the Tonic living IS the passage of time for the substrate.
@@ -5441,9 +5825,9 @@ class Graph:
         weight_factor = synapse.weight / synapse.max_weight
 
         # Factor 2: confirmation history
-        history = self._synapse_confirmation_history.get(synapse.synapse_id)
-        if history and len(history) > 0:
-            confirmation_rate = sum(1 for x in history if x) / len(history)
+        _hc = self._pb.hist_counts(synapse.synapse_id)   # [2026-11-13] #1221: (confirmed, held) of the last 100
+        if _hc is not None and _hc[1] > 0:
+            confirmation_rate = _hc[0] / _hc[1]
         else:
             confirmation_rate = 0.5  # Neutral prior
 
@@ -5674,8 +6058,10 @@ class Graph:
         stats["native_steps"] = stats.get("native_steps", 0) + 1
         stats["s_cand"] = stats.get("s_cand", 0.0) + _time_mod.perf_counter() - _tp
         _tp = _time_mod.perf_counter()
-        pending_by_target = {pr.target_node_id: pr for pr in self.active_predictions.values()
-                             if pr.contributors is not None}
+        # [2026-11-13] #1221: the open receiver predictions by target, as prediction ids (the book holds them); the
+        # predictions registered in THIS call are also kept as objects, because their chains read the merged strength.
+        pending_by_target = dict(self._pb.receiver_pending())
+        _new_by_id: Dict[str, Prediction] = {}
         new_preds: List[Prediction] = []
         episodes: List[str] = []
         for strength, tgt, d, rho, contrib, peak, conf_ema in passing:
@@ -5683,11 +6069,14 @@ class Graph:
             conf = min(1.0, 0.6 * strength + 0.4 * conf_ema)
             old = pending_by_target.get(tgt)
             if old is not None:
-                merged = dict(old.contributors_raw or {})
-                merged.update(syns)
-                self._receiver_set_contributors(old, merged)
-                old.strength = max(old.strength, strength)
-                old.confidence = max(old.confidence, conf)
+                self._pb.receiver_merge(old, [(sid, pre_id, w) for sid, pre_id, w in contrib], strength, conf)
+                _obj = _new_by_id.get(old)
+                if _obj is not None:
+                    merged = dict(_obj.contributors_raw or {})
+                    merged.update(syns)
+                    self._receiver_set_contributors(_obj, merged)
+                    _obj.strength = max(_obj.strength, strength)
+                    _obj.confidence = max(_obj.confidence, conf)
                 stats["merged"] += 1
                 continue
             episodes.append(tgt)   # the neuron reached its predictive state: an episode, registered or not
@@ -5702,8 +6091,9 @@ class Graph:
             self._receiver_set_contributors(pred, syns)
             if pre > 0.0:
                 node.voltage += pre
-            self.active_predictions[pred.prediction_id] = pred
-            pending_by_target[tgt] = pred
+            _pb_insert(self._pb, pred.prediction_id, pred)
+            pending_by_target[tgt] = pred.prediction_id
+            _new_by_id[pred.prediction_id] = pred
             self._predicted_this_step.add(tgt)
             self._total_predictions_made += 1
             stats["registered"] += 1
@@ -5755,8 +6145,8 @@ class Graph:
                 pred.source_node_id = par.source_node_id   # the chain's origin
                 if pre > 0.0:
                     sn.voltage += pre
-                self.active_predictions[pred.prediction_id] = pred
-                pending_by_target[sname] = pred
+                _pb_insert(self._pb, pred.prediction_id, pred)   # [2026-11-13] #1221 (the chain's origin is kept)
+                pending_by_target[sname] = pred.prediction_id
                 path[pred.prediction_id] = path[par.prediction_id] | {sname}
                 self._predicted_this_step.add(sname)
                 self._total_predictions_made += 1
@@ -5767,24 +6157,8 @@ class Graph:
                            confidence=conf, chain_depth=hop, timestep=self.timestep)
             parents = nxt
 
-    def _prediction_links(self, pred: "Prediction") -> List[Tuple[Any, float]]:
-        """[2026-11-01] S18: the synapses a prediction's outcome acts on, with shares: a receiver prediction's existing
-        contributors; otherwise today's one source->target synapse at share 1.0 (x * 1.0 == x: unchanged)."""
-        if pred.contributors:
-            out = []
-            for sid, share in pred.contributors:
-                syn = self.synapses.get(sid)
-                if syn is not None:   # pruned mid-flight: skipped
-                    out.append((syn, share))
-            return out
-        syn = self._find_synapse(pred.source_node_id, pred.target_node_id)
-        return [(syn, 1.0)] if syn is not None else []
-
-    def _receiver_record(self, pred: "Prediction", hit: float) -> None:
-        """[2026-11-01] S18: a receiver prediction's outcome updates its target's own record (conf_ema, alpha 0.05)."""
-        if pred.contributors is None:
-            return
-        self.nodes.receiver_record(pred.target_node_id, hit)   # [2026-11-10] a NodeStore column (Rust-only)
+    # ([2026-11-13] #1221: _prediction_links and _receiver_record are the book's: PredictionBook::links, and the
+    # NodeStore.receiver_record call inside confirm / expire_run)
 
     @staticmethod
     def _receiver_set_contributors(pred: "Prediction", syns: Dict[str, Tuple[str, float]]) -> None:
@@ -5797,181 +6171,61 @@ class Graph:
     def _evaluate_predictions(self, fired_set: Set[str]) -> None:
         """Check active predictions against fired nodes (PRD §5.1).
 
-        Confirmed predictions strengthen the causal link.
-        Failed predictions (expired) weaken the link and trigger surprise.
+        Confirmed predictions strengthen the causal link ([2026-11-01] S18: a receiver prediction's contributors, by
+        share), record the confirmation in each link's history and in the receiver's own record, join the step's
+        signed reward (S10 / S13) and are logged as outcomes.
+        [2026-11-13] #1221: all of it is ng_tract.PredictionBook.confirm (the bodies of the former
+        _evaluate_predictions and _on_prediction_confirmed); the event is emitted here.
         """
-        confirm_bonus = self.config["prediction_confirm_bonus"]
-        error_penalty = self.config["prediction_error_penalty"]
+        rows = self._pb.confirm(
+            self.timestep, list(fired_set), self.synapses, self.nodes, self.config["prediction_confirm_bonus"],
+            self.config["three_factor_enabled"], self._stab_s10_rpe() is not None,
+            self._stab_s13_per_source() is not None, bool(self._event_handlers.get("prediction_confirmed")))
+        self._pb_reward_events()
+        for source, target, strength, confidence, delay in rows:
+            self._emit("prediction_confirmed", source=source, target=target, strength=strength, confidence=confidence,
+                       delay=delay, timestep=self.timestep)
 
-        to_remove: List[str] = []
+    def _pb_reward_events(self) -> None:
+        """[2026-11-13] #1221: move the book's S10 / S13 outcome events of this pass onto the step's lists (read once
+        per step where the signed reward is broadcast). Nothing is created when the pass produced none."""
+        s10, s13 = self._pb.take_reward_events()
+        if s10:
+            self.__dict__.setdefault("_s10_events", []).extend(s10)
+        if s13:
+            self.__dict__.setdefault("_s13_events", []).extend(s13)
 
-        for pid, pred in list(self.active_predictions.items()):
-            if pred.target_node_id in fired_set:
-                # Prediction confirmed
-                self._on_prediction_confirmed(pred, confirm_bonus)
-                to_remove.append(pid)
+    def _surprise_explore(self, pred: Prediction) -> Tuple[Optional[List[str]], int]:
+        """Explore alternative pathways after a SOURCE-SIDE prediction error (PRD §5.2): the host half of the former
+        _surprise_exploration ([2026-11-13] #1221; the context salience, the novelty test and log are the book's).
 
-        for pid in to_remove:
-            self.active_predictions.pop(pid, None)
+        When A→B prediction fails, examine what DID fire instead. Under the co-firing tally (#1050) each alternative
+        gets one tally touch and a pair sprouts only at theta; under the surprise slot (#1212) only the slot's few
+        alternatives are considered; with neither, a speculative synapse A→C (weight 0.1, tagged "surprise_driven") is
+        created to every node that fired in the window.
 
-    def _on_prediction_confirmed(
-        self, pred: Prediction, confirm_bonus: float
-    ) -> None:
-        """Handle a confirmed prediction (PRD §5.1).
-
-        Effects:
-            - Strengthen the causal link (weight += bonus × confidence)
-            - Record confirmation in synapse history
-            - Emit PredictionConfirmed event
-        """
-        # Find the synapse from source to target ([2026-11-01] S18: or the receiver prediction's contributors, by share)
-        for _j, (syn, _share) in enumerate(self._prediction_links(pred)):
-            bonus = confirm_bonus * pred.confidence * _share
-            if not self.config["three_factor_enabled"]:
-                syn.weight = min(syn.weight + bonus, syn.max_weight)
-            else:
-                # In three-factor mode, add to eligibility trace
-                syn.eligibility_trace += bonus
-            syn.last_update_time = float(self.timestep)
-            if syn.weight > syn.peak_weight:
-                syn.peak_weight = syn.weight
-
-            # Update confirmation history
-            history = self._synapse_confirmation_history.setdefault(
-                syn.synapse_id, deque(maxlen=100)
-            )
-            history.append(True)
-        self._receiver_record(pred, 1.0)
-
-        self._total_predictions_confirmed += 1
-        # [2026-10-27] S10: the outcome joins this step's signed reward (None = off: nothing kept)
-        if self._stab_s10_rpe() is not None:
-            self.__dict__.setdefault("_s10_events", []).append(pred.confidence)
-            if self._stab_s13_per_source() is not None:   # [2026-10-28] S13: who predicted, and whether it came true
-                self.__dict__.setdefault("_s13_events", []).append((pred.source_node_id, 1.0, pred.confidence))
-
-        outcome = PredictionOutcome(
-            prediction=pred,
-            confirmed=True,
-            resolved_at=self.timestep,
-            actual_firing_nodes=[pred.target_node_id],
-        )
-        self._prediction_outcomes.append(outcome)
-
-        self._emit(
-            "prediction_confirmed",
-            source=pred.source_node_id,
-            target=pred.target_node_id,
-            strength=pred.strength,
-            confidence=pred.confidence,
-            delay=self.timestep - pred.created_at,
-            timestep=self.timestep,
-        )
-
-    def _on_prediction_error(
-        self, pred: Prediction, error_penalty: float, recent_fired: Set[str]
-    ) -> None:
-        """Handle a prediction error / surprise (PRD §5.1, §5.2).
-
-        Effects:
-            - Weaken the causal link (weight -= penalty × confidence)
-            - Emit SurpriseEvent
-            - Trigger surprise-driven exploration
-        """
-        for syn, _share in self._prediction_links(pred):   # [2026-11-01] S18: contributors by share, else the one link
-            penalty = error_penalty * pred.confidence * _share
-            if not self.config["three_factor_enabled"]:
-                syn.weight = max(0.0, syn.weight - penalty)
-            else:
-                syn.eligibility_trace -= penalty
-            syn.last_update_time = float(self.timestep)
-
-            # Update confirmation history
-            history = self._synapse_confirmation_history.setdefault(
-                syn.synapse_id, deque(maxlen=100)
-            )
-            history.append(False)
-        self._receiver_record(pred, 0.0)
-
-        self._total_predictions_errors += 1
-
-        outcome = PredictionOutcome(
-            prediction=pred,
-            confirmed=False,
-            resolved_at=self.timestep,
-            actual_firing_nodes=heapq.nsmallest(self._NOVEL_SAMPLE, recent_fired),   # [2026-11-04] #1210b: a sample
-            n_actual_firing=len(recent_fired),
-        )
-        self._prediction_outcomes.append(outcome)
-
-        if self._event_handlers.get("prediction_error"):   # [2026-11-05] #1212: the full list only when heard
-            self._emit(
-                "prediction_error",
-                source=pred.source_node_id,
-                expected_target=pred.target_node_id,
-                strength=pred.strength,
-                confidence=pred.confidence,
-                actual_fired=list(recent_fired),
-                timestep=self.timestep,
-            )
-
-        # Surprise-driven exploration (PRD §5.2)
-        self._surprise_exploration(pred, recent_fired)
-
-        # Surprise-driven neuromodulatory crystallization
-        # Failed predictions broadcast reward to ALL active eligibility traces.
-        # Strength scales with prediction confidence — high-confidence failures
-        # produce stronger crystallization than low-confidence failures.
-        # No scope: this is a broadcast signal, not a targeted one.
-        # Note: the direct prediction penalty (line ~2171 above) reduces this
-        # synapse's trace BEFORE the broadcast commits it. This is correct —
-        # the failing synapse gets reduced crystallization. The broadcast
-        # benefits other active traces that weren't involved in the failed
-        # prediction.
-        # [2026-10-27] S10: the outcome joins this step's signed reward instead of broadcasting on its own
-        if self._stab_s10_rpe() is not None:
-            self.__dict__.setdefault("_s10_events", []).append(-pred.confidence)
-            if self._stab_s13_per_source() is not None:   # [2026-10-28] S13
-                self.__dict__.setdefault("_s13_events", []).append((pred.source_node_id, 0.0, pred.confidence))
-        elif self.config.get("three_factor_enabled", False):
-            surprise_strength = pred.confidence * self.config.get("surprise_reward_scaling", 0.5)
-            if surprise_strength > 0.01:  # Don't bother with negligible surprise
-                self.inject_reward(surprise_strength)
-
-    def _surprise_exploration(
-        self, pred: Prediction, recent_fired: Set[str]
-    ) -> None:
-        """Explore alternative pathways after prediction error (PRD §5.2).
-
-        When A→B prediction fails, examine what DID fire instead.
-        If node C fired when B was expected:
-            - Create speculative synapse A→C (weight 0.1)
-            - Tag as "surprise-driven" in metadata
-
-        Also check for novel sequences (no learned patterns).
+        Returns (alternatives, sprouted): alternatives None = the fired window minus the expected target, read in
+        place by the book (the native surprise window, #1212); else the list this miss used.
         """
         source_id = pred.source_node_id
         expected_id = pred.target_node_id
         sprout_weight = self.config["surprise_sprouting_weight"]
-
-        # Find what fired instead of the expected target. [2026-11-05] #1212: under the native surprise window the
-        # set is not built per failed prediction (recent_fired minus the expected target is read in place below)
         sprouted_count = 0
-        # [2026-11-01] S18 (#1202; Josh 2026-11-01): a RECEIVER prediction's miss wires nothing. Its learning is the
-        # weakening of what converged + the error signal (_on_prediction_error) + the context tag and novelty count
-        # below; wiring the predictor to every recent firer is "completely backwards … not brain-like" (Josh). The
-        # source-side path (contributors None) explores exactly as before.
-        # [2026-11-09] #1136 merge: the #1212 window / slot apply to that source-side path only (a receiver miss reads
-        # recent_fired minus the expected target for its novelty count, as S18 does).
-        _sprout = pred.contributors is None
-        _tally = _sprout and bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
+        _tally = bool(self.config.get("sprout_tally_enabled", False))   # [2026-10-08] #1050 (absent = unchanged)
         _win = _tally and getattr(self, "_surprise_window_t", None) == self.timestep
-        if _sprout and self.config.get("surprise_slot_enabled", False):
+        if self.config.get("surprise_slot_enabled", False):
             # [2026-11-05] #1212 surprise slot (spec 2026-11-05-surprise-alternatives-design): only nodes that fired
             # in step() where the expected target was due, within reach, the few rarest -- not the whole window
-            alternative_nodes = self._surprise_slot_alternatives(pred)
+            alternative_nodes: Any = self._surprise_slot_alternatives(pred)
+        elif _win:
+            alternative_nodes = None
         else:
-            alternative_nodes = None if _win else recent_fired - {expected_id}
+            # the same set, built in the same order, as the former `recent_fired - {expected_id}` (ids added in the
+            # spike record's order): the no-tally walk below follows this set's iteration order, as it always did
+            _rf: Set[str] = set()
+            for _a in self._pb.window_ids_ordered():
+                _rf.add(_a)
+            alternative_nodes = _rf - {expected_id}
         if _tally:
             sprouted_count = self._surprise_exploration_tally(pred, alternative_nodes)
         # #59: cap the surprise-driven feeder too. The degree cap only guarded co-firing
@@ -5984,7 +6238,7 @@ class Graph:
         def _deg(x: str) -> int:
             return len(self._outgoing.get(x, ())) + len(self._incoming.get(x, ()))
 
-        for alt_id in (() if (_tally or not _sprout) else alternative_nodes):
+        for alt_id in (() if _tally else alternative_nodes):
             if alt_id == source_id:
                 continue
             if alt_id not in self.nodes:
@@ -6032,59 +6286,18 @@ class Graph:
                 "surprise_sprouted",
                 source=source_id,
                 expected=expected_id,
-                alternatives=list(recent_fired - {expected_id} if alternative_nodes is None else alternative_nodes),
+                alternatives=([a for a in self._pb.window_ids() if a != expected_id] if alternative_nodes is None
+                              else list(alternative_nodes)),
                 count=sprouted_count,
                 timestep=self.timestep,
             )
-
-        # Amygdala Protocol: boost salience on existing synapses that were active
-        # during this surprise. The context-of-surprise is as important as the
-        # new alternative path (Phase 4).
-        salience_max = self.config["he_salience_max"]
-        surprise_magnitude = pred.strength * pred.confidence
-        context_boost = 1.0 + (surprise_magnitude * 2.0)  # softer than new synapse boost
-        for syn_id in self._outgoing.get(source_id, set()):
-            syn = self.synapses.get(syn_id)
-            if syn and syn.inactive_steps < self.config["co_activation_window"] * 2:
-                # Recently active from source — this was part of the context.
-                syn.salience = min(salience_max, max(syn.salience, context_boost))
-
-        # Novelty detection: check if any fired sequence has NO learned patterns
-        if alternative_nodes is None:   # #1212: the same test, read from recent_fired without the expected target
-            _any_alt = len(recent_fired) > (1 if expected_id in recent_fired else 0)
-            _novel = _any_alt and not self._has_learned_pattern(source_id, recent_fired, exclude=expected_id)
-        else:
-            _novel = bool(alternative_nodes) and not self._has_learned_pattern(source_id, alternative_nodes)
-        if _novel:
-            self._total_novel_sequences += 1
-            _alts = (a for a in recent_fired if a != expected_id) if alternative_nodes is None else alternative_nodes
-            self._log_novel_sequence(source_id, _alts)
-
-            if self._event_handlers.get("novel_sequence"):   # #1212: the full list only when heard
-                self._emit(
-                    "novel_sequence",
-                    source=source_id,
-                    firing_nodes=list(recent_fired - {expected_id} if alternative_nodes is None else alternative_nodes),
-                    timestep=self.timestep,
-                )
+        return (None if alternative_nodes is None else list(alternative_nodes)), sprouted_count
 
     # [2026-11-04] #1210: a logged novel-sequence event keeps the count and a fixed-size sample of the firing nodes, not
     # every one (each held ~21 k ids: 980 MB of a 1.33 GB checkpoint, ~1.6 GB resident, read by nothing)
     _NOVEL_SAMPLE = 32
 
-    def _log_novel_sequence(self, source_id: str, firing: Iterable[str]) -> None:
-        """Append one novel-sequence event to the (capped) log: source, n_firing, the _NOVEL_SAMPLE smallest firing ids
-        (deterministic across hash seeds) and the timestep. The emitted event still carries the full list."""
-        firing = list(firing)
-        self._novel_sequence_log.append({
-            "source": source_id,
-            "firing_nodes": heapq.nsmallest(self._NOVEL_SAMPLE, firing),
-            "n_firing": len(firing),
-            "timestep": self.timestep,
-        })
-        # Cap log size
-        if len(self._novel_sequence_log) > 1000:
-            self._novel_sequence_log = self._novel_sequence_log[-500:]
+    # ([2026-11-13] #1221: _log_novel_sequence is the book's: the 32 smallest firing ids, the count, the cap 1000 -> 500)
 
     @classmethod
     def _compact_novel_event(cls, e: Any) -> Any:
@@ -6095,72 +6308,82 @@ class Graph:
             e = dict(e, firing_nodes=heapq.nsmallest(cls._NOVEL_SAMPLE, fn), n_firing=e.get("n_firing", len(fn)))
         return e
 
-    def _has_learned_pattern(
-        self, source_id: str, targets: Set[str], exclude: Optional[str] = None
-    ) -> bool:
-        """Check if any of the targets have a learned connection from source.
-
-        A "learned pattern" means there exists a synapse with weight above
-        the prediction threshold. [2026-11-05] #1212: `exclude` drops one target (targets minus {exclude}, unbuilt).
-        """
-        threshold = self.config["prediction_threshold"]
-        for syn_id in self._outgoing.get(source_id, set()):
-            syn = self.synapses.get(syn_id)
-            if syn and syn.post_node_id in targets and syn.post_node_id != exclude and syn.weight >= threshold:
-                return True
-        return False
+    # ([2026-11-13] #1221: _has_learned_pattern is SynapseStore::pb_has_learned, called by the book)
 
     def _cleanup_predictions(self) -> None:
-        """Remove expired predictions and trigger error handling (PRD §5.1).
+        """Remove expired predictions and trigger error handling (PRD §5.1, §5.2).
 
-        Called each step to clean up predictions that have exceeded their
-        window without confirmation.
+        Called each step. [2026-11-13] #1221: the pass is ng_tract.PredictionBook's (the former _cleanup_predictions,
+        _on_prediction_error, _log_novel_sequence and the bookkeeping half of _surprise_exploration): the fired window
+        is built once from the spike record; each expired prediction weakens its links ([2026-11-01] S18: the
+        contributors, by share), records the miss in their histories, in the receiver's own record and in corrected
+        DiffPC ([2026-11-03] S19), is logged as an outcome, tags the context (salience), counts and logs a novel
+        sequence, and joins the step's signed reward (S10 / S13). A receiver prediction's miss wires nothing and is
+        finished inside the book. A source-side miss comes back here once for its exploration (_surprise_explore);
+        so does every miss while a surprise event has a listener, and a miss whose surprise reward is the pre-S10
+        inject_reward broadcast.
         """
-        error_penalty = self.config["prediction_error_penalty"]
-
-        # Collect recently fired nodes for surprise analysis
-        recent_window = self.config["prediction_window"]
-        recent_fired: Set[str] = set()
-        for nid, spikes in self._recent_spikes.items():
-            for t in spikes:
-                if self.timestep - t <= recent_window:
-                    recent_fired.add(nid)
-                    break
-
-        expired: List[str] = []
-        for pid, pred in self.active_predictions.items():
-            if self.timestep > pred.expires_at:
-                expired.append(pid)
+        cfg = self.config
+        _h_err = bool(self._event_handlers.get("prediction_error"))
+        _h_nov = bool(self._event_handlers.get("novel_sequence"))
+        _heard = _h_err or _h_nov or bool(self._event_handlers.get("surprise_sprouted"))
+        _dp_p = self.__dict__.get("_diffpc_p")   # [2026-11-03] S19: a receiver prediction's miss
+        _dps = self.__dict__.get("_diffpc") if _dp_p is not None else None
+        n = self._pb.expire_begin(
+            self.timestep, cfg["prediction_window"], cfg["prediction_error_penalty"], cfg["three_factor_enabled"],
+            cfg["co_activation_window"], cfg["he_salience_max"], cfg["prediction_threshold"],
+            self._stab_s10_rpe() is not None, self._stab_s13_per_source() is not None,
+            cfg.get("surprise_reward_scaling", 0.5), (bool(_dp_p[3]) if _dps is not None else None), _heard)
 
         # [2026-11-05] #1212: under the tally, the fired window goes to the native store once for the step (sorted,
         # live nodes only: the order and filter each surprise touch used to rebuild), not once per failed prediction
         self._surprise_window_t = None
         # (not when a prediction_error handler is registered: one could remove a node mid-loop, which the per-prediction
         # path re-checks -- review M1; none is registered on the CC daemon)
-        if (expired and self.config.get("sprout_tally_enabled", False) and not self.config.get("surprise_slot_enabled", False)
-                and not self._event_handlers.get("prediction_error")):
+        if (n and cfg.get("sprout_tally_enabled", False) and not cfg.get("surprise_slot_enabled", False)
+                and not _h_err):
             _sw = _cofire_surprise_native(self.synapses)
             if _sw is not None and _cofire_tally_native(self.synapses) is not None:
-                _sw[0](sorted(a for a in recent_fired if a in self.nodes))
+                _sw[0](self._pb.window_ids(self.nodes))
                 self._surprise_window_t = self.timestep
 
-        _dp_p = self.__dict__.get("_diffpc_p")   # [2026-11-03] S19: a receiver prediction's miss
-        _dps = self.__dict__.get("_diffpc") if _dp_p is not None else None
-        for pid in expired:
-            pred = self.active_predictions.pop(pid)
-            if _dps is not None and pred.drive is not None:
-                _dps.record_miss(self.nodes, pred.target_node_id, float(pred.strength), bool(_dp_p[3]))
-            self._on_prediction_error(pred, error_penalty, recent_fired)
+        while n:
+            miss = self._pb.expire_run(self.synapses, self.nodes, _dps)
+            if miss is None:
+                break
+            pid, source, target, strength, confidence, created_at, chain_depth, is_recv = miss
+            if _h_err:   # [2026-11-05] #1212: the full list only when heard
+                self._emit("prediction_error", source=source, expected_target=target, strength=strength,
+                           confidence=confidence, actual_fired=self._pb.window_ids(), timestep=self.timestep)
+            alts: Optional[List[str]] = None
+            if not is_recv:
+                # Surprise-driven exploration (PRD §5.2). [2026-11-01] S18 (#1202; Josh 2026-11-01): a RECEIVER
+                # prediction's miss wires nothing ("completely backwards … not brain-like"); its learning is the
+                # weakening of what converged + the error signal + the context tag and novelty count.
+                alts, _n = self._surprise_explore(Prediction(
+                    prediction_id=pid, source_node_id=source, target_node_id=target, strength=strength,
+                    confidence=confidence, created_at=created_at, chain_depth=chain_depth))
+            novel, reward = self._pb.expire_finish(self.synapses, alts)
+            if novel and _h_nov:   # #1212: the full list only when heard
+                self._emit("novel_sequence", source=source,
+                           firing_nodes=([a for a in self._pb.window_ids() if a != target] if alts is None
+                                         else list(alts)),
+                           timestep=self.timestep)
+            # Surprise-driven neuromodulatory crystallization (pre-S10 path only; with S10 the outcome joins the
+            # step's one signed reward): failed predictions broadcast reward to ALL active eligibility traces,
+            # scaled by the prediction's confidence. The failing link's own trace was reduced first.
+            if reward is not None:
+                self.inject_reward(reward)
+        self._pb_reward_events()
 
     def _find_synapse(
         self, pre_id: str, post_id: str
     ) -> Optional[Synapse]:
-        """Find a synapse connecting pre_id → post_id, if one exists."""
-        for syn_id in self._outgoing.get(pre_id, set()):
-            syn = self.synapses.get(syn_id)
-            if syn and syn.post_node_id == post_id:
-                return syn
-        return None
+        """Find a synapse connecting pre_id → post_id, if one exists. [2026-11-13] #1221 / #1223: native, and with a
+        fixed answer when a pair has two synapses (the lowest row); the former walk of a set of ids followed the
+        process's str hash order there."""
+        sid = self.synapses.find_first(pre_id, post_id)
+        return self.synapses.get(sid) if sid is not None else None
 
     # -----------------------------------------------------------------------
     # Phase 3: Public Prediction API (PRD §8)
@@ -6753,8 +6976,7 @@ class Graph:
                 node_cap = [(nid, node, dict(node.metadata) if isinstance(node.metadata, dict) else node.metadata)
                             for nid, node in self.nodes.items()]
             nhe_copy = dict(self._node_hyperedges)
-            rs_copy = dict(self._recent_spikes)
-            hist_copy = dict(self._synapse_confirmation_history)
+            pb_copy = self._pb.copy()   # [2026-11-13] #1221: the spike record, the history, the predictions: its own
             dirty = (set(self._dirty_nodes), set(self._dirty_synapses), set(self._dirty_hyperedges))
             hyperedges_copy = dict(self.hyperedges)
             cfg_copy = dict(self.config)
@@ -6798,8 +7020,7 @@ class Graph:
         shadow._outgoing = out_copy
         shadow._incoming = in_copy
         shadow._node_hyperedges = nhe_copy
-        shadow._recent_spikes = rs_copy
-        shadow._synapse_confirmation_history = hist_copy
+        shadow._pb = pb_copy
         shadow._dirty_nodes, shadow._dirty_synapses, shadow._dirty_hyperedges = dirty
         shadow.hyperedges = hyperedges_copy
         shadow.config = cfg_copy
@@ -8018,15 +8239,11 @@ class Graph:
 
         # Build a set of recently-fired-but-not-this-step nodes for quick lookup
         fired_set = set(fired_ids)
+        # [2026-11-13] #1221: one native pass over the spike record (ids in record order, so the set is built in the
+        # order the Python loop added them)
         candidates: Set[str] = set()
-        for nid, spikes in self._recent_spikes.items():
-            if nid in fired_set:
-                continue
-            if any(
-                0 < (self.timestep - t) <= window
-                for t in spikes
-            ):
-                candidates.add(nid)
+        for _dt, nid in self._pb.spikes_recent_within(self.timestep, window, list(fired_set)):
+            candidates.add(nid)
 
         if not candidates:
             return 0
@@ -8200,17 +8417,8 @@ class Graph:
         st = self._sprout_tally_stats_dict()
         fired_set = set(fired_ids)
         now = self.timestep
-        recent: List[Tuple[int, str]] = []
-        for nid, spikes in self._recent_spikes.items():
-            if nid in fired_set:
-                continue
-            best = 0
-            for t in spikes:
-                dt = now - t
-                if 0 < dt <= window and (best == 0 or dt < best):
-                    best = dt
-            if best:
-                recent.append((best, nid))
+        # [2026-11-13] #1221: (smallest dt, id) per node in record order, natively
+        recent: List[Tuple[int, str]] = [tuple(x) for x in self._pb.spikes_recent_within(now, window, list(fired_set))]
         if not recent:
             return 0
         recent.sort(key=lambda x: x[0])    # most recent first; stable within a step (dict order)
@@ -9891,6 +10099,32 @@ class Graph:
             "pre_charge_applied": pred.pre_charge_applied,
         }
 
+    def _serialize_prediction_row(self, row, receiver_part: bool = False) -> Dict[str, Any]:
+        """[2026-11-13] #1221: one PredictionBook row in _serialize_prediction's shape (same keys, same order).
+        `receiver_part` (#1222; Josh 2026-11-13 "It needs to be fixed"): an open RECEIVER prediction also carries its
+        merge input, drive and rho, so a restore brings it back as a receiver prediction (before, it came back as a
+        source-side one: its outcome acted on one link, and a miss explored). Loaders that do not know the three keys
+        ignore them."""
+        (pid, src, tgt), (strength, conf, created, expires, depth), (via, pre, is_recv, drive, rho) = row
+        d = {
+            "prediction_id": pid,
+            "source_node_id": src,
+            "target_node_id": tgt,
+            "strength": strength,
+            "confidence": conf,
+            "created_at": created,
+            "expires_at": expires,
+            "chain_depth": depth,
+            "via_hyperedge": via,
+            "pre_charge_applied": pre,
+        }
+        if receiver_part and is_recv:
+            raw = self._pb.receiver_raw(pid)
+            d["contributors_raw"] = [list(x) for x in (raw[0] if raw is not None else [])]
+            d["drive"] = drive
+            d["rho"] = rho
+        return d
+
     def _serialize_prediction_state(self, ps: PredictionState) -> Dict[str, Any]:
         """Serialize a Phase 2.5 hyperedge-level PredictionState."""
         return {
@@ -9917,12 +10151,11 @@ class Graph:
         _archived   = None if _native_he else list(self._archived_hyperedges.items())
         # [2026-10-18] H2: the pass state the native passes own, packed by the store (detached bytes)
         _he_ps_packed = self.hyperedges.pass_state_msgpack() if self._he_ps_native() else None
-        _act_preds  = list(self.active_predictions.items())
-        _syn_hist   = list(self._synapse_confirmation_history.items())
+        _act_preds  = self._pb.items()            # [2026-11-13] #1221: rows, no Prediction objects
+        _syn_hist   = self._pb.hist_items()
         _he_preds   = list(self._active_predictions.items())
         _delay_buf  = list(self._delay_buffer.items())
-        _recent_spk = [(nid, spikes) for nid, spikes
-                       in self._recent_spikes.items() if spikes]
+        _recent_spk = [(nid, spikes) for nid, spikes, _cap in self._pb.spike_items(True)]
         # The native backend creates this packed payload for the capture. It does
         # not borrow live state, and bytearray is intentionally not deep-copied:
         # that would duplicate the largest capture allocation inside _step_lock.
@@ -9950,19 +10183,19 @@ class Graph:
             }),
             # Phase 3: Active synapse-level predictions
             "active_predictions": {
-                pid: self._serialize_prediction(pred)
-                for pid, pred in _act_preds
+                row[0][0]: self._serialize_prediction_row(row, receiver_part=self._PB_SAVE_RECEIVER_PART)
+                for row in _act_preds
             },
             # Phase 3: Recent prediction outcomes
             "prediction_outcomes": [
                 {
-                    "prediction": self._serialize_prediction(po.prediction),
-                    "confirmed": po.confirmed,
-                    "resolved_at": po.resolved_at,
-                    "actual_firing_nodes": copy.deepcopy(po.actual_firing_nodes, _memo) if _memo is not None else po.actual_firing_nodes,
-                    **({"n_actual_firing": po.n_actual_firing} if po.n_actual_firing else {}),   # [2026-11-04] #1210b
+                    "prediction": self._serialize_prediction_row(_row),
+                    "confirmed": _confirmed,
+                    "resolved_at": _resolved_at,
+                    "actual_firing_nodes": _actual,   # [2026-11-13] #1221: a fresh list from the book (no deepcopy needed)
+                    **({"n_actual_firing": _n_actual} if _n_actual else {}),   # [2026-11-04] #1210b
                 }
-                for po in self._prediction_outcomes
+                for _row, _confirmed, _resolved_at, _actual, _n_actual in self._pb.outcome_items()
             ],
             # Phase 3: Per-synapse confirmation history
             "synapse_confirmation_history": {
@@ -10408,6 +10641,11 @@ class Graph:
                 via_hyperedge=pd.get("via_hyperedge"),
                 pre_charge_applied=pd.get("pre_charge_applied", 0.0),
             )
+            _raw = pd.get("contributors_raw")
+            if _raw is not None:   # [2026-11-13] #1222: a receiver prediction comes back as one
+                pred.contributors_raw = {x[0]: (x[1], x[2]) for x in _raw}
+                pred.contributors = []
+                pred.drive, pred.rho = pd.get("drive"), pd.get("rho")
             self.active_predictions[pid] = pred
 
         # Restore Phase 3 prediction outcomes
