@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-13] DudeMan CC -- native tick piece 1 (#1221): a miss is driven through Graph._cleanup_predictions
+#   (tests/native_tick_helpers.miss); the base comparison levels the twin-synapse rule (#1223).
 # [2026-11-05] DudeMan CC (#1212; Josh 2026-11-05 "write it up ... You have my go") — CREATE
 # What: the surprise slot (config surprise_slot_enabled): (1) off / keys absent = e2f93d4 exactly (whole-run checkpoint
 #       bytes, tally, stats); (2) on: the slot, reach and top-k rules on hand-built graphs -- a node outside the slot or
@@ -74,7 +76,13 @@ CFG = dict(T.TALLY, **T.DISUSE, prediction_threshold=0.5)   # the workload's wei
 @pytest.mark.parametrize("seed", P1.SEEDS[:2])
 @pytest.mark.parametrize("mode", ["off", "on"])
 @pytest.mark.parametrize("cfg", [CFG, dict(CFG, surprise_slot_enabled=False, surprise_topk=1)])
-def test_off_is_the_base_exactly(mode, seed, cfg):
+def test_off_is_the_base_exactly(mode, seed, cfg, monkeypatch):
+    # [2026-11-13] #1221 / #1223: _find_synapse now resolves a pair with two synapses to the lowest row (the base's walk
+    # of a set of ids follows the process's str hash order); the base gets the same rule so everything else must match
+    def _find_first(self, pre_id, post_id):
+        sid = self.synapses.find_first(pre_id, post_id)
+        return self.synapses.get(sid) if sid is not None else None
+    monkeypatch.setattr(BASE.Graph, "_find_synapse", _find_first)
     start = P1.built_bytes(seed)
     act = T.tally_workload(30)
     a, (la, _), ga = _run(NF, mode, start, act, seed, cfg)
@@ -162,7 +170,8 @@ def test_the_alternatives_feed_the_tally_as_today():
         g.nodes[nid].firing_rate_ema = 0.01
     _ring(g, [(100, []), (101, ["C1", "Y", "C2"]), (102, [])])
     g.timestep = 111
-    g._surprise_exploration(_pred(100), {"C1", "C2", "Y", "H", "Z"})   # recent_fired is ignored under the slot
+    from tests import native_tick_helpers as NTH   # [2026-11-13] #1221: a miss through the engine's own pass
+    NTH.miss(g, _pred(100), {"C1", "C2", "Y", "H", "Z"})   # recent_fired is ignored under the slot
     held = dict(g.cofire_tally_state())
     assert set(held) == {"C1", "Y"} and held["C1"][0][0] == "A"
     assert g._sprout_tally_stats["surprise_calls"] == 1

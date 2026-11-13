@@ -1,21 +1,21 @@
 # ---- Changelog ----
-# [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221), parity before the engine edit
-# What: runs ng_tract.PredictionBook's confirm / expire beside the engine's own Python (`_evaluate_predictions`,
-#       `_cleanup_predictions`, `_on_prediction_confirmed`, `_on_prediction_error`, `_surprise_exploration`,
-#       `_log_novel_sequence`) on identical twin graphs and compares the checkpoints byte for byte.
-# Why:  plan docs/superpowers/plans/2026-11-13-native-tick-m1-prediction-miss-path.md §3; `neuro_foundation.py` is
-#       protected, so until Josh's "proceed" the engine is NOT edited: the candidate side is the same engine file
-#       imported a second time with those two methods replaced IN THIS TEST by a shim over the book.
-# How:  the shim copies the Python state into the book before each pass and back after it (the engine still owns the
-#       state on this branch), so every effect of a confirmation and of a miss is the book's; the host half (the tally
-#       touch, the rails, create_synapse, event emission) is the engine's own code, as it stays in piece 1.
-#       Needs an ng_tract with PredictionBook (ng-tract-rs branch cc-laptop-native-tick-m1-20261113); skipped otherwise.
+# [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): the engine against itself
+#   before the port.
+# What: the engine on this branch (predictions, confirmations and misses in ng_tract.PredictionBook) beside the engine
+#       at ec3c1f5 (the same passes in Python), loaded from git: twin runs, final checkpoints byte for byte.
+# Why:  plan docs/superpowers/plans/2026-11-13-native-tick-m1-prediction-miss-path.md §3 and §7.
+# How:  the oracle is `git show ec3c1f5:neuro_foundation.py` (tests.test_hyperedge_store_h2._load). Two differences are
+#       deliberate and are levelled here so that everything else must be equal: (1) a pair of nodes joined by two
+#       synapses resolves to the lowest row (the oracle's walk of a set of ids follows the process's str hash order:
+#       punch #1223), so the oracle gets the same rule; (2) #1222's three extra keys on an open receiver prediction are
+#       switched off for the byte comparison and tested on their own below.
+#       [2026-11-13, first version] before the engine was edited this file ran the book through a shim that replaced
+#       two methods of an unedited twin (15 cases byte-identical); the engine edit replaced the shim.
 # -------------------
-import importlib.util
 import os
 import random
 import sys
-from collections import deque
+import tempfile
 
 import pytest
 
@@ -30,197 +30,23 @@ from tests import test_stability_s18 as S18        # noqa: E402
 HAVE_BOOK = hasattr(NF.ng_tract, "PredictionBook")
 pytestmark = pytest.mark.skipif(not HAVE_BOOK, reason="installed ng_tract has no PredictionBook")
 
-
-def _load_twin(name):
-    spec = importlib.util.spec_from_file_location(name, NF.__file__)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+PREPORT_REV = os.environ.get("NG_NATIVE_TICK_M1_PREPORT_REV", "ec3c1f5")
+PRE = H2._load(PREPORT_REV, "nf_native_tick_m1_preport") if HAVE_BOOK else None
 
 
-SHIM = _load_twin("nf_native_tick_m1_shim")
-CHECKS = {"windows": 0, "confirm": 0, "miss": 0, "recv_miss": 0, "host_miss": 0}
+def _find_first(self, pre_id, post_id):
+    sid = self.synapses.find_first(pre_id, post_id)
+    return self.synapses.get(sid) if sid is not None else None
 
 
-def _book(g):
-    b = g.__dict__.get("_pb_shim")
-    if b is None:
-        b = g.__dict__["_pb_shim"] = SHIM.ng_tract.PredictionBook()
-    return b
+@pytest.fixture(autouse=True)
+def _levelled(monkeypatch):
+    if PRE is not None:
+        monkeypatch.setattr(PRE.Graph, "_find_synapse", _find_first)
+    monkeypatch.setattr(NF.Graph, "_PB_SAVE_RECEIVER_PART", False)
 
-
-def _sync_in(g, b):
-    b.spike_clear()
-    for nid, dq in g._recent_spikes.items():
-        b.spike_set(nid, list(dq), dq.maxlen)
-    b.hist_clear()
-    for sid, dq in g._synapse_confirmation_history.items():
-        b.hist_set(sid, list(dq))
-    b.clear()
-    for pid, p in g.active_predictions.items():
-        recv = None
-        if p.contributors is not None:
-            recv = ([(sid, pre, w) for sid, (pre, w) in p.contributors_raw.items()], p.drive, p.rho)
-        b.insert(pid, p.source_node_id, p.target_node_id, p.strength, p.confidence, p.created_at, p.expires_at,
-                 p.chain_depth, p.via_hyperedge, p.pre_charge_applied, recv)
-        if recv is not None:
-            assert b.contributors(pid) == [tuple(x) for x in p.contributors], "shares differ from the engine's"
-    b.outcomes_clear()
-    b.novel_clear()
-    for e in g._novel_sequence_log:
-        b.novel_push_restored(e["source"], list(e["firing_nodes"]), e["n_firing"], e["timestep"])
-    b.set_counters(g._total_predictions_made, g._total_predictions_confirmed, g._total_predictions_errors,
-                   g._total_novel_sequences)
-
-
-def _sync_out(g, b, objs):
-    for pid in [pid for pid in g.active_predictions if pid not in b]:
-        del g.active_predictions[pid]
-    g._synapse_confirmation_history = {sid: deque(v, maxlen=100) for sid, v in b.hist_items()}
-    for (ids, _nums, _rest), confirmed, resolved_at, actual, n_actual in b.outcome_items():
-        g._prediction_outcomes.append(SHIM.PredictionOutcome(
-            prediction=objs[ids[0]], confirmed=confirmed, resolved_at=resolved_at, actual_firing_nodes=actual,
-            n_actual_firing=n_actual))
-    g._novel_sequence_log = [{"source": s, "firing_nodes": f, "n_firing": n, "timestep": t}
-                             for s, f, n, t in b.novel_items()]
-    _made, g._total_predictions_confirmed, g._total_predictions_errors, g._total_novel_sequences = b.counters()
-    s10, s13 = b.take_reward_events()
-    if s10:
-        g.__dict__.setdefault("_s10_events", []).extend(s10)
-    if s13:
-        g.__dict__.setdefault("_s13_events", []).extend(s13)
-
-
-def _flags(g):
-    return g._stab_s10_rpe() is not None, g._stab_s13_per_source() is not None
-
-
-def _shim_evaluate(self, fired_set):
-    b = _book(self)
-    _sync_in(self, b)
-    objs = dict(self.active_predictions)
-    s10, s13 = _flags(self)
-    rows = b.confirm(self.timestep, list(fired_set), self.synapses, self.nodes,
-                     self.config["prediction_confirm_bonus"], self.config["three_factor_enabled"], s10, s13, True)
-    CHECKS["confirm"] += len(rows)
-    _sync_out(self, b, objs)
-    for source, target, strength, confidence, delay in rows:
-        self._emit("prediction_confirmed", source=source, target=target, strength=strength, confidence=confidence,
-                   delay=delay, timestep=self.timestep)
-
-
-def _python_recent_fired(g):
-    out = set()
-    for nid, spikes in g._recent_spikes.items():
-        for t in spikes:
-            if g.timestep - t <= g.config["prediction_window"]:
-                out.add(nid)
-                break
-    return out
-
-
-def _host_explore(self, pred, b):
-    """The engine's exploration step for one source-side miss (neuro_foundation.py :5953-6038): unchanged code."""
-    cfg = self.config
-    expected_id = pred.target_node_id
-    _tally = bool(cfg.get("sprout_tally_enabled", False))
-    _win = _tally and getattr(self, "_surprise_window_t", None) == self.timestep
-    if cfg.get("surprise_slot_enabled", False):
-        alternative = self._surprise_slot_alternatives(pred)
-    else:
-        alternative = None if _win else set(b.window_ids()) - {expected_id}
-    sprouted = 0
-    if _tally:
-        sprouted = self._surprise_exploration_tally(pred, alternative)
-    else:
-        raise AssertionError("the no-tally source-side path is not covered by this shim (creation order: see plan)")
-    if sprouted > 0 and self._event_handlers.get("surprise_sprouted"):
-        alts = [a for a in b.window_ids() if a != expected_id] if alternative is None else sorted(alternative)
-        self._emit("surprise_sprouted", source=pred.source_node_id, expected=expected_id, alternatives=alts,
-                   count=sprouted, timestep=self.timestep)
-    return None if alternative is None else sorted(alternative)
-
-
-def _shim_cleanup(self):
-    b = _book(self)
-    _sync_in(self, b)
-    objs = dict(self.active_predictions)
-    cfg = self.config
-    s10, s13 = _flags(self)
-    heard = [bool(self._event_handlers.get(k)) for k in ("prediction_error", "surprise_sprouted", "novel_sequence")]
-    dp_p = self.__dict__.get("_diffpc_p")
-    dps = self.__dict__.get("_diffpc") if dp_p is not None else None
-    n = b.expire_begin(self.timestep, cfg["prediction_window"], cfg["prediction_error_penalty"],
-                       cfg["three_factor_enabled"], cfg["co_activation_window"], cfg["he_salience_max"],
-                       cfg["prediction_threshold"], s10, s13, cfg.get("surprise_reward_scaling", 0.5),
-                       (bool(dp_p[3]) if dps is not None else None), any(heard))
-    want = _python_recent_fired(self)
-    assert b.window_count() == len(want) and set(b.window_ids()) == want, "the fired window differs"
-    CHECKS["windows"] += 1
-    self._surprise_window_t = None
-    if (n and cfg.get("sprout_tally_enabled", False) and not cfg.get("surprise_slot_enabled", False) and not heard[0]):
-        _sw = SHIM._cofire_surprise_native(self.synapses)
-        if _sw is not None and SHIM._cofire_tally_native(self.synapses) is not None:
-            _sw[0](b.window_ids(self.nodes))
-            self._surprise_window_t = self.timestep
-    while True:
-        m = b.expire_run(self.synapses, self.nodes, dps)
-        if m is None:
-            break
-        pid, source, target, strength, confidence, _created, _depth, is_recv = m
-        pred = objs[pid]
-        CHECKS["host_miss"] += 1
-        if heard[0]:
-            self._emit("prediction_error", source=source, expected_target=target, strength=strength,
-                       confidence=confidence, actual_fired=b.window_ids(), timestep=self.timestep)
-        alts = None if is_recv else _host_explore(self, pred, b)
-        novel, reward = b.expire_finish(self.synapses, alts)
-        if novel and heard[2]:
-            firing = [a for a in b.window_ids() if a != target] if alts is None else alts
-            self._emit("novel_sequence", source=source, firing_nodes=firing, timestep=self.timestep)
-        if reward is not None:
-            self.inject_reward(reward)
-    CHECKS["miss"] += n
-    CHECKS["recv_miss"] += sum(1 for pid in objs if pid not in b and objs[pid].contributors is not None
-                               and self.timestep > objs[pid].expires_at)
-    _sync_out(self, b, objs)
-
-
-SHIM.Graph._evaluate_predictions = _shim_evaluate
-SHIM.Graph._cleanup_predictions = _shim_cleanup
-
-
-def _reset():
-    for k in CHECKS:
-        CHECKS[k] = 0
-
-
-# ---------------------------------------------------------------------------
-# (1) receiver on (S18), with and without the corrected DiffPC (S19): the S18 whole-run twin, engine vs book
-# ---------------------------------------------------------------------------
-
-@S18.needs_recv
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("s19", [False, True])
-def test_receiver_whole_run_book_equals_engine(seed, s19):
-    _reset()
-    start = H2.built(seed)
-    t = S.Pair(S18.restore_as(NF, "native", start), S18.restore_as(SHIM, "native", start), seed)
-    extra = {"diffpc_receiver_enabled": True} if s19 else {}
-    t.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON, **extra)))
-    S.drive(t, random.Random(seed), 25, sleep_every=True)
-    assert CHECKS["windows"] > 0 and CHECKS["confirm"] + CHECKS["miss"] > 0, CHECKS      # not vacuous
-    assert S18._state_rows(t.a.g) == S18._state_rows(t.b.g)
-    assert S18.ckpt(t.a.g) == S18.ckpt(t.b.g)
-
-
-# ---------------------------------------------------------------------------
-# (2) source-side with the co-firing tally (the live daemon's path): the #1050 whole-run workload, engine vs book
-# ---------------------------------------------------------------------------
 
 def _restore(mod, b):
-    import tempfile
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "c.msgpack")
         with open(p, "wb") as f:
@@ -230,42 +56,133 @@ def _restore(mod, b):
         return g
 
 
-def _run(mod, start, act, seed, cfg, heard=False):
+# ---------------------------------------------------------------------------
+# (1) receiver on (S18), with and without the corrected DiffPC (S19)
+# ---------------------------------------------------------------------------
+
+@S18.needs_recv
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("s19", [False, True])
+def test_receiver_whole_run_equals_the_preport_engine(seed, s19):
+    start = H2.built(seed)
+    t = S.Pair(S18.restore_as(PRE, "native", start), S18.restore_as(NF, "native", start), seed)
+    extra = {"diffpc_receiver_enabled": True} if s19 else {}
+    t.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON, **extra)))
+    S.drive(t, random.Random(seed), 25, sleep_every=True)
+    g = t.b.g
+    assert g._recv_stats["registered"] > 0
+    assert g._total_predictions_confirmed + g._total_predictions_errors > 0          # not vacuous
+    assert S18._state_rows(t.a.g) == S18._state_rows(t.b.g)
+    assert S18.ckpt(t.a.g) == S18.ckpt(t.b.g)
+
+
+# ---------------------------------------------------------------------------
+# (2) source-side with the co-firing tally (the live daemon's path), with and without listeners
+# ---------------------------------------------------------------------------
+
+def _run(mod, start, act, seed, cfg, heard):
     g = _restore(mod, start)
     g.config.update(cfg)
     log = T1050._heard(g) if heard else []
     out = P1.seeded(seed, lambda rng: act(g, rng), uuid_stream=1)
-    return P1.ckpt_bytes(g), out, log
-
-
-def _find_first(self, pre_id, post_id):
-    """Graph._find_synapse under the book's fixed rule for a pair with two synapses (the lowest row). The engine's own
-    walk of a set of synapse ids picks by str hash order there, which differs from process to process (found
-    2026-11-13: 22 of 876 pairs in the P1 graph have two synapses), so no fixed rule can equal it; both sides of the
-    twin get this rule, and everything else must then be byte-equal."""
-    sid = self.synapses.find_first(pre_id, post_id)
-    return self.synapses.get(sid) if sid is not None else None
+    return P1.ckpt_bytes(g), out, log, g
 
 
 @T1050.needs_window
 @pytest.mark.parametrize("seed", P1.SEEDS)
 @pytest.mark.parametrize("heard", [False, True])
-def test_tally_whole_run_book_equals_engine(seed, heard, monkeypatch):
-    _reset()
-    monkeypatch.setattr(NF.Graph, "_find_synapse", _find_first)
-    monkeypatch.setattr(SHIM.Graph, "_find_synapse", _find_first)
+@pytest.mark.parametrize("tally", [True, False])
+def test_source_side_whole_run_equals_the_preport_engine(seed, heard, tally):
     start = P1.built_bytes(seed)
-    cfg = dict(T1050.TALLY, **T1050.DISUSE, prediction_threshold=0.5)   # the workload's weights predict
-    act = T1050.tally_workload(30)
-    a, (la, _), ea = _run(NF, start, act, seed, cfg, heard)
-    b, (lb, _), eb = _run(SHIM, start, act, seed, cfg, heard)
-    assert CHECKS["windows"] > 0 and CHECKS["miss"] > 0, CHECKS
-    assert ea == eb and (len(ea) > 0) == heard                 # every event, with its ids, when heard
+    cfg = dict(T1050.DISUSE, prediction_threshold=0.5)   # the workload's weights predict (default bar 3.0)
+    if tally:
+        cfg.update(T1050.TALLY)
+    act = T1050.tally_workload(30) if tally else _plain_workload(30)
+    a, (la, _), ea, ga = _run(PRE, start, act, seed, cfg, heard)
+    b, (lb, _), eb, gb = _run(NF, start, act, seed, cfg, heard)
+    assert gb._total_predictions_errors == ga._total_predictions_errors > 0          # misses really happened
+    assert ea == eb and (len(ea) > 0) == heard                                       # every event, with its ids
+    assert ga._novel_sequence_log == list(gb._novel_sequence_log)
     P1.compare(la, lb, [], [], a, b)
 
 
+def _plain_workload(rounds):
+    """The #1050 workload without its tally reads (the no-tally path wires every node of the fired window)."""
+    def act(g, rng):
+        log = []
+        hot = sorted(rng.sample(list(g.nodes), 10))
+        for k in range(rounds):
+            if k % 6 < 2:
+                for nid in (hot[:5] if k % 6 == 0 else hot[5:]):
+                    if nid in g.nodes:
+                        g.stimulate(nid, 2.5)
+            for nid in rng.sample(list(g.nodes), min(6, len(g.nodes))):
+                g.stimulate(nid, rng.uniform(0.5, 3.0))
+            r = g.step()
+            log.append((list(r.fired_node_ids), r.synapses_pruned, r.synapses_sprouted))
+            log.append(P1.syn_state(g))
+            ids = rng.sample(list(g.nodes), min(6, len(g.nodes)))
+            p = g.prime_and_propagate(ids, [1.5] * len(ids), steps=3, write_mode=True)
+            log.append(P1.fe(p.fired_entries))
+            if k % 7 == 3 and len(g.nodes) > 20:
+                g.remove_node(rng.choice(sorted(g.nodes)))
+            if k % 5 == 4:
+                g.inject_reward(0.2)
+        log.append(sorted((s.pre_node_id, s.post_node_id, sid) for sid, s in g.synapses.items()))
+        return log, []
+    return act
+
+
 # ---------------------------------------------------------------------------
-# (3) the registration calls the engine edit will use (not reached through the shim): merge and the pending index
+# (3) a save in mid-flight restores into the same run
+# ---------------------------------------------------------------------------
+
+@S18.needs_recv
+@pytest.mark.parametrize("seed", [0, 1])
+def test_restore_mid_flight_equals_the_preport_engine(seed):
+    start = H2.built(seed)
+    t = S.Pair(S18.restore_as(PRE, "native", start), S18.restore_as(NF, "native", start), seed)
+    t.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON)))
+    S.drive(t, random.Random(seed), 12)
+    mid_a, mid_b = S18.ckpt(t.a.g), S18.ckpt(t.b.g)
+    assert mid_a == mid_b and len(t.b.g.active_predictions) > 0
+    t2 = S.Pair(S18.restore_as(PRE, "native", mid_a), S18.restore_as(NF, "native", mid_b), seed + 50)
+    t2.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON)))
+    S.drive(t2, random.Random(seed + 50), 12, sleep_every=True)
+    assert S18.ckpt(t2.a.g) == S18.ckpt(t2.b.g)
+
+
+# ---------------------------------------------------------------------------
+# (4) #1222: an open receiver prediction survives a save / restore as a receiver prediction
+# ---------------------------------------------------------------------------
+
+@S18.needs_recv
+def test_receiver_prediction_keeps_its_receiver_part_across_a_restore(monkeypatch):
+    monkeypatch.setattr(NF.Graph, "_PB_SAVE_RECEIVER_PART", True)
+    start = H2.built(0)
+    g = S18.restore_as(NF, "native", start)
+    g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
+    rng = random.Random(3)
+    for _ in range(12):
+        for nid in rng.sample(list(g.nodes.keys()), 8):
+            g.stimulate(nid, 2.5)
+        g.step()
+        if any(p.contributors for p in g.active_predictions.values()):
+            break
+    before = {pid: p for pid, p in g.active_predictions.items() if p.contributors}
+    assert before, "the run produced no open receiver prediction"
+    g2 = S18.restore_as(NF, "native", S18.ckpt(g))
+    after = dict(g2.active_predictions.items())
+    for pid, p in before.items():
+        q = after[pid]
+        assert q.contributors == p.contributors and q.contributors_raw == p.contributors_raw
+        assert (q.drive, q.rho, q.source_node_id, q.strength, q.confidence) == \
+               (p.drive, p.rho, p.source_node_id, p.strength, p.confidence)
+    S18.restore_as(PRE, "native", S18.ckpt(g))            # the older loader still reads the file
+
+
+# ---------------------------------------------------------------------------
+# (5) the registration calls: merge and the pending index follow the engine's own arithmetic
 # ---------------------------------------------------------------------------
 
 def test_receiver_merge_and_pending_index_follow_the_engine():

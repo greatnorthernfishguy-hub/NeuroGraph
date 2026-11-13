@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-13] DudeMan CC -- native tick piece 1 (#1221): a miss is driven through Graph._cleanup_predictions
+#   (tests/native_tick_helpers.miss); the Python methods these tests called are ng_tract.PredictionBook's now.
 # [2026-11-05] DudeMan CC (#1212 review M1) — the window test expects no window while a prediction_error handler is registered.
 # [2026-10-08] Claude (lane sprout-1050) — CREATE: #1050 co-firing tally sprouting — equivalence, rules, native == fallback
 # What: (1) keys ABSENT: the branch == the trial tip 4de1166 exactly over the P1 whole-run workload (step, Tonic ticks,
@@ -32,6 +34,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 import neuro_foundation as NF  # noqa: E402  (the branch)
 from tests import test_sleep_p1 as P1  # noqa: E402  (builder, workload, helpers)
+from tests import native_tick_helpers as NTH  # noqa: E402
 
 BASE_REV = os.environ.get("NG_SPROUT_1050_BASE_REV", "4de1166")
 NATIVE = hasattr(NF.ng_tract.SynapseStore, "cofire_tally_update")
@@ -292,16 +295,16 @@ def test_restore_starts_cold(impl, tmp_path):
 def test_surprise_feeds_the_tally_and_sprouts_only_on_repetition_born_as_today(impl):
     g = graph(n=8, sprout_tally_theta=2.4, sprout_tally_horizon_steps=50)
     g.timestep = 100
-    pred = NF.Prediction(source_node_id="n00", target_node_id="n01", strength=0.8, confidence=0.5)
-    g._surprise_exploration(pred, {"n01", "n02", "n03"})          # one violated expectation: no shotgun
+    _p = lambda: NF.Prediction(source_node_id="n00", target_node_id="n01", strength=0.8, confidence=0.5)  # noqa: E731
+    NTH.miss(g, _p(), {"n01", "n02", "n03"})                      # one violated expectation: no shotgun
     assert edges(g) == []
     held = dict(g.cofire_tally_state())
     assert held["n02"][0][0] == "n00" and held["n03"][0][0] == "n00"    # owner = what fired instead, partner = source
     g.timestep = 110
-    g._surprise_exploration(pred, {"n02"})
+    NTH.miss(g, _p(), {"n02"})
     assert edges(g) == []
     g.timestep = 120
-    g._surprise_exploration(pred, {"n02"})                         # third occasion n02 instead of n01
+    NTH.miss(g, _p(), {"n02"})                                     # third occasion n02 instead of n01
     assert edges(g) == [("n00", "n02")]
     s = g._find_synapse("n00", "n02")
     assert s.weight == g.config["surprise_sprouting_weight"]
@@ -315,7 +318,7 @@ def test_surprise_keys_absent_still_sprouts_today(monkeypatch):
     for i in range(4):
         g.create_node(node_id=f"n{i:02d}")
     pred = NF.Prediction(source_node_id="n00", target_node_id="n01", strength=0.8, confidence=0.5)
-    g._surprise_exploration(pred, {"n01", "n02", "n03"})
+    NTH.miss(g, pred, {"n01", "n02", "n03"})
     assert edges(g) == [("n00", "n02"), ("n00", "n03")]
     assert g.cofire_tally_state() == []
 

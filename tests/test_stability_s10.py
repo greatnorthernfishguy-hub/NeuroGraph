@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-13] DudeMan CC -- native tick piece 1 (#1221): a miss is driven through Graph._cleanup_predictions
+#   (tests/native_tick_helpers.miss); the Python methods these tests called are ng_tract.PredictionBook's now.
 # [2026-11-04] DudeMan CC — the with_s9 case removed with S9 itself (LAW 3 dead-end removal; S9 superseded by S10).
 # [2026-10-27] Claude (lane stability-s10, #1136; Josh 2026-10-27 "what's the most similar, conceptually, to how the brain
 #   does it?" / "Yes, go ahead") — S10: the reward is a signed prediction error against expectation, once per step
@@ -24,6 +26,7 @@ import pytest
 from tests import test_hyperedge_store_h2 as H2   # noqa: E402
 from tests import test_stability_s as S            # noqa: E402
 from tests import test_stability_s7b as S7B        # noqa: E402
+from tests import native_tick_helpers as NTH      # noqa: E402
 
 NF = H2.NF
 BASE_REV = os.environ.get("NG_S10_BASE_REV", "7274482")
@@ -108,7 +111,7 @@ def _pred(m, a, b, conf=0.8):
 def test_a_failed_prediction_no_longer_broadcasts_on_its_own():
     g, syn = _graph(NF, True)
     w0 = _w(g, syn)
-    g._on_prediction_error(_pred(NF, "A", "B"), 0.1, {"C"})
+    NTH.miss(g, _pred(NF, "A", "B"), {"C"}, error_penalty=0.1)
     assert _w(g, syn) == w0
     assert g._s10_events == [-0.8]
     # the S9 branch's base broadcasts at once

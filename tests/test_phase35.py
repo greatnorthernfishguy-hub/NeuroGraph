@@ -65,6 +65,14 @@ def build_predictive_graph(**extra_config) -> Graph:
     return Graph(config=config)
 
 
+def _novel_miss(g: Graph, firing) -> None:
+    """[2026-11-13] #1221: one failed prediction A -> (a node that did not fire) with `firing` as the fired window: a
+    novel sequence (A has no learned link into it), logged by the engine's own pass."""
+    from tests import native_tick_helpers as NTH
+    from neuro_foundation import Prediction
+    NTH.miss(g, Prediction(source_node_id="A", target_node_id="not-fired", strength=0.5, confidence=0.5), firing)
+
+
 def checkpoint_and_restore(g: Graph) -> Graph:
     """Serialize and deserialize a Graph through a temp file."""
     path = tempfile.mktemp(suffix=".msgpack")
@@ -369,7 +377,7 @@ class TestPredictionSupportStatePersistence:
     def test_novel_sequence_event_keeps_count_and_sample(self):
         g = build_predictive_graph()
         firing = {f"n{i:05d}" for i in range(5000)}
-        g._log_novel_sequence("A", firing)
+        _novel_miss(g, firing)   # [2026-11-13] #1221: through the engine's own miss pass (the log is the book's)
         e = g._novel_sequence_log[-1]
         assert e["n_firing"] == 5000
         assert e["firing_nodes"] == sorted(firing)[:32]   # the 32 smallest: the same under any hash seed
@@ -378,7 +386,7 @@ class TestPredictionSupportStatePersistence:
     def test_novel_sequence_log_cap_unchanged(self):
         g = build_predictive_graph()
         for _ in range(1001):
-            g._log_novel_sequence("A", ["x"])
+            _novel_miss(g, ["x"])
         assert len(g._novel_sequence_log) == 500
 
     def test_oversized_old_events_are_cut_on_restore(self):

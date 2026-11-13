@@ -55,6 +55,14 @@ ckpt = S.ckpt
 restore_as = S.restore_as
 
 
+@pytest.fixture(autouse=True)
+def _pre_1222_file_shape(monkeypatch):
+    """[2026-11-13] #1221 / #1222: this file compares checkpoint bytes with engines from before #1222 (an open receiver
+    prediction is now saved with its contributors / drive / rho). The older shape is asked for here; #1222 itself is
+    tested in tests/test_native_tick_m1.py."""
+    monkeypatch.setattr(NF.Graph, "_PB_SAVE_RECEIVER_PART", False)
+
+
 def _same_as_base(a, b):
     return D1210.same_ckpt(ckpt(a), ckpt(b))   # tests/d1210_intended.py
 
