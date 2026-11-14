@@ -3,6 +3,16 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- punch #1223: merge the bind's stacked forest<->tree copies
+# What: cc_merge_bind_tree_twins(graph, archive_path): per forest<->tree pair holding several of the bind's own edges,
+#       the smallest-id copy stays with the group's highest weight stepped N-1 times by the bind's soft bound; the
+#       rest are archived (JSON lines) and removed through Graph.remove_synapse. The two birth weights are named
+#       (_CC_BIND_TREE_BIRTH_DOWN / _UP; values unchanged). No new switch: the host runs it at load when
+#       CC_NG_BIND_REINFORCE_EXISTING is on.
+# Why:  5,088 surplus copies on the CC graph (2,060 pairs, up to 48 per pair), written by recurring turns before
+#       #1173's reinforce-on-recurrence was switched on (2026-11-14); prediction learning lands on one copy only.
+#       Josh 2026-11-14: "Just do choice 3" (switch on, no new twins, existing copies merged).
+# How:  plan under the step lock, archive outside it, apply under it with a re-check of every group; idempotent.
 # [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1203 concepts stage 1, #1136 before-live ports; plan
 #   docs/superpowers/plans/2026-11-10-concepts-rust-port.md; Josh 2026-11-10 "Let's do it" on C1 / C2 / C3(a))
 #   What: the concept index's prototypes and search are ng_tract.ConceptIndex: _cc_concept_index rebuilds it,
@@ -4022,6 +4032,8 @@ _CC_HE_REINFORCE_CEILING_DEFAULT = 2.0
 # inhibitory one on the same pair is not reinforced; a new bind synapse is written beside it, as with the switch off).
 _CC_REINFORCE_SITES = frozenset({"tree_synapse"})
 _CC_BIND_TREE_DELAY = 1   # the bind writes forest<->tree synapses with create_synapse's default delay
+_CC_BIND_TREE_BIRTH_DOWN = 0.2    # forest -> tree, the weight the bind gives the edge at birth
+_CC_BIND_TREE_BIRTH_UP = 0.15     # tree -> forest
 
 
 def cc_bind_reinforce_enabled() -> bool:
@@ -4611,6 +4623,105 @@ def _cc_reinforce_synapse(graph, sid, birth_weight, journal, params=None):
     return True
 
 
+_CC_TWIN_ARCHIVE_FIELDS = ("synapse_id", "pre_node_id", "post_node_id", "weight", "peak_weight", "max_weight", "delay",
+                           "creation_time", "last_update_time", "eligibility_trace", "low_weight_steps",
+                           "inactive_steps", "salience")
+
+
+def _cc_twin_row(syn) -> dict:
+    row = {k: getattr(syn, k, None) for k in _CC_TWIN_ARCHIVE_FIELDS}
+    st = getattr(syn, "synapse_type", None)
+    row["synapse_type"] = getattr(st, "name", st)
+    row["metadata"] = dict(getattr(syn, "metadata", None) or {})
+    return row
+
+
+def _cc_bind_tree_twin_groups(graph) -> dict:
+    """(pre, post) -> sorted synapse ids, for every forest<->tree pair that holds MORE THAN ONE of the bind's own
+    edges (EXCITATORY, delay 1). A tree id is its forest id + "::tree::" + the concept, so the pair is recognised by
+    its ids alone; a delayed or inhibitory synapse on the pair is a different edge and is never in a group."""
+    groups = {}
+    for sid, syn in graph.synapses.items():
+        pre, post = syn.pre_node_id, syn.post_node_id
+        if not (post.startswith(pre + "::tree::") or pre.startswith(post + "::tree::")):
+            continue
+        if _cc_is_bind_tree_synapse(syn):
+            groups.setdefault((pre, post), []).append(sid)
+    return {k: sorted(v) for k, v in groups.items() if len(v) > 1}
+
+
+def cc_merge_bind_tree_twins(graph, archive_path=None, params=None) -> dict:
+    """#1223 (2026-11-14, Josh "Just do choice 3"): merge the parallel forest<->tree synapses the bind stacked before
+    reinforce-on-recurrence (#1173) was switched on, as that switch would have left them: ONE edge per pair.
+
+    Per pair with N copies: the copy find_synapse_id returns (the smallest id, the one a later recurrence reinforces)
+    stays; its weight becomes the group's HIGHEST weight (nothing learned is lost) stepped N-1 times by the bind's own
+    soft bound (_cc_soft_bound_step: eta, ceiling = ceiling_factor x the birth weight of that direction, never above
+    max_weight; a weight already above the ceiling is left as it is); peak_weight follows, and it takes the group's
+    largest eligibility trace (credit not yet committed). The other N-1 copies are
+    removed through Graph.remove_synapse (indices, confirmation history and pred_weights stay consistent).
+
+    Nothing is discarded: before the first change every copy's full record, and the kept copy's new weight, is appended
+    to `archive_path` (JSON lines, fsync). No archive path = no merge (returns the count only: a dry run). A group
+    that changed between the read and the write is left alone and counted in "skipped". Idempotent: a graph without
+    such groups is not touched. The removals are operator removals: the save guard (#1051) sees them as unexplained,
+    which they are; 1.5 % on the CC graph of 2026-11-14 is inside its 2 % floor tolerance.
+
+    Returns {"pairs", "surplus", "removed", "merged_pairs", "skipped", "largest", "archive"}."""
+    import json as _json
+    p = params or cc_bind_reinforce_params(graph)
+    plan = []
+    with _cc_mutation_lock(graph):
+        for (pre, post), sids in sorted(_cc_bind_tree_twin_groups(graph).items()):
+            syns = [graph.synapses[s] for s in sids]
+            kept = syns[0]
+            birth = _CC_BIND_TREE_BIRTH_DOWN if post.startswith(pre + "::tree::") else _CC_BIND_TREE_BIRTH_UP
+            ceiling = min(p["ceiling_factor"] * birth, float(kept.max_weight))
+            w = max(float(x.weight) for x in syns)
+            for _ in range(len(sids) - 1):
+                w = _cc_soft_bound_step(w, p["eta"], ceiling)
+            w = max(0.0, min(w, float(kept.max_weight)))
+            peak = max(max(float(x.peak_weight) for x in syns), w)
+            # review 2026-11-14 (minor 3): credit not yet committed (the eligibility trace) moves to the survivor too
+            trace = max((float(getattr(x, "eligibility_trace", 0.0) or 0.0) for x in syns), key=abs)
+            plan.append({"pre": pre, "post": post, "keep": sids[0], "remove": sids[1:], "new_weight": w,
+                         "new_peak_weight": peak, "new_eligibility_trace": trace,
+                         "copies": [_cc_twin_row(x) for x in syns]})
+    out = {"pairs": len(plan), "surplus": sum(len(g["remove"]) for g in plan), "removed": 0, "merged_pairs": 0,
+           "skipped": 0, "largest": max((len(g["copies"]) for g in plan), default=0), "archive": archive_path}
+    if not plan or not archive_path:
+        return out
+    with open(archive_path, "a", encoding="utf-8") as f:       # outside the lock: no file I/O under the step lock
+        for g in plan:
+            f.write(_json.dumps(g, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    with _cc_mutation_lock(graph):
+        for g in plan:
+            ids = [g["keep"], *g["remove"]]
+            now = [graph.synapses.get(s) for s in ids]
+            # review 2026-11-14 (minor 1): compared as written (JSON text), so a NaN field equals itself
+            if any(x is None for x in now) or (_json.dumps([_cc_twin_row(x) for x in now], sort_keys=True)
+                                               != _json.dumps(g["copies"], sort_keys=True)):
+                out["skipped"] += 1
+                continue
+            # review 2026-11-14 (minor 2): the copies go first, the survivor's weight last; a failure in between leaves
+            # fewer copies and an UNSTEPPED weight, so the next load steps too little, never twice
+            for sid in g["remove"]:
+                graph.remove_synapse(sid)
+                out["removed"] += 1
+            kept = now[0]
+            kept.weight = g["new_weight"]
+            kept.peak_weight = g["new_peak_weight"]
+            kept.eligibility_trace = g["new_eligibility_trace"]
+            try:
+                graph._dirty_synapses.add(g["keep"])
+            except Exception:  # noqa: BLE001 -- dirty tracking is an incremental-save optimisation; the weight is written
+                pass
+            out["merged_pairs"] += 1
+    return out
+
+
 def _cc_reinforce_hyperedge(graph, hid, journal, params=None):
     """Reinforce the EXISTING same-member hyperedge `hid`: the recurrence is the whole bound set occurring together
     again, so every member's weight takes a soft-bound step, w += he_eta * (he_ceiling - w) (he_eta defaults to
@@ -4716,8 +4827,8 @@ def _cc_bind_conversational_topology(graph, forest_id, result, forest_embedding,
         status["has_trees"] = bool(tree_ids)
         status["has_windows"] = bool(window_ids)
         for tid in tree_ids:
-            _syn("tree_synapse", forest_id, tid, 0.2)
-            _syn("tree_synapse", tid, forest_id, 0.15)
+            _syn("tree_synapse", forest_id, tid, _CC_BIND_TREE_BIRTH_DOWN)
+            _syn("tree_synapse", tid, forest_id, _CC_BIND_TREE_BIRTH_UP)
             status["tree_pairs"] += 1
         for wid in window_ids:
             _syn("window_synapse", forest_id, wid, 0.2)
