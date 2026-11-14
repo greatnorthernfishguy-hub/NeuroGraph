@@ -1,3 +1,7 @@
+# [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221 / #1223)
+# What: the base engine resolves a twin-synapse pair to the lowest row, like the branch (autouse fixture).
+# Why:  seed 4 builds a twin pair; the base picked one by str hash order, so the whole-run compare differed.
+# How:  monkeypatch BASE.Graph._find_synapse -> SynapseStore.find_first, as tests/test_surprise_slot.py does.
 # [2026-10-06] Claude (lane sleep-p1) — D15 (sleep-phase spec): the BASE engine gets D15's one named intended change
 #   (tests/d15_intended.apply_d15_rule: drop pre.pred_weights[post] with the last pre->post synapse) so this file keeps checking
 #   everything else bitwise; with D15 switched off the file passes unchanged (SLEEP_P1.md §6).
@@ -261,6 +265,18 @@ def test_built_graph_bytes(seed, mode):
 # ---------------------------------------------------------------------------
 # 2. whole runs: every flag combination, OFF and ON against the trial tip
 # ---------------------------------------------------------------------------
+
+def _find_first(self, pre_id, post_id):
+    sid = self.synapses.find_first(pre_id, post_id)
+    return self.synapses.get(sid) if sid is not None else None
+
+
+@pytest.fixture(autouse=True)
+def _twin_rule_levelled(monkeypatch):
+    # [2026-11-13] #1221 / #1223: a pair of nodes joined by two synapses resolves to the lowest row now; the base
+    # walked a set of ids (the process's str hash order). The base gets the same rule; all else must stay equal.
+    monkeypatch.setattr(BASE.Graph, "_find_synapse", _find_first)
+
 
 @pytest.mark.parametrize("flags", list(FLAGS))
 @pytest.mark.parametrize("seed", SEEDS)

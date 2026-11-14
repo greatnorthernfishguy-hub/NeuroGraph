@@ -153,7 +153,8 @@ def build_graph(nf, seed, n_want=6, n_plain=40, n_syn=600, tonic_ages=False, ext
         syn.salience = rng.choice(_SALIENCE)
         syn.creation_time = float(TIMESTEP - rng.choice(_AGE))
         if rng.random() < 0.2:
-            g._synapse_confirmation_history.setdefault(syn.synapse_id, collections.deque([True, False, True], maxlen=10))
+            if syn.synapse_id not in g._synapse_confirmation_history:   # [2026-11-13] #1221: a view of the Rust book
+                g._synapse_confirmation_history[syn.synapse_id] = collections.deque([True, False, True], maxlen=10)
     g._dirty_synapses.update(g.synapses.keys())
     return g, {"rim": rim, "wants": wants, "plain": plain, "leaves": leaves}
 
