@@ -118,3 +118,36 @@ def test_after_the_merge_a_recurrence_with_the_switch_on_reinforces_the_one_edge
     st = B._bind(g, {})
     (one,) = B._pairs(g)[(F, T[0])]
     assert st["reinforced_synapses"] == 4 and one.weight == pytest.approx(w + 0.2 * (0.6 - w))
+
+
+# ---- review 2026-11-14 (Grok 4.7, minors 1, 3, 4) ----
+
+def test_an_inhibitory_synapse_on_the_pair_is_never_grouped(tmp_path):
+    from neuro_foundation import SynapseType
+    g = _stacked(1)
+    a = g.create_synapse(F, T[0], weight=0.3, synapse_type=SynapseType.INHIBITORY)
+    b = g.create_synapse(F, T[0], weight=0.3, synapse_type=SynapseType.INHIBITORY)
+    r = O.cc_merge_bind_tree_twins(g, str(tmp_path / "a.jsonl"))
+    assert r["pairs"] == 0 and {a.synapse_id, b.synapse_id} <= set(g.synapses.keys())
+
+
+def test_a_nan_field_does_not_block_the_merge_and_the_largest_trace_moves_to_the_survivor(tmp_path):
+    g = _stacked(3)
+    a = sorted(B._pairs(g)[(F, T[0])], key=lambda s: s.synapse_id)
+    a[1].eligibility_trace = float("nan")
+    b = sorted(B._pairs(g)[(F, T[1])], key=lambda s: s.synapse_id)
+    b[2].eligibility_trace = -0.8
+    b[1].eligibility_trace = 0.3
+    r = O.cc_merge_bind_tree_twins(g, str(tmp_path / "a.jsonl"))
+    assert r["skipped"] == 0 and r["removed"] == 8
+    assert B._pairs(g)[(F, T[1])][0].eligibility_trace == -0.8
+
+
+def test_an_existing_confirmation_history_of_a_removed_copy_goes_with_it(tmp_path):
+    import collections
+    g = _stacked(2)
+    keep, gone = sorted(s.synapse_id for s in B._pairs(g)[(F, T[0])])
+    g._synapse_confirmation_history[keep] = collections.deque([True], maxlen=10)
+    g._synapse_confirmation_history[gone] = collections.deque([False], maxlen=10)
+    O.cc_merge_bind_tree_twins(g, str(tmp_path / "a.jsonl"))
+    assert keep in g._synapse_confirmation_history and gone not in g._synapse_confirmation_history

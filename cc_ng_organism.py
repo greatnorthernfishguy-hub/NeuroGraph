@@ -4657,7 +4657,8 @@ def cc_merge_bind_tree_twins(graph, archive_path=None, params=None) -> dict:
     Per pair with N copies: the copy find_synapse_id returns (the smallest id, the one a later recurrence reinforces)
     stays; its weight becomes the group's HIGHEST weight (nothing learned is lost) stepped N-1 times by the bind's own
     soft bound (_cc_soft_bound_step: eta, ceiling = ceiling_factor x the birth weight of that direction, never above
-    max_weight; a weight already above the ceiling is left as it is); peak_weight follows. The other N-1 copies are
+    max_weight; a weight already above the ceiling is left as it is); peak_weight follows, and it takes the group's
+    largest eligibility trace (credit not yet committed). The other N-1 copies are
     removed through Graph.remove_synapse (indices, confirmation history and pred_weights stay consistent).
 
     Nothing is discarded: before the first change every copy's full record, and the kept copy's new weight, is appended
@@ -4681,8 +4682,11 @@ def cc_merge_bind_tree_twins(graph, archive_path=None, params=None) -> dict:
                 w = _cc_soft_bound_step(w, p["eta"], ceiling)
             w = max(0.0, min(w, float(kept.max_weight)))
             peak = max(max(float(x.peak_weight) for x in syns), w)
+            # review 2026-11-14 (minor 3): credit not yet committed (the eligibility trace) moves to the survivor too
+            trace = max((float(getattr(x, "eligibility_trace", 0.0) or 0.0) for x in syns), key=abs)
             plan.append({"pre": pre, "post": post, "keep": sids[0], "remove": sids[1:], "new_weight": w,
-                         "new_peak_weight": peak, "copies": [_cc_twin_row(x) for x in syns]})
+                         "new_peak_weight": peak, "new_eligibility_trace": trace,
+                         "copies": [_cc_twin_row(x) for x in syns]})
     out = {"pairs": len(plan), "surplus": sum(len(g["remove"]) for g in plan), "removed": 0, "merged_pairs": 0,
            "skipped": 0, "largest": max((len(g["copies"]) for g in plan), default=0), "archive": archive_path}
     if not plan or not archive_path:
@@ -4696,19 +4700,24 @@ def cc_merge_bind_tree_twins(graph, archive_path=None, params=None) -> dict:
         for g in plan:
             ids = [g["keep"], *g["remove"]]
             now = [graph.synapses.get(s) for s in ids]
-            if any(x is None for x in now) or [_cc_twin_row(x) for x in now] != g["copies"]:
+            # review 2026-11-14 (minor 1): compared as written (JSON text), so a NaN field equals itself
+            if any(x is None for x in now) or (_json.dumps([_cc_twin_row(x) for x in now], sort_keys=True)
+                                               != _json.dumps(g["copies"], sort_keys=True)):
                 out["skipped"] += 1
                 continue
+            # review 2026-11-14 (minor 2): the copies go first, the survivor's weight last; a failure in between leaves
+            # fewer copies and an UNSTEPPED weight, so the next load steps too little, never twice
+            for sid in g["remove"]:
+                graph.remove_synapse(sid)
+                out["removed"] += 1
             kept = now[0]
             kept.weight = g["new_weight"]
             kept.peak_weight = g["new_peak_weight"]
+            kept.eligibility_trace = g["new_eligibility_trace"]
             try:
                 graph._dirty_synapses.add(g["keep"])
             except Exception:  # noqa: BLE001 -- dirty tracking is an incremental-save optimisation; the weight is written
                 pass
-            for sid in g["remove"]:
-                graph.remove_synapse(sid)
-                out["removed"] += 1
             out["merged_pairs"] += 1
     return out
 
