@@ -244,3 +244,47 @@ def test_host_reader_queries_equal_the_python_loops(seed):
         fired = [nid for nid, spikes in g._recent_spikes.items() if spikes and spikes[-1] == g.timestep]
         assert g._pb.spikes_last_append_at(int(g.timestep)) == fired
     assert seen > 0
+
+
+# ---------------------------------------------------------------------------
+# (7) [2026-11-14] review (Grok 4.7): a restored receiver prediction MISSES as a receiver prediction
+# ---------------------------------------------------------------------------
+
+@S18.needs_recv
+@pytest.mark.parametrize("seed", [0, 1])
+def test_a_restored_receiver_prediction_misses_as_one(monkeypatch, seed):
+    """Saved with its receiver part (#1222), restored, then left to expire: the restored graph must end where the
+    graph that was never saved ends (a source-side miss would sprout and skip the receiver record)."""
+    monkeypatch.setattr(NF.Graph, "_PB_SAVE_RECEIVER_PART", True)
+    g = S18.restore_as(NF, "native", H2.built(seed))
+    g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
+    rng = random.Random(seed + 7)
+    for _ in range(14):
+        for nid in rng.sample(list(g.nodes.keys()), 8):
+            g.stimulate(nid, 2.5)
+        g.step()
+        if sum(1 for p in g.active_predictions.values() if p.contributors) >= 2:
+            break
+    open_recv = [pid for pid, p in g.active_predictions.items() if p.contributors]
+    assert open_recv, "the run produced no open receiver prediction"
+    g2 = S18.restore_as(NF, "native", S18.ckpt(g))
+    g2.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
+    g1 = S18.restore_as(NF, "native", S18.ckpt(g))          # the same file again: restore is deterministic
+    g1.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
+    errs0 = g2._total_predictions_errors
+    quiet = lambda gg: P1.seeded(seed, lambda rng: [gg.step() for _ in range(int(gg.config["prediction_window"]) + 3)],
+                                 uuid_stream=1)
+    quiet(g2)
+    quiet(g1)
+    assert not set(open_recv) & set(g2.active_predictions.keys())            # they resolved
+    assert g2._total_predictions_errors > errs0
+    assert S18.ckpt(g1) == S18.ckpt(g2)
+    # the same file read as a file without the receiver part ends somewhere else: the part is what made the difference
+    monkeypatch.setattr(NF.Graph, "_PB_SAVE_RECEIVER_PART", False)
+    old_shape = S18.ckpt(g)
+    monkeypatch.setattr(NF.Graph, "_PB_SAVE_RECEIVER_PART", True)
+    g3 = S18.restore_as(NF, "native", old_shape)
+    g3.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
+    assert not any(p.contributors for p in g3.active_predictions.values())
+    quiet(g3)
+    assert S18.ckpt(g3) != S18.ckpt(g2)
