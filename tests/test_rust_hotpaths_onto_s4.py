@@ -1,3 +1,7 @@
+# [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221)
+# What: where a test hides the store's native batch methods (HideNative), the prediction book gets the real store.
+# Why:  ng_tract.PredictionBook is Rust with no Python path, so it cannot take a Python proxy of the store.
+# How:  hide_native(g) wraps g._pb in RealStoreForBook, which swaps the proxy for the store it wraps on each call.
 # [2026-11-09] DudeMan CC (Claude Opus 5.5, laptop; test repair #1217; Josh 2026-11-09 "Yes, please") -- the checkpoint
 #   compares go through tests/d1210_intended.same_ckpt: since #1210 / #1210b (2026-11-04) the base 5246b63's checkpoint
 #   differed in exactly the novel-sequence / error-outcome id lists, so 48 of these tests failed and checked nothing.
@@ -132,10 +136,39 @@ class DetUUID:
         return uuid.UUID(int=self.rng.getrandbits(128), version=4)
 
 
+class RealStoreForBook:
+    """[2026-11-13, #1221] The prediction book is Rust and takes the store itself: hand it the store under the proxy."""
+
+    def __init__(self, book):
+        object.__setattr__(self, "_b", book)
+
+    def __getattr__(self, name):
+        attr = getattr(self._b, name)
+        if not callable(attr):
+            return attr
+
+        def call(*a, **k):
+            return attr(*[x._s if isinstance(x, HideNative) else x for x in a],
+                        **{n: (x._s if isinstance(x, HideNative) else x) for n, x in k.items()})
+        return call
+
+    def __len__(self):
+        return len(self._b)
+
+    def __contains__(self, k):
+        return k in self._b
+
+
+def hide_native(g):
+    g.synapses = HideNative(g.synapses)
+    if hasattr(g, "_pb"):
+        g._pb = RealStoreForBook(g._pb)
+
+
 def run_one(mod, base_bytes, action, seed, fallback=False, keep=False):
     g = restore(mod, base_bytes)
     if fallback:
-        g.synapses = HideNative(g.synapses)
+        hide_native(g)
     saved = uuid.uuid4
     uuid.uuid4 = DetUUID(seed)
     random.seed(seed)
@@ -511,7 +544,7 @@ def test_tonic_features_site(seed, fallback):
     fake = types.SimpleNamespace(_graph=g, _identity_embedding_tensor=lambda: zero)
     fa = base_fn(fake)
     if fallback:
-        g.synapses = HideNative(g.synapses)
+        hide_native(g)
     fb = tonic_engine.TonicEngine._extract_graph_features_for_model(fake)
     for f in fa.__dataclass_fields__:
         va, vb = getattr(fa, f), getattr(fb, f)

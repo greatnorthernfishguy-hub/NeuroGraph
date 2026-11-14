@@ -6,6 +6,10 @@
 # [2026-10-04] Claude (lane vdb-lock-leak) — VectorFake carries a _lock: the transplanted
 #   SimpleVectorDB methods now take the store's own leaf RLock (#270). Assertions unchanged.
 # How: AST extraction; detached mutable payloads, independent msgpack decoding, barriers.
+# [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221)
+# What: the fake graph of test_actual_propagation_cannot_prime_during_capture carries an empty prediction book (_pb).
+# Why:  prime_and_propagate reads the open predictions' targets from ng_tract.PredictionBook now.
+# How:  a two-method stand-in (targets, spike_append); the lock assertion is unchanged.
 # -------------------
 import ast
 import copy
@@ -159,7 +163,7 @@ def test_actual_propagation_cannot_prime_during_capture(write_mode):
     module=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),fn],type_ignores=[])
     exec(compile(ast.fix_missing_locations(module),'prime_under_test','exec'),ns)
     node=SimpleNamespace(voltage=0.,resting_potential=0.,refractory_remaining=0,intrinsic_excitability=1)
-    graph=SimpleNamespace(_step_lock=threading.RLock(),nodes={'n':node},hyperedges={},active_predictions={},_active_predictions={},timestep=0,config={'decay_rate':.9,'he_experience_threshold':1})
+    graph=SimpleNamespace(_step_lock=threading.RLock(),nodes={'n':node},hyperedges={},active_predictions={},_active_predictions={},_pb=SimpleNamespace(targets=lambda *a:[],spike_append=lambda *a:None),timestep=0,config={'decay_rate':.9,'he_experience_threshold':1})
     entered=threading.Event();done=threading.Event();errors=[]
     def prime():
         entered.set()
