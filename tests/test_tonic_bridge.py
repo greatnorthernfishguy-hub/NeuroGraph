@@ -3,6 +3,8 @@
 # Never instantiates NeuroGraphMemory against live checkpoints.
 #
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (#1221): the mock memory's graph carries a
+#   real ng_tract.PredictionBook holding the test's predictions, because _curiosity_signal now asks the book.
 # [2026-05-15] Claude (Sonnet 4.6) — Task 1: test scaffold
 # What: Test file for TonicBridge + Spec A Python-side helpers.
 # Why:  New code requires test coverage before implementation.
@@ -183,6 +185,11 @@ class TestTonicBridge(unittest.TestCase):
                           hyperedges=None, vector_db=None, in_conversation=False):
         mem = MagicMock()
         mem.graph.active_predictions = active_predictions or {}
+        # [2026-11-14] #1221: TonicBridge._curiosity_signal asks the Rust book; the mock graph carries a real one
+        import ng_tract as _ngt
+        mem.graph._pb = _ngt.PredictionBook()
+        for _pid, _p in (active_predictions or {}).items():
+            mem.graph._pb.insert(_pid, _p.source_node_id, _p.target_node_id, 0.5, float(_p.confidence), 0, 10)
         mem.graph.nodes = nodes or {}
         mem.graph.hyperedges = hyperedges or {}
         mem.vector_db = vector_db or {}

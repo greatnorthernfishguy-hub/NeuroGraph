@@ -145,11 +145,12 @@ def test_restore_mid_flight_equals_the_preport_engine(seed):
     t.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON)))
     S.drive(t, random.Random(seed), 12)
     mid_a, mid_b = S18.ckpt(t.a.g), S18.ckpt(t.b.g)
-    assert mid_a == mid_b and len(t.b.g.active_predictions) > 0
+    assert mid_a == mid_b            # [2026-11-14] open predictions at the midpoint depend on the hash seed: not required
     t2 = S.Pair(S18.restore_as(PRE, "native", mid_a), S18.restore_as(NF, "native", mid_b), seed + 50)
     t2.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON)))
     S.drive(t2, random.Random(seed + 50), 12, sleep_every=True)
     assert S18.ckpt(t2.a.g) == S18.ckpt(t2.b.g)
+    assert t2.b.g._total_predictions_made > 0                                        # not vacuous
 
 
 # ---------------------------------------------------------------------------
@@ -208,3 +209,38 @@ def test_receiver_merge_and_pending_index_follow_the_engine():
     assert b.contributors("p1") == p1.contributors and rest[2:] == (True, 0.3, 0.2)
     assert not b.receiver_merge("p0", [], 1.0, 1.0) and not b.receiver_merge("nope", [], 1.0, 1.0)
     assert b.targets() == ["T", "U", "T"] and b.targets(True) == ["T", "T"] and len(b) == 3
+
+
+# ---------------------------------------------------------------------------
+# (6) [2026-11-14] the host readers' queries equal the loops they replaced
+# ---------------------------------------------------------------------------
+
+@S18.needs_recv
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_host_reader_queries_equal_the_python_loops(seed):
+    g = S18.restore_as(NF, "native", H2.built(seed))
+    g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
+    rng = random.Random(seed)
+    seen = 0
+    for _ in range(14):
+        for nid in rng.sample(list(g.nodes.keys()), 8):
+            g.stimulate(nid, 2.5)
+        g.step()
+        preds = list(g.active_predictions.values())
+        seen += len(preds)
+        confs = sorted({p.confidence for p in preds})
+        for thr in [0.0, 0.6] + confs[:2] + confs[-1:]:
+            for n in (1, 3, 1000):
+                want = sorted((p for p in preds if p.confidence > thr), key=lambda p: p.confidence, reverse=True)[:n]
+                got = g._pb.top_by_confidence(n, thr)
+                assert [r[0][0] for r in got] == [p.prediction_id for p in want]
+                assert [NF._pb_prediction(g._pb, r).source_node_id for r in got] == [p.source_node_id for p in want]
+        for nid in {p.target_node_id for p in preds} | {"nobody"}:
+            t = 0.0
+            for p in preds:
+                if p.target_node_id == nid:
+                    t += p.confidence
+            assert g._pb.confidence_on(nid) == t
+        fired = [nid for nid, spikes in g._recent_spikes.items() if spikes and spikes[-1] == g.timestep]
+        assert g._pb.spikes_last_append_at(int(g.timestep)) == fired
+    assert seen > 0

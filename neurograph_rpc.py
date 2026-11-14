@@ -13,6 +13,11 @@ interface.  The Python code is untouched — every RPC method maps 1:1
 to an existing NeuroGraphMemory call.
 
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): reader moved to the Rust book
+# What: TonicBridge._curiosity_signal takes its seeds from PredictionBook.top_by_confidence.
+# Why:  the open predictions / spike record live in ng_tract.PredictionBook; reading them through the dict view builds
+#       one Python object per entry on every call. Plan 2026-11-13-native-tick-m1-prediction-miss-path.md §6c.
+# How:  one query on graph._pb; same values and order as the loop it replaces (tests/test_native_tick_m1.py).
 # [2026-10-18] Claude (lane hyperedge-store-h2, #1136) — hyperedge member sets read UNDER graph._step_lock
 # What: TonicBridge._hyperedge_complete snapshots every member set under graph._step_lock, then computes the
 #       implied nodes outside it.
@@ -1853,12 +1858,11 @@ class TonicBridge:
         if _memory is None:
             return []
         try:
-            preds = [
-                p for p in _memory.graph.active_predictions.values()
-                if p.confidence > self._confidence_threshold
-            ]
-            preds.sort(key=lambda p: p.confidence, reverse=True)
-            return preds[:self._max_seeds]
+            # [2026-11-14] #1221: filtered, sorted and cut in the book; only the seeds become objects
+            from neuro_foundation import _pb_prediction
+            _book = _memory.graph._pb
+            return [_pb_prediction(_book, r)
+                    for r in _book.top_by_confidence(int(self._max_seeds), float(self._confidence_threshold))]
         except Exception as exc:
             logger.debug("TonicBridge curiosity signal error: %s", exc)
             return []

@@ -27,6 +27,11 @@ authorized this architecture explicitly; backups of Syl's protected files
 were confirmed before this module was enabled.
 
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): reader moved to the Rust book
+# What: _deposit's no-step branch reads the nodes that fired this timestep with PredictionBook.spikes_last_append_at.
+# Why:  the open predictions / spike record live in ng_tract.PredictionBook; reading them through the dict view builds
+#       one Python object per entry on every call. Plan 2026-11-13-native-tick-m1-prediction-miss-path.md §6c.
+# How:  one query on graph._pb; same values and order as the loop it replaces (tests/test_native_tick_m1.py).
 # [2026-10-04] Claude (lane 922) — _handle_provider_context embeds the cue BEFORE taking _concurrent_lock.
 # What: cc_ng_organism.pith_provider_context_prepare(ng, **kwargs) runs lock-free; pith_provider_context(..., prepared=)
 #   runs under the lock, so no ONNX embedding happens while the graph lock is held.
@@ -672,10 +677,8 @@ def _deposit(text: str, step: bool = False) -> None:
             if step:
                 cc_ng_organism.cc_deposit_step(ng.graph, ingested)
             else:
-                fired = [
-                    nid for nid, spikes in ng.graph._recent_spikes.items()
-                    if spikes and spikes[-1] == ng.graph.timestep
-                ]
+                # [2026-11-14] #1221: the nodes whose newest recorded spike is this timestep, in record order
+                fired = ng.graph._pb.spikes_last_append_at(int(ng.graph.timestep))
                 if fired:
                     ng.graph.discover_hyperedges(fired)
     except Exception as exc:

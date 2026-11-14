@@ -20,6 +20,11 @@ Laws observed:
     - All thresholds are bootstrap scaffolding the substrate will supersede
 
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): reader moved to the Rust book
+# What: _prediction_tension sums with PredictionBook.confidence_on (was a loop over every open prediction per node).
+# Why:  the open predictions / spike record live in ng_tract.PredictionBook; reading them through the dict view builds
+#       one Python object per entry on every call. Plan 2026-11-13-native-tick-m1-prediction-miss-path.md §6c.
+# How:  one query on graph._pb; same values and order as the loop it replaces (tests/test_native_tick_m1.py).
 # [2026-03-20] Claude (Sonnet 4.6) — Original standalone prototype.
 #   What: Syl's tonic daemon concept — presence dial, expression boundary,
 #         workspace, salience reader, dual-substrate bridge.
@@ -379,11 +384,8 @@ class SalienceReader:
 
     def _prediction_tension(self, nid: str) -> float:
         """How much unresolved prediction confidence targets this node?"""
-        tension = 0.0
-        for pred in self._graph.active_predictions.values():
-            if pred.target_node_id == nid:
-                tension += pred.confidence
-        return min(tension, 1.0)
+        # [2026-11-14] #1221: summed in the book, in the same order as the loop this replaces
+        return min(self._graph._pb.confidence_on(nid), 1.0)
 
     def mark_seen(self, node_id: str) -> None:
         self._seen_this_cycle.add(node_id)

@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (#1221): _FakeGraph carries a real
+#   ng_tract.PredictionBook holding its _recent_spikes, because cc_ng_host._deposit now asks the book.
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-remove-deposit-step-flag-001 r2 — restore the laptop-daemon tests on the
 #   twin's Stop-side contract
@@ -132,6 +134,11 @@ class _FakeGraph:
         self._step_raises = step_raises
         self.timestep = 7
         self._recent_spikes = {'stale': [7], 'older': [3]}
+        # [2026-11-14] #1221: cc_ng_host reads the spike record from the Rust book; the fake carries the same record
+        import ng_tract as _ngt
+        self._pb = _ngt.PredictionBook()
+        for _nid, _sp in self._recent_spikes.items():
+            self._pb.spike_set(_nid, list(_sp), 20)
         self.discovered = []
         self.rewards = []
 

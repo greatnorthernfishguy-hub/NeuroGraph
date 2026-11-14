@@ -3,6 +3,11 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): reader moved to the Rust book
+# What: generate_emergent_want takes its seeds from PredictionBook.top_by_confidence.
+# Why:  the open predictions / spike record live in ng_tract.PredictionBook; reading them through the dict view builds
+#       one Python object per entry on every call. Plan 2026-11-13-native-tick-m1-prediction-miss-path.md §6c.
+# How:  one query on graph._pb; same values and order as the loop it replaces (tests/test_native_tick_m1.py).
 # [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- punch #1223: merge the bind's stacked forest<->tree copies
 # What: cc_merge_bind_tree_twins(graph, archive_path): per forest<->tree pair holding several of the bind's own edges,
 #       the smallest-id copy stays with the group's highest weight stepped N-1 times by the bind's soft bound; the
@@ -3384,14 +3389,12 @@ def generate_emergent_want(
     if graph is None:
         return None
     try:
-        preds = [
-            p for p in graph.active_predictions.values()
-            if p.confidence > confidence_threshold
-        ]
-        if not preds:
+        # [2026-11-14] #1221: filtered, sorted and cut in the book; only the seeds become objects
+        from neuro_foundation import _pb_prediction
+        _book = graph._pb
+        seeds = [_pb_prediction(_book, r) for r in _book.top_by_confidence(int(max_seeds), float(confidence_threshold))]
+        if not seeds:
             return None
-        preds.sort(key=lambda p: p.confidence, reverse=True)
-        seeds = preds[:max_seeds]
 
         # Read-only attractor settle -- write_mode=False is MANDATORY, this
         # is observation, never a graph mutation (matches TonicBridge exactly).
