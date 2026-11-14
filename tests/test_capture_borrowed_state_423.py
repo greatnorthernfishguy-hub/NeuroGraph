@@ -1,5 +1,7 @@
 """Detached canonical serializers preserve learned and temporal state without Graph startup."""
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC — #1221 review minors: the dead _serialize_prediction is gone from the engine; the method
+#   list names its successor _serialize_prediction_row.
 # [2026-09-11] Codex — audit #423 borrowed-state detachment in every checkpoint mode.
 # What: Mutate nested/shared live state after capture; compare against legacy deep copy.
 # Why: Removing the expensive outer deepcopy must not leave snapshot aliases behind.
@@ -19,7 +21,7 @@ import pytest
 
 SOURCE = Path(__file__).parents[1] / 'neuro_foundation.py'
 METHODS = {'capture_checkpoint', '_serialize_full', '_serialize_incremental',
-           '_serialize_node', '_serialize_hyperedge', '_serialize_prediction',
+           '_serialize_node', '_serialize_hyperedge', '_serialize_prediction_row',
            '_serialize_prediction_state', 'write_checkpoint'}
 
 

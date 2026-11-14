@@ -1,3 +1,13 @@
+# [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) — #1221 review minors (Grok 4.7, plan §6f; Josh 2026-11-14 "2 Proceed")
+# What: the dead _serialize_prediction is gone (_serialize_prediction_row is the one writer); _NovelLogView.append keeps
+#   the engine's 1000 -> 500 cap; two comments and one docstring that still called the spike record a Python container
+#   are corrected; _pb_insert's docstring states that a hand-built receiver prediction's drive / rho of None is stored
+#   as 0.0 (the book holds plain floats). Declared, not changed (plan §6f): the fired-id lists of prediction_error /
+#   novel_sequence / surprise_sprouted events are in sorted order (the old engine gave the process's set order, which
+#   changed on every restart; Josh "1 Sure, declare it"); an outcome's snapshot prediction has no receiver part; the
+#   book takes the expired set up front, so a prediction_error handler that changes ANOTHER expired prediction during
+#   the pass can get KeyError (no host handler does); S10 / S13 rows reach _s10_events at the end of the pass.
+# Why: plan docs/superpowers/plans/2026-11-13-native-tick-m1-prediction-miss-path.md §6f. How: tests/test_native_tick_m1.py.
 # [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) — native tick piece 1 (punch #1221; Josh 2026-11-13 "I see no
 #   problems with moving to one native Rust tick." / "1 Proceed"): the prediction engine's working state and its
 #   confirm / miss handling are ng_tract.PredictionBook.
@@ -1870,7 +1880,8 @@ def _pb_prediction(book, row) -> "Prediction":
 def _pb_insert(book, pid: str, p: "Prediction", keep_source: bool = True) -> str:
     """`active_predictions[pid] = p`. A receiver prediction (contributors not None) goes in with its merge input when
     it has one (the shares are then the book's own, equal to _receiver_set_contributors'), else with its contributors
-    list as given. Returns the source stored."""
+    list as given. Returns the source stored. The book holds drive and rho as plain floats: None (only a hand-built
+    receiver prediction has it; the engine and the restore always set both) is stored as 0.0 and reads back as 0.0."""
     recv = shares = None
     if p.contributors is not None:
         raw = p.contributors_raw
@@ -2149,12 +2160,22 @@ class _NovelLogView:
     def __eq__(self, other):
         return self._all() == list(other)
 
-    def append(self, e):
+    def _push(self, e):
         self._b.novel_push_restored(e["source"], list(e["firing_nodes"]), e.get("n_firing"), int(e["timestep"]))
 
+    def append(self, e):
+        """One more event, with the engine's cap: past 1000 entries the newest 500 are kept."""
+        self._push(e)
+        if self._b.novel_len() > 1000:
+            keep = self._all()[-500:]
+            self._b.novel_clear()
+            for k in keep:
+                self._push(k)
+
     def extend(self, events):
+        """The restore's path (the setter): whatever the file held, uncapped, as the old assignment was."""
         for e in events:
-            self.append(e)
+            self._push(e)
 
     def clear(self):
         self._b.novel_clear()
@@ -4307,7 +4328,8 @@ class Graph:
                 self._steps_since_last_fire += 1
 
             # 4. Reset fired nodes and set refractory
-            #    [2026-10-06] P2a: the native pass does the node writes; _recent_spikes stays Python (P3)
+            #    [2026-10-06] P2a: the native pass does the node writes ([2026-11-13] #1221: the spike record is the
+            #    book's, appended just below)
             _native = getattr(self.nodes, "fire", None)
             if _native is not None and (_native(fired_ids, self.timestep, _delta_Ca if _delta_Ca else None)
                                         if _ca5 is None else
@@ -6949,8 +6971,8 @@ class Graph:
         every column the sleep reads: weight, salience, low_weight_steps, peak, trace, creation time, metadata stamps,
         endpoints), every node's metadata contents (copied dicts: the protection flags and the fair-chance counters the
         orphan sweep reads), the native node store's checkpoint bytes when it is on, and C-level shallow copies of the
-        small maps (hyperedge membership, recent spikes, confirmation history, hyperedges, dirty sets, config, the
-        fair-chance registration), plus a shallow copy of the Graph object (timestep etc.). After the hold, with the
+        small maps (hyperedge membership, hyperedges, dirty sets, config, the fair-chance registration), the prediction
+        book's own copy (PredictionBook.copy: the spike record, the confirmation history, the open predictions), plus a shallow copy of the Graph object (timestep etc.). After the hold, with the
         live lock free: the shadow synapse store is loaded from those bytes; the Node shells are copied (creation_time,
         the only other node field the sleep reads, never changes after creation) with the captured metadata and an
         EMPTY pred_weights (the sleep's only use of pred_weights is the D15 deletion on removal, which decides nothing;
@@ -10084,23 +10106,8 @@ class Graph:
             "creation_time": he.creation_time,
         }
 
-    def _serialize_prediction(self, pred: Prediction) -> Dict[str, Any]:
-        """Serialize a Phase 3 synapse-level Prediction."""
-        return {
-            "prediction_id": pred.prediction_id,
-            "source_node_id": pred.source_node_id,
-            "target_node_id": pred.target_node_id,
-            "strength": pred.strength,
-            "confidence": pred.confidence,
-            "created_at": pred.created_at,
-            "expires_at": pred.expires_at,
-            "chain_depth": pred.chain_depth,
-            "via_hyperedge": pred.via_hyperedge,
-            "pre_charge_applied": pred.pre_charge_applied,
-        }
-
     def _serialize_prediction_row(self, row, receiver_part: bool = False) -> Dict[str, Any]:
-        """[2026-11-13] #1221: one PredictionBook row in _serialize_prediction's shape (same keys, same order).
+        """[2026-11-13] #1221: one PredictionBook row in the saved prediction shape (the old _serialize_prediction's keys, same order).
         `receiver_part` (#1222; Josh 2026-11-13 "It needs to be fixed"): an open RECEIVER prediction also carries its
         merge input, drive and rho, so a restore brings it back as a receiver prediction (before, it came back as a
         source-side one: its outcome acted on one link, and a miss explored). Loaders that do not know the three keys

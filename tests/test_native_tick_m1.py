@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-14] DudeMan CC — #1221 review minors (plan §6f): case (8) the novel-event log's append through the view keeps
+#   the engine's 1000 -> 500 cap; the restore (the setter) keeps whatever the file held.
 # [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): the engine against itself
 #   before the port.
 # What: the engine on this branch (predictions, confirmations and misses in ng_tract.PredictionBook) beside the engine
@@ -288,3 +290,18 @@ def test_a_restored_receiver_prediction_misses_as_one(monkeypatch, seed):
     assert not any(p.contributors for p in g3.active_predictions.values())
     quiet(g3)
     assert S18.ckpt(g3) != S18.ckpt(g2)
+
+
+def test_novel_log_append_through_the_view_keeps_the_cap():
+    """(8) Review minor: `_novel_sequence_log.append` is capped as the engine's own log is; the setter is not."""
+    import neuro_foundation as nf
+    g = nf.Graph()
+    ev = lambda i: {"source": "s", "firing_nodes": ["a"], "n_firing": 1, "timestep": i}
+    for i in range(1000):
+        g._novel_sequence_log.append(ev(i))
+    assert len(g._novel_sequence_log) == 1000
+    g._novel_sequence_log.append(ev(1000))
+    assert len(g._novel_sequence_log) == 500
+    assert [e["timestep"] for e in g._novel_sequence_log] == list(range(501, 1001))
+    g._novel_sequence_log = [ev(i) for i in range(1200)]
+    assert len(g._novel_sequence_log) == 1200
