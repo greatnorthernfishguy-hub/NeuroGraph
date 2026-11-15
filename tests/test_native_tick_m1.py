@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-14 evening] DudeMan CC — case (9): the surprise window handed over inside Rust (PredictionBook.
+#   surprise_window_to) ends byte-equal to the list path (window_ids -> cofire_tally_set_window).
 # [2026-11-14] DudeMan CC — #1221 review minors (plan §6f): case (8) the novel-event log's append through the view keeps
 #   the engine's 1000 -> 500 cap; the restore (the setter) keeps whatever the file held.
 # [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): the engine against itself
@@ -305,3 +307,30 @@ def test_novel_log_append_through_the_view_keeps_the_cap():
     assert [e["timestep"] for e in g._novel_sequence_log] == list(range(501, 1001))
     g._novel_sequence_log = [ev(i) for i in range(1200)]
     assert len(g._novel_sequence_log) == 1200
+
+
+@T1050.needs_window
+@pytest.mark.parametrize("seed", [0, 1])
+def test_surprise_window_inside_rust_equals_the_list_path(monkeypatch, seed):
+    """(9) _cleanup_predictions' two ways of setting the #1212 surprise window give the same run."""
+    assert hasattr(NF.ng_tract.PredictionBook(), "surprise_window_to") if hasattr(NF, "ng_tract") else True
+    start = P1.built_bytes(seed)
+    cfg = dict(T1050.DISUSE, prediction_threshold=0.5)
+    cfg.update(T1050.TALLY)
+    act = T1050.tally_workload(30)
+    a, (la, _), _, ga = _run(NF, start, act, seed, cfg, False)          # the store's own bound method: inside Rust
+    orig, calls = NF._cofire_surprise_native, []
+
+    def listed(store):
+        pair = orig(store)
+        if pair is None:
+            return None
+
+        def set_window(ids):
+            calls.append(len(ids))
+            return pair[0](ids)
+        return (set_window, pair[1])
+    monkeypatch.setattr(NF, "_cofire_surprise_native", listed)           # a wrapped function: the list path
+    b, (lb, _), _, gb = _run(NF, start, act, seed, cfg, False)
+    assert calls and ga._total_predictions_errors == gb._total_predictions_errors > 0
+    P1.compare(la, lb, [], [], a, b)

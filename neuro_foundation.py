@@ -1,3 +1,7 @@
+# [2026-11-14 evening] DudeMan CC — #1221 after arm M1136NT1 (plan §6h/§6i; Josh 2026-11-14 "Proceed and Yes."):
+#   _cleanup_predictions hands the #1212 surprise window to the store with PredictionBook.surprise_window_to (inside
+#   Rust) instead of window_ids -> a Python list -> cofire_tally_set_window. Same ids, same order. The list path stays
+#   for an older wheel and for a test that swaps the store's set-window function.
 # [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) — #1221 review minors (Grok 4.7, plan §6f; Josh 2026-11-14 "2 Proceed")
 # What: the dead _serialize_prediction is gone (_serialize_prediction_row is the one writer); _NovelLogView.append keeps
 #   the engine's 1000 -> 500 cap; two comments and one docstring that still called the spike record a Python container
@@ -6366,7 +6370,13 @@ class Graph:
                 and not _h_err):
             _sw = _cofire_surprise_native(self.synapses)
             if _sw is not None and _cofire_tally_native(self.synapses) is not None:
-                _sw[0](self._pb.window_ids(self.nodes))
+                # [2026-11-14] #1221: the window goes book -> store inside Rust (the same sorted, live-filtered ids;
+                # an older wheel's book has no surprise_window_to and takes the list path)
+                _swt = getattr(self._pb, "surprise_window_to", None)
+                if _swt is not None and _sw[0] == getattr(self.synapses, "cofire_tally_set_window", None):
+                    _swt(self.synapses, self.nodes)
+                else:
+                    _sw[0](self._pb.window_ids(self.nodes))
                 self._surprise_window_t = self.timestep
 
         while n:
