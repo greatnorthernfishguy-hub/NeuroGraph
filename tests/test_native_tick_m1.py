@@ -1,4 +1,7 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC — second review (Grok 4.7, on ng-tract-rs 89f3ab4 / NG 08167ff), two test minors: case (7)
+#   now requires an open receiver prediction to MISS (the book's outcomes), not only to leave the table; case (9)
+#   counts the native calls of each run (sys.setprofile), so the Rust path is shown to have been taken.
 # [2026-11-14 evening] DudeMan CC — case (9): the surprise window handed over inside Rust (PredictionBook.
 #   surprise_window_to) ends byte-equal to the list path (window_ids -> cofire_tally_set_window).
 # [2026-11-14] DudeMan CC — #1221 review minors (plan §6f): case (8) the novel-event log's append through the view keeps
@@ -257,8 +260,9 @@ def test_host_reader_queries_equal_the_python_loops(seed):
 @S18.needs_recv
 @pytest.mark.parametrize("seed", [0, 1])
 def test_a_restored_receiver_prediction_misses_as_one(monkeypatch, seed):
-    """Saved with its receiver part (#1222), restored, then left to expire: the restored graph must end where the
-    graph that was never saved ends (a source-side miss would sprout and skip the receiver record)."""
+    """Saved with its receiver part (#1222), restored, then left to expire: at least one of the open receiver
+    predictions must MISS (read from the book's outcomes), two restores of the file must end equal, and the same file
+    without the receiver part, where the same predictions miss as source-side ones, must end somewhere else."""
     monkeypatch.setattr(NF.Graph, "_PB_SAVE_RECEIVER_PART", True)
     g = S18.restore_as(NF, "native", H2.built(seed))
     g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
@@ -281,6 +285,11 @@ def test_a_restored_receiver_prediction_misses_as_one(monkeypatch, seed):
     quiet(g2)
     quiet(g1)
     assert not set(open_recv) & set(g2.active_predictions.keys())            # they resolved
+    # [2026-11-16] review (Grok 4.7): resolved is not missed. The outcome record says which way each one went.
+    missed = lambda gg: {it[0][0][0] for it in gg._pb.outcome_items() if not it[1]} & set(open_recv)
+    missed2 = missed(g2)
+    assert missed2, "none of the open receiver predictions missed: the miss path was not run"
+    assert missed(g1) == missed2
     assert g2._total_predictions_errors > errs0
     assert S18.ckpt(g1) == S18.ckpt(g2)
     # the same file read as a file without the receiver part ends somewhere else: the part is what made the difference
@@ -291,6 +300,7 @@ def test_a_restored_receiver_prediction_misses_as_one(monkeypatch, seed):
     g3.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
     assert not any(p.contributors for p in g3.active_predictions.values())
     quiet(g3)
+    assert missed(g3) & missed2, "without the receiver part none of the same predictions missed"
     assert S18.ckpt(g3) != S18.ckpt(g2)
 
 
@@ -318,7 +328,21 @@ def test_surprise_window_inside_rust_equals_the_list_path(monkeypatch, seed):
     cfg = dict(T1050.DISUSE, prediction_threshold=0.5)
     cfg.update(T1050.TALLY)
     act = T1050.tally_workload(30)
-    a, (la, _), _, ga = _run(NF, start, act, seed, cfg, False)          # the store's own bound method: inside Rust
+    # [2026-11-16] review (Grok 4.7): which path a run took is counted, not assumed. sys.setprofile reports every
+    # call into a native method by name, so an engine whose guard never took the Rust path fails here.
+    import sys
+    native_calls = {"surprise_window_to": 0, "window_ids": 0}
+
+    def prof(frame, event, arg):
+        if event == "c_call" and getattr(arg, "__name__", None) in native_calls:
+            native_calls[arg.__name__] += 1
+    sys.setprofile(prof)
+    try:
+        a, (la, _), _, ga = _run(NF, start, act, seed, cfg, False)      # the store's own bound method: inside Rust
+    finally:
+        sys.setprofile(None)
+    assert native_calls["surprise_window_to"] > 0 and native_calls["window_ids"] == 0, native_calls
+    native_calls.update(surprise_window_to=0, window_ids=0)
     orig, calls = NF._cofire_surprise_native, []
 
     def listed(store):
@@ -331,6 +355,11 @@ def test_surprise_window_inside_rust_equals_the_list_path(monkeypatch, seed):
             return pair[0](ids)
         return (set_window, pair[1])
     monkeypatch.setattr(NF, "_cofire_surprise_native", listed)           # a wrapped function: the list path
-    b, (lb, _), _, gb = _run(NF, start, act, seed, cfg, False)
+    sys.setprofile(prof)
+    try:
+        b, (lb, _), _, gb = _run(NF, start, act, seed, cfg, False)
+    finally:
+        sys.setprofile(None)
+    assert native_calls["surprise_window_to"] == 0 and native_calls["window_ids"] == len(calls) > 0, native_calls
     assert calls and ga._total_predictions_errors == gb._total_predictions_errors > 0
     P1.compare(la, lb, [], [], a, b)
