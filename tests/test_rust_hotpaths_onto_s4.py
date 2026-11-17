@@ -1,3 +1,7 @@
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop) -- #1221 / #1223: the base engine gets the fixed twin rule (a pair
+#   of nodes joined by two synapses resolves to the lowest row), as tests/test_nodestore_p1.py already does. Without it
+#   test_whole_run[2-*] / [3-*] passed or failed by PYTHONHASHSEED (the base walked a set of ids): found in the
+#   whole-suite run of 2026-11-16 (fails at seeds 0 and 1, passes at 2 and 3).
 # [2026-11-13] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221)
 # What: where a test hides the store's native batch methods (HideNative), the prediction book gets the real store.
 # Why:  ng_tract.PredictionBook is Rust with no Python path, so it cannot take a Python proxy of the store.
@@ -157,6 +161,16 @@ class RealStoreForBook:
 
     def __contains__(self, k):
         return k in self._b
+
+
+def _find_first(self, pre_id, post_id):
+    sid = self.synapses.find_first(pre_id, post_id)
+    return self.synapses.get(sid) if sid is not None else None
+
+
+@pytest.fixture(autouse=True)
+def _twin_rule_levelled(monkeypatch):
+    monkeypatch.setattr(BASE.Graph, "_find_synapse", _find_first)
 
 
 def hide_native(g):
