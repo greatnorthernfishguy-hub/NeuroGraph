@@ -16,6 +16,12 @@ isolation.  All tests use temporary directories — no live data touched.
 # Why: f19dbc2 (2026-06-04, substrate-as-protocol PRD Phase 4) made record_outcome a no-op;
 #   c59ecc7 (2026-04-20, #155) deleted the _peer_events cache. Both deliberate.
 # How: _deposit / _pairs helpers on the base class.
+# [2026-11-17] DudeMan CC — removed test_upgrade_preserves_pending_signals (#1242)
+# What/Why: Josh 2026-11-17: almost all tracts were retired as Law breakers and replaced by the
+#   Commons (deposit raw, bucket what you need); only a very few tracts remain. Nothing writes
+#   into a myelinated tract any more, so the file -> mmap upgrade is retired machinery. The test
+#   failed on a real defect in it (preload writes BTF frames, drain reads JSON lines); the defect
+#   and how to reproduce it are kept in punchlist #1242.
 # -------------------
 
 
@@ -461,22 +467,6 @@ class TestMyelination(TractBridgeTestBase):
 
         self.assertEqual([t for _, t in self._pairs(bridge_b._drain_all())],
                          [f"mmap:{i}" for i in range(20)])
-
-    def test_upgrade_preserves_pending_signals(self):
-        """File-based signals are drained and preloaded into mmap on upgrade."""
-        bridge_a = self._make_bridge("mod_a")
-        bridge_b = self._make_bridge("mod_b")
-
-        # Deposit while unmyelinated
-        for i in range(5):
-            self._deposit(bridge_a, "mod_b", f"pre:{i}")
-
-        # Myelinate — should drain file-based and preload into mmap
-        bridge_a.myelinate_tract("mod_b")
-
-        # Drain from B — the preloaded events, each exactly once
-        targets = [t for _, t in self._pairs(bridge_b._drain_all())]
-        self.assertEqual(sorted(targets), [f"pre:{i}" for i in range(5)])
 
     def test_downgrade_preserves_pending_signals(self):
         """Mmap signals are drained and deposited to file on downgrade."""
