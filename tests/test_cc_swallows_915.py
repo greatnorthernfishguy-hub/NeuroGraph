@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- stale pin: test_generate_emergent_want_is_untouched compared the function
+#   to this lane's base (895a809a); later deliberate commits changed that function: aa15336 ("#905: born-bound emergent want ..."), 26a0a11 ("CC emergent
+#   want text from the nodes' own words, never raw node ids") and d16df64 ("H2 #1136: hyperedge readers outside the step lock read member sets under
+#   it (H1 reader audit)"). Re-based onto d16df64, the last commit that changed it (as tests/test_cc_bind_atomic_904.py N8 did); same `git show`
+#   mechanism, still FAILS (never skips) when the pinned revision cannot be read. Nothing else changed.
 # [2026-10-01] Z12 builder (Claude Sonnet 5.5), lane held-clock-visible-901, dispatch #13433 (Exec P501 / le-052 #4) — tests for the READABLE counter and the
 #   rate-limited want-create WARNING: cc_want_create_failure_count() totals both functions and rises by the failures; a second failure inside the interval is
 #   COUNTED but not re-logged (per function); the first failure always warns; the warning returns after the interval; the success path is still quiet and
@@ -282,7 +287,8 @@ def test_generate_emergent_want_is_untouched():
         start = src.index('def generate_emergent_want(')
         end = src.index('\ndef ', start + 10)
         return src[start:end]
-    base = subprocess.run(['git', '-C', str(_WORKTREE), 'show', '895a809a60ab86afacd8ef193b95c4ab39f6893f:cc_ng_organism.py'],
+    # [2026-11-16 #761] re-based 895a809a -> d16df64 (the last deliberate change to this function)
+    base = subprocess.run(['git', '-C', str(_WORKTREE), 'show', 'd16df64c519b2c76f6923ecd38b60004f51afa01:cc_ng_organism.py'],
                           capture_output=True, text=True).stdout
     assert base, 'cannot read the base; a pin must FAIL, not skip'
     assert body(new) == body(base)

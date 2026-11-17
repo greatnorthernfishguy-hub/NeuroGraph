@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- stale pin: test_gsg_backfill_stamps_missing_skips_present_never_saves
+#   imported cc_gsg_backfill, which eec6f38 ("#413: close the Ingestor door ...": "Also renamed cc_gsg_backfill -> cc_stamp_missing_geometry")
+#   renamed. Re-pinned to the function as three deliberate commits left it: the new name (eec6f38); the direction comes from the node's OWN text,
+#   never the vdb (58a16bb "poincare_dir comes from the SNN, not the vdb (LAW 4 fix at the source)"), so the unstamped node now carries
+#   _forest_content and a node with only a vdb row is NOT stamped; an already-stamped legacy LIST is migrated in place to packed float32 bytes and
+#   counted (05ecf77 "#400: pack poincare_dir on the CC half -- writers, readers, and the missing migration"), its direction unchanged.
+#   Still pinned as before: stamp-only (C2: never saves), a stamped node keeps its direction, the second run is 0.
 # [2026-07-07] Claude Code (Fable 5) — CC retrieval-enrichment tests (#358)
 # What: Tests for cc_novelty, cc_anticipate, cc_gsg_rescore, cc_gsg_backfill,
 #   the rebuilt cc_pattern_completion_recall, and constant pins (C5).
@@ -194,27 +201,37 @@ def test_gsg_rescore_fails_soft(cc_ng):
 
 
 def test_gsg_backfill_stamps_missing_skips_present_never_saves(cc_ng):
-    from cc_ng_organism import cc_gsg_backfill
+    from cc_ng_organism import cc_stamp_missing_geometry   # eec6f38: the function formerly named cc_gsg_backfill
+    from neuro_foundation import pack_poincare_dir, poincare_dir_array
     from ng_embed import embed
     g, vdb = cc_ng.graph, cc_ng.vector_db
-    g.create_node(node_id="old_node")                   # pre-GSG node: vdb entry, no stamp
+    # pre-GSG node: its OWN text, no stamp (58a16bb: the direction is derived from the node's own content)
+    g.create_node(node_id="old_node", metadata={"_forest_content": "an old memory"})
     vdb.insert(id="old_node", embedding=embed("an old memory"), content="an old memory")
-    g.create_node(node_id="already")                    # already stamped
+    g.create_node(node_id="already")                    # already stamped, in the legacy boxed-list form
     vdb.insert(id="already", embedding=embed("stamped"), content="stamped")
     g.nodes["already"].metadata["poincare_dir"] = [1.0, 0.0]
-    g.create_node(node_id="no_vdb")                     # graph-only, nothing to stamp from
+    g.create_node(node_id="packed")                     # already stamped, in the current packed form
+    current = pack_poincare_dir([0.0, 1.0])
+    g.nodes["packed"].metadata["poincare_dir"] = current
+    g.create_node(node_id="no_text")                    # no text of its own: nothing to stamp from, even WITH a vdb row
+    vdb.insert(id="no_text", embedding=embed("only the vdb knows this"), content="only the vdb knows this")
 
     save_calls = []
     cc_ng.save = lambda *a, **k: save_calls.append("ng.save")          # C2 spies
     g.checkpoint = lambda *a, **k: save_calls.append("graph.checkpoint")
 
-    stamped = cc_gsg_backfill(g, vdb)
-    assert stamped == 1
+    touched = cc_stamp_missing_geometry(g, vdb)
+    assert touched == 2                                 # 1 stamped (old_node) + 1 legacy list migrated (already; 05ecf77 / #400)
     assert g.nodes["old_node"].metadata.get("poincare_dir")
-    assert g.nodes["already"].metadata["poincare_dir"] == [1.0, 0.0]   # untouched
-    assert "poincare_dir" not in (g.nodes["no_vdb"].metadata or {})
+    assert isinstance(g.nodes["old_node"].metadata["poincare_dir"], bytes)
+    # the already-stamped DIRECTION is untouched; only its storage form moved list -> packed float32 bytes
+    assert g.nodes["already"].metadata["poincare_dir"] == pack_poincare_dir([1.0, 0.0])
+    assert poincare_dir_array(g.nodes["already"].metadata).tolist() == [1.0, 0.0]
+    assert g.nodes["packed"].metadata["poincare_dir"] is current       # untouched
+    assert "poincare_dir" not in (g.nodes["no_text"].metadata or {})
     assert save_calls == []                             # C2: STAMP-ONLY, never persists
-    assert cc_gsg_backfill(g, vdb) == 0                 # idempotent second run
+    assert cc_stamp_missing_geometry(g, vdb) == 0       # idempotent second run
 
 
 # ---- Task 4: rebuilt recall — substrate primacy ----

@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- dead path: the golden BASE checkout /home/josh/worktrees/ng-want-hub-base-26a0a11
+#   (a scratch worktree made for 45f0812, since removed) no longer exists, so all 14 G tests errored in the fixture. When
+#   WANT_HUB_BASE_CHECKOUT is not set the base is now read from git (`git show BASE_REV:<file>`, as test_hyperedge_store_h2 `_load`
+#   does) into a pytest temp dir; its git_rev is BASE_REV only after the imported file is byte-compared with the git blob.
+#   An explicit WANT_HUB_BASE_CHECKOUT is still honoured exactly as before. No assertion changed.
 # [2026-10-04] Claude (lane want-hub-engine-onto-s4) — golden base re-pinned to the trial-s4 tip 26a0a11 (the commit the engine now sits on);
 #   BASE_REV gains a WANT_HUB_BASE_REV env override (default 26a0a11), BASE_CHECKOUT default -> /home/josh/worktrees/ng-want-hub-base-26a0a11. No assertion changed.
 # [2026-09-30] Claude Sonnet 5.5 (Z12 builder, dispatch #12011, ADDENDUM 3 tests fold — le-036 / checker-029) — tests-first for the engine fold:
@@ -52,7 +57,9 @@ import want_hub_golden_driver as drv  # noqa: E402
 # Both pins stay env-overridable (LAW 5) so the original e4ebf982 golden can still be re-run.
 BASE_REV = os.environ.get("WANT_HUB_BASE_REV", "26a0a11123ed7daf81621e92316baaf911a28e30")
 # Read-only BASE checkout (never commit there). Env override per LAW 5.
-BASE_CHECKOUT = Path(os.environ.get("WANT_HUB_BASE_CHECKOUT", "/home/josh/worktrees/ng-want-hub-base-26a0a11"))
+# [2026-11-16 #761] no default scratch path any more: unset => the base is materialized from git (see base_checkout).
+BASE_CHECKOUT = Path(os.environ["WANT_HUB_BASE_CHECKOUT"]) if os.environ.get("WANT_HUB_BASE_CHECKOUT") else None
+_GIT_BASE = {}   # {"dir": Path} once the base has been materialized from git for this module
 K = 3          # guaranteed links per direction in the small synthetic graphs
 B_SMALL = 12   # budget that binds (fewer than the eligible count)
 _NG_MODULES = ("neuro_foundation", "ng_lite", "ng_tract_bridge", "ng_ecosystem", "ng_autonomic", "ng_embed",
@@ -119,12 +126,38 @@ def _run_driver(checkout, scenario, out_dir, tag, ids="counter"):
     rec = json.loads(lines[-1])
     assert not rec.get("void"), "VOID run (P379): %s" % rec.get("reason")
     assert p.returncode == 0, "driver rc=%s\n%s" % (p.returncode, p.stderr[-2000:])
+    if _GIT_BASE.get("dir") is not None and Path(checkout) == _GIT_BASE["dir"]:
+        # a directory read from git has no HEAD of its own: its revision is proven by content, not by rev-parse
+        nf_file = Path(rec["neuro_foundation_file"])
+        assert nf_file.parent == _GIT_BASE["dir"].resolve(), "base run imported %s" % nf_file
+        blob = subprocess.run(["git", "-C", str(REPO), "show", "%s:neuro_foundation.py" % BASE_REV], capture_output=True)
+        assert blob.returncode == 0 and nf_file.read_bytes() == blob.stdout, "materialized base is not %s" % BASE_REV
+        rec["git_rev"] = BASE_REV
     rec["_ckpt"] = str(ckpt)
     return rec
 
 
+def _materialize_base(rev, dest):
+    """[2026-11-16 #761] The base engine read from git (`git show <rev>:<file>`, the mechanism tests/test_hyperedge_store_h2.py
+    `_load` uses) into a pytest temp dir: every top-level *.py of <rev>, so the driver's separate process imports the base
+    neuro_foundation from a directory that holds nothing but that revision. Fails loudly if git cannot supply the revision."""
+    ls = subprocess.run(["git", "-C", str(REPO), "ls-tree", "--name-only", rev], capture_output=True, text=True)
+    assert ls.returncode == 0, "cannot read base %s from git: %s" % (rev, ls.stderr[-500:])
+    names = [n for n in ls.stdout.splitlines() if n.endswith(".py")]
+    assert "neuro_foundation.py" in names, "base %s has no neuro_foundation.py" % rev
+    dest = Path(dest)
+    for n in names:
+        blob = subprocess.run(["git", "-C", str(REPO), "show", "%s:%s" % (rev, n)], capture_output=True)
+        assert blob.returncode == 0, "cannot read %s:%s from git: %s" % (rev, n, blob.stderr[-500:])
+        (dest / n).write_bytes(blob.stdout)
+    return dest
+
+
 @pytest.fixture(scope="module")
-def base_checkout():
+def base_checkout(tmp_path_factory):
+    if BASE_CHECKOUT is None:
+        _GIT_BASE["dir"] = _materialize_base(BASE_REV, tmp_path_factory.mktemp("want_hub_base"))
+        return _GIT_BASE["dir"]
     assert BASE_CHECKOUT.is_dir(), "base checkout missing: %s" % BASE_CHECKOUT
     rev = drv.git_rev(str(BASE_CHECKOUT))
     assert rev == BASE_REV, "base checkout is at %s, must be %s" % (rev, BASE_REV)

@@ -4,6 +4,16 @@
 # What: Mutate nested/shared live state after capture; compare against legacy deep copy.
 # Why: Removing the expensive outer deepcopy must not leave snapshot aliases behind.
 # How: Extract actual serializers into a fake host; no Graph imports or constructors.
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- the fake host now also
+#   extracts the real Graph._he_ps_native method and the real module helper _ckpt_id_list. Commit edb08a6
+#   (2026-10-19, "H2 #1136 -- native hyperedge passes ...") made _serialize_full/_serialize_incremental call
+#   self._he_ps_native() and _serialize_hyperedge call _ckpt_id_list(); the extraction list predated both, so
+#   every capture died on AttributeError/NameError before reaching an assertion. Three more names the full
+#   serializer grew since are supplied the same way: the real Graph._stab_s8_bound (0a120c7, 2026-10-25, S8
+#   #1136 -- returns None with its config key absent, so no key is written), a StrengthBudgetRule stand-in
+#   beside the existing HomeostaticRule one (39c0422, 2026-10-04, strength budget -- no such rule in the fake's
+#   empty _plasticity_rules, so no key is written), and n_actual_firing=0 on the fake prediction outcome (the
+#   PredictionOutcome dataclass default; 45a3dcd, 2026-11-04, #1210b -- saved only when set). No assertion changed.
 # -------------------
 import ast
 import copy
@@ -20,7 +30,9 @@ import pytest
 SOURCE = Path(__file__).parents[1] / 'neuro_foundation.py'
 METHODS = {'capture_checkpoint', '_serialize_full', '_serialize_incremental',
            '_serialize_node', '_serialize_hyperedge', '_serialize_prediction',
-           '_serialize_prediction_state', 'write_checkpoint'}
+           '_serialize_prediction_state', 'write_checkpoint', '_he_ps_native', '_stab_s8_bound'}
+# Module-level helpers the extracted serializers call (edb08a6); taken from the real source, not faked.
+MODULE_HELPERS = {'_ckpt_id_list'}
 
 
 class Mode(enum.Enum):
@@ -34,14 +46,18 @@ class SerializerFake:
 
 
 def install_serializers():
-    cls = next(n for n in ast.parse(SOURCE.read_text()).body
+    tree = ast.parse(SOURCE.read_text())
+    cls = next(n for n in tree.body
                if isinstance(n, ast.ClassDef) and n.name == 'Graph')
-    body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in METHODS]
+    helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in MODULE_HELPERS]
+    assert {n.name for n in helpers} == MODULE_HELPERS
+    body = helpers + [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in METHODS]
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
                         names=[ast.alias(name='annotations')], level=0)] + body,
                         type_ignores=[])
     ns = dict(copy=copy, math=math, msgpack=msgpack, CheckpointMode=Mode,
-              HomeostaticRule=type('HomeostaticFake', (), {}))
+              HomeostaticRule=type('HomeostaticFake', (), {}),
+              StrengthBudgetRule=type('StrengthBudgetFake', (), {}))
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), 'exec'), ns)
     for name in METHODS:
         setattr(SerializerFake, name, ns[name])
@@ -92,7 +108,7 @@ def fixture():
         timestep=4, synapses=SynapsesFake({'s': {'weight': .5, 'metadata': shared}}),
         active_predictions={'p': pred},
         _prediction_outcomes=[SimpleNamespace(prediction=pred, confirmed=True, resolved_at=4,
-                                              actual_firing_nodes=['n'])],
+                                              actual_firing_nodes=['n'], n_actual_firing=0)],
         _synapse_confirmation_history={'s': deque([True, False])},
         _novel_sequence_log=deque([{'sequence': ['n', 'm'], 'metadata': shared}]),
         _reward_history=deque([{'scope': ['n'], 'metadata': shared}]),

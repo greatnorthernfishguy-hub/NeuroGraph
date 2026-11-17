@@ -1,17 +1,41 @@
+# ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- six long-failing tests; no assertion changed.
+#   (1) env leak: the cc_ng fixture let the dual pass call the LIVE TID service (and read NG_EMBED_REMOTE): with TID up a turn
+#       gets tree nodes (which copy the forest's creation_mode, ng_embed.py tree_meta) so "exactly one conversational node" saw 3;
+#       with TID down every deposit returns False (R3 atomicity). The fixture now stubs NGEmbed._extract_concepts -> [] and drops
+#       NG_EMBED_REMOTE, bracketed by NGEmbed.reset_instance() -- the isolation two tests in this file already used (d9106a3).
+#   (2) stale call: ng_tract.deposit_experience(content=, tract_path=, content_type=) is not the wheel's signature; the Rust API
+#       is deposit_experience(raw, source, tract_paths) (ng-tract-rs e3c071a "Add deposit_topology, deposit_experience, ..."),
+#       as cc_ng_organism.py (46f9cf8) and the newer drain tests (a3fff06, 81807e7) call it. The two drain tests now do too.
+#   (3) stale pin: the three emergent-want tests used a fake graph whose seeds do not exist and cannot be bound. aa15336 ("#905:
+#       born-bound emergent want ...") mints a want only if a seed node exists and takes a seed->want synapse, and 26a0a11 ("CC
+#       emergent want text from the nodes' own words, never raw node ids") builds its text from the nodes' own words. The fake
+#       graph now holds the seed nodes (with labels) and has create_synapse / remove_node, plus the _step_lock that
+#       _cc_mutation_lock takes (3954843 "Coordinate CC deposits and preserve durable generations before retention").
+# -------------------
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile, shutil
+import threading
 import pytest
 
 
 @pytest.fixture
-def cc_ng():
+def cc_ng(monkeypatch):
     from openclaw_hook import NeuroGraphMemory
+    from ng_embed import NGEmbed
+    # [2026-11-16 #761] no live service, no shell leak: the TID concept extraction is stubbed to "no concepts" (a legitimate
+    # empty: forest written, zero trees) and NG_EMBED_REMOTE is dropped; the singleton caches its remote-vs-local decision,
+    # so it is reset on both sides.
+    monkeypatch.delenv("NG_EMBED_REMOTE", raising=False)
+    monkeypatch.setattr(NGEmbed, "_extract_concepts", lambda self, text: [])
+    NGEmbed.reset_instance()
     workspace = tempfile.mkdtemp(prefix='cc_dual_pass_test_')
     ng = NeuroGraphMemory(workspace_dir=workspace,
                           config={"tonic": {"enabled": False}, "peer_bridge": {"enabled": False}})
     yield ng
+    NGEmbed.reset_instance()
     shutil.rmtree(workspace, ignore_errors=True)
 
 
@@ -325,6 +349,8 @@ class _FakeWantGraph:
         self.nodes = {}
         self.config = {"default_threshold": 1.0}
         self._pp_fired = []
+        self.synapses = []
+        self._step_lock = threading.RLock()   # the want is created under the graph's mutation lock (3954843)
 
     def prime_and_propagate(self, node_ids, currents, steps, write_mode):
         assert write_mode is False  # curiosity is observation, never mutation
@@ -334,6 +360,19 @@ class _FakeWantGraph:
         n = _FakeNode(metadata)
         self.nodes[node_id] = n
         return n
+
+    # [2026-11-16 #761] #905 (aa15336): a want is born bound (one seed -> want synapse) or rolled back.
+    def create_synapse(self, pre, post, weight=0.0):
+        assert pre in self.nodes and post in self.nodes
+        self.synapses.append((pre, post, weight))
+
+    def remove_node(self, node_id):
+        self.nodes.pop(node_id, None)
+
+    def add_seeds(self, *node_ids):
+        """The prediction endpoints as real nodes with their own words (a label that is not the node id)."""
+        for nid in node_ids:
+            self.nodes[nid] = _FakeNode({"label": "words of " + nid})
 
 
 def test_emergent_want_same_concept_reinforces_single_node():
@@ -347,6 +386,7 @@ def test_emergent_want_same_concept_reinforces_single_node():
     graph._pp_fired = ["concept_a"]
     vdb = _FakeVDB({"concept_a": np.array([1.0, 0.0, 0.0], dtype=np.float32)})
 
+    graph.add_seeds("src1", "tgt1", "src2", "tgt2")
     graph.active_predictions = {"p1": _FakePred(0.9, "src1", "tgt1")}
     r1 = generate_emergent_want(graph, vdb)
     assert r1 is not None
@@ -375,6 +415,7 @@ def test_emergent_want_distinct_concepts_make_distinct_nodes():
     from cc_ng_organism import generate_emergent_want
 
     graph = _FakeWantGraph()
+    graph.add_seeds("src", "tgt")
     graph.active_predictions = {"p1": _FakePred(0.9, "src", "tgt")}
 
     graph.nodes["concept_a"] = _FakeNode({"label": "alpha"})
@@ -401,6 +442,7 @@ def test_emergent_want_unresolved_concepts_stay_distinct():
     graph._pp_fired = []   # nothing fires -> no concept node -> concept_label stays None
     vdb = _FakeVDB({})     # no embeddings to resolve a concept from
 
+    graph.add_seeds("srcA", "tgtA", "srcB", "tgtB")
     graph.active_predictions = {"p1": _FakePred(0.9, "srcA", "tgtA")}
     r1 = generate_emergent_want(graph, vdb)
     assert r1 is not None
@@ -433,16 +475,14 @@ def test_drain_ingest_tract_absorbs_experience_entries(cc_ng, tmp_path):
 
     # Use real ng_tract.deposit_experience() to write BTF entries
     ng_tract.deposit_experience(
-        content=b"the user asked about numpy conflicts",
+        raw=b"the user asked about numpy conflicts",
         source="cc_gateway",
-        tract_path=tract_path,
-        content_type="text",
+        tract_paths=[tract_path],
     )
     ng_tract.deposit_experience(
-        content=b"I should look into the ng_tract_venv.pth file",
+        raw=b"I should look into the ng_tract_venv.pth file",
         source="cc_gateway",
-        tract_path=tract_path,
-        content_type="text",
+        tract_paths=[tract_path],
     )
 
     state = {"last_forest_id": None}
@@ -474,10 +514,9 @@ def test_drain_ingest_tract_preserves_concurrent_append(cc_ng, tmp_path, monkeyp
 
     tract_path = str(tmp_path / "turns.tract")
     ng_tract.deposit_experience(
-        content=b"first entry, present at read time",
+        raw=b"first entry, present at read time",
         source="cc_gateway",
-        tract_path=tract_path,
-        content_type="text",
+        tract_paths=[tract_path],
     )
 
     real_dual_pass = cc_ng_organism.run_conversational_dual_pass
@@ -489,10 +528,9 @@ def test_drain_ingest_tract_preserves_concurrent_append(cc_ng, tmp_path, monkeyp
             # Simulate miniTID appending a new turn while this drain pass is
             # still mid-loop, before the truncation step below runs.
             ng_tract.deposit_experience(
-                content=b"second entry, appended mid-drain",
+                raw=b"second entry, appended mid-drain",
                 source="cc_gateway",
-                tract_path=tract_path,
-                content_type="text",
+                tract_paths=[tract_path],
             )
         return real_dual_pass(graph, vector_db, text, emb, state)
 

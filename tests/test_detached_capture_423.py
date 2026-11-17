@@ -1,5 +1,10 @@
 """#423 canonical capture/write contracts using extracted code and disposable fakes."""
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- the fake graph in
+#   test_actual_propagation_cannot_prime_during_capture carries `_stability_params=lambda: None` (the real method's
+#   answer when every stability key is absent, as in this fake's config). Commit 4822f33 (2026-10-19, "S #1136 -- the
+#   stability set ... every key absent = 11d3898") made prime_and_propagate call self._stability_params() after the
+#   prime; the SimpleNamespace fake had none (AttributeError collected in `errors`). Assertions unchanged.
 # [2026-09-11] Codex — replace constructor-based native draft with isolated tests.
 # What: exercise real persistence methods without importing Graph or embedding modules.
 # Why: offline repair must not instantiate NG/models or touch live state.
@@ -159,7 +164,8 @@ def test_actual_propagation_cannot_prime_during_capture(write_mode):
     module=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),fn],type_ignores=[])
     exec(compile(ast.fix_missing_locations(module),'prime_under_test','exec'),ns)
     node=SimpleNamespace(voltage=0.,resting_potential=0.,refractory_remaining=0,intrinsic_excitability=1)
-    graph=SimpleNamespace(_step_lock=threading.RLock(),nodes={'n':node},hyperedges={},active_predictions={},_active_predictions={},timestep=0,config={'decay_rate':.9,'he_experience_threshold':1})
+    graph=SimpleNamespace(_step_lock=threading.RLock(),nodes={'n':node},hyperedges={},active_predictions={},_active_predictions={},timestep=0,config={'decay_rate':.9,'he_experience_threshold':1},
+                          _stability_params=lambda:None)  # [2026-11-16] 4822f33: all stability keys absent -> None
     entered=threading.Event();done=threading.Event();errors=[]
     def prime():
         entered.set()

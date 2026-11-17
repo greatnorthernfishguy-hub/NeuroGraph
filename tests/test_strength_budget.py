@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- dead path: the (G) base checkout /home/josh/worktrees/ng-s4-base-20261004 (a scratch
+#   worktree of origin/cc-laptop-trial-s4-20261002, since removed) no longer exists, so the 2 G tests errored in the fixture.
+#   When STRENGTH_BUDGET_BASE_CHECKOUT is not set the base is now read from git (`git show 45f0812:<file>`, as
+#   test_hyperedge_store_h2 `_load` does) into a pytest temp dir. 45f0812 is the trial-s4 tip the strength-budget commit
+#   39c0422 was made on (its parent). An explicit STRENGTH_BUDGET_BASE_CHECKOUT is still honoured as before. No assertion changed.
 # [2026-10-04] Claude (lane strength-budget) — NEW tests: per-node strength budget + sleep downscaling
 # What: (G) OFF is byte-identical to the base checkout (outputs + checkpoint bytes, separate processes); (R) the rule:
 #   off = no-op, normalization math, OUT-then-IN order, interval + counter persistence, invalid setting is loud and harmless;
@@ -32,7 +37,10 @@ import neuro_foundation as nf  # noqa: E402
 if Path(nf.__file__).resolve().parent != REPO:
     raise RuntimeError("P379: neuro_foundation resolved to %s, not this worktree (%s); refusing to run" % (nf.__file__, REPO))
 
-BASE_CHECKOUT = Path(os.environ.get("STRENGTH_BUDGET_BASE_CHECKOUT", "/home/josh/worktrees/ng-s4-base-20261004"))
+# [2026-11-16 #761] no default scratch path any more: unset => the base is materialized from git (see base_checkout).
+BASE_CHECKOUT = Path(os.environ["STRENGTH_BUDGET_BASE_CHECKOUT"]) if os.environ.get("STRENGTH_BUDGET_BASE_CHECKOUT") else None
+# the parent of the strength-budget commit 39c0422 (the trial-s4 tip it was made on); env-overridable (LAW 5)
+BASE_REV = os.environ.get("STRENGTH_BUDGET_BASE_REV", "45f0812")
 FLOOR = 2 * nf.DEFAULT_CONFIG["weight_threshold"]
 CC = "constitutional::rim::choice_clause"
 
@@ -127,8 +135,27 @@ def _drive(checkout, tmp_path, tag, config_json=""):
     return rec
 
 
+def _materialize_base(rev, dest):
+    """[2026-11-16 #761] The base engine read from git (`git show <rev>:<file>`, the mechanism tests/test_hyperedge_store_h2.py
+    `_load` uses) into a pytest temp dir: every top-level *.py of <rev>, so the driver's separate process imports the base
+    neuro_foundation from a directory that holds nothing but that revision. Fails loudly if git cannot supply the revision."""
+    ls = subprocess.run(["git", "-C", str(REPO), "ls-tree", "--name-only", rev], capture_output=True, text=True)
+    assert ls.returncode == 0, "cannot read base %s from git: %s" % (rev, ls.stderr[-500:])
+    names = [n for n in ls.stdout.splitlines() if n.endswith(".py")]
+    assert "neuro_foundation.py" in names, "base %s has no neuro_foundation.py" % rev
+    dest = Path(dest)
+    for n in names:
+        blob = subprocess.run(["git", "-C", str(REPO), "show", "%s:%s" % (rev, n)], capture_output=True)
+        assert blob.returncode == 0, "cannot read %s:%s from git: %s" % (rev, n, blob.stderr[-500:])
+        (dest / n).write_bytes(blob.stdout)
+    return dest
+
+
 @pytest.fixture(scope="module")
-def base_checkout():
+def base_checkout(tmp_path_factory):
+    global BASE_CHECKOUT
+    if BASE_CHECKOUT is None:
+        BASE_CHECKOUT = _materialize_base(BASE_REV, tmp_path_factory.mktemp("strength_budget_base"))
     assert (BASE_CHECKOUT / "neuro_foundation.py").is_file(), "base checkout missing: %s" % BASE_CHECKOUT
     assert BASE_CHECKOUT.resolve() != REPO
     return BASE_CHECKOUT

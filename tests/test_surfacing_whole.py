@@ -3,6 +3,12 @@
 # #812 turn 1 — the shared CES surfacing path renders WHOLE (LAW 4: fix at the source).
 #
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- env dependence: collection failed in a clean environment
+#   ("NG modules under test are NOT under <worktree>": cc_ng_organism, tonic_thread, ng_salience_gate from ~/NeuroGraph) because
+#   neurograph_rpc prepends ~/NeuroGraph to sys.path at import unless it is already there (aef8391a, 2026-03-26), and this file
+#   imported cc_ng_organism / tonic_thread AFTER rpc but BEFORE re-asserting its root. It loaded only when the shell's PYTHONPATH
+#   already listed ~/NeuroGraph. The import of rpc now keeps the primary LAST on sys.path and removes it afterwards (see the
+#   comment at the import). The #770 guard and every assertion are unchanged.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12684) — #812 turn 2, part 1
 # What: (e) the strict xfail for the Substrate Context 300-clip now PASSES (asserted whole) and
 #   gains a `surfaced`-group twin; (f) Tonic latent thread renders whole (end-to-end through
@@ -49,7 +55,23 @@ sys.path.insert(0, str(_ROOT))
 
 import surface_resolver  # noqa: E402
 import surfacing  # noqa: E402
-import neurograph_rpc as rpc  # noqa: E402
+
+# [2026-11-16 #761] neurograph_rpc does `sys.path.insert(0, ~/NeuroGraph)` at import UNLESS that directory is already on
+# sys.path (neurograph_rpc.py "NeuroGraph repo must be importable"). With it at [0], everything imported after that line --
+# rpc's own module-level `from ng_salience_gate import ...`, then cc_ng_organism and tonic_thread below -- came from the
+# PRIMARY checkout, and the #770 guard below (rightly) refused. This file only ever loaded when the shell's PYTHONPATH
+# already listed ~/NeuroGraph. So: the primary is put LAST on sys.path for the duration of rpc's import (rpc then prepends
+# nothing, and every module that exists in this root still resolves here first) and is taken off again right after, so
+# nothing later can resolve into it. The guard is unchanged and still checks every loaded NG module.
+_PRIMARY = os.path.expanduser("~/NeuroGraph")
+_primary_added = _PRIMARY not in sys.path and Path(_PRIMARY).resolve() != _ROOT
+if _primary_added:
+    sys.path.append(_PRIMARY)
+try:
+    import neurograph_rpc as rpc  # noqa: E402
+finally:
+    if _primary_added:
+        sys.path.remove(_PRIMARY)
 import cc_ng_organism as cc  # noqa: E402
 import tonic_thread  # noqa: E402
 

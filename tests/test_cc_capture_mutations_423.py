@@ -1,5 +1,13 @@
 """Real CC application functions extracted via AST; no NG constructors/models."""
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- the `functions()` namespace also carries
+#   `VDB_META_SLIM=False` (the module-level switch's default, off = the unchanged deposit this harness tests). Commit 6fa8ba0
+#   ("#1216 S1: CC_NG_VDB_META_SLIM (default off = unchanged) ...") made _cc_deposit_memory_node read that module constant,
+#   which an AST extract of FUNCTIONS cannot carry (NameError -> swallowed as 'recall insert failed' -> 4 tests). Harness-only;
+#   NO assertion changed. test_dual_pass_outcome_and_embedding_outside_lock also extracts the real `_cc_concepts_runnable`:
+#   commit 182caba (2026-11-10, "Grok review fixes ...: concepts need the native index") made run_conversational_dual_pass ask
+#   that helper instead of cc_concepts_enabled() directly; it returns False off the namespace's cc_concepts_enabled=lambda: False
+#   before touching anything else, so concepts stay off exactly as the 2026-10-31 entry below intends.
 # [2026-10-31] DudeMan CC (Claude Opus 5.5, laptop; #1203 stage 1) -- the `functions()` namespace also carries
 #   `cc_concepts_enabled=lambda: False` (the dual pass reads the CC_NG_CONCEPTS switch through it). Harness-only.
 # [2026-10-23 night] Claude Code (Opus 5.5, laptop) — #1173; harness-only, NO assertion changed
@@ -92,7 +100,9 @@ def functions(*names):
               cc_anticipate=lambda *a:None,
               PROBATION_UNADVANCED_CREATION_MODES=('ingested',),
               # [2026-10-23 night] #1173: the bind reads its LAW 5 switch through this helper (default off = the old adds)
-              cc_bind_reinforce_enabled=lambda: False, cc_concepts_enabled=lambda: False)
+              cc_bind_reinforce_enabled=lambda: False, cc_concepts_enabled=lambda: False,
+              # [2026-11-16] #1216 S1 (6fa8ba0): the deposit reads this module constant (default off = the full metadata)
+              VDB_META_SLIM=False)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*nodes],type_ignores=[])),str(SOURCE),'exec'),ns)
     return ns
 
@@ -140,7 +150,7 @@ def test_partial_insert_failure_propagates(packer):
 @pytest.mark.parametrize('fail_insert,raise_dual_pass_incomplete',[(False,False),(True,False),(False,True)])
 def test_dual_pass_outcome_and_embedding_outside_lock(packer,monkeypatch,fail_insert,raise_dual_pass_incomplete):
     import sys
-    ns=functions('_cc_deposit_memory_node','_CCConversationalDualPassEco','run_conversational_dual_pass','_cc_bind_conversational_topology')
+    ns=functions('_cc_deposit_memory_node','_CCConversationalDualPassEco','run_conversational_dual_pass','_cc_bind_conversational_topology','_cc_concepts_runnable')
     ns['_cc_concept_passes_floor']=lambda c:True
     g=Graph()
     class Embed:

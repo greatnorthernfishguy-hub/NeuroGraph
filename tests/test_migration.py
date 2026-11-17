@@ -4,12 +4,21 @@ Tests for the NeuroGraph checkpoint migration framework.
 Covers:
 - Version detection
 - Migration path planning
-- Individual migration steps (0.1.0 → 0.2.0 → 0.2.5 → 0.3.0 → 0.3.5 → 0.4.0 → 0.4.1)
+- Individual migration steps (0.1.0 → 0.2.0 → 0.2.5 → 0.3.0 → 0.3.5 → 0.4.0 → 0.4.1 → 0.4.2)
 - Full migration from oldest to latest
 - Backup and rollback
 - Checkpoint info
 - Edge cases (already at target, unknown version)
 """
+# ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- pins follow two deliberate changes:
+#   (1) commit f6c576f (2026-04-15, "feat(neuro_foundation): v0.4.2 hibernation fix -- serialize ephemeral process state")
+#       added schema 0.4.2 and the 0.4.1 -> 0.4.2 step, so a 0.1.0 checkpoint now takes 7 steps (was 6), a 0.2.5 one 5
+#       (was 4), the last step is ("0.4.1", "0.4.2"), and Graph.checkpoint() writes version "0.4.2" (was "0.4.1").
+#   (2) commit a4a4762 (2026-06-14, "fix(#325): Graph.checkpoint() enforces msgpack -- kill the silent lossy-JSON
+#       topology path") makes Graph.checkpoint() raise on a non-.msgpack path, so the save -> migrate -> restore
+#       roundtrip writes graph.msgpack (was graph.json). Every other assertion is unchanged.
+# -------------------
 
 import json
 import os
@@ -184,13 +193,13 @@ class TestVersionDetection:
 class TestMigrationPlanning:
     def test_plan_v010_to_current(self):
         steps = plan_migration("0.1.0", CURRENT_VERSION)
-        assert len(steps) == 6
+        assert len(steps) == 7
         assert steps[0] == ("0.1.0", "0.2.0")
-        assert steps[-1] == ("0.4.0", "0.4.1")
+        assert steps[-1] == ("0.4.1", "0.4.2")
 
     def test_plan_v025_to_current(self):
         steps = plan_migration("0.2.5", CURRENT_VERSION)
-        assert len(steps) == 4
+        assert len(steps) == 5
         assert steps[0] == ("0.2.5", "0.3.0")
 
     def test_plan_already_current(self):
@@ -275,7 +284,7 @@ class TestFullMigration:
         data = _make_v010_checkpoint()
         migrated, applied = migrate_data(data)
         assert migrated["version"] == CURRENT_VERSION
-        assert len(applied) == 6
+        assert len(applied) == 7
         # All Phase 2+ fields present
         he = migrated["hyperedges"]["he1"]
         assert "activation_count" in he
@@ -327,7 +336,7 @@ class TestFileUpgrade:
         result = upgrade_checkpoint(path)
         assert result["version_before"] == "0.1.0"
         assert result["version_after"] == CURRENT_VERSION
-        assert len(result["steps_applied"]) == 6
+        assert len(result["steps_applied"]) == 7
         assert result["backup_path"] is not None
 
         # Verify file was updated
@@ -359,7 +368,7 @@ class TestFileUpgrade:
 
         result = upgrade_checkpoint(path, dry_run=True)
         assert result["dry_run"] is True
-        assert len(result["steps_applied"]) == 6
+        assert len(result["steps_applied"]) == 7
 
         # File should NOT be modified
         data = load_checkpoint(path)
@@ -514,12 +523,12 @@ class TestGraphIntegration:
         for _ in range(10):
             g1.step()
 
-        path = str(tmp_dir / "graph.json")
+        path = str(tmp_dir / "graph.msgpack")   # #325 (a4a4762): checkpoint() is msgpack-only
         g1.checkpoint(path)
 
         # The saved checkpoint should already be at current version
         info = get_checkpoint_info(path)
-        assert info["version"] == "0.4.1"  # serialization version
+        assert info["version"] == "0.4.2"  # serialization version (f6c576f)
 
         # Upgrade (should be a no-op — already at current version)
         result = upgrade_checkpoint(path)

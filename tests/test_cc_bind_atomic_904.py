@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- stale pin: test_generate_emergent_want_is_untouched compared the function
+#   to #905's version (ee94f7d2); two later deliberate commits changed that function: 26a0a11 ("CC emergent want text from the nodes' own words, never
+#   raw node ids") and d16df64 ("H2 #1136: hyperedge readers outside the step lock read member sets under it (H1 reader audit)"). RE-BASED again (same
+#   precedent as N8 below, not retired) onto d16df64, the last commit that changed it, through the same `git show` mechanism. Nothing else changed;
+#   test_ng_embed_is_unedited_vendored_file is deliberately left as it is (a call for Josh).
 # [2026-10-23 night] Claude Code (Opus 5.5, laptop) — #1173: test_signatures_are_pinned lists drain_ingest_tract's new last keyword
 #   per_text (default False = per raw frame); the rest of the pin unchanged.
 # [2026-10-23] Claude Code (Opus 5.5, laptop; #920) — test_signatures_are_pinned: run_conversational_dual_pass gained the keyword
@@ -1217,7 +1222,8 @@ def test_generate_emergent_want_is_untouched():
         start = src.index('def generate_emergent_want(')
         end = src.index('\ndef ', start + 10)
         return src[start:end]
-    ref = subprocess.run(['git', '-C', str(_WORKTREE), 'show', 'ee94f7d2c516cce40ff81bd32e4febb9781e8e04:cc_ng_organism.py'],
+    # [2026-11-16 #761] re-based ee94f7d2 -> d16df64 (the last deliberate change to this function: 26a0a11 own-words text, then d16df64 #1136 H2)
+    ref = subprocess.run(['git', '-C', str(_WORKTREE), 'show', 'd16df64c519b2c76f6923ecd38b60004f51afa01:cc_ng_organism.py'],
                          capture_output=True, text=True)
-    assert ref.returncode == 0 and ref.stdout, 'cannot read #905 (ee94f7d2) cc_ng_organism.py: %s' % ref.stderr.strip()
+    assert ref.returncode == 0 and ref.stdout, 'cannot read the pinned (d16df64) cc_ng_organism.py: %s' % ref.stderr.strip()
     assert body(new) == body(ref.stdout)
