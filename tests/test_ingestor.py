@@ -15,6 +15,14 @@ Tests cover:
 """
 
 # ---- Changelog ----
+# [2026-11-17] DudeMan CC — TestZipExtractor: the two "unsupported file" tests use real unsupported types (#494, #761)
+# What: test_empty_zip and test_skips_unsupported_files used .png / .jpg / .csv as the unsupported files.
+# Why: 6c9f912 (2026-03-16) made images and .csv supported inside ZIPs (ZipExtractor._SUPPORTED_EXTS).
+# How: .bin / .exe instead; the assertions are unchanged.
+# -------------------
+
+
+# ---- Changelog ----
 # [2026-09-24] Z12 CC (Sonnet 5) — #495: rewrite 24 infrastructure tests off use_model=False scaffolding
 #   What: TestNoveltyDampening (10), TestHypergraphAssociator (6), TestUniversalIngestor (6),
 #         TestEdgeCases::test_very_long_input (1), and TestZipExtractor::test_end_to_end_zip_ingestion (1)
@@ -1454,10 +1462,11 @@ class TestZipExtractor(unittest.TestCase):
             os.unlink(path)
 
     def test_skips_unsupported_files(self):
-        """ZIP with unsupported files (images, binaries) skips them."""
+        """ZIP with unsupported files (binaries) skips them."""
+        # Images and .csv are supported types since 6c9f912 (2026-03-16).
         path = self._make_zip({
-            "photo.jpg": "fake image data",
-            "data.csv": "a,b,c",
+            "tool.exe": "fake binary data",
+            "blob.bin": "abc",
             "readme.md": "# Supported",
         })
         try:
@@ -1489,7 +1498,8 @@ class TestZipExtractor(unittest.TestCase):
 
     def test_empty_zip(self):
         """ZIP with no supported files produces empty text."""
-        path = self._make_zip({"image.png": "fake"})
+        # .png is a supported type since 6c9f912 (2026-03-16): use a binary.
+        path = self._make_zip({"blob.bin": "fake"})
         try:
             ext = ZipExtractor()
             result = ext.extract(path)

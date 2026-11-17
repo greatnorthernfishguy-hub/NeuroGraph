@@ -5,6 +5,11 @@
 # (prune/sprout mutates synapses UNDER _step_lock) changes the dict mid-iteration.
 # (_rebuild_index's sorted(nodes.keys()) is a single C call = GIL-atomic, but we snapshot
 # it under the lock too as cheap insurance.) Fix: snapshot under the Graph's _step_lock.
+# [2026-11-17] DudeMan CC — first test: 5000 -> 500 reader iterations (#761).
+# What/Why: the writer re-takes _step_lock in a tight loop, so every reader call waits ~3 GIL
+#   switch intervals for it: measured 15.3 ms a call against the writer, 1.08 ms alone
+#   (5000 calls = 77 s against the 30 s join; failing "under load" since at least 2026-10-21).
+#   The test is about the race, not speed: 500 calls still cross thousands of writer mutations.
 import threading
 from neuro_foundation import Graph
 from lenia.graph_substrate import NeuroGraphSubstrate
@@ -35,7 +40,7 @@ def test_build_adjacency_no_race_under_concurrent_step_mutation():
 
     def reader():
         try:
-            for _ in range(5000):
+            for _ in range(500):
                 sub._build_adjacency()
                 sub._rebuild_index()
         except Exception as e:  # noqa: BLE001 — catching the race is the point
