@@ -295,7 +295,7 @@ class ActivationPersistence:
             # the msgpack envelope opens with a map header), so either engine's file restores under either suffix.
             with open(sidecar_path, "rb") as f:
                 raw = f.read()
-            if raw[:1] == b"{":
+            if raw.lstrip()[:1] == b"{":   # leading whitespace is still JSON, as json.load took it
                 data = json.loads(raw.decode("utf-8"))
             else:
                 import msgpack
