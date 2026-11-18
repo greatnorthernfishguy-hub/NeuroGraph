@@ -75,18 +75,77 @@ def test_msgpack_suffix_writes_msgpack_with_the_same_envelope(tmp_path):
     assert sorted(captured["entries"]) == ["a", "b", "ünï::tree::x y"]
 
 
-def test_msgpack_sidecar_restores_exact_values(tmp_path):
+def test_msgpack_sidecar_restores_exact_values(tmp_path, monkeypatch):
+    import activation_persistence as mod
     ap = _ap(MSGPACK_SUFFIX)
     ckpt = str(tmp_path / "main.msgpack")
     src = _graph()
-    ap.write_state(ckpt, ap.capture_state(src))
+    captured = ap.capture_state(src)
+    ap.write_state(ckpt, captured)
+    assert Path(ckpt + MSGPACK_SUFFIX).read_bytes() == msgpack.packb(captured, use_bin_type=True)
+    monkeypatch.setattr(mod.time, "time", lambda: captured["saved_at"])   # no time has passed: no decay
     dst = _fresh_graph()
     assert _ap(MSGPACK_SUFFIX).restore(dst, ckpt) == 3
     for nid in ("a", "b", "ünï::tree::x y"):
-        # restore applies decay for the seconds since the save: compare against the same formula
-        assert abs(dst.nodes[nid].voltage - src.nodes[nid].voltage) <= abs(src.nodes[nid].voltage) * 1e-4
+        assert dst.nodes[nid].voltage == src.nodes[nid].voltage                       # float64, bit for bit
         assert dst.nodes[nid].intrinsic_excitability == src.nodes[nid].intrinsic_excitability
     assert dst.nodes["rest"].voltage == 0.0
+
+
+def test_msgpack_keeps_minus_infinity_and_empty_entries(tmp_path):
+    ap = _ap(MSGPACK_SUFFIX)
+    ckpt = str(tmp_path / "main.msgpack")
+    g = _graph()
+    g.nodes["a"].last_spike_time = float("-inf")                 # a node that never fired
+    captured = ap.capture_state(g)
+    ap.write_state(ckpt, captured)
+    back = msgpack.unpackb(Path(ckpt + MSGPACK_SUFFIX).read_bytes(), raw=False)
+    assert back["entries"]["a"]["last_spike_time"] == float("-inf")
+    empty = dict(captured, entries={})
+    ap.write_state(ckpt, empty)
+    assert msgpack.unpackb(Path(ckpt + MSGPACK_SUFFIX).read_bytes(), raw=False) == empty
+    assert _ap(MSGPACK_SUFFIX).restore(_fresh_graph(), ckpt) == 0
+
+
+def test_failed_msgpack_write_raises_and_leaves_bookkeeping(tmp_path):
+    ap = _ap(MSGPACK_SUFFIX)
+    ckpt = str(tmp_path / "main.msgpack")
+    good = ap.capture_state(_graph())
+    ap.write_state(ckpt, good)
+    before_stats, before_bytes = ap.get_stats(), Path(ckpt + MSGPACK_SUFFIX).read_bytes()
+    bad = dict(good, saved_at=good["saved_at"] + 5.0, timestep=2 ** 64)   # msgpack cannot pack this int
+    try:
+        ap.write_state(ckpt, bad)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("a failed write must raise")
+    assert ap.get_stats() == before_stats
+    assert Path(ckpt + MSGPACK_SUFFIX).read_bytes() == before_bytes
+
+
+def test_json_with_leading_whitespace_still_restores(tmp_path):
+    ckpt = str(tmp_path / "main.msgpack")
+    captured = _ap().capture_state(_graph())
+    Path(ckpt + LEGACY_SUFFIX).write_text("\n  " + json.dumps(captured))
+    assert _ap().restore(_fresh_graph(), ckpt) == 3
+
+
+def test_native_columns_capture_packs_as_msgpack(tmp_path):
+    """The NodeStore path hands numpy columns; .tolist() makes plain floats, which msgpack takes."""
+    import numpy as np
+    g = _graph()
+    ids = list(g.nodes)
+    cols = lambda names: (ids, *[np.array([getattr(g.nodes[i], n) for i in ids], dtype=np.float64) for n in names])
+    class Nodes(dict):
+        columns = staticmethod(cols)
+    g2 = SimpleNamespace(nodes=Nodes(g.nodes), timestep=g.timestep)
+    ap = _ap(MSGPACK_SUFFIX)
+    ckpt = str(tmp_path / "main.msgpack")
+    captured = ap.capture_state(g2)
+    assert sorted(captured["entries"]) == ["a", "b", "ünï::tree::x y"]
+    ap.write_state(ckpt, captured)
+    assert msgpack.unpackb(Path(ckpt + MSGPACK_SUFFIX).read_bytes(), raw=False) == captured
 
 
 def test_receipt_names_the_msgpack_path(tmp_path):
@@ -95,6 +154,7 @@ def test_receipt_names_the_msgpack_path(tmp_path):
     captured = ap.capture_state(_graph())
     receipt = ap.write_state(ckpt, captured, with_receipt=True)
     assert receipt == {"path": ckpt + MSGPACK_SUFFIX, "saved_at": captured["saved_at"]}
+    assert Path(ckpt + MSGPACK_SUFFIX).read_bytes()[:1] == b"\x84"   # the four-key envelope as a msgpack map
 
 
 def test_msgpack_suffix_falls_back_to_the_legacy_json_file(tmp_path):
