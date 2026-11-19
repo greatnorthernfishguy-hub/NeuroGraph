@@ -303,9 +303,21 @@ class ActivationPersistence:
                 logger.info("Activation sidecar at %s is the old JSON format: read once; the next save writes msgpack",
                             sidecar_path)
             else:
-                data = msgpack.unpackb(raw, raw=False)
+                # strict_map_key=False: a node id that is not a str (none seen, but create_node does not force it)
+                # comes back as the id it was, instead of failing the whole restore.
+                data = msgpack.unpackb(raw, raw=False, strict_map_key=False)
+            # The envelope's shape is checked here, inside the try, so a file that parses but is not an activation
+            # envelope restores nothing instead of raising below (review, Grok 4.7, 2026-11-18).
             if not isinstance(data, dict):
                 raise ValueError("activation sidecar is not a mapping: %s" % type(data).__name__)
+            if not isinstance(data.get("entries", {}), dict):
+                raise ValueError("activation sidecar entries is not a mapping")
+            if isinstance(data.get("saved_at", 0.0), bool) or not isinstance(data.get("saved_at", 0.0), (int, float)):
+                raise ValueError("activation sidecar saved_at is not a number")
+            for _nid, _st in data.get("entries", {}).items():
+                if not isinstance(_st, dict) or isinstance(_st.get("voltage"), bool) \
+                        or not isinstance(_st.get("voltage"), (int, float)):
+                    raise ValueError("activation sidecar entry %r has no numeric voltage" % (_nid,))
         except Exception as exc:
             logger.warning("Failed to read activation sidecar: %s", exc)
             return 0
