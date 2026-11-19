@@ -28,6 +28,14 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#1243; Josh 2026-11-18 "openclaw hook is also supposed to be msgpack") — _sidecar_defect reads msgpack
+# (PROTECTED CHANGE on branch cc-laptop-activations-msgpack-1243-20261118; its own commit)
+# What: _sidecar_defect() unpacks the activation sidecar as msgpack instead of json.load. Nothing else: the file name
+#       (<checkpoint>.activations.json) and every place that names it are unchanged.
+# Why:  activation_persistence.write_state writes msgpack only from the same branch; with json.load here every save
+#       with a receipt would report "sidecar unreadable after save". No JSON branch: the file checked is the one this
+#       save just wrote.
+# How:  msgpack.unpackb(raw=False) on the file's bytes; the token comparison (saved_at, a float64) is unchanged.
 # [2026-10-22] Claude Code (Opus 5.5; #1161 / #1123) — save(after_capture=...): a caller's outer lock ends at the capture
 # (PROTECTED CHANGE on review branch cc-laptop-save-lock-20261022 ONLY; merges only after Josh's protected-file "proceed")
 # What: save() takes an optional keyword after_capture (a no-argument callable). It is called exactly once, right after
@@ -714,8 +722,11 @@ def _sidecar_defect(path: str, token: Any) -> Optional[str]:
     if token is None:
         return "activation writer reported no successful-write token"
     try:
-        with open(path) as f:
-            data = json.load(f)
+        # [2026-11-18] #1243: the sidecar is msgpack (activation_persistence.write_state). This check runs on the
+        # file that save just wrote, so there is no old-JSON case here: a JSON file at this point is a defect.
+        import msgpack
+        with open(path, "rb") as f:
+            data = msgpack.unpackb(f.read(), raw=False)
     except Exception as exc:
         return f"sidecar unreadable after save: {type(exc).__name__}: {exc}"
     if not isinstance(data, dict) or "entries" not in data:
