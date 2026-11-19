@@ -1,5 +1,6 @@
 """#423 canonical capture/write contracts using extracted code and disposable fakes."""
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#1243) -- the activation sidecar is msgpack now (same file name): the two sidecar reads unpack msgpack.
 # [2026-09-11] Codex — replace constructor-based native draft with isolated tests.
 # What: exercise real persistence methods without importing Graph or embedding modules.
 # Why: offline repair must not instantiate NG/models or touch live state.
@@ -142,7 +143,7 @@ def test_activation_capture_uses_captured_values(tmp_path):
     g=SimpleNamespace(nodes={'n':node},timestep=7)
     cap=ap.capture_state(g);node.voltage=.9;g.timestep=9
     path=ap.write_state(str(tmp_path/'g.msgpack'),cap)
-    data=json.loads(Path(path).read_text());assert data['timestep']==7
+    data=msgpack.unpackb(Path(path).read_bytes(),raw=False);assert data['timestep']==7
     assert data['entries']['n']['voltage']==.5
     assert ap._last_save_time==data['saved_at']
 
@@ -209,4 +210,4 @@ def test_activation_explicit_receipt_does_not_require_clock_advance(tmp_path):
     ap._last_save_time=12.0
     receipt=ap.write_state(str(tmp_path/'g.msgpack'),cap,with_receipt=True)
     assert receipt=={'path':str(tmp_path/'g.msgpack.activations.json'),'saved_at':12.0}
-    assert json.loads(Path(receipt['path']).read_text())['saved_at']==receipt['saved_at']
+    assert msgpack.unpackb(Path(receipt['path']).read_bytes(),raw=False)['saved_at']==receipt['saved_at']

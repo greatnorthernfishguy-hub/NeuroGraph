@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#1243) -- the activation sidecar is msgpack now (same file name): the kill-proof reader unpacks msgpack.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — created with the PROTECTED activation_persistence.py commit
 # What: SIGKILL proof for ActivationPersistence.write_state(): a forked child rewrites a 40,000-entry sidecar in a loop;
 #       the parent SIGKILLs it at random points; after every kill the sidecar parses with all entries, and complete
@@ -9,6 +10,7 @@
 """Atomic-save proof for the activation sidecar (protected file activation_persistence.py)."""
 
 import json
+import msgpack
 import sys
 from pathlib import Path
 
@@ -35,7 +37,7 @@ def test_sigkill_activation_sidecar_never_tears(tmp_path):
     seen = []
 
     def verify():
-        d = json.load(open(ckpt + ".activations.json"))
+        d = msgpack.unpackb(open(ckpt + ".activations.json", "rb").read(), raw=False)
         assert len(d["entries"]) == 40000
         seen.append(d["saved_at"])
         _clean_tmps(tmp_path)

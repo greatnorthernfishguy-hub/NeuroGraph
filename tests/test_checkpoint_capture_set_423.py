@@ -1,11 +1,13 @@
 """Canonical producer captures a common set and publishes outside mutation lock."""
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#1243) -- the activation sidecar is msgpack now (same file name): the saved sidecar is unpacked as msgpack.
 # [2026-09-11] Codex — common capture, failure and concurrent publication tests.
 # What: real extracted producer with isolated fakes and thread barriers.
 # Why: separate correct writers must still agree on the same state and lock order.
 # How: resume mutations before first write; verify files, manifest and receipt.
 # -------------------
 import json
+import msgpack
 import threading
 from types import MethodType
 
@@ -61,7 +63,7 @@ def test_saved_set_uses_capture_even_when_mutation_resumes(tmp_path,receipt,quar
     else:
         assert me._checkpoint_path.read_bytes()==original_graph
         assert me._vector_db_path.read_bytes()==original_vectors
-        sidecar=json.loads((tmp_path/'main.msgpack.activations.json').read_text())
+        sidecar=msgpack.unpackb((tmp_path/'main.msgpack.activations.json').read_bytes(),raw=False)
         assert sidecar['timestep']==4242
         manifest=json.loads((tmp_path/'main.msgpack.manifest.json').read_text())
         assert manifest['nodes']==12 and manifest['timestep']==4242

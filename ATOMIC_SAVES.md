@@ -117,6 +117,10 @@ Several sidecars are JSON (`activations.json`, manifest, guard state/history, `c
 daemon's small state files). Per [[saves-are-msgpack-never-json]] saves are msgpack; changing those formats is a reader
 change and, for the activation sidecar, a protected-format change — out of scope for this lane, flagged for Josh.
 
+**[2026-11-18] #1243:** the activation sidecar is msgpack now (Josh's proceed; same file name; the reader still takes
+the old JSON file once, a temporary catchment). The manifest, guard state / history and the other JSON files above are
+unchanged.
+
 ## Proof
 
 All runs isolated (`~/.cache/flow-lenia-f1/run-isolated.sh`: bwrap PID namespace, read-only binds over the live trees and

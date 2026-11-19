@@ -1,4 +1,5 @@
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#1243) -- the activation sidecar is msgpack now (same file name): _ngmemory_kill_proof reads the activation sidecar as msgpack.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be
 #   atomic") — created
 # What: (1) checkpoint_guardian.atomic_file_write: a failing writer leaves the previous file and no tmp; the tmp is
@@ -255,7 +256,7 @@ def _ngmemory_kill_proof(tmp_path, check_sidecar):
         json.load(open(os.path.join(ckpt_dir, "main.msgpack.manifest.json")))
         side = os.path.join(ckpt_dir, "main.msgpack.activations.json")
         if check_sidecar:
-            json.load(open(side))
+            msgpack.unpackb(open(side, "rb").read(), raw=False)   # [2026-11-18] #1243: the sidecar is msgpack
         _clean_tmps(ckpt_dir)
 
     v = _kill_rounds(loop, verify, rounds=15, seed=4, lo=0.05, hi=0.6)

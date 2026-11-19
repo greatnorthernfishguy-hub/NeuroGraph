@@ -1,6 +1,7 @@
 """#1161 / #1123: NeuroGraphMemory.save(after_capture=...) lets a caller drop its outer lock at the capture.
 
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#1243) -- the activation sidecar is msgpack now (same file name): _sidecar_sans_time unpacks msgpack.
 # [2026-10-22] Claude Code (Opus 5.5; #1161 / #1123) — created
 # What: (A) the shipped save() body (AST-extracted, the #423 harness) calls after_capture exactly once, after the capture
 #       and before the permit / any write; an outer lock released there is free for the whole write (the hold is measured);
@@ -16,6 +17,7 @@
 """
 
 import json
+import msgpack
 import os
 import shutil
 import sys
@@ -206,7 +208,7 @@ def _vdb_dim(ng):
 
 
 def _sidecar_sans_time(path):
-    d = json.loads(Path(path).read_text())
+    d = msgpack.unpackb(Path(path).read_bytes(), raw=False)
     d.pop('saved_at', None)
     return d
 

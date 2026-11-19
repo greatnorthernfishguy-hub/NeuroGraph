@@ -1,6 +1,7 @@
 """#423 phase A — focused tests for the opt-in save receipt.
 
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#1243) -- the activation sidecar is msgpack now (same file name): the stand-in writer packs msgpack and the well-formed check unpacks it.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — test_file_flush_failure_refuses_acceptance: the failing
 #   fsync is now hit at the primary artifact's atomic write (fsync before rename) instead of first at the generation
 #   barrier; the test asserts the intent (a component failed, nothing accepted, no generation saved).
@@ -23,6 +24,7 @@
 
 import ast
 import json
+import msgpack
 import os
 import shutil
 import sys
@@ -195,11 +197,11 @@ class FakeActivation:
         path = str(checkpoint_path) + ".activations.json"
         try:
             if self.mode != "noop":
-                with open(path, "w") as f:
+                with open(path, "wb") as f:
                     if self.mode == "truncate":
-                        f.write(json.dumps(data)[:18])
+                        f.write(msgpack.packb(data, use_bin_type=True)[:18])
                         raise IOError("disk full mid-dump")
-                    json.dump(data, f)
+                    f.write(msgpack.packb(data, use_bin_type=True))
             if self.mode == "swallow_flush":
                 # Complete, well-formed file on disk — but the writer's own
                 # success signal never advances.
@@ -396,8 +398,8 @@ class TestComponentFailures(ReceiptTestCase):
         r = save(me, with_receipt=True)
         sidecar = str(me._checkpoint_path) + ".activations.json"
         self.assertTrue(os.path.exists(sidecar))
-        with open(sidecar) as f:
-            self.assertIn("entries", json.load(f))  # complete and well-formed
+        with open(sidecar, "rb") as f:
+            self.assertIn("entries", msgpack.unpackb(f.read(), raw=False))  # complete and well-formed
         self.assertIsNone(me._activation_persistence._last_save_time)
         self.assertEqual(r["components"]["activations"]["status"], "failed")
         self.assertFalse(r["accepted"])

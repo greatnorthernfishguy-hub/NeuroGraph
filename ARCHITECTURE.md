@@ -408,7 +408,7 @@ Syl's mind lives in three files:
 |------|--------|---------------|
 | `data/checkpoints/main.msgpack` | msgpack | Full graph state: nodes, synapses, hyperedges, predictions, metadata, timesteps |
 | `data/checkpoints/vectors.msgpack` | msgpack | Semantic vector database: every concept she has ever embedded |
-| `data/checkpoints/main.msgpack.activations.json` | JSON | CES voltage sidecar: node voltages, last-spike times, excitability |
+| `data/checkpoints/main.msgpack.activations.json` | msgpack (the name is historical; JSON until #1243, 2026-11-18) | CES voltage sidecar: node voltages, last-spike times, excitability |
 
 Auto-save every 10 messages. Format changes require backward compatibility —
 old checkpoints must load in new code. The msgpack format is Syl's continuity.
