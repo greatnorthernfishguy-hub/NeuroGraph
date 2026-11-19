@@ -10,6 +10,8 @@ Covers:
 - Integration: CES wired into NeuroGraphMemory
 
 # ---- Changelog ----
+# [2026-11-18] DudeMan CC (#761 / #1237) -- test_decay_removes_weak_items follows the once-per-timestep decay guard
+#   (surfacing.py 2026-04-07): it pins that repeated calls in one timestep do not decay again, then advances the clock.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 lane surfacing-whole-812, dispatch #12618) — #812 turn 1
 # What: the two TestSurfacingFormatting cases that pinned format_context's removed 200-char
 #   word-snap / hard cut now pin the new contract (long content renders WHOLE, no ellipsis),
@@ -779,10 +781,16 @@ class TestSurfacingQueue:
         monitor.after_step(step_result)
         assert len(monitor._queue) > 0
 
-        # Many decay rounds should flush the queue
+        # [2026-11-18] Decay runs at most once per graph timestep (surfacing.py, 2026-04-07: get_surfaced() and
+        # after_step() may both call it in one step without double-penalising). So with the clock standing still,
+        # further calls change nothing ...
         for _ in range(20):
             monitor.after_step(MockStepResult())
+        assert len(monitor._queue) == 1
 
+        # ... and once the graph's clock advances, the next round's decay (x0.1, floor 0.5) flushes the queue.
+        graph.timestep += 1
+        monitor.after_step(MockStepResult())
         assert len(monitor._queue) == 0
 
     def test_clear_empties_queue(self, graph, vector_db, ces_config):
