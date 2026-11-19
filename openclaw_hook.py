@@ -726,7 +726,7 @@ def _sidecar_defect(path: str, token: Any) -> Optional[str]:
         # file that save just wrote, so there is no old-JSON case here: a JSON file at this point is a defect.
         import msgpack
         with open(path, "rb") as f:
-            data = msgpack.unpackb(f.read(), raw=False)
+            data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
     except Exception as exc:
         return f"sidecar unreadable after save: {type(exc).__name__}: {exc}"
     if not isinstance(data, dict) or "entries" not in data:
