@@ -1,8 +1,8 @@
 """
 CES Activation Persistence — Save and restore node activation state across sessions.
 
-Writes a sidecar file alongside the main msgpack checkpoint (JSON under the
-default ".activations.json" suffix, msgpack under a ".msgpack" suffix) that
+Writes a msgpack sidecar file alongside the main msgpack checkpoint (the file
+keeps its historical name, <checkpoint>.activations.json) that
 captures each node's voltage, last-fired step, and excitability.  On
 restore, a temporal decay is applied based on elapsed wall-clock time so
 that stale activations fade naturally.
@@ -16,7 +16,21 @@ Usage::
     ap.restore(graph, "/path/to/checkpoint.msgpack")
 
 # ---- Changelog ----
-# [2026-11-18] DudeMan CC (#1243; Josh 2026-11-18 "you have my go and Proceed for ... #1243") — the sidecar's format
+# [2026-11-18 15:40] DudeMan CC (#1243; Josh 2026-11-18: "I don't want the JSON though, not as a secondary or fallback
+#   state"; "only still accepting JSON for any residual JSON still in the pipe, and is intended to be removed once
+#   there is no more left to process"; keep the existing file name) — the sidecar is msgpack, full stop
+#   (PROTECTED CHANGE on branch cc-laptop-activations-msgpack-1243-20261118; replaces the same day's stage 1 below)
+#   What: write_state() writes msgpack only, under the unchanged name <checkpoint>.activations.json (the name is held by
+#         the generation ring, the Syl's Law hooks, the daemon, installers and docs; none of them parse it).
+#         restore() reads msgpack. TEMPORARY CATCHMENT: a file whose first non-blank byte is "{" is the old engine's
+#         JSON sidecar still on disk (or in an older ring generation); it is read once and the next save overwrites it
+#         with msgpack. REMOVE that branch once no JSON sidecar is left on any machine (laptop CC, Syl, the ring
+#         generations, the s7 harness's ckpt-src). The suffix-selected JSON writer and the legacy-path fallback of the
+#         entry below are gone.
+#   Why:  saves are msgpack, never JSON (Josh 2026-10-13; Format-for-Purpose: SNN state is msgpack only).
+#   How:  msgpack.packb(use_bin_type=True) through checkpoint_guardian.atomic_write_bytes; unpackb(raw=False): float64
+#         exact, same envelope keys. openclaw_hook._sidecar_defect reads msgpack in its own commit.
+# [2026-11-18] DudeMan CC (#1243; SUPERSEDED the same day by the entry above; Josh 2026-11-18 "you have my go and Proceed for ... #1243") — the sidecar's format
 #   follows its suffix (PROTECTED CHANGE on branch cc-laptop-activations-msgpack-1243-20261118; stage 1, no default moved)
 #   What: write_state() packs the envelope as msgpack when the configured sidecar suffix ends in ".msgpack"; with the
 #         default ".activations.json" suffix it writes the same JSON bytes as before. restore() reads either format by
@@ -212,16 +226,10 @@ class ActivationPersistence:
 
         try:
             # Atomic (temp + fsync + os.replace + dir fsync): a kill mid-write leaves the previous sidecar, never a
-            # truncated one. Same path, same JSON bytes, so restore() and the generation ring's copy are unchanged.
-            # [2026-11-18] #1243: a ".msgpack" sidecar suffix writes msgpack; any other suffix writes the JSON above.
-            # (Literals, not module constants: tests/test_detached_capture_423.py runs this method's source alone.)
-            if sidecar_path.endswith(".msgpack"):
-                import msgpack
-                from checkpoint_guardian import atomic_write_bytes
-                atomic_write_bytes(sidecar_path, msgpack.packb(captured, use_bin_type=True))
-            else:
-                from checkpoint_guardian import atomic_write_text
-                atomic_write_text(sidecar_path, json.dumps(captured))
+            # truncated one. [2026-11-18] #1243: msgpack only; the path (and so the ring's copy) is unchanged.
+            import msgpack
+            from checkpoint_guardian import atomic_write_bytes
+            atomic_write_bytes(sidecar_path, msgpack.packb(captured, use_bin_type=True))
         except Exception as exc:
             logger.error(
                 "Failed to save activation sidecar to %s: %s", sidecar_path, exc,
@@ -280,25 +288,21 @@ class ActivationPersistence:
         sidecar_path = self._sidecar_path_for(checkpoint_path)
 
         if not Path(sidecar_path).exists():
-            # [2026-11-18] #1243: first start after the suffix moved off the legacy name: the old engine's file is
-            # still the newest warmth there is. Read it; it is left in place.
-            legacy_path = checkpoint_path + ".activations.json"
-            if sidecar_path != legacy_path and Path(legacy_path).exists():
-                logger.info("No activation sidecar at %s: reading the legacy %s", sidecar_path, legacy_path)
-                sidecar_path = legacy_path
-            else:
-                logger.debug("No activation sidecar at %s", sidecar_path)
-                return 0
+            logger.debug("No activation sidecar at %s", sidecar_path)
+            return 0
 
         try:
-            # [2026-11-18] #1243: the format is read off the content, not the name ("{" opens the JSON envelope;
-            # the msgpack envelope opens with a map header), so either engine's file restores under either suffix.
+            import msgpack
             with open(sidecar_path, "rb") as f:
                 raw = f.read()
-            if raw.lstrip()[:1] == b"{":   # leading whitespace is still JSON, as json.load took it
+            if raw.lstrip()[:1] == b"{":
+                # [2026-11-18] #1243 TEMPORARY CATCHMENT (remove when no JSON sidecar is left anywhere): the old
+                # engine's JSON sidecar. Nothing writes JSON any more; the next save replaces this file with msgpack.
+                # (A msgpack envelope opens with a map header, never with "{".)
                 data = json.loads(raw.decode("utf-8"))
+                logger.info("Activation sidecar at %s is the old JSON format: read once; the next save writes msgpack",
+                            sidecar_path)
             else:
-                import msgpack
                 data = msgpack.unpackb(raw, raw=False)
             if not isinstance(data, dict):
                 raise ValueError("activation sidecar is not a mapping: %s" % type(data).__name__)
