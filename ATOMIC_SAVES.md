@@ -47,7 +47,7 @@ recomputed (cost noted).
 | A5 | `~/.et_modules/registry.json` (+ `et_module.json` manifests) | `et_modules/manager.py:373` (`:88`) — NG and Elmer copies identical | `open('w')` in place | module register (live: 10:56) | degrades (registry discarded, modules forgotten until re-register) | local `_atomic_write_text` (`:47`, used `:131`, `:415`) — NG `c92dda5`, Elmer `2f06958` |
 | A6 | `checkpoints/main.msgpack`, `vectors.msgpack`, `quarantine/*` | `openclaw_hook.py:1793/1810` -> `checkpoint_guardian.atomic_file_write` `:385` | tmp + `os.replace`, **no fsync before the rename** (fsync came later, in `rotate_generations`) | autosave ~5 min | **irreplaceable** on power loss / hard hang (ecryptfs `~`; laptop GPU freezes): empty/partial file under the final name | `atomic_file_write` fsyncs the tmp, replaces, fsyncs the dir; reports stale tmps (`checkpoint_guardian.py:465`) — NG `c92dda5`. Protected writers untouched. |
 | A7 | `main.msgpack.manifest.json`, `.guard_state.json`, `.guard_history.json` | `checkpoint_guardian.py:158`, `:211`, `:520` | tmp + replace, no fsync | every save | degrades (gate reference / #1051 history reset) | `atomic_write_text` (`:168`, `:219`, `:622`) |
-| A8 | `checkpoints/main.msgpack.activations.json` | **PROTECTED** `activation_persistence.py:191` `write_state` | `open('w')` + json.dump in place | every save | irreplaceable-ish (all CES warmth; `restore()` rejects a torn file; the generation ring copies it as-is) | `checkpoint_guardian.atomic_write_text` (`:203`) — NG `fc4dfdf`, **needs Josh's "proceed"** |
+| A8 | `checkpoints/main.msgpack.activations.json` | **PROTECTED** `activation_persistence.py:191` `write_state` | `open('w')` + json.dump in place | every save | irreplaceable-ish (all CES warmth; `restore()` rejects a torn file; the generation ring copies it as-is) | `checkpoint_guardian.atomic_write_text` (`:203`) — NG `fc4dfdf`, **needs Josh's "proceed"** **[2026-11-18] #1243: msgpack bytes now (`atomic_write_bytes`), same name; do not `jq` it.** |
 | A9 | `lenia/channels.json` | `lenia/channels.py:291` | `open('w')` in place | channel lifecycle events | degrades (registry unparseable at load) | `atomic_write_text` (`:296`) |
 | A10 | `lenia/enabled` | `lenia/kill_switch.py:82`, `:101` | `write_text` (truncate first) | enable/disable | degrades: empty file = Lenia silently OFF next start | `atomic_write_text` (`:87`, `:106`) |
 | A11 | `lenia/distance_cache.npz` | `lenia/kernel.py:355` | tmp + replace (#261), no fsync | Lenia checkpoints | rebuildable but multi-hour | file-object `savez_compressed` + fsync + dir fsync (`:360`) |
@@ -113,7 +113,7 @@ recomputed (cost noted).
 
 ## Format notes (not changed here)
 
-Several sidecars are JSON (`activations.json`, manifest, guard state/history, `channels.json`, `registry.json`, the
+Several sidecars are JSON (`activations.json` **until 2026-11-18, msgpack since: see the #1243 note below**, manifest, guard state/history, `channels.json`, `registry.json`, the
 daemon's small state files). Per [[saves-are-msgpack-never-json]] saves are msgpack; changing those formats is a reader
 change and, for the activation sidecar, a protected-format change — out of scope for this lane, flagged for Josh.
 

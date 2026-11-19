@@ -202,3 +202,29 @@ def test_sidecar_defect_accepts_the_msgpack_file_and_rejects_json(tmp_path):
     assert "unreadable" in defect(receipt["path"], receipt["saved_at"]) or "entries" in defect(receipt["path"], receipt["saved_at"])
     Path(receipt["path"]).write_bytes(msgpack.packb({"saved_at": receipt["saved_at"]}))
     assert "entries" in defect(receipt["path"], receipt["saved_at"])
+
+
+def test_a_file_that_parses_but_is_not_an_envelope_restores_nothing(tmp_path):
+    ckpt = str(tmp_path / "main.msgpack")
+    for bad in ({"saved_at": "nope", "entries": {"a": {"voltage": 1.0}}}, {"entries": [1], "saved_at": 1.0},
+                {"entries": {"a": {"excitability": 2.0}}, "saved_at": 1.0}, {"entries": {"a": 5}, "saved_at": 1.0}):
+        for raw in (msgpack.packb(bad), json.dumps(bad).encode()):
+            Path(ckpt + SUFFIX).write_bytes(raw)
+            g = _fresh_graph()
+            assert _ap().restore(g, ckpt) == 0
+            assert all(n.voltage == 0.0 and n.intrinsic_excitability == 1.0 for n in g.nodes.values())
+
+
+def test_a_non_str_node_id_round_trips(tmp_path, monkeypatch):
+    g = _graph()
+    g.nodes[7] = SimpleNamespace(voltage=2.5, resting_potential=0.0, last_spike_time=1.0, intrinsic_excitability=3.0)
+    ap = _ap()
+    ckpt = str(tmp_path / "main.msgpack")
+    captured = ap.capture_state(g)
+    receipt = ap.write_state(ckpt, captured, with_receipt=True)
+    assert _sidecar_defect()(receipt["path"], receipt["saved_at"]) is None
+    monkeypatch.setattr(mod.time, "time", lambda: captured["saved_at"])
+    dst = _fresh_graph()
+    dst.nodes[7] = SimpleNamespace(voltage=0.0, resting_potential=0.0, last_spike_time=0.0, intrinsic_excitability=1.0)
+    assert _ap().restore(dst, ckpt) == 4
+    assert dst.nodes[7].voltage == 2.5 and dst.nodes[7].intrinsic_excitability == 3.0
