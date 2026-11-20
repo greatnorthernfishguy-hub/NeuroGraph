@@ -1,3 +1,14 @@
+# [2026-11-20] DudeMan CC (Claude Fable 5.2, laptop) — native tick M2 (#1221): the receiver's registration and chains leave
+#   the engine's Python (Josh 2026-11-20 "You may proceed.").
+# What: _receiver_predictions is one call, ng_tract.receiver_step (candidate scan + registration + chains);
+#   _receiver_chains is deleted (LAW 3: its body is the crate's); _mint_prediction_ids hands the crate its uuid4 ids;
+#   the receiver switch now needs a wheel with receiver_step. Same predictions, same order, same ids under a seeded id
+#   stream, same checkpoint bytes (tests/test_native_tick_m2.py against the engine before this change, loaded from git).
+#   Declared difference: `prediction_generated` events are emitted after the whole pass, in registration order (they
+#   were emitted one by one inside it); nothing in the ecosystem listens to that event today.
+# Why: go-live register 2026-11-19 / 11-20: at live size (84k nodes) the receiver pass is 484 ms a step = 11 % of the
+#   step (spec 2026-11-01-receiver-side-prediction-design §10: 2 %), 356 ms of it in these two Python loops.
+# How: see ng-tract-rs src/receiver.rs (receiver_step). The receiver stays OFF by default; copy runs only.
 # [2026-11-14 evening] DudeMan CC — #1221 after arm M1136NT1 (plan §6h/§6i; Josh 2026-11-14 "Proceed and Yes."):
 #   _cleanup_predictions hands the #1212 surprise window to the store with PredictionBook.surprise_window_to (inside
 #   Rust) instead of window_ids -> a Python list -> cofire_tally_set_window. Same ids, same order. The list path stays
@@ -1879,6 +1890,12 @@ def _pb_prediction(book, row) -> "Prediction":
         p.contributors = [tuple(x) for x in (book.contributors(pid) or [])]
         p.contributors_raw = {sid: (pre_id, w) for sid, pre_id, w in raw[0]} if raw is not None else {}
     return p
+
+
+def _mint_prediction_ids(n: int) -> List[str]:
+    """[2026-11-20] native tick M2: n new prediction ids for ng_tract.receiver_step, drawn as Prediction's own default
+    does (uuid4), in registration order."""
+    return [str(uuid.uuid4()) for _ in range(n)]
 
 
 def _pb_insert(book, pid: str, p: "Prediction", keep_source: bool = True) -> str:
@@ -5465,11 +5482,11 @@ class Graph:
             rho0, k, eta, rho_min, alpha, floor, margin = p
             ok = (all(math.isfinite(x) for x in p) and 0.0 < rho_min <= rho0 < 1.0 and k > 0.0
                   and 0.0 < eta < 1.0 and 0.0 < alpha <= 1.0 and floor >= 0.0 and margin >= 0.0)
-            if ok and not (hasattr(ng_tract, "receiver_candidates")
+            if ok and not (hasattr(ng_tract, "receiver_step")
                            and getattr(type(self.nodes), "receiver_round", 0) >= 3
                            and isinstance(self.synapses, getattr(ng_tract, "SynapseStore", ()))):
                 # [2026-11-10] Rust-only (Josh 2026-11-03): no Python path for the receiver
-                self._stab_error_once(["prediction_receiver_enabled"], "an ng_tract wheel with receiver_candidates and "
+                self._stab_error_once(["prediction_receiver_enabled"], "an ng_tract wheel with receiver_step and "
                                       "the native NodeStore (receiver_round >= 3) and SynapseStore")
                 return None
             if ok:
@@ -6064,124 +6081,39 @@ class Graph:
     def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
         """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
         but cannot fire it alone: rho_T * theta <= D < theta - v (spec §4.1-4.4, 4.7-4.8). Chains: §4.6.
-        [2026-11-10] Rust-only: the candidate scan is ng_tract.receiver_candidates; registration stays here."""
+        [2026-11-10] Rust-only: the candidate scan moved to ng_tract.
+        [2026-11-20] native tick M2 (#1221): the whole pass is ONE call, ng_tract.receiver_step: the candidate scan,
+        registration (merge into an open prediction, the table cap, the pre-charge, the prediction written into the
+        book, the episode marks) and the chains. Here: the pending input (the delivery queue is the engine's), the
+        counters, and the `prediction_generated` events, emitted after the pass in registration order."""
         import time as _time_mod
         _t0 = _time_mod.perf_counter()
         rho0, k, eta, rho_min, alpha, chain_floor, margin = params
         stats = self._receiver_stats()
-        window = self.config["prediction_window"]
-        max_active = self._receiver_max_active()
-        pre_factor = self.config["prediction_pre_charge_factor"]
-        _tp = _time_mod.perf_counter()
         pend = self._pending_input()
-        stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _tp
-        _tp = _time_mod.perf_counter()
+        stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _t0
         _gain, _pool = self._receiver_theta_args()
-        passing, skipped = ng_tract.receiver_candidates(
-            self.nodes, self.synapses, list(fired_ids), pend, self.timestep, rho0, k, eta, rho_min, alpha,
-            self.config["decay_rate"], _gain, _pool)
+        (merged, dropped, registered, chains, skipped), targets, rows, (s_cand, s_reg, s_chain) = ng_tract.receiver_step(
+            self._pb, self.nodes, self.synapses, list(fired_ids), pend, self.timestep, rho0, k, eta, rho_min, alpha,
+            self.config["decay_rate"], _gain, _pool, self.config["prediction_window"], self._receiver_max_active(),
+            self.config["prediction_pre_charge_factor"], margin, self.config["prediction_chain_decay"], chain_floor,
+            self.config["prediction_max_chain_depth"], _mint_prediction_ids,
+            bool(self._event_handlers.get("prediction_generated")))
+        stats["merged"] += merged
+        stats["dropped"] += dropped
+        stats["registered"] += registered
+        stats["chains"] += chains
         stats["read_skipped"] += skipped
         stats["native_steps"] = stats.get("native_steps", 0) + 1
-        stats["s_cand"] = stats.get("s_cand", 0.0) + _time_mod.perf_counter() - _tp
-        _tp = _time_mod.perf_counter()
-        # [2026-11-13] #1221: the open receiver predictions by target, as prediction ids (the book holds them); the
-        # predictions registered in THIS call are also kept as objects, because their chains read the merged strength.
-        pending_by_target = dict(self._pb.receiver_pending())
-        _new_by_id: Dict[str, Prediction] = {}
-        new_preds: List[Prediction] = []
-        episodes: List[str] = []
-        for strength, tgt, d, rho, contrib, peak, conf_ema in passing:
-            syns = {sid: (pre_id, w) for sid, pre_id, w in contrib}
-            conf = min(1.0, 0.6 * strength + 0.4 * conf_ema)
-            old = pending_by_target.get(tgt)
-            if old is not None:
-                self._pb.receiver_merge(old, [(sid, pre_id, w) for sid, pre_id, w in contrib], strength, conf)
-                _obj = _new_by_id.get(old)
-                if _obj is not None:
-                    merged = dict(_obj.contributors_raw or {})
-                    merged.update(syns)
-                    self._receiver_set_contributors(_obj, merged)
-                    _obj.strength = max(_obj.strength, strength)
-                    _obj.confidence = max(_obj.confidence, conf)
-                stats["merged"] += 1
-                continue
-            episodes.append(tgt)   # the neuron reached its predictive state: an episode, registered or not
-            if len(self.active_predictions) >= max_active:
-                stats["dropped"] += 1
-                continue
-            node = self.nodes.get(tgt)
-            pre = min(strength * pre_factor * node.intrinsic_excitability, max(0.0, node.threshold - peak - margin))
-            pred = Prediction(target_node_id=tgt, strength=strength, confidence=conf, created_at=self.timestep,
-                              expires_at=self.timestep + window, chain_depth=0, pre_charge_applied=pre,
-                              drive=d, rho=rho)
-            self._receiver_set_contributors(pred, syns)
-            if pre > 0.0:
-                node.voltage += pre
-            _pb_insert(self._pb, pred.prediction_id, pred)
-            pending_by_target[tgt] = pred.prediction_id
-            _new_by_id[pred.prediction_id] = pred
-            self._predicted_this_step.add(tgt)
-            self._total_predictions_made += 1
-            stats["registered"] += 1
-            new_preds.append(pred)
-            self._emit("prediction_generated", source=pred.source_node_id, target=tgt, strength=strength,
-                       confidence=conf, chain_depth=0, timestep=self.timestep)
-        self.nodes.receiver_mark(episodes, alpha)
-        stats["s_reg"] = stats.get("s_reg", 0.0) + _time_mod.perf_counter() - _tp
-        _tp = _time_mod.perf_counter()
-        self._receiver_chains(new_preds, pend, pending_by_target, params)
-        stats["s_chain"] = stats.get("s_chain", 0.0) + _time_mod.perf_counter() - _tp
+        stats["s_cand"] = stats.get("s_cand", 0.0) + s_cand
+        stats["s_reg"] = stats.get("s_reg", 0.0) + s_reg
+        stats["s_chain"] = stats.get("s_chain", 0.0) + s_chain
+        self._predicted_this_step.update(targets)
+        self._total_predictions_made += registered
+        for source, tgt, strength, conf, depth in rows:
+            self._emit("prediction_generated", source=source, target=tgt, strength=strength, confidence=conf,
+                       chain_depth=depth, timestep=self.timestep)
         stats["seconds"] += _time_mod.perf_counter() - _t0
-
-    def _receiver_chains(self, parents: List["Prediction"], pend: Dict[str, List[float]],
-                         pending_by_target: Dict[str, "Prediction"], params: tuple) -> None:
-        """Spec §4.6: a predicted node is a weak, imagined source (its strength x chain_decay x the delivered factors of
-        its own synapses), added to each successor's real pending input; the successor is tested with the same rule;
-        several parents may converge; each parent continues only to its strongest passing successor; a chain stops
-        below chain_floor or at prediction_max_chain_depth. Credited to the chain's origin (source_node_id).
-        [2026-11-10] Rust-only: each hop's scoring is ng_tract.receiver_chain_hop; registration stays here."""
-        rho0, _k, _eta, _rho_min, alpha, chain_floor, margin = params
-        stats = self._receiver_stats()
-        decay = self.config["prediction_chain_decay"]
-        max_depth = self.config["prediction_max_chain_depth"]
-        max_active = self._receiver_max_active()
-        window = self.config["prediction_window"]
-        pre_factor = self.config["prediction_pre_charge_factor"]
-        _gain, _pool = self._receiver_theta_args()
-        path = {pr.prediction_id: {pr.target_node_id} for pr in parents}
-        for hop in range(1, max_depth + 1):
-            if not parents:
-                return
-            wins, dropped, skipped = ng_tract.receiver_chain_hop(
-                self.nodes, self.synapses, [(p.target_node_id, p.strength, list(path[p.prediction_id])) for p in parents],
-                pend, list(pending_by_target), len(self.active_predictions), max_active, self.timestep, rho0, alpha,
-                self.config["decay_rate"], _gain, _pool, decay, chain_floor)
-            stats["dropped"] += dropped
-            stats["read_skipped"] += skipped
-            nxt: List[Prediction] = []
-            for pi, strength, sname, d, rho, peak, conf_ema, contrib in wins:
-                par = parents[pi]
-                sn = self.nodes.get(sname)
-                conf = min(1.0, 0.6 * strength + 0.4 * conf_ema)
-                pre = min(strength * pre_factor * sn.intrinsic_excitability, max(0.0, sn.threshold - peak - margin))
-                pred = Prediction(target_node_id=sname, strength=strength, confidence=conf,
-                                  created_at=self.timestep, expires_at=self.timestep + window, chain_depth=hop,
-                                  pre_charge_applied=pre, drive=d, rho=rho)
-                self._receiver_set_contributors(pred, {sid: (pre_id, part) for sid, pre_id, part in contrib})
-                pred.source_node_id = par.source_node_id   # the chain's origin
-                if pre > 0.0:
-                    sn.voltage += pre
-                _pb_insert(self._pb, pred.prediction_id, pred)   # [2026-11-13] #1221 (the chain's origin is kept)
-                pending_by_target[sname] = pred.prediction_id
-                path[pred.prediction_id] = path[par.prediction_id] | {sname}
-                self._predicted_this_step.add(sname)
-                self._total_predictions_made += 1
-                stats["registered"] += 1
-                stats["chains"] += 1
-                nxt.append(pred)
-                self._emit("prediction_generated", source=pred.source_node_id, target=sname, strength=strength,
-                           confidence=conf, chain_depth=hop, timestep=self.timestep)
-            parents = nxt
 
     # ([2026-11-13] #1221: _prediction_links and _receiver_record are the book's: PredictionBook::links, and the
     # NodeStore.receiver_record call inside confirm / expire_run)
