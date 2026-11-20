@@ -601,8 +601,9 @@ def test_receiver_pass_asks_for_the_effective_threshold(ca_on, monkeypatch):
     g = _native_graph(1)
     g.config["ca_split_enabled"] = ca_on
     seen = []
-    # [2026-11-10] Rust-only: the candidate and chain scans take (ahp_gain, pool) as their own arguments
-    for name, gi in (("receiver_candidates", 11), ("receiver_chain_hop", 11)):
+    # [2026-11-10] Rust-only: the scans take (ahp_gain, pool) as their own arguments
+    # [2026-11-20] native tick M2: the whole pass is ng_tract.receiver_step (ahp_gain, pool at 12, 13)
+    for name, gi in (("receiver_step", 12),):
         orig = getattr(NF.ng_tract, name)
         monkeypatch.setattr(NF.ng_tract, name, lambda *a, _o=orig, _gi=gi: (seen.append((a[_gi], a[_gi + 1])), _o(*a))[1])
     g._receiver_predictions(list(g.nodes.keys())[:30], g._stab_receiver())
