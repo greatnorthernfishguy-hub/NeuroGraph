@@ -1,3 +1,15 @@
+# [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos, punch #1221) — step()'s propagation and delivery as
+#   native passes with the delivery queue in the SynapseStore (config native_propagation_enabled, default off).
+# What: with the key on (and a wheel whose SynapseStore has propagate_round >= 1), step 2 is
+#   synapses.deliver_step and step 5 is synapses.propagate_step; the queue of in-flight currents lives in the store
+#   (rows, no (id, current) tuples), _pending_input / the receiver read it there, the capture writes the same
+#   `delay_buffer` field from it. A declined pass moves the queue back and runs that step's Python loop. Key absent:
+#   every call is the one before this change (the Python loop and `_delay_buffer` stay as they are).
+# Why: profile LS1121PROF (docs superpowers/specs/2026-11-20-recall-without-the-step-lock-design.md §2b, §7): the
+#   Python propagation loop is about 40 % of step() at 85k nodes. Josh 2026-11-20 "We do NOT translate into Python";
+#   2026-11-21 on §7: not bit-identical "still acceptable", one dot product "OK", "Proceed".
+# How: ng-tract-rs store.rs propagate_step / deliver_step (rows ascending instead of set order; one f64 dot product
+#   per synapse): equal to the Python loop to rounding, NOT bit-identical (declared). tests/test_native_propagation.py.
 # [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos, punch #1221) — the receiver cap's firing average
 #   and the table size that follows it are the PredictionBook's, not the engine's (Josh 2026-11-20 "We do NOT translate
 #   into Python"; 2026-11-21 "Proceed").
@@ -4287,8 +4299,17 @@ class Graph:
                 _decay_voltages_python(self.nodes, decay)
 
             # 2. Deliver delayed spikes arriving this timestep
-            arrivals = self._delay_buffer.pop(self.timestep, [])
-            for target_id, current in arrivals:
+            # [2026-11-21] native_propagation_enabled: one native pass on the store's own queue (a decline moves the
+            # queue back and this step runs the loop below)
+            _nprop = self._prop_native()
+            _narr = None
+            if _nprop:
+                _narr = self.synapses.delay_arrivals(self.timestep) if _dps is not None else []
+                if self.synapses.deliver_step(self.nodes, self.timestep) is None:
+                    self._delay_to_python()
+                    _nprop, _narr = False, None
+            arrivals = _narr if _narr is not None else self._delay_buffer.pop(self.timestep, [])
+            for target_id, current in (() if _nprop else arrivals):
                 target = self.nodes.get(target_id)
                 if target is None:
                     logger.debug(
@@ -4419,7 +4440,14 @@ class Graph:
             # spends it); an inhibitory presynaptic node is exempt (the hook for the interneuron round)
             _std5 = ((_stab.std[0], _stab.std[1], float(self.timestep))
                      if _stab is not None and _stab.std is not None else None)
-            for nid in fired_ids:
+            # [2026-11-21] native_propagation_enabled: the whole loop below as one native pass (rows, no tuples)
+            if _nprop:
+                _nprop = self.synapses.propagate_step(
+                    self.nodes, list(fired_ids), self.timestep, None if _std5 is None else (_std5[0], _std5[1]),
+                    (_GSG_MSG_DECAY, _GSG_MSG_DECAY_SPHER, _GSG_KAPPA_L2, *_GSG_LAYER_NORMS_NF)) is not None
+                if not _nprop:
+                    self._delay_to_python()
+            for nid in (() if _nprop else fired_ids):
                 node = self.nodes[nid]
                 sign = -1.0 if node.is_inhibitory else 1.0
                 _gsg_resolve(nid, node)
@@ -6082,6 +6110,8 @@ class Graph:
         out: Dict[str, List[float]] = {}
         t = self.timestep
         n = int(self.config.get("d_max", 5))
+        if self.__dict__.get("_prop_is_native"):   # [2026-11-21] the queue is the store's
+            return self.synapses.delay_pending(t, n)
         for k in range(1, n + 1):
             for tgt, cur in self._delay_buffer.get(t + k, ()):
                 row = out.get(tgt)
@@ -6089,6 +6119,34 @@ class Graph:
                     row = out[tgt] = [0.0] * n
                 row[k - 1] += cur
         return out
+
+    def _prop_native(self) -> bool:
+        """[2026-11-21] native_propagation_enabled (default off): step 2 and step 5 run as native passes and the
+        delivery queue lives in the SynapseStore. Called once at step 2; moves the queue to whichever side runs this
+        step (entries queued by the other side are carried over, nothing is dropped)."""
+        on = bool(self.config.get("native_propagation_enabled", False))
+        if on and not (getattr(type(self.synapses), "propagate_round", 0) >= 1
+                       and isinstance(self.nodes, getattr(ng_tract, "NodeStore", ()))):
+            self._stab_error_once(["native_propagation_enabled"], "an ng_tract wheel with propagate_step "
+                                  "(SynapseStore.propagate_round >= 1) and the native NodeStore")
+            on = False
+        if on:
+            if self._delay_buffer:
+                self.synapses.delay_import([(int(t), [(str(a), float(c)) for a, c in v])
+                                            for t, v in self._delay_buffer.items()])
+                self._delay_buffer.clear()
+            self.__dict__["_prop_is_native"] = True
+        elif self.__dict__.get("_prop_is_native"):
+            self._delay_to_python()
+        return on
+
+    def _delay_to_python(self) -> None:
+        """[2026-11-21] The store's delivery queue back into `_delay_buffer` (the key went off, or a native pass
+        declined): same ticks, same (id, current) entries."""
+        for t, entries in self.synapses.delay_export():
+            self._delay_buffer.setdefault(t, []).extend(entries)
+        self.synapses.delay_clear()
+        self.__dict__["_prop_is_native"] = False
 
     def _receiver_theta_args(self) -> Tuple[float, bool]:
         """[2026-11-01] S18cal finding: the threshold fire detection actually applies. (ahp_gain, pool) for
@@ -6140,7 +6198,8 @@ class Graph:
         _t0 = _time_mod.perf_counter()
         rho0, k, eta, rho_min, alpha, chain_floor, margin = params
         stats = self._receiver_stats()
-        pend = self._pending_input()
+        _pn = bool(self.__dict__.get("_prop_is_native"))   # [2026-11-21] then receiver_step reads the store's queue
+        pend = None if _pn else self._pending_input()
         stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _t0
         _gain, _pool = self._receiver_theta_args()
         _cap_f = self._receiver_cap_factor()   # [2026-11-21] > 0: the book keeps the average and sets the cap
@@ -6149,7 +6208,8 @@ class Graph:
             self.config["decay_rate"], _gain, _pool, self.config["prediction_window"], self._receiver_max_active(),
             self.config["prediction_pre_charge_factor"], margin, self.config["prediction_chain_decay"], chain_floor,
             self.config["prediction_max_chain_depth"], _mint_prediction_ids,
-            bool(self._event_handlers.get("prediction_generated")), *((_cap_f,) if _cap_f > 0.0 else ()))
+            bool(self._event_handlers.get("prediction_generated")),
+            *((_cap_f, int(self.config.get("d_max", 5))) if _pn else (_cap_f,) if _cap_f > 0.0 else ()))
         stats["merged"] += merged
         stats["dropped"] += dropped
         stats["registered"] += registered
@@ -10158,6 +10218,11 @@ class Graph:
         _syn_hist   = self._pb.hist_items()
         _he_preds   = list(self._active_predictions.items())
         _delay_buf  = list(self._delay_buffer.items())
+        if self.__dict__.get("_prop_is_native"):   # [2026-11-21] the queue is the store's: the same field from it
+            _dq = {ts: list(entries) for ts, entries in _delay_buf}
+            for ts, entries in self.synapses.delay_export():
+                _dq.setdefault(ts, []).extend(entries)
+            _delay_buf = list(_dq.items())
         _recent_spk = [(nid, spikes) for nid, spikes, _cap in self._pb.spike_items(True)]
         # The native backend creates this packed payload for the capture. It does
         # not borrow live state, and bytearray is intentionally not deep-copied:
@@ -10394,6 +10459,8 @@ class Graph:
         if "_cofire_tally" in self.__dict__:   # [2026-10-08] #1050 Python-fallback tally: cold after a restore
             self._cofire_tally = {"k": 0, "tables": {}}   # (the native one is emptied by synapses.clear())
         self._delay_buffer.clear()
+        if self.__dict__.pop("_prop_is_native", None):   # [2026-11-21] the store's queue too (the next step re-syncs)
+            self.synapses.delay_clear()
         self._active_predictions.clear()
         self._prediction_window_fired.clear()
         self._archived_hyperedges.clear()
