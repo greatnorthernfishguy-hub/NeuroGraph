@@ -1,3 +1,13 @@
+# [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos, punch #1221) — the receiver cap's firing average
+#   and the table size that follows it are the PredictionBook's, not the engine's (Josh 2026-11-20 "We do NOT translate
+#   into Python"; 2026-11-21 "Proceed").
+# What: _receiver_note_firing is removed and _receiver_max_active is the fixed size again; with
+#   prediction_receiver_cap_factor > 0 the factor is passed to ng_tract.receiver_step, which keeps the average and
+#   computes the cap in the book (ng-tract-rs 28bfe25: rc_note_firing / rc_cap, the same arithmetic). A silent step is
+#   noted through PredictionBook.receiver_note_firing; restore() resets through receiver_fire_avg_reset. A factor > 0
+#   on a wheel without these logs once and stays on the fixed size. Factor 0: the call is the 2026-11-20 one.
+# Why: the 2026-11-20 cap added new Python engine state; Josh's rule is no new Python engine logic.
+# How: tests/test_native_tick_m2.py (the cap cases read the book: receiver_fire_avg / receiver_last_cap).
 # [2026-11-20 night] DudeMan CC (Claude Fable 5.2, laptop) — the cap's three review minors (Grok 4.7; Josh 2026-11-20
 #   "You can address those 3 minor issues ... proceed").
 # What: (1) a step where nothing fires now counts as 0 in the firing average (it was skipped, so the cap stayed at the
@@ -5905,10 +5915,11 @@ class Graph:
         hyperedge sources.
         """
         if not fired_ids:
-            if self._receiver_cap_factor() > 0.0:   # [2026-11-20] a silent step counts in the firing average
+            _cap_f = self._receiver_cap_factor()
+            if _cap_f > 0.0:   # [2026-11-20] a silent step counts in the firing average ([2026-11-21] kept in the book)
                 _recv_params = self._stab_receiver()
                 if _recv_params is not None:
-                    self._receiver_note_firing(0, _recv_params[4])
+                    self._pb.receiver_note_firing(0, _recv_params[4], _cap_f)
             return
         # [2026-11-01] S18 (#1202): receiver-side, graded predictions replace the source-side gate when on
         _recv_params = self._stab_receiver()
@@ -6092,39 +6103,30 @@ class Graph:
         return gain, pool
 
     def _receiver_cap_factor(self) -> float:
-        """[2026-11-20] prediction_receiver_cap_factor (default 0 = the fixed table size); a bad value reads as 0."""
+        """[2026-11-20] prediction_receiver_cap_factor (default 0 = the fixed table size); a bad value reads as 0.
+        [2026-11-21] The average and the following cap live in the PredictionBook; a wheel without them reads as 0."""
         try:
             f = float(self.config.get("prediction_receiver_cap_factor", 0.0))
         except (TypeError, ValueError):
             return 0.0
-        return f if (math.isfinite(f) and f > 0.0) else 0.0
-
-    def _receiver_note_firing(self, fired_n: int, alpha: float) -> None:
-        """[2026-11-20] The mind's firing per step as a slow average (the receiver's own rate constant,
-        prediction_receiver_ema_alpha), kept only while the cap factor is on. Engine state, not a checkpoint field:
-        after a load it starts again from the first step's count."""
-        if self._receiver_cap_factor() <= 0.0:
-            return
-        prev = getattr(self, "_receiver_fire_avg", None)
-        self._receiver_fire_avg = float(fired_n) if prev is None else prev + alpha * (float(fired_n) - prev)
+        if not (math.isfinite(f) and f > 0.0):
+            return 0.0
+        if not hasattr(self._pb, "receiver_note_firing"):
+            self._stab_error_once(["prediction_receiver_cap_factor"], "an ng_tract wheel whose PredictionBook keeps "
+                                  "the firing average (receiver_note_firing)")
+            return 0.0
+        return f
 
     def _receiver_max_active(self) -> int:
         """[2026-11-01] S18short: the receiver path's own table size (prediction_receiver_max_active, default 10000):
         with each neuron predicted about as often as it fires, ~fired-per-step x window predictions are pending.
         [2026-11-20] spec §4 rule 7 as amended: with prediction_receiver_cap_factor > 0 the cap follows the mind,
-        factor x prediction_window x the firing-per-step average, never below the fixed size and never above one
-        per neuron."""
+        factor x prediction_window x the firing-per-step average, never below this fixed size and never above one
+        per neuron. [2026-11-21] That part is computed in ng_tract.receiver_step; this is the fixed size only."""
         try:
-            base = max(0, int(self.config.get("prediction_receiver_max_active", 10000)))
+            return max(0, int(self.config.get("prediction_receiver_max_active", 10000)))
         except (TypeError, ValueError):
-            base = 10000
-        factor = self._receiver_cap_factor()
-        avg = getattr(self, "_receiver_fire_avg", None)
-        if factor <= 0.0 or avg is None:
-            return base
-        # one open prediction per neuron (rule 3): the node count is the ceiling, whatever the factor
-        follow = min(factor * float(self.config["prediction_window"]) * avg, float(len(self.nodes)))
-        return max(base, int(follow)) if follow == follow else base
+            return 10000
 
     def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
         """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
@@ -6141,13 +6143,13 @@ class Graph:
         pend = self._pending_input()
         stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _t0
         _gain, _pool = self._receiver_theta_args()
-        self._receiver_note_firing(len(fired_ids), alpha)
+        _cap_f = self._receiver_cap_factor()   # [2026-11-21] > 0: the book keeps the average and sets the cap
         (merged, dropped, registered, chains, skipped), targets, rows, (s_cand, s_reg, s_chain) = ng_tract.receiver_step(
             self._pb, self.nodes, self.synapses, list(fired_ids), pend, self.timestep, rho0, k, eta, rho_min, alpha,
             self.config["decay_rate"], _gain, _pool, self.config["prediction_window"], self._receiver_max_active(),
             self.config["prediction_pre_charge_factor"], margin, self.config["prediction_chain_decay"], chain_floor,
             self.config["prediction_max_chain_depth"], _mint_prediction_ids,
-            bool(self._event_handlers.get("prediction_generated")))
+            bool(self._event_handlers.get("prediction_generated")), *((_cap_f,) if _cap_f > 0.0 else ()))
         stats["merged"] += merged
         stats["dropped"] += dropped
         stats["registered"] += registered
@@ -9986,7 +9988,9 @@ class Graph:
     def restore(self, path: str) -> None:
         """Load state from checkpoint (PRD §8 restore, §6)."""
         self.__dict__.pop("_breaker_lift_active", None)   # [2026-10-22] S6-1: transient, never carried across a restore
-        self.__dict__.pop("_receiver_fire_avg", None)     # [2026-11-20] transient: the firing average starts again
+        _fa_reset = getattr(self.__dict__.get("_pb"), "receiver_fire_avg_reset", None)
+        if _fa_reset is not None:   # [2026-11-20] transient: the firing average starts again ([2026-11-21] the book's)
+            _fa_reset()
         if path.endswith(".msgpack"):
             if msgpack is None:
                 raise ImportError("msgpack required for .msgpack deserialization")
