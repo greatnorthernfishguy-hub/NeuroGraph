@@ -1,3 +1,10 @@
+# [2026-11-20 night] DudeMan CC (Claude Fable 5.2, laptop) — the cap's three review minors (Grok 4.7; Josh 2026-11-20
+#   "You can address those 3 minor issues ... proceed").
+# What: (1) a step where nothing fires now counts as 0 in the firing average (it was skipped, so the cap stayed at the
+#   last firing step's level through a quiet stretch); (2) restore() drops _receiver_fire_avg like the other transient
+#   state; (3) the following cap is bounded by the node count (one open prediction per neuron, spec §4 rule 3), so no
+#   factor can overflow inside the step. All three act only with prediction_receiver_cap_factor > 0.
+# Why / How: review of 411714e; tests/test_native_tick_m2.py.
 # [2026-11-20 evening] DudeMan CC (Claude Fable 5.2, laptop) — S18 receiver table: the cap follows the mind (Josh
 #   2026-11-20 "Yeah to the cap" / "Proceed with the cap edit").
 # What: prediction_receiver_cap_factor (default 0 = the fixed prediction_receiver_max_active, byte-identical). When
@@ -5898,6 +5905,10 @@ class Graph:
         hyperedge sources.
         """
         if not fired_ids:
+            if self._receiver_cap_factor() > 0.0:   # [2026-11-20] a silent step counts in the firing average
+                _recv_params = self._stab_receiver()
+                if _recv_params is not None:
+                    self._receiver_note_firing(0, _recv_params[4])
             return
         # [2026-11-01] S18 (#1202): receiver-side, graded predictions replace the source-side gate when on
         _recv_params = self._stab_receiver()
@@ -6101,7 +6112,8 @@ class Graph:
         """[2026-11-01] S18short: the receiver path's own table size (prediction_receiver_max_active, default 10000):
         with each neuron predicted about as often as it fires, ~fired-per-step x window predictions are pending.
         [2026-11-20] spec §4 rule 7 as amended: with prediction_receiver_cap_factor > 0 the cap follows the mind,
-        factor x prediction_window x the firing-per-step average, never below the fixed size."""
+        factor x prediction_window x the firing-per-step average, never below the fixed size and never above one
+        per neuron."""
         try:
             base = max(0, int(self.config.get("prediction_receiver_max_active", 10000)))
         except (TypeError, ValueError):
@@ -6110,7 +6122,9 @@ class Graph:
         avg = getattr(self, "_receiver_fire_avg", None)
         if factor <= 0.0 or avg is None:
             return base
-        return max(base, int(factor * float(self.config["prediction_window"]) * avg))
+        # one open prediction per neuron (rule 3): the node count is the ceiling, whatever the factor
+        follow = min(factor * float(self.config["prediction_window"]) * avg, float(len(self.nodes)))
+        return max(base, int(follow)) if follow == follow else base
 
     def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
         """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
@@ -9972,6 +9986,7 @@ class Graph:
     def restore(self, path: str) -> None:
         """Load state from checkpoint (PRD §8 restore, §6)."""
         self.__dict__.pop("_breaker_lift_active", None)   # [2026-10-22] S6-1: transient, never carried across a restore
+        self.__dict__.pop("_receiver_fire_avg", None)     # [2026-11-20] transient: the firing average starts again
         if path.endswith(".msgpack"):
             if msgpack is None:
                 raise ImportError("msgpack required for .msgpack deserialization")
