@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-11-20 evening] DudeMan CC (Claude Fable 5.2, laptop) -- the receiver table cap follows the mind
+#   (prediction_receiver_cap_factor; spec 2026-11-01-receiver-side-prediction-design s4 rule 7 as amended; Josh
+#   "Yeah to the cap"). Added: the factor on with a cap that never binds equals the engine before the change (which
+#   ignores the key); the cap handed to the crate each step is max(fixed, factor x window x the slow firing average),
+#   recomputed here by hand; fewer drops than the fixed cap; bad factor values read as off.
 # [2026-11-20] DudeMan CC (Claude Fable 5.2, laptop) -- native tick M2 (punch #1221): the receiver's registration and
 #   chains in the crate (ng_tract.receiver_step), against the engine before that change.
 # What: twin runs with the S18 receiver on: the engine at bb440b8 (registration and the chain hop loop in Python, loaded
@@ -127,3 +132,61 @@ def test_a_wheel_without_receiver_step_keeps_the_receiver_off(monkeypatch, caplo
     with caplog.at_level("ERROR"):
         assert g._stab_receiver() is None
     assert any("receiver_step" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# [2026-11-20 evening] the table cap follows the mind (prediction_receiver_cap_factor)
+# ---------------------------------------------------------------------------
+CHAINY = {"prediction_receiver_chain_floor": 0.0, "prediction_receiver_rho0": 0.12, "prediction_receiver_rho_min": 0.1}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_cap_factor_on_but_not_binding_equals_the_engine_before_it(seed):
+    """Fixed size 10000 never binds here; the oracle engine does not know the key. Same run, same bytes."""
+    t = _pair(seed, dict(CHAINY, prediction_receiver_cap_factor=2.0))
+    S.drive(t, random.Random(seed), 40)
+    assert t.b.g._recv_stats["dropped"] == 0
+    assert t.b.g._receiver_fire_avg is not None and not hasattr(t.a.g, "_receiver_fire_avg")
+    _same_end(t)
+
+
+def _run_capped(seed, extra, monkeypatch=None, seen=None):
+    start = H2.built(seed)
+    t = S.Pair(S18.restore_as(NF, "native", start), S18.restore_as(NF, "native", start), seed)
+    t.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON, **CHAINY, **extra)))
+    if seen is not None:
+        orig = NF.ng_tract.receiver_step
+        book = t.b.g._pb
+
+        def spy(*a):
+            if a[0] is book:
+                seen.append((len(a[3]), a[15]))
+            return orig(*a)
+        monkeypatch.setattr(NF.ng_tract, "receiver_step", spy)
+    S.drive(t, random.Random(seed), 40)
+    return t.b.g
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_the_cap_is_factor_x_window_x_the_firing_average(seed, monkeypatch):
+    seen = []
+    g = _run_capped(seed, {"prediction_receiver_max_active": 1, "prediction_receiver_cap_factor": 2.0}, monkeypatch, seen)
+    alpha, window = float(g.config.get("prediction_receiver_ema_alpha", 0.01)), g.config["prediction_window"]
+    avg, grew = None, 0
+    for fired_n, cap in seen:
+        avg = float(fired_n) if avg is None else avg + alpha * (float(fired_n) - avg)
+        assert cap == max(1, int(2.0 * float(window) * avg)), (fired_n, cap, avg)
+        grew += cap > 1
+    assert grew > 0 and g._receiver_fire_avg == avg and g._receiver_max_active() == seen[-1][1]
+    fixed = _run_capped(seed, {"prediction_receiver_max_active": 1})
+    assert not hasattr(fixed, "_receiver_fire_avg")
+    assert fixed._recv_stats["dropped"] > g._recv_stats["dropped"]
+    assert fixed._recv_stats["registered"] < g._recv_stats["registered"]
+
+
+@pytest.mark.parametrize("bad", [0, -1, "x", None, float("nan"), float("inf")])
+def test_a_bad_cap_factor_is_the_fixed_cap(bad):
+    g = S18._native_graph(1)
+    g.config.update(prediction_receiver_max_active=7, prediction_receiver_cap_factor=bad)
+    g._receiver_note_firing(500, 0.01)
+    assert g._receiver_max_active() == 7 and not hasattr(g, "_receiver_fire_avg")
