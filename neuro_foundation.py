@@ -1,3 +1,13 @@
+# [2026-11-20 evening] DudeMan CC (Claude Fable 5.2, laptop) — S18 receiver table: the cap follows the mind (Josh
+#   2026-11-20 "Yeah to the cap" / "Proceed with the cap edit").
+# What: prediction_receiver_cap_factor (default 0 = the fixed prediction_receiver_max_active, byte-identical). When
+#   > 0, _receiver_max_active = max(the fixed size, factor x prediction_window x a slow average of nodes fired per
+#   step); _receiver_note_firing keeps that average (rate = prediction_receiver_ema_alpha) only while the factor is
+#   on; it is engine state, not saved. Strongest kept and the dropped count are unchanged (ng_tract.receiver_step).
+# Why: spec 2026-11-01-receiver-side-prediction-design §4 rule 7 as amended 2026-11-20: at 84k nodes the fixed 10,000
+#   equals the table's normal load (1,087 registered a step x 10) and 99,674 predictions were dropped in 1,719 steps
+#   (go-live register 2026-11-20 read). The per-neuron rules bound the table; the cap is a flood guard.
+# How: copy runs set the key through CC_SNN_CONFIG (spec value: 2). The receiver stays OFF by default.
 # [2026-11-20] DudeMan CC (Claude Fable 5.2, laptop) — native tick M2 (#1221): the receiver's registration and chains leave
 #   the engine's Python (Josh 2026-11-20 "You may proceed.").
 # What: _receiver_predictions is one call, ng_tract.receiver_step (candidate scan + registration + chains);
@@ -6070,13 +6080,37 @@ class Graph:
         pool = stab.inhib is not None and stab.ilayer is None
         return gain, pool
 
+    def _receiver_cap_factor(self) -> float:
+        """[2026-11-20] prediction_receiver_cap_factor (default 0 = the fixed table size); a bad value reads as 0."""
+        try:
+            f = float(self.config.get("prediction_receiver_cap_factor", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return f if (math.isfinite(f) and f > 0.0) else 0.0
+
+    def _receiver_note_firing(self, fired_n: int, alpha: float) -> None:
+        """[2026-11-20] The mind's firing per step as a slow average (the receiver's own rate constant,
+        prediction_receiver_ema_alpha), kept only while the cap factor is on. Engine state, not a checkpoint field:
+        after a load it starts again from the first step's count."""
+        if self._receiver_cap_factor() <= 0.0:
+            return
+        prev = getattr(self, "_receiver_fire_avg", None)
+        self._receiver_fire_avg = float(fired_n) if prev is None else prev + alpha * (float(fired_n) - prev)
+
     def _receiver_max_active(self) -> int:
         """[2026-11-01] S18short: the receiver path's own table size (prediction_receiver_max_active, default 10000):
-        with each neuron predicted about as often as it fires, ~fired-per-step x window predictions are pending."""
+        with each neuron predicted about as often as it fires, ~fired-per-step x window predictions are pending.
+        [2026-11-20] spec §4 rule 7 as amended: with prediction_receiver_cap_factor > 0 the cap follows the mind,
+        factor x prediction_window x the firing-per-step average, never below the fixed size."""
         try:
-            return max(0, int(self.config.get("prediction_receiver_max_active", 10000)))
+            base = max(0, int(self.config.get("prediction_receiver_max_active", 10000)))
         except (TypeError, ValueError):
-            return 10000
+            base = 10000
+        factor = self._receiver_cap_factor()
+        avg = getattr(self, "_receiver_fire_avg", None)
+        if factor <= 0.0 or avg is None:
+            return base
+        return max(base, int(factor * float(self.config["prediction_window"]) * avg))
 
     def _receiver_predictions(self, fired_ids: List[str], params: tuple) -> None:
         """A neuron T is predicted when the input pending for it charges it at least rho_T of the way to its threshold
@@ -6093,6 +6127,7 @@ class Graph:
         pend = self._pending_input()
         stats["s_pend"] = stats.get("s_pend", 0.0) + _time_mod.perf_counter() - _t0
         _gain, _pool = self._receiver_theta_args()
+        self._receiver_note_firing(len(fired_ids), alpha)
         (merged, dropped, registered, chains, skipped), targets, rows, (s_cand, s_reg, s_chain) = ng_tract.receiver_step(
             self._pb, self.nodes, self.synapses, list(fired_ids), pend, self.timestep, rho0, k, eta, rho_min, alpha,
             self.config["decay_rate"], _gain, _pool, self.config["prediction_window"], self._receiver_max_active(),
