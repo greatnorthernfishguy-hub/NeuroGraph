@@ -1,4 +1,6 @@
 # ---- Changelog ----
+# [2026-11-21] DudeMan CC (Claude Fable 5.2) -- the cap cases read the PredictionBook (receiver_fire_avg /
+#   receiver_last_cap): the average and the following cap moved into ng_tract (ng-tract-rs 28bfe25; SQ10, #1221).
 # [2026-11-20 evening] DudeMan CC (Claude Fable 5.2, laptop) -- the receiver table cap follows the mind
 #   (prediction_receiver_cap_factor; spec 2026-11-01-receiver-side-prediction-design s4 rule 7 as amended; Josh
 #   "Yeah to the cap"). Added: the factor on with a cap that never binds equals the engine before the change (which
@@ -147,7 +149,8 @@ def test_cap_factor_on_but_not_binding_equals_the_engine_before_it(seed):
     t = _pair(seed, dict(CHAINY, prediction_receiver_cap_factor=2.0))
     S.drive(t, random.Random(seed), 40)
     assert t.b.g._recv_stats["dropped"] == 0
-    assert t.b.g._receiver_fire_avg is not None and not hasattr(t.a.g, "_receiver_fire_avg")
+    assert t.b.g._pb.receiver_fire_avg() is not None and t.a.g._pb.receiver_fire_avg() is None
+    assert not hasattr(t.b.g, "_receiver_fire_avg")   # [2026-11-21] the average is the book's, not the engine's
     _same_end(t)
 
 
@@ -155,16 +158,24 @@ def _run_capped(seed, extra, monkeypatch=None, seen=None):
     start = H2.built(seed)
     t = S.Pair(S18.restore_as(NF, "native", start), S18.restore_as(NF, "native", start), seed)
     t.op("keys", lambda g: g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON, **CHAINY, **extra)))
-    if seen is not None:   # side b only: every count fed to the average (silent steps too) and every cap handed over
+    if seen is not None:   # side b only: every count fed to the average (silent steps too) and every cap the book used
         orig, book, gb = NF.ng_tract.receiver_step, t.b.g._pb, t.b.g
-        note = gb._receiver_note_firing
+        gen = gb._generate_predictions
 
         def spy(*a):
-            if a[0] is book:
-                seen.append(("cap", a[15], len(gb.nodes), len(a[3])))
-            return orig(*a)
+            if a[0] is not book:
+                return orig(*a)
+            seen.append(("note", len(a[3])))
+            out = orig(*a)
+            seen.append(("cap", book.receiver_last_cap(), len(gb.nodes), a[15], a[23] if len(a) > 23 else 0.0))
+            return out
+
+        def gen_spy(fired):
+            if not fired:
+                seen.append(("note", 0))
+            return gen(fired)
         monkeypatch.setattr(NF.ng_tract, "receiver_step", spy)
-        monkeypatch.setattr(gb, "_receiver_note_firing", lambda n, al: (seen.append(("note", n)), note(n, al))[1])
+        monkeypatch.setattr(gb, "_generate_predictions", gen_spy)
     S.drive(t, random.Random(seed), 40)
     return t.b.g
 
@@ -174,19 +185,18 @@ def test_the_cap_is_factor_x_window_x_the_firing_average(seed, monkeypatch):
     seen = []
     g = _run_capped(seed, {"prediction_receiver_max_active": 1, "prediction_receiver_cap_factor": 2.0}, monkeypatch, seen)
     alpha, window = float(g.config.get("prediction_receiver_ema_alpha", 0.01)), g.config["prediction_window"]
-    avg, grew, last_n = None, 0, None
+    avg, grew = None, 0
     for ev in seen:
         if ev[0] == "note":
-            last_n = ev[1]
-            avg = float(last_n) if avg is None else avg + alpha * (float(last_n) - avg)
+            avg = float(ev[1]) if avg is None else avg + alpha * (float(ev[1]) - avg)
             continue
-        _, cap, n_nodes, fired_n = ev
-        assert fired_n == last_n                       # the count noted just before this call is this step's firing
+        _, cap, n_nodes, base, factor = ev
+        assert (base, factor) == (1, 2.0)              # the engine hands over the fixed size and the factor only
         assert cap == max(1, int(min(2.0 * float(window) * avg, float(n_nodes)))), (ev, avg)
         grew += cap > 1
-    assert grew > 0 and g._receiver_fire_avg == avg
+    assert grew > 0 and g._pb.receiver_fire_avg() == avg
     fixed = _run_capped(seed, {"prediction_receiver_max_active": 1})
-    assert not hasattr(fixed, "_receiver_fire_avg")
+    assert fixed._pb.receiver_fire_avg() is None
     assert fixed._recv_stats["dropped"] > g._recv_stats["dropped"]
     assert fixed._recv_stats["registered"] < g._recv_stats["registered"]
 
@@ -194,38 +204,44 @@ def test_the_cap_is_factor_x_window_x_the_firing_average(seed, monkeypatch):
 @pytest.mark.parametrize("bad", [0, -1, "x", None, float("nan"), float("inf")])
 def test_a_bad_cap_factor_is_the_fixed_cap(bad):
     g = S18._native_graph(1)
-    g.config.update(prediction_receiver_max_active=7, prediction_receiver_cap_factor=bad)
-    g._receiver_note_firing(500, 0.01)
-    assert g._receiver_max_active() == 7 and not hasattr(g, "_receiver_fire_avg")
+    g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON, prediction_receiver_max_active=7,
+                         prediction_receiver_cap_factor=bad))
+    assert g._receiver_cap_factor() == 0.0 and g._receiver_max_active() == 7
+    g._generate_predictions([])
+    g._receiver_predictions([], g._stab_receiver())
+    assert g._pb.receiver_fire_avg() is None and g._pb.receiver_last_cap() == 7
 
 
 def test_a_silent_step_counts_as_zero_in_the_firing_average():
     g = S18._native_graph(1)
     g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON, prediction_receiver_cap_factor=2.0))
     alpha = g._stab_receiver()[4]
-    g._receiver_note_firing(100, alpha)
+    g._pb.receiver_note_firing(100, alpha, 2.0)
     g._generate_predictions([])
-    assert g._receiver_fire_avg == 100.0 + alpha * (0.0 - 100.0)
+    assert g._pb.receiver_fire_avg() == 100.0 + alpha * (0.0 - 100.0)
     off = S18._native_graph(1)
     off.config.update(dict(S18.ARM, **S18.RPE, **S18.ON))
     off._generate_predictions([])
-    assert not hasattr(off, "_receiver_fire_avg")
+    assert off._pb.receiver_fire_avg() is None
 
 
 def test_restore_starts_the_firing_average_again(tmp_path):
     g = S18._native_graph(1)
     g.config.update(prediction_receiver_cap_factor=2.0)
-    g._receiver_note_firing(100, 0.01)
+    g._pb.receiver_note_firing(100, 0.01, 2.0)
+    assert g._pb.receiver_fire_avg() == 100.0
     path = str(tmp_path / "c.msgpack")
     g.checkpoint(path)
     g.restore(path)
-    assert not hasattr(g, "_receiver_fire_avg")
+    assert g._pb.receiver_fire_avg() is None
     assert g._receiver_max_active() == int(g.config.get("prediction_receiver_max_active", 10000))
 
 
 @pytest.mark.parametrize("factor", [1e6, 1e300, 1.7e308])
 def test_the_following_cap_never_exceeds_one_per_neuron(factor):
     g = S18._native_graph(1)
-    g.config.update(prediction_receiver_max_active=1, prediction_receiver_cap_factor=factor)
-    g._receiver_note_firing(10 ** 6, 0.01)
-    assert g._receiver_max_active() == len(g.nodes) > 1
+    g.config.update(dict(S18.ARM, **S18.RPE, **S18.ON, prediction_receiver_max_active=1,
+                         prediction_receiver_cap_factor=factor))
+    g._pb.receiver_note_firing(10 ** 6, 0.01, factor)
+    g._receiver_predictions([], g._stab_receiver())
+    assert g._pb.receiver_last_cap() == len(g.nodes) > 1
