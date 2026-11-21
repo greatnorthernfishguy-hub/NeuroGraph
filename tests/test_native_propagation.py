@@ -14,6 +14,7 @@
 #       covered by the twin runs against the engine from git (tests/test_native_tick_m1.py, _m2.py, test_stability_s*).
 # How:  tests.test_hyperedge_store_h2 Side (identical uuid / random streams) and its built() start graphs.
 # -------------------
+import math
 import os
 import random
 import sys
@@ -43,7 +44,7 @@ def _queue(g):
     return {t: sorted(v) for t, v in q.items()}
 
 
-def _twins(seed, extra=None, stamp=False):
+def _twins(seed, extra=None, stamp=False, mixed=False):
     start = H2.built(seed)
     a, b = S.restore_as(NF, "native", start), S.restore_as(NF, "native", start)
     for g in (a, b):
@@ -60,6 +61,16 @@ def _twins(seed, extra=None, stamp=False):
                 n.diffpc_layer = i % 3
                 if i % 5 == 0:
                     n.manifold_type = "spherical"
+                if mixed and i % 7 == 3:           # a direction that is not unit length
+                    md["poincare_dir"] = NF.pack_poincare_dir(d * np.float32(1.3))
+                    n.metadata = md
+        if mixed:                                  # inhibitory nodes and inhibitory synapses (review 2026-11-21)
+            for i, nid in enumerate(sorted(g.nodes.keys())):
+                if i % 4 == 1:
+                    g.nodes[nid].is_inhibitory = True
+            for i, sid in enumerate(sorted(g.synapses.keys())):
+                if i % 6 == 2:
+                    g.synapses[sid].synapse_type = NF.SynapseType.INHIBITORY
     b.config.update(KEY)
     return H2.Side(a, seed), H2.Side(b, seed)
 
@@ -83,10 +94,14 @@ def _compare(a, b, rel, where):
             assert _close(ca, cb, rel), (where, t, tid, ca, cb)
     for nid in a.nodes.keys():
         assert _close(a.nodes[nid].voltage, b.nodes[nid].voltage, rel), (where, nid)
+    pa, pb = a._pending_input(), b._pending_input()       # the receiver's read: the Python walk against the store's
+    assert sorted(pa) == sorted(pb), where
+    for tid in pa:
+        assert all(_close(x, y, rel) for x, y in zip(pa[tid], pb[tid])) and len(pa[tid]) == len(pb[tid]), (where, tid)
 
 
-def _run(seed, steps, extra=None, stamp=False, rel=1e-9):
-    sa, sb = _twins(seed, extra, stamp)
+def _run(seed, steps, extra=None, stamp=False, rel=1e-9, mixed=False):
+    sa, sb = _twins(seed, extra, stamp, mixed)
     fired_total = queued = 0
     for i in range(steps):
         ra = sa(lambda g: (_kick(g, random.Random(seed * 100 + i)), g.step())[1])
@@ -118,6 +133,48 @@ def test_manifold_attenuation_matches_the_numpy_arithmetic(seed):
     a, b = _run(seed, 30, stamp=True, rel=2e-5)
     plain = sorted(c for v in _queue(_run(seed, 30)[1]).values() for _, c in v)
     assert sorted(c for v in _queue(b).values() for _, c in v) != plain      # the attenuation did act
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_inhibitory_nodes_and_synapses_depression_and_non_unit_directions(seed):
+    """One node in four inhibitory, one synapse in six INHIBITORY, depression on (exempt for both), every node with
+    a direction and some not unit length."""
+    a, b = _run(seed, 30, {"syn_std_enabled": True}, stamp=True, rel=2e-5, mixed=True)
+    cur = [c for v in _queue(b).values() for _, c in v]
+    assert any(c < 0 for c in cur) and any(c > 0 for c in cur)
+    ra, rb = a.synapses.std_resources(float(a.timestep)), b.synapses.std_resources(float(b.timestep))
+    assert len(ra) == len(rb) and all(_close(x, y, 1e-9) for x, y in zip(ra, rb)) and min(rb) < 1.0
+
+
+def _fired_pair(pd_a, pd_b, spherical=False):
+    """A -> B with the given directions, A made to fire: (Python loop's queued current, native pass's)."""
+    out = []
+    for on in (False, True):
+        g = _two_nodes(pd_a, pd_b)
+        g.config.pop("native_propagation_enabled")
+        if on:
+            g.config.update(KEY)
+        if spherical:
+            g.nodes["A"].manifold_type = g.nodes["B"].manifold_type = "spherical"
+        g.nodes["A"].voltage = 5.0
+        r = g.step()
+        assert list(r.fired_node_ids) == ["A"]
+        (entries,) = _queue(g).values()
+        assert [t for t, _ in entries] == ["B"]
+        out.append(entries[0][1])
+    return out
+
+
+def test_a_nan_direction_takes_the_branch_the_python_takes():
+    nan, ok = NF.pack_poincare_dir([float("nan"), 0.8, 0.0]), NF.pack_poincare_dir([0.0, 0.6, 0.8])
+    py, rs = _fired_pair(nan, ok)                       # hyperbolic, pre NaN: the current is NaN on both sides
+    assert math.isnan(py) and math.isnan(rs)
+    py, rs = _fired_pair(ok, nan)                       # hyperbolic, post NaN: max(1.0, nan) = 1.0 -> no attenuation
+    assert py == rs == 0.5
+    py, rs = _fired_pair(nan, ok, spherical=True)       # spherical: min(1 - 1e-7, nan) keeps the clamp
+    assert _close(py, rs, 1e-12) and 0.0 < rs < 0.5
+    py, rs = _fired_pair(NF.pack_poincare_dir([1.2, 1.6, 0.0]), ok)   # twice unit length: the norm cap
+    assert _close(py, rs, 1e-6)
 
 
 def test_the_key_going_off_moves_the_queue_back():
