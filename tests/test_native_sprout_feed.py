@@ -107,3 +107,48 @@ def test_a_bad_parameter_raises_and_touches_nothing():
     with pytest.raises(ValueError):
         g._pb.sprout_tally_feed(g.synapses, sorted(g.nodes.keys())[:3], g.timestep, 5, 0, 2.0, 0.5, 0.1, 3)
     assert g.cofire_tally_state() == before
+
+
+def test_a_bad_parameter_raises_with_no_candidate_too():
+    """Review 2026-11-22: the parameter check runs before the empty-window return."""
+    g = S.restore_as(NF, "native", H2.built(0))
+    with pytest.raises(ValueError):
+        g._pb.sprout_tally_feed(g.synapses, [], g.timestep + 10_000, 5, 0, 2.0, 0.5, 0.1, 3)
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_duplicates_and_ids_that_are_not_nodes_match_the_wrapper(seed):
+    """Review 2026-11-22: a fired list with a repeated id and an id that is no node gives the wrapper's crossings
+    and tally on both paths."""
+    a, b = _twins(seed)
+    sa, sb = H2.Side(a, seed), H2.Side(b, seed)
+    for i in range(8):
+        _drive(sa, seed, i)
+        _drive(sb, seed, i)
+    rng = random.Random(seed + 7)
+    base = rng.sample(sorted(a.nodes.keys()), 8)
+    fired = base + [base[0], "no-such-node", base[3]]
+    prm = a._sprout_tally_params()
+    window = a.config["co_activation_window"]
+    recent = [tuple(x) for x in a._pb.spikes_recent_within(a.timestep, window, list(set(fired)))]
+    recent.sort(key=lambda x: x[0])
+    assert len({dt for dt, _ in recent}) < len(recent)        # ties in dt: the stable order is exercised
+    py = a._sprout_tally_feed(list(fired), [n for _, n in recent], prm)
+    rs = b._pb.sprout_tally_feed(b.synapses, list(fired), b.timestep, window, prm["k"], prm["theta"], prm["lam"],
+                                 prm["floor"], prm["gap"])
+    assert [tuple(x) for x in rs] == py
+    assert a.cofire_tally_state() == b.cofire_tally_state()
+
+
+def test_the_key_with_the_python_tally_forced_stays_on_the_python_tally(monkeypatch):
+    """Review 2026-11-22: with the native tally unavailable the key changes nothing (no state split between the
+    Python tally and the store's)."""
+    monkeypatch.setattr(NF, "_cofire_tally_native", lambda store: None)
+    a, b = _twins(0)
+    sa, sb = H2.Side(a, 0), H2.Side(b, 0)
+    for i in range(12):
+        _drive(sa, 0, i)
+        _drive(sb, 0, i)
+        assert S.state(a) == S.state(b), i
+    assert a.__dict__.get("_cofire_tally") == b.__dict__.get("_cofire_tally")
+    assert b.__dict__.get("_cofire_tally") is not None
