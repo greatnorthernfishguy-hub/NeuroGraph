@@ -68,6 +68,38 @@ def install_serializers():
 install_serializers()
 
 
+class BookFake:
+    """[2026-11-22] DudeMan CC (NG suite repair #761, after #1221): the serializers read predictions, outcomes, the
+    confirmation history and the spike record from the Rust PredictionBook (`self._pb`) as rows. This stand-in answers
+    those five read calls from the fixture's own collections, in the book's row shapes, with a fresh list per call
+    (the book hands out copies: detached by construction). Assertions unchanged."""
+
+    def __init__(self, g):
+        self.g = g
+
+    @staticmethod
+    def _row(p):
+        return ((p.prediction_id, p.source_node_id, p.target_node_id),
+                (p.strength, p.confidence, p.created_at, p.expires_at, p.chain_depth),
+                (p.via_hyperedge, p.pre_charge_applied, False, 0.0, 0.0))
+
+    def items(self):
+        return [self._row(p) for p in self.g.active_predictions.values()]
+
+    def hist_items(self):
+        return [(sid, list(h)) for sid, h in self.g._synapse_confirmation_history.items()]
+
+    def outcome_items(self):
+        return [(self._row(o.prediction), o.confirmed, o.resolved_at, list(o.actual_firing_nodes), o.n_actual_firing)
+                for o in self.g._prediction_outcomes]
+
+    def spike_items(self, nonempty=False):
+        return [(nid, list(d), 100) for nid, d in self.g._recent_spikes.items() if d or not nonempty]
+
+    def receiver_raw(self, pid):
+        return None
+
+
 class SynapsesFake(dict):
     packed_type = bytes
     last_packed = None
@@ -120,6 +152,8 @@ def fixture():
         _he_output_candidates={'h': {'m': 3}}, _delay_buffer={5: [('n', .2)]},
         _recent_spikes={'n': deque([1, 4])}, _steps_since_last_fire=0, _plasticity_rules=[],
         _dirty_nodes={'n'}, _dirty_synapses={'s'}, _dirty_hyperedges={'h'})
+    graph._pb = BookFake(graph)   # [2026-11-22] #1221: the prediction book's read calls (see BookFake)
+    graph._PB_SAVE_RECEIVER_PART = True   # the Graph class constant the serializer reads (#1222)
     for name in ('total_pruned total_sprouted total_he_discovered total_he_consolidated '
                  'total_predictions_made total_predictions_confirmed total_predictions_errors '
                  'total_novel_sequences total_rewards_injected total_predictions total_confirmed '

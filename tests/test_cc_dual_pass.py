@@ -356,6 +356,22 @@ class _FakeWantGraph:
         assert write_mode is False  # curiosity is observation, never mutation
         return _FakeResult(self._pp_fired)
 
+    # [2026-11-22 #761] #1221 (3b0034e): generate_emergent_want takes its seeds from the prediction book,
+    # `graph._pb.top_by_confidence(max_seeds, threshold)`: confidence above the threshold, highest first, cut to
+    # max_seeds, as book rows. Answered here from this fake's active_predictions (the loop the book call replaced).
+    @property
+    def _pb(self):
+        preds = self.active_predictions
+
+        class _Book:
+            @staticmethod
+            def top_by_confidence(max_seeds, threshold):
+                rows = [(pid, p) for pid, p in preds.items() if p.confidence > threshold]
+                rows.sort(key=lambda x: x[1].confidence, reverse=True)
+                return [((pid, p.source_node_id, p.target_node_id), (0.0, p.confidence, 0, 0, 0),
+                         (None, False, False, 0.0, 0.0)) for pid, p in rows[:max_seeds]]
+        return _Book()
+
     def create_node(self, node_id, metadata=None):
         n = _FakeNode(metadata)
         self.nodes[node_id] = n
