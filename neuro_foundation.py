@@ -1,3 +1,15 @@
+# [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos; Josh 2026-11-21 "moving all of this stuff into
+#   Rust and then removing the Python is the entire point of the exercise") — the homeostat's degree targets as a
+#   NodeStore column (config native_degree_targets_enabled, default off).
+# What: with the key on and native stores, HomeostaticRule._refresh_degree_targets is one call,
+#   NodeStore.refresh_degree_targets (targets, diffpc_layer, manifold_type, on rows), the targets stay in the store,
+#   and every pass that took the dict is given None (= read the column). The rule's dict moves into the column when
+#   the key turns on and back out when it turns off; the checkpoint key homeostatic_degree_targets is the column's
+#   export. With the column in use a declined homeostat pass RAISES (no Python loop over an empty dict).
+# Why: profile after native propagation: the Python refresh (sets of synapse-id strings, one Python object per
+#   synapse of every candidate) was 19 % of the step; the dict was looked up per row by five passes each call.
+# How: HomeostaticRule._dt_col / targets_arg / targets_dict. tests/test_native_degree_targets.py. Declared
+#   differences: a removed node's stale target is not kept or saved; NaN prediction errors sort last.
 # [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos, punch #1221 / #1201 option B) — read-mode
 #   prime_and_propagate as ONE native call (config native_recall_enabled, default off).
 # What: with the key on, a read-mode sweep (write_mode False) is ng_tract.recall_sweep: the copy of the voltages and
@@ -2918,6 +2930,7 @@ class HomeostaticRule(PlasticityRule):
         self.ema_alpha = ema_alpha
         self.degree_sensitivity = degree_sensitivity
         self._degree_targets: Dict[str, float] = {}
+        self._dt_col = False   # [2026-11-21] True while the targets live in the NodeStore column (dict left empty)
         self._steps_since_scaling = 0
         # [2026-10-26] #1146: True only for the rule a Graph builds from its own config (see _sync_from_config)
         self._follows_config = bool(follows_config)
@@ -2937,8 +2950,39 @@ class HomeostaticRule(PlasticityRule):
         if changed:
             self._refresh_degree_targets(graph)
 
+    def targets_arg(self, graph: "Graph") -> Optional[Dict[str, float]]:
+        """[2026-11-21] What a native pass is given as `degree_targets`: None (= the NodeStore's own column) with
+        config native_degree_targets_enabled on native stores, else the rule's dict. Moves the targets between the
+        dict and the column when the key changes, so neither is ever stale."""
+        nodes = graph.nodes
+        if graph.config.get("native_degree_targets_enabled", False):
+            if (getattr(nodes, "refresh_degree_targets", None) is not None
+                    and isinstance(graph.synapses, ng_tract.SynapseStore)):
+                if not self._dt_col:
+                    nodes.degree_targets_import(self._degree_targets)
+                    self._degree_targets = {}
+                    self._dt_col = True
+                return None
+            graph._stab_error_once(["native_degree_targets_enabled"], "an ng_tract wheel with "
+                                   "refresh_degree_targets and the native node and synapse stores")
+        if self._dt_col:
+            self._degree_targets = dict(nodes.degree_targets_export())
+            nodes.degree_targets_clear()
+            self._dt_col = False
+        return self._degree_targets
+
+    def targets_dict(self, graph: "Graph") -> Dict[str, float]:
+        """[2026-11-21] {node id: target} wherever the targets live (checkpoint capture, tests, reports)."""
+        return dict(graph.nodes.degree_targets_export()) if self._dt_col else dict(self._degree_targets)
+
     def _refresh_degree_targets(self, graph: "Graph") -> None:
         """Compute per-node firing targets adjusted for vertex degree (DAS-GNN, #104)."""
+        if self.targets_arg(graph) is None:
+            # [2026-11-21] native_degree_targets_enabled: targets, DiffPC layers and manifold types in one pass
+            graph.nodes.refresh_degree_targets(graph.synapses, float(self.target_firing_rate),
+                                               float(self.degree_sensitivity or 0.0),
+                                               float(graph.config.get("gsg_spherical_fraction", 0.20)))
+            return
         if not self.degree_sensitivity or not graph.nodes:
             self._degree_targets = {}
             return
@@ -3055,12 +3099,15 @@ class HomeostaticRule(PlasticityRule):
         # Threshold adaptation: continuous, 0.001/step (PRD §3.2.1)
         threshold_ceiling = graph.config.get("threshold_ceiling", 5.0)
         _native = getattr(graph.nodes, "adapt_thresholds", None)
-        if _native is None or not (_native(self._degree_targets, self.target_firing_rate,
+        _T = self.targets_arg(graph)   # [2026-11-21] None = the NodeStore's own column
+        if _native is None or not (_native(_T, self.target_firing_rate,
                                            self.threshold_rate, threshold_ceiling) if _n_ev is None
-                                   else _native(self._degree_targets, self.target_firing_rate,
+                                   else _native(_T, self.target_firing_rate,
                                                 _thr_rate, threshold_ceiling,
                                                 (_n_ev[0],) if _ev_in is None else (_n_ev[0],) + _ev_in + _w_step,
                                                 **_tkw)):
+            if _T is None:
+                raise RuntimeError("native_degree_targets_enabled: adapt_thresholds declined (no Python loop)")
             _adapt_thresholds_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                      self.threshold_rate, threshold_ceiling)
 
@@ -3075,10 +3122,13 @@ class HomeostaticRule(PlasticityRule):
         # {nid: target / rate} for the non-silent nodes in node order; `ratio ** scaling_factor`
         # stays in Python (libm pow is not proven bit-identical to CPython's float.__pow__).
         _native = getattr(graph.nodes, "adapt_excitability", None)
-        _ratios = ((_native(self._degree_targets, self.target_firing_rate, self.excitability_rate) if _n_ev is None
-                    else _native(self._degree_targets, self.target_firing_rate, _exc_rate,
+        _T = self.targets_arg(graph)
+        _ratios = ((_native(_T, self.target_firing_rate, self.excitability_rate) if _n_ev is None
+                    else _native(_T, self.target_firing_rate, _exc_rate,
                                  _n_ev if _ev_in is None else _n_ev + _ev_in + _w_int, **_xkw))
                    if _native is not None else None)
+        if _ratios is None and _T is None:
+            raise RuntimeError("native_degree_targets_enabled: adapt_excitability declined (no Python loop)")
         if _ratios is None:
             node_scales = _adapt_excitability_python(graph.nodes, self._degree_targets, self.target_firing_rate,
                                                      self.excitability_rate, self.scaling_factor)
@@ -3099,7 +3149,7 @@ class HomeostaticRule(PlasticityRule):
                 _s2kw["quiet"] = _qw
             if _st.up_bound is not None:   # [2026-10-25] S8
                 _s2kw["up_bound"] = _st.up_bound
-            node_scales = graph.nodes.evidence_scales(self._degree_targets, self.target_firing_rate,
+            node_scales = graph.nodes.evidence_scales(_T, self.target_firing_rate,
                                                       self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3], **_s2kw) or {}
 
         # [2026-10-04] One native pass applies every node's scale to its incoming
@@ -5843,7 +5893,7 @@ class Graph:
         §1.2): reads the E topology and firing, never content; never touches an E node or a synapse. Caller holds
         nothing; takes _step_lock. Returns the counts (None = the native pass declined; nothing touched)."""
         hr = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
-        targets = hr._degree_targets if hr is not None else {}
+        targets = hr.targets_arg(self) if hr is not None else {}
         default = float(hr.target_firing_rate if hr is not None else self.config.get("target_firing_rate", 0.05))
         with self._step_lock:
             out = self.nodes.interneurons_recruit(self.synapses, params, targets, default, int(self.timestep))
@@ -9949,7 +9999,7 @@ class Graph:
         self._breaker_lift_active = k + 1
         thr_rate, exc_rate, interval, dthr, slow, prop = bk
         rule = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
-        targets = rule._degree_targets if rule is not None else {}
+        targets = rule.targets_arg(self) if rule is not None else {}
         default_t = float(rule.target_firing_rate) if rule is not None else float(self.config["target_firing_rate"])
         er = exc_rate if (k % max(1, int(interval)) == 0) else None
         if self.nodes.breaker_lift(targets, default_t, thr_rate, er, dthr, slow=slow, prop=prop) is None:
@@ -10396,8 +10446,8 @@ class Graph:
                  if isinstance(r, StrengthBudgetRule)), 0)) else {}),
             # [2026-10-19] #1134 (S window): the homeostat's per-node degree targets, so a restored graph continues
             # step for step. Emitted ONLY with config homeostatic_degree_targets_persist (absent = the key set above).
-            **({"homeostatic_degree_targets": dict(next(
-                (r._degree_targets for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), {}))}
+            **({"homeostatic_degree_targets": next(
+                (r.targets_dict(self) for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), {})}
                if self.config.get("homeostatic_degree_targets_persist", False) else {}),
             # [2026-10-25] S8 (#1136): each node's total up-scaling (only with the bound on)
             **({"syn_scale_up_totals": dict(self.nodes.s8_totals())}
@@ -10891,6 +10941,10 @@ class Graph:
                 _dt = data.get("homeostatic_degree_targets")
                 if isinstance(_dt, dict):
                     rule._degree_targets = dict(_dt)
+                    rule._dt_col = False   # [2026-11-21] the column (if in use) is refilled from this at the next use
+                elif rule._dt_col:
+                    # the restored nodes are new rows with no target, as a rule restored with no saved targets
+                    rule._dt_col = False
                 break
         # 2026-10-04 strength budget interval counter (absent key == 0).
         for rule in self._plasticity_rules:
