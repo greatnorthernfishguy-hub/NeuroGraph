@@ -1,3 +1,10 @@
+# [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10) — _sprout_from_tally's candidates stay in Rust (config
+#   native_sprout_feed_enabled, default off).
+# What: with the key on, PredictionBook.sprout_tally_feed builds the candidate list (recent spikes that did not fire
+#   now, most recent first, stable) and feeds SynapseStore's tally in one call; only the few crossings come back.
+# Why: profile LS1121DT: the (dt, id) tuples out and the candidate list back in were 8.4 % of the step.
+# How: ng-tract-rs prediction_book.rs sprout_tally_feed / store.rs tally_feed (the body of cofire_tally_update).
+#   tests/test_native_sprout_feed.py: twins identical step for step.
 # [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos; Josh 2026-11-21 "moving all of this stuff into
 #   Rust and then removing the Python is the entire point of the exercise") — the homeostat's degree targets as a
 #   NodeStore column (config native_degree_targets_enabled, default off).
@@ -8610,13 +8617,26 @@ class Graph:
         st = self._sprout_tally_stats_dict()
         fired_set = set(fired_ids)
         now = self.timestep
-        # [2026-11-13] #1221: (smallest dt, id) per node in record order, natively
-        recent: List[Tuple[int, str]] = [tuple(x) for x in self._pb.spikes_recent_within(now, window, list(fired_set))]
-        if not recent:
-            return 0
-        recent.sort(key=lambda x: x[0])    # most recent first; stable within a step (dict order)
-        st["calls"] += 1
-        crossings = self._sprout_tally_feed(list(fired_ids), [nid for _, nid in recent], prm)
+        _nf = getattr(self._pb, "sprout_tally_feed", None)
+        if (self.config.get("native_sprout_feed_enabled", False) and _nf is not None
+                and _cofire_tally_native(self.synapses) is not None):
+            # [2026-11-21] native_sprout_feed_enabled: the candidates are built and handed to the tally inside Rust
+            # (no (dt, id) tuple per recent node out, no candidate list back in); the crossings are few
+            _got = _nf(self.synapses, list(fired_ids), now, window, prm["k"], prm["theta"], prm["lam"],
+                       prm["floor"], prm["gap"])
+            if _got is None:
+                return 0
+            st["calls"] += 1
+            crossings = [tuple(x) for x in _got]
+        else:
+            # [2026-11-13] #1221: (smallest dt, id) per node in record order, natively
+            recent: List[Tuple[int, str]] = [tuple(x) for x in
+                                             self._pb.spikes_recent_within(now, window, list(fired_set))]
+            if not recent:
+                return 0
+            recent.sort(key=lambda x: x[0])    # most recent first; stable within a step (dict order)
+            st["calls"] += 1
+            crossings = self._sprout_tally_feed(list(fired_ids), [nid for _, nid in recent], prm)
         made = self._sprout_tally_rails(crossings, st)
         if keep is not None and keep < 1.0 and made:   # [2026-10-21] RD §5 (B): each accepted sprout kept w.p. keep
             _kept = [pm for pm in made if random.random() < keep]
