@@ -776,7 +776,6 @@ class TestSurfacingQueue:
         # after_step() may both call it in one step without double-penalising). So with the clock standing still,
         # further calls change nothing ...
         for _ in range(20):
-            graph.timestep += 1
             monitor.after_step(MockStepResult())
         assert len(monitor._queue) == 1
 
