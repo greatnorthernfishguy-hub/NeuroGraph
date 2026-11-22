@@ -49,19 +49,29 @@ def _rows(res):
                   for e in res.fired_entries)
 
 
+def _state(g):
+    """The checkpoint bytes plus what a checkpoint does not carry and a sweep could touch (review 2026-11-21): the
+    synapses' depression resources, the hyperedge passes' decline counters, every node's voltage and refractory
+    count read straight from the store."""
+    ids = sorted(g.nodes.keys())
+    return (S18.ckpt(g), [float(x) for x in g.synapses.std_resources(float(g.timestep))],
+            tuple(g.hyperedges.pass_declines()),
+            [(g.nodes[n].voltage, g.nodes[n].refractory_remaining) for n in ids])
+
+
 def _both(g, ids, currents, steps, monkeypatch):
     """(python rows, native rows); asserts the native call was taken and that neither changed the checkpoint."""
     calls = []
     orig = NF.ng_tract.recall_sweep
     monkeypatch.setattr(NF.ng_tract, "recall_sweep", lambda *a: (calls.append(1), orig(*a))[1])
-    before = S18.ckpt(g)
+    before = _state(g)
     g.config.pop(KEY, None)
     py = g.prime_and_propagate(ids, currents, steps=steps)
-    assert not calls and S18.ckpt(g) == before
+    assert not calls and _state(g) == before
     g.config[KEY] = True
     rs = g.prime_and_propagate(ids, currents, steps=steps)
     g.config.pop(KEY)
-    assert calls == [1] and S18.ckpt(g) == before
+    assert calls == [1] and _state(g) == before
     assert (py.steps_run, py.nodes_primed) == (rs.steps_run, rs.nodes_primed)
     return _rows(py), _rows(rs)
 
@@ -97,8 +107,24 @@ def test_the_same_nodes_fire_at_the_same_sweep_step(seed, arm, monkeypatch):
 
 
 def test_the_brakes_arm_does_brake():
-    g = _warm(1, ARMS["brakes"])
-    assert g._recall_brakes(g._stability_params()) is not None
+    """The brakes are given to the native call and change what it returns (so the brakes arm above compares a braked
+    sweep on both sides, not two unbraked ones)."""
+    differ = 0
+    for seed in (0, 1, 2):
+        g = _warm(seed, ARMS["brakes"])
+        assert g._recall_brakes(g._stability_params()) is not None
+        g.config[KEY] = True
+        rng = random.Random(seed)
+        ids_all = sorted(g.nodes.keys())
+        for trial in range(6):
+            ids = rng.sample(ids_all, min(4 + trial, len(ids_all)))
+            cur = [rng.uniform(0.8, 2.5) for _ in ids]
+            on = _rows(g.prime_and_propagate(ids, cur, steps=4))
+            g.config["recall_brakes_enabled"] = False
+            off = _rows(g.prime_and_propagate(ids, cur, steps=4))
+            g.config["recall_brakes_enabled"] = True
+            differ += on != off
+    assert differ > 0
 
 
 @pytest.mark.parametrize("steps", [0, 1])
@@ -108,9 +134,12 @@ def test_few_steps_and_an_unknown_prime(steps, monkeypatch):
     py, rs = _both(g, ids, [2.0] * 4, steps, monkeypatch)
     _same(py, rs)
     assert (len(rs) == 0) == (steps == 0)
-    g.config[KEY] = True                    # a prime that is not a node is skipped by the native call
-    res = g.prime_and_propagate(ids + ["no-such-node"], [2.0] * 5, steps=2)
-    assert {e.node_id for e in res.fired_entries} >= set(ids) and "no-such-node" not in {e.node_id for e in res.fired_entries}
+    for on in (False, True):                # a prime that is not a node: KeyError on both paths, the mind put back
+        g.config[KEY] = on
+        before = _state(g)
+        with pytest.raises(KeyError):
+            g.prime_and_propagate(ids + ["no-such-node"], [2.0] * 5, steps=2)
+        assert _state(g) == before
 
 
 def test_no_primes_and_write_mode_do_not_take_the_call(monkeypatch):
