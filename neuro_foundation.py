@@ -8,7 +8,9 @@
 #   export. With the column in use a declined homeostat pass RAISES (no Python loop over an empty dict).
 # Why: profile after native propagation: the Python refresh (sets of synapse-id strings, one Python object per
 #   synapse of every candidate) was 19 % of the step; the dict was looked up per row by five passes each call.
-# How: HomeostaticRule._dt_col / targets_arg / targets_dict. tests/test_native_degree_targets.py. Declared
+# How: HomeostaticRule.targets_arg / targets_dict; the in-use state is the store's own (degree_targets_on), so a
+#   rule shared by two graphs (the sleep-observe shadow) never moves one graph's targets into the other; the shadow's
+#   store takes a copy of the live column (review 2026-11-21, Grok 4.7). tests/test_native_degree_targets.py. Declared
 #   differences: a removed node's stale target is not kept or saved; NaN prediction errors sort last.
 # [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos, punch #1221 / #1201 option B) — read-mode
 #   prime_and_propagate as ONE native call (config native_recall_enabled, default off).
@@ -2930,7 +2932,6 @@ class HomeostaticRule(PlasticityRule):
         self.ema_alpha = ema_alpha
         self.degree_sensitivity = degree_sensitivity
         self._degree_targets: Dict[str, float] = {}
-        self._dt_col = False   # [2026-11-21] True while the targets live in the NodeStore column (dict left empty)
         self._steps_since_scaling = 0
         # [2026-10-26] #1146: True only for the rule a Graph builds from its own config (see _sync_from_config)
         self._follows_config = bool(follows_config)
@@ -2950,30 +2951,36 @@ class HomeostaticRule(PlasticityRule):
         if changed:
             self._refresh_degree_targets(graph)
 
+    @staticmethod
+    def _col_on(nodes) -> bool:
+        """[2026-11-21] Does this node store's own column hold the targets? (The state is the store's, not the
+        rule's: a rule can be shared by two graphs, e.g. the sleep-observe shadow.)"""
+        f = getattr(nodes, "degree_targets_on", None)
+        return bool(f()) if f is not None else False
+
     def targets_arg(self, graph: "Graph") -> Optional[Dict[str, float]]:
         """[2026-11-21] What a native pass is given as `degree_targets`: None (= the NodeStore's own column) with
         config native_degree_targets_enabled on native stores, else the rule's dict. Moves the targets between the
-        dict and the column when the key changes, so neither is ever stale."""
+        dict and the column when the key changes. A store whose column is already in use is never written from the
+        dict; a store that turns the key off hands its column back to the dict."""
         nodes = graph.nodes
         if graph.config.get("native_degree_targets_enabled", False):
-            if (getattr(nodes, "refresh_degree_targets", None) is not None
+            if (getattr(nodes, "degree_targets_on", None) is not None
                     and isinstance(graph.synapses, ng_tract.SynapseStore)):
-                if not self._dt_col:
+                if not nodes.degree_targets_on():
                     nodes.degree_targets_import(self._degree_targets)
                     self._degree_targets = {}
-                    self._dt_col = True
                 return None
             graph._stab_error_once(["native_degree_targets_enabled"], "an ng_tract wheel with "
                                    "refresh_degree_targets and the native node and synapse stores")
-        if self._dt_col:
+        if self._col_on(nodes):
             self._degree_targets = dict(nodes.degree_targets_export())
             nodes.degree_targets_clear()
-            self._dt_col = False
         return self._degree_targets
 
     def targets_dict(self, graph: "Graph") -> Dict[str, float]:
         """[2026-11-21] {node id: target} wherever the targets live (checkpoint capture, tests, reports)."""
-        return dict(graph.nodes.degree_targets_export()) if self._dt_col else dict(self._degree_targets)
+        return dict(graph.nodes.degree_targets_export()) if self._col_on(graph.nodes) else dict(self._degree_targets)
 
     def _refresh_degree_targets(self, graph: "Graph") -> None:
         """Compute per-node firing targets adjusted for vertex degree (DAS-GNN, #104)."""
@@ -3149,8 +3156,11 @@ class HomeostaticRule(PlasticityRule):
                 _s2kw["quiet"] = _qw
             if _st.up_bound is not None:   # [2026-10-25] S8
                 _s2kw["up_bound"] = _st.up_bound
-            node_scales = graph.nodes.evidence_scales(_T, self.target_firing_rate,
-                                                      self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3], **_s2kw) or {}
+            _es = graph.nodes.evidence_scales(_T, self.target_firing_rate,
+                                              self.scaling_factor, _s_ev[1], _s_ev[2], _s_ev[3], **_s2kw)
+            if _es is None and _T is None:
+                raise RuntimeError("native_degree_targets_enabled: evidence_scales declined (no Python loop)")
+            node_scales = _es or {}
 
         # [2026-10-04] One native pass applies every node's scale to its incoming
         # synapses: weight = max(0, min(weight * scale, max_weight)). Each synapse has
@@ -7157,6 +7167,11 @@ class Graph:
             cfg_copy = dict(self.config)
             fc = getattr(self, "_fair_chance_cfg", None)
             fc_copy = dict(fc) if isinstance(fc, dict) else fc
+            # [2026-11-21] the homeostat rule is shared with the shadow: settle where the live targets are (dict or the
+            # store's column) before the shadow can reach the rule, so the shadow never takes the live graph's dict
+            _hr = next((r for r in self._plasticity_rules if isinstance(r, HomeostaticRule)), None)
+            if _hr is not None:
+                _hr.targets_arg(self)
             shadow = copy.copy(self)
             hold = _time.perf_counter() - t
         store = type(self.synapses)()
@@ -7170,6 +7185,9 @@ class Graph:
             nodes_copy.set_ring_buffer_class(RingBuffer)
             nodes_copy.bulk_load_msgpack(bytes(nodes_packed))
             del nodes_packed                  # its own copy: the D15 pred_weights deletion writes the shadow only
+            # [2026-11-21] the live column's targets and its in-use state, on rows (the rule is shared with the shadow)
+            if getattr(self.nodes, "degree_targets_on", None) is not None and self.nodes.degree_targets_on():
+                nodes_copy.degree_targets_copy_from(self.nodes)
         else:
             nodes_copy = {}
             for nid, node, md in node_cap:
@@ -10941,10 +10959,8 @@ class Graph:
                 _dt = data.get("homeostatic_degree_targets")
                 if isinstance(_dt, dict):
                     rule._degree_targets = dict(_dt)
-                    rule._dt_col = False   # [2026-11-21] the column (if in use) is refilled from this at the next use
-                elif rule._dt_col:
-                    # the restored nodes are new rows with no target, as a rule restored with no saved targets
-                    rule._dt_col = False
+                    # [2026-11-21] with the column in use, the restored store is refilled from this at the next use
+                    # (restore cleared the store, so its column is not in use)
                 break
         # 2026-10-04 strength budget interval counter (absent key == 0).
         for rule in self._plasticity_rules:
