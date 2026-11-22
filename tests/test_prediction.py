@@ -12,6 +12,12 @@ Covers:
     - Reward scoping (local vs global)
     - Prediction state cleanup (no memory leaks)
 """
+# ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- the two TestPredictionSerialization tests
+#   checkpoint to a ".msgpack" temp path (was ".json"). Commit a4a4762 (2026-06-14, "fix(#325): Graph.checkpoint()
+#   enforces msgpack -- kill the silent lossy-JSON topology path") makes checkpoint() raise ValueError on any other
+#   suffix; that commit moved 3 sibling tests off .json and missed these two. Assertions unchanged.
+# -------------------
 
 import math
 import sys
@@ -892,7 +898,7 @@ class TestPredictionSerialization:
         original_errors = g._total_predictions_errors
 
         # Save and restore
-        path = tempfile.mktemp(suffix=".json")
+        path = tempfile.mktemp(suffix=".msgpack")   # #325 (a4a4762): checkpoint() is msgpack-only
         try:
             g.checkpoint(path)
             g2 = Graph()
@@ -913,7 +919,7 @@ class TestPredictionSerialization:
         syn = list(g.synapses.values())[0]
         syn.metadata = {"creation_mode": "surprise_driven", "test": True}
 
-        path = tempfile.mktemp(suffix=".json")
+        path = tempfile.mktemp(suffix=".msgpack")   # #325 (a4a4762): checkpoint() is msgpack-only
         try:
             g.checkpoint(path)
             g2 = Graph()

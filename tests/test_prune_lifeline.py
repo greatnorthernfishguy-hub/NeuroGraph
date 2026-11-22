@@ -1,4 +1,9 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- dead path: the (G) base checkout /home/josh/worktrees/ng-prune-lifeline-base-20261004
+#   (a scratch worktree of trial-s4 @ 39c0422, since removed) no longer exists, so the 4 G tests errored in the fixture. When
+#   PRUNE_LIFELINE_BASE_CHECKOUT is not set the base is now read from git (`git show 39c0422:<file>`, as test_hyperedge_store_h2
+#   `_load` does) into a pytest temp dir. 39c0422 is the base this file's own header names (parent of the engine commit 79e35e6).
+#   An explicit PRUNE_LIFELINE_BASE_CHECKOUT is still honoured exactly as before. No assertion changed.
 # [2026-10-04] Claude (lane prune-lifeline, turn 2) — (T) last-link fair-chance grace tests; (L) lifeline tests pinned to grace 0
 # What: (T) a non-protected node's last link is held for last_link_grace_steps (stamped once, default 2000, not in DEFAULT_CONFIG),
 #   then faces the normal rules; a node that gains a link is unaffected and its stamp clears; all-eligible keeps the strongest;
@@ -37,7 +42,10 @@ import neuro_foundation as nf  # noqa: E402
 if Path(nf.__file__).resolve().parent != REPO:
     raise RuntimeError("P379: neuro_foundation resolved to %s, not this worktree (%s); refusing to run" % (nf.__file__, REPO))
 
-BASE_CHECKOUT = Path(os.environ.get("PRUNE_LIFELINE_BASE_CHECKOUT", "/home/josh/worktrees/ng-prune-lifeline-base-20261004"))
+# [2026-11-16 #761] no default scratch path any more: unset => the base is materialized from git (see base_checkout).
+BASE_CHECKOUT = Path(os.environ["PRUNE_LIFELINE_BASE_CHECKOUT"]) if os.environ.get("PRUNE_LIFELINE_BASE_CHECKOUT") else None
+# the commit the prune-lifeline engine change (79e35e6) sits on; env-overridable like the checkout (LAW 5)
+BASE_REV = os.environ.get("PRUNE_LIFELINE_BASE_REV", "39c0422")
 FLAG = "prune_protected_faint_links"
 CC = "constitutional::rim::choice_clause"
 GRACE = nf.DEFAULT_CONFIG["grace_period"]
@@ -115,8 +123,27 @@ def _engine_drive(checkout, tmp_path, tag, cfg=None):
     return _run_driver("prune_lifeline_engine_driver.py", checkout, tmp_path, tag, extra)
 
 
+def _materialize_base(rev, dest):
+    """[2026-11-16 #761] The base engine read from git (`git show <rev>:<file>`, the mechanism tests/test_hyperedge_store_h2.py
+    `_load` uses) into a pytest temp dir: every top-level *.py of <rev>, so the driver's separate process imports the base
+    neuro_foundation from a directory that holds nothing but that revision. Fails loudly if git cannot supply the revision."""
+    ls = subprocess.run(["git", "-C", str(REPO), "ls-tree", "--name-only", rev], capture_output=True, text=True)
+    assert ls.returncode == 0, "cannot read base %s from git: %s" % (rev, ls.stderr[-500:])
+    names = [n for n in ls.stdout.splitlines() if n.endswith(".py")]
+    assert "neuro_foundation.py" in names, "base %s has no neuro_foundation.py" % rev
+    dest = Path(dest)
+    for n in names:
+        blob = subprocess.run(["git", "-C", str(REPO), "show", "%s:%s" % (rev, n)], capture_output=True)
+        assert blob.returncode == 0, "cannot read %s:%s from git: %s" % (rev, n, blob.stderr[-500:])
+        (dest / n).write_bytes(blob.stdout)
+    return dest
+
+
 @pytest.fixture(scope="module")
-def base_checkout():
+def base_checkout(tmp_path_factory):
+    global BASE_CHECKOUT
+    if BASE_CHECKOUT is None:
+        BASE_CHECKOUT = _materialize_base(BASE_REV, tmp_path_factory.mktemp("prune_lifeline_base"))
     assert (BASE_CHECKOUT / "neuro_foundation.py").is_file(), "base checkout missing: %s" % BASE_CHECKOUT
     assert BASE_CHECKOUT.resolve() != REPO
     assert "_protected_lifelines" not in (BASE_CHECKOUT / "neuro_foundation.py").read_text(), "base already has the change"

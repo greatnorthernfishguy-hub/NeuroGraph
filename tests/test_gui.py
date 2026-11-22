@@ -11,6 +11,14 @@ Covers:
   - GitUpdater: clone, fetch/compare, pull/deploy (mocked git)
   - IngestionManager: ingest + move to ingested/
 """
+# ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- test_unsupported_extensions_ignored named
+#   three extensions that later commits deliberately made SUPPORTED: .csv and .zip by 156012b (2026-02-27, "Sync deployed
+#   CES + ecosystem files ...") and .jpg by 6c9f912 (2026-03-16, "... Fix SUPPORTED_EXTENSIONS: add images, zip, docx").
+#   The .zip line also contradicted the sibling test_zip_extension_supported. Those three examples are replaced with
+#   extensions that are still unsupported (.dll, .iso, .bin); .exe is kept. Still four assertions, same rule under test,
+#   and the test now also asserts its examples are absent from SUPPORTED_EXTENSIONS so it cannot silently go stale again.
+# -------------------
 
 from __future__ import annotations
 
@@ -132,10 +140,10 @@ class TestFileWatcherIgnore:
         assert FileWatcher.should_ignore("/inbox/backup~") is True
 
     def test_unsupported_extensions_ignored(self):
-        assert FileWatcher.should_ignore("/inbox/photo.jpg") is True
-        assert FileWatcher.should_ignore("/inbox/data.csv") is True
-        assert FileWatcher.should_ignore("/inbox/archive.zip") is True
-        assert FileWatcher.should_ignore("/inbox/data.exe") is True
+        # [2026-11-16] .jpg / .csv / .zip are supported now (6c9f912, 156012b); these four are not.
+        for name in ("library.dll", "disk.iso", "blob.bin", "data.exe"):
+            assert os.path.splitext(name)[1] not in SUPPORTED_EXTENSIONS
+            assert FileWatcher.should_ignore(f"/inbox/{name}") is True
 
     def test_zip_extension_supported(self):
         """ZIP files should NOT be ignored since ZipExtractor handles them."""

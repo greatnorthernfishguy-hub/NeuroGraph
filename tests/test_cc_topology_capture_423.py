@@ -1,4 +1,12 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- harness follows the merge, NO assertion changed:
+#   the AST-extracted names now include `_drop_banned_meta` and the namespace carries the real `_BANNED_META` (imported from
+#   cc_topology_export, as the merge does). Commit 5637eb9 (2026-10-02, "Drop banned metadata on topology merge") made
+#   merge_cc_topology call `_drop_banned_meta(meta)` per inbound node; without it the extracted merge raised NameError
+#   (4 tests). The test frames carry only {'cc': True}, so nothing is dropped and every pinned value is as before.
+#   Likewise `find_synapse_id` / `find_hyperedge_id` join the extracted names (and `Callable` the namespace): commit 4aa8c82
+#   (2026-10-23, "#1173 fix set (NG): reinforce on recurrence ...") split the two idempotency guards into lookups that
+#   return the id; `_synapse_exists` / `_hyperedge_exists` are now `find_*_id(...) is not None` ("this guard's answer is unchanged").
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up: harness follows the merge
 # What: the AST-extracted names now also include `cc_ack_membership` (the ack writer's new function; it calls the extracted
 #   `cc_current_membership`) and `_reset_reoffer_streaks` (the one streak reset, N4). No assertion changed.
@@ -34,7 +42,7 @@ from pathlib import Path
 import sys
 import threading
 from types import SimpleNamespace, ModuleType
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
 import pytest
@@ -84,7 +92,8 @@ def load_merge(monkeypatch, graph, vectors, frames):
     tree = ast.parse(source.read_text())
     names = {'merge_cc_topology', 'cc_current_membership', 'cc_ack_membership', '_reset_reoffer_streaks', '_unbound_nodes',
              'whole_graph_guard', 'redact_node_id', '_track_reoffers', 'held_unbound_nodes',
-             '_synapse_exists', '_hyperedge_exists', 'TopologyMergeAbort'}
+             '_synapse_exists', '_hyperedge_exists', 'TopologyMergeAbort', '_drop_banned_meta',
+             'find_synapse_id', 'find_hyperedge_id'}
     selected = ast.Module(body=[n for n in tree.body
                               if getattr(n, 'name', None) in names], type_ignores=[])
     calls = {'consolidation': [], 'membership': [], 'decode': 0}
@@ -112,7 +121,8 @@ def load_merge(monkeypatch, graph, vectors, frames):
     organism._cc_deposit_memory_node = deposit
     organism._cc_callosum_consolidate = consolidate
     monkeypatch.setitem(sys.modules, 'cc_ng_organism', organism)
-    ns = dict(Any=Any, Dict=Dict, List=List, Optional=Optional, Set=Set,
+    from cc_topology_export import _BANNED_META   # the real constant _drop_banned_meta reads (5637eb9)
+    ns = dict(Any=Any, Callable=Callable, Dict=Dict, List=List, Optional=Optional, Set=Set, _BANNED_META=_BANNED_META,
               os=os, re=re, hashlib=hashlib, np=np, logger=logging.getLogger(__name__),
               _DEFAULT_MAX_NODES_PER_CALL=25,
               _REOFFER_WARN_STREAK_DEFAULT=5, _REOFFER_WARN_STREAK_ENV='CC_TOPOLOGY_REOFFER_WARN_STREAK',

@@ -1,4 +1,11 @@
 # Tests for #reach reach-teaching (docs/prd/2026-06-21-reach-teaching-plan.md)
+# ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- test_render_whisper_floor_at_high_competence:
+#   the whisper's length bound is 250 (was 200). Commit deafdc4 (2026-06-26, "#337: fix reach confabulation on bare file
+#   path") deliberately added the file-path cue to the whisper ("When Josh shares a bare file path, that is an invitation
+#   ..."), taking it from under 200 to 211 characters. The test now also pins that cue, and still requires the whisper
+#   to carry the [[reach: gesture, no examples, and to stay a short single block.
+# -------------------
 import neurograph_rpc as ng
 
 
@@ -66,7 +73,8 @@ def test_render_whisper_floor_at_high_competence():
     assert "## How I Reach" in out
     assert "[[reach:" in out
     assert "For example" not in out
-    assert len(out) < 200
+    assert "bare file path" in out          # #337 (deafdc4): the file-path cue is part of the whisper
+    assert len(out) < 250                   # was 200 before #337 added that cue (211 today)
 
 
 def test_render_empty_when_unseeded():

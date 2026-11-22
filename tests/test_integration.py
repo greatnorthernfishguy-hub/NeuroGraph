@@ -8,6 +8,14 @@ Covers PRD §9 acceptance criteria:
 5. ≥30% of speculative synapses are pruned within grace period
 6. No memory leaks over 100K steps
 """
+# ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- test_speculative_synapses_pruned stops
+#   stimulating n0 once the engine has collected it. Commit 7588129 (2026-05-05, "feat(#237): add orphan-node
+#   collection to _structural_plasticity()") removes a node whose last synapse was pruned, so after n0's speculative
+#   synapse is pruned (the very thing this test wants) Graph.stimulate('n0') raised KeyError('Node n0 not found')
+#   before the assertion was reached. The random draw is still taken every step (same stimulus sequence while n0
+#   lives); the >=30% pruned assertion is unchanged.
+# -------------------
 
 import gc
 import json
@@ -104,7 +112,9 @@ class TestStructuralPlasticityPruning:
         rng = np.random.RandomState(42)
         for _ in range(600):  # Beyond grace_period of 500
             # Only stimulate a few unrelated nodes
-            g.stimulate(node_ids[0], rng.random() * 0.3)
+            current = rng.random() * 0.3
+            if node_ids[0] in g.nodes:   # #237 (7588129): an orphaned node is collected with its last synapse
+                g.stimulate(node_ids[0], current)
             g.step()
 
         # Count surviving speculative synapses

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- stale spy scope: 06b8a5e ("#905-DELTA: the whole-graph clock hold
+#   covers ONLY nodes whose binding is in transit") routes both GUARD asks (the batch-end check in merge_cc_topology and the per-slice `_guard`)
+#   through `held_unbound_nodes`, so the frame that calls `_unbound_nodes` is now `held_unbound_nodes` and the two spies (which looked one frame up
+#   for a _GUARD_CALLERS name) saw NO guard ask: test_d_the_guard_is_asked_about_every_node... failed (0 asks) and
+#   test_d_idle_steps_zero_never_evaluates_the_guard... passed vacuously. Both spies now use `_asker()`, which looks through that one
+#   intermediate frame. No assertion changed.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #13930) — #918 fold-up (Q1): the second ack caller of the
 #   one predicate is now named `cc_ack_membership` (the ack writer's function; `cc_current_membership` no longer calls
 #   `_unbound_nodes`): test_d_the_guard_is_asked_about_every_node... pins `("cc_ack_membership", True)` instead of
@@ -52,6 +58,15 @@ sys.path.insert(0, str(_WORKTREE))
 # #918: the merge's GUARD asks `_unbound_nodes` from these two frames only (the batch-end check in merge_cc_topology and the
 # per-slice closure from whole_graph_guard); cc_ack_membership and _track_reoffers are the other two callers.
 _GUARD_CALLERS = ("merge_cc_topology", "_guard")
+
+
+def _asker():
+    """Name of the function asking the one predicate, seen from inside a spy on `tmg._unbound_nodes`: the spy's caller, or -- when that
+    is `held_unbound_nodes` (06b8a5e: the guard's asks go through it) -- the function that called `held_unbound_nodes`."""
+    f = sys._getframe(2)
+    if f.f_code.co_name == "held_unbound_nodes":
+        f = f.f_back
+    return f.f_code.co_name
 
 from neuro_foundation import Graph  # noqa: E402
 from universal_ingestor import SimpleVectorDB  # noqa: E402
@@ -412,7 +427,7 @@ def test_d_idle_steps_zero_never_evaluates_the_guard_and_never_blocks(tmp_path, 
     real = tmg._unbound_nodes
 
     def spy(g, ids):
-        if sys._getframe(1).f_code.co_name in _GUARD_CALLERS:              # #918: only the GUARD's asks
+        if _asker() in _GUARD_CALLERS:                                     # #918: only the GUARD's asks
             calls.append(set(ids))
         return real(g, ids)
 
@@ -440,7 +455,7 @@ def test_d_the_guard_is_asked_about_every_node_in_the_graph_under_the_step_lock(
     real = tmg._unbound_nodes
 
     def spy_guard(g, ids):
-        caller = sys._getframe(1).f_code.co_name
+        caller = _asker()
         if caller in _GUARD_CALLERS:
             asked.append((set(ids), set(g.nodes)))
             owned_at_guard.append(g._step_lock._is_owned())

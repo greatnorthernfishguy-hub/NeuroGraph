@@ -1,3 +1,12 @@
+# ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- TestETModuleManager.setUp points
+#   ETModuleManager.KNOWN_LOCATIONS at a directory inside the test's own temp dir. discover() scans KNOWN_LOCATIONS
+#   under the REAL home, and since commit e0754b0 (2026-04-10, "... et_modules path registry update") those
+#   paths ("~/NeuroGraph/", canonical per ROUTING.md) match this developer machine's live checkout, whose et_module.json then replaced the
+#   registry entry the test had just written: test_get_neurograph_path got '/home/<user>/NeuroGraph' instead of its
+#   temp dir. An environment leak (it passes on a machine without ~/NeuroGraph), not a behaviour change; the tests
+#   already assumed "No known locations exist in temp dir". No assertion changed.
+# -------------------
 # WARNING: This test file has significant DEAD CODE.
 # Multiple test methods were written against the legacy NGPeerBridge + JSONL
 # world that no longer exists post substrate-as-protocol PRD Phase 3 Step 5
@@ -156,6 +165,11 @@ class TestETModuleManager(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        # [2026-11-16] isolate discovery from the developer's real home (~/NeuroGraph/ etc. are KNOWN_LOCATIONS)
+        _locs = patch.object(ETModuleManager, "KNOWN_LOCATIONS",
+                             [os.path.join(self.tmpdir, "no_known_location")])
+        _locs.start()
+        self.addCleanup(_locs.stop)
         self.manager = ETModuleManager(root_dir=self.tmpdir)
 
     def tearDown(self):

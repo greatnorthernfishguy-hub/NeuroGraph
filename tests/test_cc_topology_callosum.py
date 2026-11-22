@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- stale read: test_poincare_dir_is_rederived_locally_not_transmitted read
+#   the re-derived stamp with np.asarray(list). 05ecf77 ("#400: pack poincare_dir on the CC half -- writers, readers, and the missing migration")
+#   stores it as packed float32 bytes, so the stamp is now read with the canonical reader neuro_foundation.poincare_dir_array (bytes or legacy
+#   list) and its presence asserted. The shape / unit-norm / not-the-sender's-garbage assertions are unchanged.
 # [2026-10-01] Claude Sonnet 5.5 (Z12 builder, lane ack-bound-918, dispatch #14104) — #918 fold-up 2 (comment text only): two comments
 #   that said "current CC membership" over `cc_ack_membership` now say it is the ACK (the CC nodes held BOUND); the fold-up header
 #   below names `test_journaled_but_culled_node_is_readmitted` correctly (it said `test_readmitted...`). No assertion changed.
@@ -34,7 +38,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neuro_foundation import Graph, SynapseType          # noqa: E402
+from neuro_foundation import Graph, SynapseType, poincare_dir_array   # noqa: E402
 from universal_ingestor import SimpleVectorDB            # noqa: E402
 import cc_topology_export as tex                          # noqa: E402
 import cc_topology_merge as tmg                           # noqa: E402
@@ -145,7 +149,8 @@ def test_poincare_dir_is_rederived_locally_not_transmitted(tmp_path):
     rg, rv = _receiver()
     _merge(rg, rv, path, tmp_path)
     for n in rg.nodes.values():
-        pd = np.asarray(n.metadata["poincare_dir"], dtype=np.float32)
+        pd = poincare_dir_array(n.metadata)               # 05ecf77 / #400: stored packed; the canonical reader decodes it
+        assert pd is not None, "no poincare_dir re-derived on the receiver"
         assert pd.shape == (DIM,)
         assert np.linalg.norm(pd) == pytest.approx(1.0, abs=1e-4), "not a unit direction"
         assert not np.allclose(pd, 9.0)

@@ -1,4 +1,11 @@
 # ---- Changelog ----
+# [2026-11-16] DudeMan CC (Claude Fable 5.2, laptop; NG suite repair #761) -- two stale pins.
+#   test_embedding_failure_routes_to_retry_queue: 18842da ("feat(#294-A): single filing point ...") moved the absorb inner loop into
+#       _file_conversational_experience, which returns True only when the turn was DISPATCHED; a turn whose embed failed is enqueued
+#       for retry and no longer counted as absorbed. The count pin is now 0; the retry-queue assertion (the point of the test) is unchanged.
+#   test_tree_concept_lands_in_graph_and_vdb: d501695 ("#294 hygiene: degenerate-fragment floor at the recall-store insertion gate")
+#       refuses a tree concept shorter than 5 chars, so the 4-char "joke" is no longer indexed (by design). The test now deposits a
+#       concept that passes the floor and asserts the floor's precondition; the landing assertions are unchanged.
 # [2026-06-07] CC (Opus 4.8) — Task A: Ingestor-free experiential path tests
 # What: Rewritten for the experiential conversation path — _absorb routes a turn
 #       through the dual-pass (NOT ingestor.ingest); the eco adapter deposits the
@@ -116,8 +123,8 @@ def test_embedding_failure_routes_to_retry_queue(monkeypatch):
     monkeypatch.setattr(rpc, "_enqueue_failed_extraction", lambda text: enqueued.append(text))
     n = rpc._absorb_conversational_experience(
         [_FakeEntry(rpc._ENTRY_EXPERIENCE, "anima", b"retry me")])
-    assert n == 1
-    assert enqueued == ["retry me"]
+    assert n == 0          # not absorbed (18842da: only a DISPATCHED turn counts) ...
+    assert enqueued == ["retry me"]   # ... but never dropped: it is in the #297 retry queue
 
 
 # ── The experiential deposit: forest gestalt + trees into BOTH stores ──
@@ -189,10 +196,12 @@ def test_forest_gestalt_lands_in_graph_and_vdb_dampened(monkeypatch):
 def test_tree_concept_lands_in_graph_and_vdb(monkeypatch):
     g, v = _install_graph(monkeypatch)
     eco = rpc._ConversationalDualPassEco(rpc._memory)
-    eco.record_outcome(np.ones(8, dtype=np.float32), "conv::abc::tree::joke", True,
-                       metadata={"_tree_concept": True, "_concept": "joke"})
-    assert "conv::abc::tree::joke" in g.nodes
-    assert any(i["content"] == "joke" for i in v.inserts)
+    concept = "lighthouse joke"
+    assert rpc._concept_passes_floor(concept)       # d501695: only a concept above the degenerate-fragment floor is indexed
+    eco.record_outcome(np.ones(8, dtype=np.float32), "conv::abc::tree::" + concept, True,
+                       metadata={"_tree_concept": True, "_concept": concept})
+    assert "conv::abc::tree::" + concept in g.nodes
+    assert any(i["content"] == concept for i in v.inserts)
 
 
 def test_link_call_is_noop(monkeypatch):
