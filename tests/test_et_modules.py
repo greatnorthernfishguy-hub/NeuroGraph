@@ -39,6 +39,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch   # [2026-11-22] kept for setUp (the #761 repair uses it; the cherry-pick dropped the import)
 from pathlib import Path
 
 # Ensure project root is importable
