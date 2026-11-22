@@ -1,3 +1,15 @@
+# [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos, punch #1221 / #1201 option B) — read-mode
+#   prime_and_propagate as ONE native call (config native_recall_enabled, default off).
+# What: with the key on, a read-mode sweep (write_mode False) is ng_tract.recall_sweep: the copy of the voltages and
+#   refractory counts, the working set, the prime, the sweep steps and the put-back all happen inside the call, on
+#   rows; this function only wraps the returned rows as FiredEntry. Still under _step_lock (stage 1 of the design).
+#   A declined call (non-canonical values, the hyperedge pass declining) has put everything back and the Python
+#   sweep below runs. Key absent, or write mode: the code below, unchanged.
+# Why: design docs superpowers/specs/2026-11-20-recall-without-the-step-lock-design.md §2a / §3a; profile LS1121PROF:
+#   the sweep is 109 s of 900, 99.9 % in Python lines. Josh 2026-11-20 "copy the existing Rust, run the whatever pass
+#   in Rust"; "Sure, sounds legit" on the declared order difference (row order instead of set order).
+# How: ng-tract-rs src/recall.rs. tests/test_native_recall.py: same nodes fire at the same sweep step, voltages equal
+#   to rounding, the checkpoint bytes unchanged by a recall.
 # [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10 BTF ethos, punch #1221) — step()'s propagation and delivery as
 #   native passes with the delivery queue in the SynapseStore (config native_propagation_enabled, default off).
 # What: with the key on (and a wheel whose SynapseStore has propagate_round >= 1), step 2 is
@@ -4898,6 +4910,13 @@ class Graph:
             if not node_ids:
                 return PropagationResult(steps_run=steps, nodes_primed=0)
 
+            # [2026-11-21] native_recall_enabled: the whole read-mode sweep as one native call (a declined call has
+            # put everything back; the loop below then runs)
+            if not write_mode and self.config.get("native_recall_enabled", False):
+                _nr = self._native_recall(node_ids, currents, steps)
+                if _nr is not None:
+                    return _nr
+
             # #59 age-on-write gate — computed once. When on, the Tonic's write cycle keeps
             # exercised synapses fresh (inactive_steps=0 on use) AND ages the rest toward the
             # inactivity prune. Off -> neither happens -> byte-identical to the legacy path.
@@ -6119,6 +6138,37 @@ class Graph:
                     row = out[tgt] = [0.0] * n
                 row[k - 1] += cur
         return out
+
+    def _native_recall(self, node_ids: List[str], currents: List[float], steps: int) -> Optional["PropagationResult"]:
+        """[2026-11-21] Read-mode prime_and_propagate as ng_tract.recall_sweep (caller holds _step_lock). None = the
+        stores are not the native ones (logged once) or the call declined: the caller's own sweep runs."""
+        if not (hasattr(ng_tract, "recall_sweep") and getattr(self, "_native_he_passes", False)
+                and isinstance(self.nodes, getattr(ng_tract, "NodeStore", ()))
+                and isinstance(self.synapses, getattr(ng_tract, "SynapseStore", ()))
+                and isinstance(self.hyperedges, getattr(ng_tract, "HyperedgeStore", ()))):
+            self._stab_error_once(["native_recall_enabled"], "an ng_tract wheel with recall_sweep and the native "
+                                  "node, synapse and hyperedge stores")
+            return None
+        st = self._stability_params()
+        on = bool(self.config.get("recall_brakes_enabled", False))
+        out = ng_tract.recall_sweep(
+            self.nodes, self.synapses, self.hyperedges, self._pb, [str(n) for n in node_ids],
+            [float(c) for c in currents], int(steps), self.config["decay_rate"], self.config["he_experience_threshold"],
+            st.he if st is not None and st.he is not None else None,
+            self._recall_brakes(st) if on else None,
+            on and getattr(type(self.nodes), "recall_round", 0) >= 1,
+            [t for ps in self._active_predictions.values() for t in ps.predicted_targets])
+        if out is None:
+            return None
+        fired, brakes_declined = out
+        if brakes_declined:
+            self._stab_error_once(("recall_brakes_enabled",), "a canonical node store (recall_detect declined; this "
+                                  "sweep step ran without the brakes)")
+        result = PropagationResult(steps_run=steps, nodes_primed=len(node_ids))
+        result.fired_entries.extend(
+            FiredEntry(node_id=nid, firing_step=k, voltage_at_fire=v, was_predicted=p, source_distance=d)
+            for nid, k, v, p, d in fired)
+        return result
 
     def _prop_native(self) -> bool:
         """[2026-11-21] native_propagation_enabled (default off): step 2 and step 5 run as native passes and the
