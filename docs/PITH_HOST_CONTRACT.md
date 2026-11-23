@@ -83,15 +83,21 @@ Both socket hosts are thin binders:
 Each binder passes only its own CC NeuroGraph, conversation-state bookkeeping,
 Commons arousal reader, and existing graph consistency lock. Neither host reads
 Quest storage. Neither host nudges, deposits, steps, saves, or changes topology.
-The current instruction and latest already-rendered bounded Quest focus arrive
-from the harness and are used as attention cues only. `provider_context` does
-not echo either value. miniTID keeps their one exact occurrence in the live
-message tail when it composes the overall provider prompt.
+The current instruction arrives from the harness and is used as the attention
+cue only. `provider_context` does not echo it. miniTID keeps its one exact
+occurrence in the live message tail when it composes the overall provider prompt.
+
+**Quest focus (Card 8, 2026-11-22; Josh, Exec Packet 336; Pith PRD v0.1 S3.1).**
+`quest_focus` is still accepted in the request and is IGNORED: it is not
+validated, not part of the recall cue, and not a live rail. Quest is not an
+input to `provider_context`. One consequence: a learned node whose text equals
+a quest text the harness also prints is ordinary learned material and is
+rendered whole, so that text can appear twice in the composed prompt.
 
 If an identical stored forest fires, Pith keeps its learned relationships but
 renders a structural live-tail placeholder instead of the duplicate text (and
 does not repeat that node's live-tail anchors). This preserves a connected
-correction without echoing the instruction or Quest focus.
+correction without echoing the instruction.
 
 Pattern completion remains topology-native: the vector store seeds the existing
 `_harvest_associations` read-mode propagation. Pith treats fired nodes as roots,
@@ -123,7 +129,7 @@ use that canonical behavior rather than compensating beside it.
 | Field | Required | Contract |
 |---|---:|---|
 | `current_instruction` | yes | non-empty string; current human request |
-| `quest_focus` | no | already-rendered bounded Quest focus; empty string allowed |
+| `quest_focus` | no | accepted and ignored (Card 8, 2026-11-22); any value |
 | `budget_chars` | no | total returned `context` envelope, integer 500–40000; defaults to the breathing L1 budget |
 | `root_count` | no | bounded ignition-root count, integer 1–24 |
 
@@ -145,9 +151,11 @@ export CC_PITH_PROVIDER_MAX_QUEST_CHARS=8000
 
 Five controls, not six: `CC_PITH_PROVIDER_NODE_CHARS` (the old 700-char per-node
 clip) no longer exists (#813). A node is rendered whole. If a host still exports
-it, it is ignored and harmless. The two `MAX_*_CHARS` controls are request
-guards, not clips: an oversized request is refused whole with a closed
-`unavailable` state (see below), never shortened.
+it, it is ignored and harmless. `CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS` is a
+request guard, not a clip: an oversized instruction is refused whole with a
+closed `unavailable` state (see below), never shortened.
+`CC_PITH_PROVIDER_MAX_QUEST_CHARS` no longer guards anything (Card 8); it stays
+exported because the service preflight still requires the variable.
 
 They appear in `pith_effective_config()` and both hosts' allow-listed telemetry,
 so an operator can verify resolved authority after restart. This branch does not
@@ -168,7 +176,7 @@ An `empty` result warns `topology_empty` when nothing fired and
 `capacity_empty` when connected material existed but no whole line fit.
 
 The unavailable warning vocabulary is closed:
-`invalid_instruction`, `instruction_too_large`, `invalid_quest_focus`,
+`invalid_instruction`, `instruction_too_large`,
 `ng_unavailable`, `invalid_budget`, `invalid_root_count`,
 `constitutional_core_missing`, `constitutional_core_exceeds_budget`,
 `context_bound_failed`, `assembly_failed`, and `symbol_unavailable`
@@ -275,7 +283,7 @@ old provider output cannot revive an old quest when current topology is empty.
 ### Behavioral acceptance
 
 A blank session receiving this fresh context plus the one exact live-tail copy
-of the current instruction and Quest focus can identify the active mission,
+of the current instruction (and whatever Quest text the harness itself prints) can identify the active mission,
 done condition, next action, constitutional core, exact working anchor,
 relevant correction, and unresolved stale/conflict state. After a side quest,
 it resumes the parent rather than an older quest.
