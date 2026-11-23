@@ -311,25 +311,34 @@ class TestRepoWideGuard:
     def _fresh_commons(self):
         orig = commons_mod._commons
         commons_mod._commons = None
+        # [2026-11-22] B-2: remember how long the record was; put it back to THAT, never wipe it (a block another
+        # test recorded earlier in the session must still fail the session at its end).
+        self._record_len = len(_repo_conftest.get_blocked_persist_attempts())
         yield
         commons_mod._commons = orig
-        # Never leave a block recorded past this class's own tests, real session or not.
-        _repo_conftest.reset_blocked_persist_attempts()
+        _repo_conftest.truncate_blocked_persist_attempts(self._record_len)
 
     def test_persist_to_tmp_path_still_works(self, tmp_path):
+        start = len(_repo_conftest.get_blocked_persist_attempts())
         target = tmp_path / "guard-sanity-commons.msgpack"
         c = commons_mod.get_commons()
         c.persist(str(target))
         assert target.exists()
         assert target.stat().st_size > 0
-        assert _repo_conftest.get_blocked_persist_attempts() == []
+        assert len(_repo_conftest.get_blocked_persist_attempts()) == start
 
     def test_persist_to_real_path_raises_and_is_recorded_then_cleared(self):
+        # [2026-11-22] B-1 (HIGH): this test calls persist() with the REAL path on a fresh EMPTY Commons. Only the
+        # repo guard stops that write. Fail closed: unless THIS guard is the outermost wrapper of Commons.persist
+        # (not disabled at configure, not wrapped by another plugin, not --noconftest), do not make the call.
+        if not getattr(commons_mod.Commons.persist, "_is_738_guard", False):
+            pytest.skip("#738 guard is not the outermost Commons.persist wrapper: refusing to call persist() "
+                        "with the real checkpoint path")
         before = _real_file_fingerprint()
         assert _repo_conftest.real_commons_path() == REAL_COMMONS_PATH == os.path.realpath(
             REAL_COMMONS_PATH
         )
-        assert _repo_conftest.get_blocked_persist_attempts() == []
+        start = len(_repo_conftest.get_blocked_persist_attempts())
 
         c = commons_mod.get_commons()
         with pytest.raises(RuntimeError, match=r"#738"):
@@ -337,7 +346,7 @@ class TestRepoWideGuard:
 
         # Recorded — this is what makes pytest_sessionfinish fail the session if a test
         # swallows the RuntimeError the way handle_after_turn's bare except does.
-        recorded = _repo_conftest.get_blocked_persist_attempts()
+        recorded = _repo_conftest.get_blocked_persist_attempts()[start:]
         assert len(recorded) == 1
         nodeid, path = recorded[0]
         assert path == REAL_COMMONS_PATH
@@ -346,8 +355,101 @@ class TestRepoWideGuard:
         # Exercise-then-clear: proves the record mechanism works without failing the real
         # session running this file (the autouse fixture above also clears defensively,
         # this explicit clear is the point of the test, not a cleanup incidental to it).
-        _repo_conftest.reset_blocked_persist_attempts()
-        assert _repo_conftest.get_blocked_persist_attempts() == []
+        _repo_conftest.truncate_blocked_persist_attempts(start)
+        assert len(_repo_conftest.get_blocked_persist_attempts()) == start
 
         # And the real file was never touched by the raise itself.
         assert _real_file_fingerprint() == before
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# [2026-11-22] DudeMan CC -- the correction's own tests (B-1 .. B-5). None of them calls persist() with the real path.
+# ---------------------------------------------------------------------------------------------------------------
+
+class TestCorrectionB1TheDangerousTestFailsClosed:
+    def test_it_skips_before_any_persist_when_the_guard_is_not_outermost(self, monkeypatch):
+        """With another wrapper outermost (no _is_738_guard mark) the guard test must skip BEFORE it persists."""
+        calls = []
+
+        def _other_plugins_wrapper(self, filepath):      # stands in for a plugin that wrapped persist last
+            calls.append(filepath)
+            raise AssertionError("persist must not be reached")
+
+        monkeypatch.setattr(commons_mod.Commons, "persist", _other_plugins_wrapper)
+        t = TestRepoWideGuard()
+        with pytest.raises(pytest.skip.Exception):
+            t.test_persist_to_real_path_raises_and_is_recorded_then_cleared()
+        assert calls == []
+
+
+class TestCorrectionB2TheRecordIsNotWiped:
+    def test_a_block_recorded_before_the_class_survives_its_teardown(self):
+        marker = ("tests/elsewhere.py::test_that_swallowed_a_block", "/somewhere/else/commons.msgpack")
+        _repo_conftest._blocked_persist_attempts.append(marker)
+        try:
+            n = len(_repo_conftest.get_blocked_persist_attempts())
+            _repo_conftest._blocked_persist_attempts.append(("made-by-the-class", "x"))
+            _repo_conftest.truncate_blocked_persist_attempts(n)      # what the class fixture's teardown does
+            assert _repo_conftest.get_blocked_persist_attempts()[-1] == marker
+        finally:
+            _repo_conftest._blocked_persist_attempts.remove(marker)
+
+
+class TestCorrectionB3ExitStatusIsNotMasked:
+    @pytest.mark.parametrize("status,want", [(0, 1), (1, 1), (2, 2), (3, 3), (4, 4)])
+    def test_sessionfinish_only_turns_a_pass_into_a_failure(self, status, want, capsys):
+        from types import SimpleNamespace
+        marker = ("tests/elsewhere.py::test_b3", "/somewhere/else/commons.msgpack")
+        _repo_conftest._blocked_persist_attempts.append(marker)
+        try:
+            session = SimpleNamespace(exitstatus=status)
+            _repo_conftest.pytest_sessionfinish(session, status)
+            assert session.exitstatus == want
+            assert "#738 REPO-WIDE GUARD" in capsys.readouterr().err      # the banner prints in every case
+        finally:
+            _repo_conftest._blocked_persist_attempts.remove(marker)
+
+    def test_sessionfinish_does_nothing_with_an_empty_record(self):
+        from types import SimpleNamespace
+        if _repo_conftest.get_blocked_persist_attempts():
+            pytest.skip("a block is recorded in this session; the session-end check will report it")
+        session = SimpleNamespace(exitstatus=0)
+        _repo_conftest.pytest_sessionfinish(session, 0)
+        assert session.exitstatus == 0
+
+
+class TestCorrectionB4SetButEmptyFallsBackToTheDefault:
+    @pytest.mark.parametrize("value", ["", None])
+    def test_empty_or_unset_gives_the_default(self, value):
+        env = _subprocess_env({} if value is None else {"NG_COMMONS_CHECKPOINT_PATH": value})
+        if value is None:
+            env.pop("NG_COMMONS_CHECKPOINT_PATH", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", "import neurograph_rpc; print(neurograph_rpc._COMMONS_CHECKPOINT_PATH)"],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        assert proc.stdout.strip().splitlines()[-1] == REAL_COMMONS_PATH
+
+
+class TestCorrectionB5FailedCommonsSavesAreVisible:
+    def test_both_commons_persist_handlers_log_at_warning_or_higher(self):
+        """Source-level pin: every `except` that follows a Commons persist to the checkpoint path logs at WARNING+."""
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(neurograph_rpc))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            # the persist call is a statement of THIS try's own body (not of a try nested inside it)
+            if not any(isinstance(n, ast.Expr) and "persist(_COMMONS_CHECKPOINT_PATH)" in ast.unparse(n)
+                       for n in node.body):
+                continue
+            for h in node.handlers:
+                levels = [c.func.attr for c in ast.walk(h) if isinstance(c, ast.Call)
+                          and isinstance(c.func, ast.Attribute) and getattr(c.func.value, "id", None) == "logger"]
+                found.append(levels)
+        assert len(found) == 2, found
+        for levels in found:
+            assert levels and all(lv in ("warning", "error", "critical", "exception") for lv in levels), found
+

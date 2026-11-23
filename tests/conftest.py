@@ -7,8 +7,8 @@ Executive Packet 373).
 #       whose target resolves to the literal real checkpoint
 #       ~/NeuroGraph/data/checkpoints/commons.msgpack raises, records the offending test
 #       nodeid, and fails the pytest session at the end if any block was left unresolved
-#       (handle_after_turn swallows the raise in a bare except, so the raise alone would
-#       pass silently — see neurograph_rpc.py:3796-3800 in this lane's first commit).
+#       (neurograph_rpc.handle_after_turn swallows the raise in its Commons-persist except, so the
+#       raise alone would pass silently).
 #       (A2) Registers the `slow` and `timeout` markers via pytest_configure so an
 #       environment without pytest-timeout installed does not warn/error on
 #       tests/test_snn.py's new markers.
@@ -26,6 +26,13 @@ Executive Packet 373).
 #      record is resettable (reset_blocked_persist_attempts()) specifically so this file's
 #      own guard test can provoke a block, assert it was recorded, and clear it before the
 #      real session ends.
+# [2026-11-22] DudeMan CC (Claude Fable 5.2, laptop) -- the correction that was assigned and never built
+#   (worker-002-correction, findings B-2, B-3, B-6, B-7 of the two reviews of 2026-09-30; punch #1249)
+# What: truncate_blocked_persist_attempts(n) (B-2: a class fixture puts the record back to the length it found,
+#       it no longer erases blocks other tests recorded earlier in the session); pytest_sessionfinish sets the exit
+#       status to 1 only when it was 0 (B-3: an interrupted / internal-error / usage-error status is not masked;
+#       the banner still prints); the `slow` marker text says what is true (B-6); comments name the swallowing
+#       functions, not line numbers (B-7).
 # -------------------
 """
 
@@ -61,6 +68,12 @@ def reset_blocked_persist_attempts():
     _blocked_persist_attempts.clear()
 
 
+def truncate_blocked_persist_attempts(length):
+    """Test-facing hook (B-2) — put the record back to `length` entries (the length a fixture captured at its
+    setup). Blocks recorded BEFORE the fixture started stay; only those made since are dropped."""
+    del _blocked_persist_attempts[max(0, int(length)):]
+
+
 def get_blocked_persist_attempts():
     """Test-facing hook — read-only snapshot of the current block record."""
     return list(_blocked_persist_attempts)
@@ -83,7 +96,8 @@ def pytest_configure(config):
     # tests/test_snn.py never produce PytestUnknownMarkWarning, whether or not the
     # pytest-timeout plugin (which would otherwise register `timeout` itself) is installed.
     config.addinivalue_line(
-        "markers", "slow: marks a test as slow/long-running (row #754) — not selected by default runs"
+        "markers", "slow: marks a test as slow/long-running (row #754). Registered for selection with -m \"not slow\"; "
+        "it is NOT deselected by default. Where pytest-timeout is installed the test's own timeout marker bounds it."
     )
     config.addinivalue_line(
         "markers",
@@ -139,10 +153,13 @@ def pytest_sessionfinish(session, exitstatus):
         for nodeid, path in _blocked_persist_attempts:
             print(f"  - {nodeid!r} attempted persist to {path}", file=sys.stderr)
         print(
-            "handle_after_turn swallows this RuntimeError in a bare except (neurograph_rpc.py "
-            "~:3796-3800), so without this sessionfinish check the offending test would have "
+            "neurograph_rpc.handle_after_turn swallows this RuntimeError in its Commons-persist "
+            "except, so without this sessionfinish check the offending test would have "
             "passed silently. Failing the session instead.",
             file=sys.stderr,
         )
         print("=" * 78, file=sys.stderr)
-        session.exitstatus = 1
+        # B-3: only a session that would otherwise have passed is turned into a failure; 2 (interrupted),
+        # 3 (internal error), 4 (usage error) and an existing 1 are left as they are.
+        if int(exitstatus) == 0:
+            session.exitstatus = 1

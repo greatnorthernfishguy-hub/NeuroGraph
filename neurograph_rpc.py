@@ -870,7 +870,9 @@ _MAX_DRAIN_NODES: int = 15000  # Stop experience ingestion above this node count
 #      var is unset. Matches the existing NG_COMMONS_* naming (see NG_COMMONS_ENHANCE* below).
 # -------------------
 _COMMONS_CHECKPOINT_PATH = os.path.expanduser(
-    os.environ.get("NG_COMMONS_CHECKPOINT_PATH", "~/NeuroGraph/data/checkpoints/commons.msgpack")
+    # [2026-11-22] #738 B-4: `or`, not a get() default: a variable that is SET BUT EMPTY must fall back to the
+    # default too ("" expanded to "" made restore log "starting fresh" and every persist("") fail unseen).
+    os.environ.get("NG_COMMONS_CHECKPOINT_PATH") or "~/NeuroGraph/data/checkpoints/commons.msgpack"
 )
 
 # Lenia FlowGraph — continuous field dynamics (initialized on bootstrap)
@@ -3910,7 +3912,9 @@ def handle_after_turn(params: Dict[str, Any]) -> None:
             from commons import get_commons as _get_commons
             _get_commons().persist(_COMMONS_CHECKPOINT_PATH)
         except Exception as _exc:
-            logger.debug("Commons persist failed (non-fatal): %s", _exc)
+            # [2026-11-22] #738 B-5: WARNING, not debug: a Commons that cannot be saved must be visible at the
+            # default log level (in production nothing else reports it).
+            logger.warning("Commons persist failed (non-fatal): %s", _exc)
         logger.info(
             "Auto-save at message %d (%s)",
             _memory._message_count,
@@ -6369,7 +6373,8 @@ def main() -> None:
                     _get_commons().persist(_COMMONS_CHECKPOINT_PATH)
                     logger.info("Commons persisted on clean exit")
                 except Exception as _ce:
-                    logger.debug("Commons persist on exit failed (non-fatal): %s", _ce)
+                    # [2026-11-22] #738 B-5: WARNING, not debug (see handle_after_turn's Commons persist)
+                    logger.warning("Commons persist on exit failed (non-fatal): %s", _ce)
                 break
             line = line.strip()
             if not line:
