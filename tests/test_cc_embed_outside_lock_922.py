@@ -143,7 +143,8 @@ def test_provider_context_identical_with_and_without_prepare(cc_ng):
         legacy = org.pith_provider_context(cc_ng, **kwargs)
         _clear_embed_cache(cc_ng)
         prepared = org.pith_provider_context_prepare(cc_ng, **kwargs)
-        assert prepared is not None and prepared.query.endswith("Quest: #922 lock hold")
+        # [2026-11-22] Card 8: the cue is the instruction alone (quest_focus is accepted and ignored)
+        assert prepared is not None and prepared.query == q.strip()
         new = org.pith_provider_context(cc_ng, prepared=prepared, **kwargs)
         assert new == legacy
     assert legacy["state"] in ("ok", "empty")
@@ -253,7 +254,8 @@ def test_prepare_refuses_what_the_graph_step_refuses_and_never_raises():
     assert org.pith_provider_context_prepare(ng, current_instruction="") is None
     assert org.pith_provider_context_prepare(
         ng, current_instruction="x" * (org._CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS + 1)) is None
-    assert org.pith_provider_context_prepare(ng, current_instruction="ok", quest_focus=5) is None
+    # [2026-11-22] Card 8: a malformed quest_focus is ignored; neither half refuses the request for it
+    assert org.pith_provider_context_prepare(ng, current_instruction="ok", quest_focus=5) is not None
     assert org.pith_provider_context_prepare(SimpleNamespace(graph=None),
                                              current_instruction="ok") is None
     assert org.cc_recall_prepare(None, "q") is None and org.cc_recall_prepare(ng, "") is None

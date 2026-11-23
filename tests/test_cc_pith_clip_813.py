@@ -352,8 +352,10 @@ def test_reject_loudly_guards_still_refuse_the_whole_request():
     big = "x" * (pith._CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS + 1)
     r = pith.pith_provider_context(ng, big)
     assert r["state"] == "unavailable" and r["warnings"] == ["instruction_too_large"]
+    # [2026-11-22] Card 8: quest_focus is accepted and ignored, so an oversized one no longer refuses the request
     r = pith.pith_provider_context(ng, "ok", "q" * (pith._CC_PITH_PROVIDER_MAX_QUEST_CHARS + 1))
-    assert r["state"] == "unavailable" and r["warnings"] == ["invalid_quest_focus"]
+    assert r["state"] != "unavailable" and "invalid_quest_focus" not in r["warnings"]
+    assert r == pith.pith_provider_context(ng, "ok")
 
 
 # ------------------------------------------------------------------ the host contract
