@@ -331,7 +331,9 @@ class TestRepoWideGuard:
         # [2026-11-22] B-1 (HIGH): this test calls persist() with the REAL path on a fresh EMPTY Commons. Only the
         # repo guard stops that write. Fail closed: unless THIS guard is the outermost wrapper of Commons.persist
         # (not disabled at configure, not wrapped by another plugin, not --noconftest), do not make the call.
-        if not getattr(commons_mod.Commons.persist, "_is_738_guard", False):
+        # [2026-11-23] review: identity with the guard's own function object, not the attribute (functools.wraps
+        # copies __dict__, so an outer wrapper would carry `_is_738_guard` without being the guard).
+        if not _repo_conftest.guard_is_outermost(commons_mod):
             pytest.skip("#738 guard is not the outermost Commons.persist wrapper: refusing to call persist() "
                         "with the real checkpoint path")
         before = _real_file_fingerprint()
@@ -452,4 +454,41 @@ class TestCorrectionB5FailedCommonsSavesAreVisible:
         assert len(found) == 2, found
         for levels in found:
             assert levels and all(lv in ("warning", "error", "critical", "exception") for lv in levels), found
+
+
+class TestCorrectionReview20261123:
+    def test_a_wraps_made_outer_wrapper_carries_the_attribute_but_is_not_the_guard(self, monkeypatch):
+        """functools.wraps copies __dict__: the attribute check alone would let the dangerous test run."""
+        import functools
+        guard = commons_mod.Commons.persist
+        calls = []
+
+        @functools.wraps(guard)
+        def outer(self, filepath):
+            calls.append(filepath)
+            raise AssertionError("persist must not be reached")
+
+        monkeypatch.setattr(commons_mod.Commons, "persist", outer)
+        assert getattr(commons_mod.Commons.persist, "_is_738_guard", False) is True      # the trap
+        assert _repo_conftest.guard_is_outermost(commons_mod) is False
+        with pytest.raises(pytest.skip.Exception):
+            TestRepoWideGuard().test_persist_to_real_path_raises_and_is_recorded_then_cleared()
+        assert calls == []
+
+    def test_restore_of_the_real_path_is_refused_and_recorded(self):
+        if _repo_conftest._GUARD_STATUS.get("restore_fn") is None or \
+                commons_mod.Commons.restore is not _repo_conftest._GUARD_STATUS["restore_fn"]:
+            pytest.skip("#738 restore guard is not the outermost Commons.restore: refusing to call it")
+        before = _real_file_fingerprint()
+        start = len(_repo_conftest.get_blocked_persist_attempts())
+        orig = commons_mod._commons
+        commons_mod._commons = None
+        try:
+            with pytest.raises(RuntimeError, match=r"#738"):
+                commons_mod.get_commons().restore(REAL_COMMONS_PATH)
+            assert len(_repo_conftest.get_blocked_persist_attempts()) == start + 1
+        finally:
+            commons_mod._commons = orig
+            _repo_conftest.truncate_blocked_persist_attempts(start)
+        assert _real_file_fingerprint() == before
 

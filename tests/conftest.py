@@ -55,7 +55,7 @@ _REAL_COMMONS_PATH = os.path.realpath(
 _blocked_persist_attempts = []  # list[(nodeid, resolved_path)]
 _current_test_nodeid = [None]   # single-slot holder, set by the autouse tracker fixture below
 
-_GUARD_STATUS = {"installed": False, "reason": None}
+_GUARD_STATUS = {"installed": False, "reason": None, "fn": None, "restore_fn": None}
 
 
 def reset_blocked_persist_attempts():
@@ -72,6 +72,13 @@ def truncate_blocked_persist_attempts(length):
     """Test-facing hook (B-2) — put the record back to `length` entries (the length a fixture captured at its
     setup). Blocks recorded BEFORE the fixture started stay; only those made since are dropped."""
     del _blocked_persist_attempts[max(0, int(length)):]
+
+
+def guard_is_outermost(commons_module):
+    """Test-facing hook (review 2026-11-23): True only when Commons.persist IS this guard's own function object.
+    Identity, not the `_is_738_guard` attribute: functools.wraps copies __dict__, so an outer wrapper made with it
+    would carry the attribute without being the guard."""
+    return _GUARD_STATUS["fn"] is not None and commons_module.Commons.persist is _GUARD_STATUS["fn"]
 
 
 def get_blocked_persist_attempts():
@@ -139,6 +146,25 @@ def pytest_configure(config):
 
     _guarded_persist._is_738_guard = True
     commons.Commons.persist = _guarded_persist
+    _GUARD_STATUS["fn"] = _guarded_persist
+
+    # [2026-11-23] review (Grok 4.7): Commons.restore -> NGLite.load can REWRITE the file it loads without going
+    # through persist (a legacy JSON checkpoint is converted in place). A test has no business opening the real
+    # checkpoint at all, so restore of the real path is refused and recorded the same way.
+    _orig_restore = getattr(commons.Commons, "restore", None)
+    if _orig_restore is not None:
+        def _guarded_restore(self, filepath, *a, **k):
+            resolved = os.path.realpath(os.path.expanduser(filepath))
+            if resolved == _REAL_COMMONS_PATH:
+                _blocked_persist_attempts.append((_current_test_nodeid[0], resolved))
+                raise RuntimeError(
+                    f"#738 repo-wide guard (tests/conftest.py): refused Commons.restore() of the REAL "
+                    f"checkpoint {resolved} from test {_current_test_nodeid[0]!r} (a load can rewrite the file).")
+            return _orig_restore(self, filepath, *a, **k)
+
+        _guarded_restore._is_738_guard = True
+        commons.Commons.restore = _guarded_restore
+        _GUARD_STATUS["restore_fn"] = _guarded_restore
     _GUARD_STATUS["installed"] = True
 
 
