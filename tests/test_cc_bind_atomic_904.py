@@ -1223,7 +1223,8 @@ def test_generate_emergent_want_is_untouched():
         end = src.index('\ndef ', start + 10)
         return src[start:end]
     # [2026-11-16 #761] re-based ee94f7d2 -> d16df64 (the last deliberate change to this function: 26a0a11 own-words text, then d16df64 #1136 H2)
-    ref = subprocess.run(['git', '-C', str(_WORKTREE), 'show', 'd16df64c519b2c76f6923ecd38b60004f51afa01:cc_ng_organism.py'],
+    # [2026-11-22 #761] re-based d16df64 -> 3b0034e (#1221: the seeds come from PredictionBook.top_by_confidence)
+    ref = subprocess.run(['git', '-C', str(_WORKTREE), 'show', '3b0034e7cb97511ed8bcf9ea3de70476e80a583d:cc_ng_organism.py'],
                          capture_output=True, text=True)
     assert ref.returncode == 0 and ref.stdout, 'cannot read the pinned (d16df64) cc_ng_organism.py: %s' % ref.stderr.strip()
     assert body(new) == body(ref.stdout)
