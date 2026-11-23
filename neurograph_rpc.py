@@ -4734,13 +4734,16 @@ def _scan_drain_pulse_loop() -> None:
                 if _memory is not None:
                     try:
                         _auto_step = _memory.graph.step()
+                        # [2026-11-22] review (Grok 4.7): the step's success is noted as soon as step() returns, so a
+                        # failing deposit below cannot make the alarm report "no successful autonomous step" while
+                        # the mind is stepping (the deposit failure is still counted and warned by the except path).
+                        _no_advance_note_step_success(now=_tick_now)
                         _deposit_topology_to_river(_auto_step)
                         # Substrate metrics flow autonomously too (#320) — gate only, NOT jsonl
                         # (to_jsonl=False: the gate bounds the Commons; jsonl is per-turn). So
                         # Bunyan/THC/Immunis health-monitor the substrate while idle, no conversation
                         # needed ([[feedback_no_conversation_dependency]]).
                         _deposit_substrate_metrics(_auto_step, to_jsonl=False)
-                        _no_advance_note_step_success(now=_tick_now)
                     except BaseException as _exc:  # noqa: BLE001 - see _LOOP_MUST_PROPAGATE
                         if isinstance(_exc, _LOOP_MUST_PROPAGATE):
                             raise

@@ -752,3 +752,17 @@ class TestRealLoopWiring(_RealLoopTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# [2026-11-22] DudeMan CC -- review (Grok 4.7) of the landed alarm: the step's success must be noted before the
+# deposits that follow it, so a deposit that fails every pulse cannot read as "no successful autonomous step".
+class TestSuccessIsNotedBeforeTheDeposits(unittest.TestCase):
+    def test_success_note_comes_right_after_step_and_before_both_deposits(self):
+        src = inspect.getsource(rpc)
+        step = src.index("_auto_step = _memory.graph.step()")
+        note = src.index("_no_advance_note_step_success(now=_tick_now)", step)
+        river = src.index("_deposit_topology_to_river(_auto_step)", step)
+        metrics = src.index("_deposit_substrate_metrics(_auto_step, to_jsonl=False)", step)
+        self.assertLess(note, river)
+        self.assertLess(note, metrics)
+        self.assertEqual(src.count("_no_advance_note_step_success(now=_tick_now)"), 1)
