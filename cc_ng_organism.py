@@ -2093,6 +2093,17 @@ def surface_wants_for_graph(graph: Any, vdb: Optional[Any] = None) -> List[Dict[
         return open_wants
 
 
+# [2026-11-22] #1185: the generic vendored names the module loader isolates per module, and the host modules
+# every hosted organ shares (never popped). Same lists as neurograph_rpc._GENERIC_PREFIXES / _SHARED_HOST_MODULES.
+_CC_GENERIC_PREFIXES = ("core", "pipelines", "runtime", "surgery", "openclaw_adapter", "ng_ecosystem",
+                        "ng_lite", "ng_autonomic", "ng_peer_bridge", "ng_tract_bridge")
+_CC_SHARED_HOST_MODULES = frozenset({"ng_embed"})
+
+
+def _cc_is_generic_vendored_name(name: str) -> bool:
+    return any(name == p or name.startswith(p + ".") for p in _CC_GENERIC_PREFIXES)
+
+
 def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
     """Host the CC's own ecosystem organs in-process — the CC-scoped port of
     canonical neurograph_rpc.py::_bootstrap_modules().
@@ -2136,9 +2147,20 @@ def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
     # Elmer loads last (heaviest — transformer models), matching canonical order.
     modules = sorted(module_defs.items(), key=lambda x: (1 if x[0] == "elmer" else 0, x[0]))
 
-    _generic_prefixes = ("core", "pipelines", "runtime", "surgery", "openclaw_adapter",
-                         "ng_ecosystem", "ng_lite", "ng_embed", "ng_autonomic",
-                         "ng_peer_bridge", "ng_tract_bridge")
+    # [2026-11-22] #1185 (the fix of neurograph_rpc._bootstrap_modules, syl-stage1 cac1740, ported to this loader):
+    # ng_embed is the host's ONE shared module (imported here so it is present and complete, never stashed or
+    # popped), and the host's own generic modules are captured once, by identity, before any module loads. After
+    # each module exactly these objects go back, so a half-executed copy that a concurrent thread imported during
+    # a load window can never be restored as the host's module.
+    _generic_prefixes = _CC_GENERIC_PREFIXES
+    try:
+        import ng_embed as _host_ng_embed  # noqa: F401 -- one complete, shared embedder module
+    except Exception as exc:  # noqa: BLE001
+        logger.error("CC modules: host ng_embed import failed before module loads: %s", exc)
+    _host_generics = {
+        name: mod for name, mod in list(sys.modules.items())
+        if _cc_is_generic_vendored_name(name) and name not in _CC_SHARED_HOST_MODULES
+    }
 
     for module_id, meta in modules:
         if module_id in skip:
@@ -2171,14 +2193,14 @@ def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
             pass
 
         path_snapshot = list(sys.path)
-        stashed: Dict[str, Any] = {}
+        stashed: Dict[str, Any] = dict(_host_generics)   # #1185: the host's own objects, not "whatever is there"
         try:
             # Namespace isolation: stash generic collisions so the module's own
             # vendored core/ng_lite/etc. load fresh (canonical lines 841-870).
             for mod_name in list(sys.modules.keys()):
                 for pfx in _generic_prefixes:
                     if mod_name == pfx or mod_name.startswith(pfx + "."):
-                        stashed[mod_name] = sys.modules.pop(mod_name)
+                        sys.modules.pop(mod_name)
                         break
             if install_path and install_path not in sys.path:
                 sys.path.insert(0, install_path)
@@ -2225,10 +2247,15 @@ def bootstrap_cc_modules(workspace_dir: str) -> List[str]:
                         sys.modules.pop(mod_name, None)
                         break
             sys.path[:] = path_snapshot
-            for mod_name, mod_obj in stashed.items():
-                if mod_name not in sys.modules:
-                    sys.modules[mod_name] = mod_obj
+            # #1185: unconditional -- whatever a concurrent thread put under a host name during the window
+            # (possibly a half-executed copy) is replaced by the host's complete module object.
+            sys.modules.update(stashed)
 
+    # #1185: final reconciliation, and a loud check that the shared embedder module is the complete one.
+    sys.modules.update(_host_generics)
+    _emb = sys.modules.get("ng_embed")
+    if _emb is None or not all(hasattr(_emb, n) for n in ("NGEmbed", "embed", "embed_batch")):
+        logger.error("CC modules: sys.modules['ng_embed'] is incomplete after module loads (%r)", _emb)
     return started
 
 
