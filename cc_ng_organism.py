@@ -3,6 +3,16 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-22] DudeMan CC (Claude Fable 5.2, laptop) -- Card 8 re-done on the current line: Quest out of the Pith
+#   provider context (punch #1249; branch z11-card8-quest-removal-20260929 held finished and reviewed since 09-28).
+# What: _pith_provider_cue no longer validates or appends quest_focus; pith_provider_context no longer closes the
+#       call on a malformed quest_focus and no longer fences it in live_rails; pith_provider_context_prepare
+#       therefore embeds the instruction alone. The parameter stays, accepted and ignored (callers still forward it).
+# Why:  Josh, Exec Packet 336: "removing is correct, then, carry on"; Pith PRD v0.1 S3.1. The hold on the branch
+#       (P329) was about merging to NG main (auto-deploys to the VPS), not about the laptop line.
+# How:  the three behaviour blocks deleted, in the two functions the branch knew and in the cue helper and the
+#       prepare half added since. CC_PITH_PROVIDER_MAX_QUEST_CHARS is left alone: cc-ng-service.py's preflight
+#       requires the variable to start the service. tests/test_pith_provider_context.py updated.
 # [2026-11-14] DudeMan CC (Claude Fable 5.2, laptop) -- native tick piece 1 (punch #1221): reader moved to the Rust book
 # What: generate_emergent_want takes its seeds from PredictionBook.top_by_confidence.
 # Why:  the open predictions / spike record live in ng_tract.PredictionBook; reading them through the dict view builds
@@ -9378,23 +9388,20 @@ def _pith_provider_unavailable(reason: str) -> Dict[str, Any]:
     }
 
 
-def _pith_provider_cue(current_instruction: Any, quest_focus: Any) -> Optional[str]:
+def _pith_provider_cue(current_instruction: Any, quest_focus: Any = None) -> Optional[str]:
     """The recall cue pith_provider_context builds from a VALID request, else None.
 
     One definition shared by pith_provider_context and pith_provider_context_prepare so
-    the prepared embeddings are always for the exact cue the graph step recalls with."""
+    the prepared embeddings are always for the exact cue the graph step recalls with.
+
+    [2026-11-22] Card 8 (Josh, Exec Packet 336, 2026-09-28: "removing is correct, then, carry on"; Pith PRD v0.1
+    S3.1: "Quest is not part of Pith or NeuroGraph ... not a rail, not a cue, and not an input to
+    provider_context"): `quest_focus` is accepted and IGNORED. It is not validated, not appended to the cue."""
     if not isinstance(current_instruction, str) or not current_instruction.strip():
         return None
     if len(current_instruction) > _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS:
         return None
-    if quest_focus is None:
-        quest_focus = ""
-    if not isinstance(quest_focus, str) or len(quest_focus) > _CC_PITH_PROVIDER_MAX_QUEST_CHARS:
-        return None
-    cue = current_instruction.strip()
-    if quest_focus.strip():
-        cue += "\n\n" + quest_focus.strip()
-    return cue
+    return current_instruction.strip()
 
 
 def pith_provider_context_prepare(ng: Any, current_instruction: Any = None,
@@ -9427,7 +9434,10 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
                           prepared: Optional["CCRecallEmbeddings"] = None) -> Dict[str, Any]:
     """Construct a fresh provider-ready situational model from CC's live SNN.
 
-    `current_instruction` and the already-rendered `quest_focus` orient attention
+    [2026-11-22] Card 8: `quest_focus` is accepted and IGNORED (Pith PRD v0.1 S3.1 / S12.1); the parameter stays
+    only because callers still forward it (cc-ng-daemon.py, cc_ng_host.py); delete it once both forwards are gone.
+
+    `current_instruction` (the already-rendered `quest_focus` no longer does) orients attention
     but are not echoed: miniTID owns their one exact occurrence in the live
     message tail.  They are never deposited, classified, or fetched from Quest
     storage here.  Learned material comes only from the current
@@ -9445,10 +9455,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
         return _pith_provider_unavailable("invalid_instruction")
     if len(current_instruction) > _CC_PITH_PROVIDER_MAX_INSTRUCTION_CHARS:
         return _pith_provider_unavailable("instruction_too_large")
-    if quest_focus is None:
-        quest_focus = ""
-    if not isinstance(quest_focus, str) or len(quest_focus) > _CC_PITH_PROVIDER_MAX_QUEST_CHARS:
-        return _pith_provider_unavailable("invalid_quest_focus")
+    # [2026-11-22] Card 8: quest_focus is accepted and ignored (no validation: a malformed one cannot close the call)
     graph = getattr(ng, "graph", None) if ng is not None else None
     if graph is None:
         return _pith_provider_unavailable("ng_unavailable")
@@ -9461,7 +9468,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
             or not 1 <= roots <= 24):
         return _pith_provider_unavailable("invalid_root_count")
 
-    cue = _pith_provider_cue(current_instruction, quest_focus)  # validated above: never None here
+    cue = _pith_provider_cue(current_instruction)  # validated above: never None here
     try:
         core = render_constitutional_core(graph)
         if not core:
@@ -9490,12 +9497,7 @@ def pith_provider_context(ng: Any, current_instruction: str, quest_focus: str = 
             # Identity is indivisible and non-evictable.  Never abbreviate it
             # merely to make a context envelope look healthy.
             return _pith_provider_unavailable("constitutional_core_exceeds_budget")
-        live_rails = {current_instruction.strip(): "current instruction"}
-        if quest_focus.strip():
-            quest_text = quest_focus.strip()
-            prior = live_rails.get(quest_text)
-            live_rails[quest_text] = (
-                "current instruction and Quest focus" if prior else "Quest focus")
+        live_rails = {current_instruction.strip(): "current instruction"}   # Card 8: the instruction is the only rail
         fresh = pith_connected_activation_basins(
             graph, surfaced, live_rails=live_rails,
             node_limit=_pith_provider_node_limit(core, budget))

@@ -332,10 +332,13 @@ def test_exact_live_rail_collision_keeps_relationship_without_echo(monkeypatch):
 
     assert result["state"] == "ok"
     assert instruction not in result["context"]
-    assert quest not in result["context"]
     assert "[current instruction is present exactly once in the live tail]" in result["context"]
-    assert "[Quest focus is present exactly once in the live tail]" in result["context"]
     assert "Use the corrected topology path" in result["context"]
+    # [2026-11-22] Card 8: Quest is not a rail. The quest text passed in has NO effect on the output, also when
+    # it equals a learned node's own text: that node is ordinary learned material, shown or not as without it.
+    assert "Quest focus" not in result["context"]
+    without = pith.pith_provider_context(SimpleNamespace(graph=graph), instruction)
+    assert result["context"] == without["context"]
 
 
 def test_total_context_bound_drops_oversized_connected_line_whole_without_tearing(monkeypatch):
@@ -487,7 +490,7 @@ def test_provider_context_preserves_graph_and_uses_read_only_harvest_overrides(m
         conv_state={"primed_nodes": {"predicted": (50.0, 99999999999.0)}})
 
     assert result["state"] == "ok"
-    assert observed["query"] == "Continue\n\nQuest focus"
+    assert observed["query"] == "Continue"   # [2026-11-22] Card 8: the cue is the instruction alone
     assert observed["max_surfaced_override"] == pith._CC_PITH_PROVIDER_ROOTS
     assert observed["config"] == before[0]
     assert graph.config == before[0]
@@ -594,7 +597,6 @@ def test_same_graph_context_is_model_agnostic_without_transcript_replay(monkeypa
         ({"current_instruction": ""}, "invalid_instruction"),
         ({"current_instruction": "x", "budget_chars": 499}, "invalid_budget"),
         ({"current_instruction": "x", "root_count": 25}, "invalid_root_count"),
-        ({"current_instruction": "x", "quest_focus": 7}, "invalid_quest_focus"),
     ],
 )
 def test_invalid_provider_requests_return_only_bounded_closed_notices(kwargs, warning):
@@ -604,3 +606,24 @@ def test_invalid_provider_requests_return_only_bounded_closed_notices(kwargs, wa
     assert result["state"] == "unavailable" and result["ok"] is False
     assert result["warnings"] == [warning]
     assert len(result["context"]) < 180
+
+
+# [2026-11-22] Card 8 (Josh, Exec Packet 336; Pith PRD v0.1 S3.1): quest_focus is accepted and ignored.
+@pytest.mark.parametrize("quest", [7, None, "", "x" * 200_000, ["not", "text"], "Mission: anything at all"])
+def test_a_quest_focus_of_any_shape_never_closes_the_call_and_never_changes_it(quest, monkeypatch):
+    graph = _Graph()
+    graph.node("core", "Respect conscious agency.", constitutional=True)
+    graph.node("root", "Learned material about the topology path", role="action")
+    seen = []
+    monkeypatch.setattr(
+        pith, "cc_pattern_completion_recall",
+        lambda _ng, query, *_a, **_k: (seen.append(query), [{"node_id": "root", "score": 1.0}])[1])
+    ng = SimpleNamespace(graph=graph)
+    plain = pith.pith_provider_context(ng, "Continue Slice A")
+    with_quest = pith.pith_provider_context(ng, "Continue Slice A", quest)
+    assert with_quest["state"] == plain["state"] != "unavailable"
+    assert with_quest["warnings"] == plain["warnings"]
+    assert with_quest["context"] == plain["context"]
+    assert seen == ["Continue Slice A", "Continue Slice A"]        # the cue is the instruction alone, both times
+    assert pith._pith_provider_cue("Continue Slice A", quest) == "Continue Slice A"
+
