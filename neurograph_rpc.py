@@ -1,3 +1,9 @@
+# [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; punch #1251) — COMMENTS ONLY: who tunes these values
+#   What: The surfacing-outcome docstring and the reach-competence comment no longer name Elmer as the learner. No code change.
+#   Why: Josh 2026-11-23: nothing here was ever meant to be tuned BY Elmer. Each mind / NG-Lite tunes its own values;
+#     Elmer's TuningSocket is the PATTERN they copy, and Elmer tunes only its own NG-Lite (LAW 1; punch #222, #1251).
+#     Older changelog entries that say "Elmer tunes" are history and are superseded by this one.
+#   How: text edits.
 # [2026-10-05] Claude (lane rust-hotpaths-onto-s4) — _deposit_substrate_metrics reads synapses.weights_copy() (overnight d0e3a40 rebased onto trial s4) / why: ~0.3-0.5 s per afterTurn of per-SynapseRef churn; review branch
 """
 NeuroGraph JSON-RPC Bridge — OpenClaw ContextEngine integration.
@@ -1637,8 +1643,8 @@ def _deposit_surfacing_outcome(params: Dict[str, Any], user_text: Optional[str])
     - What Syl said in response (lastAssistantMessage from TS plugin)
 
     No classification. The substrate sees: "these nodes were in the context
-    window when this input/output pair happened." Elmer learns what surfacing
-    patterns correlate with coherent responses via the River.
+    window when this input/output pair happened." Any module may bucket this
+    from the Commons; NeuroGraph's own surfacing tuning reads its own firing.
 
     Each surfaced node gets a record_outcome with its own embedding and
     opaque metadata containing text previews of the turn. The substrate's
@@ -3243,7 +3249,7 @@ def _anticipate(fired_node_ids: List[str]) -> None:
 # Design: docs/prd/2026-06-21-reach-teaching-design.md. The node is constitutional (permanent
 # prune-protection = the never-silent FLOOR, #92); only the /assemble surfacing salience fades.
 REACH_NODE_ID = "selfcap::reach::teaching"
-REACH_COMPETENCE_GAIN = 0.05   # Elmer TuningSocket competence gain (asymmetric; loss deferred — no rust signal yet)
+REACH_COMPETENCE_GAIN = 0.05   # competence gain, the TuningSocket PATTERN (NeuroGraph's own; asymmetric; loss deferred — no rust signal yet)
 REACH_VIVID_BELOW = 0.30       # rc < this: full description + worked examples (new muscle)
 REACH_DESC_BELOW = 0.70        # rc < this: description only; rc >= this: one-line whisper (the floor)
 
