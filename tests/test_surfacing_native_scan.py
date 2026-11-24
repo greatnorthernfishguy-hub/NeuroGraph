@@ -148,3 +148,26 @@ def test_bad_parameters_raise():
         NF.ng_tract.surfacing_scan(g.nodes, g.hyperedges, g.timestep, 0.95, float("inf"), 0.5, 0.3, 0.2, 5)
     with pytest.raises(TypeError):
         NF.ng_tract.surfacing_scan(g.nodes, {}, g.timestep, 0.95, 0.3, 0.5, 0.3, 0.2, 5)
+
+
+def test_a_long_run_of_unshowable_nodes_at_the_top_does_not_leave_the_result_short():
+    """Review 2026-11-23 (Grok 4.7): the candidate window widens until max_items are showable."""
+    g = _graph(2)
+    full = SurfacingMonitor(g, _Vdb(), _cfg())
+    _run(g, 2, 14, full)
+    g.config[KEY] = True
+    order = [r["node_id"] for r in full.get_surfaced(ALL)]
+    assert len(order) >= 45
+    holes = SurfacingMonitor(g, _Vdb(order[:42]), _cfg())      # more unshowable nodes than the first window (40)
+    got = holes.get_surfaced(3)
+    assert [r["node_id"] for r in got] == order[42:45]
+
+
+def test_the_monitors_own_floor_admits_and_the_graphs_floor_drops():
+    g = _graph(0)
+    cfg = _cfg()
+    cfg.surfacing.min_confidence = 10.0                          # nothing is admitted
+    mon = SurfacingMonitor(g, _Vdb(), cfg)
+    _run(g, 0, 6, mon)
+    g.config[KEY] = True
+    assert mon.get_surfaced(ALL) == []

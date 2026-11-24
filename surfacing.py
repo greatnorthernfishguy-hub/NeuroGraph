@@ -28,6 +28,7 @@ Usage::
 #       The mind steps on its own clock now (the unified Tonic), ~2,000 nodes a step: walking them in Python on
 #       every step is what the Rust work removes. Josh 2026-11-23: "find what was already built, and take it from
 #       there", kept in Rust.
+#       While the key is on the pushed queue is not read or decayed (on the laptop it is empty).
 # How:  declared differences from the pushed queue are listed in ng-tract-rs src/surfacing.rs. With the key on and
 #       no native store / no surfacing_scan in the wheel: one ERROR line, then the queue path as before.
 # [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — _score_node counts memberships natively when available
@@ -280,29 +281,38 @@ class SurfacingMonitor:
         he_cls = getattr(ng_tract, "HyperedgeStore", None)
         decay_rate = graph_config.get("surfacing_decay_rate", self._cfg.decay_rate)
         min_confidence = graph_config.get("surfacing_min_confidence", self._cfg.min_confidence)
-        # more candidates than items: a fired node with nothing showable (an interneuron, a bare node) is passed over
-        rows, skipped = scan(nodes, hes if (he_cls is not None and isinstance(hes, he_cls)) else None,
-                             int(getattr(self._graph, 'timestep', 0)), float(decay_rate), float(min_confidence),
-                             float(self._cfg.weight_voltage), float(self._cfg.weight_excitability),
-                             float(self._cfg.weight_he_membership), max(int(max_items) * 8, 32))
-        self._native_scan_skipped = int(skipped)
+        # More candidates than items: a fired node with nothing showable (a bare node) is passed over. Review
+        # 2026-11-23: the window widens until max_items are showable or the queue is exhausted, so a long run of
+        # unshowable nodes at the top cannot leave the result short.
+        he_arg = hes if (he_cls is not None and isinstance(hes, he_cls)) else None
+        top_n = max(int(max_items) * 8, 32)
         results: List[Dict[str, Any]] = []
-        for node_id, score, _age in rows:
-            if len(results) >= max_items:
+        while True:
+            rows, skipped = scan(nodes, he_arg, int(getattr(self._graph, 'timestep', 0)), float(decay_rate),
+                                 float(min_confidence), float(self._cfg.weight_voltage),
+                                 float(self._cfg.weight_excitability), float(self._cfg.weight_he_membership),
+                                 top_n, float(self._cfg.min_confidence))
+            self._native_scan_skipped = int(skipped)
+            results = []
+            for node_id, score, _age in rows:
+                if len(results) >= max_items:
+                    break
+                node = nodes.get(node_id)
+                if node is None:
+                    continue
+                resolved_item = self._resolve_item(node_id, node)
+                if resolved_item is None:
+                    continue
+                content, image_ref, metadata = resolved_item
+                entry: Dict[str, Any] = {"node_id": node_id, "content": content, "score": round(score, 4)}
+                if image_ref:
+                    entry["image_ref"] = image_ref
+                if self._cfg.include_metadata:
+                    entry["metadata"] = metadata
+                results.append(entry)
+            if len(results) >= max_items or len(rows) < top_n:
                 break
-            node = nodes.get(node_id)
-            if node is None:
-                continue
-            resolved_item = self._resolve_item(node_id, node)
-            if resolved_item is None:
-                continue
-            content, image_ref, metadata = resolved_item
-            entry: Dict[str, Any] = {"node_id": node_id, "content": content, "score": round(score, 4)}
-            if image_ref:
-                entry["image_ref"] = image_ref
-            if self._cfg.include_metadata:
-                entry["metadata"] = metadata
-            results.append(entry)
+            top_n *= 4
         return results
 
     def get_surfaced(self, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
