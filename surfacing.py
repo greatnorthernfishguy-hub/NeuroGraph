@@ -17,6 +17,19 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-11-24] Claude (Fable 5.2) — #1251 step 2: the self-tuning surfacing queue (read side; key off by default)
+#   What: With graph.config['surfacing_selftune'] on, get_surfaced() returns the node store's self-tuning queue
+#         (ng_tract NodeStore.sf_queue: nodes that grew warm, strongest first), resolved to their content here.
+#         persist_tuning() copies the queue's learned threshold ratio into graph.config['surfacing_threshold_ratio']
+#         (an explicit call for the host to make before a save); tuning_stats() reads the queue's counters.
+#   Why:  Josh 2026-11-23: NeuroGraph tunes its own weights and thresholds (Elmer's TuningSocket is the pattern,
+#         never the tuner) and the mind's surfacing is read from the mind, not the Commons. The design is the
+#         original CES Module 3 monitor (docs/archive/surfacing.pdf): threshold-gated warmth, a threshold that
+#         lowers when surfaced nodes go on to fire and rises when they expire unused.
+#   How:  All queue state and the per-step work are in Rust (ng-tract-rs surfacing_tune.rs, stepped from fire
+#         detection); this file only switches it on from the config key, reads it, and resolves content. A node
+#         with nothing showable is passed over at the read (it leaves the queue by expiry). Not native = one ERROR
+#         and the existing paths, as with surfacing_native_scan.
 # [2026-11-23] Claude (Fable 5.2) — Comment correction: who tunes the surfacing values (#1251)
 #   What: _score_node docstring and the _decay_queue comment no longer say Elmer tunes
 #         these values. Comments only; no behaviour change.
@@ -191,6 +204,14 @@ class SurfacingMonitor:
         # Stats
         self._total_surfaced: int = 0
 
+        # [2026-11-24] #1251: the self-tuning queue (in the node store). Switched from the config key, read live.
+        self._selftune_on: bool = False
+        self._selftune_warned: bool = False
+        try:
+            self._selftune_sync()
+        except Exception as exc:  # noqa: BLE001 - a monitor that cannot start its queue still constructs
+            logger.error("surfacing_selftune could not be switched on at start (%s)", type(exc).__name__)
+
     # ── Public API ─────────────────────────────────────────────────────
 
     def after_step(self, step_result: Any) -> None:
@@ -264,6 +285,74 @@ class SurfacingMonitor:
         if not content and not image_ref:
             return None
         return content, image_ref, metadata
+
+    def _selftune_sync(self) -> Any:
+        """[2026-11-24] Bring the node store's self-tuning queue in line with graph.config['surfacing_selftune'].
+        Returns the node store while the queue is on, else None. On the first switch-on the learned ratio saved in
+        graph.config['surfacing_threshold_ratio'] (if any) is handed back to the queue."""
+        graph_config = getattr(self._graph, 'config', {})
+        want = bool(graph_config.get("surfacing_selftune"))
+        nodes = self._graph.nodes
+        configure = getattr(nodes, "sf_configure", None)
+        if configure is None:
+            if want and not self._selftune_warned:
+                self._selftune_warned = True
+                logger.error("surfacing_selftune is on but the graph's node store has no self-tuning queue: "
+                             "surfacing stays on the existing paths")
+            return None
+        # Compared with the STORE's own state, not a flag here: a restore can replace the node store, and a second
+        # monitor on the same graph shares the one queue.
+        if bool(nodes.sf_stats()[0]) != want:
+            saved = graph_config.get("surfacing_threshold_ratio") if want else None
+            if saved is not None:
+                configure(want, float(saved))
+            else:
+                configure(want)
+        self._selftune_on = want
+        return nodes if want else None
+
+    def _selftune_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
+        """[2026-11-24] The self-tuning queue's active items, warmest first. None = the key is off or the node
+        store has no such queue: the caller uses the other paths."""
+        nodes = self._selftune_sync()
+        if nodes is None:
+            return None
+        results: List[Dict[str, Any]] = []
+        for node_id, warmth, _surfaced_at, _steps, _engaged in nodes.sf_queue():
+            node = nodes.get(node_id)
+            if node is None:
+                continue
+            resolved_item = self._resolve_item(node_id, node)
+            if resolved_item is None:
+                continue
+            content, image_ref, metadata = resolved_item
+            entry: Dict[str, Any] = {"node_id": node_id, "content": content, "score": round(warmth, 4)}
+            if image_ref:
+                entry["image_ref"] = image_ref
+            if self._cfg.include_metadata:
+                entry["metadata"] = metadata
+            results.append(entry)
+        results.sort(key=lambda e: e["score"], reverse=True)
+        return results[:max_items]
+
+    def persist_tuning(self) -> Optional[float]:
+        """[2026-11-24] Copy the self-tuning queue's learned threshold ratio into graph.config, where a save
+        carries it. Returns the ratio written, or None while the queue is off. Called by the host before a save."""
+        nodes = self._selftune_sync()
+        if nodes is None:
+            return None
+        ratio = float(nodes.sf_stats()[1])
+        self._graph.config["surfacing_threshold_ratio"] = ratio
+        return ratio
+
+    def tuning_stats(self) -> Optional[Dict[str, Any]]:
+        """[2026-11-24] The self-tuning queue's counters (read-only), or None while it is off."""
+        nodes = self._selftune_sync()
+        if nodes is None:
+            return None
+        on, ratio, steps, surfaced, engaged, expired, active = nodes.sf_stats()
+        return {"on": bool(on), "threshold_ratio": float(ratio), "steps": int(steps), "total_surfaced": int(surfaced),
+                "total_engaged": int(engaged), "total_expired": int(expired), "queue_size": int(active)}
 
     def _native_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
         """[2026-11-23] The queue read from the spike stamps (ng_tract.surfacing_scan). None = the key is off or the
@@ -343,6 +432,9 @@ class SurfacingMonitor:
         # stale concepts to persist at inflated scores.
         if max_items is None:
             max_items = self._cfg.max_surfaced
+        tuned = self._selftune_surfaced(max_items)  # [2026-11-24] #1251: key off -> None -> the paths below
+        if tuned is not None:
+            return tuned
         native = self._native_surfaced(max_items)   # [2026-11-23] key off / not native -> None -> the queue below
         if native is not None:
             return native
