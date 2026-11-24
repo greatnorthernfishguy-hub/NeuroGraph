@@ -48,6 +48,12 @@ Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
 # ---- Changelog ----
+# [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; punch #1251) — COMMENTS ONLY: who tunes these values
+#   What: set_relevance_threshold's docstring names the owning module as the tuner, not Elmer. No code change.
+#   Why: Josh 2026-11-23: nothing here was ever meant to be tuned BY Elmer. Each mind / NG-Lite tunes its own values;
+#     Elmer's TuningSocket is the PATTERN they copy, and Elmer tunes only its own NG-Lite (LAW 1; punch #222, #1251).
+#     Older changelog entries that say "Elmer tunes" are history and are superseded by this one.
+#   How: text edits.
 # [2026-10-25] Claude Code (Opus 5.5, laptop) — #1189 resumable, bounded, damage-tolerant cursor drain
 #   What: _drain_with_cursor rewritten around the tract's own frame validation:
 #     (a) a damaged unit (zero-filled / torn body, bad header) starts a damaged region
@@ -735,7 +741,7 @@ class NGTractBridge(NGBridge):
     def set_relevance_threshold(self, value: float) -> None:
         """Update relevance threshold from external tuning (Punchlist #44).
 
-        Called by NGLite.update_tunable() when Elmer adjusts the
+        Called by NGLite.update_tunable() when the owning module adjusts the
         relevance_threshold parameter.  The bridge uses this threshold
         to gate which peer events are absorbed during recommendations.
         """

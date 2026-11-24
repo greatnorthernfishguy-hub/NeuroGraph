@@ -1,3 +1,9 @@
+# [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; punch #1251) — COMMENTS ONLY: who tunes these values
+#   What: Three DEFAULT_CONFIG comments name NeuroGraph as the tuner of its own values, not Elmer. No code change.
+#   Why: Josh 2026-11-23: nothing here was ever meant to be tuned BY Elmer. Each mind / NG-Lite tunes its own values;
+#     Elmer's TuningSocket is the PATTERN they copy, and Elmer tunes only its own NG-Lite (LAW 1; punch #222, #1251).
+#     Older changelog entries that say "Elmer tunes" are history and are superseded by this one.
+#   How: text edits.
 # [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop; SQ10) — _sprout_from_tally's candidates stay in Rust (config
 #   native_sprout_feed_enabled, default off).
 # What: with the key on, PredictionBook.sprout_tally_feed builds the candidate list (recent spikes that did not fire
@@ -3532,7 +3538,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "prediction_error_penalty": 0.02,    # Weight penalty on error (×confidence)
     "prediction_max_active": 1000,       # Max active predictions (memory limit)
     "surprise_sprouting_weight": 0.1,    # Initial weight for surprise-driven synapses
-    "surprise_reward_scaling": 0.5,      # Modulates surprise -> reward strength. Elmer-tunable.
+    "surprise_reward_scaling": 0.5,      # Modulates surprise -> reward strength. NeuroGraph's own tunable.
     "eligibility_trace_tau": 100,        # Decay time constant for eligibility traces
     "three_factor_enabled": True,        # Reward-gated STDP via eligibility traces
     # Phase 2: Hypergraph Engine config
@@ -3542,7 +3548,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "he_discovery_window": 10,
     "he_discovery_min_co_fires": 5,
     "he_discovery_min_nodes": 3,
-    "he_discovery_overlap_threshold": 0.5,  # bootstrap — candidate for Elmer TuningSocket graduation
+    "he_discovery_overlap_threshold": 0.5,  # bootstrap — self-tuned by NeuroGraph's coordinator (#222, TuningSocket pattern)
     "he_consolidation_overlap": 0.8,
     "he_member_evolution_window": 50,
     "he_member_evolution_min_co_fires": 10,
@@ -3580,7 +3586,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Zero-firing circuit breaker — detects prolonged substrate silence
     "zero_fire_alert_steps": 50,      # Steps of zero firing before warning event
     "zero_fire_breaker_steps": 200,   # Steps of zero firing before emergency intervention
-    # CES attention dynamics (#55) — substrate-tuned via Elmer
+    # CES attention dynamics (#55) — NeuroGraph's own tunables (TuningSocket pattern)
     "surfacing_decay_rate": 0.95,     # Per-step score decay in surfacing queue
     "surfacing_min_confidence": 0.3,  # Below this, surfaced items are pruned
 }
