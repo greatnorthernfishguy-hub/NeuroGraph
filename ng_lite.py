@@ -69,6 +69,12 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; punch #1251) — COMMENTS ONLY: who tunes these values
+#   What: The DEFAULT_CONFIG and TUNABLE_PARAMS comments name the owning module as the tuner, not Elmer. No code change.
+#   Why: Josh 2026-11-23: nothing here was ever meant to be tuned BY Elmer. Each mind / NG-Lite tunes its own values;
+#     Elmer's TuningSocket is the PATTERN they copy, and Elmer tunes only its own NG-Lite (LAW 1; punch #222, #1251).
+#     Older changelog entries that say "Elmer tunes" are history and are superseded by this one.
+#   How: text edits.
 # [2026-10-15] Claude Code (Opus 5.5, lane nglite-sleep) — #1114 Phase 1: NGLite.sleep(); the epoch; cap eviction by the same rule
 # What: (1) NGLite.sleep(now=None): one sleep pass the HOST calls on its own autonomic clock (NG-Lite has no timer).
 #   Strength-aware downscaling d = sleep_d0 * sleep_h / (sleep_h + w) / armor, w <- w * (1 - d), armor =
@@ -649,7 +655,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Persistence
     "snapshot_version": "1.0.0",
 
-    # CES attention dynamics (#55) — substrate-tuned via Elmer
+    # CES attention dynamics (#55) — the owning mind's own tunables (TuningSocket pattern)
     "surfacing_decay_rate": 0.95,     # Per-step score decay in surfacing queue
     "surfacing_min_confidence": 0.3,  # Below this, surfaced items are pruned
     "prediction_window": 10,          # Steps a prediction pre-charges targets
@@ -658,7 +664,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "receptor_layer_enabled": True,
     "receptor_layer_k": 256,                # Initial prototype count
     "receptor_prototype_threshold": 0.75,   # Centred cosine to snap to a prototype (#1107, MEAN_CENTRE.md §3)
-    "receptor_ema_alpha": 0.001,            # Slow drift rate (Elmer will tune later)
+    "receptor_ema_alpha": 0.001,            # Slow drift rate (the owning module tunes it later)
     "receptor_warmup_count": 256,           # Inputs before k-means init fires
 }
 
@@ -2067,10 +2073,10 @@ class NGLite:
         return epoch, last
 
     # -------------------------------------------------------------------
-    # Dynamic Tuning (Phase 4 — Elmer outward)
+    # Dynamic Tuning (Phase 4)
     # -------------------------------------------------------------------
 
-    # Parameters Elmer (or any organ) is permitted to adjust at runtime.
+    # Parameters the module that OWNS this NG-Lite may adjust at runtime (never another module's).
     # Keys map to (min, max) bounds.  Anything not in this dict is frozen.
     TUNABLE_PARAMS: Dict[str, Tuple[float, float]] = {
         "success_boost":              (0.01,  0.50),
