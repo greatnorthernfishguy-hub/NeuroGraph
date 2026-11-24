@@ -17,6 +17,19 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-11-23] DudeMan CC (Claude Fable 5.2, laptop; SQ11 restore mind-shaped surfacing, punch #1250) -- the queue can be
+#       READ from the spike stamps (graph.config['surfacing_native_scan'], absent = off = this file exactly as before)
+# What: with the key on and a native NodeStore, get_surfaced() asks ng_tract.surfacing_scan for the strongest nodes
+#       that fired lately (the same salience and the same per-step decay as _score_node / _decay_queue, computed in
+#       Rust over the node columns) and resolves their content with the same resolver after_step uses
+#       (_resolve_item, moved out of after_step, unchanged). Nothing is pushed per step and no lock is taken.
+# Why:  on the laptop CC the queue has been empty since 2026-09-07: the daemon stopped calling on_message, the only
+#       caller of after_step (docs 5868a0603), while cc_assemble_recall still reads get_surfaced() on every prompt.
+#       The mind steps on its own clock now (the unified Tonic), ~2,000 nodes a step: walking them in Python on
+#       every step is what the Rust work removes. Josh 2026-11-23: "find what was already built, and take it from
+#       there", kept in Rust.
+# How:  declared differences from the pushed queue are listed in ng-tract-rs src/surfacing.rs. With the key on and
+#       no native store / no surfacing_scan in the wheel: one ERROR line, then the queue path as before.
 # [2026-10-18] Claude (lane hyperedge-store-h1, #1136) — _score_node counts memberships natively when available
 # What: when graph.hyperedges is a native ng_tract.HyperedgeStore (it has membership_count), the hyperedge-membership
 #       count is one HyperedgeStore.membership_count(node_id) under the same _step_lock; otherwise the unchanged scan.
@@ -199,30 +212,10 @@ class SurfacingMonitor:
             if score < self._cfg.min_confidence:
                 continue
 
-            # Substrate-first, image-aware resolution (#410 / #82). The vdb is
-            # fallback only; a vision node resolves to an image, not to nothing.
-            db_entry = self._vector_db.get(node_id)
-            content = ""
-            image_ref: Optional[str] = None
-            metadata: Dict[str, Any] = dict(getattr(node, "metadata", None) or {})
-            try:
-                from surface_resolver import resolve_surface_item
-                resolved = resolve_surface_item(node, db_entry)
-            except Exception:  # noqa: BLE001 - fail-safe: old vdb path for this node
-                resolved = None
-                if db_entry is not None:
-                    content = db_entry.get("content", "") or ""
-                    metadata = db_entry.get("metadata", {}) or {}
-            if resolved is not None:
-                if resolved.get("kind") == "image":
-                    image_ref = resolved.get("image_ref")
-                else:
-                    content = resolved.get("content", "") or ""
-                if db_entry is not None and not metadata:
-                    metadata = db_entry.get("metadata", {}) or {}
-
-            if not content and not image_ref:
+            resolved_item = self._resolve_item(node_id, node)
+            if resolved_item is None:
                 continue  # Nothing showable — neither her words nor her sight
+            content, image_ref, metadata = resolved_item
 
             item = _SurfacedItem(
                 node_id=node_id,
@@ -234,6 +227,83 @@ class SurfacingMonitor:
 
             self._insert_item(item)
             self._total_surfaced += 1
+
+    def _resolve_item(self, node_id: str, node: Any):
+        """What a surfaced node shows: (content, image_ref, metadata), or None when there is nothing showable.
+        [2026-11-23] moved out of after_step unchanged, so the native read (below) resolves the same way."""
+        # Substrate-first, image-aware resolution (#410 / #82). The vdb is
+        # fallback only; a vision node resolves to an image, not to nothing.
+        db_entry = self._vector_db.get(node_id)
+        content = ""
+        image_ref: Optional[str] = None
+        metadata: Dict[str, Any] = dict(getattr(node, "metadata", None) or {})
+        try:
+            from surface_resolver import resolve_surface_item
+            resolved = resolve_surface_item(node, db_entry)
+        except Exception:  # noqa: BLE001 - fail-safe: old vdb path for this node
+            resolved = None
+            if db_entry is not None:
+                content = db_entry.get("content", "") or ""
+                metadata = db_entry.get("metadata", {}) or {}
+        if resolved is not None:
+            if resolved.get("kind") == "image":
+                image_ref = resolved.get("image_ref")
+            else:
+                content = resolved.get("content", "") or ""
+            if db_entry is not None and not metadata:
+                metadata = db_entry.get("metadata", {}) or {}
+        if not content and not image_ref:
+            return None
+        return content, image_ref, metadata
+
+    def _native_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
+        """[2026-11-23] The queue read from the spike stamps (ng_tract.surfacing_scan). None = the key is off or the
+        native read is not available: the caller uses the pushed queue as before."""
+        graph_config = getattr(self._graph, 'config', {})
+        if not graph_config.get("surfacing_native_scan"):
+            return None
+        try:
+            import ng_tract
+        except Exception:  # noqa: BLE001
+            ng_tract = None
+        scan = getattr(ng_tract, "surfacing_scan", None)
+        nodes = self._graph.nodes
+        store_cls = getattr(ng_tract, "NodeStore", None)
+        if scan is None or store_cls is None or not isinstance(nodes, store_cls):
+            if not getattr(self, "_native_scan_warned", False):
+                self._native_scan_warned = True
+                logger.error("surfacing_native_scan is on but %s: the surfacing queue stays on the pushed path",
+                             "the installed ng_tract has no surfacing_scan" if scan is None
+                             else "the graph's node store is not native")
+            return None
+        hes = self._graph.hyperedges
+        he_cls = getattr(ng_tract, "HyperedgeStore", None)
+        decay_rate = graph_config.get("surfacing_decay_rate", self._cfg.decay_rate)
+        min_confidence = graph_config.get("surfacing_min_confidence", self._cfg.min_confidence)
+        # more candidates than items: a fired node with nothing showable (an interneuron, a bare node) is passed over
+        rows, skipped = scan(nodes, hes if (he_cls is not None and isinstance(hes, he_cls)) else None,
+                             int(getattr(self._graph, 'timestep', 0)), float(decay_rate), float(min_confidence),
+                             float(self._cfg.weight_voltage), float(self._cfg.weight_excitability),
+                             float(self._cfg.weight_he_membership), max(int(max_items) * 8, 32))
+        self._native_scan_skipped = int(skipped)
+        results: List[Dict[str, Any]] = []
+        for node_id, score, _age in rows:
+            if len(results) >= max_items:
+                break
+            node = nodes.get(node_id)
+            if node is None:
+                continue
+            resolved_item = self._resolve_item(node_id, node)
+            if resolved_item is None:
+                continue
+            content, image_ref, metadata = resolved_item
+            entry: Dict[str, Any] = {"node_id": node_id, "content": content, "score": round(score, 4)}
+            if image_ref:
+                entry["image_ref"] = image_ref
+            if self._cfg.include_metadata:
+                entry["metadata"] = metadata
+            results.append(entry)
+        return results
 
     def get_surfaced(self, max_items: Optional[int] = None) -> List[Dict[str, Any]]:
         """Return the top surfaced items sorted by score.
@@ -253,10 +323,13 @@ class SurfacingMonitor:
         # Decay before read — fixes lifecycle ordering where assemble()
         # reads the queue before afterTurn() applies decay, causing
         # stale concepts to persist at inflated scores.
-        self._decay_queue()
-
         if max_items is None:
             max_items = self._cfg.max_surfaced
+        native = self._native_surfaced(max_items)   # [2026-11-23] key off / not native -> None -> the queue below
+        if native is not None:
+            return native
+
+        self._decay_queue()
 
         # Sort by score descending
         sorted_items = sorted(self._queue, key=lambda x: x.score, reverse=True)
