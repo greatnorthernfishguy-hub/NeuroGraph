@@ -30,6 +30,10 @@ Usage::
 #         detection); this file only switches it on from the config key, reads it, and resolves content. A node
 #         with nothing showable is passed over at the read (it leaves the queue by expiry). Not native = one ERROR
 #         and the existing paths, as with surfacing_native_scan.
+#   2026-11-24 later (Josh: "How does the human brain do it?"): engagement is GRADED, in the crate: a surfaced node
+#         is watched for its window and scored by its fires above its own running rate, plus whether a recall sweep
+#         reached it. note_shown() has the nodes the host actually showed watched too; engagement_scores() reads
+#         the outcomes. Measured first on a copy (punch #1251): the source's yes/no saturated at 99.6 %.
 #   Review 2026-11-24 (Grok 4.7, no blocker): reads are read-only now. The queue is switched in ONE place,
 #         sync_tuning() (construction, and the host's own clock), never from get_surfaced / tuning_stats /
 #         persist_tuning; a failed read falls through to the existing paths; a non-finite saved ratio is ignored.
@@ -371,8 +375,33 @@ class SurfacingMonitor:
         on, ratio, steps, surfaced, engaged, expired, active = nodes.sf_stats()
         if not on:
             return None
+        watching, scored, unused, dropped, eng_sum = nodes.sf_engagement()
         return {"on": True, "threshold_ratio": float(ratio), "steps": int(steps), "total_surfaced": int(surfaced),
-                "total_engaged": int(engaged), "total_expired": int(expired), "queue_size": int(active)}
+                "total_engaged": int(engaged), "total_expired": int(expired), "queue_size": int(active),
+                "watching": int(watching), "total_scored": int(scored), "total_unused": int(unused),
+                "watch_dropped": int(dropped),
+                "mean_engagement": (float(eng_sum) / int(scored)) if scored else None}
+
+    def note_shown(self, node_ids: List[str]) -> int:
+        """[2026-11-24] The host actually showed these nodes (whichever path surfaced them): have each watched for
+        its window, so what becomes of it is scored (engagement_scores). An explicit host call, never made from a
+        read. Returns how many watches were added; 0 while the self-tuning queue is not running."""
+        nodes = self._selftune_store()
+        if nodes is None or not node_ids:
+            return 0
+        return int(nodes.sf_watch([str(n) for n in node_ids if n]))
+
+    def engagement_scores(self, drain: bool = False) -> List[Dict[str, Any]]:
+        """[2026-11-24] What became of each surfaced node whose window has closed, oldest first: its fires above its
+        own running rate (`excess`), the graded `engagement` in -1..1, whether a recall sweep reached it (`cue`), and
+        `source` ("queue" = it entered the self-tuning queue, "shown" = the host showed it). `drain` empties the
+        list. [] while the queue is not running."""
+        nodes = self._selftune_store()
+        if nodes is None:
+            return []
+        return [{"node_id": nid, "excess": float(ex), "engagement": float(en), "fires": int(fires),
+                 "rate_when_surfaced": float(rate), "cue": bool(cue), "source": "shown" if src == 1 else "queue"}
+                for nid, ex, en, fires, rate, cue, src in nodes.sf_scores(bool(drain))]
 
     def _native_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
         """[2026-11-23] The queue read from the spike stamps (ng_tract.surfacing_scan). None = the key is off or the

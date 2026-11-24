@@ -2,8 +2,9 @@
 # [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; SQ11, punch #1251 step 2) -- the self-tuning surfacing queue
 #   (graph.config['surfacing_selftune']; ng_tract NodeStore.sf_configure / sf_queue / sf_stats).
 # What: on REAL graph steps: (1) a node that grows warm enters the queue and a cooler one does not; a node that
-#       fires this step is not a candidate; (2) a queued node that goes on to fire lowers the threshold ratio by
-#       0.012 x 0.04; one that cools unused raises it by 0.008 x 0.04; (3) the queue holds six; (4) the key off is
+#       fires this step is not a candidate; (2) engagement is graded: a surfaced node is watched 30 steps and scored
+#       by its fires above its own running rate (+ whether a recall sweep reached it); the ratio moves by that
+#       amount when the window closes; what the host showed can be watched too; (3) the queue holds six; (4) the key off is
 #       the existing path and the queue does nothing; (5) a node with nothing showable is passed over at the read;
 #       (6) persist_tuning writes the learned ratio into graph.config and a new monitor hands it back to the queue;
 #       (7) switching the key off empties the queue and keeps the ratio; (8) a graph without a native node store
@@ -77,21 +78,62 @@ def test_a_warm_node_enters_the_queue_a_cool_one_and_a_firing_one_do_not():
     assert (st["on"], st["threshold_ratio"], st["total_surfaced"], st["queue_size"]) == (True, 0.72, 1, 1)
 
 
-def test_a_queued_node_that_fires_lowers_the_ratio_and_one_that_cools_raises_it():
+def _steps(g, n):
+    res = None
+    for _ in range(n):
+        res = g.step()
+    return res
+
+
+def test_engagement_is_graded_against_the_nodes_own_rate():
     g = _graph()
     mon = _mon(g)
+    g.nodes["n01"].firing_rate_ema = 0.1                # a node that usually fires 3 times in 30 steps
     _warm(g, "n00", 0.90)
     _warm(g, "n01", 0.90)
     g.step()
     assert sorted(_ids(mon)) == ["n00", "n01"]
-    _warm(g, "n00", 1.60)       # goes on to fire: engaged
-    _warm(g, "n01", 0.05)       # cools off unused
+    _warm(g, "n00", 1.60)                               # n00 (usual rate 0) goes on to fire once
+    _warm(g, "n01", 0.05)                               # n01 goes quiet
     res = g.step()
     assert "n00" in res.fired_node_ids
     st = mon.tuning_stats()
-    assert (st["total_engaged"], st["total_expired"], st["queue_size"]) == (1, 2, 0)
-    assert st["threshold_ratio"] == pytest.approx(0.72 + ENGAGE + EXPIRE, abs=1e-12)
-    assert _ids(mon) == []
+    assert (st["total_scored"], st["threshold_ratio"], st["watching"]) == (0, 0.72, 2)   # nothing moves yet
+    assert _ids(mon) == []                              # both have left the visible queue
+    _steps(g, 29)                                       # their 30-step windows close
+    by = {s["node_id"]: s for s in mon.engagement_scores()}
+    assert by["n00"]["fires"] == 1 and by["n00"]["excess"] == pytest.approx(1.0) and by["n00"]["engagement"] == pytest.approx(0.5)
+    assert by["n01"]["fires"] == 0 and by["n01"]["excess"] == pytest.approx(-3.0) and by["n01"]["engagement"] == -1.0
+    assert by["n00"]["source"] == "queue" and by["n00"]["cue"] is False
+    st = mon.tuning_stats()
+    assert (st["total_scored"], st["total_engaged"], st["total_unused"], st["watching"]) == (2, 1, 1, 0)
+    assert st["threshold_ratio"] == pytest.approx(0.72 + 0.5 * ENGAGE + 1.0 * EXPIRE, abs=1e-12)
+    assert st["mean_engagement"] == pytest.approx(-0.25)
+    assert mon.engagement_scores(drain=True) and mon.engagement_scores() == []
+
+
+def test_a_node_over_its_own_threshold_but_held_down_is_not_a_candidate():
+    g = _graph()
+    mon = _mon(g)
+    node = g.nodes["n00"]
+    node.voltage = 1.5 * node.threshold
+    node.refractory_remaining = 3                       # over threshold and cannot fire
+    _warm(g, "n01", 0.90)
+    res = g.step()
+    assert "n00" not in res.fired_node_ids and _ids(mon) == ["n01"]
+
+
+def test_the_host_can_have_what_it_showed_watched_and_scored():
+    g = _graph()
+    mon = _mon(g)
+    assert mon.note_shown(["n05", "n06", "no-such-node", ""]) == 2
+    assert mon.note_shown(["n05"]) == 0                 # already being watched
+    _warm(g, "n05", 1.60)
+    _steps(g, 30)
+    by = {s["node_id"]: s for s in mon.engagement_scores()}
+    assert by["n05"]["source"] == "shown" and by["n05"]["engagement"] == pytest.approx(0.5)
+    assert by["n06"]["engagement"] == 0.0
+    assert mon.tuning_stats()["threshold_ratio"] == 0.72    # what the host showed does not move the queue's ratio
 
 
 def test_the_queue_holds_six_warmest_first():
@@ -126,10 +168,11 @@ def test_a_node_with_nothing_showable_is_passed_over_at_the_read():
 def test_the_learned_ratio_is_saved_to_config_and_handed_back_to_a_new_queue():
     g = _graph()
     mon = _mon(g)
+    g.nodes["n00"].firing_rate_ema = 0.1
     _warm(g, "n00", 0.90)
     g.step()
     _warm(g, "n00", 0.05)
-    g.step()
+    _steps(g, 30)                                       # one unused outcome: the ratio has moved
     ratio = mon.persist_tuning()
     assert ratio == pytest.approx(0.72 + EXPIRE, abs=1e-12) and g.config["surfacing_threshold_ratio"] == ratio
 
@@ -190,10 +233,11 @@ def test_a_saved_ratio_that_is_not_a_finite_number_is_ignored(bad):
 def test_a_restore_while_on_takes_the_restored_ratio_at_the_next_sync(tmp_path):
     g = _graph()
     mon = _mon(g)
+    g.nodes["n00"].firing_rate_ema = 0.1
     _warm(g, "n00", 0.90)
     g.step()
     _warm(g, "n00", 0.05)
-    g.step()                                            # one unused expiry: the ratio has moved
+    _steps(g, 30)                                       # one unused outcome: the ratio has moved
     learned = mon.persist_tuning()
     assert learned == pytest.approx(0.72 + EXPIRE, abs=1e-12)
     path = str(tmp_path / "c.msgpack")
@@ -208,19 +252,20 @@ def test_a_restore_while_on_takes_the_restored_ratio_at_the_next_sync(tmp_path):
     assert mon.tuning_stats()["threshold_ratio"] == pytest.approx(learned, abs=1e-12)
 
 
-def test_a_queued_node_fired_by_a_recall_sweep_is_engaged_not_an_unused_expiry():
+def test_a_node_the_cue_reached_scores_as_engaged():
     g = _graph()
     g.config["native_recall_enabled"] = True            # the live path: the sweep is one native call (recall_sweep)
     mon = _mon(g)
+    g.nodes["n00"].firing_rate_ema = 0.1                # without the cue this node would score as unused
     _warm(g, "n00", 0.90)
     g.step()
     assert _ids(mon) == ["n00"]
     g.prime_and_propagate(node_ids=["n00"], currents=[5.0], steps=1, write_mode=False)   # the cue reaches it
-    assert mon.tuning_stats()["total_engaged"] == 1
-    assert mon.tuning_stats()["threshold_ratio"] == pytest.approx(0.72 + ENGAGE, abs=1e-12)
     _warm(g, "n00", 0.0)
-    g.step()
-    assert mon.tuning_stats()["threshold_ratio"] == pytest.approx(0.72 + ENGAGE, abs=1e-12)   # no penalty after
+    _steps(g, 30)
+    (score,) = mon.engagement_scores()
+    assert score["cue"] is True and score["engagement"] > -1.0
+    assert score["engagement"] == pytest.approx(max(-1.0, min(1.0, score["excess"] / 2.0 + 1.0)))
 
 
 def test_a_failing_read_falls_through_to_the_existing_paths(caplog):
