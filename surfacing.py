@@ -30,6 +30,9 @@ Usage::
 #         detection); this file only switches it on from the config key, reads it, and resolves content. A node
 #         with nothing showable is passed over at the read (it leaves the queue by expiry). Not native = one ERROR
 #         and the existing paths, as with surfacing_native_scan.
+#   Review 2026-11-24 (Grok 4.7, no blocker): reads are read-only now. The queue is switched in ONE place,
+#         sync_tuning() (construction, and the host's own clock), never from get_surfaced / tuning_stats /
+#         persist_tuning; a failed read falls through to the existing paths; a non-finite saved ratio is ignored.
 # [2026-11-23] Claude (Fable 5.2) — Comment correction: who tunes the surfacing values (#1251)
 #   What: _score_node docstring and the _decay_queue comment no longer say Elmer tunes
 #         these values. Comments only; no behaviour change.
@@ -205,11 +208,13 @@ class SurfacingMonitor:
         self._total_surfaced: int = 0
 
         # [2026-11-24] #1251: the self-tuning queue (in the node store). Switched from the config key, read live.
-        self._selftune_on: bool = False
         self._selftune_warned: bool = False
+        self._selftune_read_warned: bool = False
         try:
-            self._selftune_sync()
-        except Exception as exc:  # noqa: BLE001 - a monitor that cannot start its queue still constructs
+            self.sync_tuning()
+        except BaseException as exc:  # noqa: BLE001 - a monitor that cannot start its queue still constructs
+            if not isinstance(exc, Exception) and type(exc).__name__ != "PanicException":
+                raise
             logger.error("surfacing_selftune could not be switched on at start (%s)", type(exc).__name__)
 
     # ── Public API ─────────────────────────────────────────────────────
@@ -286,36 +291,45 @@ class SurfacingMonitor:
             return None
         return content, image_ref, metadata
 
-    def _selftune_sync(self) -> Any:
+    def _selftune_store(self) -> Any:
+        """[2026-11-24] The node store when it carries a self-tuning queue, else None. Reads nothing else."""
+        nodes = getattr(self._graph, "nodes", None)
+        return nodes if getattr(nodes, "sf_configure", None) is not None else None
+
+    def sync_tuning(self) -> bool:
         """[2026-11-24] Bring the node store's self-tuning queue in line with graph.config['surfacing_selftune'].
-        Returns the node store while the queue is on, else None. On the first switch-on the learned ratio saved in
-        graph.config['surfacing_threshold_ratio'] (if any) is handed back to the queue."""
+        The ONE place the queue is switched: called at construction and by the host on its own clock (the laptop
+        daemon: before each save), never from a read. On a switch-on the learned ratio saved in
+        graph.config['surfacing_threshold_ratio'] (when it is a finite number) is handed back to the queue.
+        Returns whether the queue is on afterwards."""
         graph_config = getattr(self._graph, 'config', {})
         want = bool(graph_config.get("surfacing_selftune"))
-        nodes = self._graph.nodes
-        configure = getattr(nodes, "sf_configure", None)
-        if configure is None:
+        nodes = self._selftune_store()
+        if nodes is None:
             if want and not self._selftune_warned:
                 self._selftune_warned = True
                 logger.error("surfacing_selftune is on but the graph's node store has no self-tuning queue: "
                              "surfacing stays on the existing paths")
-            return None
-        # Compared with the STORE's own state, not a flag here: a restore can replace the node store, and a second
-        # monitor on the same graph shares the one queue.
+            return False
         if bool(nodes.sf_stats()[0]) != want:
             saved = graph_config.get("surfacing_threshold_ratio") if want else None
-            if saved is not None:
-                configure(want, float(saved))
+            try:
+                saved = float(saved) if saved is not None else None
+            except (TypeError, ValueError):
+                saved = None
+            if saved is not None and saved == saved and saved not in (float("inf"), float("-inf")):
+                nodes.sf_configure(want, saved)
             else:
-                configure(want)
-        self._selftune_on = want
-        return nodes if want else None
+                nodes.sf_configure(want)
+        return want
 
     def _selftune_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
-        """[2026-11-24] The self-tuning queue's active items, warmest first. None = the key is off or the node
-        store has no such queue: the caller uses the other paths."""
-        nodes = self._selftune_sync()
-        if nodes is None:
+        """[2026-11-24] The self-tuning queue's active items, warmest first. None = the key is off, the queue is
+        not running, or the node store has no such queue: the caller uses the other paths. Read-only."""
+        if not getattr(self._graph, 'config', {}).get("surfacing_selftune"):
+            return None
+        nodes = self._selftune_store()
+        if nodes is None or not nodes.sf_stats()[0]:
             return None
         results: List[Dict[str, Any]] = []
         for node_id, warmth, _surfaced_at, _steps, _engaged in nodes.sf_queue():
@@ -337,21 +351,27 @@ class SurfacingMonitor:
 
     def persist_tuning(self) -> Optional[float]:
         """[2026-11-24] Copy the self-tuning queue's learned threshold ratio into graph.config, where a save
-        carries it. Returns the ratio written, or None while the queue is off. Called by the host before a save."""
-        nodes = self._selftune_sync()
+        carries it. Returns the ratio written, or None while the queue is not running. Called by the host before
+        a save, after sync_tuning()."""
+        nodes = self._selftune_store()
         if nodes is None:
             return None
-        ratio = float(nodes.sf_stats()[1])
+        stats = nodes.sf_stats()
+        if not stats[0]:
+            return None
+        ratio = float(stats[1])
         self._graph.config["surfacing_threshold_ratio"] = ratio
         return ratio
 
     def tuning_stats(self) -> Optional[Dict[str, Any]]:
-        """[2026-11-24] The self-tuning queue's counters (read-only), or None while it is off."""
-        nodes = self._selftune_sync()
+        """[2026-11-24] The self-tuning queue's counters, or None while it is not running. Read-only."""
+        nodes = self._selftune_store()
         if nodes is None:
             return None
         on, ratio, steps, surfaced, engaged, expired, active = nodes.sf_stats()
-        return {"on": bool(on), "threshold_ratio": float(ratio), "steps": int(steps), "total_surfaced": int(surfaced),
+        if not on:
+            return None
+        return {"on": True, "threshold_ratio": float(ratio), "steps": int(steps), "total_surfaced": int(surfaced),
                 "total_engaged": int(engaged), "total_expired": int(expired), "queue_size": int(active)}
 
     def _native_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
@@ -432,7 +452,18 @@ class SurfacingMonitor:
         # stale concepts to persist at inflated scores.
         if max_items is None:
             max_items = self._cfg.max_surfaced
-        tuned = self._selftune_surfaced(max_items)  # [2026-11-24] #1251: key off -> None -> the paths below
+        # [2026-11-24] #1251: key off / queue not running -> None -> the paths below. A failure in this read (a
+        # Rust panic included) is logged once and the existing paths answer: it never replaces them with an error.
+        try:
+            tuned = self._selftune_surfaced(max_items)
+        except BaseException as exc:  # noqa: BLE001
+            if not isinstance(exc, Exception) and type(exc).__name__ != "PanicException":
+                raise
+            tuned = None
+            if not self._selftune_read_warned:
+                self._selftune_read_warned = True
+                logger.error("the self-tuning surfacing queue could not be read (%s): the existing paths are used",
+                             type(exc).__name__)
         if tuned is not None:
             return tuned
         native = self._native_surfaced(max_items)   # [2026-11-23] key off / not native -> None -> the queue below

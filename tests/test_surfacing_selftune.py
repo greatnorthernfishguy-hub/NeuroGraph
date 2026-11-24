@@ -151,7 +151,10 @@ def test_switching_the_key_off_empties_the_queue_and_keeps_the_ratio():
     g.step()
     assert _ids(mon) == ["n00"]
     g.config[KEY] = False
-    assert mon.get_surfaced(100) == [] and g.nodes.sf_queue() == [] and g.nodes.sf_stats()[0] is False
+    assert mon.get_surfaced(100) == []                  # the read stops at once ...
+    assert g.nodes.sf_stats()[0] is True                # ... and does not touch the switch
+    assert mon.sync_tuning() is False
+    assert g.nodes.sf_queue() == [] and g.nodes.sf_stats()[0] is False
     assert g.nodes.sf_stats()[1] == 0.72 and mon2 is not None
 
 
@@ -163,3 +166,67 @@ def test_a_graph_without_a_native_node_store_logs_once_and_stays_on_the_existing
         g.step()
         assert mon.get_surfaced(100) == [] and mon.get_surfaced(100) == []
     assert caplog.text.count("surfacing_selftune is on but") == 1
+
+
+def test_reads_never_switch_the_queue_only_sync_does():
+    g = _graph()
+    mon = _mon(g, on=False)
+    g.config[KEY] = True                                # the key turns on after construction
+    assert mon.tuning_stats() is None and mon.persist_tuning() is None and mon.get_surfaced(100) == []
+    assert g.nodes.sf_stats()[0] is False and "surfacing_threshold_ratio" not in g.config
+    assert mon.sync_tuning() is True and g.nodes.sf_stats()[0] is True
+    _warm(g, "n00", 0.90)
+    g.step()
+    assert _ids(mon) == ["n00"]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "not a number", None])
+def test_a_saved_ratio_that_is_not_a_finite_number_is_ignored(bad):
+    g = _graph()
+    g.config["surfacing_threshold_ratio"] = bad
+    assert _mon(g).tuning_stats()["threshold_ratio"] == 0.72
+
+
+def test_a_restore_while_on_takes_the_restored_ratio_at_the_next_sync(tmp_path):
+    g = _graph()
+    mon = _mon(g)
+    _warm(g, "n00", 0.90)
+    g.step()
+    _warm(g, "n00", 0.05)
+    g.step()                                            # one unused expiry: the ratio has moved
+    learned = mon.persist_tuning()
+    assert learned == pytest.approx(0.72 + EXPIRE, abs=1e-12)
+    path = str(tmp_path / "c.msgpack")
+    g.checkpoint(path)
+    g.config["surfacing_threshold_ratio"] = 0.5         # a different value in memory, then restore over it
+    g.nodes.sf_configure(True, 0.5)
+    g.restore(path)
+    assert g.nodes.sf_stats()[0] is False               # the restore put the queue back to off / defaults
+    assert mon.persist_tuning() is None                 # nothing is written while it is off
+    g.config[KEY] = True
+    assert mon.sync_tuning() is True
+    assert mon.tuning_stats()["threshold_ratio"] == pytest.approx(learned, abs=1e-12)
+
+
+def test_a_queued_node_fired_by_a_recall_sweep_is_engaged_not_an_unused_expiry():
+    g = _graph()
+    g.config["native_recall_enabled"] = True            # the live path: the sweep is one native call (recall_sweep)
+    mon = _mon(g)
+    _warm(g, "n00", 0.90)
+    g.step()
+    assert _ids(mon) == ["n00"]
+    g.prime_and_propagate(node_ids=["n00"], currents=[5.0], steps=1, write_mode=False)   # the cue reaches it
+    assert mon.tuning_stats()["total_engaged"] == 1
+    assert mon.tuning_stats()["threshold_ratio"] == pytest.approx(0.72 + ENGAGE, abs=1e-12)
+    _warm(g, "n00", 0.0)
+    g.step()
+    assert mon.tuning_stats()["threshold_ratio"] == pytest.approx(0.72 + ENGAGE, abs=1e-12)   # no penalty after
+
+
+def test_a_failing_read_falls_through_to_the_existing_paths(caplog):
+    g = _graph()
+    mon = _mon(g)
+    mon._selftune_surfaced = lambda n: (_ for _ in ()).throw(RuntimeError("boom"))
+    with caplog.at_level(logging.ERROR):
+        assert mon.get_surfaced(100) == [] and mon.get_surfaced(100) == []
+    assert caplog.text.count("could not be read") == 1
