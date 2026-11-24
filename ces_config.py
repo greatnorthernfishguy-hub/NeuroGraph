@@ -20,6 +20,12 @@ Usage::
     cfg = load_ces_config(config_path="~/.neurograph/ces.json")
 
 # ---- Changelog ----
+# [2026-11-23] Claude (Fable 5.2) — Comment correction: who tunes the salience weights (#1251)
+#   What: The SurfacingConfig weight comment no longer says Elmer tunes them. Comment only.
+#   Why:  Josh 2026-11-23: NeuroGraph tunes its own weights and thresholds using the PATTERN
+#         Elmer uses; Elmer never writes them (LAW 1; punch #222). Older entries below that
+#         say "tunable by Elmer's TuningSocket" are history, superseded by this one.
+#   How:  Text edit.
 # [2026-09-08] Cursor Agent — Drop dead Ollama streaming fields and unused SurfacingConfig.format
 #   What: Removed StreamingConfig.ollama_model / ollama_url / ollama_check_interval
 #         (StreamParser embeds via ng_embed only since 2026-04-21) and SurfacingConfig.format
@@ -84,8 +90,10 @@ class SurfacingConfig:
     queue_capacity: int = 50
 
     # Salience scoring weights — determines what Syl notices.
-    # Bootstrap scaffolding: Elmer tunes these via TuningSocket as the
-    # substrate accumulates evidence about which signals matter.
+    # Bootstrap scaffolding. NeuroGraph tunes its own weights, using the
+    # competence PATTERN Elmer's TuningSocket is the reference for; Elmer
+    # does not write them (LAW 1, punch #222). No self-tuner for these three
+    # is built yet (punch #1251).
     weight_voltage: float = 0.5       # Firing strength contribution
     weight_excitability: float = 0.3  # Intrinsic excitability contribution
     weight_he_membership: float = 0.2 # Hyperedge membership contribution

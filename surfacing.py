@@ -17,6 +17,14 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-11-23] Claude (Fable 5.2) — Comment correction: who tunes the surfacing values (#1251)
+#   What: _score_node docstring and the _decay_queue comment no longer say Elmer tunes
+#         these values. Comments only; no behaviour change.
+#   Why:  Josh 2026-11-23: the weights were never meant to be tuned BY Elmer; NeuroGraph
+#         tunes its own weights and thresholds using the PATTERN Elmer uses (LAW 1; punch
+#         #222 "Elmer TuningSocket does NOT write cross-module"). Older entries below that
+#         say "Elmer tunes" are history and are superseded by this one.
+#   How:  Text edits.
 # [2026-11-23] DudeMan CC (Claude Fable 5.2, laptop; SQ11 restore mind-shaped surfacing, punch #1250) -- the queue can be
 #       READ from the spike stamps (graph.config['surfacing_native_scan'], absent = off = this file exactly as before)
 # What: with the key on and a native NodeStore, get_surfaced() asks ng_tract.surfacing_scan for the strongest nodes
@@ -422,8 +430,11 @@ class SurfacingMonitor:
         """Compute a composite relevance score for a fired node.
 
         Weights read from CES SurfacingConfig (bootstrap defaults: 0.5/0.3/0.2).
-        These are tunable by Elmer's TuningSocket as the substrate learns which
-        signals matter for surfacing.
+        They are bootstrap values. NeuroGraph tunes its own weights and
+        thresholds, using the per-parameter competence PATTERN that Elmer's
+        TuningSocket is the reference for; Elmer does not write them (LAW 1,
+        punch #222). No self-tuner for these three weights is built yet
+        (punch #1251).
 
         Components:
         - voltage_normalized = effective_voltage / node.threshold (capped at 2.0)
@@ -527,7 +538,7 @@ class SurfacingMonitor:
             return  # Already decayed this step
         self._last_decay_step = current_step
 
-        # Read from substrate config (tunable via Elmer) with CES config fallback
+        # Read from substrate config (NeuroGraph's own tunable) with CES config fallback
         graph_config = getattr(self._graph, 'config', {})
         decay_rate = graph_config.get("surfacing_decay_rate", self._cfg.decay_rate)
         min_confidence = graph_config.get("surfacing_min_confidence", self._cfg.min_confidence)
