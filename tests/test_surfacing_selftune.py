@@ -275,3 +275,101 @@ def test_a_failing_read_falls_through_to_the_existing_paths(caplog):
     with caplog.at_level(logging.ERROR):
         assert mon.get_surfaced(100) == [] and mon.get_surfaced(100) == []
     assert caplog.text.count("could not be read") == 1
+
+
+# ---- [2026-11-24 evening] the salience weights tune themselves (crate surfacing_tune.rs Weights) ----
+
+BOOT = [0.5, 0.3, 0.2, 2.0, 10.0]
+
+
+def test_the_weights_start_at_the_values_in_force_and_are_not_readable_while_off():
+    g = _graph()
+    off = _mon(g, on=False)
+    assert off.tuned_weights() is None
+    g2 = _graph()
+    w = _mon(g2).tuned_weights()
+    assert w["values"] == BOOT and w["competence"] == [0.0] * 5 and w["outcomes"] == [0] * 5 and w["cycles"] == 0
+    assert w["names"][1] == "weight_excitability" and w["last_mean_engagement"] is None
+
+
+def test_a_weight_whose_term_goes_with_engagement_is_raised_by_the_tuningsocket_step():
+    g = _graph(n=30)
+    mon = _mon(g)
+    shown = ["n%02d" % i for i in range(24)]
+    for i, nid in enumerate(shown):                     # half excitable, half not; no hyperedges; nothing has fired
+        g.nodes[nid].intrinsic_excitability = 1.5 if i % 2 == 0 else 0.5
+    assert mon.note_shown(shown) == 24
+    for i, nid in enumerate(shown):
+        if i % 2 == 0:
+            _warm(g, nid, 1.60)                         # the excitable ones go on to fire
+    _steps(g, 30)
+    w = mon.tuned_weights()
+    assert w["cycles"] == 1 and w["last_mean_engagement"] == pytest.approx(0.25)
+    assert w["values"][1] == pytest.approx(0.3 * 1.02)  # excitability went with engagement: +2 % at zero competence
+    assert w["values"][0] == 0.5 and w["values"][2] == 0.2 and w["values"][3:] == [2.0, 10.0]   # no spread: untouched
+    assert w["outcomes"] == [0] * 5                     # judged at the next cycle
+    assert all(s["source"] == "shown" for s in mon.engagement_scores())
+
+
+def test_the_tuned_weights_ride_in_the_config_across_a_restart_and_a_bad_record_is_ignored(caplog):
+    g = _graph()
+    mon = _mon(g)
+    g.nodes.sf_restore_weights([0.7, 0.25, 0.4, 3.0, 20.0], [0.2, 0.1, 0.0, 0.3, 0.0], [6, 2, 0, 5, 0])
+    mon.persist_tuning()
+    saved = g.config["surfacing_tuned_weights"]
+    assert saved == {"values": [0.7, 0.25, 0.4, 3.0, 20.0], "competence": [0.2, 0.1, 0.0, 0.3, 0.0], "outcomes": [6, 2, 0, 5, 0]}
+    g2 = _graph()
+    g2.config["surfacing_tuned_weights"] = saved
+    w = _mon(g2).tuned_weights()
+    assert w["values"] == saved["values"] and w["competence"] == saved["competence"] and w["outcomes"] == saved["outcomes"]
+    for bad in ({"values": [1.0]}, {"values": "x", "competence": [], "outcomes": []}, "nonsense"):
+        g3 = _graph()
+        g3.config["surfacing_tuned_weights"] = bad
+        with caplog.at_level(logging.WARNING):
+            assert _mon(g3).tuned_weights()["values"] == BOOT
+
+
+def test_with_the_tuner_on_the_fired_reading_and_the_warm_reading_take_turns():
+    g = _graph()
+    g.config["surfacing_native_scan"] = True
+    mon = _mon(g)
+    _warm(g, "n00", 1.60)                               # fires: the fired reading
+    _warm(g, "n01", 1.60)
+    _warm(g, "n02", 0.90)                               # warm, does not fire: the warm reading
+    res = g.step()
+    assert {"n00", "n01"} <= set(res.fired_node_ids) and "n02" not in res.fired_node_ids
+    ids = _ids(mon)
+    assert set(ids) == {"n00", "n01", "n02"} and ids[1] == "n02" and ids[0] in ("n00", "n01")
+    assert [r["node_id"] for r in mon.get_surfaced(2)] == ids[:2]
+
+
+def test_the_fired_reading_ranks_with_the_tuned_cap():
+    g = _graph()
+    g.config["surfacing_native_scan"] = True
+    mon = _mon(g)
+    g.nodes["n00"].intrinsic_excitability = 4.0
+    g.nodes["n01"].intrinsic_excitability = 2.0
+    _warm(g, "n00", 1.60)
+    _warm(g, "n01", 1.60)
+    g.step()
+    tie = {r["node_id"]: r["score"] for r in mon.get_surfaced(10)}
+    assert tie["n00"] == tie["n01"]                     # the formula's cap of 2.0 cannot tell them apart
+    g.nodes.sf_restore_weights([0.5, 0.3, 0.2, 5.0, 10.0], [0.0] * 5, [0] * 5)
+    wide = {r["node_id"]: r["score"] for r in mon.get_surfaced(10)}
+    assert wide["n00"] > wide["n01"]
+
+
+def test_nodes_shown_without_learn_are_scored_but_do_not_teach_the_weights():
+    g = _graph(n=30)
+    mon = _mon(g)
+    shown = ["n%02d" % i for i in range(24)]
+    for i, nid in enumerate(shown):
+        g.nodes[nid].intrinsic_excitability = 1.5 if i % 2 == 0 else 0.5
+    assert mon.note_shown(shown, learn=False) == 24
+    for i, nid in enumerate(shown):
+        if i % 2 == 0:
+            _warm(g, nid, 1.60)
+    _steps(g, 30)
+    assert len(mon.engagement_scores()) == 24
+    w = mon.tuned_weights()
+    assert w["cycles"] == 0 and w["values"] == BOOT

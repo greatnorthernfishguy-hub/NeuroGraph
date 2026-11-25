@@ -34,6 +34,10 @@ Usage::
 #         is watched for its window and scored by its fires above its own running rate, plus whether a recall sweep
 #         reached it. note_shown() has the nodes the host actually showed watched too; engagement_scores() reads
 #         the outcomes. Measured first on a copy (punch #1251): the source's yes/no saturated at 99.6 %.
+#   2026-11-24 evening: THE WEIGHTS TUNE THEMSELVES (crate surfacing_tune.rs Weights; the TuningSocket pattern, owned
+#         by NeuroGraph). tuned_weights() reads them; the native scan ranks with them (and the two tuned caps) while
+#         the tuner runs; persist_tuning / sync_tuning carry them across a restart in
+#         graph.config['surfacing_tuned_weights']; note_shown() hands each shown node's salience inputs to the tuner.
 #   Review 2026-11-24 (Grok 4.7, no blocker): reads are read-only now. The queue is switched in ONE place,
 #         sync_tuning() (construction, and the host's own clock), never from get_surfaced / tuning_stats /
 #         persist_tuning; a failed read falls through to the existing paths; a non-finite saved ratio is ignored.
@@ -325,7 +329,35 @@ class SurfacingMonitor:
                 nodes.sf_configure(want, saved)
             else:
                 nodes.sf_configure(want)
+            if want:
+                self._restore_weights(nodes, graph_config.get("surfacing_tuned_weights"))
         return want
+
+    def _restore_weights(self, nodes: Any, saved: Any) -> bool:
+        """[2026-11-24] Hand the saved self-tuned weights (persist_tuning's dict) back to the queue's tuner. A
+        missing or malformed record leaves the bootstrap values in force (one WARNING for a malformed one)."""
+        if not isinstance(saved, dict):
+            return False
+        try:
+            nodes.sf_restore_weights([float(x) for x in saved["values"]], [float(x) for x in saved["competence"]],
+                                     [int(x) for x in saved["outcomes"]])
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("saved surfacing weights were not usable (%s): the bootstrap values stay in force",
+                           type(exc).__name__)
+            return False
+
+    def tuned_weights(self) -> Optional[Dict[str, Any]]:
+        """[2026-11-24] The salience weights and caps NeuroGraph is tuning for itself, with each one's competence and
+        outcome count, or None while the self-tuning queue is not running. Read-only."""
+        nodes = self._selftune_store()
+        if nodes is None or not nodes.sf_stats()[0]:
+            return None
+        values, competence, outcomes, cycles, health = nodes.sf_weights()
+        names = ("weight_voltage", "weight_excitability", "weight_he_membership", "excitability_cap", "he_membership_cap")
+        return {"values": [float(x) for x in values], "competence": [float(x) for x in competence],
+                "outcomes": [int(x) for x in outcomes], "cycles": int(cycles),
+                "last_mean_engagement": None if health is None else float(health), "names": list(names)}
 
     def _selftune_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
         """[2026-11-24] The self-tuning queue's active items, warmest first. None = the key is off, the queue is
@@ -365,6 +397,10 @@ class SurfacingMonitor:
             return None
         ratio = float(stats[1])
         self._graph.config["surfacing_threshold_ratio"] = ratio
+        values, competence, outcomes, _cycles, _health = nodes.sf_weights()
+        self._graph.config["surfacing_tuned_weights"] = {
+            "values": [float(x) for x in values], "competence": [float(x) for x in competence],
+            "outcomes": [int(x) for x in outcomes]}
         return ratio
 
     def tuning_stats(self) -> Optional[Dict[str, Any]]:
@@ -382,14 +418,29 @@ class SurfacingMonitor:
                 "watch_dropped": int(dropped),
                 "mean_engagement": (float(eng_sum) / int(scored)) if scored else None}
 
-    def note_shown(self, node_ids: List[str]) -> int:
+    def note_shown(self, node_ids: List[str], learn: bool = True) -> int:
         """[2026-11-24] The host actually showed these nodes (whichever path surfaced them): have each watched for
         its window, so what becomes of it is scored (engagement_scores). An explicit host call, never made from a
-        read. Returns how many watches were added; 0 while the self-tuning queue is not running."""
+        read. `learn`: these nodes were ranked by the salience weights (the fired reading), so their outcomes also
+        teach the weights' tuner; False = scored only (a node another path chose, e.g. the cue-driven recall).
+        Returns how many watches were added; 0 while the self-tuning queue is not running."""
         nodes = self._selftune_store()
         if nodes is None or not node_ids:
             return 0
-        return int(nodes.sf_watch([str(n) for n in node_ids if n]))
+        ids = [str(n) for n in node_ids if n]
+        if not learn:
+            return int(nodes.sf_watch(ids))
+        try:
+            import ng_tract
+            watch = getattr(ng_tract, "surfacing_watch", None)
+            he_cls = getattr(ng_tract, "HyperedgeStore", None)
+        except Exception:  # noqa: BLE001
+            watch = he_cls = None
+        if watch is None:
+            return int(nodes.sf_watch(ids))             # watched and scored, without the inputs the weights learn from
+        hes = self._graph.hyperedges
+        he_arg = hes if (he_cls is not None and isinstance(hes, he_cls)) else None
+        return int(watch(nodes, he_arg, ids, int(getattr(self._graph, 'timestep', 0))))
 
     def engagement_scores(self, drain: bool = False) -> List[Dict[str, Any]]:
         """[2026-11-24] What became of each surfaced node whose window has closed, oldest first: its fires above its
@@ -432,12 +483,20 @@ class SurfacingMonitor:
         # unshowable nodes at the top cannot leave the result short.
         he_arg = hes if (he_cls is not None and isinstance(hes, he_cls)) else None
         top_n = max(int(max_items) * 8, 32)
+        # [2026-11-24] #1251: while NeuroGraph's own tuner runs, the scan ranks with the weights and caps it has
+        # learned; otherwise the config's bootstrap weights and the formula's caps, exactly as before.
+        w_v, w_e, w_h = (float(self._cfg.weight_voltage), float(self._cfg.weight_excitability),
+                         float(self._cfg.weight_he_membership))
+        caps: tuple = ()
+        tuned = self.tuned_weights() if graph_config.get("surfacing_selftune") else None
+        if tuned is not None:
+            w_v, w_e, w_h, exc_cap, he_cap = tuned["values"]
+            caps = (float(exc_cap), float(he_cap))
         results: List[Dict[str, Any]] = []
         while True:
             rows, skipped = scan(nodes, he_arg, int(getattr(self._graph, 'timestep', 0)), float(decay_rate),
-                                 float(min_confidence), float(self._cfg.weight_voltage),
-                                 float(self._cfg.weight_excitability), float(self._cfg.weight_he_membership),
-                                 top_n, float(self._cfg.min_confidence))
+                                 float(min_confidence), w_v, w_e, w_h,
+                                 top_n, float(self._cfg.min_confidence), *caps)
             self._native_scan_skipped = int(skipped)
             results = []
             for node_id, score, _age in rows:
@@ -493,9 +552,21 @@ class SurfacingMonitor:
                 self._selftune_read_warned = True
                 logger.error("the self-tuning surfacing queue could not be read (%s): the existing paths are used",
                              type(exc).__name__)
-        if tuned is not None:
-            return tuned
         native = self._native_surfaced(max_items)   # [2026-11-23] key off / not native -> None -> the queue below
+        if tuned is not None:
+            # [2026-11-24] two readings of what is on the mind, shown side by side (CES: sources are concatenated,
+            # not either/or): what fired lately, ranked by the self-tuned weights, and what is warm and has not
+            # fired. They take turns, the fired reading first; a node in both is shown once.
+            if native is None:
+                return tuned
+            merged: List[Dict[str, Any]] = []
+            seen: set = set()
+            for k in range(max(len(native), len(tuned))):
+                for src in (native, tuned):
+                    if k < len(src) and src[k]["node_id"] not in seen:
+                        seen.add(src[k]["node_id"])
+                        merged.append(src[k])
+            return merged[:max_items]
         if native is not None:
             return native
 
