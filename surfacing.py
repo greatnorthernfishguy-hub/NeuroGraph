@@ -17,6 +17,10 @@ Usage::
     context = monitor.format_context()
 
 # ---- Changelog ----
+# [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; punch #1251) -- tuned_weights() reports samples_in_cycle
+#   What: the number of shown nodes already scored into the weights' open cycle (ng_tract NodeStore.sf_weights_samples;
+#         the key is left out on a wheel without it). Why: after the 2026-11-24 go-live "0 cycles" could not be told
+#         from a hand-over that never arrives. How: read-only.
 # [2026-11-24] Claude (Fable 5.2) — #1251 step 2: the self-tuning surfacing queue (read side; key off by default)
 #   What: With graph.config['surfacing_selftune'] on, get_surfaced() returns the node store's self-tuning queue
 #         (ng_tract NodeStore.sf_queue: nodes that grew warm, strongest first), resolved to their content here.
@@ -355,9 +359,13 @@ class SurfacingMonitor:
             return None
         values, competence, outcomes, cycles, health = nodes.sf_weights()
         names = ("weight_voltage", "weight_excitability", "weight_he_membership", "excitability_cap", "he_membership_cap")
-        return {"values": [float(x) for x in values], "competence": [float(x) for x in competence],
-                "outcomes": [int(x) for x in outcomes], "cycles": int(cycles),
-                "last_mean_engagement": None if health is None else float(health), "names": list(names)}
+        out = {"values": [float(x) for x in values], "competence": [float(x) for x in competence],
+               "outcomes": [int(x) for x in outcomes], "cycles": int(cycles),
+               "last_mean_engagement": None if health is None else float(health), "names": list(names)}
+        samples = getattr(nodes, "sf_weights_samples", None)     # [2026-11-24] shown nodes scored into the OPEN cycle
+        if samples is not None:
+            out["samples_in_cycle"] = int(samples())
+        return out
 
     def _selftune_surfaced(self, max_items: int) -> Optional[List[Dict[str, Any]]]:
         """[2026-11-24] The self-tuning queue's active items, warmest first. None = the key is off, the queue is

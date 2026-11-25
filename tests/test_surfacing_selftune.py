@@ -398,3 +398,18 @@ def test_a_node_removed_mid_window_is_dropped_without_a_score():
     _steps(g, 30)
     assert [s["node_id"] for s in mon.engagement_scores()] == ["n06"]
     assert mon.tuning_stats()["watch_dropped"] == 1
+
+
+def test_the_open_cycles_sample_count_is_reported_when_the_wheel_has_it():
+    g = _graph()
+    mon = _mon(g)
+    tw = mon.tuned_weights()
+    if not hasattr(g.nodes, "sf_weights_samples"):
+        assert "samples_in_cycle" not in tw
+        return
+    assert tw["samples_in_cycle"] == 0
+    _warm(g, "n00", 0.90)
+    g.step()
+    assert mon.note_shown(["n00", "n01"], learn=True) >= 1
+    _steps(g, 31)
+    assert mon.tuned_weights()["samples_in_cycle"] >= 1 and mon.tuned_weights()["cycles"] == 0
