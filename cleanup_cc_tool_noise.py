@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # ---- Changelog ----
+# [2026-11-25] Claude (Fable 5.2, laptop; punch #412 bucket) -- find the nodes that hold a prompt the harness wrote
+# What: harness_prompt_hashes() reads Claude Code session transcripts and returns the hashes of every prompt the
+#       harness itself flags as its own (a user entry with promptSource 'system', or a queued_command attachment
+#       whose origin.kind is 'task-notification') and of every other prompt; find_harness_prompt_nodes() returns
+#       the graph nodes whose own text (_forest_content) is exactly one of the first and none of the second.
+#       cleanup_harness_prompts() removes them (graph node with its synapses / hyperedge memberships, and its
+#       vector-store entry), DRY RUN unless apply=True, with the same atomic write + manifest refresh as cleanup().
+#       scope 'all' = every matched node (the whole-turn node, its windows, and every concept node made from that
+#       prompt); scope 'unconnected' = the whole-turn and window nodes, plus only those concept nodes that have no
+#       synapse to anything outside the matched set. cleanup() (tool echoes) is unchanged. CLI: --harness-prompts.
+# Why:  Josh 2026-11-25: task notifications are to be treated as tools, and the ones already in the main graph
+#       cleaned "after a dry run". The flag is the harness's own; the node's wording is not examined.
+# How:  sha256 of the exact text; streaming read of each transcript; unreadable files and lines are skipped.
 # [2026-10-04] Claude (lane vdb-lock-leak) — vector-store reads go through SimpleVectorDB's locked accessors (#270)
 # What: find_tool_noise uses vdb.get_content; find_orphan_vdb_tool_noise iterates vdb.items_snapshot().
 # Why:  SimpleVectorDB is now guarded by its own leaf lock; direct reads of its embeddings/content/metadata
@@ -90,6 +103,137 @@ def find_orphan_vdb_tool_noise(graph, vdb, already_matched: set) -> list:
     return matches
 
 
+def harness_hash(text: str) -> bytes:
+    return __import__("hashlib").sha256(text.encode("utf-8", "replace")).digest()
+
+
+def harness_prompt_hashes(transcript_paths) -> tuple:
+    """(flagged, other): the hashes of every prompt the harness flags as its own in these session transcripts, and
+    of every other prompt in them. A text in both sets was also typed by someone: it is not the harness's alone."""
+    import json
+    flagged, other = set(), set()
+    for path in transcript_paths:
+        try:
+            with open(path, "rb") as f:
+                for raw in f:
+                    if b'"user"' not in raw and b"queued_command" not in raw:
+                        continue
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(d, dict):
+                        continue
+                    if d.get("type") == "attachment":
+                        a = d.get("attachment")
+                        if isinstance(a, dict) and a.get("type") == "queued_command" and isinstance(a.get("prompt"), str) and a["prompt"]:
+                            o = a.get("origin")
+                            own = isinstance(o, dict) and o.get("kind") == "task-notification"
+                            (flagged if own else other).add(harness_hash(a["prompt"]))
+                        continue
+                    if d.get("type") != "user":
+                        continue
+                    m = d.get("message")
+                    c = m.get("content") if isinstance(m, dict) else None
+                    if isinstance(c, list):
+                        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                            continue
+                        c = "\n".join(b["text"] for b in c if isinstance(b, dict) and b.get("type") == "text"
+                                      and isinstance(b.get("text"), str))
+                    if isinstance(c, str) and c:
+                        (flagged if d.get("promptSource") == "system" else other).add(harness_hash(c))
+        except OSError:
+            continue
+    return flagged, other
+
+
+def find_harness_prompt_nodes(graph, flagged, other) -> list:
+    """Node ids whose own text (_forest_content) is exactly a prompt the harness flagged as its own and nobody typed."""
+    matches = []
+    for node_id, node in graph.nodes.items():
+        text = (getattr(node, "metadata", None) or {}).get("_forest_content")
+        if isinstance(text, str) and text:
+            h = harness_hash(text)
+            if h in flagged and h not in other:
+                matches.append(node_id)
+    return matches
+
+
+def select_harness_prompt_nodes(graph, matched, scope: str = "all") -> dict:
+    """What the clean would remove, by kind. scope 'all': every matched node. scope 'unconnected': the whole-turn and
+    window nodes, and a concept (tree) node only when none of its synapses reaches a node outside `matched`."""
+    if scope not in ("all", "unconnected"):
+        raise ValueError("scope must be 'all' or 'unconnected'")
+    matched = set(matched)
+    outside = set()
+    if scope == "unconnected":
+        for syn in graph.synapses.values():
+            a, b = syn.pre_node_id, syn.post_node_id
+            if a in matched and b not in matched:
+                outside.add(a)
+            elif b in matched and a not in matched:
+                outside.add(b)
+    chosen, kinds, kept = [], {"turn": 0, "window": 0, "concept": 0}, 0
+    for node_id in matched:
+        node = graph.nodes.get(node_id)
+        if node is None:
+            continue
+        meta = getattr(node, "metadata", None) or {}
+        kind = "concept" if meta.get("_tree_concept") else ("window" if ("::window::" in node_id or meta.get("_window")) else "turn")
+        if kind == "concept" and node_id in outside:
+            kept += 1
+            continue
+        chosen.append(node_id)
+        kinds[kind] += 1
+    return {"node_ids": chosen, "by_kind": kinds, "concepts_kept_connected": kept}
+
+
+def cleanup_harness_prompts(main_path: str, vectors_path: str, transcript_paths, apply: bool = False,
+                            scope: str = "all", native_stores: bool = True) -> dict:
+    """Remove the nodes that hold a prompt the harness wrote itself. OFFLINE only; dry run unless apply=True."""
+    from neuro_foundation import Graph
+    from universal_ingestor import SimpleVectorDB
+
+    flagged, other = harness_prompt_hashes(transcript_paths)
+    graph = Graph(None, native_node_store=True, native_hyperedge_store=True) if native_stores else Graph()
+    graph.restore(main_path)
+    vdb = SimpleVectorDB()
+    vdb.load(vectors_path)
+    before = {"nodes": len(graph.nodes), "synapses": len(graph.synapses), "hyperedges": len(graph.hyperedges),
+              "vdb": vdb.count(), "timestep": graph.timestep}
+    matched = find_harness_prompt_nodes(graph, flagged, other)
+    sel = select_harness_prompt_nodes(graph, matched, scope)
+    report = {"status": "dry_run", "scope": scope, "prompts_flagged_by_harness": len(flagged),
+              "prompts_also_typed": len(flagged & other), "matched_nodes": len(matched),
+              "would_remove": len(sel["node_ids"]), "by_kind": sel["by_kind"],
+              "concepts_kept_connected": sel["concepts_kept_connected"],
+              "would_remove_vdb_entries": sum(1 for n in sel["node_ids"] if vdb.get_content(n, None) is not None),
+              "before": before}
+    if not apply:
+        return report
+
+    removed = removed_vdb = 0
+    for node_id in sel["node_ids"]:
+        if node_id in graph.nodes:
+            graph.remove_node(node_id)
+            removed += 1
+        if vdb.delete(node_id):
+            removed_vdb += 1
+    from checkpoint_guardian import atomic_file_write, read_manifest, write_manifest
+    atomic_file_write(main_path, lambda p: graph.checkpoint(p))
+    atomic_file_write(vectors_path, lambda p: vdb.save(p))
+    m = read_manifest(main_path) or {}
+    m.pop("version", None); m.pop("saved_at", None)
+    m.update({"nodes": len(graph.nodes), "synapses": len(graph.synapses),
+              "hyperedges": len(graph.hyperedges), "timestep": graph.timestep,
+              "vdb_count": vdb.count(), "offline_pass": "cleanup_cc_tool_noise:harness_prompts"})
+    write_manifest(main_path, m)
+    report.update({"status": "ok", "removed_nodes": removed, "removed_vdb_entries": removed_vdb,
+                   "after": {"nodes": len(graph.nodes), "synapses": len(graph.synapses),
+                             "hyperedges": len(graph.hyperedges), "vdb": vdb.count(), "timestep": graph.timestep}})
+    return report
+
+
 def cleanup(main_path: str, vectors_path: str, apply: bool = False) -> dict:
     from neuro_foundation import Graph
     from universal_ingestor import SimpleVectorDB
@@ -160,6 +304,10 @@ def main() -> int:
     ap.add_argument("--main-checkpoint", required=True, help="Path to main.msgpack")
     ap.add_argument("--vectors-checkpoint", required=True, help="Path to vectors.msgpack")
     ap.add_argument("--apply", action="store_true", help="Actually remove + save (default: dry run)")
+    ap.add_argument("--harness-prompts", action="store_true",
+                    help="Clean the nodes holding a prompt the harness flagged as its own (needs --transcripts)")
+    ap.add_argument("--transcripts", action="append", default=[], help="Glob of session transcripts (repeatable)")
+    ap.add_argument("--scope", default="all", choices=("all", "unconnected"))
     a = ap.parse_args()
     if not Path(a.main_checkpoint).exists():
         logger.error("checkpoint not found: %s", a.main_checkpoint)
@@ -167,6 +315,17 @@ def main() -> int:
     if not Path(a.vectors_checkpoint).exists():
         logger.error("checkpoint not found: %s", a.vectors_checkpoint)
         return 1
+    if a.harness_prompts:
+        import glob
+        paths = sorted({p for g in a.transcripts for p in glob.glob(g, recursive=True)})
+        if not paths:
+            logger.error("--harness-prompts needs --transcripts globs that match at least one file")
+            return 1
+        r = cleanup_harness_prompts(a.main_checkpoint, a.vectors_checkpoint, paths, apply=a.apply, scope=a.scope)
+        print("\n" + "=" * 44 + "\nCC Harness-Prompt Cleanup\n" + "=" * 44)
+        for k, v in r.items():
+            print(f"  {k}: {v}")
+        return 0
     r = cleanup(a.main_checkpoint, a.vectors_checkpoint, apply=a.apply)
     print("\n" + "=" * 44 + "\nCC Tool-Noise Cleanup\n" + "=" * 44)
     for k, v in r.items():
