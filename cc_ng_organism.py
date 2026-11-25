@@ -3,6 +3,17 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; SQ11, punch #1250 item D) -- the CC's outbound intent deposit
+# What: cc_outbound_tract_path() (env CC_NG_OUTBOUND_TRACT, LAW 5) and cc_deposit_outbound_intent(text): one raw
+#   experience frame (source "cc_outbound") appended to the CC's own outbound tract by the crate's tract writer.
+# Why:  Josh 2026-11-23/24: a want the CC's Tonic surfaces should be able to start a turn with no message from him,
+#   as Syl's Outbound Initiator does (neurograph_rpc.deposit_outbound_intent -> animus_outbound.tract -> Anima's
+#   outbound.rs). generate_emergent_want left that half out on purpose ("CC has no equivalent"); the six rulings in
+#   docs/prd/2026-11-24-cc-own-turn-channel-proposal.md now define the equivalent. This is only the deposit: being in
+#   the tract is the whole signal (LAW 7); a host-side drainer decides when a frame becomes a turn.
+# How:  ng_tract.deposit_experience (the BTF writer every other CC tract uses), not Syl's hand-built frame; the text
+#   is the want as the mind composed it, whole. The host calls this after generate_emergent_want returns a want;
+#   generate_emergent_want itself is NOT touched (#905).
 # [2026-11-22] DudeMan CC (Claude Fable 5.2, laptop) -- Card 8 re-done on the current line: Quest out of the Pith
 #   provider context (punch #1249; branch z11-card8-quest-removal-20260929 held finished and reviewed since 09-28).
 # What: _pith_provider_cue no longer validates or appends quest_focus; pith_provider_context no longer closes the
@@ -5323,6 +5334,35 @@ def bootstrap_trisynaptic(memory: Any, queue: List[Dict[str, Any]],
 _DEFAULT_CC_GATEWAY_TRACT_PATH = os.path.expanduser(
     "~/.claude/plugins/neurograph/tracts/cc_gateway/turns.tract"
 )
+
+
+_DEFAULT_CC_OUTBOUND_TRACT_PATH = os.path.expanduser("~/.et_modules/shared_learning/cc_outbound.tract")
+
+
+def cc_outbound_tract_path() -> str:
+    """[2026-11-24] The CC's own outbound tract (LAW 5: CC_NG_OUTBOUND_TRACT). The deposit below and the host-side
+    drainer read the same variable with the same default."""
+    return os.environ.get("CC_NG_OUTBOUND_TRACT", "").strip() or _DEFAULT_CC_OUTBOUND_TRACT_PATH
+
+
+def cc_deposit_outbound_intent(text: str, tract_path: Optional[str] = None) -> bool:
+    """[2026-11-24] Append one raw outbound intent (a want the mind composed) to the CC's outbound tract.
+
+    The CC counterpart of neurograph_rpc.deposit_outbound_intent. Raw text in, nothing classified (LAW 7): being in
+    this tract is the signal. Returns True when a frame was written. Empty text writes nothing. A failure is one
+    WARNING (exception class only, never the text) and False: a want that could not be deposited is still a
+    want-node in the mind."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    path = tract_path or cc_outbound_tract_path()
+    try:
+        import ng_tract
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ng_tract.deposit_experience(text.encode("utf-8"), "cc_outbound", [path])
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CC outbound intent NOT deposited: reason=deposit_failed exc_class=%s", type(exc).__name__)
+        return False
 
 
 def cc_gateway_tract_path() -> str:
