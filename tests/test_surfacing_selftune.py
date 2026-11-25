@@ -43,6 +43,9 @@ class _Vdb:
 
 def _graph(n=12, kind="native"):
     g = S.graph_of(NF, kind)
+    # these test nodes have no synapses: without this the orphan sweep removes them after 25 steps, mid-window
+    # (a node removed mid-window is dropped unscored, which test_a_node_removed_mid_window... pins)
+    g.config["orphan_node_grace_period"] = 10 ** 9
     for i in range(n):
         g.create_node("n%02d" % i)
     return g
@@ -373,3 +376,25 @@ def test_nodes_shown_without_learn_are_scored_but_do_not_teach_the_weights():
     assert len(mon.engagement_scores()) == 24
     w = mon.tuned_weights()
     assert w["cycles"] == 0 and w["values"] == BOOT
+
+
+def test_a_queued_node_the_host_then_shows_is_taken_up_for_the_weights_once():
+    g = _graph()
+    mon = _mon(g)
+    _warm(g, "n00", 0.90)
+    g.step()
+    assert _ids(mon) == ["n00"]                         # in the queue: already being watched, without its inputs
+    assert mon.note_shown(["n00"]) == 1                 # the host shows it: the watch takes its inputs
+    assert mon.note_shown(["n00"]) == 0                 # once
+    assert mon.tuning_stats()["watching"] == 1          # still one watch, its window unchanged
+
+
+def test_a_node_removed_mid_window_is_dropped_without_a_score():
+    g = _graph()
+    mon = _mon(g)
+    assert mon.note_shown(["n05", "n06"], learn=False) == 2
+    g.step()
+    g.remove_node("n05")
+    _steps(g, 30)
+    assert [s["node_id"] for s in mon.engagement_scores()] == ["n06"]
+    assert mon.tuning_stats()["watch_dropped"] == 1
