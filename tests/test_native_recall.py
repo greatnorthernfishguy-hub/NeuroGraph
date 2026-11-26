@@ -1,4 +1,10 @@
 # ---- Changelog ----
+# [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1131) -- prime_and_propagate(evoked=True)
+# What: with a wheel whose recall_sweep takes `evoked`, the read-mode call returns result.evoked True and exactly the
+#       nodes whose first firing under the cue is above their first firing with zero current (two plain calls on the
+#       same state), with the net voltage; the mind is unchanged. A wheel without the keyword, the key off, or a
+#       non-native graph gives result.evoked False and the plain result.
+# Why:  stage 3 plan s13-14: the subtraction has to happen before the harvest cuts its pool.
 # [2026-11-21] DudeMan CC (Claude Fable 5.2, laptop) -- read-mode prime_and_propagate as one native call
 #   (config native_recall_enabled; ng_tract.recall_sweep; SQ10, punch #1221 / #1201 option B).
 # What: on ONE graph at one moment, the same recall twice: the existing Python sweep (key absent), then the native
@@ -163,3 +169,77 @@ def test_a_graph_that_is_not_native_logs_once_and_runs_the_python_sweep(kind, ca
         b = g.prime_and_propagate(ids, [2.0] * 3, steps=2)
     assert _rows(a) == _rows(b) and len(a.fired_entries) > 0
     assert sum(KEY in r.message for r in caplog.records) == 1
+
+
+# ---------------------------------------------------------------- [2026-11-26] evoked=True (#1131)
+_HAS_EVOKED = "evoked" in (getattr(getattr(NF.ng_tract, "recall_sweep", None), "__text_signature__", "") or "")
+
+
+def _first(res):
+    out = {}
+    for e in res.fired_entries:
+        out.setdefault(e.node_id, e)
+    return out
+
+
+@pytest.mark.skipif(not _HAS_EVOKED, reason="installed ng_tract.recall_sweep has no evoked keyword")
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("arm", sorted(ARMS))
+def test_evoked_is_the_cue_sweep_minus_the_stimulus_free_sweep(seed, arm):
+    g = _warm(seed, ARMS[arm])
+    g.config[KEY] = True
+    rng = random.Random(seed + 50)
+    ids_all = sorted(g.nodes.keys())
+    kept_any = dropped_any = 0
+    for trial in range(6):
+        ids = rng.sample(ids_all, min(3 + trial, len(ids_all)))
+        cur = [rng.uniform(0.8, 2.5) for _ in ids]
+        steps = 3 + trial % 3
+        before = _state(g)
+        cue = g.prime_and_propagate(ids, cur, steps=steps)
+        null = g.prime_and_propagate(ids, [0.0] * len(ids), steps=steps)
+        ev = g.prime_and_propagate(ids, cur, steps=steps, evoked=True)
+        assert _state(g) == before
+        assert ev.evoked is True and cue.evoked is False and null.evoked is False
+        c, n = _first(cue), _first(null)
+        want = {}
+        for nid, e in c.items():
+            net = e.voltage_at_fire - (n[nid].voltage_at_fire if nid in n else 0.0)
+            if net > 0.0:
+                want[nid] = (e.firing_step, net, e.was_predicted, e.source_distance)
+        got = {e.node_id: (e.firing_step, e.voltage_at_fire, e.was_predicted, e.source_distance)
+               for e in ev.fired_entries}
+        assert len(got) == len(ev.fired_entries), "one entry per node"
+        assert got == want
+        kept_any += len(want)
+        dropped_any += len(c) - len(want)
+    assert kept_any > 0 and dropped_any > 0     # not vacuous: the rule both kept and dropped nodes
+
+
+def test_a_wheel_without_the_keyword_gives_the_plain_result(monkeypatch):
+    g = _warm(0, ARMS["plain"])
+    g.config[KEY] = True
+    ids = sorted(g.nodes.keys())[:4]
+    cur = [1.5] * len(ids)
+    plain = g.prime_and_propagate(ids, cur, steps=3)
+    orig = NF.ng_tract.recall_sweep
+    seen = []
+
+    def old_wheel(*a, **k):          # a Python function has no __text_signature__: what an older wheel looks like
+        seen.append(dict(k))
+        return orig(*a)
+    monkeypatch.setattr(NF.ng_tract, "recall_sweep", old_wheel)
+    res = g.prime_and_propagate(ids, cur, steps=3, evoked=True)
+    assert seen == [{}], "the keyword is not sent to a wheel that does not take it"
+    assert res.evoked is False and _rows(res) == _rows(plain)
+
+
+def test_evoked_on_a_graph_that_is_not_native_runs_the_plain_python_sweep():
+    g = NF.Graph()
+    for nid in ("a", "b"):
+        g.create_node(node_id=nid)
+    g.create_synapse("a", "b", weight=1.0)
+    plain = g.prime_and_propagate(["a"], [2.0], steps=2)
+    res = g.prime_and_propagate(["a"], [2.0], steps=2, evoked=True)
+    assert res.evoked is False and _rows(res) == _rows(plain)
+

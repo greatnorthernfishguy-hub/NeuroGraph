@@ -168,6 +168,15 @@
 #         _concurrent_lock past shutdown's 90 s wait, so the final graph save was skipped (~12 min lost). Its pass cap
 #         (CC_NG_DRAIN_MAX_SECONDS 120) is longer than the wait.
 #   How:  default None = behaviour unchanged; the daemon passes `lambda: not STATE.running`.
+# [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1131) -- evoked before the pool cut
+# What: with CC_RECALL_EVOKED on, cc_pattern_completion_recall asks the harvest for the evoked nodes
+#       (_harvest_associations(evoked_override=True) -> prime_and_propagate(evoked=True) -> ng_tract.recall_sweep(
+#       evoked=True)). Items that come back marked "evoked" are only re-sorted by their net strength; the Python
+#       rule (_cc_evoked_over_spontaneous, a second sweep on the already-cut pool) stays as the path for a harvest
+#       that could not do it (older wheel, non-native store, declined call). No new switch.
+# Why:  copy run PV1126 (2026-11-26): the pool of 48 earliest firers was all background, the rule kept a median of 0,
+#       and the composed context was empty at 9-10 of 17 real moments. Stage 3 plan s13-14.
+# How:  _cc_evoked_kwargs(); one branch at the rule's call site.
 # [2026-10-16] Claude Code (Opus 5.5) — #1131 condition F: recall reports what the cue EVOKED (gated, default OFF)
 # What: cc_pattern_completion_recall gains an evoked-minus-spontaneous stage behind CC_RECALL_EVOKED (default "0";
 #       knob CC_RECALL_EVOKED_OVERSAMPLE, default 6). When on: the harvest is oversampled (k x 6), ONE stimulus-free
@@ -6715,6 +6724,13 @@ _CC_RECALL_EVOKED = os.environ.get("CC_RECALL_EVOKED", "0") not in ("0", "false"
 _CC_RECALL_EVOKED_OVERSAMPLE = max(1, int(os.environ.get("CC_RECALL_EVOKED_OVERSAMPLE", "6")))
 
 
+def _cc_evoked_kwargs() -> Dict[str, Any]:
+    """[2026-11-26] #1131: with CC_RECALL_EVOKED on, ask the harvest's sweep for the evoked nodes only (the subtraction
+    happens in the native sweep, before the harvest cuts its pool). Empty when the switch is off, so the harvest call is
+    the one it always was. A harvest that could not do it returns unmarked items and the Python rule below runs."""
+    return {"evoked_override": True} if _CC_RECALL_EVOKED else {}
+
+
 def _cc_recall_harvest_steps(graph: Any, novelty: float) -> int:
     """The propagation depth the recall harvest actually runs, so the spontaneous sweep
     covers the same window.  Mirrors openclaw_hook._harvest_associations' step choice
@@ -6845,6 +6861,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                 propagation_steps_override=(
                     _CC_RECALL_PROP_STEPS if _CC_RECALL_PROP_STEPS > 0 else None
                 ),
+                **_cc_evoked_kwargs(),
             )
         else:
             # Existing hook recall temporarily overrides the graph's harvest
@@ -6855,7 +6872,8 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             if _CC_RECALL_PROP_STEPS > 0:
                 cfg["propagation_steps"] = _CC_RECALL_PROP_STEPS
             try:
-                surfaced = [] if harvest_skip else ng._harvest_associations(query, novelty=novelty)
+                surfaced = [] if harvest_skip else ng._harvest_associations(
+                    query, novelty=novelty, **_cc_evoked_kwargs())
             finally:
                 cfg["max_surfaced"] = old_max
                 cfg["prime_threshold"] = old_thresh
@@ -6867,8 +6885,13 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         # sweep sees the same network moment the harvest's propagation did. Skipped
         # when the harvest found nothing (no cost on an empty recall).
         if _CC_RECALL_EVOKED and surfaced:
-            surfaced = _cc_evoked_over_spontaneous(
-                ng.graph, surfaced, _cc_recall_harvest_steps(ng.graph, novelty))
+            if all(item.get("evoked") for item in surfaced):
+                # [2026-11-26] the native sweep already kept only what the cue evoked, before the harvest's cut;
+                # same order the Python rule leaves (net strength, strongest first). No second sweep.
+                surfaced.sort(key=lambda x: x.get("strength", 0.0), reverse=True)
+            else:
+                surfaced = _cc_evoked_over_spontaneous(
+                    ng.graph, surfaced, _cc_recall_harvest_steps(ng.graph, novelty))
 
         # Anticipatory bonus (#256 port) -- canonical rpc.py:2981-2989
         promoted_ids: set = set()

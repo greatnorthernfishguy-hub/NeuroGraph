@@ -151,10 +151,12 @@ def test_spontaneous_sweep_is_one_read_mode_call_at_the_harvest_depth(switch, mo
             calls = []
             real = ng.graph.prime_and_propagate
 
-            def spy(node_ids, currents, steps=3, write_mode=False, _real=real):
+            def spy(node_ids, currents, steps=3, write_mode=False, _real=real, **kw):
+                # [2026-11-26] the harvest now asks for evoked=True; this dict graph cannot do it natively, so the
+                # result comes back unmarked and the second (stimulus-free) sweep still runs, as asserted below
                 calls.append((list(currents), steps, write_mode))
                 return _real(node_ids=node_ids, currents=currents, steps=steps,
-                             write_mode=write_mode)
+                             write_mode=write_mode, **kw)
             ng.graph.prime_and_propagate = spy
             for preserve in (False, True):
                 calls.clear()
@@ -229,3 +231,45 @@ def test_env_defaults_are_off():
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
                          capture_output=True, text=True, timeout=300)
     assert out.stdout.strip().splitlines()[-1] == "False 6", out.stderr[-2000:]
+
+
+# ---------------------------------------------------------------- [2026-11-26] the sweep did the subtraction (#1131)
+def test_items_the_sweep_marked_evoked_are_not_filtered_again(switch, monkeypatch):
+    """When the harvest's sweep already returned only evoked nodes (native recall_sweep(evoked=True)), the organism
+    makes no second sweep and only orders by net strength."""
+    switch(True)
+    ng = _build_ng()
+    real = ng.graph.prime_and_propagate
+    calls = []
+
+    def native_like(node_ids, currents, steps=3, write_mode=False, evoked=False):
+        calls.append((list(currents), evoked))
+        res = real(node_ids=node_ids, currents=currents, steps=steps, write_mode=write_mode)
+        if evoked:      # stand in for the native sweep: keep the cue's chain, with net strengths, and say so
+            res.fired_entries[:] = [e for e in res.fired_entries if e.node_id in ("cue", "evoked")]
+            for e in res.fired_entries:
+                e.voltage_at_fire = {"cue": 0.25, "evoked": 0.75}[e.node_id]
+            res.evoked = True
+        return res
+    ng.graph.prime_and_propagate = native_like
+    for preserve in (False, True):
+        calls.clear()
+        out = org.cc_pattern_completion_recall(ng, CUE_TEXT, k=4, state={}, preserve_graph_config=preserve)
+        assert len(calls) == 1 and calls[0][1] is True, calls          # one sweep, asked for evoked
+        assert _ids(out) == ["evoked", "cue"]                          # net strength, strongest first
+        assert [r["score"] for r in out] == [0.75, 0.25]
+
+
+def test_switch_off_does_not_ask_the_sweep_for_evoked(switch):
+    switch(False)
+    ng = _build_ng()
+    real = ng.graph.prime_and_propagate
+    seen = []
+
+    def spy(node_ids, currents, steps=3, write_mode=False, **kw):
+        seen.append(dict(kw))
+        return real(node_ids=node_ids, currents=currents, steps=steps, write_mode=write_mode, **kw)
+    ng.graph.prime_and_propagate = spy
+    org.cc_pattern_completion_recall(ng, CUE_TEXT, k=2)
+    assert seen == [{}]
+
