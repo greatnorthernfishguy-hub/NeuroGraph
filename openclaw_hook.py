@@ -28,6 +28,16 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1131; Josh 2026-11-26 "You have my proceed.")
+# (PROTECTED CHANGE on branch cc-laptop-evoked-recall-20261126; its own commit)
+# What: _harvest_associations(evoked_override=None), beside max_surfaced_override / propagation_steps_override. True is
+#       passed to graph.prime_and_propagate(evoked=True); when the sweep reports it did so (result.evoked), each
+#       harvested item is marked "evoked": True and its strength is the net (evoked minus spontaneous) value.
+#       None / False = the call and the result exactly as before.
+# Why:  the harvest sorts by firing step and cuts to the pool here; cc_ng_organism subtracted background firing only
+#       afterwards, so with hundreds of stimulus-free firers the pool was all background (copy run PV1126: nothing
+#       recalled at 9-10 of 17 real moments). The subtraction now happens in the sweep, before this cut.
+# How:  one keyword passed through and one mark on the items; no change to seeds, sort or cut.
 # [2026-11-18] DudeMan CC (#1243; Josh 2026-11-18 "openclaw hook is also supposed to be msgpack") — _sidecar_defect reads msgpack
 # (PROTECTED CHANGE on branch cc-laptop-activations-msgpack-1243-20261118; its own commit)
 # What: _sidecar_defect() unpacks the activation sidecar as msgpack instead of json.load. Nothing else: the file name
@@ -1343,8 +1353,16 @@ class NeuroGraphMemory:
         *,
         max_surfaced_override: Optional[int] = None,
         propagation_steps_override: Optional[int] = None,
+        evoked_override: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic priming + spreading activation harvest.
+
+        evoked_override ([2026-11-26], #1131): True asks the sweep for only what the
+        cue drove above its own stimulus-free firing. When the sweep did that, each
+        returned item carries "evoked": True and its strength is the net value, so
+        the cut below is taken among evoked nodes; when it could not (an older wheel,
+        a non-native store, a declined call) nothing changes and no item is marked.
+        None / False (default) = unchanged.
 
         Embeds the input text, finds similar existing nodes via the vector DB,
         injects current into those nodes, runs N SNN steps, and harvests
@@ -1401,7 +1419,9 @@ class NeuroGraphMemory:
                 node_ids=prime_ids,
                 currents=prime_currents,
                 steps=propagation_steps,
+                **({"evoked": True} if evoked_override else {}),
             )
+            sweep_evoked = bool(getattr(propagation, "evoked", False))
 
             # Harvest content from fired nodes
             surfaced = []
@@ -1422,6 +1442,7 @@ class NeuroGraphMemory:
                         "latency": entry.firing_step,
                         "strength": entry.voltage_at_fire,
                         "was_predicted": entry.was_predicted,
+                        **({"evoked": True} if sweep_evoked else {}),
                     })
 
             # Sort: lower latency first, then higher strength
