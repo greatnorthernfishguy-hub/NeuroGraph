@@ -1,3 +1,13 @@
+# [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1131; Josh 2026-11-26 "You have my proceed.")
+#   What: prime_and_propagate(evoked=False) and _native_recall(evoked=False). With evoked=True on a read-mode sweep the
+#     native call is ng_tract.recall_sweep(evoked=True): only nodes the cue drove above their own stimulus-free
+#     firing come back, with the net strength, and PropagationResult.evoked is True. A wheel without the keyword, a
+#     declined native call or a non-native store leaves evoked False and the result exactly as before, so the caller
+#     can tell and apply its own rule. Default False = unchanged.
+#   Why: the evoked-minus-spontaneous rule (dev-log 2026-10-16, #1131) ran in cc_ng_organism AFTER the harvest had cut
+#     the fired list to its earliest firers; with hundreds of nodes firing with no cue the pool was all background and
+#     recall came back empty at 9-10 of 17 real moments (copy run PV1126, stage 3 plan s13-14).
+#   How: one keyword passed through; no sweep logic here (it is in ng-tract-rs recall.rs).
 # [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; punch #1251) — COMMENTS ONLY: who tunes these values
 #   What: Three DEFAULT_CONFIG comments name NeuroGraph as the tuner of its own values, not Elmer. No code change.
 #   Why: Josh 2026-11-23: nothing here was ever meant to be tuned BY Elmer. Each mind / NG-Lite tunes its own values;
@@ -2318,6 +2328,7 @@ class PropagationResult:
     fired_entries: List[FiredEntry] = field(default_factory=list)
     steps_run: int = 0
     nodes_primed: int = 0
+    evoked: bool = False   # [2026-11-26] True = the native sweep already kept only what the cue evoked (#1131)
 
 
 # ---------------------------------------------------------------------------
@@ -4954,6 +4965,7 @@ class Graph:
         currents: List[float],
         steps: int = 3,
         write_mode: bool = False,
+        evoked: bool = False,
     ) -> PropagationResult:
         """Prime nodes and propagate activation through the network.
 
@@ -4975,6 +4987,9 @@ class Graph:
             steps: Number of SNN steps to propagate.
             write_mode: If True, enable plasticity and persist voltage
                 changes. Used by The Tonic for latent space exploration.
+            evoked: [2026-11-26] read mode only. Ask the native sweep to return
+                only what the cue drove above its own stimulus-free firing
+                (result.evoked says whether it did; False = the plain result).
 
         Returns:
             PropagationResult with all nodes that fired, ranked by latency.
@@ -4986,7 +5001,7 @@ class Graph:
             # [2026-11-21] native_recall_enabled: the whole read-mode sweep as one native call (a declined call has
             # put everything back; the loop below then runs)
             if not write_mode and self.config.get("native_recall_enabled", False):
-                _nr = self._native_recall(node_ids, currents, steps)
+                _nr = self._native_recall(node_ids, currents, steps, evoked=evoked)
                 if _nr is not None:
                     return _nr
 
@@ -6212,7 +6227,8 @@ class Graph:
                 row[k - 1] += cur
         return out
 
-    def _native_recall(self, node_ids: List[str], currents: List[float], steps: int) -> Optional["PropagationResult"]:
+    def _native_recall(self, node_ids: List[str], currents: List[float], steps: int,
+                       evoked: bool = False) -> Optional["PropagationResult"]:
         """[2026-11-21] Read-mode prime_and_propagate as ng_tract.recall_sweep (caller holds _step_lock). None = the
         stores are not the native ones (logged once) or the call declined: the caller's own sweep runs."""
         if not (hasattr(ng_tract, "recall_sweep") and getattr(self, "_native_he_passes", False)
@@ -6224,20 +6240,23 @@ class Graph:
             return None
         st = self._stability_params()
         on = bool(self.config.get("recall_brakes_enabled", False))
+        # [2026-11-26] evoked only when the wheel's recall_sweep takes the keyword (an older wheel: the plain sweep)
+        evoked = bool(evoked) and "evoked" in (getattr(ng_tract.recall_sweep, "__text_signature__", "") or "")
         out = ng_tract.recall_sweep(
             self.nodes, self.synapses, self.hyperedges, self._pb, [str(n) for n in node_ids],
             [float(c) for c in currents], int(steps), self.config["decay_rate"], self.config["he_experience_threshold"],
             st.he if st is not None and st.he is not None else None,
             self._recall_brakes(st) if on else None,
             on and getattr(type(self.nodes), "recall_round", 0) >= 1,
-            [t for ps in self._active_predictions.values() for t in ps.predicted_targets])
+            [t for ps in self._active_predictions.values() for t in ps.predicted_targets],
+            **({"evoked": True} if evoked else {}))
         if out is None:
             return None
         fired, brakes_declined = out
         if brakes_declined:
             self._stab_error_once(("recall_brakes_enabled",), "a canonical node store (recall_detect declined; this "
                                   "sweep step ran without the brakes)")
-        result = PropagationResult(steps_run=steps, nodes_primed=len(node_ids))
+        result = PropagationResult(steps_run=steps, nodes_primed=len(node_ids), evoked=evoked)
         result.fired_entries.extend(
             FiredEntry(node_id=nid, firing_step=k, voltage_at_fire=v, was_predicted=p, source_distance=d)
             for nid, k, v, p, d in fired)
