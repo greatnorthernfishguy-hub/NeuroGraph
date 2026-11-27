@@ -28,6 +28,16 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1254c; Josh 2026-11-27 "3. Proceed")
+# (PROTECTED CHANGE on branch cc-laptop-harvest-unindexed-20261127; its own commit)
+# What: _harvest_associations(keep_unindexed_override=None). True keeps a fired node that the vector DB has no row
+#       for, as long as the graph still has the node: the item carries empty content, empty metadata and
+#       "unindexed": True, and the caller resolves the text from the node itself. None / False = exactly as before
+#       (such a node is dropped).
+# Why:  the vector DB only seeds; what surfaces is what fires. But the harvest kept a fired node only if the vector DB
+#       had a row for it, so window nodes, small tree concepts and wants (6,164 of 86,018 nodes on the laptop CC,
+#       2026-11-27) could fire and never surface; 44 of 1,177 fired nodes were dropped this way in copy run SEED1126.
+# How:  one keyword and one branch at the vector DB lookup; no change to seeds, sweep, sort or cut.
 # [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1131; Josh 2026-11-26 "You have my proceed.")
 # (PROTECTED CHANGE on branch cc-laptop-evoked-recall-20261126; its own commit)
 # What: _harvest_associations(evoked_override=None), beside max_surfaced_override / propagation_steps_override. True is
@@ -1354,8 +1364,14 @@ class NeuroGraphMemory:
         max_surfaced_override: Optional[int] = None,
         propagation_steps_override: Optional[int] = None,
         evoked_override: Optional[bool] = None,
+        keep_unindexed_override: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic priming + spreading activation harvest.
+
+        keep_unindexed_override ([2026-11-27], #1254c): True keeps a fired node the
+        vector DB has no row for (the graph must still have it). Its item has empty
+        content and metadata and "unindexed": True; the caller takes the text from
+        the node. None / False (default) = unchanged: such a node is dropped.
 
         evoked_override ([2026-11-26], #1131): True asks the sweep for only what the
         cue drove above its own stimulus-free firing. When the sweep did that, each
@@ -1434,6 +1450,12 @@ class NeuroGraphMemory:
                 seen.add(entry.node_id)
 
                 db_entry = self.vector_db.get(entry.node_id)
+                unindexed = False
+                if (db_entry is None and keep_unindexed_override
+                        and entry.node_id in self.graph.nodes):
+                    # #1254c: the node fired and exists; the vector DB only seeds.
+                    db_entry = {}
+                    unindexed = True
                 if db_entry is not None:
                     surfaced.append({
                         "node_id": entry.node_id,
@@ -1443,6 +1465,7 @@ class NeuroGraphMemory:
                         "strength": entry.voltage_at_fire,
                         "was_predicted": entry.was_predicted,
                         **({"evoked": True} if sweep_evoked else {}),
+                        **({"unindexed": True} if unindexed else {}),
                     })
 
             # Sort: lower latency first, then higher strength
