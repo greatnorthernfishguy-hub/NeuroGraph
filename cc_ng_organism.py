@@ -3,6 +3,16 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11) -- CC_RECALL_CUE_NG_EMBED: recall's cue leaves the Ingestor
+# What: with the switch on, a recall embeds its cue once with ng_embed directly (_cc_cue_vec: ng_embed.embed, then one
+#       L2 normalisation, the same vector the Ingestor's embed_text returns) and hands it to the harvest
+#       (_harvest_associations(query_vec_override=), protected, its own commit) and to the GSG re-score. The
+#       Ingestor's embedder and its private cache (_cc_hold_harvest_vector) are not touched on this path. It
+#       supersedes CC_RECALL_ONE_EMBED when on. Off (default) = as before.
+# Why:  Josh 2026-11-27: "We don't use the Universal Ingestor for experience or recall, only the pattern". The cue was
+#       embedded by self.ingestor.embedder (the Ingestor's EmbeddingEngine), and #922 / #1201 reached into its cache.
+# How:  CCRecallEmbeddings.cue_direct marks a prepared vector made this way; an ng_embed failure falls back to the
+#       old path for that call (the harvest then embeds and fails or succeeds exactly as before).
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_NG_VDB_CAPTURE_SPLIT
 # What: cc_enable_vdb_two_stage_capture(vdb) sets vdb.two_stage_capture when the env is 1, so a save takes only the
 #       vector DB's references inside the step lock and copies after it. Row metadata is detached inside the lock
@@ -6899,8 +6909,18 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
     try:
         from surface_resolver import resolve_surface_content
         harvest_skip = prepared is not None and prepared.harvest_status == "failed"
+        cue_vec = None   # [2026-11-27] CC_RECALL_CUE_NG_EMBED: the cue's vector from ng_embed, handed to the harvest
         if prepared is not None and prepared.harvest_status == "warm":
-            _cc_hold_harvest_vector(ng, prepared)
+            if getattr(prepared, "cue_direct", False):
+                cue_vec = prepared.harvest_vec
+            else:
+                _cc_hold_harvest_vector(ng, prepared)
+        elif prepared is None and RECALL_CUE_NG_EMBED:
+            try:
+                cue_vec = _cc_cue_vec(query)
+            except Exception as exc:
+                logger.debug("recall: direct cue embed failed, the harvest embeds as before: %s", type(exc).__name__)
+        _cue_kw = {"query_vec_override": cue_vec} if cue_vec is not None else {}
         novelty = cc_novelty(state, ng.graph) if state is not None else 0.5
         cfg = ng.graph.config
         old_max = cfg.get("max_surfaced", 10)
@@ -6925,6 +6945,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                     _CC_RECALL_PROP_STEPS if _CC_RECALL_PROP_STEPS > 0 else None
                 ),
                 **_cc_evoked_kwargs(),
+                **_cue_kw,
             )
         else:
             # Existing hook recall temporarily overrides the graph's harvest
@@ -6936,7 +6957,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                 cfg["propagation_steps"] = _CC_RECALL_PROP_STEPS
             try:
                 surfaced = [] if harvest_skip else ng._harvest_associations(
-                    query, novelty=novelty, **_cc_evoked_kwargs())
+                    query, novelty=novelty, **_cc_evoked_kwargs(), **_cue_kw)
             finally:
                 cfg["max_surfaced"] = old_max
                 cfg["prime_threshold"] = old_thresh
@@ -7005,7 +7026,8 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
             # vector (a cache hit on the embedder, it ran a moment ago) serves the re-score; None = embed as before.
             # Only when there is something to re-score (review 2026-11-27: an empty list must not cost an embedding).
             surfaced = cc_gsg_rescore(surfaced, query, ng.graph,
-                                      query_emb=_cc_one_embed_vec(ng, query) if surfaced else None)
+                                      query_emb=(cue_vec if cue_vec is not None
+                                                 else (_cc_one_embed_vec(ng, query) if surfaced else None)))
         elif not prepared.gsg_failed:
             surfaced = cc_gsg_rescore(surfaced, query, ng.graph, query_emb=prepared.gsg_emb)
         # (a prepared whose GSG embed failed: un-rescored, as cc_gsg_rescore's fail-soft returns it)
@@ -7391,12 +7413,27 @@ class CCRecallEmbeddings:
     harvest_vec: Any = None
     gsg_emb: Any = None
     gsg_failed: bool = False
+    cue_direct: bool = False   # [2026-11-27] harvest_vec came from ng_embed directly (CC_RECALL_CUE_NG_EMBED)
 
 
 def _cc_harvest_embedder(ng: Any) -> Any:
     """The embedder ng._harvest_associations embeds its query with (self.ingestor.embedder)."""
     embedder = getattr(getattr(ng, "ingestor", None), "embedder", None)
     return embedder if callable(getattr(embedder, "embed_text", None)) else None
+
+
+# [2026-11-27] recall's cue is embedded with ng_embed directly, not through the Ingestor's embedder. LAW 5: the env.
+RECALL_CUE_NG_EMBED = os.environ.get("CC_RECALL_CUE_NG_EMBED", "0") == "1"
+
+
+def _cc_cue_vec(query: str) -> Any:
+    """The cue's unit vector from ng_embed alone: ng_embed.embed(query), L2-normalised once (what the Ingestor's
+    embed_text returns for the same text: it runs ng_embed.embed_batch and normalises). RAISES when ng_embed does."""
+    import numpy as _np
+    from ng_embed import embed as _embed
+    vec = _np.asarray(_embed(query), dtype=_np.float32)
+    norm = float(_np.linalg.norm(vec))
+    return vec / _np.float32(norm) if norm > 0 else vec
 
 
 # [2026-11-27] #1201 (quest SQ11): with CC_RECALL_ONE_EMBED=1 a recall embeds its query once, not twice. LAW 5: the env.
@@ -7432,6 +7469,13 @@ def cc_recall_prepare(ng: Any, query: str) -> Optional[CCRecallEmbeddings]:
     if not query or ng is None:
         return None
     try:
+        if RECALL_CUE_NG_EMBED:
+            try:
+                _vec = _cc_cue_vec(query)
+                return CCRecallEmbeddings(query=query, harvest_status="warm", harvest_vec=_vec, gsg_emb=_vec,
+                                          gsg_failed=False, cue_direct=True)
+            except Exception as exc:
+                logger.debug("cc_recall_prepare: direct cue embed failed, using the old path: %s", type(exc).__name__)
         harvest_status, harvest_vec = "absent", None
         embedder = _cc_harvest_embedder(ng)
         if embedder is not None:
