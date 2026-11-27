@@ -28,6 +28,14 @@ Usage:
     print(ng.stats())
 
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11; Josh 2026-11-27 "Yes to all 3 of your proposals")
+# (PROTECTED CHANGE on branch cc-laptop-cue-ng-embed-20261127; its own commit)
+# What: _harvest_associations(query_vec_override=None). When the caller hands in the cue's vector, the harvest
+#       seeds from it and does not call self.ingestor.embedder. None (default) = embed through the Ingestor's
+#       embedder exactly as before.
+# Why:  the Universal Ingestor is the document path; experience and recall must not run through it (Josh,
+#       2026-07-31, 09-26, 11-25, 11-27). Recall's cue was embedded by the Ingestor's EmbeddingEngine.
+# How:  one keyword and one conditional at the embed; no change to seeds, sweep, sort or cut.
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201; Josh 2026-11-27 "Yes, you may proceed.")
 # (PROTECTED CHANGE on branch cc-laptop-vdb-capture-split-20261127; its own commit)
 # What: _capture_checkpoint_state: when the vector DB has two_stage_capture set (default False), only its
@@ -1364,8 +1372,12 @@ class NeuroGraphMemory:
         max_surfaced_override: Optional[int] = None,
         propagation_steps_override: Optional[int] = None,
         evoked_override: Optional[bool] = None,
+        query_vec_override: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic priming + spreading activation harvest.
+
+        query_vec_override ([2026-11-27]): the cue's embedding, computed by the caller.
+        When given, the Ingestor's embedder is not called. None (default) = unchanged.
 
         evoked_override ([2026-11-26], #1131): True asks the sweep for only what the
         cue drove above its own stimulus-free firing. When the sweep did that, each
@@ -1404,7 +1416,8 @@ class NeuroGraphMemory:
 
         try:
             # Embed the input and find similar existing nodes
-            query_vec = self.ingestor.embedder.embed_text(text)
+            query_vec = (self.ingestor.embedder.embed_text(text)
+                         if query_vec_override is None else query_vec_override)
             similar = self.vector_db.search(
                 query_vec, k=prime_k, threshold=prime_threshold
             )
