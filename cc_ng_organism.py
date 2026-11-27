@@ -5,9 +5,8 @@
 # ---- Changelog ----
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_NG_VDB_CAPTURE_SPLIT
 # What: cc_enable_vdb_two_stage_capture(vdb) sets vdb.two_stage_capture when the env is 1, so a save takes only the
-#       vector DB's references inside the step lock and copies after it. It RAISES unless CC_NG_VDB_META_SLIM is also on
-#       and the store has the two stages: without the slim copy a vector row shares the node's live metadata dict, which
-#       is edited in place, and a copy made after the lock could read it mid-edit.
+#       vector DB's references inside the step lock and copies after it. Row metadata is detached inside the lock
+#       (review, Grok 4.7: NodeRegistrar.register rows share the node's live dict even with CC_NG_VDB_META_SLIM on).
 # Why:  the vector DB's capture held the step lock 4.4 s per save on the live daemon; recall waits on that lock.
 # How:  called from cc_enable_native_vdb_scan's call site (the daemon already calls that at load), so no daemon change.
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_RECALL_ONE_EMBED
@@ -3723,14 +3722,12 @@ VDB_CAPTURE_SPLIT = os.environ.get("CC_NG_VDB_CAPTURE_SPLIT", "0") == "1"
 def cc_enable_vdb_two_stage_capture(vdb: Any) -> bool:
     """Set `vdb.two_stage_capture` when CC_NG_VDB_CAPTURE_SPLIT=1. Returns True when it is now on.
 
-    RAISES RuntimeError when the env is on but CC_NG_VDB_META_SLIM is off (a vector row would then share the node's
-    live metadata dict, edited in place, and the copy made after the lock could read it mid-edit) or the store has no
-    capture_refs / materialize_capture. Off or no store: False, nothing touched.
+    RAISES RuntimeError when the env is on but the store has no capture_refs / materialize_capture. Off or no store:
+    False, nothing touched. (Row metadata is detached inside the lock by capture_refs(detach_metadata=True), so a row
+    that shares a node's live dict is safe; with CC_NG_VDB_META_SLIM off every row is such a row and the hold is longer.)
     """
     if not VDB_CAPTURE_SPLIT or vdb is None:
         return False
-    if not VDB_META_SLIM:
-        raise RuntimeError("CC_NG_VDB_CAPTURE_SPLIT=1 needs CC_NG_VDB_META_SLIM=1")
     if not (hasattr(vdb, "capture_refs") and hasattr(vdb, "materialize_capture")):
         raise RuntimeError("CC_NG_VDB_CAPTURE_SPLIT=1 but the vector DB has no two-stage capture")
     vdb.two_stage_capture = True

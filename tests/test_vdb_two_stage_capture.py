@@ -90,7 +90,7 @@ def test_flag_off_captures_inside_the_lock_as_before(ng, monkeypatch):
     assert getattr(ng.vector_db, "two_stage_capture", False) is False
     calls = _spy(ng, monkeypatch)
     cap = ng._capture_checkpoint_state()
-    assert calls[0] == ("capture_state", True)
+    assert calls == [("capture_state", True), ("capture_refs", True), ("materialize_capture", True)]
     assert cap["counts"]["vdb_count"] == cap["vectors"]["count"] == 4
 
 
@@ -100,6 +100,7 @@ def test_flag_on_takes_only_the_references_inside_the_lock(ng, monkeypatch):
     calls = _spy(ng, monkeypatch)
     cap = ng._capture_checkpoint_state()
     assert calls == [("capture_refs", True), ("materialize_capture", False)]
+    assert ng.vector_db.two_stage_capture is True
     assert not ng.graph._step_lock._is_owned()
     assert msgpack.packb(cap["vectors"], use_bin_type=True) == msgpack.packb(base["vectors"], use_bin_type=True)
     assert cap["counts"] == base["counts"] and set(cap) == set(base)
@@ -124,26 +125,43 @@ def test_flag_on_a_full_save_writes_the_same_vector_file(ng):
     assert open(ng._vector_db_path, "rb").read() == one
 
 
-def test_enabler_needs_the_env_and_the_slim_metadata_switch(monkeypatch):
+def test_enabler_needs_the_env_and_a_two_stage_store(monkeypatch):
     import cc_ng_organism as org
     v = _vdb(2)
     monkeypatch.setattr(org, "VDB_CAPTURE_SPLIT", False)
     assert org.cc_enable_vdb_two_stage_capture(v) is False and v.two_stage_capture is False
     monkeypatch.setattr(org, "VDB_CAPTURE_SPLIT", True)
-    monkeypatch.setattr(org, "VDB_META_SLIM", False)
     with pytest.raises(RuntimeError):
-        org.cc_enable_vdb_two_stage_capture(v)
-    assert v.two_stage_capture is False
-    monkeypatch.setattr(org, "VDB_META_SLIM", True)
+        org.cc_enable_vdb_two_stage_capture(object())          # a store without the two stages
     assert org.cc_enable_vdb_two_stage_capture(v) is True and v.two_stage_capture is True
     assert org.cc_enable_vdb_two_stage_capture(None) is False
 
 
 def test_a_misconfigured_capture_switch_does_not_block_the_native_scan(monkeypatch):
     import cc_ng_organism as org
-    v = _vdb(2)
     monkeypatch.setattr(org, "VDB_CAPTURE_SPLIT", True)
-    monkeypatch.setattr(org, "VDB_META_SLIM", False)
     monkeypatch.setattr(org, "VDB_NATIVE_SCAN", False)
-    assert org.cc_enable_native_vdb_scan(v) is False        # no raise
-    assert v.two_stage_capture is False
+    assert org.cc_enable_native_vdb_scan(object()) is False        # no raise
+
+
+def test_detached_refs_survive_an_in_place_edit_of_a_shared_metadata_dict():
+    """A row whose metadata IS a node's live dict (NodeRegistrar.register): edits after the instant are not saved."""
+    v = _vdb(3)
+    live = {"creation_mode": "ingested", "probation_remaining": 5, "nested": {"a": [1]}}
+    v.insert(id="doc", embedding=np.ones(16, dtype=np.float32), content="doc", metadata=live)
+    assert v.metadata["doc"] is live
+    refs = v.capture_refs(detach_metadata=True)
+    live["probation_remaining"] = 4
+    live["added"] = True
+    live["nested"]["a"].append(2)
+    got = v.materialize_capture(refs, detach=False)["entries"]["doc"]["metadata"]
+    assert got == {"creation_mode": "ingested", "probation_remaining": 5, "nested": {"a": [1]}}
+    flat = v.materialize_capture(refs, detach=False)["entries"]["n0"]["metadata"]
+    assert flat == v.metadata["n0"] and flat is not v.metadata["n0"]
+
+
+def test_detached_refs_pack_to_the_same_bytes_as_capture_state():
+    v = _vdb()
+    one = v.capture_state(detach=True)
+    two = v.materialize_capture(v.capture_refs(detach_metadata=True), detach=False)
+    assert msgpack.packb(one, use_bin_type=True) == msgpack.packb(two, use_bin_type=True)
