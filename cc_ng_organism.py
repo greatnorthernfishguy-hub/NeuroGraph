@@ -6973,7 +6973,9 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
         if prepared is None:
             # [2026-11-27] #1201: no prepared half (the hook path). With CC_RECALL_ONE_EMBED the harvest's own query
             # vector (a cache hit on the embedder, it ran a moment ago) serves the re-score; None = embed as before.
-            surfaced = cc_gsg_rescore(surfaced, query, ng.graph, query_emb=_cc_one_embed_vec(ng, query))
+            # Only when there is something to re-score (review 2026-11-27: an empty list must not cost an embedding).
+            surfaced = cc_gsg_rescore(surfaced, query, ng.graph,
+                                      query_emb=_cc_one_embed_vec(ng, query) if surfaced else None)
         elif not prepared.gsg_failed:
             surfaced = cc_gsg_rescore(surfaced, query, ng.graph, query_emb=prepared.gsg_emb)
         # (a prepared whose GSG embed failed: un-rescored, as cc_gsg_rescore's fail-soft returns it)

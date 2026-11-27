@@ -79,6 +79,40 @@ def test_the_helper_for_the_path_without_a_prepared_half(monkeypatch):
 
 
 def test_the_rescore_takes_the_vector_and_does_not_embed(monkeypatch):
+    graph = types.SimpleNamespace(nodes={})
     n = _count(monkeypatch)
-    out = org.cc_gsg_rescore([], "q", types.SimpleNamespace(nodes={}), query_emb=np.ones(8, dtype=np.float32))
-    assert out == [] and n[0] == 0
+    org.cc_gsg_rescore([{"node_id": "x"}], "q", graph, query_emb=np.ones(8, dtype=np.float32))
+    assert n[0] == 0                                           # the vector was used
+    org.cc_gsg_rescore([{"node_id": "x"}], "q", graph, query_emb=None)
+    assert n[0] == 1                                           # without it the re-score embeds, as before
+    org.cc_gsg_rescore([], "q", graph, query_emb=None)
+    assert n[0] == 1                                           # nothing to re-score: no embedding
+
+
+def _hook_ng(monkeypatch):
+    import test_cc_recall_evoked as ev
+    ng = ev._build_ng()
+    emb = _Emb()
+    emb.embed_text = lambda text, _e=emb: (setattr(_e, "calls", _e.calls + 1), np.array([1.0, 0.0], dtype=np.float32))[1]
+    ng.ingestor = types.SimpleNamespace(embedder=emb)
+    return ng, emb, ev.CUE_TEXT
+
+
+def test_the_hook_path_embeds_once_with_the_switch_on_and_twice_off(monkeypatch):
+    for on, want in ((False, 1), (True, 0)):
+        n = _count(monkeypatch)
+        monkeypatch.setattr(org, "RECALL_ONE_EMBED", on)
+        ng, emb, cue = _hook_ng(monkeypatch)
+        out = org.cc_pattern_completion_recall(ng, cue, k=4)       # no prepared half: the hook path
+        assert out, "the stand-in mind must surface something for this test to mean anything"
+        assert n[0] == want
+
+
+def test_an_empty_recall_costs_no_extra_embedding(monkeypatch):
+    n = _count(monkeypatch)
+    monkeypatch.setattr(org, "RECALL_ONE_EMBED", True)
+    ng, emb, cue = _hook_ng(monkeypatch)
+    ng.vector_db.search = lambda *a, **k: []                      # no seed: nothing surfaces
+    before = emb.calls
+    assert org.cc_pattern_completion_recall(ng, cue, k=4) == []
+    assert n[0] == 0 and emb.calls - before == 1                  # the harvest's own embed only
