@@ -563,7 +563,9 @@ class SimpleVectorDB:
         scored: List[Tuple[str, np.ndarray, float]] = []
         if getattr(self, "native_scan", False):
             import ng_tract as _ngt
-            for row, sim in _ngt.vdb_scan(snapshot, query_vector, float(threshold)):
+            # a contiguous, aligned vector for the native call (np.dot took any 1-D layout; review 2026-11-26)
+            _q = np.require(query_vector, requirements=["C", "A"])
+            for row, sim in _ngt.vdb_scan(snapshot, _q, float(threshold)):
                 id, emb = snapshot[row]
                 scored.append((id, emb, sim))
         else:

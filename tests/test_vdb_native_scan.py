@@ -87,6 +87,31 @@ def test_an_unreadable_row_raises_with_the_switch_on():
         b.search(np.ones(4, dtype=np.float32), threshold=0.0)
 
 
+def test_queries_the_loop_took_in_any_layout():
+    a, b, m = _stores(n=40, d=16)
+    strided = np.repeat(m[3], 2)[::2]                          # 1-D, not contiguous
+    zero = np.zeros(32, dtype=np.float32)[::2]                 # zero norm: search() does not replace it
+    assert not strided.flags["C_CONTIGUOUS"] and not zero.flags["C_CONTIGUOUS"]
+    for q in (strided, zero, m[3].astype(np.float64), m[3].astype(">f4")):
+        ra, rb = a.search(q, k=5, threshold=-1.0), b.search(q, k=5, threshold=-1.0)
+        assert [i for i, _ in ra] == [i for i, _ in rb]
+        for (_, x), (_, y) in zip(ra, rb):
+            assert abs(x - y) < 2e-6
+    for store in (a, b):                                       # a (1, d) query is refused by both paths
+        with pytest.raises(TypeError):
+            store.search(m[3].reshape(1, -1), k=5, threshold=-1.0)
+
+
+def test_the_flag_survives_pickle_and_copy_and_is_not_saved(tmp_path):
+    import copy
+    import pickle
+    _, b, _ = _stores(n=5, d=8)
+    assert pickle.loads(pickle.dumps(b)).native_scan is True
+    assert copy.deepcopy(b).native_scan is True
+    assert "native_scan" not in b.capture_state()
+    assert SimpleVectorDB().native_scan is False
+
+
 def test_the_organism_switch(monkeypatch):
     import cc_ng_organism as org
     vdb = SimpleVectorDB()
