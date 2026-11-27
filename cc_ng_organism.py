@@ -10,7 +10,8 @@
 #       embedder, the first vector is used for both. Off (default) = two runs, as before.
 # Why:  TIM1126 / TIM1126B: the query embeddings are 25-40 % of a hook recall's time (the second run alone about 1.3 s).
 # How:  declared difference: the re-score's query direction is the unit vector normalised once more (equal to rounding).
-#       Any other harvest embedder, or a failed first embed, takes the old path.
+#       Any other harvest embedder, or a failed first embed, takes the old path. The hook path (no prepared half)
+#       gets the same through _cc_one_embed_vec at the re-score (TIM1127C showed it still embedded twice).
 # [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_NG_NATIVE_VDB_SCAN
 # What: VDB_NATIVE_SCAN (the env) and cc_enable_native_vdb_scan(vdb): switches SimpleVectorDB.native_scan on for this
 #       host's vector DB, so search() runs its scan as one native call (ng_tract.vdb_scan). Off = nothing changes.
@@ -6970,7 +6971,9 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
 
         # GSG geodesic re-score -- canonical rpc.py:2991-3038
         if prepared is None:
-            surfaced = cc_gsg_rescore(surfaced, query, ng.graph)
+            # [2026-11-27] #1201: no prepared half (the hook path). With CC_RECALL_ONE_EMBED the harvest's own query
+            # vector (a cache hit on the embedder, it ran a moment ago) serves the re-score; None = embed as before.
+            surfaced = cc_gsg_rescore(surfaced, query, ng.graph, query_emb=_cc_one_embed_vec(ng, query))
         elif not prepared.gsg_failed:
             surfaced = cc_gsg_rescore(surfaced, query, ng.graph, query_emb=prepared.gsg_emb)
         # (a prepared whose GSG embed failed: un-rescored, as cc_gsg_rescore's fail-soft returns it)
@@ -7366,6 +7369,21 @@ def _cc_harvest_embedder(ng: Any) -> Any:
 
 # [2026-11-27] #1201 (quest SQ11): with CC_RECALL_ONE_EMBED=1 a recall embeds its query once, not twice. LAW 5: the env.
 RECALL_ONE_EMBED = os.environ.get("CC_RECALL_ONE_EMBED", "0") == "1"
+
+
+def _cc_one_embed_vec(ng: Any, query: str) -> Any:
+    """The harvest embedder's vector for `query` when CC_RECALL_ONE_EMBED is on and that embedder is ng_embed-backed
+    (so it is the same model run ng_embed.embed would repeat); None otherwise, or when it raises."""
+    if not RECALL_ONE_EMBED:
+        return None
+    embedder = _cc_harvest_embedder(ng)
+    if embedder is None or getattr(embedder, "_ng_embed", None) is None or not getattr(embedder, "_model_available", False):
+        return None
+    try:
+        return embedder.embed_text(query)
+    except Exception as exc:
+        logger.debug("_cc_one_embed_vec: harvest embed failed (non-fatal): %s", exc)
+        return None
 
 
 def cc_recall_prepare(ng: Any, query: str) -> Optional[CCRecallEmbeddings]:

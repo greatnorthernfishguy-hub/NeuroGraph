@@ -66,3 +66,19 @@ def test_on_but_another_embedder_or_a_failure_takes_the_old_path(monkeypatch):
         n = _count(monkeypatch)
         p = org.cc_recall_prepare(_ng(e), "q")
         assert n[0] == 1 and p.gsg_emb is not None and p.gsg_emb is not p.harvest_vec
+
+
+def test_the_helper_for_the_path_without_a_prepared_half(monkeypatch):
+    monkeypatch.setattr(org, "RECALL_ONE_EMBED", False)
+    assert org._cc_one_embed_vec(_ng(_Emb()), "q") is None
+    monkeypatch.setattr(org, "RECALL_ONE_EMBED", True)
+    assert org._cc_one_embed_vec(_ng(_Emb()), "q") is not None
+    for e in (_Emb(backed=False), _Emb(available=False), _Emb(fail=True)):
+        assert org._cc_one_embed_vec(_ng(e), "q") is None
+    assert org._cc_one_embed_vec(types.SimpleNamespace(), "q") is None
+
+
+def test_the_rescore_takes_the_vector_and_does_not_embed(monkeypatch):
+    n = _count(monkeypatch)
+    out = org.cc_gsg_rescore([], "q", types.SimpleNamespace(nodes={}), query_emb=np.ones(8, dtype=np.float32))
+    assert out == [] and n[0] == 0
