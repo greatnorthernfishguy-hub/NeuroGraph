@@ -31,8 +31,9 @@ Usage:
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201; Josh 2026-11-27 "Yes, you may proceed.")
 # (PROTECTED CHANGE on branch cc-laptop-vdb-capture-split-20261127; its own commit)
 # What: _capture_checkpoint_state: when the vector DB has two_stage_capture set (default False), only its
-#       capture_refs() runs inside the step lock (the consistent instant); materialize_capture() builds the copies
-#       after the lock is released. counts["vdb_count"] is the number of references, taken inside the lock as before.
+#       capture_refs(detach_metadata=True) runs inside the step lock (the consistent instant, each row's metadata
+#       detached there because some rows share a node's live dict); materialize_capture() builds the rest after
+#       the lock is released. counts["vdb_count"] is the number of references, taken inside the lock as before.
 #       Flag absent / False = capture_state() inside the lock, exactly as before.
 # Why:  the vector DB's whole capture (4.4 s live; 0.4 s of it the instant, the rest copying) ran inside the step
 #       lock that recall waits on.
@@ -1604,7 +1605,7 @@ class NeuroGraphMemory:
                 _vdb_refs = None
                 if getattr(self.vector_db, "two_stage_capture", False):
                     # #1201: the instant only; the copies are built after the lock.
-                    _vdb_refs = self.vector_db.capture_refs()
+                    _vdb_refs = self.vector_db.capture_refs(detach_metadata=True)
                     _vdb_count = len(_vdb_refs)
                 else:
                     captured["vectors"] = self.vector_db.capture_state(detach=True)
@@ -1628,7 +1629,8 @@ class NeuroGraphMemory:
                     captured["counts"]["removals"] = _ledger.snapshot()
             if _vdb_refs is not None:
                 stage = "vectors"
-                captured["vectors"] = self.vector_db.materialize_capture(_vdb_refs, detach=True)
+                # the metadata was detached at the instant (capture_refs above), so no second copy
+                captured["vectors"] = self.vector_db.materialize_capture(_vdb_refs, detach=False)
                 if captured["vectors"]["count"] != _vdb_count:
                     raise RuntimeError("vector capture count changed between its two stages")
             return captured
