@@ -3,6 +3,11 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_NG_NATIVE_VDB_SCAN
+# What: VDB_NATIVE_SCAN (the env) and cc_enable_native_vdb_scan(vdb): switches SimpleVectorDB.native_scan on for this
+#       host's vector DB, so search() runs its scan as one native call (ng_tract.vdb_scan). Off = nothing changes.
+# Why:  TIM1126: the Python scan was 62 % of a hook recall's time. Josh 2026-11-26: port the seed scan as it is.
+# How:  the daemon calls it once after load and logs the result; the env on with a wheel that lacks vdb_scan raises.
 # [2026-11-24] DudeMan CC (Claude Fable 5.2, laptop; SQ11, punch #1250 item D) -- the CC's outbound intent deposit
 # What: cc_outbound_tract_path() (env CC_NG_OUTBOUND_TRACT, LAW 5) and cc_deposit_outbound_intent(text): one raw
 #   experience frame (source "cc_outbound") appended to the CC's own outbound tract by the crate's tract writer.
@@ -3693,6 +3698,25 @@ def _cc_mutation_lock(graph):
     # Optional graph=None callers return without mutation; a real graph must
     # expose its canonical lock. Fix incomplete doubles at their own source.
     return nullcontext() if graph is None else graph._step_lock
+
+
+# [2026-11-26] #1201 (quest SQ11): the vector DB's seed scan as one native call. LAW 5: the switch is the env.
+VDB_NATIVE_SCAN = os.environ.get("CC_NG_NATIVE_VDB_SCAN", "0") == "1"
+
+
+def cc_enable_native_vdb_scan(vdb: Any) -> bool:
+    """Switch `vdb.native_scan` on when CC_NG_NATIVE_VDB_SCAN=1 and the installed ng_tract has `vdb_scan`.
+
+    Returns True when the scan is now native. With the env on and no `vdb_scan` in the wheel this RAISES
+    (RuntimeError): the caller logs it loudly; the store keeps the Python loop.
+    """
+    if not VDB_NATIVE_SCAN or vdb is None:
+        return False
+    import ng_tract as _ngt
+    if not hasattr(_ngt, "vdb_scan"):
+        raise RuntimeError("CC_NG_NATIVE_VDB_SCAN=1 but the installed ng_tract has no vdb_scan")
+    vdb.native_scan = True
+    return True
 
 
 # #1216 S1: the vector DB entry's metadata. Off: the node's own dict (shared while the process runs, a separate stale copy

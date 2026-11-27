@@ -46,6 +46,20 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) — SimpleVectorDB.search: the scan as one
+#   native call when the instance's `native_scan` is True
+# What: search() keeps its snapshot under the lock, its sort, and its re-validation under the lock. Only the loop in
+#       between (one np.dot per stored vector, in Python) is replaced, when `self.native_scan` is True, by
+#       ng_tract.vdb_scan(snapshot, query, threshold): the rows at or above the threshold with their similarity.
+#       `native_scan` is a class attribute, False: every instance that nobody switches on runs the loop exactly as
+#       before (Syl's process included). The laptop CC sets it from CC_NG_NATIVE_VDB_SCAN (cc_ng_organism).
+# Why:  TIM1126 (2026-11-26): this loop was 62 % of a hook recall's time (2 s at best, up to 22 s while other threads
+#       held the interpreter). Josh 2026-11-26: port the seed scan to Rust as it is; no new ranking, index or tuning.
+# How:  the native call reads each stored array in place and does the arithmetic with the interpreter released.
+#       DECLARED DIFFERENCE: similarities equal numpy's to rounding (about 1e-6), not bit for bit, so a vector whose
+#       similarity is within rounding of the threshold can fall on the other side. With the switch on, a store the
+#       native call cannot read (a row that is not a 1-D contiguous float32 / float64 array) RAISES; it does not fall
+#       back to the loop. The loop stays for instances with the switch off; deleting it is Josh's call.
 # [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: SimpleVectorDB fails loud on a wrong dimension
 # What: SimpleVectorDB(dim=None) — the store's vector dimension. Explicit, or fixed by the first vector
 #   inserted / the vectors loaded. load() refuses a file whose vectors are not all that dimension (or are of
@@ -447,6 +461,10 @@ class SimpleVectorDB:
         results = db.search(np.array([0.1, 0.9, 0.2]), k=5, threshold=0.5)
     """
 
+    # [2026-11-26] #1201: True = search() runs its scan as one native call (ng_tract.vdb_scan). Set per instance by the
+    # host (the laptop CC: CC_NG_NATIVE_VDB_SCAN through cc_ng_organism.cc_enable_native_vdb_scan). False = the loop.
+    native_scan: bool = False
+
     def __init__(self, dim: Optional[int] = None) -> None:
         self._lock = self._make_lock()
         self.embeddings: Dict[str, np.ndarray] = {}
@@ -543,10 +561,16 @@ class SimpleVectorDB:
             query_vector = query_vector / norm
 
         scored: List[Tuple[str, np.ndarray, float]] = []
-        for id, emb in snapshot:
-            sim = float(np.dot(query_vector, emb))
-            if sim >= threshold:
+        if getattr(self, "native_scan", False):
+            import ng_tract as _ngt
+            for row, sim in _ngt.vdb_scan(snapshot, query_vector, float(threshold)):
+                id, emb = snapshot[row]
                 scored.append((id, emb, sim))
+        else:
+            for id, emb in snapshot:
+                sim = float(np.dot(query_vector, emb))
+                if sim >= threshold:
+                    scored.append((id, emb, sim))
         scored.sort(key=lambda x: x[2], reverse=True)
 
         results: List[Tuple[str, float]] = []
