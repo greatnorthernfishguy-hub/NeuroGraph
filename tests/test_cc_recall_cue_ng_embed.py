@@ -127,3 +127,36 @@ def test_on_an_ng_embed_failure_falls_back_to_the_old_path(ng, monkeypatch):
     assert _ids(org.cc_pattern_completion_recall(ng, QUERY, k=5)) == off and QUERY in calls
     prepared = org.cc_recall_prepare(ng, QUERY)
     assert prepared.cue_direct is False and prepared.harvest_status == "warm"
+
+
+def test_both_switches_on_is_one_direct_embedding_and_no_ingestor_call(ng, monkeypatch):
+    """Review 2026-11-27: CC_RECALL_ONE_EMBED on as well (the live state) changes nothing."""
+    import ng_embed
+    monkeypatch.setattr(org, "RECALL_CUE_NG_EMBED", False)
+    monkeypatch.setattr(org, "RECALL_ONE_EMBED", True)
+    off = _ids(org.cc_pattern_completion_recall(ng, QUERY, k=5))
+    monkeypatch.setattr(org, "RECALL_CUE_NG_EMBED", True)
+    _poison_ingestor_embedder(ng, monkeypatch)
+    n = []
+    real = ng_embed.embed
+    monkeypatch.setattr(ng_embed, "embed", lambda t, **k: (n.append(t), real(t, **k))[1])
+    assert _ids(org.cc_pattern_completion_recall(ng, QUERY, k=5)) == off and n == [QUERY]
+    n.clear()
+    prepared = org.cc_recall_prepare(ng, QUERY)
+    assert _ids(org.cc_pattern_completion_recall(ng, QUERY, k=5, prepared=prepared)) == off and n == [QUERY]
+
+
+def test_a_long_cue_and_an_empty_cue_match_the_ingestor_embedder(ng):
+    long_text = "the distance cache rebuild finished and the lenia kernel was repopulated " * 120
+    for text in (long_text, " "):
+        a = np.asarray(ng.ingestor.embedder.embed_text(text), dtype=np.float32)
+        b = org._cc_cue_vec(text)
+        assert a.shape == b.shape and np.allclose(a, b, atol=1e-5)
+
+
+def test_a_prepared_object_for_another_query_is_ignored(ng, monkeypatch):
+    monkeypatch.setattr(org, "RECALL_CUE_NG_EMBED", True)
+    _poison_ingestor_embedder(ng, monkeypatch)
+    other = org.cc_recall_prepare(ng, "something else entirely")
+    base = _ids(org.cc_pattern_completion_recall(ng, QUERY, k=5))
+    assert _ids(org.cc_pattern_completion_recall(ng, QUERY, k=5, prepared=other)) == base and base
