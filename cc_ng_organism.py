@@ -3,6 +3,14 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1254c) -- CC_RECALL_KEEP_UNINDEXED
+# What: with the switch on, recall asks the harvest to keep a fired node the vector DB has no row for
+#       (_harvest_associations(keep_unindexed_override=True), protected, its own commit). Nothing else changes here:
+#       the final loop already takes each result's text from the node first (resolve_surface_content) and drops a
+#       result with no text. Off (default) = the harvest call is the one it always was.
+# Why:  6,164 of 86,018 nodes have no vector row (windows of long turns, small tree concepts, wants); they fired and
+#       were dropped at the harvest (SEED1126: 44 of 1,177 fired nodes). The vector DB only seeds.
+# How:  _cc_unindexed_kwargs(), merged into the two harvest calls beside _cc_evoked_kwargs().
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_RECALL_ONE_EMBED
 # What: cc_recall_prepare ran the embedding model twice on the same query: the harvest embedder's embed_text (which
 #       calls ng_embed.embed_batch and normalises) and ng_embed.embed for the GSG re-score (which normalises it again
@@ -6764,6 +6772,16 @@ def _cc_evoked_kwargs() -> Dict[str, Any]:
     return {"evoked_override": True} if _CC_RECALL_EVOKED else {}
 
 
+_CC_RECALL_KEEP_UNINDEXED = os.environ.get("CC_RECALL_KEEP_UNINDEXED", "0") == "1"
+
+
+def _cc_unindexed_kwargs() -> Dict[str, Any]:
+    """[2026-11-27] #1254c: with CC_RECALL_KEEP_UNINDEXED on, ask the harvest to keep a fired node the vector DB has no
+    row for. Empty when the switch is off, so the harvest call is the one it always was (and an engine checkout without
+    the keyword is never handed it)."""
+    return {"keep_unindexed_override": True} if _CC_RECALL_KEEP_UNINDEXED else {}
+
+
 def _cc_recall_harvest_steps(graph: Any, novelty: float) -> int:
     """The propagation depth the recall harvest actually runs, so the spontaneous sweep
     covers the same window.  Mirrors openclaw_hook._harvest_associations' step choice
@@ -6895,6 +6913,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                     _CC_RECALL_PROP_STEPS if _CC_RECALL_PROP_STEPS > 0 else None
                 ),
                 **_cc_evoked_kwargs(),
+                **_cc_unindexed_kwargs(),
             )
         else:
             # Existing hook recall temporarily overrides the graph's harvest
@@ -6906,7 +6925,7 @@ def cc_pattern_completion_recall(ng: Any, query: str, k: int = 5,
                 cfg["propagation_steps"] = _CC_RECALL_PROP_STEPS
             try:
                 surfaced = [] if harvest_skip else ng._harvest_associations(
-                    query, novelty=novelty, **_cc_evoked_kwargs())
+                    query, novelty=novelty, **_cc_evoked_kwargs(), **_cc_unindexed_kwargs())
             finally:
                 cfg["max_surfaced"] = old_max
                 cfg["prime_threshold"] = old_thresh
