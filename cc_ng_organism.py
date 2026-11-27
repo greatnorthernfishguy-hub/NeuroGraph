@@ -3,6 +3,14 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_RECALL_ONE_EMBED
+# What: cc_recall_prepare ran the embedding model twice on the same query: the harvest embedder's embed_text (which
+#       calls ng_embed.embed_batch and normalises) and ng_embed.embed for the GSG re-score (which normalises it again
+#       itself, cc_gsg_rescore -> _cc_embed_to_poincare_dir). With the switch on and an ng_embed-backed harvest
+#       embedder, the first vector is used for both. Off (default) = two runs, as before.
+# Why:  TIM1126 / TIM1126B: the query embeddings are 25-40 % of a hook recall's time (the second run alone about 1.3 s).
+# How:  declared difference: the re-score's query direction is the unit vector normalised once more (equal to rounding).
+#       Any other harvest embedder, or a failed first embed, takes the old path.
 # [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_NG_NATIVE_VDB_SCAN
 # What: VDB_NATIVE_SCAN (the env) and cc_enable_native_vdb_scan(vdb): switches SimpleVectorDB.native_scan on for this
 #       host's vector DB, so search() runs its scan as one native call (ng_tract.vdb_scan). Off = nothing changes.
@@ -7356,6 +7364,10 @@ def _cc_harvest_embedder(ng: Any) -> Any:
     return embedder if callable(getattr(embedder, "embed_text", None)) else None
 
 
+# [2026-11-27] #1201 (quest SQ11): with CC_RECALL_ONE_EMBED=1 a recall embeds its query once, not twice. LAW 5: the env.
+RECALL_ONE_EMBED = os.environ.get("CC_RECALL_ONE_EMBED", "0") == "1"
+
+
 def cc_recall_prepare(ng: Any, query: str) -> Optional[CCRecallEmbeddings]:
     """LOCK-FREE half of pattern-completion recall (#922): compute the query's embeddings.
 
@@ -7380,12 +7392,18 @@ def cc_recall_prepare(ng: Any, query: str) -> Optional[CCRecallEmbeddings]:
                 logger.debug("cc_recall_prepare: harvest embed failed (non-fatal): %s", exc)
                 harvest_status = "failed"
         gsg_emb, gsg_failed = None, False
-        try:
-            from ng_embed import embed as _embed
-            gsg_emb = _embed(query)
-        except Exception as exc:
-            logger.debug("cc_recall_prepare: GSG embed failed (non-fatal): %s", exc)
-            gsg_failed = True
+        if (RECALL_ONE_EMBED and harvest_status == "warm" and harvest_vec is not None
+                and getattr(embedder, "_ng_embed", None) is not None and getattr(embedder, "_model_available", False)):
+            # [2026-11-27] #1201: the harvest embedder IS ng_embed (same model, same text, same flags), and the
+            # re-score only uses the query's direction, so the vector just computed serves both. One model run.
+            gsg_emb = harvest_vec
+        else:
+            try:
+                from ng_embed import embed as _embed
+                gsg_emb = _embed(query)
+            except Exception as exc:
+                logger.debug("cc_recall_prepare: GSG embed failed (non-fatal): %s", exc)
+                gsg_failed = True
         return CCRecallEmbeddings(query=query, harvest_status=harvest_status,
                                   harvest_vec=harvest_vec, gsg_emb=gsg_emb,
                                   gsg_failed=gsg_failed)

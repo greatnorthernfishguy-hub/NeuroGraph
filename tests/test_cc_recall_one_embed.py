@@ -1,0 +1,68 @@
+# ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CREATE
+# What: cc_recall_prepare with CC_RECALL_ONE_EMBED: one model run when the harvest embedder is ng_embed-backed, the
+#       old two runs otherwise; the re-score direction is the same to rounding.
+# Why:  the same query was embedded twice per recall.
+# How:  a stand-in harvest embedder and a counted ng_embed.embed; no model is loaded.
+# -------------------
+import types
+
+import numpy as np
+
+import cc_ng_organism as org
+import ng_embed
+
+
+class _Emb:
+    def __init__(self, backed=True, available=True, fail=False):
+        self._ng_embed = object() if backed else None
+        self._model_available = available
+        self.fail = fail
+        self.calls = 0
+
+    def embed_text(self, text):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("no")
+        v = np.arange(1, 9, dtype=np.float32)
+        return v / np.linalg.norm(v)
+
+
+def _ng(emb):
+    return types.SimpleNamespace(ingestor=types.SimpleNamespace(embedder=emb))
+
+
+def _count(monkeypatch):
+    n = [0]
+
+    def embed(text, **k):
+        n[0] += 1
+        return np.arange(1, 9, dtype=np.float32) * 3.0          # the raw (un-normalised) vector
+    monkeypatch.setattr(ng_embed, "embed", embed)
+    return n
+
+
+def test_off_runs_both_as_before(monkeypatch):
+    n = _count(monkeypatch)
+    monkeypatch.setattr(org, "RECALL_ONE_EMBED", False)
+    e = _Emb()
+    p = org.cc_recall_prepare(_ng(e), "q")
+    assert e.calls == 1 and n[0] == 1 and p.gsg_emb is not p.harvest_vec
+
+
+def test_on_runs_the_model_once_and_the_direction_is_the_same(monkeypatch):
+    n = _count(monkeypatch)
+    monkeypatch.setattr(org, "RECALL_ONE_EMBED", True)
+    e = _Emb()
+    p = org.cc_recall_prepare(_ng(e), "q")
+    assert e.calls == 1 and n[0] == 0 and p.gsg_emb is p.harvest_vec and not p.gsg_failed
+    raw = np.arange(1, 9, dtype=np.float32) * 3.0
+    assert np.allclose(org._cc_embed_to_poincare_dir(p.gsg_emb), org._cc_embed_to_poincare_dir(raw), atol=1e-6)
+
+
+def test_on_but_another_embedder_or_a_failure_takes_the_old_path(monkeypatch):
+    monkeypatch.setattr(org, "RECALL_ONE_EMBED", True)
+    for e in (_Emb(backed=False), _Emb(available=False), _Emb(fail=True)):
+        n = _count(monkeypatch)
+        p = org.cc_recall_prepare(_ng(e), "q")
+        assert n[0] == 1 and p.gsg_emb is not None and p.gsg_emb is not p.harvest_vec
