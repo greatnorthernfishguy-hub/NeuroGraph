@@ -16,6 +16,8 @@
 # What: the fake graph of test_actual_propagation_cannot_prime_during_capture carries an empty prediction book (_pb).
 # Why:  prime_and_propagate reads the open predictions' targets from ng_tract.PredictionBook now.
 # How:  a two-method stand-in (targets, spike_append); the lock assertion is unchanged.
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; #1201) -- VectorFake also takes capture_refs and materialize_capture:
+#   capture_state is now those two stages. Assertions unchanged.
 # -------------------
 import ast
 import copy
@@ -72,7 +74,7 @@ class VectorFake:
         self.content = {'n': 'raw experience'}
         self.metadata = {'n': {'nested': [1]}}
         self._lock = threading.RLock()  # [2026-10-04] lane vdb-lock-leak: SimpleVectorDB's own leaf lock (#270)
-for name, fn in methods('universal_ingestor.py', 'SimpleVectorDB', {'capture_state','write_state','save'}).items():
+for name, fn in methods('universal_ingestor.py', 'SimpleVectorDB', {'capture_state','capture_refs','materialize_capture','write_state','save'}).items():
     setattr(VectorFake, name, fn)
 
 class ActivationFake:

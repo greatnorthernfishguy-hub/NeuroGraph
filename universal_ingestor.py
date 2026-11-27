@@ -46,6 +46,14 @@ Grok Review Changelog (v0.7.1):
         bounded by max_chunk_tokens.
 
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- SimpleVectorDB two-stage capture
+# What: capture_state() is now capture_refs() (the consistent instant: references taken under the store's lock) plus
+#       materialize_capture(refs) (the copies: embedding bytes, metadata deep copy, the mapping). capture_state() calls
+#       both, so its result is what it always was. Class attribute two_stage_capture (default False) tells the
+#       checkpoint capture in openclaw_hook to run only the first stage inside the graph's step lock.
+# Why:  the whole capture ran inside the step lock: 3.1 s on 80,704 entries (0.4 s references, the rest copying),
+#       4.4 s on the live daemon, and hook recall waits on that lock.
+# How:  a split of the existing function, no change to what is captured or written.
 # [2026-11-26] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) — SimpleVectorDB.search: the scan as one
 #   native call when the instance's `native_scan` is True
 # What: search() keeps its snapshot under the lock, its sort, and its re-validation under the lock. Only the loop in
@@ -670,6 +678,10 @@ class SimpleVectorDB:
     #       Ids are listed first and each embedding read by key, so the #423 KeyError refusal on an
     #       uncoordinated (lock-bypassing) disappearance is preserved.
     # -------------------
+    # [2026-11-27] #1201: True = the checkpoint capture takes only capture_refs() inside the graph's step lock
+    # and materializes after it. Set by the host (cc_ng_organism.cc_enable_vdb_two_stage_capture); default off.
+    two_stage_capture: bool = False
+
     def capture_state(self, detach: bool = True) -> Dict[str, Any]:
         """Capture vector DB state in RAM — performs NO disk I/O.
 
@@ -698,11 +710,24 @@ class SimpleVectorDB:
         # The #423 refusal is kept: ids are listed first and each embedding is read by
         # key, so an entry that disappears through an UNCOORDINATED (lock-bypassing)
         # mutation still raises KeyError instead of silently publishing a smaller set.
+        return self.materialize_capture(self.capture_refs(), detach=detach)
+
+    def capture_refs(self) -> list:
+        """Stage 1 of capture_state: the consistent instant. The (id, array, content, metadata)
+        references of every entry, taken under ``self._lock``; nothing is copied. Hand the result
+        to :meth:`materialize_capture`. Safe to defer that call only while stored values are
+        replaced and never edited in place (see capture_state)."""
         with self._lock:
-            refs = [
+            return [
                 (id, self.embeddings[id], self.content.get(id, ""), self.metadata.get(id, {}))
                 for id in list(self.embeddings.keys())
             ]
+
+    def materialize_capture(self, refs: list, detach: bool = True) -> Dict[str, Any]:
+        """Stage 2 of capture_state: build the mapping for :meth:`write_state` from
+        :meth:`capture_refs`' references. Takes no lock and reads no live container."""
+        import numpy as np
+
         entries: Dict[str, Any] = {}
         for id, emb, content, meta in refs:
             entries[id] = {
