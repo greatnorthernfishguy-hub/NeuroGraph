@@ -712,16 +712,37 @@ class SimpleVectorDB:
         # mutation still raises KeyError instead of silently publishing a smaller set.
         return self.materialize_capture(self.capture_refs(), detach=detach)
 
-    def capture_refs(self) -> list:
+    def capture_refs(self, detach_metadata: bool = False) -> list:
         """Stage 1 of capture_state: the consistent instant. The (id, array, content, metadata)
-        references of every entry, taken under ``self._lock``; nothing is copied. Hand the result
-        to :meth:`materialize_capture`. Safe to defer that call only while stored values are
-        replaced and never edited in place (see capture_state)."""
+        references of every entry, taken under ``self._lock``. Hand the result to
+        :meth:`materialize_capture`.
+
+        Arrays and strings are replaced on insert / load and never edited in place, so their
+        references stay valid after the lock. A metadata dict is NOT always safe: some insert
+        paths (NodeRegistrar.register) store the node's own live dict, which is edited in place.
+        ``detach_metadata=True`` therefore detaches every metadata dict HERE, at the instant: a
+        dict of plain scalars is copied with ``dict()`` (a complete detach), anything else is
+        deep-copied. A caller that materializes after releasing the mutation lock must pass True
+        and then call ``materialize_capture(refs, detach=False)``. False (default) = the live
+        references, as capture_state always took them."""
+        scalars = (str, int, float, bool, bytes, type(None))
         with self._lock:
-            return [
-                (id, self.embeddings[id], self.content.get(id, ""), self.metadata.get(id, {}))
-                for id in list(self.embeddings.keys())
-            ]
+            if not detach_metadata:
+                return [
+                    (id, self.embeddings[id], self.content.get(id, ""), self.metadata.get(id, {}))
+                    for id in list(self.embeddings.keys())
+                ]
+            refs = []
+            for id in list(self.embeddings.keys()):
+                meta = self.metadata.get(id, {})
+                flat = True
+                for value in meta.values():
+                    if not isinstance(value, scalars):
+                        flat = False
+                        break
+                refs.append((id, self.embeddings[id], self.content.get(id, ""),
+                             dict(meta) if flat else copy.deepcopy(meta)))
+            return refs
 
     def materialize_capture(self, refs: list, detach: bool = True) -> Dict[str, Any]:
         """Stage 2 of capture_state: build the mapping for :meth:`write_state` from
