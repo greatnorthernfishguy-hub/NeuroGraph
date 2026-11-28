@@ -149,6 +149,16 @@ Design principles (PRD §2.1):
     - Persistence-native: all state is serializable
 
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201; Josh 2026-11-27 "Yes, you may for step 1.")
+# (PROTECTED CHANGE on branch cc-laptop-ckpt-snapshot-20261127; its own commit)
+#   What: Graph.checkpoint_snapshot_stores (class attribute, default False). When a host sets it True and the native
+#     synapse store has checkpoint_snapshot(), _serialize_full puts that detached snapshot under "synapses" instead of
+#     the packed bytes, and write_checkpoint writes snapshot.to_msgpack() there. The bytes written are the ones
+#     to_checkpoint_msgpack() would have produced at the capture (ng-tract-rs 0fa35d9, one shared encoder).
+#     False, or a store without the method = exactly as before.
+#   Why: a save's capture holds _step_lock while every store packs (live median 14.7 s); the synapse store's pack is
+#     about 1 s of it. With the snapshot the lock covers a block copy and the packing runs in the write, after the lock.
+#   How: one branch in _serialize_full, one in write_checkpoint. No change to the checkpoint format or to restore.
 # [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 before-live Rust ports; Josh 2026-11-10 "You may proceed")
 #   What: S18 receiver predictions Rust-only (plan docs/superpowers/plans/2026-11-10-s18-receiver-rust-only.md). The
 #         per-neuron state (rho / pred_ema / conf_ema / last_t) is NodeStore columns; the candidate scan is
@@ -10089,6 +10099,10 @@ class Graph:
     #       makes standalone capture detached too — the detached footprint is UNMEASURED on
     #       live-substrate sizes and must be measured before live use (#423).
     # -------------------
+    # [2026-11-27] #1201: True = the native stores that can are captured as detached snapshots and packed at write time.
+    # Set by the host (cc_ng_organism.cc_enable_checkpoint_snapshot); default off.
+    checkpoint_snapshot_stores: bool = False
+
     def capture_checkpoint(
         self,
         mode: CheckpointMode = CheckpointMode.FULL,
@@ -10189,6 +10203,8 @@ class Graph:
                 if key in ("synapses", "nodes", "hyperedges", "archived_hyperedges", "he_last_fired_step",
                            "he_output_candidates", "interneurons") and isinstance(value, (bytes, bytearray)):
                     f.write(value)  # verbatim pre-packed {sid: {15-key}} / {nid: {19-key}} map
+                elif key == "synapses" and hasattr(value, "to_msgpack"):
+                    f.write(value.to_msgpack())  # [2026-11-27] #1201: a store snapshot, packed here, after the lock
                 else:
                     f.write(packer.pack(value))
 
@@ -10390,7 +10406,10 @@ class Graph:
         # The native backend creates this packed payload for the capture. It does
         # not borrow live state, and bytearray is intentionally not deep-copied:
         # that would duplicate the largest capture allocation inside _step_lock.
-        _packed_synapses = self.synapses.to_checkpoint_msgpack()
+        # [2026-11-27] #1201: with checkpoint_snapshot_stores a detached copy is taken here and packed in write_checkpoint
+        _packed_synapses = (self.synapses.checkpoint_snapshot()
+                            if getattr(self, "checkpoint_snapshot_stores", False) and hasattr(self.synapses, "checkpoint_snapshot")
+                            else self.synapses.to_checkpoint_msgpack())
         # [2026-10-20] round I (#1151): the interneuron layer, packed natively (None = no layer = no key)
         _il_packed = (self.nodes.interneurons_to_msgpack()
                       if getattr(self, "_native_nodes", False) and hasattr(self.nodes, "interneurons_to_msgpack") else None)
