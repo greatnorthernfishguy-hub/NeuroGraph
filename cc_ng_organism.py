@@ -3,6 +3,12 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_NG_CKPT_SNAPSHOT
+# What: cc_enable_checkpoint_snapshot(graph) sets graph.checkpoint_snapshot_stores when the env is 1, the engine has
+#       the attribute and the synapse store has checkpoint_snapshot() (ng-tract-rs 0fa35d9 or later); it RAISES when
+#       the env is on and either is missing. Off = nothing touched.
+# Why:  a save then copies the synapse store inside the step lock and packs it after (the lock hold is what recall waits on).
+# How:  called by the daemon after load (a logged line), like cc_enable_native_vdb_scan.
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11) -- CC_RECALL_CUE_NG_EMBED: recall's cue leaves the Ingestor
 # What: with the switch on, a recall embeds its cue once with ng_embed directly (_cc_cue_vec: ng_embed.embed, then one
 #       L2 normalisation, the same vector the Ingestor's embed_text returns) and hands it to the harvest
@@ -3723,6 +3729,25 @@ def _cc_mutation_lock(graph):
     # Optional graph=None callers return without mutation; a real graph must
     # expose its canonical lock. Fix incomplete doubles at their own source.
     return nullcontext() if graph is None else graph._step_lock
+
+
+# [2026-11-27] #1201: a save captures the native synapse store as a detached snapshot and packs it after the step lock.
+CKPT_SNAPSHOT = os.environ.get("CC_NG_CKPT_SNAPSHOT", "0") == "1"
+
+
+def cc_enable_checkpoint_snapshot(graph: Any) -> bool:
+    """Set `graph.checkpoint_snapshot_stores` when CC_NG_CKPT_SNAPSHOT=1. Returns True when it is now on.
+
+    RAISES RuntimeError when the env is on but the engine has no such attribute or the synapse store has no
+    checkpoint_snapshot (an older wheel). Off or no graph: False, nothing touched."""
+    if not CKPT_SNAPSHOT or graph is None:
+        return False
+    if not hasattr(type(graph), "checkpoint_snapshot_stores"):
+        raise RuntimeError("CC_NG_CKPT_SNAPSHOT=1 but the engine has no checkpoint_snapshot_stores")
+    if not hasattr(getattr(graph, "synapses", None), "checkpoint_snapshot"):
+        raise RuntimeError("CC_NG_CKPT_SNAPSHOT=1 but the synapse store has no checkpoint_snapshot (older ng_tract)")
+    graph.checkpoint_snapshot_stores = True
+    return True
 
 
 # [2026-11-27] #1201: a save captures the vector DB in two stages (references inside the step lock, copies after).
