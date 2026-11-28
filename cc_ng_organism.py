@@ -3,6 +3,13 @@
 # the callosum, wholeness ring, hyperedge binding and orphan collection (2026-07-31).
 # The wholeness ring ALREADY EXISTS here (Leg 2). Open defect: merge-journal poison-pill.
 # ---- Changelog ----
+# [2026-11-28] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1254c) -- CC_RECALL_FOLD_WINDOWS
+# What: cc_enable_recall_fold_windows(graph) sets graph.nodes.recall_fold_windows when the env is 1 and the node store
+#       has the setting (ng-tract-rs with the #1254c fold); it RAISES when the env is on and the store has not.
+# Why:  a fired window node has no vector row by design (#295), so recall's harvest dropped it; the Rust sweep now
+#       returns it as its turn (Josh 2026-11-28: "The fold should be in the Rust sweep"). No Python on the path.
+# How:  called by the daemon after load (a logged line). The fold applies to evoked sweeps only (CC_RECALL_EVOKED=1,
+#       recall's harvest); every other reader of a sweep's fired list sees it as before.
 # [2026-11-27] DudeMan CC (Claude Fable 5.2, laptop; quest SQ11, punch #1201) -- CC_NG_CKPT_SNAPSHOT
 # What: cc_enable_checkpoint_snapshot(graph) sets graph.checkpoint_snapshot_stores when the env is 1, the engine has
 #       the attribute and the synapse store has checkpoint_snapshot() (ng-tract-rs 0fa35d9 or later); it RAISES when
@@ -3747,6 +3754,25 @@ def cc_enable_checkpoint_snapshot(graph: Any) -> bool:
     if not hasattr(getattr(graph, "synapses", None), "checkpoint_snapshot"):
         raise RuntimeError("CC_NG_CKPT_SNAPSHOT=1 but the synapse store has no checkpoint_snapshot (older ng_tract)")
     graph.checkpoint_snapshot_stores = True
+    return True
+
+
+# [2026-11-28] #1254c: recall's sweep returns a fired window node as its turn (the fold is in ng_tract.recall_sweep).
+RECALL_FOLD_WINDOWS = os.environ.get("CC_RECALL_FOLD_WINDOWS", "0") == "1"
+
+
+def cc_enable_recall_fold_windows(graph: Any) -> bool:
+    """Set `graph.nodes.recall_fold_windows` when CC_RECALL_FOLD_WINDOWS=1. Returns True when it is now on.
+
+    RAISES RuntimeError when the env is on but the node store has no such setting (a Python node store, or an older
+    wheel). Off or no graph: False, nothing touched. The sweep folds only when it is asked for evoked firings, which
+    recall's harvest does with CC_RECALL_EVOKED=1; with that off the setting changes nothing."""
+    if not RECALL_FOLD_WINDOWS or graph is None:
+        return False
+    nodes = getattr(graph, "nodes", None)
+    if not hasattr(type(nodes), "recall_fold_windows"):
+        raise RuntimeError("CC_RECALL_FOLD_WINDOWS=1 but the node store has no recall_fold_windows (older ng_tract)")
+    nodes.recall_fold_windows = True
     return True
 
 
