@@ -27,12 +27,21 @@ WIN = TURN + "::window::0"
 def ng():
     from openclaw_hook import NeuroGraphMemory
     from ng_embed import embed
+    import neuro_foundation as nf
     ws = tempfile.mkdtemp(prefix='fold_windows_test_')
-    m = NeuroGraphMemory(workspace_dir=ws, config={"tonic": {"enabled": False}, "peer_bridge": {"enabled": False}})
+    old = (nf._NATIVE_NODE_STORE_DEFAULT, nf._NATIVE_HYPEREDGE_STORE_DEFAULT)
+    nf.set_native_node_store_default(True)            # the host switches the daemon sets before it builds its graph
+    nf.set_native_hyperedge_store_default(True)
+    try:
+        m = NeuroGraphMemory(workspace_dir=ws, config={"tonic": {"enabled": False}, "peer_bridge": {"enabled": False}})
+    finally:
+        nf.set_native_node_store_default(old[0])
+        nf.set_native_hyperedge_store_default(old[1])
     if not hasattr(type(m.graph.nodes), "recall_fold_windows"):
         shutil.rmtree(ws, ignore_errors=True)
-        pytest.skip("node store without recall_fold_windows")
+        pytest.skip("node store without recall_fold_windows (an older ng_tract)")
     g = m.graph
+    g.config["native_recall_enabled"] = True
     g.create_node(node_id="cue", metadata={"_forest_content": CUE})
     g.nodes["cue"].threshold = 0.1
     m.vector_db.insert(id="cue", embedding=embed(CUE), content=CUE)
@@ -67,7 +76,7 @@ def test_off_the_fired_window_is_dropped_and_on_its_turn_is_returned(ng):
     fired = {e.node_id for e in ng.graph.prime_and_propagate(["cue"], [1.0], steps=3).fired_entries}
     assert WIN in fired and TURN not in fired
     if not getattr(ng.graph.prime_and_propagate(["cue"], [1.0], steps=3, evoked=True), "evoked", False):
-        pytest.skip("the sweep did not run natively with evoked (no native recall in this configuration)")
+        pytest.fail("the sweep did not run natively with evoked: the test would prove nothing")
     assert TURN not in _harvest(ng, evoked_override=True) and WIN not in _harvest(ng, evoked_override=True)
     ng.graph.nodes.recall_fold_windows = True
     out = ng._harvest_associations(CUE, evoked_override=True)
