@@ -20,6 +20,7 @@ from neuro_foundation import CheckpointMode, Graph, SynapseType
 
 def _graph():
     g = Graph()
+    # step 2: something in the prediction book's two maps, so the packed path has content to get wrong
     for i in range(12):
         g.create_node(node_id=f"n{i}", metadata={"k": i})
     kinds = (SynapseType.EXCITATORY, SynapseType.INHIBITORY, SynapseType.MODULATORY)
@@ -29,6 +30,11 @@ def _graph():
             sid = getattr(syn, "synapse_id", None)
             if sid is not None:
                 g.synapses[sid].metadata = {"origin": "test", "i": i}
+    # step 2: content in the prediction book's two maps (real synapse and node ids, so a restore keeps them)
+    for i, sid in enumerate(list(g.synapses.keys())[:25]):
+        g._pb.hist_set(sid, [(i + j) % 2 == 0 for j in range(1 + i % 7)])
+    for i in range(6):
+        g._pb.spike_set(f"n{i}", [40 + i, 41 + i, 42 + i][: 1 + i % 3], 16)
     return g
 
 
@@ -104,3 +110,42 @@ def test_organism_enabler(monkeypatch):
         org.cc_enable_checkpoint_snapshot(object())                       # no engine attribute
     assert org.cc_enable_checkpoint_snapshot(g) is True and g.checkpoint_snapshot_stores is True
     assert Graph.checkpoint_snapshot_stores is False                      # the instance, not the class
+
+
+# ---- [2026-11-27] step 2: the prediction book's two maps as packed bytes ----
+
+def test_off_the_two_book_maps_are_dicts_as_before():
+    g = _graph()
+    cap = g.capture_checkpoint(CheckpointMode.FULL)
+    assert cap["synapse_confirmation_history"] == {sid: list(h) for sid, h in g._pb.hist_items()}
+    assert len(cap["synapse_confirmation_history"]) == 25
+    assert cap["recent_spikes"] == {nid: list(sp) for nid, sp, _c in g._pb.spike_items(True)}
+    assert cap["recent_spikes"]["n1"] == [41, 42]
+
+
+def test_on_the_two_book_maps_are_bytes_and_decode_to_the_same_dicts():
+    import msgpack
+    g = _graph()
+    off = g.capture_checkpoint(CheckpointMode.FULL)
+    g.checkpoint_snapshot_stores = True
+    on = g.capture_checkpoint(CheckpointMode.FULL)
+    for key in ("synapse_confirmation_history", "recent_spikes"):
+        assert isinstance(on[key], (bytes, bytearray))
+        assert bytes(on[key]) == msgpack.packb(off[key], use_bin_type=True)
+    assert list(on) == list(off)                                   # the same keys in the same order
+
+
+def test_on_restore_gives_back_the_history_and_the_spikes(tmp_path):
+    g = _graph()
+    g.checkpoint_snapshot_stores = True
+    path = tmp_path / "on.msgpack"
+    g.checkpoint(str(path), CheckpointMode.FULL)
+    g.checkpoint_snapshot_stores = False
+    ref = tmp_path / "off.msgpack"
+    g.checkpoint(str(ref), CheckpointMode.FULL)
+    assert open(path, "rb").read() == open(ref, "rb").read()
+    h, r = Graph(), Graph()
+    h.restore(str(path))
+    r.restore(str(ref))
+    assert h._pb.hist_items() == r._pb.hist_items() and len(h._pb.hist_items()) == 25
+    assert h._pb.spike_items(True) == r._pb.spike_items(True) and h._pb.spike_items(True)
