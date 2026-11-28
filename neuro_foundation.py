@@ -159,6 +159,14 @@ Design principles (PRD §2.1):
 #   Why: a save's capture holds _step_lock while every store packs (live median 14.7 s); the synapse store's pack is
 #     about 1 s of it. With the snapshot the lock covers a block copy and the packing runs in the write, after the lock.
 #   How: one branch in _serialize_full, one in write_checkpoint. No change to the checkpoint format or to restore.
+# [2026-11-27] DudeMan CC (same quest, same proceed; Josh 2026-11-27 "I'm good with your 4 step order") -- step 2
+# (PROTECTED CHANGE, its own commit)
+#   What: with checkpoint_snapshot_stores on and a prediction book that has hist_msgpack / spikes_msgpack
+#     (ng-tract-rs 1dbe45e), _serialize_full takes "synapse_confirmation_history" and "recent_spikes" as the book's
+#     packed bytes, and write_checkpoint writes them verbatim. Off, or an older book = the dicts, exactly as before.
+#   Why: the capture built 163 k + 53 k Python lists inside _step_lock (about 1.8 s at live size) only to pack them in
+#     the write, and those allocations woke the cycle collector mid-capture.
+#   How: two branches in _serialize_full, two key names added to write_checkpoint's verbatim list. Same file bytes.
 # [2026-11-10] DudeMan CC (Claude Opus 5.5, laptop; #1136 before-live Rust ports; Josh 2026-11-10 "You may proceed")
 #   What: S18 receiver predictions Rust-only (plan docs/superpowers/plans/2026-11-10-s18-receiver-rust-only.md). The
 #         per-neuron state (rho / pred_ema / conf_ema / last_t) is NodeStore columns; the candidate scan is
@@ -10201,7 +10209,8 @@ class Graph:
                 # [2026-10-18] H2: and the two hyperedge pass-state maps when the native passes own them
                 # [2026-10-20] round I (#1151): and the interneuron layer (native packed map)
                 if key in ("synapses", "nodes", "hyperedges", "archived_hyperedges", "he_last_fired_step",
-                           "he_output_candidates", "interneurons") and isinstance(value, (bytes, bytearray)):
+                           "he_output_candidates", "interneurons",
+                           "synapse_confirmation_history", "recent_spikes") and isinstance(value, (bytes, bytearray)):
                     f.write(value)  # verbatim pre-packed {sid: {15-key}} / {nid: {19-key}} map
                 elif key == "synapses" and hasattr(value, "to_msgpack"):
                     f.write(value.to_msgpack())  # [2026-11-27] #1201: a store snapshot, packed here, after the lock
@@ -10394,7 +10403,10 @@ class Graph:
         # [2026-10-18] H2: the pass state the native passes own, packed by the store (detached bytes)
         _he_ps_packed = self.hyperedges.pass_state_msgpack() if self._he_ps_native() else None
         _act_preds  = self._pb.items()            # [2026-11-13] #1221: rows, no Prediction objects
-        _syn_hist   = self._pb.hist_items()
+        # [2026-11-27] #1201 step 2: the book packs its two maps itself when the host switch is on and the wheel can
+        _pb_packed  = (getattr(self, "checkpoint_snapshot_stores", False)
+                       and hasattr(self._pb, "hist_msgpack") and hasattr(self._pb, "spikes_msgpack"))
+        _syn_hist   = None if _pb_packed else self._pb.hist_items()
         _he_preds   = list(self._active_predictions.items())
         _delay_buf  = list(self._delay_buffer.items())
         if self.__dict__.get("_prop_is_native"):   # [2026-11-21] the queue is the store's: the same field from it
@@ -10402,7 +10414,7 @@ class Graph:
             for ts, entries in self.synapses.delay_export():
                 _dq.setdefault(ts, []).extend(entries)
             _delay_buf = list(_dq.items())
-        _recent_spk = [(nid, spikes) for nid, spikes, _cap in self._pb.spike_items(True)]
+        _recent_spk = None if _pb_packed else [(nid, spikes) for nid, spikes, _cap in self._pb.spike_items(True)]
         # The native backend creates this packed payload for the capture. It does
         # not borrow live state, and bytearray is intentionally not deep-copied:
         # that would duplicate the largest capture allocation inside _step_lock.
@@ -10448,10 +10460,10 @@ class Graph:
                 for _row, _confirmed, _resolved_at, _actual, _n_actual in self._pb.outcome_items()
             ],
             # Phase 3: Per-synapse confirmation history
-            "synapse_confirmation_history": {
+            "synapse_confirmation_history": (self._pb.hist_msgpack() if _pb_packed else {
                 syn_id: list(history)
                 for syn_id, history in _syn_hist
-            },
+            }),
             # Phase 3: Logs
             "novel_sequence_log": copy.deepcopy(list(self._novel_sequence_log), _memo) if _memo is not None else list(self._novel_sequence_log),
             "reward_history": copy.deepcopy(list(self._reward_history), _memo) if _memo is not None else list(self._reward_history),
@@ -10510,10 +10522,10 @@ class Graph:
                 str(ts): [[nid, curr] for nid, curr in entries]
                 for ts, entries in _delay_buf
             },
-            "recent_spikes": {
+            "recent_spikes": (self._pb.spikes_msgpack() if _pb_packed else {
                 nid: list(spikes)
                 for nid, spikes in _recent_spk
-            },
+            }),
             "steps_since_last_fire": self._steps_since_last_fire,
             "homeostatic_steps_since_scaling": next(
                 (r._steps_since_scaling for r in self._plasticity_rules
